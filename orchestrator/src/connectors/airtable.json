@@ -1,0 +1,63 @@
+{
+  "provider": "airtable",
+  "protocol": "http",
+  "display": {
+    "name": "Airtable",
+    "category": "Database",
+    "blurb": "Read and write Airtable base records and inspect base schema — authenticated with a personal access token brokered at the egress proxy, never seen by the agent.",
+    "icon": { "mono": "AT", "color": "#fcb400" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "airtable.api_token" }
+    ]
+  },
+  "hosts": ["api.airtable.com"],
+  "test": { "path": "/v0/meta/whoami" },
+  "operations": [
+    {
+      "grants": ["bases:read"],
+      "match": { "method": "GET", "path": "/v0/meta/bases*" }
+    },
+    {
+      "grants": ["schema:read"],
+      "match": { "method": "GET", "path": "/v0/meta/bases/*/tables*" }
+    },
+    {
+      "grants": ["records:read"],
+      "match": { "method": "GET", "path": "/v0/*/*" }
+    },
+    {
+      "grants": ["records:write"],
+      "match": { "method": "POST", "path": "/v0/*/*" }
+    },
+    {
+      "grants": ["records:write"],
+      "match": { "method": "PATCH", "path": "/v0/*/*" }
+    },
+    {
+      "grants": ["records:write"],
+      "match": { "method": "PUT", "path": "/v0/*/*" }
+    },
+    {
+      "grants": ["records:write"],
+      "match": { "method": "DELETE", "path": "/v0/*/*" }
+    },
+    {
+      "grants": ["comments:read"],
+      "match": { "method": "GET", "path": "/v0/*/*/*/comments*" }
+    },
+    {
+      "grants": ["comments:write"],
+      "match": { "method": "POST", "path": "/v0/*/*/*/comments*" }
+    }
+  ],
+  "cli": {
+    "bins": ["airtable"],
+    "binSource": "bundled",
+    "dummyEnv": { "AIRTABLE_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `airtable` to read and write Airtable data from this session. Authentication is automatic: the egress proxy injects the personal access token on requests to api.airtable.com; `AIRTABLE_TOKEN` is a managed placeholder. Do NOT set a real token or run any login.\n\nBase id (e.g. `appXXXXXXXXXXXXXX`) and table name/id (e.g. `Tasks` or `tblXXXXXXXXXXXXXX`) are NON-secret arguments you pass on the command line. The PAT is scoped to specific bases/workspaces at creation — only those are reachable.\n\nDiscover what you can reach:\n  airtable whoami                              Token owner + scopes (requires no extra power)\n  airtable bases                               List accessible bases (requires `bases:read`)\n  airtable schema <baseId>                     List tables/fields/views in a base (requires `schema:read`)\n\nRecords:\n  airtable list <baseId> <table> [field=value ...]   List records, paginated; pass e.g. maxRecords=10, view=Grid, filterByFormula=... (requires `records:read`)\n  airtable get <baseId> <table> <recordId>           Fetch one record (requires `records:read`)\n  airtable create <baseId> <table> '<json>'          Create records; <json> is a body like {\"records\":[{\"fields\":{...}}]} (requires `records:write`)\n  airtable update <baseId> <table> '<json>'          PATCH records (partial update); body {\"records\":[{\"id\":\"rec...\",\"fields\":{...}}]} (requires `records:write`)\n  airtable delete <baseId> <table> <recordId>        Delete one record (requires `records:write`)\n\nComments:\n  airtable comments <baseId> <table> <recordId>          List a record's comments (requires `comments:read`)\n  airtable comment <baseId> <table> <recordId> <text>    Add a comment (requires `comments:write`)\n\nEscape hatches (the path is appended to https://api.airtable.com/v0):\n  airtable get-raw <path>                  GET an arbitrary /v0 path (e.g. airtable get-raw /meta/whoami)\n  airtable api <METHOD> <path> ['<json>']  Any method; JSON body sent as application/json\n\nResponses are JSON. Airtable returns 200 on success and {\"error\":{...}} with a 4xx on failure (e.g. 422 for invalid fields, 403 for a base the token can't reach)."
+  }
+}

@@ -209,9 +209,9 @@ describe("ProfileService — auth + field filtering", () => {
     try {
       const r = await s.client.createProfile({
         name: "Capable", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {},
-        capabilities: ["github:issues:write", "datadog:observability:read@idx-1"],
+        capabilities: ["github:issues:write", "datadog:metrics:read@idx-1"],
       });
-      expect(r.profile!.capabilities).toEqual(["github:issues:write", "datadog:observability:read@idx-1"]);
+      expect(r.profile!.capabilities).toEqual(["github:issues:write", "datadog:metrics:read@idx-1"]);
     } finally { await s.close(); }
   });
 });

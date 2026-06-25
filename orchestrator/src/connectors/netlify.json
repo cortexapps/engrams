@@ -1,0 +1,103 @@
+{
+  "provider": "netlify",
+  "protocol": "http",
+  "display": {
+    "name": "Netlify",
+    "category": "Deployment",
+    "blurb": "Inspect and manage Netlify sites, deploys, builds, forms and DNS during a run — authenticated with a personal access token brokered at the egress proxy, never seen by the agent.",
+    "icon": { "mono": "NL", "color": "#00ad9f" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "netlify.api_token" }
+    ]
+  },
+  "hosts": ["api.netlify.com"],
+  "test": { "path": "/api/v1/user" },
+  "operations": [
+    {
+      "grants": ["sites:read"],
+      "match": { "method": "GET", "path": "/api/v1/sites*" }
+    },
+    {
+      "grants": ["sites:write"],
+      "match": { "method": "POST", "path": "/api/v1/sites*" }
+    },
+    {
+      "grants": ["sites:write"],
+      "match": { "method": "PATCH", "path": "/api/v1/sites/*" }
+    },
+    {
+      "grants": ["sites:write"],
+      "match": { "method": "DELETE", "path": "/api/v1/sites/*" }
+    },
+    {
+      "grants": ["deploys:read"],
+      "match": { "method": "GET", "path": "/api/v1/sites/*/deploys*" }
+    },
+    {
+      "grants": ["deploys:read"],
+      "match": { "method": "GET", "path": "/api/v1/deploys/*" }
+    },
+    {
+      "grants": ["deploys:write"],
+      "match": { "method": "POST", "path": "/api/v1/sites/*/deploys*" }
+    },
+    {
+      "grants": ["deploys:write"],
+      "match": { "method": "POST", "path": "/api/v1/deploys/*/restore" }
+    },
+    {
+      "grants": ["builds:read"],
+      "match": { "method": "GET", "path": "/api/v1/sites/*/builds*" }
+    },
+    {
+      "grants": ["builds:write"],
+      "match": { "method": "POST", "path": "/api/v1/sites/*/builds*" }
+    },
+    {
+      "grants": ["forms:read"],
+      "match": { "method": "GET", "path": "/api/v1/sites/*/forms*" }
+    },
+    {
+      "grants": ["forms:read"],
+      "match": { "method": "GET", "path": "/api/v1/forms/*" }
+    },
+    {
+      "grants": ["env:read"],
+      "match": { "method": "GET", "path": "/api/v1/accounts/*/env*" }
+    },
+    {
+      "grants": ["env:write"],
+      "match": { "method": "POST", "path": "/api/v1/accounts/*/env*" }
+    },
+    {
+      "grants": ["env:write"],
+      "match": { "method": "PUT", "path": "/api/v1/accounts/*/env/*" }
+    },
+    {
+      "grants": ["env:write"],
+      "match": { "method": "DELETE", "path": "/api/v1/accounts/*/env/*" }
+    },
+    {
+      "grants": ["dns:read"],
+      "match": { "method": "GET", "path": "/api/v1/dns_zones*" }
+    },
+    {
+      "grants": ["account:read"],
+      "match": { "method": "GET", "path": "/api/v1/user" }
+    },
+    {
+      "grants": ["account:read"],
+      "match": { "method": "GET", "path": "/api/v1/accounts*" }
+    }
+  ],
+  "cli": {
+    "bins": ["netlify"],
+    "binSource": "bundled",
+    "dummyEnv": { "NETLIFY_AUTH_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `netlify` to inspect and manage Netlify from this session via the REST API (https://api.netlify.com/api/v1). Authentication is automatic: the egress proxy injects your personal access token (Bearer) on every request to api.netlify.com; `NETLIFY_AUTH_TOKEN` is a managed placeholder. Do NOT run any login or set a real token.\n\nEach subcommand needs the matching power on your profile — a call to a path your profile didn't grant is denied at the network boundary, not authenticated.\n\nIdentity / accounts:\n  netlify whoami                          Current user (GET /user) — needs `account:read`.\n  netlify accounts                        List accounts (GET /accounts) — needs `account:read`.\nSites (needs `sites:read`, or `sites:write` to mutate):\n  netlify sites                           List your sites.\n  netlify site <site-id>                  Show one site.\n  netlify create-site name=<n> [field=value ...]   Create a site (POST).\n  netlify delete-site <site-id>           Delete a site.\nDeploys (`deploys:read` / `deploys:write`):\n  netlify deploys <site-id>               List a site's deploys.\n  netlify deploy <deploy-id>              Show one deploy.\n  netlify restore <deploy-id>            Restore (roll back to) a deploy (POST).\nBuilds (`builds:read` / `builds:write`):\n  netlify builds <site-id>                List a site's builds.\n  netlify build <site-id>                 Trigger a build (POST).\nForms (`forms:read`):\n  netlify forms <site-id>                 List a site's forms.\nEnv vars (`env:read` / `env:write`):\n  netlify env <account-id> [site_id=<id>] List account-level env vars.\nDNS (`dns:read`):\n  netlify dns                             List DNS zones.\nGeneric passthrough:\n  netlify get  <path> [field=value ...]   Raw GET  https://api.netlify.com/api/v1/<path> (query params).\n  netlify api  <METHOD> <path> [field=value ...]   Raw call with a JSON body from field=value pairs.\n<path> is relative to /api/v1 (e.g. `netlify get sites` or `netlify api POST sites name=demo`). Responses are JSON, pretty-printed when jq is present."
+  }
+}

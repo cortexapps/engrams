@@ -1,0 +1,156 @@
+#!/bin/sh
+# engrams Sentry CLI — a thin wrapper over the Sentry REST API (v0, /api/0/).
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `SENTRY_AUTH_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped org auth
+# token on every request to sentry.io (and strips any token you supply). There
+# is NOTHING to log in to — do not set a real token or run any `login`.
+#
+# Each subcommand needs the matching power on your profile (sentry:projects:read,
+# sentry:issues:read, sentry:issues:write, sentry:events:read,
+# sentry:releases:read, sentry:teams:read, sentry:monitors:read,
+# sentry:organizations:read); calls to a path your profile didn't grant are
+# denied at the network boundary, not authenticated.
+set -eu
+
+BASE="https://sentry.io"
+TOKEN="${SENTRY_AUTH_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams Sentry CLI — auth is brokered by the platform (no token to set).
+
+Usage:
+  sentry orgs                              List your organizations
+  sentry projects <org>                    List an org's projects
+  sentry issues <org> [field=value ...]    List an org's issues (e.g. query=is:unresolved)
+  sentry issue <org> <issue-id>            Retrieve one issue
+  sentry resolve <org> <issue-id>          Resolve an issue (status=resolved)
+  sentry ignore <org> <issue-id>           Ignore/mute an issue (status=ignored)
+  sentry events <org> [field=value ...]    Query an org's events
+  sentry releases <org>                    List an org's releases
+  sentry teams <org>                       List an org's teams
+  sentry monitors <org>                    List an org's cron monitors
+  sentry get <path> [field=value ...]      Raw GET (path may be /api/0/... or an /api/0-relative tail)
+  sentry api <METHOD> <path> [-- args]     Raw call with an explicit method; args after -- go to curl
+
+<org> is an organization slug (run `sentry orgs` to find it). Paths that do not
+start with /api are auto-prefixed with /api/0/. Responses are JSON; the API
+returns 401/403 if your profile didn't grant the path.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# Normalize a path: pass through /api/... unchanged, else prefix /api/0/.
+norm_path() {
+    case "$1" in
+    /api/*) printf '%s' "$1" ;;
+    /*) printf '/api/0%s' "$1" ;;
+    *) printf '/api/0/%s' "$1" ;;
+    esac
+}
+
+# request <METHOD> <path> [curl-args...] — call the Sentry API with brokered auth.
+request() {
+    m="$1"
+    p="$2"
+    shift 2
+    curl -sS -X "$m" "$BASE$(norm_path "$p")" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Accept: application/json" \
+        "$@" | pretty
+}
+
+# get <path> [field=value ...] — GET, turning each field=value into a query param.
+get() {
+    p="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    # -G folds --data-urlencode pairs into the query string for a GET.
+    request GET "$p" -G "$@"
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+orgs)
+    get "/api/0/organizations/"
+    ;;
+projects)
+    org="${1:?usage: sentry projects <org>}"
+    get "/api/0/organizations/$org/projects/"
+    ;;
+issues)
+    org="${1:?usage: sentry issues <org> [field=value ...]}"
+    shift
+    get "/api/0/organizations/$org/issues/" "$@"
+    ;;
+issue)
+    org="${1:?usage: sentry issue <org> <issue-id>}"
+    id="${2:?usage: sentry issue <org> <issue-id>}"
+    get "/api/0/organizations/$org/issues/$id/"
+    ;;
+resolve)
+    org="${1:?usage: sentry resolve <org> <issue-id>}"
+    id="${2:?usage: sentry resolve <org> <issue-id>}"
+    request PUT "/api/0/organizations/$org/issues/$id/" \
+        -H "Content-Type: application/json" \
+        --data '{"status":"resolved"}'
+    ;;
+ignore)
+    org="${1:?usage: sentry ignore <org> <issue-id>}"
+    id="${2:?usage: sentry ignore <org> <issue-id>}"
+    request PUT "/api/0/organizations/$org/issues/$id/" \
+        -H "Content-Type: application/json" \
+        --data '{"status":"ignored"}'
+    ;;
+events)
+    org="${1:?usage: sentry events <org> [field=value ...]}"
+    shift
+    get "/api/0/organizations/$org/events/" "$@"
+    ;;
+releases)
+    org="${1:?usage: sentry releases <org>}"
+    get "/api/0/organizations/$org/releases/"
+    ;;
+teams)
+    org="${1:?usage: sentry teams <org>}"
+    get "/api/0/organizations/$org/teams/"
+    ;;
+monitors)
+    org="${1:?usage: sentry monitors <org>}"
+    get "/api/0/organizations/$org/monitors/"
+    ;;
+get)
+    p="${1:?usage: sentry get <path> [field=value ...]}"
+    shift
+    get "$p" "$@"
+    ;;
+api)
+    m="${1:?usage: sentry api <METHOD> <path> [-- curl-args]}"
+    p="${2:?usage: sentry api <METHOD> <path> [-- curl-args]}"
+    shift 2
+    # Drop a leading `--` separator if present.
+    [ "${1:-}" = "--" ] && shift || true
+    request "$m" "$p" "$@"
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "sentry: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

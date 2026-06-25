@@ -13,6 +13,7 @@ import {
   buildRegistry,
   parseCapability,
   grantsCapability,
+  isGraphqlMatch,
   compileIntegrationPolicy,
   compileCliIntegrations,
   INTEGRATIONS_CLI_BUNDLE,
@@ -44,6 +45,30 @@ const githubRaw = {
   hosts: ["api.github.com"],
   operations: [
     { grants: ["issues:write"], match: { method: "POST", path: "/repos/*/issues" } },
+  ],
+};
+
+// ADR 0059: a connector mixing REST + GraphQL operations under shared powers.
+const githubGraphqlRaw = {
+  provider: "github",
+  protocol: "http",
+  credential: { source: "mint", mint: { kind: "github_app" } },
+  hosts: ["api.github.com"],
+  graphqlEndpoint: "/graphql",
+  operations: [
+    { grants: ["pulls:write"], match: { method: "POST", path: "/repos/*/pulls" } },
+    { grants: ["pulls:write"], match: { operation: "mutation", field: "mergePullRequest" } },
+    {
+      grants: ["issues:write"],
+      match: { operation: "mutation", field: "createIssue" },
+      asset: {
+        kind: "issue",
+        surface: "asset",
+        success: { noGraphqlErrors: true },
+        data: { id: "$.resp.data.createIssue.issue.id" },
+        fetchable: { external: "$.resp.data.createIssue.issue.url" },
+      },
+    },
   ],
 };
 
@@ -120,6 +145,46 @@ describe("parseConnector", () => {
     };
     expect(() => parseConnector(bad, "x")).toThrow(/surface/);
   });
+
+  // ADR 0059: GraphQL operations.
+  test("accepts a GraphQL match + defaults graphqlEndpoint to /graphql", () => {
+    const c = parseConnector(githubGraphqlRaw, "github");
+    expect(c.graphqlEndpoint).toBe("/graphql");
+    const gqlOp = c.operations.find((o) => o.match && isGraphqlMatch(o.match));
+    expect(gqlOp).toBeDefined();
+    if (gqlOp?.match && isGraphqlMatch(gqlOp.match)) {
+      expect(gqlOp.match.operation).toBe("mutation");
+      expect(gqlOp.match.field).toBe("mergePullRequest");
+    }
+  });
+
+  test("a pure-REST connector leaves graphqlEndpoint undefined", () => {
+    expect(parseConnector(githubRaw, "github").graphqlEndpoint).toBeUndefined();
+  });
+
+  test("honors an explicit graphqlEndpoint", () => {
+    const c = parseConnector({ ...githubGraphqlRaw, graphqlEndpoint: "/api/graphql" }, "github");
+    expect(c.graphqlEndpoint).toBe("/api/graphql");
+  });
+
+  test("rejects a graphqlEndpoint that isn't an absolute path", () => {
+    expect(() => parseConnector({ ...githubGraphqlRaw, graphqlEndpoint: "graphql" }, "x")).toThrow(/graphqlEndpoint/);
+  });
+
+  test("rejects a match mixing HTTP and GraphQL shapes", () => {
+    const bad = { ...githubRaw, operations: [{ grants: ["x"], match: { method: "POST", operation: "mutation", field: "f" } }] };
+    expect(() => parseConnector(bad, "x")).toThrow(/not both/);
+  });
+
+  test("rejects a bad GraphQL operation type", () => {
+    const bad = { ...githubRaw, operations: [{ grants: ["x"], match: { operation: "subscribe", field: "f" } }] };
+    expect(() => parseConnector(bad, "x")).toThrow(/match\.operation/);
+  });
+
+  test("rejects a GraphQL field that isn't a valid name", () => {
+    const bad = { ...githubRaw, operations: [{ grants: ["x"], match: { operation: "mutation", field: "no spaces" } }] };
+    expect(() => parseConnector(bad, "x")).toThrow(/match\.field/);
+  });
 });
 
 describe("buildRegistry", () => {
@@ -175,6 +240,8 @@ describe("compileIntegrationPolicy", () => {
         mint_provider: "",
         methods: ["GET"],
         path_globs: ["/api/v2/logs/events*"],
+        graphql_operation: "",
+        graphql_field: "",
       },
     ]);
   });
@@ -318,6 +385,9 @@ describe("compileIntegrationPolicy — observes", () => {
         asset_kind: "issue",
         surface: "asset",
         success_status_class: "2xx",
+        success_no_graphql_errors: false,
+        graphql_operation: "",
+        graphql_field: "",
         data: [
           ["number", "$.resp.number"],
           ["title", "$.resp.title"],
@@ -333,6 +403,48 @@ describe("compileIntegrationPolicy — observes", () => {
   });
 });
 
+describe("compileIntegrationPolicy — GraphQL (ADR 0059)", () => {
+  const reg = registryOf(githubGraphqlRaw);
+
+  test("a GraphQL mint op compiles to a POST /graphql inject gated by operation+field", () => {
+    const policy = compileIntegrationPolicy(["github:pulls:write"], reg);
+    const gql = policy.injects.find((i) => i.graphql_field === "mergePullRequest");
+    expect(gql).toMatchObject({
+      mint_provider: "github",
+      methods: ["POST"],
+      path_globs: ["/graphql"],
+      graphql_operation: "mutation",
+      graphql_field: "mergePullRequest",
+    });
+  });
+
+  test("the same power flows to BOTH the REST and GraphQL surfaces", () => {
+    // The core ADR 0059 property: granting `pulls:write` opens the REST endpoint
+    // AND the GraphQL mutation — one inject per surface.
+    const policy = compileIntegrationPolicy(["github:pulls:write"], reg);
+    const paths = policy.injects.map((i) => i.path_globs.join(","));
+    expect(paths).toContain("/repos/*/pulls");
+    expect(paths).toContain("/graphql");
+    expect(policy.injects).toHaveLength(2);
+  });
+
+  test("a GraphQL asset op compiles to a graphql observe with the noGraphqlErrors rule", () => {
+    const policy = compileIntegrationPolicy(["github:issues:write"], reg);
+    expect(policy.observes).toHaveLength(1);
+    expect(policy.observes[0]).toMatchObject({
+      provider: "github",
+      asset_kind: "issue",
+      methods: ["POST"],
+      path_globs: ["/graphql"],
+      graphql_operation: "mutation",
+      graphql_field: "createIssue",
+      success_no_graphql_errors: true,
+      success_status_class: null,
+    });
+    expect(policy.observes[0]!.data).toEqual([["id", "$.resp.data.createIssue.issue.id"]]);
+  });
+});
+
 describe("on-disk registry", () => {
   test("loads the shipped connectors", () => {
     const reg = connectorRegistry();
@@ -344,20 +456,31 @@ describe("on-disk registry", () => {
   });
 
   test("the shipped datadog connector compiles BOTH pup injects (api + app key)", () => {
-    const policy = compileIntegrationPolicy(["datadog:observability:read"]);
-    expect(policy.injects).toHaveLength(2);
-    expect(policy.injects.map((i) => i.header_name).sort()).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY"]);
-    expect(policy.injects.map((i) => i.secret_ref).sort()).toEqual(["datadog-api-key", "datadog-app-key"]);
+    const policy = compileIntegrationPolicy(["datadog:metrics:read"]);
+    // metrics:read activates several ops (query, metric metadata, v2 query); each
+    // emits one inject per header (DD-API-KEY + DD-APPLICATION-KEY) gated to that
+    // op's path — so assert on the unique header/secret SET, not the entry count.
+    const headers = [...new Set(policy.injects.map((i) => i.header_name))].sort();
+    expect(headers).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY"]);
+    const refs = [...new Set(policy.injects.map((i) => i.secret_ref))].sort();
+    expect(refs).toEqual(["datadog-api-key", "datadog-app-key"]);
   });
 
-  test("the shipped github issues:write compiles a minted inject + an issue observe", () => {
+  test("the shipped github issues:write compiles minted injects + issue observes (REST + GraphQL)", () => {
     const policy = compileIntegrationPolicy(["github:issues:write"]);
-    expect(policy.injects).toHaveLength(1);
-    expect(policy.injects[0]!.mint_provider).toBe("github");
-    expect(policy.observes).toHaveLength(1);
-    expect(policy.observes[0]!.provider).toBe("github");
-    expect(policy.observes[0]!.asset_kind).toBe("issue");
-    expect(policy.observes[0]!.fetchable).toBe("$.resp.html_url");
+    // issues:write activates several gated ops — the REST create/edit/comment/label
+    // endpoints AND the GraphQL createIssue/updateIssue/… mutations (ADR 0059); each
+    // emits a minted inject for github.
+    expect(policy.injects.length).toBeGreaterThan(0);
+    expect(policy.injects.every((i) => i.mint_provider === "github")).toBe(true);
+    // Two issue assets are observed: the REST create (POST /repos/*/issues, gated by
+    // the 2xx status) and the GraphQL createIssue mutation (gated by noGraphqlErrors).
+    expect(policy.observes.every((o) => o.provider === "github" && o.asset_kind === "issue")).toBe(true);
+    const rest = policy.observes.find((o) => o.path_globs.includes("/repos/*/issues") && !o.graphql_field);
+    expect(rest?.fetchable).toBe("$.resp.html_url");
+    expect(rest?.success_status_class).toBe("2xx");
+    const gql = policy.observes.find((o) => o.graphql_field === "createIssue");
+    expect(gql?.success_no_graphql_errors).toBe(true);
   });
 });
 
@@ -427,11 +550,13 @@ describe("parseConnector — admin-trust hardening", () => {
 // ---------------------------------------------------------------------------
 
 describe("loadRegistry", () => {
-  const sentryRaw = {
-    provider: "sentry",
+  // A fictional provider that is NOT one of the shipped on-disk seeds, so these
+  // tests exercise the custom (DB) merge path without colliding with a built-in.
+  const customRaw = {
+    provider: "customco",
     protocol: "http",
-    credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" }] },
-    hosts: ["sentry.io"],
+    credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "customco-token", template: "Bearer {}" }] },
+    hosts: ["api.customco.example"],
     operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
   };
   const source = (rows: Array<{ provider: string; config: unknown }>) => ({ list: async () => rows });
@@ -439,15 +564,15 @@ describe("loadRegistry", () => {
   beforeEach(() => invalidateRegistry());
 
   test("merges custom connectors with the built-in seeds", async () => {
-    const reg = await loadRegistry(source([{ provider: "sentry", config: sentryRaw }]));
+    const reg = await loadRegistry(source([{ provider: "customco", config: customRaw }]));
     expect(reg.has("datadog")).toBe(true); // built-in seed
     expect(reg.has("github")).toBe(true); // built-in seed
-    expect(reg.has("sentry")).toBe(true); // custom
-    expect(grantsCapability("sentry", "issues:read", reg)).toBe(true);
+    expect(reg.has("customco")).toBe(true); // custom
+    expect(grantsCapability("customco", "issues:read", reg)).toBe(true);
   });
 
   test("built-in seeds take precedence — a custom row can't shadow one", async () => {
-    const evilGithub = { ...sentryRaw, provider: "github", hosts: ["evil.example.com"] };
+    const evilGithub = { ...customRaw, provider: "github", hosts: ["evil.example.com"] };
     const reg = await loadRegistry(source([{ provider: "github", config: evilGithub }]));
     // The built-in github (mint) wins; the custom inject row is ignored.
     expect(reg.get("github")!.credential.source).toBe("mint");
@@ -457,16 +582,16 @@ describe("loadRegistry", () => {
     const reg = await loadRegistry(
       source([
         { provider: "bad", config: { provider: "bad", protocol: "ftp" } },
-        { provider: "sentry", config: sentryRaw },
+        { provider: "customco", config: customRaw },
       ]),
     );
     expect(reg.has("bad")).toBe(false);
-    expect(reg.has("sentry")).toBe(true);
+    expect(reg.has("customco")).toBe(true);
   });
 
   test("skips a row whose config.provider mismatches the row key", async () => {
-    const reg = await loadRegistry(source([{ provider: "sentry", config: { ...sentryRaw, provider: "other" } }]));
-    expect(reg.has("sentry")).toBe(false);
+    const reg = await loadRegistry(source([{ provider: "customco", config: { ...customRaw, provider: "other" } }]));
+    expect(reg.has("customco")).toBe(false);
     expect(reg.has("other")).toBe(false);
   });
 
@@ -482,10 +607,10 @@ describe("loadRegistry", () => {
 
   test("invalidateRegistry forces a re-read", async () => {
     const first = await loadRegistry(source([]));
-    expect(first.has("sentry")).toBe(false);
+    expect(first.has("customco")).toBe(false);
     invalidateRegistry();
-    const second = await loadRegistry(source([{ provider: "sentry", config: sentryRaw }]));
-    expect(second.has("sentry")).toBe(true);
+    const second = await loadRegistry(source([{ provider: "customco", config: customRaw }]));
+    expect(second.has("customco")).toBe(true);
   });
 });
 
@@ -685,7 +810,7 @@ describe("cli facet (ADR 0058)", () => {
     expect(slack.cli?.binSource).toBe("bundled");
     expect(slack.cli?.dummyEnv).toEqual({ SLACK_TOKEN: "x-engrams-managed" });
     // `slack whoami` hits /api/auth.test — gated so the token is injected there too.
-    expect(slack.operations.some((o) => o.match?.path === "/api/auth.test")).toBe(true);
+    expect(slack.operations.some((o) => o.match && !isGraphqlMatch(o.match) && o.match.path === "/api/auth.test")).toBe(true);
   });
 
   test("the slack seed requests the ADR-0059 trigger scopes", () => {
@@ -743,7 +868,7 @@ describe("cli facet (ADR 0058)", () => {
   });
 
   test("the on-disk github + datadog connectors expose their cli facet", () => {
-    const plan = compileCliIntegrations(["github:pulls:write", "datadog:observability:read"], connectorRegistry());
+    const plan = compileCliIntegrations(["github:pulls:write", "datadog:metrics:read"], connectorRegistry());
     expect(plan.enabled.map((e) => e.provider).sort()).toEqual(["datadog", "github"]);
     expect(plan.dummyEnv.GH_TOKEN).toBe("x-engrams-managed");
     expect(plan.dummyEnv.DD_API_KEY).toBe("x-engrams-managed");

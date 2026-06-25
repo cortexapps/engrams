@@ -1078,9 +1078,12 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
     /// else read the chunk from the bake's chunk store and push it.
     ///
     /// Bounded concurrency keeps peak memory at
-    /// `CONCURRENCY × chunk_size` (~128 MiB) regardless of image
-    /// size; per-blob retry with backoff means a transient blip
-    /// costs one 16 MiB re-upload, not the whole push.
+    /// `concurrency × chunk_size` (default 32 × 16 MiB ≈ 512 MiB)
+    /// regardless of image size; per-blob retry with backoff means a
+    /// transient blip costs one 16 MiB re-upload, not the whole push.
+    /// The in-flight count is [`push_concurrency`] (env-tunable) —
+    /// GHCR throttles per-connection, so a fat warm-image push stays
+    /// network-bound rather than serialized behind a handful of streams.
     ///
     /// Returns `(pushed, skipped)` counts.
     async fn push_chunk_blobs(
@@ -1097,7 +1100,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             .await
             .map_err(|e| BuildError::Docker(format!("registry auth: {e}")))?;
 
-        const CONCURRENCY: usize = 8;
+        let concurrency = push_concurrency();
         const MAX_ATTEMPTS: u32 = 5;
 
         async fn push_one(
@@ -1164,7 +1167,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         let mut tasks = FuturesUnordered::new();
         let mut pushed = 0usize;
         let mut skipped = 0usize;
-        for _ in 0..CONCURRENCY {
+        for _ in 0..concurrency {
             if let Some((i, entry)) = iter.next() {
                 tasks.push(push_one(
                     oci,
@@ -1194,6 +1197,27 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         }
         Ok((pushed, skipped))
     }
+}
+
+/// In-flight concurrent blob uploads for a chunked-image push.
+///
+/// Default 32; override via `ENGRAM_PUSH_CONCURRENCY`. GHCR throttles
+/// per-connection (warm-image bakes observe ~1.8 MB/s/stream), so the
+/// aggregate push rate scales with concurrency until the registry's
+/// own ceiling — bump the env var to probe it. Peak memory is
+/// `N × 16 MiB` chunk, so a big N is RAM, not CPU, bound. A junk or
+/// `0` value falls back to the default rather than wedging the push.
+fn push_concurrency() -> usize {
+    parse_push_concurrency(std::env::var("ENGRAM_PUSH_CONCURRENCY").ok())
+}
+
+/// Pure core of [`push_concurrency`], split out so the parse/clamp is
+/// unit-testable without poking the process environment.
+fn parse_push_concurrency(raw: Option<String>) -> usize {
+    const DEFAULT: usize = 32;
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT)
 }
 
 /// Result of a successful push to an OCI registry.
@@ -1343,6 +1367,35 @@ mod tests {
         assert!(
             !DEFAULT_INIT_SHIM.contains("FIXME(dns-exfil)"),
             "the DNS-exfil FIXME is fixed; the stale marker should be removed",
+        );
+    }
+
+    /// `ENGRAM_PUSH_CONCURRENCY` parsing: a valid override wins, but
+    /// unset / junk / zero all fall back to the default (32) rather
+    /// than wedging the push at 0 in-flight uploads.
+    #[test]
+    fn push_concurrency_parse_and_clamp() {
+        assert_eq!(parse_push_concurrency(None), 32, "unset → default");
+        assert_eq!(
+            parse_push_concurrency(Some("64".into())),
+            64,
+            "valid override"
+        );
+        assert_eq!(parse_push_concurrency(Some(" 16 ".into())), 16, "trimmed");
+        assert_eq!(
+            parse_push_concurrency(Some("0".into())),
+            32,
+            "0 → default, never 0 streams"
+        );
+        assert_eq!(
+            parse_push_concurrency(Some("nope".into())),
+            32,
+            "junk → default"
+        );
+        assert_eq!(
+            parse_push_concurrency(Some("".into())),
+            32,
+            "empty → default"
         );
     }
 }

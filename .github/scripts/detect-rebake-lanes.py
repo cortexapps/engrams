@@ -317,8 +317,16 @@ def main():
     test_rust = ci_self or bool(cc) or any_path(changed, RUST_COMMON)
     # musl cross-compile of the FC host binaries — same closure as host_binaries.
     test_cross = ci_self or host_binaries
-    # Firecracker integration lane — the e2e binary closure + its inputs.
-    test_fc = ci_self or e2e
+    # Firecracker integration lane. Gated on the e2e binary CLOSURE (the FC
+    # backend + host-agent + their deps — the Rust the FC integration tests
+    # exercise; engram-sandbox-firecracker is in host-agent's closure, and the
+    # FC tests live in that crate) and the vendored FC fork — NOT the full `e2e`
+    # flag. The e2e stack's non-crate inputs (deploy/bundles/, deploy/demo*,
+    # Tiltfile, deploy/dev/) don't affect the FC tests, which use their own
+    # fixtures and mount bundles via the sandbox crates already in the closure;
+    # tripping FC on a bundle-payload edit was a needless ~KVM lane. The
+    # e2e-STACK lane still gates on `e2e`, so bundle staging is validated there.
+    test_fc = ci_self or bool(cc & e2e_closure) or fc_fork
     # web / orchestrator: their own sources or the protos they codegen from.
     test_web = ci_self or proto or any_path(changed, WEB_PATHS)
     test_orchestrator = ci_self or proto or any_path(changed, ORCH_PATHS)

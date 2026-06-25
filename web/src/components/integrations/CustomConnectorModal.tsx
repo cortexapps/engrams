@@ -69,10 +69,22 @@ let nextOpId = 1;
 interface OpRow {
   id: number;
   grant: string;
+  /** REST (`method`/`path`) or GraphQL (`operation`/`field`) — ADR 0059. */
+  kind: "rest" | "graphql";
   method: string;
   path: string;
+  operation: string;
+  field: string;
 }
-const newOp = (): OpRow => ({ id: nextOpId++, grant: "", method: "GET", path: "" });
+const newOp = (): OpRow => ({
+  id: nextOpId++,
+  grant: "",
+  kind: "rest",
+  method: "GET",
+  path: "",
+  operation: "mutation",
+  field: "",
+});
 
 // ADR 0058: a connector may inject several headers, each backed by its own org
 // secret (most APIs need one; some, e.g. Datadog, need DD-API-KEY + DD-APPLICATION-KEY).
@@ -128,6 +140,8 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
   const [hosts, setHosts] = useState("");
   const [creds, setCreds] = useState<CredRow[]>([newCred()]);
   const [ops, setOps] = useState<OpRow[]>([newOp()]);
+  // ADR 0059: the single path GraphQL ops POST to. Shown only when ≥1 GraphQL op.
+  const [graphqlEndpoint, setGraphqlEndpoint] = useState("/graphql");
   const [mono, setMono] = useState("");
   const [color, setColor] = useState(PALETTE[0]!);
   const [logo, setLogo] = useState<File | null>(null);
@@ -158,12 +172,16 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
     (splitList(cliBins).length > 0 &&
       cliDoc.trim().length > 0 &&
       (cliSource === "bundled" || cliFile !== null));
+  // ADR 0059: any GraphQL op opens the `graphqlEndpoint` field + the GraphQL gate.
+  const hasGraphql = ops.some((o) => o.grant.trim() && o.kind === "graphql");
   const valid = Boolean(
     name.trim() &&
-      hosts.trim() &&
-      ops.some((o) => o.grant.trim()) &&
-      creds.some((c) => c.header.trim()) &&
-      cliValid,
+    hosts.trim() &&
+    ops.some((o) => o.grant.trim()) &&
+    // A GraphQL op needs a field; the server rejects an empty one anyway.
+    ops.every((o) => !o.grant.trim() || o.kind !== "graphql" || o.field.trim()) &&
+    creds.some((c) => c.header.trim()) &&
+    cliValid,
   );
   const pending =
     upsert.isPending || putSecret.isPending || uploadLogo.isPending || uploadSkill.isPending;
@@ -179,14 +197,22 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
       .filter((c) => c.header.trim())
       .map((c) => ({
         ...c,
-        ref: c.secretRef.trim() || (single ? `${provider}-token` : `${provider}-${sanitizeRef(c.header)}`),
+        ref:
+          c.secretRef.trim() ||
+          (single ? `${provider}-token` : `${provider}-${sanitizeRef(c.header)}`),
       }));
     const operations = ops
       .filter((o) => o.grant.trim())
       .map((o) => {
         const match: Record<string, string> = {};
-        if (o.method.trim()) match.method = o.method.trim();
-        if (o.path.trim()) match.path = o.path.trim();
+        if (o.kind === "graphql") {
+          // ADR 0059: a GraphQL match is { operation, field }.
+          if (o.operation.trim()) match.operation = o.operation.trim();
+          if (o.field.trim()) match.field = o.field.trim();
+        } else {
+          if (o.method.trim()) match.method = o.method.trim();
+          if (o.path.trim()) match.path = o.path.trim();
+        }
         return { grants: [o.grant.trim()], ...(Object.keys(match).length ? { match } : {}) };
       });
     try {
@@ -223,9 +249,14 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
         display: { name: name.trim(), category, icon: { mono: monogram, color } },
         credential: {
           source: "inject",
-          injects: resolved.map((c) => ({ header: c.header.trim(), secretRef: c.ref, template: c.template })),
+          injects: resolved.map((c) => ({
+            header: c.header.trim(),
+            secretRef: c.ref,
+            template: c.template,
+          })),
         },
         hosts: splitList(hosts),
+        ...(hasGraphql ? { graphqlEndpoint: graphqlEndpoint.trim() || "/graphql" } : {}),
         operations,
         ...(cli ? { cli } : {}),
       };
@@ -445,16 +476,37 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
           <div className="flex flex-col gap-2">
             <Text variant="label">Operations</Text>
             <p className="text-[0.74rem] leading-relaxed text-muted-foreground">
-              The <strong>action slug</strong> is the capability a profile grants; the{" "}
-              <strong>method + path</strong> become the proxy's gate (the path is matched as a glob
-              — <code className="font-mono">*</code> matches any characters). Read/write and the
-              label are derived for display — not stored.
+              The <strong>action slug</strong> is the capability a profile grants. For{" "}
+              <strong>REST</strong> the <strong>method + path</strong> are the proxy's gate (the
+              path is a glob — <code className="font-mono">*</code> matches any characters); for{" "}
+              <strong>GraphQL</strong> the <strong>operation + field</strong> are matched against
+              the request body, so the same power can cover both surfaces. Read/write and the label
+              are derived for display — not stored.
             </p>
+            {hasGraphql && (
+              <div className="grid grid-cols-[1.4fr_1fr] items-center gap-2">
+                <span className="text-[0.74rem] text-muted-foreground">GraphQL endpoint</span>
+                <Input
+                  className="font-mono text-xs"
+                  placeholder="/graphql"
+                  aria-label="graphql endpoint"
+                  spellCheck={false}
+                  value={graphqlEndpoint}
+                  onChange={(e) => setGraphqlEndpoint(e.target.value)}
+                />
+              </div>
+            )}
             {ops.map((o) => {
               const g = o.grant.trim();
+              const access =
+                o.kind === "graphql"
+                  ? o.operation === "query"
+                    ? "read"
+                    : "write"
+                  : accessOf(o.method);
               return (
                 <div key={o.id} className="flex flex-col gap-1.5">
-                  <div className="grid grid-cols-[1.4fr_4.5rem_1.8fr_2rem] items-center gap-2">
+                  <div className="grid grid-cols-[1.4fr_5.5rem_1fr_2rem] items-center gap-2">
                     <Input
                       className="font-mono text-xs"
                       placeholder="issues:read"
@@ -469,31 +521,90 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
                         )
                       }
                     />
-                    <Input
-                      className="font-mono text-xs"
-                      placeholder="GET"
-                      aria-label="method"
-                      value={o.method}
-                      onChange={(e) =>
+                    <Select
+                      value={o.kind}
+                      onValueChange={(v) =>
                         setOps((r) =>
-                          r.map((x) =>
-                            x.id === o.id ? { ...x, method: e.target.value.toUpperCase() } : x,
-                          ),
+                          r.map((x) => (x.id === o.id ? { ...x, kind: v as OpRow["kind"] } : x)),
                         )
                       }
-                    />
-                    <Input
-                      className="font-mono text-xs"
-                      placeholder="/api/0/issues/*"
-                      aria-label="path"
-                      spellCheck={false}
-                      value={o.path}
-                      onChange={(e) =>
-                        setOps((r) =>
-                          r.map((x) => (x.id === o.id ? { ...x, path: e.target.value } : x)),
-                        )
-                      }
-                    />
+                    >
+                      <SelectTrigger className="text-xs" aria-label="operation kind">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="rest">REST</SelectItem>
+                        <SelectItem value="graphql">GraphQL</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    {o.kind === "graphql" ? (
+                      <div className="grid grid-cols-[7rem_1fr] gap-2">
+                        <Select
+                          value={o.operation}
+                          onValueChange={(v) =>
+                            setOps((r) =>
+                              r.map((x) => (x.id === o.id ? { ...x, operation: v } : x)),
+                            )
+                          }
+                        >
+                          <SelectTrigger
+                            className="font-mono text-xs"
+                            aria-label="graphql operation"
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="query">query</SelectItem>
+                            <SelectItem value="mutation">mutation</SelectItem>
+                            <SelectItem value="subscription">subscription</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <Input
+                          className="font-mono text-xs"
+                          placeholder="mergePullRequest"
+                          aria-label="graphql field"
+                          spellCheck={false}
+                          value={o.field}
+                          onChange={(e) =>
+                            setOps((r) =>
+                              r.map((x) =>
+                                x.id === o.id
+                                  ? { ...x, field: e.target.value.replace(/\s/g, "") }
+                                  : x,
+                              ),
+                            )
+                          }
+                        />
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-[4.5rem_1fr] gap-2">
+                        <Input
+                          className="font-mono text-xs"
+                          placeholder="GET"
+                          aria-label="method"
+                          value={o.method}
+                          onChange={(e) =>
+                            setOps((r) =>
+                              r.map((x) =>
+                                x.id === o.id ? { ...x, method: e.target.value.toUpperCase() } : x,
+                              ),
+                            )
+                          }
+                        />
+                        <Input
+                          className="font-mono text-xs"
+                          placeholder="/api/0/issues/*"
+                          aria-label="path"
+                          spellCheck={false}
+                          value={o.path}
+                          onChange={(e) =>
+                            setOps((r) =>
+                              r.map((x) => (x.id === o.id ? { ...x, path: e.target.value } : x)),
+                            )
+                          }
+                        />
+                      </div>
+                    )}
                     <Button
                       type="button"
                       variant="ghost"
@@ -513,15 +624,24 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
                         {provider}:{g}
                       </code>
                       <span className="text-[0.74rem]">"{humanizeAction(g)}"</span>
-                      <AccessTag access={accessOf(o.method)} />
-                      {o.path && (
-                        <span className="text-[0.72rem]">
-                          · gate{" "}
-                          <code className="font-mono">
-                            {(o.method || "GET").toUpperCase()} {o.path}
-                          </code>
-                        </span>
-                      )}
+                      <AccessTag access={access} />
+                      {o.kind === "graphql"
+                        ? o.field && (
+                            <span className="text-[0.72rem]">
+                              · gate{" "}
+                              <code className="font-mono">
+                                {o.operation} {o.field}
+                              </code>
+                            </span>
+                          )
+                        : o.path && (
+                            <span className="text-[0.72rem]">
+                              · gate{" "}
+                              <code className="font-mono">
+                                {(o.method || "GET").toUpperCase()} {o.path}
+                              </code>
+                            </span>
+                          )}
                     </div>
                   )}
                 </div>
@@ -575,7 +695,9 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
                   </label>
                   <label className="flex flex-col gap-1.5">
                     <Text variant="label">
-                      {cliSource === "uploaded" ? "Binary path(s) in the archive" : "Command name(s)"}
+                      {cliSource === "uploaded"
+                        ? "Binary path(s) in the archive"
+                        : "Command name(s)"}
                     </Text>
                     <Input
                       className="font-mono text-xs"

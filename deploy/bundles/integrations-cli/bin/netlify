@@ -1,0 +1,191 @@
+#!/bin/sh
+# engrams Netlify CLI — a thin wrapper over the Netlify REST API (/api/v1).
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `NETLIFY_AUTH_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped personal
+# access token on every request to api.netlify.com (and strips any token you
+# supply). There is NOTHING to log in to — do not set a real token or run any
+# `login`.
+#
+# Each subcommand needs the matching power on your profile (netlify:sites:read,
+# netlify:sites:write, netlify:deploys:read, netlify:deploys:write,
+# netlify:builds:read, netlify:builds:write, netlify:forms:read,
+# netlify:env:read, netlify:env:write, netlify:dns:read, netlify:account:read);
+# a call to a path your profile didn't grant is denied at the network boundary,
+# not authenticated.
+set -eu
+
+API="https://api.netlify.com/api/v1"
+TOKEN="${NETLIFY_AUTH_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams Netlify CLI — auth is brokered by the platform (no token to set).
+
+Usage:
+  netlify whoami                          Current user (GET /user)
+  netlify accounts                        List accounts (GET /accounts)
+  netlify sites                           List your sites (GET /sites)
+  netlify site <site-id>                  Show one site (GET /sites/<id>)
+  netlify create-site name=<n> [k=v ...]  Create a site (POST /sites)
+  netlify delete-site <site-id>           Delete a site (DELETE /sites/<id>)
+  netlify deploys <site-id>               List a site's deploys
+  netlify deploy <deploy-id>              Show one deploy (GET /deploys/<id>)
+  netlify restore <deploy-id>             Restore a deploy (POST /deploys/<id>/restore)
+  netlify builds <site-id>                List a site's builds
+  netlify build <site-id>                 Trigger a build (POST /sites/<id>/builds)
+  netlify forms <site-id>                 List a site's forms
+  netlify env <account-id> [k=v ...]      List account env vars (GET /accounts/<id>/env)
+  netlify dns                             List DNS zones (GET /dns_zones)
+  netlify get <path> [k=v ...]            Raw GET /api/v1/<path> (query params)
+  netlify api <METHOD> <path> [k=v ...]   Raw call with a JSON body from k=v pairs
+
+<path> is relative to /api/v1 (e.g. `netlify get sites`). Responses are JSON.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# get <path> [curl-args...] — GET an /api/v1 path with brokered auth.
+get() {
+    p="$1"
+    shift
+    curl -sS "$API/$p" -H "Authorization: Bearer $TOKEN" "$@" | pretty
+}
+
+# write <METHOD> <path> [curl-args...] — non-GET request with brokered auth.
+write() {
+    m="$1"
+    p="$2"
+    shift 2
+    curl -sS -X "$m" "$API/$p" -H "Authorization: Bearer $TOKEN" "$@" | pretty
+}
+
+# Build a JSON object on stdout from field=value pairs (string values only).
+json_body() {
+    if command -v jq >/dev/null 2>&1; then
+        set -- "$@"
+        jq_args=""
+        obj='{}'
+        for kv in "$@"; do
+            k=${kv%%=*}
+            v=${kv#*=}
+            obj=$(printf '%s' "$obj" | jq --arg k "$k" --arg v "$v" '. + {($k): $v}')
+        done
+        printf '%s' "$obj"
+    else
+        # Minimal fallback: naive JSON (values treated as strings).
+        out='{'
+        first=1
+        for kv in "$@"; do
+            k=${kv%%=*}
+            v=${kv#*=}
+            [ "$first" -eq 1 ] || out="$out,"
+            first=0
+            out="$out\"$k\":\"$v\""
+        done
+        out="$out}"
+        printf '%s' "$out"
+    fi
+}
+
+# Translate field=value args into repeated --data-urlencode pairs (for GET query
+# strings). POSIX-safe, no arrays.
+query_get() {
+    p="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    # curl puts --data-urlencode in the body for GET only with -G.
+    get "$p" -G "$@"
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    get user
+    ;;
+accounts)
+    get accounts
+    ;;
+sites)
+    if [ "$#" -gt 0 ]; then query_get sites "$@"; else get sites; fi
+    ;;
+site)
+    id="${1:?usage: netlify site <site-id>}"
+    get "sites/$id"
+    ;;
+create-site)
+    write POST sites -H "Content-Type: application/json" --data "$(json_body "$@")"
+    ;;
+delete-site)
+    id="${1:?usage: netlify delete-site <site-id>}"
+    write DELETE "sites/$id"
+    ;;
+deploys)
+    id="${1:?usage: netlify deploys <site-id>}"
+    shift
+    if [ "$#" -gt 0 ]; then query_get "sites/$id/deploys" "$@"; else get "sites/$id/deploys"; fi
+    ;;
+deploy)
+    id="${1:?usage: netlify deploy <deploy-id>}"
+    get "deploys/$id"
+    ;;
+restore)
+    id="${1:?usage: netlify restore <deploy-id>}"
+    write POST "deploys/$id/restore"
+    ;;
+builds)
+    id="${1:?usage: netlify builds <site-id>}"
+    get "sites/$id/builds"
+    ;;
+build)
+    id="${1:?usage: netlify build <site-id>}"
+    write POST "sites/$id/builds"
+    ;;
+forms)
+    id="${1:?usage: netlify forms <site-id>}"
+    get "sites/$id/forms"
+    ;;
+env)
+    id="${1:?usage: netlify env <account-id> [field=value ...]}"
+    shift
+    if [ "$#" -gt 0 ]; then query_get "accounts/$id/env" "$@"; else get "accounts/$id/env"; fi
+    ;;
+dns)
+    get dns_zones
+    ;;
+get)
+    p="${1:?usage: netlify get <path> [field=value ...]}"
+    shift
+    if [ "$#" -gt 0 ]; then query_get "$p" "$@"; else get "$p"; fi
+    ;;
+api)
+    m="${1:?usage: netlify api <METHOD> <path> [field=value ...]}"
+    p="${2:?usage: netlify api <METHOD> <path> [field=value ...]}"
+    shift 2
+    if [ "$#" -gt 0 ]; then
+        write "$m" "$p" -H "Content-Type: application/json" --data "$(json_body "$@")"
+    else
+        write "$m" "$p"
+    fi
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "netlify: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

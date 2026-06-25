@@ -1,0 +1,170 @@
+#!/bin/sh
+# engrams Shopify CLI — a thin wrapper over the Shopify Admin API.
+#
+# Auth is brokered (ADR 0056/0057): this carries only the
+# `SHOPIFY_ACCESS_TOKEN` placeholder; the egress proxy injects the real,
+# capability-scoped custom-app access token in the `X-Shopify-Access-Token`
+# header on every request to *.myshopify.com (and strips any token you supply).
+# There is NOTHING to log in to — do not set a real token or run any `login`.
+#
+# The store subdomain and the Admin API version are NOT secrets:
+#   SHOPIFY_STORE        the *.myshopify.com subdomain (e.g. "acme"), or --store
+#   SHOPIFY_API_VERSION  Admin API version in the URL path (default 2026-01)
+#
+# Each subcommand needs the matching power on your profile (shopify:products:read,
+# shopify:orders:write, shopify:graphql, …); calls to a path your profile didn't
+# grant are denied at the network boundary, not authenticated.
+set -eu
+
+TOKEN="${SHOPIFY_ACCESS_TOKEN:-x-engrams-managed}"
+API_VERSION="${SHOPIFY_API_VERSION:-2026-01}"
+
+# A leading `--store <name>` overrides $SHOPIFY_STORE.
+STORE="${SHOPIFY_STORE:-}"
+if [ "${1:-}" = "--store" ]; then
+    STORE="${2:?usage: --store <subdomain>}"
+    shift 2
+fi
+
+require_store() {
+    if [ -z "$STORE" ]; then
+        echo "shopify: no store set — pass --store <subdomain> or set SHOPIFY_STORE" >&2
+        echo "         (the subdomain of <subdomain>.myshopify.com; it is not a secret)" >&2
+        exit 2
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+engrams Shopify CLI — auth is brokered by the platform (no token to set).
+
+Set the store first: --store <subdomain> or SHOPIFY_STORE=<subdomain>
+(the part before .myshopify.com). The API version defaults to 2026-01
+(override with SHOPIFY_API_VERSION). Both are non-secret.
+
+Usage:
+  shopify products [field=value ...]      List products       (products:read)
+  shopify product <id>                    Get one product     (products:read)
+  shopify orders [field=value ...]        List orders         (orders:read)
+  shopify customers [field=value ...]     List customers      (customers:read)
+  shopify inventory [field=value ...]     List inventory levels (inventory:read)
+  shopify shop                            Shop info / identity check (any read)
+  shopify graphql '<query>' [vars-json]   Run GraphQL         (shopify:graphql)
+  shopify get  <path> [field=value ...]   Raw GET  under /admin/api/<ver>/
+  shopify post <path> [json-body]         Raw POST under /admin/api/<ver>/
+  shopify api  <METHOD> <path> [json]     Raw call, any method
+
+<path> is relative to /admin/api/<version>/ (omit the leading slash); REST
+resources end in .json (e.g. `shopify get products/123.json`). Responses are
+JSON; auth failures return HTTP 401/403.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# json_string <text> — encode arbitrary text as a JSON string literal (with the
+# surrounding quotes). Prefers jq; falls back to a POSIX escaper that handles the
+# characters a GraphQL document can contain (backslash, quote, newline, tab, CR).
+json_string() {
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$1" | jq -Rs .
+    else
+        printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+            | awk 'BEGIN{ORS=""; print "\""} {if(NR>1)print "\\n"; printf "%s",$0} END{print "\""}'
+    fi
+}
+
+# rest <METHOD> <path> [curl-args...] — call an Admin API path with brokered auth.
+rest() {
+    require_store
+    m="$1"
+    path="$2"
+    shift 2
+    curl -sS -X "$m" "https://$STORE.myshopify.com/admin/api/$API_VERSION/$path" \
+        -H "X-Shopify-Access-Token: $TOKEN" \
+        -H "Accept: application/json" \
+        "$@" | pretty
+}
+
+# Build --data-urlencode flag pairs from field=value args (POSIX-safe, no arrays).
+encode_query() {
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    # A GET with --data-urlencode sends the query string in the URL via -G.
+    rest GET "$RESOURCE" -G "$@"
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+products)
+    RESOURCE="products.json"
+    encode_query "$@"
+    ;;
+product)
+    id="${1:?usage: shopify product <id>}"
+    rest GET "products/$id.json"
+    ;;
+orders)
+    RESOURCE="orders.json"
+    encode_query "$@"
+    ;;
+customers)
+    RESOURCE="customers.json"
+    encode_query "$@"
+    ;;
+inventory)
+    RESOURCE="inventory_levels.json"
+    encode_query "$@"
+    ;;
+shop)
+    rest GET "shop.json"
+    ;;
+graphql)
+    query="${1:?usage: shopify graphql '<query>' [variables-json]}"
+    vars="${2:-{}}"
+    # Encode the query to a JSON string in its own step — nesting "$(... "$x" ...)"
+    # mis-parses on some POSIX sh (the inner quotes close the outer).
+    qjson=$(json_string "$query")
+    body=$(printf '{"query":%s,"variables":%s}' "$qjson" "$vars")
+    rest POST "graphql.json" -H "Content-Type: application/json" --data "$body"
+    ;;
+get)
+    path="${1:?usage: shopify get <path> [field=value ...]}"
+    shift
+    RESOURCE="$path"
+    encode_query "$@"
+    ;;
+post)
+    path="${1:?usage: shopify post <path> [json-body]}"
+    body="${2:-{}}"
+    rest POST "$path" -H "Content-Type: application/json" --data "$body"
+    ;;
+api)
+    m="${1:?usage: shopify api <METHOD> <path> [json-body]}"
+    path="${2:?usage: shopify api <METHOD> <path> [json-body]}"
+    body="${3:-}"
+    if [ -n "$body" ]; then
+        rest "$m" "$path" -H "Content-Type: application/json" --data "$body"
+    else
+        rest "$m" "$path"
+    fi
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "shopify: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

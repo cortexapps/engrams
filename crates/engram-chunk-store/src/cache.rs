@@ -7,9 +7,16 @@
 //!
 //! Properties:
 //!
-//! - **Atomic writes**: bytes land in a temp file alongside the
-//!   target path, then rename. Crashes mid-write don't leave the
-//!   cache pointing at half-written chunks.
+//! - **Atomic writes**: bytes land in a *writer-unique* temp file
+//!   alongside the target path, then rename into place. Crashes
+//!   mid-write don't leave the cache pointing at half-written chunks.
+//!   The temp name carries pid + a process-global counter so two
+//!   processes sharing one cache_root — the in-process restore
+//!   prefetch and the out-of-process `engram-uffd-handler`, which
+//!   fault the same memory chunks concurrently — never collide on a
+//!   fixed temp path and lose the rename with `ENOENT` (the chunks
+//!   end up uncached, so every read falls through to GCS — a prod
+//!   cold-recovery resume spent ~92 s page-faulting from GCS this way).
 //! - **LRU eviction**: when the cache filesystem is fuller than the
 //!   free-space floor (default: keep ~10% free) — or, if an absolute
 //!   ceiling is configured, when total cached bytes exceed it — the
@@ -726,9 +733,7 @@ impl ChunkCache {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let tmp = target.with_extension("partial");
-        fs::write(&tmp, bytes).await?;
-        fs::rename(&tmp, &target).await?;
+        write_atomic(&target, bytes).await?;
         Ok(())
     }
 
@@ -759,10 +764,10 @@ impl ChunkCache {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).await?;
         }
-        // Write to a temp file and rename — atomic on POSIX.
-        let tmp = target.with_extension("partial");
-        fs::write(&tmp, bytes).await?;
-        fs::rename(&tmp, &target).await?;
+        // Writer-unique temp + rename — atomic on POSIX, and safe even
+        // when the out-of-process UFFD handler caches the same hash into
+        // this shared cache_root concurrently (see `write_atomic`).
+        write_atomic(&target, bytes).await?;
 
         // Best-effort eviction sweep, DEBOUNCED to at most once per
         // interval across all writers. The previous per-write sweep
@@ -927,6 +932,43 @@ impl ChunkCache {
         let entries = self.list_entries().await?;
         Ok(entries.iter().map(|e| e.size).sum())
     }
+}
+
+/// Atomically place `bytes` at `target` (which must already have its
+/// parent dir) via a writer-unique temp + rename. Last-writer-wins on
+/// the content-addressed target is correct (the bytes are identical),
+/// and because each writer renames its *own* temp, two writers racing
+/// the same hash never see the other's temp vanish mid-rename. On any
+/// failure the temp is removed best-effort, so an ENOSPC/crash doesn't
+/// strand an orphan the LRU sweep won't reclaim (it only tracks 62-hex
+/// chunk files, not `.partial.*`).
+async fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = unique_tmp_path(target);
+    let res = async {
+        fs::write(&tmp, bytes).await?;
+        fs::rename(&tmp, target).await
+    }
+    .await;
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp).await;
+    }
+    Ok(res?)
+}
+
+/// A writer-unique sibling temp path for `target`:
+/// `<target-filename>.partial.<pid>.<seq>`. The pid disambiguates across
+/// processes sharing a cache_root (the restore prefetch vs. the
+/// out-of-process UFFD handler); the process-global counter
+/// disambiguates concurrent writers within one process. Stays in
+/// `target`'s parent dir so the rename is same-filesystem (atomic), and
+/// the dotted suffix keeps `list_entries`' 62-hex filter from ever
+/// mistaking a temp for a cache entry.
+fn unique_tmp_path(target: &Path) -> PathBuf {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".partial.{}.{}", std::process::id(), seq));
+    target.with_file_name(name)
 }
 
 #[derive(Debug)]
@@ -1169,6 +1211,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body0_actual.len(), 4 * 1024);
+    }
+
+    /// Regression: two `ChunkCache`s over the SAME cache_root — modeling
+    /// the in-process restore prefetch and the out-of-process
+    /// `engram-uffd-handler`, which share the dir and each keep their own
+    /// in-memory singleflight map — must cache the same hash concurrently
+    /// without losing the temp+rename to ENOENT. Before the writer-unique
+    /// temp name, every writer staged a *fixed* `<hash>.partial`, so two
+    /// racing the same hash meant the loser's `rename` hit
+    /// `No such file or directory` (the winner had already renamed the
+    /// shared temp away). The chunk then stayed uncached and every read
+    /// fell through to GCS — a ~92 s prod cold-recovery resume.
+    /// (`put` writes straight through `write_local`, bypassing `get`'s
+    /// singleflight, so even one cache reproduces the race; the two-cache
+    /// split mirrors the real cross-process shape.)
+    #[tokio::test]
+    async fn concurrent_writers_same_hash_dont_lose_the_rename() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let make = || {
+            ChunkCache::new_with_floor(
+                ChunkCacheConfig {
+                    root: cache_dir.path().to_path_buf(),
+                    budget_bytes: NO_CEILING,
+                    sweep_debounce_ms: 0,
+                },
+                0.0,
+            )
+        };
+        let cache_a = make();
+        let cache_b = make();
+
+        // A few distinct hashes, each hammered by many concurrent writers
+        // split across both caches. 512 KiB bodies match the prod memory
+        // chunk size that surfaced the bug, giving a wide write window.
+        let bodies: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i; 512 * 1024]).collect();
+        let hashes: Vec<ChunkHash> = bodies.iter().map(|b| ChunkHash::of(b)).collect();
+
+        let mut tasks = Vec::new();
+        for (h, body) in hashes.iter().copied().zip(bodies.iter()) {
+            for w in 0..16 {
+                let cache = if w % 2 == 0 {
+                    cache_a.clone()
+                } else {
+                    cache_b.clone()
+                };
+                let body = body.clone();
+                tasks.push(tokio::spawn(async move { cache.put(h, &body).await }));
+            }
+        }
+        for t in tasks {
+            t.await
+                .unwrap()
+                .expect("concurrent put of the same hash must not lose the temp+rename");
+        }
+
+        // Every chunk is durably cached and served from local (no fetch).
+        let reader = make();
+        for (h, body) in hashes.iter().copied().zip(bodies.iter()) {
+            assert!(reader.contains(h).await, "chunk {h:?} should be cached");
+            let got = reader
+                .get(h, || async {
+                    panic!("must hit local cache, not fetch");
+                    #[allow(unreachable_code)]
+                    Ok(Bytes::new())
+                })
+                .await
+                .unwrap();
+            assert_eq!(&got[..], &body[..]);
+        }
     }
 
     #[tokio::test]

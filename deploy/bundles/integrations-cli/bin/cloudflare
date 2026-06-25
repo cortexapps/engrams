@@ -1,0 +1,159 @@
+#!/bin/sh
+# engrams Cloudflare CLI — a thin wrapper over the Cloudflare REST v4 API.
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `CLOUDFLARE_API_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped API token on
+# every request to api.cloudflare.com (and strips any token you supply). There is
+# NOTHING to log in to — do not set a real token or run any `login`.
+#
+# Each subcommand needs the matching power on your profile (cloudflare:zones:read,
+# cloudflare:zones:write, cloudflare:dns:read, cloudflare:dns:write,
+# cloudflare:accounts:read, cloudflare:workers:read, cloudflare:pages:read,
+# cloudflare:r2:read, …); calls to a path your profile didn't grant are denied at
+# the network boundary, not authenticated.
+set -eu
+
+API="https://api.cloudflare.com/client/v4"
+TOKEN="${CLOUDFLARE_API_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams Cloudflare CLI — auth is brokered by the platform (no token to set).
+
+Usage:
+  cloudflare whoami                                   Verify the token (user/tokens/verify)
+  cloudflare zones [field=value ...]                  List zones (GET /zones)
+  cloudflare zone <zone_id>                           Get one zone (GET /zones/<id>)
+  cloudflare purge <zone_id>                          Purge everything (POST /zones/<id>/purge_cache)
+  cloudflare dns <zone_id> [field=value ...]          List DNS records (GET /zones/<id>/dns_records)
+  cloudflare dns-create <zone_id> <type> <name> <content> [proxied]
+                                                      Create a DNS record (POST)
+  cloudflare dns-delete <zone_id> <record_id>         Delete a DNS record (DELETE)
+  cloudflare accounts [field=value ...]               List accounts (GET /accounts)
+  cloudflare workers <account_id>                     List Worker scripts (GET)
+  cloudflare pages <account_id>                       List Pages projects (GET)
+  cloudflare r2 <account_id>                          List R2 buckets (GET)
+  cloudflare get <path> [field=value ...]             Raw GET, <path> under /client/v4
+  cloudflare api <METHOD> <path> [json-body]          Raw call with optional JSON body
+
+<path> is relative to /client/v4 (a leading slash is optional). Responses are JSON
+{"success":true|false,"result":...,"errors":[...]}.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# Normalize a caller-supplied path to start with exactly one leading slash.
+norm_path() {
+    case "$1" in
+    /*) printf '%s' "$1" ;;
+    *) printf '/%s' "$1" ;;
+    esac
+}
+
+# req <METHOD> <path> [curl-args...] — call the API with brokered auth.
+req() {
+    method="$1"
+    path="$2"
+    shift 2
+    curl -sS -X "$method" "$API$(norm_path "$path")" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        "$@" | pretty
+}
+
+# get_q <path> [field=value ...] — GET with each field=value as a query param.
+get_q() {
+    path="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    # curl -G turns --data-urlencode pairs into the query string for a GET.
+    req GET "$path" -G "$@"
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    req GET /user/tokens/verify
+    ;;
+zones)
+    get_q /zones "$@"
+    ;;
+zone)
+    id="${1:?usage: cloudflare zone <zone_id>}"
+    req GET "/zones/$id"
+    ;;
+purge)
+    id="${1:?usage: cloudflare purge <zone_id>}"
+    req POST "/zones/$id/purge_cache" --data '{"purge_everything":true}'
+    ;;
+dns)
+    id="${1:?usage: cloudflare dns <zone_id> [field=value ...]}"
+    shift
+    get_q "/zones/$id/dns_records" "$@"
+    ;;
+dns-create)
+    id="${1:?usage: cloudflare dns-create <zone_id> <type> <name> <content> [proxied]}"
+    type="${2:?usage: cloudflare dns-create <zone_id> <type> <name> <content> [proxied]}"
+    name="${3:?usage: cloudflare dns-create <zone_id> <type> <name> <content> [proxied]}"
+    content="${4:?usage: cloudflare dns-create <zone_id> <type> <name> <content> [proxied]}"
+    proxied="${5:-false}"
+    body=$(printf '{"type":"%s","name":"%s","content":"%s","proxied":%s}' \
+        "$type" "$name" "$content" "$proxied")
+    req POST "/zones/$id/dns_records" --data "$body"
+    ;;
+dns-delete)
+    id="${1:?usage: cloudflare dns-delete <zone_id> <record_id>}"
+    rid="${2:?usage: cloudflare dns-delete <zone_id> <record_id>}"
+    req DELETE "/zones/$id/dns_records/$rid"
+    ;;
+accounts)
+    get_q /accounts "$@"
+    ;;
+workers)
+    acct="${1:?usage: cloudflare workers <account_id>}"
+    req GET "/accounts/$acct/workers/scripts"
+    ;;
+pages)
+    acct="${1:?usage: cloudflare pages <account_id>}"
+    req GET "/accounts/$acct/pages/projects"
+    ;;
+r2)
+    acct="${1:?usage: cloudflare r2 <account_id>}"
+    req GET "/accounts/$acct/r2/buckets"
+    ;;
+get)
+    path="${1:?usage: cloudflare get <path> [field=value ...]}"
+    shift
+    get_q "$path" "$@"
+    ;;
+api)
+    method="${1:?usage: cloudflare api <METHOD> <path> [json-body]}"
+    path="${2:?usage: cloudflare api <METHOD> <path> [json-body]}"
+    body="${3:-}"
+    if [ -n "$body" ]; then
+        req "$method" "$path" --data "$body"
+    else
+        req "$method" "$path"
+    fi
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "cloudflare: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

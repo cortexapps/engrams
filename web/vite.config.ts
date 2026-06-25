@@ -72,6 +72,16 @@ const proxyAgent = new http.Agent({ keepAlive: true });
 export default defineConfig({
   plugins: [react(), tailwindcss(), ghosttyWasmPlugin()],
   resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
+  build: {
+    // The prod dashboard CSP is `img-src 'self'` (no `data:`) —
+    // deploy/helm/engram/templates/web-configmap.yaml (ADR 0026). Vite's default
+    // inlines assets <4 KB as `data:` URIs, which that CSP then blocks: an <img>
+    // logo (the bundled connector marks) fails to load and ProviderTile silently
+    // falls back to its monogram. Same class of bug as the ghostty WASM data: URI
+    // above. Emit every asset as a real same-origin file so `img-src 'self'`
+    // covers it. (A few extra tiny requests; negligible under HTTP/2.)
+    assetsInlineLimit: 0,
+  },
   server: {
     port: 5173,
     // ngrok (and similar tunnels) forward their own *.ngrok-free.app Host

@@ -1097,7 +1097,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      profiles: makeFakeProfiles({ capabilities: ["github:issues:write", "datadog:observability:read"] }),
+      profiles: makeFakeProfiles({ capabilities: ["github:issues:write", "datadog:metrics:read"] }),
       images: fakeImages(),
       db: okDb(),
     });
@@ -1106,7 +1106,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
       expect(fakeSessions.createReqs[0]?.capabilities).toEqual([
         "github:issues:write",
-        "datadog:observability:read",
+        "datadog:metrics:read",
       ]);
     } finally {
       await srv.close();
@@ -1118,7 +1118,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      profiles: makeFakeProfiles({ capabilities: ["datadog:observability:read"] }),
+      profiles: makeFakeProfiles({ capabilities: ["datadog:slos:read"] }),
       images: fakeImages(),
       db: okDb(),
     });
@@ -1129,7 +1129,8 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       expect(json).toBeDefined();
       const policy = JSON.parse(json!);
       // ADR 0058: the datadog connector (pup) injects BOTH DD-API-KEY and
-      // DD-APPLICATION-KEY; its read op carries no asset, so no observe.
+      // DD-APPLICATION-KEY. `slos:read` is a single GET op, so it compiles to
+      // exactly those two injects, gated to the SLO path; no asset → no observe.
       expect(policy.injects).toEqual([
         {
           hosts: ["api.datadoghq.com"],
@@ -1138,7 +1139,9 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
           secret_ref: "datadog-api-key",
           mint_provider: "",
           methods: ["GET"],
-          path_globs: ["/api/*"],
+          path_globs: ["/api/v1/slo*"],
+          graphql_operation: "",
+          graphql_field: "",
         },
         {
           hosts: ["api.datadoghq.com"],
@@ -1147,7 +1150,9 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
           secret_ref: "datadog-app-key",
           mint_provider: "",
           methods: ["GET"],
-          path_globs: ["/api/*"],
+          path_globs: ["/api/v1/slo*"],
+          graphql_operation: "",
+          graphql_field: "",
         },
       ]);
       expect(policy.observes).toEqual([]);
@@ -1171,13 +1176,18 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       const json = fakeSessions.createReqs[0]?.integrationPolicyJson;
       expect(json).toBeDefined();
       const policy = JSON.parse(json!);
-      // mint now rides the inject plane (ADR 0056 amendment): a minted inject +
-      // its observe. The coordinator fills the header from the integration.
-      expect(policy.injects).toHaveLength(1);
-      expect(policy.injects[0].mint_provider).toBe("github");
-      expect(policy.observes).toHaveLength(1);
-      expect(policy.observes[0].provider).toBe("github");
-      expect(policy.observes[0].asset_kind).toBe("issue");
+      // mint now rides the inject plane (ADR 0056 amendment): minted injects +
+      // observes. issues:write activates several gated ops — REST endpoints AND
+      // GraphQL mutations (ADR 0059); each a minted inject. The issue asset is
+      // observed on both the REST create and the GraphQL createIssue mutation.
+      expect(policy.injects.length).toBeGreaterThan(0);
+      expect(policy.injects.every((i: { mint_provider: string }) => i.mint_provider === "github")).toBe(true);
+      expect(policy.observes.length).toBeGreaterThan(0);
+      expect(
+        policy.observes.every(
+          (o: { provider: string; asset_kind: string }) => o.provider === "github" && o.asset_kind === "issue",
+        ),
+      ).toBe(true);
     } finally {
       await srv.close();
     }

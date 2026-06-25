@@ -19,7 +19,7 @@ axum = { version = "0.7", features = ["macros", "ws"] }
 axum-core = { version = "0.4", default-features = false, features = ["tracing"] }
 base64 = { version = "0.22" }
 byteorder = { version = "1" }
-bytes = { version = "1" }
+bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
@@ -41,6 +41,7 @@ hyper = { version = "1", features = ["full"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "logging", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
 idna = { version = "1" }
+indexmap = { version = "2", features = ["serde"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
@@ -93,7 +94,7 @@ zeroize = { version = "1" }
 [build-dependencies]
 base64 = { version = "0.22" }
 byteorder = { version = "1" }
-bytes = { version = "1" }
+bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
@@ -109,6 +110,7 @@ futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 idna = { version = "1" }
+indexmap = { version = "2", features = ["serde"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 num-traits = { version = "0.2", features = ["i128", "libm"] }

@@ -1081,7 +1081,12 @@ jobs:
       - name: Download Claude Code CLI (Linux x64)
         id: claude_cli
         run: |
-          CLAUDE_VERSION=$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest)
+          # PINNED, not floating `latest`: claude >=2.1.187 removed AskUserQuestion
+          # from headless `--print` mode, which silently breaks ADR 0054 interactive
+          # questions in every baked image (cortexapps/engrams#431). 2.1.185 is the
+          # newest CLI that still offers the tool headlessly; bump deliberately and
+          # re-verify AUQ (the `system/init` tool list) before raising this.
+          CLAUDE_VERSION=2.1.185
           curl -fsSL --retry 3 \
             "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
             -o /tmp/claude

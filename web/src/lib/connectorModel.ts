@@ -201,7 +201,9 @@ export interface ParsedConnectorConfig {
 
 interface RawOp {
   grants?: string[];
-  match?: { method?: string; path?: string };
+  /** Either an HTTP match (`method`/`path`) or a GraphQL match (`operation`/`field`),
+   * ADR 0059. Access derives from the method for REST, the operation for GraphQL. */
+  match?: { method?: string; path?: string; operation?: string; field?: string };
   asset?: { kind?: string };
 }
 
@@ -254,7 +256,13 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
   const capabilities: ParsedCapability[] = [];
   const seen = new Set<string>();
   for (const op of (raw.operations as RawOp[] | undefined) ?? []) {
-    const access = accessOf(op.match?.method);
+    // ADR 0059: a GraphQL op's access derives from its operation type
+    // (query → read, mutation/subscription → write); a REST op from its method.
+    const access: Access = op.match?.operation
+      ? op.match.operation === "query"
+        ? "read"
+        : "write"
+      : accessOf(op.match?.method);
     for (const action of op.grants ?? []) {
       if (seen.has(action)) {
         if (op.asset?.kind) {

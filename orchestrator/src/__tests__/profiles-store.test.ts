@@ -31,7 +31,7 @@ describe("ProfileStore", () => {
       includeUserTokens: false,
       envVars: { ANTHROPIC_MODEL: "claude-opus-4-8" },
       skills: ["skills"],
-      capabilities: ["github:issues:write", "datadog:observability:read"],
+      capabilities: ["github:issues:write", "datadog:metrics:read"],
       network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
       secrets: [],
       isDefault: false,
@@ -41,7 +41,7 @@ describe("ProfileStore", () => {
       expect(created.id).toBeDefined();
       expect(created.deletedAt).toBeNull();
       // ADR 0056: capabilities round-trip through the store.
-      expect(created.capabilities).toEqual(["github:issues:write", "datadog:observability:read"]);
+      expect(created.capabilities).toEqual(["github:issues:write", "datadog:metrics:read"]);
 
       const active = await store.getActive(created.id);
       expect(active?.name).toBe(input.name);

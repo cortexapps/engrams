@@ -1,0 +1,210 @@
+#!/bin/sh
+# engrams Asana CLI — a thin wrapper over the Asana REST API (v1.0).
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `ASANA_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped personal
+# access token on every request to app.asana.com (and strips any token you
+# supply). There is NOTHING to log in to — do not set a real token or run any
+# `login`.
+#
+# Each subcommand needs the matching power on your profile (asana:tasks:read,
+# asana:tasks:write, asana:projects:read, asana:projects:write,
+# asana:stories:read, asana:stories:write, asana:tags:read, asana:users:read);
+# calls to a path/method your profile didn't grant are denied at the network
+# boundary, not authenticated.
+set -eu
+
+API="https://app.asana.com/api/1.0"
+TOKEN="${ASANA_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams Asana CLI — auth is brokered by the platform (no token to set).
+
+Usage:
+  asana whoami                                 Current user (GET /users/me)
+  asana workspaces                             List your workspaces
+  asana users [workspace=<gid>]                List users
+  asana tasks project=<gid> [field=value ...]  List tasks (GET /tasks)
+  asana task <task-gid>                        Get one task
+  asana task-create name="X" projects=<gid> [notes=...]   Create a task
+  asana task-update <task-gid> field=value ...            Update a task (PUT)
+  asana task-delete <task-gid>                            Delete a task
+  asana search <workspace-gid> text=<q> [field=value ...] Search tasks
+  asana stories <task-gid>                     List a task's comments/stories
+  asana comment <task-gid> <text...>           Add a comment (type=comment)
+  asana projects [workspace=<gid>]             List projects
+  asana project <project-gid>                  Get one project
+  asana project-create name="X" workspace=<gid> [field=value ...]  Create a project
+  asana tags [workspace=<gid>]                 List tags
+  asana get  <path> [field=value ...]          Raw GET (query params)
+  asana post <path> [field=value ...]          Raw POST (JSON {"data":{...}})
+  asana api  <METHOD> <path> [curl-args ...]   Fully raw call
+
+Endpoints sit under https://app.asana.com/api/1.0. Asana wraps responses as
+{"data": ...} and request bodies as {"data": {...}}. GIDs are opaque numeric
+strings. Replies are JSON; on error {"errors":[{"message":"..."}]}.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# req <METHOD> <path> [curl-args...] — call the Asana API with brokered auth.
+# <path> may be absolute-on-host (/...) or a bare resource (tasks); both work.
+req() {
+    m="$1"
+    p="$2"
+    shift 2
+    case "$p" in
+        /*) url="$API$p" ;;
+        http*) url="$p" ;;
+        *) url="$API/$p" ;;
+    esac
+    curl -sS -X "$m" "$url" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Accept: application/json" \
+        "$@" | pretty
+}
+
+# get <path> [field=value ...] — GET with each field=value as a query param.
+get() {
+    p="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    # -G folds --data-urlencode pairs into the query string for a GET.
+    req GET "$p" -G "$@"
+}
+
+# json_body field=value ... — build an Asana {"data":{...}} JSON body.
+# POSIX-portable (no jq required): each value is emitted as a JSON string with
+# double-quotes/backslashes escaped, except bare true/false/null and integers,
+# which pass through unquoted so booleans/numbers land as the right JSON type.
+json_body() {
+    printf '{"data":{'
+    sep=""
+    for kv in "$@"; do
+        k=${kv%%=*}
+        v=${kv#*=}
+        case "$v" in
+            true|false|null) jv="$v" ;;
+            ''|*[!0-9]*)
+                ev=$(printf '%s' "$v" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+                jv="\"$ev\""
+                ;;
+            *) jv="$v" ;;
+        esac
+        printf '%s"%s":%s' "$sep" "$k" "$jv"
+        sep=","
+    done
+    printf '}}'
+}
+
+# post <path> [field=value ...] — POST a {"data":{...}} JSON body built from fields.
+post() {
+    p="$1"
+    shift
+    body=$(json_body "$@")
+    req POST "$p" -H "Content-Type: application/json" --data "$body"
+}
+
+# put <path> [field=value ...] — PUT a {"data":{...}} JSON body built from fields.
+put() {
+    p="$1"
+    shift
+    body=$(json_body "$@")
+    req PUT "$p" -H "Content-Type: application/json" --data "$body"
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    req GET "/users/me"
+    ;;
+workspaces)
+    get "/workspaces" "$@"
+    ;;
+users)
+    get "/users" "$@"
+    ;;
+tasks)
+    get "/tasks" "$@"
+    ;;
+task)
+    gid="${1:?usage: asana task <task-gid>}"
+    req GET "/tasks/$gid"
+    ;;
+task-create)
+    post "/tasks" "$@"
+    ;;
+task-update)
+    gid="${1:?usage: asana task-update <task-gid> field=value ...}"
+    shift
+    put "/tasks/$gid" "$@"
+    ;;
+task-delete)
+    gid="${1:?usage: asana task-delete <task-gid>}"
+    req DELETE "/tasks/$gid"
+    ;;
+search)
+    ws="${1:?usage: asana search <workspace-gid> text=<q> [field=value ...]}"
+    shift
+    get "/workspaces/$ws/tasks/search" "$@"
+    ;;
+stories)
+    gid="${1:?usage: asana stories <task-gid>}"
+    req GET "/tasks/$gid/stories"
+    ;;
+comment)
+    gid="${1:?usage: asana comment <task-gid> <text...>}"
+    shift
+    post "/tasks/$gid/stories" "text=$*" "type=comment"
+    ;;
+projects)
+    get "/projects" "$@"
+    ;;
+project)
+    gid="${1:?usage: asana project <project-gid>}"
+    req GET "/projects/$gid"
+    ;;
+project-create)
+    post "/projects" "$@"
+    ;;
+tags)
+    get "/tags" "$@"
+    ;;
+get)
+    p="${1:?usage: asana get <path> [field=value ...]}"
+    shift
+    get "$p" "$@"
+    ;;
+post)
+    p="${1:?usage: asana post <path> [field=value ...]}"
+    shift
+    post "$p" "$@"
+    ;;
+api)
+    m="${1:?usage: asana api <METHOD> <path> [curl-args ...]}"
+    p="${2:?usage: asana api <METHOD> <path> [curl-args ...]}"
+    shift 2
+    req "$m" "$p" "$@"
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "asana: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

@@ -1,0 +1,91 @@
+{
+  "provider": "gitlab",
+  "protocol": "http",
+  "display": {
+    "name": "GitLab",
+    "category": "Source control",
+    "blurb": "Browse projects, open merge requests and issues, and inspect pipelines — driven by the official `glab` CLI and authenticated with a brokered personal access token.",
+    "icon": { "mono": "GL", "color": "#fc6d26" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "gitlab.api_token" }
+    ]
+  },
+  "hosts": ["gitlab.com"],
+  "test": { "path": "/api/v4/user" },
+  "operations": [
+    {
+      "grants": ["projects:read"],
+      "match": { "method": "GET", "path": "/api/v4/projects*" }
+    },
+    {
+      "grants": ["merge_requests:read"],
+      "match": { "method": "GET", "path": "/api/v4/projects/*/merge_requests*" }
+    },
+    {
+      "grants": ["merge_requests:write"],
+      "match": { "method": "POST", "path": "/api/v4/projects/*/merge_requests" },
+      "asset": {
+        "kind": "merge_request",
+        "surface": "asset",
+        "success": { "statusClass": "2xx" },
+        "data": { "iid": "$.resp.iid", "title": "$.resp.title" },
+        "fetchable": { "external": "$.resp.web_url" }
+      }
+    },
+    {
+      "grants": ["issues:read"],
+      "match": { "method": "GET", "path": "/api/v4/projects/*/issues*" }
+    },
+    {
+      "grants": ["issues:write"],
+      "match": { "method": "POST", "path": "/api/v4/projects/*/issues" },
+      "asset": {
+        "kind": "issue",
+        "surface": "asset",
+        "success": { "statusClass": "2xx" },
+        "data": { "iid": "$.resp.iid", "title": "$.resp.title" },
+        "fetchable": { "external": "$.resp.web_url" }
+      }
+    },
+    {
+      "grants": ["pipelines:read"],
+      "match": { "method": "GET", "path": "/api/v4/projects/*/pipelines*" }
+    },
+    {
+      "grants": ["pipelines:write"],
+      "match": { "method": "POST", "path": "/api/v4/projects/*/pipeline*" }
+    },
+    {
+      "grants": ["repository:read"],
+      "match": { "method": "GET", "path": "/api/v4/projects/*/repository/*" }
+    },
+    {
+      "grants": ["repository:write"],
+      "match": { "method": "POST", "path": "/api/v4/projects/*/repository/commits" }
+    },
+    {
+      "grants": [
+        "projects:read",
+        "merge_requests:read",
+        "merge_requests:write",
+        "issues:read",
+        "issues:write",
+        "pipelines:read",
+        "pipelines:write",
+        "repository:read",
+        "repository:write"
+      ],
+      "match": { "method": "GET", "path": "/api/v4/user" }
+    }
+  ],
+  "cli": {
+    "bins": ["glab"],
+    "binSource": "bundled",
+    "dummyEnv": { "GITLAB_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `glab` (the official GitLab CLI) to drive GitLab from this session — browse projects, open and review merge requests and issues, and inspect CI/CD pipelines on gitlab.com. Authentication is automatic: the egress proxy injects a capability-scoped GitLab personal access token (Authorization: Bearer) on every request to the GitLab REST API (/api/v4) and strips anything you supply. `GITLAB_TOKEN` is a managed placeholder. Do NOT run `glab auth login` or set a real token.\n\nCommon commands and the power each needs:\n- Projects: `glab repo view <group/project>`, `glab repo list` — requires `projects:read`.\n- Merge requests: `glab mr list`, `glab mr view <id>` (requires `merge_requests:read`); `glab mr create --source-branch <b> --target-branch main --title \"...\" --description \"...\"` (requires `merge_requests:write`). To open an MR: push your branch first (git auth is brokered, nothing to configure), then create the MR.\n- Issues: `glab issue list`, `glab issue view <iid>` (requires `issues:read`); `glab issue create --title \"...\" --description \"...\"` (requires `issues:write`).\n- Pipelines: `glab ci list`, `glab ci status`, `glab ci view` (requires `pipelines:read`); `glab ci run`/`glab ci trigger` (requires `pipelines:write`).\n- Repository contents (files, tree, commits, branches, tags): read requires `repository:read`; creating commits via the API requires `repository:write`.\n\nRaw REST passthrough: `glab api projects/:id/merge_requests` (GET) or `glab api --method POST projects/:id/issues -f title=\"...\"`. Only the resource families your profile granted are reachable — a call to a path you weren't granted is denied at the network boundary, not authenticated. Run `glab --help` to explore."
+  }
+}

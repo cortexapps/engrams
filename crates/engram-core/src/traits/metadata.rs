@@ -793,6 +793,36 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Vec<crate::types::SnapshotId>, MetaError> {
         Ok(Vec::new())
     }
+    /// The `session_id IS NULL` mirror of [`Self::prune_session_snapshots`]:
+    /// reap orphaned per-image *base* snapshots. Every image re-bake/refresh
+    /// captures a fresh base and swaps `enabled_images.base_snapshot_id` to
+    /// it (`upsert_enabled_image`'s `ON CONFLICT`), leaving the PRIOR base
+    /// row dangling — `session_id IS NULL`, pointed to by no `enabled_images`
+    /// row. Nothing else ever deletes it, and it keeps pinning its own
+    /// disk+memory chunks via pin-set sources #3/#4
+    /// (`list_recoverable_snapshot_{disk,memory}_manifests`, which filter on
+    /// `recoverable = TRUE` with NO `session_id` predicate) — so without this
+    /// reaper every refresh permanently leaks one base snapshot's chunks
+    /// (20–32 GB for the heavy dogfood images).
+    ///
+    /// Deletes `session_id IS NULL` rows older than `grace` that are NOT
+    /// referenced by any `enabled_images.base_snapshot_id` — including
+    /// soft-deleted image rows, whose chunk lineage is intentionally still
+    /// pinned (ADR 0021 P1.8). The `base_snapshot_id` FK
+    /// (`REFERENCES snapshots(id)`, no `ON DELETE`) is a hard backstop: even
+    /// a buggy predicate can't delete an in-use base. Bumps `chunk_generation`
+    /// in the same TX (GC-barrier symmetry with `record_snapshot`); the
+    /// existing chunk-GC + snapshot-blob-GC sweeps then reclaim the
+    /// now-unpinned chunks and portable `snapshots/<id>/` blobs. Returns the
+    /// deleted ids (count is the only consumer today).
+    ///
+    /// Default `Ok(vec![])` so mocks without a snapshots table skip it.
+    async fn prune_orphan_base_snapshots(
+        &self,
+        _grace: chrono::Duration,
+    ) -> Result<Vec<crate::types::SnapshotId>, MetaError> {
+        Ok(Vec::new())
+    }
     /// ADR 0014 M1.11: fetch a single snapshot row by id. Used by
     /// the heartbeat-ack template enrichment path to surface the
     /// snapshot's persisted `disk_manifest` + `memory_manifest`
@@ -1617,9 +1647,15 @@ pub trait MetadataStore: Send + Sync {
     /// transiently demotes rows) and NO `session_id` filter
     /// (`session_id IS NULL` template/base captures are referenced by
     /// `enabled_images.base_snapshot_id` and have no self-heal
-    /// backstop). It is complete because base rows are never deleted —
-    /// `prune_session_snapshots` is `session_id IS NOT NULL` only, and
-    /// the `base_snapshot_id` FK has no `ON DELETE`.
+    /// backstop). The set is exact — a blob is pinned IFF its row
+    /// exists. A *current* base row is never reaped
+    /// (`prune_orphan_base_snapshots` skips ids still referenced by
+    /// `enabled_images.base_snapshot_id`, and the `base_snapshot_id` FK
+    /// with no `ON DELETE` is a hard backstop), so its blobs stay
+    /// pinned; a *superseded* base that reaper deletes correctly drops
+    /// out of the pin set so its now-unreferenced blobs get collected.
+    /// `prune_session_snapshots` (`session_id IS NOT NULL`) never
+    /// touches base rows.
     async fn snapshot_blob_pin_set(&self) -> Result<Vec<crate::types::SnapshotId>, MetaError> {
         Ok(Vec::new())
     }

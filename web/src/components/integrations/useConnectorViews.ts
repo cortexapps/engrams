@@ -8,6 +8,7 @@
 import { useConnectors, useIntegrationCatalog } from "@/hooks/useIntegrations";
 import { useProfiles } from "@/hooks/useProfiles";
 import { fallbackIdentity, type Access } from "@/lib/connectorModel";
+import { builtinLogo } from "@/lib/connectorLogos";
 import type { ProviderCatalogEntry } from "@/gen/engram/app/v1/integration_pb";
 
 export interface ConnectorCapabilityView {
@@ -52,6 +53,9 @@ export function useConnectorViews(): ConnectorViewsResult {
     const row = rowByProvider.get(e.provider);
     const grantsProvider = (caps: string[]) => caps.some((c) => c.startsWith(`${e.provider}:`));
     const used = allProfiles.filter((p) => grantsProvider(p.capabilities ?? []));
+    // Logo precedence (matches useProviderIdentity): bundled built-in →
+    // uploaded overlay → monogram.
+    const logo = builtinLogo(e.provider) ?? (e.display?.icon?.logo || undefined);
     return {
       provider: e.provider,
       name: e.display?.name || fb.name,
@@ -60,7 +64,7 @@ export function useConnectorViews(): ConnectorViewsResult {
       icon: {
         mono: e.display?.icon?.mono || fb.icon.mono,
         color: e.display?.icon?.color || fb.icon.color,
-        ...(e.display?.icon?.logo ? { logo: e.display.icon.logo } : {}),
+        ...(logo ? { logo } : {}),
       },
       credentialSource: e.credentialSource === "mint" ? "mint" : "inject",
       hosts: e.hosts,
@@ -93,6 +97,7 @@ export function writeCount(caps: ConnectorCapabilityView[]): number {
 export function catalogToViews(providers: ProviderCatalogEntry[]): ConnectorView[] {
   return providers.map((e) => {
     const fb = fallbackIdentity(e.provider);
+    const logo = builtinLogo(e.provider) ?? (e.display?.icon?.logo || undefined);
     return {
       provider: e.provider,
       name: e.display?.name || fb.name,
@@ -101,7 +106,7 @@ export function catalogToViews(providers: ProviderCatalogEntry[]): ConnectorView
       icon: {
         mono: e.display?.icon?.mono || fb.icon.mono,
         color: e.display?.icon?.color || fb.icon.color,
-        ...(e.display?.icon?.logo ? { logo: e.display.icon.logo } : {}),
+        ...(logo ? { logo } : {}),
       },
       credentialSource: e.credentialSource === "mint" ? "mint" : "inject",
       hosts: e.hosts,

@@ -104,6 +104,46 @@ describe("parseConnectorConfig", () => {
     ]);
   });
 
+  test("ADR 0059: GraphQL op access derives from the operation (query→read, mutation→write)", () => {
+    const raw = JSON.stringify({
+      provider: "github",
+      credential: { source: "mint", mint: { kind: "github_app" } },
+      hosts: ["api.github.com"],
+      graphqlEndpoint: "/graphql",
+      operations: [
+        { grants: ["repo:read"], match: { operation: "query", field: "repository" } },
+        { grants: ["pulls:write"], match: { operation: "mutation", field: "mergePullRequest" } },
+      ],
+    });
+    const c = parseConnectorConfig(raw, "github");
+    expect(c.capabilities).toEqual([
+      { action: "repo:read", access: "read" },
+      { action: "pulls:write", access: "write" },
+    ]);
+  });
+
+  test("ADR 0059: a power's REST op (listed first) defines access; its GraphQL op dedupes in", () => {
+    // Mirrors github.json: a REST op precedes the GraphQL op under the same power.
+    const raw = JSON.stringify({
+      provider: "github",
+      credential: { source: "mint", mint: { kind: "github_app" } },
+      hosts: ["api.github.com"],
+      graphqlEndpoint: "/graphql",
+      operations: [
+        {
+          grants: ["pulls:write"],
+          match: { method: "POST", path: "/repos/*/pulls" },
+          asset: { kind: "pull_request" },
+        },
+        { grants: ["pulls:write"], match: { operation: "mutation", field: "mergePullRequest" } },
+      ],
+    });
+    const c = parseConnectorConfig(raw, "github");
+    expect(c.capabilities).toEqual([
+      { action: "pulls:write", access: "write", asset: "pull_request" },
+    ]);
+  });
+
   test("defaults display off the provider when absent; inject credential", () => {
     const raw = JSON.stringify({
       provider: "sentry",

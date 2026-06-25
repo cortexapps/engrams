@@ -1,0 +1,151 @@
+#!/bin/sh
+# engrams PagerDuty CLI — a thin wrapper over the PagerDuty REST API v2.
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `PAGERDUTY_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped API token on
+# every request to api.pagerduty.com (and strips any token you supply). There is
+# NOTHING to log in to — do not set a real token or run any `login`.
+#
+# Each subcommand needs the matching power on your profile (pagerduty:incidents:read,
+# pagerduty:incidents:write, pagerduty:services:read, pagerduty:schedules:read,
+# pagerduty:oncalls:read, pagerduty:escalation_policies:read, pagerduty:users:read);
+# calls to a path your profile didn't grant are denied at the network boundary,
+# not authenticated.
+set -eu
+
+API="https://api.pagerduty.com"
+TOKEN="${PAGERDUTY_TOKEN:-x-engrams-managed}"
+# REST API v2 requires the versioned Accept header (constant, non-secret).
+ACCEPT="application/vnd.pagerduty+json;version=2"
+# Writes (PUT/POST on /incidents) require a `From` header naming the requester's
+# email. Set PD_FROM to a valid PagerDuty user email; defaults empty (writes 400).
+FROM="${PD_FROM:-}"
+
+usage() {
+    cat <<'EOF'
+engrams PagerDuty CLI — auth is brokered by the platform (no token to set).
+
+Usage:
+  pd incidents [field=value ...]    List incidents (GET /incidents)
+  pd incident <id>                  Get one incident (GET /incidents/<id>)
+  pd ack <id>                       Acknowledge an incident (PUT /incidents)
+  pd resolve <id>                   Resolve an incident (PUT /incidents)
+  pd services [field=value ...]     List services (GET /services)
+  pd schedules [field=value ...]    List on-call schedules (GET /schedules)
+  pd oncalls [field=value ...]      Who is on call (GET /oncalls)
+  pd policies [field=value ...]     List escalation policies (GET /escalation_policies)
+  pd users [field=value ...]        List users (GET /users)
+  pd whoami                         Probe auth (GET /abilities)
+  pd get <path> [field=value ...]   Raw GET to <path> with query params
+  pd api <METHOD> <path> [body]     Raw call; body is a JSON string (for POST/PUT)
+
+Filter list endpoints with repeated array params, e.g.
+  pd incidents statuses[]=triggered statuses[]=acknowledged
+  pd oncalls schedule_ids[]=PXXXXXX
+
+ack/resolve issue PUT /incidents and need a requester email — set PD_FROM=you@org.com.
+Responses are JSON; non-2xx bodies carry an `error` object.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# get <path> [field=value ...] — GET with each field=value as a query param.
+get() {
+    path="$1"
+    shift
+    set -- "$@"
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    curl -sS -G "$API$path" \
+        -H "Authorization: Token token=$TOKEN" \
+        -H "Accept: $ACCEPT" \
+        "$@" | pretty
+}
+
+# manage_incident <id> <status> — PUT /incidents to ack/resolve one incident.
+manage_incident() {
+    id="$1"
+    status="$2"
+    body=$(printf '{"incidents":[{"id":"%s","type":"incident_reference","status":"%s"}]}' "$id" "$status")
+    set -- -sS -X PUT "$API/incidents" \
+        -H "Authorization: Token token=$TOKEN" \
+        -H "Accept: $ACCEPT" \
+        -H "Content-Type: application/json" \
+        -d "$body"
+    [ -n "$FROM" ] && set -- "$@" -H "From: $FROM"
+    curl "$@" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+incidents)
+    get /incidents "$@"
+    ;;
+incident)
+    id="${1:?usage: pd incident <id>}"
+    get "/incidents/$id"
+    ;;
+ack)
+    id="${1:?usage: pd ack <id>}"
+    manage_incident "$id" acknowledged
+    ;;
+resolve)
+    id="${1:?usage: pd resolve <id>}"
+    manage_incident "$id" resolved
+    ;;
+services)
+    get /services "$@"
+    ;;
+schedules)
+    get /schedules "$@"
+    ;;
+oncalls)
+    get /oncalls "$@"
+    ;;
+policies)
+    get /escalation_policies "$@"
+    ;;
+users)
+    get /users "$@"
+    ;;
+whoami)
+    get /abilities
+    ;;
+get)
+    path="${1:?usage: pd get <path> [field=value ...]}"
+    shift
+    get "$path" "$@"
+    ;;
+api)
+    method="${1:?usage: pd api <METHOD> <path> [body]}"
+    path="${2:?usage: pd api <METHOD> <path> [body]}"
+    body="${3:-}"
+    set -- -sS -X "$method" "$API$path" \
+        -H "Authorization: Token token=$TOKEN" \
+        -H "Accept: $ACCEPT"
+    if [ -n "$body" ]; then
+        set -- "$@" -H "Content-Type: application/json" -d "$body"
+    fi
+    [ -n "$FROM" ] && set -- "$@" -H "From: $FROM"
+    curl "$@" | pretty
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "pd: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

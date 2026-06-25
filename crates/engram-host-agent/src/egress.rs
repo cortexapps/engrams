@@ -99,6 +99,23 @@ impl HostEgress {
     }
 }
 
+/// ADR 0059: build the proxy's optional GraphQL matcher from the wire fields.
+/// `Ok(None)` = a REST entry (empty op); `Ok(Some(_))` = a valid GraphQL entry;
+/// `Err(())` = a non-empty but unparseable op (a corrupt entry — the caller skips
+/// it, fail-closed, so it never degrades into a permissive REST gate on `/graphql`).
+fn graphql_match(op: &str, field: &str) -> Result<Option<engram_egress_proxy::GraphqlMatch>, ()> {
+    if op.is_empty() {
+        return Ok(None);
+    }
+    match engram_egress_proxy::GraphqlOperation::parse(op) {
+        Some(operation) => Ok(Some(engram_egress_proxy::GraphqlMatch {
+            operation,
+            field: field.to_string(),
+        })),
+        None => Err(()),
+    }
+}
+
 /// Translate an incoming wire policy into the proxy's `SessionState`
 /// shape and register it against `guest_ip`. The proxy looks up
 /// sessions by IP on every connection — this is the source of
@@ -133,6 +150,19 @@ pub fn register_policy(
     for i in policy.injects {
         let allow =
             engram_egress_proxy::HostList::from_manifest(&i.allow_hosts, &i.allow_host_patterns)?;
+        // ADR 0059: a non-empty-but-unparseable graphql op is a corrupt entry —
+        // skip it (fail-closed) so it never degrades into a permissive REST gate
+        // on `/graphql`.
+        let graphql = match graphql_match(&i.graphql_operation, &i.graphql_field) {
+            Ok(g) => g,
+            Err(()) => {
+                tracing::warn!(
+                    op = %i.graphql_operation,
+                    "skipping inject with unparseable graphql operation",
+                );
+                continue;
+            }
+        };
         injects.push(engram_egress_proxy::InjectEntry {
             secret: i.secret,
             header_name: i.header_name,
@@ -141,6 +171,7 @@ pub fn register_policy(
             policy: engram_egress_proxy::RequestPolicy {
                 methods: i.methods,
                 path_globs: i.path_globs,
+                graphql,
             },
         });
     }
@@ -151,19 +182,37 @@ pub fn register_policy(
     for o in policy.observes {
         let allow =
             engram_egress_proxy::HostList::from_manifest(&o.allow_hosts, &o.allow_host_patterns)?;
+        let graphql = match graphql_match(&o.graphql_operation, &o.graphql_field) {
+            Ok(g) => g,
+            Err(()) => {
+                tracing::warn!(
+                    op = %o.graphql_operation,
+                    "skipping observe with unparseable graphql operation",
+                );
+                continue;
+            }
+        };
+        // ADR 0059: a GraphQL observe gates success on the absence of top-level
+        // `errors`; a REST observe on the 2xx status class (else Always).
+        let success = if o.success_no_graphql_errors {
+            engram_egress_proxy::SuccessRule::NoGraphqlErrors
+        } else {
+            match o.success_status_class.as_deref() {
+                Some("2xx") => engram_egress_proxy::SuccessRule::StatusClass2xx,
+                _ => engram_egress_proxy::SuccessRule::Always,
+            }
+        };
         observes.push(engram_egress_proxy::ObserveEntry {
             allow,
             policy: engram_egress_proxy::RequestPolicy {
                 methods: o.methods,
                 path_globs: o.path_globs,
+                graphql,
             },
             provider: o.provider,
             asset_kind: o.asset_kind,
             surface: o.surface,
-            success: match o.success_status_class.as_deref() {
-                Some("2xx") => engram_egress_proxy::SuccessRule::StatusClass2xx,
-                _ => engram_egress_proxy::SuccessRule::Always,
-            },
+            success,
             data: o.data,
             fetchable: o.fetchable,
         });
@@ -203,43 +252,96 @@ mod tests {
                 network_allow_hosts: vec![],
                 network_allow_host_patterns: vec![],
                 secrets: vec![],
-                injects: vec![EgressInjectEntry {
-                    secret: "dd-secret".into(),
-                    header_name: "DD-API-KEY".into(),
-                    header_template: "{}".into(),
-                    allow_hosts: vec!["api.datadoghq.com".into()],
-                    allow_host_patterns: vec![],
-                    methods: vec!["GET".into()],
-                    path_globs: vec!["/api/v2/logs*".into()],
-                }],
-                observes: vec![EgressObserveEntry {
-                    allow_hosts: vec!["api.github.com".into()],
-                    allow_host_patterns: vec![],
-                    methods: vec!["POST".into()],
-                    path_globs: vec!["/repos/*/issues".into()],
-                    provider: "github".into(),
-                    asset_kind: "issue".into(),
-                    surface: "asset".into(),
-                    success_status_class: Some("2xx".into()),
-                    data: vec![("number".into(), "$.resp.number".into())],
-                    fetchable: Some("$.resp.html_url".into()),
-                }],
+                injects: vec![
+                    EgressInjectEntry {
+                        secret: "dd-secret".into(),
+                        header_name: "DD-API-KEY".into(),
+                        header_template: "{}".into(),
+                        allow_hosts: vec!["api.datadoghq.com".into()],
+                        allow_host_patterns: vec![],
+                        methods: vec!["GET".into()],
+                        path_globs: vec!["/api/v2/logs*".into()],
+                        graphql_operation: String::new(),
+                        graphql_field: String::new(),
+                    },
+                    // ADR 0059: a GraphQL inject (gated by operation+field).
+                    EgressInjectEntry {
+                        secret: "gh-token".into(),
+                        header_name: "Authorization".into(),
+                        header_template: "Bearer {}".into(),
+                        allow_hosts: vec!["api.github.com".into()],
+                        allow_host_patterns: vec![],
+                        methods: vec!["POST".into()],
+                        path_globs: vec!["/graphql".into()],
+                        graphql_operation: "mutation".into(),
+                        graphql_field: "mergePullRequest".into(),
+                    },
+                ],
+                observes: vec![
+                    EgressObserveEntry {
+                        allow_hosts: vec!["api.github.com".into()],
+                        allow_host_patterns: vec![],
+                        methods: vec!["POST".into()],
+                        path_globs: vec!["/repos/*/issues".into()],
+                        provider: "github".into(),
+                        asset_kind: "issue".into(),
+                        surface: "asset".into(),
+                        success_status_class: Some("2xx".into()),
+                        success_no_graphql_errors: false,
+                        graphql_operation: String::new(),
+                        graphql_field: String::new(),
+                        data: vec![("number".into(), "$.resp.number".into())],
+                        fetchable: Some("$.resp.html_url".into()),
+                    },
+                    // ADR 0059: a GraphQL observe (NoGraphqlErrors success rule).
+                    EgressObserveEntry {
+                        allow_hosts: vec!["api.github.com".into()],
+                        allow_host_patterns: vec![],
+                        methods: vec!["POST".into()],
+                        path_globs: vec!["/graphql".into()],
+                        provider: "github".into(),
+                        asset_kind: "issue".into(),
+                        surface: "asset".into(),
+                        success_status_class: None,
+                        success_no_graphql_errors: true,
+                        graphql_operation: "mutation".into(),
+                        graphql_field: "createIssue".into(),
+                        data: vec![("id".into(), "$.resp.data.createIssue.issue.id".into())],
+                        fetchable: None,
+                    },
+                ],
                 secret_mode: SecretMode::Broker,
             },
         )
         .expect("register");
 
         let state = registry.lookup(guest_ip).expect("session registered");
-        assert_eq!(state.injects.len(), 1);
+        assert_eq!(state.injects.len(), 2);
         let inj = &state.injects[0];
         assert_eq!(inj.secret, "dd-secret");
         assert_eq!(inj.header_name, "DD-API-KEY");
         assert!(inj.allow.matches("api.datadoghq.com"));
         assert!(inj.policy.allows("GET", "/api/v2/logs/events"));
         assert!(!inj.policy.allows("POST", "/api/v2/logs/events"));
+        assert!(
+            inj.policy.graphql.is_none(),
+            "REST inject has no graphql matcher"
+        );
 
-        // ADR 0056 Phase 4: the observe spec translates into a proxy ObserveEntry.
-        assert_eq!(state.observes.len(), 1);
+        // ADR 0059: the GraphQL inject translates into a RequestPolicy.graphql.
+        let gql_inj = &state.injects[1];
+        assert_eq!(gql_inj.secret, "gh-token");
+        let g = gql_inj
+            .policy
+            .graphql
+            .as_ref()
+            .expect("graphql matcher present");
+        assert_eq!(g.operation, engram_egress_proxy::GraphqlOperation::Mutation);
+        assert_eq!(g.field, "mergePullRequest");
+        assert!(gql_inj.policy.path_matches("/graphql"));
+
+        // ADR 0056 Phase 4: the REST observe spec translates into a proxy ObserveEntry.
+        assert_eq!(state.observes.len(), 2);
         let obs = &state.observes[0];
         assert_eq!(obs.provider, "github");
         assert_eq!(obs.asset_kind, "issue");
@@ -251,5 +353,22 @@ mod tests {
             engram_egress_proxy::SuccessRule::StatusClass2xx
         ));
         assert_eq!(obs.fetchable.as_deref(), Some("$.resp.html_url"));
+
+        // ADR 0059: the GraphQL observe maps to a graphql matcher + NoGraphqlErrors.
+        let gql_obs = &state.observes[1];
+        let go = gql_obs
+            .policy
+            .graphql
+            .as_ref()
+            .expect("graphql matcher present");
+        assert_eq!(
+            go.operation,
+            engram_egress_proxy::GraphqlOperation::Mutation
+        );
+        assert_eq!(go.field, "createIssue");
+        assert!(matches!(
+            gql_obs.success,
+            engram_egress_proxy::SuccessRule::NoGraphqlErrors
+        ));
     }
 }

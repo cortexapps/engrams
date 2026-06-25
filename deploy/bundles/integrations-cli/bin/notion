@@ -1,0 +1,174 @@
+#!/bin/sh
+# engrams Notion CLI — a thin wrapper over the Notion REST API (v1).
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `NOTION_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped internal
+# integration token on every request to api.notion.com (and strips any token you
+# supply). There is NOTHING to log in to — do not set a real token.
+#
+# The required `Notion-Version` header is a constant (NOT a secret) this script
+# sends itself. A page/database/block only responds if it has been shared with
+# the integration.
+#
+# Each subcommand needs the matching power on your profile (notion:search:read,
+# notion:pages:read|write, notion:databases:read|write, notion:blocks:read|write,
+# notion:comments:read|write, notion:users:read); calls to a path your profile
+# didn't grant are denied at the network boundary, not authenticated.
+set -eu
+
+API="https://api.notion.com"
+TOKEN="${NOTION_TOKEN:-x-engrams-managed}"
+NOTION_VERSION="2026-03-11"
+
+usage() {
+    cat <<'EOF'
+engrams Notion CLI — auth is brokered by the platform (no token to set).
+
+Usage:
+  notion whoami                          The integration's bot user (GET /v1/users/me)
+  notion search [query] [field=value...] Search pages/databases by title (POST /v1/search)
+  notion page <page-id>                  Retrieve a page (GET /v1/pages/<id>)
+  notion create-page <json>              Create a page (POST /v1/pages); <json> = request body
+  notion update-page <page-id> <json>    Update page properties (PATCH /v1/pages/<id>)
+  notion db <database-id>                Retrieve a database schema (GET /v1/databases/<id>)
+  notion query <database-id> [json]      Query a database (POST /v1/databases/<id>/query)
+  notion update-db <database-id> <json>  Update a database (PATCH /v1/databases/<id>)
+  notion block <block-id>                Retrieve a block (GET /v1/blocks/<id>)
+  notion children <block-id>             List child blocks (GET /v1/blocks/<id>/children)
+  notion append <block-id> <json>        Append child blocks (PATCH /v1/blocks/<id>/children)
+  notion comments <block-or-page-id>     List comments (GET /v1/comments?block_id=<id>)
+  notion comment <json>                  Create a comment (POST /v1/comments); <json> = body
+  notion users                           List workspace users (GET /v1/users)
+  notion get <path> [field=value ...]    Raw GET under /v1, e.g. notion get /v1/pages/<id>
+  notion api <METHOD> <path> [json]      Raw call, e.g. notion api POST /v1/search '{"query":"x"}'
+
+Identifiers are Notion UUIDs (with or without dashes). The integration only sees
+pages/databases shared with it. Responses are JSON; a 401/403 means the
+credential or the page-share is missing, a 400 usually means a malformed body.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# request <METHOD> <path> [curl-args...] — call the Notion API with brokered auth
+# and the constant version header.
+request() {
+    m="$1"
+    path="$2"
+    shift 2
+    curl -sS -X "$m" "$API$path" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Notion-Version: $NOTION_VERSION" \
+        -H "Content-Type: application/json" \
+        "$@" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    request GET /v1/users/me
+    ;;
+search)
+    # Optional first positional becomes the search "query"; remaining field=value
+    # pairs are folded into a JSON body via jq (when present) or sent raw.
+    if command -v jq >/dev/null 2>&1; then
+        body='{}'
+        if [ "$#" -gt 0 ] && ! printf '%s' "$1" | grep -q '='; then
+            body=$(printf '%s' "$1" | jq -R '{query: .}')
+            shift
+        fi
+        for kv in "$@"; do
+            k=${kv%%=*}
+            v=${kv#*=}
+            body=$(printf '%s' "$body" | jq --arg k "$k" --arg v "$v" '. + {($k): $v}')
+        done
+        request POST /v1/search --data "$body"
+    else
+        request POST /v1/search --data "${1:-{\}}"
+    fi
+    ;;
+page)
+    id="${1:?usage: notion page <page-id>}"
+    request GET "/v1/pages/$id"
+    ;;
+create-page)
+    body="${1:?usage: notion create-page <json>}"
+    request POST /v1/pages --data "$body"
+    ;;
+update-page)
+    id="${1:?usage: notion update-page <page-id> <json>}"
+    body="${2:?usage: notion update-page <page-id> <json>}"
+    request PATCH "/v1/pages/$id" --data "$body"
+    ;;
+db)
+    id="${1:?usage: notion db <database-id>}"
+    request GET "/v1/databases/$id"
+    ;;
+query)
+    id="${1:?usage: notion query <database-id> [json]}"
+    body="${2:-{\}}"
+    request POST "/v1/databases/$id/query" --data "$body"
+    ;;
+update-db)
+    id="${1:?usage: notion update-db <database-id> <json>}"
+    body="${2:?usage: notion update-db <database-id> <json>}"
+    request PATCH "/v1/databases/$id" --data "$body"
+    ;;
+block)
+    id="${1:?usage: notion block <block-id>}"
+    request GET "/v1/blocks/$id"
+    ;;
+children)
+    id="${1:?usage: notion children <block-id>}"
+    request GET "/v1/blocks/$id/children"
+    ;;
+append)
+    id="${1:?usage: notion append <block-id> <json>}"
+    body="${2:?usage: notion append <block-id> <json>}"
+    request PATCH "/v1/blocks/$id/children" --data "$body"
+    ;;
+comments)
+    id="${1:?usage: notion comments <block-or-page-id>}"
+    request GET "/v1/comments?block_id=$id"
+    ;;
+comment)
+    body="${1:?usage: notion comment <json>}"
+    request POST /v1/comments --data "$body"
+    ;;
+users)
+    request GET /v1/users
+    ;;
+get)
+    path="${1:?usage: notion get <path> [field=value ...]}"
+    shift
+    # Append field=value pairs as a query string (POSIX-safe, no arrays).
+    qs=""
+    for kv in "$@"; do
+        if [ -z "$qs" ]; then qs="?$kv"; else qs="$qs&$kv"; fi
+    done
+    request GET "$path$qs"
+    ;;
+api)
+    m="${1:?usage: notion api <METHOD> <path> [json-body]}"
+    path="${2:?usage: notion api <METHOD> <path> [json-body]}"
+    body="${3:-}"
+    if [ -n "$body" ]; then
+        request "$m" "$path" --data "$body"
+    else
+        request "$m" "$path"
+    fi
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "notion: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

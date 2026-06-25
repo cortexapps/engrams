@@ -1,0 +1,83 @@
+{
+  "provider": "notion",
+  "protocol": "http",
+  "display": {
+    "name": "Notion",
+    "category": "Knowledge base",
+    "blurb": "Search the workspace, read and edit pages, query and update databases, manage blocks and comments — authenticated with an internal integration token brokered at the egress proxy.",
+    "icon": { "mono": "NO", "color": "#1f2328" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "notion.api_token" }
+    ]
+  },
+  "hosts": ["api.notion.com"],
+  "test": { "path": "/v1/users/me" },
+  "operations": [
+    {
+      "grants": ["search:read"],
+      "match": { "method": "POST", "path": "/v1/search" }
+    },
+    {
+      "grants": ["pages:read"],
+      "match": { "method": "GET", "path": "/v1/pages/*" }
+    },
+    {
+      "grants": ["pages:write"],
+      "match": { "method": "POST", "path": "/v1/pages" }
+    },
+    {
+      "grants": ["pages:write"],
+      "match": { "method": "PATCH", "path": "/v1/pages/*" }
+    },
+    {
+      "grants": ["databases:read"],
+      "match": { "method": "GET", "path": "/v1/databases/*" }
+    },
+    {
+      "grants": ["databases:read"],
+      "match": { "method": "POST", "path": "/v1/databases/*/query" }
+    },
+    {
+      "grants": ["databases:write"],
+      "match": { "method": "POST", "path": "/v1/databases" }
+    },
+    {
+      "grants": ["databases:write"],
+      "match": { "method": "PATCH", "path": "/v1/databases/*" }
+    },
+    {
+      "grants": ["blocks:read"],
+      "match": { "method": "GET", "path": "/v1/blocks/*" }
+    },
+    {
+      "grants": ["blocks:write"],
+      "match": { "method": "PATCH", "path": "/v1/blocks/*" }
+    },
+    {
+      "grants": ["blocks:write"],
+      "match": { "method": "DELETE", "path": "/v1/blocks/*" }
+    },
+    {
+      "grants": ["comments:read"],
+      "match": { "method": "GET", "path": "/v1/comments" }
+    },
+    {
+      "grants": ["comments:write"],
+      "match": { "method": "POST", "path": "/v1/comments" }
+    },
+    {
+      "grants": ["users:read"],
+      "match": { "method": "GET", "path": "/v1/users*" }
+    }
+  ],
+  "cli": {
+    "bins": ["notion"],
+    "binSource": "bundled",
+    "dummyEnv": { "NOTION_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `notion` to drive the Notion REST API from this session — search the workspace, read/write pages, query/update databases, manage blocks and comments. Authentication is automatic: the egress proxy injects the internal integration token (Bearer) on requests to api.notion.com; `NOTION_TOKEN` is a managed placeholder. The CLI also sends the required `Notion-Version: 2026-03-11` header itself (not a secret). Do NOT set a real token or log in. A page/database/block only responds if it has been shared with the integration.\n\nSubcommands and the power each needs:\n- `notion whoami` — the integration's bot user (GET /v1/users/me). Always available.\n- `notion search [query] [field=value ...]` — search pages/databases by title (POST /v1/search). Needs `search:read`.\n- `notion page <page-id>` — retrieve a page (GET). Needs `pages:read`.\n- `notion create-page parent_page_id=<id> [field=value ...]` — create a page (POST /v1/pages). Needs `pages:write`.\n- `notion update-page <page-id> [field=value ...]` — update page properties (PATCH). Needs `pages:write`.\n- `notion db <database-id>` — retrieve a database schema (GET). Needs `databases:read`.\n- `notion query <database-id> [field=value ...]` — query a database (POST /v1/databases/<id>/query). Needs `databases:read`.\n- `notion update-db <database-id> [field=value ...]` — update a database (PATCH). Needs `databases:write`.\n- `notion block <block-id>` — retrieve a block (GET). Needs `blocks:read`.\n- `notion children <block-id>` — list a block's children (GET /v1/blocks/<id>/children). Needs `blocks:read`.\n- `notion append <block-id> <json>` — append child blocks (PATCH /v1/blocks/<id>/children); <json> is the request body, e.g. '{\"children\":[...]}'. Needs `blocks:write`.\n- `notion comments <block-or-page-id>` — list comments (GET /v1/comments?block_id=<id>). Needs `comments:read`.\n- `notion comment <json>` — create a comment (POST /v1/comments); <json> is the body. Needs `comments:write`.\n- `notion users` — list workspace users (GET /v1/users). Needs `users:read`.\n\nGeneric escape hatches (any path under /v1, version header added for you):\n- `notion get <path> [field=value ...]` — GET, e.g. `notion get /v1/pages/<id>`.\n- `notion api <METHOD> <path> [json-body]` — raw call, e.g. `notion api POST /v1/search '{\"query\":\"roadmap\"}'`.\nResponses are JSON; a 401/403 means the credential or the integration's page-share is missing, a 400 usually means a malformed body."
+  }
+}

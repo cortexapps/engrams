@@ -104,6 +104,17 @@ pub struct IntegrationInject {
     /// `RequestPolicy`.
     #[serde(default)]
     pub path_globs: Vec<String>,
+    /// ADR 0059: GraphQL operation type for body-parsed gating (`"query"` |
+    /// `"mutation"` | `"subscription"`). Empty = a REST entry (gate by
+    /// methods/path only). Paired with `graphql_field`; for a GraphQL entry
+    /// `path_globs` carries the `/graphql` endpoint and `methods` is `["POST"]`,
+    /// so it is *also* method+path gated (defense in depth).
+    #[serde(default)]
+    pub graphql_operation: String,
+    /// ADR 0059: the GraphQL top-level field this entry authorizes (e.g.
+    /// `"mergePullRequest"`). Empty = a REST entry.
+    #[serde(default)]
+    pub graphql_field: String,
 }
 
 /// One response-observation spec. On an outbound request to `hosts` matching
@@ -127,6 +138,20 @@ pub struct IntegrationObserve {
     /// Status class gating emission, e.g. `"2xx"`. `None` → emit on any status.
     #[serde(default)]
     pub success_status_class: Option<String>,
+    /// ADR 0059: GraphQL success rule — emit only when the response carries no
+    /// non-empty top-level `errors` array (in addition to HTTP 2xx). Set for a
+    /// GraphQL observe; takes precedence over `success_status_class`.
+    #[serde(default)]
+    pub success_no_graphql_errors: bool,
+    /// ADR 0059: GraphQL operation type for body-parsed firing (`"query"` |
+    /// `"mutation"`). Empty = a REST observe (fire by methods/path). Paired with
+    /// `graphql_field`.
+    #[serde(default)]
+    pub graphql_operation: String,
+    /// ADR 0059: the GraphQL top-level field this observe fires on (e.g.
+    /// `"createIssue"`). Empty = a REST observe.
+    #[serde(default)]
+    pub graphql_field: String,
     /// `(field name, extractor path)` pairs for the asset's `data` payload.
     #[serde(default)]
     pub data: Vec<(String, String)>,
@@ -167,12 +192,58 @@ mod tests {
                 mint_provider: String::new(),
                 methods: vec!["GET".into()],
                 path_globs: vec!["/api/v2/logs*".into()],
+                graphql_operation: String::new(),
+                graphql_field: String::new(),
             }],
             observes: vec![],
             ..Default::default()
         };
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(IntegrationPolicy::parse(&json).unwrap(), Some(p));
+    }
+
+    #[test]
+    fn round_trips_a_graphql_inject_and_observe() {
+        // ADR 0059: a GraphQL inject (mint, gated by operation+field) + its observe.
+        let p = IntegrationPolicy {
+            injects: vec![IntegrationInject {
+                hosts: vec!["api.github.com".into()],
+                header_name: String::new(),
+                header_template: String::new(),
+                secret_ref: String::new(),
+                mint_provider: "github".into(),
+                methods: vec!["POST".into()],
+                path_globs: vec!["/graphql".into()],
+                graphql_operation: "mutation".into(),
+                graphql_field: "createIssue".into(),
+            }],
+            observes: vec![IntegrationObserve {
+                hosts: vec!["api.github.com".into()],
+                methods: vec!["POST".into()],
+                path_globs: vec!["/graphql".into()],
+                provider: "github".into(),
+                asset_kind: "issue".into(),
+                surface: "asset".into(),
+                success_status_class: None,
+                success_no_graphql_errors: true,
+                graphql_operation: "mutation".into(),
+                graphql_field: "createIssue".into(),
+                data: vec![("id".into(), "$.resp.data.createIssue.issue.id".into())],
+                fetchable: None,
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(IntegrationPolicy::parse(&json).unwrap(), Some(p));
+    }
+
+    #[test]
+    fn graphql_fields_default_when_absent() {
+        // A policy serialized before ADR 0059 (no graphql fields) still decodes.
+        let json = r#"{"injects":[{"hosts":["h"],"header_name":"X","header_template":"{}","secret_ref":"r","methods":["POST"],"path_globs":["/graphql"]}]}"#;
+        let p = IntegrationPolicy::parse(json).unwrap().unwrap();
+        assert!(p.injects[0].graphql_operation.is_empty());
+        assert!(p.injects[0].graphql_field.is_empty());
     }
 
     #[test]
@@ -196,6 +267,9 @@ mod tests {
                 asset_kind: "issue".into(),
                 surface: "asset".into(),
                 success_status_class: Some("2xx".into()),
+                success_no_graphql_errors: false,
+                graphql_operation: String::new(),
+                graphql_field: String::new(),
                 data: vec![("number".into(), "$.resp.number".into())],
                 fetchable: Some("$.resp.html_url".into()),
             }],
