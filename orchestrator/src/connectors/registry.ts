@@ -18,8 +18,10 @@
  * Validation is a hand-written typed loader (matching the codebase's other
  * `assert*Valid` guards) rather than a JSON-Schema dependency: connectors are
  * trusted first-party files, so this is a developer-error guard, not a security
- * boundary. Only `http` is implemented; `grpc`/`graphql` are designed-in shapes
- * (ADR §3) a later phase adds as new host-proxy parsers.
+ * boundary. The `protocol` is `http`; GraphQL operations ride `http` too —
+ * the *match shape* (`{operation, field}`) selects body-parsed GraphQL gating
+ * (ADR 0059), so one connector mixes REST + GraphQL ops sharing powers. `grpc`
+ * remains a designed-in shape (ADR 0056 §3) a later phase adds as a proxy parser.
  *
  * This phase compiles only Plane-B *injects* (credential source = inject). Mint
  * connectors (`source: "mint"`, e.g. GitHub) validate + gate capabilities now;
@@ -53,10 +55,29 @@ export interface MintCredential {
 }
 export type Credential = InjectCredential | MintCredential;
 
-/** HTTP request match — the one protocol-shaped field (ADR §3). */
+/** HTTP request match — the protocol-shaped field for a REST operation (ADR §3). */
 export interface HttpMatch {
   method?: string;
   path?: string;
+}
+
+/**
+ * GraphQL request match — the protocol-shaped field for a GraphQL operation
+ * (ADR 0059). A connector stays `protocol: "http"` (GraphQL is HTTP transport);
+ * the *match shape* selects body-parsed GraphQL gating, so one connector can mix
+ * REST + GraphQL operations sharing the same powers. The egress proxy parses the
+ * request body and gates by `(operation, field)` against the connector's
+ * {@link Connector.graphqlEndpoint}.
+ */
+export interface GraphqlMatch {
+  operation: "query" | "mutation" | "subscription";
+  /** Top-level selection field (aliases resolve to it), e.g. `mergePullRequest`. */
+  field: string;
+}
+
+/** Discriminate a GraphQL match from an HTTP match (a GraphQL match has `operation`). */
+export function isGraphqlMatch(m: HttpMatch | GraphqlMatch): m is GraphqlMatch {
+  return (m as GraphqlMatch).operation !== undefined;
 }
 
 /** Response→asset map (consumed in Phase 4; validated + carried now). */
@@ -71,7 +92,8 @@ export interface AssetSpec {
 export interface Operation {
   /** Capability `action`s that activate this operation. */
   grants: string[];
-  match?: HttpMatch;
+  /** Either an HTTP match (`method`/`path`) or a GraphQL match (`operation`/`field`). */
+  match?: HttpMatch | GraphqlMatch;
   asset?: AssetSpec;
 }
 
@@ -208,10 +230,16 @@ export interface OauthFacet {
 
 export interface Connector {
   provider: string;
-  /** Only `"http"` is implemented; other values are rejected at load. */
+  /** Only `"http"` is implemented; other values are rejected at load. GraphQL
+   * operations ride `http` too (ADR 0059) — the match shape, not this field,
+   * selects body-parsed GraphQL gating. */
   protocol: "http";
   credential: Credential;
   hosts: string[];
+  /** ADR 0059: the single path GraphQL operations POST to (e.g. `/graphql`).
+   * Defaulted to `/graphql` when any operation has a GraphQL match; absent for a
+   * pure-REST connector. */
+  graphqlEndpoint?: string;
   operations: Operation[];
   /** Always defaulted from `provider` when absent (see {@link parseConnector}). */
   display: ConnectorDisplay;
@@ -244,6 +272,11 @@ export interface IntegrationInjectJson {
   mint_provider: string;
   methods: string[];
   path_globs: string[];
+  /** ADR 0059: GraphQL operation type for body-parsed gating ("query" |
+   * "mutation" | "subscription"); empty = a REST inject. Paired with `graphql_field`. */
+  graphql_operation: string;
+  /** ADR 0059: GraphQL top-level field this inject authorizes; empty = REST. */
+  graphql_field: string;
 }
 /** One response-observation spec, snake_case to match the Rust serde shape. */
 export interface IntegrationObserveJson {
@@ -254,6 +287,13 @@ export interface IntegrationObserveJson {
   asset_kind: string;
   surface: string;
   success_status_class: string | null;
+  /** ADR 0059: GraphQL success rule — emit only when the response has no
+   * top-level `errors` (plus HTTP 2xx). Takes precedence over `success_status_class`. */
+  success_no_graphql_errors: boolean;
+  /** ADR 0059: GraphQL operation type for body-parsed firing; empty = a REST observe. */
+  graphql_operation: string;
+  /** ADR 0059: GraphQL top-level field this observe fires on; empty = REST. */
+  graphql_field: string;
   /** `[field, extractorPath]` pairs (serde `Vec<(String, String)>`). */
   data: [string, string][];
   fetchable: string | null;
@@ -370,6 +410,8 @@ const MAX_CLI_DOC_BYTES = 8 * 1024;
 const CLI_BIN_RE = /^[A-Za-z0-9._-]+$/;
 /** POSIX-ish env var name. */
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** ADR 0059: a GraphQL field / operation name (matches the egress proxy's parser). */
+const GRAPHQL_FIELD_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
  * Reject a host that isn't a bare hostname — optionally a single leading-label
@@ -650,7 +692,7 @@ export function parseConnector(raw: unknown, where: string): Connector {
 
   if (typeof o.provider !== "string" || !o.provider) fail(where, '"provider" must be a non-empty string');
   if (!PROVIDER_RE.test(o.provider)) fail(where, `"provider" "${o.provider}" must be a lowercase identifier ([a-z0-9][a-z0-9_-]*)`);
-  if (o.protocol !== "http") fail(where, `"protocol" must be "http" (got ${JSON.stringify(o.protocol)}); grpc/graphql are not yet implemented`);
+  if (o.protocol !== "http") fail(where, `"protocol" must be "http" (got ${JSON.stringify(o.protocol)}); GraphQL rides http via a "{operation, field}" match (ADR 0059), grpc is not yet implemented`);
 
   const cred = o.credential as Record<string, unknown> | undefined;
   if (typeof cred !== "object" || cred === null) fail(where, '"credential" must be an object');
@@ -698,13 +740,30 @@ export function parseConnector(raw: unknown, where: string): Connector {
     const op = rawOp as Record<string, unknown>;
     const grants = asStringArray(opWhere, "grants", op.grants);
     if (grants.length > MAX_GRANTS) fail(opWhere, `"grants" has ${grants.length} entries (max ${MAX_GRANTS})`);
-    let match: HttpMatch | undefined;
+    let match: HttpMatch | GraphqlMatch | undefined;
     if (op.match !== undefined) {
       if (typeof op.match !== "object" || op.match === null) fail(opWhere, '"match" must be an object');
       const m = op.match as Record<string, unknown>;
-      if (m.method !== undefined && typeof m.method !== "string") fail(opWhere, '"match.method" must be a string');
-      if (m.path !== undefined && typeof m.path !== "string") fail(opWhere, '"match.path" must be a string');
-      match = { ...(typeof m.method === "string" ? { method: m.method } : {}), ...(typeof m.path === "string" ? { path: m.path } : {}) };
+      // ADR 0059: a match is EITHER an HTTP match (method/path) OR a GraphQL match
+      // (operation/field). Discriminate by which keys are present; reject a mix.
+      const isGraphql = m.operation !== undefined || m.field !== undefined;
+      const isHttp = m.method !== undefined || m.path !== undefined;
+      if (isGraphql && isHttp) {
+        fail(opWhere, '"match" must be an HTTP match (method/path) OR a GraphQL match (operation/field), not both');
+      }
+      if (isGraphql) {
+        if (m.operation !== "query" && m.operation !== "mutation" && m.operation !== "subscription") {
+          fail(opWhere, '"match.operation" must be "query", "mutation", or "subscription"');
+        }
+        if (typeof m.field !== "string" || !GRAPHQL_FIELD_RE.test(m.field)) {
+          fail(opWhere, '"match.field" must be a GraphQL field name ([A-Za-z_][A-Za-z0-9_]*)');
+        }
+        match = { operation: m.operation, field: m.field };
+      } else {
+        if (m.method !== undefined && typeof m.method !== "string") fail(opWhere, '"match.method" must be a string');
+        if (m.path !== undefined && typeof m.path !== "string") fail(opWhere, '"match.path" must be a string');
+        match = { ...(typeof m.method === "string" ? { method: m.method } : {}), ...(typeof m.path === "string" ? { path: m.path } : {}) };
+      }
     }
     let asset: AssetSpec | undefined;
     if (op.asset !== undefined) {
@@ -738,11 +797,32 @@ export function parseConnector(raw: unknown, where: string): Connector {
 
   const oauth = o.oauth !== undefined ? parseOauth(where, o.oauth, hosts) : undefined;
 
+  // ADR 0059: the GraphQL endpoint (the single path GraphQL ops POST to). Required
+  // when any operation has a GraphQL match; defaults to `/graphql`. Validated like
+  // a path (absolute, no `..` / control chars) since it widens what the proxy will
+  // body-parse + gate.
+  let graphqlEndpoint: string | undefined;
+  const hasGraphqlOp = operations.some((op) => op.match !== undefined && isGraphqlMatch(op.match));
+  if (o.graphqlEndpoint !== undefined) {
+    if (
+      typeof o.graphqlEndpoint !== "string" ||
+      !o.graphqlEndpoint.startsWith("/") ||
+      o.graphqlEndpoint.includes("..") ||
+      /[\s\r\n\0]/.test(o.graphqlEndpoint)
+    ) {
+      fail(where, '"graphqlEndpoint" must be an absolute path ("/…") with no "..", whitespace, or control chars');
+    }
+    graphqlEndpoint = o.graphqlEndpoint;
+  } else if (hasGraphqlOp) {
+    graphqlEndpoint = "/graphql";
+  }
+
   return {
     provider: o.provider,
     protocol: "http",
     credential,
     hosts,
+    ...(graphqlEndpoint ? { graphqlEndpoint } : {}),
     operations,
     display,
     ...(cli ? { cli } : {}),
@@ -904,12 +984,24 @@ export function compileIntegrationPolicy(
     for (const op of connector.operations) {
       if (!op.grants.includes(cap.action)) continue;
       for (const h of connector.hosts) grantedHosts.add(h);
-      const methods = op.match?.method ? [op.match.method.toUpperCase()] : [];
-      // Emit the connector match path as a whole glob (the proxy globs `*` over
-      // the full request path). Previously this was truncated at the first `*`
-      // and prefix-matched, which over-matched siblings — e.g. `/repos/*/pulls`
-      // collapsed to `/repos/` and fired the gate/observe on `/repos/o/r/git/refs`.
-      const path_globs = op.match?.path ? [op.match.path] : [];
+      // ADR 0059: a GraphQL op gates `POST <graphqlEndpoint>` and is body-matched
+      // by (operation, field); a REST op gates by (method, path glob). The path
+      // glob is emitted whole (the proxy globs `*` over the full request path —
+      // previously truncated at the first `*`, which over-matched siblings, e.g.
+      // `/repos/*/pulls` collapsing to `/repos/` and firing on `/repos/o/r/git/refs`).
+      let methods: string[];
+      let path_globs: string[];
+      let graphql_operation = "";
+      let graphql_field = "";
+      if (op.match && isGraphqlMatch(op.match)) {
+        methods = ["POST"];
+        path_globs = [connector.graphqlEndpoint ?? "/graphql"];
+        graphql_operation = op.match.operation;
+        graphql_field = op.match.field;
+      } else {
+        methods = op.match?.method ? [op.match.method.toUpperCase()] : [];
+        path_globs = op.match?.path ? [op.match.path] : [];
+      }
 
       if (connector.credential.source === "inject") {
         // One egress inject per declared header (most connectors have one; e.g.
@@ -923,6 +1015,8 @@ export function compileIntegrationPolicy(
             mint_provider: "",
             methods,
             path_globs,
+            graphql_operation,
+            graphql_field,
           };
           const key = JSON.stringify(entry);
           if (!seenInject.has(key)) {
@@ -946,6 +1040,8 @@ export function compileIntegrationPolicy(
           mint_provider: connector.provider,
           methods,
           path_globs,
+          graphql_operation,
+          graphql_field,
         };
         const key = JSON.stringify(entry);
         if (!seenInject.has(key)) {
@@ -966,6 +1062,11 @@ export function compileIntegrationPolicy(
           asset_kind: a.kind,
           surface: a.surface,
           success_status_class: typeof statusClass === "string" ? statusClass : null,
+          // ADR 0059: a GraphQL asset gates success on the absence of top-level
+          // `errors` (the connector sets `success: { noGraphqlErrors: true }`).
+          success_no_graphql_errors: a.success?.noGraphqlErrors === true,
+          graphql_operation,
+          graphql_field,
           data: Object.entries(a.data ?? {}),
           fetchable: typeof fetchableExternal === "string" ? fetchableExternal : null,
         };
@@ -1148,7 +1249,14 @@ export function buildProviderCatalog(registry: Map<string, Connector>): Provider
   for (const connector of registry.values()) {
     const byAction = new Map<string, CatalogCapability>();
     for (const op of connector.operations) {
-      const access = accessOf(op.match?.method);
+      // ADR 0059: a GraphQL op's access derives from its operation type
+      // (query → read, mutation/subscription → write); a REST op from its method.
+      const access: CatalogAccess =
+        op.match && isGraphqlMatch(op.match)
+          ? op.match.operation === "query"
+            ? "read"
+            : "write"
+          : accessOf(op.match?.method);
       for (const action of op.grants) {
         const existing = byAction.get(action);
         if (existing) {
