@@ -92,6 +92,9 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     // live in the org store, never here), so they're member-visible like skills.
     network: row.network,
     secrets: row.secrets,
+    // ADR 0059: the org default profile (member-visible — describes selection,
+    // not a secret).
+    isDefault: row.isDefault,
     archived: row.deletedAt != null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -282,6 +285,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         capabilities: req.capabilities ?? [],
         network,
         secrets,
+        isDefault: req.isDefault,
       });
       return { profile: toProto(row, true) };
     },
@@ -309,6 +313,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         capabilities: req.capabilities ?? [],
         network,
         secrets,
+        isDefault: req.isDefault,
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
       return { profile: toProto(row, true) };

@@ -62,6 +62,7 @@ function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
     },
     async get(id) { return rows.get(id) ?? null; },
     async getActive(id) { const r = rows.get(id); return r && r.deletedAt == null ? r : null; },
+    async getDefault() { return [...rows.values()].find((r) => r.isDefault && r.deletedAt == null) ?? null; },
     async getByIds(ids) { return ids.map((i) => rows.get(i)).filter(Boolean) as ProfileRow[]; },
     async create(input) { const id = `p${n++}`; const r = mk(id, input); rows.set(id, r); return r; },
     async update(id, input) {
@@ -94,6 +95,7 @@ const archived: ProfileRow = {
   id: "arch", name: "Archived", description: "", icon: "Bot", imageId: "img-1",
   includeUserTokens: false, envVars: { K: "V" }, skills: [], capabilities: [], createdAt: new Date(0), updatedAt: new Date(0),
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
+  isDefault: false,
   deletedAt: new Date(0),
 };
 const active: ProfileRow = { ...archived, id: "act", name: "Active", deletedAt: null };

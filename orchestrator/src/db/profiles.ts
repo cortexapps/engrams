@@ -31,6 +31,8 @@ export interface ProfileRow {
   // ADR 0057: profile-defined egress allow-list + injected secrets.
   network: ProfileNetwork;
   secrets: ProfileSecret[];
+  // ADR 0059: the org default profile (at most one active).
+  isDefault: boolean;
   createdAt: Date;
   updatedAt: Date;
   deletedAt: Date | null;
@@ -47,6 +49,7 @@ export interface ProfileInput {
   capabilities: string[];
   network: ProfileNetwork;
   secrets: ProfileSecret[];
+  isDefault: boolean;
 }
 
 /** The seam injected into ProfileService and TaskService. */
@@ -57,6 +60,8 @@ export interface ProfileStore {
   get(id: string): Promise<ProfileRow | null>;
   /** Active (deleted_at IS NULL) only, or null. Used by createTask. */
   getActive(id: string): Promise<ProfileRow | null>;
+  /** The org's active default profile (ADR 0059), or null if none is set. */
+  getDefault(): Promise<ProfileRow | null>;
   /** Rows for the given ids (active or archived) — for snapshot enrichment. */
   getByIds(ids: string[]): Promise<ProfileRow[]>;
   create(input: ProfileInput): Promise<ProfileRow>;
@@ -79,6 +84,7 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     capabilities: (r.capabilities ?? []) as string[],
     network: (r.network ?? DEFAULT_PROFILE_NETWORK) as ProfileNetwork,
     secrets: (r.secrets ?? []) as ProfileSecret[],
+    isDefault: r.isDefault,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
     deletedAt: r.deletedAt,
@@ -105,6 +111,14 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
         .limit(1);
       return rows[0] ? toRow(rows[0]) : null;
     },
+    async getDefault() {
+      const rows = await db
+        .select()
+        .from(profileTable)
+        .where(and(eq(profileTable.isDefault, true), isNull(profileTable.deletedAt)))
+        .limit(1);
+      return rows[0] ? toRow(rows[0]) : null;
+    },
     async getByIds(ids) {
       if (ids.length === 0) return [];
       const rows = await db.select().from(profileTable).where(inArray(profileTable.id, ids));
@@ -112,17 +126,37 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
     },
     async create(input) {
       const id = crypto.randomUUID();
-      await db.insert(profileTable).values({ id, ...input });
+      // At-most-one default (ADR 0059): if this profile is the default, clear
+      // any prior default in the same tx before inserting.
+      await db.transaction(async (tx) => {
+        if (input.isDefault) {
+          await tx
+            .update(profileTable)
+            .set({ isDefault: false })
+            .where(eq(profileTable.isDefault, true));
+        }
+        await tx.insert(profileTable).values({ id, ...input });
+      });
       const row = await this.get(id);
       return row!;
     },
     async update(id, input) {
       const existing = await this.getActive(id);
       if (!existing) return null;
-      await db
-        .update(profileTable)
-        .set({ ...input, updatedAt: new Date() })
-        .where(eq(profileTable.id, id));
+      // Clear any prior default first (incl. self), then write this row's input
+      // (which carries isDefault) — at-most-one without a self-exclusion clause.
+      await db.transaction(async (tx) => {
+        if (input.isDefault) {
+          await tx
+            .update(profileTable)
+            .set({ isDefault: false })
+            .where(eq(profileTable.isDefault, true));
+        }
+        await tx
+          .update(profileTable)
+          .set({ ...input, updatedAt: new Date() })
+          .where(eq(profileTable.id, id));
+      });
       return this.get(id);
     },
     async softDelete(id) {
