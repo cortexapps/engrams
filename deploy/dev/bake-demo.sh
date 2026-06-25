@@ -69,7 +69,10 @@ cargo build --release --target "$TARGET" -p engram-agentd -p engram-harness-clau
 cargo build --release -p engram-cli -p engram-publish-builtin-harness
 
 # Bundle the matching Claude Code CLI (cached across runs).
-CLAUDE_VERSION="$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest)"
+# PINNED, not floating `latest`: claude >=2.1.187 dropped AskUserQuestion from
+# headless `--print` mode, breaking ADR 0054 interactive questions
+# (cortexapps/engrams#431). 2.1.185 is the newest CLI that still offers it.
+CLAUDE_VERSION="2.1.185"
 CACHE="$HOME/.cache/engram-claude-cli/$CLAUDE_VERSION/$CLAUDE_PLAT"
 if [ ! -x "$CACHE/claude" ]; then
     echo "==> download claude CLI $CLAUDE_VERSION ($CLAUDE_PLAT)"
