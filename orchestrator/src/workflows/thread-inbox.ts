@@ -38,9 +38,11 @@ export interface SourceAnswer {
   answers: Record<string, string[]>;
 }
 
-/** Everything the thread workflow can receive, tagged by origin. */
+/** Everything the thread workflow can receive, tagged by origin. `lastMessage`
+ *  on the terminal is the session's final assistant message (if any), which the
+ *  pump captured while walking the log — it enriches the closing summary. */
 export type ThreadInbox =
   | { kind: "session_event"; event: CuratedEvent }
-  | { kind: "session_terminal"; ok: boolean }
+  | { kind: "session_terminal"; ok: boolean; lastMessage?: string }
   | { kind: "trigger_mention"; mention: SourceMention }
   | { kind: "trigger_answer"; answer: SourceAnswer };

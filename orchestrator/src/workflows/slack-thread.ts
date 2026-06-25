@@ -26,6 +26,8 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import {
   routeSessionEvent,
+  summarizeAsset,
+  type AssetSummary,
   type CommunicationPolicy,
   type StartedSession,
 } from "./communication-policy.ts";
@@ -142,7 +144,10 @@ async function slackThreadWorkflowImpl(): Promise<void> {
   })({ sessionId: session.id, threadWfId: DBOS.workflowID! });
 
   // 3) Drain loop — one recv multiplexes session events ∪ trigger events.
+  // `questionTs` and `assets` are plain workflow-local state, rebuilt
+  // deterministically on replay from the checkpointed recv'd messages.
   const questionTs = new Map<string, string>();
+  const assets: AssetSummary[] = [];
   let lastTs = ctx0.maxTs;
 
   for (;;) {
@@ -151,12 +156,16 @@ async function slackThreadWorkflowImpl(): Promise<void> {
 
     switch (msg.kind) {
       case "session_terminal": {
-        if (msg.ok) await DBOS.runStep(() => pol.onComplete(m), { name: "onComplete" });
-        else await DBOS.runStep(() => pol.onFail(m, SESSION_FAILED_MSG), { name: "onFail" });
+        if (msg.ok) {
+          const summary = { lastMessage: msg.lastMessage ?? null, assets };
+          await DBOS.runStep(() => pol.onComplete(m, session, summary), { name: "onComplete" });
+        } else {
+          await DBOS.runStep(() => pol.onFail(m, SESSION_FAILED_MSG), { name: "onFail" });
+        }
         return;
       }
       case "session_event": {
-        await dispatchSessionEvent(pol, m, msg, questionTs);
+        await dispatchSessionEvent(pol, m, msg, questionTs, assets);
         break;
       }
       case "trigger_mention": {
@@ -188,6 +197,7 @@ async function dispatchSessionEvent(
   m: SourceMention,
   msg: Extract<ThreadInbox, { kind: "session_event" }>,
   questionTs: Map<string, string>,
+  assets: AssetSummary[],
 ): Promise<void> {
   const effect = routeSessionEvent(msg.event);
   switch (effect.kind) {
@@ -204,6 +214,10 @@ async function dispatchSessionEvent(
       break;
     }
     case "asset": {
+      // Render it live, and accumulate durable assets for the closing recap
+      // (transient actions summarize to null and are skipped).
+      const recap = summarizeAsset(msg.event);
+      if (recap) assets.push(recap);
       await DBOS.runStep(() => pol.onAsset(m, msg.event), { name: "onAsset" });
       break;
     }

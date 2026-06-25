@@ -27,13 +27,15 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import { readSessionEventsBounded } from "../control-plane/session-events.ts";
 import { THREAD_TOPIC, type ThreadInbox } from "./thread-inbox.ts";
 
-/** Workflow input. `after`/`epoch` are set only on a self-restart (the cursor
- *  and epoch the prior pump handed off); a fresh pump starts at the log head. */
+/** Workflow input. `after`/`epoch`/`lastMessage` are set only on a self-restart
+ *  (the cursor, epoch, and last-seen assistant message the prior pump handed
+ *  off); a fresh pump starts at the log head. */
 export interface IngestInput {
   sessionId: string;
   threadWfId: string;
   after?: bigint;
   epoch?: number;
+  lastMessage?: string;
 }
 
 /** Poll cadence when a bounded read returned no new curated content (tail). */
@@ -55,6 +57,9 @@ async function sessionIngestWorkflowImpl(input: IngestInput): Promise<void> {
   const { sessionId, threadWfId } = input;
   let after: bigint = input.after ?? -1n;
   const epoch = input.epoch ?? 0;
+  // The session's most-recent assistant message seen so far — carried across a
+  // self-restart so the closing summary stays correct even past a history bound.
+  let lastMessage: string | undefined = input.lastMessage;
 
   for (let i = 0; i < RESTART_AFTER_ITERATIONS; i++) {
     const page = await readPage(sessionId, after);
@@ -65,11 +70,12 @@ async function sessionIngestWorkflowImpl(input: IngestInput): Promise<void> {
       await DBOS.send<ThreadInbox>(threadWfId, { kind: "session_event", event: ev }, THREAD_TOPIC);
     }
     after = page.nextAfter;
+    if (page.lastAssistantText !== undefined) lastMessage = page.lastAssistantText;
 
     if (page.terminal) {
       await DBOS.send<ThreadInbox>(
         threadWfId,
-        { kind: "session_terminal", ok: page.terminal.ok },
+        { kind: "session_terminal", ok: page.terminal.ok, ...(lastMessage ? { lastMessage } : {}) },
         THREAD_TOPIC,
       );
       return;
@@ -85,7 +91,7 @@ async function sessionIngestWorkflowImpl(input: IngestInput): Promise<void> {
   // deterministic id makes this restart idempotent under replay.
   await DBOS.startWorkflow(sessionIngestWorkflow, {
     workflowID: `ingest:${sessionId}#${epoch + 1}`,
-  })({ sessionId, threadWfId, after, epoch: epoch + 1 });
+  })({ sessionId, threadWfId, after, epoch: epoch + 1, ...(lastMessage ? { lastMessage } : {}) });
 }
 
 export const sessionIngestWorkflow = DBOS.registerWorkflow(sessionIngestWorkflowImpl, {

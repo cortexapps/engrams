@@ -115,4 +115,55 @@ describe("readSessionEventsBounded()", () => {
     expect(out.terminal).toBeUndefined();
     expect(out.events.map((e) => e.kind)).toEqual(["run_completed"]);
   });
+
+  // The closing summary (ADR 0059, onComplete) is enriched with the session's
+  // last assistant message. agent_message is NOT a curated content kind (it's
+  // noise for the thread), but the pump already walks every page to the
+  // terminal — so the reader surfaces the last assistant text per page and the
+  // pump tracks the most-recent across pages, riding it on session_terminal.
+  describe("lastAssistantText", () => {
+    const am = (idx: bigint, role: string, text: string): WireEvent => ({
+      idx,
+      kind: "agent_message",
+      payloadJson: JSON.stringify({ run_id: "r", message_id: `m${idx}`, role, text }),
+    });
+
+    test("surfaces the text of the LAST assistant agent_message in the page", async () => {
+      const page: WireEvent[] = [
+        am(0n, "assistant", "first"),
+        { idx: 1n, kind: "run_started", payloadJson: "{}" },
+        am(2n, "assistant", "final answer"),
+      ];
+      const out = await readSessionEventsBounded("s", -1n, fakeList(page, 2n));
+      expect(out.lastAssistantText).toBe("final answer");
+    });
+
+    test("ignores user/system roles", async () => {
+      const page: WireEvent[] = [
+        am(0n, "assistant", "real"),
+        am(1n, "user", "the prompt echo"),
+        am(2n, "system", "a system note"),
+      ];
+      const out = await readSessionEventsBounded("s", -1n, fakeList(page, 2n));
+      expect(out.lastAssistantText).toBe("real");
+    });
+
+    test("undefined when the page has no assistant message", async () => {
+      const out = await readSessionEventsBounded(
+        "s",
+        -1n,
+        fakeList([{ idx: 0n, kind: "run_started", payloadJson: "{}" }], 0n),
+      );
+      expect(out.lastAssistantText).toBeUndefined();
+    });
+
+    test("a malformed agent_message payload is skipped (never throws)", async () => {
+      const page: WireEvent[] = [
+        am(0n, "assistant", "good"),
+        { idx: 1n, kind: "agent_message", payloadJson: "not json" },
+      ];
+      const out = await readSessionEventsBounded("s", -1n, fakeList(page, 1n));
+      expect(out.lastAssistantText).toBe("good");
+    });
+  });
 });

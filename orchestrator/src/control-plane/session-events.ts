@@ -57,6 +57,12 @@ export interface BoundedRead {
   nextAfter: bigint;
   /** Set when the page contained a terminal `status_changed`; `ok` = Completed. */
   terminal?: { ok: boolean };
+  /** Text of the LAST assistant `agent_message` in this page, if any. Drives the
+   *  closing-summary enrichment (ADR 0059, onComplete): agent_message is not a
+   *  curated content kind, but the pump already walks every page, so we surface
+   *  the last assistant text here and the pump tracks the most-recent across
+   *  pages — no extra coordinator round-trip. */
+  lastAssistantText?: string;
 }
 
 /**
@@ -103,17 +109,34 @@ export async function readSessionEventsBounded(
   const { events: page, nextAfterIdx } = await list(sessionId, after, PAGE_LIMIT);
   const events: CuratedEvent[] = [];
   let terminal: { ok: boolean } | undefined;
+  let lastAssistantText: string | undefined;
   for (const ev of page) {
     if (ev.kind === "status_changed") {
       const to = parseTerminalState(ev.payloadJson);
       if (to) terminal = { ok: to === "completed" };
       continue; // a control signal, never forwarded as content
     }
+    if (ev.kind === "agent_message") {
+      const text = parseAssistantText(ev.payloadJson);
+      if (text !== undefined) lastAssistantText = text; // keep the latest
+      continue; // noise as content, but its text feeds the closing summary
+    }
     if (curated(ev.kind) && ev.idx !== undefined) {
       events.push({ idx: ev.idx, kind: ev.kind, payloadJson: ev.payloadJson });
     }
   }
-  return { events, nextAfter: nextAfterIdx, terminal };
+  return { events, nextAfter: nextAfterIdx, terminal, lastAssistantText };
+}
+
+/** Extract the text of an `agent_message` payload iff it is from the assistant
+ *  (the prompt echo rides `role:"user"`, system notes `role:"system"`). */
+function parseAssistantText(payloadJson: string): string | undefined {
+  try {
+    const p = JSON.parse(payloadJson) as { role?: unknown; text?: unknown };
+    return p?.role === "assistant" && typeof p.text === "string" ? p.text : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Extract a terminal `to` state from a status_changed payload, else undefined. */

@@ -22,6 +22,21 @@ export interface StartedSession {
   webUrl: string;
 }
 
+/** A durable asset the session produced (a PR, a shared file), collapsed to one
+ *  recap line for the closing summary. `url` is set only for assets with an
+ *  external link (a PR page); files are reached via the session web URL. */
+export interface AssetSummary {
+  label: string;
+  url?: string;
+}
+
+/** What `onComplete` renders: the session's final assistant message (if any)
+ *  plus the durable assets it produced, in arrival order. */
+export interface ClosingSummary {
+  lastMessage: string | null;
+  assets: AssetSummary[];
+}
+
 /**
  * The provider seam. Every method is invoked by the framework as a checkpointed
  * DBOS step, so a completed effect is never re-run on replay. `onUserQuestion`
@@ -43,8 +58,9 @@ export interface CommunicationPolicy {
   onAnswered(m: SourceMention, ev: CuratedEvent, ref: string | undefined): Promise<void>;
   /** Render an asset (a PR `integration_asset` or a `file_shared` artifact). */
   onAsset(m: SourceMention, ev: CuratedEvent): Promise<void>;
-  /** The session completed successfully — always posts a closing summary. */
-  onComplete(m: SourceMention): Promise<void>;
+  /** The session completed successfully — posts a closing summary enriched with
+   *  the session's last assistant message + a recap of the assets it produced. */
+  onComplete(m: SourceMention, session: StartedSession, summary: ClosingSummary): Promise<void>;
   /** A failure (identity, create, or terminal-failure) — ❌ + actionable text. */
   onFail(m: SourceMention, message: string): Promise<void>;
   /** Gather thread messages after `since` (null = the whole thread) into a
@@ -88,4 +104,48 @@ function parseToolCallId(payloadJson: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** The asset/file payload shapes the recap reads (a structural slice of the
+ *  coordinator's `integration_asset` / `file_shared` events). */
+interface AssetPayload {
+  provider?: string;
+  asset_kind?: string;
+  surface?: string;
+  data?: { number?: unknown; title?: unknown };
+  fetchable?: { kind?: string; url?: string } | null;
+  caption?: string;
+}
+
+/**
+ * Collapse a curated asset event into a one-line recap entry, or null if it
+ * isn't a durable asset worth recapping. Pure. A transient
+ * `integration_asset` with `surface:"action"` (a verb the agent ran, not a
+ * surviving side-effect — ADR 0056) is NOT recapped.
+ */
+export function summarizeAsset(ev: CuratedEvent): AssetSummary | null {
+  let p: AssetPayload;
+  try {
+    p = JSON.parse(ev.payloadJson) as AssetPayload;
+  } catch {
+    return null;
+  }
+
+  if (ev.kind === "file_shared") {
+    return { label: typeof p.caption === "string" && p.caption ? p.caption : "shared a file" };
+  }
+
+  if (ev.kind === "integration_asset") {
+    if (p.surface === "action") return null; // transient, not a recap asset
+    const url = p.fetchable?.kind === "external" ? p.fetchable.url : undefined;
+    const provider = typeof p.provider === "string" ? p.provider : "asset";
+    const kind = typeof p.asset_kind === "string" ? p.asset_kind : "";
+    const label =
+      kind === "pull_request"
+        ? `PR #${String(p.data?.number ?? "")}: ${String(p.data?.title ?? "")}`.trim()
+        : `${provider} ${kind}`.trim();
+    return url ? { label, url } : { label };
+  }
+
+  return null;
 }
