@@ -1,11 +1,20 @@
 # ADR 0059: GraphQL operation gating + observation for integration connectors
 
-Status: 2026-06-25 — **Proposed.** The egress proxy gains a body-parsing GraphQL
-parser so a connector power (e.g. `pulls:write`) authorizes the GraphQL operations
-that back it, not just the REST endpoints — closing a regression the
-ADR 0056 connector model opened for `gh`. Field-level gating + response
-observation. Commit chain recorded at the bottom; flip to **Accepted** when the
-phases below land.
+Status: 2026-06-25 — **Accepted** (implementation landed; runtime stack-smoke +
+field-set finalization are the remaining operational gates, below). The egress
+proxy gains a body-parsing GraphQL parser so a connector power (e.g. `pulls:write`)
+authorizes the GraphQL operations that back it, not just the REST endpoints —
+closing a regression the ADR 0056 connector model opened for `gh`. Field-level
+gating + response observation. All unit/integration tests + `just check` +
+orchestrator typecheck/tests are green; the local-stack smoke against a live `gh`
+(and the real-traffic refinement of the GitHub query-field set) is the post-merge
+validation gate, not a design open. Commit chain at the bottom.
+
+**Implementation divergence from the phasing below:** the proxy engine and the
+wire/coordinator/host-agent threading shipped as **one** Rust commit rather than
+two — splitting them would have left a non-compiling intermediate (the proxy's new
+`RequestPolicy.graphql` field and the host-agent construction site that fills it
+are inseparable). The capability is otherwise exactly as phased.
 
 Builds on **ADR 0056** (generic integrations — the interceptor gate/inject/observe
 + connector config; §3 already sketches the GraphQL `match` shape as deferred
@@ -156,25 +165,39 @@ alias. Locked by a test.
 - GitHub's `github.json` grows a GraphQL operation block; the `cli.doc` notes the
   newly-working commands.
 
-## Phasing (one logical change per commit)
+## Phasing + commit chain
 
-1. **ADR 0059 Proposed** (this file).
-2. **Proxy engine** — `engram-egress-proxy`: `graphql.rs` parser,
-   `RequestPolicy.graphql` (+ `GraphqlMatch`/`GraphqlOperation`),
-   `SuccessRule::NoGraphqlErrors`, intercept body-buffer + set-coverage gate +
-   GraphQL observe firing; `async-graphql-parser` dep + hakari. Proxy unit + e2e
-   tests. Self-contained behind otherwise-unused fields.
-3. **Wire + coordinator + host-agent threading** — `engram-core`
-   (`integration.rs`/`egress.rs` fields), `session_boot.rs` (copy through mint +
-   inject + observe), host-agent `egress.rs` `register_policy` (build
-   `RequestPolicy.graphql` + `NoGraphqlErrors`). Core + host-agent tests.
-4. **Orchestrator** — `registry.ts`: the `GraphqlMatch` union, `graphqlEndpoint`,
-   `parseConnector` validation, `compileIntegrationPolicy` emission;
-   `connectors.test.ts` cases.
-5. **GitHub connector** — `github.json` GraphQL operations mapped to existing
-   powers + `cli.doc` update.
-6. **ADR 0059 Accepted** — with the commit chain + the real-`gh`-traffic
-   verification result.
+1. **ADR 0059 Proposed** — `792346d2`.
+2. **Egress pipeline (Rust)** — `3bfce923`: `engram-egress-proxy` (`graphql.rs`
+   parser via `async-graphql-parser`, `RequestPolicy.graphql` +
+   `GraphqlMatch`/`GraphqlOperation`, `SuccessRule::NoGraphqlErrors`, intercept
+   body-buffer + set-coverage gate + GraphQL observe firing; proxy unit + e2e
+   tests + hakari), the wire fields on `IntegrationInject/Observe` +
+   `EgressInject/ObserveEntry` (`engram-core`), `session_boot.rs` copy-through,
+   host-agent `register_policy` translation, and `WIRE_VERSION` 4→5
+   (`engram-protocol` + golden). (Proxy engine + wire threading merged into one
+   commit — see the divergence note in the Status; splitting left a
+   non-compiling intermediate.)
+3. **Orchestrator compile** — `d90acb3a`: `registry.ts` `GraphqlMatch` union,
+   `graphqlEndpoint`, `parseConnector` validation, `compileIntegrationPolicy`
+   emission, `buildProviderCatalog` access; `connectors.test.ts` + `tasks.test.ts`.
+4. **GitHub connector** — `083ef8ac`: `github.json` GraphQL operations mapped to
+   existing powers + `cli.doc`.
+5. **ADR 0059 Accepted** — this commit.
+
+### Remaining operational gates (post-merge, not design opens)
+
+- Capture real `gh` GraphQL traffic (`GH_DEBUG=api` / mitmproxy) for the target
+  commands and tighten `github.json`'s query-field set to match — the strict
+  parser denies an unmapped field, so the supported set must be exercised before a
+  prod profile relies on it.
+- Local-stack smoke (`just integration-session` / e2e): a `pulls:write` +
+  `issues:write` profile runs a GraphQL-backed `gh` write — it succeeds, emits an
+  `IntegrationAsset`, an unmapped GraphQL mutation is 403'd, and a read-only
+  profile is denied GraphQL mutations.
+- The web custom-connector authoring UI gains a GraphQL match form (out of scope
+  here — GraphQL connectors are already authorable via raw JSON; the built-in
+  GitHub connector, which fixes the regression, needs no UI).
 
 ### Verification (gate before Accepted)
 
