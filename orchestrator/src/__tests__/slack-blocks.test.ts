@@ -16,6 +16,7 @@ import {
   buildQuestionBlocks,
   buildAnsweredBlocks,
   buildClosingBlocks,
+  buildMessageBlocks,
   ACTION_ANSWER,
   ACTION_OPEN,
   CALLBACK_SUBMIT,
@@ -230,6 +231,31 @@ describe("buildClosingBlocks()", () => {
     const blocks = buildClosingBlocks(session, { lastMessage: null, assets: [] });
     expect(JSON.stringify(blocks)).toContain("https://engrams.dev/sessions/s1");
     expect(blocks.length).toBeGreaterThan(0);
+  });
+});
+
+describe("buildMessageBlocks()", () => {
+  const sectionTexts = (blocks: unknown[]) =>
+    blocks
+      .filter((b) => (b as { type?: string }).type === "section")
+      .map((b) => (b as { text: { text: string } }).text.text);
+
+  test("short text → a single mrkdwn section carrying it verbatim", () => {
+    const blocks = buildMessageBlocks("hello from the agent");
+    expect(sectionTexts(blocks)).toEqual(["hello from the agent"]);
+  });
+
+  test("text longer than Slack's 3000-char section cap splits across sections", () => {
+    const long = "x".repeat(7000);
+    const blocks = buildMessageBlocks(long);
+    const texts = sectionTexts(blocks);
+    expect(texts.length).toBeGreaterThan(1);
+    for (const t of texts) expect(t.length).toBeLessThanOrEqual(3000);
+    expect(texts.join("")).toBe(long); // no content lost
+  });
+
+  test("empty text → no blocks", () => {
+    expect(buildMessageBlocks("")).toEqual([]);
   });
 });
 

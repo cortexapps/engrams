@@ -118,8 +118,16 @@ export async function readSessionEventsBounded(
     }
     if (ev.kind === "agent_message") {
       const text = parseAssistantText(ev.payloadJson);
-      if (text !== undefined) lastAssistantText = text; // keep the latest
-      continue; // noise as content, but its text feeds the closing summary
+      if (text !== undefined) {
+        lastAssistantText = text; // keep the latest, for the closing summary
+        // Forward the assistant's text to the thread as content (the workflow
+        // coalesces consecutive ones into one per-turn message). Only the
+        // assistant role — the prompt echo (`user`) and system notes never post.
+        if (ev.idx !== undefined) {
+          events.push({ idx: ev.idx, kind: "agent_message", payloadJson: ev.payloadJson });
+        }
+      }
+      continue;
     }
     if (curated(ev.kind) && ev.idx !== undefined) {
       events.push({ idx: ev.idx, kind: ev.kind, payloadJson: ev.payloadJson });

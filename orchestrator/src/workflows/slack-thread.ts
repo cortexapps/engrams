@@ -152,10 +152,17 @@ async function slackThreadWorkflowImpl(): Promise<void> {
   })({ sessionId: session.id, threadWfId: DBOS.workflowID! });
 
   // 3) Drain loop — one recv multiplexes session events ∪ trigger events.
-  // `questionTs` and `assets` are plain workflow-local state, rebuilt
-  // deterministically on replay from the checkpointed recv'd messages.
-  const questionTs = new Map<string, string>();
-  const assets: AssetSummary[] = [];
+  // `st` is plain workflow-local render state, rebuilt deterministically on
+  // replay from the checkpointed recv'd messages + step outputs (the bubble ts
+  // is a checkpointed `onAssistantMessage` output; the accumulated text is
+  // recomputed from the recv'd message events). `currentMention` is the mention
+  // driving the live turn, so the run lifecycle reacts on the right message.
+  const st: ThreadRender = {
+    questionTs: new Map<string, string>(),
+    assets: [],
+    bubble: null,
+    currentMention: m,
+  };
   let lastTs = ctx0.maxTs;
 
   for (;;) {
@@ -165,7 +172,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
     switch (msg.kind) {
       case "session_terminal": {
         if (msg.ok) {
-          const summary = { lastMessage: msg.lastMessage ?? null, assets };
+          const summary = { lastMessage: msg.lastMessage ?? null, assets: st.assets };
           await DBOS.runStep(() => pol.onComplete(m, session, summary), { name: "onComplete" });
         } else {
           await DBOS.runStep(() => pol.onFail(m, SESSION_FAILED_MSG), { name: "onFail" });
@@ -173,10 +180,16 @@ async function slackThreadWorkflowImpl(): Promise<void> {
         return;
       }
       case "session_event": {
-        await dispatchSessionEvent(pol, m, msg, questionTs, assets);
+        await dispatchSessionEvent(pol, m, msg, st);
         break;
       }
       case "trigger_mention": {
+        // Acknowledge the new message itself (👀), like the initial mention; the
+        // ⏳→✅ working/done indicator rides this turn's run lifecycle, reacting
+        // on the new message (currentMention).
+        await DBOS.runStep(() => pol.onPickup(msg.mention), { name: "onPickup" });
+        st.currentMention = msg.mention;
+        st.bubble = null; // a new turn — the next response starts a fresh message
         const ctx = await DBOS.runStep(() => pol.gatherThreadContext(m, lastTs), {
           name: "gatherThreadContext",
         });
@@ -198,34 +211,78 @@ async function slackThreadWorkflowImpl(): Promise<void> {
   }
 }
 
-/** Route one curated session event to the policy, tracking question refs so a
- *  later `question_answered` can update the posted message. */
+/** Per-thread render state the drain loop threads through `dispatchSessionEvent`.
+ *  All fields are workflow-local and replay-deterministic. */
+interface ThreadRender {
+  /** tool_call_id → posted question `ts`, so an answer updates that message. */
+  questionTs: Map<string, string>;
+  /** Durable assets, accumulated for the closing recap. */
+  assets: AssetSummary[];
+  /** The active assistant message consecutive responses coalesce into, or null
+   *  when the next response should open a fresh message. */
+  bubble: { ts: string; text: string } | null;
+  /** The mention driving the live turn — the run lifecycle reacts on it. */
+  currentMention: SourceMention;
+}
+
+/** Cap an assistant bubble's accumulated text; past this a new response opens a
+ *  fresh message rather than re-sending an ever-growing `chat.update` payload. */
+const MAX_BUBBLE_CHARS = 8000;
+
+/** Route one curated session event to the policy. Assistant responses coalesce
+ *  into `st.bubble`; questions/assets get their own message (and seal the bubble
+ *  so thread ordering is preserved); the run lifecycle drives the ⏳→✅ indicator. */
 async function dispatchSessionEvent(
   pol: CommunicationPolicy,
   m: SourceMention,
   msg: Extract<ThreadInbox, { kind: "session_event" }>,
-  questionTs: Map<string, string>,
-  assets: AssetSummary[],
+  st: ThreadRender,
 ): Promise<void> {
   const effect = routeSessionEvent(msg.event);
   switch (effect.kind) {
+    case "message": {
+      if (!effect.text) break;
+      // Append to the live bubble unless it would overflow — then roll to a new
+      // one. `ref` undefined posts a fresh message; set edits in place.
+      const append =
+        st.bubble !== null && st.bubble.text.length + effect.text.length + 2 <= MAX_BUBBLE_CHARS;
+      const text = append ? `${st.bubble!.text}\n\n${effect.text}` : effect.text;
+      const ref = append ? st.bubble!.ts : undefined;
+      const ts = await DBOS.runStep(() => pol.onAssistantMessage(m, text, ref), {
+        name: "onAssistantMessage",
+      });
+      st.bubble = { ts, text };
+      break;
+    }
+    case "working": {
+      st.bubble = null; // a new run — its first response opens a fresh message
+      await DBOS.runStep(() => pol.onWorking(st.currentMention), { name: "onWorking" });
+      break;
+    }
+    case "idle": {
+      st.bubble = null;
+      await DBOS.runStep(() => pol.onIdle(st.currentMention), { name: "onIdle" });
+      break;
+    }
     case "question": {
+      st.bubble = null; // the question is its own message
       const ref = await DBOS.runStep(() => pol.onUserQuestion(m, msg.event), {
         name: "onUserQuestion",
       });
-      if (effect.toolCallId) questionTs.set(effect.toolCallId, ref);
+      if (effect.toolCallId) st.questionTs.set(effect.toolCallId, ref);
       break;
     }
     case "answered": {
-      const ref = effect.toolCallId ? questionTs.get(effect.toolCallId) : undefined;
+      const ref = effect.toolCallId ? st.questionTs.get(effect.toolCallId) : undefined;
       await DBOS.runStep(() => pol.onAnswered(m, msg.event, ref), { name: "onAnswered" });
       break;
     }
     case "asset": {
-      // Render it live, and accumulate durable assets for the closing recap
-      // (transient actions summarize to null and are skipped).
+      // The asset is its own message; accumulate durable ones for the closing
+      // recap (transient actions summarize to null and are skipped).
+      st.bubble = null;
       const recap = summarizeAsset(msg.event);
-      if (recap) assets.push(recap);
+      if (recap) st.assets.push(recap);
       await DBOS.runStep(() => pol.onAsset(m, msg.event), { name: "onAsset" });
       break;
     }

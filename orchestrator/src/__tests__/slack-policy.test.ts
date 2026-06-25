@@ -69,14 +69,18 @@ describe("foldReplies()", () => {
 
 describe("makeSlackPolicy()", () => {
   function fakeClient() {
-    const calls: { posts: any[]; updates: any[]; reactions: any[]; replies: any[] } = {
+    const calls: { posts: any[]; updates: any[]; reactions: any[]; unreacts: any[]; replies: any[] } = {
       posts: [],
       updates: [],
       reactions: [],
+      unreacts: [],
       replies: [],
     };
     const client: SlackPolicyClient = {
-      reactions: { add: async (a) => void calls.reactions.push(a) },
+      reactions: {
+        add: async (a) => void calls.reactions.push(a),
+        remove: async (a) => void calls.unreacts.push(a),
+      },
       chat: {
         postMessage: async (a) => {
           calls.posts.push(a);
@@ -99,6 +103,43 @@ describe("makeSlackPolicy()", () => {
 
   test("systemPromptAppend is a non-empty constant", () => {
     expect(policy(fakeClient().client).systemPromptAppend.length).toBeGreaterThan(0);
+  });
+
+  test("per-turn lifecycle on the message: 👀 onPickup, ⏳ onWorking, then onIdle clears ⏳ and adds ✅", async () => {
+    const { client, calls } = fakeClient();
+    const p = policy(client);
+    await p.onPickup(M);
+    await p.onWorking(M);
+    await p.onIdle(M);
+    expect(calls.reactions).toEqual([
+      { channel: "C1", timestamp: "100.0", name: "eyes" },
+      { channel: "C1", timestamp: "100.0", name: "hourglass_flowing_sand" },
+      { channel: "C1", timestamp: "100.0", name: "white_check_mark" },
+    ]);
+    expect(calls.unreacts).toEqual([
+      { channel: "C1", timestamp: "100.0", name: "hourglass_flowing_sand" },
+    ]);
+    // no thread posts — the lifecycle is reactions-only.
+    expect(calls.posts).toHaveLength(0);
+  });
+
+  test("onAssistantMessage posts a NEW bubble when ref is undefined, returning its ts", async () => {
+    const { client, calls } = fakeClient();
+    const ref = await policy(client).onAssistantMessage(M, "first response", undefined);
+    expect(ref).toBe("posted-1");
+    expect(calls.posts[0].thread_ts).toBe("100.0");
+    expect(JSON.stringify(calls.posts[0].blocks)).toContain("first response");
+    expect(calls.updates).toHaveLength(0);
+  });
+
+  test("onAssistantMessage EDITS the bubble in place when ref is set, returning the same ref", async () => {
+    const { client, calls } = fakeClient();
+    const ref = await policy(client).onAssistantMessage(M, "first\n\nsecond", "posted-1");
+    expect(ref).toBe("posted-1");
+    expect(calls.updates).toHaveLength(1);
+    expect(calls.updates[0].ts).toBe("posted-1");
+    expect(JSON.stringify(calls.updates[0].blocks)).toContain("second");
+    expect(calls.posts).toHaveLength(0);
   });
 
   test("onUserQuestion posts the question blocks and returns the message ts", async () => {

@@ -321,6 +321,21 @@ export function buildQuestionBlocks(route: ThreadRoute, parsed: ParsedUserQuesti
   return blocks;
 }
 
+/** Slack's hard per-section `text` cap; we split below it to never trip
+ *  `invalid_blocks` on a long turn. */
+const SECTION_LIMIT = 2900;
+
+/** Render assistant text into mrkdwn section blocks, splitting on the per-section
+ *  cap so a long (or coalesced multi-response) turn renders without loss. Empty
+ *  text → no blocks (the caller skips the post/update). */
+export function buildMessageBlocks(text: string): KnownBlock[] {
+  const blocks: KnownBlock[] = [];
+  for (let i = 0; i < text.length; i += SECTION_LIMIT) {
+    blocks.push(section(text.slice(i, i + SECTION_LIMIT)));
+  }
+  return blocks;
+}
+
 /** The resolved question message (replaces the live one via chat.update). */
 export function buildAnsweredBlocks(answers: Record<string, string[]>): KnownBlock[] {
   const lines = Object.entries(answers).map(

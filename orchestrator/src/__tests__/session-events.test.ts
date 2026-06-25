@@ -166,4 +166,38 @@ describe("readSessionEventsBounded()", () => {
       expect(out.lastAssistantText).toBe("good");
     });
   });
+
+  // Assistant text is now forwarded to the thread as content (coalesced into a
+  // per-turn message downstream). agent_message stays OUT of CURATED_KINDS — it
+  // is forwarded only for the assistant role, via the reader's special branch.
+  describe("assistant message forwarding", () => {
+    const am = (idx: bigint, role: string, text: string): WireEvent => ({
+      idx,
+      kind: "agent_message",
+      payloadJson: JSON.stringify({ role, text }),
+    });
+
+    test("forwards assistant agent_message events as curated content (idx + payload)", async () => {
+      const page: WireEvent[] = [
+        { idx: 0n, kind: "run_started", payloadJson: "{}" },
+        am(1n, "assistant", "working on it"),
+        am(2n, "user", "the prompt echo"),
+        am(3n, "system", "a note"),
+        am(4n, "assistant", "done"),
+      ];
+      const out = await readSessionEventsBounded("s", -1n, fakeList(page, 4n));
+      expect(out.events.map((e) => e.kind)).toEqual([
+        "run_started",
+        "agent_message",
+        "agent_message",
+      ]);
+      expect(out.events.filter((e) => e.kind === "agent_message").map((e) => e.idx)).toEqual([1n, 4n]);
+    });
+
+    test("a malformed assistant agent_message is neither forwarded nor crashes", async () => {
+      const page: WireEvent[] = [{ idx: 0n, kind: "agent_message", payloadJson: "not json" }];
+      const out = await readSessionEventsBounded("s", -1n, fakeList(page, 0n));
+      expect(out.events).toEqual([]);
+    });
+  });
 });

@@ -20,6 +20,7 @@ import {
   buildAnsweredBlocks,
   buildAssetLine,
   buildClosingBlocks,
+  buildMessageBlocks,
 } from "./slack-blocks.ts";
 import { summarizeAsset, type CommunicationPolicy, type StartedSession } from "../workflows/communication-policy.ts";
 import type { SourceMention } from "../workflows/thread-inbox.ts";
@@ -47,7 +48,10 @@ export interface SlackReply {
 /** The Slack WebClient surface this policy uses — a structural subset so a fake
  *  satisfies it in tests (the real WebClient does too). */
 export interface SlackPolicyClient {
-  reactions: { add(args: { channel: string; timestamp: string; name: string }): Promise<unknown> };
+  reactions: {
+    add(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
+    remove(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
+  };
   chat: {
     postMessage(args: {
       channel: string;
@@ -131,6 +135,17 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
     }
   }
 
+  /** Remove a reaction; best-effort (a missing/duplicate remove must not wedge
+   *  the step). */
+  async function unreact(m: SourceMention, name: string): Promise<void> {
+    try {
+      const c = await getClient();
+      await c.reactions.remove({ channel: m.channel, timestamp: m.ts, name });
+    } catch {
+      /* no_reaction / missing_scope — UX-only */
+    }
+  }
+
   async function post(m: SourceMention, text: string, blocks?: KnownBlock[]): Promise<string> {
     const c = await getClient();
     const res = await c.chat.postMessage({
@@ -149,8 +164,33 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
 
     async onStarted(m, session) {
       log.info({ channel: m.channel, thread: m.threadRoot, sessionId: session.id }, "slack: session started");
-      await react(m, "white_check_mark");
       await post(m, `Started a session — ${session.webUrl}`);
+    },
+
+    /** A run began — the agent is working on this turn (⏳ on the message). */
+    onWorking: (m) => react(m, "hourglass_flowing_sand"),
+
+    /** The run finished — turn done, session idle, waiting for the user: clear
+     *  the ⏳ and add ✅ on the message that drove the turn. */
+    async onIdle(m) {
+      log.info({ channel: m.channel, thread: m.threadRoot, ts: m.ts }, "slack: turn complete — waiting for the user");
+      await unreact(m, "hourglass_flowing_sand");
+      await react(m, "white_check_mark");
+    },
+
+    /** Render or extend the turn's running message. With no `ref` we post a new
+     *  thread message; with one we edit it in place (the framework hands us the
+     *  full accumulated text each time). */
+    async onAssistantMessage(m, text, ref) {
+      const blocks = buildMessageBlocks(text);
+      if (blocks.length === 0) return ref ?? "";
+      const fallback = text.length > 3000 ? `${text.slice(0, 2999)}…` : text;
+      if (ref) {
+        const c = await getClient();
+        await c.chat.update({ channel: m.channel, ts: ref, text: fallback, blocks });
+        return ref;
+      }
+      return post(m, fallback, blocks);
     },
 
     async onUserQuestion(m, ev) {

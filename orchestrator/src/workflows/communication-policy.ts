@@ -50,8 +50,18 @@ export interface CommunicationPolicy {
 
   /** The trigger was picked up (Slack: 👀 on the mention). */
   onPickup(m: SourceMention): Promise<void>;
-  /** The session started (Slack: ✅ + a link message). */
+  /** The session started (Slack: a link message into the thread). */
   onStarted(m: SourceMention, session: StartedSession): Promise<void>;
+  /** A run began on `m`'s turn — the agent is working (Slack: ⏳ on the message). */
+  onWorking(m: SourceMention): Promise<void>;
+  /** A run finished — the turn is done and the session is idle, waiting for the
+   *  user (Slack: clear the ⏳ and add ✅ on `m`). This is the per-turn ack and
+   *  the "your turn" indicator the static delivered-✅ couldn't express. */
+  onIdle(m: SourceMention): Promise<void>;
+  /** Render or extend the turn's running assistant message with `text` (the full
+   *  accumulated text the framework coalesced); `ref` is the existing message to
+   *  edit, or undefined to post a new one. Returns the (new or same) message ref. */
+  onAssistantMessage(m: SourceMention, text: string, ref: string | undefined): Promise<string>;
   /** Render an `AskUserQuestion`; return the provider message ref. */
   onUserQuestion(m: SourceMention, ev: CuratedEvent): Promise<string>;
   /** A question was answered; `ref` is the value `onUserQuestion` returned. */
@@ -74,6 +84,11 @@ export type SessionEffect =
   | { kind: "question"; toolCallId: string | undefined }
   | { kind: "answered"; toolCallId: string | undefined }
   | { kind: "asset" }
+  /** Assistant text — coalesced into the turn's running thread message. */
+  | { kind: "message"; text: string }
+  /** A run began (agent is working) / finished (idle, waiting for the user). */
+  | { kind: "working" }
+  | { kind: "idle" }
   | { kind: "ignore" };
 
 /**
@@ -91,8 +106,25 @@ export function routeSessionEvent(ev: CuratedEvent): SessionEffect {
     case "integration_asset":
     case "file_shared":
       return { kind: "asset" };
+    case "agent_message":
+      return { kind: "message", text: parseMessageText(ev.payloadJson) };
+    case "run_started":
+      return { kind: "working" };
+    case "run_completed":
+      return { kind: "idle" };
     default:
       return { kind: "ignore" };
+  }
+}
+
+/** Extract the assistant text from an `agent_message` payload (empty if absent
+ *  or unparseable — the event still routes, it just renders nothing). */
+function parseMessageText(payloadJson: string): string {
+  try {
+    const t: unknown = (JSON.parse(payloadJson) as { text?: unknown })?.text;
+    return typeof t === "string" ? t : "";
+  } catch {
+    return "";
   }
 }
 

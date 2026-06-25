@@ -323,6 +323,8 @@ How each curated event becomes a thread effect (each a checkpointed DBOS step):
 | `file_shared` (image/video — "show your work") | **Upload bytes to Slack** so it renders inline: `files.getUploadURLExternal` → PUT → `files.completeUploadExternal(channel_id, thread_ts)`. Fallback to a web-UI artifact link for large/unsupported media. (needs `files:write`) |
 | `user_question` (AskUserQuestion) | **Adaptive Block Kit**, see below |
 | `question_answered` | `chat.update` the question message (via the `ts` held in workflow-local state) to a locked "✓ answered: X" |
+| `agent_message` (assistant text) | **Coalesced per turn** into one `section`-block message: the first response posts; consecutive ones `chat.update` it (appended) until a question/asset/new-mention seals the bubble, or it exceeds ~8k chars (rolls to a new message). The prompt echo (`user`) + system notes never post. |
+| `run_started` / `run_completed` | The per-turn working/idle indicator on the triggering message: `run_started` → ⏳ `onWorking`; `run_completed` (non-terminal) → clear ⏳ + ✅ `onIdle` (the "your turn" signal). |
 | terminal `status_changed` | `onComplete` summary (ok) / `onFail` ❌ + message |
 
 **AskUserQuestion → adaptive Block Kit.** The `user_question` event carries
@@ -343,6 +345,21 @@ the button `value` / modal `private_metadata`) so the Interactivity endpoint map
 it to the right `AnswerQuestion(session_id, tool_call_id, answers)` call. Answers
 are a `StringList` of chosen labels keyed by question text; a custom "Other" string
 is passed as its label.
+
+**As-built: full-response thread + working/idle indicator (2026-06-25).** The thread
+shows the *whole* conversation, not only artifacts/questions. Assistant `agent_message`s
+are forwarded by the pump (assistant role only) and the framework **coalesces consecutive
+responses within a turn into one message** (append via `chat.update`); a question, an
+asset, or a new mention seals that bubble so the next response opens a fresh message
+below it (chronological order). The `onAck` sketch above split into a per-turn reaction
+lifecycle on the triggering message — **`onPickup` 👀 (received) → `onWorking` ⏳ (run
+started) → `onIdle` ✅ (run completed, non-terminal = idle, "your turn")** — which is the
+explicit "session is waiting for the user" signal a static delivered-✅ could not express.
+`onStarted` now only posts the session link. True token-by-token streaming (the ephemeral
+`agent_message_chunk` deltas, off the durable pump) is intentionally deferred — it needs a
+separate live `streamEvents` consumer with rate-limit throttling and single-writer
+coordination, a follow-up beyond this ADR. Assistant text posts as raw markdown (Slack
+mrkdwn fidelity is a known follow-up).
 
 ## Bidirectional AskUserQuestion (Slack ↔ web parity)
 

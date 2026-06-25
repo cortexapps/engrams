@@ -33,10 +33,22 @@ describe("routeSessionEvent()", () => {
     expect(routeSessionEvent(ev("file_shared"))).toEqual({ kind: "asset" });
   });
 
-  test("run_started / run_completed → ignore (curated but not rendered as content)", () => {
-    expect(routeSessionEvent(ev("run_started"))).toEqual({ kind: "ignore" });
-    // run_completed is NOT terminal (Invariant 2) and renders nothing.
-    expect(routeSessionEvent(ev("run_completed"))).toEqual({ kind: "ignore" });
+  test("run_started → working, run_completed → idle (the working/waiting indicator)", () => {
+    expect(routeSessionEvent(ev("run_started"))).toEqual({ kind: "working" });
+    // run_completed is NOT terminal (Invariant 2) — it means the turn finished
+    // and the session is idle, waiting for the next mention.
+    expect(routeSessionEvent(ev("run_completed"))).toEqual({ kind: "idle" });
+  });
+
+  test("agent_message → message, carrying the assistant text", () => {
+    expect(routeSessionEvent(ev("agent_message", '{"role":"assistant","text":"hello there"}'))).toEqual({
+      kind: "message",
+      text: "hello there",
+    });
+  });
+
+  test("an agent_message with an unparseable payload → message with empty text", () => {
+    expect(routeSessionEvent(ev("agent_message", "not json"))).toEqual({ kind: "message", text: "" });
   });
 
   test("a question with an unparseable payload still routes (toolCallId undefined)", () => {
