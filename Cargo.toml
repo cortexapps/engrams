@@ -167,7 +167,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false, feat
 # The 0.28 / tracing-opentelemetry 0.29 set is a known-compatible pairing
 # and uses tonic 0.12 (matching our gRPC stack).
 opentelemetry = "0.28"
-opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.29"
 
