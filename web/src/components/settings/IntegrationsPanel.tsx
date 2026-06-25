@@ -15,9 +15,9 @@ import { Text } from "@/components/ui/text";
 import { ConnectSheet } from "@/components/integrations/ConnectSheet";
 import { CustomConnectorModal } from "@/components/integrations/CustomConnectorModal";
 import { ProviderCard } from "@/components/integrations/ProviderCard";
+import { CategoryFilter } from "@/components/integrations/CategoryFilter";
 import { useConnectorViews, type ConnectorView } from "@/components/integrations/useConnectorViews";
 import { PageHeading } from "../page-heading";
-import { TabRow } from "../TabRow";
 
 export function IntegrationsPanel() {
   const { views, isLoading, error } = useConnectorViews();
@@ -32,6 +32,13 @@ export function IntegrationsPanel() {
     return ["all", ...seen];
   }, [views]);
 
+  // Provider count per category id (+ `all` = total) — the dropdown's live counts.
+  const catCounts = useMemo(() => {
+    const m: Record<string, number> = { all: views.length };
+    for (const v of views) m[v.category] = (m[v.category] ?? 0) + 1;
+    return m;
+  }, [views]);
+
   const ql = q.trim().toLowerCase();
   const match = (v: ConnectorView) => {
     if (cat !== "all" && v.category !== cat) return false;
@@ -43,7 +50,6 @@ export function IntegrationsPanel() {
   const shown = views.filter(match);
   const connected = shown.filter((v) => v.status === "connected");
   const available = shown.filter((v) => v.status !== "connected");
-  const tabs = categories.map((c) => ({ id: c, label: c === "all" ? "All" : c }));
   const connectView = connect ? views.find((v) => v.provider === connect) : undefined;
 
   return (
@@ -60,17 +66,18 @@ export function IntegrationsPanel() {
         }
       />
 
-      <div className="relative max-w-sm">
-        <SearchIcon className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-        <Input
-          className="pl-9"
-          placeholder="Search providers and powers"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-        />
+      <div className="flex flex-wrap items-center gap-2.5 border-b pb-4">
+        <div className="relative min-w-[200px] flex-1">
+          <SearchIcon className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            className="pl-9"
+            placeholder="Search providers and powers"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
+        </div>
+        <CategoryFilter cats={categories} counts={catCounts} active={cat} onChange={setCat} />
       </div>
-
-      <TabRow tabs={tabs} active={cat} onChange={setCat} />
 
       {error != null && (
         <p className="text-sm text-destructive">could not load integrations — {String(error)}</p>
