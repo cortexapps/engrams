@@ -67,7 +67,10 @@ export function MainSidebar() {
           <SidebarMenuItem>
             <SidebarMenuButton asChild size="lg">
               <Link to="/sessions" aria-label="engrams — tasks">
-                <span className="flex aspect-square size-8 items-center justify-center">
+                <span
+                  className="flex aspect-square size-8 items-center justify-center"
+                  style={{ color: "var(--sidebar-primary)" }}
+                >
                   <EngramMark size={26} mode="static" />
                 </span>
                 <span className="font-semibold">engrams</span>

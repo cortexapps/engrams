@@ -24,7 +24,7 @@ const COL = {
   // sidebar (sage), the paper content (petrol ink), and either auth theme.
   ink: "currentColor",
   amber: "#b85c0a",
-  verd: "#3a6b5c",
+  verd: "var(--mark-terminal)",
   rule: "#d9cfb8",
   paper: "#f4eedf",
 } as const;
@@ -99,7 +99,7 @@ function driveLoop(layer: SVGGElement, period = 2600): { stop: () => void } {
       d,
       fill: "none",
       stroke: COL.ink,
-      "stroke-width": 1.6,
+      "stroke-width": 1.9,
       "stroke-linecap": "round",
       "stroke-linejoin": "round",
     }) as SVGPathElement;
@@ -107,7 +107,8 @@ function driveLoop(layer: SVGGElement, period = 2600): { stop: () => void } {
     const nodes = pts.map((p, k) => {
       const tone = k === 0 ? COL.amber : k === pts.length - 1 ? COL.verd : COL.ink;
       const rad = k === 0 ? 4 : k === pts.length - 1 ? 3.6 : 3;
-      const n = el("circle", { cx: p[0], cy: p[1], r: rad, fill: tone });
+      const n = el("circle", { cx: p[0], cy: p[1], r: rad });
+      (n as SVGElement).style.fill = tone;
       (n as SVGElement).style.transformBox = "fill-box";
       (n as SVGElement).style.transformOrigin = "center";
       layer.appendChild(n);
@@ -283,7 +284,7 @@ export function EngramMark({
           d={baseD}
           fill="none"
           stroke={COL.ink}
-          strokeWidth="1.6"
+          strokeWidth="1.9"
           strokeLinecap="round"
           strokeLinejoin="round"
         />
@@ -296,8 +297,7 @@ export function EngramMark({
             cx={p[0]}
             cy={p[1]}
             r={radOf(k)}
-            fill={toneOf(k)}
-            style={{ transformBox: "fill-box", transformOrigin: "center" }}
+            style={{ fill: toneOf(k), transformBox: "fill-box", transformOrigin: "center" }}
           />
         ))}
       </g>
