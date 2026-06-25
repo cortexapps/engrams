@@ -79,29 +79,47 @@ export interface SlackPolicyDeps {
 }
 
 /**
- * Fold a page of thread replies into a follow-up prompt + the new cursor. Pure.
+ * Fold a page of thread replies into the session prompt + the new cursor. Pure.
  * The cursor (`maxTs`) advances past EVERY reply seen — including the bot's own
- * — so the next gather never re-reads, but only HUMAN message text feeds the
- * prompt (the agent must never be prompted with its own posts). `since` is
- * exclusive: `conversations.replies(oldest=)` is inclusive, so the boundary
- * message is dropped here.
+ * — so the next gather never re-reads; only HUMAN message text feeds the prompt
+ * (the agent must never be prompted with its own posts). `since` is exclusive:
+ * `conversations.replies(oldest=)` is inclusive, so the boundary message is
+ * dropped here.
+ *
+ * Shape: the triggering @mention (identified by `triggerTs`) is the directive
+ * and goes at the BOTTOM; every other human message is prior thread context,
+ * wrapped in `<thread context>…</thread context>` above it. With no other
+ * messages the prompt is just the directive (no wrapper). If `triggerTs` matches
+ * nothing in this page (the mention wasn't returned), fall back to a plain join.
  */
 export function foldReplies(
   messages: SlackReply[],
   since: string | null,
   botUserId?: string,
+  triggerTs?: string,
 ): { prompt: string; maxTs: string } {
   let maxTs = since ?? "0";
-  const parts: string[] = [];
+  const human: { ts: string; text: string }[] = [];
   for (const msg of messages) {
     const ts = msg.ts ?? "";
     if (since && num(ts) <= num(since)) continue; // already delivered
-    if (num(ts) > num(maxTs)) maxTs = ts;
+    if (num(ts) > num(maxTs)) maxTs = ts; // advance past everything seen
     if (msg.bot_id || (botUserId && msg.user === botUserId)) continue; // never our own
     const text = stripMentions(msg.text ?? "", botUserId).trim();
-    if (text) parts.push(text);
+    if (text) human.push({ ts, text });
   }
-  return { prompt: parts.join("\n\n"), maxTs };
+
+  const idx = triggerTs ? human.findIndex((h) => h.ts === triggerTs) : -1;
+  if (idx === -1) {
+    // No identified directive — emit the messages plainly, no wrapper.
+    return { prompt: human.map((h) => h.text).join("\n\n"), maxTs };
+  }
+  const context = human.filter((_, i) => i !== idx).map((h) => h.text);
+  const directive = human[idx].text;
+  const prompt = context.length
+    ? `<thread context>\n${context.join("\n")}\n</thread context>\n\n${directive}`
+    : directive;
+  return { prompt, maxTs };
 }
 
 const num = (ts: string): number => Number.parseFloat(ts) || 0;
@@ -241,7 +259,10 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
         ts: m.threadRoot,
         ...(since ? { oldest: since } : {}),
       });
-      return foldReplies(res.messages ?? [], since, botUserId);
+      // m.ts is the triggering @mention — the directive; everything else in the
+      // thread is context (wrapped). For a follow-up the workflow passes the new
+      // mention, so its ts is the directive for that turn.
+      return foldReplies(res.messages ?? [], since, botUserId, m.ts);
     },
   };
 

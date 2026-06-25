@@ -23,7 +23,68 @@ const M: SourceMention = {
 const ev = (kind: string, payloadJson: string): CuratedEvent => ({ idx: 0n, kind, payloadJson });
 
 describe("foldReplies()", () => {
-  test("first gather (since=null): folds human messages, strips mentions, advances the cursor", () => {
+  test("wraps prior thread messages in <thread context>, with the @mention as the directive at the bottom", () => {
+    const out = foldReplies(
+      [
+        { ts: "100.0", user: "U1", text: "msg" },
+        { ts: "101.0", user: "U2", text: "hello" },
+        { ts: "102.0", user: "U1", text: "whats up" },
+        { ts: "103.0", user: "U1", text: "<@BOT> could you please handle this" },
+      ],
+      null,
+      "BOT",
+      "103.0", // the triggering @mention's ts
+    );
+    expect(out.prompt).toBe(
+      "<thread context>\nmsg\nhello\nwhats up\n</thread context>\n\ncould you please handle this",
+    );
+    expect(out.maxTs).toBe("103.0");
+  });
+
+  test("no prior context (the mention itself starts the thread) → just the directive, no wrapper", () => {
+    const out = foldReplies(
+      [{ ts: "100.0", user: "U1", text: "<@BOT> do the thing" }],
+      null,
+      "BOT",
+      "100.0",
+    );
+    expect(out.prompt).toBe("do the thing");
+    expect(out.maxTs).toBe("100.0");
+  });
+
+  test("incremental follow-up: new messages before the new mention become the context", () => {
+    const out = foldReplies(
+      [
+        { ts: "200.0", user: "U1", text: "actually wait" },
+        { ts: "201.0", user: "U1", text: "<@BOT> also do X" },
+      ],
+      "100.0",
+      "BOT",
+      "201.0",
+    );
+    expect(out.prompt).toBe("<thread context>\nactually wait\n</thread context>\n\nalso do X");
+    expect(out.maxTs).toBe("201.0");
+  });
+
+  test("the bot's own messages advance the cursor but never feed back into the prompt", () => {
+    const out = foldReplies(
+      [
+        { ts: "150.0", bot_id: "B1", text: "Started a session…" },
+        { ts: "160.0", user: "U1", text: "<@BOT> thanks, now add tests" },
+      ],
+      "100.0",
+      "BOT",
+      "160.0",
+    );
+    expect(out.prompt).toBe("thanks, now add tests");
+    expect(out.maxTs).toBe("160.0");
+  });
+
+  test("no new messages → empty prompt, cursor unchanged", () => {
+    expect(foldReplies([], "100.0", "BOT", undefined)).toEqual({ prompt: "", maxTs: "100.0" });
+  });
+
+  test("directive not among the replies → plain join, no wrapper (graceful fallback)", () => {
     const out = foldReplies(
       [
         { ts: "100.0", user: "U1", text: "<@BOT> please fix the build" },
@@ -31,39 +92,10 @@ describe("foldReplies()", () => {
       ],
       null,
       "BOT",
+      "999.0", // no message carries this ts
     );
     expect(out.prompt).toBe("please fix the build\n\nit fails on CI");
     expect(out.maxTs).toBe("101.0");
-  });
-
-  test("incremental gather: only messages strictly after `since` count", () => {
-    const out = foldReplies(
-      [
-        { ts: "100.0", user: "U1", text: "old" },
-        { ts: "200.0", user: "U1", text: "new follow-up" },
-      ],
-      "100.0",
-      "BOT",
-    );
-    expect(out.prompt).toBe("new follow-up");
-    expect(out.maxTs).toBe("200.0");
-  });
-
-  test("the bot's own messages advance the cursor but never feed back into the prompt", () => {
-    const out = foldReplies(
-      [
-        { ts: "150.0", bot_id: "B1", text: "Started a session…" },
-        { ts: "160.0", user: "U1", text: "thanks, now add tests" },
-      ],
-      "100.0",
-      "BOT",
-    );
-    expect(out.prompt).toBe("thanks, now add tests");
-    expect(out.maxTs).toBe("160.0");
-  });
-
-  test("no new messages → empty prompt, cursor unchanged", () => {
-    expect(foldReplies([], "100.0", "BOT")).toEqual({ prompt: "", maxTs: "100.0" });
   });
 });
 

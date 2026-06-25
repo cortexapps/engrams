@@ -24,6 +24,7 @@
  */
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
+import { log as rootLog } from "../log.ts";
 import {
   routeSessionEvent,
   summarizeAsset,
@@ -33,6 +34,8 @@ import {
 } from "./communication-policy.ts";
 import { THREAD_TOPIC, type ThreadInbox, type SourceMention } from "./thread-inbox.ts";
 import { sessionIngestWorkflow } from "./session-ingest.ts";
+
+const log = rootLog.child({ component: "slack" });
 
 /** Session-lifecycle ops the thread workflow needs, behind one seam so the
  *  workflow logic is tested without a live coordinator. P2 wires the real
@@ -139,7 +142,13 @@ async function slackThreadWorkflowImpl(): Promise<void> {
         }),
       { name: "createSession" },
     );
-  } catch {
+  } catch (err) {
+    // Surface WHY create failed — this path used to swallow the cause, leaving
+    // only the generic "Couldn't start a session" with no way to diagnose.
+    log.error(
+      { channel: m.channel, thread: m.threadRoot, err },
+      "slack: failed to start session",
+    );
     await DBOS.runStep(() => pol.onFail(m, CREATE_FAIL_MSG), { name: "onFail" });
     return;
   }
@@ -190,7 +199,9 @@ async function slackThreadWorkflowImpl(): Promise<void> {
         await DBOS.runStep(() => pol.onPickup(msg.mention), { name: "onPickup" });
         st.currentMention = msg.mention;
         st.bubble = null; // a new turn — the next response starts a fresh message
-        const ctx = await DBOS.runStep(() => pol.gatherThreadContext(m, lastTs), {
+        // Gather as the NEW mention so it (not the original) is the directive at
+        // the bottom of the prompt; the rest of the new messages are context.
+        const ctx = await DBOS.runStep(() => pol.gatherThreadContext(msg.mention, lastTs), {
           name: "gatherThreadContext",
         });
         await DBOS.runStep(
