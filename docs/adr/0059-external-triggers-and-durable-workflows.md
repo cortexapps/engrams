@@ -57,9 +57,13 @@ slot into the same framework but are **out of scope** here.
 
 **Non-goals (this ADR)**
 
-- Slack OAuth app registration / bot-token storage — **handled separately**; this
-  ADR consumes the bot token + per-workspace trigger config that layer provides,
-  and **requires it to grant the scopes in §Slack scopes**.
+- A new Slack OAuth/install layer — **not needed.** The `slack` connector already
+  exists (`orchestrator/src/connectors/slack.json`, ADR 0056–0058): an `oauth` facet
+  ("Add to Slack", `routes/integration-oauth.ts`), a KEK-sealed `slack.bot_token`
+  org secret, and an in-process authenticated client via `getSlackClient()`
+  (`integrations/slack.ts`). This ADR **extends** that connector (adds scopes + a
+  `trigger` facet) rather than building a parallel layer. The only out-of-band step
+  is Slack-app-dashboard config (Event + Interactivity Request URLs, client creds).
 - An identity-linking subsystem — replaced by a single email-match seam.
 - Linear / Jira / cron adapters — designed-for, not built.
 - Branch fanout, CI repair swarms, multi-agent workrooms, fork/checkpoint
@@ -154,7 +158,7 @@ Postgres.
 Ordering matters: ack 200 **only after** both durable writes commit; a crash
 before the ack is covered by Slack's retry (≤3: immediate, +1m, +5m).
 ```
-POST /slack/events:
+POST /api/v1/integrations/slack/events:
   verifyHmac(rawBody, headers)                          // v0 HMAC, reject >5min stale, constant-time
   if url_verification: return challenge
   evt = parse(body)
@@ -345,7 +349,7 @@ async function dispatch(m, event):                       // m = {channel, thread
 answer); the only thing it does synchronously is `views.open` (`trigger_id` dies
 in 3s):**
 ```js
-POST /slack/interactivity:
+POST /api/v1/integrations/slack/interactivity:
   verifyHmac(rawBody, headers); p = parse(payload)
   switch p.type:
 
@@ -511,19 +515,42 @@ is **surface-only**: the Assistant feature changes none of our plumbing
 the framework is surface-agnostic and the Assistant pane can be added later as an
 optional secondary 1:1 entry point feeding the same `SlackThreadWorkflow`.
 
-## Slack scopes (for the separate install layer)
+## Slack wiring: extend the existing connector
 
-`app_mentions:read` (trigger), `chat:write` (post/update), `reactions:write`
-(the 👀/✅/❌ acks), `files:write` (upload "show your work" media),
-`channels:history`/`groups:history` (thread context + `conversations.replies`
-cursor), `users:read` + `users:read.email` (identity). Plus the **Interactivity
-Request URL** configured (distinct from the Events URL) for the
-`block_actions`/`view_submission` payloads.
+The Slack edge plugs into machinery that already exists; we add to it rather than
+rebuild it.
+
+- **Sender = `getSlackClient()`.** Every outbound call (`chat.postMessage`/`update`,
+  `reactions.add`, `views.open`, `conversations.replies`, `files.*`) is a method on
+  the cached, authenticated `@slack/web-api` `WebClient` from
+  `integrations/slack.ts`. The bot token resolves coordinator-side (Mode B), never
+  reaching a guest. No hand-rolled HTTP, no bespoke token plumbing.
+- **Routes live under the integrations namespace**, beside
+  `/api/v1/integrations/:provider/oauth/*`:
+  `/api/v1/integrations/slack/events` (Event Subscriptions) and
+  `/api/v1/integrations/slack/interactivity` (`block_actions`/`view_submission`).
+  Each does its own v0 HMAC verify; they are net-new (today `routes/events.ts` is the
+  browser SSE route, unrelated).
+- **Scopes to add to `slack.json` `oauth.scopes`** — the connector grants
+  `chat:write`, `channels:read`, `groups:read`, `users:read`, `files:write`,
+  `files:read` today. This ADR needs **five more** (verified against
+  `docs.slack.dev`): `app_mentions:read` (receive the trigger), **`channels:history`
+  + `groups:history`** (`conversations.replies` reads messages — `channels:read` only
+  grants metadata), `reactions:write` (the 👀/✅/❌ acks), and `users:read.email`
+  (the `email` field on `users.info`, required *in addition to* `users:read`).
+  `im:history`/`mpim:history` are **not** needed — the surface is `app_mention` in
+  channels, not DMs.
+- **Trigger config = a new `trigger` facet on the connector** (`{ defaultProfileId,
+  systemPromptAppend }`), consistent with the existing credential/oauth/cli facets
+  and admin-authorable through the same IntegrationService CRUD. (Resolves open Q.)
+- **Single-workspace for v1.** The connector resolves one `slack.bot_token`. Multi-
+  workspace (per-`team_id` token, keyed `getTriggerConfig("slack", team)`) is a real
+  future extension — the OAuth `tokenSecretRef` is a single ref today.
 
 ## Security & authz
 
-- HMAC verification on **both** endpoints; bot token sealed in the org-secret store
-  (provided by the install layer).
+- HMAC verification on **both** endpoints; bot token is the existing connector's
+  KEK-sealed `slack.bot_token`, resolved coordinator-side via `getSlackClient()`.
 - Triggered sessions run with the **profile's** capabilities/network/secrets
   exactly as a UI task — **no new privilege path**. The agent never receives
   control-plane creds; the orchestrator mediates all side effects.
@@ -604,10 +631,11 @@ when a second consumer actually exists; the present design precludes none of it.
   skeleton with the recv/drain loop, the workflow-local `questionTs` map, and
   `continue-as-new` (threading the map through); tests for crash/restart, duplicate
   sends, cursor reconstruction, terminal exit.
-- **P2 — Slack adapter.** Events + interactivity endpoints (verify/ack/dedupe); the
-  communication policy (👀/✅/❌ reactions, link, Block Kit questions, asset posts,
-  closing summary); `@mention` context gathering + `SendPrompt` follow-ups; identity
-  seam; consume the install layer's token + trigger config.
+- **P2 — Slack adapter.** Extend the `slack` connector (add the five scopes + a
+  `trigger` facet); the `/api/v1/integrations/slack/{events,interactivity}` endpoints
+  (verify/ack/dedupe); the communication policy via `getSlackClient()` (👀/✅/❌
+  reactions, link, Block Kit questions, asset posts, closing summary); `@mention`
+  context gathering + `SendPrompt` follow-ups; identity seam.
 - **P3 — `append_system_prompt`.** Proto #11 → coordinator persistence + replay →
   harness flag; per-trigger config; Linux-target verification.
 
@@ -629,8 +657,6 @@ Each phase is its own PR, the ADR updated between phases per repo convention.
 1. Closing-summary composition — templated (status + asset links) vs. enriched by
    the session's last assistant message?
 2. Should both reactions persist (👀 + ✅) or swap to a single ✅? (Default: persist.)
-3. Trigger-config home — co-located with the separately-built Slack install record,
-   or its own `trigger_source` table? (Coordinate with that work.)
 
 ## References
 
