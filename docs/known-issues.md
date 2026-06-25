@@ -250,9 +250,7 @@ chunk-store GC deleted").
 
 ## 15. Wire compatibility is enforced at hello but bincode-positional
 
-`engram-protocol::WIRE_VERSION` (`1` today, reset when nothing was
-deployed externally yet — the historical changelog comments were
-stripped at the same time) + the hello-frame handshake reject
+`engram-protocol::WIRE_VERSION` (`5` today) + the hello-frame handshake reject
 coord/host-agent version mismatches loudly. The handshake itself
 works.
 
