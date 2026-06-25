@@ -11,6 +11,8 @@ import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
 import integrationOpRoute from "./routes/integration-op.ts";
 import integrationOauthRoute from "./routes/integration-oauth.ts";
+import slackEventsRoute from "./routes/slack-events.ts";
+import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 // Side-effect import: registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
@@ -27,8 +29,12 @@ import { controlPlaneTransport } from "./control-plane/transport.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
 // ADR 0059: embedded DBOS engine. Workflow modules (P1+) must be imported
 // ABOVE the initDbos() call below so their workflows/steps are registered
-// before DBOS.launch().
+// before DBOS.launch(). Importing slack-thread.ts registers both the thread
+// workflow and (transitively) the per-session ingest pump.
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
+import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
+import { makeSlackPolicy } from "./integrations/slack-policy.ts";
+import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 
 const app = new Hono();
 
@@ -57,6 +63,10 @@ app.route("/", adminRoute);
 app.route("/", integrationOpRoute);
 // OAuth acquisition for connectors with an `oauth` facet (e.g. Slack "Add to Slack").
 app.route("/", integrationOauthRoute);
+// ADR 0059: Slack external-trigger webhooks (events + interactivity). Both
+// verify every request with the SDK against the slack.signing_secret org secret.
+app.route("/", slackEventsRoute);
+app.route("/", slackInteractivityRoute);
 
 // ADR 0051 Task 21: Shell WebSocket route.
 const { app: shellApp, injectUpgrade } = makeShellRoute();
@@ -110,8 +120,13 @@ const server = buildServer(
   { upgradeWebSocket, wss, injectWebSocket },
 );
 
-// ADR 0059: launch the embedded DBOS engine before serving any traffic, so a
-// webhook that arrives the instant we bind can start a workflow.
+// ADR 0059: inject the SlackThreadWorkflow's seams (the Slack provider
+// mechanics + the session-lifecycle control plane) before launching the engine,
+// so the first webhook-driven workflow has them. Then launch the embedded DBOS
+// engine before serving any traffic, so a webhook that arrives the instant we
+// bind can start a workflow.
+setThreadPolicy(makeSlackPolicy());
+setThreadControlPlane(makeThreadControlPlane());
 await initDbos();
 
 server.listen(config.port, "0.0.0.0", () => {
