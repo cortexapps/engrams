@@ -79,6 +79,25 @@ describe("SessionProfileEditor (create)", () => {
     });
   });
 
+  it("toggling Default includes is_default in the create payload (ADR 0059)", async () => {
+    render(<SessionProfileEditor mode="create" />);
+    fireEvent.change(screen.getByLabelText(/profile name/i), {
+      target: { value: "Default Agent" },
+    });
+    fireEvent.click(screen.getByLabelText(/default profile/i));
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0]).toMatchObject({ isDefault: true });
+  });
+
+  it("leaves is_default false when the toggle is untouched", async () => {
+    render(<SessionProfileEditor mode="create" />);
+    fireEvent.change(screen.getByLabelText(/profile name/i), { target: { value: "Plain Agent" } });
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0]).toMatchObject({ isDefault: false });
+  });
+
   it("toggling a skill includes it in the payload (ADR 0055)", async () => {
     render(<SessionProfileEditor mode="create" />);
     fireEvent.change(screen.getByLabelText(/profile name/i), {

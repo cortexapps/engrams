@@ -84,6 +84,7 @@ const schema = z.object({
   description: z.string(),
   icon: z.string(),
   imageId: z.string().min(1, "Select an image"),
+  isDefault: z.boolean(),
   includeUserTokens: z.boolean(),
   skills: z.array(z.string()),
   capabilities: z.array(z.string()),
@@ -99,6 +100,7 @@ const EMPTY: ProfileFormValues = {
   description: "",
   icon: "Bot",
   imageId: "",
+  isDefault: false,
   includeUserTokens: false,
   skills: [],
   capabilities: [],
@@ -148,6 +150,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       description: p.description,
       icon: p.icon,
       imageId: p.imageId,
+      isDefault: p.isDefault,
       includeUserTokens: p.includeUserTokens,
       skills: p.skills ?? [],
       capabilities: p.capabilities ?? [],
@@ -216,6 +219,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       description: vals.description,
       icon: vals.icon,
       imageId: vals.imageId,
+      isDefault: vals.isDefault,
       includeUserTokens: vals.includeUserTokens,
       skills: vals.skills,
       capabilities: vals.capabilities,
@@ -307,6 +311,26 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                       Optional — shown wherever this profile is offered.
                     </FieldDescription>
                   </Field>
+                )}
+              />
+              <Controller
+                control={control}
+                name="isDefault"
+                render={({ field }) => (
+                  <div className="flex items-center gap-3 rounded-md border bg-background px-3 py-2.5">
+                    <Switch
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                      aria-label="Default profile"
+                    />
+                    <div className="flex-1">
+                      <div className="text-[0.84rem]">Make this the default profile</div>
+                      <div className="text-[0.74rem] text-muted-foreground">
+                        Externally triggered sessions (e.g. a Slack mention) launch with the default
+                        profile. Only one profile can be the default.
+                      </div>
+                    </div>
+                  </div>
                 )}
               />
             </FieldGroup>
