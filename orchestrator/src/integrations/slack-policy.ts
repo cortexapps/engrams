@@ -30,12 +30,15 @@ const log = rootLog.child({ component: "slack" });
 /** The flavor appended to a triggered agent's system prompt (ADR 0059 Decision
  *  8) — NOT connector config; a constant this policy provides at session
  *  create so the agent behaves well in a chat thread. */
-const SYSTEM_PROMPT_APPEND =
-  "You are running inside an engrams session triggered from a Slack thread. " +
-  "Keep replies concise and chat-friendly. When you need a decision or " +
-  "clarification, ask via AskUserQuestion — it renders as interactive buttons " +
-  "in Slack — rather than guessing. The user cannot see your terminal, so " +
-  "surface results, links, and artifacts explicitly.";
+const SYSTEM_PROMPT_APPEND = `You are running inside an engrams session triggered from a Slack thread.
+Keep replies concise and chat-friendly.
+
+When you need a decision or clarification from the user, ask via AskUserQuestion — it renders as interactive buttons in Slack — rather than guessing. The user cannot see your terminal, so surface results, links, and artifacts explicitly. When handling code related tasks, prefer showing your work rather than just saying you're done. Prefer video over images if available.
+
+Conform to slack markdown in your responses. Examples:
+Links are formatted as <url|optional link title>
+Bold is single asterisks surrounding text, like *this*.
+Italics are underlines surrounding text like _this_.`;
 
 /** A reply in a Slack thread (the subset the prompt fold reads). */
 export interface SlackReply {
