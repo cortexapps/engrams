@@ -57,15 +57,22 @@ pub fn parse_request_body(body: &[u8]) -> Option<ParsedGraphql> {
 
     let doc = async_graphql_parser::parse_query(&query).ok()?;
 
-    // Select the operation: a single op (also covers the anonymous `{ ... }`
-    // shorthand, which the parser models as one Query op); or, for a multi-op
-    // document, the one named by `operationName` (required + must resolve).
+    // Select the operation. `async-graphql-parser` models an *anonymous* op
+    // (`{ ... }`) as `Single`, but a *named* op as `Multiple` — even when it's the
+    // only one. `gh` always names its single operation (e.g. `query RepositoryInfo`)
+    // and sends no `operationName` (it's unambiguous), so the single-named case is
+    // the common path and must be accepted; only a genuinely multi-operation
+    // document needs `operationName` to disambiguate.
     let op = match &doc.operations {
         DocumentOperations::Single(op) => &op.node,
-        DocumentOperations::Multiple(ops) => {
-            let name = req.operation_name.as_deref()?;
-            &ops.iter().find(|(k, _)| k.as_str() == name)?.1.node
-        }
+        DocumentOperations::Multiple(ops) => match req.operation_name.as_deref() {
+            // An explicit `operationName` must resolve to one of the operations.
+            Some(name) => &ops.iter().find(|(k, _)| k.as_str() == name)?.1.node,
+            // No `operationName`: unambiguous iff the document has exactly one op.
+            None if ops.len() == 1 => &ops.values().next()?.node,
+            // 2+ operations with no selector — ambiguous, fail closed.
+            None => return None,
+        },
     };
 
     let operation = match op.ty {
@@ -122,6 +129,55 @@ mod tests {
         assert_eq!(
             p.top_level,
             vec![(GraphqlOperation::Mutation, "mergePullRequest".into())]
+        );
+    }
+
+    // Real `gh` traffic: `gh` NAMES its single operation and sends no
+    // `operationName`. async-graphql-parser models a *named* op as `Multiple` even
+    // when it's the only one, so these must be accepted (they were rejected as
+    // "unparseable" pre-fix — the prod regression on session 2f25d473).
+    #[test]
+    fn single_named_query_without_operation_name() {
+        // The exact shape `gh repo view` sends.
+        let p = parse(
+            "query RepositoryInfo($owner: String!, $name: String!) { \
+             repository(owner: $owner, name: $name) { name owner { id login } description } }",
+        )
+        .unwrap();
+        assert_eq!(
+            p.top_level,
+            vec![(GraphqlOperation::Query, "repository".into())]
+        );
+    }
+
+    #[test]
+    fn single_named_mutation_without_operation_name() {
+        // The shape `gh pr create` sends.
+        let p = parse(
+            "mutation CreatePullRequest($input: CreatePullRequestInput!) { \
+             createPullRequest(input: $input) { pullRequest { number url } } }",
+        )
+        .unwrap();
+        assert_eq!(
+            p.top_level,
+            vec![(GraphqlOperation::Mutation, "createPullRequest".into())]
+        );
+    }
+
+    #[test]
+    fn named_query_with_leading_fragment_definition() {
+        // The shape `gh pr list` sends: a fragment DEFINITION then a named query.
+        // The fragment definition lives in `doc.fragments` (not the operation's
+        // top-level selection), so it's ignored; the top-level field is `repository`.
+        let p = parse(
+            "fragment pr on PullRequest { number title } \
+             query PullRequestList($owner: String!, $repo: String!) { \
+             repository(owner: $owner, name: $repo) { pullRequests(first: 1) { nodes { ...pr } } } }",
+        )
+        .unwrap();
+        assert_eq!(
+            p.top_level,
+            vec![(GraphqlOperation::Query, "repository".into())]
         );
     }
 

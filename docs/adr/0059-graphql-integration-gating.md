@@ -185,12 +185,29 @@ alias. Locked by a test.
    existing powers + `cli.doc`.
 5. **ADR 0059 Accepted** — this commit.
 
+### Post-merge pitfall (fixed): the parser rejected `gh`'s named single operations
+
+Prod session `2f25d473` surfaced the "exercise against real `gh` traffic" gate the
+hard way: every `gh` GraphQL call (`gh repo view`, `gh pr list`, `gh auth status`)
+was rejected as `reason="unparseable or unsupported graphql operation"`. Root
+cause: `gh` **names** its single operation (`query RepositoryInfo`, `mutation
+CreatePullRequest`) and sends **no** `operationName`; `async-graphql-parser`
+classifies a *named* operation as `DocumentOperations::Multiple` even when it's the
+only one, and the parser required `operationName` to disambiguate `Multiple` → it
+fail-closed on every real `gh` request. The unit tests had only exercised
+*anonymous* ops (`{ viewer }`), which parse as `Single`. Fixed: a `Multiple` doc
+with exactly one operation is accepted without `operationName`; only a genuinely
+2+-operation doc still requires it. Regression tests now use the exact `gh repo
+view` / `gh pr create` / `gh pr list` (named op + leading fragment definition)
+shapes.
+
 ### Remaining operational gates (post-merge, not design opens)
 
 - Capture real `gh` GraphQL traffic (`GH_DEBUG=api` / mitmproxy) for the target
   commands and tighten `github.json`'s query-field set to match — the strict
   parser denies an unmapped field, so the supported set must be exercised before a
-  prod profile relies on it.
+  prod profile relies on it. (The named-operation pitfall above was the first such
+  catch.)
 - Local-stack smoke (`just integration-session` / e2e): a `pulls:write` +
   `issues:write` profile runs a GraphQL-backed `gh` write — it succeeds, emits an
   `IntegrationAsset`, an unmapped GraphQL mutation is 403'd, and a read-only

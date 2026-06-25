@@ -68,6 +68,52 @@ fn permissions_for_caps(caps: &[Capability]) -> BTreeMap<String, String> {
     out
 }
 
+fn perm_rank(level: &str) -> u8 {
+    match level {
+        "admin" => 3,
+        "write" => 2,
+        "read" => 1,
+        _ => 0,
+    }
+}
+
+/// Clamp `requested` App permissions to what the installation actually `granted`:
+/// keep a permission only if granted, capping its level at the granted level.
+/// Returns `(clamped, dropped)` where `dropped` describes each requested
+/// permission the installation can't fully satisfy.
+///
+/// GitHub's create-installation-token API is **all-or-nothing**: if any requested
+/// permission exceeds the App's grant it 422s the *entire* token, so one
+/// over-broad capability (e.g. `secrets:read` on an App without `secrets`) breaks
+/// ALL github access — git push and the API alike. Clamping degrades that to "the
+/// over-broad capability simply doesn't work" while everything the App can grant
+/// keeps working.
+fn clamp_permissions(
+    requested: &BTreeMap<String, String>,
+    granted: &BTreeMap<String, String>,
+) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut clamped = BTreeMap::new();
+    let mut dropped = Vec::new();
+    for (perm, want) in requested {
+        match granted.get(perm) {
+            Some(have) if perm_rank(have) >= perm_rank(want) => {
+                clamped.insert(perm.clone(), want.clone());
+            }
+            Some(have) => {
+                // Granted, but at a lower level — take the lower level.
+                clamped.insert(perm.clone(), have.clone());
+                dropped.push(format!(
+                    "{perm} (wanted {want}, installation grants {have})"
+                ));
+            }
+            None => dropped.push(format!(
+                "{perm} (wanted {want}, not granted to the installation)"
+            )),
+        }
+    }
+    (clamped, dropped)
+}
+
 /// ADR 0056 (Plane A): restrict the minted token to specific repositories when
 /// EVERY bound `github:` capability names one via its `resource`
 /// (`owner/repo` or `repo` → the repo name). If any cap is unscoped (no
@@ -103,6 +149,10 @@ pub struct GitHubApp {
     base_url: String,
     /// owner → installation id (installations rarely change).
     installations: Mutex<HashMap<String, u64>>,
+    /// owner → the permissions the installation actually grants (the App's
+    /// configured access). Used to clamp a token request so one over-broad
+    /// capability can't 422 the whole all-or-nothing mint. Rarely changes.
+    installation_perms: Mutex<HashMap<String, BTreeMap<String, String>>>,
     /// scope key → last minted credential (lazily refreshed near expiry).
     tokens: Mutex<HashMap<String, ScopedCredential>>,
 }
@@ -124,6 +174,7 @@ impl GitHubApp {
             http,
             base_url: GITHUB_API.to_string(),
             installations: Mutex::new(HashMap::new()),
+            installation_perms: Mutex::new(HashMap::new()),
             tokens: Mutex::new(HashMap::new()),
         })
     }
@@ -236,6 +287,45 @@ impl GitHubApp {
             .map_err(|e| IntegrationError::Protocol(format!("installation json: {e}")))?;
         Ok(inst.id)
     }
+
+    /// The permissions the installation actually grants (cached by owner key),
+    /// read off the installation object. Used only to clamp a token request after
+    /// a 422 (see [`Self::mint_basic`]); best-effort, so callers treat an error as
+    /// "unknown grant" and skip clamping.
+    async fn installation_permissions(
+        &self,
+        owner: Option<&str>,
+        id: u64,
+    ) -> Result<BTreeMap<String, String>, IntegrationError> {
+        let key = owner.unwrap_or("").to_string();
+        if let Some(p) = self.installation_perms.lock().get(&key).cloned() {
+            return Ok(p);
+        }
+        let jwt = self.app_jwt()?;
+        let url = format!("{}/app/installations/{}", self.base_url, id);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&jwt)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .send()
+            .await
+            .map_err(|e| IntegrationError::Backend(Box::new(e)))?;
+        let resp = ensure_ok(resp, "look up installation permissions").await?;
+        #[derive(Deserialize)]
+        struct InstPerms {
+            #[serde(default)]
+            permissions: BTreeMap<String, String>,
+        }
+        let ip: InstPerms = resp.json().await.map_err(|e| {
+            IntegrationError::Protocol(format!("installation permissions json: {e}"))
+        })?;
+        self.installation_perms
+            .lock()
+            .insert(key, ip.permissions.clone());
+        Ok(ip.permissions)
+    }
 }
 
 impl GitHubApp {
@@ -300,7 +390,53 @@ impl GitHubApp {
             .send()
             .await
             .map_err(|e| IntegrationError::Backend(Box::new(e)))?;
-        let resp = ensure_ok(resp, "mint installation token").await?;
+        // GitHub's create-installation-token API is all-or-nothing: a 422 here is
+        // almost always "the permissions requested are not granted to this
+        // installation" — one over-broad capability (e.g. `secrets:read` on an App
+        // without `secrets`) poisons the WHOLE request, breaking git push + the API
+        // alike. Clamp to the installation's actual grant and retry once, so the
+        // capabilities the App can satisfy still work and only the over-broad ones
+        // drop out. (`permissions.is_empty()` uses the default scopes below — nothing
+        // to clamp.)
+        let resp = if resp.status().as_u16() == 422 && !permissions.is_empty() {
+            let granted = self
+                .installation_permissions(owner, id)
+                .await
+                .unwrap_or_default();
+            let (clamped, dropped) = clamp_permissions(&permissions, &granted);
+            if granted.is_empty() || clamped.is_empty() || clamped == permissions {
+                // Couldn't learn the grant, the App grants nothing requested, or
+                // there was nothing to clamp — surface the original 422 (don't loop).
+                ensure_ok(resp, "mint installation token").await?
+            } else {
+                tracing::warn!(
+                    owner = owner.unwrap_or("<default>"),
+                    dropped = ?dropped,
+                    "github mint: installation-token 422; retried with permissions clamped to the \
+                     App's grant. Grant these to the App (or trim the profile's caps) to use them.",
+                );
+                let mut body2 = serde_json::json!({
+                    "permissions": serde_json::to_value(&clamped)
+                        .map_err(|e| IntegrationError::Protocol(format!("permissions json: {e}")))?,
+                });
+                if !repositories.is_empty() {
+                    body2["repositories"] = serde_json::json!(repositories);
+                }
+                let resp2 = self
+                    .http
+                    .post(&url)
+                    .bearer_auth(&jwt)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", API_VERSION)
+                    .json(&body2)
+                    .send()
+                    .await
+                    .map_err(|e| IntegrationError::Backend(Box::new(e)))?;
+                ensure_ok(resp2, "mint installation token (clamped to App grant)").await?
+            }
+        } else {
+            ensure_ok(resp, "mint installation token").await?
+        };
         #[derive(Deserialize)]
         struct TokenResp {
             token: String,
@@ -463,6 +599,67 @@ mod tests {
     fn empty_caps_yield_empty_permissions() {
         // The caller falls back to the default scopes for an empty set.
         assert!(permissions_for_caps(&[]).is_empty());
+    }
+
+    fn perms(kv: &[(&str, &str)]) -> BTreeMap<String, String> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn clamp_drops_permissions_the_app_lacks() {
+        // The prod incident (session 2f25d473): the profile requested secrets/actions
+        // the App installation doesn't grant → GitHub 422'd the WHOLE token, breaking
+        // git push + the API. Clamp keeps what the App grants (so push + PRs work) and
+        // drops the rest.
+        let requested = permissions_for_caps(&caps(&[
+            "github:contents:write",
+            "github:pulls:write",
+            "github:issues:write",
+            "github:secrets:read",
+            "github:actions:read",
+        ]));
+        let granted = perms(&[
+            ("contents", "write"),
+            ("pull_requests", "write"),
+            ("issues", "write"),
+            ("metadata", "read"),
+        ]);
+        let (clamped, dropped) = clamp_permissions(&requested, &granted);
+        assert_eq!(clamped.get("contents").map(String::as_str), Some("write"));
+        assert_eq!(
+            clamped.get("pull_requests").map(String::as_str),
+            Some("write")
+        );
+        assert_eq!(clamped.get("issues").map(String::as_str), Some("write"));
+        assert!(!clamped.contains_key("secrets"));
+        assert!(!clamped.contains_key("actions"));
+        assert_eq!(dropped.len(), 2, "secrets + actions reported as dropped");
+    }
+
+    #[test]
+    fn clamp_caps_level_to_the_grant() {
+        // Requested write, App grants only read → take read, report the downgrade.
+        let (clamped, dropped) = clamp_permissions(
+            &perms(&[("contents", "write")]),
+            &perms(&[("contents", "read")]),
+        );
+        assert_eq!(clamped.get("contents").map(String::as_str), Some("read"));
+        assert_eq!(dropped.len(), 1);
+    }
+
+    #[test]
+    fn clamp_is_a_noop_when_grant_covers_the_request() {
+        let requested = perms(&[("contents", "write"), ("pull_requests", "write")]);
+        let granted = perms(&[
+            ("contents", "write"),
+            ("pull_requests", "write"),
+            ("issues", "write"),
+        ]);
+        let (clamped, dropped) = clamp_permissions(&requested, &granted);
+        assert_eq!(clamped, requested);
+        assert!(dropped.is_empty());
     }
 
     #[test]
