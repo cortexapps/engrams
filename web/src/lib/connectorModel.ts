@@ -176,6 +176,11 @@ export interface ParsedCli {
 export interface ParsedOauth {
   clientIdRef: string;
   clientSecretRef: string;
+  /** Bot scopes the token exchange requests — drives the Slack app manifest (ADR 0060). */
+  scopes: string[];
+  /** Org secret for the app's webhook-signing secret, when the provider has an inbound
+   * webhook surface (ADR 0060 Slack triggers). Present → the connect flow seals it. */
+  signingSecretRef?: string;
 }
 
 export interface ParsedConnectorConfig {
@@ -220,10 +225,26 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
     mint?: { kind?: string };
   };
   const credentialSource: "mint" | "inject" = cred.source === "mint" ? "mint" : "inject";
-  const oauthRaw = raw.oauth as { clientIdRef?: string; clientSecretRef?: string } | undefined;
+  const oauthRaw = raw.oauth as
+    | {
+        clientIdRef?: string;
+        clientSecretRef?: string;
+        signingSecretRef?: unknown;
+        scopes?: unknown;
+      }
+    | undefined;
   const oauth =
     oauthRaw?.clientIdRef && oauthRaw?.clientSecretRef
-      ? { clientIdRef: oauthRaw.clientIdRef, clientSecretRef: oauthRaw.clientSecretRef }
+      ? {
+          clientIdRef: oauthRaw.clientIdRef,
+          clientSecretRef: oauthRaw.clientSecretRef,
+          scopes: Array.isArray(oauthRaw.scopes)
+            ? oauthRaw.scopes.filter((s): s is string => typeof s === "string")
+            : [],
+          ...(typeof oauthRaw.signingSecretRef === "string"
+            ? { signingSecretRef: oauthRaw.signingSecretRef }
+            : {}),
+        }
       : undefined;
   const d = (raw.display ?? {}) as {
     name?: string;

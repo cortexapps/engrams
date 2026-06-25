@@ -956,3 +956,98 @@ async fn image_list_enabled_images_reflects_store() {
 
     server.abort();
 }
+
+// =====================================================================
+// ListSessionEvents (ADR 0060 P1) — the unary bounded read of the event
+// log that the SessionIngestWorkflow pump walks forward. Unfiltered:
+// curation is the consumer's concern.
+// =====================================================================
+
+/// Page through five events: assert each batch's idxs + the returned
+/// `next_after_idx` cursor, and that a read at the tail returns nothing and
+/// echoes the cursor rather than rewinding.
+#[tokio::test]
+async fn session_list_events_paginates() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+
+    let sid = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".to_string(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+
+    // idx 0..=4 on the log.
+    for kind in [
+        "run_started",
+        "user_question",
+        "file_shared",
+        "integration_asset",
+        "run_completed",
+    ] {
+        meta.append_session_event(sid, kind, serde_json::json!({ "k": kind }))
+            .await
+            .expect("append event");
+    }
+
+    let (addr, server) = serve(state).await;
+    let channel = dial(addr).await;
+    let mut client = app::session_service_client::SessionServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    );
+
+    // ---- Page 1: from the start (after_idx unset), limit 3 → idx 0,1,2 ----
+    let p1 = client
+        .list_session_events(app::ListSessionEventsRequest {
+            session_id: sid.to_string(),
+            after_idx: None,
+            limit: Some(3),
+        })
+        .await
+        .expect("ListSessionEvents page 1")
+        .into_inner();
+    assert_eq!(
+        p1.events.iter().map(|e| e.idx).collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2)],
+        "page 1 idxs"
+    );
+    assert_eq!(p1.next_after_idx, 2, "page 1 cursor = last returned idx");
+
+    // ---- Page 2: after_idx 2, limit 10 → the remaining idx 3,4 ----
+    let p2 = client
+        .list_session_events(app::ListSessionEventsRequest {
+            session_id: sid.to_string(),
+            after_idx: Some(p1.next_after_idx),
+            limit: Some(10),
+        })
+        .await
+        .expect("ListSessionEvents page 2")
+        .into_inner();
+    assert_eq!(
+        p2.events.iter().map(|e| e.idx).collect::<Vec<_>>(),
+        vec![Some(3), Some(4)],
+        "page 2 idxs"
+    );
+    assert_eq!(p2.next_after_idx, 4, "page 2 cursor");
+    assert_eq!(
+        p2.events[1].kind, "run_completed",
+        "kinds pass through verbatim (unfiltered)"
+    );
+
+    // ---- Page 3: at the tail → empty, cursor echoes (no rewind) ----
+    let p3 = client
+        .list_session_events(app::ListSessionEventsRequest {
+            session_id: sid.to_string(),
+            after_idx: Some(p2.next_after_idx),
+            limit: Some(10),
+        })
+        .await
+        .expect("ListSessionEvents page 3")
+        .into_inner();
+    assert!(p3.events.is_empty(), "tail read returns nothing");
+    assert_eq!(p3.next_after_idx, 4, "tail cursor echoes, never rewinds");
+
+    server.abort();
+}

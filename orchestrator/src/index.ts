@@ -1,6 +1,8 @@
 import { Hono } from "hono";
+import { logger as honoLogger } from "hono/logger";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { config } from "./config.ts";
+import { log } from "./log.ts";
 import { buildServer } from "./server.ts";
 import health from "./routes/health.ts";
 import authRoute from "./routes/auth.ts";
@@ -11,6 +13,8 @@ import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
 import integrationOpRoute from "./routes/integration-op.ts";
 import integrationOauthRoute from "./routes/integration-oauth.ts";
+import slackEventsRoute from "./routes/slack-events.ts";
+import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 // Side-effect import: registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
@@ -25,6 +29,14 @@ import { registerIntegration } from "./rpc/integration.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
+// ADR 0060: embedded DBOS engine. Workflow modules (P1+) must be imported
+// ABOVE the initDbos() call below so their workflows/steps are registered
+// before DBOS.launch(). Importing slack-thread.ts registers both the thread
+// workflow and (transitively) the per-session ingest pump.
+import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
+import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
+import { makeSlackPolicy } from "./integrations/slack-policy.ts";
+import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 
 const app = new Hono();
 
@@ -37,6 +49,11 @@ const { upgradeWebSocket, injectWebSocket, wss } = createNodeWebSocket({ app });
 // handleProtocols is read by ws's handleUpgrade on each connection.
 wss.options.handleProtocols = (protocols: Set<string>) =>
   protocols.has("tty") ? "tty" : false;
+
+// Request logging (hono/logger) routed through pino, so every HTTP leg — the
+// Slack webhooks included — logs `<-- METHOD path` / `--> METHOD path status ms`.
+const httpLog = log.child({ component: "http" });
+app.use(honoLogger((message) => httpLog.info(message)));
 
 // Mount routes.
 app.route("/", health);
@@ -53,6 +70,10 @@ app.route("/", adminRoute);
 app.route("/", integrationOpRoute);
 // OAuth acquisition for connectors with an `oauth` facet (e.g. Slack "Add to Slack").
 app.route("/", integrationOauthRoute);
+// ADR 0060: Slack external-trigger webhooks (events + interactivity). Both
+// verify every request with the SDK against the slack.signing_secret org secret.
+app.route("/", slackEventsRoute);
+app.route("/", slackInteractivityRoute);
 
 // ADR 0051 Task 21: Shell WebSocket route.
 const { app: shellApp, injectUpgrade } = makeShellRoute();
@@ -106,19 +127,31 @@ const server = buildServer(
   { upgradeWebSocket, wss, injectWebSocket },
 );
 
+// ADR 0060: inject the SlackThreadWorkflow's seams (the Slack provider
+// mechanics + the session-lifecycle control plane) before launching the engine,
+// so the first webhook-driven workflow has them. Then launch the embedded DBOS
+// engine before serving any traffic, so a webhook that arrives the instant we
+// bind can start a workflow.
+setThreadPolicy(makeSlackPolicy());
+setThreadControlPlane(makeThreadControlPlane());
+await initDbos();
+
 server.listen(config.port, "0.0.0.0", () => {
-  console.log(`Orchestrator listening on port ${config.port}`);
+  log.info({ port: config.port }, "orchestrator listening");
 });
 
 // Graceful shutdown on SIGTERM (e.g. Tilt stop, Kubernetes pod termination).
 process.on("SIGTERM", () => {
-  console.log("Orchestrator: SIGTERM received, shutting down gracefully…");
-  server.close((err) => {
+  log.info("orchestrator: SIGTERM received, shutting down gracefully");
+  server.close(async (err) => {
+    // Quiesce DBOS (stops queue/recovery loops, closes the system-DB pool)
+    // after the HTTP server stops accepting connections.
+    await shutdownDbos();
     if (err) {
-      console.error("Orchestrator: error during shutdown", err);
+      log.error({ err }, "orchestrator: error during shutdown");
       process.exit(1);
     }
-    console.log("Orchestrator: shutdown complete");
+    log.info("orchestrator: shutdown complete");
     process.exit(0);
   });
 });

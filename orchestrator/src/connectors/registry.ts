@@ -221,6 +221,10 @@ export interface OauthFacet {
   clientIdRef: string;
   /** Org secret holding the OAuth app's client secret. */
   clientSecretRef: string;
+  /** Org secret holding the app's request-signing secret, when the provider verifies
+   * inbound webhooks with one (ADR 0060 Slack triggers). Admin-entered like the client
+   * creds; absent for providers without an inbound webhook surface. */
+  signingSecretRef?: string;
   /** Org secret the obtained access token is written to (the injected credential). */
   tokenSecretRef: string;
   /** Top-level field of the token response holding the access token (e.g.
@@ -680,6 +684,9 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
     scopes,
     clientIdRef: secretRef("clientIdRef", o.clientIdRef),
     clientSecretRef: secretRef("clientSecretRef", o.clientSecretRef),
+    ...(o.signingSecretRef !== undefined
+      ? { signingSecretRef: secretRef("signingSecretRef", o.signingSecretRef) }
+      : {}),
     tokenSecretRef: secretRef("tokenSecretRef", o.tokenSecretRef),
     tokenResponsePath: secretRef("tokenResponsePath", o.tokenResponsePath),
   };

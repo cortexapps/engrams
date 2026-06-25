@@ -250,6 +250,41 @@ impl app::session_service_server::SessionService for AppSessionService {
         Ok(Response::new(Box::pin(full_stream)))
     }
 
+    // ADR 0060: unary catch-up read of the persistent log for the reverse
+    // channel. Thin adapter over `list_session_events_core`; maps each
+    // persisted event through the SAME decoder the StreamEvents replay arm
+    // uses (`merged_to_parts`), so the unary page is byte-identical to the
+    // stream. Unfiltered — curation is the consumer's concern.
+    async fn list_session_events(
+        &self,
+        req: Request<app::ListSessionEventsRequest>,
+    ) -> Result<Response<app::ListSessionEventsResponse>, Status> {
+        self.auth.check(&req)?;
+        let r = req.into_inner();
+        let id = parse_session_id(&r.session_id)?;
+        let (events, next_after_idx) =
+            crate::api::events::list_session_events_core(&self.state, id, r.after_idx, r.limit)
+                .await
+                .map_err(into_status)?;
+        let events = events
+            .into_iter()
+            .map(|ev| {
+                let (idx, kind, payload_json) = crate::api::events::merged_to_parts(
+                    crate::api::events::MergedEvent::Replay(ev),
+                );
+                app::SessionEvent {
+                    idx,
+                    kind,
+                    payload_json,
+                }
+            })
+            .collect();
+        Ok(Response::new(app::ListSessionEventsResponse {
+            events,
+            next_after_idx,
+        }))
+    }
+
     type ExecStream = BoxStream<app::ExecOutput>;
 
     // ADR 0039 Task 12: streaming Exec over gRPC.

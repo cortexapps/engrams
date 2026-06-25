@@ -189,6 +189,7 @@
     "tokenUrl": "https://slack.com/api/oauth.v2.access",
     "scopes": [
       "chat:write",
+      "app_mentions:read",
       "channels:read",
       "channels:history",
       "channels:manage",
@@ -213,6 +214,7 @@
     ],
     "clientIdRef": "slack.client_id",
     "clientSecretRef": "slack.client_secret",
+    "signingSecretRef": "slack.signing_secret",
     "tokenSecretRef": "slack.bot_token",
     "tokenResponsePath": "access_token"
   }

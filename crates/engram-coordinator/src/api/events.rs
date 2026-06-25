@@ -58,6 +58,47 @@ pub(crate) async fn events_core(
     Ok((replayed, live_rx))
 }
 
+/// ADR 0060: default page size when `limit` is unset / non-positive.
+const LIST_DEFAULT_LIMIT: i64 = 500;
+/// ADR 0060: hard cap so one unary read stays bounded regardless of `limit`.
+const LIST_MAX_LIMIT: i64 = 1000;
+
+/// ADR 0060: unary, bounded, UNFILTERED read of the persistent log — the
+/// catch-up read the reverse-channel pump (`SessionIngestWorkflow`) walks
+/// forward. Returns events with `idx > after_idx` (`None` ≡ from the start of
+/// the log), capped, plus the cursor to pass as `after_idx` next time: the
+/// last returned idx, or the request's `after_idx` echoed back when the page
+/// is empty so a caller at the tail never rewinds. Curation is the consumer's
+/// concern (unlike the SSE/stream path, which is also unfiltered). The gRPC
+/// handler maps each [`PersistedEvent`](engram_core::types::PersistedEvent) to
+/// a proto `SessionEvent` via [`merged_to_parts`] so the unary read is
+/// byte-identical to the stream's replay arm.
+pub(crate) async fn list_session_events_core(
+    state: &SharedState,
+    id: SessionId,
+    after_idx: Option<i64>,
+    limit: Option<i64>,
+) -> Result<(Vec<engram_core::types::PersistedEvent>, i64), ApiError> {
+    state.services.meta.get_session(id).await?;
+    let after = after_idx.unwrap_or(-1);
+    let events = state
+        .services
+        .meta
+        .list_session_events_since(id, after, clamp_list_limit(limit))
+        .await?;
+    let next_after_idx = events.last().map(|e| e.idx).unwrap_or(after);
+    Ok((events, next_after_idx))
+}
+
+/// Clamp a caller-supplied `limit` to `(0, LIST_MAX_LIMIT]`, defaulting an
+/// unset / non-positive value to `LIST_DEFAULT_LIMIT`.
+fn clamp_list_limit(limit: Option<i64>) -> i64 {
+    match limit {
+        Some(n) if n > 0 => n.min(LIST_MAX_LIMIT),
+        _ => LIST_DEFAULT_LIMIT,
+    }
+}
+
 /// A single item from the unified replay→live event stream. The app-gRPC
 /// `StreamEvents` RPC maps over [`merged_event_stream`]; all dedupe / lag /
 /// high-water semantics live there, and the axum SSE handler frames the
@@ -182,6 +223,19 @@ mod tests {
             chunk: "hi".into(),
             at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn clamp_list_limit_defaults_and_caps() {
+        // Unset / non-positive → the default page size.
+        assert_eq!(clamp_list_limit(None), LIST_DEFAULT_LIMIT);
+        assert_eq!(clamp_list_limit(Some(0)), LIST_DEFAULT_LIMIT);
+        assert_eq!(clamp_list_limit(Some(-5)), LIST_DEFAULT_LIMIT);
+        // In-range → passed through verbatim.
+        assert_eq!(clamp_list_limit(Some(10)), 10);
+        // Above the hard cap → clamped to it.
+        assert_eq!(clamp_list_limit(Some(LIST_MAX_LIMIT + 1)), LIST_MAX_LIMIT);
+        assert_eq!(clamp_list_limit(Some(1_000_000)), LIST_MAX_LIMIT);
     }
 
     #[test]

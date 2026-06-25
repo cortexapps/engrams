@@ -206,4 +206,41 @@ describe("parseConnectorConfig", () => {
     const raw = JSON.stringify({ provider: "x", hosts: ["h"], operations: [] });
     expect(parseConnectorConfig(raw, "x").cli).toBeUndefined();
   });
+
+  test("surfaces the OAuth facet's scopes (ADR 0060 Slack app manifest)", () => {
+    const raw = JSON.stringify({
+      provider: "slack",
+      credential: {
+        source: "inject",
+        injects: [{ header: "Authorization", template: "Bearer {}", secretRef: "slack.bot_token" }],
+      },
+      hosts: ["slack.com"],
+      operations: [],
+      oauth: {
+        clientIdRef: "slack.client_id",
+        clientSecretRef: "slack.client_secret",
+        signingSecretRef: "slack.signing_secret",
+        scopes: ["chat:write", "app_mentions:read"],
+      },
+    });
+    const c = parseConnectorConfig(raw, "slack");
+    expect(c.oauth).toEqual({
+      clientIdRef: "slack.client_id",
+      clientSecretRef: "slack.client_secret",
+      signingSecretRef: "slack.signing_secret",
+      scopes: ["chat:write", "app_mentions:read"],
+    });
+  });
+
+  test("an OAuth facet without scopes yields an empty scope list + no signing ref (no throw)", () => {
+    const raw = JSON.stringify({
+      provider: "x",
+      hosts: ["h"],
+      operations: [],
+      oauth: { clientIdRef: "x.client_id", clientSecretRef: "x.client_secret" },
+    });
+    const c = parseConnectorConfig(raw, "x");
+    expect(c.oauth?.scopes).toEqual([]);
+    expect(c.oauth?.signingSecretRef).toBeUndefined();
+  });
 });

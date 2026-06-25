@@ -539,6 +539,13 @@ orchestrator_env = {
     'CONTROL_PLANE_GRPC_URL': 'http://127.0.0.1:50061',
     'CONTROL_PLANE_HTTP_URL': 'http://127.0.0.1:8090',
     'ORCHESTRATOR_PORT': '8787',
+    # Public origin the BROWSER uses (the web dev server) — NOT the orchestrator's
+    # own :8787. better-auth's session cookie is scoped here, /api is proxied here
+    # (vite.config.ts), and the OAuth redirect + Slack session links are built from
+    # it. Unset → it falls back to 127.0.0.1:8787, so the OAuth callback bypasses the
+    # proxy and arrives cookie-less → 401. Override with an https tunnel URL (ngrok/
+    # cloudflared) for real Slack OAuth, which rejects non-https redirect URLs.
+    'ORCHESTRATOR_PUBLIC_URL': env_or('ORCHESTRATOR_PUBLIC_URL', 'http://localhost:5173'),
     'TRUSTED_ORIGINS': 'http://localhost:5173',
     # Dev-only better-auth signing secret (≥32 chars). better-auth 1.6.16
     # silently falls back to a publicly-known constant when unset, so the

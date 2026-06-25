@@ -44,38 +44,29 @@ import { ConnectError, Code } from "@connectrpc/connect";
 import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
 import { subject } from "@casl/ability";
 import { eq, inArray } from "drizzle-orm";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Task, TaskSessionRef } from "../gen/engram/app/v1/task_pb.ts";
 import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 
 import { abilityFor } from "../authz/ability.ts";
-import { evictOwnerCacheEntry } from "../authz/resolve.ts";
 import { auth } from "../auth/better-auth.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
-import * as schema from "../db/schema.ts";
 import { sessions as defaultSessions, images as defaultImages } from "../control-plane/client.ts";
-import {
-  makeUserSecretStore,
-  type UserSecretStore,
-  CLAUDE_OAUTH_ENV_VAR,
-} from "../db/user-secrets.ts";
+import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import type { ImagesClient } from "./profiles.ts";
-import {
-  compileIntegrationPolicy,
-  compileCliIntegrations,
-  policyHasContent,
-  loadRegistry,
-  type CustomConnectorSource,
-} from "../connectors/registry.ts";
+import type { CustomConnectorSource } from "../connectors/registry.ts";
+import { createTaskWithSession, type Db } from "./task-create.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
 export type { ImagesClient } from "./profiles.ts";
+// Re-export the Drizzle DB handle so existing importers (tests) keep their
+// `import type { Db } from "../rpc/tasks.ts"`. Canonical home is task-create.ts.
+export type { Db } from "./task-create.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -105,9 +96,6 @@ export interface SessionsClient {
   getSession(req: { sessionId: string }): Promise<{ session?: Session | undefined }>;
   deleteSession(req: { sessionId: string }): Promise<unknown>;
 }
-
-/** Drizzle DB type used by TaskService. */
-export type Db = NodePgDatabase<typeof schema>;
 
 /** Injectable better-auth getSession function. */
 export type GetSession = (
@@ -390,120 +378,29 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         throw new ConnectError("profile_id is required", Code.InvalidArgument);
       }
 
-      // 1. Load the active profile (ADR §5.1). Missing/archived → rejected.
-      const profile = await profiles.getActive(req.profileId);
-      if (!profile) {
-        throw new ConnectError("profile not found or archived", Code.NotFound);
-      }
+      // Create the task + its primary session via the shared primitive — the
+      // SAME path the external-trigger ThreadControlPlane uses (ADR 0060), so a
+      // UI chat task and a triggered session share one privilege/compensation
+      // path. Throws NotFound (profile missing/archived) or FailedPrecondition
+      // (image disabled); compensates the orphan session on a DB failure.
+      const { taskId } = await createTaskWithSession(
+        {
+          profiles,
+          images: imagesClient,
+          connectors,
+          sessions: sessionsClient,
+          secrets: resolveSecrets(),
+          db: getDbFn(),
+        },
+        {
+          type: "chat",
+          ownerUserId: user.id,
+          profileId: req.profileId,
+          title: req.title ?? null,
+          ...(req.prompt != null ? { prompt: req.prompt } : {}),
+        },
+      );
 
-      // 2. Resolve image_id → current image_uri (ADR §5.2). Defense in depth
-      //    behind the DisableImage guard (Task 8): reject if no longer enabled.
-      const catalog = await imagesClient.listEnabledImages({});
-      const image = catalog.images.find((i) => i.id === profile.imageId);
-      if (!image) {
-        throw new ConnectError(
-          "the profile's image is no longer enabled — contact an admin",
-          Code.FailedPrecondition,
-        );
-      }
-
-      // 3. Assemble harness_env (ADR §5.4), lowest → highest precedence:
-      //    user Claude token (only if include_user_tokens) < profile env_vars.
-      //    NEVER log values.
-      const harness: Record<string, string> = {};
-      if (profile.includeUserTokens) {
-        try {
-          const userToken = await resolveSecrets().get(user.id, CLAUDE_OAUTH_ENV_VAR);
-          if (userToken) harness[CLAUDE_OAUTH_ENV_VAR] = userToken;
-        } catch (secretErr) {
-          console.warn(
-            `[TaskService] createTask: token lookup failed for user ${user.id} — booting without it`,
-            secretErr,
-          );
-        }
-      }
-      // ADR 0058: CLI integrations. Resolve the registry once (reused by the
-      // policy compile below), then merge each enabled CLI's dummy env (so the
-      // tool stops gating on local auth — the real credential is injected
-      // host-side by the egress proxy, never in the guest) + the enabled-CLI
-      // catalog the in-guest `engrams integrations` helper reads. Profile
-      // envVars still override (applied last).
-      const registry = await loadRegistry(connectors);
-      const cliPlan = compileCliIntegrations(profile.capabilities, registry);
-      for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
-      if (cliPlan.enabled.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(cliPlan.enabled);
-      for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v; // profile overrides
-      const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
-
-      // 4. Create the upstream session. Mode is always "agent" (ADR §5). The
-      //    profile's selected skills (ADR 0055) ride as bundle names; the
-      //    coordinator resolves them to reserved-slot mounts at boot. The
-      //    profile's capabilities (ADR 0056) ride as "provider:action[@resource]"
-      //    strings; the coordinator binds them to the session (+ later clamps).
-      //    The capabilities are also compiled here (B′) against the connector
-      //    config into a per-session IntegrationPolicy — the activated Plane-B
-      //    injects + response-observation specs — which rides as a JSON string
-      //    the coordinator persists, resolving inject secret_refs host-side and
-      //    shipping the observes to the proxy. Only shipped when non-empty (a
-      //    capability-less profile, or one whose ops declare no inject/asset).
-      // ADR 0057: the policy is now the full session policy — it also carries
-      // the profile's network allow-list + injected secrets, which the
-      // coordinator sources the egress policy from. Shipped whenever it carries
-      // anything (caps OR secrets OR a non-trivial network).
-      const policy = compileIntegrationPolicy(profile.capabilities, registry, {
-        network: profile.network,
-        secrets: profile.secrets,
-      });
-      const integrationPolicyJson = policyHasContent(policy)
-        ? JSON.stringify(policy)
-        : undefined;
-      // ADR 0058: enabling a bundled CLI integration adds the shared
-      // integrations-cli bundle to the session's selected skills (one dyn_* slot
-      // for all CLIs), unioned with the profile's own skills.
-      const selectedSkills = [...new Set([...profile.skills, ...cliPlan.bundles])];
-      const created = await sessionsClient.createSession({
-        imageUri: image.imageUri,
-        mode: "agent",
-        ...(req.prompt != null ? { prompt: req.prompt } : {}),
-        ...(harnessEnv != null ? { harnessEnv } : {}),
-        ...(selectedSkills.length > 0 ? { selectedSkills } : {}),
-        ...(profile.capabilities.length > 0 ? { capabilities: profile.capabilities } : {}),
-        ...(integrationPolicyJson != null ? { integrationPolicyJson } : {}),
-      });
-
-      // 5. Insert task + task_session (recording profile_id). Compensate on failure.
-      const taskId = crypto.randomUUID();
-      try {
-        const db = getDbFn();
-        await db.transaction(async (tx) => {
-          await tx.insert(taskTable).values({
-            id: taskId,
-            type: "chat",
-            title: req.title ?? null,
-            status: "open",
-            createdByUserId: user.id,
-            source: {},
-          });
-          await tx.insert(taskSessionTable).values({
-            taskId,
-            sessionId: created.sessionId,
-            role: "primary",
-            profileId: profile.id,
-          });
-        });
-      } catch (dbErr) {
-        try {
-          await sessionsClient.deleteSession({ sessionId: created.sessionId });
-        } catch (delErr) {
-          console.error(
-            `[TaskService] createTask compensation: failed to delete orphan session ${created.sessionId} after DB error`,
-            delErr,
-          );
-        }
-        throw dbErr;
-      }
-
-      evictOwnerCacheEntry(created.sessionId);
       const loaded = await loadTask(taskId, getDbFn(), sessionsClient, profiles, imagesClient);
       return { task: loaded };
     },

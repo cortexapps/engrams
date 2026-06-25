@@ -2,10 +2,23 @@ import { expect, test, describe } from "bun:test";
 import { checkDb, getDb } from "../db/client.ts";
 import { makeProfileStore } from "../db/profiles.ts";
 import { profile as profileTable } from "../db/schema.ts";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
 const dbReachable = DB_URL ? await checkDb() : false;
+
+const baseInput = {
+  description: "d",
+  icon: "Bot",
+  imageId: "img-1",
+  includeUserTokens: false,
+  envVars: {},
+  skills: [],
+  capabilities: [],
+  network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
+  secrets: [],
+  isDefault: false,
+};
 
 describe("ProfileStore", () => {
   test.skipIf(!dbReachable)("create → getActive → list → update → softDelete", async () => {
@@ -21,6 +34,7 @@ describe("ProfileStore", () => {
       capabilities: ["github:issues:write", "datadog:metrics:read"],
       network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
       secrets: [],
+      isDefault: false,
     };
     const created = await store.create(input);
     try {
@@ -52,6 +66,32 @@ describe("ProfileStore", () => {
       expect(await store.update(created.id, input)).toBeNull();
     } finally {
       await getDb().delete(profileTable).where(eq(profileTable.id, created.id)).catch(() => {});
+    }
+  });
+
+  // ADR 0060: at-most-one default. Setting a profile default clears the prior;
+  // soft-deleting the default leaves none. getDefault() returns the active one.
+  test.skipIf(!dbReachable)("is_default: at-most-one + getDefault + clears on soft-delete", async () => {
+    const store = makeProfileStore(getDb());
+    const a = await store.create({ ...baseInput, name: `Def A ${Date.now()}`, isDefault: true });
+    const b = await store.create({ ...baseInput, name: `Def B ${Date.now()}`, isDefault: true });
+    try {
+      // Creating B as default cleared A — exactly one active default.
+      expect((await store.get(a.id))?.isDefault).toBe(false);
+      expect((await store.get(b.id))?.isDefault).toBe(true);
+      expect((await store.getDefault())?.id).toBe(b.id);
+
+      // Re-promoting A via update flips the default back (and clears B).
+      const promoted = await store.update(a.id, { ...baseInput, name: a.name, isDefault: true });
+      expect(promoted?.isDefault).toBe(true);
+      expect((await store.get(b.id))?.isDefault).toBe(false);
+      expect((await store.getDefault())?.id).toBe(a.id);
+
+      // Soft-deleting the default leaves none.
+      await store.softDelete(a.id);
+      expect(await store.getDefault()).toBeNull();
+    } finally {
+      await getDb().delete(profileTable).where(inArray(profileTable.id, [a.id, b.id])).catch(() => {});
     }
   });
 });

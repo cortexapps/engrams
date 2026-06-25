@@ -191,6 +191,7 @@ function makeFakeProfiles(opts?: {
     capabilities: opts?.capabilities ?? [],
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
+    isDefault: false,
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,
@@ -206,6 +207,9 @@ function makeFakeProfiles(opts?: {
     async getActive(id) {
       const r = rows.get(id);
       return r && !r.deletedAt ? r : null;
+    },
+    async getDefault() {
+      return [...rows.values()].find((r) => r.isDefault && !r.deletedAt) ?? null;
     },
     async getByIds(ids) {
       return ids.map((i) => rows.get(i)).filter(Boolean) as ProfileRow[];
