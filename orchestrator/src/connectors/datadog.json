@@ -4,7 +4,7 @@
   "display": {
     "name": "Datadog",
     "category": "Observability",
-    "blurb": "Query Datadog during a run via the `pup` agent CLI. Both keys are brokered — injected at the egress proxy, never seen by the agent.",
+    "blurb": "Query and manage Datadog — logs, metrics, monitors, dashboards, events, incidents, SLOs, hosts, APM traces, plus CI Visibility & Test Optimization (pipelines + flaky tests) — via the `pup` agent CLI. Both keys are brokered at the egress proxy, never seen by the agent.",
     "icon": { "mono": "DD", "color": "#632ca6" }
   },
   "credential": {
@@ -18,13 +18,201 @@
   "test": { "path": "/api/v1/dashboard" },
   "operations": [
     {
-      "grants": ["observability:read"],
-      "match": { "method": "GET", "path": "/api/*" }
+      "grants": ["logs:read"],
+      "match": { "method": "GET", "path": "/api/v2/logs/events*" }
+    },
+    {
+      "grants": ["logs:read"],
+      "match": { "method": "POST", "path": "/api/v2/logs/events/search" }
+    },
+    {
+      "grants": ["metrics:read"],
+      "match": { "method": "GET", "path": "/api/v1/query*" }
+    },
+    {
+      "grants": ["metrics:read"],
+      "match": { "method": "GET", "path": "/api/v1/metrics*" }
+    },
+    {
+      "grants": ["metrics:read"],
+      "match": { "method": "GET", "path": "/api/v2/metrics*" }
+    },
+    {
+      "grants": ["metrics:read"],
+      "match": { "method": "POST", "path": "/api/v2/query/timeseries" }
+    },
+    {
+      "grants": ["metrics:read"],
+      "match": { "method": "POST", "path": "/api/v2/query/scalar" }
+    },
+    {
+      "grants": ["monitors:read"],
+      "match": { "method": "GET", "path": "/api/v1/monitor*" }
+    },
+    {
+      "grants": ["monitors:write"],
+      "match": { "method": "POST", "path": "/api/v1/monitor*" }
+    },
+    {
+      "grants": ["monitors:write"],
+      "match": { "method": "PUT", "path": "/api/v1/monitor/*" }
+    },
+    {
+      "grants": ["monitors:write"],
+      "match": { "method": "DELETE", "path": "/api/v1/monitor/*" }
+    },
+    {
+      "grants": ["dashboards:read"],
+      "match": { "method": "GET", "path": "/api/v1/dashboard*" }
+    },
+    {
+      "grants": ["dashboards:write"],
+      "match": { "method": "POST", "path": "/api/v1/dashboard*" },
+      "asset": {
+        "kind": "dashboard",
+        "surface": "asset",
+        "success": { "statusClass": "2xx" },
+        "data": { "id": "$.resp.id", "title": "$.resp.title" },
+        "fetchable": { "external": "$.resp.url" }
+      }
+    },
+    {
+      "grants": ["dashboards:write"],
+      "match": { "method": "PUT", "path": "/api/v1/dashboard/*" }
+    },
+    {
+      "grants": ["dashboards:write"],
+      "match": { "method": "DELETE", "path": "/api/v1/dashboard/*" }
+    },
+    {
+      "grants": ["events:read"],
+      "match": { "method": "GET", "path": "/api/v1/events*" }
+    },
+    {
+      "grants": ["events:read"],
+      "match": { "method": "GET", "path": "/api/v2/events*" }
+    },
+    {
+      "grants": ["events:read"],
+      "match": { "method": "POST", "path": "/api/v2/events/search" }
+    },
+    {
+      "grants": ["events:write"],
+      "match": { "method": "POST", "path": "/api/v1/events" }
+    },
+    {
+      "grants": ["incidents:read"],
+      "match": { "method": "GET", "path": "/api/v2/incidents*" }
+    },
+    {
+      "grants": ["incidents:write"],
+      "match": { "method": "POST", "path": "/api/v2/incidents*" }
+    },
+    {
+      "grants": ["incidents:write"],
+      "match": { "method": "PATCH", "path": "/api/v2/incidents/*" }
+    },
+    {
+      "grants": ["slos:read"],
+      "match": { "method": "GET", "path": "/api/v1/slo*" }
+    },
+    {
+      "grants": ["hosts:read"],
+      "match": { "method": "GET", "path": "/api/v1/hosts*" }
+    },
+    {
+      "grants": ["synthetics:read"],
+      "match": { "method": "GET", "path": "/api/v1/synthetics/*" }
+    },
+    {
+      "grants": ["downtimes:read"],
+      "match": { "method": "GET", "path": "/api/v1/downtime*" }
+    },
+    {
+      "grants": ["downtimes:read"],
+      "match": { "method": "GET", "path": "/api/v2/downtime*" }
+    },
+    {
+      "grants": ["apm:read"],
+      "match": { "method": "GET", "path": "/api/v2/spans*" }
+    },
+    {
+      "grants": ["apm:read"],
+      "match": { "method": "POST", "path": "/api/v2/spans/events/search" }
+    },
+    {
+      "grants": ["notebooks:read"],
+      "match": { "method": "GET", "path": "/api/v1/notebooks*" }
+    },
+    {
+      "grants": ["users:read"],
+      "match": { "method": "GET", "path": "/api/v2/users*" }
+    },
+    {
+      "grants": ["tags:read"],
+      "match": { "method": "GET", "path": "/api/v1/tags/*" }
+    },
+
+    {
+      "grants": ["ci_pipelines:read"],
+      "match": { "method": "GET", "path": "/api/v2/ci/pipelines/events*" }
+    },
+    {
+      "grants": ["ci_pipelines:read"],
+      "match": { "method": "POST", "path": "/api/v2/ci/pipelines/events/search" }
+    },
+    {
+      "grants": ["ci_pipelines:read"],
+      "match": { "method": "POST", "path": "/api/v2/ci/pipelines/analytics/aggregate" }
+    },
+    {
+      "grants": ["ci_pipelines:write"],
+      "match": { "method": "POST", "path": "/api/v2/ci/pipeline" }
+    },
+    {
+      "grants": ["ci_tests:read"],
+      "match": { "method": "GET", "path": "/api/v2/ci/tests/events*" }
+    },
+    {
+      "grants": ["ci_tests:read"],
+      "match": { "method": "POST", "path": "/api/v2/ci/tests/events/search" }
+    },
+    {
+      "grants": ["ci_tests:read"],
+      "match": { "method": "POST", "path": "/api/v2/ci/tests/analytics/aggregate" }
+    },
+    {
+      "grants": ["test_optimization:read"],
+      "match": { "method": "POST", "path": "/api/v2/test/flaky-test-management/tests" }
+    },
+    {
+      "grants": ["test_optimization:read"],
+      "match": { "method": "POST", "path": "/api/v2/ci/test-optimization/settings/service" }
+    },
+    {
+      "grants": ["test_optimization:read"],
+      "match": { "method": "POST", "path": "/api/v2/ci/test-optimization/settings/policies" }
+    },
+    {
+      "grants": ["test_optimization:write"],
+      "match": { "method": "PATCH", "path": "/api/v2/test/flaky-test-management/tests" }
+    },
+    {
+      "grants": ["test_optimization:write"],
+      "match": { "method": "PATCH", "path": "/api/v2/ci/test-optimization/settings/service" }
+    },
+    {
+      "grants": ["test_optimization:write"],
+      "match": { "method": "DELETE", "path": "/api/v2/ci/test-optimization/settings/service" }
+    },
+    {
+      "grants": ["test_optimization:write"],
+      "match": { "method": "PATCH", "path": "/api/v2/ci/test-optimization/settings/policies" }
     }
   ],
   "cli": {
     "bins": ["pup"],
     "dummyEnv": { "DD_API_KEY": "x-engrams-managed", "DD_APP_KEY": "x-engrams-managed" },
-    "doc": "Use `pup` (the official Datadog CLI for agents) to query Datadog from this session — logs, metrics, monitors, dashboards, and more (200+ commands across 33+ products). Authentication is automatic: `DD_API_KEY` and `DD_APP_KEY` are managed placeholders the egress proxy replaces with the real keys on requests to api.datadoghq.com. Do NOT run `pup auth login` or set real keys. This profile grants read access (GET) to the Datadog API; run `pup --help` to explore commands."
+    "doc": "Use `pup` (the official Datadog CLI for agents) to query and manage Datadog from this session — logs, metrics, monitors, dashboards, events, incidents, SLOs, hosts, APM/traces, synthetics, and more (200+ commands across 33+ products). Authentication is automatic: `DD_API_KEY` and `DD_APP_KEY` are managed placeholders the egress proxy replaces with the real keys on requests to api.datadoghq.com. Do NOT run `pup auth login` or set real keys.\n\nEach call needs the matching power on your profile; a path your profile didn't grant is denied at the network boundary, not authenticated. Powers and what they unlock:\n- Observability read: `logs:read` (search/list logs), `metrics:read` (timeseries query + metric metadata), `monitors:read`, `dashboards:read`, `events:read`, `incidents:read`, `slos:read`, `hosts:read`, `synthetics:read`, `downtimes:read`, `apm:read` (spans/traces), `notebooks:read`, `users:read`, `tags:read`.\n- Observability write: `monitors:write` (create/update/delete + mute), `dashboards:write` (create/update/delete), `events:write` (post an event), `incidents:write` (declare/update an incident).\n- CI Visibility & Test Optimization: `ci_pipelines:read` (list/search/aggregate CI pipeline events — /api/v2/ci/pipelines/...), `ci_tests:read` (list/search/aggregate CI test events — /api/v2/ci/tests/...), `test_optimization:read` (search flaky tests via /api/v2/test/flaky-test-management/tests + read test-optimization service settings & flaky-test policies). Writes: `ci_pipelines:write` (send a pipeline event), `test_optimization:write` (update flaky-test states + modify settings/policies). Use these to triage flaky tests, slow suites, and CI pipeline failures from a session.\n\nThis profile is for the US1 site (api.datadoghq.com). Run `pup --help` to explore commands."
   }
 }

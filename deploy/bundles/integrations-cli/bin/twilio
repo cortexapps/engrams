@@ -1,0 +1,176 @@
+#!/bin/sh
+# engrams Twilio CLI — a thin wrapper over the Twilio REST API (2010-04-01).
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `TWILIO_BASIC_AUTH`
+# placeholder; the egress proxy injects the real, capability-scoped
+# `Authorization: Basic <base64(AccountSid:AuthToken)>` header on every request to
+# api.twilio.com (and strips any value you supply). There is NOTHING to log in to —
+# do not set a real token or paste credentials.
+#
+# Each subcommand needs the matching power on your profile (twilio:messages:write,
+# twilio:messages:read, twilio:calls:write, twilio:calls:read,
+# twilio:phone_numbers:read, twilio:recordings:read, twilio:account:read); a call to
+# a path your profile didn't grant is denied at the network boundary, not authenticated.
+set -eu
+
+BASE="https://api.twilio.com/2010-04-01"
+# Placeholder credential — the egress proxy overwrites the Authorization header.
+TOKEN="${TWILIO_BASIC_AUTH:-x-engrams-managed}"
+# The Account SID is a non-secret identifier that appears in resource paths (NOT auth).
+SID="${TWILIO_ACCOUNT_SID:-}"
+
+usage() {
+    cat <<'EOF'
+engrams Twilio CLI — auth is brokered by the platform (no token to set).
+
+Usage:
+  twilio whoami                            List accounts (verifies the credential)
+  twilio sms <to> <from> <body...>         Send an SMS (POST Messages.json)
+  twilio messages [Key=Value ...]          List messages (To=, From=, PageSize=, ...)
+  twilio call <to> <from> <twiml-url>      Place a call (POST Calls.json, Url=...)
+  twilio calls [Key=Value ...]             List calls
+  twilio numbers [Key=Value ...]           List your IncomingPhoneNumbers
+  twilio recordings [Key=Value ...]        List call recordings
+  twilio get <path> [Key=Value ...]        Raw GET to <path> (query from Key=Value)
+  twilio api <METHOD> <path> [Key=Value]   Raw call; form-encodes Key=Value for POST/PUT
+
+The Account SID rides $TWILIO_ACCOUNT_SID (an AC... identifier, NOT auth); set it if a
+command reports a missing account. Append `.json` and read JSON; list responses page via
+PageSize / Page. Twilio replies with JSON ({"sid":...} or {"code":...,"message":...}).
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# Require an account SID for resource paths that embed it.
+need_sid() {
+    if [ -z "$SID" ]; then
+        echo "twilio: set TWILIO_ACCOUNT_SID to your Account SID (AC...) for this command" >&2
+        exit 2
+    fi
+}
+
+# request <METHOD> <full-url> [curl data args...] — send with the brokered auth header.
+request() {
+    method="$1"
+    url="$2"
+    shift 2
+    curl -sS -X "$method" "$url" -H "Authorization: Basic $TOKEN" "$@" | pretty
+}
+
+# get <full-url> [Key=Value ...] — GET, mapping each Key=Value into the query string
+# via `-G --data-urlencode` (POSIX-safe newline re-split, no arrays).
+get() {
+    url="$1"
+    shift
+    flags="-G"
+    for kv in "$@"; do flags="$flags
+--data-urlencode
+$kv"; done
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    request GET "$url" "$@"
+}
+
+# post_form <full-url> [Key=Value ...] — POST/PUT/etc, form-encoding each Key=Value.
+post_form() {
+    method="$1"
+    url="$2"
+    shift 2
+    flags=""
+    for kv in "$@"; do flags="$flags--data-urlencode
+$kv
+"; done
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    request "$method" "$url" "$@"
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    request GET "$BASE/Accounts.json"
+    ;;
+sms)
+    to="${1:?usage: twilio sms <to> <from> <body...>}"
+    from="${2:?usage: twilio sms <to> <from> <body...>}"
+    shift 2
+    body="$*"
+    need_sid
+    request POST "$BASE/Accounts/$SID/Messages.json" \
+        --data-urlencode "To=$to" \
+        --data-urlencode "From=$from" \
+        --data-urlencode "Body=$body"
+    ;;
+messages)
+    need_sid
+    get "$BASE/Accounts/$SID/Messages.json" "$@"
+    ;;
+call)
+    to="${1:?usage: twilio call <to> <from> <twiml-url>}"
+    from="${2:?usage: twilio call <to> <from> <twiml-url>}"
+    url="${3:?usage: twilio call <to> <from> <twiml-url>}"
+    need_sid
+    request POST "$BASE/Accounts/$SID/Calls.json" \
+        --data-urlencode "To=$to" \
+        --data-urlencode "From=$from" \
+        --data-urlencode "Url=$url"
+    ;;
+calls)
+    need_sid
+    get "$BASE/Accounts/$SID/Calls.json" "$@"
+    ;;
+numbers)
+    need_sid
+    get "$BASE/Accounts/$SID/IncomingPhoneNumbers.json" "$@"
+    ;;
+recordings)
+    need_sid
+    get "$BASE/Accounts/$SID/Recordings.json" "$@"
+    ;;
+get)
+    path="${1:?usage: twilio get <path> [Key=Value ...]}"
+    shift
+    case "$path" in
+    /*) url="https://api.twilio.com$path" ;;
+    *) url="$BASE/$path" ;;
+    esac
+    get "$url" "$@"
+    ;;
+api)
+    method="${1:?usage: twilio api <METHOD> <path> [Key=Value ...]}"
+    path="${2:?usage: twilio api <METHOD> <path> [Key=Value ...]}"
+    shift 2
+    case "$path" in
+    /*) url="https://api.twilio.com$path" ;;
+    *) url="$BASE/$path" ;;
+    esac
+    method=$(printf '%s' "$method" | tr '[:lower:]' '[:upper:]')
+    if [ "$method" = "GET" ] || [ "$method" = "HEAD" ]; then
+        get "$url" "$@"
+    else
+        post_form "$method" "$url" "$@"
+    fi
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "twilio: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

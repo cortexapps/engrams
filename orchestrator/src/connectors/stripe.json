@@ -1,0 +1,75 @@
+{
+  "provider": "stripe",
+  "protocol": "http",
+  "display": {
+    "name": "Stripe",
+    "category": "Payments",
+    "blurb": "Read and manage payments data — charges, customers, payment intents, refunds, invoices, and the account balance. Authenticated with a Stripe secret key brokered at the egress proxy; the key never reaches the agent.",
+    "icon": { "mono": "ST", "color": "#635bff" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "stripe.api_key" }
+    ]
+  },
+  "hosts": ["api.stripe.com"],
+  "test": { "path": "/v1/balance" },
+  "operations": [
+    {
+      "grants": ["balance:read"],
+      "match": { "method": "GET", "path": "/v1/balance*" }
+    },
+    {
+      "grants": ["charges:read"],
+      "match": { "method": "GET", "path": "/v1/charges*" }
+    },
+    {
+      "grants": ["charges:write"],
+      "match": { "method": "POST", "path": "/v1/charges*" }
+    },
+    {
+      "grants": ["customers:read"],
+      "match": { "method": "GET", "path": "/v1/customers*" }
+    },
+    {
+      "grants": ["customers:write"],
+      "match": { "method": "POST", "path": "/v1/customers*" }
+    },
+    {
+      "grants": ["customers:write"],
+      "match": { "method": "DELETE", "path": "/v1/customers*" }
+    },
+    {
+      "grants": ["payment_intents:read"],
+      "match": { "method": "GET", "path": "/v1/payment_intents*" }
+    },
+    {
+      "grants": ["payment_intents:write"],
+      "match": { "method": "POST", "path": "/v1/payment_intents*" }
+    },
+    {
+      "grants": ["refunds:read"],
+      "match": { "method": "GET", "path": "/v1/refunds*" }
+    },
+    {
+      "grants": ["refunds:write"],
+      "match": { "method": "POST", "path": "/v1/refunds*" }
+    },
+    {
+      "grants": ["invoices:read"],
+      "match": { "method": "GET", "path": "/v1/invoices*" }
+    },
+    {
+      "grants": ["invoices:write"],
+      "match": { "method": "POST", "path": "/v1/invoices*" }
+    }
+  ],
+  "cli": {
+    "bins": ["stripe"],
+    "binSource": "bundled",
+    "dummyEnv": { "STRIPE_API_KEY": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use the official `stripe` CLI to read and manage Stripe data from this session — charges, customers, payment intents, refunds, invoices, and the account balance. Authentication is automatic: the egress proxy injects the real, capability-scoped Stripe secret key as `Authorization: Bearer <key>` on every request to api.stripe.com; `STRIPE_API_KEY` is a managed placeholder. Do NOT run `stripe login`, set a real key, or use `stripe listen`/webhooks (those need a live login the proxy can't broker).\n\nThe CLI maps directly onto the REST API under /v1. Read with `stripe get`, write with `stripe post`, delete with `stripe delete`:\n  - Balance: `stripe get /v1/balance` (requires `balance:read`). This is also the connection probe.\n  - Charges: `stripe get /v1/charges` / `stripe get /v1/charges/<id>` (requires `charges:read`); `stripe post /v1/charges -d amount=2000 -d currency=usd -d source=tok_visa` (requires `charges:write`).\n  - Customers: `stripe get /v1/customers` / `stripe get /v1/customers/<id>` (requires `customers:read`); `stripe post /v1/customers -d email=a@b.com` and `stripe delete /v1/customers/<id>` (requires `customers:write`).\n  - Payment intents: `stripe get /v1/payment_intents` (requires `payment_intents:read`); `stripe post /v1/payment_intents -d amount=2000 -d currency=usd` (requires `payment_intents:write`).\n  - Refunds: `stripe get /v1/refunds` (requires `refunds:read`); `stripe post /v1/refunds -d charge=<ch_id>` (requires `refunds:write`).\n  - Invoices: `stripe get /v1/invoices` (requires `invoices:read`); `stripe post /v1/invoices -d customer=<cus_id>` (requires `invoices:write`).\n\nList params use repeated `-d`, e.g. `stripe get /v1/charges -d limit=3 -d \"created[gte]=1700000000\"`. A request to a path your profile didn't grant is denied at the network boundary, not authenticated. Run `stripe --help` to explore other resources (those still flow through the brokered key but only granted paths are reachable)."
+  }
+}

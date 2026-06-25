@@ -1,0 +1,188 @@
+#!/bin/sh
+# engrams Jira CLI — a thin wrapper over the Jira Cloud REST API v3.
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `JIRA_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped Atlassian
+# API token (Basic auth) on every request to api.atlassian.com / *.atlassian.net
+# (and strips any token you supply). There is NOTHING to log in to — do not set a
+# real token or run any `login`.
+#
+# Pick your Jira instance (NOT a secret — set exactly one):
+#   JIRA_CLOUD_ID=<cloud-id>   → https://api.atlassian.com/ex/jira/<id>/rest/api/3
+#   JIRA_SITE=<subdomain>      → https://<subdomain>.atlassian.net/rest/api/3
+# JIRA_CLOUD_ID wins if both are set.
+#
+# Each subcommand needs the matching power on your profile (jira:myself:read,
+# jira:issues:read, jira:issues:write, jira:projects:read, jira:users:read); a
+# path your profile didn't grant is denied at the network boundary, not
+# authenticated.
+set -eu
+
+TOKEN="${JIRA_TOKEN:-x-engrams-managed}"
+
+# Resolve the REST v3 base URL from the (non-secret) instance selector.
+base_url() {
+    if [ -n "${JIRA_CLOUD_ID:-}" ]; then
+        printf 'https://api.atlassian.com/ex/jira/%s/rest/api/3' "$JIRA_CLOUD_ID"
+    elif [ -n "${JIRA_SITE:-}" ]; then
+        printf 'https://%s.atlassian.net/rest/api/3' "$JIRA_SITE"
+    else
+        echo "jira: set JIRA_CLOUD_ID=<cloud-id> (gateway) or JIRA_SITE=<subdomain> (site host) first." >&2
+        echo "      e.g. export JIRA_SITE=acme   →   https://acme.atlassian.net/rest/api/3" >&2
+        exit 2
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+engrams Jira CLI — auth is brokered by the platform (no token to set).
+
+Set your instance first (NOT a secret; set exactly one):
+  export JIRA_CLOUD_ID=<cloud-id>   # api.atlassian.com/ex/jira/<id> gateway
+  export JIRA_SITE=<subdomain>      # <subdomain>.atlassian.net site host
+
+Usage:
+  jira whoami                          Current user (GET /myself)
+  jira search <JQL> [field=value ...]  JQL search (GET /search/jql)
+  jira issue <KEY>                     Fetch one issue (GET /issue/<KEY>)
+  jira create <PROJ> <TYPE> <summary>  Create an issue (POST /issue)
+  jira comment <KEY> <text...>         Add a comment (POST /issue/<KEY>/comment)
+  jira transitions <KEY>               List transitions (GET /issue/<KEY>/transitions)
+  jira transition <KEY> <id>           Perform a transition (POST /issue/<KEY>/transitions)
+  jira projects [field=value ...]      List projects (GET /project/search)
+  jira users [field=value ...]         Search users (GET /user/search)
+  jira get <path> [field=value ...]    Raw GET  /rest/api/3/<path>
+  jira post <path> [json]              Raw POST /rest/api/3/<path> with a JSON body
+
+Responses are JSON; errors come back as {"errorMessages":[...],"errors":{...}}.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# get <path> [curl-args...] — GET a REST v3 path with brokered Basic auth.
+get() {
+    p="$1"
+    shift
+    curl -sS -X GET "$(base_url)/$p" \
+        -H "Authorization: Basic $TOKEN" \
+        -H "Accept: application/json" \
+        "$@" | pretty
+}
+
+# post <path> [curl-args...] — POST a REST v3 path with brokered Basic auth.
+post() {
+    p="$1"
+    shift
+    curl -sS -X POST "$(base_url)/$p" \
+        -H "Authorization: Basic $TOKEN" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        "$@" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    get myself
+    ;;
+search)
+    jql="${1:?usage: jira search <JQL> [field=value ...]}"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    get "search/jql" -G --data-urlencode "jql=$jql" "$@"
+    ;;
+issue)
+    key="${1:?usage: jira issue <KEY>}"
+    shift
+    get "issue/$key" "$@"
+    ;;
+create)
+    proj="${1:?usage: jira create <PROJECT_KEY> <ISSUETYPE> <summary...>}"
+    type="${2:?usage: jira create <PROJECT_KEY> <ISSUETYPE> <summary...>}"
+    shift 2
+    summary="$*"
+    body=$(cat <<EOF
+{"fields":{"project":{"key":"$proj"},"issuetype":{"name":"$type"},"summary":"$summary"}}
+EOF
+)
+    post issue --data "$body"
+    ;;
+comment)
+    key="${1:?usage: jira comment <KEY> <text...>}"
+    shift
+    text="$*"
+    body=$(cat <<EOF
+{"body":{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"$text"}]}]}}
+EOF
+)
+    post "issue/$key/comment" --data "$body"
+    ;;
+transitions)
+    key="${1:?usage: jira transitions <KEY>}"
+    shift
+    get "issue/$key/transitions" "$@"
+    ;;
+transition)
+    key="${1:?usage: jira transition <KEY> <transition-id>}"
+    id="${2:?usage: jira transition <KEY> <transition-id>}"
+    post "issue/$key/transitions" --data "{\"transition\":{\"id\":\"$id\"}}"
+    ;;
+projects)
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    get "project/search" -G "$@"
+    ;;
+users)
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    get "user/search" -G "$@"
+    ;;
+get)
+    p="${1:?usage: jira get <path> [field=value ...]}"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    if [ "$#" -gt 0 ]; then get "$p" -G "$@"; else get "$p"; fi
+    ;;
+post)
+    p="${1:?usage: jira post <path> [json]}"
+    shift
+    json="${1:-{}}"
+    post "$p" --data "$json"
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "jira: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

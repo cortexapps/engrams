@@ -1,0 +1,99 @@
+{
+  "provider": "hubspot",
+  "protocol": "http",
+  "display": {
+    "name": "HubSpot",
+    "category": "CRM",
+    "blurb": "Read and write HubSpot CRM records — contacts, companies, deals, and tickets — plus owners and property metadata. Authenticated with a private app access token, brokered at the egress proxy and never seen by the agent.",
+    "icon": { "mono": "HS", "color": "#ff7a59" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "hubspot.api_token" }
+    ]
+  },
+  "hosts": ["api.hubapi.com"],
+  "test": { "path": "/account-info/v3/details" },
+  "operations": [
+    {
+      "grants": ["contacts:read"],
+      "match": { "method": "GET", "path": "/crm/v3/objects/contacts*" }
+    },
+    {
+      "grants": ["contacts:read"],
+      "match": { "method": "POST", "path": "/crm/v3/objects/contacts/search" }
+    },
+    {
+      "grants": ["contacts:write"],
+      "match": { "method": "POST", "path": "/crm/v3/objects/contacts" }
+    },
+    {
+      "grants": ["contacts:write"],
+      "match": { "method": "PATCH", "path": "/crm/v3/objects/contacts/*" }
+    },
+    {
+      "grants": ["companies:read"],
+      "match": { "method": "GET", "path": "/crm/v3/objects/companies*" }
+    },
+    {
+      "grants": ["companies:read"],
+      "match": { "method": "POST", "path": "/crm/v3/objects/companies/search" }
+    },
+    {
+      "grants": ["companies:write"],
+      "match": { "method": "POST", "path": "/crm/v3/objects/companies" }
+    },
+    {
+      "grants": ["companies:write"],
+      "match": { "method": "PATCH", "path": "/crm/v3/objects/companies/*" }
+    },
+    {
+      "grants": ["deals:read"],
+      "match": { "method": "GET", "path": "/crm/v3/objects/deals*" }
+    },
+    {
+      "grants": ["deals:read"],
+      "match": { "method": "POST", "path": "/crm/v3/objects/deals/search" }
+    },
+    {
+      "grants": ["deals:write"],
+      "match": { "method": "POST", "path": "/crm/v3/objects/deals" }
+    },
+    {
+      "grants": ["deals:write"],
+      "match": { "method": "PATCH", "path": "/crm/v3/objects/deals/*" }
+    },
+    {
+      "grants": ["tickets:read"],
+      "match": { "method": "GET", "path": "/crm/v3/objects/tickets*" }
+    },
+    {
+      "grants": ["tickets:read"],
+      "match": { "method": "POST", "path": "/crm/v3/objects/tickets/search" }
+    },
+    {
+      "grants": ["tickets:write"],
+      "match": { "method": "POST", "path": "/crm/v3/objects/tickets" }
+    },
+    {
+      "grants": ["tickets:write"],
+      "match": { "method": "PATCH", "path": "/crm/v3/objects/tickets/*" }
+    },
+    {
+      "grants": ["owners:read"],
+      "match": { "method": "GET", "path": "/crm/v3/owners*" }
+    },
+    {
+      "grants": ["properties:read"],
+      "match": { "method": "GET", "path": "/crm/v3/properties/*" }
+    }
+  ],
+  "cli": {
+    "bins": ["hubspot"],
+    "binSource": "bundled",
+    "dummyEnv": { "HUBSPOT_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `hubspot` to read and write HubSpot CRM records from this session — contacts, companies, deals, tickets — plus owners and property metadata. Authentication is automatic: the egress proxy injects the private app access token on requests to api.hubapi.com; `HUBSPOT_TOKEN` is a managed placeholder. Do NOT set a real token or run any login.\n\nEach subcommand needs the matching power on your profile; a call to a path your profile didn't grant is denied at the network boundary, not authenticated.\n\nList records: `hubspot list <object> [field=value ...]` (e.g. `hubspot list contacts limit=10 properties=email,firstname,lastname`). <object> is contacts|companies|deals|tickets. Requires the `<object>:read` power (e.g. `contacts:read`).\nGet one record: `hubspot get <object> <id> [properties=a,b]` — requires `<object>:read`.\nSearch records: `hubspot search <object> <filterProperty> <operator> <value>` — POSTs a filtered search (operator is EQ|NEQ|GT|LT|CONTAINS_TOKEN|HAS_PROPERTY…). Requires `<object>:read`.\nCreate a record: `hubspot create <object> prop=value [prop=value ...]` (e.g. `hubspot create contacts email=a@b.com firstname=Ada`). Requires `<object>:write`.\nUpdate a record: `hubspot update <object> <id> prop=value [...]` (PATCH). Requires `<object>:write`.\nOwners: `hubspot owners [email=foo@bar.com]` (requires `owners:read`). Property metadata: `hubspot properties <object>` (requires `properties:read`).\nIdentity / connection check: `hubspot whoami` (account-info/v3/details).\nRaw passthrough: `hubspot api <METHOD> <path> [field=value ...]` (e.g. `hubspot api GET /crm/v3/objects/deals limit=5`); GET/HEAD send fields as query params, others as a JSON body. HubSpot replies with JSON; errors are `{\"status\":\"error\",\"message\":...,\"category\":...}`."
+  }
+}

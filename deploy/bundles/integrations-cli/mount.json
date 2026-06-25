@@ -3,7 +3,32 @@
   "skills": [
     {
       "name": "integrations",
-      "bins": ["bin/engrams-integrations", "bin/gh", "bin/pup", "bin/slack"],
+      "bins": [
+        "bin/engrams-integrations",
+        "bin/gh",
+        "bin/pup",
+        "bin/slack",
+        "bin/glab",
+        "bin/stripe",
+        "bin/linear",
+        "bin/jira",
+        "bin/sentry",
+        "bin/pd",
+        "bin/cloudflare",
+        "bin/vercel",
+        "bin/netlify",
+        "bin/circle",
+        "bin/newrelic",
+        "bin/notion",
+        "bin/asana",
+        "bin/twilio",
+        "bin/sendgrid",
+        "bin/hubspot",
+        "bin/airtable",
+        "bin/figma",
+        "bin/discord",
+        "bin/shopify"
+      ],
       "requires_env": "ENGRAM_CLI_INTEGRATIONS"
     }
   ]

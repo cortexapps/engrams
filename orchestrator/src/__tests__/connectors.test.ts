@@ -344,16 +344,23 @@ describe("on-disk registry", () => {
   });
 
   test("the shipped datadog connector compiles BOTH pup injects (api + app key)", () => {
-    const policy = compileIntegrationPolicy(["datadog:observability:read"]);
-    expect(policy.injects).toHaveLength(2);
-    expect(policy.injects.map((i) => i.header_name).sort()).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY"]);
-    expect(policy.injects.map((i) => i.secret_ref).sort()).toEqual(["datadog-api-key", "datadog-app-key"]);
+    const policy = compileIntegrationPolicy(["datadog:metrics:read"]);
+    // metrics:read activates several ops (query, metric metadata, v2 query); each
+    // emits one inject per header (DD-API-KEY + DD-APPLICATION-KEY) gated to that
+    // op's path — so assert on the unique header/secret SET, not the entry count.
+    const headers = [...new Set(policy.injects.map((i) => i.header_name))].sort();
+    expect(headers).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY"]);
+    const refs = [...new Set(policy.injects.map((i) => i.secret_ref))].sort();
+    expect(refs).toEqual(["datadog-api-key", "datadog-app-key"]);
   });
 
   test("the shipped github issues:write compiles a minted inject + an issue observe", () => {
     const policy = compileIntegrationPolicy(["github:issues:write"]);
-    expect(policy.injects).toHaveLength(1);
-    expect(policy.injects[0]!.mint_provider).toBe("github");
+    // issues:write activates several gated ops (create, edit, comment, label, …);
+    // each emits a minted inject for github. The issue observe rides only the
+    // create op's asset, so there is exactly one.
+    expect(policy.injects.length).toBeGreaterThan(0);
+    expect(policy.injects.every((i) => i.mint_provider === "github")).toBe(true);
     expect(policy.observes).toHaveLength(1);
     expect(policy.observes[0]!.provider).toBe("github");
     expect(policy.observes[0]!.asset_kind).toBe("issue");
@@ -427,11 +434,13 @@ describe("parseConnector — admin-trust hardening", () => {
 // ---------------------------------------------------------------------------
 
 describe("loadRegistry", () => {
-  const sentryRaw = {
-    provider: "sentry",
+  // A fictional provider that is NOT one of the shipped on-disk seeds, so these
+  // tests exercise the custom (DB) merge path without colliding with a built-in.
+  const customRaw = {
+    provider: "customco",
     protocol: "http",
-    credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" }] },
-    hosts: ["sentry.io"],
+    credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "customco-token", template: "Bearer {}" }] },
+    hosts: ["api.customco.example"],
     operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
   };
   const source = (rows: Array<{ provider: string; config: unknown }>) => ({ list: async () => rows });
@@ -439,15 +448,15 @@ describe("loadRegistry", () => {
   beforeEach(() => invalidateRegistry());
 
   test("merges custom connectors with the built-in seeds", async () => {
-    const reg = await loadRegistry(source([{ provider: "sentry", config: sentryRaw }]));
+    const reg = await loadRegistry(source([{ provider: "customco", config: customRaw }]));
     expect(reg.has("datadog")).toBe(true); // built-in seed
     expect(reg.has("github")).toBe(true); // built-in seed
-    expect(reg.has("sentry")).toBe(true); // custom
-    expect(grantsCapability("sentry", "issues:read", reg)).toBe(true);
+    expect(reg.has("customco")).toBe(true); // custom
+    expect(grantsCapability("customco", "issues:read", reg)).toBe(true);
   });
 
   test("built-in seeds take precedence — a custom row can't shadow one", async () => {
-    const evilGithub = { ...sentryRaw, provider: "github", hosts: ["evil.example.com"] };
+    const evilGithub = { ...customRaw, provider: "github", hosts: ["evil.example.com"] };
     const reg = await loadRegistry(source([{ provider: "github", config: evilGithub }]));
     // The built-in github (mint) wins; the custom inject row is ignored.
     expect(reg.get("github")!.credential.source).toBe("mint");
@@ -457,16 +466,16 @@ describe("loadRegistry", () => {
     const reg = await loadRegistry(
       source([
         { provider: "bad", config: { provider: "bad", protocol: "ftp" } },
-        { provider: "sentry", config: sentryRaw },
+        { provider: "customco", config: customRaw },
       ]),
     );
     expect(reg.has("bad")).toBe(false);
-    expect(reg.has("sentry")).toBe(true);
+    expect(reg.has("customco")).toBe(true);
   });
 
   test("skips a row whose config.provider mismatches the row key", async () => {
-    const reg = await loadRegistry(source([{ provider: "sentry", config: { ...sentryRaw, provider: "other" } }]));
-    expect(reg.has("sentry")).toBe(false);
+    const reg = await loadRegistry(source([{ provider: "customco", config: { ...customRaw, provider: "other" } }]));
+    expect(reg.has("customco")).toBe(false);
     expect(reg.has("other")).toBe(false);
   });
 
@@ -482,10 +491,10 @@ describe("loadRegistry", () => {
 
   test("invalidateRegistry forces a re-read", async () => {
     const first = await loadRegistry(source([]));
-    expect(first.has("sentry")).toBe(false);
+    expect(first.has("customco")).toBe(false);
     invalidateRegistry();
-    const second = await loadRegistry(source([{ provider: "sentry", config: sentryRaw }]));
-    expect(second.has("sentry")).toBe(true);
+    const second = await loadRegistry(source([{ provider: "customco", config: customRaw }]));
+    expect(second.has("customco")).toBe(true);
   });
 });
 
@@ -726,7 +735,7 @@ describe("cli facet (ADR 0058)", () => {
   });
 
   test("the on-disk github + datadog connectors expose their cli facet", () => {
-    const plan = compileCliIntegrations(["github:pulls:write", "datadog:observability:read"], connectorRegistry());
+    const plan = compileCliIntegrations(["github:pulls:write", "datadog:metrics:read"], connectorRegistry());
     expect(plan.enabled.map((e) => e.provider).sort()).toEqual(["datadog", "github"]);
     expect(plan.dummyEnv.GH_TOKEN).toBe("x-engrams-managed");
     expect(plan.dummyEnv.DD_API_KEY).toBe("x-engrams-managed");

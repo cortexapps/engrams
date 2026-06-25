@@ -1,0 +1,59 @@
+{
+  "provider": "discord",
+  "protocol": "http",
+  "display": {
+    "name": "Discord",
+    "category": "Communication",
+    "blurb": "Read and post Discord messages, inspect channels, guilds, and members — authenticated with a bot token brokered host-side (the agent never sees it).",
+    "icon": { "mono": "DC", "color": "#5865f2" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bot {}", "secretRef": "discord.bot_token" }
+    ]
+  },
+  "hosts": ["discord.com"],
+  "test": { "path": "/api/v10/users/@me" },
+  "operations": [
+    {
+      "grants": ["messages:read"],
+      "match": { "method": "GET", "path": "/api/v10/channels/*/messages*" }
+    },
+    {
+      "grants": ["messages:write"],
+      "match": { "method": "POST", "path": "/api/v10/channels/*/messages*" }
+    },
+    {
+      "grants": ["messages:write"],
+      "match": { "method": "PATCH", "path": "/api/v10/channels/*/messages/*" }
+    },
+    {
+      "grants": ["messages:write"],
+      "match": { "method": "DELETE", "path": "/api/v10/channels/*/messages/*" }
+    },
+    {
+      "grants": ["channels:read"],
+      "match": { "method": "GET", "path": "/api/v10/channels/*" }
+    },
+    {
+      "grants": ["guilds:read"],
+      "match": { "method": "GET", "path": "/api/v10/guilds/*" }
+    },
+    {
+      "grants": ["users:read"],
+      "match": { "method": "GET", "path": "/api/v10/users/*" }
+    },
+    {
+      "grants": ["dms:write"],
+      "match": { "method": "POST", "path": "/api/v10/users/@me/channels" }
+    }
+  ],
+  "cli": {
+    "bins": ["discord"],
+    "binSource": "bundled",
+    "dummyEnv": { "DISCORD_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `discord` to talk to the Discord REST API (v10) from this session — read and post channel messages, inspect channels, guilds, and members. Authentication is automatic: the egress proxy injects the real, capability-scoped bot token (`Authorization: Bot …`) on every request to discord.com; `DISCORD_TOKEN` is a managed placeholder. Do NOT set a real token or run any login. Channel/guild/user IDs are non-secret snowflake args you pass on the command line.\n\nSubcommands and the power each needs:\n- `discord whoami` — show the bot identity (GET /users/@me). Needs `users:read`.\n- `discord messages <channel-id> [limit=50]` — list recent messages (GET /channels/<id>/messages). Needs `messages:read`.\n- `discord post <channel-id> <text…>` — post a message (POST /channels/<id>/messages). Needs `messages:write`.\n- `discord edit <channel-id> <message-id> <text…>` — edit a message (PATCH). Needs `messages:write`.\n- `discord delete <channel-id> <message-id>` — delete a message (DELETE). Needs `messages:write`.\n- `discord channel <channel-id>` — fetch a channel (GET /channels/<id>). Needs `channels:read`.\n- `discord guild <guild-id>` — fetch a guild (GET /guilds/<id>). Needs `guilds:read`.\n- `discord members <guild-id> [limit=100]` — list guild members (GET /guilds/<id>/members). Needs `guilds:read`.\n- `discord dm <user-id> <text…>` — open a DM channel then post (POST /users/@me/channels + POST /channels/<id>/messages). Needs `dms:write` AND `messages:write`.\n- `discord get <path>` / `discord api <METHOD> <path> [json]` — raw passthrough under /api/v10 (e.g. `discord get /users/@me`). The power is whatever the method+path resolves to.\n\nA call to a path your profile didn't grant is denied at the network boundary, not authenticated. Discord returns JSON on success and `{\"message\":\"…\",\"code\":…}` on error."
+  }
+}

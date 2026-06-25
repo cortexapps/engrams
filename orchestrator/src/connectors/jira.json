@@ -1,0 +1,70 @@
+{
+  "provider": "jira",
+  "protocol": "http",
+  "display": {
+    "name": "Jira",
+    "category": "Issue tracking",
+    "blurb": "Search, read, create, and transition Jira issues; browse projects and users — authenticated with an Atlassian API token (Basic auth, brokered at the egress proxy).",
+    "icon": { "mono": "JI", "color": "#0052cc" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Basic {}", "secretRef": "jira.basic_auth" }
+    ]
+  },
+  "hosts": ["api.atlassian.com", "*.atlassian.net"],
+  "test": { "path": "/me" },
+  "operations": [
+    {
+      "grants": ["myself:read"],
+      "match": { "method": "GET", "path": "*/rest/api/3/myself" }
+    },
+    {
+      "grants": ["issues:read"],
+      "match": { "method": "GET", "path": "*/rest/api/3/issue/*" }
+    },
+    {
+      "grants": ["issues:read"],
+      "match": { "method": "GET", "path": "*/rest/api/3/search/jql*" }
+    },
+    {
+      "grants": ["issues:read"],
+      "match": { "method": "POST", "path": "*/rest/api/3/search/jql*" }
+    },
+    {
+      "grants": ["issues:write"],
+      "match": { "method": "POST", "path": "*/rest/api/3/issue" },
+      "asset": {
+        "kind": "issue",
+        "surface": "asset",
+        "success": { "statusClass": "2xx" },
+        "data": { "key": "$.resp.key", "id": "$.resp.id" },
+        "fetchable": { "external": "$.resp.self" }
+      }
+    },
+    {
+      "grants": ["issues:write"],
+      "match": { "method": "PUT", "path": "*/rest/api/3/issue/*" }
+    },
+    {
+      "grants": ["issues:write"],
+      "match": { "method": "POST", "path": "*/rest/api/3/issue/*" }
+    },
+    {
+      "grants": ["projects:read"],
+      "match": { "method": "GET", "path": "*/rest/api/3/project*" }
+    },
+    {
+      "grants": ["users:read"],
+      "match": { "method": "GET", "path": "*/rest/api/3/user*" }
+    }
+  ],
+  "cli": {
+    "bins": ["jira"],
+    "binSource": "bundled",
+    "dummyEnv": { "JIRA_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `jira` to work with Jira Cloud (REST API v3) from this session — search/read issues, create and transition issues, comment, and browse projects/users. Authentication is automatic: the egress proxy injects the real Atlassian API token (Basic auth) on requests to api.atlassian.com and *.atlassian.net; `JIRA_TOKEN` is a managed placeholder. Do NOT set a real token or run any login.\n\nFIRST set your site. The CLI needs to know which Jira instance to hit (this is NOT a secret):\n- Scoped-token gateway (default): `export JIRA_CLOUD_ID=<your-cloud-id>` → requests go to https://api.atlassian.com/ex/jira/<id>/rest/api/3/... . Find your cloud id at https://<site>.atlassian.net/_edgeAuth/jira-cloud-id or via the accessible-resources list.\n- Classic site host: `export JIRA_SITE=<your-site>` (the subdomain of <site>.atlassian.net) → requests go to https://<site>.atlassian.net/rest/api/3/... .\nSet exactly one; JIRA_CLOUD_ID wins if both are set.\n\nSubcommands:\n- `jira whoami` — current user (GET /myself). Needs `myself:read`.\n- `jira search '<JQL>' [field=value ...]` — JQL search (GET /search/jql, e.g. `jira search 'project=ENG AND status=\"In Progress\"'`). Needs `issues:read`.\n- `jira issue <KEY>` — fetch one issue (GET /issue/KEY). Needs `issues:read`.\n- `jira create <PROJECT_KEY> <ISSUETYPE> <summary...>` — create an issue (POST /issue). Needs `issues:write`. Prints the new issue key.\n- `jira comment <KEY> <text...>` — add a comment (POST /issue/KEY/comment). Needs `issues:write`.\n- `jira transitions <KEY>` — list available transitions (GET /issue/KEY/transitions, needs `issues:read`); `jira transition <KEY> <transition-id>` performs one (POST, needs `issues:write`).\n- `jira projects` — list projects (GET /project/search). Needs `projects:read`.\n- `jira users [field=value ...]` — search users (GET /user/search). Needs `users:read`.\n- `jira get <path> [field=value ...]` / `jira post <path> [json]` — raw call against /rest/api/3/<path> (e.g. `jira get issue/ENG-1`). Needs the matching read/write power for that path.\n\nResponses are JSON. Errors come back as {\"errorMessages\":[...],\"errors\":{...}}. A path your profile didn't grant is denied at the network boundary, not authenticated."
+  }
+}

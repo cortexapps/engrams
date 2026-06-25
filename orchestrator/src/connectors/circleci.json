@@ -1,0 +1,67 @@
+{
+  "provider": "circleci",
+  "protocol": "http",
+  "display": {
+    "name": "CircleCI",
+    "category": "CI/CD",
+    "blurb": "Inspect pipelines, workflows, and jobs, trigger and rerun runs, and read insights — authenticated with a personal API token brokered by the egress proxy.",
+    "icon": { "mono": "CI", "color": "#161616" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Circle-Token", "secretRef": "circleci.api_token" }
+    ]
+  },
+  "hosts": ["circleci.com"],
+  "test": { "path": "/api/v2/me" },
+  "operations": [
+    {
+      "grants": ["pipelines:read"],
+      "match": { "method": "GET", "path": "/api/v2/pipeline/*" }
+    },
+    {
+      "grants": ["pipelines:read"],
+      "match": { "method": "GET", "path": "/api/v2/project/*/pipeline*" }
+    },
+    {
+      "grants": ["pipelines:write"],
+      "match": { "method": "POST", "path": "/api/v2/project/*/pipeline" }
+    },
+    {
+      "grants": ["workflows:read"],
+      "match": { "method": "GET", "path": "/api/v2/workflow/*" }
+    },
+    {
+      "grants": ["workflows:write"],
+      "match": { "method": "POST", "path": "/api/v2/workflow/*" }
+    },
+    {
+      "grants": ["jobs:read"],
+      "match": { "method": "GET", "path": "/api/v2/project/*/job/*" }
+    },
+    {
+      "grants": ["jobs:read"],
+      "match": { "method": "GET", "path": "/api/v2/project/*/*/artifacts" }
+    },
+    {
+      "grants": ["jobs:write"],
+      "match": { "method": "POST", "path": "/api/v2/project/*/job/*/cancel" }
+    },
+    {
+      "grants": ["projects:read"],
+      "match": { "method": "GET", "path": "/api/v2/project/*" }
+    },
+    {
+      "grants": ["insights:read"],
+      "match": { "method": "GET", "path": "/api/v2/insights/*" }
+    }
+  ],
+  "cli": {
+    "bins": ["circle"],
+    "binSource": "bundled",
+    "dummyEnv": { "CIRCLECI_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `circle` to drive CircleCI from this session — inspect pipelines, workflows, and jobs, trigger and rerun runs, and read insights. Authentication is automatic: the egress proxy injects a personal API token in the `Circle-Token` header on every request to circleci.com; `CIRCLECI_TOKEN` is a managed placeholder. Do NOT run any login or set a real token.\n\nProjects are addressed by a project slug `<vcs>/<org>/<repo>`, where `<vcs>` is `gh` (GitHub) or `bb` (Bitbucket) — e.g. `gh/acme/widgets`.\n\nIdentity check: `circle whoami` (GET /me).\nProject: `circle project <slug>` — project details (requires `projects:read`).\nPipelines: `circle pipelines <slug>` lists a project's pipelines; `circle pipeline <pipeline-id>` shows one; `circle pipeline-workflows <pipeline-id>` lists its workflows (requires `pipelines:read`). `circle trigger <slug> [branch=main] [field=value …]` triggers a new pipeline (requires `pipelines:write`).\nWorkflows: `circle workflow <workflow-id>` shows one; `circle workflow-jobs <workflow-id>` lists its jobs (requires `workflows:read`). `circle cancel-workflow <workflow-id>` and `circle rerun-workflow <workflow-id> [field=value …]` (requires `workflows:write`).\nJobs: `circle job <slug> <job-number>` job details; `circle artifacts <slug> <job-number>` lists artifacts (requires `jobs:read`). `circle cancel-job <slug> <job-number>` (requires `jobs:write`).\nInsights: `circle insights <slug>` workflow metrics (requires `insights:read`).\nPassthrough: `circle get <path>` / `circle api <METHOD> <path> [field=value …]` for any v2 endpoint (path is relative to /api/v2, e.g. `circle get me`). Calls to a path your profile didn't grant are denied at the network boundary."
+  }
+}

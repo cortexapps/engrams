@@ -1,0 +1,71 @@
+{
+  "provider": "sendgrid",
+  "protocol": "http",
+  "display": {
+    "name": "SendGrid",
+    "category": "Email",
+    "blurb": "Send transactional email and manage marketing contacts, lists, templates, suppressions, and stats via the SendGrid v3 API. The API key is brokered — injected at the egress proxy, never seen by the agent.",
+    "icon": { "mono": "SG", "color": "#3368fa" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "sendgrid.api_key" }
+    ]
+  },
+  "hosts": ["api.sendgrid.com"],
+  "test": { "path": "/v3/scopes" },
+  "operations": [
+    {
+      "grants": ["mail:send"],
+      "match": { "method": "POST", "path": "/v3/mail/send" }
+    },
+    {
+      "grants": ["templates:read"],
+      "match": { "method": "GET", "path": "/v3/templates*" }
+    },
+    {
+      "grants": ["contacts:read"],
+      "match": { "method": "GET", "path": "/v3/marketing/contacts*" }
+    },
+    {
+      "grants": ["contacts:write"],
+      "match": { "method": "PUT", "path": "/v3/marketing/contacts" }
+    },
+    {
+      "grants": ["contacts:read"],
+      "match": { "method": "POST", "path": "/v3/marketing/contacts/search*" }
+    },
+    {
+      "grants": ["lists:read"],
+      "match": { "method": "GET", "path": "/v3/marketing/lists*" }
+    },
+    {
+      "grants": ["suppressions:read"],
+      "match": { "method": "GET", "path": "/v3/suppression/*" }
+    },
+    {
+      "grants": ["suppressions:write"],
+      "match": { "method": "DELETE", "path": "/v3/suppression/*" }
+    },
+    {
+      "grants": ["stats:read"],
+      "match": { "method": "GET", "path": "/v3/stats*" }
+    },
+    {
+      "grants": ["stats:read"],
+      "match": { "method": "GET", "path": "/v3/categories/stats*" }
+    },
+    {
+      "grants": ["mail:send", "templates:read", "contacts:read", "contacts:write", "lists:read", "suppressions:read", "suppressions:write", "stats:read"],
+      "match": { "method": "GET", "path": "/v3/scopes" }
+    }
+  ],
+  "cli": {
+    "bins": ["sendgrid"],
+    "binSource": "bundled",
+    "dummyEnv": { "SENDGRID_API_KEY": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `sendgrid` to drive the SendGrid v3 API from this session — send transactional email and manage marketing contacts, lists, templates, suppressions, and stats. Authentication is automatic: the egress proxy injects the org's SendGrid API key (Authorization: Bearer …) on every request to api.sendgrid.com; `SENDGRID_API_KEY` is a managed placeholder. Do NOT set a real key or run any login. Each subcommand needs the matching power on your profile; a call to a path your profile didn't grant is denied at the network boundary, not authenticated.\n\nSubcommands and the power each needs:\n  sendgrid send <to> <from> <subject> <text...>   Send a plain-text email (needs `mail:send`; POST /v3/mail/send).\n  sendgrid templates [field=value ...]            List dynamic templates (needs `templates:read`; GET /v3/templates). Tip: `sendgrid templates generations=dynamic`.\n  sendgrid contacts [field=value ...]             List marketing contacts (needs `contacts:read`; GET /v3/marketing/contacts).\n  sendgrid contact-search <sql>                   Search contacts by SGQL (needs `contacts:read`; POST /v3/marketing/contacts/search).\n  sendgrid upsert-contact <json>                  Add/update contacts from a JSON body (needs `contacts:write`; PUT /v3/marketing/contacts).\n  sendgrid lists [field=value ...]                List marketing lists (needs `lists:read`; GET /v3/marketing/lists).\n  sendgrid bounces [field=value ...]              List bounce suppressions (needs `suppressions:read`; GET /v3/suppression/bounces).\n  sendgrid stats [field=value ...]                Global email stats (needs `stats:read`; GET /v3/stats — requires start_date, e.g. `sendgrid stats start_date=2026-06-01`).\n  sendgrid scopes                                 Show the API key's granted scopes (any read power; GET /v3/scopes).\n  sendgrid get <path> [field=value ...]           Raw GET of any /v3 path with query params.\n  sendgrid api <METHOD> <path> [json-body]        Raw call (GET/POST/PUT/PATCH/DELETE) with an optional JSON body.\n\nPaths may be given with or without the leading /v3. Responses are JSON (pretty-printed when jq is present)."
+  }
+}

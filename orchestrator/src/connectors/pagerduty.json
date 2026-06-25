@@ -1,0 +1,71 @@
+{
+  "provider": "pagerduty",
+  "protocol": "http",
+  "display": {
+    "name": "PagerDuty",
+    "category": "Incident management",
+    "blurb": "Triage incidents, inspect services and escalation policies, and see who's on call — driven by the `pd` CLI over the PagerDuty REST API v2. The API token is brokered: injected at the egress proxy, never seen by the agent.",
+    "icon": { "mono": "PD", "color": "#06ac38" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Token token={}", "secretRef": "pagerduty.api_token" }
+    ]
+  },
+  "hosts": ["api.pagerduty.com"],
+  "test": { "path": "/abilities" },
+  "operations": [
+    {
+      "grants": ["incidents:read"],
+      "match": { "method": "GET", "path": "/incidents*" }
+    },
+    {
+      "grants": ["incidents:write"],
+      "match": { "method": "POST", "path": "/incidents" }
+    },
+    {
+      "grants": ["incidents:write"],
+      "match": { "method": "PUT", "path": "/incidents*" }
+    },
+    {
+      "grants": ["services:read"],
+      "match": { "method": "GET", "path": "/services*" }
+    },
+    {
+      "grants": ["schedules:read"],
+      "match": { "method": "GET", "path": "/schedules*" }
+    },
+    {
+      "grants": ["oncalls:read"],
+      "match": { "method": "GET", "path": "/oncalls*" }
+    },
+    {
+      "grants": ["escalation_policies:read"],
+      "match": { "method": "GET", "path": "/escalation_policies*" }
+    },
+    {
+      "grants": ["users:read"],
+      "match": { "method": "GET", "path": "/users*" }
+    },
+    {
+      "grants": [
+        "incidents:read",
+        "incidents:write",
+        "services:read",
+        "schedules:read",
+        "oncalls:read",
+        "escalation_policies:read",
+        "users:read"
+      ],
+      "match": { "method": "GET", "path": "/abilities" }
+    }
+  ],
+  "cli": {
+    "bins": ["pd"],
+    "binSource": "bundled",
+    "dummyEnv": { "PAGERDUTY_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `pd` to drive PagerDuty from this session — triage incidents, inspect services / schedules / escalation policies, and see who's on call (REST API v2). Authentication is automatic: the egress proxy injects the brokered API token on every request to api.pagerduty.com; `PAGERDUTY_TOKEN` is a managed placeholder. Do NOT set a real token or run any login. The CLI sends the required `Accept: application/vnd.pagerduty+json;version=2` header for you. Calls to a path your profile didn't grant are denied at the network boundary, not authenticated.\n\nSubcommands (each needs the matching power on your profile):\n  pd incidents [field=value ...]   List incidents — `pd incidents statuses[]=triggered statuses[]=acknowledged` (incidents:read).\n  pd incident <id>                 Get one incident by ID (incidents:read).\n  pd ack <id>                      Acknowledge an incident — PUT /incidents (incidents:write).\n  pd resolve <id>                  Resolve an incident — PUT /incidents (incidents:write).\n  pd services [field=value ...]    List services (services:read).\n  pd schedules [field=value ...]   List on-call schedules (schedules:read).\n  pd oncalls [field=value ...]     Who is on call now — `pd oncalls` or filter `pd oncalls schedule_ids[]=PXXXXXX` (oncalls:read).\n  pd policies [field=value ...]    List escalation policies (escalation_policies:read).\n  pd users [field=value ...]       List users (users:read).\n  pd whoami                        Probe auth via GET /abilities.\n  pd get <path> [field=value ...]  Raw GET: `pd get /incidents since=2026-06-01T00:00:00Z` (uses the power matching the path).\n  pd api <METHOD> <path> [json]    Raw call: `pd api POST /incidents '{\"incident\":{...}}'` (needs the :write power for that resource).\n\nNotes: list endpoints paginate with `limit` and `offset`. Writes to /incidents (`pd ack`/`pd resolve`, and creating incidents via `pd api POST /incidents`) require PagerDuty's `From` header naming a requester email — set `PD_FROM=you@your-org.com` in the environment and the CLI adds it; without it the write returns a 400. The API replies with JSON; non-2xx bodies carry an `error` object."
+  }
+}

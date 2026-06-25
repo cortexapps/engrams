@@ -14,7 +14,7 @@
 # symlinks onto PATH. Auth is brokered: each CLI carries a harmless placeholder
 # and the egress proxy injects the real credential host-side (ADR 0056/0057).
 name = "integrations-cli"
-description = "Integration CLIs (gh, pup) + a discovery skill; binaries run on the base image's glibc."
+description = "Integration CLIs (gh, glab, stripe, pup, + per-provider wrappers) + a discovery skill; binaries run on the base image's glibc."
 
 [versions]
 # GitHub CLI — a static Go binary (no glibc deps).
@@ -23,3 +23,7 @@ gh = "2.62.0"
 # glibc Rust binary. Runs directly on the base image's libc (no bundled libs).
 # Targets a full glibc base — the same constraint as the binary itself.
 pup = "1.4.0"
+# GitLab CLI (glab) — a static Go binary from gitlab.com/gitlab-org/cli releases.
+glab = "1.105.0"
+# Stripe CLI — a static Go binary from github.com/stripe/stripe-cli releases.
+stripe = "1.43.2"

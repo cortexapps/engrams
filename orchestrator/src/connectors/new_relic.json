@@ -1,0 +1,67 @@
+{
+  "provider": "new_relic",
+  "protocol": "http",
+  "display": {
+    "name": "New Relic",
+    "category": "Observability",
+    "blurb": "Query New Relic during a run — run NRQL and explore entities, dashboards, and alerts via NerdGraph (GraphQL), plus the REST v2 API for applications and alert policies. The user API key is brokered: injected at the egress proxy, never seen by the agent.",
+    "icon": { "mono": "NR", "color": "#1ce783" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Api-Key", "secretRef": "new_relic.api_key" }
+    ]
+  },
+  "hosts": ["api.newrelic.com"],
+  "test": { "path": "/v2/users.json" },
+  "operations": [
+    {
+      "grants": ["nerdgraph:query"],
+      "match": { "method": "POST", "path": "/graphql" }
+    },
+    {
+      "grants": ["applications:read"],
+      "match": { "method": "GET", "path": "/v2/applications*" }
+    },
+    {
+      "grants": ["applications:read"],
+      "match": { "method": "GET", "path": "/v2/mobile_applications*" }
+    },
+    {
+      "grants": ["applications:read"],
+      "match": { "method": "GET", "path": "/v2/browser_applications*" }
+    },
+    {
+      "grants": ["transactions:read"],
+      "match": { "method": "GET", "path": "/v2/key_transactions*" }
+    },
+    {
+      "grants": ["alerts:read"],
+      "match": { "method": "GET", "path": "/v2/alerts_*" }
+    },
+    {
+      "grants": ["alerts:write"],
+      "match": { "method": "POST", "path": "/v2/alerts_*" }
+    },
+    {
+      "grants": ["alerts:write"],
+      "match": { "method": "PUT", "path": "/v2/alerts_*" }
+    },
+    {
+      "grants": ["alerts:write"],
+      "match": { "method": "DELETE", "path": "/v2/alerts_*" }
+    },
+    {
+      "grants": ["users:read"],
+      "match": { "method": "GET", "path": "/v2/users*" }
+    }
+  ],
+  "cli": {
+    "bins": ["newrelic"],
+    "binSource": "bundled",
+    "dummyEnv": { "NEW_RELIC_API_KEY": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `newrelic` to query New Relic from this session. Authentication is automatic: the egress proxy injects your user API key in the `Api-Key` header on every request to api.newrelic.com; `NEW_RELIC_API_KEY` is a managed placeholder. Do NOT set a real key or run any login.\n\nNerdGraph (GraphQL) is the primary API and a single POST endpoint (https://api.newrelic.com/graphql), so it cannot be split into read/write — one coarse power, `nerdgraph:query`, grants it. Run NRQL or any GraphQL query/mutation through it:\n  newrelic graphql '{ actor { user { name email } } }'            Run an arbitrary GraphQL query (requires `nerdgraph:query`)\n  newrelic nrql <accountId> \"SELECT count(*) FROM Transaction SINCE 1 hour ago\"   Run NRQL via NerdGraph (requires `nerdgraph:query`)\n  newrelic whoami                                                  Show the authenticated user (actor.user; requires `nerdgraph:query`)\n\nREST v2 helpers (each GET path is its own power):\n  newrelic apps [filter[name]=foo]      List APM applications — GET /v2/applications.json (requires `applications:read`)\n  newrelic transactions                 List key transactions — GET /v2/key_transactions.json (requires `transactions:read`)\n  newrelic policies                     List alert policies — GET /v2/alerts_policies.json (requires `alerts:read`)\n  newrelic users                        List account users — GET /v2/users.json (requires `users:read`)\n  newrelic rest <path> [field=value ...]   Raw REST v2 GET, e.g. `newrelic rest alerts_conditions.json policy_id=123` (path is relative to /v2/; power depends on the resource).\n\nWriting alerts (POST/PUT/DELETE under /v2/alerts_*) requires the `alerts:write` power — use `newrelic rest` with `-X` is not exposed; prefer NerdGraph mutations for changes. A call to a path your profile didn't grant is denied at the network boundary, not authenticated."
+  }
+}

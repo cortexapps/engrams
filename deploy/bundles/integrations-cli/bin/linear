@@ -1,0 +1,143 @@
+#!/bin/sh
+# engrams Linear CLI — a thin wrapper over the Linear GraphQL API.
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `LINEAR_API_KEY`
+# placeholder; the egress proxy injects the real, capability-scoped personal API
+# key on every request to api.linear.app (and strips any value you supply). There
+# is NOTHING to log in to — do not set a real key or run any `login`.
+#
+# Linear is a GraphQL-only API: ONE endpoint (POST /graphql). It has a SINGLE
+# power, `linear:graphql`, which grants both reads (queries) AND writes
+# (mutations) — read/write cannot be split by path on a GraphQL API. A request is
+# denied at the network boundary, not authenticated, if your profile lacks it.
+#
+# The personal API key is sent as a RAW Authorization header (no "Bearer" prefix);
+# OAuth would use Bearer, but engrams brokers a personal key.
+set -eu
+
+API="https://api.linear.app/graphql"
+TOKEN="${LINEAR_API_KEY:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams Linear CLI — auth is brokered by the platform (no key to set).
+
+Usage:
+  linear whoami                          Current user (viewer query)
+  linear teams                           List your teams (id, key, name)
+  linear issues [query...]               Search issues by free text (first 25)
+  linear issue <id>                      Fetch one issue by id or identifier (ENG-123)
+  linear projects                        List projects (id, name, state)
+  linear comment <issueId> <text...>     Add a comment to an issue (mutation)
+  linear create <teamId> <title> [desc]  Create an issue (mutation)
+  linear query <graphql> [varsJSON]      Run an arbitrary query/mutation
+  linear raw <json-body>                 POST a raw GraphQL JSON body verbatim
+
+Linear is GraphQL-only: one endpoint, POST https://api.linear.app/graphql. All
+subcommands need the `linear:graphql` power. Responses are JSON {"data":{...}} or
+{"errors":[...]}; GraphQL can return HTTP 200 with an "errors" array.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# json_str <value> — emit a JSON-escaped string literal (quotes included).
+# Uses jq if available; otherwise a minimal POSIX fallback (escapes \ and ").
+json_str() {
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$1" | jq -Rs .
+    else
+        esc=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        printf '"%s"' "$esc"
+    fi
+}
+
+# gql <query> [variablesJSON] — POST a GraphQL document with brokered auth.
+gql() {
+    q="$1"
+    vars="${2:-}"
+    qstr=$(json_str "$q")
+    if [ -n "$vars" ]; then
+        body=$(printf '{"query":%s,"variables":%s}' "$qstr" "$vars")
+    else
+        body=$(printf '{"query":%s}' "$qstr")
+    fi
+    raw "$body"
+}
+
+# raw <json-body> — POST a raw GraphQL JSON request body verbatim.
+raw() {
+    curl -sS -X POST "$API" \
+        -H "Authorization: $TOKEN" \
+        -H "Content-Type: application/json" \
+        --data-binary "$1" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    gql 'query { viewer { id name email } }'
+    ;;
+teams)
+    gql 'query { teams(first: 100) { nodes { id key name } } }'
+    ;;
+issues)
+    term="$*"
+    if [ -n "$term" ]; then
+        vars=$(printf '{"q":%s}' "$(json_str "$term")")
+        gql 'query Search($q: String!) { issueSearch(query: $q, first: 25) { nodes { id identifier title state { name } } } }' "$vars"
+    else
+        gql 'query { issues(first: 25) { nodes { id identifier title state { name } } } }'
+    fi
+    ;;
+issue)
+    id="${1:?usage: linear issue <id>}"
+    vars=$(printf '{"id":%s}' "$(json_str "$id")")
+    gql 'query Issue($id: String!) { issue(id: $id) { id identifier title description state { name } assignee { name } } }' "$vars"
+    ;;
+projects)
+    gql 'query { projects(first: 100) { nodes { id name state } } }'
+    ;;
+comment)
+    issue="${1:?usage: linear comment <issueId> <text...>}"
+    shift
+    text="$*"
+    [ -n "$text" ] || { echo "usage: linear comment <issueId> <text...>" >&2; exit 2; }
+    vars=$(printf '{"issueId":%s,"body":%s}' "$(json_str "$issue")" "$(json_str "$text")")
+    gql 'mutation Comment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }' "$vars"
+    ;;
+create)
+    team="${1:?usage: linear create <teamId> <title> [description]}"
+    title="${2:?usage: linear create <teamId> <title> [description]}"
+    desc="${3:-}"
+    if [ -n "$desc" ]; then
+        vars=$(printf '{"teamId":%s,"title":%s,"description":%s}' \
+            "$(json_str "$team")" "$(json_str "$title")" "$(json_str "$desc")")
+    else
+        vars=$(printf '{"teamId":%s,"title":%s}' "$(json_str "$team")" "$(json_str "$title")")
+    fi
+    gql 'mutation Create($teamId: String!, $title: String!, $description: String) { issueCreate(input: { teamId: $teamId, title: $title, description: $description }) { success issue { id identifier url } } }' "$vars"
+    ;;
+query)
+    q="${1:?usage: linear query <graphql> [varsJSON]}"
+    shift
+    gql "$q" "${1:-}"
+    ;;
+raw)
+    body="${1:?usage: linear raw <json-body>}"
+    raw "$body"
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "linear: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

@@ -18,7 +18,11 @@
 # Layout produced (ADR 0055: mounted at a dynamic reserved slot
 # `/opt/engram/dyn/<i>`; agentd symlinks each bin/ entry onto PATH):
 #   bin/gh                    fetched static Go binary
+#   bin/glab                  fetched static Go binary (GitLab CLI)
+#   bin/stripe                fetched static Go binary (Stripe CLI)
 #   bin/pup                   fetched glibc Rust binary (Datadog CLI for agents)
+#   bin/<provider>            committed POSIX-sh + curl connector wrappers (linear,
+#                             jira, sentry, pd, … — brokered auth, copied in)
 #   bin/engrams-integrations  the discovery helper (committed; copied in)
 #   skills/integrations/      the SKILL.md (committed; copied in)
 #
@@ -34,6 +38,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Pinned versions — keep in lockstep with manifest.toml.
 GH_VERSION="${GH_VERSION:-2.62.0}"
 PUP_VERSION="${PUP_VERSION:-1.4.0}"
+GLAB_VERSION="${GLAB_VERSION:-1.105.0}"
+STRIPE_VERSION="${STRIPE_VERSION:-1.43.2}"
 
 build_tree() {
     local dest="$1"
@@ -48,6 +54,8 @@ build_tree() {
     docker run --rm \
         -e GH_VERSION="$GH_VERSION" \
         -e PUP_VERSION="$PUP_VERSION" \
+        -e GLAB_VERSION="$GLAB_VERSION" \
+        -e STRIPE_VERSION="$STRIPE_VERSION" \
         -e HOST_UID="$(id -u)" \
         -e HOST_GID="$(id -g)" \
         -v "$dest:/out" \
@@ -59,8 +67,8 @@ build_tree() {
 
         ARCH="$(dpkg --print-architecture)"   # amd64 | arm64
         case "$ARCH" in
-            amd64) GH_ARCH=amd64; PUP_ARCH=x86_64 ;;
-            arm64) GH_ARCH=arm64; PUP_ARCH=arm64 ;;
+            amd64) GH_ARCH=amd64; PUP_ARCH=x86_64; GLAB_ARCH=amd64; STRIPE_ARCH=x86_64 ;;
+            arm64) GH_ARCH=arm64; PUP_ARCH=arm64;  GLAB_ARCH=arm64; STRIPE_ARCH=arm64 ;;
             *) echo "unsupported arch $ARCH" >&2; exit 1 ;;
         esac
 
@@ -89,6 +97,22 @@ build_tree() {
         cp "$(find /tmp/pup -type f -name pup | head -1)" /out/bin/pup
         chmod 0755 /out/bin/pup
 
+        # 3) GitLab CLI (glab) — a static Go binary published on GitLab releases
+        #    (mirrored on GitHub). The tarball nests it under bin/glab.
+        mkdir -p /tmp/glab
+        curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${GLAB_ARCH}.tar.gz" \
+            | tar -xz -C /tmp/glab
+        cp "$(find /tmp/glab -type f -name glab | head -1)" /out/bin/glab
+        chmod 0755 /out/bin/glab
+
+        # 4) Stripe CLI — a static Go binary on GitHub releases; the tarball
+        #    contains a single `stripe` executable at its root (ARCH = x86_64 | arm64).
+        mkdir -p /tmp/stripe
+        curl -fsSL "https://github.com/stripe/stripe-cli/releases/download/v${STRIPE_VERSION}/stripe_${STRIPE_VERSION}_linux_${STRIPE_ARCH}.tar.gz" \
+            | tar -xz -C /tmp/stripe
+        cp "$(find /tmp/stripe -type f -name stripe | head -1)" /out/bin/stripe
+        chmod 0755 /out/bin/stripe
+
         chown -R "$HOST_UID:$HOST_GID" /out
     '
 
@@ -102,6 +126,14 @@ build_tree() {
     # the bot token host-side.
     cp "$here/bin/slack" "$dest/bin/slack"
     chmod 0755 "$dest/bin/slack"
+    # The per-provider connector CLIs are committed POSIX-sh + curl wrappers (no
+    # fetched binary): auth is brokered, so each just calls the provider's REST
+    # API and the egress proxy injects the real credential host-side (ADR 0056/0057).
+    for bin in linear jira sentry pd cloudflare vercel netlify circle newrelic \
+               notion asana twilio sendgrid hubspot airtable figma discord shopify; do
+        cp "$here/bin/$bin" "$dest/bin/$bin"
+        chmod 0755 "$dest/bin/$bin"
+    done
     mkdir -p "$dest/skills"
     cp -R "$here/skills/." "$dest/skills/"
 }
