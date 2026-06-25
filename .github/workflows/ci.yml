@@ -487,13 +487,28 @@ jobs:
         run: pnpm test
 
   # ADR 0051 Task 14: the orchestration tier (Bun/Hono). install + tsc
-  # --noEmit + bun test (the .live smoke test self-skips without a live
-  # coordinator). Inert until the tier is wired to traffic.
+  # --noEmit + bun test. A Postgres service backs (a) the live DB-gated tests
+  # (db.test.ts etc., which self-skip without a reachable ORCHESTRATOR_DATABASE_URL)
+  # and (b) the ADR 0059 DBOS engine — DBOS keeps its system tables in a `dbos`
+  # schema of this same database. The .live smoke test still self-skips without a
+  # live coordinator.
   orchestrator:
     name: orchestrator (bun)
     needs: detect
     if: needs.detect.outputs.test_orchestrator == 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: engram
+          POSTGRES_DB: engram_orchestrator_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: orchestrator
@@ -502,6 +517,10 @@ jobs:
       # assignments, but the module-level `config` singleton reads this at
       # import time. A dummy value is fine for CI unit tests.
       CONTROL_PLANE_BEARER: ci-test-token
+      # Reachable Postgres → the DB-gated tests + the DBOS smoke test run here
+      # (instead of self-skipping). `bun run migrate` below applies the Drizzle
+      # schema before the suite; DBOS creates its own `dbos` schema on launch.
+      ORCHESTRATOR_DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_orchestrator_test
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
@@ -511,6 +530,8 @@ jobs:
         run: bun install --frozen-lockfile
       - name: bun typecheck
         run: bun run typecheck
+      - name: apply orchestrator migrations
+        run: bun run migrate
       - name: bun test
         run: bun test
 
