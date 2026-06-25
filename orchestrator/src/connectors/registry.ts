@@ -206,6 +206,26 @@ export interface OauthFacet {
   tokenResponsePath: string;
 }
 
+/**
+ * ADR 0058 P3: the MCP facet — exposes a connector's provider to the in-guest
+ * `claude` CLI as a **remote MCP server**. Present on built-in *and* custom
+ * connectors (validated by {@link parseConnector}).
+ *
+ * Only `transport: "http"` is wired; stdio (P4) is out of scope for HTTP-API
+ * integrations (rejected at parse). Auth + egress reuse the inject rail with no
+ * new substrate: the harness writes `{ mcpServers: { <provider>: { type:"http",
+ * url } } }` with **no token**, and the proxy injects `Authorization` host-side on
+ * the connector's `hosts`. Declare an operation with no `match` so the bearer
+ * injects on *every* MCP request (POST/GET/DELETE, any path — empty method/path
+ * globs mean "any" in `RequestPolicy`).
+ */
+export interface McpFacet {
+  /** Only `"http"` is wired; `"stdio"` is rejected at parse (ADR 0058 P4). */
+  transport: "http";
+  /** The remote MCP endpoint. https; its host must be one of the connector's `hosts`. */
+  url: string;
+}
+
 export interface Connector {
   provider: string;
   /** Only `"http"` is implemented; other values are rejected at load. */
@@ -217,6 +237,8 @@ export interface Connector {
   display: ConnectorDisplay;
   /** ADR 0058: optional CLI facet — the provider is drivable through a CLI. */
   cli?: CliFacet;
+  /** ADR 0058 P3: optional MCP facet — the provider is exposed as a remote MCP server. */
+  mcp?: McpFacet;
   /** ADR 0058: optional probe path for "Test connection" (default `/`). */
   test?: ConnectorTest;
   /** Optional OAuth authorization-code acquisition (e.g. Slack "Add to Slack"). */
@@ -643,6 +665,40 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
   };
 }
 
+/** Validate the MCP facet (admin-trust boundary). Like {@link parseOauth}, `hosts`
+ * gates the endpoint host — the same egress-trust boundary — so a custom connector
+ * can't point the in-guest MCP client at a host the proxy wouldn't authenticate or
+ * route. Only `transport: "http"` is wired (ADR 0058 P3); `stdio` is rejected. */
+function parseMcp(where: string, raw: unknown, hosts: string[]): McpFacet {
+  if (typeof raw !== "object" || raw === null) fail(where, '"mcp" must be an object');
+  const o = raw as Record<string, unknown>;
+
+  if (o.transport !== "http") {
+    if (o.transport === "stdio") {
+      fail(
+        where,
+        '"mcp.transport" "stdio" is not yet wired (ADR 0058 P4 — stdio MCP is out of scope for HTTP-API integrations; expose a remote "http" server)',
+      );
+    }
+    fail(where, `"mcp.transport" must be "http" (got ${JSON.stringify(o.transport)})`);
+  }
+
+  if (typeof o.url !== "string" || !o.url) fail(where, '"mcp.url" must be a non-empty string');
+  if (/[\s\r\n]/.test(o.url as string)) fail(where, '"mcp.url" must not contain whitespace');
+  let url: URL;
+  try {
+    url = new URL(o.url as string);
+  } catch {
+    return fail(where, '"mcp.url" must be a valid URL');
+  }
+  if (url.protocol !== "https:") fail(where, '"mcp.url" must be an https URL');
+  if (!hosts.includes(url.host)) {
+    fail(where, `"mcp.url" host "${url.host}" must be one of the connector's hosts (${hosts.join(", ")})`);
+  }
+
+  return { transport: "http", url: o.url as string };
+}
+
 /** Validate + narrow one raw connector object. Throws Error on any malformation. */
 export function parseConnector(raw: unknown, where: string): Connector {
   if (typeof raw !== "object" || raw === null) fail(where, "must be a JSON object");
@@ -725,6 +781,7 @@ export function parseConnector(raw: unknown, where: string): Connector {
 
   const display = parseDisplay(where, o.display, o.provider);
   const cli = o.cli !== undefined ? parseCli(where, o.cli) : undefined;
+  const mcp = o.mcp !== undefined ? parseMcp(where, o.mcp, hosts) : undefined;
 
   let test: ConnectorTest | undefined;
   if (o.test !== undefined) {
@@ -746,6 +803,7 @@ export function parseConnector(raw: unknown, where: string): Connector {
     operations,
     display,
     ...(cli ? { cli } : {}),
+    ...(mcp ? { mcp } : {}),
     ...(test ? { test } : {}),
     ...(oauth ? { oauth } : {}),
   };
@@ -867,6 +925,28 @@ export function grantsCapability(
   const c = registry.get(provider);
   if (!c) return false;
   return c.operations.some((op) => op.grants.includes(action));
+}
+
+/** The set of providers a profile's capabilities actually grant ≥1 operation of —
+ * the shared *enablement* gate for the optional facets ({@link compileCliIntegrations}
+ * and {@link compileMcpIntegrations}). A facet (CLI / MCP) is enabled iff its
+ * connector is in this set. (`compileIntegrationPolicy` gates per-operation rather
+ * than per-provider, so it does its own walk.) */
+function grantedProviderSet(
+  capabilities: string[],
+  registry: Map<string, Connector>,
+): Set<string> {
+  const granted = new Set<string>();
+  for (const capStr of capabilities) {
+    const cap = parseCapability(capStr);
+    if (!cap) continue;
+    const connector = registry.get(cap.provider);
+    if (!connector) continue;
+    if (connector.operations.some((op) => op.grants.includes(cap.action))) {
+      granted.add(cap.provider);
+    }
+  }
+  return granted;
 }
 
 /**
@@ -1048,16 +1128,7 @@ export function compileCliIntegrations(
   capabilities: string[],
   registry: Map<string, Connector> = connectorRegistry(),
 ): CliIntegrationPlan {
-  const grantedProviders = new Set<string>();
-  for (const capStr of capabilities) {
-    const cap = parseCapability(capStr);
-    if (!cap) continue;
-    const connector = registry.get(cap.provider);
-    if (!connector) continue;
-    if (connector.operations.some((op) => op.grants.includes(cap.action))) {
-      grantedProviders.add(cap.provider);
-    }
-  }
+  const grantedProviders = grantedProviderSet(capabilities, registry);
 
   const dummyEnv: Record<string, string> = {};
   const dummyFiles: CliDummyFile[] = [];
@@ -1078,6 +1149,49 @@ export function compileCliIntegrations(
   }
 
   return { dummyEnv, dummyFiles, enabled, bundles: [...bundles] };
+}
+
+// ---------------------------------------------------------------------------
+// MCP integration plan (ADR 0058 P3) — the per-session remote-MCP artifact
+// ---------------------------------------------------------------------------
+
+/** One enabled remote MCP server — the input the harness renders into
+ * `--mcp-config`. `name` becomes the server's tool namespace (the agent sees its
+ * tools as `mcp__<name>__<tool>`). */
+export interface EnabledMcp {
+  name: string;
+  url: string;
+}
+
+/** The per-session MCP artifact compiled from a profile's capabilities. */
+export interface McpIntegrationPlan {
+  /** Enabled remote MCP servers, sorted by name — what the harness writes into
+   * `--mcp-config` (and ships as the `ENGRAM_MCP_INTEGRATIONS` env var). */
+  enabled: EnabledMcp[];
+}
+
+/**
+ * Compile a profile's bound capabilities → the per-session {@link McpIntegrationPlan}.
+ *
+ * A connector's MCP server is *enabled* iff the profile holds ≥1 capability the
+ * connector grants (same gate as {@link compileCliIntegrations}). Auth + egress are
+ * **not** compiled here — they ride {@link compileIntegrationPolicy}'s inject + the
+ * #420 hosts-union exactly as for raw HTTP: the connector lists the MCP host in
+ * `hosts` and an operation with no `match` so the bearer injects on every MCP
+ * request, no token in the guest. This plan only names the enabled `{ name, url }`
+ * servers for the harness to write into `--mcp-config`.
+ */
+export function compileMcpIntegrations(
+  capabilities: string[],
+  registry: Map<string, Connector> = connectorRegistry(),
+): McpIntegrationPlan {
+  const enabled: EnabledMcp[] = [];
+  for (const provider of [...grantedProviderSet(capabilities, registry)].sort()) {
+    const mcp = registry.get(provider)!.mcp;
+    if (!mcp) continue;
+    enabled.push({ name: provider, url: mcp.url });
+  }
+  return { enabled };
 }
 
 // ---------------------------------------------------------------------------

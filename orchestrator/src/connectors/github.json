@@ -8,7 +8,7 @@
     "icon": { "mono": "GH", "color": "#1f2328" }
   },
   "credential": { "source": "mint", "mint": { "kind": "github_app" } },
-  "hosts": ["api.github.com"],
+  "hosts": ["api.github.com", "api.githubcopilot.com"],
   "operations": [
     {
       "grants": ["contents:read"],
@@ -47,8 +47,16 @@
         "data": { "number": "$.resp.number", "title": "$.resp.title" },
         "fetchable": { "external": "$.resp.html_url" }
       }
+    },
+    {
+      "grants": ["mcp:use"],
+      "match": { "path": "/mcp*" }
     }
   ],
+  "mcp": {
+    "transport": "http",
+    "url": "https://api.githubcopilot.com/mcp/"
+  },
   "cli": {
     "bins": ["gh"],
     "dummyEnv": { "GH_TOKEN": "x-engrams-managed" },

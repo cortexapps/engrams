@@ -67,6 +67,7 @@ import type { ImagesClient } from "./profiles.ts";
 import {
   compileIntegrationPolicy,
   compileCliIntegrations,
+  compileMcpIntegrations,
   policyHasContent,
   loadRegistry,
   type CustomConnectorSource,
@@ -432,6 +433,12 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const cliPlan = compileCliIntegrations(profile.capabilities, registry);
       for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
       if (cliPlan.enabled.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(cliPlan.enabled);
+      // ADR 0058 P3: enabled remote MCP servers ride one more harness_env var (no
+      // CreateSessionRequest change); the harness writes the `--mcp-config` file
+      // from it. Auth/egress are already compiled into the policy below (inject +
+      // #420 hosts-union), so this carries only { name, url } — never a token.
+      const mcpPlan = compileMcpIntegrations(profile.capabilities, registry);
+      if (mcpPlan.enabled.length > 0) harness.ENGRAM_MCP_INTEGRATIONS = JSON.stringify(mcpPlan.enabled);
       for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v; // profile overrides
       const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
