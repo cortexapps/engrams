@@ -25,6 +25,10 @@ import { registerIntegration } from "./rpc/integration.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
+// ADR 0059: embedded DBOS engine. Workflow modules (P1+) must be imported
+// ABOVE the initDbos() call below so their workflows/steps are registered
+// before DBOS.launch().
+import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 
 const app = new Hono();
 
@@ -106,6 +110,10 @@ const server = buildServer(
   { upgradeWebSocket, wss, injectWebSocket },
 );
 
+// ADR 0059: launch the embedded DBOS engine before serving any traffic, so a
+// webhook that arrives the instant we bind can start a workflow.
+await initDbos();
+
 server.listen(config.port, "0.0.0.0", () => {
   console.log(`Orchestrator listening on port ${config.port}`);
 });
@@ -113,7 +121,10 @@ server.listen(config.port, "0.0.0.0", () => {
 // Graceful shutdown on SIGTERM (e.g. Tilt stop, Kubernetes pod termination).
 process.on("SIGTERM", () => {
   console.log("Orchestrator: SIGTERM received, shutting down gracefully…");
-  server.close((err) => {
+  server.close(async (err) => {
+    // Quiesce DBOS (stops queue/recovery loops, closes the system-DB pool)
+    // after the HTTP server stops accepting connections.
+    await shutdownDbos();
     if (err) {
       console.error("Orchestrator: error during shutdown", err);
       process.exit(1);
