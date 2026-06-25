@@ -77,6 +77,11 @@
   --instrument-nominal: oklch(0.6 0.15 150); /* signal green — emerald, not lime */
   --instrument-caution: oklch(0.7 0.155 71); /* amber */
   --instrument-critical: oklch(0.55 0.21 27); /* instrument red ≈ destructive */
+
+  /* Logomark terminal node — the verdigris endpoint of the engram trace. Paper-era
+     dark value for light grounds; the dark theme overrides to a brighter teal so it
+     reads against the deep green-black background. */
+  --mark-terminal: #3a6b5c;
 }
 
 .dark {
@@ -116,6 +121,8 @@
   --instrument-nominal: oklch(0.72 0.16 150);
   --instrument-caution: oklch(0.8 0.15 75);
   --instrument-critical: oklch(0.66 0.2 25);
+
+  --mark-terminal: oklch(0.7 0.085 178); /* #5EB09E — brighter verdigris on dark ground */
 }
 
 /* The section rail (the second sidebar) is one step lighter than the primary
