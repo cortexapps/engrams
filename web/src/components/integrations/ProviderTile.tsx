@@ -45,7 +45,10 @@ export function ProviderTile({ mono, color, logo, name, size = 32, className }: 
         boxShadow: "inset 0 0 0 1px color-mix(in oklch, black 18%, transparent)",
       }}
     >
-      {mono}
+      {/* The monogram is the base layer AND the fallback: hidden while a logo
+          renders (else a transparent logo lets the letters ghost through), shown
+          again if the logo fails to load. */}
+      {!showLogo && mono}
       {showLogo && (
         <img
           src={logo}

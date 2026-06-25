@@ -20,6 +20,7 @@ import {
 } from "../gen/engram/app/v1/integration-IntegrationService_connectquery";
 import { listMintKinds } from "../gen/engram/app/v1/mint-MintService_connectquery";
 import { fallbackIdentity, type ProviderIdentity } from "../lib/connectorModel";
+import { builtinLogo } from "../lib/connectorLogos";
 
 /** Built-in seeds (read-only) + admin-authored connectors. Each carries `status`. */
 export function useConnectors() {
@@ -94,10 +95,6 @@ export function useTestConnector() {
   return useMutation(testConnector);
 }
 
-/** Pre-bundled built-in brand logos (provider → asset URL). Extension point: drop
- * a curated SVG in and map it here; until then built-ins use the monogram. */
-const BUILTIN_LOGOS: Record<string, string> = {};
-
 /**
  * Resolve a provider's full display identity from the member catalog, falling
  * back to the deterministic monogram identity for an unknown provider (e.g. a
@@ -110,7 +107,7 @@ export function useProviderIdentity(provider: string): ProviderIdentity {
   const fallback = fallbackIdentity(provider);
   if (!entry) return fallback;
   const d = entry.display;
-  const logo = BUILTIN_LOGOS[provider] ?? (d?.icon?.logo || undefined);
+  const logo = builtinLogo(provider) ?? (d?.icon?.logo || undefined);
   return {
     provider,
     name: d?.name || fallback.name,
