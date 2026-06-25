@@ -10,6 +10,7 @@ use std::sync::Arc;
 use engram_core::traits::{BlobStorage, CloudBackend, HostClient, MetadataStore, SecretStore};
 
 pub mod api;
+pub mod base_snapshot_retention;
 pub mod blob;
 pub mod bundle_gc;
 pub mod checkpoint_retention;
@@ -230,6 +231,18 @@ pub async fn run_with_registry_and_local(
     // `snapshots` one row per session per cadence interval forever.
     let _checkpoint_retention = checkpoint_retention::spawn(
         checkpoint_retention::CheckpointRetentionConfig::default(),
+        state.clone(),
+    );
+
+    // Orphaned base-snapshot reaper: image refresh swaps
+    // `enabled_images.base_snapshot_id` to a fresh capture and leaves the
+    // prior base row dangling (session_id NULL, no pointer). Nothing else
+    // deletes it, and it keeps pinning its own chunks via pin-set sources
+    // #3/#4 — so without this every refresh leaks a base snapshot's chunks
+    // (20–32 GB for the heavy images). Complements checkpoint_retention,
+    // which is `session_id IS NOT NULL` only.
+    let _base_snapshot_retention = base_snapshot_retention::spawn(
+        base_snapshot_retention::BaseSnapshotRetentionConfig::default(),
         state.clone(),
     );
 
