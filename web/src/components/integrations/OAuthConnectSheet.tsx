@@ -7,7 +7,7 @@
  */
 
 import { useState } from "react";
-import { ArrowUpRightIcon, InfoIcon, LockIcon } from "lucide-react";
+import { ArrowUpRightIcon, CheckIcon, CopyIcon, InfoIcon, LockIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -15,6 +15,7 @@ import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { usePutOrgSecret } from "@/hooks/useOrgSecrets";
 import type { ParsedOauth } from "@/lib/connectorModel";
+import { buildSlackManifest } from "@/lib/slackManifest";
 import { ProviderTile } from "./ProviderTile";
 import { SecretField } from "./SecretField";
 import type { ConnectorView } from "./useConnectorViews";
@@ -33,9 +34,19 @@ export function OAuthConnectSheet({
   const [clientSecret, setClientSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState<"url" | "manifest" | null>(null);
 
   const redirectUri = `${window.location.origin}/api/v1/integrations/${view.provider}/oauth/callback`;
   const filled = clientId.trim().length > 0 && clientSecret.trim().length > 0;
+  const isSlack = view.provider === "slack";
+
+  const copy = (what: "url" | "manifest", text: string) => {
+    if (typeof navigator === "undefined" || !navigator.clipboard) return;
+    void navigator.clipboard.writeText(text).then(() => {
+      setCopied(what);
+      setTimeout(() => setCopied((c) => (c === what ? null : c)), 2000);
+    });
+  };
 
   const connect = async () => {
     setError(null);
@@ -75,12 +86,47 @@ export function OAuthConnectSheet({
             </div>
           </div>
 
-          <label className="flex flex-col gap-1.5">
+          <div className="flex flex-col gap-1.5">
             <Text variant="label">Redirect URL (add this to your {view.name} app)</Text>
             <code className="select-all rounded-md border bg-card px-3 py-2 font-mono text-[0.72rem] break-all">
               {redirectUri}
             </code>
-          </label>
+            <div className="mt-1 flex flex-wrap gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => copy("url", redirectUri)}
+              >
+                {copied === "url" ? (
+                  <CheckIcon className="size-3.5 text-instrument-nominal" />
+                ) : (
+                  <CopyIcon className="size-3.5" />
+                )}
+                Copy redirect URL
+              </Button>
+              {isSlack && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    copy(
+                      "manifest",
+                      buildSlackManifest({ origin: window.location.origin, scopes: oauth.scopes }),
+                    )
+                  }
+                >
+                  {copied === "manifest" ? (
+                    <CheckIcon className="size-3.5 text-instrument-nominal" />
+                  ) : (
+                    <CopyIcon className="size-3.5" />
+                  )}
+                  Copy app manifest
+                </Button>
+              )}
+            </div>
+          </div>
 
           <label className="flex flex-col gap-1.5">
             <span className="flex items-baseline gap-2">

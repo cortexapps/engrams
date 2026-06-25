@@ -176,6 +176,8 @@ export interface ParsedCli {
 export interface ParsedOauth {
   clientIdRef: string;
   clientSecretRef: string;
+  /** Bot scopes the token exchange requests — drives the Slack app manifest (ADR 0059). */
+  scopes: string[];
 }
 
 export interface ParsedConnectorConfig {
@@ -218,10 +220,18 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
     mint?: { kind?: string };
   };
   const credentialSource: "mint" | "inject" = cred.source === "mint" ? "mint" : "inject";
-  const oauthRaw = raw.oauth as { clientIdRef?: string; clientSecretRef?: string } | undefined;
+  const oauthRaw = raw.oauth as
+    | { clientIdRef?: string; clientSecretRef?: string; scopes?: unknown }
+    | undefined;
   const oauth =
     oauthRaw?.clientIdRef && oauthRaw?.clientSecretRef
-      ? { clientIdRef: oauthRaw.clientIdRef, clientSecretRef: oauthRaw.clientSecretRef }
+      ? {
+          clientIdRef: oauthRaw.clientIdRef,
+          clientSecretRef: oauthRaw.clientSecretRef,
+          scopes: Array.isArray(oauthRaw.scopes)
+            ? oauthRaw.scopes.filter((s): s is string => typeof s === "string")
+            : [],
+        }
       : undefined;
   const d = (raw.display ?? {}) as {
     name?: string;
@@ -253,7 +263,9 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
       ? {
           bins: (rawCli.bins as unknown[]).filter((b): b is string => typeof b === "string"),
           binSource:
-            rawCli.binSource === "uploaded" || rawCli.binSource === "npx" ? rawCli.binSource : "bundled",
+            rawCli.binSource === "uploaded" || rawCli.binSource === "npx"
+              ? rawCli.binSource
+              : "bundled",
           ...(typeof rawCli.bundle === "string" ? { bundle: rawCli.bundle } : {}),
         }
       : undefined;
