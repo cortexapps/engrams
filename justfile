@@ -143,7 +143,7 @@ trace-down:
 # set, leaves it alone. Run once per dev box.
 bootstrap:
     @set -e; \
-    touch .env ; \
+    [ -f .env ] || touch .env ; \
     if grep -q '^ENGRAM_KEK_MASTER_KEY=' .env 2>/dev/null; then \
         echo "ENGRAM_KEK_MASTER_KEY already present in .env — leaving as-is" ; \
     else \
