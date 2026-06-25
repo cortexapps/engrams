@@ -19,6 +19,7 @@ pub mod bypass;
 pub mod ca;
 pub mod cert_mint;
 pub mod dns;
+pub mod graphql;
 pub mod inject;
 pub mod intercept;
 pub mod observe;
@@ -38,11 +39,12 @@ pub use resolver::{
 
 pub use ca::{Ca, CaError, CaSource, EnvCaSource, LocalDiskCaSource};
 pub use cert_mint::{CertMint, MintError};
+pub use graphql::{parse_request_body as parse_graphql_request, ParsedGraphql};
 pub use observe::{ObserveSink, ObservedAsset};
 pub use policy::{HostList, HostSpec, ParseError as PolicyParseError};
 pub use registry::{
-    Decision, InjectEntry, ObserveEntry, Registry, RequestPolicy, SecretEntry, SessionState,
-    SuccessRule,
+    Decision, GraphqlMatch, GraphqlOperation, InjectEntry, ObserveEntry, Registry, RequestPolicy,
+    SecretEntry, SessionState, SuccessRule,
 };
 pub use sni::{peek_sni, PeekError as SniPeekError};
 pub use substitute::{scan_for_violation, substitute};

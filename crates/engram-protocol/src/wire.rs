@@ -41,7 +41,9 @@ use serde::{Deserialize, Serialize};
 // v3 (ADR 0056 Phase 3b): added `injects` to `SessionEgressPolicy` (coord→host).
 // v4 (ADR 0056 Phase 4b): added `observes`. A mixed-version fleet fails fast on
 // the version gate above rather than misparsing the positional bincode payload.
-pub const WIRE_VERSION: u32 = 4;
+// v5 (ADR 0059): added `graphql_operation`/`graphql_field` to the inject + observe
+// entries (+ `success_no_graphql_errors` on observe) for GraphQL operation gating.
+pub const WIRE_VERSION: u32 = 5;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

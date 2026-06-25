@@ -173,6 +173,7 @@ mod tests {
         let p = RequestPolicy {
             methods: vec!["GET".into()],
             path_globs: vec!["/api/v2/logs*".into()],
+            graphql: None,
         };
         assert!(p.allows("GET", "/api/v2/logs/events"));
         assert!(p.allows("GET", "/api/v2/logs/events?query=x")); // query swallowed by `*`
@@ -187,6 +188,7 @@ mod tests {
         let pulls = RequestPolicy {
             methods: vec!["POST".into()],
             path_globs: vec!["/repos/*/pulls".into()],
+            graphql: None,
         };
         assert!(pulls.allows("POST", "/repos/octo/repo/pulls"));
         assert!(!pulls.allows("POST", "/repos/octo/repo/git/refs"));

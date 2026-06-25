@@ -197,6 +197,11 @@ rustls-pemfile = "2"
 tls-parser = "0.12"
 nom = "7"
 socket2 = "0.6"
+# GraphQL request-body parsing for egress gating (ADR 0059). Strict,
+# all-or-nothing parser (a clean typed AST or a hard error) — deliberately
+# NOT an error-resilient parser, since a partial parse at a security gate is a
+# smuggling vector. Used only by engram-egress-proxy.
+async-graphql-parser = "7"
 
 # DNS wire-format parsing (used by the egress proxy's udp/53 + tcp/53
 # listeners to enforce allow_hosts on resolution, not just on

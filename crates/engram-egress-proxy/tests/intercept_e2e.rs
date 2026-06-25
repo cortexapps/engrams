@@ -22,7 +22,8 @@ use engram_egress_proxy::intercept::{
 use engram_egress_proxy::observe::{ObserveSink, ObservedAsset};
 use engram_egress_proxy::policy::HostList;
 use engram_egress_proxy::registry::{
-    InjectEntry, ObserveEntry, RequestPolicy, SecretEntry, SuccessRule,
+    GraphqlMatch, GraphqlOperation, InjectEntry, ObserveEntry, RequestPolicy, SecretEntry,
+    SuccessRule,
 };
 use engram_egress_proxy::resolver::StaticResolver;
 use parking_lot::Mutex;
@@ -87,6 +88,7 @@ fn inject_entry(secret: &str, methods: &[&str], paths: &[&str]) -> InjectEntry {
         policy: RequestPolicy {
             methods: methods.iter().map(|s| s.to_string()).collect(),
             path_globs: paths.iter().map(|s| s.to_string()).collect(),
+            graphql: None,
         },
     }
 }
@@ -528,6 +530,7 @@ async fn observes_response_and_emits_asset() {
         policy: RequestPolicy {
             methods: vec!["POST".into()],
             path_globs: vec!["/repos/*/issues".into()],
+            graphql: None,
         },
         provider: "github".into(),
         asset_kind: "issue".into(),
@@ -631,6 +634,7 @@ async fn failed_status_emits_no_asset() {
         policy: RequestPolicy {
             methods: vec!["POST".into()],
             path_globs: vec!["/repos/*/issues".into()],
+            graphql: None,
         },
         provider: "github".into(),
         asset_kind: "issue".into(),
@@ -682,5 +686,355 @@ async fn failed_status_emits_no_asset() {
     assert!(
         collected.lock().is_empty(),
         "a 422 must not emit an asset (the effect did not occur)",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0059: GraphQL operation gating + observation.
+// ---------------------------------------------------------------------------
+
+/// A GraphQL inject entry gating `POST /graphql` for one (operation, field),
+/// injecting `Authorization: Bearer <secret>` (mirrors GitHub's mint plane).
+fn graphql_inject_entry(secret: &str, op: GraphqlOperation, field: &str) -> InjectEntry {
+    InjectEntry {
+        secret: secret.into(),
+        header_name: "Authorization".into(),
+        header_template: "Bearer {}".into(),
+        allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
+        policy: RequestPolicy {
+            methods: vec!["POST".into()],
+            path_globs: vec!["/graphql".into()],
+            graphql: Some(GraphqlMatch {
+                operation: op,
+                field: field.into(),
+            }),
+        },
+    }
+}
+
+/// A GraphQL observe entry for one (operation, field), emitting an `issue` asset
+/// from `$.resp.data.createIssue.issue.id`, gated by `NoGraphqlErrors`.
+fn graphql_observe_entry(op: GraphqlOperation, field: &str) -> ObserveEntry {
+    ObserveEntry {
+        allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
+        policy: RequestPolicy {
+            methods: vec!["POST".into()],
+            path_globs: vec!["/graphql".into()],
+            graphql: Some(GraphqlMatch {
+                operation: op,
+                field: field.into(),
+            }),
+        },
+        provider: "github".into(),
+        asset_kind: "issue".into(),
+        surface: "asset".into(),
+        success: SuccessRule::NoGraphqlErrors,
+        data: vec![("id".into(), "$.resp.data.createIssue.issue.id".into())],
+        fetchable: None,
+    }
+}
+
+/// Build a `POST /graphql` request whose body is the JSON envelope `{"query": …}`.
+fn graphql_post(body_json: &str) -> Vec<u8> {
+    format!(
+        "POST /graphql HTTP/1.1\r\nHost: fake-upstream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body_json.len(),
+        body_json,
+    )
+    .into_bytes()
+}
+
+/// A `{"query": …}` JSON envelope around a raw GraphQL document.
+fn gql(query: &str) -> String {
+    serde_json::json!({ "query": query }).to_string()
+}
+
+/// Run an intercept with the given GraphQL inject entries against a single client
+/// request; return (proxy outcome, bytes the upstream received). Upstream replies
+/// `200 OK` (the gating tests only care whether the request was forwarded).
+async fn run_graphql_inject(
+    ca: Arc<Ca>,
+    injects: Vec<InjectEntry>,
+    request: Vec<u8>,
+) -> (Result<(), InterceptError>, Vec<u8>) {
+    let mint = Arc::new(CertMint::new(ca.clone()));
+    let server_cfg = build_server_config(mint);
+    let client_cfg = build_client_config();
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
+    let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
+    let proxy_task = tokio::spawn(async move {
+        let inj_refs: Vec<&InjectEntry> = injects.iter().collect();
+        intercept::run(
+            proxy_from_client,
+            Vec::new(),
+            "fake-upstream",
+            upstream_addr.port(),
+            resolver,
+            &[],
+            &inj_refs,
+            &[],
+            SessionId::new(),
+            None,
+            server_cfg,
+            client_cfg,
+        )
+        .await
+    });
+
+    let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
+    tls_client.write_all(&request).await.unwrap();
+    tls_client.flush().await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut buf = [0u8; 1024];
+        let _ = tls_client.read(&mut buf).await;
+    })
+    .await;
+    let _ = tls_client.shutdown().await;
+    drop(tls_client);
+
+    let outcome = proxy_task.await.unwrap();
+    let cap = captured.lock().clone();
+    (outcome, cap)
+}
+
+#[tokio::test]
+async fn graphql_allows_mapped_mutation() {
+    let ca = ca();
+    let inj = graphql_inject_entry("tok-abc", GraphqlOperation::Mutation, "mergePullRequest");
+    let req = graphql_post(&gql(
+        "mutation { mergePullRequest(input: {}) { clientMutationId } }",
+    ));
+    let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
+    if let Err(e) = &outcome {
+        let msg = format!("{e}");
+        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
+            panic!("proxy returned unexpected error: {e}");
+        }
+    }
+    let seen = String::from_utf8_lossy(&captured);
+    assert!(
+        seen.contains("Authorization: Bearer tok-abc\r\n"),
+        "upstream should see the injected token on the mapped mutation; got: {seen}",
+    );
+    assert!(seen.starts_with("POST /graphql HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn graphql_denies_unmapped_mutation() {
+    let ca = ca();
+    // Granted: mergePullRequest. The client asks for a different mutation.
+    let inj = graphql_inject_entry("tok-abc", GraphqlOperation::Mutation, "mergePullRequest");
+    let req = graphql_post(&gql(
+        "mutation { deleteRepository(input: {}) { clientMutationId } }",
+    ));
+    let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
+    assert!(
+        matches!(outcome, Err(InterceptError::GraphqlRejected { .. })),
+        "expected GraphqlRejected, got: {outcome:?}",
+    );
+    assert!(
+        captured.is_empty(),
+        "upstream must see nothing when the operation is not permitted",
+    );
+}
+
+#[tokio::test]
+async fn graphql_denies_when_one_of_multiple_fields_unmapped() {
+    let ca = ca();
+    // Granted: query viewer only. The doc selects viewer AND repository — set
+    // coverage requires BOTH, so the whole request is denied.
+    let inj = graphql_inject_entry("tok-abc", GraphqlOperation::Query, "viewer");
+    let req = graphql_post(&gql(
+        "query { viewer { login } repository(owner: \"o\", name: \"r\") { id } }",
+    ));
+    let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
+    assert!(
+        matches!(outcome, Err(InterceptError::GraphqlRejected { .. })),
+        "expected GraphqlRejected (uncovered field), got: {outcome:?}",
+    );
+    assert!(captured.is_empty());
+}
+
+#[tokio::test]
+async fn graphql_allows_aliased_field() {
+    let ca = ca();
+    // An alias must resolve to the underlying field — `a:` must not bypass the gate.
+    let inj = graphql_inject_entry("tok-abc", GraphqlOperation::Mutation, "mergePullRequest");
+    let req = graphql_post(&gql(
+        "mutation { a: mergePullRequest(input: {}) { clientMutationId } }",
+    ));
+    let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
+    if let Err(e) = &outcome {
+        let msg = format!("{e}");
+        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
+            panic!("proxy returned unexpected error: {e}");
+        }
+    }
+    assert!(String::from_utf8_lossy(&captured).contains("Authorization: Bearer tok-abc\r\n"));
+}
+
+#[tokio::test]
+async fn graphql_allows_mapped_query_and_anonymous_shorthand() {
+    let ca = ca();
+    let inj = graphql_inject_entry("tok-q", GraphqlOperation::Query, "viewer");
+    for query in ["query { viewer { login } }", "{ viewer { login } }"] {
+        let req = graphql_post(&gql(query));
+        let (outcome, captured) = run_graphql_inject(ca.clone(), vec![inj.clone()], req).await;
+        if let Err(e) = &outcome {
+            let msg = format!("{e}");
+            if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
+                panic!("proxy returned unexpected error on `{query}`: {e}");
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&captured).contains("Authorization: Bearer tok-q\r\n"),
+            "query `{query}` should be allowed",
+        );
+    }
+}
+
+#[tokio::test]
+async fn graphql_denies_oversized_body() {
+    let ca = ca();
+    let inj = graphql_inject_entry("tok-abc", GraphqlOperation::Mutation, "mergePullRequest");
+    // Declare a Content-Length far over the 256 KiB cap — rejected before reading.
+    let body = gql("mutation { mergePullRequest(input: {}) { clientMutationId } }");
+    let req = format!(
+        "POST /graphql HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 9999999\r\n\r\n{body}",
+    )
+    .into_bytes();
+    let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
+    assert!(
+        matches!(outcome, Err(InterceptError::GraphqlRejected { .. })),
+        "expected GraphqlRejected (over cap), got: {outcome:?}",
+    );
+    assert!(captured.is_empty());
+}
+
+#[tokio::test]
+async fn graphql_denies_unparseable_body() {
+    let ca = ca();
+    let inj = graphql_inject_entry("tok-abc", GraphqlOperation::Mutation, "mergePullRequest");
+    // A syntactically broken GraphQL document — fail closed.
+    let req = graphql_post(r#"{"query":"mutation { "}"#);
+    let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
+    assert!(
+        matches!(outcome, Err(InterceptError::GraphqlRejected { .. })),
+        "expected GraphqlRejected (unparseable), got: {outcome:?}",
+    );
+    assert!(captured.is_empty());
+}
+
+#[tokio::test]
+async fn graphql_denies_batched_array() {
+    let ca = ca();
+    let inj = graphql_inject_entry("tok-q", GraphqlOperation::Query, "viewer");
+    // A batched (array) request is unsupported — deny.
+    let req = graphql_post(r#"[{"query":"query { viewer { login } }"}]"#);
+    let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
+    assert!(
+        matches!(outcome, Err(InterceptError::GraphqlRejected { .. })),
+        "expected GraphqlRejected (batched array), got: {outcome:?}",
+    );
+    assert!(captured.is_empty());
+}
+
+/// Run an intercept with a GraphQL observe entry, returning the assets the sink
+/// collected. `upstream_response` is the raw HTTP response bytes the fake upstream
+/// returns.
+async fn run_graphql_observe(
+    ca: Arc<Ca>,
+    observe: ObserveEntry,
+    request: Vec<u8>,
+    upstream_response: Vec<u8>,
+) -> Vec<ObservedAsset> {
+    let mint = Arc::new(CertMint::new(ca.clone()));
+    let server_cfg = build_server_config(mint);
+    let client_cfg = build_client_config();
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let upstream_addr = fake_upstream_resp(captured.clone(), upstream_response).await;
+    let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
+
+    let collected: Arc<Mutex<Vec<(SessionId, ObservedAsset)>>> = Arc::new(Mutex::new(Vec::new()));
+    let collected_for_sink = collected.clone();
+    let sink: ObserveSink =
+        Arc::new(move |sid, asset| collected_for_sink.lock().push((sid, asset)));
+
+    let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
+    let proxy_task = tokio::spawn(async move {
+        let observes: Vec<&ObserveEntry> = vec![&observe];
+        intercept::run(
+            proxy_from_client,
+            Vec::new(),
+            "fake-upstream",
+            upstream_addr.port(),
+            resolver,
+            &[],
+            &[],
+            &observes,
+            SessionId::new(),
+            Some(&sink),
+            server_cfg,
+            client_cfg,
+        )
+        .await
+    });
+
+    let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
+    tls_client.write_all(&request).await.unwrap();
+    tls_client.flush().await.unwrap();
+    let mut resp = Vec::new();
+    let _ = tls_client.read_to_end(&mut resp).await;
+    let _ = tls_client.shutdown().await;
+    drop(tls_client);
+    let _ = proxy_task.await.unwrap();
+
+    let assets: Vec<ObservedAsset> = collected.lock().iter().map(|(_, a)| a.clone()).collect();
+    assets
+}
+
+#[tokio::test]
+async fn graphql_observe_emits_on_no_errors() {
+    let ca = ca();
+    let observe = graphql_observe_entry(GraphqlOperation::Mutation, "createIssue");
+    let req = graphql_post(&gql("mutation { createIssue(input: {}) { issue { id } } }"));
+    let body = r#"{"data":{"createIssue":{"issue":{"id":"I_1"}}}}"#;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .into_bytes();
+    let assets = run_graphql_observe(ca, observe, req, response).await;
+    assert_eq!(assets.len(), 1, "exactly one asset emitted");
+    assert_eq!(assets[0].provider, "github");
+    assert_eq!(assets[0].asset_kind, "issue");
+    assert_eq!(
+        assets[0].data.get("id"),
+        Some(&serde_json::json!("I_1")),
+        "asset id extracted from $.resp.data.createIssue.issue.id",
+    );
+}
+
+#[tokio::test]
+async fn graphql_observe_suppressed_on_errors() {
+    let ca = ca();
+    let observe = graphql_observe_entry(GraphqlOperation::Mutation, "createIssue");
+    let req = graphql_post(&gql("mutation { createIssue(input: {}) { issue { id } } }"));
+    // HTTP 200 but a GraphQL-level error → no side effect → no asset (the key
+    // difference from REST, where 2xx alone would emit).
+    let body = r#"{"errors":[{"message":"nope"}],"data":null}"#;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .into_bytes();
+    let assets = run_graphql_observe(ca, observe, req, response).await;
+    assert!(
+        assets.is_empty(),
+        "a GraphQL `errors` response must not emit an asset; got: {assets:?}",
     );
 }

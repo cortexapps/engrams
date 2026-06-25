@@ -34,6 +34,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use engram_core::SessionId;
 
 use crate::cert_mint::CertMint;
+use crate::graphql::{self, ParsedGraphql};
 use crate::inject;
 use crate::observe::{self, ObserveSink};
 use crate::registry::{InjectEntry, ObserveEntry, SecretEntry};
@@ -47,6 +48,13 @@ use crate::substitute::{scan_for_violation, substitute};
 /// past this mark just don't get scanned (and a streaming upload
 /// with a placeholder at byte 1M+1 is not a realistic attack).
 const SCAN_BUDGET: usize = 1024 * 1024;
+
+/// ADR 0059: cap on the GraphQL request body we buffer before gating. A GraphQL
+/// endpoint's body must be read in full before we can decide (we cannot
+/// stream-then-revoke), so this bounds per-connection memory. GraphQL query
+/// documents are a few KiB; 256 KiB is generous. Only requests to a declared
+/// GraphQL endpoint pay this — REST/bypass hosts keep the header-only early stop.
+const GRAPHQL_REQUEST_BODY_BUDGET: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub enum InterceptError {
@@ -65,6 +73,13 @@ pub enum InterceptError {
     },
     /// ADR 0056: an inject-gated request had no parseable HTTP/1.1 request line.
     MalformedRequest,
+    /// ADR 0059: a GraphQL request to a gated endpoint was rejected — the body was
+    /// unparseable / over-cap / unsupported framing, or its operation+field isn't
+    /// permitted by the integration policy. `reason` is a static tag for logs
+    /// (never the request body).
+    GraphqlRejected {
+        reason: &'static str,
+    },
     InvalidServerName(String),
 }
 
@@ -83,6 +98,12 @@ impl std::fmt::Display for InterceptError {
             }
             Self::MalformedRequest => {
                 write!(f, "malformed request line on an inject-gated host")
+            }
+            Self::GraphqlRejected { reason } => {
+                write!(
+                    f,
+                    "graphql request rejected by integration policy: {reason}"
+                )
             }
             Self::InvalidServerName(s) => write!(f, "invalid SNI `{s}`"),
         }
@@ -294,20 +315,75 @@ where
         None
     };
 
-    // ADR 0056 (Plane B): an inject-gated host must satisfy a request
-    // policy (method + path). Add the matching injection's auth header(s);
-    // a request whose shape matches no injection is rejected — the
-    // operation isn't permitted on this host.
+    // ADR 0059: is this request destined for a declared GraphQL endpoint? (Any
+    // inject/observe entry that carries a GraphQL matcher AND whose path glob
+    // matches this request's path — i.e. `POST /graphql`.) Only then do we buffer
+    // + parse the body; REST/bypass hosts keep the header-only early stop above.
+    let is_graphql = match &req_line {
+        Some((_, path)) => {
+            injects
+                .iter()
+                .any(|i| i.policy.graphql.is_some() && i.policy.path_matches(path))
+                || observes
+                    .iter()
+                    .any(|o| o.policy.graphql.is_some() && o.policy.path_matches(path))
+        }
+        None => false,
+    };
+
+    // ADR 0059: for a GraphQL endpoint, read the FULL request body (bounded) and
+    // parse it into its top-level operation/fields. Fail-closed: anything we can't
+    // read or parse cleanly rejects the request before a byte reaches upstream.
+    // `gh` (and standard GraphQL clients) send a Content-Length'd, identity-encoded
+    // JSON body — chunked/compressed bodies are denied.
+    let parsed_graphql: Option<ParsedGraphql> = if is_graphql {
+        let headers_end = prefix.windows(4).position(|w| w == b"\r\n\r\n").ok_or(
+            InterceptError::GraphqlRejected {
+                reason: "no header terminator",
+            },
+        )?;
+        let head = std::str::from_utf8(&prefix[..headers_end]).map_err(|_| {
+            InterceptError::GraphqlRejected {
+                reason: "non-utf8 headers",
+            }
+        })?;
+        let content_length = graphql_content_length(head)?;
+        let body_start = headers_end + 4;
+        let body_end = body_start + content_length;
+        read_to_content_length(&mut client_tls, &mut prefix, body_end).await?;
+        let body = &prefix[body_start..body_end];
+        Some(
+            graphql::parse_request_body(body).ok_or(InterceptError::GraphqlRejected {
+                reason: "unparseable or unsupported graphql operation",
+            })?,
+        )
+    } else {
+        None
+    };
+
+    // ADR 0056/0059 (Plane B): an inject-gated host must satisfy a request policy.
+    // REST: gate by (method, path) glob. GraphQL: every top-level field must be
+    // covered by some granted GraphQL inject (set coverage). A request matching no
+    // injection is rejected — the operation isn't permitted on this host.
     if !injects.is_empty() {
         let (method, path) = req_line.clone().ok_or(InterceptError::MalformedRequest)?;
-        let matched: Vec<&InjectEntry> = injects
-            .iter()
-            .copied()
-            .filter(|i| i.policy.allows(&method, &path))
-            .collect();
-        if matched.is_empty() {
-            return Err(InterceptError::RequestRejected { method, path });
-        }
+        let matched: Vec<&InjectEntry> = if let Some(doc) = &parsed_graphql {
+            gate_graphql_injects(injects, &method, &path, doc).ok_or(
+                InterceptError::GraphqlRejected {
+                    reason: "operation not permitted by integration policy",
+                },
+            )?
+        } else {
+            let m: Vec<&InjectEntry> = injects
+                .iter()
+                .copied()
+                .filter(|i| i.policy.graphql.is_none() && i.policy.allows(&method, &path))
+                .collect();
+            if m.is_empty() {
+                return Err(InterceptError::RequestRejected { method, path });
+            }
+            m
+        };
         prefix = inject::inject_headers(prefix, &matched);
     }
 
@@ -318,15 +394,28 @@ where
     }
     prefix = substitute(prefix, sni, secrets);
 
-    // ADR 0056 (Phase 4): observe the response for any observe spec whose
-    // request shape matches. Only when a sink is wired (the host-agent's
-    // bridge to the coordinator) — without a consumer there's no point
-    // buffering the response.
+    // ADR 0056 (Phase 4) / 0059: observe the response for any observe spec whose
+    // request shape matches — REST by (method, path); GraphQL by a top-level
+    // (operation, field) in the parsed body. Only when a sink is wired (the
+    // host-agent's bridge to the coordinator) — without a consumer there's no
+    // point buffering the response.
     let firing: Vec<&ObserveEntry> = match (&req_line, sink) {
         (Some((method, path)), Some(_)) => observes
             .iter()
             .copied()
-            .filter(|o| o.policy.allows(method, path))
+            .filter(|o| match (&o.policy.graphql, &parsed_graphql) {
+                (Some(g), Some(doc)) => {
+                    o.policy.method_matches(method)
+                        && o.policy.path_matches(path)
+                        && doc
+                            .top_level
+                            .iter()
+                            .any(|(op, field)| g.matches(*op, field))
+                }
+                (None, _) => o.policy.allows(method, path),
+                // A GraphQL observe spec never fires on a non-GraphQL request.
+                (Some(_), None) => false,
+            })
             .collect(),
         _ => Vec::new(),
     };
@@ -364,6 +453,107 @@ where
     // (legitimately checking for clean shutdown) to fail.
     let _ = client_tls.shutdown().await;
     let _ = upstream_tls.shutdown().await;
+    Ok(())
+}
+
+/// ADR 0059: GraphQL set-coverage gate. Returns the inject entries whose auth
+/// header should be applied iff EVERY top-level field in `doc` is covered by some
+/// granted GraphQL inject whose method + path also match. Fail-closed: an empty
+/// document, or ANY uncovered field, → `None` (the caller rejects the request).
+fn gate_graphql_injects<'a>(
+    injects: &[&'a InjectEntry],
+    method: &str,
+    path: &str,
+    doc: &ParsedGraphql,
+) -> Option<Vec<&'a InjectEntry>> {
+    if doc.top_level.is_empty() {
+        return None;
+    }
+    let candidates: Vec<&'a InjectEntry> = injects
+        .iter()
+        .copied()
+        .filter(|i| {
+            i.policy.graphql.is_some()
+                && i.policy.method_matches(method)
+                && i.policy.path_matches(path)
+        })
+        .collect();
+    let mut applied: Vec<&'a InjectEntry> = Vec::new();
+    for (op, field) in &doc.top_level {
+        let m = candidates.iter().copied().find(|i| {
+            i.policy
+                .graphql
+                .as_ref()
+                .is_some_and(|g| g.matches(*op, field))
+        })?;
+        if !applied.iter().any(|a| std::ptr::eq(*a, m)) {
+            applied.push(m);
+        }
+    }
+    Some(applied)
+}
+
+/// ADR 0059: extract + validate the Content-Length of a GraphQL request from its
+/// header block. Fail-closed: a chunked or non-identity-encoded body, an over-cap
+/// length, or a missing Content-Length → `Err` (we can't safely bound + read it).
+/// `gh` and standard GraphQL clients always send an identity Content-Length'd body.
+fn graphql_content_length(head: &str) -> Result<usize, InterceptError> {
+    let mut content_length: Option<usize> = None;
+    let mut lines = head.split("\r\n");
+    let _ = lines.next(); // request line
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match name.as_str() {
+            "content-length" => content_length = value.parse::<usize>().ok(),
+            "transfer-encoding" if value.to_ascii_lowercase().contains("chunked") => {
+                return Err(InterceptError::GraphqlRejected {
+                    reason: "chunked graphql body unsupported",
+                });
+            }
+            "content-encoding" if !value.eq_ignore_ascii_case("identity") => {
+                return Err(InterceptError::GraphqlRejected {
+                    reason: "compressed graphql body",
+                });
+            }
+            _ => {}
+        }
+    }
+    match content_length {
+        Some(n) if n <= GRAPHQL_REQUEST_BODY_BUDGET => Ok(n),
+        Some(_) => Err(InterceptError::GraphqlRejected {
+            reason: "graphql body exceeds cap",
+        }),
+        None => Err(InterceptError::GraphqlRejected {
+            reason: "graphql request without content-length",
+        }),
+    }
+}
+
+/// Read from `client_tls` into `prefix` until it holds `body_end` bytes (the body
+/// per Content-Length). Fail-closed on a truncated stream (client EOF before the
+/// declared length). `body_end` is already known `<= headers + cap`.
+async fn read_to_content_length<C>(
+    client_tls: &mut C,
+    prefix: &mut Vec<u8>,
+    body_end: usize,
+) -> Result<(), InterceptError>
+where
+    C: AsyncRead + Unpin,
+{
+    while prefix.len() < body_end {
+        let mut chunk = [0u8; 8192];
+        let n = client_tls.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(InterceptError::GraphqlRejected {
+                reason: "truncated graphql body",
+            });
+        }
+        prefix.extend_from_slice(&chunk[..n]);
+    }
     Ok(())
 }
 

@@ -77,6 +77,47 @@ pub struct InjectEntry {
     pub policy: RequestPolicy,
 }
 
+/// ADR 0059: a GraphQL operation type. The body-parsed operation must equal this
+/// for a [`GraphqlMatch`] to fire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphqlOperation {
+    Query,
+    Mutation,
+    Subscription,
+}
+
+impl GraphqlOperation {
+    /// Parse the wire token (`"query"` | `"mutation"` | `"subscription"`,
+    /// case-insensitive). `None` for anything else (a REST entry leaves the
+    /// GraphQL fields empty, so the caller only parses non-empty tokens).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "query" => Some(Self::Query),
+            "mutation" => Some(Self::Mutation),
+            "subscription" => Some(Self::Subscription),
+            _ => None,
+        }
+    }
+}
+
+/// ADR 0059: one GraphQL operation matcher — operation type + top-level field
+/// name (e.g. `mutation` / `mergePullRequest`). Field comparison is
+/// case-sensitive (GraphQL field names are); operation is the enum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphqlMatch {
+    pub operation: GraphqlOperation,
+    pub field: String,
+}
+
+impl GraphqlMatch {
+    /// Does this matcher cover a parsed `(operation, field)` selection? The field
+    /// is the *underlying* GraphQL field name (aliases are resolved by the parser
+    /// before this is called — an alias must never bypass the gate).
+    pub fn matches(&self, operation: GraphqlOperation, field: &str) -> bool {
+        self.operation == operation && self.field == field
+    }
+}
+
 /// ADR 0056: the request shapes a Plane-B injection gates + applies to.
 /// Layered on top of the SNI host match. `methods` empty = any method;
 /// `path_globs` empty = any path.
@@ -88,18 +129,36 @@ pub struct InjectEntry {
 /// `*` and prefix-matched — a coarse over-match where `/repos/*/pulls` collapsed
 /// to `/repos/` and the gate fired on *any* `/repos/…` request; fixed in #413,
 /// renamed from `path_prefixes` to match.)
+///
+/// ADR 0059: when `graphql` is `Some`, this entry gates a GraphQL operation — the
+/// request must still satisfy `methods`/`path_globs` (the `POST /graphql`
+/// endpoint), AND the body-parsed top-level operation must match. REST entries
+/// leave `graphql` `None`; their `allows(method, path)` semantics are unchanged.
 #[derive(Clone, Debug, Default)]
 pub struct RequestPolicy {
     pub methods: Vec<String>,
     pub path_globs: Vec<String>,
+    pub graphql: Option<GraphqlMatch>,
 }
 
 impl RequestPolicy {
-    /// Is `(method, path)` permitted? Method match is case-insensitive; path
-    /// match is a glob over the whole path (`*` = any chars). Empty list = "any".
+    /// Is `(method, path)` permitted by the REST gate? Method match is
+    /// case-insensitive; path match is a glob over the whole path (`*` = any
+    /// chars). Empty list = "any". This ignores `graphql` — GraphQL entries are
+    /// gated by [`Self::method_matches`] + [`Self::path_matches`] **plus** the
+    /// body parse (see `intercept`), not by `allows`.
     pub fn allows(&self, method: &str, path: &str) -> bool {
-        (self.methods.is_empty() || self.methods.iter().any(|m| m.eq_ignore_ascii_case(method)))
-            && (self.path_globs.is_empty() || self.path_globs.iter().any(|p| glob_match(p, path)))
+        self.method_matches(method) && self.path_matches(path)
+    }
+
+    /// Case-insensitive method match; empty `methods` = any method.
+    pub fn method_matches(&self, method: &str) -> bool {
+        self.methods.is_empty() || self.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+    }
+
+    /// Glob path match over the whole path; empty `path_globs` = any path.
+    pub fn path_matches(&self, path: &str) -> bool {
+        self.path_globs.is_empty() || self.path_globs.iter().any(|p| glob_match(p, path))
     }
 }
 
@@ -147,14 +206,21 @@ pub enum SuccessRule {
     StatusClass2xx,
     /// Record on any status (the connector omitted a success rule).
     Always,
+    /// ADR 0059 (GraphQL): record when the response is HTTP 2xx AND its JSON body
+    /// carries no non-empty top-level `errors` array. The `errors` check needs the
+    /// body, so [`Self::satisfied_by`] only covers the 2xx half; `observe::evaluate`
+    /// applies the `errors` gate for this variant.
+    NoGraphqlErrors,
 }
 
 impl SuccessRule {
-    /// Does `status` satisfy this rule? `None` (unparseable status) is treated
-    /// as "indeterminate" — see [`crate::observe`] for the coarse-emit posture.
+    /// Does `status` satisfy this rule's HTTP-status half? `None` (unparseable
+    /// status) is treated as "indeterminate" — see [`crate::observe`] for the
+    /// coarse-emit posture. For [`Self::NoGraphqlErrors`] the body-level `errors`
+    /// check is applied separately in `observe::evaluate`.
     pub fn satisfied_by(&self, status: u16) -> bool {
         match self {
-            Self::StatusClass2xx => (200..300).contains(&status),
+            Self::StatusClass2xx | Self::NoGraphqlErrors => (200..300).contains(&status),
             Self::Always => true,
         }
     }
@@ -319,6 +385,7 @@ mod tests {
                 policy: RequestPolicy {
                     methods: vec!["GET".into()],
                     path_globs: vec!["/api/v2/logs*".into()],
+                    graphql: None,
                 },
             }],
             observes: vec![ObserveEntry {
@@ -326,6 +393,7 @@ mod tests {
                 policy: RequestPolicy {
                     methods: vec!["POST".into()],
                     path_globs: vec!["/repos/*/issues".into()],
+                    graphql: None,
                 },
                 provider: "github".into(),
                 asset_kind: "issue".into(),
