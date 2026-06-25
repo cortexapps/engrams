@@ -22,6 +22,7 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import { isValidSlackRequest } from "@slack/bolt";
 import type { ModalView } from "@slack/types";
 
+import { log as rootLog } from "../log.ts";
 import { getSlackClient, getSlackSigningSecret } from "../integrations/slack.ts";
 import { parseInteractivity, type ThreadRoute } from "../integrations/slack-blocks.ts";
 import { threadHash, selectThreadWorkflowId } from "../workflows/thread-workflow-id.ts";
@@ -62,6 +63,8 @@ async function defaultOpenModal(triggerId: string, view: ModalView): Promise<voi
   await client.views.open({ trigger_id: triggerId, view });
 }
 
+const log = rootLog.child({ component: "slack" });
+
 export function makeSlackInteractivityRoute(deps: SlackInteractivityDeps = {}): Hono {
   const signingSecret = deps.signingSecret ?? getSlackSigningSecret;
   const deliverAnswer = deps.deliverAnswer ?? defaultDeliverAnswer;
@@ -84,9 +87,11 @@ export function makeSlackInteractivityRoute(deps: SlackInteractivityDeps = {}): 
     const action = parseInteractivity(payload);
     switch (action.kind) {
       case "answer":
+        log.info({ toolCallId: action.answer.toolCallId }, "slack: answer received");
         await deliverAnswer(action.route, action.answer);
         return c.body(null, 200);
       case "open_modal":
+        log.info("slack: opening answer modal");
         await openModal(action.triggerId, action.view);
         return c.body(null, 200);
       case "ignore":

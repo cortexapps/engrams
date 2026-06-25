@@ -17,6 +17,7 @@ import { Hono } from "hono";
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import { isValidSlackRequest } from "@slack/bolt";
 
+import { log as rootLog } from "../log.ts";
 import { getSlackSigningSecret } from "../integrations/slack.ts";
 import { classifySlackEvent } from "../integrations/slack-webhook.ts";
 import { threadHash, selectThreadWorkflowId } from "../workflows/thread-workflow-id.ts";
@@ -30,6 +31,8 @@ export interface SlackEventsDeps {
   /** The Slack signing secret resolver (default = the org-secret resolver). */
   signingSecret?: () => Promise<string>;
 }
+
+const log = rootLog.child({ component: "slack" });
 
 export function makeSlackEventsRoute(deps: SlackEventsDeps = {}): Hono {
   const signingSecret = deps.signingSecret ?? getSlackSigningSecret;
@@ -49,7 +52,10 @@ export function makeSlackEventsRoute(deps: SlackEventsDeps = {}): Hono {
 
     const evt = classifySlackEvent(rawBody);
     if (evt.kind === "challenge") return c.text(evt.challenge);
-    if (evt.kind === "ignore") return c.body(null, 200);
+    if (evt.kind === "ignore") {
+      log.debug("slack: non-mention event ignored");
+      return c.body(null, 200);
+    }
 
     const m = evt.mention;
     const workflowId = await selectThreadWorkflowId(
@@ -58,6 +64,10 @@ export function makeSlackEventsRoute(deps: SlackEventsDeps = {}): Hono {
         const status = await DBOS.getWorkflowStatus(id);
         return status != null && TERMINAL_WF.has(status.status);
       },
+    );
+    log.info(
+      { channel: m.channel, user: m.user, thread: m.threadRoot, workflowId },
+      "slack: app_mention → thread workflow",
     );
     // 1st mention creates the thread workflow; later ones are a no-op start and
     // the send delivers. Ack only after both commit (Invariant 3); the event_id

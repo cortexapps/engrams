@@ -1,6 +1,8 @@
 import { Hono } from "hono";
+import { logger as honoLogger } from "hono/logger";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { config } from "./config.ts";
+import { log } from "./log.ts";
 import { buildServer } from "./server.ts";
 import health from "./routes/health.ts";
 import authRoute from "./routes/auth.ts";
@@ -47,6 +49,11 @@ const { upgradeWebSocket, injectWebSocket, wss } = createNodeWebSocket({ app });
 // handleProtocols is read by ws's handleUpgrade on each connection.
 wss.options.handleProtocols = (protocols: Set<string>) =>
   protocols.has("tty") ? "tty" : false;
+
+// Request logging (hono/logger) routed through pino, so every HTTP leg — the
+// Slack webhooks included — logs `<-- METHOD path` / `--> METHOD path status ms`.
+const httpLog = log.child({ component: "http" });
+app.use(honoLogger((message) => httpLog.info(message)));
 
 // Mount routes.
 app.route("/", health);
@@ -130,21 +137,21 @@ setThreadControlPlane(makeThreadControlPlane());
 await initDbos();
 
 server.listen(config.port, "0.0.0.0", () => {
-  console.log(`Orchestrator listening on port ${config.port}`);
+  log.info({ port: config.port }, "orchestrator listening");
 });
 
 // Graceful shutdown on SIGTERM (e.g. Tilt stop, Kubernetes pod termination).
 process.on("SIGTERM", () => {
-  console.log("Orchestrator: SIGTERM received, shutting down gracefully…");
+  log.info("orchestrator: SIGTERM received, shutting down gracefully");
   server.close(async (err) => {
     // Quiesce DBOS (stops queue/recovery loops, closes the system-DB pool)
     // after the HTTP server stops accepting connections.
     await shutdownDbos();
     if (err) {
-      console.error("Orchestrator: error during shutdown", err);
+      log.error({ err }, "orchestrator: error during shutdown");
       process.exit(1);
     }
-    console.log("Orchestrator: shutdown complete");
+    log.info("orchestrator: shutdown complete");
     process.exit(0);
   });
 });

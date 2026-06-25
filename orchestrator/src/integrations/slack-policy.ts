@@ -12,6 +12,7 @@
 
 import type { KnownBlock } from "@slack/types";
 
+import { log as rootLog } from "../log.ts";
 import { getSlackClient } from "./slack.ts";
 import {
   parseUserQuestion,
@@ -22,6 +23,8 @@ import {
 } from "./slack-blocks.ts";
 import { summarizeAsset, type CommunicationPolicy, type StartedSession } from "../workflows/communication-policy.ts";
 import type { SourceMention } from "../workflows/thread-inbox.ts";
+
+const log = rootLog.child({ component: "slack" });
 
 /** The flavor appended to a triggered agent's system prompt (ADR 0059 Decision
  *  8) — NOT connector config; a constant this policy provides at session
@@ -145,11 +148,13 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
     onPickup: (m) => react(m, "eyes"),
 
     async onStarted(m, session) {
+      log.info({ channel: m.channel, thread: m.threadRoot, sessionId: session.id }, "slack: session started");
       await react(m, "white_check_mark");
       await post(m, `Started a session — ${session.webUrl}`);
     },
 
     async onUserQuestion(m, ev) {
+      log.info({ channel: m.channel, thread: m.threadRoot }, "slack: posting agent question");
       const parsed = parseUserQuestion(ev.payloadJson);
       if (!parsed) return post(m, "The agent asked a question (couldn't render it here).");
       const blocks = buildQuestionBlocks(route(m), parsed);
@@ -176,10 +181,15 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
     },
 
     async onComplete(m, session: StartedSession, summary) {
+      log.info(
+        { channel: m.channel, thread: m.threadRoot, sessionId: session.id, assets: summary.assets.length },
+        "slack: session complete",
+      );
       await post(m, "Session complete", buildClosingBlocks(session, summary));
     },
 
     async onFail(m, message) {
+      log.warn({ channel: m.channel, thread: m.threadRoot, reason: message }, "slack: session failed");
       await react(m, "x");
       await post(m, `❌ ${message}`);
     },

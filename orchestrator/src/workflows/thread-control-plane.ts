@@ -15,6 +15,7 @@
  * accepted (ADR Decision 9): it idle-evicts cheaply.
  */
 
+import { log as rootLog } from "../log.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import { sessions as defaultSessions, images as defaultImages } from "../control-plane/client.ts";
@@ -27,6 +28,8 @@ import type { CustomConnectorSource } from "../connectors/registry.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 import { config } from "../config.ts";
 import type { ThreadControlPlane } from "./slack-thread.ts";
+
+const log = rootLog.child({ component: "slack" });
 
 /** A StringList map value (proto3 maps can't hold `repeated` directly). */
 interface StringList {
@@ -111,9 +114,9 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
         try {
           await sessions.deleteSession({ sessionId: created.sessionId });
         } catch (delErr) {
-          console.error(
-            `[ThreadControlPlane] failed to delete orphan session ${created.sessionId}`,
-            delErr,
+          log.error(
+            { sessionId: created.sessionId, err: delErr },
+            "slack: failed to delete orphan session after task-persist failure",
           );
         }
         throw err;
