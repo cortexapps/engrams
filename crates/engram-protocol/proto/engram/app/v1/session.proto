@@ -25,6 +25,11 @@ service SessionService {
   // Streams the event envelope itself, not a wrapped Response message.
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
   rpc StreamEvents(StreamEventsRequest) returns (stream SessionEvent);
+  // ADR 0059: unary, paginated, UNFILTERED read of the persistent event log
+  // (curation is the consumer's concern). The reverse-channel pump
+  // (SessionIngestWorkflow) walks `after_idx` forward in bounded batches; a
+  // unary read is far more testable than racing the StreamEvents tail.
+  rpc ListSessionEvents(ListSessionEventsRequest) returns (ListSessionEventsResponse);
   // One streaming RPC; the unary HTTP route's semantics are the
   // degenerate collected case.
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
@@ -255,6 +260,27 @@ message SessionEvent {
   // payload_json = {"missed": n}.
   string kind = 2;
   string payload_json = 3;
+}
+
+message ListSessionEventsRequest {
+  string session_id = 1;
+  // Return events strictly after this idx, in idx order. UNSET = from the
+  // start of the log (mirrors StreamEvents.since; proto3 default 0 would
+  // silently skip idx 0).
+  optional int64 after_idx = 2;
+  // Max events to return. Server clamps to a hard cap; unset/non-positive
+  // uses the server default page size.
+  optional int64 limit = 3;
+}
+
+message ListSessionEventsResponse {
+  // The page, oldest-first — the same envelope StreamEvents emits, so a
+  // consumer renders catch-up and live events identically.
+  repeated SessionEvent events = 1;
+  // Pass as the next call's `after_idx` to continue. The last returned
+  // event's idx, or the request's `after_idx` echoed back when the page is
+  // empty, so a caller at the tail never rewinds its cursor.
+  int64 next_after_idx = 2;
 }
 
 message ExecRequest {

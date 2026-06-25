@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/session.proto.
  */
 export const file_engram_app_v1_session: GenFile = /*@__PURE__*/
-  fileDesc("ChtlbmdyYW0vYXBwL3YxL3Nlc3Npb24ucHJvdG8SDWVuZ3JhbS5hcHAudjEiFQoTTGlzdFNlc3Npb25zUmVxdWVzdCJIChRMaXN0U2Vzc2lvbnNSZXNwb25zZRIwCghzZXNzaW9ucxgBIAMoCzIeLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbkxpc3RJdGVtIrQBCg9TZXNzaW9uTGlzdEl0ZW0SJwoHc2Vzc2lvbhgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbhIYCgtvd25lcl9lbWFpbBgCIAEoCUgAiAEBEhcKCm93bmVyX25hbWUYAyABKAlIAYgBARIXCgpvd25lcl9raW5kGAQgASgJSAKIAQFCDgoMX293bmVyX2VtYWlsQg0KC19vd25lcl9uYW1lQg0KC19vd25lcl9raW5kIrgBCgdTZXNzaW9uEgoKAmlkGAEgASgJEg4KBnN0YXR1cxgCIAEoCRIUCgdob3N0X2lkGAMgASgJSACIAQESFwoKc2FuZGJveF9pZBgEIAEoCUgBiAEBEg0KBWltYWdlGAUgASgJEgwKBG1vZGUYBiABKAkSEgoKY3JlYXRlZF9hdBgHIAEoCRIWCg5sYXN0X2FjdGl2ZV9hdBgIIAEoCUIKCghfaG9zdF9pZEINCgtfc2FuZGJveF9pZCLDAwoUQ3JlYXRlU2Vzc2lvblJlcXVlc3QSEQoJaW1hZ2VfdXJpGAEgASgJEgwKBG1vZGUYAiABKAkSEwoGcHJvbXB0GAMgASgJSACIAQESFgoJcHJvbXB0X2lkGAcgASgJSAGIAQESQQoHc2VjcmV0cxgFIAMoCzIwLmVuZ3JhbS5hcHAudjEuQ3JlYXRlU2Vzc2lvblJlcXVlc3QuU2VjcmV0c0VudHJ5EkgKC2hhcm5lc3NfZW52GAYgAygLMjMuZW5ncmFtLmFwcC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdC5IYXJuZXNzRW52RW50cnkSFwoPc2VsZWN0ZWRfc2tpbGxzGAggAygJEhQKDGNhcGFiaWxpdGllcxgJIAMoCRIfChdpbnRlZ3JhdGlvbl9wb2xpY3lfanNvbhgKIAEoCRouCgxTZWNyZXRzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ARoxCg9IYXJuZXNzRW52RW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4AUIJCgdfcHJvbXB0QgwKCl9wcm9tcHRfaWRKBAgEEAUiYAoVQ3JlYXRlU2Vzc2lvblJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDgoGc3RhdHVzGAIgASgJEhUKDWltYWdlX3ZlcnNpb24YAyABKAkSDAoEa2luZBgEIAEoCSInChFHZXRTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIj0KEkdldFNlc3Npb25SZXNwb25zZRInCgdzZXNzaW9uGAEgASgLMhYuZW5ncmFtLmFwcC52MS5TZXNzaW9uIioKFERlbGV0ZVNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiFwoVRGVsZXRlU2Vzc2lvblJlc3BvbnNlIkgKEVNlbmRQcm9tcHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSDAoEdGV4dBgCIAEoCRIRCglwcm9tcHRfaWQYAyABKAkiNgoSU2VuZFByb21wdFJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEbm90ZRgCIAEoCSImChBJbnRlcnJ1cHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiNQoRSW50ZXJydXB0UmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRub3RlGAIgASgJIk4KF0VkaXRRdWV1ZWRQcm9tcHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEQoJcHJvbXB0X2lkGAIgASgJEgwKBHRleHQYAyABKAkiPAoYRWRpdFF1ZXVlZFByb21wdFJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEbm90ZRgCIAEoCSJDChpEZXF1ZXVlUXVldWVkUHJvbXB0UmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhEKCXByb21wdF9pZBgCIAEoCSI/ChtEZXF1ZXVlUXVldWVkUHJvbXB0UmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRub3RlGAIgASgJItABChVBbnN3ZXJRdWVzdGlvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIUCgx0b29sX2NhbGxfaWQYAiABKAkSQgoHYW5zd2VycxgDIAMoCzIxLmVuZ3JhbS5hcHAudjEuQW5zd2VyUXVlc3Rpb25SZXF1ZXN0LkFuc3dlcnNFbnRyeRpJCgxBbnN3ZXJzRW50cnkSCwoDa2V5GAEgASgJEigKBXZhbHVlGAIgASgLMhkuZW5ncmFtLmFwcC52MS5TdHJpbmdMaXN0OgI4ASIcCgpTdHJpbmdMaXN0Eg4KBnZhbHVlcxgBIAMoCSI6ChZBbnN3ZXJRdWVzdGlvblJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEbm90ZRgCIAEoCSJHChNTdHJlYW1FdmVudHNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEgoFc2luY2UYAiABKANIAIgBAUIICgZfc2luY2UiTAoMU2Vzc2lvbkV2ZW50EhAKA2lkeBgBIAEoA0gAiAEBEgwKBGtpbmQYAiABKAkSFAoMcGF5bG9hZF9qc29uGAMgASgJQgYKBF9pZHgi/QEKC0V4ZWNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFAoHY29tbWFuZBgCIAEoCUgAiAEBEgwKBGFyZ3YYAyADKAkSMAoDZW52GAQgAygLMiMuZW5ncmFtLmFwcC52MS5FeGVjUmVxdWVzdC5FbnZFbnRyeRIUCgd3b3JrZGlyGAUgASgJSAGIAQESGQoMdGltZW91dF9zZWNzGAYgASgESAKIAQEaKgoIRW52RW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4AUIKCghfY29tbWFuZEIKCghfd29ya2RpckIPCg1fdGltZW91dF9zZWNzIpEBCgpFeGVjT3V0cHV0Ei0KB3N0YXJ0ZWQYASABKAsyGi5lbmdyYW0uYXBwLnYxLkV4ZWNTdGFydGVkSAASEAoGc3Rkb3V0GAIgASgMSAASEAoGc3RkZXJyGAMgASgMSAASJwoEZXhpdBgEIAEoCzIXLmVuZ3JhbS5hcHAudjEuRXhlY0V4aXRIAEIHCgVldmVudCIeCgtFeGVjU3RhcnRlZBIPCgdleGVjX2lkGAEgASgJIl8KCEV4ZWNFeGl0EhgKC2V4aXRfc3RhdHVzGAEgASgFSACIAQESKQoGcnVzYWdlGAIgASgLMhkuZW5ncmFtLmFwcC52MS5FeGVjUnVzYWdlQg4KDF9leGl0X3N0YXR1cyKZAQoKRXhlY1J1c2FnZRIPCgd3YWxsX21zGAEgASgEEhgKC3BlYWtfcnNzX2tiGAIgASgESACIAQESGAoLdXNlcl9jcHVfbXMYAyABKARIAYgBARIXCgpzeXNfY3B1X21zGAQgASgESAKIAQFCDgoMX3BlYWtfcnNzX2tiQg4KDF91c2VyX2NwdV9tc0INCgtfc3lzX2NwdV9tcyJdCg1HZXRMb2dSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEQoEa2luZBgCIAEoCUgAiAEBEhIKBWxpbWl0GAMgASgDSAGIAQFCBwoFX2tpbmRCCAoGX2xpbWl0ImQKDkdldExvZ1Jlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEa2luZBgCIAEoCRIwCgZldmVudHMYAyADKAsyIC5lbmdyYW0uYXBwLnYxLkNvbnZlcnNhdGlvbkVudHJ5IlAKEUNvbnZlcnNhdGlvbkVudHJ5EgsKA2lkeBgBIAEoAxIMCgRraW5kGAIgASgJEgoKAmF0GAMgASgJEhQKDHBheWxvYWRfanNvbhgEIAEoCSIlCg9TbmFwc2hvdFJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSKGAQoQU25hcHNob3RSZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEhgKC3NuYXBzaG90X2lkGAIgASgJSACIAQESFwoKc2l6ZV9ieXRlcxgDIAEoBEgBiAEBEgwKBG5vdGUYBCABKAlCDgoMX3NuYXBzaG90X2lkQg0KC19zaXplX2J5dGVzIiMKDVJlc3VtZVJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSKEAQoOUmVzdW1lUmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIYCgtzbmFwc2hvdF9pZBgCIAEoCUgAiAEBEhcKCnNpemVfYnl0ZXMYAyABKARIAYgBARIMCgRub3RlGAQgASgJQg4KDF9zbmFwc2hvdF9pZEINCgtfc2l6ZV9ieXRlcyInChFFdmljdExvY2FsUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIhQKEkV2aWN0TG9jYWxSZXNwb25zZSImChBFdmljdElkbGVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiNwoRRXZpY3RJZGxlUmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkiKAoSR2V0Q293U3RhdGVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiZAoTR2V0Q293U3RhdGVSZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEi8KBXN0YXRlGAIgASgLMhsuZW5ncmFtLmFwcC52MS5Db3dTdGF0ZVZpZXdIAIgBAUIICgZfc3RhdGUiugMKDENvd1N0YXRlVmlldxISCgpzYW5kYm94X2lkGAEgASgJEhcKCnNlc3Npb25faWQYAiABKAlIAIgBARIYChBkaXNrX21hbmlmZXN0X2lkGAMgASgJEh0KFWRpc2tfbWFuaWZlc3RfdmVyc2lvbhgEIAEoBBIUCgxkaXJ0eV9jaHVua3MYBSABKA0SEwoLZGlydHlfYnl0ZXMYBiABKAQSGgoNbGFzdF9mbHVzaF9hdBgHIAEoCUgBiAEBEhMKC2Jhc2VfY2h1bmtzGAggASgNEhkKEWJhc2VfY2h1bmtzX2xvY2FsGAkgASgNEh8KEm1lbW9yeV9tYW5pZmVzdF9pZBgKIAEoCUgCiAEBEiQKF21lbW9yeV9tYW5pZmVzdF92ZXJzaW9uGAsgASgESAOIAQESHQoQbGFzdF9zbmFwc2hvdF9hdBgMIAEoCUgEiAEBQg0KC19zZXNzaW9uX2lkQhAKDl9sYXN0X2ZsdXNoX2F0QhUKE19tZW1vcnlfbWFuaWZlc3RfaWRCGgoYX21lbW9yeV9tYW5pZmVzdF92ZXJzaW9uQhMKEV9sYXN0X3NuYXBzaG90X2F0IiwKFkxpc3RDaGVja3BvaW50c1JlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSJkChdMaXN0Q2hlY2twb2ludHNSZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEjUKC2NoZWNrcG9pbnRzGAIgAygLMiAuZW5ncmFtLmFwcC52MS5DaGVja3BvaW50U3VtbWFyeSKmAQoRQ2hlY2twb2ludFN1bW1hcnkSEwoLc25hcHNob3RfaWQYASABKAkSEgoKY3JlYXRlZF9hdBgCIAEoCRISCgpzaXplX2J5dGVzGAMgASgEEhoKDWV2ZW50c19jdXJzb3IYBCABKANIAIgBARITCgtyZWNvdmVyYWJsZRgFIAEoCBIRCglpc19sYXRlc3QYBiABKAhCEAoOX2V2ZW50c19jdXJzb3IiPQoSR2V0QXJ0aWZhY3RSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEwoLYXJ0aWZhY3RfaWQYAiABKAkiYgoTR2V0QXJ0aWZhY3RSZXNwb25zZRIzCghtZXRhZGF0YRgBIAEoCzIfLmVuZ3JhbS5hcHAudjEuQXJ0aWZhY3RNZXRhZGF0YUgAEg8KBWNodW5rGAIgASgMSABCBQoDbXNnIk0KEEFydGlmYWN0TWV0YWRhdGESEgoKbWVkaWFfdHlwZRgBIAEoCRISCgpzaXplX2J5dGVzGAIgASgEEhEKCWZpbGVfbmFtZRgDIAEoCSJjCh1DcmVhdGVBcnRpZmFjdEZyb21QYXRoUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEgwKBHBhdGgYAiABKAkSFAoHY2FwdGlvbhgDIAEoCUgAiAEBQgoKCF9jYXB0aW9uIl0KHkNyZWF0ZUFydGlmYWN0RnJvbVBhdGhSZXNwb25zZRITCgthcnRpZmFjdF9pZBgBIAEoCRISCgptZWRpYV90eXBlGAIgASgJEhIKCnNpemVfYnl0ZXMYAyABKAQitAEKEVJlbGF5U2hlbGxSZXF1ZXN0EigKBG9wZW4YASABKAsyGC5lbmdyYW0uYXBwLnYxLlNoZWxsT3BlbkgAEg4KBHRleHQYAiABKAlIABIQCgZiaW5hcnkYAyABKAxIABIOCgRwaW5nGAQgASgMSAASDgoEcG9uZxgFIAEoDEgAEioKBWNsb3NlGAYgASgLMhkuZW5ncmFtLmFwcC52MS5TaGVsbENsb3NlSABCBwoFZnJhbWUiiwEKElJlbGF5U2hlbGxSZXNwb25zZRIOCgR0ZXh0GAEgASgJSAASEAoGYmluYXJ5GAIgASgMSAASDgoEcGluZxgDIAEoDEgAEg4KBHBvbmcYBCABKAxIABIqCgVjbG9zZRgFIAEoCzIZLmVuZ3JhbS5hcHAudjEuU2hlbGxDbG9zZUgAQgcKBWZyYW1lIh8KCVNoZWxsT3BlbhISCgpzZXNzaW9uX2lkGAEgASgJIioKClNoZWxsQ2xvc2USDAoEY29kZRgBIAEoDRIOCgZyZWFzb24YAiABKAky4g0KDlNlc3Npb25TZXJ2aWNlElcKDExpc3RTZXNzaW9ucxIiLmVuZ3JhbS5hcHAudjEuTGlzdFNlc3Npb25zUmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuTGlzdFNlc3Npb25zUmVzcG9uc2USWgoNQ3JlYXRlU2Vzc2lvbhIjLmVuZ3JhbS5hcHAudjEuQ3JlYXRlU2Vzc2lvblJlcXVlc3QaJC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXNwb25zZRJRCgpHZXRTZXNzaW9uEiAuZW5ncmFtLmFwcC52MS5HZXRTZXNzaW9uUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuR2V0U2Vzc2lvblJlc3BvbnNlEloKDURlbGV0ZVNlc3Npb24SIy5lbmdyYW0uYXBwLnYxLkRlbGV0ZVNlc3Npb25SZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5EZWxldGVTZXNzaW9uUmVzcG9uc2USUQoKU2VuZFByb21wdBIgLmVuZ3JhbS5hcHAudjEuU2VuZFByb21wdFJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLlNlbmRQcm9tcHRSZXNwb25zZRJOCglJbnRlcnJ1cHQSHy5lbmdyYW0uYXBwLnYxLkludGVycnVwdFJlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkludGVycnVwdFJlc3BvbnNlEmMKEEVkaXRRdWV1ZWRQcm9tcHQSJi5lbmdyYW0uYXBwLnYxLkVkaXRRdWV1ZWRQcm9tcHRSZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5FZGl0UXVldWVkUHJvbXB0UmVzcG9uc2USbAoTRGVxdWV1ZVF1ZXVlZFByb21wdBIpLmVuZ3JhbS5hcHAudjEuRGVxdWV1ZVF1ZXVlZFByb21wdFJlcXVlc3QaKi5lbmdyYW0uYXBwLnYxLkRlcXVldWVRdWV1ZWRQcm9tcHRSZXNwb25zZRJdCg5BbnN3ZXJRdWVzdGlvbhIkLmVuZ3JhbS5hcHAudjEuQW5zd2VyUXVlc3Rpb25SZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5BbnN3ZXJRdWVzdGlvblJlc3BvbnNlElEKDFN0cmVhbUV2ZW50cxIiLmVuZ3JhbS5hcHAudjEuU3RyZWFtRXZlbnRzUmVxdWVzdBobLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbkV2ZW50MAESPwoERXhlYxIaLmVuZ3JhbS5hcHAudjEuRXhlY1JlcXVlc3QaGS5lbmdyYW0uYXBwLnYxLkV4ZWNPdXRwdXQwARJFCgZHZXRMb2cSHC5lbmdyYW0uYXBwLnYxLkdldExvZ1JlcXVlc3QaHS5lbmdyYW0uYXBwLnYxLkdldExvZ1Jlc3BvbnNlEksKCFNuYXBzaG90Eh4uZW5ncmFtLmFwcC52MS5TbmFwc2hvdFJlcXVlc3QaHy5lbmdyYW0uYXBwLnYxLlNuYXBzaG90UmVzcG9uc2USRQoGUmVzdW1lEhwuZW5ncmFtLmFwcC52MS5SZXN1bWVSZXF1ZXN0Gh0uZW5ncmFtLmFwcC52MS5SZXN1bWVSZXNwb25zZRJRCgpFdmljdExvY2FsEiAuZW5ncmFtLmFwcC52MS5FdmljdExvY2FsUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuRXZpY3RMb2NhbFJlc3BvbnNlEk4KCUV2aWN0SWRsZRIfLmVuZ3JhbS5hcHAudjEuRXZpY3RJZGxlUmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuRXZpY3RJZGxlUmVzcG9uc2USVAoLR2V0Q293U3RhdGUSIS5lbmdyYW0uYXBwLnYxLkdldENvd1N0YXRlUmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuR2V0Q293U3RhdGVSZXNwb25zZRJgCg9MaXN0Q2hlY2twb2ludHMSJS5lbmdyYW0uYXBwLnYxLkxpc3RDaGVja3BvaW50c1JlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkxpc3RDaGVja3BvaW50c1Jlc3BvbnNlElYKC0dldEFydGlmYWN0EiEuZW5ncmFtLmFwcC52MS5HZXRBcnRpZmFjdFJlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLkdldEFydGlmYWN0UmVzcG9uc2UwARJ1ChZDcmVhdGVBcnRpZmFjdEZyb21QYXRoEiwuZW5ncmFtLmFwcC52MS5DcmVhdGVBcnRpZmFjdEZyb21QYXRoUmVxdWVzdBotLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQXJ0aWZhY3RGcm9tUGF0aFJlc3BvbnNlMmUKEVNoZWxsUmVsYXlTZXJ2aWNlElAKBVJlbGF5EiAuZW5ncmFtLmFwcC52MS5SZWxheVNoZWxsUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuUmVsYXlTaGVsbFJlc3BvbnNlKAEwAWIGcHJvdG8z");
+  fileDesc("ChtlbmdyYW0vYXBwL3YxL3Nlc3Npb24ucHJvdG8SDWVuZ3JhbS5hcHAudjEiFQoTTGlzdFNlc3Npb25zUmVxdWVzdCJIChRMaXN0U2Vzc2lvbnNSZXNwb25zZRIwCghzZXNzaW9ucxgBIAMoCzIeLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbkxpc3RJdGVtIrQBCg9TZXNzaW9uTGlzdEl0ZW0SJwoHc2Vzc2lvbhgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbhIYCgtvd25lcl9lbWFpbBgCIAEoCUgAiAEBEhcKCm93bmVyX25hbWUYAyABKAlIAYgBARIXCgpvd25lcl9raW5kGAQgASgJSAKIAQFCDgoMX293bmVyX2VtYWlsQg0KC19vd25lcl9uYW1lQg0KC19vd25lcl9raW5kIrgBCgdTZXNzaW9uEgoKAmlkGAEgASgJEg4KBnN0YXR1cxgCIAEoCRIUCgdob3N0X2lkGAMgASgJSACIAQESFwoKc2FuZGJveF9pZBgEIAEoCUgBiAEBEg0KBWltYWdlGAUgASgJEgwKBG1vZGUYBiABKAkSEgoKY3JlYXRlZF9hdBgHIAEoCRIWCg5sYXN0X2FjdGl2ZV9hdBgIIAEoCUIKCghfaG9zdF9pZEINCgtfc2FuZGJveF9pZCLDAwoUQ3JlYXRlU2Vzc2lvblJlcXVlc3QSEQoJaW1hZ2VfdXJpGAEgASgJEgwKBG1vZGUYAiABKAkSEwoGcHJvbXB0GAMgASgJSACIAQESFgoJcHJvbXB0X2lkGAcgASgJSAGIAQESQQoHc2VjcmV0cxgFIAMoCzIwLmVuZ3JhbS5hcHAudjEuQ3JlYXRlU2Vzc2lvblJlcXVlc3QuU2VjcmV0c0VudHJ5EkgKC2hhcm5lc3NfZW52GAYgAygLMjMuZW5ncmFtLmFwcC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdC5IYXJuZXNzRW52RW50cnkSFwoPc2VsZWN0ZWRfc2tpbGxzGAggAygJEhQKDGNhcGFiaWxpdGllcxgJIAMoCRIfChdpbnRlZ3JhdGlvbl9wb2xpY3lfanNvbhgKIAEoCRouCgxTZWNyZXRzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ARoxCg9IYXJuZXNzRW52RW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4AUIJCgdfcHJvbXB0QgwKCl9wcm9tcHRfaWRKBAgEEAUiYAoVQ3JlYXRlU2Vzc2lvblJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDgoGc3RhdHVzGAIgASgJEhUKDWltYWdlX3ZlcnNpb24YAyABKAkSDAoEa2luZBgEIAEoCSInChFHZXRTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIj0KEkdldFNlc3Npb25SZXNwb25zZRInCgdzZXNzaW9uGAEgASgLMhYuZW5ncmFtLmFwcC52MS5TZXNzaW9uIioKFERlbGV0ZVNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiFwoVRGVsZXRlU2Vzc2lvblJlc3BvbnNlIkgKEVNlbmRQcm9tcHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSDAoEdGV4dBgCIAEoCRIRCglwcm9tcHRfaWQYAyABKAkiNgoSU2VuZFByb21wdFJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEbm90ZRgCIAEoCSImChBJbnRlcnJ1cHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiNQoRSW50ZXJydXB0UmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRub3RlGAIgASgJIk4KF0VkaXRRdWV1ZWRQcm9tcHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEQoJcHJvbXB0X2lkGAIgASgJEgwKBHRleHQYAyABKAkiPAoYRWRpdFF1ZXVlZFByb21wdFJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEbm90ZRgCIAEoCSJDChpEZXF1ZXVlUXVldWVkUHJvbXB0UmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhEKCXByb21wdF9pZBgCIAEoCSI/ChtEZXF1ZXVlUXVldWVkUHJvbXB0UmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRub3RlGAIgASgJItABChVBbnN3ZXJRdWVzdGlvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIUCgx0b29sX2NhbGxfaWQYAiABKAkSQgoHYW5zd2VycxgDIAMoCzIxLmVuZ3JhbS5hcHAudjEuQW5zd2VyUXVlc3Rpb25SZXF1ZXN0LkFuc3dlcnNFbnRyeRpJCgxBbnN3ZXJzRW50cnkSCwoDa2V5GAEgASgJEigKBXZhbHVlGAIgASgLMhkuZW5ncmFtLmFwcC52MS5TdHJpbmdMaXN0OgI4ASIcCgpTdHJpbmdMaXN0Eg4KBnZhbHVlcxgBIAMoCSI6ChZBbnN3ZXJRdWVzdGlvblJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEbm90ZRgCIAEoCSJHChNTdHJlYW1FdmVudHNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEgoFc2luY2UYAiABKANIAIgBAUIICgZfc2luY2UiTAoMU2Vzc2lvbkV2ZW50EhAKA2lkeBgBIAEoA0gAiAEBEgwKBGtpbmQYAiABKAkSFAoMcGF5bG9hZF9qc29uGAMgASgJQgYKBF9pZHgicgoYTGlzdFNlc3Npb25FdmVudHNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFgoJYWZ0ZXJfaWR4GAIgASgDSACIAQESEgoFbGltaXQYAyABKANIAYgBAUIMCgpfYWZ0ZXJfaWR4QggKBl9saW1pdCJgChlMaXN0U2Vzc2lvbkV2ZW50c1Jlc3BvbnNlEisKBmV2ZW50cxgBIAMoCzIbLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbkV2ZW50EhYKDm5leHRfYWZ0ZXJfaWR4GAIgASgDIv0BCgtFeGVjUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhQKB2NvbW1hbmQYAiABKAlIAIgBARIMCgRhcmd2GAMgAygJEjAKA2VudhgEIAMoCzIjLmVuZ3JhbS5hcHAudjEuRXhlY1JlcXVlc3QuRW52RW50cnkSFAoHd29ya2RpchgFIAEoCUgBiAEBEhkKDHRpbWVvdXRfc2VjcxgGIAEoBEgCiAEBGioKCEVudkVudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAFCCgoIX2NvbW1hbmRCCgoIX3dvcmtkaXJCDwoNX3RpbWVvdXRfc2VjcyKRAQoKRXhlY091dHB1dBItCgdzdGFydGVkGAEgASgLMhouZW5ncmFtLmFwcC52MS5FeGVjU3RhcnRlZEgAEhAKBnN0ZG91dBgCIAEoDEgAEhAKBnN0ZGVychgDIAEoDEgAEicKBGV4aXQYBCABKAsyFy5lbmdyYW0uYXBwLnYxLkV4ZWNFeGl0SABCBwoFZXZlbnQiHgoLRXhlY1N0YXJ0ZWQSDwoHZXhlY19pZBgBIAEoCSJfCghFeGVjRXhpdBIYCgtleGl0X3N0YXR1cxgBIAEoBUgAiAEBEikKBnJ1c2FnZRgCIAEoCzIZLmVuZ3JhbS5hcHAudjEuRXhlY1J1c2FnZUIOCgxfZXhpdF9zdGF0dXMimQEKCkV4ZWNSdXNhZ2USDwoHd2FsbF9tcxgBIAEoBBIYCgtwZWFrX3Jzc19rYhgCIAEoBEgAiAEBEhgKC3VzZXJfY3B1X21zGAMgASgESAGIAQESFwoKc3lzX2NwdV9tcxgEIAEoBEgCiAEBQg4KDF9wZWFrX3Jzc19rYkIOCgxfdXNlcl9jcHVfbXNCDQoLX3N5c19jcHVfbXMiXQoNR2V0TG9nUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhEKBGtpbmQYAiABKAlIAIgBARISCgVsaW1pdBgDIAEoA0gBiAEBQgcKBV9raW5kQggKBl9saW1pdCJkCg5HZXRMb2dSZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEgwKBGtpbmQYAiABKAkSMAoGZXZlbnRzGAMgAygLMiAuZW5ncmFtLmFwcC52MS5Db252ZXJzYXRpb25FbnRyeSJQChFDb252ZXJzYXRpb25FbnRyeRILCgNpZHgYASABKAMSDAoEa2luZBgCIAEoCRIKCgJhdBgDIAEoCRIUCgxwYXlsb2FkX2pzb24YBCABKAkiJQoPU25hcHNob3RSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkihgEKEFNuYXBzaG90UmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIYCgtzbmFwc2hvdF9pZBgCIAEoCUgAiAEBEhcKCnNpemVfYnl0ZXMYAyABKARIAYgBARIMCgRub3RlGAQgASgJQg4KDF9zbmFwc2hvdF9pZEINCgtfc2l6ZV9ieXRlcyIjCg1SZXN1bWVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkihAEKDlJlc3VtZVJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSGAoLc25hcHNob3RfaWQYAiABKAlIAIgBARIXCgpzaXplX2J5dGVzGAMgASgESAGIAQESDAoEbm90ZRgEIAEoCUIOCgxfc25hcHNob3RfaWRCDQoLX3NpemVfYnl0ZXMiJwoRRXZpY3RMb2NhbFJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSIUChJFdmljdExvY2FsUmVzcG9uc2UiJgoQRXZpY3RJZGxlUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIjcKEUV2aWN0SWRsZVJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDgoGc3RhdHVzGAIgASgJIigKEkdldENvd1N0YXRlUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJImQKE0dldENvd1N0YXRlUmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIvCgVzdGF0ZRgCIAEoCzIbLmVuZ3JhbS5hcHAudjEuQ293U3RhdGVWaWV3SACIAQFCCAoGX3N0YXRlIroDCgxDb3dTdGF0ZVZpZXcSEgoKc2FuZGJveF9pZBgBIAEoCRIXCgpzZXNzaW9uX2lkGAIgASgJSACIAQESGAoQZGlza19tYW5pZmVzdF9pZBgDIAEoCRIdChVkaXNrX21hbmlmZXN0X3ZlcnNpb24YBCABKAQSFAoMZGlydHlfY2h1bmtzGAUgASgNEhMKC2RpcnR5X2J5dGVzGAYgASgEEhoKDWxhc3RfZmx1c2hfYXQYByABKAlIAYgBARITCgtiYXNlX2NodW5rcxgIIAEoDRIZChFiYXNlX2NodW5rc19sb2NhbBgJIAEoDRIfChJtZW1vcnlfbWFuaWZlc3RfaWQYCiABKAlIAogBARIkChdtZW1vcnlfbWFuaWZlc3RfdmVyc2lvbhgLIAEoBEgDiAEBEh0KEGxhc3Rfc25hcHNob3RfYXQYDCABKAlIBIgBAUINCgtfc2Vzc2lvbl9pZEIQCg5fbGFzdF9mbHVzaF9hdEIVChNfbWVtb3J5X21hbmlmZXN0X2lkQhoKGF9tZW1vcnlfbWFuaWZlc3RfdmVyc2lvbkITChFfbGFzdF9zbmFwc2hvdF9hdCIsChZMaXN0Q2hlY2twb2ludHNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiZAoXTGlzdENoZWNrcG9pbnRzUmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRI1CgtjaGVja3BvaW50cxgCIAMoCzIgLmVuZ3JhbS5hcHAudjEuQ2hlY2twb2ludFN1bW1hcnkipgEKEUNoZWNrcG9pbnRTdW1tYXJ5EhMKC3NuYXBzaG90X2lkGAEgASgJEhIKCmNyZWF0ZWRfYXQYAiABKAkSEgoKc2l6ZV9ieXRlcxgDIAEoBBIaCg1ldmVudHNfY3Vyc29yGAQgASgDSACIAQESEwoLcmVjb3ZlcmFibGUYBSABKAgSEQoJaXNfbGF0ZXN0GAYgASgIQhAKDl9ldmVudHNfY3Vyc29yIj0KEkdldEFydGlmYWN0UmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhMKC2FydGlmYWN0X2lkGAIgASgJImIKE0dldEFydGlmYWN0UmVzcG9uc2USMwoIbWV0YWRhdGEYASABKAsyHy5lbmdyYW0uYXBwLnYxLkFydGlmYWN0TWV0YWRhdGFIABIPCgVjaHVuaxgCIAEoDEgAQgUKA21zZyJNChBBcnRpZmFjdE1ldGFkYXRhEhIKCm1lZGlhX3R5cGUYASABKAkSEgoKc2l6ZV9ieXRlcxgCIAEoBBIRCglmaWxlX25hbWUYAyABKAkiYwodQ3JlYXRlQXJ0aWZhY3RGcm9tUGF0aFJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRwYXRoGAIgASgJEhQKB2NhcHRpb24YAyABKAlIAIgBAUIKCghfY2FwdGlvbiJdCh5DcmVhdGVBcnRpZmFjdEZyb21QYXRoUmVzcG9uc2USEwoLYXJ0aWZhY3RfaWQYASABKAkSEgoKbWVkaWFfdHlwZRgCIAEoCRISCgpzaXplX2J5dGVzGAMgASgEIrQBChFSZWxheVNoZWxsUmVxdWVzdBIoCgRvcGVuGAEgASgLMhguZW5ncmFtLmFwcC52MS5TaGVsbE9wZW5IABIOCgR0ZXh0GAIgASgJSAASEAoGYmluYXJ5GAMgASgMSAASDgoEcGluZxgEIAEoDEgAEg4KBHBvbmcYBSABKAxIABIqCgVjbG9zZRgGIAEoCzIZLmVuZ3JhbS5hcHAudjEuU2hlbGxDbG9zZUgAQgcKBWZyYW1lIosBChJSZWxheVNoZWxsUmVzcG9uc2USDgoEdGV4dBgBIAEoCUgAEhAKBmJpbmFyeRgCIAEoDEgAEg4KBHBpbmcYAyABKAxIABIOCgRwb25nGAQgASgMSAASKgoFY2xvc2UYBSABKAsyGS5lbmdyYW0uYXBwLnYxLlNoZWxsQ2xvc2VIAEIHCgVmcmFtZSIfCglTaGVsbE9wZW4SEgoKc2Vzc2lvbl9pZBgBIAEoCSIqCgpTaGVsbENsb3NlEgwKBGNvZGUYASABKA0SDgoGcmVhc29uGAIgASgJMsoOCg5TZXNzaW9uU2VydmljZRJXCgxMaXN0U2Vzc2lvbnMSIi5lbmdyYW0uYXBwLnYxLkxpc3RTZXNzaW9uc1JlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLkxpc3RTZXNzaW9uc1Jlc3BvbnNlEloKDUNyZWF0ZVNlc3Npb24SIy5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5DcmVhdGVTZXNzaW9uUmVzcG9uc2USUQoKR2V0U2Vzc2lvbhIgLmVuZ3JhbS5hcHAudjEuR2V0U2Vzc2lvblJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkdldFNlc3Npb25SZXNwb25zZRJaCg1EZWxldGVTZXNzaW9uEiMuZW5ncmFtLmFwcC52MS5EZWxldGVTZXNzaW9uUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuRGVsZXRlU2Vzc2lvblJlc3BvbnNlElEKClNlbmRQcm9tcHQSIC5lbmdyYW0uYXBwLnYxLlNlbmRQcm9tcHRSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5TZW5kUHJvbXB0UmVzcG9uc2USTgoJSW50ZXJydXB0Eh8uZW5ncmFtLmFwcC52MS5JbnRlcnJ1cHRSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5JbnRlcnJ1cHRSZXNwb25zZRJjChBFZGl0UXVldWVkUHJvbXB0EiYuZW5ncmFtLmFwcC52MS5FZGl0UXVldWVkUHJvbXB0UmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuRWRpdFF1ZXVlZFByb21wdFJlc3BvbnNlEmwKE0RlcXVldWVRdWV1ZWRQcm9tcHQSKS5lbmdyYW0uYXBwLnYxLkRlcXVldWVRdWV1ZWRQcm9tcHRSZXF1ZXN0GiouZW5ncmFtLmFwcC52MS5EZXF1ZXVlUXVldWVkUHJvbXB0UmVzcG9uc2USXQoOQW5zd2VyUXVlc3Rpb24SJC5lbmdyYW0uYXBwLnYxLkFuc3dlclF1ZXN0aW9uUmVxdWVzdBolLmVuZ3JhbS5hcHAudjEuQW5zd2VyUXVlc3Rpb25SZXNwb25zZRJRCgxTdHJlYW1FdmVudHMSIi5lbmdyYW0uYXBwLnYxLlN0cmVhbUV2ZW50c1JlcXVlc3QaGy5lbmdyYW0uYXBwLnYxLlNlc3Npb25FdmVudDABEmYKEUxpc3RTZXNzaW9uRXZlbnRzEicuZW5ncmFtLmFwcC52MS5MaXN0U2Vzc2lvbkV2ZW50c1JlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLkxpc3RTZXNzaW9uRXZlbnRzUmVzcG9uc2USPwoERXhlYxIaLmVuZ3JhbS5hcHAudjEuRXhlY1JlcXVlc3QaGS5lbmdyYW0uYXBwLnYxLkV4ZWNPdXRwdXQwARJFCgZHZXRMb2cSHC5lbmdyYW0uYXBwLnYxLkdldExvZ1JlcXVlc3QaHS5lbmdyYW0uYXBwLnYxLkdldExvZ1Jlc3BvbnNlEksKCFNuYXBzaG90Eh4uZW5ncmFtLmFwcC52MS5TbmFwc2hvdFJlcXVlc3QaHy5lbmdyYW0uYXBwLnYxLlNuYXBzaG90UmVzcG9uc2USRQoGUmVzdW1lEhwuZW5ncmFtLmFwcC52MS5SZXN1bWVSZXF1ZXN0Gh0uZW5ncmFtLmFwcC52MS5SZXN1bWVSZXNwb25zZRJRCgpFdmljdExvY2FsEiAuZW5ncmFtLmFwcC52MS5FdmljdExvY2FsUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuRXZpY3RMb2NhbFJlc3BvbnNlEk4KCUV2aWN0SWRsZRIfLmVuZ3JhbS5hcHAudjEuRXZpY3RJZGxlUmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuRXZpY3RJZGxlUmVzcG9uc2USVAoLR2V0Q293U3RhdGUSIS5lbmdyYW0uYXBwLnYxLkdldENvd1N0YXRlUmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuR2V0Q293U3RhdGVSZXNwb25zZRJgCg9MaXN0Q2hlY2twb2ludHMSJS5lbmdyYW0uYXBwLnYxLkxpc3RDaGVja3BvaW50c1JlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkxpc3RDaGVja3BvaW50c1Jlc3BvbnNlElYKC0dldEFydGlmYWN0EiEuZW5ncmFtLmFwcC52MS5HZXRBcnRpZmFjdFJlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLkdldEFydGlmYWN0UmVzcG9uc2UwARJ1ChZDcmVhdGVBcnRpZmFjdEZyb21QYXRoEiwuZW5ncmFtLmFwcC52MS5DcmVhdGVBcnRpZmFjdEZyb21QYXRoUmVxdWVzdBotLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQXJ0aWZhY3RGcm9tUGF0aFJlc3BvbnNlMmUKEVNoZWxsUmVsYXlTZXJ2aWNlElAKBVJlbGF5EiAuZW5ncmFtLmFwcC52MS5SZWxheVNoZWxsUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuUmVsYXlTaGVsbFJlc3BvbnNlKAEwAWIGcHJvdG8z");
 
 /**
  * @generated from message engram.app.v1.ListSessionsRequest
@@ -674,6 +674,69 @@ export const SessionEventSchema: GenMessage<SessionEvent> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_session, 22);
 
 /**
+ * @generated from message engram.app.v1.ListSessionEventsRequest
+ */
+export type ListSessionEventsRequest = Message<"engram.app.v1.ListSessionEventsRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * Return events strictly after this idx, in idx order. UNSET = from the
+   * start of the log (mirrors StreamEvents.since; proto3 default 0 would
+   * silently skip idx 0).
+   *
+   * @generated from field: optional int64 after_idx = 2;
+   */
+  afterIdx?: bigint;
+
+  /**
+   * Max events to return. Server clamps to a hard cap; unset/non-positive
+   * uses the server default page size.
+   *
+   * @generated from field: optional int64 limit = 3;
+   */
+  limit?: bigint;
+};
+
+/**
+ * Describes the message engram.app.v1.ListSessionEventsRequest.
+ * Use `create(ListSessionEventsRequestSchema)` to create a new message.
+ */
+export const ListSessionEventsRequestSchema: GenMessage<ListSessionEventsRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_session, 23);
+
+/**
+ * @generated from message engram.app.v1.ListSessionEventsResponse
+ */
+export type ListSessionEventsResponse = Message<"engram.app.v1.ListSessionEventsResponse"> & {
+  /**
+   * The page, oldest-first — the same envelope StreamEvents emits, so a
+   * consumer renders catch-up and live events identically.
+   *
+   * @generated from field: repeated engram.app.v1.SessionEvent events = 1;
+   */
+  events: SessionEvent[];
+
+  /**
+   * Pass as the next call's `after_idx` to continue. The last returned
+   * event's idx, or the request's `after_idx` echoed back when the page is
+   * empty, so a caller at the tail never rewinds its cursor.
+   *
+   * @generated from field: int64 next_after_idx = 2;
+   */
+  nextAfterIdx: bigint;
+};
+
+/**
+ * Describes the message engram.app.v1.ListSessionEventsResponse.
+ * Use `create(ListSessionEventsResponseSchema)` to create a new message.
+ */
+export const ListSessionEventsResponseSchema: GenMessage<ListSessionEventsResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_session, 24);
+
+/**
  * @generated from message engram.app.v1.ExecRequest
  */
 export type ExecRequest = Message<"engram.app.v1.ExecRequest"> & {
@@ -716,7 +779,7 @@ export type ExecRequest = Message<"engram.app.v1.ExecRequest"> & {
  * Use `create(ExecRequestSchema)` to create a new message.
  */
 export const ExecRequestSchema: GenMessage<ExecRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 23);
+  messageDesc(file_engram_app_v1_session, 25);
 
 /**
  * engram_core::types::ExecEvent is authoritative for the stream body:
@@ -768,7 +831,7 @@ export type ExecOutput = Message<"engram.app.v1.ExecOutput"> & {
  * Use `create(ExecOutputSchema)` to create a new message.
  */
 export const ExecOutputSchema: GenMessage<ExecOutput> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 24);
+  messageDesc(file_engram_app_v1_session, 26);
 
 /**
  * @generated from message engram.app.v1.ExecStarted
@@ -785,7 +848,7 @@ export type ExecStarted = Message<"engram.app.v1.ExecStarted"> & {
  * Use `create(ExecStartedSchema)` to create a new message.
  */
 export const ExecStartedSchema: GenMessage<ExecStarted> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 25);
+  messageDesc(file_engram_app_v1_session, 27);
 
 /**
  * @generated from message engram.app.v1.ExecExit
@@ -813,7 +876,7 @@ export type ExecExit = Message<"engram.app.v1.ExecExit"> & {
  * Use `create(ExecExitSchema)` to create a new message.
  */
 export const ExecExitSchema: GenMessage<ExecExit> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 26);
+  messageDesc(file_engram_app_v1_session, 28);
 
 /**
  * engram_core::types::ExecRusage. wall_ms is coordinator-measured wall
@@ -849,7 +912,7 @@ export type ExecRusage = Message<"engram.app.v1.ExecRusage"> & {
  * Use `create(ExecRusageSchema)` to create a new message.
  */
 export const ExecRusageSchema: GenMessage<ExecRusage> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 27);
+  messageDesc(file_engram_app_v1_session, 29);
 
 /**
  * @generated from message engram.app.v1.GetLogRequest
@@ -882,7 +945,7 @@ export type GetLogRequest = Message<"engram.app.v1.GetLogRequest"> & {
  * Use `create(GetLogRequestSchema)` to create a new message.
  */
 export const GetLogRequestSchema: GenMessage<GetLogRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 28);
+  messageDesc(file_engram_app_v1_session, 30);
 
 /**
  * @generated from message engram.app.v1.GetLogResponse
@@ -909,7 +972,7 @@ export type GetLogResponse = Message<"engram.app.v1.GetLogResponse"> & {
  * Use `create(GetLogResponseSchema)` to create a new message.
  */
 export const GetLogResponseSchema: GenMessage<GetLogResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 29);
+  messageDesc(file_engram_app_v1_session, 31);
 
 /**
  * @generated from message engram.app.v1.ConversationEntry
@@ -945,7 +1008,7 @@ export type ConversationEntry = Message<"engram.app.v1.ConversationEntry"> & {
  * Use `create(ConversationEntrySchema)` to create a new message.
  */
 export const ConversationEntrySchema: GenMessage<ConversationEntry> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 30);
+  messageDesc(file_engram_app_v1_session, 32);
 
 /**
  * @generated from message engram.app.v1.SnapshotRequest
@@ -962,7 +1025,7 @@ export type SnapshotRequest = Message<"engram.app.v1.SnapshotRequest"> & {
  * Use `create(SnapshotRequestSchema)` to create a new message.
  */
 export const SnapshotRequestSchema: GenMessage<SnapshotRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 31);
+  messageDesc(file_engram_app_v1_session, 33);
 
 /**
  * @generated from message engram.app.v1.SnapshotResponse
@@ -996,7 +1059,7 @@ export type SnapshotResponse = Message<"engram.app.v1.SnapshotResponse"> & {
  * Use `create(SnapshotResponseSchema)` to create a new message.
  */
 export const SnapshotResponseSchema: GenMessage<SnapshotResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 32);
+  messageDesc(file_engram_app_v1_session, 34);
 
 /**
  * @generated from message engram.app.v1.ResumeRequest
@@ -1013,7 +1076,7 @@ export type ResumeRequest = Message<"engram.app.v1.ResumeRequest"> & {
  * Use `create(ResumeRequestSchema)` to create a new message.
  */
 export const ResumeRequestSchema: GenMessage<ResumeRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 33);
+  messageDesc(file_engram_app_v1_session, 35);
 
 /**
  * Same shape as SnapshotResponse (the HTTP resume handler reuses it);
@@ -1048,7 +1111,7 @@ export type ResumeResponse = Message<"engram.app.v1.ResumeResponse"> & {
  * Use `create(ResumeResponseSchema)` to create a new message.
  */
 export const ResumeResponseSchema: GenMessage<ResumeResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 34);
+  messageDesc(file_engram_app_v1_session, 36);
 
 /**
  * @generated from message engram.app.v1.EvictLocalRequest
@@ -1065,7 +1128,7 @@ export type EvictLocalRequest = Message<"engram.app.v1.EvictLocalRequest"> & {
  * Use `create(EvictLocalRequestSchema)` to create a new message.
  */
 export const EvictLocalRequestSchema: GenMessage<EvictLocalRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 35);
+  messageDesc(file_engram_app_v1_session, 37);
 
 /**
  * Today's HTTP handler returns 202 Accepted with no body.
@@ -1080,7 +1143,7 @@ export type EvictLocalResponse = Message<"engram.app.v1.EvictLocalResponse"> & {
  * Use `create(EvictLocalResponseSchema)` to create a new message.
  */
 export const EvictLocalResponseSchema: GenMessage<EvictLocalResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 36);
+  messageDesc(file_engram_app_v1_session, 38);
 
 /**
  * @generated from message engram.app.v1.EvictIdleRequest
@@ -1097,7 +1160,7 @@ export type EvictIdleRequest = Message<"engram.app.v1.EvictIdleRequest"> & {
  * Use `create(EvictIdleRequestSchema)` to create a new message.
  */
 export const EvictIdleRequestSchema: GenMessage<EvictIdleRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 37);
+  messageDesc(file_engram_app_v1_session, 39);
 
 /**
  * Mirrors api/admin.rs EvictIdleResponse. The synchronous pipeline has
@@ -1124,7 +1187,7 @@ export type EvictIdleResponse = Message<"engram.app.v1.EvictIdleResponse"> & {
  * Use `create(EvictIdleResponseSchema)` to create a new message.
  */
 export const EvictIdleResponseSchema: GenMessage<EvictIdleResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 38);
+  messageDesc(file_engram_app_v1_session, 40);
 
 /**
  * @generated from message engram.app.v1.GetCowStateRequest
@@ -1141,7 +1204,7 @@ export type GetCowStateRequest = Message<"engram.app.v1.GetCowStateRequest"> & {
  * Use `create(GetCowStateRequestSchema)` to create a new message.
  */
 export const GetCowStateRequestSchema: GenMessage<GetCowStateRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 39);
+  messageDesc(file_engram_app_v1_session, 41);
 
 /**
  * @generated from message engram.app.v1.GetCowStateResponse
@@ -1166,7 +1229,7 @@ export type GetCowStateResponse = Message<"engram.app.v1.GetCowStateResponse"> &
  * Use `create(GetCowStateResponseSchema)` to create a new message.
  */
 export const GetCowStateResponseSchema: GenMessage<GetCowStateResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 40);
+  messageDesc(file_engram_app_v1_session, 42);
 
 /**
  * Mirrors engram_coordinator::cow_state::CowStateView. One row per
@@ -1259,7 +1322,7 @@ export type CowStateView = Message<"engram.app.v1.CowStateView"> & {
  * Use `create(CowStateViewSchema)` to create a new message.
  */
 export const CowStateViewSchema: GenMessage<CowStateView> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 41);
+  messageDesc(file_engram_app_v1_session, 43);
 
 /**
  * @generated from message engram.app.v1.ListCheckpointsRequest
@@ -1276,7 +1339,7 @@ export type ListCheckpointsRequest = Message<"engram.app.v1.ListCheckpointsReque
  * Use `create(ListCheckpointsRequestSchema)` to create a new message.
  */
 export const ListCheckpointsRequestSchema: GenMessage<ListCheckpointsRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 42);
+  messageDesc(file_engram_app_v1_session, 44);
 
 /**
  * @generated from message engram.app.v1.ListCheckpointsResponse
@@ -1301,7 +1364,7 @@ export type ListCheckpointsResponse = Message<"engram.app.v1.ListCheckpointsResp
  * Use `create(ListCheckpointsResponseSchema)` to create a new message.
  */
 export const ListCheckpointsResponseSchema: GenMessage<ListCheckpointsResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 43);
+  messageDesc(file_engram_app_v1_session, 45);
 
 /**
  * ADR 0028 A.log: one checkpoint in a session's chain.
@@ -1353,7 +1416,7 @@ export type CheckpointSummary = Message<"engram.app.v1.CheckpointSummary"> & {
  * Use `create(CheckpointSummarySchema)` to create a new message.
  */
 export const CheckpointSummarySchema: GenMessage<CheckpointSummary> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 44);
+  messageDesc(file_engram_app_v1_session, 46);
 
 /**
  * @generated from message engram.app.v1.GetArtifactRequest
@@ -1375,7 +1438,7 @@ export type GetArtifactRequest = Message<"engram.app.v1.GetArtifactRequest"> & {
  * Use `create(GetArtifactRequestSchema)` to create a new message.
  */
 export const GetArtifactRequestSchema: GenMessage<GetArtifactRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 45);
+  messageDesc(file_engram_app_v1_session, 47);
 
 /**
  * @generated from message engram.app.v1.GetArtifactResponse
@@ -1406,7 +1469,7 @@ export type GetArtifactResponse = Message<"engram.app.v1.GetArtifactResponse"> &
  * Use `create(GetArtifactResponseSchema)` to create a new message.
  */
 export const GetArtifactResponseSchema: GenMessage<GetArtifactResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 46);
+  messageDesc(file_engram_app_v1_session, 48);
 
 /**
  * @generated from message engram.app.v1.ArtifactMetadata
@@ -1436,7 +1499,7 @@ export type ArtifactMetadata = Message<"engram.app.v1.ArtifactMetadata"> & {
  * Use `create(ArtifactMetadataSchema)` to create a new message.
  */
 export const ArtifactMetadataSchema: GenMessage<ArtifactMetadata> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 47);
+  messageDesc(file_engram_app_v1_session, 49);
 
 /**
  * ADR 0026 trusted operator file pull: capture ANY file in the session
@@ -1466,7 +1529,7 @@ export type CreateArtifactFromPathRequest = Message<"engram.app.v1.CreateArtifac
  * Use `create(CreateArtifactFromPathRequestSchema)` to create a new message.
  */
 export const CreateArtifactFromPathRequestSchema: GenMessage<CreateArtifactFromPathRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 48);
+  messageDesc(file_engram_app_v1_session, 50);
 
 /**
  * @generated from message engram.app.v1.CreateArtifactFromPathResponse
@@ -1493,7 +1556,7 @@ export type CreateArtifactFromPathResponse = Message<"engram.app.v1.CreateArtifa
  * Use `create(CreateArtifactFromPathResponseSchema)` to create a new message.
  */
 export const CreateArtifactFromPathResponseSchema: GenMessage<CreateArtifactFromPathResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 49);
+  messageDesc(file_engram_app_v1_session, 51);
 
 /**
  * Frame kinds mirror the WS frames / host ProxyShellMessage 1:1. Request
@@ -1552,7 +1615,7 @@ export type RelayShellRequest = Message<"engram.app.v1.RelayShellRequest"> & {
  * Use `create(RelayShellRequestSchema)` to create a new message.
  */
 export const RelayShellRequestSchema: GenMessage<RelayShellRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 50);
+  messageDesc(file_engram_app_v1_session, 52);
 
 /**
  * @generated from message engram.app.v1.RelayShellResponse
@@ -1599,7 +1662,7 @@ export type RelayShellResponse = Message<"engram.app.v1.RelayShellResponse"> & {
  * Use `create(RelayShellResponseSchema)` to create a new message.
  */
 export const RelayShellResponseSchema: GenMessage<RelayShellResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 51);
+  messageDesc(file_engram_app_v1_session, 53);
 
 /**
  * @generated from message engram.app.v1.ShellOpen
@@ -1616,7 +1679,7 @@ export type ShellOpen = Message<"engram.app.v1.ShellOpen"> & {
  * Use `create(ShellOpenSchema)` to create a new message.
  */
 export const ShellOpenSchema: GenMessage<ShellOpen> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 52);
+  messageDesc(file_engram_app_v1_session, 54);
 
 /**
  * @generated from message engram.app.v1.ShellClose
@@ -1638,7 +1701,7 @@ export type ShellClose = Message<"engram.app.v1.ShellClose"> & {
  * Use `create(ShellCloseSchema)` to create a new message.
  */
 export const ShellCloseSchema: GenMessage<ShellClose> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 53);
+  messageDesc(file_engram_app_v1_session, 55);
 
 /**
  * The orchestrator-facing app contract (ADR 0051 §2.3, rev 2026-06-10).
@@ -1740,6 +1803,19 @@ export const SessionService: GenService<{
     methodKind: "server_streaming";
     input: typeof StreamEventsRequestSchema;
     output: typeof SessionEventSchema;
+  },
+  /**
+   * ADR 0059: unary, paginated, UNFILTERED read of the persistent event log
+   * (curation is the consumer's concern). The reverse-channel pump
+   * (SessionIngestWorkflow) walks `after_idx` forward in bounded batches; a
+   * unary read is far more testable than racing the StreamEvents tail.
+   *
+   * @generated from rpc engram.app.v1.SessionService.ListSessionEvents
+   */
+  listSessionEvents: {
+    methodKind: "unary";
+    input: typeof ListSessionEventsRequestSchema;
+    output: typeof ListSessionEventsResponseSchema;
   },
   /**
    * One streaming RPC; the unary HTTP route's semantics are the

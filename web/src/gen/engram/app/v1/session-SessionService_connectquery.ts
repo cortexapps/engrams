@@ -60,6 +60,16 @@ export const dequeueQueuedPrompt = SessionService.method.dequeueQueuedPrompt;
 export const answerQuestion = SessionService.method.answerQuestion;
 
 /**
+ * ADR 0059: unary, paginated, UNFILTERED read of the persistent event log
+ * (curation is the consumer's concern). The reverse-channel pump
+ * (SessionIngestWorkflow) walks `after_idx` forward in bounded batches; a
+ * unary read is far more testable than racing the StreamEvents tail.
+ *
+ * @generated from rpc engram.app.v1.SessionService.ListSessionEvents
+ */
+export const listSessionEvents = SessionService.method.listSessionEvents;
+
+/**
  * @generated from rpc engram.app.v1.SessionService.GetLog
  */
 export const getLog = SessionService.method.getLog;
