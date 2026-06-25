@@ -10,8 +10,8 @@
  *
  * Shape: the first `recv` is the initial @mention; ack pickup, resolve the
  * engrams user (unlinked → fail), pick the org default profile, gather the
- * thread into a prompt, create the session (carrying the policy's constant
- * system prompt), ack started, start the per-session pump, then a single recv
+ * thread into a prompt, create the task (carrying the policy's constant system
+ * prompt), ack started, start the per-session pump, then a single recv
  * loop multiplexes session events ∪ trigger events off `THREAD_TOPIC`:
  *   - session_event   → route to the policy (question/answer-update/asset)
  *   - session_terminal → closing summary (ok) or failure, then exit
@@ -39,8 +39,8 @@ const log = rootLog.child({ component: "slack" });
 
 /** Session-lifecycle ops the thread workflow needs, behind one seam so the
  *  workflow logic is tested without a live coordinator. P2 wires the real
- *  client (profile-compiled createSession, identity via Slack users.info). */
-export interface CreateSessionInput {
+ *  client (profile-compiled createTask, identity via Slack users.info). */
+export interface CreateTaskInput {
   profileId: string;
   ownerUserId: string;
   prompt: string;
@@ -54,7 +54,9 @@ export interface ThreadControlPlane {
   resolveUser(provider: string, externalUserId: string): Promise<string | null>;
   /** The org's `is_default` profile, or null if none is configured. */
   getDefaultProfile(): Promise<{ id: string } | null>;
-  createSession(input: CreateSessionInput): Promise<StartedSession>;
+  /** Create the task (and its primary session) the thread drives — the same
+   *  create path as a UI chat task; never a bare session (ADR 0059). */
+  createTask(input: CreateTaskInput): Promise<StartedSession>;
   /** Deliver a follow-up prompt; `promptId` is the dedupe key (Decision 9). */
   sendPrompt(sessionId: string, prompt: string, promptId: string): Promise<void>;
   answerQuestion(
@@ -128,7 +130,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
   try {
     session = await DBOS.runStep(
       () =>
-        cp.createSession({
+        cp.createTask({
           profileId: profile.id,
           ownerUserId: userId,
           prompt: ctx0.prompt,
@@ -140,7 +142,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
             threadRoot: m.threadRoot,
           },
         }),
-      { name: "createSession" },
+      { name: "createTask" },
     );
   } catch (err) {
     // Surface WHY create failed — this path used to swallow the cause, leaving

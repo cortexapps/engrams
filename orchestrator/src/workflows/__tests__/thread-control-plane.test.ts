@@ -1,16 +1,19 @@
 /**
  * Real ThreadControlPlane wiring (ADR 0059 P2.7).
  *
- * The trigger-specific glue: createSession compiles the default profile (shared
- * with CreateTask), injects ENGRAM_APPEND_SYSTEM_PROMPT into harness_env so the
- * harness flag fires (the chosen delivery channel — no coordinator change), and
- * persists a `slack_thread` task owned by the resolved engrams user. Wired with
- * fakes so this logic is unit-tested without a DB or a live control plane.
+ * The trigger-specific glue: createTask runs the shared create path (the same
+ * one CreateTask uses) against the default profile, injects
+ * ENGRAM_APPEND_SYSTEM_PROMPT into harness_env so the harness flag fires (the
+ * chosen delivery channel — no coordinator change), and persists a
+ * `slack_thread` task owned by the resolved engrams user. Wired with fakes so
+ * this logic is unit-tested without a live control plane (a recording fake DB
+ * captures the persisted task + task_session rows).
  */
 
 import { expect, test, describe } from "bun:test";
 import type { ProfileRow, ProfileStore } from "../../db/profiles.ts";
 import type { ImagesClient } from "../../rpc/profiles.ts";
+import type { Db } from "../../rpc/task-create.ts";
 import { makeThreadControlPlane } from "../thread-control-plane.ts";
 
 const profileRow = (): ProfileRow => ({
@@ -40,12 +43,21 @@ const fakeProfiles = (): ProfileStore =>
 const fakeImages = (): ImagesClient =>
   ({ listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }) }) as unknown as ImagesClient;
 
+/** A fake DB that records each `.values()` payload in insert order (task first,
+ *  primary task_session second). */
+function recordingDb(records: Record<string, unknown>[]): Db {
+  return {
+    transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
+      const tx = { insert: () => ({ values: async (v: Record<string, unknown>) => void records.push(v) }) };
+      return fn(tx);
+    },
+  } as unknown as Db;
+}
+
 describe("makeThreadControlPlane", () => {
-  test("createSession injects ENGRAM_APPEND_SYSTEM_PROMPT + persists a slack_thread task", async () => {
+  test("createTask injects ENGRAM_APPEND_SYSTEM_PROMPT + persists a slack_thread task", async () => {
     let createdReq: { harnessEnv?: Record<string, string> } | undefined;
-    let persisted:
-      | { type: string; ownerUserId: string; sessionId: string; source: Record<string, unknown> }
-      | undefined;
+    const records: Record<string, unknown>[] = [];
 
     const cp = makeThreadControlPlane({
       profiles: fakeProfiles(),
@@ -53,6 +65,7 @@ describe("makeThreadControlPlane", () => {
       connectors: { list: async () => [] },
       secrets: { get: async () => null },
       resolveUser: async () => "user-1",
+      db: recordingDb(records),
       sessions: {
         createSession: async (req) => {
           createdReq = req;
@@ -62,17 +75,9 @@ describe("makeThreadControlPlane", () => {
         answerQuestion: async () => {},
         deleteSession: async () => {},
       },
-      persistTask: async (args) => {
-        persisted = {
-          type: args.type,
-          ownerUserId: args.ownerUserId,
-          sessionId: args.sessionId,
-          source: args.source,
-        };
-      },
     });
 
-    const started = await cp.createSession({
+    const started = await cp.createTask({
       profileId: "default-profile",
       ownerUserId: "user-1",
       prompt: "hello",
@@ -81,12 +86,13 @@ describe("makeThreadControlPlane", () => {
     });
 
     expect(createdReq?.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe("You were triggered from Slack.");
-    expect(persisted).toEqual({
+    // records[0] = task, records[1] = primary task_session.
+    expect(records[0]).toMatchObject({
       type: "slack_thread",
-      ownerUserId: "user-1",
-      sessionId: "sess-1",
+      createdByUserId: "user-1",
       source: { provider: "slack", team: "T1", channel: "C1", threadRoot: "100.0" },
     });
+    expect(records[1]).toMatchObject({ sessionId: "sess-1", role: "primary", profileId: "default-profile" });
     expect(started.id).toBe("sess-1");
     expect(started.webUrl).toContain("/sessions/sess-1");
   });
@@ -98,13 +104,13 @@ describe("makeThreadControlPlane", () => {
       connectors: { list: async () => [] },
       secrets: { get: async () => null },
       resolveUser: async (provider, ext) => (provider === "slack" && ext === "U1" ? "user-7" : null),
+      db: recordingDb([]),
       sessions: {
         createSession: async () => ({ sessionId: "s" }),
         sendPrompt: async () => {},
         answerQuestion: async () => {},
         deleteSession: async () => {},
       },
-      persistTask: async () => {},
     });
 
     expect((await cp.getDefaultProfile())?.id).toBe("default-profile");

@@ -44,29 +44,29 @@ import { ConnectError, Code } from "@connectrpc/connect";
 import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
 import { subject } from "@casl/ability";
 import { eq, inArray } from "drizzle-orm";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Task, TaskSessionRef } from "../gen/engram/app/v1/task_pb.ts";
 import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 
 import { abilityFor } from "../authz/ability.ts";
-import { evictOwnerCacheEntry } from "../authz/resolve.ts";
 import { auth } from "../auth/better-auth.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
-import * as schema from "../db/schema.ts";
 import { sessions as defaultSessions, images as defaultImages } from "../control-plane/client.ts";
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import type { ImagesClient } from "./profiles.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
-import { compileSessionCreateInput } from "./session-compile.ts";
+import { createTaskWithSession, type Db } from "./task-create.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
 export type { ImagesClient } from "./profiles.ts";
+// Re-export the Drizzle DB handle so existing importers (tests) keep their
+// `import type { Db } from "../rpc/tasks.ts"`. Canonical home is task-create.ts.
+export type { Db } from "./task-create.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -96,9 +96,6 @@ export interface SessionsClient {
   getSession(req: { sessionId: string }): Promise<{ session?: Session | undefined }>;
   deleteSession(req: { sessionId: string }): Promise<unknown>;
 }
-
-/** Drizzle DB type used by TaskService. */
-export type Db = NodePgDatabase<typeof schema>;
 
 /** Injectable better-auth getSession function. */
 export type GetSession = (
@@ -381,60 +378,29 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         throw new ConnectError("profile_id is required", Code.InvalidArgument);
       }
 
-      // 1. Load the active profile (ADR §5.1). Missing/archived → rejected.
-      const profile = await profiles.getActive(req.profileId);
-      if (!profile) {
-        throw new ConnectError("profile not found or archived", Code.NotFound);
-      }
-
-      // 2-4. Compile the upstream CreateSession request from the profile
-      //    (image, harness env, skills, integration policy). Shared with the
-      //    external-trigger ThreadControlPlane (ADR 0059) so the privilege path
-      //    is identical. Throws FailedPrecondition if the image is disabled.
-      const sessionInput = await compileSessionCreateInput(
-        profile,
+      // Create the task + its primary session via the shared primitive — the
+      // SAME path the external-trigger ThreadControlPlane uses (ADR 0059), so a
+      // UI chat task and a triggered session share one privilege/compensation
+      // path. Throws NotFound (profile missing/archived) or FailedPrecondition
+      // (image disabled); compensates the orphan session on a DB failure.
+      const { taskId } = await createTaskWithSession(
         {
+          profiles,
           images: imagesClient,
           connectors,
-          resolveUserToken: (envVar) => resolveSecrets().get(user.id, envVar),
+          sessions: sessionsClient,
+          secrets: resolveSecrets(),
+          db: getDbFn(),
         },
-        { ...(req.prompt != null ? { prompt: req.prompt } : {}) },
+        {
+          type: "chat",
+          ownerUserId: user.id,
+          profileId: req.profileId,
+          title: req.title ?? null,
+          ...(req.prompt != null ? { prompt: req.prompt } : {}),
+        },
       );
-      const created = await sessionsClient.createSession(sessionInput);
 
-      // 5. Insert task + task_session (recording profile_id). Compensate on failure.
-      const taskId = crypto.randomUUID();
-      try {
-        const db = getDbFn();
-        await db.transaction(async (tx) => {
-          await tx.insert(taskTable).values({
-            id: taskId,
-            type: "chat",
-            title: req.title ?? null,
-            status: "open",
-            createdByUserId: user.id,
-            source: {},
-          });
-          await tx.insert(taskSessionTable).values({
-            taskId,
-            sessionId: created.sessionId,
-            role: "primary",
-            profileId: profile.id,
-          });
-        });
-      } catch (dbErr) {
-        try {
-          await sessionsClient.deleteSession({ sessionId: created.sessionId });
-        } catch (delErr) {
-          console.error(
-            `[TaskService] createTask compensation: failed to delete orphan session ${created.sessionId} after DB error`,
-            delErr,
-          );
-        }
-        throw dbErr;
-      }
-
-      evictOwnerCacheEntry(created.sessionId);
       const loaded = await loadTask(taskId, getDbFn(), sessionsClient, profiles, imagesClient);
       return { task: loaded };
     },
