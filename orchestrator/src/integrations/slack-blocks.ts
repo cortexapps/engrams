@@ -24,8 +24,17 @@ import type {
   StartedSession,
 } from "../workflows/communication-policy.ts";
 
-/** Inline single-select option button (one per option). */
+/** Inline single-select option button (one per option). The concrete buttons
+ *  carry a per-option index suffix (`auq_answer:<i>`) for Slack action_id
+ *  uniqueness; `isAnswerAction` matches both the bare and suffixed forms. */
 export const ACTION_ANSWER = "auq_answer";
+
+/** True for any inline answer-option button action_id — the bare `auq_answer`
+ *  or the per-option `auq_answer:<i>`. Routing identity is in the button value,
+ *  not the action_id, so the index is irrelevant to classification. */
+function isAnswerAction(id: string | undefined): boolean {
+  return id === ACTION_ANSWER || (id?.startsWith(`${ACTION_ANSWER}:`) ?? false);
+}
 /** "Answer…" button that opens the modal for a multi/multi-question ask. */
 export const ACTION_OPEN = "auq_open";
 /** The answer modal's `callback_id`. */
@@ -105,11 +114,11 @@ export function parseInteractivity(payloadJson: string): InteractivityAction {
 
   if (p.type === "block_actions") {
     const action = p.actions?.find(
-      (a) => a.action_id === ACTION_ANSWER || a.action_id === ACTION_OPEN,
+      (a) => isAnswerAction(a.action_id) || a.action_id === ACTION_OPEN,
     );
     if (!action?.value) return { kind: "ignore" };
     try {
-      if (action.action_id === ACTION_ANSWER) {
+      if (isAnswerAction(action.action_id)) {
         const v = JSON.parse(action.value) as AnswerValue;
         if (typeof v.t !== "string" || typeof v.q !== "string" || typeof v.a !== "string" || !v.r) {
           return { kind: "ignore" };
@@ -278,9 +287,14 @@ export function buildQuestionBlocks(route: ThreadRoute, parsed: ParsedUserQuesti
     const q = questions[0];
     blocks.push({
       type: "actions",
-      elements: q.options.map((label) => ({
+      // Each button needs a UNIQUE action_id within the message — Slack rejects
+      // a message with two elements sharing one (`invalid_blocks`). The chosen
+      // option rides the button `value` (the `a` field), not the action_id, so
+      // suffixing the index is purely for uniqueness; `parseInteractivity`
+      // classifies any `auq_answer*` action as an answer.
+      elements: q.options.map((label, i) => ({
         type: "button",
-        action_id: ACTION_ANSWER,
+        action_id: `${ACTION_ANSWER}:${i}`,
         text: { type: "plain_text", text: truncate(label, 75) },
         value: JSON.stringify({ t, q: q.question, a: label, r: route }),
       })),

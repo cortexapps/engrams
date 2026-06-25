@@ -161,8 +161,26 @@ describe("buildQuestionBlocks()", () => {
   test("a single single-select question → inline option buttons carrying the route", () => {
     const blocks = buildQuestionBlocks(ROUTE, parsed(false));
     const els = buttons(blocks);
-    expect(els.map((e) => e.action_id)).toEqual([ACTION_ANSWER, ACTION_ANSWER]);
+    // Each option button gets a UNIQUE action_id (`auq_answer:<i>`) — Slack
+    // rejects a message with two elements sharing an action_id (`invalid_blocks`).
+    expect(els.map((e) => e.action_id)).toEqual([`${ACTION_ANSWER}:0`, `${ACTION_ANSWER}:1`]);
     expect(JSON.parse(els[0].value)).toEqual({ t: "tc", q: "Q0", a: "yes", r: ROUTE });
+  });
+
+  test("inline option buttons round-trip: each unique action_id still parses to an answer", () => {
+    const els = buttons(buildQuestionBlocks(ROUTE, parsed(false)));
+    const ids = els.map((e) => e.action_id);
+    expect(new Set(ids).size).toBe(ids.length); // all unique within the message
+    for (const el of els) {
+      const out = parseInteractivity(
+        JSON.stringify({
+          type: "block_actions",
+          trigger_id: "trig",
+          actions: [{ action_id: el.action_id, value: el.value }],
+        }),
+      );
+      expect(out.kind).toBe("answer");
+    }
   });
 
   test("a multi-select question → a single 'Answer…' (open modal) button", () => {
