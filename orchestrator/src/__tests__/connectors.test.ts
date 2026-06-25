@@ -688,6 +688,23 @@ describe("cli facet (ADR 0058)", () => {
     expect(slack.operations.some((o) => o.match?.path === "/api/auth.test")).toBe(true);
   });
 
+  test("the slack seed requests the ADR-0059 trigger scopes", () => {
+    const scopes = connectorRegistry().get("slack")!.oauth!.scopes;
+    // The five scopes the external-triggers reverse channel needs (in addition
+    // to the existing post/read/upload set): receive the @mention, read thread
+    // replies (history, not just metadata), react for the acks, and read the
+    // email for identity matching.
+    for (const s of [
+      "app_mentions:read",
+      "channels:history",
+      "groups:history",
+      "reactions:write",
+      "users:read.email",
+    ]) {
+      expect(scopes).toContain(s);
+    }
+  });
+
   test("granting a slack power enables the slack CLI + the shared bundle", () => {
     const plan = compileCliIntegrations(["slack:chat:write"], connectorRegistry());
     const slack = plan.enabled.find((e) => e.provider === "slack");
