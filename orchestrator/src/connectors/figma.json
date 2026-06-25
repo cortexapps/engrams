@@ -1,0 +1,79 @@
+{
+  "provider": "figma",
+  "protocol": "http",
+  "display": {
+    "name": "Figma",
+    "category": "Design",
+    "blurb": "Read Figma files, render image exports, browse projects/components/styles, and post comments — authenticated with a brokered personal access token in the X-Figma-Token header.",
+    "icon": { "mono": "FI", "color": "#f24e1e" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "X-Figma-Token", "secretRef": "figma.api_token" }
+    ]
+  },
+  "hosts": ["api.figma.com"],
+  "test": { "path": "/v1/me" },
+  "operations": [
+    {
+      "grants": ["me:read"],
+      "match": { "method": "GET", "path": "/v1/me" }
+    },
+    {
+      "grants": ["files:read"],
+      "match": { "method": "GET", "path": "/v1/files/*" }
+    },
+    {
+      "grants": ["images:read"],
+      "match": { "method": "GET", "path": "/v1/images/*" }
+    },
+    {
+      "grants": ["comments:read"],
+      "match": { "method": "GET", "path": "/v1/files/*/comments*" }
+    },
+    {
+      "grants": ["comments:write"],
+      "match": { "method": "POST", "path": "/v1/files/*/comments*" }
+    },
+    {
+      "grants": ["projects:read"],
+      "match": { "method": "GET", "path": "/v1/teams/*/projects" }
+    },
+    {
+      "grants": ["projects:read"],
+      "match": { "method": "GET", "path": "/v1/projects/*" }
+    },
+    {
+      "grants": ["components:read"],
+      "match": { "method": "GET", "path": "/v1/teams/*/components*" }
+    },
+    {
+      "grants": ["components:read"],
+      "match": { "method": "GET", "path": "/v1/components/*" }
+    },
+    {
+      "grants": ["components:read"],
+      "match": { "method": "GET", "path": "/v1/component_sets/*" }
+    },
+    {
+      "grants": ["components:read"],
+      "match": { "method": "GET", "path": "/v1/styles/*" }
+    },
+    {
+      "grants": ["components:read"],
+      "match": { "method": "GET", "path": "/v1/teams/*/styles" }
+    },
+    {
+      "grants": ["components:read"],
+      "match": { "method": "GET", "path": "/v1/teams/*/component_sets" }
+    }
+  ],
+  "cli": {
+    "bins": ["figma"],
+    "binSource": "bundled",
+    "dummyEnv": { "FIGMA_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `figma` to read from Figma during a run — files, image exports, comments, projects, components, and styles. Authentication is automatic: the egress proxy injects a brokered personal access token in the `X-Figma-Token` header on every request to api.figma.com; `FIGMA_TOKEN` is a managed placeholder. Do NOT set a real token or run any login.\n\nMost commands take a <file-key> — the id from a Figma file URL (figma.com/file/<KEY>/... or figma.com/design/<KEY>/...).\n\nIdentity check: `figma whoami` (GET /v1/me, requires `me:read`).\nGet a file's document JSON: `figma file <file-key> [field=value …]` (e.g. `depth=2`) — requires `files:read`. File metadata: `figma meta <file-key>`. Specific nodes: `figma nodes <file-key> ids=1:2,1:3`. Version history: `figma versions <file-key>`.\nRender image exports of nodes: `figma images <file-key> ids=1:2 format=png scale=2` (GET /v1/images, requires `images:read`) — returns a JSON map of node-id → temporary S3 URL.\nComments: list with `figma comments <file-key>` (requires `comments:read`); add with `figma comment <file-key> \"text…\"` (POST, requires `comments:write`).\nProjects: `figma projects <team-id>` lists a team's projects; `figma project-files <project-id>` lists files in a project (requires `projects:read`).\nLibrary: `figma components <team-id>`, `figma styles <team-id>`, `figma component <key>`, `figma style <key>` (requires `components:read`).\nGeneric GET: `figma get <path> [field=value …]` — e.g. `figma get /v1/files/<file-key>/dev_resources`. Whether a path is reachable depends on the powers your profile granted; ungranted paths are denied at the network boundary, not authenticated."
+  }
+}

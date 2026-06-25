@@ -1,0 +1,95 @@
+{
+  "provider": "shopify",
+  "protocol": "http",
+  "display": {
+    "name": "Shopify",
+    "category": "Commerce",
+    "blurb": "Read and manage a Shopify store's products, orders, customers, and inventory via the Admin API — authenticated with a custom-app access token brokered at the egress proxy.",
+    "icon": { "mono": "SH", "color": "#5e8e3e" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "X-Shopify-Access-Token", "secretRef": "shopify.access_token" }
+    ]
+  },
+  "hosts": ["*.myshopify.com"],
+  "test": { "path": "/admin/api/2026-01/shop.json" },
+  "operations": [
+    {
+      "grants": ["products:read", "orders:read", "customers:read", "inventory:read"],
+      "match": { "method": "GET", "path": "/admin/api/*/shop.json" }
+    },
+    {
+      "grants": ["products:read"],
+      "match": { "method": "GET", "path": "/admin/api/*/products*" }
+    },
+    {
+      "grants": ["products:write"],
+      "match": { "method": "POST", "path": "/admin/api/*/products*" }
+    },
+    {
+      "grants": ["products:write"],
+      "match": { "method": "PUT", "path": "/admin/api/*/products*" }
+    },
+    {
+      "grants": ["products:write"],
+      "match": { "method": "DELETE", "path": "/admin/api/*/products*" }
+    },
+    {
+      "grants": ["orders:read"],
+      "match": { "method": "GET", "path": "/admin/api/*/orders*" }
+    },
+    {
+      "grants": ["orders:write"],
+      "match": { "method": "POST", "path": "/admin/api/*/orders*" }
+    },
+    {
+      "grants": ["orders:write"],
+      "match": { "method": "PUT", "path": "/admin/api/*/orders*" }
+    },
+    {
+      "grants": ["orders:write"],
+      "match": { "method": "DELETE", "path": "/admin/api/*/orders*" }
+    },
+    {
+      "grants": ["customers:read"],
+      "match": { "method": "GET", "path": "/admin/api/*/customers*" }
+    },
+    {
+      "grants": ["customers:write"],
+      "match": { "method": "POST", "path": "/admin/api/*/customers*" }
+    },
+    {
+      "grants": ["customers:write"],
+      "match": { "method": "PUT", "path": "/admin/api/*/customers*" }
+    },
+    {
+      "grants": ["customers:write"],
+      "match": { "method": "DELETE", "path": "/admin/api/*/customers*" }
+    },
+    {
+      "grants": ["inventory:read"],
+      "match": { "method": "GET", "path": "/admin/api/*/inventory_*" }
+    },
+    {
+      "grants": ["inventory:read"],
+      "match": { "method": "GET", "path": "/admin/api/*/locations*" }
+    },
+    {
+      "grants": ["inventory:write"],
+      "match": { "method": "POST", "path": "/admin/api/*/inventory_*" }
+    },
+    {
+      "grants": ["shopify:graphql"],
+      "match": { "method": "POST", "path": "/admin/api/*/graphql.json" }
+    }
+  ],
+  "cli": {
+    "bins": ["shopify"],
+    "binSource": "bundled",
+    "dummyEnv": { "SHOPIFY_ACCESS_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `shopify` to drive a Shopify store's Admin API from this session — read/manage products, orders, customers, and inventory, or run arbitrary GraphQL. Authentication is automatic: the egress proxy injects the custom-app access token in the `X-Shopify-Access-Token` header on every request to *.myshopify.com; `SHOPIFY_ACCESS_TOKEN` is a managed placeholder. Do NOT set a real token or run any login.\n\nThe store subdomain is NOT a secret — set `SHOPIFY_STORE` (e.g. `acme` for acme.myshopify.com) or pass `--store acme` once. The Admin API version (default 2026-01) rides the URL path; override with `SHOPIFY_API_VERSION` if needed.\n\nSubcommands and the power each needs:\n  shopify products [field=value ...]   List products (GET products.json) — needs products:read\n  shopify product <id>                 Get one product — needs products:read\n  shopify orders [field=value ...]     List orders (GET orders.json) — needs orders:read\n  shopify customers [field=value ...]  List customers (GET customers.json) — needs customers:read\n  shopify inventory [field=value ...]  List inventory levels — needs inventory:read\n  shopify shop                         Shop info (GET shop.json) — read identity check, needs any read power\n  shopify graphql '<query>' [JSON-vars]  Run a GraphQL query/mutation (POST graphql.json) — needs shopify:graphql\n  shopify get  <path> [field=value ...]  Raw GET  under /admin/api/<version>/<path>\n  shopify post <path> [JSON-body]        Raw POST under /admin/api/<version>/<path>\n  shopify api  <METHOD> <path> [body]    Raw call, any method\n\nPaths are relative to /admin/api/<version>/ (omit the leading slash). REST resources end in `.json` (e.g. `shopify get products/123.json`). Responses are JSON; auth failures return HTTP 401/403."
+  }
+}

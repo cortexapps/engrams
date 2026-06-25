@@ -1,0 +1,59 @@
+{
+  "provider": "twilio",
+  "protocol": "http",
+  "display": {
+    "name": "Twilio",
+    "category": "Communication",
+    "blurb": "Send SMS, place calls, and manage phone numbers via the Twilio REST API (2010-04-01). Authenticated with HTTP Basic (AccountSid:AuthToken), brokered at the egress proxy — the agent never sees the token.",
+    "icon": { "mono": "TW", "color": "#f22f46" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Basic {}", "secretRef": "twilio.basic_auth" }
+    ]
+  },
+  "hosts": ["api.twilio.com"],
+  "test": { "path": "/2010-04-01/Accounts.json" },
+  "operations": [
+    {
+      "grants": ["account:read"],
+      "match": { "method": "GET", "path": "/2010-04-01/Accounts*.json" }
+    },
+    {
+      "grants": ["messages:read"],
+      "match": { "method": "GET", "path": "/2010-04-01/Accounts/*/Messages*" }
+    },
+    {
+      "grants": ["messages:write"],
+      "match": { "method": "POST", "path": "/2010-04-01/Accounts/*/Messages.json" }
+    },
+    {
+      "grants": ["calls:read"],
+      "match": { "method": "GET", "path": "/2010-04-01/Accounts/*/Calls*" }
+    },
+    {
+      "grants": ["calls:write"],
+      "match": { "method": "POST", "path": "/2010-04-01/Accounts/*/Calls.json" }
+    },
+    {
+      "grants": ["phone_numbers:read"],
+      "match": { "method": "GET", "path": "/2010-04-01/Accounts/*/IncomingPhoneNumbers*" }
+    },
+    {
+      "grants": ["phone_numbers:read"],
+      "match": { "method": "GET", "path": "/2010-04-01/Accounts/*/AvailablePhoneNumbers*" }
+    },
+    {
+      "grants": ["recordings:read"],
+      "match": { "method": "GET", "path": "/2010-04-01/Accounts/*/Recordings*" }
+    }
+  ],
+  "cli": {
+    "bins": ["twilio"],
+    "binSource": "bundled",
+    "dummyEnv": { "TWILIO_BASIC_AUTH": "x-engrams-managed", "TWILIO_ACCOUNT_SID": "" },
+    "credentialDelivery": "inject",
+    "doc": "Use `twilio` to drive the Twilio REST API (2010-04-01) from this session — send SMS, place calls, and inspect phone numbers / recordings. Authentication is automatic: the egress proxy injects the real `Authorization: Basic <base64(AccountSid:AuthToken)>` header on every request to api.twilio.com. `TWILIO_BASIC_AUTH` is a managed placeholder — do NOT set a real token, paste credentials, or run any login.\n\nMost resource paths embed your Account SID. The CLI reads it from `TWILIO_ACCOUNT_SID` (a non-secret identifier, NOT auth) or you can pass it as the first segment; set it to your `AC...` SID if commands report a missing account. Subcommands:\n  twilio whoami                          List accounts (Accounts.json) — verifies the brokered credential. Needs `account:read`.\n  twilio sms <to> <from> <body...>       Send an SMS (POST Messages.json). Needs `messages:write`.\n  twilio messages [Key=Value ...]        List messages, e.g. `twilio messages PageSize=20 To=+1555...`. Needs `messages:read`.\n  twilio call <to> <from> <twiml-url>    Place a call (POST Calls.json, Url=<twiml-url>). Needs `calls:write`.\n  twilio calls [Key=Value ...]           List calls. Needs `calls:read`.\n  twilio numbers [Key=Value ...]         List your IncomingPhoneNumbers. Needs `phone_numbers:read`.\n  twilio recordings [Key=Value ...]      List call recordings. Needs `recordings:read`.\n  twilio get <path> [Key=Value ...]      Raw GET, e.g. `twilio get /2010-04-01/Accounts/AC.../Messages.json`.\n  twilio api <METHOD> <path> [Key=Value] Raw call with any method (form-encodes Key=Value for POST/PUT).\nThe API returns JSON when the path ends in `.json` (the CLI appends it for resource subcommands); list responses are paged via PageSize / Page. A call to a path your profile didn't grant is denied at the network boundary, not authenticated."
+  }
+}

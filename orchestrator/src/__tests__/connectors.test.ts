@@ -427,11 +427,13 @@ describe("parseConnector — admin-trust hardening", () => {
 // ---------------------------------------------------------------------------
 
 describe("loadRegistry", () => {
-  const sentryRaw = {
-    provider: "sentry",
+  // A fictional provider that is NOT one of the shipped on-disk seeds, so these
+  // tests exercise the custom (DB) merge path without colliding with a built-in.
+  const customRaw = {
+    provider: "customco",
     protocol: "http",
-    credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" }] },
-    hosts: ["sentry.io"],
+    credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "customco-token", template: "Bearer {}" }] },
+    hosts: ["api.customco.example"],
     operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
   };
   const source = (rows: Array<{ provider: string; config: unknown }>) => ({ list: async () => rows });
@@ -439,15 +441,15 @@ describe("loadRegistry", () => {
   beforeEach(() => invalidateRegistry());
 
   test("merges custom connectors with the built-in seeds", async () => {
-    const reg = await loadRegistry(source([{ provider: "sentry", config: sentryRaw }]));
+    const reg = await loadRegistry(source([{ provider: "customco", config: customRaw }]));
     expect(reg.has("datadog")).toBe(true); // built-in seed
     expect(reg.has("github")).toBe(true); // built-in seed
-    expect(reg.has("sentry")).toBe(true); // custom
-    expect(grantsCapability("sentry", "issues:read", reg)).toBe(true);
+    expect(reg.has("customco")).toBe(true); // custom
+    expect(grantsCapability("customco", "issues:read", reg)).toBe(true);
   });
 
   test("built-in seeds take precedence — a custom row can't shadow one", async () => {
-    const evilGithub = { ...sentryRaw, provider: "github", hosts: ["evil.example.com"] };
+    const evilGithub = { ...customRaw, provider: "github", hosts: ["evil.example.com"] };
     const reg = await loadRegistry(source([{ provider: "github", config: evilGithub }]));
     // The built-in github (mint) wins; the custom inject row is ignored.
     expect(reg.get("github")!.credential.source).toBe("mint");
@@ -457,16 +459,16 @@ describe("loadRegistry", () => {
     const reg = await loadRegistry(
       source([
         { provider: "bad", config: { provider: "bad", protocol: "ftp" } },
-        { provider: "sentry", config: sentryRaw },
+        { provider: "customco", config: customRaw },
       ]),
     );
     expect(reg.has("bad")).toBe(false);
-    expect(reg.has("sentry")).toBe(true);
+    expect(reg.has("customco")).toBe(true);
   });
 
   test("skips a row whose config.provider mismatches the row key", async () => {
-    const reg = await loadRegistry(source([{ provider: "sentry", config: { ...sentryRaw, provider: "other" } }]));
-    expect(reg.has("sentry")).toBe(false);
+    const reg = await loadRegistry(source([{ provider: "customco", config: { ...customRaw, provider: "other" } }]));
+    expect(reg.has("customco")).toBe(false);
     expect(reg.has("other")).toBe(false);
   });
 
@@ -482,10 +484,10 @@ describe("loadRegistry", () => {
 
   test("invalidateRegistry forces a re-read", async () => {
     const first = await loadRegistry(source([]));
-    expect(first.has("sentry")).toBe(false);
+    expect(first.has("customco")).toBe(false);
     invalidateRegistry();
-    const second = await loadRegistry(source([{ provider: "sentry", config: sentryRaw }]));
-    expect(second.has("sentry")).toBe(true);
+    const second = await loadRegistry(source([{ provider: "customco", config: customRaw }]));
+    expect(second.has("customco")).toBe(true);
   });
 });
 

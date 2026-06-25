@@ -1,0 +1,67 @@
+{
+  "provider": "sentry",
+  "protocol": "http",
+  "display": {
+    "name": "Sentry",
+    "category": "Observability",
+    "blurb": "Triage errors during a run — list projects, query issues and events, resolve/assign issues, and inspect releases, teams, and cron monitors. Authenticated with a brokered org auth token (injected at the egress proxy, never seen by the agent).",
+    "icon": { "mono": "SE", "color": "#362d59" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "sentry.auth_token" }
+    ]
+  },
+  "hosts": ["sentry.io"],
+  "test": { "path": "/api/0/organizations/" },
+  "operations": [
+    {
+      "grants": ["organizations:read"],
+      "match": { "method": "GET", "path": "/api/0/organizations/" }
+    },
+    {
+      "grants": ["projects:read"],
+      "match": { "method": "GET", "path": "/api/0/organizations/*/projects/*" }
+    },
+    {
+      "grants": ["projects:read"],
+      "match": { "method": "GET", "path": "/api/0/projects/*" }
+    },
+    {
+      "grants": ["issues:read"],
+      "match": { "method": "GET", "path": "/api/0/organizations/*/issues/*" }
+    },
+    {
+      "grants": ["issues:write"],
+      "match": { "method": "PUT", "path": "/api/0/organizations/*/issues/*" }
+    },
+    {
+      "grants": ["events:read"],
+      "match": { "method": "GET", "path": "/api/0/organizations/*/events/*" }
+    },
+    {
+      "grants": ["releases:read"],
+      "match": { "method": "GET", "path": "/api/0/organizations/*/releases/*" }
+    },
+    {
+      "grants": ["releases:write"],
+      "match": { "method": "POST", "path": "/api/0/organizations/*/releases/" }
+    },
+    {
+      "grants": ["teams:read"],
+      "match": { "method": "GET", "path": "/api/0/organizations/*/teams/*" }
+    },
+    {
+      "grants": ["monitors:read"],
+      "match": { "method": "GET", "path": "/api/0/organizations/*/monitors/*" }
+    }
+  ],
+  "cli": {
+    "bins": ["sentry"],
+    "binSource": "bundled",
+    "dummyEnv": { "SENTRY_AUTH_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `sentry` to triage Sentry from this session — list projects, query issues/events, resolve or assign issues, and inspect releases, teams, and cron monitors. Authentication is automatic: the egress proxy injects the org auth token (Bearer) on requests to sentry.io; `SENTRY_AUTH_TOKEN` is a managed placeholder. Do NOT run any login or set a real token. Calls to a path your profile didn't grant are denied at the network boundary, not authenticated.\n\nMost commands take an <org> slug (and some a <project> slug). Find them first with `sentry orgs`.\n\nCommands and the power each needs:\n  sentry orgs                                List your organizations (organizations:read)\n  sentry projects <org>                      List an org's projects (projects:read)\n  sentry issues <org> [query=...] [project=...]   List an org's issues (issues:read)\n  sentry issue <org> <issue-id>              Retrieve one issue (issues:read)\n  sentry resolve <org> <issue-id>            Resolve an issue (issues:write)\n  sentry ignore <org> <issue-id>             Ignore/mute an issue (issues:write)\n  sentry events <org> [field=value ...]      Query org events (events:read)\n  sentry releases <org>                      List releases (releases:read)\n  sentry teams <org>                         List teams (teams:read)\n  sentry monitors <org>                      List cron monitors (monitors:read)\n  sentry get <path> [field=value ...]        Raw GET under https://sentry.io (path may be /api/0/... or an /api/0-relative tail)\n  sentry api <METHOD> <path> [-- curl-args]  Raw call with an explicit method\n\nResponses are JSON; issue queries support Sentry search syntax (e.g. `query=is:unresolved`). Paths starting without /api are auto-prefixed with /api/0/."
+  }
+}

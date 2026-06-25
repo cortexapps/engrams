@@ -1,0 +1,67 @@
+{
+  "provider": "vercel",
+  "protocol": "http",
+  "display": {
+    "name": "Vercel",
+    "category": "Deployment",
+    "blurb": "Inspect Vercel projects, deployments, build logs, domains, and teams — authenticated with a brokered Vercel access token (Bearer), injected at the egress proxy and never seen by the agent.",
+    "icon": { "mono": "VC", "color": "#000000" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "vercel.api_token" }
+    ]
+  },
+  "hosts": ["api.vercel.com"],
+  "test": { "path": "/v2/user" },
+  "operations": [
+    {
+      "grants": ["user:read"],
+      "match": { "method": "GET", "path": "/v*/user*" }
+    },
+    {
+      "grants": ["projects:read"],
+      "match": { "method": "GET", "path": "/v*/projects*" }
+    },
+    {
+      "grants": ["projects:write"],
+      "match": { "method": "POST", "path": "/v*/projects*" }
+    },
+    {
+      "grants": ["projects:write"],
+      "match": { "method": "PATCH", "path": "/v*/projects*" }
+    },
+    {
+      "grants": ["projects:write"],
+      "match": { "method": "DELETE", "path": "/v*/projects*" }
+    },
+    {
+      "grants": ["deployments:read"],
+      "match": { "method": "GET", "path": "/v*/deployments*" }
+    },
+    {
+      "grants": ["deployments:write"],
+      "match": { "method": "POST", "path": "/v*/deployments*" }
+    },
+    {
+      "grants": ["deployments:write"],
+      "match": { "method": "DELETE", "path": "/v*/deployments*" }
+    },
+    {
+      "grants": ["domains:read"],
+      "match": { "method": "GET", "path": "/v*/domains*" }
+    },
+    {
+      "grants": ["teams:read"],
+      "match": { "method": "GET", "path": "/v*/teams*" }
+    }
+  ],
+  "cli": {
+    "bins": ["vercel"],
+    "binSource": "bundled",
+    "dummyEnv": { "VERCEL_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `vercel` to inspect a Vercel account from this session — projects, deployments, build logs, domains, and teams via the Vercel REST API (api.vercel.com). Authentication is automatic: the egress proxy injects the real, capability-scoped Vercel access token (Authorization: Bearer …) on every request; `VERCEL_TOKEN` is a managed placeholder. Do NOT run any login or set a real token. This is NOT the official `vercel` deploy CLI — it is a thin REST wrapper.\n\nMost commands accept an optional `--team <teamId>` (sent as the `?teamId=` query param) to act on a team scope instead of your personal account.\n\nIdentity check: `vercel whoami` (GET /v2/user). Needs `user:read`.\nList projects: `vercel projects` (GET /v10/projects). Project env vars: `vercel env <projectIdOrName>` (GET /v10/projects/{id}/env). Both need `projects:read`. Create/update/delete a project needs `projects:write`.\nList deployments: `vercel deployments [app=NAME projectId=… limit=…]` (GET /v7/deployments). One deployment: `vercel deployment <idOrUrl>` (GET /v13/deployments/{id}). Build logs: `vercel logs <idOrUrl>` (GET /v3/deployments/{id}/events). All need `deployments:read`. Triggering/cancelling a deployment needs `deployments:write`.\nList domains: `vercel domains` (GET /v5/domains). Needs `domains:read`.\nList teams: `vercel teams` (GET /v2/teams). Needs `teams:read`.\nAny other endpoint: `vercel get <path> [key=value …]` for a GET (query params), or `vercel api <METHOD> <path> [json-body]` for any method (e.g. `vercel api POST /v13/deployments '{\"name\":\"x\"}'`). Paths are full like `/v10/projects`. A call to a path/method your profile didn't grant is denied at the network boundary, not authenticated."
+  }
+}

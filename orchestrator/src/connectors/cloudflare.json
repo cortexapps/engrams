@@ -1,0 +1,115 @@
+{
+  "provider": "cloudflare",
+  "protocol": "http",
+  "display": {
+    "name": "Cloudflare",
+    "category": "Infrastructure",
+    "blurb": "Manage Cloudflare zones, DNS records, cache, Workers, Pages, and R2 via the REST v4 API — authenticated with a scoped API token brokered at the egress proxy, never seen by the agent.",
+    "icon": { "mono": "CF", "color": "#f6821f" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "cloudflare.api_token" }
+    ]
+  },
+  "hosts": ["api.cloudflare.com"],
+  "test": { "path": "/client/v4/user/tokens/verify" },
+  "operations": [
+    {
+      "grants": ["zones:read"],
+      "match": { "method": "GET", "path": "/client/v4/zones*" }
+    },
+    {
+      "grants": ["zones:write"],
+      "match": { "method": "POST", "path": "/client/v4/zones*" }
+    },
+    {
+      "grants": ["zones:write"],
+      "match": { "method": "PATCH", "path": "/client/v4/zones/*" }
+    },
+    {
+      "grants": ["zones:write"],
+      "match": { "method": "DELETE", "path": "/client/v4/zones/*" }
+    },
+    {
+      "grants": ["dns:read"],
+      "match": { "method": "GET", "path": "/client/v4/zones/*/dns_records*" }
+    },
+    {
+      "grants": ["dns:write"],
+      "match": { "method": "POST", "path": "/client/v4/zones/*/dns_records*" }
+    },
+    {
+      "grants": ["dns:write"],
+      "match": { "method": "PUT", "path": "/client/v4/zones/*/dns_records/*" }
+    },
+    {
+      "grants": ["dns:write"],
+      "match": { "method": "PATCH", "path": "/client/v4/zones/*/dns_records/*" }
+    },
+    {
+      "grants": ["dns:write"],
+      "match": { "method": "DELETE", "path": "/client/v4/zones/*/dns_records/*" }
+    },
+    {
+      "grants": ["accounts:read"],
+      "match": { "method": "GET", "path": "/client/v4/accounts*" }
+    },
+    {
+      "grants": ["workers:read"],
+      "match": { "method": "GET", "path": "/client/v4/accounts/*/workers/*" }
+    },
+    {
+      "grants": ["workers:write"],
+      "match": { "method": "PUT", "path": "/client/v4/accounts/*/workers/*" }
+    },
+    {
+      "grants": ["workers:write"],
+      "match": { "method": "POST", "path": "/client/v4/accounts/*/workers/*" }
+    },
+    {
+      "grants": ["workers:write"],
+      "match": { "method": "DELETE", "path": "/client/v4/accounts/*/workers/*" }
+    },
+    {
+      "grants": ["pages:read"],
+      "match": { "method": "GET", "path": "/client/v4/accounts/*/pages/*" }
+    },
+    {
+      "grants": ["pages:write"],
+      "match": { "method": "POST", "path": "/client/v4/accounts/*/pages/*" }
+    },
+    {
+      "grants": ["pages:write"],
+      "match": { "method": "PATCH", "path": "/client/v4/accounts/*/pages/*" }
+    },
+    {
+      "grants": ["pages:write"],
+      "match": { "method": "DELETE", "path": "/client/v4/accounts/*/pages/*" }
+    },
+    {
+      "grants": ["r2:read"],
+      "match": { "method": "GET", "path": "/client/v4/accounts/*/r2/*" }
+    },
+    {
+      "grants": ["r2:write"],
+      "match": { "method": "POST", "path": "/client/v4/accounts/*/r2/*" }
+    },
+    {
+      "grants": ["r2:write"],
+      "match": { "method": "PUT", "path": "/client/v4/accounts/*/r2/*" }
+    },
+    {
+      "grants": ["r2:write"],
+      "match": { "method": "DELETE", "path": "/client/v4/accounts/*/r2/*" }
+    }
+  ],
+  "cli": {
+    "bins": ["cloudflare"],
+    "binSource": "bundled",
+    "dummyEnv": { "CLOUDFLARE_API_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `cloudflare` to drive the Cloudflare REST v4 API from this session — manage zones, DNS records, cache, Workers, Pages, and R2. Authentication is automatic: the egress proxy injects your scoped API token (Bearer) on every request to api.cloudflare.com; `CLOUDFLARE_API_TOKEN` is a managed placeholder. Do NOT run any login or set a real token.\n\nEach subcommand needs the matching power on your profile; calls to a path your profile didn't grant are denied at the network boundary, not authenticated.\n\nIdentity / token check: `cloudflare whoami` (GET /user/tokens/verify — always allowed).\nZones: `cloudflare zones` (list, needs `zones:read`); `cloudflare zone <zone_id>` (get, `zones:read`); `cloudflare purge <zone_id>` (purge everything, `zones:write`).\nDNS: `cloudflare dns <zone_id>` (list records, `dns:read`); `cloudflare dns-create <zone_id> <type> <name> <content> [proxied]` (`dns:write`); `cloudflare dns-delete <zone_id> <record_id>` (`dns:write`).\nAccounts: `cloudflare accounts` (list, `accounts:read`).\nWorkers: `cloudflare workers <account_id>` (list scripts, `workers:read`). Pages: `cloudflare pages <account_id>` (list projects, `pages:read`). R2: `cloudflare r2 <account_id>` (list buckets, `r2:read`).\nGeneric passthrough: `cloudflare get <path> [field=value …]` (any GET, query params) and `cloudflare api <METHOD> <path> [json-body]` (e.g. `cloudflare api POST /zones/<id>/dns_records '{\"type\":\"A\",\"name\":\"x.example.com\",\"content\":\"1.2.3.4\"}'`). <path> is relative to /client/v4. Responses are JSON {\"success\":true|false,\"result\":…,\"errors\":[…]}."
+  }
+}

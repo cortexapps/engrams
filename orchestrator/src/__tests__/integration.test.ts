@@ -122,11 +122,11 @@ function fakeStore(seed: ConnectorRow[] = []): { store: ConnectorStore; rec: Rec
   return { store, rec };
 }
 
-const SENTRY = JSON.stringify({
-  provider: "sentry",
+const CUSTOM = JSON.stringify({
+  provider: "customco",
   protocol: "http",
-  credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" }] },
-  hosts: ["sentry.io"],
+  credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "customco-token", template: "Bearer {}" }] },
+  hosts: ["customco.io"],
   operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
 });
 
@@ -170,8 +170,8 @@ describe("IntegrationService (native)", () => {
     const mem = await spawn({ getSession: makeGetSession("m"), connectors: fakeStore().store });
     try {
       await expectErr(mem.client.listConnectors({}), Code.PermissionDenied);
-      await expectErr(mem.client.upsertConnector({ configJson: SENTRY }), Code.PermissionDenied);
-      await expectErr(mem.client.deleteConnector({ provider: "sentry" }), Code.PermissionDenied);
+      await expectErr(mem.client.upsertConnector({ configJson: CUSTOM }), Code.PermissionDenied);
+      await expectErr(mem.client.deleteConnector({ provider: "customco" }), Code.PermissionDenied);
     } finally {
       await mem.close();
     }
@@ -179,8 +179,8 @@ describe("IntegrationService (native)", () => {
 
   test("ListConnectors merges built-in seeds (read-only) with custom rows", async () => {
     const custom: ConnectorRow = {
-      provider: "sentry",
-      config: JSON.parse(SENTRY),
+      provider: "customco",
+      config: JSON.parse(CUSTOM),
       createdAt: new Date("2026-01-02T00:00:00Z"),
       updatedAt: new Date("2026-01-02T00:00:00Z"),
     };
@@ -193,7 +193,7 @@ describe("IntegrationService (native)", () => {
       const byProvider = new Map(r.connectors.map((c) => [c.provider, c]));
       expect(byProvider.get("github")?.builtin).toBe(true); // file seed
       expect(byProvider.get("datadog")?.builtin).toBe(true); // file seed
-      expect(byProvider.get("sentry")?.builtin).toBe(false); // custom
+      expect(byProvider.get("customco")?.builtin).toBe(false); // custom
     } finally {
       await s.close();
     }
@@ -203,10 +203,10 @@ describe("IntegrationService (native)", () => {
     const { store, rec } = fakeStore();
     const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: store });
     try {
-      const r = await s.client.upsertConnector({ configJson: SENTRY });
+      const r = await s.client.upsertConnector({ configJson: CUSTOM });
       expect(rec.upserts).toHaveLength(1);
-      expect(rec.upserts[0]!.provider).toBe("sentry");
-      expect(r.connector?.provider).toBe("sentry");
+      expect(rec.upserts[0]!.provider).toBe("customco");
+      expect(r.connector?.provider).toBe("customco");
       expect(r.connector?.builtin).toBe(false);
     } finally {
       await s.close();
@@ -214,7 +214,7 @@ describe("IntegrationService (native)", () => {
   });
 
   test("UpsertConnector rejects a built-in provider", async () => {
-    const evil = JSON.stringify({ ...JSON.parse(SENTRY), provider: "github" });
+    const evil = JSON.stringify({ ...JSON.parse(CUSTOM), provider: "github" });
     const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: fakeStore().store });
     try {
       await expectErr(s.client.upsertConnector({ configJson: evil }), Code.InvalidArgument);
@@ -228,7 +228,7 @@ describe("IntegrationService (native)", () => {
     try {
       await expectErr(s.client.upsertConnector({ configJson: "{not json" }), Code.InvalidArgument);
       // valid JSON, invalid connector (overbroad host wildcard rejected by parseConnector hardening)
-      const bad = JSON.stringify({ ...JSON.parse(SENTRY), hosts: ["*"] });
+      const bad = JSON.stringify({ ...JSON.parse(CUSTOM), hosts: ["*"] });
       await expectErr(s.client.upsertConnector({ configJson: bad }), Code.InvalidArgument);
     } finally {
       await s.close();
@@ -237,17 +237,17 @@ describe("IntegrationService (native)", () => {
 
   test("DeleteConnector deletes custom; rejects built-in", async () => {
     const custom: ConnectorRow = {
-      provider: "sentry",
-      config: JSON.parse(SENTRY),
+      provider: "customco",
+      config: JSON.parse(CUSTOM),
       createdAt: new Date(),
       updatedAt: new Date(),
     };
     const { store, rec } = fakeStore([custom]);
     const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: store });
     try {
-      const r = await s.client.deleteConnector({ provider: "sentry" });
+      const r = await s.client.deleteConnector({ provider: "customco" });
       expect(r.deleted).toBe(true);
-      expect(rec.deletes).toEqual(["sentry"]);
+      expect(rec.deletes).toEqual(["customco"]);
       await expectErr(s.client.deleteConnector({ provider: "github" }), Code.InvalidArgument);
     } finally {
       await s.close();
@@ -326,7 +326,10 @@ describe("GetIntegrationCatalog (member-readable)", () => {
     const mem = await spawn({ getSession: makeGetSession("m"), connectors: fakeStore().store });
     try {
       const r = await mem.client.getIntegrationCatalog({});
-      expect(JSON.stringify(r)).not.toMatch(/secretRef|datadog-api-key|github_app|DD-API-KEY|template/);
+      // Match the inject KEYS as quoted JSON ("secretRef"/"template"), not bare
+      // substrings — else a legitimate capability action like SendGrid's
+      // `templates:read` trips the `template` guard. Secret VALUES/kinds stay bare.
+      expect(JSON.stringify(r)).not.toMatch(/"secretRef"|"template"|datadog-api-key|github_app|DD-API-KEY/);
     } finally {
       await mem.close();
     }
@@ -453,12 +456,12 @@ describe("UploadConnectorLogo + catalog overlay", () => {
 
   test("deleteConnector also clears the connector's logo", async () => {
     invalidateRegistry();
-    const custom: ConnectorRow = { provider: "sentry", config: JSON.parse(SENTRY), createdAt: new Date(), updatedAt: new Date() };
-    const fl = fakeLogoStore({ sentry: { mediaType: "image/png", data: Buffer.from(PNG_BYTES) } });
+    const custom: ConnectorRow = { provider: "customco", config: JSON.parse(CUSTOM), createdAt: new Date(), updatedAt: new Date() };
+    const fl = fakeLogoStore({ customco: { mediaType: "image/png", data: Buffer.from(PNG_BYTES) } });
     const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: fakeStore([custom]).store, connectorLogos: fl.store });
     try {
-      await s.client.deleteConnector({ provider: "sentry" });
-      expect(fl.rows.has("sentry")).toBe(false);
+      await s.client.deleteConnector({ provider: "customco" });
+      expect(fl.rows.has("customco")).toBe(false);
     } finally {
       await s.close();
     }

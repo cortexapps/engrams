@@ -1,0 +1,92 @@
+{
+  "provider": "asana",
+  "protocol": "http",
+  "display": {
+    "name": "Asana",
+    "category": "Project management",
+    "blurb": "Read and manage Asana tasks, projects, comments, and tags — authenticated with a personal access token that the egress proxy injects, never seen by the agent.",
+    "icon": { "mono": "AS", "color": "#f06a6a" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "asana.api_token" }
+    ]
+  },
+  "hosts": ["app.asana.com"],
+  "test": { "path": "/api/1.0/users/me" },
+  "operations": [
+    {
+      "grants": ["tasks:read"],
+      "match": { "method": "GET", "path": "/api/1.0/tasks*" }
+    },
+    {
+      "grants": ["tasks:read"],
+      "match": { "method": "GET", "path": "/api/1.0/workspaces/*/tasks/search*" }
+    },
+    {
+      "grants": ["tasks:write"],
+      "match": { "method": "POST", "path": "/api/1.0/tasks*" }
+    },
+    {
+      "grants": ["tasks:write"],
+      "match": { "method": "PUT", "path": "/api/1.0/tasks/*" }
+    },
+    {
+      "grants": ["tasks:write"],
+      "match": { "method": "DELETE", "path": "/api/1.0/tasks/*" }
+    },
+    {
+      "grants": ["projects:read"],
+      "match": { "method": "GET", "path": "/api/1.0/projects*" }
+    },
+    {
+      "grants": ["projects:read"],
+      "match": { "method": "GET", "path": "/api/1.0/workspaces/*/projects/search*" }
+    },
+    {
+      "grants": ["projects:write"],
+      "match": { "method": "POST", "path": "/api/1.0/projects*" }
+    },
+    {
+      "grants": ["stories:read"],
+      "match": { "method": "GET", "path": "/api/1.0/tasks/*/stories*" }
+    },
+    {
+      "grants": ["stories:write"],
+      "match": { "method": "POST", "path": "/api/1.0/tasks/*/stories*" }
+    },
+    {
+      "grants": ["tags:read"],
+      "match": { "method": "GET", "path": "/api/1.0/tags*" }
+    },
+    {
+      "grants": ["users:read"],
+      "match": { "method": "GET", "path": "/api/1.0/users*" }
+    },
+    {
+      "grants": ["users:read"],
+      "match": { "method": "GET", "path": "/api/1.0/workspaces*" }
+    },
+    {
+      "grants": [
+        "tasks:read",
+        "tasks:write",
+        "projects:read",
+        "projects:write",
+        "stories:read",
+        "stories:write",
+        "tags:read",
+        "users:read"
+      ],
+      "match": { "method": "GET", "path": "/api/1.0/users/me" }
+    }
+  ],
+  "cli": {
+    "bins": ["asana"],
+    "binSource": "bundled",
+    "dummyEnv": { "ASANA_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `asana` to interact with Asana from this session — read and manage tasks, projects, comments, and tags. Authentication is automatic: the egress proxy injects your personal access token (PAT) on requests to app.asana.com; `ASANA_TOKEN` is a managed placeholder. Do NOT set a real token or run any login.\n\nAll endpoints sit under https://app.asana.com/api/1.0. Asana wraps responses as {\"data\": ...} and request bodies as {\"data\": {...}}. The CLI sends `Accept: application/json` (and `Content-Type: application/json` on writes) for you. GIDs are opaque numeric-string ids.\n\nIdentity / discovery:\n  asana whoami                          Current user (GET /users/me)\n  asana workspaces                      List your workspaces (requires users:read)\n  asana users [workspace=<gid>]         List users (requires users:read)\n\nTasks (tasks:read / tasks:write):\n  asana tasks project=<gid>             List tasks in a project (GET /tasks; one of project/assignee+workspace/section/tag is required by Asana)\n  asana task <task-gid>                 Get a single task (GET /tasks/{gid})\n  asana task-create name=\"My task\" projects=<gid> [notes=...] [assignee=me]  Create a task (POST /tasks)\n  asana task-update <task-gid> completed=true [name=...] [notes=...]         Update a task (PUT /tasks/{gid})\n  asana search <workspace-gid> text=<q> [opt_fields=name,completed]          Search tasks (GET /workspaces/{gid}/tasks/search)\n\nComments / stories (stories:read / stories:write):\n  asana stories <task-gid>              List a task's stories/comments (GET /tasks/{gid}/stories)\n  asana comment <task-gid> <text...>    Add a comment (POST /tasks/{gid}/stories, type=comment)\n\nProjects (projects:read / projects:write):\n  asana projects [workspace=<gid>]      List projects (GET /projects)\n  asana project <project-gid>           Get a project (GET /projects/{gid})\n  asana project-create name=\"Q3 plan\" workspace=<gid>  Create a project (POST /projects)\n\nTags (tags:read): asana tags [workspace=<gid>]  List tags (GET /tags).\n\nEscape hatches (still gated by your granted powers at the proxy):\n  asana get  <path> [field=value ...]   Raw GET  (query params), e.g. asana get /tasks project=123\n  asana post <path> [field=value ...]   Raw POST (sent as JSON {\"data\":{...}})\n  asana api  <METHOD> <path> [-d '{json}']  Fully raw call.\n\nEach subcommand needs the matching power on your profile; a call to a path/method your profile didn't grant is denied at the network boundary, not authenticated."
+  }
+}
