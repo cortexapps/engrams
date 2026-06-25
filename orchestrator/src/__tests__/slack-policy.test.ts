@@ -1,5 +1,5 @@
 /**
- * Slack CommunicationPolicy (ADR 0059 P2.10) — the provider-mechanics impl.
+ * Slack CommunicationPolicy (ADR 0060 P2.10) — the provider-mechanics impl.
  *
  * The Block Kit shaping is tested in slack-blocks.test.ts; here we pin the
  * policy's own logic: `foldReplies` (the pure thread→prompt cursor fold) and

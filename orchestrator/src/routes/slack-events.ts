@@ -1,5 +1,5 @@
 /**
- * Slack Events API endpoint (ADR 0059 P2.8).
+ * Slack Events API endpoint (ADR 0060 P2.8).
  *
  *   POST /api/v1/integrations/slack/events
  *

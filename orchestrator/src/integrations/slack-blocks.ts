@@ -1,5 +1,5 @@
 /**
- * Slack Block Kit contract for AskUserQuestion (ADR 0059 P2.9/P2.10) — pure.
+ * Slack Block Kit contract for AskUserQuestion (ADR 0060 P2.9/P2.10) — pure.
  *
  * One module owns BOTH halves of the answer round-trip so they cannot drift:
  *   - the question message's interactive elements (built in slack-policy.ts via

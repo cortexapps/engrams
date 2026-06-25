@@ -31,7 +31,7 @@ export interface ProfileRow {
   // ADR 0057: profile-defined egress allow-list + injected secrets.
   network: ProfileNetwork;
   secrets: ProfileSecret[];
-  // ADR 0059: the org default profile (at most one active).
+  // ADR 0060: the org default profile (at most one active).
   isDefault: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -60,7 +60,7 @@ export interface ProfileStore {
   get(id: string): Promise<ProfileRow | null>;
   /** Active (deleted_at IS NULL) only, or null. Used by createTask. */
   getActive(id: string): Promise<ProfileRow | null>;
-  /** The org's active default profile (ADR 0059), or null if none is set. */
+  /** The org's active default profile (ADR 0060), or null if none is set. */
   getDefault(): Promise<ProfileRow | null>;
   /** Rows for the given ids (active or archived) — for snapshot enrichment. */
   getByIds(ids: string[]): Promise<ProfileRow[]>;
@@ -126,7 +126,7 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
     },
     async create(input) {
       const id = crypto.randomUUID();
-      // At-most-one default (ADR 0059): if this profile is the default, clear
+      // At-most-one default (ADR 0060): if this profile is the default, clear
       // any prior default in the same tx before inserting.
       await db.transaction(async (tx) => {
         if (input.isDefault) {

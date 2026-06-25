@@ -1,5 +1,5 @@
 /**
- * SessionIngestWorkflow — the reverse-channel pump (ADR 0059 Decision 1, P1.3).
+ * SessionIngestWorkflow — the reverse-channel pump (ADR 0060 Decision 1, P1.3).
  *
  * One per session (`workflowID = ingest:<sessionId>[#<epoch>]`, which IS the
  * one-pump-per-session guarantee — no lease). It walks the coordinator's
@@ -8,7 +8,7 @@
  * mailbox, then sends a single terminal message and exits when the session
  * reaches a terminal state.
  *
- * Two invariants this file pins (ADR 0059 §Correctness invariants):
+ * Two invariants this file pins (ADR 0060 §Correctness invariants):
  *  1. **Effect-before-cursor.** Each `DBOS.send` (a checkpointed, replay-once
  *     step) commits BEFORE the local cursor `after` advances. A crash in between
  *     replays the send, which DBOS returns from its checkpoint — no re-send, no

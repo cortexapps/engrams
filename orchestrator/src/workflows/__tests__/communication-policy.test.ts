@@ -1,5 +1,5 @@
 /**
- * Framework event-classification (ADR 0059 P1.4).
+ * Framework event-classification (ADR 0060 P1.4).
  *
  * `routeSessionEvent` is the pure decision the thread workflow makes for each
  * curated session event: which `CommunicationPolicy` method to invoke (and,
@@ -60,7 +60,7 @@ describe("routeSessionEvent()", () => {
 });
 
 // summarizeAsset collapses a curated asset event into a one-line label (+ link)
-// for the closing-summary recap (ADR 0059 onComplete). Pure; only DURABLE
+// for the closing-summary recap (ADR 0060 onComplete). Pure; only DURABLE
 // assets count — a transient `surface:"action"` (a query the agent ran) is not
 // a recap line (matches the ADR 0056 asset-vs-action distinction).
 describe("summarizeAsset()", () => {

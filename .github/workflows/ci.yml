@@ -489,7 +489,7 @@ jobs:
   # ADR 0051 Task 14: the orchestration tier (Bun/Hono). install + tsc
   # --noEmit + bun test. A Postgres service backs (a) the live DB-gated tests
   # (db.test.ts etc., which self-skip without a reachable ORCHESTRATOR_DATABASE_URL)
-  # and (b) the ADR 0059 DBOS engine — DBOS keeps its system tables in a `dbos`
+  # and (b) the ADR 0060 DBOS engine — DBOS keeps its system tables in a `dbos`
   # schema of this same database. The .live smoke test still self-skips without a
   # live coordinator.
   orchestrator:

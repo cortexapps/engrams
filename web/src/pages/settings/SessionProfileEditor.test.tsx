@@ -79,7 +79,7 @@ describe("SessionProfileEditor (create)", () => {
     });
   });
 
-  it("toggling Default includes is_default in the create payload (ADR 0059)", async () => {
+  it("toggling Default includes is_default in the create payload (ADR 0060)", async () => {
     render(<SessionProfileEditor mode="create" />);
     fireEvent.change(screen.getByLabelText(/profile name/i), {
       target: { value: "Default Agent" },

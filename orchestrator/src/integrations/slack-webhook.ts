@@ -1,5 +1,5 @@
 /**
- * Slack Events API payload classification (ADR 0059 P2.8) — pure, DBOS-free.
+ * Slack Events API payload classification (ADR 0060 P2.8) — pure, DBOS-free.
  *
  * The route verifies the request with the SDK (`isValidSlackRequest`) and then
  * classifies the raw body here: a url_verification handshake, an `app_mention`

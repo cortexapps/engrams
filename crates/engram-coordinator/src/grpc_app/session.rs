@@ -250,7 +250,7 @@ impl app::session_service_server::SessionService for AppSessionService {
         Ok(Response::new(Box::pin(full_stream)))
     }
 
-    // ADR 0059: unary catch-up read of the persistent log for the reverse
+    // ADR 0060: unary catch-up read of the persistent log for the reverse
     // channel. Thin adapter over `list_session_events_core`; maps each
     // persisted event through the SAME decoder the StreamEvents replay arm
     // uses (`merged_to_parts`), so the unary page is byte-identical to the

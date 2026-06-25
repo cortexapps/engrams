@@ -29,7 +29,7 @@ import { registerIntegration } from "./rpc/integration.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
-// ADR 0059: embedded DBOS engine. Workflow modules (P1+) must be imported
+// ADR 0060: embedded DBOS engine. Workflow modules (P1+) must be imported
 // ABOVE the initDbos() call below so their workflows/steps are registered
 // before DBOS.launch(). Importing slack-thread.ts registers both the thread
 // workflow and (transitively) the per-session ingest pump.
@@ -70,7 +70,7 @@ app.route("/", adminRoute);
 app.route("/", integrationOpRoute);
 // OAuth acquisition for connectors with an `oauth` facet (e.g. Slack "Add to Slack").
 app.route("/", integrationOauthRoute);
-// ADR 0059: Slack external-trigger webhooks (events + interactivity). Both
+// ADR 0060: Slack external-trigger webhooks (events + interactivity). Both
 // verify every request with the SDK against the slack.signing_secret org secret.
 app.route("/", slackEventsRoute);
 app.route("/", slackInteractivityRoute);
@@ -127,7 +127,7 @@ const server = buildServer(
   { upgradeWebSocket, wss, injectWebSocket },
 );
 
-// ADR 0059: inject the SlackThreadWorkflow's seams (the Slack provider
+// ADR 0060: inject the SlackThreadWorkflow's seams (the Slack provider
 // mechanics + the session-lifecycle control plane) before launching the engine,
 // so the first webhook-driven workflow has them. Then launch the embedded DBOS
 // engine before serving any traffic, so a webhook that arrives the instant we

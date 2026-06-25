@@ -69,7 +69,7 @@ describe("ProfileStore", () => {
     }
   });
 
-  // ADR 0059: at-most-one default. Setting a profile default clears the prior;
+  // ADR 0060: at-most-one default. Setting a profile default clears the prior;
   // soft-deleting the default leaves none. getDefault() returns the active one.
   test.skipIf(!dbReachable)("is_default: at-most-one + getDefault + clears on soft-delete", async () => {
     const store = makeProfileStore(getDb());

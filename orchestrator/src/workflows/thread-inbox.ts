@@ -1,5 +1,5 @@
 /**
- * The thread workflow's single mailbox contract (ADR 0059 P1.4).
+ * The thread workflow's single mailbox contract (ADR 0060 P1.4).
  *
  * `DBOS.recv` is single-topic, so the ADR's "one recv multiplexes
  * { session events ∪ trigger events }" is realized by funnelling BOTH sources
@@ -17,7 +17,7 @@ export const THREAD_TOPIC = "thread";
 /**
  * An `@mention` — the initial trigger or a follow-up. The provider-shaped
  * fields are opaque to the framework; only the source's `CommunicationPolicy`
- * interprets them. Shape matches the Slack events handler (ADR 0059 §handler).
+ * interprets them. Shape matches the Slack events handler (ADR 0060 §handler).
  */
 export interface SourceMention {
   team: string;

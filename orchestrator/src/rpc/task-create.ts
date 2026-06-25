@@ -1,13 +1,13 @@
 /**
  * Task creation — profile→session compilation + the create-a-task primitive
- * (ADR 0052/0055/0056/0057; extracted in ADR 0059 P2.7, unified here).
+ * (ADR 0052/0055/0056/0057; extracted in ADR 0060 P2.7, unified here).
  *
  * `createTaskWithSession` is the ONE path that turns a profile into a running
  * agent: compile the CreateSession request, create the upstream session, then
  * persist the `task` + primary `task_session` rows atomically (compensating by
  * deleting the orphan session if the DB write fails). Both the TaskService
  * CreateTask RPC (UI chat tasks) and the external-trigger ThreadControlPlane
- * (ADR 0059 Slack threads) call it, so a triggered session runs with the SAME
+ * (ADR 0060 Slack threads) call it, so a triggered session runs with the SAME
  * capabilities/network/secrets/skills as a UI task (no new privilege path) and
  * a session is NEVER created outside the task model.
  *
@@ -66,7 +66,7 @@ export interface SessionCompileDeps {
 export interface SessionCompileOpts {
   prompt?: string;
   /** Extra harness env merged LAST (highest precedence) — e.g. the trigger's
-   *  ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0059). */
+   *  ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060). */
   extraHarnessEnv?: Record<string, string>;
 }
 
@@ -153,7 +153,7 @@ export interface CreateTaskDeps {
 }
 
 export interface CreateTaskParams {
-  /** Task type: "chat" (UI) | "slack_thread" (ADR 0059 trigger) | … */
+  /** Task type: "chat" (UI) | "slack_thread" (ADR 0060 trigger) | … */
   type: string;
   /** The engrams user who owns the task (createdByUserId → the CASL subject). */
   ownerUserId: string;
@@ -164,7 +164,7 @@ export interface CreateTaskParams {
   /** Type-specific trigger ref recorded on the task row (operator-visible). */
   source?: Record<string, unknown>;
   /** Extra harness env merged LAST — e.g. the trigger's
-   *  ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0059). */
+   *  ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060). */
   extraHarnessEnv?: Record<string, string>;
 }
 

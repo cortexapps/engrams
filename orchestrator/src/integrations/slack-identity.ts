@@ -1,5 +1,5 @@
 /**
- * Slack → engrams identity seam (ADR 0059 Decision 4, P2.4).
+ * Slack → engrams identity seam (ADR 0060 Decision 4, P2.4).
  *
  * One function, no schema: map a provider user to an engrams user id by email
  * match. Slack: `users.info` → `profile.email` (needs `users:read.email`) →

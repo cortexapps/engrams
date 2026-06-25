@@ -813,7 +813,7 @@ describe("cli facet (ADR 0058)", () => {
     expect(slack.operations.some((o) => o.match && !isGraphqlMatch(o.match) && o.match.path === "/api/auth.test")).toBe(true);
   });
 
-  test("the slack seed requests the ADR-0059 trigger scopes", () => {
+  test("the slack seed requests the ADR-0060 trigger scopes", () => {
     const scopes = connectorRegistry().get("slack")!.oauth!.scopes;
     // The five scopes the external-triggers reverse channel needs (in addition
     // to the existing post/read/upload set): receive the @mention, read thread

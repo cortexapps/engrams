@@ -1,5 +1,5 @@
 /**
- * Real ThreadControlPlane wiring (ADR 0059 P2.7).
+ * Real ThreadControlPlane wiring (ADR 0060 P2.7).
  *
  * The trigger-specific glue: createTask runs the shared create path (the same
  * one CreateTask uses) against the default profile, injects

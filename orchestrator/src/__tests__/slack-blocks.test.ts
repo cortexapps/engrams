@@ -1,5 +1,5 @@
 /**
- * Slack Block Kit contract (ADR 0059 P2.9/P2.10) — pure, unit-tested.
+ * Slack Block Kit contract (ADR 0060 P2.9/P2.10) — pure, unit-tested.
  *
  * One module owns the answer round-trip: the question message's buttons carry
  * {tool_call_id, route, …} so `parseInteractivity` can turn a Slack

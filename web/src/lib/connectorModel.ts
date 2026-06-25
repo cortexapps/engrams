@@ -176,10 +176,10 @@ export interface ParsedCli {
 export interface ParsedOauth {
   clientIdRef: string;
   clientSecretRef: string;
-  /** Bot scopes the token exchange requests — drives the Slack app manifest (ADR 0059). */
+  /** Bot scopes the token exchange requests — drives the Slack app manifest (ADR 0060). */
   scopes: string[];
   /** Org secret for the app's webhook-signing secret, when the provider has an inbound
-   * webhook surface (ADR 0059 Slack triggers). Present → the connect flow seals it. */
+   * webhook surface (ADR 0060 Slack triggers). Present → the connect flow seals it. */
   signingSecretRef?: string;
 }
 

@@ -65,7 +65,7 @@ describe("oauth facet parse", () => {
     expect(() => parseConnector({ ...base, oauth: partial }, "x")).toThrow(/clientSecretRef/);
   });
 
-  test("the built-in slack seed declares the signing-secret ref (ADR 0059 triggers)", () => {
+  test("the built-in slack seed declares the signing-secret ref (ADR 0060 triggers)", () => {
     // The webhook verifier (getSlackSigningSecret) reads this ref; the connect UI
     // seals it. Both MUST agree on the name — guard against drift here.
     const slack = connectorRegistry().get("slack");

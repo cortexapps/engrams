@@ -21,7 +21,7 @@ describe("buildSlackManifest", () => {
     expect(m.oauth_config.scopes.bot).toEqual(scopes);
   });
 
-  test("subscribes app_mention to the events request URL (ADR 0059)", () => {
+  test("subscribes app_mention to the events request URL (ADR 0060)", () => {
     const m = parse();
     expect(m.settings.event_subscriptions.request_url).toBe(
       "https://engrams.example.com/api/v1/integrations/slack/events",
@@ -29,7 +29,7 @@ describe("buildSlackManifest", () => {
     expect(m.settings.event_subscriptions.bot_events).toContain("app_mention");
   });
 
-  test("enables interactivity at the interactivity request URL (ADR 0059)", () => {
+  test("enables interactivity at the interactivity request URL (ADR 0060)", () => {
     const m = parse();
     expect(m.settings.interactivity.is_enabled).toBe(true);
     expect(m.settings.interactivity.request_url).toBe(

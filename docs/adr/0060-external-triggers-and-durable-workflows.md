@@ -1,4 +1,4 @@
-# ADR 0059: External triggers and durable background-agent workflows (Slack-first)
+# ADR 0060: External triggers and durable background-agent workflows (Slack-first)
 
 Status: 2026-06-25 — **Accepted.** Substrate simplified after an adversarial design
 review (see §Design review): the reverse channel is DBOS-native (2 workflows, zero

@@ -1,5 +1,5 @@
 /**
- * The per-source communication seam (ADR 0059 §Communication policy, P1.4).
+ * The per-source communication seam (ADR 0060 §Communication policy, P1.4).
  *
  * "Where does this go" is CODE, not config. The thread workflow (the
  * framework) owns event classification, identity, session create/resume, the
@@ -45,7 +45,7 @@ export interface ClosingSummary {
  */
 export interface CommunicationPolicy {
   /** Constant flavor appended to the agent's system prompt at session create
-   *  (ADR 0059 Decision 8) — NOT connector config. */
+   *  (ADR 0060 Decision 8) — NOT connector config. */
   readonly systemPromptAppend: string;
 
   /** The trigger was picked up (Slack: 👀 on the mention). */

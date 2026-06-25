@@ -1,5 +1,5 @@
 /**
- * Slack Events API payload classification (ADR 0059 P2.8) — pure, unit-tested.
+ * Slack Events API payload classification (ADR 0060 P2.8) — pure, unit-tested.
  *
  * The route verifies the signature with the SDK (`isValidSlackRequest`), then
  * hands the raw body here to classify into the framework's shapes. Field

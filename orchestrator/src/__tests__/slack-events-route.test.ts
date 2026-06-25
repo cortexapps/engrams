@@ -1,5 +1,5 @@
 /**
- * Slack events route — verification + challenge wiring (ADR 0059 P2.8).
+ * Slack events route — verification + challenge wiring (ADR 0060 P2.8).
  *
  * Exercises the route's use of the SDK verifier (isValidSlackRequest) and the
  * url_verification echo via Hono's in-memory request (no server, no DBOS — the

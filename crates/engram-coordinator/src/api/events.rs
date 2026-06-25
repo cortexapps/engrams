@@ -58,12 +58,12 @@ pub(crate) async fn events_core(
     Ok((replayed, live_rx))
 }
 
-/// ADR 0059: default page size when `limit` is unset / non-positive.
+/// ADR 0060: default page size when `limit` is unset / non-positive.
 const LIST_DEFAULT_LIMIT: i64 = 500;
-/// ADR 0059: hard cap so one unary read stays bounded regardless of `limit`.
+/// ADR 0060: hard cap so one unary read stays bounded regardless of `limit`.
 const LIST_MAX_LIMIT: i64 = 1000;
 
-/// ADR 0059: unary, bounded, UNFILTERED read of the persistent log — the
+/// ADR 0060: unary, bounded, UNFILTERED read of the persistent log — the
 /// catch-up read the reverse-channel pump (`SessionIngestWorkflow`) walks
 /// forward. Returns events with `idx > after_idx` (`None` ≡ from the start of
 /// the log), capped, plus the cursor to pass as `after_idx` next time: the

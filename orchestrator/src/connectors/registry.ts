@@ -222,7 +222,7 @@ export interface OauthFacet {
   /** Org secret holding the OAuth app's client secret. */
   clientSecretRef: string;
   /** Org secret holding the app's request-signing secret, when the provider verifies
-   * inbound webhooks with one (ADR 0059 Slack triggers). Admin-entered like the client
+   * inbound webhooks with one (ADR 0060 Slack triggers). Admin-entered like the client
    * creds; absent for providers without an inbound webhook surface. */
   signingSecretRef?: string;
   /** Org secret the obtained access token is written to (the injected credential). */

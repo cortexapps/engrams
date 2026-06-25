@@ -207,7 +207,7 @@ describe("parseConnectorConfig", () => {
     expect(parseConnectorConfig(raw, "x").cli).toBeUndefined();
   });
 
-  test("surfaces the OAuth facet's scopes (ADR 0059 Slack app manifest)", () => {
+  test("surfaces the OAuth facet's scopes (ADR 0060 Slack app manifest)", () => {
     const raw = JSON.stringify({
       provider: "slack",
       credential: {

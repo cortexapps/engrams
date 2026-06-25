@@ -1,5 +1,5 @@
 /**
- * Embedded DBOS engine lifecycle (ADR 0059 P0, Decision 3).
+ * Embedded DBOS engine lifecycle (ADR 0060 P0, Decision 3).
  *
  * DBOS runs *inside* the Bun orchestrator process — durable workflows backed by
  * the orchestrator's existing Postgres, with the DBOS system tables isolated in

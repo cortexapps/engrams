@@ -122,7 +122,7 @@ export type Profile = Message<"engram.app.v1.Profile"> & {
   secrets: ProfileSecret[];
 
   /**
-   * ADR 0059: the org default profile — a trigger (no UI to pick one) launches
+   * ADR 0060: the org default profile — a trigger (no UI to pick one) launches
    * its session with this. At most one active default (the store clears the
    * prior when one is set).
    *
@@ -396,7 +396,7 @@ export type CreateProfileRequest = Message<"engram.app.v1.CreateProfileRequest">
   secrets: ProfileSecret[];
 
   /**
-   * ADR 0059: mark this the org default (clears any prior default).
+   * ADR 0060: mark this the org default (clears any prior default).
    *
    * @generated from field: bool is_default = 11;
    */
@@ -493,7 +493,7 @@ export type UpdateProfileRequest = Message<"engram.app.v1.UpdateProfileRequest">
   secrets: ProfileSecret[];
 
   /**
-   * ADR 0059: mark this the org default (clears any prior default).
+   * ADR 0060: mark this the org default (clears any prior default).
    *
    * @generated from field: bool is_default = 12;
    */

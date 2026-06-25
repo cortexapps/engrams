@@ -1,5 +1,5 @@
 /**
- * SlackThreadWorkflow — the brain, one per thread (ADR 0059 P1.4).
+ * SlackThreadWorkflow — the brain, one per thread (ADR 0060 P1.4).
  *
  * `workflowID = task:<hash(team,channel,thread_root)>`, so a thread maps to
  * exactly one workflow (idempotent start). It is the framework half of the
@@ -55,7 +55,7 @@ export interface ThreadControlPlane {
   /** The org's `is_default` profile, or null if none is configured. */
   getDefaultProfile(): Promise<{ id: string } | null>;
   /** Create the task (and its primary session) the thread drives — the same
-   *  create path as a UI chat task; never a bare session (ADR 0059). */
+   *  create path as a UI chat task; never a bare session (ADR 0060). */
   createTask(input: CreateTaskInput): Promise<StartedSession>;
   /** Deliver a follow-up prompt; `promptId` is the dedupe key (Decision 9). */
   sendPrompt(sessionId: string, prompt: string, promptId: string): Promise<void>;

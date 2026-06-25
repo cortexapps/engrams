@@ -1312,7 +1312,7 @@ mod adapter {
         question_outstanding: &hook_server::QuestionOutstanding,
     ) -> SessionOutcome {
         let resume_id = read_claude_session_id().await;
-        // ADR 0059: ENGRAM_APPEND_SYSTEM_PROMPT (carried via harness_env) flavors
+        // ADR 0060: ENGRAM_APPEND_SYSTEM_PROMPT (carried via harness_env) flavors
         // the agent's system prompt. Read per spawn — it is constant for the
         // process, and a respawn must re-apply it.
         let append_system_prompt = std::env::var("ENGRAM_APPEND_SYSTEM_PROMPT").ok();
@@ -2163,7 +2163,7 @@ mod adapter {
             argv.push("--resume".into());
             argv.push(id.clone());
         }
-        // ADR 0059: an external trigger (e.g. Slack) flavors the agent's system
+        // ADR 0060: an external trigger (e.g. Slack) flavors the agent's system
         // prompt via ENGRAM_APPEND_SYSTEM_PROMPT (carried through harness_env).
         // Empty = unset (skip the flag).
         if let Some(p) = append_system_prompt {
@@ -2759,7 +2759,7 @@ mod adapter {
         use std::pin::Pin;
         use std::task::{Context, Poll};
 
-        // ADR 0059: an external trigger flavors the agent's system prompt via
+        // ADR 0060: an external trigger flavors the agent's system prompt via
         // ENGRAM_APPEND_SYSTEM_PROMPT (rides harness_env). build_claude_argv
         // turns a set value into `--append-system-prompt <value>`.
         #[test]

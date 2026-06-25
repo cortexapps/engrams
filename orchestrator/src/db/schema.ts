@@ -40,7 +40,7 @@ const bytea = customType<{ data: Buffer }>({
 
 export const task = pgTable("task", {
   id: text("id").primaryKey(), // nanoid/uuid
-  type: text("type").notNull(), // 'chat' (UI) | 'slack_thread' (ADR 0059 trigger)
+  type: text("type").notNull(), // 'chat' (UI) | 'slack_thread' (ADR 0060 trigger)
   title: text("title"),
   status: text("status").notNull().default("open"), // open|working|awaiting_review|done|failed
   createdByUserId: text("created_by_user_id"), // better-auth user id; null = automation (future)
@@ -125,7 +125,7 @@ export const profile = pgTable("profile", {
   // compiled into the per-session SessionPolicy + consumed at boot in B2.
   network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
   secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
-  // ADR 0059: the org's default profile — a trigger (no UI to pick one) launches
+  // ADR 0060: the org's default profile — a trigger (no UI to pick one) launches
   // its session with this. At most one active default; the store clears the
   // prior when one is set.
   isDefault: boolean("is_default").notNull().default(false),

@@ -1,5 +1,5 @@
 /**
- * Reverse-channel reader + curation (ADR 0059 P1.2).
+ * Reverse-channel reader + curation (ADR 0060 P1.2).
  *
  * The SessionIngestWorkflow pump walks the coordinator's append-only log
  * forward via `readSessionEventsBounded`, forwarding only the events an
@@ -116,7 +116,7 @@ describe("readSessionEventsBounded()", () => {
     expect(out.events.map((e) => e.kind)).toEqual(["run_completed"]);
   });
 
-  // The closing summary (ADR 0059, onComplete) is enriched with the session's
+  // The closing summary (ADR 0060, onComplete) is enriched with the session's
   // last assistant message. agent_message is NOT a curated content kind (it's
   // noise for the thread), but the pump already walks every page to the
   // terminal — so the reader surfaces the last assistant text per page and the

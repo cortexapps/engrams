@@ -1,5 +1,5 @@
 /**
- * Slack → engrams identity seam (ADR 0059 P2.4, Decision 4).
+ * Slack → engrams identity seam (ADR 0060 P2.4, Decision 4).
  *
  * Pure resolution logic with both external reads injected (the Slack client +
  * the email→user lookup), so no live Slack and no DB. The real defaults hit

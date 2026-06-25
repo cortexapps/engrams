@@ -55,7 +55,7 @@ message Profile {
   // org secret store by `ref` (the value lives there, never here). Lifted from
   // the image manifest onto the profile; B2 consumes it at boot.
   repeated ProfileSecret secrets = 14;
-  // ADR 0059: the org default profile — a trigger (no UI to pick one) launches
+  // ADR 0060: the org default profile — a trigger (no UI to pick one) launches
   // its session with this. At most one active default (the store clears the
   // prior when one is set).
   bool is_default = 15;
@@ -123,7 +123,7 @@ message CreateProfileRequest {
   // ADR 0057: see Profile.network / Profile.secrets.
   ProfileNetwork network = 9;
   repeated ProfileSecret secrets = 10;
-  // ADR 0059: mark this the org default (clears any prior default).
+  // ADR 0060: mark this the org default (clears any prior default).
   bool is_default = 11;
 }
 
@@ -146,7 +146,7 @@ message UpdateProfileRequest {
   // ADR 0057: see Profile.network / Profile.secrets.
   ProfileNetwork network = 10;
   repeated ProfileSecret secrets = 11;
-  // ADR 0059: mark this the org default (clears any prior default).
+  // ADR 0060: mark this the org default (clears any prior default).
   bool is_default = 12;
 }
 

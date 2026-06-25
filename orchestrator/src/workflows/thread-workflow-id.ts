@@ -1,5 +1,5 @@
 /**
- * Thread → DBOS workflow-id selection (ADR 0059 Invariant 4). SDK-agnostic.
+ * Thread → DBOS workflow-id selection (ADR 0060 Invariant 4). SDK-agnostic.
  *
  * A thread maps to a deterministic workflow id so the events handler's
  * `startWorkflow` is idempotent (the 1st mention creates, later ones no-op +

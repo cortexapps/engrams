@@ -379,7 +379,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       }
 
       // Create the task + its primary session via the shared primitive — the
-      // SAME path the external-trigger ThreadControlPlane uses (ADR 0059), so a
+      // SAME path the external-trigger ThreadControlPlane uses (ADR 0060), so a
       // UI chat task and a triggered session share one privilege/compensation
       // path. Throws NotFound (profile missing/archived) or FailedPrecondition
       // (image disabled); compensates the orphan session on a DB failure.

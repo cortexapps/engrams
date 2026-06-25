@@ -958,7 +958,7 @@ async fn image_list_enabled_images_reflects_store() {
 }
 
 // =====================================================================
-// ListSessionEvents (ADR 0059 P1) — the unary bounded read of the event
+// ListSessionEvents (ADR 0060 P1) — the unary bounded read of the event
 // log that the SessionIngestWorkflow pump walks forward. Unfiltered:
 // curation is the consumer's concern.
 // =====================================================================

@@ -87,7 +87,7 @@ export const POLICY: Record<string, PolicyEntry> = {
     subject: "Session",
     sessionIdField: "sessionId",
   },
-  // ADR 0059: unary catch-up read of the session event log (the reverse-channel
+  // ADR 0060: unary catch-up read of the session event log (the reverse-channel
   // pump uses it server-side; through the public passthrough it is the same
   // owner-scoped read as GetLog).
   "SessionService.ListSessionEvents": {

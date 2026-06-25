@@ -1,5 +1,5 @@
 /**
- * Builds a Slack app manifest (ADR 0059 external triggers) the admin can paste
+ * Builds a Slack app manifest (ADR 0060 external triggers) the admin can paste
  * into Slack's "Create an app from a manifest" flow. It pre-fills the three things
  * that are easy to get wrong by hand: the OAuth redirect URL, the full bot scope
  * set (sourced from the connector's own `oauth.scopes`, so it never drifts from

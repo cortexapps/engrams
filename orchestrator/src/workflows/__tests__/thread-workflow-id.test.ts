@@ -1,5 +1,5 @@
 /**
- * Thread-reuse epoch selection (ADR 0059 Invariant 4) — pure, unit-tested.
+ * Thread-reuse epoch selection (ADR 0060 Invariant 4) — pure, unit-tested.
  */
 
 import { expect, test, describe } from "bun:test";

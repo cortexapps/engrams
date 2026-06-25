@@ -1,5 +1,5 @@
 /**
- * Slack interactivity route (ADR 0059 P2.9) — verification + dispatch.
+ * Slack interactivity route (ADR 0060 P2.9) — verification + dispatch.
  *
  * The route verifies with the SDK (`isValidSlackRequest`) over the raw form
  * body, parses the `payload` field via the Block Kit contract, and dispatches:

@@ -1,5 +1,5 @@
 /**
- * Task creation (ADR 0059 P2.7) — the shared create path.
+ * Task creation (ADR 0060 P2.7) — the shared create path.
  *
  * `compileSessionCreateInput` turns a profile into a CreateSession request;
  * `createTaskWithSession` is the ONE create path (UI CreateTask RPC + the

@@ -1,5 +1,5 @@
 /**
- * Slack CommunicationPolicy (ADR 0059 P2.10) — the v1 provider-mechanics impl
+ * Slack CommunicationPolicy (ADR 0060 P2.10) — the v1 provider-mechanics impl
  * behind the SlackThreadWorkflow's policy seam. Pure Block Kit shaping lives in
  * slack-blocks.ts; this module is the thin layer that drives the Slack WebClient
  * (reactions, posts, updates, thread reads). Every method is invoked by the
@@ -27,7 +27,7 @@ import type { SourceMention } from "../workflows/thread-inbox.ts";
 
 const log = rootLog.child({ component: "slack" });
 
-/** The flavor appended to a triggered agent's system prompt (ADR 0059 Decision
+/** The flavor appended to a triggered agent's system prompt (ADR 0060 Decision
  *  8) — NOT connector config; a constant this policy provides at session
  *  create so the agent behaves well in a chat thread. */
 const SYSTEM_PROMPT_APPEND = `You are running inside an engrams session triggered from a Slack thread.

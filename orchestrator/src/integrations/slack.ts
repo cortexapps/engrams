@@ -25,7 +25,7 @@ export function getSlackClient(deps?: RunOpDeps): Promise<WebClient> {
 }
 
 /**
- * The Slack request-signing secret (ADR 0059) — an org secret
+ * The Slack request-signing secret (ADR 0060) — an org secret
  * `slack.signing_secret`, set through the SAME integration settings as the bot
  * token / client creds. Resolved coordinator-side via the credential path (the
  * only orchestrator secret-read path; org secrets are otherwise write-only),

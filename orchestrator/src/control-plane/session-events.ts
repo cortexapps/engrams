@@ -1,8 +1,8 @@
 /**
- * Reverse-channel session-event reader + curation (ADR 0059 P1.2).
+ * Reverse-channel session-event reader + curation (ADR 0060 P1.2).
  *
  * The coordinator's append-only session event log is the durable, ordered,
- * replayable inbox for the reverse channel (ADR 0059 Decision 1). The
+ * replayable inbox for the reverse channel (ADR 0060 Decision 1). The
  * SessionIngestWorkflow pump walks it forward in bounded pages via the unary
  * `ListSessionEvents` RPC, forwarding only the events an external surface
  * (Slack, …) cares about and detecting the terminal status_changed that ends
@@ -37,7 +37,7 @@ export function curated(kind: string): boolean {
 /**
  * Terminal `engram_core::SessionState` values (snake_case on the wire). A
  * `status_changed` into one of these ends the ingest loop. `run_completed` is
- * NOT here on purpose (ADR 0059 Invariant 2): a session re-runs on a follow-up
+ * NOT here on purpose (ADR 0060 Invariant 2): a session re-runs on a follow-up
  * mention, so only a terminal session state exits.
  */
 const TERMINAL_STATES: ReadonlySet<string> = new Set(["completed", "failed", "dead"]);
@@ -58,7 +58,7 @@ export interface BoundedRead {
   /** Set when the page contained a terminal `status_changed`; `ok` = Completed. */
   terminal?: { ok: boolean };
   /** Text of the LAST assistant `agent_message` in this page, if any. Drives the
-   *  closing-summary enrichment (ADR 0059, onComplete): agent_message is not a
+   *  closing-summary enrichment (ADR 0060, onComplete): agent_message is not a
    *  curated content kind, but the pump already walks every page, so we surface
    *  the last assistant text here and the pump tracks the most-recent across
    *  pages — no extra coordinator round-trip. */
@@ -84,7 +84,7 @@ export type ListEventsFn = (
 ) => Promise<{ events: WireEvent[]; nextAfterIdx: bigint }>;
 
 /** Page size per bounded read — keeps the pump's step count proportional to
- *  event activity (ADR 0059 §DBOS adoption, `operation_outputs` growth). */
+ *  event activity (ADR 0060 §DBOS adoption, `operation_outputs` growth). */
 const PAGE_LIMIT = 200n;
 
 /** Production list fn: the coordinator's unary `ListSessionEvents` RPC. */

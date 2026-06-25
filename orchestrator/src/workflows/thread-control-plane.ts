@@ -1,5 +1,5 @@
 /**
- * Real ThreadControlPlane (ADR 0059 P2.7) — the session-lifecycle half of the
+ * Real ThreadControlPlane (ADR 0060 P2.7) — the session-lifecycle half of the
  * SlackThreadWorkflow's seams, wired to the orchestrator's stores + the
  * control-plane client. Construct once at init and pass to `setThreadControlPlane`.
  *

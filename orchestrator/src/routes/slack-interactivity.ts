@@ -1,5 +1,5 @@
 /**
- * Slack interactivity endpoint (ADR 0059 P2.9).
+ * Slack interactivity endpoint (ADR 0060 P2.9).
  *
  *   POST /api/v1/integrations/slack/interactivity
  *
