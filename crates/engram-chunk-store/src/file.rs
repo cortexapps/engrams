@@ -654,11 +654,17 @@ mod tests {
         let blob = tempfile::tempdir().unwrap();
         let _ = blob; // already held by store via _d
         let cache_dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::new(ChunkCacheConfig {
-            root: cache_dir.path().to_path_buf(),
-            budget_bytes: 1024 * 1024 * 1024,
-            sweep_debounce_ms: 0,
-        });
+        // Pin the floor to 0 so the test is deterministic regardless of
+        // the host disk's fill level (the default free-space floor would
+        // evict these just-populated chunks on a >80%-full disk).
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: 1024 * 1024 * 1024,
+                sweep_debounce_ms: 0,
+            },
+            0.0,
+        );
         let work = tempfile::tempdir().unwrap();
         let data = (0..40u8).cycle().take(5 * 1024 * 1024).collect::<Vec<_>>();
         let src = work.path().join("src.bin");
@@ -886,9 +892,13 @@ mod tests {
         // content-address the same hash into the store and mask the
         // no-GCS-PUT assertion.
         let cache_dir = tempfile::tempdir().unwrap();
-        let cache = crate::cache::ChunkCache::new(crate::cache::ChunkCacheConfig::new(
-            cache_dir.path().to_path_buf(),
-        ));
+        // Pin the floor to 0: the local sink writes the rebuilt chunk into
+        // this cache and the test reads it back, so the default free-space
+        // floor must not evict it on a near-full host disk.
+        let cache = crate::cache::ChunkCache::new_with_floor(
+            crate::cache::ChunkCacheConfig::new(cache_dir.path().to_path_buf()),
+            0.0,
+        );
         let (local, new_hashes) = s
             .update_for_dirty_ranges_sparse_with_sink(&prev, &diff, &ranges, Some(&cache))
             .await
