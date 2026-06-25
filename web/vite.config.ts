@@ -74,6 +74,14 @@ export default defineConfig({
   resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
   server: {
     port: 5173,
+    // ngrok (and similar tunnels) forward their own *.ngrok-free.app Host
+    // header, which Vite's dev-server host check rejects with a 403
+    // ("Blocked request. This host is not allowed.") BEFORE the /api proxy
+    // runs — so Slack webhooks (e.g. /api/v1/integrations/slack/events)
+    // tunneled in for local testing never reach the orchestrator. Allow the
+    // ngrok domains (leading dot = the domain and all its subdomains) so a
+    // rotating tunnel host passes without re-editing this file each run.
+    allowedHosts: [".ngrok-free.dev", ".ngrok-free.app", ".ngrok.app", ".ngrok.io"],
     proxy: {
       // ---- Orchestrator: Connect/gRPC bridge ----
       "/rpc": {
