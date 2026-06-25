@@ -12,10 +12,13 @@ use std::sync::Arc;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use engram_core::traits::MetadataStore;
+use engram_core::types::manifest::ManifestRef;
 use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::Capability;
+use engram_core::types::EnabledImage;
 use engram_core::{SandboxId, SessionId, SnapshotId};
+use uuid::Uuid;
 
 async fn pg() -> Option<Arc<dyn MetadataStore>> {
     let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
@@ -74,6 +77,26 @@ fn checkpoint_row(
         recoverable: true,
         aux_bundles: vec![],
         events_cursor,
+    }
+}
+
+/// A per-image base/template capture (`session_id IS NULL`) — the row shape
+/// `prune_orphan_base_snapshots` reaps once it is no longer referenced by an
+/// enabled image.
+fn base_row(created_at: chrono::DateTime<Utc>) -> SnapshotRecord {
+    SnapshotRecord {
+        id: SnapshotId::new(),
+        session_id: None,
+        host_id: None,
+        image_version: "base-reaper-test".into(),
+        size_bytes: 1024,
+        created_at,
+        last_accessed_at: created_at,
+        disk_manifest: None,
+        memory_manifest: None,
+        recoverable: true,
+        aux_bundles: vec![],
+        events_cursor: None,
     }
 }
 
@@ -177,8 +200,12 @@ async fn prune_keeps_latest_and_window_drops_aged_history() {
     meta.record_snapshot(other_only.clone())
         .await
         .expect("record other");
-    // A template snapshot (session_id NULL), ancient — exempt.
-    let mut template = checkpoint_row(session_id, now - ChronoDuration::days(30), None);
+    // A template snapshot (session_id NULL) — exempt from checkpoint
+    // retention regardless of age (the WHERE is `session_id IS NOT NULL`).
+    // Kept recent so the global `prune_orphan_base_snapshots` reaper (which
+    // CAN run concurrently against this shared DB under local parallel test
+    // runs; CI serializes the live-PG lane) doesn't collect it mid-test.
+    let mut template = checkpoint_row(session_id, now - ChronoDuration::hours(1), None);
     template.session_id = None;
     meta.record_snapshot(template.clone())
         .await
@@ -224,6 +251,107 @@ async fn prune_keeps_latest_and_window_drops_aged_history() {
     assert!(
         template_back,
         "template snapshots are exempt from retention"
+    );
+}
+
+/// The `session_id IS NULL` reaper: a superseded base capture (referenced
+/// by no `enabled_images.base_snapshot_id`) past the grace window is
+/// deleted; the current (referenced) base is kept even when old; a fresh
+/// orphan within grace is kept; session snapshots are never touched.
+/// Asserts only on its own row ids, so it tolerates rows other live-PG
+/// tests leave in the shared database.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn prune_orphan_base_snapshots_reaps_superseded_only() {
+    let Some(meta) = pg().await else { return };
+    let now = Utc::now();
+
+    // Three base captures (session_id NULL).
+    let current_base = base_row(now - ChronoDuration::days(5));
+    let orphan_old = base_row(now - ChronoDuration::days(5));
+    let orphan_fresh = base_row(now - ChronoDuration::hours(1));
+    for r in [&current_base, &orphan_old, &orphan_fresh] {
+        meta.record_snapshot(r.clone()).await.expect("record base");
+    }
+
+    // Mark current_base as the live base of an enabled image — it must
+    // survive despite its age. Unique URI so it can't ON CONFLICT a
+    // sibling test's row.
+    meta.upsert_enabled_image(EnabledImage {
+        id: Uuid::new_v4(),
+        image_uri: format!("localhost:5001/demo:base-reaper-{}", Uuid::new_v4()),
+        manifest_toml: String::new(),
+        manifest_digest: "sha256:base-reaper".into(),
+        disk_manifest: None,
+        base_snapshot_id: Some(current_base.id),
+        base_snapshot_disk_manifest: Some(ManifestRef::new()),
+        base_snapshot_memory_manifest: None,
+        last_refreshed_at: now,
+        created_at: now,
+        updated_at: None,
+        soft_deleted_at: None,
+    })
+    .await
+    .expect("enable image");
+
+    // An old session checkpoint — the base reaper (session_id NULL only)
+    // must leave it untouched; that's checkpoint_retention's job.
+    let (session_id, _s) = seed_active(&meta).await;
+    let sess_snap = checkpoint_row(session_id, now - ChronoDuration::days(5), None);
+    meta.record_snapshot(sess_snap.clone())
+        .await
+        .expect("record session snap");
+
+    let deleted = meta
+        .prune_orphan_base_snapshots(ChronoDuration::hours(24))
+        .await
+        .expect("prune bases");
+
+    assert!(
+        deleted.contains(&orphan_old.id),
+        "a superseded base past grace must be reaped",
+    );
+    assert!(
+        !deleted.contains(&current_base.id),
+        "the live base of an enabled image must never be reaped",
+    );
+    assert!(
+        !deleted.contains(&orphan_fresh.id),
+        "a fresh orphan within grace must be kept",
+    );
+    assert!(
+        !deleted.contains(&sess_snap.id),
+        "session snapshots are out of scope for the base reaper",
+    );
+
+    // Row-level effect, robust to other tests' rows in the shared DB.
+    assert!(
+        meta.get_snapshot(orphan_old.id)
+            .await
+            .expect("get")
+            .is_none(),
+        "reaped base row is gone",
+    );
+    assert!(
+        meta.get_snapshot(current_base.id)
+            .await
+            .expect("get")
+            .is_some(),
+        "live base row remains",
+    );
+    assert!(
+        meta.get_snapshot(orphan_fresh.id)
+            .await
+            .expect("get")
+            .is_some(),
+        "fresh orphan row remains",
+    );
+    assert!(
+        meta.get_snapshot(sess_snap.id)
+            .await
+            .expect("get")
+            .is_some(),
+        "session snapshot row remains",
     );
 }
 

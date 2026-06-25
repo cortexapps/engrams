@@ -2462,6 +2462,59 @@ impl MetadataStore for PostgresStore {
             .collect())
     }
 
+    async fn prune_orphan_base_snapshots(
+        &self,
+        grace: chrono::Duration,
+    ) -> Result<Vec<engram_core::types::SnapshotId>, MetaError> {
+        // The `session_id IS NULL` mirror of `prune_session_snapshots`.
+        // A base/template snapshot is orphaned once no `enabled_images`
+        // row points at it via `base_snapshot_id`; an image refresh
+        // swaps that pointer to a fresh capture (`upsert_enabled_image`'s
+        // ON CONFLICT) and leaves the prior row dangling. Delete those
+        // past `grace`, bump `chunk_generation` in the same TX (GC-barrier
+        // symmetry), and let the chunk-GC + snapshot-blob-GC sweeps reclaim
+        // the freed chunks / portable `snapshots/<id>/` blobs.
+        //
+        // The subquery's `base_snapshot_id IS NOT NULL` keeps a stray NULL
+        // out of the `NOT IN` set — a NULL there makes `NOT IN` match zero
+        // rows, which would silently disable the reaper. It is deliberately
+        // unfiltered by `soft_deleted_at`: a soft-deleted image's base is
+        // still chunk-lineage-pinned (ADR 0021 P1.8), so it must stay. The
+        // `base_snapshot_id` FK (no `ON DELETE`) is a hard backstop against
+        // ever deleting an in-use base even if this predicate regressed.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
+            r#"
+            DELETE FROM snapshots s
+            WHERE s.session_id IS NULL
+              AND s.created_at < NOW() - $1::interval
+              AND s.id NOT IN (
+                  SELECT base_snapshot_id
+                  FROM enabled_images
+                  WHERE base_snapshot_id IS NOT NULL
+              )
+            RETURNING s.id
+            "#,
+        )
+        .bind(sqlx::postgres::types::PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: grace.num_microseconds().unwrap_or(i64::MAX),
+        })
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id,)| engram_core::types::SnapshotId::from(id))
+            .collect())
+    }
+
     async fn latest_event_idx_at_or_before(
         &self,
         sid: SessionId,
