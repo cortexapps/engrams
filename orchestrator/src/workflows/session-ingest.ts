@@ -24,28 +24,8 @@
  */
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
-import {
-  readSessionEventsBounded,
-  type CuratedEvent,
-  type ListEventsFn,
-} from "../control-plane/session-events.ts";
-
-/** Mailbox topic the pump sends on; the thread workflow `recv`s the same. */
-export const SESSION_TOPIC = "session";
-
-/** A curated content event forwarded to the thread. */
-export interface SessionEventMessage {
-  event: CuratedEvent;
-}
-
-/** The single closing message: the session reached a terminal state. */
-export interface SessionTerminalMessage {
-  event: { kind: "terminal"; ok: boolean };
-}
-
-/** What the thread workflow `recv`s on the `session` topic. `kind === "terminal"`
- *  discriminates the closing message from content. */
-export type SessionMessage = SessionEventMessage | SessionTerminalMessage;
+import { readSessionEventsBounded, type ListEventsFn } from "../control-plane/session-events.ts";
+import { THREAD_TOPIC, type ThreadInbox } from "./thread-inbox.ts";
 
 /** Workflow input. `after`/`epoch` are set only on a self-restart (the cursor
  *  and epoch the prior pump handed off); a fresh pump starts at the log head. */
@@ -94,15 +74,15 @@ async function sessionIngestWorkflowImpl(input: IngestInput): Promise<void> {
     // Effect-before-cursor: forward each curated event (replay-once send)
     // BEFORE advancing the cursor.
     for (const ev of page.events) {
-      await DBOS.send<SessionMessage>(threadWfId, { event: ev }, SESSION_TOPIC);
+      await DBOS.send<ThreadInbox>(threadWfId, { kind: "session_event", event: ev }, THREAD_TOPIC);
     }
     after = page.nextAfter;
 
     if (page.terminal) {
-      await DBOS.send<SessionMessage>(
+      await DBOS.send<ThreadInbox>(
         threadWfId,
-        { event: { kind: "terminal", ok: page.terminal.ok } },
-        SESSION_TOPIC,
+        { kind: "session_terminal", ok: page.terminal.ok },
+        THREAD_TOPIC,
       );
       return;
     }

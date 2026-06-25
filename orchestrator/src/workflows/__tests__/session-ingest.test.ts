@@ -15,24 +15,20 @@ import { expect, test, describe, afterAll } from "bun:test";
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import { initDbos, shutdownDbos } from "../dbos.ts";
 import { checkDb } from "../../db/client.ts";
-import {
-  sessionIngestWorkflow,
-  __setIngestEventSourceForTests,
-  SESSION_TOPIC,
-  type SessionMessage,
-} from "../session-ingest.ts";
+import { sessionIngestWorkflow, __setIngestEventSourceForTests } from "../session-ingest.ts";
+import { THREAD_TOPIC, type ThreadInbox } from "../thread-inbox.ts";
 
 // A collector workflow standing in for the SlackThreadWorkflow (P1.4): drains
-// the "session" mailbox until the terminal message, returning what it saw.
-const RECV_TIMEOUT_MS = 5_000;
+// the shared thread mailbox until the terminal message, returning what it saw.
+const RECV_TIMEOUT_S = 5;
 const collectorWorkflow = DBOS.registerWorkflow(
-  async (): Promise<SessionMessage[]> => {
-    const msgs: SessionMessage[] = [];
+  async (): Promise<ThreadInbox[]> => {
+    const msgs: ThreadInbox[] = [];
     for (;;) {
-      const m = await DBOS.recv<SessionMessage>(SESSION_TOPIC, RECV_TIMEOUT_MS);
+      const m = await DBOS.recv<ThreadInbox>(THREAD_TOPIC, RECV_TIMEOUT_S);
       if (m === null) break;
       msgs.push(m);
-      if (m.event.kind === "terminal") break;
+      if (m.kind === "session_terminal") break;
     }
     return msgs;
   },
@@ -87,13 +83,10 @@ describe("SessionIngestWorkflow (requires ORCHESTRATOR_DATABASE_URL)", () => {
 
       // run_started, user_question, file_shared (agent_message + status_changed
       // filtered out), then the terminal.
-      expect(msgs.map((m) => m.event.kind)).toEqual([
-        "run_started",
-        "user_question",
-        "file_shared",
-        "terminal",
-      ]);
-      expect(msgs[msgs.length - 1]!.event).toEqual({ kind: "terminal", ok: true });
+      expect(
+        msgs.map((m) => (m.kind === "session_event" ? m.event.kind : m.kind)),
+      ).toEqual(["run_started", "user_question", "file_shared", "session_terminal"]);
+      expect(msgs[msgs.length - 1]!).toEqual({ kind: "session_terminal", ok: true });
     },
   );
 });
