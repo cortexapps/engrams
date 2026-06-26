@@ -19,7 +19,7 @@ use engram_agentd::{
 };
 use engram_core::traits::sandbox::{HarnessSink, SandboxBackend};
 use engram_core::types::ids::{SandboxId, SnapshotId};
-use engram_core::types::sandbox::{AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use parking_lot::Mutex;
@@ -54,6 +54,12 @@ pub struct VzConfig {
     /// Default vCPU count applied when `SandboxSpec::cpu.vcpus` is
     /// zero or unset.
     pub default_vcpus: u32,
+    /// ADR 0061: directory holding content-addressed skill bundles
+    /// (`<sha>.erofs`) + the `current.json` stamp — the VZ mirror of the
+    /// FC host's `/var/lib/engram/shared`. Set from
+    /// `bundles::bundle_dir_from_env()` by the host-agent. Drives whose
+    /// `sha256` is `Some` attach `bundle_dir/<sha>.erofs`.
+    pub bundle_dir: PathBuf,
 }
 
 impl VzConfig {
@@ -62,7 +68,15 @@ impl VzConfig {
             kernel_path: kernel_path.into(),
             default_memory_mib: 512,
             default_vcpus: 1,
+            bundle_dir: PathBuf::from(AuxRoDrive::SHARED_DIR),
         }
+    }
+
+    /// ADR 0061: point the backend at the host's staged-bundle dir
+    /// (`ENGRAM_BUNDLE_DIR` in dev, `/var/lib/engram/shared` in prod).
+    pub fn with_bundle_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.bundle_dir = dir.into();
+        self
     }
 }
 

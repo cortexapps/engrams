@@ -26,6 +26,8 @@ use objc2_virtualization::{
     VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 
+#[allow(unused_imports)] // consumed by Task 5 (with_aux_ro_drives)
+use engram_core::types::sandbox::AuxRoDrive;
 use crate::console_bridge::{build_console_device, ConsolePortFds};
 use tokio::sync::oneshot;
 
@@ -378,6 +380,16 @@ impl VzVm {
     }
 }
 
+/// ADR 0061: host path of a resolved skill generation for the VZ backend.
+/// Content-keyed `<bundle_dir>/<sha>.erofs` — VZ stages erofs where FC
+/// stages squashfs (the Kata VZ kernel has no CONFIG_SQUASHFS). The sha
+/// comes from the host's `current.json` stamp via the coordinator's
+/// resolved `AuxRoDrive.sha256`, so path and content never disagree.
+#[allow(dead_code)] // consumed by Task 5 (build_configuration aux-ro-drives path)
+pub(crate) fn staged_erofs_path(bundle_dir: &std::path::Path, sha: &str) -> std::path::PathBuf {
+    bundle_dir.join(format!("{sha}.erofs"))
+}
+
 /// Build a fully-configured `VZVirtualMachineConfiguration` for
 /// `cfg`. Linux boot, virtio-block rootfs, multi-port virtio-console
 /// for the host↔guest control channels, virtio-net NAT, and a
@@ -633,6 +645,12 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn staged_erofs_path_is_content_keyed() {
+        let p = super::staged_erofs_path(std::path::Path::new("/var/shared"), "abc123");
+        assert_eq!(p, std::path::PathBuf::from("/var/shared/abc123.erofs"));
     }
 
     #[test]
