@@ -212,6 +212,7 @@ resolves `skills` → its sha → a reserved slot.
 | `240d16e4` | `fix(vz): restore clone-stays-intact rationale comment in restore_impl` |
 | `76d41112` | `docs(runbook): re-bake uses a fresh session, not a stack restart` |
 | `d09fa9fe` | `fix(just): pack VZ skill erofs with -b 4096 to match guest page size` |
+| `b5c51973` | `feat(vz): wire the artifact-upload channel (port 1029) so engram-share works on VZ` |
 
 ### Decisions and divergences
 
@@ -252,6 +253,19 @@ the new VZ impl is reached. Bundle materialize/publish are gated on non-empty
 `aux_bundles`; VZ leaves `aux_bundles: []`, so VZ never hits the `.squashfs`
 BlobStorage upload path.
 
+**Artifact-upload channel wired on VZ (`b5c51973`, scope extension).** Once skills
+mounted, the `share-file` skill's `engram-share` helper surfaced a *separate*
+pre-existing VZ gap: it dials the host on `UPLOAD_VSOCK_PORT` (1029) to stream a
+file out, but the VZ console bridge only wired ports 1024/1025/1026 (1027 ready /
+1028 forge / 1029 upload were FC-only). Rather than a separate ADR, the upload
+channel was wired in this branch so skills are *functional*, not just mounted:
+`PORT_UPLOAD` added to the VZ virtio-console device + an `upload_pump` that bridges
+it to the host-agent's existing `UploadSink`. VZ's port is a single persistent
+stream (FC accepts one vsock connection per upload), so the pump serializes
+uploads, delimiting each by the header's `size_bytes`. No guest re-bake —
+`engram-transport` resolves ports by sysfs name (`engram-port-1029`). The forge
+channel (1028) remains an FC-only gap; out of scope here.
+
 **erofs block size must be forced to 4 KiB (live-validation catch, `d09fa9fe`).**
 `mkfs.erofs` defaults its block size to the *host* page size. On macOS/Apple Silicon
 that is 16 KiB (blkszbits 14), but the Linux guest uses 4 KiB pages and erofs requires
@@ -273,6 +287,9 @@ Validated on a running `just dev` VZ stack against the re-baked `demo-claude:war
   `/dev/vdb /opt/engram/dyn/0 erofs ro,relatime,…`; `/opt/engram/dyn/0` contains the
   skill's `bin/`, `skills/`, and `mount.json`
   (`{"kind":"skill","skills":[{"name":"share-file",…}]}`).
+- **`engram-share` upload works** (after `b5c51973`) — the in-guest helper streams
+  a file over port 1029 and it surfaces in the session (previously failed with
+  "virtio port 1029 isn't available").
 
 Still deferred (not force-tested): resume re-attach parity — idle-eviction was paused by
 disk pressure on the test box, so the session could not be driven to a snapshot/restore.
