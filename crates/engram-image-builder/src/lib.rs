@@ -298,25 +298,27 @@ if [ -b /dev/vdb ]; then
 fi
 mark ca_staged
 # ADR 0055: mount each reserved dynamic-mount slot the host attached as an
-# extra read-only virtio-blk drive. Slots carry a sentinel squashfs at
-# base-snapshot capture; a per-session create patch_drives the profile-selected
-# skills into the slots' devices in the paused restore window. We mount every
-# squashfs device (squashfs-only, so the ext4 CA drive is never matched) at a
-# sequential /opt/engram/dyn/<i> — the index tracks the host's slot order (FC
-# preserves attach order). The mounts freeze into the base snapshot's VFS; on a
-# fresh-create restore the host has swapped some slots' devices, and agentd
-# umount/remounts /opt/engram/dyn/* at session bind so each superblock re-parses
-# its (possibly swapped) device (ADR 0035 §3). agentd then reads each mount's
-# mount.json to wire skills (sentinels are skipped). Best-effort.
+# extra read-only virtio-blk drive. Slots carry a sentinel at base-snapshot
+# capture; a per-session create patch_drives the profile-selected skills into
+# the slots' devices in the paused restore window. We mount every read-only
+# bundle device (squashfs on FC, erofs on VZ — the ext4 CA drive is never
+# matched) at a sequential /opt/engram/dyn/<i> — the index tracks the host's
+# slot order (FC preserves attach order). The mounts freeze into the base
+# snapshot's VFS; on a fresh-create restore the host has swapped some slots'
+# devices, and agentd umount/remounts /opt/engram/dyn/* at session bind so
+# each superblock re-parses its (possibly swapped) device (ADR 0035 §3).
+# agentd then reads each mount's mount.json to wire skills (sentinels are
+# skipped). Best-effort.
 i=0
 for dev in /dev/vd*; do
     [ -b "$dev" ] || continue
     [ "$dev" = "/dev/vda" ] && continue  # rootfs
     mkdir -p "/opt/engram/dyn/$i" 2>/dev/null || true
-    if mount -t squashfs -o ro "$dev" "/opt/engram/dyn/$i" 2>/dev/null; then
+    if mount -t squashfs -o ro "$dev" "/opt/engram/dyn/$i" 2>/dev/null || \
+       mount -t erofs -o ro "$dev" "/opt/engram/dyn/$i" 2>/dev/null; then
         i=$((i + 1))
     else
-        rmdir "/opt/engram/dyn/$i" 2>/dev/null || true  # not squashfs (e.g. CA ext4)
+        rmdir "/opt/engram/dyn/$i" 2>/dev/null || true  # not a bundle device (e.g. CA ext4)
     fi
 done
 mark bundles_mounted
@@ -1367,6 +1369,35 @@ mod tests {
         assert!(
             !DEFAULT_INIT_SHIM.contains("FIXME(dns-exfil)"),
             "the DNS-exfil FIXME is fixed; the stale marker should be removed",
+        );
+    }
+
+    /// ADR 0061: the dyn-mount loop must try squashfs first (FC path) then
+    /// erofs (VZ's Kata kernel has no CONFIG_SQUASHFS). The ext4 CA drive
+    /// must never be matched because only read-only bundle formats are
+    /// attempted.
+    #[test]
+    fn init_shim_dyn_mount_tries_squashfs_then_erofs() {
+        assert!(
+            DEFAULT_INIT_SHIM.contains("mount -t squashfs -o ro"),
+            "dyn-mount loop must try squashfs first (FC path)",
+        );
+        assert!(
+            DEFAULT_INIT_SHIM.contains("mount -t erofs -o ro"),
+            "dyn-mount loop must try erofs as fallback (VZ / Kata path)",
+        );
+        // The dyn-mount loop iterates /dev/vd* and skips /dev/vda (rootfs).
+        // It must only attempt read-only bundle formats (squashfs, erofs), never
+        // ext4 — otherwise the CA ext4 drive on /dev/vdb would be double-mounted.
+        // We verify the dyn-mount loop section (between "for dev in /dev/vd*" and
+        // "mark bundles_mounted") contains no "mount -t ext4" invocation.
+        let shim = DEFAULT_INIT_SHIM;
+        let loop_start = shim.find("for dev in /dev/vd*").expect("dyn-mount loop must be present");
+        let loop_end = shim.find("mark bundles_mounted").expect("bundles_mounted mark must be present");
+        let dyn_loop_section = &shim[loop_start..loop_end];
+        assert!(
+            !dyn_loop_section.contains("mount -t ext4"),
+            "dyn-mount loop must never attempt ext4 — that would match the CA drive",
         );
     }
 
