@@ -901,6 +901,7 @@ fn seed_enabled(
             created_at: now,
             updated_at: None,
             soft_deleted_at: None,
+            capture_env: Vec::new(),
         },
     );
     engram_protocol::heartbeat::ManifestDigest::new(&digest)

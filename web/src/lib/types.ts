@@ -339,6 +339,18 @@ export interface ListRegistriesResponse {
 // path. The dashboard's image picker reads this list (not the legacy
 // filesystem-walking /api/images endpoint).
 
+/** ADR 0057: one capture-time env entry attached to an enabled image.
+ * Injected into the image's `[warm]` hook at base-snapshot capture (NOT
+ * a session secret). `kind` flattens the proto `value` oneof: a `literal`
+ * is a plain non-secret value (a flag, a host name); a `secret_ref` is a
+ * ref string (e.g. `gcp-sm://…`) resolved server-side at capture — the ref
+ * itself is not secret and is safe to display. */
+export interface CaptureEnvVar {
+  name: string;
+  kind: "literal" | "secret_ref";
+  value: string;
+}
+
 /** Wire shape of one row from `GET /api/enabled-images`. The raw
  * manifest.toml is intentionally omitted — clients render via the
  * lifted `manifest_name` / `manifest_description` fields. */
@@ -357,6 +369,12 @@ export interface EnabledImageSummary {
   harness_name: string | null;
   last_refreshed_at: string;
   created_at: string;
+  /**
+   * ADR 0057: capture-time env attached to this enabled image (refs,
+   * never resolved values). Drives the edit form's pre-fill. Empty when
+   * the image has none.
+   */
+  capture_env: CaptureEnvVar[];
 }
 
 /** ADR 0036: state of an async image-enable job. */

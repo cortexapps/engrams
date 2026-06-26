@@ -5805,15 +5805,21 @@ impl SandboxBackend for PooledBackend {
         &self,
         spec: SandboxSpec,
         warm: Option<WarmConfig>,
+        capture_env: std::collections::HashMap<String, String>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         // ADR 0021 P1.5: no stub-harness attach — the harness lives
         // in the rootfs of the image being captured, so the snapshot
         // is already complete without any second virtio-blk drive.
 
-        // The manifest `[env]` (JAVA_HOME, PATH, …) the `[warm]` hook needs.
+        // The manifest `[env]` (JAVA_HOME, PATH, …) the `[warm]` hook needs,
+        // MERGED with the resolved capture-time env (`capture_env` — literals
+        // plus the coordinator's SecretStore-resolved refs). capture_env wins
+        // on a key collision: it's the operator's explicit capture override.
         // Captured before `spec` is moved into `create`; passed to the warm
-        // hook below as its exec env so it runs with the image's environment.
-        let session_env = spec.env.clone();
+        // hook below as its exec env so it runs with the image's environment
+        // plus whatever secrets the warm boot needs.
+        let mut session_env = spec.env.clone();
+        session_env.extend(capture_env);
 
         // Boot the capture VM (opens the cold_boot operation scope on Linux).
         let id = self.create(spec).await?;
@@ -5844,11 +5850,13 @@ impl SandboxBackend for PooledBackend {
             //
             // FAIL-LOUD: a non-zero exit or timeout aborts the capture
             // (and thus the enable) — we never ship a "cold" base snapshot
-            // that a `[warm]` hook claimed to warm. The warm command must
-            // be hermetic (baked offline caches, no network) and runs with
-            // the manifest `[env]` (passed through as the hook's exec env —
-            // the capture VM's agentd has no durable session env) but no
-            // per-session secrets.
+            // that a `[warm]` hook claimed to warm. The hook runs with the
+            // manifest `[env]` MERGED with the resolved `capture_env` (the
+            // capture VM's agentd has no durable session env, so both ride
+            // the exec). capture_env carries the dev secrets a warm boot
+            // needs (e.g. an `op` token, resolved coordinator-side); still
+            // NO per-session secrets — those are session policy, injected
+            // post-restore, not at capture.
             if let Some(warm) = warm {
                 self.run_warm_hook(id, &warm, &session_env).await?;
             }
@@ -6605,7 +6613,7 @@ mod tests {
         // No warm hook: the exemption must cover the whole capture lifetime —
         // even a big image's snapshot alone can outlast the reconcile debounce.
         pooled
-            .build_base_snapshot(live_spec("base-capture-exempt"), None)
+            .build_base_snapshot(live_spec("base-capture-exempt"), None, Default::default())
             .await
             .expect("capture");
 

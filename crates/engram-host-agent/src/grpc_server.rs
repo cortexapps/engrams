@@ -497,9 +497,17 @@ impl HostService for HostServiceImpl {
             } else {
                 decode_bincode(&inner.warm_bincode, "Option<WarmConfig>")?
             };
+            // Resolved capture-time env for the `[warm]` hook (wire v6). An
+            // empty buffer (older caller / no capture_env) decodes to an
+            // empty map.
+            let capture_env = if inner.capture_env_bincode.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                decode_bincode(&inner.capture_env_bincode, "capture_env")?
+            };
             let metadata = self
                 .inner
-                .build_base_snapshot(spec, warm)
+                .build_base_snapshot(spec, warm, capture_env)
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(BuildBaseSnapshotResponse {

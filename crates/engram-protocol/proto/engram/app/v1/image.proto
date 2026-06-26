@@ -49,12 +49,35 @@ message EnabledImageSummary {
   string last_refreshed_at = 7;
   // ISO-8601.
   string created_at = 8;
+  // Capture-time env attached to this enabled image (refs, never resolved
+  // values). Lets the dashboard's edit form pre-fill the current set.
+  repeated CaptureEnvEntry capture_env = 9;
 }
 
 message EnableImageRequest {
   // Full OCI URI. The host portion must match a registry credential row
   // for non-anonymous pulls; missing rows fall through to anonymous.
   string image_uri = 1;
+  // Capture-time env for the image's [warm] hook (resolved at base-snapshot
+  // capture, never persisted as values). An EMPTY list inherits the
+  // already-enabled row's capture_env (so a plain re-enable/refresh doesn't
+  // wipe it); a NON-EMPTY list replaces it (the add/remove/rotate edit). Not
+  // part of the image manifest (ADR 0057).
+  repeated CaptureEnvEntry capture_env = 2;
+}
+
+// One capture-time env entry for an image's [warm] hook. The value is a
+// literal (non-secret) or a secret ref resolved at capture through the same
+// SecretStore a session uses. Set on EnableImage; mirrored on
+// EnabledImageSummary so the edit form can pre-fill.
+message CaptureEnvEntry {
+  string name = 1;
+  oneof value {
+    // A literal, non-secret value (a flag, a host name).
+    string literal = 2;
+    // A secret ref (e.g. gcp-sm://…); resolved at capture, never a value.
+    string secret_ref = 3;
+  }
 }
 
 // Today's HTTP route returns 202 + the bare EnableJob; wrapped here per

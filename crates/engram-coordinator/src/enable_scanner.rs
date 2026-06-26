@@ -256,6 +256,12 @@ async fn advance_one(
     let (mut row, manifest, artifacts) = fetch_and_seal_manifest(state, &image_uri)
         .await
         .map_err(|e| AdvanceError::Pipeline(Box::new(e)))?;
+    // `fetch_and_seal_manifest` builds the row from the registry manifest,
+    // which carries no secrets (ADR 0057). The capture-time env rides the
+    // job (set on enable, inherited on refresh); stamp it onto the row so
+    // `capture_and_record_base_snapshot` can resolve + inject it into the
+    // `[warm]` hook, and the upsert persists it for the dashboard's edit form.
+    row.capture_env = job.capture_env.clone();
 
     // ---- materializing ----
     state

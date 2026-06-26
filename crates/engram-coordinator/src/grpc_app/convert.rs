@@ -524,6 +524,7 @@ pub(crate) fn enabled_image_summary_to_proto(
         harness_name,
         last_refreshed_at,
         created_at,
+        capture_env,
     } = s;
     app::EnabledImageSummary {
         id: id.to_string(),
@@ -534,7 +535,54 @@ pub(crate) fn enabled_image_summary_to_proto(
         harness_name: harness_name.clone(),
         last_refreshed_at: last_refreshed_at.to_rfc3339(),
         created_at: created_at.to_rfc3339(),
+        capture_env: capture_env.iter().map(capture_env_to_proto).collect(),
     }
+}
+
+/// One core [`engram_core::types::CaptureEnvEntry`] → proto.
+pub(crate) fn capture_env_to_proto(
+    e: &engram_core::types::CaptureEnvEntry,
+) -> app::CaptureEnvEntry {
+    use engram_core::types::CaptureEnvValue;
+    let value = Some(match &e.value {
+        CaptureEnvValue::Literal { value } => app::capture_env_entry::Value::Literal(value.clone()),
+        CaptureEnvValue::SecretRef { secret_ref } => {
+            app::capture_env_entry::Value::SecretRef(secret_ref.clone())
+        }
+    });
+    app::CaptureEnvEntry {
+        name: e.name.clone(),
+        value,
+    }
+}
+
+/// Proto `CaptureEnvEntry`s → core, validating each (non-empty name, a value
+/// set). `Err` is an `invalid_argument` at the call site.
+pub(crate) fn capture_env_from_proto(
+    entries: &[app::CaptureEnvEntry],
+) -> Result<Vec<engram_core::types::CaptureEnvEntry>, String> {
+    use engram_core::types::{CaptureEnvEntry, CaptureEnvValue};
+    entries
+        .iter()
+        .map(|e| {
+            if e.name.trim().is_empty() {
+                return Err("capture_env entry has an empty name".to_string());
+            }
+            let value = match &e.value {
+                Some(app::capture_env_entry::Value::Literal(v)) => {
+                    CaptureEnvValue::Literal { value: v.clone() }
+                }
+                Some(app::capture_env_entry::Value::SecretRef(r)) => CaptureEnvValue::SecretRef {
+                    secret_ref: r.clone(),
+                },
+                None => return Err(format!("capture_env entry `{}` has no value set", e.name)),
+            };
+            Ok(CaptureEnvEntry {
+                name: e.name.clone(),
+                value,
+            })
+        })
+        .collect()
 }
 
 /// `EnableJob` → proto `EnableJob`.
@@ -550,6 +598,10 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         chunks_done,
         attempts,
         error,
+        // capture_env rides the job internally (carried to the warm hook
+        // at capture); it is not surfaced on the job's API response — the
+        // operator sees it on EnabledImageSummary.
+        capture_env: _,
         created_at,
         updated_at,
     } = j;
@@ -643,6 +695,44 @@ mod tests {
     use engram_core::types::session::SessionMode;
     use engram_core::types::{Session, SessionState};
     use engram_core::{HostId, SandboxId, SessionId};
+
+    #[test]
+    fn capture_env_proto_round_trips() {
+        use engram_core::types::{CaptureEnvEntry, CaptureEnvValue};
+        let core = vec![
+            CaptureEnvEntry {
+                name: "FLAG".into(),
+                value: CaptureEnvValue::Literal {
+                    value: "true".into(),
+                },
+            },
+            CaptureEnvEntry {
+                name: "OP_SERVICE_ACCOUNT_TOKEN".into(),
+                value: CaptureEnvValue::SecretRef {
+                    secret_ref: "gcp-sm://projects/p/secrets/op/versions/latest".into(),
+                },
+            },
+        ];
+        let proto: Vec<_> = core.iter().map(capture_env_to_proto).collect();
+        let back = capture_env_from_proto(&proto).expect("valid round-trip");
+        assert_eq!(back, core);
+    }
+
+    #[test]
+    fn capture_env_from_proto_rejects_empty_name_and_unset_value() {
+        // Empty name → error.
+        let bad_name = vec![app::CaptureEnvEntry {
+            name: "  ".into(),
+            value: Some(app::capture_env_entry::Value::Literal("x".into())),
+        }];
+        assert!(capture_env_from_proto(&bad_name).is_err());
+        // No value set (a proto with neither oneof arm) → error.
+        let no_value = vec![app::CaptureEnvEntry {
+            name: "NAME".into(),
+            value: None,
+        }];
+        assert!(capture_env_from_proto(&no_value).is_err());
+    }
 
     fn populated_session() -> Session {
         Session {

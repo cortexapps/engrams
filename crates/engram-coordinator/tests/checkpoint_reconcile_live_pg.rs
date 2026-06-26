@@ -290,6 +290,7 @@ async fn prune_orphan_base_snapshots_reaps_superseded_only() {
         created_at: now,
         updated_at: None,
         soft_deleted_at: None,
+        capture_env: Vec::new(),
     })
     .await
     .expect("enable image");

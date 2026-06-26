@@ -281,6 +281,7 @@ impl HostClient for FakeCaptureHost {
         &self,
         _spec: SandboxSpec,
         _warm: Option<engram_core::types::image::WarmConfig>,
+        _capture_env: std::collections::HashMap<String, String>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.captures.fetch_add(1, Ordering::SeqCst);
         Ok(SnapshotMetadata {
@@ -537,7 +538,7 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
     };
 
     let job_a = meta
-        .create_or_get_enable_job(&uri_a, None)
+        .create_or_get_enable_job(&uri_a, None, &[])
         .await
         .expect("job a");
     wait_ready(job_a.id).await;
@@ -548,7 +549,7 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
     );
 
     let job_b = meta
-        .create_or_get_enable_job(&uri_b, None)
+        .create_or_get_enable_job(&uri_b, None, &[])
         .await
         .expect("job b");
     let job_b = wait_ready(job_b.id).await;

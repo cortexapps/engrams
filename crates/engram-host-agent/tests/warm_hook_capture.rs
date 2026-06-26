@@ -75,7 +75,7 @@ async fn warm_hook_process_survives_base_snapshot() {
     };
 
     let meta = pooled
-        .build_base_snapshot(env.spec(&rootfs), Some(warm))
+        .build_base_snapshot(env.spec(&rootfs), Some(warm), Default::default())
         .await
         .expect("base-snapshot capture with a passing warm hook");
 
@@ -148,7 +148,7 @@ async fn warm_hook_sees_manifest_env() {
         .insert("ENGRAM_WARM_ENV_PROBE".into(), "present".into());
 
     let meta = pooled
-        .build_base_snapshot(spec, Some(warm))
+        .build_base_snapshot(spec, Some(warm), Default::default())
         .await
         .expect("warm hook must see the manifest [env]; capture should succeed");
 
@@ -182,7 +182,7 @@ async fn warm_hook_nonzero_exit_fails_capture() {
     };
 
     let err = pooled
-        .build_base_snapshot(env.spec(&rootfs), Some(warm))
+        .build_base_snapshot(env.spec(&rootfs), Some(warm), Default::default())
         .await
         .expect_err("a non-zero warm hook must FAIL the capture (fail-loud)");
     let msg = format!("{err:?}");

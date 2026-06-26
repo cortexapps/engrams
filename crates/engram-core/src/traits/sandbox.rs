@@ -496,10 +496,16 @@ pub trait SandboxBackend: Send + Sync {
     /// after agentd-ready and before the snapshot freezes, so a
     /// long-lived process it spawns is captured live. A warm failure is
     /// fail-loud — it aborts the capture (and the enable).
+    ///
+    /// `capture_env` is the resolved capture-time env (the coordinator
+    /// already resolved any secret refs) merged over the manifest `[env]`
+    /// into the warm hook's exec environment. Empty for an image with no
+    /// capture_env or no warm hook.
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
         _warm: Option<WarmConfig>,
+        _capture_env: std::collections::HashMap<String, String>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `build_base_snapshot` (needs the pooled chunk-store wrapper)".into(),

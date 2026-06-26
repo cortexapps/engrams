@@ -20,12 +20,30 @@ import type {
   EnableImageRequest,
   DisableImageRequest,
   RefreshImageRequest,
+  CaptureEnvEntry as ProtoCaptureEnvEntry,
   EnabledImageSummary as ProtoEnabledImageSummary,
   EnableJob as ProtoEnableJob,
 } from "../../gen/engram/app/v1/image_pb";
 
+// A proto-shaped capture-env entry (the oneof flattened to the case the
+// component reads/writes).
+function makeCaptureEnv(
+  name: string,
+  kind: "literal" | "secretRef",
+  value: string,
+): ProtoCaptureEnvEntry {
+  return {
+    $typeName: "engram.app.v1.CaptureEnvEntry",
+    name,
+    value: { case: kind, value },
+  };
+}
+
 // Minimal proto-shaped enabled-image row for tests that need a row in the list.
-function makeProtoImage(imageUri: string): ProtoEnabledImageSummary {
+function makeProtoImage(
+  imageUri: string,
+  captureEnv: ProtoCaptureEnvEntry[] = [],
+): ProtoEnabledImageSummary {
   return {
     $typeName: "engram.app.v1.EnabledImageSummary",
     id: "row-1",
@@ -36,6 +54,7 @@ function makeProtoImage(imageUri: string): ProtoEnabledImageSummary {
     harnessName: "",
     lastRefreshedAt: new Date().toISOString(),
     createdAt: new Date().toISOString(),
+    captureEnv,
   };
 }
 
@@ -121,6 +140,82 @@ describe("ImagesPanel RPC contract", () => {
       expect(captures.enableCalls.length).toBeGreaterThan(0);
     });
     expect(captures.enableCalls.at(-1)!.imageUri).toBe("ghcr.io/cortex/api:warm-1");
+    // No rows added → an empty capture_env (server-side this inherits the
+    // existing set rather than wiping it).
+    expect(captures.enableCalls.at(-1)!.captureEnv).toEqual([]);
+  });
+
+  test("enable form builds capture_env entries from the editor rows", async () => {
+    const { transport, captures } = installCapturingTransport([]);
+    renderWithProviders(<ImagesPanel />, { transport });
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: /enable a new image/i }));
+
+    await user.type(
+      screen.getByPlaceholderText("ghcr.io/cortex/api:warm-1"),
+      "ghcr.io/cortex/api:warm-1",
+    );
+
+    // Add a literal capture var (the default type). A row with an empty name
+    // is skipped, so only the named row should reach the request.
+    await user.click(screen.getByRole("button", { name: /add variable/i }));
+    await user.type(screen.getByLabelText("Variable name"), "FEATURE_FLAGS");
+    await user.type(screen.getByLabelText("Variable value"), "beta,fast");
+
+    await user.click(screen.getByRole("button", { name: /^enable$/i }));
+
+    await waitFor(() => {
+      expect(captures.enableCalls.length).toBeGreaterThan(0);
+    });
+    const req = captures.enableCalls.at(-1)!;
+    expect(req.imageUri).toBe("ghcr.io/cortex/api:warm-1");
+    expect(req.captureEnv).toHaveLength(1);
+    expect(req.captureEnv[0].name).toBe("FEATURE_FLAGS");
+    expect(req.captureEnv[0].value).toEqual({ case: "literal", value: "beta,fast" });
+  });
+
+  test("edit capture env pre-fills the form and re-submits the full list", async () => {
+    // An enabled image already carrying a secret-ref capture var. The edit
+    // affordance opens the same form, pinned to the URI + pre-filled.
+    const { transport, captures } = installCapturingTransport([
+      makeProtoImage("ghcr.io/cortex/api:warm-1", [
+        makeCaptureEnv(
+          "OPENAI_API_KEY",
+          "secretRef",
+          "gcp-sm://projects/p/secrets/k/versions/latest",
+        ),
+      ]),
+    ]);
+    renderWithProviders(<ImagesPanel />, { transport });
+
+    const user = userEvent.setup();
+    await screen.findByText("ghcr.io/cortex/api:warm-1");
+
+    await user.click(screen.getByRole("button", { name: /edit capture env/i }));
+
+    // Pre-filled from the row's current capture_env.
+    expect((screen.getByLabelText("Variable name") as HTMLInputElement).value).toBe(
+      "OPENAI_API_KEY",
+    );
+    expect((screen.getByLabelText("Variable value") as HTMLInputElement).value).toBe(
+      "gcp-sm://projects/p/secrets/k/versions/latest",
+    );
+
+    // Re-submit (edit path is a re-enable with the full list).
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(captures.enableCalls.length).toBe(1);
+    });
+    const req = captures.enableCalls[0];
+    expect(req.imageUri).toBe("ghcr.io/cortex/api:warm-1");
+    expect(req.captureEnv).toHaveLength(1);
+    expect(req.captureEnv[0].name).toBe("OPENAI_API_KEY");
+    expect(req.captureEnv[0].value).toEqual({
+      case: "secretRef",
+      value: "gcp-sm://projects/p/secrets/k/versions/latest",
+    });
   });
 
   test("disable button sends {imageUri} to ImageService.DisableImage", async () => {
