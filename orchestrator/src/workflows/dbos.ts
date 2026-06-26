@@ -18,6 +18,7 @@
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import { config } from "../config.ts";
+import { dbosLogger } from "./dbos-logger.ts";
 
 let launched = false;
 
@@ -32,6 +33,9 @@ export async function initDbos(): Promise<void> {
     systemDatabaseUrl: config.databaseUrl,
     systemDatabaseSchemaName: "dbos",
     runAdminServer: false,
+    // Send the engine's logging through our pino logger (replaces DBOS's
+    // built-in console + OTLP sinks) so all process output is one format.
+    logger: dbosLogger,
   });
   await DBOS.launch();
   launched = true;
