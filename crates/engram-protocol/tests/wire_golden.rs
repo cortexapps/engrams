@@ -209,6 +209,7 @@ fn session_egress_policy() -> SessionEgressPolicy {
         guest_ip: Ipv4Addr::new(169, 254, 0, 21),
         network_allow_hosts: vec!["github.com".into()],
         network_allow_host_patterns: vec!["*.amazonaws.com".into()],
+        allow_all: false,
         secrets: vec![EgressSecretEntry {
             placeholder: "engram_ph_x".into(),
             real_value: "supersecret".into(),
@@ -326,7 +327,7 @@ fn wire_version_pinned() {
     // signal that a payload shape changed; pin it so a payload change
     // without a bump (or vice-versa) is a conscious decision.
     assert_eq!(
-        WIRE_VERSION, 6,
+        WIRE_VERSION, 7,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

@@ -365,6 +365,20 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
       await post(m, message);
     },
 
+    /** A retryable delivery hiccup — the thread is still live. ⚠️ on the mention
+     *  (so the user sees their message didn't land) + an actionable note. Unlike
+     *  onFail, this does NOT end the thread; the post is best-effort so a Slack
+     *  blip here can never wedge the workflow. */
+    async onDeliveryError(m, message) {
+      log.warn({ channel: m.channel, thread: m.threadRoot, reason: message }, "slack: delivery failed (non-fatal)");
+      await react(m, "warning");
+      try {
+        await post(m, `⚠️ ${message}`);
+      } catch {
+        /* best-effort — if Slack is down we can't notify, but we must not throw */
+      }
+    },
+
     async gatherThreadContext(m, since) {
       const c = await getClient();
       const res = await c.conversations.replies({

@@ -73,12 +73,19 @@ export interface CommunicationPolicy {
   /** The session completed successfully — posts a closing summary enriched with
    *  the session's last assistant message + a recap of the assets it produced. */
   onComplete(m: SourceMention, session: StartedSession, summary: ClosingSummary): Promise<void>;
-  /** A failure (identity, create, or terminal-failure) — ❌ + actionable text. */
+  /** A failure (identity, create, or terminal-failure) — ❌ + actionable text.
+   *  TERMINAL: the thread workflow exits after this. */
   onFail(m: SourceMention, message: string): Promise<void>;
   /** A neutral terminal close — the session's sandbox was reclaimed (host roll,
    *  `host_lost`, dev-stack churn), not a success or a failure. Informational,
    *  no alarm: the work up to that point stands, the thread just can't continue. */
   onNeutralClose(m: SourceMention, message: string): Promise<void>;
+  /** A NON-FATAL, retryable delivery failure on an otherwise-healthy thread — a
+   *  follow-up prompt or an answer that couldn't reach the live session right
+   *  now (e.g. the session was mid-resume). ⚠️ + an actionable "try again" note;
+   *  the thread workflow stays alive so the next mention retries. Distinct from
+   *  `onFail`, whose ❌ signals the thread is over. */
+  onDeliveryError(m: SourceMention, message: string): Promise<void>;
   /** Gather thread messages after `since` (null = the whole thread) into a
    *  prompt; `maxTs` is the newest message seen, the next `since`. */
   gatherThreadContext(m: SourceMention, since: string | null): Promise<{ prompt: string; maxTs: string }>;

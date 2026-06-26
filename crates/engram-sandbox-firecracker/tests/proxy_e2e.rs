@@ -335,6 +335,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         session_id,
         guest_ip,
         network_allow,
+        allow_all: false,
         secrets: vec![secret],
         injects: Vec::new(),
         observes: Vec::new(),

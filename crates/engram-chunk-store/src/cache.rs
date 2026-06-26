@@ -117,7 +117,7 @@ pub const NO_CEILING: u64 = u64::MAX;
 /// (i.e. evict to hold the mount at/under ~80% full). Re-checked via
 /// `statvfs(2)` on every sweep.
 ///
-/// Why 20% and not 10% (ADR 0060): the cache lives on a hostPath that
+/// Why 20% and not 10%: the cache lives on a hostPath that
 /// *persists across pod restarts*, and on the K8s host fleet (ADR 0044)
 /// the kubelet's default hard-eviction threshold is `nodefs.available
 /// < 10%`. A 10% floor lets the persistent cache grow right up to that

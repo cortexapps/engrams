@@ -334,7 +334,7 @@ fn decide(registry: &Registry, guest_ip: Ipv4Addr, query: &Message) -> Decision 
 }
 
 fn name_allowed(state: &SessionState, qname: &str) -> bool {
-    if state.network_allow.matches(qname) {
+    if state.allow_all || state.network_allow.matches(qname) {
         return true;
     }
     state.secrets.iter().any(|s| s.allow.matches(qname))
@@ -390,6 +390,7 @@ mod tests {
         let state = SessionState {
             session_id: SessionId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
+            allow_all: false,
             network_allow: HostList::from_manifest(&["api.anthropic.com".into()], &[]).unwrap(),
             secrets: Vec::new(),
             injects: Vec::new(),
@@ -408,6 +409,7 @@ mod tests {
         let state = SessionState {
             session_id: SessionId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
+            allow_all: false,
             network_allow: HostList::from_manifest(&[], &["*.anthropic.com".into()]).unwrap(),
             secrets: Vec::new(),
             injects: Vec::new(),
@@ -436,6 +438,7 @@ mod tests {
         let state = SessionState {
             session_id: SessionId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
+            allow_all: false,
             network_allow: HostList::from_manifest(&["api.anthropic.com".into()], &[]).unwrap(),
             secrets: Vec::new(),
             injects: Vec::new(),
@@ -471,6 +474,7 @@ mod tests {
         let state = SessionState {
             session_id: SessionId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
+            allow_all: false,
             network_allow: HostList::empty(),
             secrets: vec![crate::registry::SecretEntry {
                 placeholder: "engram_ph_test".into(),
@@ -524,6 +528,7 @@ mod tests {
         registry.register(SessionState {
             session_id: SessionId::new(),
             guest_ip: client_ip,
+            allow_all: false,
             network_allow: HostList::from_manifest(&["allowed.example.com".into()], &[]).unwrap(),
             secrets: Vec::new(),
             injects: Vec::new(),
@@ -560,6 +565,7 @@ mod tests {
         registry.register(SessionState {
             session_id: SessionId::new(),
             guest_ip: client_ip,
+            allow_all: false,
             network_allow: HostList::from_manifest(&["allowed.example.com".into()], &[]).unwrap(),
             secrets: Vec::new(),
             injects: Vec::new(),

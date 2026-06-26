@@ -29,6 +29,11 @@ pub struct SessionState {
     /// Hosts on this list are reachable; the proxy splices traffic
     /// through if no per-secret rule applies.
     pub network_allow: HostList,
+    /// Allow ALL egress, bypassing `network_allow` entirely (a `[network]
+    /// default = "allow"` posture). The capture VM's `[warm]` hook uses this
+    /// on dev images where no agent runs at capture. Per-secret/inject/observe
+    /// MITM rules still take precedence (they're matched first in `decide`).
+    pub allow_all: bool,
     /// Per-secret entries. Any of these whose `allow` matches the
     /// SNI triggers MITM + substitution.
     pub secrets: Vec<SecretEntry>,
@@ -323,7 +328,7 @@ impl SessionState {
                 observes,
             };
         }
-        if self.network_allow.matches(hostname) {
+        if self.allow_all || self.network_allow.matches(hostname) {
             Decision::Bypass
         } else {
             Decision::Reject
@@ -367,6 +372,7 @@ mod tests {
         SessionState {
             session_id: SessionId::new(),
             guest_ip: Ipv4Addr::from_str("10.200.0.2").unwrap(),
+            allow_all: false,
             network_allow: HostList::from_manifest(
                 &["api.github.com".into(), "registry.npmjs.org".into()],
                 &[],

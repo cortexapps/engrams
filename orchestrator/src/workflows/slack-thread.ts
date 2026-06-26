@@ -100,6 +100,15 @@ const SESSION_FAILED_MSG = "The session ended in failure.";
 // churn), which is not a task failure — the work stands, the thread just can't
 // continue. See `TerminalOutcome` in session-events.ts.
 const SESSION_CLOSED_MSG = "This session is complete. Start a new session if you'd like to continue.";
+// Non-fatal: the thread stays alive after these so the user can retry.
+const DELIVER_FAIL_MSG =
+  "I couldn't deliver that to your session just now — it may have been resuming. Mention me again to retry.";
+const ANSWER_FAIL_MSG = "I couldn't record that answer just now — please try again.";
+
+/** Run an effect as a checkpointed step. The workflow passes `DBOS.runStep`; a
+ *  test passes a plain runner so the drain-loop control flow is unit-testable
+ *  without a live DBOS engine (the engine integration is deferred — ADR 0060). */
+export type StepRunner = <T>(fn: () => Promise<T>, name: string) => Promise<T>;
 
 async function slackThreadWorkflowImpl(): Promise<void> {
   const pol = requirePolicy();
@@ -110,29 +119,29 @@ async function slackThreadWorkflowImpl(): Promise<void> {
   if (first === null || first.kind !== "trigger_mention") return;
   const m = first.mention;
 
-  await DBOS.runStep(() => pol.onPickup(m), { name: "onPickup" });
+  const step: StepRunner = (fn, name) => DBOS.runStep(fn, { name });
 
-  const userId = await DBOS.runStep(() => cp.resolveUser("slack", m.user), {
-    name: "resolveUser",
-  });
-  if (!userId) {
-    await DBOS.runStep(() => pol.onFail(m, NO_USER_MSG), { name: "onFail" });
-    return;
-  }
+  await step(() => pol.onPickup(m), "onPickup");
 
-  const profile = await DBOS.runStep(() => cp.getDefaultProfile(), { name: "getDefaultProfile" });
-  if (!profile) {
-    await DBOS.runStep(() => pol.onFail(m, NO_PROFILE_MSG), { name: "onFail" });
-    return;
-  }
-
-  const ctx0 = await DBOS.runStep(() => pol.gatherThreadContext(m, null), {
-    name: "gatherThreadContext",
-  });
-
+  // Everything up to (and including) the session create is FATAL-on-failure:
+  // there is no session to keep alive yet, so any throw — or an unresolved user
+  // / missing default profile — ends the thread with an actionable ❌. (A throw
+  // here used to escape the workflow uncaught, leaving only the 👀 and silence.)
   let session: StartedSession;
+  let ctx0: { prompt: string; maxTs: string };
   try {
-    session = await DBOS.runStep(
+    const userId = await step(() => cp.resolveUser("slack", m.user), "resolveUser");
+    if (!userId) {
+      await step(() => pol.onFail(m, NO_USER_MSG), "onFail");
+      return;
+    }
+    const profile = await step(() => cp.getDefaultProfile(), "getDefaultProfile");
+    if (!profile) {
+      await step(() => pol.onFail(m, NO_PROFILE_MSG), "onFail");
+      return;
+    }
+    ctx0 = await step(() => pol.gatherThreadContext(m, null), "gatherThreadContext");
+    session = await step(
       () =>
         cp.createTask({
           profileId: profile.id,
@@ -146,20 +155,17 @@ async function slackThreadWorkflowImpl(): Promise<void> {
             threadRoot: m.threadRoot,
           },
         }),
-      { name: "createTask" },
+      "createTask",
     );
   } catch (err) {
-    // Surface WHY create failed — this path used to swallow the cause, leaving
-    // only the generic "Couldn't start a session" with no way to diagnose.
-    log.error(
-      { channel: m.channel, thread: m.threadRoot, err },
-      "slack: failed to start session",
-    );
-    await DBOS.runStep(() => pol.onFail(m, CREATE_FAIL_MSG), { name: "onFail" });
+    // Surface WHY it failed — this path used to swallow the cause, leaving only
+    // the generic "Couldn't start a session" with no way to diagnose.
+    log.error({ channel: m.channel, thread: m.threadRoot, err }, "slack: failed to start session");
+    await step(() => pol.onFail(m, CREATE_FAIL_MSG), "onFail");
     return;
   }
 
-  await DBOS.runStep(() => pol.onStarted(m, session), { name: "onStarted" });
+  await step(() => pol.onStarted(m, session), "onStarted");
 
   // 2) Start the per-session pump; it sends curated events back to us.
   await DBOS.startWorkflow(sessionIngestWorkflow, {
@@ -184,55 +190,103 @@ async function slackThreadWorkflowImpl(): Promise<void> {
     const msg = await DBOS.recv<ThreadInbox>(THREAD_TOPIC, RECV_TIMEOUT_S);
     if (msg === null) continue; // idle — keep waiting for the terminal
 
-    switch (msg.kind) {
-      case "session_terminal": {
-        switch (msg.outcome) {
-          case "completed": {
-            const summary = { lastMessage: msg.lastMessage ?? null, assets: st.assets };
-            await DBOS.runStep(() => pol.onComplete(m, session, summary), { name: "onComplete" });
-            break;
-          }
-          case "failed":
-            await DBOS.runStep(() => pol.onFail(m, SESSION_FAILED_MSG), { name: "onFail" });
-            break;
-          case "neutral":
-            await DBOS.runStep(() => pol.onNeutralClose(m, SESSION_CLOSED_MSG), {
-              name: "onNeutralClose",
-            });
-            break;
+    if (msg.kind === "session_terminal") {
+      switch (msg.outcome) {
+        case "completed": {
+          const summary = { lastMessage: msg.lastMessage ?? null, assets: st.assets };
+          await step(() => pol.onComplete(m, session, summary), "onComplete");
+          break;
         }
-        return;
+        case "failed":
+          await step(() => pol.onFail(m, SESSION_FAILED_MSG), "onFail");
+          break;
+        case "neutral":
+          await step(() => pol.onNeutralClose(m, SESSION_CLOSED_MSG), "onNeutralClose");
+          break;
       }
-      case "session_event": {
-        await dispatchSessionEvent(pol, m, msg, st, session);
-        break;
+      return;
+    }
+    // A non-terminal turn (session event / follow-up @mention / answer) is
+    // handled with per-turn error isolation: a transient failure surfaces as a
+    // NON-FATAL notice and the loop continues, so one bad turn can't brick an
+    // otherwise-healthy thread (the 2026-06-26 "👀 then silence" incident).
+    lastTs = await handleInbound(step, pol, cp, session, st, lastTs, msg);
+  }
+}
+
+/** Inbound the drain loop handles after the session is live — everything except
+ *  the terminal, which the loop handles inline. */
+type InboundTurn = Exclude<ThreadInbox, { kind: "session_terminal" }>;
+
+/**
+ * Handle one non-terminal inbound message; return the (possibly advanced)
+ * `lastTs` cursor. **Never throws** — that is the whole point:
+ *
+ * - A delivery failure (`sendPrompt` / `answerQuestion` — e.g. coord returns
+ *   "sandbox not found" on a just-idle session) is caught and surfaced via
+ *   `onDeliveryError` (⚠️ + "mention me again"); the cursor does NOT advance, so
+ *   the dropped messages are re-gathered on the next mention. The thread stays
+ *   alive.
+ * - A render failure (a session event) drops that single render and logs — it's
+ *   an agent OUTPUT, not the user's input, so no user-facing notice.
+ *
+ * Previously these ran unguarded, so an uncaught throw errored the entire
+ * `SlackThreadWorkflow`, leaving the user with only the 👀 and no ❌ while the
+ * underlying session kept working invisibly.
+ */
+export async function handleInbound(
+  step: StepRunner,
+  pol: CommunicationPolicy,
+  cp: ThreadControlPlane,
+  session: StartedSession,
+  st: ThreadRender,
+  lastTs: string,
+  msg: InboundTurn,
+): Promise<string> {
+  switch (msg.kind) {
+    case "session_event": {
+      try {
+        await dispatchSessionEvent(step, pol, st.currentMention, msg, st, session);
+      } catch (err) {
+        log.error(
+          { sessionId: session.id, kind: msg.event.kind, err },
+          "slack: failed to render a session event; dropping it",
+        );
       }
-      case "trigger_mention": {
-        // Acknowledge the new message itself (👀), like the initial mention; the
-        // ⏳→✅ working/done indicator rides this turn's run lifecycle, reacting
-        // on the new message (currentMention).
-        await DBOS.runStep(() => pol.onPickup(msg.mention), { name: "onPickup" });
-        st.currentMention = msg.mention;
-        st.bubble = null; // a new turn — the next response starts a fresh message
+      return lastTs;
+    }
+    case "trigger_mention": {
+      // Acknowledge the new message itself (👀), like the initial mention; the
+      // ⏳→✅ indicator rides this turn's run lifecycle on the new message.
+      await step(() => pol.onPickup(msg.mention), "onPickup").catch(() => {});
+      st.currentMention = msg.mention;
+      st.bubble = null; // a new turn — the next response starts a fresh message
+      try {
         // Gather as the NEW mention so it (not the original) is the directive at
         // the bottom of the prompt; the rest of the new messages are context.
-        const ctx = await DBOS.runStep(() => pol.gatherThreadContext(msg.mention, lastTs), {
-          name: "gatherThreadContext",
-        });
-        await DBOS.runStep(
-          () => cp.sendPrompt(session.id, ctx.prompt, `slack:${msg.mention.eventId}`),
-          { name: "sendPrompt" },
+        const ctx = await step(() => pol.gatherThreadContext(msg.mention, lastTs), "gatherThreadContext");
+        await step(() => cp.sendPrompt(session.id, ctx.prompt, `slack:${msg.mention.eventId}`), "sendPrompt");
+        return ctx.maxTs;
+      } catch (err) {
+        log.error(
+          { sessionId: session.id, channel: msg.mention.channel, thread: msg.mention.threadRoot, err },
+          "slack: failed to deliver follow-up prompt — keeping the thread alive",
         );
-        lastTs = ctx.maxTs;
-        break;
+        await step(() => pol.onDeliveryError(msg.mention, DELIVER_FAIL_MSG), "onDeliveryError").catch(() => {});
+        return lastTs; // cursor unchanged: those messages were NOT delivered
       }
-      case "trigger_answer": {
-        await DBOS.runStep(
+    }
+    case "trigger_answer": {
+      try {
+        await step(
           () => cp.answerQuestion(session.id, msg.answer.toolCallId, msg.answer.answers),
-          { name: "answerQuestion" },
+          "answerQuestion",
         );
-        break;
+      } catch (err) {
+        log.error({ sessionId: session.id, err }, "slack: failed to deliver answer — keeping the thread alive");
+        await step(() => pol.onDeliveryError(st.currentMention, ANSWER_FAIL_MSG), "onDeliveryError").catch(() => {});
       }
+      return lastTs;
     }
   }
 }
@@ -259,6 +313,7 @@ const MAX_BUBBLE_CHARS = 8000;
  *  into `st.bubble`; questions/assets get their own message (and seal the bubble
  *  so thread ordering is preserved); the run lifecycle drives the ⏳→✅ indicator. */
 async function dispatchSessionEvent(
+  step: StepRunner,
   pol: CommunicationPolicy,
   m: SourceMention,
   msg: Extract<ThreadInbox, { kind: "session_event" }>,
@@ -275,33 +330,29 @@ async function dispatchSessionEvent(
         st.bubble !== null && st.bubble.text.length + effect.text.length + 2 <= MAX_BUBBLE_CHARS;
       const text = append ? `${st.bubble!.text}\n\n${effect.text}` : effect.text;
       const ref = append ? st.bubble!.ts : undefined;
-      const ts = await DBOS.runStep(() => pol.onAssistantMessage(m, text, ref), {
-        name: "onAssistantMessage",
-      });
+      const ts = await step(() => pol.onAssistantMessage(m, text, ref), "onAssistantMessage");
       st.bubble = { ts, text };
       break;
     }
     case "working": {
       st.bubble = null; // a new run — its first response opens a fresh message
-      await DBOS.runStep(() => pol.onWorking(st.currentMention), { name: "onWorking" });
+      await step(() => pol.onWorking(st.currentMention), "onWorking");
       break;
     }
     case "idle": {
       st.bubble = null;
-      await DBOS.runStep(() => pol.onIdle(st.currentMention), { name: "onIdle" });
+      await step(() => pol.onIdle(st.currentMention), "onIdle");
       break;
     }
     case "question": {
       st.bubble = null; // the question is its own message
-      const ref = await DBOS.runStep(() => pol.onUserQuestion(m, msg.event), {
-        name: "onUserQuestion",
-      });
+      const ref = await step(() => pol.onUserQuestion(m, msg.event), "onUserQuestion");
       if (effect.toolCallId) st.questionTs.set(effect.toolCallId, ref);
       break;
     }
     case "answered": {
       const ref = effect.toolCallId ? st.questionTs.get(effect.toolCallId) : undefined;
-      await DBOS.runStep(() => pol.onAnswered(m, msg.event, ref), { name: "onAnswered" });
+      await step(() => pol.onAnswered(m, msg.event, ref), "onAnswered");
       break;
     }
     case "asset": {
@@ -310,7 +361,7 @@ async function dispatchSessionEvent(
       st.bubble = null;
       const recap = summarizeAsset(msg.event);
       if (recap) st.assets.push(recap);
-      await DBOS.runStep(() => pol.onAsset(m, msg.event, session), { name: "onAsset" });
+      await step(() => pol.onAsset(m, msg.event, session), "onAsset");
       break;
     }
     case "ignore":

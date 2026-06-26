@@ -250,17 +250,14 @@ pub(crate) async fn run_once(
     Ok(flagged.len())
 }
 
-/// ADR 0034 Track A in-place reattach. Re-establish a desynced session's
-/// harness on its EXISTING live sandbox without a teardown, by re-issuing the
-/// resume `start_agent` against that sandbox: agentd's ADR 0045 C1 arm SIGUSR1s
-/// a live-but-wedged harness to drop+re-dial, or reaps-and-respawns an exited
-/// one. The spec is resume-shaped (`prompt = None`), shared with
-/// `finish_resume_to_active`. Called only when `rehandshake` returned
-/// `NotFound` (dead vsock).
+/// ADR 0034 Track A in-place reattach. Thin wrapper over the shared
+/// [`crate::api::snapshot::reattach_harness_in_place`] primitive (also used by
+/// the inline delivery self-heal): re-establish a desynced session's harness on
+/// its EXISTING live sandbox without a teardown. Called only when `rehandshake`
+/// returned `NotFound` (dead vsock).
 ///
-/// - `Ok(true)`  — reattach issued (`start_agent` succeeded). The harness
-///   re-emits `Idle`, which bumps `last_event_at` and drops the session out of
-///   the flagged set.
+/// - `Ok(true)`  — reattach issued. The harness re-emits `Idle`, which bumps
+///   `last_event_at` and drops the session out of the flagged set.
 /// - `Ok(false)` — nothing to do: the session moved off `d.sandbox_id` since
 ///   the scan, or no manifest bundle (dev-VM / process backend).
 /// - `Err(_)`    — host/meta error; the time-based escalation catches a
@@ -269,24 +266,9 @@ pub(crate) async fn reattach_harness_in_place(
     state: &SharedState,
     d: &DesyncedSession,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let session = state.services.meta.get_session(d.session_id).await?;
-    // Re-confirm the session is still bound to the sandbox we flagged — a
-    // concurrent eviction/resume may have moved it since the scan, and we must
-    // never re-issue start_agent against a stale or unbound sandbox.
-    if session.sandbox_id != Some(d.sandbox_id) {
-        return Ok(false);
-    }
-    let Some((agent, policy)) =
-        crate::api::snapshot::resolve_resume_agent_and_policy(state, &session, d.sandbox_id).await
-    else {
-        return Ok(false);
-    };
-    state
-        .services
-        .host
-        .start_agent(d.sandbox_id, agent, policy)
-        .await?;
-    Ok(true)
+    crate::api::snapshot::reattach_harness_in_place(state, d.session_id, d.sandbox_id)
+        .await
+        .map_err(|e| format!("in-place harness reattach: {e}").into())
 }
 
 #[cfg(test)]

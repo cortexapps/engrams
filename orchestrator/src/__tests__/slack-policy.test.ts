@@ -339,6 +339,32 @@ describe("makeSlackPolicy()", () => {
     expect(calls.posts[0].text).toBe("🔗 <https://gh/7|PR #7: Fix>");
   });
 
+  test("onFail reacts ❌ and posts the actionable message (terminal)", async () => {
+    const { client, calls } = fakeClient();
+    await policy(client).onFail(M, "Couldn't start a session.");
+    expect(calls.reactions).toEqual([{ channel: "C1", timestamp: "100.0", name: "x" }]);
+    expect(calls.posts[0].text).toBe("❌ Couldn't start a session.");
+  });
+
+  test("onDeliveryError reacts ⚠️ and posts a NON-fatal note (no ❌, thread lives on)", async () => {
+    const { client, calls } = fakeClient();
+    await policy(client).onDeliveryError(M, "Mention me again to retry.");
+    expect(calls.reactions).toEqual([{ channel: "C1", timestamp: "100.0", name: "warning" }]);
+    expect(calls.posts[0].text).toBe("⚠️ Mention me again to retry.");
+    // distinct from onFail — never the terminal ❌.
+    expect(calls.reactions.some((r) => r.name === "x")).toBe(false);
+  });
+
+  test("onDeliveryError never throws even when the post fails (best-effort notice)", async () => {
+    const { client, calls } = fakeClient();
+    client.chat.postMessage = async () => {
+      throw new Error("slack down");
+    };
+    // Must resolve, not reject — a Slack blip here must not wedge the workflow.
+    await policy(client).onDeliveryError(M, "retry please");
+    expect(calls.reactions).toEqual([{ channel: "C1", timestamp: "100.0", name: "warning" }]);
+  });
+
   test("gatherThreadContext reads replies and folds them into a prompt", async () => {
     const { client, calls } = fakeClient();
     const out = await policy(client).gatherThreadContext(M, null);
