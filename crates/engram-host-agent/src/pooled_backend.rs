@@ -6634,7 +6634,10 @@ mod tests {
                 SessionId::new(),
             )
         };
-        assert!(mk(&warm_with(None)).is_none(), "no [warm.network] → no policy");
+        assert!(
+            mk(&warm_with(None)).is_none(),
+            "no [warm.network] → no policy"
+        );
         assert!(
             mk(&warm_with(Some(engram_core::types::image::NetworkPolicy {
                 default: engram_core::types::image::NetworkDefault::Deny,
