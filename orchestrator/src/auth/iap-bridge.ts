@@ -115,14 +115,33 @@ import { config } from "../config.ts";
  * Paths the bridge lets through WITHOUT any IAP/session check — matched
  * exactly against the path component (query string stripped).
  *
- * Why: kubelet readiness probes and GCP LB health checks hit the orchestrator
- * directly, bypassing IAP, so they carry no X-Goog-IAP-JWT-Assertion. With
- * IAP_AUDIENCE set the bridge fails closed (401), which would mark the pod /
- * backend perpetually unhealthy. /healthz only reports {ok, db}, so it is
- * unauthenticated by design. Add new probe/observability paths (e.g. /readyz,
- * /metrics) here rather than scattering inline checks.
+ * Two categories live here:
+ *
+ *   1. Health/readiness probes. kubelet readiness probes and GCP LB health
+ *      checks hit the orchestrator directly, bypassing IAP, so they carry no
+ *      X-Goog-IAP-JWT-Assertion. With IAP_AUDIENCE set the bridge fails closed
+ *      (401), which would mark the pod / backend perpetually unhealthy.
+ *      /healthz only reports {ok, db}, so it is unauthenticated by design.
+ *
+ *   2. Inbound provider webhooks (ADR 0060). Slack POSTs carry no IAP
+ *      assertion and no session cookie — in prod they reach the orchestrator
+ *      through a no-IAP GCLB backend (see deploy/helm values-iap overlay), so
+ *      the fail-closed path would 401 them before the handler runs. These
+ *      routes do NOT rely on the bridge for auth: each verifies the provider's
+ *      own signature (Slack signing secret + 5-minute timestamp window via
+ *      isValidSlackRequest) and rejects a bad signature with 401 itself. The
+ *      bridge would only get in the way, so we exempt the exact webhook paths.
+ *      The strings must stay in lockstep with the routes' `app.post(...)` paths
+ *      (orchestrator/src/routes/slack-{events,interactivity}.ts).
+ *
+ * Add new probe/observability/webhook paths here rather than scattering inline
+ * checks.
  */
-const PUBLIC_PATHS: ReadonlySet<string> = new Set(["/healthz"]);
+const PUBLIC_PATHS: ReadonlySet<string> = new Set([
+  "/healthz",
+  "/api/v1/integrations/slack/events",
+  "/api/v1/integrations/slack/interactivity",
+]);
 
 // ---------------------------------------------------------------------------
 // Internal types

@@ -44,7 +44,25 @@
 # 3. `roles/iap.httpsResourceAccessor` bound to your authorized
 #    principals on the project (or on the backend service for tighter
 #    scoping). On GCP: `google_iap_web_iam_member` resources, one
-#    per principal.
+#    per principal. Bind this ONLY to the web backend — the no-IAP
+#    Slack backend (below) needs no accessor.
+#
+# 4. A second, no-IAP `BackendConfig` for the orchestrator's public
+#    Slack webhooks. IAP is enabled per GCP *backend service*, not per
+#    path, so the only way to expose a path without IAP is to route it
+#    to a different backend whose BackendConfig has IAP off. Apply it
+#    from the chart's examples dir:
+#
+#      kubectl apply -n <ns> -f examples/backendconfig-slack-no-iap.yaml
+#
+#    This overlay then (a) enables a dedicated webhook Service
+#    (`orchestrator.webhookService`) — fronting the SAME orchestrator
+#    pods — and binds the no-IAP BackendConfig to IT (not to the primary
+#    orchestrator Service, so IAP stays available there), and (b) adds two
+#    Exact-match paths to the web Ingress retargeted at that webhook
+#    Service. The two Slack URLs skip IAP; everything else stays gated.
+#    Safe because the orchestrator verifies the Slack signing secret on
+#    every webhook AND its IAP bridge exempts these paths (ADR 0060).
 #
 # What this overlay sets
 # ----------------------
@@ -72,5 +90,31 @@ web:
     hosts:
       - host: engram.REPLACE_DOMAIN
         paths:
+          # Slack external-trigger webhooks (ADR 0060). Exact-match so ONLY
+          # these two URLs are retargeted at the dedicated no-IAP webhook
+          # Service; the more-specific match wins in the URL map. They must
+          # precede the "/" rule. The orchestrator verifies the Slack signing
+          # secret itself (and its IAP bridge exempts these paths), so dropping
+          # IAP here is safe. `tpl`'d to the webhook Service fullname (resolved
+          # by web-ingress.yaml).
+          - path: /api/v1/integrations/slack/events
+            pathType: Exact
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          - path: /api/v1/integrations/slack/interactivity
+            pathType: Exact
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          # Everything else → web nginx (IAP-protected).
           - path: /
             pathType: Prefix
+
+orchestrator:
+  # A dedicated Service for the public webhook paths, fronting the SAME
+  # orchestrator pods. The no-IAP BackendConfig binds HERE — NOT on the primary
+  # orchestrator Service — so IAP stays available on the primary Service for any
+  # other Ingress (e.g. orchestrator.ingress). The web Ingress above routes the
+  # Slack Exact paths at `<release>-orchestrator-webhooks`; GKE mints a separate
+  # backend service for it, bound to the no-IAP BackendConfig below.
+  webhookService:
+    enabled: true
+    annotations:
+      cloud.google.com/backend-config: '{"default":"engram-slack-no-iap"}'

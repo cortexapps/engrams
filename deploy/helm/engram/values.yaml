@@ -494,6 +494,18 @@ orchestrator:
     port: 80
     annotations: {}
 
+  # A dedicated Service for public inbound webhooks (ADR 0060), fronting the
+  # SAME orchestrator pods (no extra workload). Off by default. Enable it when
+  # you need a webhook surface that bypasses IAP: bind a no-IAP BackendConfig
+  # via `annotations` and route the webhook Exact paths at
+  # `<release>-orchestrator-webhooks` in the web Ingress (see
+  # values-iap.yaml.example). Keeping the no-IAP binding on this Service rather
+  # than on `service` above means IAP stays available on the primary
+  # orchestrator Service (e.g. for `orchestrator.ingress`).
+  webhookService:
+    enabled: false
+    annotations: {}
+
   ingress:
     # Optional public surface for the orchestrator (the browser-native HTTP/WS
     # legs + the auth callback). Off by default — the inert deploy needs no

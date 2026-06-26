@@ -1,0 +1,44 @@
+# No-IAP BackendConfig for the orchestrator's public Slack webhooks.
+#
+# Apply this alongside the Helm release (same namespace), then point the
+# orchestrator Service at it with the annotation in values-iap.yaml.example:
+#
+#   kubectl apply -n <release-namespace> -f backendconfig-slack-no-iap.yaml
+#
+# Why this exists
+# ---------------
+# IAP is enabled per GCP *backend service*, not per path. The web Ingress
+# routes "/" to a single backend (the web nginx Service) with IAP ON
+# (BackendConfig `engram-web-iap`). To expose a path WITHOUT IAP you must
+# route it to a *different* backend service whose BackendConfig has IAP off.
+#
+# values-iap.yaml.example enables a dedicated webhook Service
+# (`<release>-orchestrator-webhooks`, fronting the same orchestrator pods) and
+# adds two Exact-match paths
+#   /api/v1/integrations/slack/events
+#   /api/v1/integrations/slack/interactivity
+# to the web Ingress, retargeted at that webhook Service. Annotating the webhook
+# Service with `cloud.google.com/backend-config: {"default":"engram-slack-no-iap"}`
+# binds ITS GCP backend service to THIS config, so those two exact URLs skip IAP
+# while everything else — including the primary orchestrator Service — stays
+# IAP-capable.
+#
+# Safe to expose without IAP: the orchestrator verifies every webhook with the
+# Slack signing secret + a 5-minute timestamp window (`isValidSlackRequest`,
+# ADR 0060) before doing any work. Slack's signature is the auth.
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: engram-slack-no-iap
+spec:
+  iap:
+    enabled: false
+  # Health check is otherwise inferred from the orchestrator's readinessProbe
+  # (GET /healthz → 200 when the DB is reachable; orchestrator-deployment.yaml).
+  # Pinned explicitly here so the no-IAP backend's health is unambiguous and
+  # independent of any future probe change.
+  healthCheck:
+    type: HTTP
+    requestPath: /healthz
+    # The orchestrator's serving port (containerPort / Service targetPort).
+    port: 8787

@@ -1,0 +1,38 @@
+{{- if and .Values.web.enabled .Values.orchestrator.webhookService.enabled -}}
+# A SECOND Service in front of the SAME orchestrator pods (identical selector,
+# zero extra workload), dedicated to public inbound webhooks (ADR 0060). It
+# exists so the no-IAP BackendConfig can be bound HERE instead of on the primary
+# orchestrator Service.
+#
+# Why a separate Service: GKE IAP is per GCP *backend service*, and a backend
+# service is keyed by (Service, port). Every Ingress routing to a given
+# (Service, port) shares one backend service and its single IAP setting — you
+# cannot IAP one path and exempt another on the same Service/port. Binding the
+# no-IAP config to the primary orchestrator Service would therefore disable IAP
+# for ANY other Ingress that targets it (e.g. orchestrator.ingress). Routing the
+# webhook paths at this dedicated Service keeps that blast radius to the webhook
+# surface alone; the primary Service stays IAP-capable.
+#
+# The web Ingress points the webhook Exact paths at this Service (see
+# values-iap.yaml.example); GKE mints its own NEG + backend service, bound to
+# the no-IAP BackendConfig via the annotation below.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "engram.orchestrator.fullname" . }}-webhooks
+  labels:
+    {{- include "engram.orchestrator.labels" . | nindent 4 }}
+  {{- with .Values.orchestrator.webhookService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.orchestrator.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "engram.orchestrator.selectorLabels" . | nindent 4 }}
+{{- end -}}
