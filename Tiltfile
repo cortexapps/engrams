@@ -397,6 +397,13 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         kernel_key: kernel_path,
         'ENGRAM_SANDBOX_WORK_DIR': work_dir,
         'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
+        # ADR 0061/0055: where the host-agent reads the bundle generation
+        # stamp (current.json) + staged <sha>.{erofs,squashfs} files. The
+        # `bundles` resource below stages them here before this resource
+        # starts (resource_deps). Without this, bundle_dir_from_env() falls
+        # back to the Linux fleet path /var/lib/engram/shared (absent on
+        # macOS) and every skill-enabled create 400s.
+        'ENGRAM_BUNDLE_DIR': _bundle_dir,
         # ADR 0039: the Tilt dev/e2e stack doesn't bake engram-uffd-handler
         # (prod's FC-host image does), and the host-agent runs under sudo
         # with a scrubbed PATH so it couldn't spawn a co-located one anyway.
@@ -490,7 +497,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
     local_resource(name,
         serve_cmd=serve_cmd,
         serve_env=env,
-        resource_deps=['coordinator'],
+        resource_deps=['coordinator', 'bundles'],
         readiness_probe=probe(
             period_secs=30,
             timeout_secs=2,
@@ -500,8 +507,29 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
             link('http://127.0.0.1:' + metrics_port + '/metrics', 'metrics'),
         ],
         labels=['app'],
-        trigger_mode=TRIGGER_MODE_MANUAL,
+        # ADR 0061: AUTO so a bundle rebuild (current.json change, in `deps`
+        # below) auto-restarts the host-agent → it re-reads the stamp and a
+        # new session runs the edited skill. Source edits are NOT in `deps`,
+        # so a .rs change still requires a manual trigger (unchanged loop).
+        trigger_mode=TRIGGER_MODE_AUTO,
+        deps=[_bundle_dir + '/current.json'],
         auto_init=True)
+
+# ADR 0061 / 0055: stage the skill bundles (content-addressed payloads +
+# a current.json stamp) under var/shared BEFORE the host-agent boots, so
+# it reports `current_bundles` and the coordinator can resolve enabled
+# skills (else `POST /sessions` 400s with "skill `skills` is unknown").
+# The fs format follows the backend: VZ's Kata kernel mounts erofs, FC
+# mounts squashfs. Re-running this (a skill edit under deploy/bundles)
+# rewrites current.json, which restarts the host-agent (its `deps` below)
+# so it re-reads the stamp — new sessions pick the edit up.
+_bundle_dir = os.path.abspath('var/shared')
+if dev_split:
+    _bundles_recipe = 'bundles-vz' if sandbox_backend == 'vz' else 'bundles-squashfs'
+    local_resource('bundles',
+        cmd='just ' + _bundles_recipe,
+        deps=['deploy/bundles'],
+        labels=['setup'])
 
 _proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT', '0'))
 if dev_split:

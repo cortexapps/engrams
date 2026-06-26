@@ -408,7 +408,10 @@ async fn main() -> Result<(), HostAgentError> {
                                 .into(),
                         )
                     })?;
-                let vz_cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel);
+                // ADR 0061: VZ reads skill bundles from the same staged
+                // dir the host-agent reports its `current_bundles` from.
+                let vz_cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel)
+                    .with_bundle_dir(engram_host_agent::bundles::bundle_dir_from_env());
                 fc_for_reattach = None;
                 // ADR 0007: attach the chunk store so `snapshot()` chunks
                 // the rootfs clone and reports the manifest ref. Without

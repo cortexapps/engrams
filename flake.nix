@@ -91,6 +91,12 @@
             # Needed by `nix develop` (the coordinator + `just check`'s pack test)
             # and bundled into the coordinator runtime image.
             squashfsTools
+            # ADR 0061: mkfs.erofs packs each skill bundle into a content-
+            # addressed RO erofs image for the VZ backend (the Kata VZ guest
+            # kernel has CONFIG_EROFS_FS but no CONFIG_SQUASHFS). Used by
+            # `just bundles-vz` (the VZ dev mirror of `bundles-squashfs`).
+            # macOS dev outside nix: `brew install erofs-utils`.
+            erofs-utils
           ] ++ lib.optionals stdenv.isLinux [
             # Parallel linker; wired in via the `shellHook` below
             # (CARGO_TARGET_*_UNKNOWN_LINUX_GNU_RUSTFLAGS). Cuts

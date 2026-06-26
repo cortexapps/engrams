@@ -27,6 +27,7 @@ use objc2_virtualization::{
 };
 
 use crate::console_bridge::{build_console_device, ConsolePortFds};
+use engram_core::types::sandbox::AuxRoDrive;
 use tokio::sync::oneshot;
 
 /// Per-VM declarative inputs. Built once at create time.
@@ -39,8 +40,12 @@ pub(crate) struct VmConfig {
     /// Linux kernel command line. Default points root at /dev/vda
     /// (the first virtio-block device) and routes the console to hvc0.
     pub kernel_cmdline: String,
-    // ADR 0021 P1.5: harness drive retired — the harness lives in
-    // the rootfs at `[harness] exec`. No second virtio-blk to attach.
+    /// ADR 0061: skill bundles to attach as read-only erofs virtio-blk
+    /// drives. Only entries with `sha256 = Some` attach (sentinels are
+    /// skipped); attach order is `/dev/vdb`, `/dev/vdc`, …
+    pub aux_ro_drives: Vec<AuxRoDrive>,
+    /// Directory the erofs payloads live in (`<sha>.erofs`).
+    pub bundle_dir: std::path::PathBuf,
 }
 
 impl VmConfig {
@@ -85,7 +90,21 @@ impl VmConfig {
             kernel_cmdline: "console=hvc0 tsc=reliable panic=0 root=/dev/vda rw \
                              quiet init=/sbin/engram-init ip=dhcp"
                 .into(),
+            aux_ro_drives: Vec::new(),
+            bundle_dir: std::path::PathBuf::new(),
         }
+    }
+
+    /// ADR 0061: attach these skill bundles (resolved `AuxRoDrive`s) from
+    /// `bundle_dir`. Sentinels (`sha256 = None`) are skipped at attach.
+    pub fn with_aux_ro_drives(
+        mut self,
+        drives: Vec<AuxRoDrive>,
+        bundle_dir: std::path::PathBuf,
+    ) -> Self {
+        self.aux_ro_drives = drives;
+        self.bundle_dir = bundle_dir;
+        self
     }
 }
 
@@ -378,6 +397,15 @@ impl VzVm {
     }
 }
 
+/// ADR 0061: host path of a resolved skill generation for the VZ backend.
+/// Content-keyed `<bundle_dir>/<sha>.erofs` — VZ stages erofs where FC
+/// stages squashfs (the Kata VZ kernel has no CONFIG_SQUASHFS). The sha
+/// comes from the host's `current.json` stamp via the coordinator's
+/// resolved `AuxRoDrive.sha256`, so path and content never disagree.
+pub(crate) fn staged_erofs_path(bundle_dir: &std::path::Path, sha: &str) -> std::path::PathBuf {
+    bundle_dir.join(format!("{sha}.erofs"))
+}
+
 /// Build a fully-configured `VZVirtualMachineConfiguration` for
 /// `cfg`. Linux boot, virtio-block rootfs, multi-port virtio-console
 /// for the host↔guest control channels, virtio-net NAT, and a
@@ -437,8 +465,40 @@ fn build_configuration(
         );
         storage.push(Retained::cast_unchecked(block_dev));
 
-        // ADR 0021 P1.5: no harness virtio-blk to attach — the
-        // harness binary lives in the rootfs.
+        // ADR 0061: attach each resolved skill bundle as a read-only erofs
+        // virtio-blk image, in slice order (/dev/vdb, /dev/vdc, …). The
+        // guest init shim RO-mounts each at /opt/engram/dyn/<i> and agentd
+        // reads its mount.json to wire the skill. Sentinel slots (sha =
+        // None) are skipped, so base-snapshot capture (whose spec carries
+        // only `reserved_slot` placeholders) attaches nothing and the base
+        // snapshot stays skill-agnostic.
+        for drive in &cfg.aux_ro_drives {
+            let Some(sha) = drive.sha256.as_deref() else {
+                continue;
+            };
+            let path = staged_erofs_path(&cfg.bundle_dir, sha);
+            if !path.exists() {
+                return Err(VzError::AttachmentFailed(format!(
+                    "skill bundle {} not staged at {} — run `just bundles-vz`",
+                    drive.drive_id,
+                    path.display()
+                )));
+            }
+            let url = nsurl_for_path(&path);
+            let att = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                VZDiskImageStorageDeviceAttachment::alloc(),
+                &url,
+                true, // read-only
+            )
+            .map_err(|err| VzError::AttachmentFailed(ns_error_message(&err)))?;
+            let att_super: Retained<objc2_virtualization::VZStorageDeviceAttachment> =
+                Retained::cast_unchecked(att);
+            let dev = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                VZVirtioBlockDeviceConfiguration::alloc(),
+                &att_super,
+            );
+            storage.push(Retained::cast_unchecked(dev));
+        }
 
         let storage_array: Retained<NSArray<VZStorageDeviceConfiguration>> =
             NSArray::from_retained_slice(&storage);
@@ -633,6 +693,12 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn staged_erofs_path_is_content_keyed() {
+        let p = super::staged_erofs_path(std::path::Path::new("/var/shared"), "abc123");
+        assert_eq!(p, std::path::PathBuf::from("/var/shared/abc123.erofs"));
     }
 
     #[test]
