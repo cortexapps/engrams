@@ -148,6 +148,41 @@ engram session prompt "$SID" "this should fail"
 # Expect a FAILED_PRECONDITION error carrying "snapshot_invalidated".
 ```
 
+## Built-in skills (ADR 0061)
+
+Built-in skills (the `skills` bundle, `playwright`, …) are mounted into the guest
+as read-only **erofs** virtio-blk drives (the VZ kernel has no squashfs). `just
+dev` wires this up for you:
+
+- The **`bundles`** Tilt resource runs `just bundles-vz` before the host-agent
+  boots — it packs each bundle in `deploy/bundles/<name>/` into a content-addressed
+  `var/shared/<sha>.erofs` and writes the `current.json` name→sha stamp. The
+  host-agent runs with `ENGRAM_BUNDLE_DIR=$PWD/var/shared`, so the coordinator can
+  resolve enabled skills. Without it, creating a session with skills enabled fails:
+  `skill \`skills\` is unknown (not a staged fleet bundle …)`.
+- A session created with skills selected (the orchestrator passes the profile's
+  `selected_skills`; the coordinator app-gRPC field is `CreateSession.selected_skills`)
+  boots with the bundle attached at `/dev/vdb` and the init shim RO-mounts it at
+  `/opt/engram/dyn/0`. Verify in the guest:
+  `engram session exec "$SID" 'cat /opt/engram/dyn/0/mount.json'`.
+
+**Rebuilding after a skill edit — `just bundles-vz`.** The recipe is a manual
+one-shot, but under `just dev` Tilt also runs it automatically: the `bundles`
+resource watches `deploy/bundles/` (`deps`), so saving a skill file there re-stages
+the erofs and rewrites `current.json`; the host-agent watches `current.json` and
+auto-restarts to re-read the stamp. Either way, **new sessions pick up the edit;
+live and resumed sessions keep their pinned `<sha>.erofs` generation** (resume
+determinism). To force it without an editor save, just run `just bundles-vz`.
+
+> **Note:** `bundles-vz` packs erofs with `-b 4096`. `mkfs.erofs` otherwise
+> defaults the block size to the macOS host page size (16 KiB), which the 4 KiB-page
+> Linux guest can't mount (`erofs: blkszbits 14 isn't supported`).
+
+Editing the guest **init shim** itself (`engram-image-builder`, e.g. the mount
+logic) is different — it's baked into the rootfs, so it needs `just bake-demo` + a
+fresh session, not just `bundles-vz`. Full edit/re-bake loop:
+`docs/runbooks/vz-dev-skills.md`.
+
 ## Diagnostic tips
 
 - **Serial console**: stderr from the coord carries kernel boot logs +
