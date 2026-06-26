@@ -60,10 +60,12 @@ pub struct EnableScannerConfig {
     /// fleet scanners.
     pub poll_interval: Duration,
     /// Claim lease. Must comfortably exceed the longest gap between
-    /// claim renewals — progress checkpoints renew every
-    /// `progress_interval` during materialize, and the capture step
-    /// renews once at entry but can then run ~3 min on dev-vm-class
-    /// hosts without touching the row.
+    /// claim renewals — both the materialize AND the capture step run a
+    /// ticker that renews every `progress_interval`. (Until that ticker
+    /// covered the capture step, a long `[warm]`-hook capture — tens of
+    /// minutes of warm boot + snapshot upload — would expire this lease
+    /// mid-capture, and a peer would re-claim and spawn a duplicate
+    /// concurrent capture that fought the first for host resources.)
     pub lease_secs: u32,
     /// Jobs claimed per tick. Enables are heavyweight (registry +
     /// GCS I/O, then a capture VM per job); a small bound keeps one
@@ -333,10 +335,42 @@ async fn advance_one(
         .meta
         .set_enable_job_state(job_id, claimant, EnableJobState::Capturing)
         .await?;
+    // Renew the claim lease throughout the capture. `build_base_snapshot` is a
+    // single long host call; for a `[warm]`-hook image the warm boot + snapshot
+    // upload run tens of minutes — far past `lease_secs`. The materialize ticker
+    // is already aborted, so without renewal here the lease expires mid-capture
+    // and a peer re-claims, spawning a SECOND concurrent capture (host
+    // contention + wasted work). Progress is static now (materialize is done),
+    // so the ticker re-writes the final `done` count purely to renew the lease.
+    let capture_ticker = {
+        let meta = state.services.meta.clone();
+        let interval = cfg.progress_interval;
+        let claimant = claimant.to_string();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                match meta
+                    .update_enable_job_progress(job_id, &claimant, done, None)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(MetaError::Conflict(msg)) => {
+                        tracing::warn!(%job_id, reason = %msg, "enable capture lease lost; stopping renewal ticker");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(%job_id, error = %e, "enable capture lease renewal failed");
+                    }
+                }
+            }
+        })
+    };
+    let capture_result = capture_and_record_base_snapshot(state, &row, &manifest).await;
+    capture_ticker.abort();
     let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
-        capture_and_record_base_snapshot(state, &row, &manifest)
-            .await
-            .map_err(classify_capture_error)?;
+        capture_result.map_err(classify_capture_error)?;
     row.base_snapshot_id = Some(base_snapshot_id);
     row.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
     // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
