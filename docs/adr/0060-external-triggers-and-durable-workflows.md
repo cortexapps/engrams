@@ -361,6 +361,24 @@ separate live `streamEvents` consumer with rate-limit throttling and single-writ
 coordination, a follow-up beyond this ADR. Assistant text posts as raw markdown (Slack
 mrkdwn fidelity is a known follow-up).
 
+**As-built: `file_shared` now uploads the actual bytes (2026-06-26).** The `file_shared`
+row above was *designed* but shipped, in the original P2.10, as the text-line fallback only
+(`📎 <caption>`), so a `share-file` artifact rendered inline in the web UI but reached Slack
+as a bare caption with no image and no link. `onAsset` now does what the table specifies:
+for a `file_shared` event it fetches the artifact bytes from the coordinator
+(`SessionService.getArtifact`, the same server-stream the web artifact route proxies — see
+`control-plane/artifact-fetch.ts`, which collects the stream into one buffer under a hard
+size cap) and uploads them into the thread via `WebClient.files.uploadV2` (the `@slack/web-api`
+helper that wraps the `getUploadURLExternal` → PUT → `completeUploadExternal` trio the table
+names), with the caption as `initial_comment`. Two guards keep it safe: artifacts over
+`MAX_SLACK_UPLOAD_BYTES` (50 MiB) skip the fetch entirely, and any fetch/upload failure falls
+back to a one-line **link to the session** (`🔗 <webUrl|caption>`) — strictly better than the
+old un-clickable `📎` line. `onAsset` gained the `session` arg (for the artifact id's session
+scope and the fallback link); the closing-summary recap (`summarizeAsset`/`onComplete`) is
+unchanged and still lists files as text. **Deployment note:** the upload needs the Slack app's
+`files:write` scope (as the table flagged) — without it every upload fails and silently
+degrades to the link fallback.
+
 ## Bidirectional AskUserQuestion (Slack ↔ web parity)
 
 Reuses the shipped ADR 0054 path, so parity is automatic:

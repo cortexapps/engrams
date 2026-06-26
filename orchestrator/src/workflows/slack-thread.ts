@@ -191,7 +191,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
         return;
       }
       case "session_event": {
-        await dispatchSessionEvent(pol, m, msg, st);
+        await dispatchSessionEvent(pol, m, msg, st, session);
         break;
       }
       case "trigger_mention": {
@@ -250,6 +250,7 @@ async function dispatchSessionEvent(
   m: SourceMention,
   msg: Extract<ThreadInbox, { kind: "session_event" }>,
   st: ThreadRender,
+  session: StartedSession,
 ): Promise<void> {
   const effect = routeSessionEvent(msg.event);
   switch (effect.kind) {
@@ -296,7 +297,7 @@ async function dispatchSessionEvent(
       st.bubble = null;
       const recap = summarizeAsset(msg.event);
       if (recap) st.assets.push(recap);
-      await DBOS.runStep(() => pol.onAsset(m, msg.event), { name: "onAsset" });
+      await DBOS.runStep(() => pol.onAsset(m, msg.event, session), { name: "onAsset" });
       break;
     }
     case "ignore":
