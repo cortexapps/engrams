@@ -689,10 +689,47 @@ rebuild it.
 | Crash after start, before send, before ack | no 200 → Slack retry → `startWorkflow` no-op + `send` lands; `event_id` idempotency = no dup |
 | `SlackThreadWorkflow` crashes mid-loop | replays from top; completed steps return checkpoints (so a completed post isn't re-sent); durable `recv` message redelivered |
 | `SessionIngestWorkflow` ("pump") dies | DBOS recovery from checkpointed `after`; `workflowID` = no second pump; no lease/takeover |
-| Session idle-evicted between mentions | `SendPrompt` → `ensure_active` auto-resume (Dead → 410 → ❌ + message) |
+| Session idle-evicted between mentions | `SendPrompt` → `ensure_active` auto-resume (Dead → 410 → ❌ + message) — but see the post-acceptance fix: the drain loop must *catch* a `SendPrompt` error, and the coord must reliably resume rather than returning `sandbox not found` |
 | `SendPrompt` step replayed after crash | deterministic `prompt_id = slack:<event_id>` → harness `seen_prompt_ids` dedupes (ADR 0052); no double-run (Decision 9) |
 | Answer delivered twice (Slack + web) | `AnswerQuestion` idempotent (ADR 0054) |
 | Duplicate reaction on replay | `reactions.add` → `already_reacted` → success |
+
+## Post-acceptance fix — drain-loop error isolation (2026-06-26)
+
+**Incident.** A follow-up `@mention` got the 👀 ack and then nothing — no ❌, no
+reply — while the underlying session kept doing real work invisibly. Root cause:
+the session had just answered an `AskUserQuestion` and gone idle; the follow-up's
+`SendPrompt` hit the coord in that window and returned `[internal] forward prompt
+to harness: sandbox not found`. In `SlackThreadWorkflow`, **only the initial
+`createTask` was wrapped in try/catch** — the drain-loop's follow-up `sendPrompt`,
+`answerQuestion`, and the pre-create steps (`resolveUser`/`getDefaultProfile`/
+`gatherThreadContext`) ran unguarded. The throw propagated out of the workflow,
+which DBOS marked **ERROR**. The `SessionIngestWorkflow` pump kept tailing the
+live session and `DBOS.send`ing curated events into the now-dead thread workflow's
+mailbox, where they were never drained — hence "👀 then silence." This contradicts
+the durability-matrix row above, which assumed the idle-evict case was handled.
+
+**Orchestrator fix (this change).** The drain loop's non-terminal handling is
+extracted into `handleInbound`, which **never throws**:
+- A **delivery** failure (`sendPrompt`/`answerQuestion`) is caught and surfaced as
+  a NON-FATAL `onDeliveryError` (⚠️ + "mention me again to retry"); the gather
+  cursor is **not** advanced, so undelivered messages re-gather on the next
+  mention, and the thread workflow stays alive. This is distinct from the terminal
+  `onFail` (❌), which still ends the thread.
+- A **render** failure (a session event → a Slack post) drops that one render and
+  logs; no user-facing notice (it's agent output, not the user's input).
+- The pre-create path (identity / default-profile / initial gather / create) is
+  now all inside one try/catch → `onFail` + return (fatal: no session to keep
+  alive yet).
+
+`handleInbound` takes an injected `StepRunner` so the control flow is unit-tested
+without a live DBOS engine (`slack-thread.test.ts`), consistent with the ADR's
+deferred-engine-testing decision.
+
+**Still open (coord-side, tracked separately).** The deeper trigger is that
+`SendPrompt` to a just-idle session returned `sandbox not found` instead of
+`ensure_active`-resuming it (the sandbox was demonstrably still alive on its host).
+That idle/harness-rebind desync is a control-plane fix, not an orchestrator one.
 
 ## Design review (why the substrate is small)
 
