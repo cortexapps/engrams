@@ -229,6 +229,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
             created_at: Utc::now(),
             updated_at: None,
             soft_deleted_at: None,
+            capture_env: Vec::new(),
         })
         .await
         .expect("upsert enabled image");
@@ -389,6 +390,7 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
             created_at: Utc::now(),
             updated_at: None,
             soft_deleted_at: None,
+            capture_env: Vec::new(),
         })
         .await
         .expect("upsert enabled image");
@@ -530,6 +532,7 @@ async fn promote_skips_candidate_that_became_repinned() {
             created_at: Utc::now(),
             updated_at: None,
             soft_deleted_at: None,
+            capture_env: Vec::new(),
         })
         .await
         .expect("upsert enabled image");
@@ -807,6 +810,7 @@ async fn base_snapshot_memfile_pinned_even_when_snapshot_not_recoverable() {
             created_at: Utc::now(),
             updated_at: None,
             soft_deleted_at: None,
+            capture_env: Vec::new(),
         })
         .await
         .expect("upsert enabled image");

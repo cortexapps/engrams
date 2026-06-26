@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
+import { PlusIcon, XIcon } from "lucide-react";
+import { create } from "@bufbuild/protobuf";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { Controller, useForm } from "react-hook-form";
+import { Controller, useFieldArray, useForm, useWatch, type Control } from "react-hook-form";
 import * as z from "zod";
 import {
   useDisableImage,
@@ -11,6 +13,7 @@ import {
 } from "../../hooks/useEnabledImages";
 import { isJobActive, useEnableJobs, useRetryEnableJob } from "../../hooks/useEnableJobs";
 import type { EnableJob, EnabledImageSummary } from "../../lib/types";
+import { CaptureEnvEntrySchema } from "../../gen/engram/app/v1/image_pb";
 import { errorMessage } from "../../lib/errors";
 import { PageHeading } from "../page-heading";
 import { Badge } from "@/components/ui/badge";
@@ -25,9 +28,16 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -111,6 +121,7 @@ export function ImagesPanel() {
               <TableHead>Image</TableHead>
               <TableHead>Manifest</TableHead>
               <TableHead>Digest</TableHead>
+              <TableHead>Capture env</TableHead>
               <TableHead>Refreshed</TableHead>
               <TableHead className="text-right">Actions</TableHead>
             </TableRow>
@@ -164,6 +175,9 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
           {shortDigest}
         </Badge>
       </TableCell>
+      <TableCell className="text-xs">
+        <CaptureEnvCell entries={row.capture_env} />
+      </TableCell>
       <TableCell
         className="font-mono text-xs text-muted-foreground"
         title={new Date(row.last_refreshed_at).toLocaleString()}
@@ -172,6 +186,14 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
       </TableCell>
       <TableCell>
         <div className="flex items-center justify-end gap-2">
+          <EnableImageDialog
+            editImage={row}
+            trigger={
+              <Button variant="ghost" size="sm">
+                Edit capture env
+              </Button>
+            }
+          />
           <Button
             variant="ghost"
             size="sm"
@@ -218,23 +240,178 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
   );
 }
 
+// Compact read-only rendering of an enabled image's capture_env in the
+// table. Secret refs are NOT secret values — the ref string is shown
+// plainly (truncated, with the full value in a title tooltip).
+function CaptureEnvCell({ entries }: { entries: EnabledImageSummary["capture_env"] }) {
+  if (entries.length === 0) {
+    return <span className="text-muted-foreground">—</span>;
+  }
+  return (
+    <div className="max-w-[16rem] space-y-0.5">
+      {entries.map((v) => (
+        <div key={v.name} className="flex items-center gap-1.5">
+          <code className="font-mono whitespace-nowrap">{v.name}</code>
+          <Badge variant="outline" className="text-[0.6rem]">
+            {v.kind === "secret_ref" ? "ref" : "literal"}
+          </Badge>
+          <span className="truncate text-muted-foreground" title={v.value}>
+            {v.value}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const captureEnvRowSchema = z.object({
+  name: z.string(),
+  kind: z.enum(["literal", "secret_ref"]),
+  value: z.string(),
+});
 const enableImageSchema = z.object({
   imageUri: z.string().trim().min(1, "image URI is required"),
+  captureEnv: z.array(captureEnvRowSchema),
 });
 type EnableImageValues = z.infer<typeof enableImageSchema>;
 
-function EnableImageDialog() {
+function captureEnvDefaults(image?: EnabledImageSummary): EnableImageValues["captureEnv"] {
+  return (image?.capture_env ?? []).map((v) => ({
+    name: v.name,
+    kind: v.kind,
+    value: v.value,
+  }));
+}
+
+// One editable capture-env row: name · type toggle · value · remove. The
+// value placeholder follows the selected type (literal vs secret ref).
+function CaptureEnvRow({
+  control,
+  index,
+  onRemove,
+}: {
+  control: Control<EnableImageValues>;
+  index: number;
+  onRemove: () => void;
+}) {
+  const kind = useWatch({ control, name: `captureEnv.${index}.kind` });
+  return (
+    <div className="flex items-start gap-2">
+      <Controller
+        control={control}
+        name={`captureEnv.${index}.name`}
+        render={({ field }) => (
+          <Input
+            {...field}
+            className="font-mono"
+            placeholder="NAME"
+            aria-label="Variable name"
+            spellCheck={false}
+            autoCapitalize="off"
+          />
+        )}
+      />
+      <Controller
+        control={control}
+        name={`captureEnv.${index}.kind`}
+        render={({ field }) => (
+          <Select value={field.value} onValueChange={field.onChange}>
+            <SelectTrigger size="sm" className="w-32 shrink-0" aria-label="Variable type">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="literal">Literal</SelectItem>
+              <SelectItem value="secret_ref">Secret ref</SelectItem>
+            </SelectContent>
+          </Select>
+        )}
+      />
+      <Controller
+        control={control}
+        name={`captureEnv.${index}.value`}
+        render={({ field }) => (
+          <Input
+            {...field}
+            className="font-mono"
+            placeholder={
+              kind === "secret_ref" ? "gcp-sm://…/secrets/foo/versions/latest" : "literal value"
+            }
+            aria-label="Variable value"
+            spellCheck={false}
+            autoCapitalize="off"
+          />
+        )}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-sm"
+        className="shrink-0"
+        onClick={onRemove}
+        aria-label="Remove variable"
+      >
+        <XIcon />
+      </Button>
+    </div>
+  );
+}
+
+// Enable a new image, or edit an already-enabled image's capture_env. In
+// edit mode the URI is pinned (read-only) and the form pre-fills with the
+// row's current capture_env — re-submitting re-enables with the full list,
+// which REPLACES the set (ADR 0057). There is no separate update RPC.
+function EnableImageDialog({
+  editImage,
+  trigger,
+}: {
+  editImage?: EnabledImageSummary;
+  trigger?: ReactNode;
+}) {
   const [open, setOpen] = useState(false);
   const enable = useEnableImage();
+  const isEdit = !!editImage;
+
   const form = useForm<EnableImageValues>({
     resolver: zodResolver(enableImageSchema),
-    defaultValues: { imageUri: "" },
+    defaultValues: {
+      imageUri: editImage?.image_uri ?? "",
+      captureEnv: captureEnvDefaults(editImage),
+    },
+  });
+  const { fields, append, remove } = useFieldArray({
+    control: form.control,
+    name: "captureEnv",
   });
 
+  // Re-seed on every open so an edit always reflects the row's current
+  // capture_env and a cancelled edit doesn't linger in the form.
+  const onOpenChange = (next: boolean) => {
+    setOpen(next);
+    if (next) {
+      form.reset({
+        imageUri: editImage?.image_uri ?? "",
+        captureEnv: captureEnvDefaults(editImage),
+      });
+    }
+  };
+
   const onSubmit = async (data: EnableImageValues) => {
+    // Skip rows with an empty name; map each surviving row's type toggle to
+    // the proto oneof. A non-empty list REPLACES the image's capture_env;
+    // an empty list on a plain re-enable inherits the existing set.
+    const captureEnv = data.captureEnv
+      .filter((r) => r.name.trim() !== "")
+      .map((r) =>
+        create(CaptureEnvEntrySchema, {
+          name: r.name.trim(),
+          value: {
+            case: r.kind === "secret_ref" ? "secretRef" : "literal",
+            value: r.value,
+          },
+        }),
+      );
     try {
-      await enable.mutateAsync({ imageUri: data.imageUri });
-      form.reset();
+      await enable.mutateAsync({ imageUri: data.imageUri, captureEnv });
       setOpen(false);
     } catch (err) {
       // Surface the coordinator's real message (e.g. a registry-auth
@@ -244,17 +421,24 @@ function EnableImageDialog() {
   };
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button>Enable a new image</Button>
-      </DialogTrigger>
-      <DialogContent>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogTrigger asChild>{trigger ?? <Button>Enable a new image</Button>}</DialogTrigger>
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Enable a new image</DialogTitle>
+          <DialogTitle>{isEdit ? "Edit capture env" : "Enable a new image"}</DialogTitle>
           <DialogDescription>
-            Full OCI reference:{" "}
-            <code className="font-mono">&lt;host&gt;[:port]/&lt;repo&gt;:&lt;tag&gt;</code>. The
-            coordinator queues an enable job — materialization progress shows in the list above.
+            {isEdit ? (
+              <>
+                Re-enabling replaces this image's capture-time env with the full list below.
+                Materialization progress shows in the list above.
+              </>
+            ) : (
+              <>
+                Full OCI reference:{" "}
+                <code className="font-mono">&lt;host&gt;[:port]/&lt;repo&gt;:&lt;tag&gt;</code>. The
+                coordinator queues an enable job — materialization progress shows in the list above.
+              </>
+            )}
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={form.handleSubmit(onSubmit)}>
@@ -268,7 +452,8 @@ function EnableImageDialog() {
                   <Input
                     {...field}
                     id={field.name}
-                    autoFocus
+                    autoFocus={!isEdit}
+                    readOnly={isEdit}
                     className="font-mono"
                     placeholder="ghcr.io/cortex/api:warm-1"
                     spellCheck={false}
@@ -279,19 +464,54 @@ function EnableImageDialog() {
                 </Field>
               )}
             />
+
+            <Field>
+              <div className="flex items-center justify-between">
+                <FieldLabel>Capture-time env</FieldLabel>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => append({ name: "", kind: "literal", value: "" })}
+                >
+                  <PlusIcon /> Add variable
+                </Button>
+              </div>
+              <FieldDescription>
+                Injected into the image's <code className="font-mono">[warm]</code> hook at
+                base-snapshot capture (not a session secret). Each is a literal value or a secret
+                ref (e.g. <code className="font-mono">gcp-sm://…</code>) resolved server-side.
+                Leaving this empty on a re-enable keeps the current set.
+              </FieldDescription>
+              {fields.length === 0 ? (
+                <p className="text-xs text-muted-foreground">No capture vars.</p>
+              ) : (
+                <div className="space-y-2">
+                  {fields.map((f, i) => (
+                    <CaptureEnvRow
+                      key={f.id}
+                      control={form.control}
+                      index={i}
+                      onRemove={() => remove(i)}
+                    />
+                  ))}
+                </div>
+              )}
+            </Field>
+
             {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
           </FieldGroup>
           <DialogFooter className="mt-4 sm:items-center">
             <Button
               type="button"
               variant="ghost"
-              onClick={() => setOpen(false)}
+              onClick={() => onOpenChange(false)}
               disabled={enable.isPending}
             >
               Cancel
             </Button>
             <Button type="submit" disabled={enable.isPending}>
-              {enable.isPending ? "Enabling…" : "Enable"}
+              {enable.isPending ? (isEdit ? "Saving…" : "Enabling…") : isEdit ? "Save" : "Enable"}
             </Button>
           </DialogFooter>
         </form>

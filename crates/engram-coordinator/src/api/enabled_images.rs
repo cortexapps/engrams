@@ -110,6 +110,9 @@ pub(crate) async fn fetch_and_seal_manifest(
         // explicitly, so even an existing soft-deleted row gets
         // undeleted by re-enabling.
         soft_deleted_at: None,
+        // Stamped by the enable scanner from the triggering job's
+        // capture_env before capture (the manifest carries no secrets).
+        capture_env: Vec::new(),
     };
     Ok((row, manifest, artifacts))
 }
@@ -279,6 +282,16 @@ pub(crate) async fn capture_and_record_base_snapshot(
     ),
     ApiError,
 > {
+    // A `[warm]` hook captures live process state (plus the resolved
+    // capture_env secrets) that is NOT a pure function of (rootfs bytes,
+    // manifest.toml): two enables with identical content can differ in
+    // capture_env or in the live external state the warm boot reaches. So
+    // content/digest reuse is unsound for warm images — always re-capture.
+    // (This is also what makes a capture_env rotate actually take effect:
+    // a re-enable with the same digest must not short-circuit to the stale
+    // snapshot.)
+    let reuse_ok = manifest.warm.is_none();
+
     // ADR 0036 P4: content-keyed reuse. A base snapshot is a function
     // of (rootfs bytes, manifest.toml) — the bundle generations it
     // embeds are only the fallback pin, because session-create swaps
@@ -292,7 +305,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // this is what makes a no-op re-bake's enable near-instant — and
     // hosts already hold the reused snapshot's chunks on NVMe, so no
     // fleet-wide re-prefetch either.
-    if let Some(disk_ref) = row.disk_manifest {
+    if let Some(disk_ref) = row.disk_manifest.filter(|_| reuse_ok) {
         if let Some(existing) = state
             .services
             .meta
@@ -352,7 +365,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
         .get_enabled_image(&row.image_uri)
         .await?
     {
-        if existing.manifest_digest == row.manifest_digest {
+        if reuse_ok && existing.manifest_digest == row.manifest_digest {
             if let Some(id) = existing.base_snapshot_id {
                 let disk_manifest = existing.base_snapshot_disk_manifest.ok_or_else(|| {
                     ApiError::Internal(format!(
@@ -440,13 +453,21 @@ pub(crate) async fn capture_and_record_base_snapshot(
         host_id = %host_id,
         "capturing base snapshot for image enable",
     );
+    // Resolve the capture-time env for the `[warm]` hook: literals pass
+    // through, secret refs resolve through the same SecretStore a session
+    // uses. The host receives only resolved values (never the refs). The
+    // values flow coord→host→capture-exec and whatever the warm processes
+    // persist lands in the base snapshot — which we treat as secret-bearing
+    // (see ADR 0007 storage model); the refs themselves never leave the DB.
+    let capture_env = resolve_capture_env(state, &row.image_uri, &row.capture_env).await;
+
     // Thread the image's optional `[warm]` hook into capture: the host
     // runs it in the live VM before the snapshot freezes, so a warmed
     // process (e.g. a gradle daemon) is captured into the base snapshot.
     // A warm failure is fail-loud — it surfaces here as a capture error
     // and aborts the enable.
     let meta = host
-        .build_base_snapshot(spec, manifest.warm.clone())
+        .build_base_snapshot(spec, manifest.warm.clone(), capture_env)
         .await
         .map_err(|e| {
             ApiError::Internal(format!(
@@ -521,6 +542,55 @@ pub(crate) async fn capture_and_record_base_snapshot(
 /// ADR 0048: enable-time manifest validation. An enabled image must
 /// declare `[resources] suggested_vcpus = N` so placement can reserve CPU
 /// and pack hosts against a budget. Pure (no I/O) so it's unit-tested directly.
+/// Resolve an enabled image's `capture_env` into concrete `name → value`
+/// pairs for the `[warm]` hook. Literals pass through; secret refs resolve
+/// through the same [`engram_core::traits::SecretStore`] a session uses
+/// (`SecretContext` built from the image ref, mirroring
+/// `session_boot::resolve_inject_entries`). A ref that doesn't resolve is
+/// skipped with a warning — the warm hook is fail-loud, so a genuinely
+/// needed-but-missing secret surfaces as a hook failure that aborts the
+/// capture, rather than silently injecting an empty value.
+async fn resolve_capture_env(
+    state: &SharedState,
+    image_uri: &str,
+    capture_env: &[engram_core::types::CaptureEnvEntry],
+) -> std::collections::HashMap<String, String> {
+    use engram_core::types::CaptureEnvValue;
+    if capture_env.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let (repo, image_tag) = engram_core::types::session::split_image_ref(image_uri);
+    let ctx = engram_core::traits::SecretContext { repo, image_tag };
+    let schema = engram_core::types::image::SecretSchema::default();
+    let mut out = std::collections::HashMap::with_capacity(capture_env.len());
+    for entry in capture_env {
+        let value = match &entry.value {
+            CaptureEnvValue::Literal { value } => value.clone(),
+            CaptureEnvValue::SecretRef { secret_ref } => {
+                match state.services.secrets.get(&ctx, secret_ref, &schema).await {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        tracing::warn!(
+                            name = %entry.name, secret_ref = %secret_ref,
+                            "capture_env secret_ref not resolvable; omitting from the [warm] hook env",
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            name = %entry.name, secret_ref = %secret_ref, error = %e,
+                            "capture_env secret_ref resolution failed; omitting from the [warm] hook env",
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+        out.insert(entry.name.clone(), value);
+    }
+    out
+}
+
 fn validate_enabled_manifest(manifest: &ImageManifest, image_uri: &str) -> Result<(), String> {
     if manifest.resources.suggested_vcpus.is_none() {
         return Err(format!(

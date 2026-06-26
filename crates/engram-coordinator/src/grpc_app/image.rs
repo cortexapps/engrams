@@ -44,10 +44,29 @@ impl app::image_service_server::ImageService for AppImageService {
         req: Request<app::EnableImageRequest>,
     ) -> Result<Response<app::EnableImageResponse>, Status> {
         self.auth.check(&req)?;
-        let image_uri = req.into_inner().image_uri;
+        let req = req.into_inner();
+        let image_uri = req.image_uri;
         if image_uri.trim().is_empty() {
             return Err(Status::invalid_argument("image_uri must not be empty"));
         }
+        let requested_capture_env =
+            convert::capture_env_from_proto(&req.capture_env).map_err(Status::invalid_argument)?;
+        // Inherit-when-empty: an empty list keeps the already-enabled row's
+        // capture_env (so a plain re-enable / re-bake roll doesn't wipe it);
+        // a non-empty list replaces it (the add/remove/rotate edit). Clearing
+        // is "send the remaining entries"; clearing ALL is a disable+enable.
+        let capture_env = if requested_capture_env.is_empty() {
+            self.state
+                .services
+                .meta
+                .get_enabled_image_any(&image_uri)
+                .await
+                .map_err(|e| into_status(crate::error::ApiError::from(e)))?
+                .map(|r| r.capture_env)
+                .unwrap_or_default()
+        } else {
+            requested_capture_env
+        };
         let (_row, _manifest, artifacts) =
             crate::api::enabled_images::fetch_and_seal_manifest(&self.state, &image_uri)
                 .await
@@ -56,7 +75,11 @@ impl app::image_service_server::ImageService for AppImageService {
             .state
             .services
             .meta
-            .create_or_get_enable_job(&image_uri, Some(artifacts.manifest_digest.as_str()))
+            .create_or_get_enable_job(
+                &image_uri,
+                Some(artifacts.manifest_digest.as_str()),
+                &capture_env,
+            )
             .await
             .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
         Ok(Response::new(app::EnableImageResponse {
@@ -130,20 +153,26 @@ impl app::image_service_server::ImageService for AppImageService {
             .get_enabled_image(&image_uri)
             .await
             .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
-        if existing.is_none() {
+        let Some(existing) = existing else {
             return Err(into_status(crate::error::ApiError::NotFound(format!(
                 "image `{image_uri}` is not enabled; enable it first"
             ))));
-        }
+        };
         let (_row, _manifest, artifacts) =
             crate::api::enabled_images::fetch_and_seal_manifest(&self.state, &image_uri)
                 .await
                 .map_err(into_status)?;
+        // Refresh carries the existing capture_env forward (no field to set on
+        // the refresh request), so a re-pull of the same tag doesn't wipe it.
         let job = self
             .state
             .services
             .meta
-            .create_or_get_enable_job(&image_uri, Some(artifacts.manifest_digest.as_str()))
+            .create_or_get_enable_job(
+                &image_uri,
+                Some(artifacts.manifest_digest.as_str()),
+                &existing.capture_env,
+            )
             .await
             .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
         Ok(Response::new(app::RefreshImageResponse {

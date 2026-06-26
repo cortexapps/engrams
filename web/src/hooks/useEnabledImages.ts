@@ -20,6 +20,13 @@ function protoImageToLegacy(img: ProtoEnabledImageSummary): EnabledImageSummary 
     harness_name: img.harnessName ?? null,
     last_refreshed_at: img.lastRefreshedAt,
     created_at: img.createdAt,
+    // Flatten the proto `value` oneof: secretRef → "secret_ref", everything
+    // else (literal, or an unset case) → "literal" with its string value.
+    capture_env: img.captureEnv.map((e) => ({
+      name: e.name,
+      kind: e.value.case === "secretRef" ? ("secret_ref" as const) : ("literal" as const),
+      value: e.value.value ?? "",
+    })),
   };
 }
 

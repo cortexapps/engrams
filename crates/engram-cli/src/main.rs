@@ -1431,6 +1431,10 @@ async fn image_enable(
         .image
         .enable_image(app::EnableImageRequest {
             image_uri: uri.to_string(),
+            // Capture-env is set via the dashboard's enable/edit form; the
+            // admin CLI enables with an empty list (inherits any existing
+            // capture_env on a re-enable).
+            capture_env: Vec::new(),
         })
         .await?
         .into_inner();

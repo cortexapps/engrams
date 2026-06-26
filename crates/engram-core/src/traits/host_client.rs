@@ -206,11 +206,14 @@ pub trait HostClient: Send + Sync {
     /// gRPC clients delegate to the backend's `build_base_snapshot`.
     ///
     /// `warm` is the image's optional capture-time prewarm hook
-    /// ([`WarmConfig`]), threaded down to the backend.
+    /// ([`WarmConfig`]), threaded down to the backend. `capture_env` is the
+    /// resolved capture-time env injected into the warm hook (refs already
+    /// resolved coordinator-side).
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
         _warm: Option<WarmConfig>,
+        _capture_env: std::collections::HashMap<String, String>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `build_base_snapshot`".into(),

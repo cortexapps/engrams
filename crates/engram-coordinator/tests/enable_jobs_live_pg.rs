@@ -51,7 +51,7 @@ async fn create_or_get_dedups_active_jobs_per_uri() {
     let uri = unique_uri("dedup");
 
     let a = meta
-        .create_or_get_enable_job(&uri, Some("sha256:digest-a"))
+        .create_or_get_enable_job(&uri, Some("sha256:digest-a"), &[])
         .await
         .expect("create");
     assert_eq!(a.state, EnableJobState::Pending);
@@ -60,7 +60,7 @@ async fn create_or_get_dedups_active_jobs_per_uri() {
 
     // Re-POST while in flight → same job, even with a moved digest.
     let b = meta
-        .create_or_get_enable_job(&uri, Some("sha256:digest-b"))
+        .create_or_get_enable_job(&uri, Some("sha256:digest-b"), &[])
         .await
         .expect("re-create");
     assert_eq!(b.id, a.id, "active job must be returned, not duplicated");
@@ -74,7 +74,7 @@ async fn create_or_get_dedups_active_jobs_per_uri() {
         .await
         .expect("ready");
     let c = meta
-        .create_or_get_enable_job(&uri, None)
+        .create_or_get_enable_job(&uri, None, &[])
         .await
         .expect("create after terminal");
     assert_ne!(c.id, a.id, "terminal jobs don't block a new enable");
@@ -86,7 +86,7 @@ async fn claim_is_exclusive_until_lease_expires() {
     let Some(meta) = connect().await else { return };
     let uri = unique_uri("claim");
     let job = meta
-        .create_or_get_enable_job(&uri, None)
+        .create_or_get_enable_job(&uri, None, &[])
         .await
         .expect("create");
 
@@ -135,7 +135,7 @@ async fn progress_state_failure_and_retry_round_trip() {
     let Some(meta) = connect().await else { return };
     let uri = unique_uri("lifecycle");
     let job = meta
-        .create_or_get_enable_job(&uri, None)
+        .create_or_get_enable_job(&uri, None, &[])
         .await
         .expect("create");
 
@@ -253,7 +253,7 @@ async fn failure_flips_failed_atomically_at_budget_and_on_force_terminal() {
     // --- Budget path (1a): max_attempts = 2. ---
     let uri = unique_uri("budget");
     let job = meta
-        .create_or_get_enable_job(&uri, None)
+        .create_or_get_enable_job(&uri, None, &[])
         .await
         .expect("create");
     meta.claim_enable_jobs("pod-a", 300, 50)
@@ -291,7 +291,7 @@ async fn failure_flips_failed_atomically_at_budget_and_on_force_terminal() {
     //     hook non-zero exit) bails on attempt 1, well under a generous budget. ---
     let uri2 = unique_uri("force-terminal");
     let job2 = meta
-        .create_or_get_enable_job(&uri2, None)
+        .create_or_get_enable_job(&uri2, None, &[])
         .await
         .expect("create 2");
     meta.claim_enable_jobs("pod-a", 300, 50)
@@ -331,7 +331,7 @@ async fn stale_claimant_writes_are_fenced_off() {
     let Some(meta) = connect().await else { return };
     let uri = unique_uri("fencing");
     let job = meta
-        .create_or_get_enable_job(&uri, None)
+        .create_or_get_enable_job(&uri, None, &[])
         .await
         .expect("create");
 
@@ -486,6 +486,7 @@ async fn find_enabled_image_by_content_keys_on_disk_manifest_and_toml() {
         created_at: now,
         updated_at: None,
         soft_deleted_at: None,
+        capture_env: Vec::new(),
     })
     .await
     .expect("seed enabled image");

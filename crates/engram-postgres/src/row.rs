@@ -339,6 +339,10 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
     // generic decode path so a row pulled before the migration runs
     // still decodes; live SELECTs always project the column.
     let soft_deleted_at: Option<DateTime<Utc>> = row.try_get("soft_deleted_at").unwrap_or(None);
+    // Capture-time env (migration 0073). Missing-column-tolerant (default
+    // empty) for a row pulled before the migration; live SELECTs project
+    // the column (NOT NULL DEFAULT '[]').
+    let capture_env = capture_env_from_row(row, "capture_env")?;
     Ok(EnabledImage {
         id,
         image_uri: row.try_get("image_uri").map_err(col_err)?,
@@ -352,7 +356,22 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
         created_at,
         updated_at,
         soft_deleted_at,
+        capture_env,
     })
+}
+
+/// Decode a `capture_env` JSONB column into `Vec<CaptureEnvEntry>`.
+/// Missing-column-tolerant (returns empty) so a row pulled before
+/// migration 0073 still decodes; a present-but-malformed value is a hard
+/// `Serialization` error.
+fn capture_env_from_row(
+    row: &PgRow,
+    col: &str,
+) -> Result<Vec<engram_core::types::CaptureEnvEntry>, MetaError> {
+    match row.try_get::<serde_json::Value, _>(col) {
+        Ok(v) => serde_json::from_value(v).map_err(|e| MetaError::Serialization(e.to_string())),
+        Err(_) => Ok(Vec::new()),
+    }
 }
 
 pub(crate) fn session_secrets_from_row(row: &PgRow) -> Result<SessionSecrets, MetaError> {
@@ -435,6 +454,7 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
         chunks_done: chunks_done.max(0) as u32,
         attempts: attempts.max(0) as u32,
         error: row.try_get("error").map_err(col_err)?,
+        capture_env: capture_env_from_row(row, "capture_env")?,
         created_at: row.try_get("created_at").map_err(col_err)?,
         updated_at: row.try_get("updated_at").map_err(col_err)?,
     })

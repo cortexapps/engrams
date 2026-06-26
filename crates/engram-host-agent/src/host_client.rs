@@ -209,8 +209,11 @@ impl HostClient for LocalHostClient {
         &self,
         spec: SandboxSpec,
         warm: Option<WarmConfig>,
+        capture_env: std::collections::HashMap<String, String>,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        self.sandbox.build_base_snapshot(spec, warm).await
+        self.sandbox
+            .build_base_snapshot(spec, warm, capture_env)
+            .await
     }
 
     async fn restore_base_for_session(

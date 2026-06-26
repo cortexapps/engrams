@@ -43,7 +43,9 @@ use serde::{Deserialize, Serialize};
 // the version gate above rather than misparsing the positional bincode payload.
 // v5 (ADR 0059): added `graphql_operation`/`graphql_field` to the inject + observe
 // entries (+ `success_no_graphql_errors` on observe) for GraphQL operation gating.
-pub const WIRE_VERSION: u32 = 5;
+// v6: added `capture_env_bincode` to `BuildBaseSnapshotRequest` — the resolved
+// capture-time env injected into the `[warm]` hook at base-snapshot capture.
+pub const WIRE_VERSION: u32 = 6;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

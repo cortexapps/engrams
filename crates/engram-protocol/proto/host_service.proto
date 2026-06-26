@@ -372,6 +372,12 @@ message BuildBaseSnapshotRequest {
   // callers decodes to `None` (coord+host roll together, so this is just
   // additive). A warm failure is fail-loud — it aborts the capture.
   bytes warm_bincode = 2;
+  // bincode-encoded `HashMap<String, String>` — the RESOLVED capture-time
+  // env injected into the `[warm]` hook's exec (the coordinator resolved any
+  // secret refs against the SecretStore before this call; the host never
+  // sees the refs). Merged over the manifest `[env]`. Empty map for an image
+  // with no capture_env or no warm hook. Wire v6.
+  bytes capture_env_bincode = 3;
 }
 message BuildBaseSnapshotResponse {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.

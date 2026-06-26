@@ -252,6 +252,41 @@ pub struct EnabledImage {
     /// whose image was disabled while it was idle can still resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soft_deleted_at: Option<DateTime<Utc>>,
+    /// Capture-time environment for the image's `[warm]` hook (see
+    /// [`CaptureEnvEntry`]). Set by the admin at enable/update time — NOT
+    /// from the image manifest (ADR 0057: the image declares only what it
+    /// *is*, not what a capture may hold). Resolved to values at
+    /// base-snapshot capture and merged into the warm hook's exec env; these
+    /// are *build/capture* secrets, distinct from a session's profile-injected
+    /// runtime secrets. Stored as refs, never resolved values. Empty for an
+    /// image with no `[warm]` hook (or one that needs no secrets).
+    #[serde(default)]
+    pub capture_env: Vec<CaptureEnvEntry>,
+}
+
+/// One capture-time environment entry for an image's `[warm]` hook. The
+/// value is either a literal (a non-secret flag) or a secret ref resolved
+/// at capture through the same [`crate::traits::SecretStore`] a session
+/// uses (e.g. `gcp-sm://…`). Set on the *enable action*, persisted on the
+/// [`EnabledImage`] row, and carried into a capture via the [`EnableJob`].
+/// The coordinator stores the ref, resolves it transiently at capture, and
+/// never logs or persists the resolved value.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureEnvEntry {
+    /// Environment variable name the warm hook sees.
+    pub name: String,
+    pub value: CaptureEnvValue,
+}
+
+/// The value half of a [`CaptureEnvEntry`]: a literal, or a secret ref.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CaptureEnvValue {
+    /// A literal, non-secret value (a flag, a host name).
+    Literal { value: String },
+    /// A secret ref resolved at capture via the `SecretStore`. The ref is
+    /// what's persisted; the resolved value is transient.
+    SecretRef { secret_ref: String },
 }
 
 /// Public summary view used by `GET /api/enabled-images`. Strips
@@ -277,6 +312,10 @@ pub struct EnabledImageSummary {
     pub harness_name: Option<String>,
     pub last_refreshed_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// Capture-time env attached to this enabled image (refs, never resolved
+    /// values) — lets the dashboard's edit form pre-fill the current set.
+    #[serde(default)]
+    pub capture_env: Vec<CaptureEnvEntry>,
 }
 
 impl From<EnabledImage> for EnabledImageSummary {
@@ -302,6 +341,7 @@ impl From<EnabledImage> for EnabledImageSummary {
             harness_name,
             last_refreshed_at: row.last_refreshed_at,
             created_at: row.created_at,
+            capture_env: row.capture_env,
         }
     }
 }
@@ -364,6 +404,14 @@ pub struct EnableJob {
     /// this exceeds its budget.
     pub attempts: u32,
     pub error: Option<String>,
+    /// Capture-time env for this enable's `[warm]` hook, carried from the
+    /// triggering request (enable/update) or inherited from the existing
+    /// enabled-image row (refresh). The scanner stamps it onto the
+    /// `EnabledImage` row before capture; `capture_and_record_base_snapshot`
+    /// resolves the refs and injects them into the warm hook. See
+    /// [`CaptureEnvEntry`].
+    #[serde(default)]
+    pub capture_env: Vec<CaptureEnvEntry>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -371,6 +419,38 @@ pub struct EnableJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_env_entry_jsonb_shape_round_trips() {
+        // The JSONB shape persisted on enabled_images/enable_jobs. A tagged
+        // `kind` discriminates literal vs secret_ref so the value is never
+        // ambiguous.
+        let entries = vec![
+            CaptureEnvEntry {
+                name: "FLAG".into(),
+                value: CaptureEnvValue::Literal {
+                    value: "true".into(),
+                },
+            },
+            CaptureEnvEntry {
+                name: "OP_TOKEN".into(),
+                value: CaptureEnvValue::SecretRef {
+                    secret_ref: "gcp-sm://p/secrets/op/versions/latest".into(),
+                },
+            },
+        ];
+        let json = serde_json::to_value(&entries).unwrap();
+        assert_eq!(json[0]["name"], "FLAG");
+        assert_eq!(json[0]["value"]["kind"], "literal");
+        assert_eq!(json[0]["value"]["value"], "true");
+        assert_eq!(json[1]["value"]["kind"], "secret_ref");
+        assert_eq!(
+            json[1]["value"]["secret_ref"],
+            "gcp-sm://p/secrets/op/versions/latest"
+        );
+        let back: Vec<CaptureEnvEntry> = serde_json::from_value(json).unwrap();
+        assert_eq!(back, entries);
+    }
 
     #[test]
     fn auth_spec_serde_round_trip_static() {

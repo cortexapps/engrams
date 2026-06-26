@@ -1106,8 +1106,12 @@ pub trait MetadataStore: Send + Sync {
         &self,
         image_uri: &str,
         manifest_digest: Option<&str>,
+        // Capture-time env for this enable's `[warm]` hook (resolved at
+        // capture, never stored as values). Carried from the triggering
+        // request (enable) or inherited from the existing row (refresh).
+        capture_env: &[crate::types::CaptureEnvEntry],
     ) -> Result<EnableJob, MetaError> {
-        let _ = (image_uri, manifest_digest);
+        let _ = (image_uri, manifest_digest, capture_env);
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))
