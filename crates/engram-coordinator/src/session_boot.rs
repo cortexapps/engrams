@@ -292,6 +292,7 @@ pub(crate) async fn boot_on_reserved_host(
         guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
         network_allow_hosts: network.allow_hosts.clone(),
         network_allow_host_patterns: network.allow_host_patterns.clone(),
+        allow_all: false,
         secrets: Vec::new(),
         injects: Vec::new(),
         observes: Vec::new(),
@@ -419,6 +420,7 @@ async fn build_egress_policy(
         guest_ip,
         network_allow_hosts: network.allow_hosts.clone(),
         network_allow_host_patterns: network.allow_host_patterns.clone(),
+        allow_all: false,
         // ADR 0057: precomputed in `prepare_inner`/resume from the policy secrets
         // (broker entries only; literals are already in the guest env).
         secrets: egress_secrets,

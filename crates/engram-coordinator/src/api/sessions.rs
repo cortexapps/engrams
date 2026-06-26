@@ -449,6 +449,7 @@ pub(crate) fn assemble_resume_egress_policy(
         // deterministic placeholders the resumed env carries).
         network_allow_hosts: network.allow_hosts.clone(),
         network_allow_host_patterns: network.allow_host_patterns.clone(),
+        allow_all: false,
         secrets: egress_secrets,
         // ADR 0056 (B′): the resolved Plane-B injections (from the persisted
         // policy), so a resumed session re-injects on the new host.

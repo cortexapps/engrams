@@ -74,6 +74,7 @@ fn placeholder_egress_policy(
         guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
         network_allow_hosts: vec![],
         network_allow_host_patterns: vec![],
+        allow_all: false,
         secrets: vec![],
         injects: vec![],
         observes: vec![],

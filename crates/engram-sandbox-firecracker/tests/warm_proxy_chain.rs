@@ -243,6 +243,7 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
         session_id,
         guest_ip: snat_ip,
         network_allow,
+        allow_all: false,
         secrets: vec![dummy_secret],
         injects: Vec::new(),
         observes: Vec::new(),

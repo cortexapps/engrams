@@ -72,6 +72,7 @@ async fn warm_hook_process_survives_base_snapshot() {
         ],
         timeout_secs: Some(60),
         workdir: None,
+        network: None,
     };
 
     let meta = pooled
@@ -139,6 +140,7 @@ async fn warm_hook_sees_manifest_env() {
         ],
         timeout_secs: Some(60),
         workdir: None,
+        network: None,
     };
 
     // The probe rides the manifest `[env]` (SandboxSpec.env) — the same
@@ -179,6 +181,7 @@ async fn warm_hook_nonzero_exit_fails_capture() {
         command: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
         timeout_secs: Some(60),
         workdir: None,
+        network: None,
     };
 
     let err = pooled
