@@ -101,6 +101,45 @@ fn spec(rootfs: &Path) -> SandboxSpec {
     }
 }
 
+/// ADR 0061: resolve a staged skill erofs (`ENGRAM_VZ_SKILL_EROFS`,
+/// pointing at a `var/shared/<sha>.erofs` produced by `just bundles-vz`)
+/// into (bundle_dir, sha). `None` (skip) when unset/missing — CI stages
+/// no bundle, exactly like the rootfs guard, so the test no-ops there.
+fn skill_erofs_preflight() -> Option<(PathBuf, String)> {
+    let path = match std::env::var("ENGRAM_VZ_SKILL_EROFS") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            eprintln!(
+                "SKIP: ENGRAM_VZ_SKILL_EROFS unset (run `just bundles-vz`, then point \
+                 it at var/shared/<sha>.erofs)"
+            );
+            return None;
+        }
+    };
+    if !path.exists() {
+        eprintln!("SKIP: ENGRAM_VZ_SKILL_EROFS={} doesn't exist", path.display());
+        return None;
+    }
+    let dir = path.parent().expect("erofs has a parent dir").to_path_buf();
+    let sha = path
+        .file_stem()
+        .expect("erofs has a file stem")
+        .to_string_lossy()
+        .into_owned();
+    Some((dir, sha))
+}
+
+fn spec_with_skill(rootfs: &Path, sha: &str) -> SandboxSpec {
+    let mut s = spec(rootfs);
+    s.aux_ro_drives = vec![engram_core::types::sandbox::AuxRoDrive {
+        drive_id: "dyn_0".into(),
+        guest_mount: PathBuf::from("/opt/engram/dyn/0"),
+        fs_type: "erofs".into(),
+        sha256: Some(sha.to_string()),
+    }];
+    s
+}
+
 /// Run one command to completion, returning (stdout, exit_code).
 async fn exec(backend: &VzBackend, id: SandboxId, sh: &str) -> (String, Option<i32>) {
     let req = ExecRequest {
@@ -193,4 +232,49 @@ async fn e2e_vz_lifecycle() {
         "un-synced write must survive snapshot→restore (flush_guest_fs); got: {out:?}",
     );
     backend.destroy(id2).await.expect("destroy 2");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires macOS + codesigned binary + VZ kernel + ENGRAM_VZ_ROOTFS + ENGRAM_VZ_SKILL_EROFS"]
+async fn e2e_vz_skill_erofs_attaches() {
+    let env = match vz_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let (bundle_dir, sha) = match skill_erofs_preflight() {
+        Some(x) => x,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let blob = Arc::new(engram_storage_local::LocalBlobStorage::new(
+        work.path().join("blob"),
+    ));
+    let cs = engram_chunk_store::ChunkStore::new(blob);
+    let backend = VzBackend::new(
+        work.path().join("sb"),
+        VzConfig::with_kernel(env.kernel.clone()).with_bundle_dir(bundle_dir),
+    )
+    .expect("VzBackend::new")
+    .with_chunk_store(cs);
+
+    let id = backend
+        .create(spec_with_skill(&env.rootfs, &sha))
+        .await
+        .expect("create");
+    await_agent(&backend, id).await;
+
+    // The erofs skill is attached as /dev/vdb (first aux drive after the
+    // /dev/vda rootfs). RO-mount it and read the bundle's mount.json to
+    // prove the attach + the kernel's erofs driver work end to end. This
+    // does not rely on the init-shim auto-mount (Part 3 / a re-bake).
+    let (out, code) = exec(
+        &backend,
+        id,
+        "mkdir -p /mnt/e && mount -t erofs -o ro /dev/vdb /mnt/e && cat /mnt/e/mount.json",
+    )
+    .await;
+    assert_eq!(code, Some(0), "mount erofs /dev/vdb failed; out={out}");
+    assert!(out.contains('{'), "mount.json not readable from erofs; out={out}");
+
+    backend.destroy(id).await.expect("destroy");
 }
