@@ -45,7 +45,12 @@ use serde::{Deserialize, Serialize};
 // entries (+ `success_no_graphql_errors` on observe) for GraphQL operation gating.
 // v6: added `capture_env_bincode` to `BuildBaseSnapshotRequest` — the resolved
 // capture-time env injected into the `[warm]` hook at base-snapshot capture.
-pub const WIRE_VERSION: u32 = 6;
+// v7: capture-VM egress for the `[warm]` hook — `WarmConfig` gains a
+// `network: Option<NetworkPolicy>` (the `warm_bincode` field of
+// `BuildBaseSnapshotRequest`) and `SessionEgressPolicy` gains `allow_all`. The
+// host registers a matching egress policy (allow-all or allowlist) for the
+// capture VM's guest IP so the warm boot can reach the network.
+pub const WIRE_VERSION: u32 = 7;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

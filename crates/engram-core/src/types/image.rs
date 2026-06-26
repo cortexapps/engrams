@@ -123,6 +123,25 @@ pub struct WarmConfig {
     /// `workdir` (and ultimately the sandbox default `/`) when omitted.
     #[serde(default)]
     pub workdir: Option<String>,
+
+    /// Network policy for the capture VM while the `[warm]` hook runs.
+    /// Absent (the default) → the capture stays **egress-less**: it gets a
+    /// tap + guest IP, but the egress proxy denies its traffic as an unknown
+    /// guest because no policy is registered. An image whose warm boot needs
+    /// the network (e.g. eager OIDC discovery, an `op inject`) opts in here,
+    /// and the host-agent registers a matching egress policy for the capture
+    /// VM's guest IP for the duration of the hook (torn down after):
+    ///
+    /// - `[warm.network] default = "allow"` → **allow-all** (the dev posture:
+    ///   no agent runs at capture, so the in-session threat model doesn't
+    ///   apply).
+    /// - `[warm.network] default = "deny"` + `allow_hosts`/`allow_host_patterns`
+    ///   → a scoped **allowlist** (for security-conscious images).
+    ///
+    /// Reuses the same [`NetworkPolicy`] a session uses, so the warm-boot
+    /// egress posture reads identically to a session's.
+    #[serde(default)]
+    pub network: Option<NetworkPolicy>,
 }
 
 impl WarmConfig {
@@ -765,6 +784,7 @@ mod tests {
             command: vec![],
             timeout_secs: None,
             workdir: None,
+            network: None,
         };
         assert!(empty.validate().is_err(), "empty command must be rejected");
 
@@ -773,6 +793,7 @@ mod tests {
             command: vec!["  ".into(), "\t".into()],
             timeout_secs: None,
             workdir: None,
+            network: None,
         };
         assert!(
             blank.validate().is_err(),
@@ -783,6 +804,7 @@ mod tests {
             command: vec!["echo".into(), "ok".into()],
             timeout_secs: None,
             workdir: None,
+            network: None,
         }
         .validate()
         .expect("a real command is valid");

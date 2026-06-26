@@ -32,6 +32,13 @@ pub struct SessionEgressPolicy {
     pub network_allow_hosts: Vec<String>,
     /// Glob patterns from `[network].allow_host_patterns`.
     pub network_allow_host_patterns: Vec<String>,
+    /// Allow ALL egress, bypassing the host allow-lists (a `[network]
+    /// default = "allow"` posture). Used by the capture VM's `[warm]` hook on
+    /// dev images where no agent runs at capture, so the in-session threat
+    /// model doesn't apply. `#[serde(default)]` so policies serialized before
+    /// this field decode as `false` (the safe default).
+    #[serde(default)]
+    pub allow_all: bool,
     /// Per-secret entries (placeholder → real_value with per-secret
     /// host allow-list). Empty for `SecretMode::Literal` images.
     pub secrets: Vec<EgressSecretEntry>,

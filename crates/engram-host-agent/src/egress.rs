@@ -133,6 +133,7 @@ pub fn register_policy(
         &policy.network_allow_hosts,
         &policy.network_allow_host_patterns,
     )?;
+    let allow_all = policy.allow_all;
     let mut secrets = Vec::with_capacity(policy.secrets.len());
     for s in policy.secrets {
         let allow =
@@ -221,6 +222,7 @@ pub fn register_policy(
         session_id: policy.session_id,
         guest_ip: policy.guest_ip,
         network_allow,
+        allow_all,
         secrets,
         injects,
         observes,
@@ -251,6 +253,7 @@ mod tests {
                 guest_ip,
                 network_allow_hosts: vec![],
                 network_allow_host_patterns: vec![],
+                allow_all: false,
                 secrets: vec![],
                 injects: vec![
                     EgressInjectEntry {

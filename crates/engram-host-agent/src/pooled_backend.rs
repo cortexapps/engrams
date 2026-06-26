@@ -645,6 +645,116 @@ pub struct PooledBackend {
 }
 
 impl PooledBackend {
+    /// Build the capture-egress policy for a `[warm]` hook from its
+    /// `[warm.network]`, or `None` when the image grants no egress (→ the
+    /// capture stays egress-less). Pure (no proxy / no I/O) so the posture
+    /// decision is unit-testable; [`Self::register_capture_egress`] adds the
+    /// guest-IP lookup + proxy registration. `default = "allow"` → allow-all
+    /// (dev posture); `default = "deny"` + non-empty lists → a scoped
+    /// allowlist; `deny` with no hosts (or no `[warm.network]`) → `None`.
+    /// `SecretMode::Literal` = SNI-filter only (no MITM): the warm hook talks
+    /// to the real upstreams over unbroken TLS.
+    fn capture_egress_policy(
+        warm: &WarmConfig,
+        sandbox_id: SandboxId,
+        guest_ip: std::net::Ipv4Addr,
+        session_id: SessionId,
+    ) -> Option<SessionEgressPolicy> {
+        let network = warm.network.as_ref()?;
+        let allow_all = matches!(
+            network.default,
+            engram_core::types::image::NetworkDefault::Allow
+        );
+        // A deny-default policy that lists no hosts grants nothing — there's no
+        // egress to register, so leave the capture egress-less.
+        if !allow_all && network.allow_hosts.is_empty() && network.allow_host_patterns.is_empty() {
+            return None;
+        }
+        Some(SessionEgressPolicy {
+            session_id,
+            sandbox_id,
+            guest_ip,
+            network_allow_hosts: network.allow_hosts.clone(),
+            network_allow_host_patterns: network.allow_host_patterns.clone(),
+            allow_all,
+            secrets: Vec::new(),
+            injects: Vec::new(),
+            observes: Vec::new(),
+            secret_mode: engram_core::types::image::SecretMode::Literal,
+        })
+    }
+
+    /// Capture-time egress: the capture VM gets a tap + guest IP like any
+    /// sandbox, but no egress policy is registered for it, so the proxy denies
+    /// its traffic as `UnknownGuest`. If the image's `[warm.network]` grants
+    /// egress (allow-all or an allowlist), register a matching policy for the
+    /// capture VM's guest IP so the hook can reach the network (e.g. eager OIDC
+    /// discovery, an `op inject`) for the duration of the capture. Returns the
+    /// synthetic [`SessionId`] the caller MUST pass to
+    /// [`Self::unregister_capture_egress`] after teardown. No-op (returns
+    /// `None`) when the image grants no egress, no local proxy is wired, or the
+    /// guest has no IP — the capture then stays egress-less.
+    async fn register_capture_egress(
+        &self,
+        id: SandboxId,
+        warm: Option<&WarmConfig>,
+    ) -> Option<SessionId> {
+        // No `[warm.network]` → egress-less (the common case); skip the lookup.
+        let warm = warm?;
+        let network = warm.network.as_ref()?;
+        let egress = self.egress.as_ref()?;
+        let Some(guest_ip) = self
+            .inner
+            .guest_ip(id)
+            .await
+            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+        else {
+            tracing::warn!(
+                sandbox_id = %id,
+                "capture egress: capture VM has no guest IP; [warm] hook runs egress-less",
+            );
+            return None;
+        };
+        let session_id = SessionId::new();
+        let policy = Self::capture_egress_policy(warm, id, guest_ip, session_id)?;
+        let allow_all = policy.allow_all;
+        match crate::egress::register_policy(&egress.registry, policy) {
+            Ok(()) => {
+                tracing::info!(
+                    sandbox_id = %id,
+                    %guest_ip,
+                    allow_all,
+                    default = ?network.default,
+                    allow_hosts = ?network.allow_hosts,
+                    allow_host_patterns = ?network.allow_host_patterns,
+                    "capture egress: registered policy for the [warm] hook",
+                );
+                Some(session_id)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    error = %e,
+                    "capture egress: policy translate failed; [warm] hook runs egress-less",
+                );
+                None
+            }
+        }
+    }
+
+    /// Tear down a capture-egress registration made by
+    /// [`Self::register_capture_egress`]. Safe to call with `None`.
+    fn unregister_capture_egress(&self, session_id: Option<SessionId>) {
+        let (Some(sid), Some(egress)) = (session_id, self.egress.as_ref()) else {
+            return;
+        };
+        egress.registry.unregister(sid);
+        tracing::debug!(
+            session_id = %sid,
+            "capture egress: unregistered policy after capture teardown",
+        );
+    }
+
     /// Run an image's capture-time `[warm]` hook ([`WarmConfig`]) in the
     /// live capture VM, just before the base snapshot is frozen. The warm
     /// command starts a long-lived process detached (e.g. `gradle
@@ -5830,6 +5940,14 @@ impl SandboxBackend for PooledBackend {
         // 2-strike debounce). Cleared after the destroy below, on every path.
         self.base_captures.insert(id, ());
 
+        // Capture-time egress: register an egress policy for the capture VM's
+        // guest IP when the image's `[warm.network]` grants it (allow-all or an
+        // allowlist), so the hook can reach the network (e.g. OIDC discovery) —
+        // without it the proxy denies the capture VM as an unknown guest. No-op
+        // for images that grant no egress. Torn down after the destroy below,
+        // on every path.
+        let capture_egress = self.register_capture_egress(id, warm.as_ref()).await;
+
         // Drive the capture to a snapshot, then ALWAYS tear the VM down —
         // a capture VM has no session and must not linger.
         let captured = async {
@@ -5857,8 +5975,8 @@ impl SandboxBackend for PooledBackend {
             // needs (e.g. an `op` token, resolved coordinator-side); still
             // NO per-session secrets — those are session policy, injected
             // post-restore, not at capture.
-            if let Some(warm) = warm {
-                self.run_warm_hook(id, &warm, &session_env).await?;
+            if let Some(warm) = &warm {
+                self.run_warm_hook(id, warm, &session_env).await?;
             }
             // Close the cold-boot window (mirrors `start_agent`) before the
             // snapshot flush opens its own `snapshot` operation scope.
@@ -5885,6 +6003,9 @@ impl SandboxBackend for PooledBackend {
         }
         // Capture is done (the VM is destroyed); drop the reconcile exemption.
         self.base_captures.remove(&id);
+        // Drop the capture-egress allowlist now that the VM is gone (no-op if
+        // none was registered).
+        self.unregister_capture_egress(capture_egress);
         captured
     }
 
@@ -6490,6 +6611,103 @@ mod tests {
     use crate::image_cache::ImageBundle;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
+
+    fn warm_with(network: Option<engram_core::types::image::NetworkPolicy>) -> WarmConfig {
+        WarmConfig {
+            command: vec!["true".into()],
+            timeout_secs: None,
+            workdir: None,
+            network,
+        }
+    }
+
+    /// An image with no `[warm.network]` — and a deny-default policy that lists
+    /// no hosts — grants no egress, so it gets NO capture-egress policy (the
+    /// capture VM stays egress-less; the default for every non-opted-in image).
+    #[test]
+    fn capture_egress_policy_none_when_no_egress_granted() {
+        let mk = |w: &WarmConfig| {
+            PooledBackend::capture_egress_policy(
+                w,
+                SandboxId::new(),
+                "169.254.0.2".parse().unwrap(),
+                SessionId::new(),
+            )
+        };
+        assert!(mk(&warm_with(None)).is_none(), "no [warm.network] → no policy");
+        assert!(
+            mk(&warm_with(Some(engram_core::types::image::NetworkPolicy {
+                default: engram_core::types::image::NetworkDefault::Deny,
+                allow_hosts: vec![],
+                allow_host_patterns: vec![],
+            })))
+            .is_none(),
+            "deny-default with no hosts grants nothing → no policy",
+        );
+    }
+
+    /// A `deny` default + declared hosts becomes a scoped allowlist policy
+    /// (`allow_all = false`, SNI-filter only, no secrets/injects/observes).
+    #[test]
+    fn capture_egress_policy_scopes_declared_allowlist() {
+        let warm = warm_with(Some(engram_core::types::image::NetworkPolicy {
+            default: engram_core::types::image::NetworkDefault::Deny,
+            allow_hosts: vec!["accounts.google.com".into()],
+            allow_host_patterns: vec!["*.auth0.com".into()],
+        }));
+        let sid = SessionId::new();
+        let sbx = SandboxId::new();
+        let policy =
+            PooledBackend::capture_egress_policy(&warm, sbx, "169.254.0.2".parse().unwrap(), sid)
+                .expect("allowlist must produce a policy");
+
+        assert_eq!(policy.session_id, sid);
+        assert_eq!(policy.sandbox_id, sbx);
+        assert!(!policy.allow_all);
+        assert_eq!(policy.network_allow_hosts, vec!["accounts.google.com"]);
+        assert_eq!(policy.network_allow_host_patterns, vec!["*.auth0.com"]);
+        assert!(matches!(
+            policy.secret_mode,
+            engram_core::types::image::SecretMode::Literal
+        ));
+        assert!(policy.secrets.is_empty());
+        assert!(policy.injects.is_empty());
+        assert!(policy.observes.is_empty());
+
+        // The proxy accepts the translated allowlist.
+        let registry = engram_egress_proxy::Registry::new();
+        crate::egress::register_policy(&registry, policy)
+            .expect("proxy must accept the capture-egress allowlist");
+    }
+
+    /// An `allow` default becomes an allow-all policy (`allow_all = true`); the
+    /// dev posture for an image whose warm boot needs unrestricted network.
+    #[test]
+    fn capture_egress_policy_allow_all_for_allow_default() {
+        let warm = warm_with(Some(engram_core::types::image::NetworkPolicy {
+            default: engram_core::types::image::NetworkDefault::Allow,
+            allow_hosts: vec![],
+            allow_host_patterns: vec![],
+        }));
+        let policy = PooledBackend::capture_egress_policy(
+            &warm,
+            SandboxId::new(),
+            "169.254.0.2".parse().unwrap(),
+            SessionId::new(),
+        )
+        .expect("allow-default must produce a policy");
+        assert!(policy.allow_all, "default=allow → allow_all");
+
+        // The proxy resolves + bypasses an arbitrary host under allow-all.
+        let registry = engram_egress_proxy::Registry::new();
+        let guest_ip = policy.guest_ip;
+        crate::egress::register_policy(&registry, policy).expect("register allow-all");
+        let state = registry.lookup(guest_ip).expect("registered");
+        assert!(matches!(
+            state.decide("anything.example.com"),
+            engram_egress_proxy::Decision::Bypass
+        ));
+    }
 
     fn live_spec(image: &str) -> SandboxSpec {
         SandboxSpec {
@@ -8463,6 +8681,7 @@ mod tests {
                 guest_ip,
                 network_allow_hosts: allow.iter().map(|s| s.to_string()).collect(),
                 network_allow_host_patterns: Vec::new(),
+                allow_all: false,
                 secrets: Vec::new(),
                 injects: Vec::new(),
                 observes: Vec::new(),
