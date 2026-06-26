@@ -1,6 +1,6 @@
 # ADR 0061: built-in skills on the VZ backend (erofs RO drives + dev-stack staging)
 
-**Status:** Proposed
+**Status:** Accepted
 
 **Related:** ADR 0055 (dynamic per-session directory mounts — the skill model
 this extends to VZ), ADR 0035 (host-side bundle generation store + the
@@ -195,5 +195,73 @@ resolves `skills` → its sha → a reserved slot.
 
 ## As-built (filled in between phases / at Accepted)
 
-_TODO: record divergences, pitfalls, and the commit chain as the work lands;
-flip Status to Accepted at the end._
+### Commit chain (branch `adr-0061-vz-builtin-skills`)
+
+| SHA | Subject |
+|---|---|
+| `0f834f6a` | `docs(adr): ADR 0061 (Proposed)` |
+| `f0e8048e` | `build(flake): add erofs-utils` |
+| `89f4de75` | `feat(just): bundles-vz — content-addressed erofs bundles` |
+| `be68677e` | `feat(tilt): stage bundles + ENGRAM_BUNDLE_DIR; restart host-agent on bundle change` |
+| `71351000` | `feat(vz): VzConfig.bundle_dir + staged_erofs_path; thread from host-agent` |
+| `4cfc0613` | `feat(vz): attach skill bundles as read-only erofs virtio-blk drives` |
+| `a37f4592` | `feat(vz): bind skills on restore_fresh, re-attach on resume` |
+| `af5ddf6e` | `test(vz): erofs skill drive attaches + mounts (live #[ignore] test)` |
+| `e5eab619` | `feat(init): squashfs \|\| erofs fallback in dyn-mount loop` |
+| `7c8f93ff` | `docs(runbook): VZ skill bundle edit + re-bake loop` |
+| `240d16e4` | `fix(vz): restore clone-stays-intact rationale comment in restore_impl` |
+| `76d41112` | `docs(runbook): re-bake uses a fresh session, not a stack restart` |
+
+### Decisions and divergences
+
+**erofs path is VZ-local; the shared `AuxRoDrive` stays `.squashfs`.** VZ derives the
+staged path as `<bundle_dir>/<sha>.erofs` via `vm::staged_erofs_path`; the shared
+`AuxRoDrive::staged_file_name` continues to return `.squashfs` for FC. The wire
+`fs_type` from the coordinator (`"squashfs"`) is cosmetic on VZ — the backend resolves
+its own `.erofs` path and the init shim mounts squashfs-or-erofs transparently.
+
+**`snapshot()` needed no change.** It already clones `live.spec`, which
+`restore_impl`/`create` populate with the resolved drives. Resume therefore
+re-attaches the same `<sha>.erofs` from the manifest with no extra logic.
+
+**`engram-agentd/src/remount.rs` needed no change.** Its `fs_type == "squashfs"`
+filter (`remount.rs:69`) correctly skips VZ's erofs mounts. VZ does no `patch_drive`
+device swap — the init-shim mount is already correct — so `activate()` reads each
+mount's `mount.json` regardless of fs type.
+
+**`restore`/`restore_fresh` collapse to one-line delegators over `restore_impl`.** The
+shared implementation takes `(metadata, Option<Vec<AuxRoDrive>>)`: `restore_fresh`
+passes `Some(selected_mounts)` (replacing drives), `restore` passes `None` (keeping
+the pinned drives from the manifest). This eliminated a previously drafted two-path
+approach and kept the code minimal.
+
+**Tilt auto-restart is scoped to `deps=[current.json]` only.** The host-agent gains
+`trigger_mode=TRIGGER_MODE_AUTO` but only fires when `current.json` changes — not on
+every `.rs` source edit — so the inner-loop build latency is unaffected. Source
+changes still require a manual Tilt trigger.
+
+**Init-shim exclusion clarification (review catch).** The init-shim unit test's
+ext4-exclusion assertion is scoped to the dyn-mount loop section only. The
+CA-staging block above the loop legitimately uses `mount -t ext4` (the harness
+substrate); the dyn-mount loop itself never emits `ext4`, so the exclusion holds.
+
+**`PooledBackend` macOS dispatch is correct without changes.** `PooledBackend`'s macOS
+path calls `inner.restore_fresh(metadata, selected_mounts)` — the override hook — so
+the new VZ impl is reached. Bundle materialize/publish are gated on non-empty
+`aux_bundles`; VZ leaves `aux_bundles: []`, so VZ never hits the `.squashfs`
+BlobStorage upload path.
+
+### Pending live verification
+
+The following behaviors require macOS hardware + a baked rootfs (`just bake-demo`) +
+a staged erofs bundle and are deferred to a developer run:
+
+- `e2e_vz_skill_erofs_attaches` — live boot, assert `/dev/vdb` appears as an erofs
+  block device, assert `/opt/engram/dyn/0` is mounted and `mount.json` is readable.
+- Resume parity smoke — snapshot a skill-enabled VZ session, restore, assert the same
+  `<sha>.erofs` re-attaches and the skill directory is present in the guest.
+- Tilt end-to-end — `just dev` + create a skill-enabled session → no 400.
+
+The attach/restore CODE paths are fully implemented and reviewed; only the
+on-hardware kernel-mount and resume re-attach remain to be confirmed on a live dev
+stack.

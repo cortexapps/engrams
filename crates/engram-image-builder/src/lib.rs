@@ -1392,8 +1392,12 @@ mod tests {
         // We verify the dyn-mount loop section (between "for dev in /dev/vd*" and
         // "mark bundles_mounted") contains no "mount -t ext4" invocation.
         let shim = DEFAULT_INIT_SHIM;
-        let loop_start = shim.find("for dev in /dev/vd*").expect("dyn-mount loop must be present");
-        let loop_end = shim.find("mark bundles_mounted").expect("bundles_mounted mark must be present");
+        let loop_start = shim
+            .find("for dev in /dev/vd*")
+            .expect("dyn-mount loop must be present");
+        let loop_end = shim
+            .find("mark bundles_mounted")
+            .expect("bundles_mounted mark must be present");
         let dyn_loop_section = &shim[loop_start..loop_end];
         assert!(
             !dyn_loop_section.contains("mount -t ext4"),

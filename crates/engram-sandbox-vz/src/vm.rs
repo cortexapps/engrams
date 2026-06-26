@@ -26,8 +26,8 @@ use objc2_virtualization::{
     VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 
-use engram_core::types::sandbox::AuxRoDrive;
 use crate::console_bridge::{build_console_device, ConsolePortFds};
+use engram_core::types::sandbox::AuxRoDrive;
 use tokio::sync::oneshot;
 
 /// Per-VM declarative inputs. Built once at create time.

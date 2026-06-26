@@ -117,7 +117,10 @@ fn skill_erofs_preflight() -> Option<(PathBuf, String)> {
         }
     };
     if !path.exists() {
-        eprintln!("SKIP: ENGRAM_VZ_SKILL_EROFS={} doesn't exist", path.display());
+        eprintln!(
+            "SKIP: ENGRAM_VZ_SKILL_EROFS={} doesn't exist",
+            path.display()
+        );
         return None;
     }
     let dir = path.parent().expect("erofs has a parent dir").to_path_buf();
@@ -274,7 +277,10 @@ async fn e2e_vz_skill_erofs_attaches() {
     )
     .await;
     assert_eq!(code, Some(0), "mount erofs /dev/vdb failed; out={out}");
-    assert!(out.contains('{'), "mount.json not readable from erofs; out={out}");
+    assert!(
+        out.contains('{'),
+        "mount.json not readable from erofs; out={out}"
+    );
 
     backend.destroy(id).await.expect("destroy");
 }
