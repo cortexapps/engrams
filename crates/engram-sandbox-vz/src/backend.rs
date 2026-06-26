@@ -282,6 +282,10 @@ impl VzBackend {
         tokio::fs::create_dir_all(&self.work_dir).await?;
         let rootfs_path = per_sandbox_rootfs_path(&self.work_dir, new_id);
 
+        // Clone the snapshot's rootfs into a fresh per-sandbox file. The
+        // snapshot's clone stays intact (so a forked session or a re-resume
+        // after this one can clone it again); the new sandbox writes only to
+        // its own clone.
         clone_or_copy(&snapshot_rootfs, &rootfs_path).await?;
         tracing::debug!(
             sandbox_id = %new_id,
