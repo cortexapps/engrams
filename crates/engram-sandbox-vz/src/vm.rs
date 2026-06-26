@@ -97,7 +97,6 @@ impl VmConfig {
 
     /// ADR 0061: attach these skill bundles (resolved `AuxRoDrive`s) from
     /// `bundle_dir`. Sentinels (`sha256 = None`) are skipped at attach.
-    #[allow(dead_code)] // called by the backend in a later task
     pub fn with_aux_ro_drives(
         mut self,
         drives: Vec<AuxRoDrive>,

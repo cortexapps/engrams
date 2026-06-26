@@ -238,6 +238,91 @@ impl VzBackend {
             }
         }
     }
+
+    /// ADR 0061: shared cold-resume path. `mounts_override = Some` (fresh
+    /// create) replaces the snapshot's reserved/sentinel slots with this
+    /// session's resolved skills; `None` (resume) keeps the snapshot's
+    /// pinned `spec.aux_ro_drives`.
+    async fn restore_impl(
+        &self,
+        metadata: SnapshotMetadata,
+        mounts_override: Option<Vec<AuxRoDrive>>,
+    ) -> Result<SandboxId, SandboxError> {
+        let src = self.snapshot_dir_for(metadata.id);
+        let manifest = crate::snapshot::read_manifest(&src).await?;
+        let mut spec = manifest.spec;
+        if let Some(mounts) = mounts_override {
+            spec.aux_ro_drives = mounts;
+        }
+        let snapshot_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
+            SandboxError::Snapshot(
+                "snapshot manifest missing rootfs_source — cannot restore without a \
+                 disk image"
+                    .into(),
+            )
+        })?;
+        if !snapshot_rootfs.exists() {
+            return Err(SandboxError::Snapshot(format!(
+                "restore: snapshot rootfs at {} no longer exists",
+                snapshot_rootfs.display()
+            )));
+        }
+        let memory_mib = if spec.memory.max_mib > 0 {
+            spec.memory.max_mib
+        } else {
+            self.cfg.default_memory_mib
+        };
+        let vcpus = if spec.cpu.vcpus > 0 {
+            spec.cpu.vcpus
+        } else {
+            self.cfg.default_vcpus
+        };
+
+        let new_id = SandboxId::new();
+        tokio::fs::create_dir_all(&self.work_dir).await?;
+        let rootfs_path = per_sandbox_rootfs_path(&self.work_dir, new_id);
+
+        clone_or_copy(&snapshot_rootfs, &rootfs_path).await?;
+        tracing::debug!(
+            sandbox_id = %new_id,
+            src = %snapshot_rootfs.display(),
+            dst = %rootfs_path.display(),
+            "vz: cloned snapshot rootfs to fresh per-sandbox path for cold-resume"
+        );
+
+        let vm_cfg = VmConfig::new(
+            self.cfg.kernel_path.clone(),
+            rootfs_path.clone(),
+            memory_mib,
+            vcpus,
+        )
+        .with_aux_ro_drives(spec.aux_ro_drives.clone(), self.cfg.bundle_dir.clone());
+        let (vm, port_fds) = VzVm::new(vm_cfg)?;
+        if let Err(e) = vm.start().await {
+            let _ = tokio::fs::remove_file(&rootfs_path).await;
+            return Err(e.into());
+        }
+
+        let vsock_uds_path = self.vsock_uds_path_for(new_id);
+
+        let harness_sink = self.harness_sink.lock().clone();
+        let bridge = ConsoleBridge::start(vsock_uds_path.clone(), port_fds, harness_sink)
+            .await
+            .map_err(SandboxError::from)?;
+
+        self.sandboxes.insert(
+            new_id,
+            VzSandboxState {
+                spec,
+                vm: Arc::new(vm),
+                bridge: parking_lot::Mutex::new(Some(bridge)),
+                vsock_uds_path,
+                rootfs_path,
+                guest_ip: Mutex::new(None),
+            },
+        );
+        Ok(new_id)
+    }
 }
 
 /// Adapter that runs the engram-agentd wire protocol against a
@@ -389,7 +474,11 @@ impl SandboxBackend for VzBackend {
             rootfs_path.clone(),
             memory_mib,
             vcpus,
-        );
+        )
+        // ADR 0061: attach this spec's skill bundles. During base-snapshot
+        // capture these are sentinel placeholders (sha = None) and attach
+        // nothing; a plain cold-create with resolved drives attaches them.
+        .with_aux_ro_drives(spec.aux_ro_drives.clone(), self.cfg.bundle_dir.clone());
         let (vm, port_fds) = VzVm::new(vm_cfg)?;
 
         // Start the VM; if start fails, drop the VM via the early
@@ -637,93 +726,21 @@ impl SandboxBackend for VzBackend {
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        // ADR 0007 Phase 6: backend looks up its own staging dir.
-        let src = self.snapshot_dir_for(metadata.id);
-        let manifest = crate::snapshot::read_manifest(&src).await?;
-        let snapshot_rootfs = manifest.spec.rootfs_source.clone().ok_or_else(|| {
-            SandboxError::Snapshot(
-                "snapshot manifest missing rootfs_source — cannot restore without a \
-                 disk image"
-                    .into(),
-            )
-        })?;
-        if !snapshot_rootfs.exists() {
-            return Err(SandboxError::Snapshot(format!(
-                "restore: snapshot rootfs at {} no longer exists",
-                snapshot_rootfs.display()
-            )));
-        }
-        let memory_mib = if manifest.spec.memory.max_mib > 0 {
-            manifest.spec.memory.max_mib
-        } else {
-            self.cfg.default_memory_mib
-        };
-        let vcpus = if manifest.spec.cpu.vcpus > 0 {
-            manifest.spec.cpu.vcpus
-        } else {
-            self.cfg.default_vcpus
-        };
+        // Resume: keep the snapshot's pinned aux drives (manifest.spec).
+        self.restore_impl(metadata, None).await
+    }
 
-        // Allocate the new sandbox id up front so we can name
-        // its per-sandbox rootfs deterministically.
-        let new_id = SandboxId::new();
-        tokio::fs::create_dir_all(&self.work_dir).await?;
-        let rootfs_path = per_sandbox_rootfs_path(&self.work_dir, new_id);
-
-        // Clone the snapshot's rootfs into a fresh per-sandbox
-        // file. The snapshot's clone stays intact (so a forked
-        // session or a re-resume after this one can clone it
-        // again); the new sandbox writes only to its own clone.
-        clone_or_copy(&snapshot_rootfs, &rootfs_path).await?;
-        tracing::debug!(
-            sandbox_id = %new_id,
-            src = %snapshot_rootfs.display(),
-            dst = %rootfs_path.display(),
-            "vz: cloned snapshot rootfs to fresh per-sandbox path for cold-resume"
-        );
-
-        // Cold-resume: build a fresh VM with the snapshot's
-        // disk-state and start it. VZ's
-        // restoreMachineStateFromURL is not actually functional
-        // for arm64 Linux guests (see snapshot() comment).
-        // Cold-boot is the canonical path — Apple's own
-        // containerization framework uses it. agentd's harness-
-        // supervisor pattern + Claude's `--resume` hand off
-        // conversation continuity across the boot.
-        let vm_cfg = VmConfig::new(
-            self.cfg.kernel_path.clone(),
-            rootfs_path.clone(),
-            memory_mib,
-            vcpus,
-        );
-        let (vm, port_fds) = VzVm::new(vm_cfg)?;
-        if let Err(e) = vm.start().await {
-            let _ = tokio::fs::remove_file(&rootfs_path).await;
-            return Err(e.into());
-        }
-
-        let vsock_uds_path = self.vsock_uds_path_for(new_id);
-
-        // Re-bind the virtio-console UDS bridge against the
-        // restored VM. The in-VM agentd is reachable via
-        // `<vsock_uds>_1024` just like a fresh VM.
-        let harness_sink = self.harness_sink.lock().clone();
-        let bridge = ConsoleBridge::start(vsock_uds_path.clone(), port_fds, harness_sink)
-            .await
-            .map_err(SandboxError::from)?;
-
-        self.sandboxes.insert(
-            new_id,
-            VzSandboxState {
-                spec: manifest.spec,
-                vm: Arc::new(vm),
-                bridge: parking_lot::Mutex::new(Some(bridge)),
-                vsock_uds_path,
-                rootfs_path,
-                guest_ip: Mutex::new(None),
-            },
-        );
-        Ok(new_id)
+    async fn restore_fresh(
+        &self,
+        metadata: SnapshotMetadata,
+        selected_mounts: Vec<AuxRoDrive>,
+    ) -> Result<SandboxId, SandboxError> {
+        // ADR 0061: fresh session create — the base snapshot is skill-
+        // agnostic; bind this session's resolved skills into the VM's aux
+        // drives. The PooledBackend calls this for `fresh == true`
+        // (pooled_backend.rs restore_with); `selected_mounts` carry
+        // `sha256 = Some` resolved against the host's current generation.
+        self.restore_impl(metadata, Some(selected_mounts)).await
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
