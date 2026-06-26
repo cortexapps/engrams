@@ -299,7 +299,13 @@ bundles-vz:
         fi
         out="var/shared/.$name.build.erofs"
         rm -f "$out"
-        if ! mkfs.erofs "$out" "$tree" >/dev/null; then
+        # -b 4096: force a 4 KiB erofs block size. mkfs.erofs defaults the
+        # block size to the HOST page size, which on macOS/Apple Silicon is
+        # 16 KiB (blkszbits 14). The Linux guest kernel uses 4 KiB pages and
+        # erofs requires block size <= page size, so a 16 KiB-block image
+        # fails to mount in-guest ("blkszbits 14 isn't supported"). 4 KiB
+        # matches the guest and mounts everywhere.
+        if ! mkfs.erofs -b 4096 "$out" "$tree" >/dev/null; then
             echo "$name erofs pack failed; skipping" >&2
             rm -rf "$tree" "$out"
             continue
