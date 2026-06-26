@@ -211,6 +211,7 @@ resolves `skills` → its sha → a reserved slot.
 | `7c8f93ff` | `docs(runbook): VZ skill bundle edit + re-bake loop` |
 | `240d16e4` | `fix(vz): restore clone-stays-intact rationale comment in restore_impl` |
 | `76d41112` | `docs(runbook): re-bake uses a fresh session, not a stack restart` |
+| `d09fa9fe` | `fix(just): pack VZ skill erofs with -b 4096 to match guest page size` |
 
 ### Decisions and divergences
 
@@ -251,17 +252,29 @@ the new VZ impl is reached. Bundle materialize/publish are gated on non-empty
 `aux_bundles`; VZ leaves `aux_bundles: []`, so VZ never hits the `.squashfs`
 BlobStorage upload path.
 
-### Pending live verification
+**erofs block size must be forced to 4 KiB (live-validation catch, `d09fa9fe`).**
+`mkfs.erofs` defaults its block size to the *host* page size. On macOS/Apple Silicon
+that is 16 KiB (blkszbits 14), but the Linux guest uses 4 KiB pages and erofs requires
+block size ≤ page size. The first live test attached `/dev/vdb` and the init shim tried
+the correct `mount -t erofs`, but the mount failed (`dmesg: erofs: blkszbits 14 isn't
+supported`) and the skill never appeared. The `bundles-vz` recipe now passes `-b 4096`.
+This is the inverse of the risk noted in the plan's self-review (which assumed the
+default was already 4 KiB).
 
-The following behaviors require macOS hardware + a baked rootfs (`just bake-demo`) +
-a staged erofs bundle and are deferred to a developer run:
+### Live validation (confirmed on macOS/VZ, 2026-06-26)
 
-- `e2e_vz_skill_erofs_attaches` — live boot, assert `/dev/vdb` appears as an erofs
-  block device, assert `/opt/engram/dyn/0` is mounted and `mount.json` is readable.
-- Resume parity smoke — snapshot a skill-enabled VZ session, restore, assert the same
-  `<sha>.erofs` re-attaches and the skill directory is present in the guest.
-- Tilt end-to-end — `just dev` + create a skill-enabled session → no 400.
+Validated on a running `just dev` VZ stack against the re-baked `demo-claude:warm-1`
+(new init shim) with a 4 KiB-block skills bundle:
 
-The attach/restore CODE paths are fully implemented and reviewed; only the
-on-hardware kernel-mount and resume re-attach remain to be confirmed on a live dev
-stack.
+- **No 400** — `CreateSession` with `selected_skills:["skills"]` returns a session
+  (previously: `skill \`skills\` is unknown …`).
+- **erofs drive attached** — `/dev/vdb` present in the guest (restore_fresh).
+- **Auto-mounted** — `/proc/self/mounts`:
+  `/dev/vdb /opt/engram/dyn/0 erofs ro,relatime,…`; `/opt/engram/dyn/0` contains the
+  skill's `bin/`, `skills/`, and `mount.json`
+  (`{"kind":"skill","skills":[{"name":"share-file",…}]}`).
+
+Still deferred (not force-tested): resume re-attach parity — idle-eviction was paused by
+disk pressure on the test box, so the session could not be driven to a snapshot/restore.
+The `restore` (resume) path is the same `restore_impl` shared with the validated
+fresh-create path, reading `manifest.spec.aux_ro_drives`.
