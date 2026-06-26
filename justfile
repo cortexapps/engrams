@@ -263,6 +263,56 @@ bundles-squashfs:
     echo "$stamp}" > var/shared/current.json
     cat var/shared/current.json
 
+# ADR 0061: build + stage the skill bundles as CONTENT-ADDRESSED erofs
+# images (<sha256>.erofs + current.json stamp) under var/shared/ — the
+# VZ-backend analog of `bundles-squashfs`. The Kata VZ guest kernel has
+# CONFIG_EROFS_FS but no CONFIG_SQUASHFS, so macOS dev stages erofs. Each
+# bundle's unpacked tree (build.sh --stage) is packed with mkfs.erofs; the
+# stamp maps logical name -> sha of the .erofs file. Run the host-agent
+# with ENGRAM_BUNDLE_DIR=$PWD/var/shared (the Tiltfile does this) so VZ
+# dev sessions resolve/attach against it. Re-run after editing a skill —
+# the stamp repoints and the host-agent restart picks up the new gen.
+bundles-vz:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v mkfs.erofs >/dev/null || {
+        echo "mkfs.erofs not found — 'brew install erofs-utils' or use 'nix develop'" >&2
+        exit 1
+    }
+    sha256_of() {
+        if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1;
+        else shasum -a 256 "$1" | cut -d' ' -f1; fi
+    }
+    mkdir -p var/shared
+    stamp="{"
+    sep=""
+    # `sentinel` rides every reserved dyn slot at capture; skills/playwright/
+    # integrations-cli are catalog skills swapped in per session. playwright/
+    # integrations-cli need Docker and are best-effort (skipped on failure),
+    # exactly as `just bundles` already degrades.
+    for name in sentinel skills playwright integrations-cli; do
+        tree="$(mktemp -d)"
+        if ! "deploy/bundles/$name/build.sh" --stage "$tree"; then
+            echo "$name bundle stage failed; skipping (sessions degrade gracefully)" >&2
+            rm -rf "$tree"
+            continue
+        fi
+        out="var/shared/.$name.build.erofs"
+        rm -f "$out"
+        if ! mkfs.erofs "$out" "$tree" >/dev/null; then
+            echo "$name erofs pack failed; skipping" >&2
+            rm -rf "$tree" "$out"
+            continue
+        fi
+        rm -rf "$tree"
+        sha="$(sha256_of "$out")"
+        mv "$out" "var/shared/$sha.erofs"
+        stamp="$stamp$sep\"$name\": \"$sha\""
+        sep=", "
+    done
+    echo "$stamp}" > var/shared/current.json
+    cat var/shared/current.json
+
 # ------------------------------------------------------------------
 # Smoke / e2e helpers — run against a stack brought up by `just dev`
 # (ADR 0024 retired the standalone `integration-up.sh`; the prod-shape
