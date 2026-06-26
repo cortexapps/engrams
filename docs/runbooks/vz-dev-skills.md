@@ -64,18 +64,22 @@ The init shim (`DEFAULT_INIT_SHIM` in `engram-image-builder`) is responsible for
 mounting `spec.aux_ro_drives` at `/opt/engram/dyn/<slot>` inside the guest. It is
 baked into the rootfs — **not** live-reloaded.
 
+The init shim is baked into the guest rootfs at image-build time, not live-reloaded —
+so a shim change needs a re-bake before any session can see it.
+
 After changing the shim:
 
 1. **Re-bake the demo image:**
    ```bash
    just bake-demo
    ```
-2. **Restart the stack** (`just dev-down && just dev`) or create a fresh session
-   against the new image — existing sessions carry the old baked shim and will not
-   pick up the change.
+2. **Create a fresh session** — the coordinator picks up the new image on its next
+   poll cycle, so a new session immediately boots from the updated rootfs. A full
+   stack restart (`just dev-down && just dev`) is not required, though you can do it
+   if you want to force an immediate poll.
 
-See project memory entry `dev-guest-harness-is-baked-not-live` for the general
-principle.
+Existing and resumed sessions carry the shim that was baked when they were created
+and will not pick up the change.
 
 ## Quick reference
 
