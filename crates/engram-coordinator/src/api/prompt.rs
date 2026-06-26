@@ -5,14 +5,104 @@
 //! clears `last_idle_at` on send so the soft idle-eviction TTL
 //! doesn't fire while the adapter is starting its next run.
 //!
+//! If the forward hits the harness-unbound desync (an `Active` session
+//! whose sandbox is alive — `/exec` works — but no harness is attached
+//! for run delivery), `deliver_with_reattach` re-attaches the harness in
+//! place and retries, so an interactive prompt/answer self-heals in a beat
+//! instead of waiting on the background desync watchdog.
+//!
 //! Dead sessions return 410 Gone — the only affordance there is
 //! `engram session fork <id>`.
 
-use engram_core::SessionId;
+use std::time::{Duration, Instant};
+
+use engram_core::{SandboxError, SessionId};
 use engram_harness_proto::AgentRole;
 
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
+
+/// Budget for the bounded poll-retry after an in-place harness reattach. The
+/// live-harness reattach arm (ADR 0045 C1) only SIGUSR1s the harness to drop +
+/// re-dial and returns immediately, so the rebind lands a beat later; an exited
+/// harness respawn takes longer. 5s comfortably covers both and stays well under
+/// the caller's overall RPC timeout.
+const REATTACH_FORWARD_BUDGET: Duration = Duration::from_secs(5);
+/// Poll cadence while waiting for the re-dialed harness to re-bind to the hub.
+const REATTACH_FORWARD_POLL: Duration = Duration::from_millis(200);
+
+/// Forward a delivery (prompt/answer) to the harness, self-healing the
+/// harness-unbound desync.
+///
+/// `forward` does the actual `send_prompt`/`answer_question`; `reattach`
+/// re-establishes the harness IN PLACE on the live sandbox (no teardown —
+/// [`crate::api::snapshot::reattach_harness_in_place`]). On the happy path
+/// `forward` succeeds immediately with zero added latency. On
+/// `SandboxError::NotFound` — the sandbox VM is alive and `/exec` works, but no
+/// harness is bound for run delivery (the ADR 0045 C1 / ADR 0034 "prompts
+/// 'sandbox not found' while exec works" desync) — we reattach and poll-retry
+/// until the re-dialed harness re-binds (bounded by `budget`, since the
+/// live-harness arm returns as soon as it SIGUSR1s, not when the re-dial lands).
+///
+/// This is the synchronous, interactive-latency counterpart to the desync
+/// watchdog's ~5-minute background reattach: a Slack follow-up or web prompt
+/// landing in the desync window recovers in a beat instead of stranding the user
+/// (incident 2026-06-26, session 0332dccf). Safe to retry — prompts dedupe by
+/// `prompt_id` (ADR 0052 `seen_prompt_ids`, surviving respawn + snapshot/restore)
+/// and answers are no-op-on-duplicate (ADR 0054), so a re-sent forward never
+/// double-runs.
+async fn deliver_with_reattach<Fwd, FwdFut, Re, ReFut>(
+    op: &'static str,
+    budget: Duration,
+    poll: Duration,
+    forward: Fwd,
+    reattach: Re,
+) -> Result<(), ApiError>
+where
+    Fwd: Fn() -> FwdFut,
+    FwdFut: std::future::Future<Output = Result<(), SandboxError>>,
+    Re: FnOnce() -> ReFut,
+    ReFut: std::future::Future<Output = Result<bool, ApiError>>,
+{
+    match forward().await {
+        Ok(()) => return Ok(()),
+        // Harness-unbound desync — heal below.
+        Err(SandboxError::NotFound) => {}
+        Err(e) => return Err(ApiError::Internal(format!("forward {op} to harness: {e}"))),
+    }
+
+    if !reattach().await? {
+        // The session moved off the sandbox (a concurrent evict/resume re-bound
+        // it) or has no agent to attach — retryable; the next attempt resolves
+        // the fresh binding.
+        return Err(ApiError::Conflict(format!(
+            "{op} delivery: harness is unbound and could not be re-attached in \
+             place (the session may be mid-resume); retry shortly"
+        )));
+    }
+
+    let deadline = Instant::now() + budget;
+    loop {
+        match forward().await {
+            Ok(()) => return Ok(()),
+            Err(SandboxError::NotFound) => {
+                if Instant::now() >= deadline {
+                    return Err(ApiError::Conflict(format!(
+                        "{op} delivery: harness did not re-bind within {}s of an \
+                         in-place reattach; retry shortly",
+                        budget.as_secs()
+                    )));
+                }
+                tokio::time::sleep(poll).await;
+            }
+            Err(e) => {
+                return Err(ApiError::Internal(format!(
+                    "forward {op} to harness after reattach: {e}"
+                )))
+            }
+        }
+    }
+}
 
 /// Shared delivery preamble for prompts and answers: auto-resume an
 /// Idle/evicted session, HOLD through an in-flight move, and resolve the
@@ -125,12 +215,19 @@ pub(crate) async fn send_prompt_core(
     let sandbox_id = ensure_active_and_resolve(state, id).await?;
 
     let prompt_text = text;
-    state
-        .services
-        .host
-        .send_prompt(sandbox_id, prompt_id.clone(), prompt_text.clone())
-        .await
-        .map_err(|e| ApiError::Internal(format!("forward prompt to harness: {e}")))?;
+    deliver_with_reattach(
+        "prompt",
+        REATTACH_FORWARD_BUDGET,
+        REATTACH_FORWARD_POLL,
+        || {
+            let host = state.services.host.clone();
+            let pid = prompt_id.clone();
+            let txt = prompt_text.clone();
+            async move { host.send_prompt(sandbox_id, pid, txt).await }
+        },
+        || crate::api::snapshot::reattach_harness_in_place(state, id, sandbox_id),
+    )
+    .await?;
 
     // Record the user's prompt in the session event log so transcripts
     // can reconstruct the conversation. The harness adapter never
@@ -182,12 +279,19 @@ pub(crate) async fn answer_question_core(
         return Err(ApiError::BadRequest("`tool_call_id` is required".into()));
     }
     let sandbox_id = ensure_active_and_resolve(state, id).await?;
-    state
-        .services
-        .host
-        .answer_question(sandbox_id, tool_call_id, answers)
-        .await
-        .map_err(|e| ApiError::Internal(format!("forward answer to harness: {e}")))?;
+    deliver_with_reattach(
+        "answer",
+        REATTACH_FORWARD_BUDGET,
+        REATTACH_FORWARD_POLL,
+        || {
+            let host = state.services.host.clone();
+            let tcid = tool_call_id.clone();
+            let ans = answers.clone();
+            async move { host.answer_question(sandbox_id, tcid, ans).await }
+        },
+        || crate::api::snapshot::reattach_harness_in_place(state, id, sandbox_id),
+    )
+    .await?;
     Ok("answer forwarded")
 }
 
@@ -241,4 +345,146 @@ pub(crate) async fn dequeue_queued_prompt_core(
         .await
         .map_err(|e| ApiError::Internal(format!("dequeue queued prompt: {e}")))?;
     Ok("queued prompt dequeued")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // Tiny budget/poll so the timeout path resolves in milliseconds.
+    const FAST_BUDGET: Duration = Duration::from_millis(60);
+    const FAST_POLL: Duration = Duration::from_millis(5);
+
+    /// Happy path: the first forward binds, so we never reattach (zero added
+    /// latency on the hot path).
+    #[tokio::test]
+    async fn forwards_clean_without_reattach() {
+        let reattached = Arc::new(AtomicUsize::new(0));
+        let r = reattached.clone();
+        let out = deliver_with_reattach(
+            "prompt",
+            FAST_BUDGET,
+            FAST_POLL,
+            || async { Ok::<(), SandboxError>(()) },
+            || {
+                let r = r.clone();
+                async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    Ok::<bool, ApiError>(true)
+                }
+            },
+        )
+        .await;
+        assert!(out.is_ok());
+        assert_eq!(
+            reattached.load(Ordering::SeqCst),
+            0,
+            "a clean forward must not reattach",
+        );
+    }
+
+    /// The incident shape: the forward hits the harness-unbound `NotFound`, we
+    /// reattach in place, and the retry binds.
+    #[tokio::test]
+    async fn reattaches_and_retries_on_harness_unbound() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reattached = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let r = reattached.clone();
+        let out = deliver_with_reattach(
+            "prompt",
+            FAST_BUDGET,
+            FAST_POLL,
+            || {
+                let c = c.clone();
+                async move {
+                    // Pre-reattach call is unbound; the post-reattach retry binds.
+                    if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(SandboxError::NotFound)
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            || {
+                let r = r.clone();
+                async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    Ok::<bool, ApiError>(true)
+                }
+            },
+        )
+        .await;
+        assert!(
+            out.is_ok(),
+            "delivery should succeed after the in-place reattach"
+        );
+        assert_eq!(reattached.load(Ordering::SeqCst), 1, "exactly one reattach");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "forward attempted twice (pre + post reattach)",
+        );
+    }
+
+    /// Reattach reports the session moved off the sandbox (concurrent
+    /// evict/resume) → a retryable Conflict, never a forward against a stale id.
+    #[tokio::test]
+    async fn conflict_when_reattach_finds_session_moved() {
+        let out = deliver_with_reattach(
+            "answer",
+            FAST_BUDGET,
+            FAST_POLL,
+            || async { Err::<(), SandboxError>(SandboxError::NotFound) },
+            || async { Ok::<bool, ApiError>(false) },
+        )
+        .await;
+        assert!(matches!(out, Err(ApiError::Conflict(_))));
+    }
+
+    /// The harness never re-binds within the budget → retryable Conflict (not a
+    /// hard 500), so the orchestrator's onDeliveryError retry path applies rather
+    /// than the thread wedging.
+    #[tokio::test]
+    async fn conflict_when_harness_never_rebinds() {
+        let out = deliver_with_reattach(
+            "prompt",
+            FAST_BUDGET,
+            FAST_POLL,
+            || async { Err::<(), SandboxError>(SandboxError::NotFound) },
+            || async { Ok::<bool, ApiError>(true) },
+        )
+        .await;
+        assert!(matches!(out, Err(ApiError::Conflict(_))));
+    }
+
+    /// A non-`NotFound` forward error is a real failure, not a binding desync:
+    /// surface it as Internal and do NOT reattach.
+    #[tokio::test]
+    async fn non_notfound_error_is_not_healed() {
+        let reattached = Arc::new(AtomicUsize::new(0));
+        let r = reattached.clone();
+        let out = deliver_with_reattach(
+            "prompt",
+            FAST_BUDGET,
+            FAST_POLL,
+            || async { Err::<(), SandboxError>(SandboxError::Timeout) },
+            || {
+                let r = r.clone();
+                async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    Ok::<bool, ApiError>(true)
+                }
+            },
+        )
+        .await;
+        assert!(matches!(out, Err(ApiError::Internal(_))));
+        assert_eq!(
+            reattached.load(Ordering::SeqCst),
+            0,
+            "a non-unbound error must not trigger a reattach",
+        );
+    }
 }

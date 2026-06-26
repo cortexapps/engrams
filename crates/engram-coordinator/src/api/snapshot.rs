@@ -136,6 +136,51 @@ pub(crate) async fn resolve_resume_agent_and_policy(
     Some((agent, policy))
 }
 
+/// Re-establish a session's harness on its EXISTING live sandbox without a
+/// teardown — the shared primitive behind the ADR 0034 Track A desync watchdog
+/// AND the inline delivery self-heal (a prompt/answer that hit a harness-unbound
+/// `SandboxError::NotFound` — the sandbox VM is alive and `/exec` works, but no
+/// harness is attached for run delivery; the ADR 0045 C1 "prompts 'sandbox not
+/// found' while exec works" desync).
+///
+/// Re-issues the resume-shape `start_agent`, which drives agentd's ADR 0045 C1
+/// reattach arm: SIGUSR1 a live-but-wedged harness to drop + re-dial, or
+/// reap + respawn an exited one. Non-destructive — a live in-flight run is
+/// preserved (the SIGUSR1 only re-dials the host connection).
+///
+/// - `Ok(true)`  — reattach issued (`start_agent` succeeded). The harness
+///   re-dials and re-binds shortly after; callers that need the binding live
+///   (delivery) must poll-retry, since the live-harness arm returns as soon as
+///   the SIGUSR1 is sent, not when the re-dial lands.
+/// - `Ok(false)` — nothing to do: the session moved off `sandbox_id` since the
+///   caller resolved it (a concurrent evict/resume re-bound it — we must never
+///   `start_agent` a stale sandbox), or there's no agent to attach (dev-VM /
+///   process backend, no manifest bundle).
+/// - `Err(_)`    — host/meta error.
+pub(crate) async fn reattach_harness_in_place(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: SandboxId,
+) -> Result<bool, ApiError> {
+    let session = state.services.meta.get_session(session_id).await?;
+    // Re-confirm the session is still bound to the sandbox the caller resolved —
+    // a concurrent eviction/resume may have moved it, and we must never re-issue
+    // start_agent against a stale or unbound sandbox.
+    if session.sandbox_id != Some(sandbox_id) {
+        return Ok(false);
+    }
+    let Some((agent, policy)) = resolve_resume_agent_and_policy(state, &session, sandbox_id).await
+    else {
+        return Ok(false);
+    };
+    state
+        .services
+        .host
+        .start_agent(sandbox_id, agent, policy)
+        .await?;
+    Ok(true)
+}
+
 #[derive(Serialize)]
 pub struct SnapshotResponse {
     pub session_id: SessionId,
