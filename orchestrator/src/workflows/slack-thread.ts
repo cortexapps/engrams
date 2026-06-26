@@ -96,6 +96,10 @@ const NO_PROFILE_MSG =
   "No default profile is configured — set one in engrams first.";
 const CREATE_FAIL_MSG = "Couldn't start a session for this request.";
 const SESSION_FAILED_MSG = "The session ended in failure.";
+// A neutral close: the sandbox was reclaimed (host roll / `host_lost` / dev-stack
+// churn), which is not a task failure — the work stands, the thread just can't
+// continue. See `TerminalOutcome` in session-events.ts.
+const SESSION_CLOSED_MSG = "This session is complete. Start a new session if you'd like to continue.";
 
 async function slackThreadWorkflowImpl(): Promise<void> {
   const pol = requirePolicy();
@@ -182,11 +186,20 @@ async function slackThreadWorkflowImpl(): Promise<void> {
 
     switch (msg.kind) {
       case "session_terminal": {
-        if (msg.ok) {
-          const summary = { lastMessage: msg.lastMessage ?? null, assets: st.assets };
-          await DBOS.runStep(() => pol.onComplete(m, session, summary), { name: "onComplete" });
-        } else {
-          await DBOS.runStep(() => pol.onFail(m, SESSION_FAILED_MSG), { name: "onFail" });
+        switch (msg.outcome) {
+          case "completed": {
+            const summary = { lastMessage: msg.lastMessage ?? null, assets: st.assets };
+            await DBOS.runStep(() => pol.onComplete(m, session, summary), { name: "onComplete" });
+            break;
+          }
+          case "failed":
+            await DBOS.runStep(() => pol.onFail(m, SESSION_FAILED_MSG), { name: "onFail" });
+            break;
+          case "neutral":
+            await DBOS.runStep(() => pol.onNeutralClose(m, SESSION_CLOSED_MSG), {
+              name: "onNeutralClose",
+            });
+            break;
         }
         return;
       }

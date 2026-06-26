@@ -75,6 +75,10 @@ export interface CommunicationPolicy {
   onComplete(m: SourceMention, session: StartedSession, summary: ClosingSummary): Promise<void>;
   /** A failure (identity, create, or terminal-failure) — ❌ + actionable text. */
   onFail(m: SourceMention, message: string): Promise<void>;
+  /** A neutral terminal close — the session's sandbox was reclaimed (host roll,
+   *  `host_lost`, dev-stack churn), not a success or a failure. Informational,
+   *  no alarm: the work up to that point stands, the thread just can't continue. */
+  onNeutralClose(m: SourceMention, message: string): Promise<void>;
   /** Gather thread messages after `since` (null = the whole thread) into a
    *  prompt; `maxTs` is the newest message seen, the next `since`. */
   gatherThreadContext(m: SourceMention, since: string | null): Promise<{ prompt: string; maxTs: string }>;

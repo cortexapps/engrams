@@ -358,6 +358,13 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
       await post(m, `❌ ${message}`);
     },
 
+    async onNeutralClose(m, message) {
+      // The sandbox was reclaimed (host roll / host_lost / dev churn), not a
+      // failure — post a plain informational note, no ❌ and no reaction.
+      log.info({ channel: m.channel, thread: m.threadRoot }, "slack: session closed (sandbox reclaimed)");
+      await post(m, message);
+    },
+
     async gatherThreadContext(m, since) {
       const c = await getClient();
       const res = await c.conversations.replies({

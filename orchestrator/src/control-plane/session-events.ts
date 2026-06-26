@@ -34,13 +34,30 @@ export function curated(kind: string): boolean {
   return CURATED_KINDS.has(kind);
 }
 
+/** How the reverse channel reports a terminal session state to a thread:
+ *  `completed` (success → closing summary), `failed` (the run errored → ❌), or
+ *  `neutral` (the sandbox was reclaimed — NOT a failure). */
+export type TerminalOutcome = "completed" | "failed" | "neutral";
+
 /**
- * Terminal `engram_core::SessionState` values (snake_case on the wire). A
- * `status_changed` into one of these ends the ingest loop. `run_completed` is
- * NOT here on purpose (ADR 0060 Invariant 2): a session re-runs on a follow-up
- * mention, so only a terminal session state exits.
+ * Terminal `engram_core::SessionState` values (snake_case on the wire) → the
+ * outcome each maps to. A `status_changed` into one of these keys ends the
+ * ingest loop:
+ *  - `completed` → success.
+ *  - `failed`    → the run errored.
+ *  - `dead`      → neutral: the sandbox was reclaimed out from under the session
+ *    (idle host roll, `host_lost`, dev-stack churn). The work up to that point
+ *    stands; the thread just can't continue — so it is NOT reported as a failure.
+ *    (`host_lost` is a transient on the way to `dead` and is itself non-terminal;
+ *    only `dead` exits the loop.)
+ * `run_completed` is deliberately absent (ADR 0060 Invariant 2): a session
+ * re-runs on a follow-up mention, so only a terminal session state exits.
  */
-const TERMINAL_STATES: ReadonlySet<string> = new Set(["completed", "failed", "dead"]);
+const TERMINAL_OUTCOME: Readonly<Record<string, TerminalOutcome>> = {
+  completed: "completed",
+  failed: "failed",
+  dead: "neutral",
+};
 
 /** A forwarded content event (a curated SessionEvent, narrowed). */
 export interface CuratedEvent {
@@ -55,8 +72,10 @@ export interface BoundedRead {
   events: CuratedEvent[];
   /** Cursor to pass as `after` next call. Echoes `after` on an empty/tail page. */
   nextAfter: bigint;
-  /** Set when the page contained a terminal `status_changed`; `ok` = Completed. */
-  terminal?: { ok: boolean };
+  /** Set when the page contained a terminal `status_changed`. `outcome`
+   *  classifies it — `completed` (success), `failed` (the run errored), or
+   *  `neutral` (the sandbox was reclaimed; not a failure — see TERMINAL_OUTCOME). */
+  terminal?: { outcome: TerminalOutcome };
   /** Text of the LAST assistant `agent_message` in this page, if any. Drives the
    *  closing-summary enrichment (ADR 0060, onComplete): agent_message is not a
    *  curated content kind, but the pump already walks every page, so we surface
@@ -108,12 +127,12 @@ export async function readSessionEventsBounded(
 ): Promise<BoundedRead> {
   const { events: page, nextAfterIdx } = await list(sessionId, after, PAGE_LIMIT);
   const events: CuratedEvent[] = [];
-  let terminal: { ok: boolean } | undefined;
+  let terminal: { outcome: TerminalOutcome } | undefined;
   let lastAssistantText: string | undefined;
   for (const ev of page) {
     if (ev.kind === "status_changed") {
-      const to = parseTerminalState(ev.payloadJson);
-      if (to) terminal = { ok: to === "completed" };
+      const outcome = parseTerminalOutcome(ev.payloadJson);
+      if (outcome) terminal = { outcome };
       continue; // a control signal, never forwarded as content
     }
     if (ev.kind === "agent_message") {
@@ -147,11 +166,12 @@ function parseAssistantText(payloadJson: string): string | undefined {
   }
 }
 
-/** Extract a terminal `to` state from a status_changed payload, else undefined. */
-function parseTerminalState(payloadJson: string): string | undefined {
+/** Map a `status_changed` payload's `to` state to its terminal outcome, or
+ *  undefined if `to` is not a terminal state. */
+function parseTerminalOutcome(payloadJson: string): TerminalOutcome | undefined {
   try {
     const to: unknown = (JSON.parse(payloadJson) as { to?: unknown })?.to;
-    return typeof to === "string" && TERMINAL_STATES.has(to) ? to : undefined;
+    return typeof to === "string" ? TERMINAL_OUTCOME[to] : undefined;
   } catch {
     return undefined;
   }

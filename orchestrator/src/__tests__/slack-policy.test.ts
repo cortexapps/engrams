@@ -226,6 +226,15 @@ describe("makeSlackPolicy()", () => {
     expect(text).toContain("https://gh/1");
   });
 
+  test("onNeutralClose posts a plain 'session is complete' note — no ❌, no reaction", async () => {
+    const { client, calls } = fakeClient();
+    await policy(client).onNeutralClose(M, "This session is complete. Start a new session if you'd like to continue.");
+    expect(calls.posts).toHaveLength(1);
+    expect(calls.posts[0].text).toContain("This session is complete");
+    expect(calls.posts[0].text).not.toContain("❌");
+    expect(calls.reactions).toHaveLength(0);
+  });
+
   // ── onAsset: file forwarding (ADR 0060 — share-file artifacts into Slack).
   const SESSION = { id: "s1", webUrl: "https://e.dev/sessions/s1" };
   const fileShared = (payload: Record<string, unknown>) =>

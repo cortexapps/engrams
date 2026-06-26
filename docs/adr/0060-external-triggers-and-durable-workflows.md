@@ -379,6 +379,23 @@ unchanged and still lists files as text. **Deployment note:** the upload needs t
 `files:write` scope (as the table flagged) — without it every upload fails and silently
 degrades to the link fallback.
 
+**As-built: the terminal is three-way, not two-way (2026-06-26).** The sketch above
+(`if msg.event.ok: onComplete else: onFail "ended in failure"`) collapsed every
+non-`completed` terminal state into a failure. But a session reaches `dead` not only
+by failing — it also dies when its **sandbox is reclaimed out from under it**: an idle
+host roll, a `host_lost` reaper sweep (a host-agent restart, which on the dev stack is
+routine), or eviction-durability (ADR 0028) not catching an active session before the
+host went away. Reporting that as "The session ended in failure" is wrong and alarming
+— the work up to that point stands, the thread just can't continue. So terminal
+detection now returns a **`TerminalOutcome`** (`session-events.ts`) mapping
+`completed → completed`, `failed → failed`, `dead → neutral`, and the thread workflow
+switches three ways: `onComplete` (closing summary), `onFail` (❌ — a genuine run
+failure), and a new **`onNeutralClose`** that posts a plain, un-alarming note
+("This session is complete. Start a new session if you'd like to continue.") with no ❌
+and no reaction. (`host_lost` stays non-terminal — only `dead` exits the loop.) This
+also matters on prod, where any host roll that outruns eviction durability would
+otherwise mis-report a completed session as failed.
+
 ## Bidirectional AskUserQuestion (Slack ↔ web parity)
 
 Reuses the shipped ADR 0054 path, so parity is automatic:
