@@ -811,6 +811,7 @@ impl HostAgent {
                 };
                 let cc = coord_client.clone();
                 let pooled_for_rehydrate = pooled.clone();
+                let harness_hub_for_rebind = harness_hub.clone();
                 registration_task = Some(tokio::spawn(async move {
                     let mut backoff = std::time::Duration::from_millis(500);
                     let cap = std::time::Duration::from_secs(30);
@@ -822,6 +823,17 @@ impl HostAgent {
                                     host_addr = %register_req.host_addr,
                                     rehydrate_sandboxes = resp.rehydrate_sandboxes.len(),
                                     "registered with coord via /api/hosts/register",
+                                );
+                                // Restore harness-hub routing for survivors
+                                // BEFORE the disk rehydrate below: the in-guest
+                                // harness is already re-dialing, and its attach
+                                // is rejected ("no sandbox bound to this
+                                // session_id") until this lands. Platform-neutral
+                                // (the hub exists on every backend); FC is where
+                                // survivors actually occur. (Session b9b28452.)
+                                rebind_survivor_sessions(
+                                    &harness_hub_for_rebind,
+                                    &resp.rehydrate_sandboxes,
                                 );
                                 // Issue #229: the coord echoes the wire
                                 // version it understands. Previously this was
@@ -1503,6 +1515,31 @@ impl HostAgent {
 /// hosts where the publisher never landed a value) are skipped
 /// with a debug log. They run "untracked" until the next eviction
 /// snapshot.
+/// Restore harness-hub routing for every survivor the coord re-handed us
+/// on (re)registration. SEPARATE from disk rehydration and platform-neutral:
+/// a host-agent roll / restart rebuilds the hub's `session_to_sandbox` map
+/// EMPTY, so the in-guest harness — which survives the roll and keeps
+/// re-dialing — has its attach answered "no sandbox bound to this
+/// session_id" and (pre-fix) exited, wedging the session `active` forever
+/// (session b9b28452). `reattach_pass` + `rehydrate_survivors` restore the
+/// VM and the disk/egress plane but never touch the harness hub; this closes
+/// that gap. Idempotent (a later bind replaces an earlier one).
+fn rebind_survivor_sessions(
+    harness_hub: &harness::HarnessHub,
+    survivors: &[coord_client::RehydrateSandboxRef],
+) {
+    if survivors.is_empty() {
+        return;
+    }
+    for s in survivors {
+        harness_hub.bind_session(s.session_id, s.sandbox_id);
+    }
+    tracing::info!(
+        count = survivors.len(),
+        "rebound harness-hub routing for survivor sessions after (re)registration",
+    );
+}
+
 #[cfg(target_os = "linux")]
 async fn rehydrate_survivors(
     pooled: &Arc<pooled_backend::PooledBackend>,
@@ -1614,5 +1651,54 @@ impl std::error::Error for HostAgentError {
 impl From<std::io::Error> for HostAgentError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_core::SessionId;
+
+    fn noop_hub() -> harness::HarnessHub {
+        harness::HarnessHub::new(std::sync::Arc::new(|_, _, _| Box::new(Box::pin(async {}))))
+    }
+
+    /// Regression (session b9b28452): after a host-agent roll the harness
+    /// hub's session→sandbox map is rebuilt EMPTY, so the surviving in-guest
+    /// harness's re-dial is rejected with "no sandbox bound to this
+    /// session_id". `rebind_survivor_sessions` must repopulate routing for
+    /// every survivor the coord re-hands us, so the harness re-attach lands
+    /// instead of the session wedging `active` forever.
+    #[test]
+    fn rebind_survivor_sessions_restores_harness_routing() {
+        let hub = noop_hub();
+        let session_id = SessionId::new();
+        let sandbox_id = SandboxId::new();
+
+        // Fresh post-roll process: nothing bound → an attach would be rejected.
+        assert!(hub.bound_sandbox(session_id).is_none());
+
+        let survivors = vec![coord_client::RehydrateSandboxRef {
+            session_id,
+            sandbox_id,
+            // A survivor with no disk manifest is skipped by the disk
+            // rehydrate, but STILL needs its harness routing restored.
+            disk_manifest_id: None,
+            disk_manifest_version: None,
+        }];
+        rebind_survivor_sessions(&hub, &survivors);
+
+        assert_eq!(
+            hub.bound_sandbox(session_id),
+            Some(sandbox_id),
+            "survivor's harness routing must be restored so its re-attach succeeds",
+        );
+    }
+
+    #[test]
+    fn rebind_survivor_sessions_is_a_noop_for_empty_list() {
+        let hub = noop_hub();
+        rebind_survivor_sessions(&hub, &[]);
+        assert!(hub.bound_sandbox(SessionId::new()).is_none());
     }
 }

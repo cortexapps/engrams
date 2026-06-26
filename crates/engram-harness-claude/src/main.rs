@@ -262,15 +262,15 @@ mod adapter {
                 .expect("install SIGUSR1 handler");
         let mut consecutive_failures: u32 = 0;
         const MAX_BACKOFF_SECS: u64 = 10;
-        // `None` → the engine finished on its own; await it below for the
-        // real exit code. `Some` → we're bailing for our own reason
-        // (gave up reaching the host / host rejected attach) and must
-        // abort the still-running engine.
-        let our_code: Option<ExitCode> = loop {
+        // The loop ends ONLY when the engine finishes on its own; every
+        // failure to reach or attach the host is retried forever (the
+        // harness is the session's sole event channel — giving up strands
+        // it). The engine's exit code is reaped after the loop.
+        loop {
             // The engine owns shutdown: once it returns (Shutdown / all
             // command senders gone) stop reconnecting and reap its code.
             if engine.is_finished() {
-                break None;
+                break;
             }
             let stream = match dial(&cli).await {
                 Some(s) => s,
@@ -312,52 +312,52 @@ mod adapter {
                     ConnOutcome::Dropped { reason: "SIGUSR1 reconnect nudge" }
                 }
             };
-            match outcome {
-                ConnOutcome::EngineDone => break None,
-                ConnOutcome::Rejected => break Some(ExitCode::from(1)),
-                ConnOutcome::HandshakeFailed { reason } => {
-                    // Same indefinite-retry posture as the dial arm: a
-                    // handshake can fail transiently for as long as the
-                    // host side is mid-rebind (live move), and exiting
-                    // strands the session.
+            match outcome.reconnect() {
+                // Engine finished on its own — reap its code below.
+                Reconnect::Stop => break,
+                // Couldn't reach/attach the host: transport flake, handshake
+                // race, OR an attach REJECTION. The last one matters — during
+                // a host-agent roll the incoming host answers "no sandbox
+                // bound to this session_id" until its reattach pass repopulates
+                // the session→sandbox map. That window is transient; the old
+                // `Rejected => exit` arm turned it terminal and orphaned the
+                // agent across a deploy roll (session b9b28452). Back off and
+                // retry forever, exactly like the dial arm — a truly-misrouted
+                // harness is harmless to retry and gets reaped by agentd's next
+                // SpawnHarness.
+                Reconnect::Backoff => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     let backoff =
                         std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(4));
                     tracing::warn!(
-                        reason,
+                        reason = outcome.reason(),
                         consecutive_failures,
                         backoff_secs = backoff,
-                        "harness handshake failed; reconnecting"
+                        "harness could not attach to host; reconnecting"
                     );
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                 }
-                ConnOutcome::Dropped { reason } => {
-                    // The connection was established and later dropped —
-                    // progress, not a failure to reach the host. Reset
-                    // the give-up counter so a long-lived session that
-                    // reconnects many times (across checkpoints) never
-                    // exhausts it; settle briefly so a flapping link
-                    // doesn't hot-loop.
+                // The connection was established and later dropped —
+                // progress, not a failure to reach the host. Reset the
+                // give-up counter so a long-lived session that reconnects
+                // many times (across checkpoints) never exhausts it; settle
+                // briefly so a flapping link doesn't hot-loop.
+                Reconnect::Settle => {
                     consecutive_failures = 0;
-                    tracing::warn!(reason, "harness connection dropped; reconnecting");
+                    tracing::warn!(
+                        reason = outcome.reason(),
+                        "harness connection dropped; reconnecting"
+                    );
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
-        };
-
-        match our_code {
-            // Engine finished — reap its exit code.
-            None => engine.await.unwrap_or_else(|e| {
-                tracing::error!(error = %e, "engine task panicked");
-                ExitCode::from(1)
-            }),
-            // We bailed; stop the still-running engine (process teardown
-            // drops the claude child too, via kill_on_drop).
-            Some(code) => {
-                engine.abort();
-                code
-            }
         }
+
+        // Engine finished — reap its exit code.
+        engine.await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "engine task panicked");
+            ExitCode::from(1)
+        })
     }
 
     /// Boxed stream half-pair so the outer reconnect loop can hold the
@@ -413,12 +413,58 @@ mod adapter {
         /// The engine finished (Shutdown / all command senders gone).
         /// Stop reconnecting and reap the engine's exit code.
         EngineDone,
-        /// Host explicitly rejected the attach — fatal, don't retry.
-        Rejected,
+        /// Host rejected the attach — typically "no sandbox bound to this
+        /// session_id" while the host-agent is mid-reattach after a roll /
+        /// restart and hasn't repopulated its session→sandbox map yet.
+        /// TRANSIENT, not fatal: the binding returns once the host finishes
+        /// reattaching, so the loop backs off and retries. (Regression:
+        /// session b9b28452 — exiting here orphaned the agent across a
+        /// deploy roll; the VM survived but the harness died and the session
+        /// wedged `active` forever.)
+        Rejected { reason: String },
         /// Handshake didn't complete (transport flake at/ before attach).
         HandshakeFailed { reason: &'static str },
         /// An established connection later dropped — re-dial.
         Dropped { reason: &'static str },
+    }
+
+    /// What the reconnect loop does after one connection's outcome.
+    /// Extracted so the retry policy is unit-testable in isolation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Reconnect {
+        /// Engine finished — end the loop and reap its exit code.
+        Stop,
+        /// An established link dropped — settle briefly, reset the counter.
+        Settle,
+        /// Couldn't reach/attach the host (transport flake, handshake race,
+        /// OR an attach rejection) — exponential backoff, retry forever.
+        Backoff,
+    }
+
+    impl ConnOutcome {
+        /// The reconnect decision for this outcome. The load-bearing
+        /// invariant: ONLY `EngineDone` stops the loop. An attach `Rejected`
+        /// — e.g. "no sandbox bound to this session_id" during a host roll —
+        /// backs off and retries, because the harness is the session's sole
+        /// event channel and giving up strands it (session b9b28452).
+        fn reconnect(&self) -> Reconnect {
+            match self {
+                ConnOutcome::EngineDone => Reconnect::Stop,
+                ConnOutcome::Dropped { .. } => Reconnect::Settle,
+                ConnOutcome::HandshakeFailed { .. } | ConnOutcome::Rejected { .. } => {
+                    Reconnect::Backoff
+                }
+            }
+        }
+
+        /// Human-readable cause for the reconnect log line.
+        fn reason(&self) -> &str {
+            match self {
+                ConnOutcome::EngineDone => "engine_done",
+                ConnOutcome::Rejected { reason } => reason,
+                ConnOutcome::HandshakeFailed { reason } | ConnOutcome::Dropped { reason } => reason,
+            }
+        }
     }
 
     /// Push an event to the connection pump. Bounded send: while
@@ -1077,8 +1123,12 @@ mod adapter {
         match read_msg::<_, HarnessAttachAck>(&mut reader).await {
             Ok(ack) if ack.ok => {}
             Ok(ack) => {
-                tracing::error!(message = ?ack.message, "host rejected attach");
-                return ConnOutcome::Rejected;
+                // Not fatal — the outer loop retries with backoff (the host
+                // is usually mid-reattach after a roll). Carry the host's
+                // message so the reconnect log names the cause.
+                return ConnOutcome::Rejected {
+                    reason: ack.message.unwrap_or_else(|| "host rejected attach".into()),
+                };
             }
             Err(e) => {
                 tracing::error!(error = %e, "attach ack read failed");
@@ -2827,6 +2877,34 @@ mod adapter {
                 Some(HarnessEvent::Idle),
                 "the un-acked event must be parked for the next connection",
             );
+        }
+
+        // Regression (session b9b28452): a host-agent roll answers the
+        // harness's re-attach with "no sandbox bound to this session_id"
+        // while it's still reattaching the survivor VM. That rejection is
+        // TRANSIENT — the reconnect loop must back off and retry, never
+        // exit. The old `Rejected => break Some(exit)` arm turned it
+        // terminal: the VM survived the roll but the harness died and the
+        // session wedged `active` forever. Only the engine finishing on its
+        // own may stop the loop.
+        #[test]
+        fn attach_rejection_retries_and_never_ends_the_loop() {
+            let rejected = ConnOutcome::Rejected {
+                reason: "no sandbox bound to this session_id".into(),
+            };
+            assert_eq!(rejected.reconnect(), Reconnect::Backoff);
+            assert_eq!(rejected.reason(), "no sandbox bound to this session_id");
+
+            // The other transport failures retry too; only EngineDone stops.
+            assert_eq!(
+                ConnOutcome::HandshakeFailed { reason: "ack_read" }.reconnect(),
+                Reconnect::Backoff,
+            );
+            assert_eq!(
+                ConnOutcome::Dropped { reason: "eof" }.reconnect(),
+                Reconnect::Settle,
+            );
+            assert_eq!(ConnOutcome::EngineDone.reconnect(), Reconnect::Stop);
         }
 
         // ADR 0054 Part C: the scrub removes exactly the suppressed

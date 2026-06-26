@@ -373,6 +373,19 @@ impl HarnessHub {
         }
     }
 
+    /// The sandbox currently bound to `session_id`, if any. The
+    /// session-lookup attach path consults the same map, so this answers
+    /// "would an in-guest harness re-dial for this session route, or get
+    /// rejected with no-sandbox-bound?" — used by the survivor rebind on
+    /// host (re)start and in tests.
+    pub fn bound_sandbox(&self, session_id: SessionId) -> Option<SandboxId> {
+        self.inner
+            .session_to_sandbox
+            .lock()
+            .get(&session_id)
+            .copied()
+    }
+
     /// Accept an anonymous connection from a harness — used by the
     /// TCP listener. Reads `HarnessAttach` from the stream, looks up
     /// `bind_session`'s map for the sandbox_id, then proceeds through
