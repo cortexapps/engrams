@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use engram_agentd::{
     read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest, WireResponse,
 };
-use engram_core::traits::sandbox::{HarnessSink, SandboxBackend};
+use engram_core::traits::sandbox::{HarnessSink, SandboxBackend, UploadSink};
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
@@ -148,6 +148,10 @@ pub struct VzBackend {
     /// bridge passes guest-initiated 1026 connections to this sink
     /// in the same way `engram-sandbox-firecracker` does.
     harness_sink: Mutex<Option<HarnessSink>>,
+    /// ADR 0026: latest artifact-upload sink (set by `set_upload_sink`).
+    /// The console bridge hands guest-initiated port-1029 uploads to it,
+    /// the same channel `engram-sandbox-firecracker` serves over vsock.
+    upload_sink: Mutex<Option<UploadSink>>,
     /// ADR 0007: when set, `snapshot()` chunks the snapshot rootfs
     /// into this store and populates `SnapshotMetadata.disk_manifest`.
     /// `None` keeps the legacy "rootfs-only-on-host" behavior — the
@@ -173,6 +177,7 @@ impl VzBackend {
             cfg,
             sandboxes: DashMap::new(),
             harness_sink: Mutex::new(None),
+            upload_sink: Mutex::new(None),
             chunk_store: None,
         })
     }
@@ -312,9 +317,11 @@ impl VzBackend {
         let vsock_uds_path = self.vsock_uds_path_for(new_id);
 
         let harness_sink = self.harness_sink.lock().clone();
-        let bridge = ConsoleBridge::start(vsock_uds_path.clone(), port_fds, harness_sink)
-            .await
-            .map_err(SandboxError::from)?;
+        let upload_sink = self.upload_sink.lock().clone();
+        let bridge =
+            ConsoleBridge::start(vsock_uds_path.clone(), port_fds, harness_sink, upload_sink)
+                .await
+                .map_err(SandboxError::from)?;
 
         self.sandboxes.insert(
             new_id,
@@ -504,10 +511,12 @@ impl SandboxBackend for VzBackend {
         // is registered, it also pipes port 1026's guest writes
         // straight to the sink.
         let harness_sink = self.harness_sink.lock().clone();
+        let upload_sink = self.upload_sink.lock().clone();
         let bridge = ConsoleBridge::start(
             vsock_uds_path.clone(),
             port_fds,
             harness_sink,
+            upload_sink,
         )
         .await
         .map_err(|e| {
@@ -589,6 +598,10 @@ impl SandboxBackend for VzBackend {
 
     fn set_harness_sink(&self, sink: HarnessSink) {
         *self.harness_sink.lock() = Some(sink);
+    }
+
+    fn set_upload_sink(&self, sink: UploadSink) {
+        *self.upload_sink.lock() = Some(sink);
     }
 
     async fn exec_stream(

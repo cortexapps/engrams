@@ -5,13 +5,22 @@
 //! unchanged while the underlying VZ device class swaps from
 //! virtio-vsock to multi-port virtio-console.
 //!
-//! # Three ports, two directions
+//! # Four ports, two directions
 //!
 //! ```text
 //!   port 1024 (host → guest, agentd):    UDS at <base>_1024  ←→  /dev/hvc1
 //!   port 1025 (host → guest, bootstrap): UDS at <base>_1025  ←→  /dev/hvc2
 //!   port 1026 (guest → host, harness):              pipe pair  ←→  /dev/hvc3 → harness_sink
+//!   port 1029 (guest → host, upload):               pipe pair  ←→  /dev/hvc4 → upload_sink
 //! ```
+//!
+//! Port 1029 (ADR 0026 artifact upload) is guest-initiated and
+//! request/response: the in-guest `engram-share` helper writes one
+//! `UploadRequest` header frame + the raw body, then reads one
+//! `UploadResponse`. FC accepts one vsock connection per upload; VZ's
+//! virtio-console gives a single *persistent* byte stream per port, so
+//! `upload_pump` delimits each upload by the header's `size_bytes` and
+//! handles them sequentially over the one stream (see its doc).
 //!
 //! For each port we create a host-side pipe pair (one for each
 //! direction) at VM-config time and hand the VZ-facing ends to a
@@ -46,7 +55,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use engram_core::traits::sandbox::{HarnessByteStream, HarnessSink};
+use engram_core::traits::sandbox::{HarnessByteStream, HarnessSink, UploadSink};
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{NSFileHandle, NSString, NSUInteger};
@@ -54,7 +63,7 @@ use objc2_virtualization::{
     VZFileHandleSerialPortAttachment, VZSerialPortAttachment, VZVirtioConsoleDeviceConfiguration,
     VZVirtioConsolePortConfiguration,
 };
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
@@ -67,11 +76,16 @@ use tokio::task::JoinHandle;
 pub(crate) const PORT_AGENTD: u32 = 1024;
 pub(crate) const PORT_BOOTSTRAP: u32 = 1025;
 pub(crate) const PORT_HARNESS: u32 = 1026;
+/// ADR 0026 artifact upload (`engram-harness_proto::UPLOAD_VSOCK_PORT`).
+/// Guest-initiated; the in-guest `engram-share` helper dials it.
+pub(crate) const PORT_UPLOAD: u32 = 1029;
 
-/// Order ports are configured. Guest's hvc index follows this
-/// ordering: hvc1 = first entry (PORT_AGENTD), hvc2, hvc3.
-/// `engram-transport`'s console impl uses the same mapping.
-const PORTS: &[u32] = &[PORT_AGENTD, PORT_BOOTSTRAP, PORT_HARNESS];
+/// Order ports are configured. The guest resolves each port by the
+/// sysfs *name* (`engram-port-<port>`, set in `build_console_device`),
+/// NOT by hvc index, so this ordering is host-internal — adding a port
+/// needs no guest/image change (`engram-transport`'s `port_to_device`
+/// scans `/sys/class/virtio-ports` by name).
+const PORTS: &[u32] = &[PORT_AGENTD, PORT_BOOTSTRAP, PORT_HARNESS, PORT_UPLOAD];
 
 /// Errors from the bridge layer. Mostly thin wrappers over
 /// `std::io::Error` annotated with which port + path tripped.
@@ -270,6 +284,7 @@ impl ConsoleBridge {
         base_path: PathBuf,
         port_fds: ConsolePortFds,
         harness_sink: Option<HarnessSink>,
+        upload_sink: Option<UploadSink>,
     ) -> Result<Self, BridgeError> {
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
         let mut by_port = port_fds.by_port;
@@ -290,6 +305,15 @@ impl ConsoleBridge {
                 tasks.push(tokio::spawn(guest_initiated_pump(fds, Arc::new(sink))));
             } else {
                 tracing::warn!("no harness sink registered; dropping port {PORT_HARNESS} pipes");
+                drop(fds);
+            }
+        }
+
+        if let Some(fds) = by_port.remove(&PORT_UPLOAD) {
+            if let Some(sink) = upload_sink {
+                tasks.push(tokio::spawn(upload_pump(fds, sink)));
+            } else {
+                tracing::warn!("no upload sink registered; dropping port {PORT_UPLOAD} pipes");
                 drop(fds);
             }
         }
@@ -429,6 +453,88 @@ async fn guest_initiated_pump(fds: HostPortFds, sink: Arc<HarnessSink>) {
     tokio::select! {
         _ = tokio::io::copy(&mut v_r, &mut p_w) => {},
         _ = tokio::io::copy(&mut p_r, &mut v_w) => {},
+    }
+}
+
+/// Pump for the guest-initiated artifact-upload port (1029, ADR 0026).
+///
+/// Unlike FC's vsock — which accepts one connection per upload — VZ's
+/// virtio-console gives a single persistent byte stream per port. The
+/// in-guest `engram-share` helper writes, per upload, one
+/// `UploadRequest` header frame followed by exactly `size_bytes` of raw
+/// body, then reads one `UploadResponse` frame; a fresh `engram-share`
+/// process does this again on the same stream. So we serialize: read
+/// one header, hand the sink a per-upload duplex carrying the replayed
+/// header + the bounded body, relay the sink's response back to the
+/// guest, then loop. Bounding the body by the header's `size_bytes` is
+/// what keeps the next upload's header from being swallowed. The pump
+/// exits when the stream EOFs/errors (VM gone).
+async fn upload_pump(fds: HostPortFds, sink: UploadSink) {
+    let HostPortFds {
+        read_from_guest,
+        write_to_guest,
+    } = fds;
+    let mut reader = match AsyncRawFdStream::new(read_from_guest) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "vz upload pump: read fd setup failed");
+            return;
+        }
+    };
+    let mut writer = match AsyncRawFdStream::new(write_to_guest) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!(error = %e, "vz upload pump: write fd setup failed");
+            return;
+        }
+    };
+
+    loop {
+        // One `UploadRequest` header frame per upload. EOF/error here
+        // means the guest's port closed (VM teardown) — exit the pump.
+        let header: engram_harness_proto::UploadRequest =
+            match engram_harness_proto::read_msg(&mut reader).await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::debug!(error = %e, "vz upload pump: header read ended; exiting");
+                    return;
+                }
+            };
+        let engram_harness_proto::UploadOp::ShareFile { size_bytes, .. } = &header.op;
+        let size_bytes = *size_bytes;
+
+        // Fresh per-upload duplex handed to the sink (it reads the
+        // header + `size_bytes` body and writes one response, then drops
+        // its half). Mirrors the one-stream-per-upload shape FC's accept
+        // loop gives the same sink.
+        let (sink_side, host_side) = tokio::io::duplex(128 * 1024);
+        sink(Box::pin(sink_side));
+        let (mut host_r, mut host_w) = tokio::io::split(host_side);
+
+        // Feed: replay the header frame, then stream exactly `size_bytes`
+        // of body from the guest stream into the sink. `.take` is the
+        // delimiter — it never reads into the next upload's header.
+        let feed = async {
+            engram_harness_proto::write_msg(&mut host_w, &header).await?;
+            let mut body = (&mut reader).take(size_bytes);
+            tokio::io::copy(&mut body, &mut host_w).await?;
+            Ok::<(), std::io::Error>(())
+        };
+        // Relay: copy the sink's `UploadResponse` frame back to the guest.
+        // Ends when the sink drops its duplex half (after the response).
+        let relay = async {
+            tokio::io::copy(&mut host_r, &mut writer).await?;
+            Ok::<(), std::io::Error>(())
+        };
+        let (feed_res, relay_res) = tokio::join!(feed, relay);
+        if let Err(e) = feed_res {
+            tracing::warn!(error = %e, "vz upload pump: feed to sink failed; exiting");
+            return;
+        }
+        if let Err(e) = relay_res {
+            tracing::warn!(error = %e, "vz upload pump: response relay failed; exiting");
+            return;
+        }
     }
 }
 
@@ -588,11 +694,82 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn upload_pump_serializes_sequential_uploads() {
+        use engram_harness_proto::{read_msg, write_msg, UploadOp, UploadRequest, UploadResponse};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // socketpair: one end is the host (handed to the pump), the
+        // other plays the in-guest `engram-share` helper.
+        let (guest_end, host_end) = make_socketpair().expect("socketpair");
+        let host_read = host_end.try_clone().expect("dup host end");
+        let host_fds = HostPortFds {
+            read_from_guest: host_read,
+            write_to_guest: host_end,
+        };
+
+        // Fake sink: read the header + exactly `size_bytes` body, reply
+        // with `Shared`, and report what it received over a channel.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(UploadRequest, Vec<u8>)>();
+        let sink: UploadSink = Arc::new(move |stream| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(stream);
+                let header: UploadRequest = read_msg(&mut r).await.expect("sink header");
+                let UploadOp::ShareFile { size_bytes, .. } = &header.op;
+                let mut body = vec![0u8; *size_bytes as usize];
+                r.read_exact(&mut body).await.expect("sink body");
+                let resp = UploadResponse::Shared {
+                    artifact_id: "aid".into(),
+                    media_type: "text/plain".into(),
+                    size_bytes: *size_bytes,
+                };
+                write_msg(&mut w, &resp).await.expect("sink resp");
+                tx.send((header, body)).expect("sink report");
+            });
+        });
+        tokio::spawn(upload_pump(host_fds, sink));
+
+        // Guest side of the socketpair.
+        let guest_std =
+            unsafe { std::os::unix::net::UnixStream::from_raw_fd(guest_end.into_raw_fd()) };
+        guest_std.set_nonblocking(true).expect("nonblocking");
+        let mut guest = tokio::net::UnixStream::from_std(guest_std).expect("tokio uds");
+
+        // Two uploads back-to-back over the SAME persistent stream — the
+        // VZ-specific case (FC gets a fresh connection each time).
+        for (i, payload) in [b"hello".to_vec(), b"a longer second body".to_vec()]
+            .into_iter()
+            .enumerate()
+        {
+            let header = UploadRequest {
+                session_id: engram_core::SessionId::new(),
+                broker_token: format!("tok-{i}"),
+                op: UploadOp::ShareFile {
+                    ext: "txt".into(),
+                    caption: None,
+                    size_bytes: payload.len() as u64,
+                },
+            };
+            write_msg(&mut guest, &header).await.expect("guest header");
+            guest.write_all(&payload).await.expect("guest body");
+
+            let resp: UploadResponse = read_msg(&mut guest).await.expect("guest resp");
+            assert!(
+                matches!(resp, UploadResponse::Shared { .. }),
+                "expected Shared, got {resp:?}"
+            );
+            let (got_header, got_body) = rx.recv().await.expect("sink delivered");
+            assert_eq!(got_header.broker_token, format!("tok-{i}"));
+            assert_eq!(got_body, payload, "body for upload {i} mismatched");
+        }
+    }
+
     #[test]
-    fn build_console_device_yields_three_ports_with_fds() {
+    fn build_console_device_yields_all_ports_with_fds() {
         let (_device, fds) = build_console_device().expect("device + fds construct");
-        assert_eq!(fds.by_port.len(), 3);
-        for &port in &[PORT_AGENTD, PORT_BOOTSTRAP, PORT_HARNESS] {
+        assert_eq!(fds.by_port.len(), 4);
+        for &port in &[PORT_AGENTD, PORT_BOOTSTRAP, PORT_HARNESS, PORT_UPLOAD] {
             assert!(fds.by_port.contains_key(&port));
         }
     }

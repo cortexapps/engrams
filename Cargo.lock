@@ -1610,6 +1610,7 @@ dependencies = [
  "engram-agentd",
  "engram-chunk-store",
  "engram-core",
+ "engram-harness-proto",
  "engram-storage-local",
  "futures",
  "libc",
