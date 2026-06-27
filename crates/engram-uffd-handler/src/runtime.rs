@@ -604,6 +604,14 @@ impl Runtime {
                             }
                         }
                     }
+                    ("canonical", Some(ResolvedPage::Zero { .. })) => {
+                        // Zero chunks are skipped — installing them would
+                        // privately materialize untouched guest RAM (see
+                        // the pass comment above). Counted once, in the
+                        // canonical pass, as zero_skipped.
+                        deferred += 1;
+                        false
+                    }
                     _ => false,
                 };
                 if did {
@@ -1215,10 +1223,12 @@ impl Runtime {
             .ok_or(HandlerError::AddressOutsideRegions(fault_addr))?
         {
             ResolvedPage::Canonical { canonical_offset } => {
-                // Route B: "canonical" no longer means "in the mmap" —
-                // it means "fetch the canonical chunk hash from the
-                // store", or, when the manifest omits this offset, a
-                // zero-filled chunk we install via UFFDIO_ZEROPAGE.
+                // Route B: "canonical" means "fetch the canonical chunk
+                // hash from the store" (shared via base-shm CONTINUE
+                // when present). Reaching this arm means the session
+                // agrees with the base here, so a hash is expected; the
+                // `None` branch is a defensive zero-fill for a malformed
+                // manifest — session omissions resolve to `Zero` below.
                 match self.backend.canonical_chunk_hash(canonical_offset) {
                     Some(hash) => {
                         // ADR 0014 M1.14: record the canonical chunk
@@ -1275,6 +1285,19 @@ impl Runtime {
                 }
                 let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
                 let installed = self.install_chunk_at(chunk_byte_offset, bytes, true)?;
+                if !installed {
+                    self.wake_page(page_aligned, page_size)?;
+                }
+            }
+            ResolvedPage::Zero { offset } => {
+                // Session omits this offset → authoritative zero page,
+                // regardless of what the base holds there (the session
+                // capture is full + zero-omitted). No chunk to record.
+                let installed = if self.base_shm.is_some() {
+                    self.install_zero_substrate(offset, true)?
+                } else {
+                    self.install_zero_at(offset, true)?
+                };
                 if !installed {
                     self.wake_page(page_aligned, page_size)?;
                 }
@@ -1502,6 +1525,16 @@ impl Runtime {
                                         self.install_zero_at(offset, false)?;
                                     }
                                 }
+                            }
+                        }
+                        Some(ResolvedPage::Zero { .. }) => {
+                            // Session omits this offset → private zero
+                            // page (the shared base is never written
+                            // with session-addressed content here).
+                            if self.base_shm.is_some() {
+                                self.install_zero_substrate(offset, false)?;
+                            } else {
+                                self.install_zero_at(offset, false)?;
                             }
                         }
                         None => {
