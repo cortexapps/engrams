@@ -13,17 +13,18 @@
 //!   `parent` set.
 //! - **Traces**: PUT/GET working-set traces by manifest+host.
 //!
-//! Chunk-store GC was removed 2026-05-23 (see ADR 0015 M5 "Known
-//! regression — chunk-store GC deleted"). BlobStorage cost grows
-//! unbounded until a redesigned sweep ships.
+//! Chunk-store GC ships as ADR 0016 Phase C: the coordinator's
+//! `chunk_gc.rs` mark-and-sweep reclaims unreferenced BlobStorage
+//! chunks. (The local NVMe cache has its own free-floor eviction —
+//! see `cache::ChunkCache`.)
 //!
 //! The local NVMe cache (`cache::ChunkCache`) is a separate layer
-//! consumed by adapters; this module's GETs go through the
-//! configured `ChunkResolver` (see ADR 0008 Phase 1). The default
-//! resolver wraps `BlobStorage` directly — identical behavior to
-//! pre-ADR-0008. Phase 2+ swaps in `TieredChunkResolver` to add
-//! OCI fallback. Writes always go through `BlobStorage` directly;
-//! the tiered story is read-only.
+//! consumed by adapters; this module's GETs go through the configured
+//! `ChunkResolver` (ADR 0008). The default resolver wraps `BlobStorage`
+//! directly; for chunked-OCI images the host-agent installs a
+//! `TieredChunkResolver` (`BlobStorage → OCI`, with write-through fill)
+//! via [`ChunkStore::with_resolver`]. Writes always go through
+//! `BlobStorage` directly; the tiered story is read-only.
 
 use std::sync::Arc;
 
@@ -65,13 +66,11 @@ impl ChunkStore {
         }
     }
 
-    /// Replace the chunk-fetch resolver. Phase 2+ of ADR 0008
-    /// uses this to install a `TieredChunkResolver` that falls
-    /// through `BlobStorage → OCI`, with opportunistic
-    /// write-through fill on miss.
-    ///
-    /// Phase 1 (today): no caller swaps the resolver; the default
-    /// `BlobStorageResolver` preserves pre-ADR-0008 behavior.
+    /// Replace the chunk-fetch resolver. The host-agent installs a
+    /// `TieredChunkResolver` here for chunked-OCI images — it falls
+    /// through `BlobStorage → OCI` with opportunistic write-through fill
+    /// on miss. The global host `ChunkStore` keeps the default
+    /// `BlobStorageResolver` (pre-ADR-0008 behavior).
     pub fn with_resolver(mut self, resolver: Arc<dyn ChunkResolver>) -> Self {
         self.resolver = resolver;
         self

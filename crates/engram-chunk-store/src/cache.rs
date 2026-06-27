@@ -17,18 +17,20 @@
 //!   fixed temp path and lose the rename with `ENOENT` (the chunks
 //!   end up uncached, so every read falls through to GCS — a prod
 //!   cold-recovery resume spent ~92 s page-faulting from GCS this way).
-//! - **LRU eviction**: when the cache filesystem is fuller than the
-//!   free-space floor (default: keep ~20% free) — or, if an absolute
-//!   ceiling is configured, when total cached bytes exceed it — the
-//!   oldest-accessed chunks get unlinked. "Oldest" is by modification
-//!   time on the cache file, which Linux + macOS both update on
-//!   `read`-via-`atime`-promotion when mounted with default options.
-//!   Cheap; doesn't require a separate in-memory metadata store. The
-//!   free-space floor is re-checked via `statvfs(2)` on every sweep, so
-//!   the cache yields disk to the snapshots and checkpoints that share
-//!   the work_dir mount rather than racing them to ENOSPC (the prod
-//!   incident where a 200 GiB byte-budget never tripped on a ~98 GiB
-//!   FC host).
+//! - **Eviction (FIFO by populate time)**: when the cache filesystem is
+//!   fuller than the free-space floor (default: keep ~20% free) — or, if
+//!   an absolute ceiling is configured, when total cached bytes exceed it
+//!   — the oldest chunks get unlinked. "Oldest" is by file modification
+//!   time, i.e. *populate* time: reads do NOT touch mtime (and atime is
+//!   not consulted), so this is FIFO by first-write, not true
+//!   LRU-by-access. Hot chunks are protected explicitly instead — by the
+//!   refcounted pin set (an enabled image's base manifest is pinned
+//!   resident), not by recency. Cheap; doesn't require a separate
+//!   in-memory metadata store. The free-space floor is re-checked via
+//!   `statvfs(2)` on every sweep, so the cache yields disk to the
+//!   snapshots and checkpoints that share the work_dir mount rather than
+//!   racing them to ENOSPC (the prod incident where a 200 GiB byte-budget
+//!   never tripped on a ~98 GiB FC host).
 //! - **Singleflight on miss**: if N threads simultaneously ask for
 //!   a chunk that's not cached, exactly one BlobStorage fetch
 //!   runs; the others await its completion.
@@ -65,10 +67,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::fs;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::error::{ChunkStoreError, Result};
 use crate::manifest::ChunkHash;
+
+/// Default populate-path sweep debounce (see `write_local`).
+pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
 
 /// Configuration for the on-disk cache.
 ///
@@ -86,9 +91,6 @@ use crate::manifest::ChunkHash;
 /// floor is a host-level / env concern resolved inside
 /// [`ChunkCache::new`]. Override it via [`FREE_FLOOR_PCT_ENV_VAR`] /
 /// [`FREE_FLOOR_BYTES_ENV_VAR`].
-/// Default populate-path sweep debounce (see `write_local`).
-pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
-
 #[derive(Clone, Debug)]
 pub struct ChunkCacheConfig {
     /// Where cached chunks live. Typically a subdirectory of the
@@ -562,12 +564,12 @@ impl ChunkCache {
                 for waiter in waiters {
                     let _ = waiter.send(clone_result(&result));
                 }
-                // ADR 0014 M1.15: counts the leader's fetch as a miss
-                // (we went to the underlying store). Singleflight
-                // followers are accounted as nvme hits when they
-                // re-enter `get` on a subsequent call — they're
-                // counted via the rx-await arm here only when the
-                // leader's fetch failed, which is rare.
+                // ADR 0014 M1.15: count the leader's fetch as a
+                // blobstorage hit (we went to the underlying store).
+                // Singleflight FOLLOWERS are not counted here at all — the
+                // rx-await arm increments no metric; a follower surfaces as
+                // an nvme hit only on its own later `get` call that finds
+                // the now-cached chunk.
                 metrics::counter!(
                     "engram_chunk_cache_hits_total",
                     "tier" => "blobstorage",
@@ -600,6 +602,16 @@ impl ChunkCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Bytes>>,
     {
+        // Already resident? Confirm presence with a cheap stat instead of
+        // reading (and discarding) the whole chunk off NVMe. prefetch only
+        // needs the chunk *resident*, not its bytes — content-addressing +
+        // verify-on-populate (ADR 0021) mean a present file is known-good,
+        // and skipping the read stops a warm-cache prefetch from inflating
+        // the nvme hit/bytes counters with reads no consumer received. A
+        // miss still routes through `get` (singleflight + verify-on-populate).
+        if self.contains(hash).await {
+            return Ok(());
+        }
         let _ = self.get(hash, fetch).await?;
         Ok(())
     }
@@ -1095,13 +1107,24 @@ impl EvictedRing {
         }
     }
 
-    /// If `hash` is tracked, remove it and return `true` (it's about to
-    /// be re-cached, so it's no longer "evicted"). Lazy removal from the
-    /// `order` deque — a stale entry is skipped on the next eviction
-    /// pop. We keep it in `order` to avoid an O(n) deque scan; the set
-    /// is the source of truth for membership.
+    /// If `hash` is tracked, remove it from BOTH `set` and `order` and
+    /// return `true` (it's about to be re-cached, so it's no longer
+    /// "evicted"). Removing from `order` too keeps the two in sync: a
+    /// later `insert` of the same hash then sees `set.insert == true` and
+    /// pushes a single fresh entry, so an overflow `pop_front` can never
+    /// drop a still-live re-inserted hash (which would undercount the
+    /// thrash metric). The O(n) scan is over a deque bounded at
+    /// `EVICTED_RING_CAP` and runs only on the cold remote-fetch path,
+    /// where a GCS round-trip dominates.
     fn take(&mut self, hash: &ChunkHash) -> bool {
-        self.set.remove(hash)
+        if self.set.remove(hash) {
+            if let Some(pos) = self.order.iter().position(|h| h == hash) {
+                self.order.remove(pos);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     #[cfg(test)]
@@ -1136,10 +1159,6 @@ fn clone_result(r: &Result<Bytes>) -> Result<Bytes> {
         Err(e) => Err(ChunkStoreError::Internal(format!("singleflight: {e}"))),
     }
 }
-
-// Suppress unused-channel warning until a consumer arrives.
-#[allow(dead_code)]
-fn _unused(_: mpsc::Receiver<()>) {}
 
 #[cfg(test)]
 mod tests {
@@ -1911,6 +1930,31 @@ mod tests {
         ring.insert(h(1));
         ring.insert(h(1));
         assert_eq!(ring.len(), 1, "re-inserting a tracked hash is a no-op");
+    }
+
+    #[test]
+    fn evicted_ring_take_then_reinsert_at_capacity_keeps_live_hash() {
+        // Regression: `take` must remove from `order` too. Otherwise a
+        // take-then-reinsert leaves a phantom duplicate in `order`, and at
+        // capacity the overflow `pop_front` drops the still-LIVE re-inserted
+        // hash from `set` — undercounting the thrash metric (a chunk that is
+        // evicted → refetched → evicted again wouldn't be counted).
+        let mut ring = EvictedRing::with_capacity(2);
+        ring.insert(h(1));
+        ring.insert(h(2)); // [1, 2] at capacity
+        assert!(ring.take(&h(1)), "take removes from both set and order");
+        ring.insert(h(1)); // [2, 1] — exactly one fresh entry for h(1)
+        assert_eq!(ring.len(), 2, "no phantom duplicate; ring stays full");
+        // Force an overflow: it must evict the genuine oldest (h(2)), NOT
+        // the live re-inserted h(1) sitting behind a stale duplicate.
+        ring.insert(h(3));
+        assert!(
+            ring.contains(&h(1)),
+            "live re-inserted hash survives overflow"
+        );
+        assert!(!ring.contains(&h(2)), "the genuine oldest is evicted");
+        assert!(ring.contains(&h(3)));
+        assert_eq!(ring.len(), 2);
     }
 
     // ---- fs_usage: statvfs smoke test on a real tempdir ----
