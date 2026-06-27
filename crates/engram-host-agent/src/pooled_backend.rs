@@ -840,17 +840,39 @@ impl PooledBackend {
         // prefetch / state materialize / NBD attach) alongside the
         // `fc.restore_in_jail` legs, so one trace shows where the whole
         // `host.restore_base_for_session` window goes. Pure observability.
+        // ADR 0022 / ADR 0045: does this restore serve memory lazily (UFFD
+        // faults / peer), or does it need a contiguous `memory.bin`
+        // materialized for `load_snapshot` (File)? Lazy iff
+        // `restore_memory_is_lazy_for(fresh)` — a fresh base-create under the
+        // ADR-0045 substrate, or any UFFD resume — OR this is a staged
+        // migration restore, which `restore_in_jail` forces to UFFD regardless
+        // of `config.restore_mode`, keyed on the migration manifest's presence.
+        // Compute it ONCE so the prefetch-block gate here and the
+        // memory.bin-materialize gate below both mirror the actual load
+        // decision and can't drift from it — or from each other. (The old
+        // `if fresh` gate mis-BLOCKED a substrate base-create on a full
+        // memory-manifest prefetch even though UFFD serves it lazily; and a
+        // File-mode host picked as a migration dest mis-materialized a
+        // `memory.bin` that `inner.restore` never reads — both on the restore
+        // critical path.)
+        let memory_is_lazy = self.inner.restore_memory_is_lazy_for(fresh)
+            || self
+                .inner
+                .snapshot_path_for(metadata.id)
+                .join("migration-session-manifest.json")
+                .exists();
+
         // ADR 0043 P1: warm the memory-chunk cache before the handler faults
-        // from it. On a File base-create (`fresh`) the serial
-        // `materialize_memory_if_missing` below reads the warmed cache, so the
-        // prefetch stays on the critical path (awaited). On a UFFD resume
-        // (`!fresh`) the chunks are consumed only by the handler's lazy faults
-        // AFTER `inner.restore`, so warming need not block resume: spawn it and
-        // let restore proceed immediately. The handler faults from the same
-        // cancel-safe single-flight cache, so a fault that races ahead of the
-        // background prefetch just fetches its one chunk itself. (Pairs with
-        // the handler-side background prefault — ADR 0043 P1 / ADR 0039 #19.)
-        if fresh {
+        // from it. A NON-LAZY restore (File base-create / File resume) feeds the
+        // warmed cache to the serial `materialize_memory_if_missing` below, so
+        // the prefetch stays on the critical path (awaited). A LAZY restore
+        // consumes the chunks only via the handler's lazy faults AFTER
+        // `inner.restore`, so warming need not block: spawn it and let restore
+        // proceed immediately. The handler faults from the same cancel-safe
+        // single-flight cache, so a fault that races ahead of the background
+        // prefetch just fetches its one chunk itself. (Pairs with the
+        // handler-side background prefault — ADR 0043 P1 / ADR 0039 #19.)
+        if !memory_is_lazy {
             let prefetched_chunks = tracing::Instrument::instrument(
                 self.prefetch_memory_chunks(&metadata),
                 tracing::info_span!("restore.prefetch_memory"),
@@ -1011,17 +1033,19 @@ impl PooledBackend {
         }
 
         // ADR 0020 Route B / ADR 0022 Option A: whether to rebuild the
-        // contiguous memory.bin is now a per-restore-flavor decision.
-        // Resume under UFFD (`fresh == false`) serves memory lazily from
-        // chunks — the handler faults straight from the cache the prefetch
-        // above just warmed, so materializing would be pure overhead.
-        // Base-create under File (`fresh == true`) needs the memfile
-        // present for `load_snapshot`; `materialize_memory_if_missing` is
-        // an idempotent no-op once the residency prefetch (image_prefetch)
-        // wrote the *per-template* file at this same snapshot-id-keyed
-        // path — which is exactly what keeps siblings sharing one inode
-        // rather than each rebuilding a divergent copy.
-        if self.inner.restore_memory_is_lazy_for(fresh) {
+        // contiguous memory.bin is the SAME per-restore laziness decision the
+        // prefetch gate above used (`memory_is_lazy`). A lazy restore — every
+        // UFFD resume, a substrate base-create, and any staged migration
+        // restore — serves memory from chunks/peer; the handler faults straight
+        // from the cache the prefetch warmed, so materializing memory.bin would
+        // be pure overhead (and on a migration dest, a wasted rebuild of a file
+        // `inner.restore` never reads). A non-lazy File restore needs the
+        // memfile present for `load_snapshot`; `materialize_memory_if_missing`
+        // is an idempotent no-op once the residency prefetch (image_prefetch)
+        // wrote the *per-template* file at this same snapshot-id-keyed path —
+        // which keeps siblings sharing one inode rather than each rebuilding a
+        // divergent copy.
+        if memory_is_lazy {
             tracing::debug!(
                 snapshot_id = %metadata.id,
                 "lazy memory restore (UFFD); skipping memory.bin materialization",
@@ -3133,11 +3157,11 @@ impl PooledBackend {
 
     /// Owner-agnostic body of [`Self::prefetch_memory_chunks`]. Takes the
     /// already-resolved store + cache (by ref) so it can run either inline
-    /// (`await`, on the File base-create path where the serial
+    /// (`await`, on a NON-LAZY File restore where the serial
     /// `materialize_memory_if_missing` reads the warmed cache) or inside a
-    /// spawned background task (ADR 0043 P1, the UFFD-resume path — the warmed
+    /// spawned background task (ADR 0043 P1, any lazy UFFD restore — the warmed
     /// chunks are consumed only by the handler's later lazy faults, so warming
-    /// need not block resume).
+    /// need not block restore).
     async fn prefetch_memory_chunks_inner(
         chunk_store: &ChunkStore,
         cache: &ChunkCache,
