@@ -25,15 +25,16 @@
 //! roll. The base-snapshot chunks live in the GCS chunk store (flushed at
 //! enable), so this path is GCS-backed, not registry-backed.
 //!
-//! Storage tier model (for the per-chunk `get_chunk` walk):
-//!   - Tier 1: local NVMe `ChunkCache` (canonical "ready" inventory; hit here =
-//!     chunk is local + counts toward readiness).
+//! Storage tier model (for the per-chunk `get_chunk` walk on the supervisor's
+//! `ChunkStore`, which uses the default `BlobStorageResolver`):
+//!   - Tier 1: local NVMe `ChunkCache` (canonical "ready" inventory; a hit
+//!     here = chunk is local + counts toward readiness).
 //!   - Tier 2: `BlobStorage` at `chunks/sha256/<hex>` (GCS) — where the base
 //!     snapshot's chunks are flushed at enable. This is the hot tier here.
-//!   - Tier 3: OCI Range GET (safety net; CDN-fills BlobStorage on a tier-2
-//!     miss). In practice the base-snapshot chunks are always in tier 2.
 //!
-//! `chunk_store.get_chunk(hash)` walks the tiers and tees on miss, so the
+//! (The OCI-fallback `TieredChunkResolver` is installed only on the
+//! host-agent's per-restore chunked-OCI store, not on this supervisor's
+//! store.) `chunk_store.get_chunk(hash)` resolves NVMe → BlobStorage, so the
 //! prefetch driver is just an eager loop over the base snapshot's chunk hashes.
 
 use std::collections::{HashMap, HashSet};
@@ -515,6 +516,34 @@ async fn prefetch_one(
     // memfile exists, so the first session restores against a warm file.
     base_memfile: Option<PathBuf>,
 ) -> Result<WarmedManifest, PrefetchError> {
+    // ADR 0045 substrate readiness gate. A memory-bearing (FC) image restores
+    // Uffd-against-the-shared-base-shm, which REQUIRES the uffd base dir to be
+    // a tmpfs/shmem mount — `UFFDIO_REGISTER MINOR` (canonical-page sharing)
+    // is shmem-only. On a freshly-rolled K8s node, node-prep mounts that tmpfs
+    // minutes AFTER the host-agent starts; until then the path is a plain
+    // container-overlay dir, and a base-shm restore there faults with
+    // "register memory ... userfaultfd ... System error", silently dropping
+    // fresh-host capacity. Withhold readiness — fail the prefetch so the image
+    // is NOT marked ready and the coordinator places no substrate session here
+    // — until the mount is visible. The 30s reconcile retries, so this
+    // self-heals once node-prep lands the mount.
+    if image.base_snapshot_memory_manifest.is_some() {
+        if let Some(base_dir) = engram_sandbox_firecracker::uffd_base_dir_from_env() {
+            // Create the dir first so the statfs reflects the real backing fs:
+            // a subdir of an always-present tmpfs (e.g. /dev/shm), or a
+            // not-yet-mounted dedicated mountpoint on the overlay. Mounting a
+            // tmpfs over an existing dir later is fine.
+            let _ = tokio::fs::create_dir_all(&base_dir).await;
+            if !dir_is_tmpfs(&base_dir) {
+                return Err(PrefetchError::SubstrateNotReady(format!(
+                    "uffd base dir {} is not a tmpfs/shmem mount yet \
+                     (node-prep may not have mounted it)",
+                    base_dir.display()
+                )));
+            }
+        }
+    }
+
     // Accumulate the deduped pin set across the disk + memory manifests.
     // `seen` keeps the pin batch unique so a chunk shared by both manifests
     // is pinned once and unpinned once.
@@ -730,6 +759,10 @@ enum PrefetchError {
     SemaphoreClosed,
     JoinError(String),
     MemfileMaterialize(String),
+    /// ADR 0045: the substrate is configured but its base dir isn't a
+    /// tmpfs/shmem mount yet (node-prep hasn't mounted it). Withhold
+    /// readiness for memory-bearing images until the mount appears.
+    SubstrateNotReady(String),
 }
 
 impl std::fmt::Display for PrefetchError {
@@ -740,15 +773,65 @@ impl std::fmt::Display for PrefetchError {
             Self::SemaphoreClosed => write!(f, "prefetch semaphore closed"),
             Self::JoinError(m) => write!(f, "task join: {m}"),
             Self::MemfileMaterialize(m) => write!(f, "materialize base memfile: {m}"),
+            Self::SubstrateNotReady(m) => write!(f, "substrate base dir not ready: {m}"),
         }
     }
 }
 
 impl std::error::Error for PrefetchError {}
 
+/// Whether `path` is on a tmpfs/shmem mount. The ADR 0045 substrate
+/// requires its base dir to be tmpfs/shmem because `UFFDIO_REGISTER MINOR`
+/// (the canonical-page sharing op) is shmem-only; on a freshly-rolled K8s
+/// node, node-prep mounts that tmpfs minutes after the host-agent starts. A
+/// missing path or a probe error reads as "not tmpfs" (i.e. not ready). On
+/// non-Linux there is no substrate, so this is vacuously true.
+#[cfg(target_os = "linux")]
+fn dir_is_tmpfs(path: &std::path::Path) -> bool {
+    // TMPFS_MAGIC (0x0102_1994) covers tmpfs and shmem (incl. /dev/shm).
+    match nix::sys::statfs::statfs(path) {
+        Ok(s) => s.filesystem_type() == nix::sys::statfs::TMPFS_MAGIC,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dir_is_tmpfs(_path: &std::path::Path) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ADR 0045 substrate readiness gate: `dir_is_tmpfs` must positively
+    // identify a real tmpfs mount and reject a non-tmpfs / missing path.
+    // Cross-checked against /proc/mounts so an unusual CI container (where
+    // /dev/shm might not be tmpfs) can't flake the positive assertion.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dir_is_tmpfs_identifies_shmem_and_rejects_others() {
+        // A non-existent path can't be a mount → not ready (no panic).
+        assert!(!dir_is_tmpfs(std::path::Path::new(
+            "/nonexistent-engram-base-xyz"
+        )));
+
+        let shm_is_tmpfs = std::fs::read_to_string("/proc/mounts")
+            .map(|m| {
+                m.lines().any(|l| {
+                    let mut f = l.split_whitespace();
+                    f.next(); // device
+                    f.next() == Some("/dev/shm") && f.next() == Some("tmpfs")
+                })
+            })
+            .unwrap_or(false);
+        if shm_is_tmpfs {
+            assert!(
+                dir_is_tmpfs(std::path::Path::new("/dev/shm")),
+                "statfs must agree with /proc/mounts that /dev/shm is tmpfs",
+            );
+        }
+    }
 
     // ADR 0022: pin a small (16 KiB) temp file resident — exercises the
     // mmap+mlock+drop path on the Linux CI runner (16 KiB fits even a
