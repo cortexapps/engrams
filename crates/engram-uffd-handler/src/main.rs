@@ -7,12 +7,17 @@
 //! from the chunk cache/store (zero-filled chunks via
 //! `UFFDIO_ZEROPAGE`). There is no `memory.bin` file.
 //!
+//! With `--base-shm` (ADR 0045 substrate), canonical (un-diverged) pages
+//! install via `UFFDIO_CONTINUE` over a shared per-template base file —
+//! one host-wide copy mapped `MAP_PRIVATE` by every fork — while divergent
+//! pages stay private via `UFFDIO_COPY`.
+//!
 //! ```text
 //! engram-uffd-handler \
 //!   --listen /tmp/uffd.sock \
 //!   --canonical-manifest <uuid>@v<n> \
 //!   --session-manifest   <uuid>@v<n> \
-//!   [--prefault-trace canonical|<host-uuid>] \
+//!   [--prefault-trace file:<path>|<host-uuid>] \
 //!   [--publish-trace-host <host-uuid>] \
 //!   [--cache-root /var/cache/engram/chunks] \
 //!   [--cache-budget-bytes 214748364800] \
@@ -117,8 +122,6 @@ mod linux {
     /// Which trace to consume on restore.
     #[derive(Clone, Debug)]
     pub enum PrefaultTraceSpec {
-        /// `traces/<manifest_id>/canonical.json` (image-bake-time).
-        Canonical,
         /// `traces/<manifest_id>/<host_id>.json` (this host's prior
         /// recording for the same manifest).
         Host(Uuid),
@@ -142,13 +145,11 @@ mod linux {
         /// clean shutdown. Omit on bake / unit-test runs where no
         /// publishing is wanted.
         pub publish_trace_host: Option<Uuid>,
-        /// ADR 0014 M1.14: write the recorded trace JSON to this
-        /// local path on clean shutdown (in addition to / instead of
-        /// `--publish-trace-host`'s BlobStorage publish). Used by the
-        /// image-builder's synthetic profile pass: the bake spawns
-        /// FC+UFFD, dials vsock to drive activity, then reads the
-        /// trace file back to stage it as an OCI layer. Omit when
-        /// the receiver doesn't care.
+        /// The per-jail trace file path: write the recorded trace JSON
+        /// here on clean shutdown (in addition to / instead of
+        /// `--publish-trace-host`'s BlobStorage publish). ADR 0045 C2
+        /// reads it back to ship the migration `hot_chunks` rider. Omit
+        /// when the receiver doesn't care.
         pub trace_output: Option<PathBuf>,
         /// ADR 0014 M1.14: when set, bypass `pick_blob_backend`'s
         /// env-var lookup and `LocalBlobStorage::new(this)` directly.
@@ -382,17 +383,13 @@ mod linux {
         })
     }
 
-    /// Accept `canonical` (string literal) or `<uuid>` (a host id).
+    /// Accept `file:<path>` (a local trace JSON) or `<uuid>` (a host id).
     fn parse_trace_spec(s: &str) -> Result<PrefaultTraceSpec, String> {
-        if s.eq_ignore_ascii_case("canonical") {
-            Ok(PrefaultTraceSpec::Canonical)
-        } else if let Some(path) = s.strip_prefix("file:") {
+        if let Some(path) = s.strip_prefix("file:") {
             Ok(PrefaultTraceSpec::File(PathBuf::from(path)))
         } else {
             let host = Uuid::parse_str(s).map_err(|e| {
-                format!(
-                    "--prefault-trace {s:?} (expected `canonical`, `file:<path>`, or <uuid>): {e}"
-                )
+                format!("--prefault-trace {s:?} (expected `file:<path>` or <uuid>): {e}")
             })?;
             Ok(PrefaultTraceSpec::Host(host))
         }
@@ -435,12 +432,6 @@ mod linux {
                     .and_then(|bytes| {
                         serde_json::from_slice(&bytes).map_err(|e| format!("parse trace: {e}"))
                     }),
-                PrefaultTraceSpec::Canonical => load_trace_via_blob(
-                    blob.clone(),
-                    TraceRef::canonical(args.session_manifest.manifest_id),
-                )
-                .await
-                .map_err(|e| e.to_string()),
                 PrefaultTraceSpec::Host(host) => load_trace_via_blob(
                     blob.clone(),
                     TraceRef::host(args.session_manifest.manifest_id, *host),
@@ -680,7 +671,7 @@ mod linux {
   --listen <sock> \\
   --canonical-manifest <uuid>@v<num> \\
   --session-manifest <uuid>@v<num> \\
-  [--prefault-trace canonical|<host-uuid>] \\
+  [--prefault-trace file:<path>|<host-uuid>] \\
   [--publish-trace-host <host-uuid>] \\
   [--cache-root <path>] \\
   [--cache-budget-bytes <bytes>] \\

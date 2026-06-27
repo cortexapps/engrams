@@ -1232,35 +1232,6 @@ async fn prepare_inner(
         image_tag,
     })
 }
-/// ADR 0020 P1: attempt to restore a session from the image's base
-/// snapshot, late-binding the session harness. Builds the
-/// `SnapshotMetadata` from the base snapshot's `snapshots` row (the
-/// portable blob keys are deterministic from `snapshot_id`), picks a
-/// host, and runs the combined restore + harness-swap op. Any error
-/// bubbles to the caller, which falls back to a cold create — so this
-/// never fails a session, it only declines to fast-path it.
-/// ADR 0039 (cache locality): the BlobStorage key for a base image's
-/// *canonical* working-set trace (`traces/<memory_manifest_id>/canonical.json`,
-/// published by the image-builder's profile pass), or `None` when the base
-/// snapshot has no memory image.
-///
-/// When set on the restore `SnapshotMetadata`, the host narrows its
-/// memory-chunk prefetch from "all base-memory chunks" to "just the chunks
-/// the kernel faults in the first ~5 s" — the REAP-style warm set
-/// (`prefetch_memory_chunks` in the pooled backend). Keyed off the *memory*
-/// manifest because the trace describes memory faults; disk-only / cold-boot
-/// base snapshots (VZ) have no memory image, so there is nothing to narrow.
-///
-/// Safe before any bake has published a canonical trace: a missing blob is
-/// treated as an empty working set and the host falls back to full-manifest
-/// prefetch (the prior, behaviour-preserving path).
-pub(crate) fn base_working_set_blob_key(
-    memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
-) -> Option<String> {
-    memory_manifest
-        .map(|m| engram_chunk_store::working_set::TraceRef::canonical(m.manifest_id).storage_key())
-}
-
 /// ADR 0051: fetch a session by id (gRPC `GetSession`). 404 on unknown id.
 pub(crate) async fn get_session_core(
     state: &SharedState,
@@ -1896,31 +1867,6 @@ mod tests {
             .collect();
         let err = assign_skill_slots(&catalog, &too_many).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
-    }
-
-    /// ADR 0039: the base-restore metadata points the host's memory-chunk
-    /// prefetch at the canonical working-set trace, keyed off the base
-    /// snapshot's *memory* manifest. Disk-only / cold-boot base snapshots
-    /// (no memory manifest) get `None` and fall back to full-manifest
-    /// prefetch.
-    #[test]
-    fn base_working_set_blob_key_points_at_canonical_trace() {
-        use engram_core::types::manifest::ManifestRef;
-        // FC base snapshot with a memory manifest → canonical trace key
-        // keyed on the *manifest_id* (not the version — the trace is per
-        // manifest lineage, stable across diff-chain version bumps).
-        let mref = ManifestRef {
-            manifest_id: uuid::Uuid::new_v4(),
-            version: 3,
-        };
-        let key = base_working_set_blob_key(Some(mref)).expect("memory manifest → Some key");
-        assert_eq!(
-            key,
-            format!("traces/{}/canonical.json", mref.manifest_id),
-            "key must be the canonical trace for the memory manifest lineage",
-        );
-        // Disk-only / cold-boot (VZ) base snapshot: no memory image → None.
-        assert_eq!(base_working_set_blob_key(None), None);
     }
 
     /// ADR 0016 §A.1.7 / ADR 0057 regression guard. The pure assembly path must

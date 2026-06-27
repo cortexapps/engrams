@@ -25,7 +25,6 @@ use engram_core::types::session::{SessionSpec, SessionState};
 use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
 
-use crate::api::sessions::base_working_set_blob_key;
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
 
@@ -177,7 +176,9 @@ pub(crate) async fn boot_on_reserved_host(
             base_snapshot_id,
         )),
         rootfs_blob_key: None,
-        working_set_blob_key: base_working_set_blob_key(record.memory_manifest),
+        // The canonical working-set trace is never produced, so the host
+        // always falls back to full-manifest memory-chunk prefetch.
+        working_set_blob_key: None,
         aux_bundles: record.aux_bundles,
     };
 

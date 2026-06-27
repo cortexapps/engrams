@@ -1558,15 +1558,6 @@ impl PooledBackend {
         ))
     }
 
-    /// ADR 0045 C1 (destination): pull the frozen source's export —
-    /// state.bin + sidecar into the local snapshot dir, every transfer
-    /// chunk into the NVMe cache (hash-verified by `cache.put`), the
-    /// inline session manifest as a local file the handler resolves
-    /// from disk, and the inline disk manifest staged for
-    /// `prepare_resume_nbd_attach`.
-    /// ADR 0045 C1: pull a chunk set from a live migration export over
-    /// the source host's gRPC channel into the local cache. Used by the
-    /// background divergence pull (LAN beats GCS by ~20x for the session
     /// ADR 0045 C2 (E2B fold): read the sandbox's per-jail working-set
     /// trace (fault-order hot set) for the migration rider. Best-effort
     /// by design: an absent/corrupt file (handler predates the dump,
@@ -1605,6 +1596,9 @@ impl PooledBackend {
         remaining
     }
 
+    /// ADR 0045 C1: pull a chunk set from a live migration export over
+    /// the source host's gRPC channel into the local cache. Used by the
+    /// background divergence pull (LAN beats GCS by ~20x for the session
     /// chain). Returns the number of chunks landed.
     async fn pull_chunks_from_source(
         source_addr: &str,
@@ -2049,6 +2043,12 @@ impl PooledBackend {
         Ok(())
     }
 
+    /// ADR 0045 C1 (destination): pull the frozen source's export —
+    /// state.bin + sidecar into the local snapshot dir, every transfer
+    /// chunk into the NVMe cache (hash-verified by `cache.put`), the
+    /// inline session manifest as a local file the handler resolves
+    /// from disk, and the inline disk manifest staged for
+    /// `prepare_resume_nbd_attach`.
     async fn migration_prestage(
         &self,
         metadata: &SnapshotMetadata,
@@ -4340,10 +4340,6 @@ impl SandboxBackend for PooledBackend {
     // about itself is what callers see.
     fn harness_dial(&self) -> engram_core::traits::HarnessDial {
         self.inner.harness_dial()
-    }
-
-    fn restore_memory_is_lazy(&self) -> bool {
-        self.inner.restore_memory_is_lazy()
     }
 
     fn restore_memory_is_lazy_for(&self, fresh: bool) -> bool {
