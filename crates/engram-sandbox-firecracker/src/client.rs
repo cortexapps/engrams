@@ -754,7 +754,8 @@ pub struct SnapshotPaths {
 
 /// `PUT /snapshot/create` payload. `snapshot_type` is `Full` for a
 /// self-contained snapshot, `Diff` for an incremental one against the
-/// previous Full. We only emit `Full` today.
+/// previous Full. We emit `Full` for self-contained captures and
+/// `Diff` for the ADR-0028 checkpoint chain.
 #[derive(Debug, Serialize)]
 struct SnapshotCreateBody {
     snapshot_path: String,
@@ -820,8 +821,6 @@ struct VsockOverrideBody {
 ///     start but simple.
 ///   - `Uffd`: a separate userfaultfd handler streams pages on demand.
 ///     Sub-100ms restore, but needs the handler process / `unsafe`.
-///     We don't emit this variant today; it lands with the UFFD
-///     handler slice.
 #[derive(Debug, Serialize)]
 struct MemBackend {
     backend_type: MemBackendType,

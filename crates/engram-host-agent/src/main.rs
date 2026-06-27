@@ -444,9 +444,11 @@ async fn main() -> Result<(), HostAgentError> {
     // match so the inner VZ backend could share it; reuse it here.
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
     let materialize_dir = cli.work_dir.join("chunked-rootfs");
-    // ADR 0007 #3a: NVMe-backed chunk cache. Budget defaults to
-    // 200 GiB; operators override via `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`
-    // for hosts with smaller NVMe or different sharing ratios.
+    // ADR 0007 #3a: NVMe-backed chunk cache. No absolute ceiling by
+    // default — a 20% free-space floor (re-probed via `statvfs(2)` on
+    // every sweep) governs, filling to ~80% of the cache disk then
+    // LRU-evicting. Operators may set an optional absolute ceiling via
+    // `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`, which then wins over the floor.
     let chunk_cache = engram_chunk_store::ChunkCache::new(
         engram_chunk_store::cache::ChunkCacheConfig::from_env_or_default(
             cli.work_dir.join("chunk-cache"),
