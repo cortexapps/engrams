@@ -23,10 +23,10 @@
 //!
 //! Dropping the canonical mmap is what removes the `materialize`
 //! pass + the `MAP_POPULATE` eager read from the restore critical
-//! path (ADR 0020). Cross-session *guest-RAM* dedup is **not**
-//! provided by this revision (`UFFDIO_COPY` always installs a private
-//! page); the future packing milestone layers `UFFDIO_CONTINUE` over
-//! a shared per-image backing on top of this same resolution logic.
+//! path (ADR 0020). Cross-session *guest-RAM* dedup ships via the
+//! ADR-0045 substrate: with `--base-shm`, canonical pages install with
+//! `UFFDIO_CONTINUE` over a shared per-template base file (one host
+//! copy), and only session-divergent pages stay private `UFFDIO_COPY`.
 //!
 //! `unsafe` blocks in this module are kernel-surface essentials
 //! (UFFDIO_COPY / UFFDIO_ZEROPAGE, fd ownership from SCM_RIGHTS);
