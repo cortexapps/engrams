@@ -77,8 +77,10 @@ pub struct PeerExport {
     /// Per-leg serve attribution (logged at DrainDone): where the
     /// per-request wall actually goes on this no-SHA-NI fleet.
     pub serve: ServeStats,
-    /// Set when the dest reports `DrainDone` — after this the source FC
-    /// is no longer needed as a page source (commit may proceed).
+    /// Serve-side marker, set when the dest reports `DrainDone`: every
+    /// sealed chunk has been drained off this source. Observability /
+    /// test signal only — the commit path does NOT consult it (commit is
+    /// gated elsewhere); production never reads this field.
     pub drained: AtomicBool,
     /// Issue #216 Gap 2: the TTL clock SHARED with the registry's
     /// `MigrationExport.last_activity` (same `Arc`). The post-copy TTL

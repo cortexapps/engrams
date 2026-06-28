@@ -45,14 +45,6 @@ pub fn rootfs_blob_key(snapshot_id: SnapshotId) -> String {
     format!("snapshots/{snapshot_id}/rootfs.tar.zst")
 }
 
-/// ADR 0014 M1.14: `snapshots/<snapshot_id>/working_set.json` —
-/// JSON-serialized `WorkingSetTrace` captured by the bake's
-/// synthetic profile pass. Pooled_backend reads it on a fresh
-/// base-snapshot restore to narrow M1.13's parallel prefetch.
-pub fn working_set_blob_key(snapshot_id: SnapshotId) -> String {
-    format!("snapshots/{snapshot_id}/working_set.json")
-}
-
 /// Upload an opaque file to `BlobStorage`. Reads the whole file
 /// into memory — meant for small payloads (state.bin sidecar,
 /// kilobytes; sidecar.json, low KiB). Don't use on rootfs blobs

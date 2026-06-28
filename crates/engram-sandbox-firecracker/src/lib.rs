@@ -364,15 +364,6 @@ pub struct FirecrackerConfig {
     /// responsible for materializing the file. The session's real
     /// harness is patched in via `swap_harness_drive` at warm-lease.
     pub stub_harness_path: Option<PathBuf>,
-    /// ADR 0014 M1.14: when set, the UFFD handler dumps its recorded
-    /// `WorkingSetTrace` to this file on clean shutdown. Used by the
-    /// image-builder's synthetic profile pass: after bake's primary
-    /// snapshot is taken, a second FC restore runs with this set so
-    /// the bake driver can read the trace back from disk + stage it
-    /// as an OCI layer. `None` in production (warm-pool refill
-    /// doesn't need to dump; the publish-trace-host path is
-    /// sufficient for runtime).
-    pub working_set_trace_output: Option<PathBuf>,
     /// ADR 0014 M1.14: bake-side override for the UFFD handler's
     /// blob root. The bake's chunk store lives at
     /// `<images_dir>/store/` rather than the runtime convention
@@ -591,7 +582,6 @@ impl FirecrackerConfig {
             host_id: None,
             uffd_cache_root: None,
             stub_harness_path: None,
-            working_set_trace_output: None,
             uffd_blob_root: None,
             // Host-passthrough by default. Prod (`engram-coordinator`)
             // and the bake (`engram-image-builder`) both opt in to a
@@ -1711,18 +1701,7 @@ impl FirecrackerBackend {
         // load gate (not this fn) waits on the UDS.
         peer: Option<&MigrationPeerSpec>,
     ) -> Result<(Child, SpawnKillGuard), SandboxError> {
-        // ADR 0014 M1.14: when the caller wires `working_set_trace_output`,
-        // it's the bake's profile pass — destroy removes jail_dir
-        // immediately after, sweeping the handler's log with it. Park
-        // the log next to the trace output (in the bake's scratch
-        // tempdir) so post-mortem diagnostics survive.
-        let log_path = match self.config.working_set_trace_output.as_ref() {
-            Some(p) => p
-                .parent()
-                .map(|d| d.join("uffd-handler.log"))
-                .unwrap_or_else(|| jail_dir.join("uffd-handler.log")),
-            None => jail_dir.join("uffd-handler.log"),
-        };
+        let log_path = jail_dir.join("uffd-handler.log");
         let log = std::fs::File::create(&log_path)
             .map_err(|e| vm_err(format!("open uffd handler log {}: {e}", log_path.display())))?;
         let log_clone = log
@@ -1796,22 +1775,12 @@ impl FirecrackerBackend {
         if let Some(host) = publish_trace_host {
             cmd.arg("--publish-trace-host").arg(host.to_string());
         }
-        // ADR 0014 M1.14: bake's profile pass sets this so the
-        // image-builder can read the trace file back without going
-        // through BlobStorage. ADR 0045 C2 (E2B fold): production
-        // spawns now default to a PER-JAIL trace file — the migration
-        // capture reads it to ship the `hot_chunks` rider (the
-        // publish-trace-host channel only lands at handler EXIT, which
-        // is too late for a live move).
-        match self.config.working_set_trace_output.as_ref() {
-            Some(path) => {
-                cmd.arg("--trace-output").arg(path);
-            }
-            None => {
-                cmd.arg("--trace-output")
-                    .arg(jail_dir.join(WORKING_SET_TRACE_FILE));
-            }
-        }
+        // ADR 0045 C2 (E2B fold): production spawns default to a
+        // PER-JAIL trace file — the migration capture reads it to ship
+        // the `hot_chunks` rider (the publish-trace-host channel only
+        // lands at handler EXIT, which is too late for a live move).
+        cmd.arg("--trace-output")
+            .arg(jail_dir.join(WORKING_SET_TRACE_FILE));
         if let Some(path) = self.config.uffd_blob_root.as_ref() {
             cmd.arg("--blob-root").arg(path);
         }
@@ -4090,17 +4059,13 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     /// ADR 0045 C2 (E2B fold): the per-jail trace dump the spawn wires
-    /// via `--trace-output` (unless the bake's profile pass overrode
-    /// the path — that mode never migrates).
+    /// via `--trace-output`.
     fn working_set_trace_path(&self, id: SandboxId) -> Option<PathBuf> {
-        match self.config.working_set_trace_output.as_ref() {
-            Some(_) => None,
-            None => Some(
-                self.work_dir
-                    .join(id.to_string())
-                    .join(WORKING_SET_TRACE_FILE),
-            ),
-        }
+        Some(
+            self.work_dir
+                .join(id.to_string())
+                .join(WORKING_SET_TRACE_FILE),
+        )
     }
 
     /// ADR 0045 C2: trait forwarding to the inherent composition (the
@@ -4464,13 +4429,6 @@ impl SandboxBackend for FirecrackerBackend {
     /// `FirecrackerConfig.stub_harness_path` (`ENGRAM_STUB_HARNESS_PATH`).
     fn stub_harness_path(&self) -> Option<std::path::PathBuf> {
         self.config.stub_harness_path.clone()
-    }
-
-    fn restore_memory_is_lazy(&self) -> bool {
-        // ADR 0020 Route B: Uffd serves memory from chunks on fault,
-        // so no materialized memory.bin is needed on restore. This is
-        // the resume-flavor answer (`fresh == false`).
-        matches!(self.config.restore_mode, RestoreMode::Uffd)
     }
 
     fn restore_memory_is_lazy_for(&self, fresh: bool) -> bool {
@@ -5371,7 +5329,6 @@ mod tests {
             host_id: None,
             uffd_cache_root: None,
             stub_harness_path: None,
-            working_set_trace_output: None,
             uffd_blob_root: None,
             cpu_template: None,
             bundle_dir: dir.path().join("bundles"),

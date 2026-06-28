@@ -1,7 +1,7 @@
 //! ADR 0028 addendum: portable snapshot-blob GC sweep — the durability
 //! half of "snapshot blobs are pinned by GC."
 //!
-//! Brings `snapshots/<id>/{state.bin,sidecar.json,working_set.json}`
+//! Brings `snapshots/<id>/{state.bin,sidecar.json}`
 //! under the same pin-set + grace + barrier model as chunks
 //! (`chunk_gc`) and bundles (`bundle_gc`). This replaces the host's
 //! inline `abort_prior_inflight_snapshot` blob deletion, which deleted
@@ -77,9 +77,8 @@ pub async fn run_one_snapshot_blob_sweep(
             .await
             .map_err(|e| GcError::ChunkStore(engram_chunk_store::ChunkStoreError::Blob(e)))?;
 
-        // Dedup the ≤3 keys per snapshot (state.bin / sidecar.json /
-        // working_set.json) down to one id so each candidate is upserted
-        // once.
+        // Dedup the ≤2 keys per snapshot (state.bin / sidecar.json)
+        // down to one id so each candidate is upserted once.
         let mut malformed = 0usize;
         let mut unpinned: HashSet<SnapshotId> = HashSet::new();
         for key in &keys {
@@ -144,7 +143,7 @@ pub async fn run_one_snapshot_blob_sweep(
                 continue;
             }
             // delete is idempotent on missing keys (both GCS + Local
-            // return Ok), so deleting all three is safe even though
+            // return Ok), so deleting both is safe even though
             // memory-less / non-FC snapshots only ever uploaded a
             // subset. A real (non-NotFound) error keeps the candidate
             // row for the next sweep to retry.
@@ -152,7 +151,6 @@ pub async fn run_one_snapshot_blob_sweep(
             for key in [
                 engram_chunk_store::snapshot_blob::state_blob_key(id),
                 engram_chunk_store::snapshot_blob::sidecar_blob_key(id),
-                engram_chunk_store::snapshot_blob::working_set_blob_key(id),
             ] {
                 if let Err(e) = blob.delete(&key).await {
                     tracing::warn!(
@@ -184,7 +182,7 @@ mod tests {
     #[test]
     fn parses_id_from_each_suffix() {
         let id = SnapshotId::new();
-        for suffix in ["state.bin", "sidecar.json", "working_set.json"] {
+        for suffix in ["state.bin", "sidecar.json"] {
             let key = format!("snapshots/{id}/{suffix}");
             assert_eq!(snapshot_id_from_key(&key), Some(id), "key={key}");
         }
