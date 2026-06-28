@@ -3270,7 +3270,15 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
 /// genuinely hung FC is caught by the process supervisor, not this timeout.
 fn snapshot_create_timeout(mem_mib: u32) -> Duration {
     const BASE_SECS: u64 = 60;
-    const MIB_PER_SEC_FLOOR: u64 = 128;
+    // Per-MiB write budget. FC's `PUT /snapshot/create` writes the full guest
+    // `memory.bin` to local disk; this floor is the slowest sustained write we
+    // budget for. The 291 GiB pd-ssd host disks nominally do ~140 MiB/s, but
+    // during a base-snapshot capture the concurrent chunk-flush (reading the
+    // snapshot back to upload it to GCS) roughly halves effective throughput to
+    // ~70 MiB/s. A 128 MiB/s floor was too optimistic: the 24 GiB dev-brain
+    // guest's 252s budget expired mid-write (prod, 2026-06). 64 MiB/s gives that
+    // guest ~444s, comfortably above the observed write time.
+    const MIB_PER_SEC_FLOOR: u64 = 64;
     Duration::from_secs(BASE_SECS + mem_mib as u64 / MIB_PER_SEC_FLOOR)
 }
 
@@ -5264,11 +5272,16 @@ mod tests {
 
     #[test]
     fn snapshot_timeout_scales_with_guest_memory() {
-        // Small VMs keep the prior 60s floor (no regression).
-        assert_eq!(snapshot_create_timeout(64), Duration::from_secs(60));
-        assert_eq!(snapshot_create_timeout(4096), Duration::from_secs(60 + 32));
-        // The dev-brain 32 GiB capture that tripped the flat 60s now gets
-        // ~5min — comfortably more than 60s.
+        // Small VMs stay essentially at the 60s floor (no regression).
+        assert_eq!(snapshot_create_timeout(64), Duration::from_secs(61));
+        assert_eq!(snapshot_create_timeout(4096), Duration::from_secs(60 + 64));
+        // The 24 GiB dev-brain capture that timed out at the old 128 MiB/s floor
+        // (252s, prod 2026-06) now gets 444s.
+        assert_eq!(
+            snapshot_create_timeout(24 * 1024),
+            Duration::from_secs(60 + 384)
+        );
+        // Big guests get an ample budget.
         let big = snapshot_create_timeout(32 * 1024);
         assert!(
             big >= Duration::from_secs(300),
