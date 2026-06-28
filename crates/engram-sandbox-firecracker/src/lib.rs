@@ -2658,7 +2658,7 @@ impl FirecrackerBackend {
         // read by `PUT /snapshot/load` in this mode and won't exist on
         // disk after a cross-host receive (PooledBackend::restore
         // skips `materialize_memory_if_missing` when
-        // `restore_memory_is_lazy()` returns true). Requiring it here
+        // `restore_memory_is_lazy_for(fresh)` returns true). Requiring it here
         // unconditionally was the prod blocker on 2026-05-29: after a
         // host-agent pod restart the new hosts had every base-snapshot restore fail
         // with "snapshot memory.bin missing" before the mode-specific
@@ -5996,6 +5996,34 @@ mod tests {
         be.config.uffd_base_dir = Some(std::path::PathBuf::from("/dev/shm/engram"));
         assert_eq!(be.effective_restore_mode(true), RestoreMode::Uffd);
         assert_eq!(be.effective_restore_mode(false), RestoreMode::Uffd);
+    }
+
+    #[test]
+    fn restore_memory_is_lazy_for_tracks_effective_mode() {
+        // The host-agent restore path keys BOTH its prefetch-block gate and its
+        // memory.bin-materialize gate on `restore_memory_is_lazy_for(fresh)`, so
+        // lock that it mirrors `effective_restore_mode`: lazy iff Uffd. A
+        // substrate fresh-create being lazy is exactly what lets a cold
+        // base-create background its memory prefetch instead of blocking on it.
+        let (mut be, _dir) = backend();
+        be.config.restore_mode = RestoreMode::Uffd;
+
+        // Substrate off: File base-create is NOT lazy (needs memory.bin);
+        // a UFFD resume IS lazy.
+        be.config.uffd_base_dir = None;
+        assert!(
+            !be.restore_memory_is_lazy_for(/*fresh=*/ true),
+            "File base-create must materialize memory.bin (not lazy)",
+        );
+        assert!(
+            be.restore_memory_is_lazy_for(/*fresh=*/ false),
+            "UFFD resume serves memory lazily",
+        );
+
+        // Substrate on: fresh-create flips to Uffd, so it is lazy too.
+        be.config.uffd_base_dir = Some(std::path::PathBuf::from("/dev/shm/engram"));
+        assert!(be.restore_memory_is_lazy_for(true));
+        assert!(be.restore_memory_is_lazy_for(false));
     }
 
     // ADR 0022: the smaps_rollup parser, exercised against the test
