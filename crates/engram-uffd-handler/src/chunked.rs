@@ -9,10 +9,13 @@
 //! - a **session-divergent chunk hash** the session manifest places
 //!   there (written-over state) — fetch + `UFFDIO_COPY`; or
 //! - the **canonical** chunk at that offset (the common case for a
-//!   freshly-resumed session) — the runtime resolves its hash via
-//!   [`ChunkedMemoryBackend::canonical_chunk_hash`] and fetches it,
-//!   or installs a zero page (`UFFDIO_ZEROPAGE`) when the manifest
-//!   omits the offset (implicit zero-fill).
+//!   freshly-resumed session, where the session agrees with the base)
+//!   — the runtime resolves its hash via
+//!   [`ChunkedMemoryBackend::canonical_chunk_hash`] and installs it
+//!   (shared via base-shm `UFFDIO_CONTINUE`, else fetch + COPY); or
+//! - a **zero page** (`UFFDIO_ZEROPAGE`) when the session manifest
+//!   omits the offset — the capture is full + zero-omitted, so an
+//!   omission means the guest zeroed it (never served as base bytes).
 //!
 //! Why chunk-native (vs the retired `memory.bin` mmap):
 //!
@@ -53,28 +56,37 @@ use bytes::Bytes;
 use engram_chunk_store::{ChunkCache, ChunkHash, ChunkStore, Manifest, ManifestKind};
 use engram_core::traits::BlobStorage;
 
-/// What the per-fault resolver returns. Both arms ultimately serve a
-/// chunk (Route B has no mmap); the discrimination is *which* hash:
-/// - `Chunk` — the session manifest's own hash at this offset
-///   (diverged / written-over state).
-/// - `Canonical` — the page matches canonical here; the runtime
-///   resolves the canonical hash via
-///   [`ChunkedMemoryBackend::canonical_chunk_hash`] and fetches it,
-///   or zero-fills (`UFFDIO_ZEROPAGE`) when the manifest omits the
-///   offset. For a base snapshot (session == canonical) every page
+/// What the per-fault resolver returns. Route B has no mmap, so the
+/// discrimination is *what backs this guest offset*:
+/// - `Chunk` — the session manifest's own hash here (diverged /
+///   written-over state); fetch + `UFFDIO_COPY`.
+/// - `Canonical` — the session agrees with the base image here; the
+///   runtime resolves the canonical hash via
+///   [`ChunkedMemoryBackend::canonical_chunk_hash`] and installs it
+///   (shared via the base-shm `UFFDIO_CONTINUE`, else fetch + COPY).
+///   For a base snapshot (session == canonical) every non-zero page
 ///   resolves to `Canonical`.
+/// - `Zero` — the session omits this offset. The session manifest is
+///   a *full*, zero-omitted capture, so omission means the guest
+///   zeroed it: install a zero page (`UFFDIO_ZEROPAGE`) regardless of
+///   what the base holds there. A base-nonzero chunk the session
+///   zeroed must NOT be served as stale base content.
 #[derive(Clone, Debug)]
 pub enum ResolvedPage {
-    /// Page matches canonical at the given chunk-aligned byte offset.
-    /// The runtime looks up the canonical chunk hash at this offset
-    /// and fetches + `UFFDIO_COPY`s it, or `UFFDIO_ZEROPAGE`s when no
-    /// chunk is recorded (zero-fill).
+    /// Session agrees with the base image at this chunk-aligned byte
+    /// offset. The runtime looks up the canonical chunk hash here and
+    /// installs it (shared base-shm CONTINUE, else fetch + COPY).
     Canonical { canonical_offset: u64 },
     /// Page diverges from canonical. The named chunk is what to
     /// fetch from the store + copy into the guest. The runtime
     /// hands this hash to the [`ChunkCache`] (via
     /// [`ChunkedMemoryBackend::fetch_chunk`]) for the bytes.
     Chunk { hash: ChunkHash },
+    /// The session manifest omits this chunk-aligned offset. Because
+    /// the session capture is full + zero-omitted (see `file.rs`'s
+    /// sparse capture), an omission is an authoritative "all zero
+    /// here" — install `UFFDIO_ZEROPAGE`, never base content.
+    Zero { offset: u64 },
 }
 
 /// In-memory shape of the canonical + session manifests. We pre-
@@ -333,19 +345,21 @@ impl ChunkedMemoryBackend {
         let canon = self.canonical.chunks.get(chunk_idx).copied().flatten();
         let session = self.session.chunks.get(chunk_idx).copied().flatten();
         Some(match (canon, session) {
+            // Session agrees with the base here → share the canonical
+            // page (base-shm CONTINUE / fetch + COPY).
             (Some(c), Some(s)) if c == s => ResolvedPage::Canonical {
                 canonical_offset: chunk_offset,
             },
-            // Session has a specific hash — use it regardless of
-            // whether canonical agrees (it doesn't, when they
-            // differ; canonical may be None for zero pages while
-            // session has explicit content).
+            // Session has its own hash here — diverged / written-over
+            // state. Use it regardless of what the base holds.
             (_, Some(s)) => ResolvedPage::Chunk { hash: s },
-            // Session says "zero-filled here." Resolve as canonical;
-            // the runtime finds no chunk hash at this offset and
-            // installs a zero page (UFFDIO_ZEROPAGE).
-            (_, None) => ResolvedPage::Canonical {
-                canonical_offset: chunk_offset,
+            // Session omits this offset. The session manifest is a
+            // full, zero-omitted capture, so omission == "the guest
+            // zeroed this chunk" — install a zero page regardless of
+            // the base. Serving canonical content here when the base
+            // is non-zero would silently un-zero guest RAM on resume.
+            (_, None) => ResolvedPage::Zero {
+                offset: chunk_offset,
             },
         })
     }
@@ -495,20 +509,37 @@ mod tests {
     }
 
     #[test]
-    fn resolves_zero_filled_chunk_to_canonical() {
-        // Session manifest omits chunk 1 (zero-filled). Resolves as
-        // canonical; the runtime zero-fills (UFFDIO_ZEROPAGE) since
-        // no chunk hash is recorded at that offset.
+    fn resolves_session_omitted_chunk_to_zero_when_base_also_zero() {
+        // Both manifests omit chunk 1 (base zero, session zero). An
+        // omission in the full session capture means "zero here", so
+        // resolve returns Zero — the runtime installs UFFDIO_ZEROPAGE.
         let canonical = synth_manifest(1024, 512, vec![(0, h(1))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1))]);
         let (cache, store, _dir) = make_cache_and_store();
         let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
         assert!(matches!(
             b.resolve(512),
-            Some(ResolvedPage::Canonical {
-                canonical_offset: 512
-            })
+            Some(ResolvedPage::Zero { offset: 512 })
         ));
+    }
+
+    #[test]
+    fn resolves_session_zeroed_base_nonzero_chunk_to_zero_not_canonical() {
+        // Regression: the base image HAS content at chunk 1 (h(2)) but
+        // the session zeroed it, so the full session manifest OMITS it.
+        // resolve MUST return Zero — serving the base's h(2) here would
+        // silently un-zero guest RAM on resume (the `(Some(c), None)`
+        // bug where the zero arm collapsed into Canonical).
+        let canonical = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
+        let session = synth_manifest(1024, 512, vec![(0, h(1))]);
+        let (cache, store, _dir) = make_cache_and_store();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
+        match b.resolve(512) {
+            Some(ResolvedPage::Zero { offset }) => assert_eq!(offset, 512),
+            other => {
+                panic!("expected Zero(512) for a session-zeroed base-nonzero chunk, got {other:?}")
+            }
+        }
     }
 
     #[test]
