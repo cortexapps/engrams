@@ -439,17 +439,26 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
     let session = state.services.meta.get_session(id).await?;
     match session.status {
         SessionState::Active => Ok(()),
-        SessionState::Idle | SessionState::Evacuating => {
-            // Both states are "snapshotted, sandbox destroyed, ready to
-            // resume." `Evacuating` differs from `Idle` only in
-            // intent (scanner-driven vs user-driven); the resume code
-            // path is the same. The `evac_resumer` (ADR 0018 commit 12)
-            // is the auto-driver for Evacuating; a synchronous
-            // /exec-triggered ensure_active beats it by inline-resuming
-            // here, which is fine — both end at Active.
+        SessionState::Idle => {
+            // Snapshotted, sandbox destroyed, ready to resume. Take the
+            // standard lease-serialized resume path inline.
             resume_session(state.clone(), id).await?;
             Ok(())
         }
+        // ADR 0018: operator drain / live teleport. Unlike Idle, an
+        // Evacuating session is NOT inline-resumable here: `resume_session`
+        // has no Evacuating arm (it would 409), and `resume_from_idle`'s
+        // rebind CAS only accepts Idle. Recovery is asynchronous — the
+        // `evac_resumer` scanner (ADR 0018 commit 12) relocates the session
+        // to the destination host and drives it `Evacuating → Created →
+        // Active`. Return a retryable 409 (like Queued/Pending) so the
+        // client polls /sessions/:id/events for the flip, rather than the
+        // misleading "only Idle / Created sessions can be resumed".
+        SessionState::Evacuating => Err(ApiError::Conflict(
+            "session is relocating (operator drain / teleport); it will \
+             resume automatically — retry shortly."
+                .into(),
+        )),
         // ADR 0034: mid-eviction. The sandbox may still be live (the
         // eviction scanner is snapshotting it), so this is explicitly
         // NOT the auto-resume arm above — kicking off a restore here
@@ -555,9 +564,12 @@ async fn ensure_active_after_evicting_hold_for(
 
         let session = state.services.meta.get_session(id).await?;
         match session.status {
-            // Settled to a resumable state — take the standard resume
-            // path (lease-serialized; see the doc comment).
-            SessionState::Idle | SessionState::Evacuating => {
+            // Settled to Idle — take the standard resume path
+            // (lease-serialized; see the doc comment). An eviction settling
+            // into Evacuating (an operator drain landed mid-hold) is NOT
+            // inline-resumable; it falls through to the `_` arm below, which
+            // re-dispatches through `ensure_active` for the retryable 409.
+            SessionState::Idle => {
                 resume_session(state.clone(), id).await?;
                 return Ok(());
             }
@@ -684,6 +696,15 @@ pub(crate) async fn resume_session(
             // not the lease — is what catches this).
             SessionState::Evicting => Err(ApiError::Conflict(
                 "session is mid-eviction; retry shortly (it will land at idle and become resumable)"
+                    .into(),
+            )),
+            // ADR 0018: operator drain / live teleport. Not directly
+            // resumable — the `evac_resumer` relocates it and drives it back
+            // to Active. Retryable, like Evicting above (and matches the
+            // `ensure_active` Evacuating arm).
+            SessionState::Evacuating => Err(ApiError::Conflict(
+                "session is relocating (operator drain / teleport); it will \
+                 resume automatically — retry shortly."
                     .into(),
             )),
             other => Err(ApiError::Conflict(format!(
@@ -2244,6 +2265,39 @@ mod evicting_gate_tests {
             last_active_at: Utc::now(),
             live_disk_manifest: None,
         }
+    }
+
+    fn evacuating_session(id: SessionId) -> Session {
+        Session {
+            status: SessionState::Evacuating,
+            image: "test/repo:evacuating-gate".into(),
+            ..evicting_session(id)
+        }
+    }
+
+    /// ADR 0018: an `ensure_active` (/exec, /events) landing while an
+    /// operator drain / teleport has the session at `Evacuating` must
+    /// return a RETRYABLE 409 — the `evac_resumer` relocates it back to
+    /// Active asynchronously. It must NOT route to `resume_session` (which
+    /// has no Evacuating arm and would 409 with the misleading "only Idle /
+    /// Created can be resumed"), and must leave the session untouched.
+    #[tokio::test]
+    async fn ensure_active_during_evacuating_returns_retryable_conflict() {
+        let id = SessionId::new();
+        let (state, _local) = build_state_for_session(evacuating_session(id));
+
+        let err = ensure_active(&state, id)
+            .await
+            .expect_err("Evacuating must not inline-resume");
+        assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
+        assert!(
+            err.to_string().contains("relocating"),
+            "must be the retryable relocating 409, not the resume_session \
+             'only Idle / Created' message, got: {err}",
+        );
+        // Untouched — not resumed, not transitioned.
+        let after = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(after.status, SessionState::Evacuating);
     }
 
     /// ADR 0034 / ADR 0039 follow-up #20: a prompt/exec arriving
