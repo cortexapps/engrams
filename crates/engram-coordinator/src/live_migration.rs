@@ -211,7 +211,7 @@ pub async fn migrate_session_live(
     if durable_row.is_none() {
         tracing::warn!(
             %session_id,
-            "live migration without a durable checkpoint row — a mid-move              failure past the freeze CANNOT be rehomed (operator-accepted)",
+            "live migration without a durable checkpoint row — a mid-move failure past the freeze CANNOT be rehomed (operator-accepted)",
         );
     }
 

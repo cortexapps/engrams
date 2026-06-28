@@ -73,23 +73,20 @@ pub struct SnapshotMetadata {
     /// represented via `disk_manifest` (chunked path) instead.
     #[serde(default)]
     pub rootfs_blob_key: Option<String>,
-    /// ADR 0014 M1.14: BlobStorage key for the snapshot's
+    /// ADR 0014 M1.14: BlobStorage key for the snapshot's CANONICAL
     /// working-set trace (`traces/<memory_manifest_id>/canonical.json`).
-    /// Captured at bake time via a synthetic profiling pass that
-    /// restores the just-taken snapshot, exercises mount(2) +
-    /// execve(2) on a stub harness, lets the UFFD handler's
-    /// recorder accumulate fault hashes for ~5s, then publishes.
-    /// A fresh base-snapshot restore consumes it to narrow M1.13's
-    /// parallel prefetch from "all chunks" to "just the working set,"
-    /// shrinking cold-cache refill from ~2s to ~500ms.
+    /// When present, a fresh base-snapshot restore consumes it to
+    /// narrow M1.13's parallel prefetch from "all chunks" to "just the
+    /// working set," shrinking cold-cache refill from ~2s to ~500ms.
     ///
-    /// `None` when bake didn't produce a trace. Restore falls back
-    /// to M1.13's full-manifest prefetch. (The existing per-host
-    /// trace mechanism at `traces/<manifest>/<host_id>.json`
-    /// continues to operate independently — the UFFD handler at
-    /// runtime accumulates per-host traces from real session
-    /// activity. M1.14's canonical trace is the bake-time
-    /// pre-seed.)
+    /// NOTE: no producer publishes a canonical trace today — the
+    /// bake-time profiling pass that would generate one was never
+    /// built, so this blob is effectively always absent and restore
+    /// falls back to M1.13's full-manifest prefetch. The per-host
+    /// trace mechanism at `traces/<manifest>/<host_id>.json` is
+    /// independent and live: the UFFD handler accumulates per-host
+    /// traces from real session activity at runtime and prefaults from
+    /// them on the next restore.
     #[serde(default)]
     pub working_set_blob_key: Option<String>,
     /// ADR 0035: bundle generations this snapshot's device model

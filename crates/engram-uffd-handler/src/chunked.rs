@@ -27,12 +27,13 @@
 //!   (or boot a fresh host) and resolution is identical — no
 //!   `memory.bin` file to ship.
 //!
-//! **Dedup caveat:** `UFFDIO_COPY` installs a *private* guest page,
-//! so this revision does not share guest RAM across sessions of an
-//! image (the source chunk-cache files are shared in the host page
-//! cache, but each guest copies). True guest-RAM packing is a future
-//! `UFFDIO_CONTINUE` milestone layered on this same resolver — see
-//! ADR 0020.
+//! **Dedup (ADR 0045 substrate):** canonical pages now share one host
+//! copy. When the runtime has a per-template base-shm attached, a page
+//! still identical to the image base installs via `UFFDIO_CONTINUE`
+//! over that shared backing — one host page-cache copy serves every
+//! fresh and resumed VM of the image — and only session-divergent
+//! pages stay private (`UFFDIO_COPY`). See ADR 0045; `runtime.rs` makes
+//! the per-fault CONTINUE-vs-COPY call.
 //!
 //! What's in this module:
 //!
