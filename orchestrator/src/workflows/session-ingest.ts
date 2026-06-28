@@ -75,7 +75,7 @@ async function sessionIngestWorkflowImpl(input: IngestInput): Promise<void> {
     if (page.terminal) {
       await DBOS.send<ThreadInbox>(
         threadWfId,
-        { kind: "session_terminal", ok: page.terminal.ok, ...(lastMessage ? { lastMessage } : {}) },
+        { kind: "session_terminal", outcome: page.terminal.outcome, ...(lastMessage ? { lastMessage } : {}) },
         THREAD_TOPIC,
       );
       return;

@@ -66,14 +66,20 @@ export interface CommunicationPolicy {
   onUserQuestion(m: SourceMention, ev: CuratedEvent): Promise<string>;
   /** A question was answered; `ref` is the value `onUserQuestion` returned. */
   onAnswered(m: SourceMention, ev: CuratedEvent, ref: string | undefined): Promise<void>;
-  /** Render an asset (a PR `integration_asset` or a `file_shared` artifact). */
-  onAsset(m: SourceMention, ev: CuratedEvent): Promise<void>;
+  /** Render an asset (a PR `integration_asset` or a `file_shared` artifact). The
+   *  session is passed so a `file_shared` artifact can be fetched by id and
+   *  uploaded to the source (and so the fallback can link to the session). */
+  onAsset(m: SourceMention, ev: CuratedEvent, session: StartedSession): Promise<void>;
   /** The session completed successfully — posts a closing summary enriched with
    *  the session's last assistant message + a recap of the assets it produced. */
   onComplete(m: SourceMention, session: StartedSession, summary: ClosingSummary): Promise<void>;
   /** A failure (identity, create, or terminal-failure) — ❌ + actionable text.
    *  TERMINAL: the thread workflow exits after this. */
   onFail(m: SourceMention, message: string): Promise<void>;
+  /** A neutral terminal close — the session's sandbox was reclaimed (host roll,
+   *  `host_lost`, dev-stack churn), not a success or a failure. Informational,
+   *  no alarm: the work up to that point stands, the thread just can't continue. */
+  onNeutralClose(m: SourceMention, message: string): Promise<void>;
   /** A NON-FATAL, retryable delivery failure on an otherwise-healthy thread — a
    *  follow-up prompt or an answer that couldn't reach the live session right
    *  now (e.g. the session was mid-resume). ⚠️ + an actionable "try again" note;

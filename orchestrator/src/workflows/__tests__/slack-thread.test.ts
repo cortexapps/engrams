@@ -40,6 +40,7 @@ function recordingPolicy() {
   const calls: Record<string, unknown[][]> = {
     onPickup: [],
     onDeliveryError: [],
+    onNeutralClose: [],
     onWorking: [],
     onIdle: [],
     onAssistantMessage: [],
@@ -72,6 +73,7 @@ function recordingPolicy() {
     onComplete: async () => {},
     onFail: async (m, message) => void calls.onFail.push([m, message]),
     onDeliveryError: async (m, message) => void calls.onDeliveryError.push([m, message]),
+    onNeutralClose: async (m, message) => void calls.onNeutralClose.push([m, message]),
     gatherThreadContext: (m, since) => gather(m, since),
   };
   return {

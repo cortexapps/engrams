@@ -101,12 +101,20 @@ describe("foldReplies()", () => {
 
 describe("makeSlackPolicy()", () => {
   function fakeClient() {
-    const calls: { posts: any[]; updates: any[]; reactions: any[]; unreacts: any[]; replies: any[] } = {
+    const calls: {
+      posts: any[];
+      updates: any[];
+      reactions: any[];
+      unreacts: any[];
+      replies: any[];
+      uploads: any[];
+    } = {
       posts: [],
       updates: [],
       reactions: [],
       unreacts: [],
       replies: [],
+      uploads: [],
     };
     const client: SlackPolicyClient = {
       reactions: {
@@ -124,6 +132,12 @@ describe("makeSlackPolicy()", () => {
         replies: async (a) => {
           calls.replies.push(a);
           return { messages: [{ ts: "100.0", user: "U1", text: "<@BOT> do the thing" }] };
+        },
+      },
+      files: {
+        uploadV2: async (a) => {
+          calls.uploads.push(a);
+          return {};
         },
       },
     };
@@ -210,6 +224,119 @@ describe("makeSlackPolicy()", () => {
     expect(text).toContain("shipped");
     expect(text).toContain("https://e.dev/sessions/s1");
     expect(text).toContain("https://gh/1");
+  });
+
+  test("onNeutralClose posts a plain 'session is complete' note — no ❌, no reaction", async () => {
+    const { client, calls } = fakeClient();
+    await policy(client).onNeutralClose(M, "This session is complete. Start a new session if you'd like to continue.");
+    expect(calls.posts).toHaveLength(1);
+    expect(calls.posts[0].text).toContain("This session is complete");
+    expect(calls.posts[0].text).not.toContain("❌");
+    expect(calls.reactions).toHaveLength(0);
+  });
+
+  // ── onAsset: file forwarding (ADR 0060 — share-file artifacts into Slack).
+  const SESSION = { id: "s1", webUrl: "https://e.dev/sessions/s1" };
+  const fileShared = (payload: Record<string, unknown>) =>
+    ev("file_shared", JSON.stringify(payload));
+
+  test("onAsset uploads a shared file as the actual bytes into the thread", async () => {
+    const { client, calls } = fakeClient();
+    let fetched: { sessionId: string; artifactId: string } | undefined;
+    const p = makeSlackPolicy({
+      client: async () => client,
+      botUserId: "BOT",
+      fetchArtifact: async (sessionId, artifactId) => {
+        fetched = { sessionId, artifactId };
+        return { bytes: new Uint8Array([1, 2, 3]), mediaType: "image/png", fileName: "shot.png" };
+      },
+    });
+    await p.onAsset(
+      M,
+      fileShared({ artifact_id: "a1", caption: "a rat", size_bytes: 3, media_type: "image/png" }),
+      SESSION,
+    );
+    expect(fetched).toEqual({ sessionId: "s1", artifactId: "a1" });
+    expect(calls.uploads).toHaveLength(1);
+    expect(calls.uploads[0].channel_id).toBe("C1");
+    expect(calls.uploads[0].thread_ts).toBe("100.0");
+    expect(calls.uploads[0].filename).toBe("shot.png");
+    expect(calls.uploads[0].initial_comment).toBe("a rat");
+    expect(Array.from(calls.uploads[0].file as Buffer)).toEqual([1, 2, 3]);
+    expect(calls.posts).toHaveLength(0); // the file IS the message, no text line
+  });
+
+  test("onAsset synthesizes a filename from media_type when the artifact has none, and omits an empty caption", async () => {
+    const { client, calls } = fakeClient();
+    const p = makeSlackPolicy({
+      client: async () => client,
+      botUserId: "BOT",
+      fetchArtifact: async () => ({ bytes: new Uint8Array([9]), mediaType: "video/mp4", fileName: "" }),
+    });
+    await p.onAsset(M, fileShared({ artifact_id: "a2", size_bytes: 1, media_type: "video/mp4" }), SESSION);
+    expect(calls.uploads[0].filename).toBe("engram-artifact.mp4");
+    expect(calls.uploads[0].initial_comment).toBeUndefined();
+  });
+
+  test("onAsset falls back to a session link when the upload throws", async () => {
+    const { client, calls } = fakeClient();
+    const p = makeSlackPolicy({
+      client: async () => client,
+      botUserId: "BOT",
+      fetchArtifact: async () => {
+        throw new Error("coordinator unreachable");
+      },
+    });
+    await p.onAsset(
+      M,
+      fileShared({ artifact_id: "a1", caption: "a rat", size_bytes: 10, media_type: "image/png" }),
+      SESSION,
+    );
+    expect(calls.uploads).toHaveLength(0);
+    expect(calls.posts).toHaveLength(1);
+    expect(calls.posts[0].text).toBe("🔗 <https://e.dev/sessions/s1|a rat>");
+  });
+
+  test("onAsset skips the fetch entirely and links when the file is over the size cap", async () => {
+    const { client, calls } = fakeClient();
+    let fetchCalled = false;
+    const p = makeSlackPolicy({
+      client: async () => client,
+      botUserId: "BOT",
+      fetchArtifact: async () => {
+        fetchCalled = true;
+        return { bytes: new Uint8Array(), mediaType: "", fileName: "" };
+      },
+    });
+    await p.onAsset(
+      M,
+      fileShared({ artifact_id: "a1", caption: "huge", size_bytes: 60 * 1024 * 1024, media_type: "video/mp4" }),
+      SESSION,
+    );
+    expect(fetchCalled).toBe(false);
+    expect(calls.uploads).toHaveLength(0);
+    expect(calls.posts[0].text).toBe("🔗 <https://e.dev/sessions/s1|huge>");
+  });
+
+  test("onAsset leaves a non-file integration_asset as a one-line post (no upload)", async () => {
+    const { client, calls } = fakeClient();
+    await policy(client).onAsset(
+      M,
+      ev(
+        "integration_asset",
+        JSON.stringify({
+          provider: "forge",
+          asset_kind: "pull_request",
+          surface: "asset",
+          data: { number: 7, title: "Fix" },
+          fetchable: { kind: "external", url: "https://gh/7" },
+        }),
+      ),
+      SESSION,
+    );
+    expect(calls.uploads).toHaveLength(0);
+    expect(calls.posts).toHaveLength(1);
+    expect(calls.posts[0].text).toBe("🔗 <https://gh/7|PR #7: Fix>");
   });
 
   test("onFail reacts ❌ and posts the actionable message (terminal)", async () => {

@@ -24,6 +24,7 @@ import {
 } from "./slack-blocks.ts";
 import { summarizeAsset, type CommunicationPolicy, type StartedSession } from "../workflows/communication-policy.ts";
 import type { SourceMention } from "../workflows/thread-inbox.ts";
+import { fetchArtifactBytes, type FetchedArtifact } from "../control-plane/artifact-fetch.ts";
 
 const log = rootLog.child({ component: "slack" });
 
@@ -39,6 +40,11 @@ Conform to slack markdown in your responses. Examples:
 Links are formatted as <url|optional link title>
 Bold is single asterisks surrounding text, like *this*.
 Italics are underlines surrounding text like _this_.`;
+
+/** Inline-upload a shared file to Slack up to this size; a larger artifact posts
+ *  a link to the session instead, so the orchestrator never buffers a huge blob
+ *  in memory just to forward it. */
+const MAX_SLACK_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MiB
 
 /** A reply in a Slack thread (the subset the prompt fold reads). */
 export interface SlackReply {
@@ -72,13 +78,29 @@ export interface SlackPolicyClient {
       limit?: number;
     }): Promise<{ messages?: SlackReply[] }>;
   };
+  files: {
+    uploadV2(args: {
+      channel_id: string;
+      thread_ts?: string;
+      file: Buffer | Uint8Array;
+      filename: string;
+      title?: string;
+      initial_comment?: string;
+    }): Promise<unknown>;
+  };
 }
+
+/** Fetch a session artifact's bytes for upload (injectable for tests; the
+ *  default collects them from the coordinator via `getArtifact`). */
+export type FetchArtifactFn = (sessionId: string, artifactId: string) => Promise<FetchedArtifact>;
 
 export interface SlackPolicyDeps {
   client?: () => Promise<SlackPolicyClient>;
   /** The bot's own user id, so its `<@bot>` mention is stripped from prompts.
    *  Optional: when unset, all `<@…>` mentions are stripped. */
   botUserId?: string;
+  /** Fetch a shared artifact's bytes (injectable for tests). */
+  fetchArtifact?: FetchArtifactFn;
 }
 
 /**
@@ -133,11 +155,61 @@ function stripMentions(text: string, botUserId?: string): string {
   return text.replace(re, " ").replace(/\s+/g, " ");
 }
 
+/** The slice of a `file_shared` event payload the upload path reads. */
+interface SharedFile {
+  artifactId: string;
+  caption?: string;
+  sizeBytes: number;
+  mediaType: string;
+}
+
+/** Parse a `file_shared` event payload, or null if it carries no artifact id.
+ *  Pure; never throws. (Shape: the coordinator's `SessionEvent::FileShared`.) */
+function parseFileShared(payloadJson: string): SharedFile | null {
+  try {
+    const p = JSON.parse(payloadJson) as {
+      artifact_id?: unknown;
+      caption?: unknown;
+      size_bytes?: unknown;
+      media_type?: unknown;
+    };
+    if (typeof p.artifact_id !== "string" || !p.artifact_id) return null;
+    return {
+      artifactId: p.artifact_id,
+      caption: typeof p.caption === "string" && p.caption ? p.caption : undefined,
+      sizeBytes: typeof p.size_bytes === "number" ? p.size_bytes : Number(p.size_bytes) || 0,
+      mediaType: typeof p.media_type === "string" ? p.media_type : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Extension by coordinator-detected media type — Slack uses the filename's
+ *  extension to choose the right inline preview. */
+const EXT_BY_MEDIA: Readonly<Record<string, string>> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "video/mp4": "mp4",
+  "video/webm": "webm",
+  "video/quicktime": "mov",
+};
+
+/** A filename for an artifact that arrived without one. */
+function synthesizeFilename(mediaType: string): string {
+  return `engram-artifact.${EXT_BY_MEDIA[mediaType] ?? "bin"}`;
+}
+
 /** Build the production Slack CommunicationPolicy (client injectable for tests). */
 export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy {
   const getClient =
     deps.client ?? (async () => (await getSlackClient()) as unknown as SlackPolicyClient);
   const botUserId = deps.botUserId;
+  const fetchArtifact: FetchArtifactFn =
+    deps.fetchArtifact ??
+    ((sessionId, artifactId) => fetchArtifactBytes(sessionId, artifactId, MAX_SLACK_UPLOAD_BYTES));
 
   const route = (m: SourceMention) => ({
     team: m.team,
@@ -235,7 +307,38 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
       }
     },
 
-    async onAsset(m, ev) {
+    async onAsset(m, ev, session) {
+      // A shared file (ADR 0026 `file_shared`) is uploaded into the thread as the
+      // actual image/video, so it renders in Slack the way it does in the web UI.
+      // Anything else — and any file we can't fetch or that's over the size cap —
+      // posts a one-line message instead.
+      const file = ev.kind === "file_shared" ? parseFileShared(ev.payloadJson) : null;
+      if (file && file.sizeBytes <= MAX_SLACK_UPLOAD_BYTES) {
+        try {
+          const art = await fetchArtifact(session.id, file.artifactId);
+          const c = await getClient();
+          await c.files.uploadV2({
+            channel_id: m.channel,
+            thread_ts: m.threadRoot,
+            file: Buffer.from(art.bytes),
+            filename: art.fileName || synthesizeFilename(art.mediaType || file.mediaType),
+            ...(file.caption ? { initial_comment: file.caption } : {}),
+          });
+          return;
+        } catch (err) {
+          log.warn(
+            { channel: m.channel, thread: m.threadRoot, artifactId: file.artifactId, err },
+            "slack: artifact upload failed — falling back to a session link",
+          );
+          // fall through to the link fallback
+        }
+      }
+      if (file) {
+        // Couldn't upload the bytes (too big, or the upload/fetch failed) — at
+        // least give a clickable link to the session, where the file renders.
+        await post(m, buildAssetLine({ label: file.caption || "shared a file", url: session.webUrl }));
+        return;
+      }
       const asset = summarizeAsset(ev);
       if (!asset) return; // transient action — not worth a thread post
       await post(m, buildAssetLine(asset));
@@ -253,6 +356,13 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
       log.warn({ channel: m.channel, thread: m.threadRoot, reason: message }, "slack: session failed");
       await react(m, "x");
       await post(m, `❌ ${message}`);
+    },
+
+    async onNeutralClose(m, message) {
+      // The sandbox was reclaimed (host roll / host_lost / dev churn), not a
+      // failure — post a plain informational note, no ❌ and no reaction.
+      log.info({ channel: m.channel, thread: m.threadRoot }, "slack: session closed (sandbox reclaimed)");
+      await post(m, message);
     },
 
     /** A retryable delivery hiccup — the thread is still live. ⚠️ on the mention

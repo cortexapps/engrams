@@ -96,6 +96,10 @@ const NO_PROFILE_MSG =
   "No default profile is configured — set one in engrams first.";
 const CREATE_FAIL_MSG = "Couldn't start a session for this request.";
 const SESSION_FAILED_MSG = "The session ended in failure.";
+// A neutral close: the sandbox was reclaimed (host roll / `host_lost` / dev-stack
+// churn), which is not a task failure — the work stands, the thread just can't
+// continue. See `TerminalOutcome` in session-events.ts.
+const SESSION_CLOSED_MSG = "This session is complete. Start a new session if you'd like to continue.";
 // Non-fatal: the thread stays alive after these so the user can retry.
 const DELIVER_FAIL_MSG =
   "I couldn't deliver that to your session just now — it may have been resuming. Mention me again to retry.";
@@ -187,11 +191,18 @@ async function slackThreadWorkflowImpl(): Promise<void> {
     if (msg === null) continue; // idle — keep waiting for the terminal
 
     if (msg.kind === "session_terminal") {
-      if (msg.ok) {
-        const summary = { lastMessage: msg.lastMessage ?? null, assets: st.assets };
-        await step(() => pol.onComplete(m, session, summary), "onComplete");
-      } else {
-        await step(() => pol.onFail(m, SESSION_FAILED_MSG), "onFail");
+      switch (msg.outcome) {
+        case "completed": {
+          const summary = { lastMessage: msg.lastMessage ?? null, assets: st.assets };
+          await step(() => pol.onComplete(m, session, summary), "onComplete");
+          break;
+        }
+        case "failed":
+          await step(() => pol.onFail(m, SESSION_FAILED_MSG), "onFail");
+          break;
+        case "neutral":
+          await step(() => pol.onNeutralClose(m, SESSION_CLOSED_MSG), "onNeutralClose");
+          break;
       }
       return;
     }
@@ -235,7 +246,7 @@ export async function handleInbound(
   switch (msg.kind) {
     case "session_event": {
       try {
-        await dispatchSessionEvent(step, pol, st.currentMention, msg, st);
+        await dispatchSessionEvent(step, pol, st.currentMention, msg, st, session);
       } catch (err) {
         log.error(
           { sessionId: session.id, kind: msg.event.kind, err },
@@ -307,6 +318,7 @@ async function dispatchSessionEvent(
   m: SourceMention,
   msg: Extract<ThreadInbox, { kind: "session_event" }>,
   st: ThreadRender,
+  session: StartedSession,
 ): Promise<void> {
   const effect = routeSessionEvent(msg.event);
   switch (effect.kind) {
@@ -349,7 +361,7 @@ async function dispatchSessionEvent(
       st.bubble = null;
       const recap = summarizeAsset(msg.event);
       if (recap) st.assets.push(recap);
-      await step(() => pol.onAsset(m, msg.event), "onAsset");
+      await step(() => pol.onAsset(m, msg.event, session), "onAsset");
       break;
     }
     case "ignore":

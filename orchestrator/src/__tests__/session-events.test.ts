@@ -12,6 +12,7 @@ import { expect, test, describe } from "bun:test";
 import {
   curated,
   readSessionEventsBounded,
+  type TerminalOutcome,
   type WireEvent,
 } from "../control-plane/session-events.ts";
 
@@ -70,7 +71,7 @@ describe("readSessionEventsBounded()", () => {
     expect(out.terminal).toBeUndefined();
   });
 
-  test("terminal status_changed (Completed → ok:true) is detected, not forwarded as content", async () => {
+  test("terminal status_changed (completed → outcome:completed) is detected, not forwarded as content", async () => {
     const page: WireEvent[] = [
       { idx: 5n, kind: "run_completed", payloadJson: "{}" },
       {
@@ -80,19 +81,23 @@ describe("readSessionEventsBounded()", () => {
       },
     ];
     const out = await readSessionEventsBounded("sess", 4n, fakeList(page, 6n));
-    expect(out.terminal).toEqual({ ok: true });
+    expect(out.terminal).toEqual({ outcome: "completed" });
     expect(out.events.map((e) => e.kind)).toEqual(["run_completed"]);
     expect(out.nextAfter).toBe(6n);
   });
 
-  test("Failed / Dead terminal → ok:false", async () => {
-    for (const to of ["failed", "dead"]) {
+  test("failed → outcome:failed; dead → outcome:neutral (sandbox reclaimed, not a failure)", async () => {
+    const cases: ReadonlyArray<[string, TerminalOutcome]> = [
+      ["failed", "failed"],
+      ["dead", "neutral"],
+    ];
+    for (const [to, outcome] of cases) {
       const out = await readSessionEventsBounded(
         "s",
         0n,
         fakeList([{ idx: 1n, kind: "status_changed", payloadJson: JSON.stringify({ to }) }], 1n),
       );
-      expect(out.terminal).toEqual({ ok: false });
+      expect(out.terminal).toEqual({ outcome });
     }
   });
 

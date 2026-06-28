@@ -9,7 +9,7 @@
  * workflow's id on `THREAD_TOPIC`. The thread workflow switches on `kind`.
  */
 
-import type { CuratedEvent } from "../control-plane/session-events.ts";
+import type { CuratedEvent, TerminalOutcome } from "../control-plane/session-events.ts";
 
 /** The one topic the thread workflow `recv`s; every sender targets it. */
 export const THREAD_TOPIC = "thread";
@@ -40,9 +40,10 @@ export interface SourceAnswer {
 
 /** Everything the thread workflow can receive, tagged by origin. `lastMessage`
  *  on the terminal is the session's final assistant message (if any), which the
- *  pump captured while walking the log — it enriches the closing summary. */
+ *  pump captured while walking the log — it enriches the closing summary.
+ *  `outcome` classifies the terminal state (success / failure / neutral). */
 export type ThreadInbox =
   | { kind: "session_event"; event: CuratedEvent }
-  | { kind: "session_terminal"; ok: boolean; lastMessage?: string }
+  | { kind: "session_terminal"; outcome: TerminalOutcome; lastMessage?: string }
   | { kind: "trigger_mention"; mention: SourceMention }
   | { kind: "trigger_answer"; answer: SourceAnswer };
