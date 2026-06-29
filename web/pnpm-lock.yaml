@@ -38,6 +38,9 @@ importers:
       '@hookform/resolvers':
         specifier: ^5.4.0
         version: 5.4.0(react-hook-form@7.80.0(react@19.2.7))
+      '@novnc/novnc':
+        specifier: ^1.7.0
+        version: 1.7.0
       '@pierre/diffs':
         specifier: ^1.2.11
         version: 1.2.11(@shikijs/themes@4.2.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
@@ -569,6 +572,9 @@ packages:
   '@noble/hashes@2.2.0':
     resolution: {integrity: sha512-IYqDGiTXab6FniAgnSdZwgWbomxpy9FtYvLKs7wCUs2a8RkITG+DFGO1DM9cr+E3/RgADRpFjrKVaJ1z6sjtEg==}
     engines: {node: '>= 20.19.0'}
+
+  '@novnc/novnc@1.7.0':
+    resolution: {integrity: sha512-ucEJOx4T2avIRCleodk7YobZj5O2Ga2AeLfQ69A/yjG9HHba2+PDgwSkN3FttrmG+70ZGx21sElNFouK13RzyA==}
 
   '@opentelemetry/semantic-conventions@1.41.1':
     resolution: {integrity: sha512-/UhIkaZgPutTFmQ7RnIJGgDXZmtEJ7Dvi86xNTFWcnRxVRNk/aotsqDJYeEvDP+FSMB2SdW+pQzNMcWP0rwuNA==}
@@ -3888,6 +3894,8 @@ snapshots:
   '@noble/ciphers@2.2.0': {}
 
   '@noble/hashes@2.2.0': {}
+
+  '@novnc/novnc@1.7.0': {}
 
   '@opentelemetry/semantic-conventions@1.41.1': {}
 
