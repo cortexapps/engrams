@@ -1,0 +1,62 @@
+#!/bin/sh
+# ADR 0064 browser bundle launcher. Self-contained, glibc-linked; runs on any
+# glibc base. ADR 0055: mounts at a dynamic slot (/opt/engram/dyn/<i>) and
+# agentd symlinks this onto PATH, so resolve our real bundle root from $0
+# (readlink -f follows the PATH symlink) — never a fixed mount path.
+#
+# Brings up, in order: Xvfb (virtual display :99) → openbox (focus/maximize,
+# no panel/menu) → x11vnc (RFB on 127.0.0.1:5900) → chromium (full UI, sized to
+# the framebuffer). No desktop/file-manager/terminal — the framebuffer shows
+# only Chrome. setsid puts the whole stack in its own process group so agentd
+# can reap it as a unit (StopBrowser → killpg).
+set -eu
+here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
+
+export LD_LIBRARY_PATH="$here/lib:${LD_LIBRARY_PATH:-}"
+export FONTCONFIG_FILE="$here/fonts.conf"
+export PATH="$here/bin:$PATH"
+
+DISPLAY_NUM="${ENGRAM_BROWSER_DISPLAY:-99}"
+export DISPLAY=":$DISPLAY_NUM"
+GEOMETRY="${ENGRAM_BROWSER_GEOMETRY:-1280x800x24}"
+VNC_PORT="${ENGRAM_BROWSER_VNC_PORT:-5900}"
+PROFILE_DIR="$(mktemp -d /tmp/engram-browser-profile.XXXXXX)"
+
+cleanup() {
+    # Kill the whole process group (we are the leader via setsid in agentd).
+    kill 0 2>/dev/null || true
+}
+trap cleanup TERM INT EXIT
+
+# 1) Virtual X display. +extension RANDR enables x11vnc -randr live resize.
+"$here/bin/Xvfb" "$DISPLAY" -screen 0 "$GEOMETRY" +extension RANDR -nolisten tcp &
+# Wait for the X socket before starting clients.
+for _ in $(seq 1 100); do
+    [ -S "/tmp/.X11-unix/X$DISPLAY_NUM" ] && break
+    sleep 0.05
+done
+
+# 2) Minimal WM so chromium gets focus + maximizes. No root menu / no panel.
+"$here/bin/openbox" &
+
+# 3) Chromium, full UI, sized to the framebuffer, no first-run prompts. The VM
+# is the isolation boundary, so --no-sandbox. Renderer shm uses the guest's
+# real /dev/shm (engram-init mounts it), so we do NOT disable dev-shm.
+"$here/chrome/chrome" \
+    --user-data-dir="$PROFILE_DIR" \
+    --no-sandbox \
+    --no-first-run --no-default-browser-check \
+    --disable-infobars \
+    --start-maximized \
+    --window-position=0,0 \
+    "${ENGRAM_BROWSER_HOMEPAGE:-about:blank}" &
+
+# 4) x11vnc last (so the display + a client window exist). -localhost: only the
+# auth-gated relay reaches it. -forever: survive client disconnects (refresh
+# grace handled host-side). -randr: honor noVNC remote resize. exec so this
+# process IS x11vnc and the trap fires when agentd kills the group.
+exec "$here/bin/x11vnc" \
+    -display "$DISPLAY" \
+    -localhost \
+    -rfbport "$VNC_PORT" \
+    -forever -shared -noxdamage -nopw -quiet -randr
