@@ -558,8 +558,19 @@ message ProxyShellMessage {
   }
 }
 
+// ADR 0064: which in-guest service the host-agent dials for this stream.
+// PROXY_TARGET_SHELL (0, default) = ttyd WebSocket on :7681. PROXY_TARGET_VNC
+// = x11vnc raw TCP on :5900 (RFB bytes ride the `binary` frame variant).
+enum ProxyTarget {
+  PROXY_TARGET_SHELL = 0;
+  PROXY_TARGET_VNC = 1;
+}
+
 message ProxyShellOpen {
   bytes sandbox_id = 1;
+  // ADR 0064: shell (default) vs vnc. Defaulting to 0=SHELL preserves the
+  // existing wire behavior for older callers and already-serialized frames.
+  ProxyTarget target = 2;
 }
 
 message ProxyShellText {

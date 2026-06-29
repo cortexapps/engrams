@@ -37,9 +37,9 @@ use crate::grpc::{
     EditHarnessQueuedPromptRequest, Empty, ExecStartRequest, GuestIpResponse,
     InterruptHarnessRequest, MigrationExportRef, MigrationFetchRequest, MigrationItem,
     ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, RehandshakeHarnessRequest,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    StartAgentRequest, StringList, UnbindHarnessSessionRequest,
+    ProxyShellPong, ProxyShellText, ProxyTarget, ReapMaterializeDirRequest,
+    RehandshakeHarnessRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, StartAgentRequest, StringList, UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -1015,6 +1015,9 @@ impl GrpcHostClient {
             yield ProxyShellMessage {
                 body: Some(ProxyShellBody::Open(ProxyShellOpen {
                     sandbox_id: sandbox_bytes,
+                    // ADR 0064: existing shell relay path; default discriminant.
+                    // P1.4 threads a real target through for the VNC stream.
+                    target: ProxyTarget::Shell as i32,
                 })),
             };
             while let Some(frame) = outbound_rx.recv().await {

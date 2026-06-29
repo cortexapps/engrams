@@ -528,8 +528,17 @@ message RelayShellResponse {
   }
 }
 
+// ADR 0064: mirrors host_service.proto ProxyTarget across the orchestrator↔
+// coordinator hop. SHELL_TARGET_SHELL (0, default) preserves the existing
+// wire behavior for older callers and already-serialized frames.
+enum ShellTarget {
+  SHELL_TARGET_SHELL = 0;
+  SHELL_TARGET_VNC = 1;
+}
+
 message ShellOpen {
   string session_id = 1;
+  ShellTarget target = 2;
 }
 
 message ShellClose {
