@@ -199,7 +199,6 @@ async fn bake_browser_rootfs(repo: &str) -> PathBuf {
         .await
         .expect("bake ext4");
 
-    let _ = images_dir_path; // silence unused-binding if no other use lands
     outcome.rootfs_path
 }
 
@@ -301,6 +300,10 @@ async fn e2e_vnc_cold_via_pooled_backend() {
     //         (on agentd's PATH). Without this, start_browser's
     //         `Command::new("engram-browser")` would ENOENT. This is the same
     //         empty-argv path a DevVm-mode session takes (see e2e_harness). ----
+    // Relies on harness_supervisor::spawn running activate() (which wire_bins
+    // symlinks engram-browser onto PATH) BEFORE the empty-argv early-return —
+    // see crates/engram-agentd/src/harness_supervisor.rs (activate() call at
+    // ~L162, the `req.argv.is_empty()` early-return at ~L170).
     pooled
         .start_agent(
             sandbox_id,

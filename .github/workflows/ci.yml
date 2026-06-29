@@ -997,6 +997,13 @@ jobs:
           just bundles-squashfs
           ls -l var/shared/
           cat var/shared/current.json
+          # `bundles-squashfs` `|| continue`s past a failed bundle build, so it
+          # always exits 0. If the `browser` build failed, current.json has no
+          # `browser` key, e2e_vnc prints `SKIP:` and the lane stays GREEN — the
+          # VNC e2e never runs. Fail loud here so a broken browser bundle FAILS
+          # the job before the FC test invocation. (python3 is preinstalled on
+          # the ubuntu runner; jq is not.)
+          python3 -c 'import json,sys; d=json.load(open("var/shared/current.json")); sys.exit(0 if "browser" in d else 1)' || { echo "FATAL: browser bundle missing from current.json — e2e_vnc would silently skip" >&2; exit 1; }
 
       # True-e2e tests (engram-host-agent crate): real bake + real
       # FC microVM + PooledBackend + real proxy + (for harness)
