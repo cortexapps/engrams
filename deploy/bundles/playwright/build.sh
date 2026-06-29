@@ -54,6 +54,7 @@ build_tree() {
         -e HOST_GID="$(id -g)" \
         -v "$dest:/out" \
         -v "$here/skills:/skills-src:ro" \
+        -v "$here/smoke.sh:/smoke.sh:ro" \
         debian:bookworm-slim bash -euo pipefail -c '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
@@ -111,6 +112,35 @@ build_tree() {
             exit 1
         fi
         collect "$shell_bin"
+
+        # 3a) NSS PKCS#11 modules + their own deps. libnss3 (collected above)
+        # dlopen'"'"'s its softoken / freebl / built-in-roots modules at runtime BY
+        # NAME — they are in NO binary'"'"'s DT_NEEDED, so the ldd-walk is
+        # structurally blind to them and never copies them, even though the
+        # libnss3 package installed them here. Same class as the fonts below
+        # (runtime data ldd can'"'"'t see). chromium only forces the NSS path when a
+        # server cert chains to a PRIVATELY-added root — i.e. the egress proxy'"'"'s
+        # MITM CA (ADR 0006); the built-in BoringSSL verifier handles public
+        # roots without NSS, so about:blank / http / public-CA HTTPS all survive
+        # and mask the gap. On that path, a missing module aborts chromium FATAL
+        # in crypto/nss_util.cc during NSS init (nss_error=-5925 can'"'"'t load
+        # softoken; -8023 softoken self-test fails for want of libfreeblpriv3).
+        # Ship the WHOLE NSS runtime module set, then ldd-collect each so its own
+        # transitive deps (softoken pulls in libsqlite3, which nothing else in
+        # the bundle links) land in /out/lib too. `find` handles the amd64/arm64
+        # multiarch dir (Debian ships these flat, not in an nss/ subdir). No .chk
+        # files: chromium runs NSS non-FIPS, so they go unverified — and a stale
+        # .chk would only risk a spurious FIPS self-test failure on an NSS bump.
+        nssdir="$(dirname "$(find /usr/lib -name libsoftokn3.so 2>/dev/null | head -n1)")"
+        if [ ! -e "$nssdir/libsoftokn3.so" ]; then
+            echo "FATAL: NSS modules not found under /usr/lib (libnss3 not installed?)" >&2
+            exit 1
+        fi
+        for m in libsoftokn3 libfreebl3 libfreeblpriv3 libnssckbi libnssdbm3; do
+            cp -nL "$nssdir/$m.so" /out/lib/ 2>/dev/null || true
+            [ -e "/out/lib/$m.so" ] && collect "/out/lib/$m.so"
+        done
+        [ -e /out/lib/libsoftokn3.so ] || { echo "FATAL: failed to stage libsoftokn3.so into the bundle" >&2; exit 1; }
 
         # 3b) Fonts + a minimal fontconfig. `ldd` collects libfontconfig but
         # NOT the font FILES or config, so without this chromium renders text
@@ -185,6 +215,13 @@ WRAP
         # 6) The show-your-work skill ships in this bundle.
         mkdir -p /out/skills
         cp -R /skills-src/show-your-work /out/skills/
+
+        # 6b) Self-containment smoke: render a private-root HTTPS page using ONLY
+        # the bundled NSS, so an incomplete lib/ (a dlopen'"'"'d NSS module or one of
+        # its deps the ldd-walk missed) fails the BAKE instead of every real
+        # navigation in a live session. Deletes the container'"'"'s system NSS first
+        # so it cannot mask a gap — see smoke.sh. The container is throwaway.
+        bash /smoke.sh /out
 
         # 7) Hand the tree back to the invoking user (see build_tree comment).
         chown -R "$HOST_UID:$HOST_GID" /out
