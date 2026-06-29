@@ -42,16 +42,26 @@ build_tree() {
         # chromium is usually a wrapper; resolve the real binary dir.
         real_dir="/usr/lib/chromium"
         cp -aL "$real_dir/." /out/chrome/ 2>/dev/null || true
-        # Ensure the launch target exists at chrome/chrome. On Debian bookworm
-        # the real ELF is named `chromium` not `chrome`; prefer a symlink so
-        # the launcher ($here/chrome/chrome) resolves to the real binary.
-        if [ ! -x /out/chrome/chrome ]; then
-            if [ -x /out/chrome/chromium ]; then
-                ln -sf chromium /out/chrome/chrome
-            else
-                cp -L "$(readlink -f "$chrome_bin")" /out/chrome/chrome
-            fi
+        # Resolve the launch target at chrome/chrome explicitly. cp -aL above
+        # dereferences symlinks, so a future chromium package shipping a `chrome`
+        # symlink in $real_dir would land here as a ~259 MB real-file copy (or a
+        # wrapper script), silently defeating the relative-symlink fix below.
+        # Drop any copied chrome first so the result is always the intended
+        # symlink (or the explicit cp fallback), never an accidental copy.
+        rm -f /out/chrome/chrome
+        # On Debian bookworm the real ELF is named `chromium` not `chrome`;
+        # prefer a relative symlink so the launcher ($here/chrome/chrome)
+        # resolves to the real binary inside the bundle.
+        if [ -x /out/chrome/chromium ]; then
+            ln -sf chromium /out/chrome/chrome
+        else
+            cp -L "$(readlink -f "$chrome_bin")" /out/chrome/chrome
         fi
+        # Fail loud (like the playwright bundle) if the real ELF is missing —
+        # e.g. $real_dir moved and cp -aL silently produced an empty chrome/.
+        # The symlink target / cp fallback above is the binary the launcher
+        # invokes; assert it exists and is executable.
+        [ -x /out/chrome/chrome ] || { echo "FATAL: chromium binary not found under $real_dir" >&2; exit 1; }
 
         cp -L "$(command -v Xvfb)"   /out/bin/Xvfb
         cp -L "$(command -v x11vnc)" /out/bin/x11vnc
