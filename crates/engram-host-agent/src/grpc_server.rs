@@ -30,7 +30,8 @@ use engram_protocol::grpc::{
     ExecStartRequest, GuestIpResponse, InterruptHarnessRequest, ListSandboxesResponse,
     MigrationCaptureResponse, MigrationExportRef, MigrationFetchRequest, MigrationFrame,
     MigrationPresetupResponse, PostCopyCaptureResponse, ProxyShellBinary, ProxyShellClose,
-    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ProxyTarget,
+    ReapMaterializeDirRequest,
     ReapMaterializeDirResponse, RehandshakeHarnessRequest, RestoreBaseForSessionRequest,
     RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, SnapshotBeginResponse,
     SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
@@ -63,11 +64,19 @@ fn link_remote_parent<T>(span: &tracing::Span, req: &Request<T>) {
 pub struct HostServiceImpl {
     inner: Arc<dyn HostClient>,
     admin: Option<Arc<dyn HostAdminHandler>>,
+    /// ADR 0064: cancellable teardown timers for the ephemeral browser stack.
+    /// A VNC viewer connect cancels any pending teardown; a disconnect
+    /// schedules `stop_browser` after a grace that the next connect cancels.
+    vnc_grace: crate::vnc_grace::VncGrace,
 }
 
 impl HostServiceImpl {
     pub fn new(inner: Arc<dyn HostClient>) -> Self {
-        Self { inner, admin: None }
+        Self {
+            inner,
+            admin: None,
+            vnc_grace: crate::vnc_grace::VncGrace::new(),
+        }
     }
 
     pub fn with_admin_handler(mut self, admin: Arc<dyn HostAdminHandler>) -> Self {
@@ -957,8 +966,14 @@ impl HostService for HostServiceImpl {
             .map_err(|_| Status::deadline_exceeded("proxy_shell: no first message within 5s"))?
             .ok_or_else(|| Status::cancelled("proxy_shell: client closed before first message"))?
             .map_err(|e| Status::internal(format!("proxy_shell: recv first message: {e}")))?;
-        let sandbox_id = match first.body {
-            Some(ProxyShellBody::Open(open)) => decode_sandbox_id(&open.sandbox_id)?,
+        let (sandbox_id, target) = match first.body {
+            Some(ProxyShellBody::Open(open)) => (
+                decode_sandbox_id(&open.sandbox_id)?,
+                // prost enum accessor → ProxyTarget (defaults to Shell for an
+                // out-of-range/unset discriminant, preserving old-caller wire
+                // behavior).
+                open.target(),
+            ),
             Some(other) => {
                 return Err(Status::invalid_argument(format!(
                     "proxy_shell: first message must be Open, got {}",
@@ -972,11 +987,19 @@ impl HostService for HostServiceImpl {
             }
         };
 
-        let tunnel = self
-            .inner
-            .proxy_shell(sandbox_id)
-            .await
-            .map_err(sandbox_to_status)?;
+        // ADR 0064: a (re)connecting VNC viewer cancels any pending teardown so
+        // a page refresh never races the previous stream's grace timer (the
+        // old stream's disconnect would otherwise kill the browser the
+        // reconnected viewer is actively using).
+        if matches!(target, ProxyTarget::Vnc) {
+            self.vnc_grace.cancel(sandbox_id);
+        }
+
+        let tunnel = match target {
+            ProxyTarget::Vnc => self.inner.proxy_vnc(sandbox_id).await,
+            _ => self.inner.proxy_shell(sandbox_id).await,
+        }
+        .map_err(sandbox_to_status)?;
         let engram_core::types::shell::ShellTunnel {
             outbound: tunnel_outbound,
             inbound: mut tunnel_inbound,
@@ -990,6 +1013,12 @@ impl HostService for HostServiceImpl {
         // the tunnel pump then writes to ttyd). Open is rejected
         // here too — it's a stream-handshake variant, not data.
         let out_tx_for_open_reject = out_tx.clone();
+        // ADR 0064: clone the teardown registry + backend handle into the drain
+        // task so we can schedule a grace teardown when the VNC viewer
+        // disconnects (the drain loop ending IS the disconnect). `self` is
+        // borrowed by the handler and not available in the spawned task.
+        let vnc_grace = self.vnc_grace.clone();
+        let backend = self.inner.clone();
         tokio::spawn(async move {
             while let Some(next) = inbound.next().await {
                 let msg = match next {
@@ -1020,6 +1049,22 @@ impl HostService for HostServiceImpl {
             // Client closed; drop the tunnel outbound so the
             // tunnel's pump tears down.
             drop(tunnel_outbound);
+
+            // ADR 0064: reap the ephemeral browser stack a short grace after the
+            // VNC viewer disconnects; a reconnect within the grace cancels this
+            // (see the cancel-on-connect above). Shell streams have no such
+            // backing process, so this is VNC-only.
+            if matches!(target, ProxyTarget::Vnc) {
+                vnc_grace.schedule(
+                    sandbox_id,
+                    std::time::Duration::from_secs(30),
+                    move || async move {
+                        if let Err(e) = backend.stop_browser(sandbox_id).await {
+                            tracing::debug!(%sandbox_id, error = %e, "browser teardown after grace");
+                        }
+                    },
+                );
+            }
         });
 
         // Tunnel inbound (ttyd → us) drains here; we forward each

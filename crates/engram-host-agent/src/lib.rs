@@ -50,6 +50,7 @@ pub mod snapshot;
 pub mod teardown_reconcile;
 pub mod trace_scope;
 pub mod util;
+mod vnc_grace;
 
 pub use config::HostAgentConfig;
 

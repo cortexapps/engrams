@@ -800,6 +800,17 @@ impl HostClient for HostRegistry {
         backend.proxy_shell(sandbox_id).await
     }
 
+    async fn proxy_vnc(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
+        // ADR 0064: route the VNC stream to the owning host exactly as
+        // `proxy_shell` does — the relay (P2.1) calls this; we resolve the
+        // host and hand off to its client's `proxy_vnc`.
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.proxy_vnc(sandbox_id).await
+    }
+
     fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
         // Fan out to every registered host. `LocalHostClient` wires
         // it onto its inner VMM backend; `RemoteHostClient`'s default

@@ -1061,6 +1061,75 @@ impl GrpcHostClient {
 
         Ok(tunnel)
     }
+
+    /// ADR 0064: open a bidi ProxyShell stream to the host for the VNC target.
+    /// Identical to [`proxy_shell`](Self::proxy_shell) except the initial Open
+    /// frame carries `target: ProxyTarget::Vnc` — the host-agent's gRPC server
+    /// reads it and dials x11vnc instead of ttyd. The frame-pumping is verbatim.
+    pub async fn proxy_vnc(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
+        use engram_core::types::shell::ShellTunnel;
+        use futures::StreamExt;
+
+        let (tunnel, ends) = ShellTunnel::pair();
+        let engram_core::types::shell::ShellTunnelEnds {
+            mut outbound_rx,
+            inbound_tx,
+        } = ends;
+
+        let sandbox_bytes = sandbox_id.as_uuid().as_bytes().to_vec();
+
+        let out_stream = async_stream::stream! {
+            yield ProxyShellMessage {
+                body: Some(ProxyShellBody::Open(ProxyShellOpen {
+                    sandbox_id: sandbox_bytes,
+                    // ADR 0064: VNC target — host dials x11vnc raw TCP on :5900.
+                    target: ProxyTarget::Vnc as i32,
+                })),
+            };
+            while let Some(frame) = outbound_rx.recv().await {
+                yield ProxyShellMessage {
+                    body: Some(shell_frame_to_proxy_body(frame)),
+                };
+            }
+        };
+
+        let mut inbound_stream = self
+            .inner
+            .clone()
+            .proxy_shell(out_stream)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+
+        // Pump inbound (host → us) into the tunnel's inbound channel.
+        tokio::spawn(async move {
+            while let Some(next) = inbound_stream.next().await {
+                let msg = match next {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "proxy_vnc client recv error");
+                        break;
+                    }
+                };
+                let sf = match proxy_body_to_shell_frame(msg.body) {
+                    Ok(Some(sf)) => sf,
+                    Ok(None) => continue, // body=None or Open echoed back (server bug; drop)
+                    Err(e) => {
+                        tracing::warn!(error = %e, "proxy_vnc decode error");
+                        break;
+                    }
+                };
+                if inbound_tx.send(sf).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(tunnel)
+    }
 }
 
 /// Translate a [`ShellFrame`] into the corresponding `ProxyShellBody`
@@ -1388,6 +1457,13 @@ impl HostClient for GrpcHostClient {
         sandbox_id: SandboxId,
     ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
         Self::proxy_shell(self, sandbox_id).await
+    }
+
+    async fn proxy_vnc(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
+        Self::proxy_vnc(self, sandbox_id).await
     }
 
     // harness_dial + set_harness_sink use the trait defaults — gRPC

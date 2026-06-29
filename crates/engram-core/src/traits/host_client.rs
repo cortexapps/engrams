@@ -429,6 +429,35 @@ pub trait HostClient: Send + Sync {
         Err(SandboxError::NotFound)
     }
 
+    /// ADR 0064: VNC analog of [`proxy_shell`](Self::proxy_shell) — open a
+    /// raw-RFB tunnel to the in-guest `x11vnc` (`:5900`) instead of the ttyd
+    /// WebSocket (`:7681`). Returns the same [`ShellTunnel`] frame pair; only
+    /// the upstream and the on-the-wire `target` (`ProxyTarget::Vnc`) differ.
+    /// RFB bytes ride `ShellFrame::Binary`; the auth-gated relay does
+    /// websockify's job.
+    ///
+    /// Default impl errors with `NotFound`: only the host-agent's local impl
+    /// and the routing impls (`GrpcHostClient`, `HostRegistry`) override it —
+    /// every test/spy `HostClient` inherits this default, exactly as for
+    /// `proxy_shell`.
+    async fn proxy_vnc(&self, sandbox_id: SandboxId) -> Result<ShellTunnel, SandboxError> {
+        let _ = sandbox_id;
+        Err(SandboxError::NotFound)
+    }
+
+    /// ADR 0064: tear down the ephemeral in-guest browser stack (Xvfb +
+    /// x11vnc) for `sandbox_id`. The host-agent's gRPC server calls this a
+    /// short grace after the last VNC viewer disconnects (see
+    /// `vnc_grace::VncGrace`). Backend analog of
+    /// [`SandboxBackend::stop_browser`]; `LocalHostClient` forwards to its
+    /// inner backend. Default no-op (`Ok(())`): only the host-agent's local
+    /// impl actually owns a browser process — every other impl inherits this,
+    /// matching the `SandboxBackend` default.
+    async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let _ = sandbox_id;
+        Ok(())
+    }
+
     /// How a harness process inside this host's sandboxes dials back
     /// to the harness channel. Static per-host capability — drives
     /// the argv shape `resolve_harness` builds. Default `Vsock`

@@ -380,6 +380,34 @@ impl HostClient for LocalHostClient {
         Ok(tunnel)
     }
 
+    async fn proxy_vnc(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
+        // ADR 0064: VNC analog of `proxy_shell`. `start_browser` (P1.2) asks
+        // agentd to bring up the in-guest browser stack (Xvfb + x11vnc) and
+        // returns the VNC port; we then dial it in the right netns and bridge
+        // raw RFB bytes through a ShellTunnel pair. Same `vm_internal_ip`
+        // (not `guest_ip`) reasoning as `proxy_shell`: x11vnc binds the VM's
+        // in-VM eth0 IP inside the per-VM netns, not the netns veth IP.
+        let port = self.sandbox.start_browser(sandbox_id).await?;
+        let guest_ip = self
+            .sandbox
+            .vm_internal_ip(sandbox_id)
+            .await
+            .ok_or_else(|| SandboxError::Vm("proxy_vnc: vm_internal_ip unavailable".into()))?;
+        let netns_name = self.sandbox.netns_name_for(sandbox_id).await;
+        let (tunnel, ends) = engram_core::types::shell::ShellTunnel::pair();
+        crate::proxy_vnc::open_vnc_tunnel_at(guest_ip, port, netns_name, ends).await?;
+        Ok(tunnel)
+    }
+
+    async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        // ADR 0064: forward to the inner backend. Called by the gRPC server's
+        // grace timer after the last VNC viewer disconnects.
+        self.sandbox.stop_browser(sandbox_id).await
+    }
+
     fn harness_dial(&self) -> HarnessDial {
         self.sandbox.harness_dial()
     }
