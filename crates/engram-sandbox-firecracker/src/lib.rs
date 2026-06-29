@@ -4427,6 +4427,78 @@ impl SandboxBackend for FirecrackerBackend {
             .map_err(|_| SandboxError::Vm("start_shell: timed out waiting for agentd".into()))?
     }
 
+    /// ADR 0064: ask agentd to ensure the in-guest browser stack (Xvfb +
+    /// openbox + chromium + x11vnc) is running and x11vnc is accepting on its
+    /// port. Returns the bound port. Mirrors [`Self::start_shell`] — the
+    /// host's `proxy_vnc` (P1.4) calls this just before dialing the guest's
+    /// raw-TCP VNC port, so the connect finds a listener.
+    async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or_else(|| {
+                SandboxError::Vm(format!("start_browser: no live sandbox {id}").into())
+            })?;
+            live.state.vsock_uds_path.clone()
+        };
+        let fut = async {
+            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await
+                .map_err(|e| {
+                    SandboxError::Vm(format!("start_browser: vsock connect: {e}").into())
+                })?;
+            engram_agentd::write_msg(&mut conn, &WireRequest::StartBrowser { port: None })
+                .await
+                .map_err(|e| SandboxError::Vm(format!("start_browser: send: {e}").into()))?;
+            let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("start_browser: recv: {e}").into()))?;
+            match resp {
+                engram_agentd::WireResponse::BrowserReady { port, spawned } => {
+                    tracing::info!(
+                        sandbox_id = %id,
+                        port,
+                        spawned,
+                        "agentd reports browser ready",
+                    );
+                    Ok(port)
+                }
+                engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
+                    format!("start_browser: agentd error ({kind}): {message}").into(),
+                )),
+                other => Err(SandboxError::Vm(
+                    format!("start_browser: unexpected response: {other:?}").into(),
+                )),
+            }
+        };
+        // The browser spawn (Xvfb + chromium cold start) is heavier than
+        // ttyd, and agentd waits up to 20s (READY_DEADLINE) for x11vnc to
+        // accept, so allow 30s of headroom here.
+        tokio::time::timeout(Duration::from_secs(30), fut)
+            .await
+            .map_err(|_| SandboxError::Vm("start_browser: timed out waiting for agentd".into()))?
+    }
+
+    /// ADR 0064: tear down the in-guest browser stack. Idempotent — a no-op
+    /// when the sandbox is gone or nothing is running. Mirrors
+    /// [`Self::start_shell`]'s connection pattern.
+    async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let vsock_uds_path = {
+            let Some(live) = self.sandboxes.get(&id) else {
+                return Ok(());
+            };
+            live.state.vsock_uds_path.clone()
+        };
+        let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("stop_browser: vsock connect: {e}").into()))?;
+        engram_agentd::write_msg(&mut conn, &WireRequest::StopBrowser)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("stop_browser: send: {e}").into()))?;
+        let _: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("stop_browser: recv: {e}").into()))?;
+        Ok(())
+    }
+
     // ADR 0021 P1.5: `swap_harness_drive` retired with the rest of
     // option-D. The harness lives in the rootfs now, so there's no
     // host file backing a virtio-blk drive to swap.

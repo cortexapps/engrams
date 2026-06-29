@@ -856,6 +856,75 @@ impl SandboxBackend for VzBackend {
         }
     }
 
+    /// ADR 0064: ask agentd to ensure the in-guest browser stack (Xvfb +
+    /// openbox + chromium + x11vnc) is running and x11vnc is accepting on its
+    /// port. Returns the bound port. Mirrors [`Self::start_shell`]: the host's
+    /// `proxy_vnc` (P1.4) calls this just before dialing the guest's raw-TCP
+    /// VNC port, so the connect finds a listener. agentd carries the browser
+    /// bundle + the StartBrowser handler in every bake, so this is a
+    /// host-side-only change.
+    async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vsock_uds_path.clone()
+        };
+        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
+        let conn = UnixStream::connect(&agent_uds).await.map_err(|e| {
+            SandboxError::Vm(
+                format!(
+                    "connect agentd UDS for StartBrowser {}: {e}",
+                    agent_uds.display()
+                )
+                .into(),
+            )
+        })?;
+        let (mut reader, mut writer) = tokio::io::split(conn);
+        // `port: None` → agentd's default (5900). agentd waits up to 20s
+        // (READY_DEADLINE) for x11vnc to accept, and the browser cold start
+        // (Xvfb + chromium) is heavier than ttyd, so allow 45s here.
+        write_msg(&mut writer, &WireRequest::StartBrowser { port: None })
+            .await
+            .map_err(|e| SandboxError::Vm(format!("write StartBrowser: {e}").into()))?;
+        let resp: WireResponse =
+            tokio::time::timeout(Duration::from_secs(45), read_msg(&mut reader))
+                .await
+                .map_err(|_| SandboxError::Vm("StartBrowser timed out after 45s".into()))?
+                .map_err(|e| SandboxError::Vm(format!("read StartBrowser response: {e}").into()))?;
+        match resp {
+            WireResponse::BrowserReady { port, .. } => Ok(port),
+            WireResponse::Error { kind, message } => Err(SandboxError::Vm(
+                format!("StartBrowser rejected ({kind}): {message}").into(),
+            )),
+            other => Err(SandboxError::Vm(
+                format!("StartBrowser: unexpected response: {other:?}").into(),
+            )),
+        }
+    }
+
+    /// ADR 0064: tear down the in-guest browser stack. Idempotent — a no-op
+    /// when the sandbox is gone or nothing is running.
+    async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let vsock_uds_path = {
+            let Some(live) = self.sandboxes.get(&id) else {
+                return Ok(());
+            };
+            live.vsock_uds_path.clone()
+        };
+        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
+        let conn = UnixStream::connect(&agent_uds).await.map_err(|e| {
+            SandboxError::Vm(format!("connect agentd UDS for StopBrowser: {e}").into())
+        })?;
+        let (mut reader, mut writer) = tokio::io::split(conn);
+        write_msg(&mut writer, &WireRequest::StopBrowser)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("write StopBrowser: {e}").into()))?;
+        let _: WireResponse = tokio::time::timeout(Duration::from_secs(15), read_msg(&mut reader))
+            .await
+            .map_err(|_| SandboxError::Vm("StopBrowser timed out".into()))?
+            .map_err(|e| SandboxError::Vm(format!("read StopBrowser response: {e}").into()))?;
+        Ok(())
+    }
+
     /// Discover the guest's primary IPv4 address by asking agentd
     /// over the vsock-bridge. First successful answer is cached on
     /// the per-sandbox state; subsequent calls are O(1) memory reads.

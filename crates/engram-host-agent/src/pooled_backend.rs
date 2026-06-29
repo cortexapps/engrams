@@ -6150,6 +6150,19 @@ impl SandboxBackend for PooledBackend {
         self.inner.start_shell(id).await
     }
 
+    /// ADR 0064: forward to inner, exactly as `start_shell` does — without
+    /// this the trait default (`Ok(5900)`) would run and the FC/VZ backend's
+    /// actual vsock StartBrowser RPC to in-VM agentd would never fire, so
+    /// the host's `proxy_vnc` would dial a port nothing started.
+    async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+        self.inner.start_browser(id).await
+    }
+
+    /// ADR 0064: forward to inner (the trait default is a no-op).
+    async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
+        self.inner.stop_browser(id).await
+    }
+
     async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
         self.inner.netns_name_for(id).await
     }
