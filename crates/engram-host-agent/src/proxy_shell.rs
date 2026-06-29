@@ -242,7 +242,7 @@ async fn connect_ttyd_in_netns(
         let deadline = std::time::Instant::now() + TTYD_DIAL_DEADLINE;
         let mut backoff = TTYD_BACKOFF_START;
         loop {
-            let stream = match connect_tcp_in_netns_linux(netns_name, guest_ip).await {
+            let stream = match connect_tcp_in_netns_linux(netns_name, guest_ip, TTYD_PORT).await {
                 Ok(s) => s,
                 Err(e) => {
                     let msg = format!("{e}");
@@ -273,13 +273,19 @@ async fn connect_ttyd_in_netns(
     }
 }
 
+/// Open a TCP socket to `guest_ip:port` from inside `netns_name` via
+/// `setns(2)` on a blocking worker thread, then adopt the connected
+/// FD back into tokio. Shared by the shell path (ttyd) and the VNC
+/// path (`proxy_vnc`, ADR 0064) — both need the same per-VM netns
+/// entry, differing only by destination port.
 #[cfg(target_os = "linux")]
-async fn connect_tcp_in_netns_linux(
+pub(crate) async fn connect_tcp_in_netns_linux(
     netns_name: &str,
     guest_ip: &str,
+    port: u16,
 ) -> Result<TcpStream, SandboxError> {
     let netns_path = format!("/var/run/netns/{netns_name}");
-    let guest_addr = format!("{guest_ip}:{TTYD_PORT}");
+    let guest_addr = format!("{guest_ip}:{port}");
 
     // We need to:
     //   1. open /proc/self/ns/net to remember root netns.

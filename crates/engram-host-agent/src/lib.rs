@@ -44,6 +44,7 @@ pub mod metrics;
 pub mod orphan_reap;
 pub mod pooled_backend;
 pub mod proxy_shell;
+pub mod proxy_vnc;
 pub mod resource;
 pub mod snapshot;
 pub mod teardown_reconcile;
