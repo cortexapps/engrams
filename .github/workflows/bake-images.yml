@@ -730,7 +730,13 @@ jobs:
   # the downstream FC-host bakes pull that GHCR artifact, so firing
   # them without it would 404 on the pull.
   notify:
-    needs: [detect, bake, publish-host-binaries, publish-bundles]
+    # publish-node-assets is in `needs` purely for ORDERING: the bundles
+    # dispatch below rolls the host fleet onto the node-assets image, and
+    # engrams-internal's deploy resolves node-assets to THIS sha — which only
+    # exists once publish-node-assets has pushed it. It is deliberately NOT in
+    # the failure guards below: a node-assets bake failure must not block
+    # engrams-changed / engrams-tf-changed (those don't roll node-assets content).
+    needs: [detect, bake, publish-host-binaries, publish-bundles, publish-node-assets]
     if: |
       always() &&
       github.event_name == 'push' &&
@@ -769,6 +775,8 @@ jobs:
           TF_CHANGED: ${{ needs.detect.outputs.tf_or_helm }}
           BUNDLES_CHANGED: ${{ needs.detect.outputs.bundles }}
           DEV_IMAGE_CHANGED: ${{ needs.detect.outputs.dev_image }}
+          # Gate the bundles dispatch on the node-assets bake (see below).
+          NODE_ASSETS_RESULT: ${{ needs.publish-node-assets.result }}
         run: |
           set -euo pipefail
           fire() {
@@ -802,8 +810,22 @@ jobs:
           # ADR 0027: a bundle change republished the squashfs artifacts above;
           # the FC-host image must re-bake to pull them onto every host. The
           # engrams-internal handler for this re-stages /var/lib/engram/shared.
+          #
+          # This MUST wait for publish-node-assets: that job bakes the node-assets
+          # image (pulling bundle-*:main) that the host fleet rolls onto, and it
+          # finishes AFTER publish-bundles. engrams-internal's deploy resolves
+          # node-assets to THIS sha; firing before the image exists made it
+          # resolve the STALE node-assets, so the fleet silently never picked up
+          # the new bundle (observed: f65f6927, the NSS-softoken bundle fix).
+          # notify now lists publish-node-assets in `needs`, so by here the image
+          # is published — fire only once it actually succeeded.
           if [[ "$BUNDLES_CHANGED" == "true" ]]; then
-            fire engrams-bundles-changed
+            if [[ "$NODE_ASSETS_RESULT" == "success" ]]; then
+              fire engrams-bundles-changed
+            else
+              echo "::error::bundles changed but publish-node-assets=$NODE_ASSETS_RESULT — the new node-assets image is absent, so a deploy would roll the fleet onto the stale one. Not firing engrams-bundles-changed."
+              exit 1
+            fi
           fi
           # ADR 0027: auto-rebake the dev-engrams dogfood session image when
           # any source it builds moved. This only triggers the bake; ENABLING
