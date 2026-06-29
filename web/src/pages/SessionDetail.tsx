@@ -7,6 +7,8 @@ import { SessionThread } from "../components/session-thread/SessionThread";
 import { TabRow } from "../components/TabRow";
 import { PageHeading } from "../components/page-heading";
 import { TerminalPane } from "../components/TerminalPane";
+import { BrowserPane } from "../components/BrowserPane";
+import { useSessionCapabilities } from "../hooks/useSessionCapabilities";
 import { statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
 import { ProfileChip } from "../components/profiles/ProfileChip";
@@ -19,13 +21,15 @@ import {
 import { Separator } from "@/components/ui/separator";
 import type { IndexedEvent, Session, ProfileSnapshotView } from "../lib/types";
 
-type ViewTab = "transcript" | "shell" | "raw";
+type ViewTab = "transcript" | "shell" | "browser" | "raw";
 
-const TABS = [
+// BROWSER is conditional on the session's capability, so the tab list is built
+// per-render (below) rather than as a module constant. RAW always trails.
+const BASE_TABS = [
   { id: "transcript" as const, label: "TRANSCRIPT" },
   { id: "shell" as const, label: "SHELL" },
-  { id: "raw" as const, label: "RAW" },
 ];
+const RAW_TAB = { id: "raw" as const, label: "RAW" };
 
 export function SessionDetail() {
   const { id } = useParams({ from: "/_app/sessions/$id" });
@@ -60,6 +64,29 @@ export function SessionDetail() {
   useEffect(() => {
     if (tab === "shell") setShellEverActive(true);
   }, [tab]);
+
+  // The in-guest browser (Xvfb + VNC, ADR 0064) is an optional capability. The
+  // BROWSER tab — and its noVNC connection — exist only when the session was
+  // launched with it enabled.
+  const { data: caps } = useSessionCapabilities(id);
+  const browserEnabled = caps?.browserEnabled ?? false;
+  const TABS = browserEnabled
+    ? [...BASE_TABS, { id: "browser" as const, label: "BROWSER" }, RAW_TAB]
+    : [...BASE_TABS, RAW_TAB];
+
+  // Same lazy keep-mounted contract as SHELL: open the noVNC RFB connection
+  // only once the user visits BROWSER, then hold it across tab switches.
+  const [browserEverActive, setBrowserEverActive] = useState(false);
+  useEffect(() => {
+    if (tab === "browser") setBrowserEverActive(true);
+  }, [tab]);
+
+  // If the capability flips off (e.g. a refetch after the guest tears the
+  // browser down) while the user is on the now-absent tab, fall back to
+  // TRANSCRIPT so we never render an orphaned/empty surface.
+  useEffect(() => {
+    if (tab === "browser" && !browserEnabled) setTab("transcript");
+  }, [tab, browserEnabled]);
 
   return (
     // The work surface IS the page — no standing instrument rail. A developer
@@ -110,6 +137,15 @@ export function SessionDetail() {
         {shellEverActive && (
           <div className="h-full" style={{ display: tab === "shell" ? "block" : "none" }}>
             <TerminalPane sessionId={id} />
+          </div>
+        )}
+
+        {/* Same keep-mounted contract as SHELL above: mount BrowserPane once
+            (after the first visit) and hide it with display:none on tab
+            switches, so the noVNC RFB connection survives without a remount. */}
+        {browserEnabled && browserEverActive && (
+          <div className="h-full" style={{ display: tab === "browser" ? "block" : "none" }}>
+            <BrowserPane sessionId={id} />
           </div>
         )}
 
