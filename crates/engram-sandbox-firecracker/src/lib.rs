@@ -4487,16 +4487,26 @@ impl SandboxBackend for FirecrackerBackend {
             };
             live.state.vsock_uds_path.clone()
         };
-        let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+        let fut = async {
+            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await
+                .map_err(|e| {
+                    SandboxError::Vm(format!("stop_browser: vsock connect: {e}").into())
+                })?;
+            engram_agentd::write_msg(&mut conn, &WireRequest::StopBrowser)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("stop_browser: send: {e}").into()))?;
+            let _: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("stop_browser: recv: {e}").into()))?;
+            Ok(())
+        };
+        // A wedged guest must never hang teardown — bound the round-trip at
+        // 15s for parity with VZ's `stop_browser` (start_browser allows 30s
+        // because it cold-starts Xvfb+chromium; teardown is far cheaper).
+        tokio::time::timeout(Duration::from_secs(15), fut)
             .await
-            .map_err(|e| SandboxError::Vm(format!("stop_browser: vsock connect: {e}").into()))?;
-        engram_agentd::write_msg(&mut conn, &WireRequest::StopBrowser)
-            .await
-            .map_err(|e| SandboxError::Vm(format!("stop_browser: send: {e}").into()))?;
-        let _: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
-            .await
-            .map_err(|e| SandboxError::Vm(format!("stop_browser: recv: {e}").into()))?;
-        Ok(())
+            .map_err(|_| SandboxError::Vm("stop_browser: timed out waiting for agentd".into()))?
     }
 
     // ADR 0021 P1.5: `swap_harness_drive` retired with the rest of
