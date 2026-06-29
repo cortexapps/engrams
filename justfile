@@ -231,6 +231,8 @@ bundles:
         || echo "playwright bundle skipped (needs Docker) — dev sessions get skills only"
     deploy/bundles/integrations-cli/build.sh --stage var/bundles/integrations-cli \
         || echo "integrations-cli bundle skipped (needs Docker) — dev sessions get no integration CLIs"
+    deploy/bundles/browser/build.sh --stage var/bundles/browser \
+        || echo "browser bundle skipped (needs Docker) — dev sessions get no browser"
 
 # ADR 0035/0055: build + stage the squashfs bundles CONTENT-ADDRESSED
 # (<sha256>.squashfs + current.json stamp) under var/shared/, the
@@ -246,9 +248,9 @@ bundles-squashfs:
     stamp="{"
     sep=""
     # ADR 0055: `sentinel` rides every reserved dyn-* slot; skills/playwright/
-    # integrations-cli are catalog skills swapped in per session. Files are
-    # content-keyed (<sha>.squashfs); the stamp maps logical name -> sha.
-    for name in sentinel skills playwright integrations-cli; do
+    # integrations-cli/browser are catalog skills swapped in per session. Files
+    # are content-keyed (<sha>.squashfs); the stamp maps logical name -> sha.
+    for name in sentinel skills playwright integrations-cli browser; do
         tmp="var/shared/.$name.build.squashfs"
         if ! "deploy/bundles/$name/build.sh" "$tmp"; then
             echo "$name bundle build failed; skipping (sessions degrade gracefully)" >&2
@@ -287,10 +289,10 @@ bundles-vz:
     stamp="{"
     sep=""
     # `sentinel` rides every reserved dyn slot at capture; skills/playwright/
-    # integrations-cli are catalog skills swapped in per session. playwright/
-    # integrations-cli need Docker and are best-effort (skipped on failure),
-    # exactly as `just bundles` already degrades.
-    for name in sentinel skills playwright integrations-cli; do
+    # integrations-cli/browser are catalog skills swapped in per session.
+    # playwright/integrations-cli/browser need Docker and are best-effort
+    # (skipped on failure), exactly as `just bundles` already degrades.
+    for name in sentinel skills playwright integrations-cli browser; do
         tree="$(mktemp -d)"
         if ! "deploy/bundles/$name/build.sh" --stage "$tree"; then
             echo "$name bundle stage failed; skipping (sessions degrade gracefully)" >&2
