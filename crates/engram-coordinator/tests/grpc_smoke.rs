@@ -755,6 +755,7 @@ async fn shell_relay_smoke() {
             .try_send(app::RelayShellRequest {
                 frame: Some(app::relay_shell_request::Frame::Open(app::ShellOpen {
                     session_id: session_id.clone(),
+                    target: app::ShellTarget::Shell as i32,
                 })),
             })
             .expect("buffer open frame (channel is empty)");
