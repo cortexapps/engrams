@@ -19,6 +19,7 @@ import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
 import { makeVncRoute } from "./routes/vnc.ts";
+import { makeCapabilitiesRoute } from "./routes/capabilities.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
 import { registerTasks } from "./rpc/tasks.ts";
@@ -89,6 +90,9 @@ app.route("/", shellApp);
 const { app: vncApp, injectUpgrade: injectVncUpgrade } = makeVncRoute();
 injectVncUpgrade(upgradeWebSocket);
 app.route("/", vncApp);
+
+// ADR 0064: session capabilities (browserEnabled, gates the web BROWSER tab).
+app.route("/", makeCapabilitiesRoute());
 
 // Default 404 for unmatched Hono paths.
 app.notFound((c) => c.json({ error: "not found" }, 404));
