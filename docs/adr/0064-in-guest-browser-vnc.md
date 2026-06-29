@@ -148,8 +148,19 @@ Binary RFB frames pass straight through — this orchestrator end is what makes 
 websockify. No new auth code: VNC access is governed identically to shell access
 (`can("read", "Session", { createdByUserId })`).
 
-The session DTO gains a `browserEnabled: bool`, derived from whether the resolved profile mounts the
-`browser` bundle, so the web can conditionally render the tab.
+**Capability surfacing (as-built).** The browser is an optional capability gated on the session's
+profile selecting the `browser` skill bundle. Rather than a bespoke REST endpoint (the early
+`GET /api/v1/sessions/:id/capabilities` was removed) — the web↔orchestrator surface is all-proto —
+the capability rides data the web already fetches: `ProfileSnapshot` (embedded on `TaskSessionRef`
+via the `TaskService` proto) gains a `repeated string skills`, and the web derives
+`browserEnabled = profile.skills.includes("browser")` client-side, from the same snapshot the
+`ProfileChip` renders. No extra round-trip, single source of truth.
+
+For a profile to *select* `browser`, it must be an offered skill: `browser` is registered as a
+built-in skill in **both** `orchestrator/src/skills/catalog.ts` (`BUILTIN_SKILLS`, the save-time
+validation) and `web/src/hooks/useSkills.ts` (the editor's picker). Omitting it there is what made an
+"added" browser silently fail to persist (the editor never offered it / validation rejected it), so
+`browserEnabled` stayed false even on a profile the operator believed had it.
 
 ### 5. Web — `BROWSER` tab + noVNC
 

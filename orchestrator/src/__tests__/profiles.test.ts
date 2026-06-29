@@ -188,6 +188,22 @@ describe("ProfileService — auth + field filtering", () => {
     } finally { await s.close(); }
   });
 
+  // ADR 0064: "browser" is a builtin skill (the opt-in in-guest browser). It
+  // must validate like any other builtin so a profile can actually select it —
+  // the gap that left browserEnabled stuck false even after "adding" it.
+  test("admin CreateProfile accepts the builtin browser skill (ADR 0064)", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),
+    });
+    try {
+      const r = await s.client.createProfile({
+        name: "Browsable", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {}, skills: ["browser"],
+      });
+      expect(r.profile!.skills).toEqual(["browser"]);
+    } finally { await s.close(); }
+  });
+
   test("admin CreateProfile with a malformed capability → InvalidArgument (ADR 0056)", async () => {
     const s = await spawn({
       getSession: makeGetSession("a", "admin"), store: makeFakeStore(),

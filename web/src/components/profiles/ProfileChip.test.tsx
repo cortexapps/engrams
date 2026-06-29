@@ -12,6 +12,7 @@ describe("ProfileChip", () => {
           icon: "Server",
           archived: false,
           imageUri: "registry/api:latest",
+          skills: [],
         }}
       />,
     );
@@ -24,7 +25,7 @@ describe("ProfileChip", () => {
   it("marks archived profiles", () => {
     render(
       <ProfileChip
-        profile={{ id: "p", name: "Old", icon: "Bot", archived: true, imageUri: "x" }}
+        profile={{ id: "p", name: "Old", icon: "Bot", archived: true, imageUri: "x", skills: [] }}
       />,
     );
     expect(screen.getByText("Old")).toBeTruthy();

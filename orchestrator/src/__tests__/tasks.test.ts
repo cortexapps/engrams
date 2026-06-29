@@ -270,6 +270,18 @@ describe("buildProfileMap — image catalog resilience", () => {
 
     expect(map.get(PROFILE_ID)!.imageUri).toBe("registry/img-1:latest");
   });
+
+  test("carries the profile's skills onto the snapshot (ADR 0064 browser-tab gate)", async () => {
+    const map = await buildProfileMap(
+      [{ profileId: PROFILE_ID }],
+      makeFakeProfiles({ skills: ["skills", "browser"] }),
+      fakeImages(),
+    );
+
+    // The web derives the BROWSER tab from snapshot.skills.includes("browser"),
+    // so the snapshot MUST surface the profile's skill set verbatim.
+    expect(map.get(PROFILE_ID)!.skills).toEqual(["skills", "browser"]);
+  });
 });
 
 /** Build a getSession stub for the given user (or return null for anon). */

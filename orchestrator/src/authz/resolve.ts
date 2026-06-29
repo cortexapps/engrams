@@ -20,7 +20,7 @@
 
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
-import { profile, task, taskSession } from "../db/schema.ts";
+import { task, taskSession } from "../db/schema.ts";
 
 const TTL_MS = 5_000;
 const MAX_SIZE = 1_000;
@@ -69,29 +69,6 @@ export async function resolveSessionOwner(
 
   cache.set(sessionId, { value, expiresAt: now + TTL_MS });
   return value;
-}
-
-/**
- * The dynamic skill-bundle names selected by the session's profile (ADR 0055),
- * via task_session.profileId → profile.skills. Returns an empty array when the
- * session has no profile row (out-of-band / pre-feature sessions). Used to gate
- * capabilities like the browser tab (ADR 0064).
- *
- * Mirrors resolveSessionOwner's query style (task_session is the entry point,
- * indexed on session_id). Not cached: capability lookups are infrequent (one
- * per session-detail load), unlike the per-frame owner check.
- */
-export async function resolveSessionProfileSkills(
-  sessionId: string,
-): Promise<string[]> {
-  const db = getDb();
-  const rows = await db
-    .select({ skills: profile.skills })
-    .from(taskSession)
-    .innerJoin(profile, eq(taskSession.profileId, profile.id))
-    .where(eq(taskSession.sessionId, sessionId))
-    .limit(1);
-  return rows[0]?.skills ?? [];
 }
 
 /**

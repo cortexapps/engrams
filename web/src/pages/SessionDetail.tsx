@@ -8,7 +8,6 @@ import { TabRow } from "../components/TabRow";
 import { PageHeading } from "../components/page-heading";
 import { TerminalPane } from "../components/TerminalPane";
 import { BrowserPane } from "../components/BrowserPane";
-import { useSessionCapabilities } from "../hooks/useSessionCapabilities";
 import { statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
 import { ProfileChip } from "../components/profiles/ProfileChip";
@@ -47,6 +46,7 @@ export function SessionDetail() {
         icon: profileSnap.icon,
         archived: profileSnap.archived,
         imageUri: profileSnap.imageUri,
+        skills: profileSnap.skills,
       }
     : null;
   const { events, streamingText } = useSessionEvents(id);
@@ -65,11 +65,12 @@ export function SessionDetail() {
     if (tab === "shell") setShellEverActive(true);
   }, [tab]);
 
-  // The in-guest browser (Xvfb + VNC, ADR 0064) is an optional capability. The
-  // BROWSER tab — and its noVNC connection — exist only when the session was
-  // launched with it enabled.
-  const { data: caps } = useSessionCapabilities(id);
-  const browserEnabled = caps?.browserEnabled ?? false;
+  // The in-guest browser (Xvfb + VNC, ADR 0064) is an optional capability,
+  // present iff the session's profile selected the `browser` skill bundle. We
+  // read that straight off the profile snapshot the masthead already shows —
+  // the same source as the ProfileChip — so there's no separate capability
+  // fetch (ADR 0064 as-built: skills ride ProfileSnapshot, not a REST endpoint).
+  const browserEnabled = (profile?.skills ?? []).includes("browser");
   const TABS = browserEnabled
     ? [...BASE_TABS, { id: "browser" as const, label: "BROWSER" }, RAW_TAB]
     : [...BASE_TABS, RAW_TAB];
@@ -81,9 +82,9 @@ export function SessionDetail() {
     if (tab === "browser") setBrowserEverActive(true);
   }, [tab]);
 
-  // If the capability flips off (e.g. a refetch after the guest tears the
-  // browser down) while the user is on the now-absent tab, fall back to
-  // TRANSCRIPT so we never render an orphaned/empty surface.
+  // If the capability flips off (e.g. an admin removes the `browser` skill from
+  // the profile and useTasks refetches the snapshot) while the user is on the
+  // now-absent tab, fall back to TRANSCRIPT so we never render an orphaned tab.
   useEffect(() => {
     if (tab === "browser" && !browserEnabled) setTab("transcript");
   }, [tab, browserEnabled]);

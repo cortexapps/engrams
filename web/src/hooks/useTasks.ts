@@ -43,6 +43,7 @@ export function taskToSessionListItem(task: Task): SessionListItem {
           icon: snap.icon,
           archived: snap.archived,
           imageUri: snap.imageUri,
+          skills: snap.skills,
         }
       : null,
   };

@@ -192,7 +192,7 @@ function buildTask(
   },
   sessionRefs: Array<{ sessionId: string; role: string | null; profileId: string | null }>,
   sessionMap: Map<string, Session>,
-  profileMap: Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string }>,
+  profileMap: Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string; skills: string[] }>,
 ): Task {
   // Derive status from the primary session's live state (if available).
   let status = row.status;
@@ -257,9 +257,9 @@ export async function buildProfileMap(
   refs: Array<{ profileId: string | null }>,
   profiles: ProfileStore,
   imagesClient: ImagesClient,
-): Promise<Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string }>> {
+): Promise<Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string; skills: string[] }>> {
   const ids = [...new Set(refs.map((r) => r.profileId).filter((x): x is string => x != null))];
-  const out = new Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string }>();
+  const out = new Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string; skills: string[] }>();
   if (ids.length === 0) return out;
   // The image catalog lives on the control plane and may be transiently
   // unavailable. Reads must stay best-effort: a catalog failure must not take
@@ -276,6 +276,10 @@ export async function buildProfileMap(
       id: p.id, name: p.name, icon: p.icon,
       archived: p.deletedAt != null,
       imageUri: uriById.get(p.imageId) ?? "",
+      // ADR 0064: carry the profile's skills so the web can gate optional
+      // session capabilities (the BROWSER tab) off the snapshot it already
+      // fetches — no separate capability call.
+      skills: p.skills,
     });
   }
   return out;
