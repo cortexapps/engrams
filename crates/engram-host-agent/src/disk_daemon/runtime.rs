@@ -19,11 +19,13 @@
 //!    fresh socket via `NBD_CMD_RECONFIGURE` after a restart — the
 //!    survivor-rehydrate primitive.
 //! 3. Spawns a tokio task that reads NBD requests over the
-//!    server-side `UnixStream`, dispatches to the backend, and
-//!    writes replies. Each request is served sequentially —
-//!    in-flight pipelining is a follow-up optimization (the kernel
-//!    side handles many handles concurrently but a sequential
-//!    serve is correct).
+//!    server-side `UnixStream` and PIPELINES them (ADR 0061): a
+//!    reader dispatches each request to a bounded pool of handler
+//!    tasks and a single writer serializes the replies back. The
+//!    kernel issues many in-flight requests per socket (correlated
+//!    by `handle`); servicing them concurrently overlaps the
+//!    per-request chunk fetches. `ENGRAM_NBD_SERVE_CONCURRENCY=1`
+//!    falls back to the strictly-serial loop.
 //!
 //! Shutdown: drop the returned [`NbdHandle`] to tear down. The
 //! `Drop` impl aborts the serve task and issues a netlink
@@ -41,12 +43,15 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream as TokioUnixStream;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle as TokioJoinHandle;
 
-use super::backend::{ChunkedDiskBackend, DiskBackendError};
-use super::nbd::{NbdCommand, NbdReply, NbdRequest, REQUEST_HEADER_LEN};
+use super::backend::{ChunkedDiskBackend, DiskBackendError, InFlightGuard};
+use super::nbd::{NbdCommand, NbdReply, NbdRequest, REPLY_HEADER_LEN, REQUEST_HEADER_LEN};
 use super::nbd_netlink::{self, NbdNetlinkParams};
 use super::slot::{NbdSlot, NbdSlotAllocator};
 
@@ -97,6 +102,21 @@ fn nbd_dead_conn_timeout_secs() -> u64 {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|s| *s > 0)
         .unwrap_or(300)
+}
+
+/// Max NBD requests serviced concurrently per sandbox (ADR 0061). The
+/// kernel issues many in-flight requests on one socket (each carries a
+/// `handle` for correlation); this bounds how many the daemon services
+/// at once, overlapping the per-request chunk fetches instead of
+/// serializing them. `1` reproduces the legacy strictly-serial serve
+/// loop exactly — the kill-switch. Override via
+/// `ENGRAM_NBD_SERVE_CONCURRENCY`.
+fn nbd_serve_concurrency() -> usize {
+    std::env::var("ENGRAM_NBD_SERVE_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(8)
 }
 
 /// Anything that can go wrong launching or running the daemon.
@@ -852,125 +872,204 @@ fn unix_socketpair() -> io::Result<(OwnedFd, std::os::unix::net::UnixStream)> {
     Ok((kernel_side, server_std))
 }
 
-/// Serve NBD requests on `stream` until the kernel disconnects or
-/// the stream errors. Each request: read 28-byte header → parse →
-/// dispatch to backend → write reply (16-byte header + optional
-/// payload). Sequential per session — kernel-side I/O concurrency
-/// is handled by the kernel, our serve loop just needs to keep up.
-async fn serve_loop(backend: Arc<ChunkedDiskBackend>, mut stream: TokioUnixStream) {
-    // ADR 0018 commit 12m: hold an `Arc<InFlightTracker>` clone for
-    // the lifetime of this connection. Each request handler scope
-    // grabs a guard (++count); drop on scope exit decrements and,
-    // on the 1→0 edge, wakes any `wait_idle()` parker. The snapshot
-    // pipeline calls `backend.wait_idle().await` after `inner.pause()`
-    // to drain the virtio→kernel-NBD→userspace pipeline before
-    // flushing.
+/// Serve NBD requests on `stream` until the kernel disconnects or the
+/// stream errors. The kernel issues many in-flight requests on one
+/// socket (correlated by `handle`), so we PIPELINE (ADR 0061): a reader
+/// parses headers and dispatches each request to a bounded pool of
+/// handler tasks; a single writer task serializes the replies back onto
+/// the wire. Out-of-order completion is legal on the wire (the handle
+/// correlates), but concurrent writes to one socket are not — hence the
+/// single writer.
+///
+/// ADR 0018 commit 12m: each in-flight request holds an `InFlightGuard`
+/// (`++count`); the guard rides with its reply to the writer and drops
+/// only AFTER the reply is flushed, so the snapshot pipeline's
+/// `backend.wait_idle().await` (called after `inner.pause()` to drain
+/// the virtio→kernel-NBD→userspace pipeline) counts a request as
+/// in-flight until its bytes are on the wire. `ENGRAM_NBD_SERVE_CONCURRENCY=1`
+/// reproduces the legacy strictly-serial loop.
+async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
     let in_flight = backend.in_flight_tracker();
+    let concurrency = nbd_serve_concurrency();
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let (mut read_half, write_half) = stream.into_split();
+    // Bounded so a kernel that stops draining replies backpressures the
+    // handlers (which keep their guards+permits) rather than buffering
+    // unboundedly. Capacity = concurrency: every in-flight reply fits, so
+    // a keeping-up kernel never blocks a handler on send.
+    let (reply_tx, reply_rx) = mpsc::channel::<ReplyMsg>(concurrency.max(1));
+    let writer = tokio::spawn(writer_loop(write_half, reply_rx));
+
     loop {
         let mut header = [0u8; REQUEST_HEADER_LEN];
-        match stream.read_exact(&mut header).await {
+        match read_half.read_exact(&mut header).await {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 tracing::info!("NBD serve loop: kernel closed socket cleanly");
-                return;
+                break;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "NBD serve loop: read header failed");
-                return;
+                break;
             }
         }
         let req = match NbdRequest::parse(&header) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(error = %e, "NBD serve loop: malformed request header");
-                return;
+                break;
             }
         };
 
-        // Disconnect short-circuits before we record an in-flight —
-        // it's just a sentinel to break the loop, nothing the
-        // barrier needs to wait on.
+        // Disconnect is a sentinel to end the loop, not a tracked op.
         if matches!(req.command, NbdCommand::Disconnect) {
             tracing::info!("NBD client requested disconnect");
+            break;
+        }
+
+        // A WRITE's payload trails its header on the read half, so it must
+        // be consumed here IN ORDER — it cannot be deferred to a
+        // concurrent handler without desyncing the stream.
+        let write_data = if matches!(req.command, NbdCommand::Write) {
+            let mut data = vec![0u8; req.length as usize];
+            if let Err(e) = read_half.read_exact(&mut data).await {
+                tracing::warn!(error = %e, "NBD write payload read failed");
+                break;
+            }
+            Some(data)
+        } else {
+            None
+        };
+
+        // Record in-flight + take a concurrency permit BEFORE spawning.
+        // Order matters: the guard is held across `acquire_owned`, so a
+        // request the reader has already accepted (header — and, for a
+        // WRITE, payload — consumed) counts toward `wait_idle` even while
+        // it waits for a slot. `acquire_owned` also backpressures the
+        // reader once `concurrency` handlers are outstanding, bounding
+        // both task count and buffered reply memory.
+        let guard = in_flight.enter();
+        let permit = match Arc::clone(&sem).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // semaphore closed (shutdown)
+        };
+        let backend = backend.clone();
+        let reply_tx = reply_tx.clone();
+        tokio::spawn(async move {
+            let msg = handle_request(&backend, req, write_data, guard, permit).await;
+            // If the writer is gone (connection torn down), the send
+            // fails and `msg` — including its guard — drops here,
+            // releasing the in-flight count.
+            let _ = reply_tx.send(msg).await;
+        });
+    }
+
+    // Stop accepting and drop our sender. The writer exits once every
+    // outstanding handler's sender clone drops — i.e. once all in-flight
+    // replies have drained — so awaiting it gives a clean teardown.
+    drop(reply_tx);
+    let _ = writer.await;
+}
+
+/// A computed NBD reply awaiting serialization onto the wire. The
+/// per-request `InFlightGuard` and concurrency `_permit` ride along and
+/// drop only after the writer flushes the reply (ADR 0061 / 0018).
+struct ReplyMsg {
+    header: [u8; REPLY_HEADER_LEN],
+    /// `Some` for READ responses (the data follows the header); `None`
+    /// for WRITE / FLUSH / TRIM, whose reply is the bare header.
+    payload: Option<Bytes>,
+    _guard: InFlightGuard,
+    _permit: OwnedSemaphorePermit,
+}
+
+/// Compute one request's reply off the read path. Runs concurrently with
+/// other handlers (bounded by the serve-loop semaphore); the backend
+/// serializes dirty-buffer mutations under its own lock, so concurrent
+/// read/write handlers cannot observe torn state.
+async fn handle_request(
+    backend: &ChunkedDiskBackend,
+    req: NbdRequest,
+    write_data: Option<Vec<u8>>,
+    guard: InFlightGuard,
+    permit: OwnedSemaphorePermit,
+) -> ReplyMsg {
+    let (reply, payload) = match req.command {
+        NbdCommand::Read => {
+            // `backend.read` self-bounds via the chunk-fetch retry budget
+            // (per-attempt timeout × max attempts), so a stalled/missing
+            // chunk surfaces as `Err` → EIO in bounded time. The kernel
+            // NBD_SET_TIMEOUT (see `spawn`) backstops a wedged daemon that
+            // never replies at all.
+            match backend.read(req.offset, req.length as u64).await {
+                Ok(bytes) => (NbdReply::ok(req.handle), Some(bytes)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "NBD read failed");
+                    (NbdReply::eio(req.handle), None)
+                }
+            }
+        }
+        NbdCommand::Write => {
+            let data = write_data.unwrap_or_default();
+            match backend.write(req.offset, &data).await {
+                Ok(()) => (NbdReply::ok(req.handle), None),
+                Err(e) => {
+                    tracing::warn!(error = %e, "NBD write failed");
+                    (NbdReply::eio(req.handle), None)
+                }
+            }
+        }
+        // FLUSH: ack at the wire level but defer durable-flush to the
+        // snapshot path (inline per-FLUSH flush-to-chunk-store would
+        // multiply object-storage cost ~100×; we trade strict-FUA for
+        // cost). TRIM: accept (so the kernel keeps offering trim) but
+        // no-op. Both as in the legacy serial loop.
+        NbdCommand::Flush | NbdCommand::Trim => (NbdReply::ok(req.handle), None),
+        // Handled in the reader before dispatch; unreachable here.
+        NbdCommand::Disconnect => (NbdReply::ok(req.handle), None),
+    };
+    ReplyMsg {
+        header: reply.encode(),
+        payload,
+        _guard: guard,
+        _permit: permit,
+    }
+}
+
+/// Drain computed replies onto the write half, one at a time, in
+/// completion order. Owning the only handle to the write half is what
+/// keeps the wire well-formed under concurrent handlers. Each message's
+/// guard+permit drop at the end of the iteration — AFTER the flush — so
+/// `wait_idle()` observes the request as in-flight until then.
+async fn writer_loop(mut write_half: OwnedWriteHalf, mut reply_rx: mpsc::Receiver<ReplyMsg>) {
+    while let Some(msg) = reply_rx.recv().await {
+        if let Err(e) = write_half.write_all(&msg.header).await {
+            tracing::warn!(error = %e, "NBD reply header write failed");
             return;
         }
-        let _guard = in_flight.enter();
-
-        match req.command {
-            NbdCommand::Read => {
-                // `backend.read` self-bounds via the chunk-fetch retry
-                // budget (per-attempt timeout × max attempts), so a
-                // stalled/missing chunk surfaces as an `Err` → EIO in
-                // bounded time rather than hanging. The kernel-side
-                // NBD_SET_TIMEOUT (see `spawn`) is the backstop for the
-                // cases the budget can't cover (a wedged serve loop or
-                // lock — where the daemon never replies at all).
-                let bytes = match backend.read(req.offset, req.length as u64).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "NBD read failed");
-                        let _ = stream.write_all(&NbdReply::eio(req.handle).encode()).await;
-                        continue;
-                    }
-                };
-                let reply = NbdReply::ok(req.handle);
-                if let Err(e) = stream.write_all(&reply.encode()).await {
-                    tracing::warn!(error = %e, "NBD reply header write failed");
-                    return;
-                }
-                if let Err(e) = stream.write_all(&bytes).await {
-                    tracing::warn!(error = %e, "NBD reply payload write failed");
-                    return;
-                }
-            }
-            NbdCommand::Write => {
-                let mut data = vec![0u8; req.length as usize];
-                if let Err(e) = stream.read_exact(&mut data).await {
-                    tracing::warn!(error = %e, "NBD write payload read failed");
-                    return;
-                }
-                let reply = match backend.write(req.offset, &data).await {
-                    Ok(()) => NbdReply::ok(req.handle),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "NBD write failed");
-                        NbdReply::eio(req.handle)
-                    }
-                };
-                if let Err(e) = stream.write_all(&reply.encode()).await {
-                    tracing::warn!(error = %e, "NBD write reply failed");
-                    return;
-                }
-            }
-            NbdCommand::Disconnect => {
-                // Handled above before `in_flight.enter()` to avoid
-                // recording a phantom in-flight on the tear-down
-                // request. This arm is unreachable in practice.
-                unreachable!("Disconnect handled before the in-flight guard")
-            }
-            NbdCommand::Flush => {
-                // Honour the FLUSH semantic at the wire level
-                // (ack immediately) but defer durable-flush to the
-                // snapshot path. Inline flush-to-chunk-store per
-                // FUA / FLUSH would multiply object-storage cost
-                // by 100x for a typical workload; we trade off
-                // strict-FUA for cost.
-                let _ = stream.write_all(&NbdReply::ok(req.handle).encode()).await;
-            }
-            NbdCommand::Trim => {
-                // Same trade-off as FLUSH — accept the request
-                // (so the kernel doesn't mark the device as
-                // unsupporting trim) but treat as a no-op. A
-                // proper implementation would mark the affected
-                // chunks as "zero-fill on next read"; deferred.
-                let _ = stream.write_all(&NbdReply::ok(req.handle).encode()).await;
+        if let Some(payload) = &msg.payload {
+            if let Err(e) = write_half.write_all(payload).await {
+                tracing::warn!(error = %e, "NBD reply payload write failed");
+                return;
             }
         }
+        // `msg` (guard + permit) drops here, after the reply is on the wire.
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk_daemon::nbd::{NBD_REPLY_MAGIC, NBD_REQUEST_MAGIC};
+    use engram_chunk_store::cache::ChunkCacheConfig;
+    use engram_chunk_store::manifest::{
+        ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHEMA_VERSION,
+    };
+    use engram_chunk_store::{ChunkCache, ChunkStore};
+    use engram_core::traits::BlobStorage;
+    use engram_core::types::manifest::ManifestRef;
+    use engram_storage_local::LocalBlobStorage;
+    use tokio::net::unix::OwnedReadHalf;
 
     /// The stale-binding sweep's liveness guard: a binding owned by a
     /// LIVE process (in particular this very process — a session that
@@ -990,5 +1089,151 @@ mod tests {
         // Non-positive pids are never a real process.
         assert!(!pid_is_alive(0));
         assert!(!pid_is_alive(-1));
+    }
+
+    /// Build a 28-byte NBD request header (no payload), flags = 0.
+    fn req_bytes(cmd: u16, handle: u64, offset: u64, length: u32) -> [u8; REQUEST_HEADER_LEN] {
+        let mut b = [0u8; REQUEST_HEADER_LEN];
+        b[0..4].copy_from_slice(&NBD_REQUEST_MAGIC.to_be_bytes());
+        b[6..8].copy_from_slice(&cmd.to_be_bytes());
+        b[8..16].copy_from_slice(&handle.to_be_bytes());
+        b[16..24].copy_from_slice(&offset.to_be_bytes());
+        b[24..28].copy_from_slice(&length.to_be_bytes());
+        b
+    }
+
+    /// Read one reply: a 16-byte header, plus `payload_len` payload bytes on a
+    /// successful READ. Returns `(handle, error, payload)`.
+    async fn read_reply(rd: &mut OwnedReadHalf, payload_len: usize) -> (u64, u32, Vec<u8>) {
+        let mut hdr = [0u8; REPLY_HEADER_LEN];
+        rd.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(
+            u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]),
+            NBD_REPLY_MAGIC,
+        );
+        let error = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        let handle = u64::from_be_bytes([
+            hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+        ]);
+        let mut payload = vec![0u8; if error == 0 { payload_len } else { 0 }];
+        if error == 0 && payload_len > 0 {
+            rd.read_exact(&mut payload).await.unwrap();
+        }
+        (handle, error, payload)
+    }
+
+    /// A 3-chunk disk backend (chunks of 0xaa / 0xbb / 0xcc) over a local blob
+    /// store. The returned `TempDir` keeps the store + cache dirs alive.
+    async fn three_chunk_backend() -> (ChunkedDiskBackend, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let cs = 4096u64;
+        let h0 = store.put_chunk(&vec![0xaa_u8; cs as usize]).await.unwrap();
+        let h1 = store.put_chunk(&vec![0xbb_u8; cs as usize]).await.unwrap();
+        let h2 = store.put_chunk(&vec![0xcc_u8; cs as usize]).await.unwrap();
+        let manifest = Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Disk,
+            chunk_size: ChunkSize::bytes(cs),
+            total_bytes: 3 * cs,
+            chunks: vec![
+                ChunkRef {
+                    offset: 0,
+                    hash: h0,
+                },
+                ChunkRef {
+                    offset: cs,
+                    hash: h1,
+                },
+                ChunkRef {
+                    offset: 2 * cs,
+                    hash: h2,
+                },
+            ],
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+        (backend, dir)
+    }
+
+    /// ADR 0061 (#1): the pipelined serve loop services several in-flight
+    /// reads concurrently, returns well-formed replies correlated by handle,
+    /// and — once every reply is drained — releases all in-flight guards so
+    /// the snapshot drain (`wait_idle`) settles. A leaked guard would hang it.
+    #[tokio::test]
+    async fn serve_loop_pipelines_reads_correlated_and_drains() {
+        let (backend, _dir) = three_chunk_backend().await;
+        let backend = Arc::new(backend);
+        let in_flight = backend.in_flight_tracker();
+        let (client, server) = TokioUnixStream::pair().unwrap();
+        let serve = tokio::spawn(serve_loop(backend, server));
+        let (mut rd, mut wr) = client.into_split();
+
+        let cs = 4096u32;
+        // Issue all three reads before reading any reply — exercise the
+        // pipeline (handlers run concurrently; replies may complete in any
+        // order, correlated by handle).
+        for (handle, off) in [(10u64, 0u64), (20, 4096), (30, 8192)] {
+            wr.write_all(&req_bytes(0, handle, off, cs)).await.unwrap();
+        }
+        let mut by_handle = std::collections::HashMap::new();
+        for _ in 0..3 {
+            let (handle, error, payload) = read_reply(&mut rd, cs as usize).await;
+            assert_eq!(error, 0, "handle {handle} errored");
+            by_handle.insert(handle, payload);
+        }
+        assert!(by_handle[&10].iter().all(|b| *b == 0xaa));
+        assert!(by_handle[&20].iter().all(|b| *b == 0xbb));
+        assert!(by_handle[&30].iter().all(|b| *b == 0xcc));
+
+        // Drain invariant: all replies are off the wire, so all guards have
+        // dropped — `wait_idle` must settle promptly (a leak would hang).
+        tokio::time::timeout(std::time::Duration::from_secs(5), in_flight.wait_idle())
+            .await
+            .expect("wait_idle did not settle after replies drained");
+
+        // Clean disconnect ends the serve loop.
+        wr.write_all(&req_bytes(2, 0, 0, 0)).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), serve).await;
+    }
+
+    /// ADR 0061 (#1): a WRITE round-trips through the pipeline — its payload is
+    /// consumed in order by the reader, applied by the backend, and a later
+    /// READ of the same range reads it back.
+    #[tokio::test]
+    async fn serve_loop_write_then_read_round_trips() {
+        let (backend, _dir) = three_chunk_backend().await;
+        let backend = Arc::new(backend);
+        let (client, server) = TokioUnixStream::pair().unwrap();
+        let serve = tokio::spawn(serve_loop(backend, server));
+        let (mut rd, mut wr) = client.into_split();
+
+        // WRITE 4096 bytes of 0xff at offset 0 (NBD_CMD_WRITE = 1): header then
+        // payload.
+        wr.write_all(&req_bytes(1, 1, 0, 4096)).await.unwrap();
+        wr.write_all(&vec![0xff_u8; 4096]).await.unwrap();
+        let (h, err, _) = read_reply(&mut rd, 0).await;
+        assert_eq!((h, err), (1, 0), "write ack");
+
+        // READ it back from the dirty buffer.
+        wr.write_all(&req_bytes(0, 2, 0, 4096)).await.unwrap();
+        let (h, err, payload) = read_reply(&mut rd, 4096).await;
+        assert_eq!((h, err), (2, 0));
+        assert!(
+            payload.iter().all(|b| *b == 0xff),
+            "read-back sees the write"
+        );
+
+        wr.write_all(&req_bytes(2, 0, 0, 0)).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), serve).await;
     }
 }
