@@ -49,6 +49,14 @@ pub const DEFAULT_DIRTY_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 /// limits (mirrors the memory prefetch + re-chunk bound).
 const DISK_FLUSH_UPLOAD_CONCURRENCY: usize = 32;
 
+/// ADR 0061: bounded concurrency for the per-chunk fetches of a single
+/// NBD read that spans multiple 16 MiB chunks. The fetches are
+/// order-independent (each `read_chunk` resolves dirty/pending/mem/base
+/// on its own); we fan them out and reassemble in order. Most NBD reads
+/// span one chunk, so this only engages on a boundary-straddling or large
+/// read — modest, but on the same path. 8 mirrors the postcopy-drain bound.
+const DISK_READ_FETCH_CONCURRENCY: usize = 8;
+
 /// Anything that can go wrong on the backend data plane.
 #[derive(Debug)]
 pub enum DiskBackendError {
@@ -787,19 +795,43 @@ impl ChunkedDiskBackend {
         if length == 0 {
             return Ok(Bytes::new());
         }
-        let mut out = Vec::with_capacity(length as usize);
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
         let chunk_size = self.chunk_size;
-        let mut cursor = offset;
         let end = offset + length;
+        // One descriptor per chunk this read spans: (chunk_idx, served chunk
+        // width, intra-chunk start, bytes to take). `intra..intra+take` is
+        // the slice this read wants from the fetched chunk.
+        let mut descriptors: Vec<(usize, u64, usize, usize)> = Vec::new();
+        let mut cursor = offset;
         while cursor < end {
             let chunk_idx = (cursor / chunk_size) as usize;
             let chunk_start = (chunk_idx as u64) * chunk_size;
             let chunk_end = std::cmp::min(chunk_start + chunk_size, self.total_bytes);
             let intra = (cursor - chunk_start) as usize;
-            let take = std::cmp::min(end, chunk_end) - cursor;
-            let chunk_bytes = self.read_chunk(chunk_idx, chunk_end - chunk_start).await?;
-            out.extend_from_slice(&chunk_bytes[intra..intra + take as usize]);
-            cursor += take;
+            let take = (std::cmp::min(end, chunk_end) - cursor) as usize;
+            descriptors.push((chunk_idx, chunk_end - chunk_start, intra, take));
+            cursor += take as u64;
+        }
+
+        // Fan the per-chunk fetches out concurrently (bounded) and reassemble
+        // IN ORDER — `buffered` preserves order. A single-chunk read (the
+        // common case) runs exactly one fetch, same as the prior serial path.
+        // Collect the futures eagerly (rather than `stream::iter(map(..))`) so
+        // the borrowing closure isn't stored in the combinator — that form
+        // trips a higher-ranked-lifetime `Send` error in the spawned handler.
+        let fetches: Vec<_> = descriptors
+            .iter()
+            .map(|&(chunk_idx, read_len, _, _)| self.read_chunk(chunk_idx, read_len))
+            .collect();
+        let fetched: Vec<Bytes> = stream::iter(fetches)
+            .buffered(DISK_READ_FETCH_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+        let mut out = Vec::with_capacity(length as usize);
+        for (&(_, _, intra, take), chunk_bytes) in descriptors.iter().zip(fetched.iter()) {
+            out.extend_from_slice(&chunk_bytes[intra..intra + take]);
         }
         Ok(Bytes::from(out))
     }
@@ -2064,6 +2096,48 @@ mod tests {
 
         let bytes = backend.read(4096, 4096).await.unwrap();
         assert!(bytes.iter().all(|b| *b == 0xbb));
+    }
+
+    /// ADR 0061 (#2): a read that straddles chunk boundaries fans the
+    /// per-chunk fetches out concurrently (`buffered`) and must reassemble
+    /// them IN ORDER — chunk 0's bytes before chunk 1's before chunk 2's, no
+    /// transposition from out-of-order fetch completion.
+    #[tokio::test]
+    async fn read_across_chunk_boundaries_reassembles_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 3 * chunk_size;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let h1 = put_chunk(&store, 0xbb, chunk_size as usize).await;
+        let h2 = put_chunk(&store, 0xcc, chunk_size as usize).await;
+        let manifest = synth_manifest(
+            total,
+            chunk_size,
+            vec![(0, h0), (chunk_size, h1), (2 * chunk_size, h2)],
+        );
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+
+        // From the middle of chunk 0 through the middle of chunk 2: 2048 of
+        // 0xaa, then 4096 of 0xbb, then 2048 of 0xcc.
+        let bytes = backend.read(2048, 2 * chunk_size).await.unwrap();
+        assert_eq!(bytes.len(), (2 * chunk_size) as usize);
+        assert!(bytes[..2048].iter().all(|b| *b == 0xaa), "chunk 0 tail");
+        assert!(
+            bytes[2048..2048 + 4096].iter().all(|b| *b == 0xbb),
+            "chunk 1 whole",
+        );
+        assert!(
+            bytes[2048 + 4096..].iter().all(|b| *b == 0xcc),
+            "chunk 2 head"
+        );
     }
 
     /// ADR 0049 follow-up regression: the same-base concurrent-restore
