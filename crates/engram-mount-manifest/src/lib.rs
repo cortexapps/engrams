@@ -39,6 +39,12 @@ pub struct MountManifest {
     /// Skills this bundle carries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<SkillEntry>,
+    /// Bundle-level wrapper paths to symlink onto PATH (basename = the PATH
+    /// command name), independent of any skill. Used by capability bundles
+    /// (e.g. ADR 0064 `browser`'s `engram-browser` launcher) that expose a
+    /// tool agentd drives but that is NOT a user-facing agent skill.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bins: Vec<String>,
     /// Bundle-relative path to a git askpass binary, if this bundle ships one
     /// (wired into `/etc/gitconfig` for forge sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,6 +78,7 @@ impl MountManifest {
                 bins,
                 requires_env: None,
             }],
+            bins: Vec::new(),
             provides_askpass: None,
         }
     }

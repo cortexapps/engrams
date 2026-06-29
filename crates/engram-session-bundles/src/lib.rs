@@ -130,6 +130,10 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
         if let Some(rel) = &manifest.provides_askpass {
             askpass = Some(slot.join(rel));
         }
+        // Bundle-level bins (ADR 0064): launchers a capability bundle puts on
+        // PATH without being a user-facing agent skill. Wired independently of
+        // the per-skill loop below — no skill dir, no `~/.agents/skills` entry.
+        wire_bins(&layout, slot, &manifest.bins, &mut report);
         for skill in &manifest.skills {
             if let Some(req) = &skill.requires_env {
                 if !session_env.contains_key(req) {
@@ -211,6 +215,34 @@ fn wire_skill(
         }
     }
     report.activated.push(name.to_string());
+}
+
+/// Symlink bundle-level bins (not tied to a skill) onto `/usr/local/bin`.
+/// Basename of each path becomes the PATH command. No skill dir is required
+/// and nothing is registered under `~/.agents/skills`.
+fn wire_bins(layout: &Layout, slot: &Path, bins: &[String], report: &mut ActivationReport) {
+    for rel in bins {
+        let src = slot.join(rel);
+        let Some(name) = Path::new(rel).file_name().and_then(|f| f.to_str()) else {
+            report.warnings.push(format!("bad bundle bin path {rel}"));
+            continue;
+        };
+        if !src.exists() {
+            report
+                .warnings
+                .push(format!("bundle bin {rel} missing at {}", src.display()));
+            continue;
+        }
+        if let Err(e) = ensure_dir(&layout.usr_local_bin) {
+            report
+                .warnings
+                .push(format!("create {}: {e}", layout.usr_local_bin.display()));
+            continue;
+        }
+        if let Err(e) = ensure_symlink(&src, &layout.usr_local_bin.join(name)) {
+            report.warnings.push(format!("link bundle bin {name}: {e}"));
+        }
+    }
 }
 
 /// Render `/etc/gitconfig`. The user block (ADR 0031 committer attribution) is
@@ -444,6 +476,37 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("no skill bundles")));
+    }
+
+    #[test]
+    fn activate_wires_bundle_level_bins_without_a_skill() {
+        // ADR 0064: the `browser` bundle ships a launcher on PATH but is NOT a
+        // user-facing agent skill — its mount.json is the flat shape
+        // {"kind":"skill","bins":["bin/engram-browser"]}. The bin must land on
+        // PATH with no phantom agent skill registered and no warning.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let slot = root.join("opt/engram/dyn/0");
+        std::fs::create_dir_all(slot.join("bin")).unwrap();
+        std::fs::write(slot.join("bin/engram-browser"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            slot.join("mount.json"),
+            br#"{"kind":"skill","bins":["bin/engram-browser"]}"#,
+        )
+        .unwrap();
+
+        let report = activate(root, &HashMap::new());
+
+        let l = Layout::under(root);
+        let link = l.usr_local_bin.join("engram-browser");
+        assert!(link.is_symlink(), "engram-browser must be symlinked onto PATH");
+        // No phantom agent skill registered under ~/.agents/skills.
+        let phantom = l.agents_skills.exists()
+            && std::fs::read_dir(&l.agents_skills)
+                .map(|d| d.count() > 0)
+                .unwrap_or(false);
+        assert!(!phantom, "bundle-level bins must NOT create an agent skill");
+        assert!(report.warnings.iter().all(|w| !w.contains("engram-browser")));
     }
 
     #[test]
