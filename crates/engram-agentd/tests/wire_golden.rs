@@ -144,6 +144,7 @@ fn wire_request_golden_and_variant_indices() {
     let install_ca = WireRequest::InstallHostCa(InstallHostCaRequest {
         cert_pem: "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".into(),
     });
+    let start_browser = WireRequest::StartBrowser { port: Some(5900) };
 
     assert_golden("request_exec", &exec);
     assert_golden("request_stat", &stat);
@@ -156,6 +157,8 @@ fn wire_request_golden_and_variant_indices() {
     assert_golden("request_spawn_harness", &spawn);
     assert_golden("request_install_host_ca", &install_ca);
     assert_golden("request_sync", &WireRequest::Sync);
+    assert_golden("request_start_browser", &start_browser);
+    assert_golden("request_stop_browser", &WireRequest::StopBrowser);
 
     assert_variant_index(&exec, 0, "WireRequest::Exec");
     assert_variant_index(&stat, 1, "WireRequest::Stat");
@@ -168,6 +171,8 @@ fn wire_request_golden_and_variant_indices() {
     assert_variant_index(&spawn, 8, "WireRequest::SpawnHarness");
     assert_variant_index(&install_ca, 9, "WireRequest::InstallHostCa");
     assert_variant_index(&WireRequest::Sync, 10, "WireRequest::Sync");
+    assert_variant_index(&start_browser, 11, "WireRequest::StartBrowser");
+    assert_variant_index(&WireRequest::StopBrowser, 12, "WireRequest::StopBrowser");
 }
 
 // ---- WireResponse ------------------------------------------------------
@@ -194,6 +199,10 @@ fn wire_response_golden_and_variant_indices() {
         kind: "NotFound".into(),
         message: "no such file".into(),
     };
+    let browser_ready = WireResponse::BrowserReady {
+        port: 5900,
+        spawned: true,
+    };
 
     assert_golden("response_stat", &stat);
     assert_golden("response_upload_ok", &WireResponse::UploadOk);
@@ -206,6 +215,8 @@ fn wire_response_golden_and_variant_indices() {
     assert_golden("response_install_host_ca_ack", &ca_ack);
     assert_golden("response_error", &error);
     assert_golden("response_synced", &WireResponse::Synced);
+    assert_golden("response_browser_ready", &browser_ready);
+    assert_golden("response_browser_stopped", &WireResponse::BrowserStopped);
 
     assert_variant_index(&stat, 0, "WireResponse::Stat");
     assert_variant_index(&WireResponse::UploadOk, 1, "WireResponse::UploadOk");
@@ -218,6 +229,12 @@ fn wire_response_golden_and_variant_indices() {
     assert_variant_index(&ca_ack, 8, "WireResponse::InstallHostCaAck");
     assert_variant_index(&error, 9, "WireResponse::Error");
     assert_variant_index(&WireResponse::Synced, 10, "WireResponse::Synced");
+    assert_variant_index(&browser_ready, 11, "WireResponse::BrowserReady");
+    assert_variant_index(
+        &WireResponse::BrowserStopped,
+        12,
+        "WireResponse::BrowserStopped",
+    );
 }
 
 // ---- WireExecEvent -----------------------------------------------------
@@ -322,6 +339,11 @@ fn regen_golden() {
         }),
     );
     write("request_sync", &WireRequest::Sync);
+    write(
+        "request_start_browser",
+        &WireRequest::StartBrowser { port: Some(5900) },
+    );
+    write("request_stop_browser", &WireRequest::StopBrowser);
 
     write(
         "response_stat",
@@ -368,6 +390,14 @@ fn regen_golden() {
         },
     );
     write("response_synced", &WireResponse::Synced);
+    write(
+        "response_browser_ready",
+        &WireResponse::BrowserReady {
+            port: 5900,
+            spawned: true,
+        },
+    );
+    write("response_browser_stopped", &WireResponse::BrowserStopped);
 
     write(
         "exec_event_stdout",
