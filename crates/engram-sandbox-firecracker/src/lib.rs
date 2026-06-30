@@ -4439,6 +4439,12 @@ impl SandboxBackend for FirecrackerBackend {
         self.config.stub_harness_path.clone()
     }
 
+    fn bundle_dir(&self) -> &std::path::Path {
+        // The one dir `read_bundle_stamp` + `resolve_aux_drive` read from, so
+        // the host-agent heartbeat reports exactly what restore will attach.
+        &self.config.bundle_dir
+    }
+
     fn restore_memory_is_lazy_for(&self, fresh: bool) -> bool {
         // ADR 0022 Option A: mirror `effective_restore_mode` exactly so
         // the materialize decision can't drift from the load decision —

@@ -455,10 +455,11 @@ pub struct PooledBackend {
     /// manifest share the materialized file (and VZ's per-sandbox
     /// APFS clonefile / FC's NBD-on-the-shared-path work on top).
     materialize_dir: Option<PathBuf>,
-    /// ADR 0035: fleet-canonical staged-bundle dir
-    /// (`<drive_id>-<sha256>.squashfs` + the bake's `current.json`).
-    /// Defaults to `AuxRoDrive::SHARED_DIR`; tests inject a tempdir
-    /// via `with_bundle_dir`.
+    /// ADR 0035/0062: staged-bundle dir (`<sha256>.squashfs` + the bake's
+    /// `current.json`). NOT set independently — `new()` copies it from
+    /// `inner.bundle_dir()`, so it always equals the dir the inner backend reads
+    /// generations from (the single source of truth; `ENGRAM_BUNDLE_DIR` or the
+    /// `SHARED_DIR` default).
     bundle_dir: PathBuf,
     /// Optional NVMe-backed LRU cache fronting the chunk store.
     /// When wired, chunk reads during materialization go through
@@ -1205,6 +1206,12 @@ impl PooledBackend {
     }
 
     pub fn new(inner: Arc<dyn SandboxBackend>) -> Self {
+        // ADR 0062: the bundle dir is the INNER backend's — never set
+        // independently. The PooledBackend materializes pinned generations into
+        // the exact dir the inner backend reads them from, so there's a single
+        // source of truth (the backend config, set once from ENGRAM_BUNDLE_DIR /
+        // the SHARED_DIR default) and no way to make them disagree.
+        let bundle_dir = inner.bundle_dir().to_path_buf();
         Self {
             inner,
             image_cache: None,
@@ -1212,7 +1219,7 @@ impl PooledBackend {
             session_bindings: Arc::new(DashMap::new()),
             chunk_store: None,
             materialize_dir: None,
-            bundle_dir: PathBuf::from(engram_core::types::sandbox::AuxRoDrive::SHARED_DIR),
+            bundle_dir,
             chunk_cache: None,
             materialize_lock: Mutex::new(()),
             oci_client: None,
@@ -2822,13 +2829,6 @@ impl PooledBackend {
         self
     }
 
-    /// ADR 0035: override the staged-bundle dir (tests). Production
-    /// keeps the fleet-canonical default.
-    pub fn with_bundle_dir(mut self, dir: PathBuf) -> Self {
-        self.bundle_dir = dir;
-        self
-    }
-
     /// Attach an NVMe-backed `ChunkCache`. Optional; chains on top
     /// of `with_chunk_store`. Production hosts wire one to
     /// amortise repeated chunk reads across manifests; dev /
@@ -4398,6 +4398,12 @@ impl SandboxBackend for PooledBackend {
 
     fn restore_memory_is_lazy_for(&self, fresh: bool) -> bool {
         self.inner.restore_memory_is_lazy_for(fresh)
+    }
+
+    fn bundle_dir(&self) -> &std::path::Path {
+        // Delegates to the inner backend — the one source of truth this wrapper
+        // also materializes into (`self.bundle_dir`, copied from here in `new`).
+        self.inner.bundle_dir()
     }
 
     async fn guest_memory_stats(&self) -> Option<engram_core::traits::sandbox::GuestMemoryStats> {
