@@ -22,7 +22,7 @@ use engram_chunk_store::{ChunkCache, ChunkStore};
 use engram_core::traits::SandboxBackend;
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::image::WarmConfig;
-use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{AgentSpec, AuxBundleRef, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
 use tokio::fs;
@@ -1075,6 +1075,36 @@ impl PooledBackend {
                     "snapshot pins aux bundles but no chunk store is wired; \
                      relying on locally staged generations"
                 );
+            }
+        }
+        // ADR 0062: a fresh create's SELECTED mounts (the catalog harness on
+        // dyn_0, per-session skills) are pins too, but they are NOT in the
+        // snapshot's `aux_bundles`, so the block above doesn't cover them. The
+        // baked skills/sentinel are pre-staged on the host image, but a
+        // catalog-PUBLISHED generation (the harness, ADR 0062) has no local
+        // stage on a host that hasn't prefetched it yet — materialize it here
+        // too, or FC's `load_snapshot` opens a `dyn_*` path the host never
+        // staged ("selected skill <sha> … is not staged on this host (catalog
+        // materialize gap?)"). Symbolic mounts (`sha256 == None`) are resolved
+        // inside the backend, not staged from blob — skip them. Empty for
+        // resumes (they carry no fresh selections), so this is a no-op there.
+        let selected_refs: Vec<AuxBundleRef> = selected_mounts
+            .iter()
+            .filter_map(|m| {
+                m.sha256.as_ref().map(|sha| AuxBundleRef {
+                    drive_id: m.drive_id.clone(),
+                    sha256: sha.clone(),
+                })
+            })
+            .collect();
+        if !selected_refs.is_empty() {
+            if let Some(cs) = self.chunk_store.as_ref() {
+                crate::bundles::BundleStore::new(
+                    cs.blob_storage().clone(),
+                    self.bundle_dir.clone(),
+                )
+                .materialize_if_missing(&selected_refs)
+                .await?;
             }
         }
         // ADR 0035 §3: fresh creates swap aux bundles to the host's
