@@ -349,6 +349,13 @@ trait).
   back/forward/reload, "+" new-tab — driven by the `Target.*` state from the control channel.
 - `web/src/pages/SessionDetail.tsx`: a BROWSER tab beside TRANSCRIPT/SHELL/RAW, gated on
   `browserEnabled`, mounted-once/`display:none` across tab switches (like the shell `TerminalPane`).
+- `web/src/components/ports/ExposedPortsSection.tsx` (**absorbed from ADR-0064 P2c / #483**): the
+  live-host port-exposure rail (a liveness dot + an external link per exposed guest port). It lives
+  **interim in the Diagnostics drawer** (ADR 0064); the BROWSER panel composes it *beside*
+  `<BrowserPane/>` (the live agent tab) and **retires the drawer placement** — nothing is rebuilt, it
+  relocates. The localhost bridge: an agent tab pointed at an *exposed* guest port surfaces an
+  "open it yourself ↗" external link (full fidelity in the user's own browser) rather than only a
+  screencast — see [ADR 0064](0064-live-host-ports-vanity-subdomains.md).
 
 ---
 
@@ -372,8 +379,10 @@ trait).
   *Accept:* `bun test` — owner allowed / non-owner 404 / unauth 401; a fake relay yields a frame
   round-trip; a disallowed CDP method is rejected.
 - **P3 — Web synthetic-chrome BrowserPane.** `BrowserChrome` (tabs/omnibox/nav/new-tab from
-  `Target.*`) + `BrowserPane` (canvas render + input + takeover) + the gated SessionDetail tab.
-  *Accept:* `pnpm test`/render; clicking "+" creates a tab; switching tabs re-points the stream.
+  `Target.*`) + `BrowserPane` (canvas render + input + takeover) + the gated SessionDetail tab,
+  composing **ADR-0064 P2c's `ExposedPortsSection` (#483)** as the exposed-ports rail and **retiring
+  its interim Diagnostics-drawer home**. *Accept:* `pnpm test`/render; clicking "+" creates a tab;
+  switching tabs re-points the stream; the ports rail renders beside the live view.
 - **P4 — Choreography (make Playwright look real).** Cursor-overlay `addInitScript`, Bézier
   interpolated `mouseMoved` (ghost-cursor) + overlay, `pressSequentially` typing, animated scroll,
   click ripple, agent-screenshot overlay-strip; via the driver shim. *Accept:* a test asserts a click
