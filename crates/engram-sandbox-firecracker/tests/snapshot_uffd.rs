@@ -92,7 +92,18 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
     };
 
     let original_id = backend.create(spec).await.expect("create");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the kernel to actually start (banner on the serial console
+    // funneled to firecracker.log) rather than sleeping a fixed worst-case.
+    // Fails fast on a kernel panic; returns the instant the VM is up.
+    let _ = common::wait_for_log_contains(
+        &work
+            .path()
+            .join(original_id.to_string())
+            .join("firecracker.log"),
+        &["Linux version"],
+        Duration::from_secs(15),
+    )
+    .await;
 
     // ADR 0007 Phase 6: backend owns its staging dir.
     let metadata = backend.snapshot(original_id).await.expect("snapshot");
@@ -207,11 +218,20 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
     let listed = backend.list().await.expect("list after restore");
     assert_eq!(listed, vec![restored_id]);
 
-    // Give the kernel a moment to fault in some pages. If the
-    // handler crashed silently we'd see those faults stall the VM
-    // and a destroy would still pass. To check the handler is
-    // alive we read the log — non-empty is good enough for v1.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Poll the handler log until it reports it's up (listening /
+    // handshake) instead of a fixed sleep. If the handler crashed
+    // silently the needles never appear and we fall through to the
+    // assertion below with the actual log contents; otherwise we
+    // proceed the instant it's serving pages.
+    let _ = common::wait_for_log_contains(
+        &work
+            .path()
+            .join(restored_id.to_string())
+            .join("uffd-handler.log"),
+        &["listening", "handshake"],
+        Duration::from_secs(5),
+    )
+    .await;
     let restored_jail = work.path().join(restored_id.to_string());
     let log_path = restored_jail.join("uffd-handler.log");
     assert!(
@@ -300,7 +320,18 @@ async fn uffd_restore_succeeds_when_memory_bin_absent_locally() {
     };
 
     let original_id = backend.create(spec).await.expect("create");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the kernel to actually start (banner on the serial console
+    // funneled to firecracker.log) rather than sleeping a fixed worst-case.
+    // Fails fast on a kernel panic; returns the instant the VM is up.
+    let _ = common::wait_for_log_contains(
+        &work
+            .path()
+            .join(original_id.to_string())
+            .join("firecracker.log"),
+        &["Linux version"],
+        Duration::from_secs(15),
+    )
+    .await;
 
     let metadata = backend.snapshot(original_id).await.expect("snapshot");
     let snap_dir = backend.snapshot_path_for(metadata.id);

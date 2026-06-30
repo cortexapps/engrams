@@ -173,7 +173,10 @@ async fn reserved_slots_n_drives_boot_snapshot_restore() {
     let fc1_log = work.join("fc1.log");
     let fc1_api = work.join("fc1.sock");
     let mut fc1 = spawn_firecracker(&fc1_api, &fc1_log).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        common::wait_for_socket(&fc1_api, Duration::from_secs(5)).await,
+        "fc1 API socket never bound",
+    );
     let client1 = FirecrackerClient::new(&fc1_api);
     configure_boot_n(&client1, &env.kernel, &rootfs, &aux_files).await;
     client1
@@ -183,8 +186,15 @@ async fn reserved_slots_n_drives_boot_snapshot_restore() {
             panic!("InstanceStart with {n} aux drives failed (FC device ceiling?): {e}")
         });
 
-    // Boot + enter the 12s snapshot-window sleep.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // Wait until the guest reaches the snapshot-window marker (the start of its
+    // 12s sleep), then snapshot — strictly more inside the window than a fixed
+    // 6s wait.
+    common::wait_for_log_contains(
+        &fc1_log,
+        &["sleeping 12s (snapshot window)"],
+        Duration::from_secs(30),
+    )
+    .await;
     let snapshot_paths = client1
         .create_snapshot(work)
         .await
@@ -195,7 +205,10 @@ async fn reserved_slots_n_drives_boot_snapshot_restore() {
     let fc2_log = work.join("fc2.log");
     let fc2_api = work.join("fc2.sock");
     let mut fc2 = spawn_firecracker(&fc2_api, &fc2_log).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        common::wait_for_socket(&fc2_api, Duration::from_secs(5)).await,
+        "fc2 API socket never bound",
+    );
     let client2 = FirecrackerClient::new(&fc2_api);
     client2
         .load_snapshot_paused(&snapshot_paths)
@@ -206,7 +219,8 @@ async fn reserved_slots_n_drives_boot_snapshot_restore() {
         .await
         .expect("resume");
 
-    let post_log = wait_for_post_resume_reads(&fc2_log, 5, Duration::from_secs(40)).await;
+    let post_log =
+        common::wait_for_log_count(&fc2_log, "post_resume_iter", 5, Duration::from_secs(40)).await;
     let hits = post_log
         .lines()
         .filter(|l| l.contains("post_resume_iter"))
@@ -245,7 +259,10 @@ async fn run_scenario(env: &common::FcEnv, mutation: Mutation, expected_post_res
     let fc1_log = work.join("fc1.log");
     let fc1_api = work.join("fc1.sock");
     let mut fc1 = spawn_firecracker(&fc1_api, &fc1_log).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        common::wait_for_socket(&fc1_api, Duration::from_secs(5)).await,
+        "fc1 API socket never bound",
+    );
 
     let client1 = FirecrackerClient::new(&fc1_api);
     configure_boot(&client1, &env.kernel, &rootfs, &gen_a).await;
@@ -254,8 +271,15 @@ async fn run_scenario(env: &common::FcEnv, mutation: Mutation, expected_post_res
         .await
         .expect("instance start");
 
-    // Give the guest time to boot + enter the 12s snapshot-window sleep.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // Wait until the guest reaches the snapshot-window marker (the start of its
+    // 12s sleep), then snapshot — strictly more inside the window than a fixed
+    // 6s wait.
+    common::wait_for_log_contains(
+        &fc1_log,
+        &["sleeping 12s (snapshot window)"],
+        Duration::from_secs(30),
+    )
+    .await;
 
     let snapshot_paths = client1
         .create_snapshot(work)
@@ -276,7 +300,10 @@ async fn run_scenario(env: &common::FcEnv, mutation: Mutation, expected_post_res
     let fc2_log = work.join("fc2.log");
     let fc2_api = work.join("fc2.sock");
     let mut fc2 = spawn_firecracker(&fc2_api, &fc2_log).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        common::wait_for_socket(&fc2_api, Duration::from_secs(5)).await,
+        "fc2 API socket never bound",
+    );
     let client2 = FirecrackerClient::new(&fc2_api);
 
     client2
@@ -298,7 +325,8 @@ async fn run_scenario(env: &common::FcEnv, mutation: Mutation, expected_post_res
         .await
         .expect("resume");
 
-    let post_log = wait_for_post_resume_reads(&fc2_log, 5, Duration::from_secs(40)).await;
+    let post_log =
+        common::wait_for_log_count(&fc2_log, "post_resume_iter", 5, Duration::from_secs(40)).await;
     let post_resume_lines: Vec<&str> = post_log
         .lines()
         .filter(|l| l.contains("post_resume_iter"))
@@ -413,23 +441,6 @@ async fn install_init_script(rootfs: &Path, work: &Path) {
         .await
         .expect("spawn umount");
     assert!(umount_status.success(), "sudo umount failed");
-}
-
-/// Poll `log_path` until `n` `"post_resume_iter"` lines appear or
-/// `timeout` elapses; returns the final log either way.
-async fn wait_for_post_resume_reads(log_path: &Path, n: usize, timeout: Duration) -> String {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let log = std::fs::read_to_string(log_path).unwrap_or_default();
-        let hits = log
-            .lines()
-            .filter(|l| l.contains("post_resume_iter"))
-            .count();
-        if hits >= n || std::time::Instant::now() >= deadline {
-            return log;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 }
 
 async fn spawn_firecracker(api_sock: &Path, log_path: &Path) -> Child {

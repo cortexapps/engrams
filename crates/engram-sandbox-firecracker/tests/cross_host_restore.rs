@@ -84,7 +84,17 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
     };
 
     let source_id = source.create(spec).await.expect("create on source");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the kernel banner on the serial console rather than a fixed
+    // settle before snapshotting.
+    let _ = common::wait_for_log_contains(
+        &source_work
+            .path()
+            .join(source_id.to_string())
+            .join("firecracker.log"),
+        &["Linux version"],
+        Duration::from_secs(15),
+    )
+    .await;
 
     let metadata = source.snapshot(source_id).await.expect("snapshot");
     let source_snap_dir = source.snapshot_path_for(metadata.id);

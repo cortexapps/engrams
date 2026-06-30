@@ -122,10 +122,12 @@ async fn run_swap_scenario(env: &common::FcEnv, pre_snapshot_reads: bool) {
     let fc1_log = work.join("fc1.log");
     let fc1_api = work.join("fc1.sock");
     let mut fc1 = spawn_firecracker(&fc1_api, &fc1_log).await;
-    // FC sometimes takes a beat to bind its API socket; the
-    // FirecrackerClient handles connect-retry, but a tiny sleep
-    // keeps the first PUT from waiting.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // FC sometimes takes a beat to bind its API socket; poll until it's bound
+    // rather than blind-sleeping a fixed margin.
+    assert!(
+        common::wait_for_socket(&fc1_api, Duration::from_secs(5)).await,
+        "fc1 API socket never bound",
+    );
 
     let client1 = FirecrackerClient::new(&fc1_api);
     configure_boot(&client1, &env.kernel, &rootfs, &harness_a).await;
@@ -134,13 +136,16 @@ async fn run_swap_scenario(env: &common::FcEnv, pre_snapshot_reads: bool) {
         .await
         .expect("instance start");
 
-    // Give the guest enough time to:
-    //  - boot
-    //  - run init.experiment
-    //  - in the staleness variant, do its 3× pre-snapshot reads
-    //  - enter the 12s sleep
-    // 6s is comfortably inside the sleep window for both variants.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // Wait for the guest to boot, run init.experiment, do its 3× pre-snapshot
+    // reads in the staleness variant, and reach the snapshot-window marker (the
+    // start of its 12s sleep). The marker is emitted AFTER the pre-reads block,
+    // so observing it guarantees those reads are already in the log.
+    common::wait_for_log_contains(
+        &fc1_log,
+        &["sleeping 12s (snapshot window)"],
+        Duration::from_secs(30),
+    )
+    .await;
 
     let pre_log = std::fs::read_to_string(&fc1_log).unwrap_or_default();
     if pre_snapshot_reads {
@@ -172,7 +177,10 @@ async fn run_swap_scenario(env: &common::FcEnv, pre_snapshot_reads: bool) {
     let fc2_log = work.join("fc2.log");
     let fc2_api = work.join("fc2.sock");
     let mut fc2 = spawn_firecracker(&fc2_api, &fc2_log).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        common::wait_for_socket(&fc2_api, Duration::from_secs(5)).await,
+        "fc2 API socket never bound",
+    );
     let client2 = FirecrackerClient::new(&fc2_api);
 
     client2
@@ -197,7 +205,8 @@ async fn run_swap_scenario(env: &common::FcEnv, pre_snapshot_reads: bool) {
     // the variant (the staleness variant ran 3 pre-snapshot reads
     // + sleeps before the 12s sleep, so its post-resume reads come
     // later). 40s is a generous ceiling.
-    let post_log = wait_for_post_resume_reads(&fc2_log, 5, Duration::from_secs(40)).await;
+    let post_log =
+        common::wait_for_log_count(&fc2_log, "post_resume_iter", 5, Duration::from_secs(40)).await;
     let post_resume_lines: Vec<&str> = post_log
         .lines()
         .filter(|l| l.contains("post_resume_iter"))
@@ -319,27 +328,6 @@ async fn install_init_script(rootfs: &Path, work: &Path, with_pre_reads: bool) {
         .await
         .expect("spawn umount");
     assert!(umount_status.success(), "sudo umount failed");
-}
-
-/// Poll `log_path` until `n` lines containing `"post_resume_iter"`
-/// appear, or `timeout` elapses. Returns the final log contents
-/// either way so the caller can produce a useful assertion message.
-async fn wait_for_post_resume_reads(log_path: &Path, n: usize, timeout: Duration) -> String {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let log = std::fs::read_to_string(log_path).unwrap_or_default();
-        let hits = log
-            .lines()
-            .filter(|l| l.contains("post_resume_iter"))
-            .count();
-        if hits >= n {
-            return log;
-        }
-        if std::time::Instant::now() >= deadline {
-            return log;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 }
 
 async fn spawn_firecracker(api_sock: &Path, log_path: &Path) -> Child {

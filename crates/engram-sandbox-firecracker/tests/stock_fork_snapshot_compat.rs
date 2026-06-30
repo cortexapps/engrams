@@ -86,7 +86,14 @@ async fn round_trip(
         .create(spec)
         .await
         .unwrap_or_else(|e| panic!("{label}: create: {e:?}"));
-    tokio::time::sleep(Duration::from_secs(2)).await; // let early boot settle
+    // Wait for the source VM to reach early boot before snapshotting — poll the
+    // serial console (funneled to firecracker.log) for the kernel banner instead
+    // of sleeping a fixed worst-case interval.
+    let fc_log = work
+        .path()
+        .join(original_id.to_string())
+        .join("firecracker.log");
+    common::wait_for_log_contains(&fc_log, &["Linux version"], Duration::from_secs(15)).await;
     let metadata = creator
         .snapshot(original_id)
         .await
