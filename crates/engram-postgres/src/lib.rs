@@ -3827,6 +3827,35 @@ impl MetadataStore for PostgresStore {
         }
     }
 
+    async fn set_session_harness(
+        &self,
+        session_id: SessionId,
+        harness: Option<&str>,
+    ) -> Result<(), MetaError> {
+        sqlx::query("UPDATE sessions SET harness = $1 WHERE id = $2")
+            .bind(harness)
+            .bind(session_id.as_uuid())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_session_harness(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, MetaError> {
+        let row = sqlx::query("SELECT harness FROM sessions WHERE id = $1")
+            .bind(session_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        match row {
+            Some(r) => Ok(sqlx::Row::try_get(&r, "harness").map_err(db_err)?),
+            None => Ok(None),
+        }
+    }
+
     // ----------------------------------------------------------------
     // ADR 0016 §A.1.5c — session_lease leasing row.
     // ----------------------------------------------------------------

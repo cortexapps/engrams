@@ -202,6 +202,7 @@ impl Driver {
             secrets: HashMap::new(),
             harness_env: HashMap::new(),
             prompt_id: None,
+            harness: None,
         };
         self.create_session_retrying(req, "dev_vm").await
     }
@@ -221,6 +222,7 @@ impl Driver {
             secrets: HashMap::new(),
             harness_env: HashMap::new(),
             prompt_id: None,
+            harness: None,
         };
         self.create_session_retrying(req, "dev_vm + skills").await
     }
@@ -254,6 +256,10 @@ impl Driver {
             secrets: HashMap::new(),
             harness_env,
             prompt_id: None,
+            // ADR 0062: an agent session selects a catalog harness. The e2e must
+            // register a "claude" harness (RegisterHarness) before this path can
+            // boot an agent — wired in the e2e harness-seeding follow-up.
+            harness: Some("claude".to_string()),
         };
         self.create_session_retrying(req, "claude").await
     }
