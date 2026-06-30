@@ -16,7 +16,11 @@
  */
 
 import { getDb } from "../db/client.ts";
-import { sessions as defaultSessions, images as defaultImages } from "../control-plane/client.ts";
+import {
+  sessions as defaultSessions,
+  images as defaultImages,
+  harnessCatalog as defaultHarnessCatalog,
+} from "../control-plane/client.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makeUserSecretStore } from "../db/user-secrets.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
@@ -24,6 +28,7 @@ import {
   createTaskWithSession,
   type Db,
   type TaskSessionsClient,
+  type HarnessCatalogClient,
 } from "../rpc/task-create.ts";
 import { resolveEngramsUser } from "../integrations/slack-identity.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
@@ -52,6 +57,7 @@ export interface ThreadControlPlaneDeps {
   profiles?: ProfileStore;
   images?: ImagesClient;
   connectors?: CustomConnectorSource;
+  harnessCatalog?: HarnessCatalogClient;
   secrets?: { get(userId: string, envVar: string): Promise<string | null> };
   sessions?: ThreadSessionsClient;
   resolveUser?: (provider: string, externalUserId: string) => Promise<string | null>;
@@ -64,6 +70,8 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
   const profiles = deps.profiles ?? makeProfileStore(getDb());
   const images = deps.images ?? (defaultImages as unknown as ImagesClient);
   const connectors = deps.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
+  const harnessCatalog =
+    deps.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
   const secrets = deps.secrets ?? makeUserSecretStore(getDb());
   const sessions = deps.sessions ?? (defaultSessions as unknown as ThreadSessionsClient);
   const resolveUser = deps.resolveUser ?? resolveEngramsUser;
@@ -75,7 +83,7 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
 
     async createTask(input) {
       const { sessionId } = await createTaskWithSession(
-        { profiles, images, connectors, sessions, secrets, db },
+        { profiles, images, connectors, harnessCatalog, sessions, secrets, db },
         {
           type: "slack_thread",
           ownerUserId: input.ownerUserId,

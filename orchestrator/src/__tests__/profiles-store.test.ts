@@ -11,6 +11,9 @@ const baseInput = {
   description: "d",
   icon: "Bot",
   imageId: "img-1",
+  harness: "claude",
+  model: null,
+  effort: null,
   includeUserTokens: false,
   envVars: {},
   skills: [],
@@ -18,6 +21,7 @@ const baseInput = {
   network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: false,
+  portExposures: [],
 };
 
 describe("ProfileStore", () => {
@@ -28,6 +32,9 @@ describe("ProfileStore", () => {
       description: "d",
       icon: "Bot",
       imageId: "img-1",
+      harness: "claude",
+      model: null,
+      effort: null,
       includeUserTokens: false,
       envVars: { ANTHROPIC_MODEL: "claude-opus-4-8" },
       skills: ["skills"],
@@ -35,6 +42,7 @@ describe("ProfileStore", () => {
       network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
       secrets: [],
       isDefault: false,
+      portExposures: [3000, 8080],
     };
     const created = await store.create(input);
     try {
@@ -42,9 +50,12 @@ describe("ProfileStore", () => {
       expect(created.deletedAt).toBeNull();
       // ADR 0056: capabilities round-trip through the store.
       expect(created.capabilities).toEqual(["github:issues:write", "datadog:metrics:read"]);
+      // ADR 0064: port_exposures round-trip through the store.
+      expect(created.portExposures).toEqual([3000, 8080]);
 
       const active = await store.getActive(created.id);
       expect(active?.name).toBe(input.name);
+      expect(active?.portExposures).toEqual([3000, 8080]);
 
       const listed = await store.list({ includeArchived: false });
       expect(listed.some((p) => p.id === created.id)).toBe(true);

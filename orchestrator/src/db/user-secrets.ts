@@ -2,9 +2,10 @@
  * Per-user, env-var-name-keyed session secret store, KEK-envelope sealed at
  * rest (ADR 0051 Drip A).
  *
- * The orchestrator OWNS the user's harness identity secrets (today just the
- * Claude `CLAUDE_CODE_OAUTH_TOKEN`) in its OWN Postgres — the
- * `user_session_secrets` table, next to the `user` rows they belong to. This
+ * The orchestrator OWNS the user's harness identity secrets (the per-user
+ * credentials each registered harness declares as `auth.user_env` — ADR 0063)
+ * in its OWN Postgres — the `user_session_secrets` table, next to the `user`
+ * rows they belong to, keyed by `(userId, envVarName)`. This
  * replaces the coordinator's per-user sealed SecretService vault: at
  * session-create the orchestrator opens all of a user's secrets here and passes
  * them to the control plane via `CreateSession.harness_env`, which the
@@ -16,7 +17,7 @@
  * only; the master key lives outside the DB (env var, sourced from GCP Secret
  * Manager in prod). Plaintext is NEVER logged.
  *
- * The `UserSecretStore` interface is the seam both `/me/claude-token`
+ * The `UserSecretStore` interface is the seam both `/me/harness-env`
  * (routes/me.ts) and TaskService.createTask (rpc/tasks.ts) depend on, and the
  * seam tests fake. The `Sealer` is also injectable (tests pass a fixed key).
  */
@@ -163,14 +164,3 @@ export function makeUserSecretStore(
     },
   };
 }
-
-/**
- * The reserved harness env-var name carrying the user's Claude OAuth token.
- *
- * This hardcoded name lives HERE in the orchestrator (Drip A): the coordinator
- * is now harness-agnostic and just injects whatever `harness_env` map it is
- * handed. A harness-agnostic declarative spec (the image manifest declaring
- * which identity env-vars its harness wants) is the future; until then the
- * single supported harness is Claude and this const is the one mapping.
- */
-export const CLAUDE_OAUTH_ENV_VAR = "CLAUDE_CODE_OAUTH_TOKEN";

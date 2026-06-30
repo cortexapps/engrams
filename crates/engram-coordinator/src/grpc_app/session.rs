@@ -581,6 +581,7 @@ mod tests {
             )]),
             secrets: std::collections::HashMap::new(),
             prompt_id: None,
+            harness: None,
         };
         let api =
             super::super::convert::create_request_from_proto(r).expect("converter must succeed");
@@ -588,6 +589,30 @@ mod tests {
         // type system is the assertion: if harness_env were added to the api
         // request and mistakenly mapped, this file would not compile.
         assert_eq!(api.image, "localhost:5001/demo:warm");
+        // ADR 0062: the (unset) per-session harness maps through verbatim.
+        assert_eq!(api.selected_harness, None);
+    }
+
+    /// ADR 0062: a set `harness` threads into the api request's
+    /// `selected_harness` (the catalog key the coordinator resolves).
+    #[test]
+    fn create_request_from_proto_threads_selected_harness() {
+        use engram_protocol::app;
+        let r = app::CreateSessionRequest {
+            selected_skills: Vec::new(),
+            capabilities: Vec::new(),
+            integration_policy_json: String::new(),
+            image_uri: "localhost:5001/demo:warm".into(),
+            mode: "agent".into(),
+            prompt: None,
+            harness_env: std::collections::HashMap::new(),
+            secrets: std::collections::HashMap::new(),
+            prompt_id: None,
+            harness: Some("claude".into()),
+        };
+        let api =
+            super::super::convert::create_request_from_proto(r).expect("converter must succeed");
+        assert_eq!(api.selected_harness.as_deref(), Some("claude"));
     }
 
     /// The RPC-layer extraction folds `harness_env` verbatim into the map that
@@ -610,6 +635,7 @@ mod tests {
             ]),
             secrets: std::collections::HashMap::new(),
             prompt_id: None,
+            harness: None,
         };
         // Same expression the RPC handler uses.
         let identity_env: std::collections::HashMap<String, String> =

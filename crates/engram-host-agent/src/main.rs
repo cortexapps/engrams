@@ -276,6 +276,12 @@ async fn main() -> Result<(), HostAgentError> {
             })?;
             let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
             fc_cfg.host_id = Some(host_id);
+            // ADR 0035/0062: read RO bundles from the same dir the host-agent
+            // reports `current_bundles` from — ENGRAM_BUNDLE_DIR in dev/e2e, the
+            // fleet-canonical SHARED_DIR in prod (env unset). Mirrors the VZ arm
+            // below; `SandboxBackend::bundle_dir` then exposes this one value so
+            // the heartbeat reads the same stamp the backend attaches from.
+            fc_cfg.bundle_dir = engram_host_agent::bundles::bundle_dir_from_env();
             // ADR 0044 K2 / GAP 2: on K8s the firecracker binary is staged
             // into a pod emptyDir (e.g. /opt/engram/firecracker), not on
             // PATH. Point the backend at it. Defaults to a PATH lookup of

@@ -63,14 +63,11 @@ fi
 
 SHORT=$(git rev-parse --short HEAD)
 LOCAL_REGISTRY="localhost:5001"
-# ADR 0021: bake the harnessed variant (`demo-claude`) so the
-# integration stack exercises the baked-harness flow end-to-end.
-# The image has `[harness] builtin = "claude"` in its engram.toml;
-# the baker pulls the published harness-claude artifact from GHCR
-# and injects it into /opt/engram/harness/ during the bake. No
-# separate harness-registration step is needed downstream — the
-# image carries its harness contract in manifest.toml.
-IMAGE_URI="$LOCAL_REGISTRY/integration-test/demo-claude:warm-$SHORT"
+# Bake the canonical `demo` image. ADR 0062: the image carries NO harness —
+# the built-in `claude` harness is a per-session selection that rides the fleet
+# `current_bundles` stamp (the e2e stages it via ENGRAM_HARNESS_CLAUDE_TREE +
+# `just bundles-squashfs`), not baked in here.
+IMAGE_URI="$LOCAL_REGISTRY/integration-test/demo:warm-$SHORT"
 
 log "==> step 1/3: bake demo image"
 log "    target: $IMAGE_URI"
@@ -89,9 +86,9 @@ fi
 
 T0=$(date +%s.%N)
 ./target/release/engram-cli image build \
-    --repo integration-test/demo-claude \
+    --repo integration-test/demo \
     --tag "warm-$SHORT" \
-    --source deploy/demo-claude \
+    --source deploy/demo \
     --format ext4 \
     --images-dir ./var/integration/images \
     --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \

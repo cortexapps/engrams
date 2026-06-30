@@ -120,9 +120,6 @@ export interface Principal {
   display_name: string | null;
   role: Role;
   is_admin: boolean;
-  /** Whether a Claude Code OAuth token is saved (drives create-session
-   * gating). The token itself is never returned. */
-  has_claude_token: boolean;
   /** Whether interactive sign-out is meaningful (OIDC mode only). Behind an
    * edge proxy (IAP) or in dev synthetic-admin there's no app session to
    * revoke, so the UI hides the Sign-out control. */
@@ -360,13 +357,6 @@ export interface EnabledImageSummary {
   manifest_digest: string;
   manifest_name: string | null;
   manifest_description: string | null;
-  /**
-   * ADR 0021: name of the harness baked into this image (lifted
-   * from `manifest.harness.name`), or null for a harness-less image.
-   * The session-create form reads this to decide whether to show the
-   * Claude OAuth/API-key picker, etc.
-   */
-  harness_name: string | null;
   last_refreshed_at: string;
   created_at: string;
   /**

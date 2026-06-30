@@ -11,6 +11,7 @@ import { relativeTime } from "../pages/sessions/session-format";
 import { SessionCowState } from "./CowState";
 import { DurabilityTimeline } from "./DurabilityTimeline";
 import { MetricRow } from "./MetricRow";
+import { ExposedPortsSection } from "./ports/ExposedPortsSection";
 import {
   Sheet,
   SheetContent,
@@ -248,6 +249,14 @@ export function DiagnosticsDrawer({
                 value={<span data-testid="event-count">{eventCount}</span>}
               />
             </dl>
+          </section>
+
+          {/* ADR 0064 (interim home): live-host port exposures. Relocates into
+              the ADR-0065 BROWSER tab when it lands; here for now, out of the
+              developer's way. The liveness probe is gated on Active. */}
+          <section className="border-t pt-4">
+            <SectionLabel>ports</SectionLabel>
+            <ExposedPortsSection sessionId={sessionId} active={session.status === "active"} />
           </section>
 
           {/* Admin live-ops — self-gating (admin + Active only), so a non-admin

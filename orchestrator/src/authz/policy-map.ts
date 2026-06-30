@@ -138,6 +138,16 @@ export const POLICY: Record<string, PolicyEntry> = {
   "ImageService.DeleteRegistry": { action: "manage", subject: "all" },
 
   // ------------------------------------------------------------------
+  // HarnessCatalogService (ADR 0063) — read is member-reachable (the
+  // harness/model/effort selectors); register/delete are admin (added with
+  // the admin Harnesses tab). Only the methods in SURFACE need entries.
+  // ------------------------------------------------------------------
+  "HarnessCatalogService.ListHarnesses": { action: "read", subject: "Harness" },
+  "HarnessCatalogService.GetHarness": { action: "read", subject: "Harness" },
+  "HarnessCatalogService.RegisterHarness": { action: "manage", subject: "all" },
+  "HarnessCatalogService.DeleteHarness": { action: "manage", subject: "all" },
+
+  // ------------------------------------------------------------------
   // FleetService — every method is admin-only
   // ------------------------------------------------------------------
   "FleetService.ListHosts": { action: "manage", subject: "all" },

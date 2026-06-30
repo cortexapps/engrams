@@ -72,6 +72,10 @@ pub(crate) struct BootInputs {
     /// inject entries at boot. `None` on the queued/resume re-prepare for now
     /// (persistence + re-inject is Phase 3b-2).
     pub integration_policy: Option<engram_core::types::IntegrationPolicy>,
+    /// ADR 0062: the selected harness name (catalog key), persisted once the
+    /// session row exists so the queue scanner + resume can reconstruct it.
+    /// `None` for a dev-VM session.
+    pub selected_harness: Option<String>,
     /// Per-request `secrets` overrides to seal into `session_secrets`
     /// once the row exists (so resume rebuilds the harness env). `None`
     /// when there are none.
@@ -134,6 +138,7 @@ pub(crate) async fn boot_on_reserved_host(
         selected_mounts,
         capabilities,
         integration_policy,
+        selected_harness,
         deferred_session_secrets,
         prompt,
         memory_mib: _,
@@ -246,6 +251,19 @@ pub(crate) async fn boot_on_reserved_host(
     // egress injections without the orchestrator. Same placement + warn-not-
     // fatal posture as the secret/capability persistence above.
     persist_integration_policy(state, session_id, integration_policy.as_ref()).await;
+
+    // ADR 0062: persist the selected harness now the row exists, so a queued
+    // re-prepare / resume reconstructs which harness to mount + exec. Warn-not-
+    // fatal, like the policy/capability persistence above.
+    if let Err(e) = state
+        .services
+        .meta
+        .set_session_harness(session_id, selected_harness.as_deref())
+        .await
+    {
+        tracing::warn!(%session_id, error = %e,
+            "persisting session harness failed; a queued re-prepare may not find it");
+    }
 
     // Inject the per-spawn forge/upload broker tokens NOW the session row
     // exists. These mint a `session_broker_tokens` row that FKs to

@@ -41,6 +41,12 @@ message CreateTaskRequest {
   // The profile the user picked (ADR §5). Required in practice; the handler
   // rejects an empty/unknown/archived id.
   string profile_id = 5;
+  // ADR 0063 B2: per-session override of the profile's default harness / model /
+  // effort (e.g. Claude Code for planning, a smaller model for execution). Unset
+  // = use the profile's default. Validated against the harness catalog.
+  optional string harness = 6;
+  optional string model = 7;
+  optional string effort = 8;
 }
 
 message CreateTaskResponse {

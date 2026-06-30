@@ -93,6 +93,16 @@ export interface Config {
    */
   oidc: OidcConfig | undefined;
   /**
+   * ORCHESTRATOR_PREVIEW_BASE_DOMAIN — the wildcard base under which live-host
+   * port previews are served (ADR 0064): a preview URL is
+   * `<scheme>://<slug>.<previewBaseDomain>`. Prod sets
+   * `preview.engrams.cortex.io` (behind the IAP wall, *443*). Dev default is
+   * `lvh.me:<port>` — `*.lvh.me` resolves to 127.0.0.1, so the preview hits this
+   * same orchestrator over plain http with no DNS/cert setup. The edge proxy
+   * (P2b) also matches inbound Host headers against this to route previews.
+   */
+  previewBaseDomain: string;
+  /**
    * ORCHESTRATOR_ADMIN_EMAILS — comma-separated bootstrap-admin allowlist.
    * Restores the pre-ADR-0051 `auth.bootstrapAdmins` Helm value: matching
    * emails are created with role 'admin' (any JIT path — IAP bridge, OIDC,
@@ -219,6 +229,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     };
   }
 
+  // OPTIONAL: preview base domain for live-host port URLs (ADR 0064). Dev
+  // default `lvh.me:<port>` resolves `*.lvh.me` → 127.0.0.1 → this orchestrator.
+  const previewBaseDomain = optional("ORCHESTRATOR_PREVIEW_BASE_DOMAIN", `lvh.me:${port}`);
+
   // OPTIONAL: bootstrap-admin allowlist (restores `auth.bootstrapAdmins`).
   // Parsed + normalised (trim/lowercase/de-dup) here; empty when unset, which
   // makes the better-auth promotion hooks fully inert. No test placeholder
@@ -250,6 +264,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     iapAudiences,
     iapJwksUrl,
     oidc,
+    previewBaseDomain,
     adminEmails,
   };
 }

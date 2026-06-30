@@ -393,6 +393,25 @@ orchestrator:
   # public https URL in any OIDC deploy, or the IdP redirect lands nowhere.
   publicUrl: ""
 
+  # ADR 0064 — live-host port previews. The wildcard base domain under which a
+  # session's exposed guest port is served at `<slug>.<baseDomain>`
+  # (ORCHESTRATOR_PREVIEW_BASE_DOMAIN). Empty ⇒ the env var is omitted and the
+  # orchestrator uses its dev default (`lvh.me:<port>`, which only resolves to
+  # 127.0.0.1 locally), so the feature is inert in a stock deploy. To enable in
+  # a real deployment set this to e.g. "preview.example.com" AND, in your values
+  # overlay, also:
+  #   - add a `*.<baseDomain>` host to web.ingress.hosts whose "/" path retargets
+  #     `service:` at the orchestrator (the same per-path retarget the Slack
+  #     webhooks use) — the orchestrator matches the Host header and tunnels to
+  #     the session's guest port;
+  #   - provision a wildcard TLS cert for `*.<baseDomain>` + a wildcard DNS
+  #     record pointing at the web Ingress IP;
+  #   - keep it behind your auth wall (e.g. the IAP BackendConfig). The
+  #     orchestrator additionally enforces a per-exposure owner/admin/share-token
+  #     check, so a leaked slug alone grants nothing.
+  preview:
+    baseDomain: ""
+
   # TRUSTED_ORIGINS — comma-joined here from this list; better-auth CORS /
   # CSRF origin allowlist (the browser origins that may call the API).
   trustedOrigins: []

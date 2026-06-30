@@ -859,6 +859,9 @@ async fn create_session_unknown_image_is_invalid_argument() {
             harness_env: HashMap::new(),
             secrets: HashMap::new(),
             prompt_id: None,
+            // ADR 0062: unused — this create fails at the unknown-image lookup
+            // before harness resolution.
+            harness: None,
         })
         .await
         .expect_err("non-enabled image must error");

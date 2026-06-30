@@ -110,9 +110,9 @@ export function EnvVarsEditor({
       )}
 
       <FieldDescription>
-        Set the model here, e.g. <code className="font-mono">ANTHROPIC_MODEL</code>. There is no
-        separate model field. Values are saved with the profile and injected into every session it
-        launches; use the eye toggle to hide a sensitive value while editing.
+        Extra env vars injected into every session this profile launches. Model and effort have
+        dedicated controls above — set those there, not here. Values are saved with the profile; use
+        the eye toggle to hide a sensitive value while editing.
       </FieldDescription>
     </div>
   );

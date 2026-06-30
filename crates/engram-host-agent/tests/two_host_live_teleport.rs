@@ -39,6 +39,8 @@ use engram_sandbox_firecracker::{
 };
 use futures::StreamExt;
 
+mod common;
+
 struct HostStack {
     pooled: Arc<PooledBackend>,
     addr: std::net::SocketAddr,
@@ -104,7 +106,10 @@ async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
     let server = tokio::spawn(async move {
         let _ = engram_host_agent::grpc_server::boot(addr, inner, None).await;
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        common::wait_tcp_bound(addr, std::time::Duration::from_secs(5)).await,
+        "host gRPC server did not bind {addr} within 5s"
+    );
     HostStack {
         pooled,
         addr,
@@ -239,7 +244,24 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         )
         .await
         .expect("start the mid-run harness on A");
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    // Wait for the harness to write its pid file rather than blind-sleeping.
+    assert!(
+        common::poll_until_async(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(50),
+            || {
+                let pooled = host_a.pooled.clone();
+                async move {
+                    !exec(&pooled, vm, "cat /dev/shm/harness-pid 2>/dev/null")
+                        .await
+                        .trim()
+                        .is_empty()
+                }
+            },
+        )
+        .await,
+        "harness pid file never appeared on A within 5s"
+    );
     let harness_pid_a = exec(&host_a.pooled, vm, "cat /dev/shm/harness-pid")
         .await
         .trim()
@@ -353,7 +375,26 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         "exactly one harness instance after the handshake"
     );
     let hb1 = exec(&host_b.pooled, moved, "cat /dev/shm/harness-heartbeat").await;
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    // Poll for the heartbeat to advance past hb1 instead of blind-sleeping.
+    let hb1_val = hb1.trim().to_string();
+    assert!(
+        common::poll_until_async(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(50),
+            || {
+                let pooled = host_b.pooled.clone();
+                let hb1_val = hb1_val.clone();
+                async move {
+                    exec(&pooled, moved, "cat /dev/shm/harness-heartbeat")
+                        .await
+                        .trim()
+                        != hb1_val.as_str()
+                }
+            },
+        )
+        .await,
+        "the mid-run harness heartbeat never advanced on the destination within 5s"
+    );
     let hb2 = exec(&host_b.pooled, moved, "cat /dev/shm/harness-heartbeat").await;
     assert_ne!(
         hb1.trim(),
@@ -587,7 +628,24 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         )
         .await
         .expect("start the epoll stdin reader on A");
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    // Wait for the reader to write its pid file rather than blind-sleeping.
+    assert!(
+        common::poll_until_async(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(50),
+            || {
+                let pooled = host_a.pooled.clone();
+                async move {
+                    !exec(&pooled, vm, "cat /dev/shm/reader-pid 2>/dev/null")
+                        .await
+                        .trim()
+                        .is_empty()
+                }
+            },
+        )
+        .await,
+        "reader pid file never appeared on A within 5s"
+    );
     let reader_pid_a = exec(&host_a.pooled, vm, "cat /dev/shm/reader-pid")
         .await
         .trim()
@@ -677,8 +735,24 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
     )
     .await;
     assert_eq!(wrote.trim(), "wrote", "post-move write into the held pipe");
-    // Give the resumed reader a moment to consume + append.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Poll for the resumed reader to consume + append the marker rather
+    // than blind-sleeping.
+    assert!(
+        common::poll_until_async(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(50),
+            || {
+                let pooled = host_b.pooled.clone();
+                async move {
+                    exec(&pooled, moved, &format!("cat {OUT} 2>/dev/null"))
+                        .await
+                        .contains(MARKER)
+                }
+            },
+        )
+        .await,
+        "the resumed reader never appended the post-move marker within 5s"
+    );
     let consumed = exec(&host_b.pooled, moved, &format!("cat {OUT}"))
         .await
         .trim()
@@ -1010,9 +1084,20 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     let cap = client_a.migration_capture(vm).await.expect("capture");
 
     // KILL the source's serving side before the dest pulls — the
-    // "source died mid-transfer" arm.
+    // "source died mid-transfer" arm. Poll until the listener actually
+    // stops accepting (connect refused) rather than blind-sleeping, so the
+    // dest genuinely pulls against a dead source.
     host_a.server.abort();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let source_addr = host_a.addr;
+    assert!(
+        common::poll_until_async(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(20),
+            || async move { tokio::net::TcpStream::connect(source_addr).await.is_err() },
+        )
+        .await,
+        "aborted source server still accepted a connection after 5s"
+    );
 
     let mut metadata = ckpt.clone();
     metadata.id = cap.snapshot_id;

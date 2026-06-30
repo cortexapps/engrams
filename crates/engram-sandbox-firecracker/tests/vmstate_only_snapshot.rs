@@ -82,7 +82,10 @@ async fn vmstate_only_writes_state_skips_memory_and_stock_rejects_it() {
             .create(spec("vmstate-only-fork", local_rootfs))
             .await
             .expect("create (fork)");
-        tokio::time::sleep(Duration::from_secs(2)).await; // let early boot settle
+        // Poll the serial console (firecracker.log) for the kernel banner rather
+        // than sleeping a fixed interval before snapshotting.
+        let fc_log = work.path().join(vm.to_string()).join("firecracker.log");
+        common::wait_for_log_contains(&fc_log, &["Linux version"], Duration::from_secs(15)).await;
 
         let st = backend.snapshot_state(vm).expect("vm state");
         let api = FirecrackerClient::new(&st.firecracker_socket);
@@ -124,7 +127,10 @@ async fn vmstate_only_writes_state_skips_memory_and_stock_rejects_it() {
             .create(spec("vmstate-only-stock", local_rootfs))
             .await
             .expect("create (stock)");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Poll the serial console (firecracker.log) for the kernel banner rather
+        // than sleeping a fixed interval before the snapshot PUT.
+        let fc_log = work.path().join(vm.to_string()).join("firecracker.log");
+        common::wait_for_log_contains(&fc_log, &["Linux version"], Duration::from_secs(15)).await;
 
         let st = backend.snapshot_state(vm).expect("vm state");
         let api = FirecrackerClient::new(&st.firecracker_socket);
