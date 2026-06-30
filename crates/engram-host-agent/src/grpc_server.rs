@@ -21,6 +21,7 @@ use engram_core::traits::HostClient;
 use engram_core::SandboxError;
 use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
+use engram_protocol::grpc::proxy_port_message::Body as ProxyPortBody;
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
     AnswerHarnessQuestionRequest, ApplyEgressPolicyRequest, BindHarnessSessionRequest,
@@ -29,11 +30,12 @@ use engram_protocol::grpc::{
     DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty, ExecExit, ExecFrame,
     ExecStartRequest, GuestIpResponse, InterruptHarnessRequest, ListSandboxesResponse,
     MigrationCaptureResponse, MigrationExportRef, MigrationFetchRequest, MigrationFrame,
-    MigrationPresetupResponse, PostCopyCaptureResponse, ProxyShellBinary, ProxyShellClose,
-    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
-    ReapMaterializeDirResponse, RehandshakeHarnessRequest, RestoreBaseForSessionRequest,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, SnapshotBeginResponse,
-    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    MigrationPresetupResponse, PostCopyCaptureResponse, ProxyPortData, ProxyPortMessage,
+    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing, ProxyShellPong,
+    ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
+    RehandshakeHarnessRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -105,6 +107,8 @@ impl HostService for HostServiceImpl {
     type ExecStartStream = Pin<Box<dyn Stream<Item = Result<ExecFrame, Status>> + Send + 'static>>;
     type ProxyShellStream =
         Pin<Box<dyn Stream<Item = Result<ProxyShellMessage, Status>> + Send + 'static>>;
+    type ProxyPortStream =
+        Pin<Box<dyn Stream<Item = Result<ProxyPortMessage, Status>> + Send + 'static>>;
 
     async fn ping(&self, _req: Request<Empty>) -> Result<Response<Empty>, Status> {
         Ok(Response::new(Empty {}))
@@ -1037,6 +1041,118 @@ impl HostService for HostServiceImpl {
 
         let out_stream = tokio_stream::wrappers::ReceiverStream::new(out_rx);
         Ok(Response::new(Box::pin(out_stream) as Self::ProxyShellStream))
+    }
+
+    /// ADR 0064: bidi RAW-BYTE port tunnel — `proxy_shell`'s sibling.
+    /// Same handshake discipline (the FIRST message MUST be
+    /// `ProxyPortOpen{sandbox_id, port}`; any other first variant, or a
+    /// later `Open`, is `InvalidArgument`), but the payload is opaque
+    /// `Data` byte chunks plus a `Close` sentinel — no WS frame
+    /// taxonomy, because this is a plain TCP pipe to a dev server.
+    async fn proxy_port(
+        &self,
+        req: Request<tonic::Streaming<ProxyPortMessage>>,
+    ) -> Result<Response<Self::ProxyPortStream>, Status> {
+        let mut inbound = req.into_inner();
+
+        use futures::StreamExt;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.next())
+            .await
+            .map_err(|_| Status::deadline_exceeded("proxy_port: no first message within 5s"))?
+            .ok_or_else(|| Status::cancelled("proxy_port: client closed before first message"))?
+            .map_err(|e| Status::internal(format!("proxy_port: recv first message: {e}")))?;
+        let (sandbox_id, port) = match first.body {
+            Some(ProxyPortBody::Open(open)) => {
+                let sid = decode_sandbox_id(&open.sandbox_id)?;
+                let port = u16::try_from(open.port)
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or_else(|| {
+                        Status::invalid_argument(format!(
+                            "proxy_port: port {} out of range (1..=65535)",
+                            open.port
+                        ))
+                    })?;
+                (sid, port)
+            }
+            Some(_) => {
+                return Err(Status::invalid_argument(
+                    "proxy_port: first message must be Open",
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "proxy_port: first message has empty body",
+                ));
+            }
+        };
+
+        let tunnel = self
+            .inner
+            .proxy_port(sandbox_id, port)
+            .await
+            .map_err(sandbox_to_status)?;
+        let engram_core::types::port::PortTunnel {
+            outbound: tunnel_outbound,
+            inbound: mut tunnel_inbound,
+        } = tunnel;
+
+        // mpsc carrying byte chunks out to the gRPC client.
+        let (out_tx, out_rx) = mpsc::channel::<Result<ProxyPortMessage, Status>>(64);
+
+        // gRPC inbound (client → us): forward Data into the tunnel
+        // outbound; Close / client-disconnect tears the tunnel down. An
+        // Open after the handshake is a protocol error (typed status, so
+        // the client surfaces a clean error rather than an opaque close).
+        let out_tx_for_reject = out_tx.clone();
+        tokio::spawn(async move {
+            while let Some(next) = inbound.next().await {
+                let msg = match next {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "proxy_port: client recv error");
+                        break;
+                    }
+                };
+                match msg.body {
+                    Some(ProxyPortBody::Data(d)) => {
+                        if tunnel_outbound.send(d.data.into()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(ProxyPortBody::Close(_)) | None => break,
+                    Some(ProxyPortBody::Open(_)) => {
+                        let _ = out_tx_for_reject
+                            .send(Err(Status::invalid_argument(
+                                "proxy_port: Open only valid as the first message",
+                            )))
+                            .await;
+                        break;
+                    }
+                }
+            }
+            // Client closed; drop the tunnel outbound so the host pump
+            // half-closes the guest socket and tears down.
+            drop(tunnel_outbound);
+        });
+
+        // Tunnel inbound (guest → us): forward each byte chunk to the
+        // gRPC client as a Data message.
+        tokio::spawn(async move {
+            while let Some(chunk) = tunnel_inbound.recv().await {
+                let msg = ProxyPortMessage {
+                    body: Some(ProxyPortBody::Data(ProxyPortData {
+                        data: chunk.to_vec(),
+                    })),
+                };
+                if out_tx.send(Ok(msg)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let out_stream = tokio_stream::wrappers::ReceiverStream::new(out_rx);
+        Ok(Response::new(Box::pin(out_stream) as Self::ProxyPortStream))
     }
 }
 

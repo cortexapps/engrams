@@ -19,6 +19,7 @@ mod integration_op;
 mod mint;
 mod mount_catalog;
 mod org_secret;
+mod port_relay;
 mod session;
 mod shell_relay;
 
@@ -36,6 +37,7 @@ pub use integration_op::AppIntegrationOpService;
 pub use mint::AppMintService;
 pub use mount_catalog::AppMountCatalogService;
 pub use org_secret::AppOrgSecretService;
+pub use port_relay::AppPortRelayService;
 pub use session::AppSessionService;
 pub use shell_relay::AppShellRelayService;
 
@@ -157,6 +159,13 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
                 },
             ),
         )
+        // ADR 0064: raw-byte port relay for vanity-subdomain preview tunnels.
+        .add_service(app::port_relay_service_server::PortRelayServiceServer::new(
+            port_relay::AppPortRelayService {
+                state: state.clone(),
+                auth: auth.clone(),
+            },
+        ))
         .add_service(app::fleet_service_server::FleetServiceServer::new(
             AppFleetService {
                 state: state.clone(),
@@ -417,6 +426,7 @@ mod convention {
         ("mod.rs", include_str!("mod.rs")),
         ("session.rs", include_str!("session.rs")),
         ("shell_relay.rs", include_str!("shell_relay.rs")),
+        ("port_relay.rs", include_str!("port_relay.rs")),
         ("fleet.rs", include_str!("fleet.rs")),
         ("image.rs", include_str!("image.rs")),
         ("mount_catalog.rs", include_str!("mount_catalog.rs")),

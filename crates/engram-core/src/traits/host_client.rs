@@ -27,6 +27,7 @@ use crate::traits::sandbox::{ForgeSink, HarnessDial, HarnessSink, UploadSink};
 use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::image::WarmConfig;
+use crate::types::port::PortTunnel;
 use crate::types::sandbox::{AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
@@ -426,6 +427,31 @@ pub trait HostClient: Send + Sync {
     /// with the wire frames.
     async fn proxy_shell(&self, sandbox_id: SandboxId) -> Result<ShellTunnel, SandboxError> {
         let _ = sandbox_id;
+        Err(SandboxError::NotFound)
+    }
+
+    /// ADR 0064: open a bidi RAW-BYTE tunnel to an arbitrary guest TCP
+    /// `port` for `sandbox_id` (a dev server the agent started). The
+    /// raw-byte sibling of [`Self::proxy_shell`]: the returned
+    /// [`PortTunnel`] is a pair of mpsc channels — `outbound` (caller →
+    /// guest socket) and `inbound` (guest socket → caller) — and either
+    /// channel closing tears the tunnel down.
+    ///
+    /// Unlike `proxy_shell` there is no host-side `start_shell` step: the
+    /// service on `port` is user/agent-managed, not host-spawned, so the
+    /// host just dials `guest_ip:port` in the right netns (a short
+    /// connection-refused retry covers the just-started race).
+    ///
+    /// Default errors with `NotFound`: only host-agent implementations
+    /// proxy ports. The Local impl dials inside the per-VM netns; the
+    /// gRPC client impl opens a `ProxyPort` bidi stream and bridges the
+    /// channels with the wire `data`/`close` frames.
+    async fn proxy_port(
+        &self,
+        sandbox_id: SandboxId,
+        port: u16,
+    ) -> Result<PortTunnel, SandboxError> {
+        let _ = (sandbox_id, port);
         Err(SandboxError::NotFound)
     }
 
