@@ -122,6 +122,14 @@ trigger in the required workflow.
   member + workspace deps + `just hakari`); don't wedge it into a convenient crate.
 - **Reliability and low latency are non-negotiable** — never trade them for transitional
   convenience; refuse "skip the work if it looks empty" shortcuts.
+- **Never launder types/lints to silence the checker.** `as unknown as X` (TS), a blanket
+  `@ts-ignore`/`@ts-expect-error`, or an `#[allow(...)]` slapped on to mute an error hides
+  real bugs — a type mismatch is the compiler telling you the runtime shapes don't line up.
+  Fix the shape instead: use the runtime-correct API, or *honestly widen* a type for a
+  real-but-untyped field (e.g. `RequestInit & { duplex?: "half" }`). A plain `as` is only OK
+  when you can state why it's sound. (ADR 0064 P2b: an `as unknown as ReadableStream` masked
+  that Bun's `http.request` ignores `createConnection` — the proxy only worked once
+  re-architected onto `fetch` + a loopback socket.)
 
 **Discipline**
 - **Investigate, never paper over.** Read the production code before changing a test
