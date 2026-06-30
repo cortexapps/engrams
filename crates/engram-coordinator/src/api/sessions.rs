@@ -535,6 +535,11 @@ pub struct CreateSessionRequest {
     /// `None` for non-gRPC / legacy callers.
     #[serde(default)]
     pub integration_policy: Option<engram_core::types::IntegrationPolicy>,
+    /// ADR 0062: the selected harness name (a catalog key) for an agent-mode
+    /// session — resolved at `prepare_inner` to the `dyn_0` catalog mount + the
+    /// `argv` the backend execs. `None` for a dev-VM session.
+    #[serde(default)]
+    pub selected_harness: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -789,6 +794,17 @@ async fn enqueue_create(
         inputs.integration_policy.as_ref(),
     )
     .await;
+    // ADR 0062: persist the selected harness now the FK target exists, so the
+    // scanner's boot re-prepare (prepare_from_row) reconstructs it.
+    if let Err(e) = state
+        .services
+        .meta
+        .set_session_harness(session_id, inputs.selected_harness.as_deref())
+        .await
+    {
+        tracing::warn!(%session_id, error = %e,
+            "queued session harness persist failed; the scanner's boot won't find it");
+    }
     if let Err(e) = state
         .emit(
             session_id,
@@ -857,6 +873,7 @@ pub(crate) async fn prepare_from_grpc(
         req.selected_skills.clone(),
         req.capabilities.clone(),
         req.integration_policy.clone(),
+        req.selected_harness.clone(),
     )
     .await
 }
@@ -931,6 +948,14 @@ pub(crate) async fn prepare_from_row(
         // ADR 0056 (B′): the integration policy persisted at create/enqueue,
         // re-read above so the queued boot re-injects on the new host.
         integration_policy,
+        // ADR 0062: the harness persisted at create/enqueue, re-read so the
+        // queued boot mounts + execs the same harness.
+        state
+            .services
+            .meta
+            .get_session_harness(session.id)
+            .await
+            .map_err(|e| ApiError::Internal(format!("get_session_harness: {e}")))?,
     )
     .await
 }
@@ -959,11 +984,13 @@ async fn resolve_selected_skills(
         return Ok(Vec::new());
     }
     // Cap up front so an over-cap request doesn't trigger N catalog lookups.
-    if names.len() > AuxRoDrive::RESERVED_SLOTS {
+    // Slot 0 is the harness (ADR 0062), so skills get RESERVED_SLOTS - 1.
+    if names.len() > AuxRoDrive::MAX_SKILL_SLOTS {
         return Err(ApiError::BadRequest(format!(
-            "session requested {} skills but only {} reserved slots exist",
+            "session requested {} skills but only {} skill slots exist (slot {} is the harness)",
             names.len(),
-            AuxRoDrive::RESERVED_SLOTS,
+            AuxRoDrive::MAX_SKILL_SLOTS,
+            AuxRoDrive::HARNESS_SLOT_INDEX,
         )));
     }
     // Start from the fleet stamp (baked admin bundles)…
@@ -1026,15 +1053,18 @@ fn assign_skill_slots(
     names: &[String],
 ) -> Result<Vec<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
     use engram_core::types::sandbox::AuxRoDrive;
-    if names.len() > AuxRoDrive::RESERVED_SLOTS {
+    if names.len() > AuxRoDrive::MAX_SKILL_SLOTS {
         return Err(ApiError::BadRequest(format!(
-            "session requested {} skills but only {} reserved slots exist",
+            "session requested {} skills but only {} skill slots exist (slot {} is the harness)",
             names.len(),
-            AuxRoDrive::RESERVED_SLOTS,
+            AuxRoDrive::MAX_SKILL_SLOTS,
+            AuxRoDrive::HARNESS_SLOT_INDEX,
         )));
     }
     let mut mounts = Vec::with_capacity(names.len());
     for (i, name) in names.iter().enumerate() {
+        // Skills occupy dyn_1.. — slot 0 is reserved for the harness (ADR 0062).
+        let slot = AuxRoDrive::HARNESS_SLOT_INDEX + 1 + i;
         let sha = catalog.get(name.as_str()).ok_or_else(|| {
             ApiError::BadRequest(format!(
                 "skill `{name}` is unknown (not a staged fleet bundle and not in the \
@@ -1042,8 +1072,8 @@ fn assign_skill_slots(
             ))
         })?;
         mounts.push(AuxRoDrive {
-            drive_id: AuxRoDrive::slot_drive_id(i),
-            guest_mount: AuxRoDrive::slot_guest_mount(i),
+            drive_id: AuxRoDrive::slot_drive_id(slot),
+            guest_mount: AuxRoDrive::slot_guest_mount(slot),
             fs_type: "squashfs".into(),
             sha256: Some((*sha).to_string()),
         });
@@ -1067,6 +1097,9 @@ async fn prepare_inner(
     capabilities: Vec<String>,
     // ADR 0056 (B′): the orchestrator-compiled integration policy, if any.
     integration_policy: Option<engram_core::types::IntegrationPolicy>,
+    // ADR 0062: the selected harness name (catalog key) — resolved to the dyn_0
+    // catalog mount + argv, and persisted so queue/resume can reconstruct it.
+    selected_harness: Option<String>,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
     // ADR 0021 P1.3: a dev-VM session leaves any baked harness undriven,
     // so a prompt is meaningless — reject it explicitly.
@@ -1094,14 +1127,9 @@ async fn prepare_inner(
             "stored manifest for {image_uri} failed to parse: {e}"
         ))
     })?;
-    if let Some(h) = manifest.harness.as_ref() {
-        if !h.is_launchable() && !mode.is_dev_vm() {
-            return Err(ApiError::Internal(format!(
-                "enabled image `{image_uri}` has a [harness] block that didn't resolve \
-                 (name/exec unset) — re-bake the image"
-            )));
-        }
-    }
+    // ADR 0062: the harness is no longer baked into the image — it's selected
+    // per session and resolved from the catalog below (`resolve_harness`). The
+    // image's `[harness]` block, if any legacy one survives, is ignored here.
 
     // -------- ADR 0057: resolve the session policy's secrets --------
     // The image manifest no longer declares secrets; the profile-compiled
@@ -1144,12 +1172,6 @@ async fn prepare_inner(
         }
     }
 
-    if let Some(h) = manifest.harness.as_ref() {
-        if let Some(name) = h.name.as_deref() {
-            spec_env.insert("ENGRAM_SESSION_HARNESS_NAME".into(), name.to_string());
-        }
-    }
-
     let mut session_env = spec_env.clone();
     session_env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
 
@@ -1177,15 +1199,23 @@ async fn prepare_inner(
     // the git-credential-injection regression on the gRPC create path. The
     // git config rides `BootInputs` so the deferred injection can stamp the
     // forge owner once the row is live.
-    let agent = resolve_harness(
+    // ADR 0062: resolve the per-session harness from the catalog → the AgentSpec
+    // the backend execs + the `dyn_0` mount carrying the current catalog
+    // generation. `None` for a dev VM (no harness, dyn_0 stays sentinel).
+    let (agent, harness_mount) = match resolve_harness(
         state,
-        manifest.harness.as_ref(),
+        selected_harness.as_deref(),
         mode,
         session_id,
         prompt.as_deref(),
         session_env.clone(),
         manifest.workdir.clone(),
-    )?;
+    )
+    .await?
+    {
+        Some((spec, mount)) => (Some(spec), Some(mount)),
+        None => (None, None),
+    };
 
     // ADR 0057: egress network comes from the session policy (deny-all when the
     // session has no policy — e.g. a direct/CLI create), never the manifest.
@@ -1204,7 +1234,12 @@ async fn prepare_inner(
     // ADR 0055: resolve the profile's selected skill names to reserved-slot
     // mounts against the fleet's staged bundles (name -> sha). Capped at
     // RESERVED_SLOTS; an unknown skill name is a 400.
-    let selected_mounts = resolve_selected_skills(state, &selected_skills).await?;
+    let mut selected_mounts = resolve_selected_skills(state, &selected_skills).await?;
+    // ADR 0062: the harness catalog rides `dyn_0` alongside the skills (dyn_1..),
+    // bound through the identical paused-window patch_drive path.
+    if let Some(mount) = harness_mount {
+        selected_mounts.push(mount);
+    }
     let memory_mib = resolved_memory_mib(&manifest);
     let cpu_budget_vcpus = resolved_vcpus(&manifest);
 
@@ -1221,6 +1256,7 @@ async fn prepare_inner(
             selected_mounts,
             capabilities,
             integration_policy,
+            selected_harness,
             deferred_session_secrets,
             prompt: prompt.filter(|s| !s.is_empty()),
             memory_mib,
@@ -1639,57 +1675,95 @@ pub(crate) async fn inject_upload_env(
     }
 }
 
-/// Resolve the image's baked harness (ADR 0021 P1.3) into the
-/// [`AgentSpec`] the backend will spawn at `start_agent` time, or
-/// `None` for the readiness-probe path. Returns `None` when:
+/// ADR 0062: resolve the session's **selected** harness into the [`AgentSpec`]
+/// the backend spawns at `start_agent` + the `dyn_0` catalog mount it execs
+/// from. Returns `None` for a dev VM (the catalog isn't mounted; any resident
+/// agent stays undriven). For an agent-mode session it returns
+/// `Some((agent_spec, harness_mount))`, where `harness_mount` is the current
+/// catalog generation bound on `dyn_0` (the SAME sha for every session at a
+/// given catalog version — selection lives in `argv`, not the drive content).
 ///
-/// - `session_mode` is [`SessionMode::DevVm`] — the user wants a pure
-///   dev VM and any resident agent stays undriven.
-/// - The image has no `[harness]` block.
-/// - The image's `[harness]` block is somehow not launchable
-///   (defence-in-depth; the validator catches this at bake time).
+/// `argv[0] = /opt/engram/dyn/0/<name>/<exec>` (the selected harness's launch
+/// entry within the shared catalog squashfs), with backend-specific dial flags:
+/// - `HostTcp` (Process): `--connect <host:port>` against the coord-owned
+///   harness listener.
+/// - `Vsock` (FC/VZ): `--vsock-host <port>` for AF_VSOCK loopback into the host.
 ///
-/// The argv builds off the manifest's resolved `exec` path (already
-/// rooted at `/opt/engram/harness/...` for built-ins, or whatever the
-/// custom-harness author's Dockerfile COPY'd), with backend-specific
-/// dial flags appended:
-/// - `HostTcp` (Process): `--connect <host:port>` against the
-///   coord-owned harness listener.
-/// - `Vsock` (FC/VZ): `--vsock-host <port>` for AF_VSOCK loopback into
-///   the host. The manifest's optional `args` ride after the standard
-///   flags so authors can pass adapter-specific switches.
-pub(crate) fn resolve_harness(
+/// The harness's descriptor `args` ride after the standard flags.
+pub(crate) async fn resolve_harness(
     state: &SharedState,
-    image_harness: Option<&engram_core::types::image::HarnessManifest>,
+    selected_harness: Option<&str>,
     session_mode: SessionMode,
     session_id: SessionId,
     initial_prompt: Option<&str>,
     session_env: HashMap<String, String>,
     workdir: Option<String>,
-) -> Result<Option<engram_core::types::sandbox::AgentSpec>, ApiError> {
+) -> Result<
+    Option<(
+        engram_core::types::sandbox::AgentSpec,
+        engram_core::types::sandbox::AuxRoDrive,
+    )>,
+    ApiError,
+> {
+    use engram_core::types::sandbox::AuxRoDrive;
+
     if session_mode.is_dev_vm() {
         return Ok(None);
     }
-    let Some(harness) = image_harness else {
-        return Ok(None);
-    };
-    // Defence-in-depth — engram.toml validation should have already
-    // rejected this at bake time.
-    let (Some(_name), Some(exec)) = (harness.name.as_deref(), harness.exec.as_deref()) else {
-        return Ok(None);
+    let Some(name) = selected_harness else {
+        return Err(ApiError::BadRequest(
+            "an agent-mode session requires a harness selection (none provided)".into(),
+        ));
     };
 
+    // Resolve the selected harness's launch contract from the catalog…
+    let row = state
+        .services
+        .meta
+        .get_harness_by_name(name)
+        .await
+        .map_err(|e| ApiError::Internal(format!("harness catalog lookup for `{name}`: {e}")))?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("harness `{name}` is not registered in the catalog"))
+        })?;
+    let descriptor = row.descriptor().map_err(|e| {
+        ApiError::Internal(format!(
+            "stored harness.toml for `{name}` failed to parse: {e}"
+        ))
+    })?;
+    // …and the current catalog generation — what `dyn_0` mounts. Identical for
+    // every session at this catalog version (the dedup-across-sessions drive).
+    let (generation_sha, _size) = state
+        .services
+        .meta
+        .harness_catalog_generation()
+        .await
+        .map_err(|e| ApiError::Internal(format!("harness catalog generation: {e}")))?
+        .ok_or_else(|| {
+            ApiError::Internal(
+                "no harness catalog generation is staged — register a harness first".into(),
+            )
+        })?;
+
+    // argv[0] = the selected harness's entry within the catalog mount on dyn_0.
+    let exec = format!(
+        "{}/{}/{}",
+        AuxRoDrive::slot_guest_mount(AuxRoDrive::HARNESS_SLOT_INDEX).display(),
+        name,
+        descriptor.exec_path(),
+    );
+
     // Harness-only extras, layered on top of `session_env` for the harness
-    // child. `session_env` already carries ENGRAM_SESSION_ID + the image
-    // env + secrets, so they aren't repeated here; the forge broker token
-    // is added by the caller (per-spawn, kept out of the cached env).
+    // child. `session_env` already carries ENGRAM_SESSION_ID + the image env +
+    // secrets, so they aren't repeated here; the forge broker token is added by
+    // the caller (per-spawn, kept out of the cached env).
     let mut env: HashMap<String, String> = HashMap::new();
     if let Some(prompt) = initial_prompt {
         env.insert("ENGRAM_INITIAL_PROMPT".into(), prompt.to_string());
     }
-    // The manifest `workdir` reaches agentd as a reserved env entry so
-    // the harness child starts there instead of `/`. See
-    // `HARNESS_CWD_ENV` for why this isn't a wire-struct field.
+    // The manifest `workdir` reaches agentd as a reserved env entry so the
+    // harness child starts there instead of `/`. See `HARNESS_CWD_ENV` for why
+    // this isn't a wire-struct field.
     if let Some(cwd) = workdir {
         env.insert(engram_harness_proto::HARNESS_CWD_ENV.to_string(), cwd);
     }
@@ -1706,7 +1780,7 @@ pub(crate) fn resolve_harness(
             };
             env.insert("ENGRAM_HARNESS_ADDR".into(), addr.to_string());
             vec![
-                exec.to_string(),
+                exec,
                 "--connect".into(),
                 addr.to_string(),
                 "--session-id".into(),
@@ -1716,7 +1790,7 @@ pub(crate) fn resolve_harness(
         engram_core::traits::HarnessDial::Vsock => {
             let port = engram_harness_proto::HARNESS_VSOCK_PORT;
             vec![
-                exec.to_string(),
+                exec,
                 "--vsock-host".into(),
                 port.to_string(),
                 "--session-id".into(),
@@ -1724,17 +1798,23 @@ pub(crate) fn resolve_harness(
             ]
         }
     };
-    // Author-supplied extra args (manifest `[harness] args = [...]`)
-    // ride after the standard dial flags so they can specialise the
-    // adapter without overriding the SDK contract.
-    argv.extend(harness.args.iter().cloned());
+    // Harness descriptor `args` ride after the standard dial flags so they can
+    // specialise the adapter without overriding the SDK contract.
+    argv.extend(descriptor.args.iter().cloned());
 
-    Ok(Some(engram_core::types::sandbox::AgentSpec {
+    let agent = engram_core::types::sandbox::AgentSpec {
         argv,
         env,
         session_env,
         host_ca_pem: None,
-    }))
+    };
+    let mount = AuxRoDrive {
+        drive_id: AuxRoDrive::slot_drive_id(AuxRoDrive::HARNESS_SLOT_INDEX),
+        guest_mount: AuxRoDrive::slot_guest_mount(AuxRoDrive::HARNESS_SLOT_INDEX),
+        fs_type: "squashfs".into(),
+        sha256: Some(generation_sha),
+    };
+    Ok(Some((agent, mount)))
 }
 
 #[cfg(test)]
@@ -1846,23 +1926,24 @@ mod tests {
         // Empty selection → empty mounts.
         assert!(assign_skill_slots(&catalog, &[]).unwrap().is_empty());
 
-        // Two skills → two drives at dyn_0 / dyn_1 with the catalog shas, in
-        // request order.
+        // ADR 0062: slot 0 is the harness, so skills start at dyn_1. Two skills
+        // → two drives at dyn_1 / dyn_2 with the catalog shas, in request order.
         let mounts = assign_skill_slots(&catalog, &["skills".into(), "playwright".into()]).unwrap();
         assert_eq!(mounts.len(), 2);
-        assert_eq!(mounts[0].drive_id, AuxRoDrive::slot_drive_id(0));
-        assert_eq!(mounts[0].guest_mount, AuxRoDrive::slot_guest_mount(0));
+        assert_eq!(mounts[0].drive_id, AuxRoDrive::slot_drive_id(1));
+        assert_eq!(mounts[0].guest_mount, AuxRoDrive::slot_guest_mount(1));
         assert_eq!(mounts[0].fs_type, "squashfs");
         assert_eq!(mounts[0].sha256.as_deref(), Some("sha_a"));
-        assert_eq!(mounts[1].drive_id, AuxRoDrive::slot_drive_id(1));
+        assert_eq!(mounts[1].drive_id, AuxRoDrive::slot_drive_id(2));
         assert_eq!(mounts[1].sha256.as_deref(), Some("sha_b"));
 
         // Unknown skill → 400.
         let err = assign_skill_slots(&catalog, &["nope".into()]).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
 
-        // Over the reserved-slot cap → 400 (even if every name is known).
-        let too_many: Vec<String> = (0..AuxRoDrive::RESERVED_SLOTS + 1)
+        // Over the skill-slot cap (RESERVED_SLOTS - 1, since the harness takes
+        // slot 0) → 400, even if every name is known.
+        let too_many: Vec<String> = (0..AuxRoDrive::MAX_SKILL_SLOTS + 1)
             .map(|_| "skills".to_string())
             .collect();
         let err = assign_skill_slots(&catalog, &too_many).unwrap_err();

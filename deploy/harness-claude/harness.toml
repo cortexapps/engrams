@@ -1,0 +1,56 @@
+# ADR 0062/0063: the built-in Claude harness descriptor.
+#
+# Shipped at the root of the harness-claude OCI artifact (alongside the `harness`
+# entry binary + the bundled `claude` CLI). RegisterHarness pulls the artifact,
+# validates this file, and packs it into the catalog squashfs; a session then
+# execs /opt/engram/dyn/0/claude/harness. Replaces the old artifact.toml.
+
+name  = "claude"
+label = "Claude Code"
+
+# Launch contract (coordinator-internal): the entry binary within this harness's
+# catalog subtree. argv[0] = /opt/engram/dyn/0/claude/harness; the SDK dial flags
+# (--vsock-host / --connect, --session-id) are appended by the coordinator.
+exec = "harness"
+
+[auth]
+# Programmatic / org credential (Slack triggers, cron, API) — resolved host-side
+# from an org secret named ANTHROPIC_API_KEY (ADR 0063 §4).
+org_env  = "ANTHROPIC_API_KEY"
+# Human / interactive credential — the per-user Claude Code OAuth token.
+user_env = "CLAUDE_CODE_OAUTH_TOKEN"
+
+[[models]]
+id      = "opus"
+label   = "Claude Opus 4.8"
+default = true
+env     = { ANTHROPIC_MODEL = "claude-opus-4-8" }
+
+[[models]]
+id    = "sonnet"
+label = "Claude Sonnet 4.6"
+env   = { ANTHROPIC_MODEL = "claude-sonnet-4-6" }
+
+[[models]]
+id    = "haiku"
+label = "Claude Haiku 4.5"
+env   = { ANTHROPIC_MODEL = "claude-haiku-4-5" }
+
+# Effort maps to Claude Code's own thinking-budget knob (MAX_THINKING_TOKENS) —
+# an opaque-to-the-API harness env, which is exactly what the descriptor exists
+# to abstract.
+[[effort]]
+id      = "medium"
+label   = "Medium"
+default = true
+env     = { MAX_THINKING_TOKENS = "16000" }
+
+[[effort]]
+id    = "high"
+label = "High"
+env   = { MAX_THINKING_TOKENS = "32000" }
+
+[[effort]]
+id    = "low"
+label = "Low"
+env   = { MAX_THINKING_TOKENS = "4000" }

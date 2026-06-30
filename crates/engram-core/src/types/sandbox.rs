@@ -155,6 +155,18 @@ impl AuxRoDrive {
     /// window.
     pub const RESERVED_SLOTS: usize = 12;
 
+    /// ADR 0062: reserved slot index for the harness catalog. Slot 0 (`dyn_0`)
+    /// carries the content-addressed catalog squashfs (every registered harness
+    /// under `<name>/`); the session `exec`s `/opt/engram/dyn/0/<name>/<exec>`.
+    /// Skills assign to `dyn_1..` (one fewer slot than `RESERVED_SLOTS`). The
+    /// harness is `exec`'d, so unlike a skill its slot must be coordinator-known
+    /// up front to build `argv[0]`.
+    pub const HARNESS_SLOT_INDEX: usize = 0;
+
+    /// ADR 0062: skill slots start after the harness slot, so a session may
+    /// carry at most this many skills (the harness occupies `dyn_0`).
+    pub const MAX_SKILL_SLOTS: usize = Self::RESERVED_SLOTS - 1;
+
     /// Firecracker `drive_id` for reserved dynamic slot `i` (`"dyn_<i>"`).
     /// Underscore, NOT hyphen: FC rejects a `PUT /drives/<id>` whose id isn't
     /// alphanumeric-or-underscore with a 400 (the device-ceiling probe caught

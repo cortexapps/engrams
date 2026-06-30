@@ -129,16 +129,17 @@ enum SessionCmd {
         /// Example: `--image ghcr.io/cortex/api:warm-2026-04`
         #[arg(long)]
         image: String,
-        /// Boot the image as a pure dev VM — leave the baked harness
-        /// (if any) resident-but-undriven. Default is to drive the
-        /// image's harness (ADR 0021 P1.3 replaced the per-session
-        /// harness selection: which harness an image runs is now an
-        /// image property).
+        /// Boot the image as a pure dev VM — no harness driven; interact
+        /// via shell / exec.
         #[arg(long, default_value_t = false)]
         dev_vm: bool,
-        /// Initial prompt for the agent. Only meaningful in the
-        /// default (agent) mode against an image that has a baked
-        /// harness; the API rejects with INVALID_ARGUMENT if a prompt is
+        /// ADR 0062: the catalog harness to run (a `HarnessCatalogService`
+        /// name, e.g. "claude"). Required for an agent session; ignored with
+        /// `--dev-vm`. Run `engram harness list` to see the catalog.
+        #[arg(long)]
+        harness: Option<String>,
+        /// Initial prompt for the agent. Only meaningful in the default
+        /// (agent) mode; the API rejects with INVALID_ARGUMENT if a prompt is
         /// supplied alongside `--dev-vm`.
         #[arg(long)]
         prompt: Option<String>,
@@ -569,8 +570,19 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             SessionCmd::Create {
                 image,
                 dev_vm,
+                harness,
                 prompt,
-            } => session_create(&mut c, image, *dev_vm, prompt.as_deref(), cli.json).await,
+            } => {
+                session_create(
+                    &mut c,
+                    image,
+                    *dev_vm,
+                    prompt.as_deref(),
+                    harness.as_deref(),
+                    cli.json,
+                )
+                .await
+            }
             SessionCmd::List => session_list(&mut c, cli.json).await,
             SessionCmd::Get { id } => session_get(&mut c, id, cli.json).await,
             SessionCmd::Exec {
@@ -780,6 +792,7 @@ async fn session_create(
     image: &str,
     dev_vm: bool,
     prompt: Option<&str>,
+    harness: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
     let req = app::CreateSessionRequest {
@@ -798,6 +811,9 @@ async fn session_create(
         harness_env: HashMap::new(),
         // Admin CLI doesn't correlate optimistic UI; let the coord mint.
         prompt_id: None,
+        // ADR 0062: the selected catalog harness (required for an agent session;
+        // ignored for --dev-vm). `engram harness list` shows the catalog.
+        harness: harness.map(str::to_string),
     };
     let resp = c.sess.create_session(req).await?.into_inner();
     if json {
