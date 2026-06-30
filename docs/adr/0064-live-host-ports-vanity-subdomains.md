@@ -114,7 +114,7 @@ WebSocket-upgrade, and gRPC all pass through transparently:
   (`/api/v1/sessions/:id/ports`, owner/admin guarded), and the `portRelay` control-plane
   client. The edge proxy that serves the slugs lands in P2b, so the returned `url` is the
   eventual address, not yet reachable.
-- **P2b (this change):** the edge reverse-proxy data plane for **HTTP** — Host-based routing
+- **P2b (landed, PR #482):** the edge reverse-proxy data plane for **HTTP** — Host-based routing
   on `<slug>.<previewBaseDomain>` (a Hono middleware mounted first), auth (owner / admin /
   share-token), and the HTTP-over-`PortRelay` transport. The transport went through a design
   change: a custom `http.request({ createConnection })` Duplex does **not** work under Bun
@@ -127,7 +127,9 @@ WebSocket-upgrade, and gRPC all pass through transparently:
   `upgrade` handler can't write to the raw socket (see `orchestrator/src/server.ts` — the
   `socket.write`/`end` no-op bug), so raw WS passthrough needs its own approach + live
   validation. HTTP previews (page loads, assets, SSE, API) work without it.
-- **P2c:** web "Expose port" UI on the session detail page.
+- **P2c (this change):** web "Expose port" UI — a PORTS tab on the session detail page
+  (`usePorts` React-Query hooks over the REST CRUD + a `PortsPanel`: expose a port, list
+  exposures with their URL, copy the (share) link, revoke).
 - **P3:** engrams-internal wildcard DNS + wildcard cert (GCP Certificate Manager + DNS auth)
   + ingress, behind IAP; prod validation.
 - **P4 (optional):** declarative `profile.portExposures`.
