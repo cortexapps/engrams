@@ -8,6 +8,7 @@ import health from "./routes/health.ts";
 import authRoute from "./routes/auth.ts";
 import eventsRoute from "./routes/events.ts";
 import artifactsRoute from "./routes/artifacts.ts";
+import portsRoute from "./routes/ports.ts";
 import connectorLogoRoute from "./routes/connector-logo.ts";
 import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
@@ -61,6 +62,9 @@ app.route("/", authRoute);
 // ADR 0051 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/harness-env).
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
+// ADR 0064 P2a: live-host port-exposure registry (CRUD). The edge reverse-proxy
+// that serves the minted slugs lands in P2b.
+app.route("/", portsRoute);
 // Connector logos (redesign): orchestrator-owned brand marks, served for <img>.
 app.route("/", connectorLogoRoute);
 app.route("/", meRoute);

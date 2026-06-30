@@ -19,11 +19,13 @@ import { relations } from "drizzle-orm";
 import {
   pgTable,
   text,
+  integer,
   jsonb,
   timestamp,
   boolean,
   primaryKey,
   index,
+  uniqueIndex,
   customType,
 } from "drizzle-orm/pg-core";
 
@@ -186,6 +188,45 @@ export const connectorLogo = pgTable("connector_logo", {
     .defaultNow()
     .$onUpdate(() => new Date()),
 });
+
+// ---------------------------------------------------------------------------
+// Port exposures (ADR 0064): live-host a session's guest port at a vanity
+// subdomain.
+//
+// Orchestrator-owned (the coordinator never learns about exposures) — a row maps
+// an auto-minted, opaque tri-word `slug` to a `(session, port)` pair the edge
+// reverse-proxy (P2b) tunnels to via PortRelayService. `session_id` is a LOGICAL
+// ref to the control-plane session (different tier, like profiles' image_id — no
+// DB FK). The slug is the routing key (`<slug>.preview.<domain>`); it deliberately
+// does NOT encode the port, so it can't be used to scan a session's other ports.
+// Hard delete: revoking an exposure must stop serving it immediately (no history).
+// `share_token` is a capability for `visibility = "shared"` links (still inside
+// the IAP wall); null for `private`. Admins can view any exposure regardless.
+// ---------------------------------------------------------------------------
+
+export const portExposure = pgTable(
+  "port_exposure",
+  {
+    slug: text("slug").primaryKey(), // tri-word, e.g. "jumping-fat-kittens"
+    sessionId: text("session_id").notNull(), // control-plane session id (logical ref, §3-style)
+    port: integer("port").notNull(), // guest TCP port (1..=65535)
+    label: text("label").notNull().default(""), // human label, e.g. "Vite dev server"
+    ownerUserId: text("owner_user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }), // creator (= session owner)
+    visibility: text("visibility").notNull().default("private"), // "private" | "shared"
+    shareToken: text("share_token"), // capability for visibility=shared; null for private
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    expiresAt: timestamp("expires_at"), // null = no expiry
+  },
+  (t) => [
+    // One exposure per (session, port) — re-exposing returns the existing slug.
+    uniqueIndex("port_exposure_session_port_idx").on(t.sessionId, t.port),
+    // List-by-session + cascade-on-session-delete (P2b/cleanup).
+    index("port_exposure_session_idx").on(t.sessionId),
+    index("port_exposure_owner_idx").on(t.ownerUserId),
+  ],
+);
 
 // ---------------------------------------------------------------------------
 // better-auth core tables + admin plugin fields (Task 16)
