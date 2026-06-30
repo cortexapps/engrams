@@ -92,9 +92,6 @@ mod tests {
             }
         });
         tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(
-            fired.load(Ordering::SeqCst),
-            "no cancel → teardown fires"
-        );
+        assert!(fired.load(Ordering::SeqCst), "no cancel → teardown fires");
     }
 }

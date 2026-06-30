@@ -85,8 +85,61 @@ macOS-host-16K / guest-4K block-size gotcha from ADR 0061), mounted per-session 
 | `Xvfb` | virtual X display `:99` (e.g. `1280x800x24`) — no physical device needed |
 | `chromium` (**full**, with UI) | the browser the human drives — *not* the headless-shell the playwright bundle ships |
 | `openbox` (minimal WM, no panel/menu) | window focus + auto-maximize so Chrome fills the framebuffer; nothing about it is user-visible |
-| `x11vnc` | RFB server bound to **`127.0.0.1:5900`** (`-localhost`), `-forever -shared`, `-randr` for resize |
+| `x11vnc` | RFB server bound to **`0.0.0.0:5900`** (all interfaces, like ttyd — *not* `-localhost`; see the reachability pitfall), `-forever -shared`, `-xrandr` for resize |
 | `engram-browser` (launcher script) | brings up `Xvfb → openbox → x11vnc → chromium` in order; position-independent (self-locates from `$0` like the playwright wrappers), surfaced on `PATH` via `mount.json` |
+| `xkbcomp` + `xkb-data` (`/usr/share/X11/xkb`) | XKB keyboard stack Xvfb needs to compile a keymap at boot — see the pitfall below |
+| NSS modules (`libsoftokn3`, `libfreebl3`, `libnssckbi` + `.chk`) | chromium `dlopen`s these for its cert DB/crypto — not `DT_NEEDED`, so the `ldd`-walk misses them — see the pitfall below |
+
+**Pitfall (live testing).** The bundle is assembled by copying the binaries plus their `ldd`
+shared-library closure — i.e. the **`DT_NEEDED` link closure only**. That misses every dependency
+loaded another way, of which there are three classes here, each producing the *same* opaque noVNC
+"connection closed unexpectedly" (the symptom is generic: x11vnc never serves a usable display, so
+the relay tears down):
+
+1. **Runtime data.** Xvfb compiles a keymap at startup and aborts hard if it can't (`Failed to
+   compile keymap` / `Failed to activate virtual core keyboard`) — so the bundle must carry the
+   `xkb-data` tree and the `xkbcomp` binary (neither is a `.so`). Xvfb also execs a **hard-coded**
+   `/usr/bin/xkbcomp` (the launcher symlinks the bundled one there; `-xkbdir` relocates only the
+   data).
+2. **`dlopen`'d modules *and their own closure*.** chromium loads the NSS softoken stack
+   (`libsoftokn3.so` + its `libfreebl3`/`libnssckbi` and the `.chk` integrity files) by SONAME at
+   runtime. They are *not* linked deps of chrome, so the `ldd`-walk never sees them, and a minimal
+   glibc base has no `libnss3`. Missing `libsoftokn3.so` makes chromium abort before it paints a
+   single frame (`FATAL:crypto/nss_util.cc … libsoftokn3.so: cannot open shared object file`). One
+   layer deeper: the modules carry their *own* `DT_NEEDED` closure that chrome doesn't link —
+   notably **`libsqlite3.so.0`**, the backing store for softoken's `sql:` cert DB — so `build.sh`
+   must `collect` (ldd-walk) the NSS modules too, not just copy them, or chromium aborts one frame
+   in on `libsqlite3.so.0`.
+3. **File perms.** Some chromium payload files ship `0600` (notably `libGLESv2.so`), which then
+   `dlopen`s in-guest as `cannot open shared object file: Permission denied` (the bundle is consumed
+   by a process that need not be the build uid). `build.sh` normalizes the tree to world-readable
+   (`chmod -R a+rX`).
+
+A fourth, unrelated trap: the x11vnc resize flag is **`-xrandr`**, not `-randr` (an unrecognized
+option makes x11vnc abort before binding the RFB port). All of the above are guarded fail-loud in
+`build.sh`. **Validation lesson:** asserting the **RFB banner** (`RFB 003.008`) is *necessary but not
+sufficient* — x11vnc serves the banner even when chromium is dead, so the banner can pass while the
+tab shows a blank/closing screen. A complete check confirms **chromium itself stays alive and
+paints** (no `FATAL` in the launcher log, the chrome process group survives past startup), not just
+that the port accepts. The FC `e2e_vnc` test asserts the banner; the chromium-liveness gap is why
+this regressed after the xkb fix landed.
+
+**Pitfall (the bind address — the one that survives every bundle fix).** Even with a perfectly
+self-contained bundle and a chromium that runs and paints, the tab still shows "connection closed
+unexpectedly / no bytes over the VNC endpoint" if x11vnc binds the wrong interface. The host-agent's
+`proxy_vnc` dials the VM's **routable IP** (`vm_internal_ip`, e.g. `192.168.64.2:5900`) from *outside*
+the guest — identical to how `proxy_shell` reaches ttyd. ttyd binds `0.0.0.0:7681`, so the shell tab
+works. x11vnc launched with **`-localhost` binds `127.0.0.1` only**, so the host's dial to
+`guest_ip:5900` is **refused** — x11vnc is up and serves RFB perfectly *on loopback* (a same-guest
+`curl telnet://127.0.0.1:5900` gets the banner), but the host never reaches it and zero bytes flow.
+Fix: the launcher omits `-localhost` so x11vnc binds all interfaces, matching ttyd. The per-VM network
+is the isolation boundary (prod FC: a per-VM netns reachable only by the host-agent; VZ dev: the same
+vmnet posture ttyd already depends on), so this does not widen exposure beyond the already-accepted
+shell. Diagnostic that pinpointed it: from inside the guest, `curl telnet://127.0.0.1:5900` returned
+the banner while `curl telnet://<guest_ip>:5900` was refused and `curl http://<guest_ip>:7681`
+(ttyd) succeeded — proving the stack was healthy and the *only* fault was the bind address. (The
+`proxy_vnc.rs` module doc-comment claiming the cold path "dials `127.0.0.1:5900`" is stale — the
+caller passes `vm_internal_ip`.)
 
 Chrome runs with its **normal full UI** (address bar + tabs — deliberately *not* `--kiosk`, since the
 human needs to navigate), sized to the framebuffer, with first-run/default-browser prompts
@@ -187,9 +240,12 @@ bloat snapshots and violate the small-snapshot assumptions behind eviction durab
 
 ### 7. Egress & security
 
-- **Reachability:** `x11vnc` binds `127.0.0.1` only, so the VNC server is unreachable except through
-  the auth-gated relay. No protocol-layer VNC password is needed (same posture as ttyd, which has no
-  VNC/SSH-layer auth — the gate is the orchestrator).
+- **Reachability:** `x11vnc` binds all interfaces (`0.0.0.0:5900`), exactly like ttyd, because the
+  host-agent's `proxy_vnc` dials the VM's routable IP from outside the guest — `-localhost` (loopback
+  only) would make that dial unreachable (see the bind-address pitfall above). The isolation boundary
+  is the **per-VM network**, not a loopback bind: in prod FC the per-VM netns is reachable only by the
+  host-agent, and the relay in front of it is auth-gated. No protocol-layer VNC password is needed
+  (same posture as ttyd, which has no VNC/SSH-layer auth — the gate is the orchestrator).
 - **Egress:** the human's browsing flows through the per-session **egress proxy** (ADR 0006, MITM,
   policy-controlled), so it's bound by the **same domain allowlist as the agent**. Profiles that
   enable the browser will typically pair it with a permissive egress policy; this ADR does not change

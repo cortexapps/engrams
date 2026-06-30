@@ -31,10 +31,9 @@ use engram_protocol::grpc::{
     MigrationCaptureResponse, MigrationExportRef, MigrationFetchRequest, MigrationFrame,
     MigrationPresetupResponse, PostCopyCaptureResponse, ProxyShellBinary, ProxyShellClose,
     ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ProxyTarget,
-    ReapMaterializeDirRequest,
-    ReapMaterializeDirResponse, RehandshakeHarnessRequest, RestoreBaseForSessionRequest,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, SnapshotBeginResponse,
-    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    ReapMaterializeDirRequest, ReapMaterializeDirResponse, RehandshakeHarnessRequest,
+    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
+    SnapshotBeginResponse, SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;

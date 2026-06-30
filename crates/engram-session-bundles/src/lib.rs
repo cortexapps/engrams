@@ -499,14 +499,20 @@ mod tests {
 
         let l = Layout::under(root);
         let link = l.usr_local_bin.join("engram-browser");
-        assert!(link.is_symlink(), "engram-browser must be symlinked onto PATH");
+        assert!(
+            link.is_symlink(),
+            "engram-browser must be symlinked onto PATH"
+        );
         // No phantom agent skill registered under ~/.agents/skills.
         let phantom = l.agents_skills.exists()
             && std::fs::read_dir(&l.agents_skills)
                 .map(|d| d.count() > 0)
                 .unwrap_or(false);
         assert!(!phantom, "bundle-level bins must NOT create an agent skill");
-        assert!(report.warnings.iter().all(|w| !w.contains("engram-browser")));
+        assert!(report
+            .warnings
+            .iter()
+            .all(|w| !w.contains("engram-browser")));
     }
 
     #[test]

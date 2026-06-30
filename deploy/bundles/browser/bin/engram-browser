@@ -23,13 +23,27 @@ VNC_PORT="${ENGRAM_BROWSER_VNC_PORT:-5900}"
 PROFILE_DIR="$(mktemp -d /tmp/engram-browser-profile.XXXXXX)"
 
 cleanup() {
-    # Kill the whole process group (we are the leader via setsid in agentd).
+    # Disarm first: `kill 0` signals the WHOLE process group — including this
+    # shell — so without clearing the traps the delivered TERM/INT re-enters
+    # cleanup and recurses until the shell aborts ("Maximum function recursion
+    # depth reached"). Clear, then kill the group (Xvfb/openbox/chromium).
+    trap - TERM INT EXIT
     kill 0 2>/dev/null || true
 }
 trap cleanup TERM INT EXIT
 
-# 1) Virtual X display. +extension RANDR enables x11vnc -randr live resize.
-"$here/bin/Xvfb" "$DISPLAY" -screen 0 "$GEOMETRY" +extension RANDR -nolisten tcp &
+# Xvfb compiles its keymap at startup by exec'ing a HARD-CODED /usr/bin/xkbcomp
+# (the X server's compiled-in path; -xkbdir relocates only the DATA, not the
+# binary). A minimal glibc base need not ship xkbcomp, so point that path at the
+# bundled one. Idempotent; the per-session guest rootfs is writable + ephemeral.
+ln -sf "$here/bin/xkbcomp" /usr/bin/xkbcomp 2>/dev/null || true
+
+# 1) Virtual X display. +extension RANDR enables x11vnc -xrandr live resize.
+# -xkbdir points the server at the bundle's relocated XKB data (build.sh copies
+# /usr/share/X11/xkb -> $here/share/X11/xkb); without it the server can't
+# compile a keymap and aborts before any client can connect.
+"$here/bin/Xvfb" "$DISPLAY" -screen 0 "$GEOMETRY" +extension RANDR -nolisten tcp \
+    -xkbdir "$here/share/X11/xkb" &
 # Wait for the X socket before starting clients.
 for _ in $(seq 1 100); do
     [ -S "/tmp/.X11-unix/X$DISPLAY_NUM" ] && break
@@ -51,12 +65,22 @@ done
     --window-position=0,0 \
     "${ENGRAM_BROWSER_HOMEPAGE:-about:blank}" &
 
-# 4) x11vnc last (so the display + a client window exist). -localhost: only the
-# auth-gated relay reaches it. -forever: survive client disconnects (refresh
-# grace handled host-side). -randr: honor noVNC remote resize. exec so this
-# process IS x11vnc and the trap fires when agentd kills the group.
+# 4) x11vnc last (so the display + a client window exist). It MUST bind all
+# interfaces (x11vnc's default) — NOT loopback. The host-agent's proxy_vnc dials
+# the VM's routable IP (vm_internal_ip, e.g. 192.168.64.2:5900) from OUTSIDE the
+# guest, exactly like the shell's ttyd which binds 0.0.0.0:7681. `-localhost`
+# binds 127.0.0.1 only, so the host's dial to guest_ip:5900 is refused, no RFB
+# bytes ever flow, and the VNC tab shows "connection closed unexpectedly". The
+# per-VM network is the isolation boundary (prod FC: a per-VM netns reachable
+# only by the host-agent; VZ dev: the same vmnet posture ttyd already relies on),
+# so binding all interfaces here matches the shell rather than widening exposure.
+# -forever: survive client disconnects (refresh grace handled host-side).
+# -xrandr: track RANDR resolution changes for noVNC remote resize (x11vnc's flag
+# is -xrandr, NOT -randr — an unrecognized option makes x11vnc abort before
+# binding the RFB port). exec so this process becomes x11vnc; agentd reaps the
+# whole group via killpg, and x11vnc handles its own signals (the shell trap
+# above only covers the pre-exec bring-up).
 exec "$here/bin/x11vnc" \
     -display "$DISPLAY" \
-    -localhost \
     -rfbport "$VNC_PORT" \
-    -forever -shared -noxdamage -nopw -quiet -randr
+    -forever -shared -noxdamage -nopw -quiet -xrandr
