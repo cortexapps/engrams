@@ -19,6 +19,7 @@ import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 // Side-effect import: registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
+import { makePreviewProxyMiddleware } from "./routes/preview-proxy.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
 import { registerTasks } from "./rpc/tasks.ts";
@@ -55,6 +56,11 @@ wss.options.handleProtocols = (protocols: Set<string>) =>
 // Slack webhooks included — logs `<-- METHOD path` / `--> METHOD path status ms`.
 const httpLog = log.child({ component: "http" });
 app.use(honoLogger((message) => httpLog.info(message)));
+
+// ADR 0064 P2b: live-host preview reverse-proxy. Mounted FIRST so a request to
+// `<slug>.<previewBaseDomain>` is resolved + tunneled to the guest port before
+// the normal app routes see it; non-preview hosts fall straight through.
+app.use(makePreviewProxyMiddleware());
 
 // Mount routes.
 app.route("/", health);
