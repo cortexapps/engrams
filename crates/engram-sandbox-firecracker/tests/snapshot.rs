@@ -76,7 +76,10 @@ async fn snapshot_then_restore_round_trips_microvm() {
     // console for the kernel banner instead of a fixed 2s; fails fast on a
     // boot panic.
     let _ = common::wait_for_log_contains(
-        &work.path().join(original_id.to_string()).join("firecracker.log"),
+        &work
+            .path()
+            .join(original_id.to_string())
+            .join("firecracker.log"),
         &["Linux version"],
         Duration::from_secs(15),
     )

@@ -87,7 +87,10 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
     // Wait for the kernel banner on the serial console rather than a fixed
     // settle before snapshotting.
     let _ = common::wait_for_log_contains(
-        &source_work.path().join(source_id.to_string()).join("firecracker.log"),
+        &source_work
+            .path()
+            .join(source_id.to_string())
+            .join("firecracker.log"),
         &["Linux version"],
         Duration::from_secs(15),
     )

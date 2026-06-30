@@ -115,17 +115,11 @@ async fn chained_restore_snapshot_lineage_holds() {
     // Cold create + settle + snapshot S1 + destroy. `metadata` is the
     // snapshot we restore the first hop from.
     let source_id = backend.create(spec).await.expect("create source");
-    // Wait for the source kernel to boot (banner on the serial console
-    // funneled to firecracker.log) rather than a fixed settle sleep.
-    let _ = common::wait_for_log_contains(
-        &work
-            .path()
-            .join(source_id.to_string())
-            .join("firecracker.log"),
-        &["Linux version"],
-        Duration::from_secs(15),
-    )
-    .await;
+    // Fixed settle before S1. This test RE-snapshots a VM restored from S1, so
+    // S1 must capture a fully-settled guest; a bare kernel-banner poll snapshots
+    // too early and the restored VM is then too fragile to re-snapshot (FC
+    // socket gone). Let early boot finish.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let mut metadata = backend.snapshot(source_id).await.expect("snapshot source");
     backend.destroy(source_id).await.expect("destroy source");
 
