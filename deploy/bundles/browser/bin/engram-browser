@@ -89,9 +89,14 @@ done
         # "profile appears to be in use"; the profile is single-tenant and
         # ephemeral, so clear it before each (re)launch.
         rm -f "$PROFILE_DIR"/Singleton* 2>/dev/null || true
+        # --test-type suppresses chrome's "unsupported command-line flag:
+        # --no-sandbox" warning bar — a bad-flags SECURITY prompt that
+        # --disable-infobars does NOT cover. --no-sandbox is intentional: the VM
+        # is the isolation boundary, so chrome's own sandbox is redundant here.
         "$here/chrome/chrome" \
             --user-data-dir="$PROFILE_DIR" \
             --no-sandbox \
+            --test-type \
             --no-first-run --no-default-browser-check \
             --disable-infobars \
             --window-position=0,0 \
