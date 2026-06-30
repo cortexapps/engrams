@@ -1,6 +1,6 @@
 # ADR 0063: harness.toml descriptor + harness-derived env wiring
 
-Status: 2026-06-29 — **Proposed.**
+Status: 2026-06-30 — **Accepted** (control-plane half shipped; see the commit chain in §Phasing).
 Builds on **ADR 0062** (per-session harness selection — the infra half + the harness catalog
 this ADR consumes), **ADR 0051** (the TypeScript orchestration tier — the coordinator stays
 harness-agnostic; the orchestrator owns harness-specific naming), **ADR 0053** (session
@@ -136,15 +136,20 @@ removed, since there is a model field now). The coordinator stays agnostic: one 
 
 ## Phasing (living checklist; each phase = one worktree + one PR)
 
-- [ ] **A1** (shared with ADR 0062) — `harness.toml` parse type + proto `HarnessDescriptor`.
-- [ ] **B1** — profile default harness/model/effort (migration, schema, proto, catalog
-  validation, web editor). *(off ADR 0062 A3 — needs the catalog RPC)*
-- [ ] **B2** — session-create override (`CreateTaskRequest`/`CreateSessionRequest.harness`,
-  compile threading, web pickers). *(off B1)*
-- [ ] **B3** — de-hardcode `user_env` (`/me/harness-tokens` + shim, injection swap, TokensPanel,
-  nudge; delete `CLAUDE_OAUTH_ENV_VAR`). *(off B1)*
-- [ ] **B4/B5** — model/effort→env merge + precedence + programmatic `org_env` inject;
-  `EnvVarsEditor` copy. Flip ADR 0062 + 0063 → Accepted with the commit chain. *(off B3)*
+- [x] **A1** (shared with ADR 0062) — `harness.toml` parse type + proto `HarnessDescriptor`.
+- [x] **B1** — profile default harness/model/effort (migration, schema, proto, catalog
+  validation, web editor). *(#484, `9819e404`)*
+- [x] **B2** — session-create override (`CreateTaskRequest`/`CreateSessionRequest.harness`,
+  compile threading, web pickers; defaults `harness = "claude"` so the orchestrator always
+  sends a selection). *(#486, `160b5343`)*
+- [x] **B3** — de-hardcode `user_env` (`/me/harness-tokens`, injection swap, TokensPanel;
+  killed the `CLAUDE_CODE_OAUTH_TOKEN` concept). *(#488, `022f4c55`)*
+- [x] **B4/B5** — model/effort→env merge + precedence + programmatic `org_env` inject (strict
+  by run type). *(#490, `dc0d17ea`)*
+
+The B-stack was authored on ADR 0062's pre-A5 A-stack, then rebased onto `main` after ADR 0062
+landed (incl. the A5 built-in-harness redesign) — B1/B2 validate against `ListHarnesses`
+(builtin ∪ catalog), so the now-built-in `claude` resolves with no catalog row.
 
 ## Consequences
 
