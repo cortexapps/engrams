@@ -43,6 +43,7 @@ harness-specific branching:
 ```toml
 name  = "claude"            # stable id; == catalog key == CreateSessionRequest.harness
 label = "Claude Code"
+description = "Anthropic's Claude Code agent…"   # optional; admin Harnesses tab (§6)
 
 [auth]
 org_env  = "ANTHROPIC_API_KEY"        # programmatic credential (org/automation)
@@ -76,8 +77,12 @@ against `^[A-Za-z_][A-Za-z0-9_]*$`, `deny_unknown_fields`). `harness.toml` *also
 coordinator-internal **launch contract** — `exec` (the entry path within the harness's catalog
 subtree, default `harness`) and `args` (ADR 0062 §5) — so a single descriptor file fully
 describes a harness. The proto `HarnessDescriptor` projection (for the orchestrator/web) omits
-`exec`/`args` (they are coordinator-only) and carries `name`/`label`/`auth`/`models`/`effort`;
-all `env` values are **config, never secrets**, so they are safe on the wire.
+`exec`/`args` (they are coordinator-only) and carries
+`name`/`label`/`description`/`auth`/`models`/`effort`; all `env` values are **config, never
+secrets**, so they are safe on the wire. The list projection `HarnessSummary` additionally carries
+a `built_in` flag (true for the platform built-in `claude`, which rides the fleet stamp + the
+coordinator-embedded descriptor rather than a catalog row) so the admin tab (§6) can hide the
+delete affordance for built-ins.
 
 ### 2. Profiles carry a harness + default model/effort
 
@@ -146,6 +151,32 @@ profile's `env_vars` (the migration intent; `EnvVarsEditor`'s "set the model her
 removed, since there is a model field now). The coordinator stays agnostic: one flat
 `harness_env`, injected verbatim and persisted for resume.
 
+### 6. Admin Harnesses tab
+
+A new admin-only `/settings/harnesses` tab (mirroring the org-secret / integrations panels) is the
+operator surface for the catalog. It is the home for the three things an admin needs that the
+profile editor (which only *picks* a harness) does not cover:
+
+- **See what's available.** Each harness from `ListHarnesses` renders its `label`, `name`,
+  `description`, the model/effort options it offers, and a `built-in` badge for the platform
+  built-in.
+- **Configure the programmatic credential.** Each harness's `auth.org_env` is surfaced with a
+  "configured / not set" status, cross-referenced against the org-secret store
+  (`useOrgSecrets`), and a **Set / Replace** action that writes the value via the existing
+  `OrgSecretService.PutSecret` (keyed on the `org_env` name — the convention §4 relies on). This
+  closes the loop: §4's programmatic inject resolves an org secret named after `org_env`, and this
+  is where an admin actually sets it. The `auth.user_env` is shown read-only with a pointer to
+  *My Tokens* (the per-user, human-run credential — never an admin concern).
+- **Register / delete custom harnesses.** A "Register harness" action (`name` + OCI `oci_ref` →
+  `RegisterHarness`) and a per-row delete for non-built-ins (`DeleteHarness`). The orchestrator
+  forwards these two write methods **admin-only** (`manage("all")`) — the read methods stay
+  member-readable (§2's note). Built-ins are not deletable (the coordinator rejects it; the tab
+  hides the affordance via the `built_in` flag).
+
+No new orchestrator service: the tab composes the existing `HarnessCatalogService` (now fully
+forwarded) and `OrgSecretService`. The only backend change beyond exposing the write methods is the
+two descriptor projection additions in §1 (`description`, `built_in`).
+
 ## Phasing (living checklist; each phase = one worktree + one PR)
 
 - [x] **A1** (shared with ADR 0062) — `harness.toml` parse type + proto `HarnessDescriptor`.
@@ -161,7 +192,10 @@ removed, since there is a model field now). The coordinator stays agnostic: one 
 - [x] **UI completion (PR A)** — expose `HarnessCatalogService` (read) through the orchestrator
   passthrough so the selectors actually populate; profile harness is a concrete dropdown (no
   "inherit"); Model/Effort enabled; launch override renders. Backfill migration `0011`.
-- [ ] **Admin Harnesses tab (PR B)** — register/delete + per-harness org-secret config. *(§6)*
+- [x] **Admin Harnesses tab (PR B)** — `/settings/harnesses`: display + per-harness org-secret
+  config (`PutSecret` keyed on `org_env`) + register/delete of custom harnesses. Proj additions
+  `HarnessSummary.built_in` + `HarnessDescriptor.description`; the two write methods forwarded
+  admin-only. *(§6)*
 
 The B-stack was authored on ADR 0062's pre-A5 A-stack, then rebased onto `main` after ADR 0062
 landed (incl. the A5 built-in-harness redesign) — B1/B2 validate against `ListHarnesses`
