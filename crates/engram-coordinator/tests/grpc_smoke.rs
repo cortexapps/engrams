@@ -133,11 +133,14 @@ async fn stream_events_smoke() {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
         image_uri: image_uri.clone(),
-        mode: String::new(),
+        mode: "dev_vm".to_string(),
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses a no-harness image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -276,11 +279,14 @@ async fn session_crud_smoke() {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
         image_uri: image_uri.clone(),
-        mode: String::new(),
+        mode: "dev_vm".to_string(),
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses a no-harness image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -402,6 +408,9 @@ async fn exec_streaming_smoke() {
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses a no-harness image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -524,6 +533,9 @@ async fn snapshot_evict_resume_smoke() {
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses a no-harness image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -658,6 +670,9 @@ async fn get_artifact_not_found_smoke() {
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses a no-harness image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -733,6 +748,9 @@ async fn shell_relay_smoke() {
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses a no-harness image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = session_client

@@ -130,6 +130,8 @@ pub(crate) fn create_request_from_proto(
         // policy (JSON). Parsed here; the coordinator resolves its inject refs
         // into the egress policy at boot.
         integration_policy_json,
+        // ADR 0062: the per-session harness selection (a catalog key).
+        harness,
         // Phase 1b: the initial prompt's client prompt_id. The create path
         // delivers the initial prompt via send_prompt (which mints one when
         // empty), so threading the client id for the FIRST message is a
@@ -162,6 +164,7 @@ pub(crate) fn create_request_from_proto(
         selected_skills,
         capabilities,
         integration_policy,
+        selected_harness: harness,
     })
 }
 

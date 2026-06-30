@@ -1301,6 +1301,27 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
+    /// ADR 0062: persist the session's selected harness name (the catalog key)
+    /// so the queue scanner + resume can reconstruct which harness to mount on
+    /// `dyn_0` + exec. `None` for a dev-VM session.
+    async fn set_session_harness(
+        &self,
+        session_id: SessionId,
+        harness: Option<&str>,
+    ) -> Result<(), MetaError> {
+        let _ = (session_id, harness);
+        Ok(())
+    }
+
+    /// ADR 0062: the session's persisted harness selection, or `None`.
+    async fn get_session_harness(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, MetaError> {
+        let _ = session_id;
+        Ok(None)
+    }
+
     // ----------------------------------------------------------------
     // ADR 0016 §A.1.5c — cross-replica per-session op lease.
     // Serializes mutually-exclusive session-lifecycle ops (idle
