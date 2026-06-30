@@ -29,8 +29,11 @@ import { registerTasks, buildProfileMap } from "../rpc/tasks.ts";
 import type { TaskDeps, SessionsClient, Db, GetSession, ImagesClient } from "../rpc/tasks.ts";
 import type { HarnessCatalogClient } from "../rpc/task-create.ts";
 import type { UserSecretStore } from "../db/user-secrets.ts";
-import { CLAUDE_OAUTH_ENV_VAR } from "../db/user-secrets.ts";
 import type { ProfileRow, ProfileStore, ProfileInput } from "../db/profiles.ts";
+
+// The claude harness's declared `auth.user_env` (see fakeHarnessCatalog); the
+// create path seals + injects the user token under this name (ADR 0063 B3).
+const USER_ENV = "CLAUDE_CODE_OAUTH_TOKEN";
 import { makeProfileStore } from "../db/profiles.ts";
 import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Session } from "../gen/engram/app/v1/session_pb.ts";
@@ -145,7 +148,7 @@ function makeFakeTokens(
   // store: userId → { envVarName → plaintext }
   const store: Record<string, Record<string, string>> = {};
   for (const [userId, token] of Object.entries(seed)) {
-    store[userId] = { [CLAUDE_OAUTH_ENV_VAR]: token };
+    store[userId] = { [USER_ENV]: token };
   }
   return {
     store,
@@ -244,6 +247,7 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
       {
         name: "claude",
         descriptor: {
+          auth: { userEnv: USER_ENV },
           models: [{ id: "opus", default: true, env: { ANTHROPIC_MODEL: "claude-opus-4-8" } }],
           effort: [],
         },

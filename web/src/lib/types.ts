@@ -120,9 +120,6 @@ export interface Principal {
   display_name: string | null;
   role: Role;
   is_admin: boolean;
-  /** Whether a Claude Code OAuth token is saved (drives create-session
-   * gating). The token itself is never returned. */
-  has_claude_token: boolean;
   /** Whether interactive sign-out is meaningful (OIDC mode only). Behind an
    * edge proxy (IAP) or in dev synthetic-admin there's no app session to
    * revoke, so the UI hides the Sign-out control. */

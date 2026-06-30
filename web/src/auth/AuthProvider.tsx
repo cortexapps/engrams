@@ -1,16 +1,16 @@
 // ADR 0051 §5 / Task 22 — AuthProvider recomposed on better-auth.
 //
-// The external interface (AuthState: principal, isAdmin, refresh) is
-// UNCHANGED — every consumer (UserChip, ProfilePanel, TokensPanel,
-// NewSessionDialog, Members, RequireAdmin, router.ts guards) keeps working.
+// The external interface (AuthState: principal, isAdmin, ability) — every
+// consumer (UserChip, ProfilePanel, NewSessionDialog, Members, RequireAdmin,
+// router.ts guards) reads from it.
 //
 // Internal recomposition:
 //   - authn + role:  authClient.useSession() — reads the better-auth session
 //     cookie (HttpOnly, same-origin). The admin plugin writes `role` onto the
 //     user object; `role === 'admin'` drives isAdmin.
-//   - has_claude_token: GET /api/v1/me/claude-token (orchestrator sealed-store
-//     route). ADR 0051 Task 28: all /api/v1 traffic now routes to the orchestrator
-//     (:8787); the vite proxy is a single catch-all and the per-path rules are gone.
+//   - Per-user harness credentials live OUTSIDE the principal now (ADR 0063):
+//     the settings page reads them via useHarnessEnv (GET /me/harness-env), so
+//     the provider no longer fetches token presence at all.
 //   - Unauthenticated path: AuthProvider renders children even when session is
 //     null (resolved-unauthenticated). The auth gate lives in the router's
 //     appLayoutRoute.beforeLoad (see router.tsx), which redirects to /login.
@@ -24,10 +24,8 @@
 //   The Principal type (lib/types.ts) mirrors the coordinator's GET /me
 //   response shape. We synthesise an equivalent object from the better-auth session
 //   so that every consumer reads `principal.email`, `principal.role`,
-//   `principal.is_admin`, `principal.has_claude_token`, `principal.display_name`,
-//   and `principal.can_sign_out` exactly as before.
+//   `principal.is_admin`, `principal.display_name`, and `principal.can_sign_out`.
 
-import { useQuery } from "@tanstack/react-query";
 import { createContext, useContext, useMemo, type ReactNode } from "react";
 import { authClient } from "@/lib/auth-client";
 import type { Principal } from "../lib/types";
@@ -43,10 +41,6 @@ export interface AuthState {
   isAdmin: boolean;
   /** CASL ability instance for the current user (ADR 0051 §6). */
   ability: AppAbility;
-  /** Re-fetch the claude-token presence flag (e.g. after saving a token
-   * flips has_claude_token). The better-auth session itself is live via
-   * authClient.useSession() and needs no manual refresh. */
-  refresh: () => void;
 }
 
 const AuthContext = createContext<AuthState | null>(null);
@@ -63,25 +57,6 @@ export function AuthContextProvider({
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
-// ---- Token presence query -----------------------------------------------
-// GET /api/v1/me/claude-token → { has_claude_token: boolean }
-// ADR 0051 Task 28: /api/v1 fully routes to the orchestrator (:8787) now;
-// the single /api Vite proxy catch-all handles it.
-async function fetchClaudeTokenPresence(): Promise<boolean> {
-  const res = await fetch("/api/v1/me/claude-token", {
-    headers: { Accept: "application/json" },
-    credentials: "include",
-  });
-  if (!res.ok) {
-    // 401 → not authenticated (session lapsed); treat as no token present
-    // rather than throwing so we don't block the auth render cycle.
-    if (res.status === 401) return false;
-    throw new Error(`/api/v1/me/claude-token → ${res.status}`);
-  }
-  const body = (await res.json()) as { has_claude_token?: boolean };
-  return body.has_claude_token === true;
-}
-
 // ---- AuthProvider --------------------------------------------------------
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -95,20 +70,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     error: sessionError,
     refetch: refetchSession,
   } = authClient.useSession();
-
-  // Claude-token presence — only fetched when the session is resolved + present.
-  const {
-    data: hasClaudeToken,
-    isLoading: tokenLoading,
-    refetch: refetchToken,
-  } = useQuery({
-    queryKey: ["me", "claude-token"],
-    queryFn: fetchClaudeTokenPresence,
-    enabled: !!session,
-    retry: 1,
-    staleTime: 60_000,
-    refetchOnWindowFocus: false,
-  });
 
   // ADR 0051 §6: derive role/id for ability BEFORE any conditional returns so
   // that useMemo is always called (Rules of Hooks — no hooks after early returns).
@@ -144,12 +105,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return <AuthContext.Provider value={null}>{children}</AuthContext.Provider>;
   }
 
-  // Session resolved but token presence query in flight — show boot screen
-  // briefly rather than flashing the app without token info.
-  if (tokenLoading) {
-    return <BootScreen />;
-  }
-
   // The admin plugin writes role as 'admin' | 'user'. We treat 'user' as 'member'
   // to match the Principal type (which uses 'member' | 'admin').
   const role = rawRole === "admin" ? "admin" : ("member" as const);
@@ -160,7 +115,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     display_name: session.user.name || null,
     role,
     is_admin: isAdmin,
-    has_claude_token: hasClaudeToken ?? false,
     // better-auth uses a session cookie — sign-out is always meaningful.
     can_sign_out: true,
     // Role is set directly by the admin plugin (not via SCIM or IdP claim
@@ -171,7 +125,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     principal,
     isAdmin,
     ability,
-    refresh: () => void refetchToken(),
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

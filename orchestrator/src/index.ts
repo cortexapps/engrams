@@ -58,7 +58,7 @@ app.use(honoLogger((message) => httpLog.info(message)));
 // Mount routes.
 app.route("/", health);
 app.route("/", authRoute);
-// ADR 0051 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/claude-token).
+// ADR 0051 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/harness-env).
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
 // Connector logos (redesign): orchestrator-owned brand marks, served for <img>.

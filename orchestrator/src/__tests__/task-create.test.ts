@@ -19,9 +19,12 @@ import {
   type HarnessCatalogClient,
   type Db,
 } from "../rpc/task-create.ts";
-import { CLAUDE_OAUTH_ENV_VAR } from "../db/user-secrets.ts";
 import type { ProfileRow, ProfileStore } from "../db/profiles.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
+
+// The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
+// the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
+const USER_ENV = "CLAUDE_CODE_OAUTH_TOKEN";
 
 const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   id: "p1",
@@ -53,6 +56,7 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
       {
         name: "claude",
         descriptor: {
+          auth: { userEnv: USER_ENV },
           models: [
             { id: "opus", default: true, env: { ANTHROPIC_MODEL: "claude-opus-4-8" } },
             { id: "sonnet", default: false, env: { ANTHROPIC_MODEL: "claude-sonnet-4-6" } },
@@ -87,9 +91,29 @@ describe("compileSessionCreateInput", () => {
 
   test("user token injected only when includeUserTokens", async () => {
     const off = await compileSessionCreateInput(profile({ includeUserTokens: false }), deps("tok"));
-    expect(off.harnessEnv?.[CLAUDE_OAUTH_ENV_VAR]).toBeUndefined();
+    expect(off.harnessEnv?.[USER_ENV]).toBeUndefined();
     const on = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"));
-    expect(on.harnessEnv?.[CLAUDE_OAUTH_ENV_VAR]).toBe("tok");
+    expect(on.harnessEnv?.[USER_ENV]).toBe("tok");
+  });
+
+  test("injects the user token under the harness's declared user_env, not a hardcoded name", async () => {
+    const customDeps: SessionCompileDeps = {
+      images: {
+        listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }),
+      } as unknown as ImagesClient,
+      connectors: { list: async () => [] },
+      harnessCatalog: {
+        listHarnesses: async () => ({
+          harnesses: [
+            { name: "claude", descriptor: { auth: { userEnv: "OPENCODE_TOKEN" }, models: [], effort: [] } },
+          ],
+        }),
+      },
+      resolveUserToken: async (envVar) => (envVar === "OPENCODE_TOKEN" ? "tok-123" : null),
+    };
+    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), customDeps);
+    expect(inp.harnessEnv?.OPENCODE_TOKEN).toBe("tok-123");
+    expect(inp.harnessEnv?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
   });
 
   test("passes the prompt through when set", async () => {

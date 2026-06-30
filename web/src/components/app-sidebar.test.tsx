@@ -35,7 +35,6 @@ test("member sees only Tasks in the rail", async () => {
         display_name: "Mem",
         role: "member",
         is_admin: false,
-        has_claude_token: true,
         can_sign_out: false,
       },
     },

@@ -22,7 +22,6 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { log as rootLog } from "../log.ts";
 import type { ProfileRow, ProfileStore } from "../db/profiles.ts";
 import type { ImagesClient } from "./profiles.ts";
-import { CLAUDE_OAUTH_ENV_VAR } from "../db/user-secrets.ts";
 import { evictOwnerCacheEntry } from "../authz/resolve.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import * as schema from "../db/schema.ts";
@@ -62,6 +61,10 @@ export interface SessionCreateInput {
 /** One harness's catalog descriptor (the bits the compiler needs): the model +
  *  effort enums map an option id → the env vars that select it (ADR 0063 §1). */
 export interface HarnessDescriptorView {
+  /** The env-var names the harness authenticates with (ADR 0063 §1): `userEnv`
+   *  is the human credential (per-user token, injected for human tasks);
+   *  `orgEnv` is the programmatic credential (B4, host-side resolved). */
+  auth?: { userEnv?: string; orgEnv?: string };
   models: Array<{ id: string; default: boolean; env: Record<string, string> }>;
   effort: Array<{ id: string; default: boolean; env: Record<string, string> }>;
 }
@@ -124,10 +127,13 @@ export async function compileSessionCreateInput(
   // Harness env, lowest → highest precedence: user token < CLI dummy env <
   // profile env_vars < model env < effort env < trigger extras. NEVER log values.
   const harness: Record<string, string> = {};
-  if (profile.includeUserTokens) {
+  // The human credential env-var name is the selected harness's declared
+  // `user_env` (ADR 0063 — no longer the hardcoded CLAUDE_CODE_OAUTH_TOKEN).
+  const userEnv = descriptor?.auth?.userEnv;
+  if (profile.includeUserTokens && userEnv) {
     try {
-      const userToken = await deps.resolveUserToken(CLAUDE_OAUTH_ENV_VAR);
-      if (userToken) harness[CLAUDE_OAUTH_ENV_VAR] = userToken;
+      const userToken = await deps.resolveUserToken(userEnv);
+      if (userToken) harness[userEnv] = userToken;
     } catch (secretErr) {
       console.warn("[task-create] user token lookup failed — booting without it", secretErr);
     }

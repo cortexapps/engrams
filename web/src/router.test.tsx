@@ -34,12 +34,10 @@ const AUTH: AuthState = {
     display_name: "Test User",
     role: "member",
     is_admin: false,
-    has_claude_token: false,
     can_sign_out: true,
   },
   isAdmin: false,
   ability: abilityFor({ id: "user-1", role: "user" }),
-  refresh: () => {},
 };
 
 function makeTestRouter(auth: AuthState | null) {
