@@ -1926,23 +1926,24 @@ mod tests {
         // Empty selection → empty mounts.
         assert!(assign_skill_slots(&catalog, &[]).unwrap().is_empty());
 
-        // Two skills → two drives at dyn_0 / dyn_1 with the catalog shas, in
-        // request order.
+        // ADR 0062: slot 0 is the harness, so skills start at dyn_1. Two skills
+        // → two drives at dyn_1 / dyn_2 with the catalog shas, in request order.
         let mounts = assign_skill_slots(&catalog, &["skills".into(), "playwright".into()]).unwrap();
         assert_eq!(mounts.len(), 2);
-        assert_eq!(mounts[0].drive_id, AuxRoDrive::slot_drive_id(0));
-        assert_eq!(mounts[0].guest_mount, AuxRoDrive::slot_guest_mount(0));
+        assert_eq!(mounts[0].drive_id, AuxRoDrive::slot_drive_id(1));
+        assert_eq!(mounts[0].guest_mount, AuxRoDrive::slot_guest_mount(1));
         assert_eq!(mounts[0].fs_type, "squashfs");
         assert_eq!(mounts[0].sha256.as_deref(), Some("sha_a"));
-        assert_eq!(mounts[1].drive_id, AuxRoDrive::slot_drive_id(1));
+        assert_eq!(mounts[1].drive_id, AuxRoDrive::slot_drive_id(2));
         assert_eq!(mounts[1].sha256.as_deref(), Some("sha_b"));
 
         // Unknown skill → 400.
         let err = assign_skill_slots(&catalog, &["nope".into()]).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
 
-        // Over the reserved-slot cap → 400 (even if every name is known).
-        let too_many: Vec<String> = (0..AuxRoDrive::RESERVED_SLOTS + 1)
+        // Over the skill-slot cap (RESERVED_SLOTS - 1, since the harness takes
+        // slot 0) → 400, even if every name is known.
+        let too_many: Vec<String> = (0..AuxRoDrive::MAX_SKILL_SLOTS + 1)
             .map(|_| "skills".to_string())
             .collect();
         let err = assign_skill_slots(&catalog, &too_many).unwrap_err();
