@@ -142,6 +142,29 @@ describe("SessionProfileEditor (create)", () => {
     expect(create.mock.calls[0][0].skills).toEqual(["playwright"]);
   });
 
+  it("adding a port includes portExposures in the create payload (ADR 0064 P4)", async () => {
+    render(<SessionProfileEditor mode="create" />);
+    fireEvent.change(screen.getByLabelText(/profile name/i), {
+      target: { value: "Dev Server Agent" },
+    });
+    openAdvanced();
+    fireEvent.change(screen.getByTestId("port-add-input"), { target: { value: "3000" } });
+    fireEvent.click(screen.getByTestId("port-add-btn"));
+    expect(screen.getByTestId("port-chip-3000")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0].portExposures).toEqual([3000]);
+  });
+
+  it("rejects an out-of-range port without adding a chip (ADR 0064 P4)", () => {
+    render(<SessionProfileEditor mode="create" />);
+    openAdvanced();
+    fireEvent.change(screen.getByTestId("port-add-input"), { target: { value: "0" } });
+    fireEvent.click(screen.getByTestId("port-add-btn"));
+    expect(screen.getByTestId("port-add-error")).toBeTruthy();
+    expect(screen.queryByTestId("port-chip-0")).toBeNull();
+  });
+
   it("renders an uploaded catalog skill as a selectable toggle (ADR 0055 P2)", () => {
     render(<SessionProfileEditor mode="create" />);
     openAdvanced();
