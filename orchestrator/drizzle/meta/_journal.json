@@ -71,6 +71,13 @@
       "when": 1782363390724,
       "tag": "0009_graceful_living_mummy",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1782788903473,
+      "tag": "0010_cheerful_bishop",
+      "breakpoints": true
     }
   ]
 }

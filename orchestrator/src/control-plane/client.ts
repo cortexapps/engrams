@@ -16,6 +16,7 @@ import { SessionService, ShellRelayService } from "../gen/engram/app/v1/session_
 import { ImageService } from "../gen/engram/app/v1/image_pb.ts";
 import { FleetService } from "../gen/engram/app/v1/fleet_pb.ts";
 import { MountCatalogService } from "../gen/engram/app/v1/mount_catalog_pb.ts";
+import { HarnessCatalogService } from "../gen/engram/app/v1/harness_pb.ts";
 import { OrgSecretService } from "../gen/engram/app/v1/org_secret_pb.ts";
 import { MintService } from "../gen/engram/app/v1/mint_pb.ts";
 import { IntegrationOpService } from "../gen/engram/app/v1/integration_op_pb.ts";
@@ -34,6 +35,9 @@ export const fleet = createClient(FleetService, controlPlaneTransport);
 
 /** MountCatalogService client — org-shared user-uploaded skill catalog (ADR 0055 P2). */
 export const mountCatalog = createClient(MountCatalogService, controlPlaneTransport);
+
+/** HarnessCatalogService client — the harness catalog (ADR 0062): list + register. */
+export const harnessCatalog = createClient(HarnessCatalogService, controlPlaneTransport);
 
 /** OrgSecretService client — admin-managed, KEK-sealed org secret store (ADR 0057). */
 export const orgSecret = createClient(OrgSecretService, controlPlaneTransport);
