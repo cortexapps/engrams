@@ -155,8 +155,11 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 build_tree "$tmp"
 cp "$here/mount.json" "$tmp/"  # ADR 0055: activate() reads this
-rm -f "$out"
-mksquashfs "$tmp" "$out" -comp zstd -all-root -noappend -no-xattrs >/dev/null
+# Reproducible content-addressed pack (ADR 0027/0035): identical content MUST
+# yield an identical sha across builds — see deploy/bundles/_pack.sh.
+# shellcheck source=../_pack.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../_pack.sh"
+pack_squashfs "$tmp" "$out"
 sha="$(sha256sum "$out" | cut -d' ' -f1)"
 echo "built $out"
 echo "sha256: $sha"

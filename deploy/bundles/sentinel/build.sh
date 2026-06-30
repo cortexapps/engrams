@@ -41,10 +41,11 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 stage_tree "$tmp"
 
-rm -f "$out"
-# -all-root: root-owned in the image (the guest mounts RO as root).
-# -no-xattrs for a stable digest.
-mksquashfs "$tmp" "$out" -comp zstd -all-root -noappend -no-xattrs >/dev/null
+# Reproducible content-addressed pack (ADR 0027/0035): identical content MUST
+# yield an identical sha across builds — see deploy/bundles/_pack.sh.
+# shellcheck source=../_pack.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../_pack.sh"
+pack_squashfs "$tmp" "$out"
 
 sha="$(sha256sum "$out" | cut -d' ' -f1)"
 echo "built $out"
