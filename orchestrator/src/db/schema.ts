@@ -140,6 +140,10 @@ export const profile = pgTable("profile", {
   // its session with this. At most one active default; the store clears the
   // prior when one is set.
   isDefault: boolean("is_default").notNull().default(false),
+  // ADR 0064: guest ports auto-exposed (private) for every session from this
+  // profile. The orchestrator mints one private port_exposure per declared port
+  // at session create (best-effort). Empty = no auto-exposed ports.
+  portExposures: jsonb("port_exposures").$type<number[]>().notNull().default([]),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at")
     .notNull()

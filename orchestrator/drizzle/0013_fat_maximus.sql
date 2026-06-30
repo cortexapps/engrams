@@ -1,0 +1,1 @@
+ALTER TABLE "profile" ADD COLUMN "port_exposures" jsonb DEFAULT '[]'::jsonb NOT NULL;

@@ -21,6 +21,7 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import { log as rootLog } from "../log.ts";
 import type { ProfileRow, ProfileStore } from "../db/profiles.ts";
+import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
 import type { ImagesClient } from "./profiles.ts";
 import { evictOwnerCacheEntry } from "../authz/resolve.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
@@ -231,6 +232,9 @@ export interface CreateTaskDeps {
   /** Resolve `envVar` for the OWNER (e.g. the Claude OAuth token), or null. */
   secrets: { get(userId: string, envVar: string): Promise<string | null> };
   db: Db;
+  /** ADR 0064: port-exposure store for auto-minting `profile.portExposures`.
+   *  Defaults to a Drizzle store over `db` when omitted. */
+  portExposures?: PortExposureStore;
 }
 
 export interface CreateTaskParams {
@@ -326,6 +330,29 @@ export async function createTaskWithSession(
       );
     }
     throw err;
+  }
+
+  // ADR 0064: auto-mint one private port-exposure per port the profile declares.
+  // Best-effort — an exposure failure must NOT fail the task (the session is
+  // already live + persisted); log and continue so the rest still land.
+  if (profile.portExposures.length > 0) {
+    const store = deps.portExposures ?? makePortExposureStore(deps.db);
+    for (const port of profile.portExposures) {
+      try {
+        await store.createOrGet({
+          sessionId: created.sessionId,
+          port,
+          label: "",
+          ownerUserId: params.ownerUserId,
+          visibility: "private",
+        });
+      } catch (e) {
+        log.warn(
+          { sessionId: created.sessionId, port, err: e },
+          "task-create: auto-expose port failed (continuing)",
+        );
+      }
+    }
   }
 
   // A just-created session must not be served a stale null from the owner

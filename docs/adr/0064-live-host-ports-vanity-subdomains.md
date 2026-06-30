@@ -144,7 +144,13 @@ WebSocket-upgrade, and gRPC all pass through transparently:
   (GCP Certificate Manager + DNS auth — google-managed certs don't do wildcards), and the
   wildcard DNS record. Drafted as a reviewable PR; a human drives the prod DNS/cert apply.
 - **P3-validate:** live end-to-end against the deployed stack, then flip this ADR to Accepted.
-- **P4 (optional):** declarative `profile.portExposures`.
+- **P4 (this change, backend):** declarative `profile.portExposures` — a `repeated uint32`
+  on the Profile message / `port_exposures` jsonb column (mirroring `skills`), settable via the
+  ProfileService Connect API. At session-create the orchestrator auto-mints one **private**
+  port-exposure per declared port (best-effort: a mint failure logs + continues, never fails
+  the task), via the same `PortExposureStore.createOrGet` the imperative CRUD route uses. No
+  per-port label/visibility in the declarative form (label = "", visibility = private). The web
+  editor control for this field is a separate follow-up (backend-only here).
 
 > Pitfall (P1 CI, fixed): the P1 proto change touched the TS-generated `session.proto` but
 > the Rust-only P1 commit didn't regenerate/commit the checked-in TS bindings → the `buf`
