@@ -79,15 +79,27 @@ describes a harness. The proto `HarnessDescriptor` projection (for the orchestra
 `exec`/`args` (they are coordinator-only) and carries `name`/`label`/`auth`/`models`/`effort`;
 all `env` values are **config, never secrets**, so they are safe on the wire.
 
-### 2. Profiles carry a default harness/model/effort
+### 2. Profiles carry a harness + default model/effort
 
-The profile gains three nullable columns: `harness`, `model`, `effort` (null ⇒ inherit the
-deployment-default harness / the descriptor's `default_model`/`default_effort`). The orchestrator
-validates them against the catalog at create/update time (`assertHarnessValid`, mirroring the
-existing `assertImageEnabled`/`assertSkillsValid`): the harness must exist in the catalog and the
-model/effort ids must exist in that harness's descriptor enum. Surfaced member-visible on the
-`Profile` proto and rendered as dropdowns in the profile editor (a new `useHarnessCatalog()` hook
-mirrors `useEnabledImages()`).
+The profile gains a **required** `harness` column + nullable `model`/`effort`. **A profile always
+names a concrete harness** — the original "null `harness` ⇒ inherit the deployment-default
+harness" semantics were **superseded** (a real dropdown of all harnesses, built-in ∪ custom, is
+clearer than a magic inherit value; existing rows were backfilled to `claude` and the column made
+NOT NULL — drizzle `0011`). null `model`/`effort` ⇒ the descriptor's `default_model`/`default_effort`.
+The orchestrator validates at create/update (`assertHarnessValid`, mirroring
+`assertImageEnabled`/`assertSkillsValid`): the harness must exist in the catalog and a set
+model/effort id must exist in that harness's descriptor enum. Surfaced member-visible on the
+`Profile` proto and rendered as dropdowns in the profile editor (a `useHarnessCatalog()` hook
+mirrors `useEnabledImages()`); the editor defaults a new profile to the first registered harness.
+
+**Web surface (this was a shipped correctness bug).** The dashboard reads the catalog through the
+orchestrator, which fronts all web traffic (ADR 0051). `HarnessCatalogService` was omitted from the
+orchestrator passthrough `SURFACE`, so `useHarnessCatalog` silently returned nothing — the
+harness/model/effort selectors in *both* the profile editor and the launch screen were dead (empty
+dropdowns; the launch override control rendered nothing). The read methods (`ListHarnesses`/
+`GetHarness`) are now forwarded member-readable (the catalog is config, not secrets — a new
+`Harness` ability subject). The write methods (`RegisterHarness`/`DeleteHarness`) stay
+orchestrator-internal until the admin Harnesses tab forwards them admin-only.
 
 ### 3. Session-create override
 
@@ -146,6 +158,10 @@ removed, since there is a model field now). The coordinator stays agnostic: one 
   killed the `CLAUDE_CODE_OAUTH_TOKEN` concept). *(#488, `022f4c55`)*
 - [x] **B4/B5** — model/effort→env merge + precedence + programmatic `org_env` inject (strict
   by run type). *(#490, `dc0d17ea`)*
+- [x] **UI completion (PR A)** — expose `HarnessCatalogService` (read) through the orchestrator
+  passthrough so the selectors actually populate; profile harness is a concrete dropdown (no
+  "inherit"); Model/Effort enabled; launch override renders. Backfill migration `0011`.
+- [ ] **Admin Harnesses tab (PR B)** — register/delete + per-harness org-secret config. *(§6)*
 
 The B-stack was authored on ADR 0062's pre-A5 A-stack, then rebased onto `main` after ADR 0062
 landed (incl. the A5 built-in-harness redesign) — B1/B2 validate against `ListHarnesses`
