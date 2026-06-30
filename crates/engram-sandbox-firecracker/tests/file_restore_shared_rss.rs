@@ -121,9 +121,8 @@ async fn file_backend_siblings_share_clean_pages() {
         aux_ro_drives: Vec::new(),
     };
     let source = backend.create(spec).await.expect("create");
-    // Boot + 64 MiB urandom fill + at least one read pass — poll the source's
-    // own RSS gauge until the blob is resident instead of sleeping a fixed 8s.
-    wait_blob_resident(work.path(), &source.to_string(), Duration::from_secs(30)).await;
+    // Boot + 64 MiB urandom fill + at least one read pass.
+    tokio::time::sleep(Duration::from_secs(8)).await;
     // If the guest didn't survive to be snapshotted, the FC API socket
     // is gone (panic=1 reboot=k → KVM reset → FC exits) and we'd get a
     // bare ECONNREFUSED. Surface the guest's own panic reason from
@@ -171,12 +170,8 @@ async fn file_backend_siblings_share_clean_pages() {
         vms.push(id);
     }
 
-    // Let each sibling's read loop sweep the blob a few times so the common
-    // working set is faulted in EVERYWHERE and the shared-page accounting
-    // (Pss << Rss) stabilizes. Polling "all RSS > blob" returns too early: a
-    // sibling crosses the threshold before all three have faulted the SAME
-    // pages, so the strict per-sibling sharing assertion below would see
-    // pre-stabilization numbers. No cheap host signal for "sharing settled".
+    // Let each sibling's read loop sweep the blob a few times so the
+    // common working set is faulted in everywhere.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // ---- 4. Measure ----
@@ -283,7 +278,7 @@ async fn file_backend_base_create_shares_residency_memfile() {
         aux_ro_drives: Vec::new(),
     };
     let source = backend.create(spec).await.expect("create");
-    wait_blob_resident(work.path(), &source.to_string(), Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
     let metadata = match backend.snapshot(source).await {
         Ok(m) => m,
         Err(e) => {
@@ -349,8 +344,6 @@ async fn file_backend_base_create_shares_residency_memfile() {
         latencies_ms.push(ms);
         vms.push(id);
     }
-    // Fixed settle so sharing (Pss << Rss) stabilizes before the strict
-    // assertion — see the note in file_backend_siblings_share_clean_pages.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // ---- Measure density + latency ----
@@ -477,7 +470,7 @@ async fn substrate_base_create_density_and_latency_parity() {
         aux_ro_drives: Vec::new(),
     };
     let source = backend.create(spec).await.expect("create");
-    wait_blob_resident(work.path(), &source.to_string(), Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
     let metadata = match backend.snapshot(source).await {
         Ok(m) => m,
         Err(e) => {
@@ -571,8 +564,8 @@ async fn substrate_base_create_density_and_latency_parity() {
         // across the *aggregate* working set, so the post-loop guard below is on
         // Σrss (tolerates one straggler) rather than per-sibling. A real
         // fleet-wide "workload never ran" still trips it; see there.
-        for round in 0..60 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        for round in 0..12 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
             let rss: Vec<u64> = vms
                 .iter()
                 .map(|id| smaps_rollup(fc_pid_for(work_path, &id.to_string())).rss_kb)
@@ -782,11 +775,10 @@ fn dump_fc_logs(dir: &Path) {
 }
 
 /// Find the firecracker process whose cmdline mentions this sandbox's
-/// jail dir (the API socket path embeds the sandbox id). `None` if no live
-/// process matches — e.g. the guest panicked on boot and FC exited.
-fn fc_pid_opt(work_dir: &Path, sandbox_id: &str) -> Option<u32> {
+/// jail dir (the API socket path embeds the sandbox id).
+fn fc_pid_for(work_dir: &Path, sandbox_id: &str) -> u32 {
     let needle = work_dir.join(sandbox_id).to_string_lossy().into_owned();
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+    for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
@@ -794,44 +786,10 @@ fn fc_pid_opt(work_dir: &Path, sandbox_id: &str) -> Option<u32> {
             continue;
         };
         if String::from_utf8_lossy(&cmdline).contains(&needle) {
-            return Some(pid);
+            return pid;
         }
     }
-    None
-}
-
-/// Strict variant for the measurement code: a missing process there is a
-/// real failure, not a transient readiness state.
-fn fc_pid_for(work_dir: &Path, sandbox_id: &str) -> u32 {
-    fc_pid_opt(work_dir, sandbox_id)
-        .unwrap_or_else(|| panic!("no firecracker process found for sandbox {sandbox_id}"))
-}
-
-/// Non-panicking RSS read for the readiness polls (the process may not exist
-/// yet / any more). The measurement path uses `smaps_rollup` instead, which
-/// panics on a missing field — there, a missing gauge is a real bug.
-fn rss_kb_opt(pid: u32) -> Option<u64> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
-    text.lines()
-        .find(|l| l.starts_with("Rss:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse().ok())
-}
-
-/// Wait until the source guest's blob workload is resident — its FC process
-/// RSS has crossed the blob size, i.e. tmpfs mounted + 64 MiB blob filled +
-/// faulted into guest RAM. This is the exact gauge the post-restore siblings
-/// are asserted on, so it's the honest "ready to snapshot" signal; we pay the
-/// real (sub-10s) boot+fill latency instead of a fixed 8s. On a dead guest
-/// the poll simply times out and the caller's `snapshot()` surfaces the
-/// console via `dump_fc_logs`.
-async fn wait_blob_resident(work: &Path, id: &str, timeout: Duration) {
-    common::poll_until(timeout, Duration::from_millis(250), || {
-        fc_pid_opt(work, id)
-            .and_then(rss_kb_opt)
-            .is_some_and(|rss| rss > BLOB_MIB * 1024)
-    })
-    .await;
+    panic!("no firecracker process found for sandbox {sandbox_id}");
 }
 
 struct SmapsRollup {
