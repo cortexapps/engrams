@@ -130,8 +130,20 @@ WebSocket-upgrade, and gRPC all pass through transparently:
 - **P2c (this change):** web "Expose port" UI — a PORTS tab on the session detail page
   (`usePorts` React-Query hooks over the REST CRUD + a `PortsPanel`: expose a port, list
   exposures with their URL, copy the (share) link, revoke).
-- **P3:** engrams-internal wildcard DNS + wildcard cert (GCP Certificate Manager + DNS auth)
-  + ingress, behind IAP; prod validation.
+- **P3a (this change, OSS):** the generic deploy *mechanism* — the helm chart wires
+  `ORCHESTRATOR_PREVIEW_BASE_DOMAIN` from a new `orchestrator.preview.baseDomain` value
+  (emitted only when set, inert by default, mirroring the IAP/OIDC knobs). No ingress-template
+  change is needed: the chart already ranges over values-supplied `web.ingress.hosts` with a
+  per-path `service:` retarget (the Slack-webhook mechanism), so a `*.<baseDomain>` host →
+  orchestrator is purely a values concern. The OSS/internal line: the chart hardcodes env
+  keys (so the env wiring + a documented value belong here), while everything naming a
+  specific domain/zone/cert/IAP-backend is company config → P3b.
+- **P3b (engrams-internal):** the company-specific resources/values — set
+  `orchestrator.preview.baseDomain: preview.engrams.cortex.io`, add the `*.preview.…` host to
+  `web.ingress.hosts` (path `/` → orchestrator service, IAP-gated), the wildcard TLS cert
+  (GCP Certificate Manager + DNS auth — google-managed certs don't do wildcards), and the
+  wildcard DNS record. Drafted as a reviewable PR; a human drives the prod DNS/cert apply.
+- **P3-validate:** live end-to-end against the deployed stack, then flip this ADR to Accepted.
 - **P4 (optional):** declarative `profile.portExposures`.
 
 > Pitfall (P1 CI, fixed): the P1 proto change touched the TS-generated `session.proto` but
