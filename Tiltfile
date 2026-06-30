@@ -194,9 +194,9 @@ dc_resource('jaeger',
 # has to land in .env before the parse-time read, so it can't be a
 # runtime resource.)
 #
-# Built-in harnesses are baked into the image (ADR 0021); `just
-# bake-demo` builds the Claude harness from source, publishes it to the
-# local registry, and bakes deploy/demo-claude/ against it.
+# ADR 0062: the image bakes NO harness — the built-in `claude` rides the
+# fleet `current_bundles` stamp (`just bundles-squashfs` / `bundles-vz`) and
+# is selected per session. `just bake-demo` just bakes deploy/demo/.
 # ----------------------------------------------------------------
 
 # Seed the cold-tier blob bucket in fake-gcs-server. Idempotent: the

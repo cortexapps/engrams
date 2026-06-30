@@ -1092,8 +1092,8 @@ mod tests {
         // bytes. The result drops the tag and pins by digest.
         let d = Digest256(FRESH.to_string());
         assert_eq!(
-            digest_pinned_uri("ghcr.io/cortexapps/engrams/demo-claude:latest", &d),
-            format!("ghcr.io/cortexapps/engrams/demo-claude@{FRESH}"),
+            digest_pinned_uri("ghcr.io/cortexapps/engrams/demo:latest", &d),
+            format!("ghcr.io/cortexapps/engrams/demo@{FRESH}"),
         );
     }
 
@@ -1101,8 +1101,8 @@ mod tests {
     fn digest_pinned_uri_adds_digest_to_untagged() {
         let d = Digest256(FRESH.to_string());
         assert_eq!(
-            digest_pinned_uri("ghcr.io/cortexapps/engrams/demo-claude", &d),
-            format!("ghcr.io/cortexapps/engrams/demo-claude@{FRESH}"),
+            digest_pinned_uri("ghcr.io/cortexapps/engrams/demo", &d),
+            format!("ghcr.io/cortexapps/engrams/demo@{FRESH}"),
         );
     }
 
@@ -1112,11 +1112,8 @@ mod tests {
         // digest (idempotent for the common no-op refresh case).
         let d = Digest256(FRESH.to_string());
         assert_eq!(
-            digest_pinned_uri(
-                &format!("ghcr.io/cortexapps/engrams/demo-claude@{PREV}"),
-                &d
-            ),
-            format!("ghcr.io/cortexapps/engrams/demo-claude@{FRESH}"),
+            digest_pinned_uri(&format!("ghcr.io/cortexapps/engrams/demo@{PREV}"), &d),
+            format!("ghcr.io/cortexapps/engrams/demo@{FRESH}"),
         );
     }
 

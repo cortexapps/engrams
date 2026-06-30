@@ -112,7 +112,7 @@ needs.
 |-----------------------|---------------------------------------------------------|
 | `dev`                 | Full stack via Tilt (run in tmux on the VM). Backend auto-detected. |
 | `dev-down`            | `tilt down` — stop the Tilt-managed processes + compose services. |
-| `bake-demo`           | Build the Claude harness + bake `deploy/demo-claude/` → local registry. |
+| `bake-demo`           | Bake `deploy/demo/` → local registry (harness-free; ADR 0062 — the `claude` harness rides the bundle stamp). |
 | `pull-kernel`         | Fetch the kernel this host's backend needs. |
 | `integration-test`    | Bake → enable → cascade → create session → delete. Run after `just dev`. |
 | `integration-session` | Like integration-test but keeps the session alive. Idempotent at HEAD. |

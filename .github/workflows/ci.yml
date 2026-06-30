@@ -105,15 +105,13 @@ env:
   RUSTFLAGS: -D warnings
   SQLX_OFFLINE: "true"
 
-  # ADR 0021 P0: single source of truth for the built-in claude
-  # harness artifact's tag. Used by:
+  # Single source of truth for the built-in claude harness artifact's
+  # tag (ADR 0062 — the artifact rides the host bundle stamp, not the
+  # image). Used by:
   #   - `bake-harness-claude-artifact` (publishes to GHCR on
   #     push-to-main; uploads as workflow artifact on every run)
-  #   - `test-e2e-stack` (downloads the artifact, re-publishes to
-  #     localhost:5001, points the baker at it via env)
-  # Bump in lockstep with `[harness] version = "..."` in
-  # `deploy/demo-claude/engram.toml` so the catalog override
-  # resolves to a tag the local registry actually serves.
+  #   - `test-e2e-stack` (downloads the artifact, unpacks it into
+  #     ENGRAM_HARNESS_CLAUDE_TREE for the bundle stamp)
   HARNESS_VERSION: v0.1.0
   HARNESS_PLATFORM: linux-x86_64
 
@@ -981,9 +979,9 @@ jobs:
       # True-e2e tests (engram-host-agent crate): real bake + real
       # FC microVM + PooledBackend + real proxy + (for harness)
       # real Claude CLI + real api.anthropic.com 401 round-trip.
-      # Resurrected for ADR 0021 P1.6 against the baked-in harness
-      # model — the harness pack travels in /opt/engram/harness/
-      # inside the rootfs, the CA via `InstallHostCa` vsock RPC.
+      # ADR 0062: the harness is a per-session bundle mounted on dyn_0
+      # (no longer baked into the rootfs); the CA via `InstallHostCa`
+      # vsock RPC.
       - name: True-e2e tests (root — e2e_shell, e2e_harness)
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
@@ -1010,17 +1008,16 @@ jobs:
   # a PR that bumps `HARNESS_VERSION` had no way to publish the new
   # tag before its own e2e_stack lane consumed it.
   #
-  # Two consumers:
-  #   - **`bake-demo-image` matrix + production** (push-to-main only):
-  #     pull from `ghcr.io/cortexapps/engrams/harness-claude:<version>-
-  #     <platform>`. This job publishes that tag on push-to-main and
-  #     skips the push on PRs.
+  # ADR 0062: the harness rides the fleet `current_bundles` stamp, NOT
+  # the image. Two consumers of this artifact:
+  #   - **production hosts** (push-to-main only): node-assets stages
+  #     `ghcr.io/cortexapps/engrams/harness-claude:<version>-<platform>`
+  #     into each host's bundle stamp. This job publishes that tag on
+  #     push-to-main and skips the push on PRs.
   #   - **`test-e2e-stack` (every PR + push)**: download the workflow
-  #     artifact this job uploads, re-publish to localhost:5001, point
-  #     the baker at it via `ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO`. The
-  #     catalog override (`engram-image-builder::BuiltinCatalog::
-  #     with_overrides_from_env`) makes the in-baker resolution swap
-  #     transparently — same tag suffix, different repo.
+  #     artifact this job uploads, unpack it into ENGRAM_HARNESS_CLAUDE_TREE,
+  #     and `just bundles-squashfs` packs it into the host stamp so the
+  #     coordinator resolves the built-in `claude` from `current_bundles`.
   #
   # Why a workflow artifact (not "PR pushes to a per-PR GHCR tag"):
   # workflow artifacts auto-expire, never write to a shared registry
@@ -1140,8 +1137,8 @@ jobs:
           # compression default.
 
       # Push-to-main only: also publish to the production GHCR tag
-      # so downstream bakes (bake-demo-image matrix, prod-side
-      # demo-claude consumers, future ones) see the same artifact.
+      # so production hosts (node-assets stages it into the bundle
+      # stamp) and future consumers see the same artifact.
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
@@ -1190,53 +1187,31 @@ jobs:
   # publish path. Push-to-main only (PRs don't need to push; the
   # e2e lane bakes its own image locally for test isolation).
   #
-  # Matrix over two variants (ADR 0021):
-  #   - `demo`         — harness-neutral starter image. Sessions
-  #                       default to `SessionMode::Agent` but the image
-  #                       has no `[harness]` block, so `resolve_harness`
-  #                       returns None and the session boots as a
-  #                       dev VM (empty-argv readiness probe). Useful
-  #                       as a base for custom-harness authors who
-  #                       bring their own binary, and for shell-only
-  #                       workloads.
-  #   - `demo-claude`  — same OS + tooling, plus `[harness] builtin
-  #                       = "claude"` in `engram.toml`. The baker
-  #                       pulls `ghcr.io/cortexapps/engrams/harness-
-  #                       claude:<version>-linux-x86_64` (published by
-  #                       the `bake-harness-claude-artifact` job above
-  #                       on push-to-main) and injects it into the
-  #                       rootfs at `/opt/engram/harness/`. Prod
-  #                       deploys point here for the default
-  #                       Claude-backed session.
+  # ADR 0062: ONE `demo` image — the workspace rootfs (debian + git +
+  # ttyd) with NO harness baked in. The harness is a per-session
+  # selection: the built-in `claude` rides the fleet `current_bundles`
+  # stamp (staged onto hosts by node-assets from the
+  # `bake-harness-claude-artifact` job), not injected into this image.
+  # Prod points here for the default session and selects
+  # `harness = "claude"` per session.
   #
-  # Each variant publishes its own image:
-  #   `ghcr.io/cortexapps/engrams/<variant>:warm-<sha>` (plus the
-  #   `:warm-<short>`, `:main`, `:latest` aliases).
+  # Publishes `ghcr.io/cortexapps/engrams/demo:warm-<sha>` (plus the
+  # `:warm-<short>`, `:main`, `:latest` aliases). Kept as a 1-entry
+  # matrix so a second image variant is a one-line addition.
   # ------------------------------------------------------------------
   bake-demo-image:
     name: bake ${{ matrix.variant }} image
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-    # Order AFTER the harness artifact is republished. `demo-claude`
-    # pulls `harness-claude:<version>-linux-x86_64` from GHCR at bake
-    # time, and that tag is version-pinned + overwritten in place — so
-    # without this dependency the two jobs race and demo-claude can bake
-    # the PREVIOUS harness binary. `bake-harness-claude-artifact` has no
-    # job-level `if`, so it runs (and this `needs:` resolves) on every
-    # event this job fires for (push-to-main / workflow_dispatch); on PRs
-    # this job is skipped by the `if:` above regardless.
-    needs: bake-harness-claude-artifact
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     permissions:
       contents: read
-      # `packages: write` is needed for the push; `packages: read`
-      # is needed because the `demo-claude` bake pulls the
-      # harness-claude artifact from GHCR. `write` implies `read`.
+      # `packages: write` for the GHCR push (`write` implies `read`).
       packages: write
     strategy:
       fail-fast: false
       matrix:
-        variant: [demo, demo-claude]
+        variant: [demo]
     steps:
       - uses: actions/checkout@v6
 
@@ -1273,10 +1248,10 @@ jobs:
           # binaries (engram-cli + others) AND musl-target release
           # agentd. The release+musl dep graph is sizeable and very
           # stable across commits — the shared cache saves ~1-2min
-          # on whichever job runs second. Both matrix legs share the
-          # same key because their cargo build inputs are identical
-          # (the demo-claude variant differs only in `engram.toml`,
-          # which engram-cli reads at bake time — not a compile input).
+          # on whichever job runs second. Shares the key with
+          # artifacts-e2e-stack because their cargo build inputs are
+          # identical (engram-cli reads the image's engram.toml at bake
+          # time — not a compile input).
           shared-key: release-musl-bake
 
       - name: Build engram-cli + static-musl agentd
@@ -1326,8 +1301,7 @@ jobs:
         env:
           # engram-cli's tracing subscriber defaults to `warn`. Bump
           # to `info` for the image-builder crate so the bake log
-          # surfaces the chunked-rootfs push progress AND (for
-          # demo-claude) the harness-artifact pull from GHCR.
+          # surfaces the chunked-rootfs push progress.
           RUST_LOG: info,engram_image_builder=info,engram_oci=info
           PUSH_URI: ${{ steps.tags.outputs.primary }}
           VARIANT: ${{ matrix.variant }}
@@ -1477,12 +1451,11 @@ jobs:
   # ------------------------------------------------------------------
   # True end-to-end against the prod-shape stack. Brings up postgres
   # + fake-gcs + local registry + real coord + real host-agent + real
-  # Firecracker. The `demo-claude` bake pulls its `harness-claude`
-  # artifact from the **local registry** (localhost:5001) which this
-  # lane populates from the workflow artifact uploaded by
-  # `bake-harness-claude-artifact`. The catalog override
-  # (`ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO`) makes the in-baker
-  # resolution swap transparently — same tag suffix, different repo.
+  # Firecracker. ADR 0062: the `demo` image bakes NO harness — the
+  # built-in `claude` harness's tree is downloaded from the
+  # `bake-harness-claude-artifact` workflow artifact, packed into the
+  # host `current_bundles` stamp (ENGRAM_HARNESS_CLAUDE_TREE +
+  # `just bundles-squashfs`), and resolved from there per session.
   # Runs the three flows in `e2e_stack.rs`.
   #
   # DAG dep on the cheap gates only (lint, test-linux, web,
@@ -1789,15 +1762,6 @@ jobs:
           echo "    baked image: $IMAGE_URI"
           echo "ENGRAM_E2E_IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
 
-      # ADR 0021 P1.5 retired `engram-cli harness add` and the
-      # entire `harness_packs` registry. The Claude harness now
-      # rides inside the baked image at /opt/engram/harness/ — the
-      # `integration-bake-demo.sh` step above baked `demo-claude/`
-      # which pulls the published harness-claude artifact from GHCR
-      # at bake time and injects it into the rootfs. No separate
-      # registration step is needed; the harness contract lives in
-      # `manifest.toml` and coord reads it from there.
-
       - name: Run e2e_stack tests
         env:
           # ADR 0051 Drip E: the coordinator's web-facing REST surface is
@@ -1808,8 +1772,8 @@ jobs:
           ENGRAM_E2E_GRPC_ADDR: http://127.0.0.1:50061
           ENGRAM_E2E_GRPC_TOKEN: dev-app-grpc-token
           # ENGRAM_E2E_IMAGE_URI set via $GITHUB_ENV in the bake step;
-          # points at the just-baked `demo-claude` image whose
-          # manifest.toml carries the resolved Claude harness contract.
+          # points at the just-baked `demo` image (harness-free; ADR 0062 —
+          # the `claude` harness rides the host `current_bundles` stamp).
           #
           # Blacksmith's kernel ships NBD built-in (CONFIG_BLK_DEV_NBD=y),
           # so the Tiltfile's `ls /dev/nbd*` discovery wires

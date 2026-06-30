@@ -48,11 +48,11 @@ in-VM `claude` process picks it up.
 /dev-vm run just bake-demo
 ```
 
-`bake-demo` cross-compiles `engram-agentd` + `engram-harness-claude` for
-the guest arch, downloads the matching `claude` CLI, publishes the
-harness artifact to the local registry, and bakes `deploy/demo-claude/`
-(the Claude harness baked into the rootfs at `/opt/engram/harness/`,
-ADR 0021) → `localhost:5001/demo-claude:warm-1`.
+`bake-demo` cross-compiles `engram-agentd` for the guest arch and bakes
+`deploy/demo/` → `localhost:5001/demo:warm-1`. ADR 0062: the image bakes
+NO harness — the built-in `claude` harness rides the fleet
+`current_bundles` stamp (staged by `just dev`/`just bundles-squashfs`)
+and mounts on `dyn_0`; a session selects it with `--harness claude`.
 
 ## Run the coordinator
 
@@ -62,17 +62,18 @@ ADR 0021) → `localhost:5001/demo-claude:warm-1`.
 ```
 
 Notes:
-- The Claude harness is baked into the image (ADR 0021) — there's no
-  `ENGRAM_DEV_AUTO_AGENT` flag and the coord needs no `ANTHROPIC_API_KEY`
-  at startup. Supply the key per session (the web form's secrets, or
-  `secrets.ANTHROPIC_API_KEY` on session create).
+- ADR 0062: the harness is a per-session selection (the built-in `claude`
+  rides the host `current_bundles` stamp), not baked into the image — the
+  coord needs no `ANTHROPIC_API_KEY` at startup. Supply the key per session
+  (the web form's secrets, or `harness_env.ANTHROPIC_API_KEY` on create).
 - Sessions take the chunked-OCI cold path; hosts prefetch chunks into
   local NVMe via the heartbeat-driven readiness loop before sessions land.
 
 ## Drive the demo
 
 ```
-SID=$(engram session create --image localhost:5001/demo-claude:warm-1 \
+SID=$(engram session create --image localhost:5001/demo:warm-1 \
+        --harness claude \
         --prompt "list /workspace and tell me what's there")
 
 # Watch the conversation live (the same SSE stream a Slack bot
