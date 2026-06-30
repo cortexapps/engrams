@@ -24,6 +24,7 @@ pub mod error;
 pub mod evac_resumer;
 pub mod evacuation;
 pub mod grpc_app;
+pub mod harness_catalog;
 pub mod harness_pack;
 pub mod harness_paths;
 pub mod host_registry;

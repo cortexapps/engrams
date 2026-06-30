@@ -9,11 +9,31 @@ package engram.app.v1;
 // derive the harness's env contract (formerly hardcoded to Claude). The harness
 // is chosen per session, not baked into the image.
 //
-// Registration (RegisterHarness) + soft-delete land with the catalog
-// implementation (ADR 0062 A3); this file defines the read surface B1 consumes
-// and the descriptor messages it shares.
+// Registration is an admin op: the coordinator pulls the OCI artifact, extracts
+// its tree, validates its harness.toml, upserts the catalog row, and re-packs
+// the single catalog squashfs (all live harnesses) that mounts on dyn_0.
 service HarnessCatalogService {
+  // Register (upsert by name) a harness from an OCI artifact reference. The
+  // coordinator pulls + validates + re-packs synchronously and returns the row.
+  rpc RegisterHarness(RegisterHarnessRequest) returns (RegisterHarnessResponse);
   rpc ListHarnesses(ListHarnessesRequest) returns (ListHarnessesResponse);
+  rpc GetHarness(GetHarnessRequest) returns (GetHarnessResponse);
+  rpc DeleteHarness(DeleteHarnessRequest) returns (DeleteHarnessResponse);
+}
+
+message RegisterHarnessRequest {
+  // Logical harness name (a single safe path segment; becomes the catalog
+  // subtree, the argv path component, and the wire value). UNIQUE org-wide.
+  string name = 1;
+  // The OCI artifact reference to pull (the harness tree + its harness.toml).
+  // Built-in and custom harnesses are uniform — both are OCI artifacts.
+  string oci_ref = 2;
+  // Registering principal (attribution / GC ownership only; org-shared catalog).
+  string owner = 3;
+}
+
+message RegisterHarnessResponse {
+  HarnessSummary harness = 1;
 }
 
 message ListHarnessesRequest {}
@@ -63,4 +83,24 @@ message HarnessOption {
   bool default = 3;
   // Env vars this option sets, merged into the session's harness env.
   map<string, string> env = 4;
+}
+
+message GetHarnessRequest {
+  // By logical name.
+  string name = 1;
+}
+
+message GetHarnessResponse {
+  HarnessSummary harness = 1;
+}
+
+message DeleteHarnessRequest {
+  // By logical name (soft-delete → the bundle GC reclaims unused generations).
+  string name = 1;
+}
+
+message DeleteHarnessResponse {
+  // Whether a live row was deleted (idempotent: deleting an absent harness is
+  // false, not an error).
+  bool deleted = 1;
 }

@@ -5,6 +5,24 @@
 import { HarnessCatalogService } from "./harness_pb";
 
 /**
+ * Register (upsert by name) a harness from an OCI artifact reference. The
+ * coordinator pulls + validates + re-packs synchronously and returns the row.
+ *
+ * @generated from rpc engram.app.v1.HarnessCatalogService.RegisterHarness
+ */
+export const registerHarness = HarnessCatalogService.method.registerHarness;
+
+/**
  * @generated from rpc engram.app.v1.HarnessCatalogService.ListHarnesses
  */
 export const listHarnesses = HarnessCatalogService.method.listHarnesses;
+
+/**
+ * @generated from rpc engram.app.v1.HarnessCatalogService.GetHarness
+ */
+export const getHarness = HarnessCatalogService.method.getHarness;
+
+/**
+ * @generated from rpc engram.app.v1.HarnessCatalogService.DeleteHarness
+ */
+export const deleteHarness = HarnessCatalogService.method.deleteHarness;
