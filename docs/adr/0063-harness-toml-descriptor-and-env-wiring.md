@@ -72,9 +72,12 @@ verbatim). `org_env`/`user_env` stay single strings (a credential is one var).
 
 Parsed by a new `engram-core::types::harness::HarnessDescriptor` (`HarnessAuth`, `HarnessOption`,
 helpers `model(id)`/`effort(id)`/`default_model()`/`default_effort()`, env-name validation
-against `^[A-Za-z_][A-Za-z0-9_]*$`, `deny_unknown_fields`). Projected onto the catalog RPC as a
-proto `HarnessDescriptor` — `env` values are **config, never secrets**, so they are safe on the
-wire.
+against `^[A-Za-z_][A-Za-z0-9_]*$`, `deny_unknown_fields`). `harness.toml` *also* carries the
+coordinator-internal **launch contract** — `exec` (the entry path within the harness's catalog
+subtree, default `harness`) and `args` (ADR 0062 §5) — so a single descriptor file fully
+describes a harness. The proto `HarnessDescriptor` projection (for the orchestrator/web) omits
+`exec`/`args` (they are coordinator-only) and carries `name`/`label`/`auth`/`models`/`effort`;
+all `env` values are **config, never secrets**, so they are safe on the wire.
 
 ### 2. Profiles carry a default harness/model/effort
 
