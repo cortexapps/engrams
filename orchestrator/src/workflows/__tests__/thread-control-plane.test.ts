@@ -13,7 +13,7 @@
 import { expect, test, describe } from "bun:test";
 import type { ProfileRow, ProfileStore } from "../../db/profiles.ts";
 import type { ImagesClient } from "../../rpc/profiles.ts";
-import type { Db } from "../../rpc/task-create.ts";
+import type { Db, HarnessCatalogClient } from "../../rpc/task-create.ts";
 import { makeThreadControlPlane } from "../thread-control-plane.ts";
 
 const profileRow = (): ProfileRow => ({
@@ -46,6 +46,20 @@ const fakeProfiles = (): ProfileStore =>
 const fakeImages = (): ImagesClient =>
   ({ listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }) }) as unknown as ImagesClient;
 
+const fakeHarnessCatalog = (): HarnessCatalogClient => ({
+  listHarnesses: async () => ({
+    harnesses: [
+      {
+        name: "claude",
+        descriptor: {
+          models: [{ id: "opus", default: true, env: { ANTHROPIC_MODEL: "claude-opus-4-8" } }],
+          effort: [],
+        },
+      },
+    ],
+  }),
+});
+
 /** A fake DB that records each `.values()` payload in insert order (task first,
  *  primary task_session second). */
 function recordingDb(records: Record<string, unknown>[]): Db {
@@ -66,6 +80,7 @@ describe("makeThreadControlPlane", () => {
       profiles: fakeProfiles(),
       images: fakeImages(),
       connectors: { list: async () => [] },
+      harnessCatalog: fakeHarnessCatalog(),
       secrets: { get: async () => null },
       resolveUser: async () => "user-1",
       db: recordingDb(records),
@@ -105,6 +120,7 @@ describe("makeThreadControlPlane", () => {
       profiles: fakeProfiles(),
       images: fakeImages(),
       connectors: { list: async () => [] },
+      harnessCatalog: fakeHarnessCatalog(),
       secrets: { get: async () => null },
       resolveUser: async (provider, ext) => (provider === "slack" && ext === "U1" ? "user-7" : null),
       db: recordingDb([]),

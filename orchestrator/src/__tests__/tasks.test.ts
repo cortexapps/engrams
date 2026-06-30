@@ -27,6 +27,7 @@ import type { AddressInfo } from "node:net";
 import { buildServer } from "../server.ts";
 import { registerTasks, buildProfileMap } from "../rpc/tasks.ts";
 import type { TaskDeps, SessionsClient, Db, GetSession, ImagesClient } from "../rpc/tasks.ts";
+import type { HarnessCatalogClient } from "../rpc/task-create.ts";
 import type { UserSecretStore } from "../db/user-secrets.ts";
 import { CLAUDE_OAUTH_ENV_VAR } from "../db/user-secrets.ts";
 import type { ProfileRow, ProfileStore, ProfileInput } from "../db/profiles.ts";
@@ -235,6 +236,22 @@ const fakeImages = (ids = ["img-1"]): ImagesClient => ({
   },
 });
 
+// A one-harness catalog ("claude") so the create path can resolve the descriptor
+// default model/effort env. spawnServer injects this unless a test overrides it.
+const fakeHarnessCatalog = (): HarnessCatalogClient => ({
+  listHarnesses: async () => ({
+    harnesses: [
+      {
+        name: "claude",
+        descriptor: {
+          models: [{ id: "opus", default: true, env: { ANTHROPIC_MODEL: "claude-opus-4-8" } }],
+          effort: [],
+        },
+      },
+    ],
+  }),
+});
+
 // ---------------------------------------------------------------------------
 // buildProfileMap resilience (ADR 0052): task reads must survive an
 // unavailable image catalog. ListTasks/GetTask both join via buildProfileMap,
@@ -339,8 +356,11 @@ async function spawnServer(deps: TaskDeps): Promise<TestServer> {
   const app = new Hono();
   app.notFound((c) => c.json({ error: "not found" }, 404));
 
+  // Default the harness catalog to a hermetic fake so create-path tests don't
+  // fall through to the real control-plane client (a test may override it).
+  const fullDeps: TaskDeps = { harnessCatalog: fakeHarnessCatalog(), ...deps };
   const srv = buildServer(app, (router) => {
-    registerTasks(router, deps);
+    registerTasks(router, fullDeps);
   });
 
   const serverUrl = await new Promise<string>((resolve) => {
@@ -1025,7 +1045,9 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     try {
       const client = makeClient(srv.serverUrl);
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
-      expect(fakeSessions.createReqs[0]?.harnessEnv).toEqual({
+      // (harness_env also carries the descriptor's default model env — ADR 0063;
+      // this test asserts only the token gate.)
+      expect(fakeSessions.createReqs[0]?.harnessEnv).toMatchObject({
         CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-secret",
       });
     } finally {
@@ -1046,7 +1068,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     try {
       const client = makeClient(srv.serverUrl);
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
-      expect(fakeSessions.createReqs[0]?.harnessEnv).toBeUndefined();
+      expect(fakeSessions.createReqs[0]?.harnessEnv?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     } finally {
       await srv.close();
     }

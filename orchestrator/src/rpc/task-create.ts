@@ -53,11 +53,28 @@ export interface SessionCreateInput {
   selectedSkills?: string[];
   capabilities?: string[];
   integrationPolicyJson?: string;
+  /** ADR 0062/0063: the selected harness (catalog name) the coordinator mounts
+   *  + execs (the proto `CreateSessionRequest.harness`). Resolved from the
+   *  per-session override ?? profile ?? deployment default. */
+  harness?: string;
+}
+
+/** One harness's catalog descriptor (the bits the compiler needs): the model +
+ *  effort enums map an option id → the env vars that select it (ADR 0063 §1). */
+export interface HarnessDescriptorView {
+  models: Array<{ id: string; default: boolean; env: Record<string, string> }>;
+  effort: Array<{ id: string; default: boolean; env: Record<string, string> }>;
+}
+export interface HarnessCatalogClient {
+  listHarnesses(req: Record<string, never>): Promise<{
+    harnesses: Array<{ name: string; descriptor?: HarnessDescriptorView }>;
+  }>;
 }
 
 export interface SessionCompileDeps {
   images: ImagesClient;
   connectors: CustomConnectorSource;
+  harnessCatalog: HarnessCatalogClient;
   /** Resolve the owner's harness token for `envVar` (e.g. CLAUDE_CODE_OAUTH_TOKEN),
    *  or null. Only called when the profile sets includeUserTokens. */
   resolveUserToken: (envVar: string) => Promise<string | null>;
@@ -65,10 +82,19 @@ export interface SessionCompileDeps {
 
 export interface SessionCompileOpts {
   prompt?: string;
+  /** ADR 0063 B2: per-session override of the profile's default harness / model /
+   *  effort. Unset = use the profile's default. */
+  harness?: string;
+  model?: string;
+  effort?: string;
   /** Extra harness env merged LAST (highest precedence) — e.g. the trigger's
    *  ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060). */
   extraHarnessEnv?: Record<string, string>;
 }
+
+/** The deployment's fallback harness when neither the session nor the profile
+ *  selects one (the canonical built-in). */
+const DEFAULT_HARNESS = "claude";
 
 /**
  * Compile a CreateSession request from an active profile. Throws
@@ -89,8 +115,14 @@ export async function compileSessionCreateInput(
     );
   }
 
+  // ADR 0062/0063: resolve the effective harness/model/effort (per-session
+  // override < profile default < deployment/descriptor default).
+  const selectedHarness = opts.harness ?? profile.harness ?? DEFAULT_HARNESS;
+  const { harnesses } = await deps.harnessCatalog.listHarnesses({});
+  const descriptor = harnesses.find((h) => h.name === selectedHarness)?.descriptor;
+
   // Harness env, lowest → highest precedence: user token < CLI dummy env <
-  // profile env_vars < trigger extras. NEVER log values.
+  // profile env_vars < model env < effort env < trigger extras. NEVER log values.
   const harness: Record<string, string> = {};
   if (profile.includeUserTokens) {
     try {
@@ -105,6 +137,18 @@ export async function compileSessionCreateInput(
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
   if (cliPlan.enabled.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(cliPlan.enabled);
   for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
+  // ADR 0063: the selected model/effort map to env vars via the harness
+  // descriptor (an explicit picker wins over a stale ANTHROPIC_MODEL in env_vars).
+  if (descriptor) {
+    const modelId =
+      opts.model ?? profile.model ?? descriptor.models.find((m) => m.default)?.id ?? descriptor.models[0]?.id;
+    const effortId =
+      opts.effort ?? profile.effort ?? descriptor.effort.find((e) => e.default)?.id ?? descriptor.effort[0]?.id;
+    const modelEnv = descriptor.models.find((m) => m.id === modelId)?.env ?? {};
+    const effortEnv = descriptor.effort.find((e) => e.id === effortId)?.env ?? {};
+    for (const [k, v] of Object.entries(modelEnv)) harness[k] = v;
+    for (const [k, v] of Object.entries(effortEnv)) harness[k] = v;
+  }
   for (const [k, v] of Object.entries(opts.extraHarnessEnv ?? {})) harness[k] = v;
   const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
@@ -122,6 +166,7 @@ export async function compileSessionCreateInput(
   return {
     imageUri: image.imageUri,
     mode: "agent",
+    harness: selectedHarness,
     ...(opts.prompt != null ? { prompt: opts.prompt } : {}),
     ...(harnessEnv != null ? { harnessEnv } : {}),
     ...(selectedSkills.length > 0 ? { selectedSkills } : {}),
@@ -146,6 +191,7 @@ export interface CreateTaskDeps {
   profiles: ProfileStore;
   images: ImagesClient;
   connectors: CustomConnectorSource;
+  harnessCatalog: HarnessCatalogClient;
   sessions: TaskSessionsClient;
   /** Resolve `envVar` for the OWNER (e.g. the Claude OAuth token), or null. */
   secrets: { get(userId: string, envVar: string): Promise<string | null> };
@@ -161,6 +207,10 @@ export interface CreateTaskParams {
   profileId: string;
   title?: string | null;
   prompt?: string;
+  /** ADR 0063 B2: per-session override of the profile's harness / model / effort. */
+  harness?: string;
+  model?: string;
+  effort?: string;
   /** Type-specific trigger ref recorded on the task row (operator-visible). */
   source?: Record<string, unknown>;
   /** Extra harness env merged LAST — e.g. the trigger's
@@ -197,10 +247,14 @@ export async function createTaskWithSession(
     {
       images: deps.images,
       connectors: deps.connectors,
+      harnessCatalog: deps.harnessCatalog,
       resolveUserToken: (envVar) => deps.secrets.get(params.ownerUserId, envVar),
     },
     {
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
+      ...(params.harness != null ? { harness: params.harness } : {}),
+      ...(params.model != null ? { model: params.model } : {}),
+      ...(params.effort != null ? { effort: params.effort } : {}),
       ...(params.extraHarnessEnv ? { extraHarnessEnv: params.extraHarnessEnv } : {}),
     },
   );

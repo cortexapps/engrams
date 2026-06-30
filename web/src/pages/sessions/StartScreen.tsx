@@ -33,7 +33,13 @@ import { createTask, listTasks } from "../../gen/engram/app/v1/task-TaskService_
 import { useProfiles } from "../../hooks/useProfiles";
 import { useIntegrationCatalog } from "../../hooks/useIntegrations";
 import { useEnabledImages } from "../../hooks/useEnabledImages";
+import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import { useTasksAsSessionList } from "../../hooks/useTasks";
+import {
+  SessionHarnessControls,
+  EMPTY_OVERRIDE,
+  type HarnessOverride,
+} from "./SessionHarnessControls";
 import { useAuth } from "../../auth/AuthProvider";
 import { useKeyboardUi } from "../../keyboard/store";
 import { MOD_LABEL } from "../../keyboard/platform";
@@ -99,6 +105,7 @@ export function StartScreen() {
   } = useProfiles(false);
   const { data: catalog } = useIntegrationCatalog();
   const { data: images } = useEnabledImages(true);
+  const { data: harnesses } = useHarnessCatalog(true);
   const { data: taskList } = useTasksAsSessionList();
   const createTaskMutation = useMutation(createTask);
 
@@ -113,6 +120,12 @@ export function StartScreen() {
   const [prompt, setPrompt] = useState("");
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // ADR 0063 B2: per-session harness/model/effort override (null = inherit the
+  // profile default). Reset on profile switch so a stale pick can't carry over.
+  const [harnessOverride, setHarnessOverride] = useState<HarnessOverride>(EMPTY_OVERRIDE);
+  useEffect(() => {
+    setHarnessOverride(EMPTY_OVERRIDE);
+  }, [selectedId]);
 
   // Preselect once profiles resolve: last-launched (this device) → the most
   // recent task's profile → the first profile. Only seeds when nothing's chosen
@@ -157,6 +170,11 @@ export function StartScreen() {
         type: "chat",
         profileId: selected.id,
         prompt: prompt.trim(),
+        // Only the explicitly-overridden fields ride along; the rest fall back to
+        // the profile / descriptor default server-side (ADR 0063 B2).
+        ...(harnessOverride.harness ? { harness: harnessOverride.harness } : {}),
+        ...(harnessOverride.model ? { model: harnessOverride.model } : {}),
+        ...(harnessOverride.effort ? { effort: harnessOverride.effort } : {}),
       });
       writeLastProfileId(selected.id);
       qc.invalidateQueries({
@@ -300,6 +318,13 @@ export function StartScreen() {
                   </Tooltip>
                 </TooltipProvider>
               )}
+              <SessionHarnessControls
+                harnesses={harnesses}
+                profileHarness={selected?.harness}
+                value={harnessOverride}
+                onChange={setHarnessOverride}
+                disabled={createTaskMutation.isPending}
+              />
               <Button
                 className="ml-auto"
                 onClick={() => void launch()}
