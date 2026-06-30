@@ -123,10 +123,16 @@ WebSocket-upgrade, and gRPC all pass through transparently:
   that raw-pipes a real local socket into a `PortRelay`-backed Duplex and `fetch()`es that
   local port — web types end to end, only Bun-supported APIs. Covered by a fake-relay e2e
   test that exercises the whole path on the Bun runtime.
-- **P2b-ws:** WebSocket-upgrade passthrough (Vite HMR etc.). Split out because Bun's node:http
-  `upgrade` handler can't write to the raw socket (see `orchestrator/src/server.ts` — the
-  `socket.write`/`end` no-op bug), so raw WS passthrough needs its own approach + live
-  validation. HTTP previews (page loads, assets, SSE, API) work without it.
+- **P2b-ws (this change):** WebSocket-upgrade passthrough (Vite HMR etc.). Bun's node:http
+  `upgrade` handler can't write the raw socket (`server.ts`'s `socket.write`/`end` no-op),
+  so raw passthrough is impossible; instead a dedicated `ws` `WebSocketServer({noServer})`
+  (separate from the shell's `tty`-pinned one) completes the client upgrade Bun-safely via
+  `handleUpgrade`, and the guest side reuses the P2b loopback trick (a one-shot `net.Server`
+  → `PortRelay` tunnel) with Bun's native `WebSocket` client, bridging messages + close both
+  ways (subprotocols + path/query carried through so HMR negotiates). Hooked into `server.ts`
+  via a `previewUpgrade` callback checked before the shell path. A fake-relay e2e test drives
+  the whole bridge (real `ws` client → upgrade → loopback → guest echo) on the Bun runtime;
+  the real coordinator `PortRelay` path still needs live validation.
 - **P2c (this change):** web "Expose port" UI — a PORTS tab on the session detail page
   (`usePorts` React-Query hooks over the REST CRUD + a `PortsPanel`: expose a port, list
   exposures with their URL, copy the (share) link, revoke).
