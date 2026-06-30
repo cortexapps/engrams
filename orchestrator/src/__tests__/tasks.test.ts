@@ -182,6 +182,7 @@ function makeFakeProfiles(opts?: {
   imageId?: string;
   skills?: string[];
   capabilities?: string[];
+  portExposures?: number[];
 }): ProfileStore {
   const row: ProfileRow = {
     id: PROFILE_ID,
@@ -199,6 +200,7 @@ function makeFakeProfiles(opts?: {
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
     isDefault: false,
+    portExposures: opts?.portExposures ?? [],
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,

@@ -117,6 +117,9 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     harness: row.harness ?? undefined,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
+    // ADR 0064: ports auto-exposed for this profile's sessions (member-visible —
+    // describes config, not a secret, like skills).
+    portExposures: row.portExposures,
     archived: row.deletedAt != null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -350,6 +353,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         harness,
         model: req.model ?? null,
         effort: req.effort ?? null,
+        portExposures: req.portExposures ?? [],
       });
       return { profile: toProto(row, true) };
     },
@@ -382,6 +386,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         harness,
         model: req.model ?? null,
         effort: req.effort ?? null,
+        portExposures: req.portExposures ?? [],
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
       return { profile: toProto(row, true) };

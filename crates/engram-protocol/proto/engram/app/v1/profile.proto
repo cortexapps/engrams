@@ -66,6 +66,8 @@ message Profile {
   optional string harness = 16;
   optional string model = 17;
   optional string effort = 18;
+  // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
+  repeated uint32 port_exposures = 19;
 }
 
 // ADR 0057: a profile's egress network allow-list. `default` is the posture for
@@ -136,6 +138,8 @@ message CreateProfileRequest {
   optional string harness = 12;
   optional string model = 13;
   optional string effort = 14;
+  // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
+  repeated uint32 port_exposures = 15;
 }
 
 message CreateProfileResponse {
@@ -163,6 +167,8 @@ message UpdateProfileRequest {
   optional string harness = 13;
   optional string model = 14;
   optional string effort = 15;
+  // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
+  repeated uint32 port_exposures = 16;
 }
 
 message UpdateProfileResponse {

@@ -32,6 +32,7 @@ const profileRow = (): ProfileRow => ({
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: true,
+  portExposures: [],
   createdAt: new Date(0),
   updatedAt: new Date(0),
   deletedAt: null,

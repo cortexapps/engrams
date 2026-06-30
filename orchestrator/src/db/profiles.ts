@@ -39,6 +39,8 @@ export interface ProfileRow {
   secrets: ProfileSecret[];
   // ADR 0060: the org default profile (at most one active).
   isDefault: boolean;
+  // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
+  portExposures: number[];
   createdAt: Date;
   updatedAt: Date;
   deletedAt: Date | null;
@@ -59,6 +61,7 @@ export interface ProfileInput {
   network: ProfileNetwork;
   secrets: ProfileSecret[];
   isDefault: boolean;
+  portExposures: number[];
 }
 
 /** The seam injected into ProfileService and TaskService. */
@@ -97,6 +100,7 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     network: (r.network ?? DEFAULT_PROFILE_NETWORK) as ProfileNetwork,
     secrets: (r.secrets ?? []) as ProfileSecret[],
     isDefault: r.isDefault,
+    portExposures: (r.portExposures ?? []) as number[],
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
     deletedAt: r.deletedAt,

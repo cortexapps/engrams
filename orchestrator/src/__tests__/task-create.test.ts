@@ -20,6 +20,11 @@ import {
   type Db,
 } from "../rpc/task-create.ts";
 import type { ProfileRow, ProfileStore } from "../db/profiles.ts";
+import type {
+  PortExposureStore,
+  PortExposureInput,
+  PortExposureRow,
+} from "../db/port-exposures.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 
 // The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
@@ -44,6 +49,7 @@ const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: false,
+  portExposures: [],
   createdAt: new Date(0),
   updatedAt: new Date(0),
   deletedAt: null,
@@ -191,8 +197,43 @@ describe("compileSessionCreateInput", () => {
 // createTaskWithSession — the shared create path
 // ---------------------------------------------------------------------------
 
-const fakeProfiles = (active = true): ProfileStore =>
-  ({ getActive: async (id: string) => (active && id === "p1" ? profile() : null) }) as unknown as ProfileStore;
+const fakeProfiles = (active = true, over: Partial<ProfileRow> = {}): ProfileStore =>
+  ({ getActive: async (id: string) => (active && id === "p1" ? profile(over) : null) }) as unknown as ProfileStore;
+
+/** A full PortExposureStore fake that records createOrGet inputs and can be made
+ *  to throw for a given port (to exercise the best-effort path). */
+function fakePortExposures(opts: { failOnPort?: number } = {}): PortExposureStore & {
+  calls: PortExposureInput[];
+} {
+  const calls: PortExposureInput[] = [];
+  return {
+    calls,
+    async createOrGet(input: PortExposureInput): Promise<PortExposureRow> {
+      calls.push(input);
+      if (opts.failOnPort === input.port) throw new Error("port store boom");
+      return {
+        slug: `slug-${input.port}`,
+        sessionId: input.sessionId,
+        port: input.port,
+        label: input.label,
+        ownerUserId: input.ownerUserId,
+        visibility: input.visibility,
+        shareToken: null,
+        createdAt: new Date(0),
+        expiresAt: null,
+      };
+    },
+    async listBySession() {
+      return [];
+    },
+    async getBySlug() {
+      return null;
+    },
+    async deleteBySlug() {
+      return false;
+    },
+  };
+}
 
 function fakeSessions(): TaskSessionsClient & { createReqs: unknown[]; deletedIds: string[] } {
   const createReqs: unknown[] = [];
@@ -223,14 +264,19 @@ function recordingDb(records: Record<string, unknown>[], throwOnTx = false): Db 
   } as unknown as Db;
 }
 
-const createDeps = (sessions: TaskSessionsClient, db: Db, active = true): CreateTaskDeps => ({
-  profiles: fakeProfiles(active),
+const createDeps = (
+  sessions: TaskSessionsClient,
+  db: Db,
+  opts: { active?: boolean; profileOver?: Partial<ProfileRow>; portExposures?: PortExposureStore } = {},
+): CreateTaskDeps => ({
+  profiles: fakeProfiles(opts.active ?? true, opts.profileOver ?? {}),
   images: { listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }) } as unknown as ImagesClient,
   connectors: { list: async () => [] },
   harnessCatalog: fakeHarnessCatalog(),
   sessions,
   secrets: { get: async () => null },
   db,
+  ...(opts.portExposures ? { portExposures: opts.portExposures } : {}),
 });
 
 describe("createTaskWithSession", () => {
@@ -275,7 +321,7 @@ describe("createTaskWithSession", () => {
   test("throws NotFound for a missing/archived profile and creates no session", async () => {
     const sessions = fakeSessions();
     await expect(
-      createTaskWithSession(createDeps(sessions, recordingDb([]), false), {
+      createTaskWithSession(createDeps(sessions, recordingDb([]), { active: false }), {
         type: "chat",
         ownerUserId: "u",
         profileId: "p1",
@@ -294,5 +340,56 @@ describe("createTaskWithSession", () => {
       }),
     ).rejects.toThrow(/db boom/);
     expect(sessions.deletedIds).toEqual(["sess-1"]);
+  });
+
+  // ADR 0064: a profile's declared portExposures auto-mint one private exposure
+  // per port at session create, against the injected PortExposureStore.
+  test("auto-mints one private port-exposure per profile.portExposures port", async () => {
+    const records: Record<string, unknown>[] = [];
+    const ports = fakePortExposures();
+    const out = await createTaskWithSession(
+      createDeps(fakeSessions(), recordingDb(records), {
+        profileOver: { portExposures: [3000, 8080] },
+        portExposures: ports,
+      }),
+      { type: "chat", ownerUserId: "user-1", profileId: "p1" },
+    );
+
+    expect(ports.calls).toHaveLength(2);
+    expect(ports.calls[0]).toEqual({
+      sessionId: out.sessionId,
+      port: 3000,
+      label: "",
+      ownerUserId: "user-1",
+      visibility: "private",
+    });
+    expect(ports.calls[1]).toMatchObject({ port: 8080, visibility: "private", ownerUserId: "user-1" });
+  });
+
+  test("does NOT mint when the profile declares no portExposures", async () => {
+    const ports = fakePortExposures();
+    await createTaskWithSession(
+      createDeps(fakeSessions(), recordingDb([]), { portExposures: ports }),
+      { type: "chat", ownerUserId: "u", profileId: "p1" },
+    );
+    expect(ports.calls).toHaveLength(0);
+  });
+
+  test("a port-exposure failure does NOT fail the task (best-effort) and later ports still mint", async () => {
+    const records: Record<string, unknown>[] = [];
+    const ports = fakePortExposures({ failOnPort: 3000 });
+    const out = await createTaskWithSession(
+      createDeps(fakeSessions(), recordingDb(records), {
+        profileOver: { portExposures: [3000, 8080] },
+        portExposures: ports,
+      }),
+      { type: "chat", ownerUserId: "u", profileId: "p1" },
+    );
+
+    // Task still created + persisted despite the 3000 failure.
+    expect(out.sessionId).toBe("sess-1");
+    expect(records).toHaveLength(2); // task + primary task_session
+    // Both ports were attempted; 8080 succeeded after 3000 threw.
+    expect(ports.calls.map((c) => c.port)).toEqual([3000, 8080]);
   });
 });

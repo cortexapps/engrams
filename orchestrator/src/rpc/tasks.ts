@@ -60,6 +60,7 @@ import {
 } from "../control-plane/client.ts";
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
+import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
 import type { ImagesClient } from "./profiles.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
 import {
@@ -129,6 +130,8 @@ export interface TaskDeps {
   images?: ImagesClient;
   /** Connector catalog (ADR 0057) — custom connectors merged with built-in seeds. */
   connectors?: CustomConnectorSource;
+  /** Port-exposure store (ADR 0064) — auto-mints profile.portExposures at create. */
+  portExposures?: PortExposureStore;
   db?: Db;
 }
 
@@ -368,6 +371,10 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
   const resolveSecrets = (): UserSecretStore =>
     deps?.secrets ?? makeUserSecretStore(getDbFn());
   const profiles: ProfileStore = deps?.profiles ?? makeProfileStore(getDbFn());
+  // Lazy (like resolveSecrets): touch getDb() only when createTask actually runs,
+  // so registering without a DB (the auth/validation tests) doesn't throw.
+  const resolvePortExposures = (): PortExposureStore =>
+    deps?.portExposures ?? makePortExposureStore(getDbFn());
   const imagesClient: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
   const harnessCatalogClient: HarnessCatalogClient =
     deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
@@ -406,6 +413,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           harnessCatalog: harnessCatalogClient,
           sessions: sessionsClient,
           secrets: resolveSecrets(),
+          portExposures: resolvePortExposures(),
           db: getDbFn(),
         },
         {

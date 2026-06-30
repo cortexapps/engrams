@@ -119,6 +119,7 @@ const archived: ProfileRow = {
   includeUserTokens: false, envVars: { K: "V" }, skills: [], capabilities: [], createdAt: new Date(0), updatedAt: new Date(0),
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
   isDefault: false,
+  portExposures: [],
   deletedAt: new Date(0),
 };
 const active: ProfileRow = { ...archived, id: "act", name: "Active", deletedAt: null };
@@ -235,6 +236,33 @@ describe("ProfileService — auth + field filtering", () => {
         capabilities: ["github:issues:write", "datadog:metrics:read@idx-1"],
       });
       expect(r.profile!.capabilities).toEqual(["github:issues:write", "datadog:metrics:read@idx-1"]);
+    } finally { await s.close(); }
+  });
+
+  // ADR 0064: declarative port exposures round-trip through create/update and
+  // default to [] when the field is omitted.
+  test("admin CreateProfile round-trips port_exposures + defaults to [] (ADR 0064)", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),
+    });
+    try {
+      const withPorts = await s.client.createProfile({
+        name: "Ported", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
+        portExposures: [3000, 8080],
+      });
+      expect(withPorts.profile!.portExposures).toEqual([3000, 8080]);
+
+      const bare = await s.client.createProfile({
+        name: "Bare", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
+      });
+      expect(bare.profile!.portExposures).toEqual([]);
+
+      const updated = await s.client.updateProfile({
+        id: withPorts.profile!.id, name: "Ported", description: "", icon: "Bot", imageId: "img-1",
+        harness: "claude", includeUserTokens: false, envVars: {}, portExposures: [5173],
+      });
+      expect(updated.profile!.portExposures).toEqual([5173]);
     } finally { await s.close(); }
   });
 });
