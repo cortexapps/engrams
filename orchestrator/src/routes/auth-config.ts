@@ -9,7 +9,7 @@
  * Posture is derived live from `config` (read per-request, not captured at
  * import) so it always reflects the running deployment:
  *   - `passwordAuth`: email/password sign-in is available. FALSE behind GCP IAP
- *     (IAP_AUDIENCE set) — IAP is then the sole identity source and the
+ *     (IAP_AUDIENCES set) — IAP is then the sole identity source and the
  *     better-auth password door is disabled (see better-auth.ts), so the Login
  *     page must not render a form the server would reject.
  *   - `signup`: public sign-up is available. Tracks `passwordAuth` — there is no
@@ -27,7 +27,7 @@ import { config } from "../config.ts";
 const authConfigRoute = new Hono();
 
 authConfigRoute.get("/api/v1/auth-config", (c) => {
-  const passwordAuth = !config.iapAudience;
+  const passwordAuth = config.iapAudiences.length === 0;
   return c.json({
     passwordAuth,
     // No public sign-up without a password door.

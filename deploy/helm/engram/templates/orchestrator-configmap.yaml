@@ -36,8 +36,8 @@ data:
   {{- with .Values.orchestrator.trustedOrigins }}
   TRUSTED_ORIGINS: {{ join "," . | quote }}
   {{- end }}
-  {{- with .Values.orchestrator.auth.iap.audience }}
-  IAP_AUDIENCE: {{ . | quote }}
+  {{- with .Values.orchestrator.auth.iap.audiences }}
+  IAP_AUDIENCES: {{ join "," . | quote }}
   {{- end }}
   {{- with .Values.orchestrator.auth.iap.jwksUrl }}
   IAP_JWKS_URL: {{ . | quote }}

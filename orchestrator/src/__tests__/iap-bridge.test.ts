@@ -3,11 +3,13 @@
  *
  * Test groups:
  *
- * 1. Inert when IAP_AUDIENCE unset — pure unit, no DB, no network.
+ * 1. Inert when IAP_AUDIENCES empty — pure unit, no DB, no network.
  * 2. Invalid / missing assertion → 401 — DB-gated (need real DB for the
  *    full server stack, but the 401 path itself doesn't touch DB).
  *    Actually these tests can run without DB since the bridge returns 401
  *    before hitting DB. We run them as non-gated tests.
+ * 2b. Multiple trusted audiences (app Ingress + preview Gateway) — the 401
+ *    case is non-gated; the accept cases are DB-gated.
  * 3. Valid IAP JWT → user + session created (DB-gated).
  * 4. User-switch re-bridges (DB-gated).
  * 5. Existing-cookie fast path skips JWT verification (non-gated unit test
@@ -19,7 +21,7 @@
  *   - serve the public JWK from an in-process HTTP server
  *   - point IAP_JWKS_URL at that server via _resetJwksCache() + env override
  *
- * The IAP_AUDIENCE env var is set per-describe via the config singleton
+ * The IAP_AUDIENCES env var is set per-describe via the config singleton
  * workaround: we directly mutate config (it's a plain object, not frozen) for
  * the duration of each test group and restore after.
  */
@@ -66,6 +68,9 @@ publicJwk.use = "sig";
 
 const IAP_ISS = "https://cloud.google.com/iap";
 const TEST_AUDIENCE = "test-audience-/projects/123/apps/test";
+// A SECOND trusted audience — models the orchestrator's two IAP front doors
+// (classic web Ingress backend + the ADR 0064 preview Gateway backend).
+const TEST_AUDIENCE_2 = "test-audience-/projects/123/global/backendServices/456";
 const TEST_EMAIL = "iap-test@example.com";
 const TEST_EMAIL_2 = "iap-test-2@example.com";
 
@@ -114,22 +119,24 @@ afterAll(async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Helper: configure config.iapAudience + config.iapJwksUrl for tests
+// Helper: configure config.iapAudiences + config.iapJwksUrl for tests
 // ---------------------------------------------------------------------------
 
-let savedAudience: string | undefined;
+let savedAudiences: string[];
 let savedJwksUrl: string;
 
-function activateIap(): void {
-  savedAudience = config.iapAudience;
+/** Activate the IAP bridge with the given trusted-audience set (defaults to a
+ * single audience). Pass multiple to exercise the multi-front-door path. */
+function activateIap(audiences: string[] = [TEST_AUDIENCE]): void {
+  savedAudiences = config.iapAudiences;
   savedJwksUrl = config.iapJwksUrl;
-  (config as { iapAudience: string | undefined }).iapAudience = TEST_AUDIENCE;
+  (config as { iapAudiences: string[] }).iapAudiences = audiences;
   (config as { iapJwksUrl: string }).iapJwksUrl = jwksBaseUrl;
   _resetJwksCache();
 }
 
 function deactivateIap(): void {
-  (config as { iapAudience: string | undefined }).iapAudience = savedAudience;
+  (config as { iapAudiences: string[] }).iapAudiences = savedAudiences;
   (config as { iapJwksUrl: string }).iapJwksUrl = savedJwksUrl;
   _resetJwksCache();
 }
@@ -192,14 +199,14 @@ function makeReqRes(options: {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Inert when IAP_AUDIENCE unset
+// 1. Inert when IAP_AUDIENCES empty
 // ---------------------------------------------------------------------------
 
-describe("IAP bridge — inert when IAP_AUDIENCE unset", () => {
+describe("IAP bridge — inert when IAP_AUDIENCES empty", () => {
   test("calls next() immediately without reading any headers", async () => {
-    // Ensure config.iapAudience is unset (it should be in dev/test by default).
-    const saved = config.iapAudience;
-    (config as { iapAudience: string | undefined }).iapAudience = undefined;
+    // Ensure config.iapAudiences is empty (it should be in dev/test by default).
+    const saved = config.iapAudiences;
+    (config as { iapAudiences: string[] }).iapAudiences = [];
 
     let nextCalled = false;
     const { req, res } = makeReqRes({});
@@ -209,19 +216,19 @@ describe("IAP bridge — inert when IAP_AUDIENCE unset", () => {
 
     expect(nextCalled).toBe(true);
 
-    (config as { iapAudience: string | undefined }).iapAudience = saved;
+    (config as { iapAudiences: string[] }).iapAudiences = saved;
   });
 
   test("no Set-Cookie header written when inert", async () => {
-    const saved = config.iapAudience;
-    (config as { iapAudience: string | undefined }).iapAudience = undefined;
+    const saved = config.iapAudiences;
+    (config as { iapAudiences: string[] }).iapAudiences = [];
 
     const { req, res, getSetCookie } = makeReqRes({});
     await iapBridge(req, res, () => {});
 
     expect(getSetCookie()).toBeUndefined();
 
-    (config as { iapAudience: string | undefined }).iapAudience = saved;
+    (config as { iapAudiences: string[] }).iapAudiences = saved;
   });
 });
 
@@ -379,6 +386,78 @@ describe("IAP bridge — missing/invalid assertion → 401", () => {
     expect(nextCalled).toBe(false);
     expect(statusCode()).toBe(401);
   });
+});
+
+// ---------------------------------------------------------------------------
+// 2b. Multiple trusted audiences — ADR 0064 (app Ingress + preview Gateway)
+// ---------------------------------------------------------------------------
+//
+// The orchestrator sits behind TWO IAP-protected GCP backend services (the
+// classic web Ingress and the dedicated `*.preview` Gateway), each with its own
+// audience. One uniform verifier must accept an assertion minted for EITHER and
+// still reject any other audience — the set is a trust list, not a wildcard, and
+// the auth layer never branches on Host/path.
+describe("IAP bridge — multiple trusted audiences", () => {
+  beforeEach(() => {
+    activateIap([TEST_AUDIENCE, TEST_AUDIENCE_2]);
+  });
+
+  afterEach(() => {
+    deactivateIap();
+  });
+
+  // Deterministic + DB-independent: an audience OUTSIDE the set is rejected
+  // exactly like the single-audience case (proves the set isn't a wildcard).
+  test("assertion for an audience outside the trusted set → 401", async () => {
+    const jwt = await signIapJwt(TEST_EMAIL, { aud: "untrusted-audience" });
+    let nextCalled = false;
+    const { req, res, statusCode } = makeReqRes({ iapJwt: jwt });
+    await iapBridge(req, res, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(false);
+    expect(statusCode()).toBe(401);
+  });
+
+  // The positive paths bridge into a real session (verify → JIT-create →
+  // cookie), so they need a DB. Signed with the SECOND audience = the preview
+  // Gateway's front door — the case that was 401ing in prod.
+  test.skipIf(!dbReachable)(
+    "assertion minted for the preview-Gateway audience verifies + bridges a session",
+    async () => {
+      const jwt = await signIapJwt(`iap-aud2-${Date.now()}@example.com`, {
+        aud: TEST_AUDIENCE_2,
+      });
+      let nextCalled = false;
+      const { req, res, statusCode, getSetCookie } = makeReqRes({ iapJwt: jwt });
+      await iapBridge(req, res, () => {
+        nextCalled = true;
+      });
+
+      expect(nextCalled).toBe(true);
+      expect(statusCode()).toBe(200);
+      expect(getSetCookie()).toBeDefined();
+    },
+  );
+
+  test.skipIf(!dbReachable)(
+    "assertion minted for the web-Ingress audience still verifies + bridges a session",
+    async () => {
+      const jwt = await signIapJwt(`iap-aud1-${Date.now()}@example.com`, {
+        aud: TEST_AUDIENCE,
+      });
+      let nextCalled = false;
+      const { req, res, statusCode, getSetCookie } = makeReqRes({ iapJwt: jwt });
+      await iapBridge(req, res, () => {
+        nextCalled = true;
+      });
+
+      expect(nextCalled).toBe(true);
+      expect(statusCode()).toBe(200);
+      expect(getSetCookie()).toBeDefined();
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -632,7 +711,7 @@ describe("IAP bridge — user-switch re-bridges (DB-gated)", () => {
 // cookie is HMAC-signed and can't be forged. The cheap path is valid.
 //
 // However: we can only set up a real session cookie if the DB is reachable.
-// Without DB we test the inert=fast-path (IAP_AUDIENCE unset).
+// Without DB we test the inert=fast-path (IAP_AUDIENCES empty).
 // ---------------------------------------------------------------------------
 
 describe("IAP bridge — existing-cookie fast path", () => {

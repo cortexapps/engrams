@@ -20,13 +20,13 @@
  *
  * HEALTH-CHECK EXEMPTION (resolved): GCP load-balancer health checks AND
  * kubelet readiness probes bypass IAP and carry no assertion — with
- * IAP_AUDIENCE set, /healthz would 401 and the backend/pod is marked
+ * IAP_AUDIENCES set, /healthz would 401 and the backend/pod is marked
  * unhealthy. `iapBridge` now short-circuits `/healthz` before any IAP logic
  * (see the top of the function), so probes always reach the health route.
  *
- * When `IAP_AUDIENCE` is unset the bridge is fully inert — it returns
+ * When `IAP_AUDIENCES` is empty the bridge is fully inert — it returns
  * immediately without touching headers, allocating memory, or reading env.
- * This is the dev-mode default; the Tiltfile does not set IAP_AUDIENCE.
+ * This is the dev-mode default; the Tiltfile does not set IAP_AUDIENCES.
  *
  * ## Production door story
  *
@@ -99,7 +99,7 @@
  *
  * ## Fail-closed
  *
- * When IAP_AUDIENCE is set but the request lacks a valid assertion AND lacks a
+ * When IAP_AUDIENCES is set but the request lacks a valid assertion AND lacks a
  * valid session cookie, the bridge returns 401. Behind IAP every real request
  * carries the header, so a missing assertion means either the request bypassed
  * IAP (forbidden) or the JWT is invalid (also forbidden). We fail closed.
@@ -122,7 +122,7 @@ import { config } from "../config.ts";
  *
  *   1. Health/readiness probes. kubelet readiness probes and GCP LB health
  *      checks hit the orchestrator directly, bypassing IAP, so they carry no
- *      X-Goog-IAP-JWT-Assertion. With IAP_AUDIENCE set the bridge fails closed
+ *      X-Goog-IAP-JWT-Assertion. With IAP_AUDIENCES set the bridge fails closed
  *      (401), which would mark the pod / backend perpetually unhealthy.
  *      /healthz only reports {ok, db}, so it is unauthenticated by design.
  *
@@ -216,15 +216,18 @@ function extractRawSessionCookie(req: IncomingMessage, cookieName: string): stri
 // IAP JWT verification
 // ---------------------------------------------------------------------------
 
-/** Verify the X-Goog-IAP-JWT-Assertion and return the email claim. */
+/** Verify the X-Goog-IAP-JWT-Assertion against the trusted audience set and
+ * return the email claim. `jose` accepts `audience: string[]` and passes if the
+ * token's `aud` matches ANY entry — so one uniform verifier covers every IAP
+ * front door (see Config.iapAudiences for why there's more than one). */
 async function verifyIapJwt(
   jwt: string,
-  audience: string,
+  audiences: string[],
 ): Promise<IapClaims> {
   const jwks = getJwks();
   const { payload } = await jwtVerify(jwt, jwks, {
     issuer: "https://cloud.google.com/iap",
-    audience,
+    audience: audiences,
     algorithms: ["ES256"],
   });
 
@@ -413,7 +416,7 @@ export type BridgeNext = () => void;
  * It calls `next()` when the request should proceed, or writes a 401 and
  * returns (without calling `next`) when the bridge rejects the request.
  *
- * When IAP_AUDIENCE is unset this is a synchronous no-op (calls next() inline).
+ * When IAP_AUDIENCES is empty this is a synchronous no-op (calls next() inline).
  *
  * @param req  Incoming HTTP request.
  * @param res  Server response (used to write Set-Cookie / 401).
@@ -435,13 +438,13 @@ export async function iapBridge(
     return;
   }
 
-  // INERT PATH: IAP_AUDIENCE unset → bridge is fully off.
-  if (!config.iapAudience) {
+  // INERT PATH: IAP_AUDIENCES empty → bridge is fully off.
+  if (config.iapAudiences.length === 0) {
     next();
     return;
   }
 
-  const audience = config.iapAudience;
+  const audiences = config.iapAudiences;
 
   // ---------------------------------------------------------------------------
   // Fast path: check existing session cookie first (avoid JWT verification).
@@ -501,7 +504,7 @@ export async function iapBridge(
 
   let claims: IapClaims;
   try {
-    claims = await verifyIapJwt(iapJwt, audience);
+    claims = await verifyIapJwt(iapJwt, audiences);
   } catch (err) {
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "invalid IAP assertion" }));

@@ -55,13 +55,27 @@ export interface Config {
    */
   kekMasterKey: string;
   /**
-   * IAP_AUDIENCE — GCP IAP audience string (e.g. /projects/PROJECT_NUM/apps/APP_ID).
-   * When unset the IAP bridge is fully inert (zero overhead, no header reads).
-   * Set this in production when the orchestrator sits behind GCP IAP.
+   * IAP_AUDIENCES — the SET of GCP IAP audiences the orchestrator trusts
+   * (comma-separated in the env). Each audience is a backend-service / app
+   * resource string (e.g. /projects/PROJECT_NUM/global/backendServices/ID). An
+   * assertion verifies if its `aud` matches ANY entry.
+   *
+   * Why a set, not one value: the orchestrator sits behind MORE THAN ONE
+   * IAP-protected GCP backend service, and a GCP IAP audience IS the backend
+   * service resource — there is no way to share one audience across backends.
+   * The app enters via the classic web Ingress backend; live-host port previews
+   * (ADR 0064) enter via a DEDICATED Gateway backend (required for the wildcard
+   * `*.preview` Certificate Manager cert, which the classic Ingress can't hold).
+   * Two IAP front doors → two audiences, both trusted here. Verification stays
+   * uniform (same JWKS / issuer / ES256); only the accepted `aud` set differs —
+   * the auth layer NEVER branches on Host or path.
+   *
+   * Empty (env unset) → the IAP bridge is fully inert (zero overhead, no header
+   * reads). Set in production when the orchestrator sits behind GCP IAP.
    * This is the production door story: IAP bridge + disabled public sign-up
-   * (see Task 22 comment chain) replace password auth in prod.
+   * replace password auth in prod.
    */
-  iapAudience: string | undefined;
+  iapAudiences: string[];
   /**
    * IAP_JWKS_URL — override the GCP IAP JWKS endpoint URL.
    * Default: https://www.gstatic.com/iap/verify/public_key-jwk (ES256 keys,
@@ -178,10 +192,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     return "";
   })();
 
-  // OPTIONAL: IAP bridge config. When IAP_AUDIENCE is unset the bridge is
-  // fully inert in dev (no overhead, no header reads). Set in prod only.
-  // No test placeholder needed — unset is valid and means "inert".
-  const iapAudience = env["IAP_AUDIENCE"] || undefined;
+  // OPTIONAL: IAP bridge config. IAP_AUDIENCES is a comma-separated SET of
+  // trusted audiences (see the Config.iapAudiences doc for why it's a set).
+  // Empty → the bridge is fully inert in dev (no overhead, no header reads).
+  // No test placeholder needed — empty is valid and means "inert".
+  const iapAudiences = (env["IAP_AUDIENCES"] ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
   const iapJwksUrl = optional(
     "IAP_JWKS_URL",
     "https://www.gstatic.com/iap/verify/public_key-jwk",
@@ -243,7 +261,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     trustedOrigins,
     betterAuthSecret,
     kekMasterKey,
-    iapAudience,
+    iapAudiences,
     iapJwksUrl,
     oidc,
     previewBaseDomain,
