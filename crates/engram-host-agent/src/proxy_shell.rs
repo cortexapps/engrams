@@ -275,12 +275,13 @@ async fn connect_ttyd_in_netns(
 }
 
 /// Open a raw `tokio::net::TcpStream` to `guest_ip:port` from *inside*
-/// `netns_name` (a warm-restored sandbox's per-VM netns). `pub(crate)`
-/// + port-parameterized so ADR 0064's [`crate::proxy_port`] reuses the
-/// same `setns(2)` dance for arbitrary guest ports — not just ttyd.
-/// (Before ADR 0064 this hardcoded `TTYD_PORT` and ignored its caller's
-/// port; harmless in prod where the shell always dials 7681, but a
-/// latent mismatch with the cold path. Now it honours `port`.)
+/// `netns_name` (a warm-restored sandbox's per-VM netns). Made
+/// `pub(crate)` and port-parameterized so ADR 0064's
+/// [`crate::proxy_port`] reuses the same `setns(2)` dance for arbitrary
+/// guest ports — not just ttyd. (Before ADR 0064 this hardcoded
+/// `TTYD_PORT` and ignored its caller's port; harmless in prod where the
+/// shell always dials 7681, but a latent mismatch with the cold path —
+/// now it honours `port`.)
 #[cfg(target_os = "linux")]
 pub(crate) async fn connect_tcp_in_netns_linux(
     netns_name: &str,
