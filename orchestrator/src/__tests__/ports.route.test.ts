@@ -7,8 +7,11 @@
  */
 
 import { expect, test, describe } from "bun:test";
+import { create } from "@bufbuild/protobuf";
 
 import { makePortsRoute } from "../routes/ports.ts";
+import { RelayPortResponseSchema } from "../gen/engram/app/v1/session_pb.ts";
+import type { PortRelayClient } from "../routes/preview-proxy.ts";
 import type {
   PortExposureRow,
   PortExposureStore,
@@ -163,5 +166,108 @@ describe("ports CRUD route", () => {
     });
     const res = await app.request("/api/v1/sessions/s1/ports", POST({ port: 3000 }));
     expect(res.status).toBe(201);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Liveness probe (GET …/ports/:slug/health)
+// ---------------------------------------------------------------------------
+
+/** A PortRelay that simulates an answering ("up") or closed ("down") guest
+ * port: it drains the probe's outbound (open + HEAD) and yields either a data
+ * frame (HTTP bytes back) or an immediate close. */
+function fakeRelay(mode: "up" | "down"): PortRelayClient {
+  return {
+    relay(inbound) {
+      return (async function* () {
+        void (async () => {
+          try {
+            for await (const _ of inbound) {
+              /* consume open + HEAD so the probe's writes don't block */
+            }
+          } catch {
+            /* aborted on settle */
+          }
+        })();
+        if (mode === "up") {
+          yield create(RelayPortResponseSchema, {
+            frame: { case: "data", value: new TextEncoder().encode("HTTP/1.0 200 OK\r\n\r\n") },
+          });
+        } else {
+          yield create(RelayPortResponseSchema, { frame: { case: "close", value: {} } });
+        }
+      })();
+    },
+  };
+}
+
+const active = async () => "active";
+const seed = (store: PortExposureStore, sessionId = "s1", port = 3000) =>
+  store.createOrGet({ sessionId, port, label: "", ownerUserId: "owner", visibility: "private" });
+
+describe("ports liveness route", () => {
+  test("active + port answers → up", async () => {
+    const store = fakeStore();
+    const row = await seed(store);
+    const app = makePortsRoute({
+      store,
+      getSession: asUser("owner"),
+      resolveOwner: ownedBy("owner"),
+      portRelay: fakeRelay("up"),
+      sessionStatus: active,
+    });
+    const res = await app.request(`/api/v1/sessions/s1/ports/${row.slug}/health`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "up" });
+  });
+
+  test("active + port silent/closed → down", async () => {
+    const store = fakeStore();
+    const row = await seed(store);
+    const app = makePortsRoute({
+      store,
+      getSession: asUser("owner"),
+      resolveOwner: ownedBy("owner"),
+      portRelay: fakeRelay("down"),
+      sessionStatus: active,
+    });
+    const res = await app.request(`/api/v1/sessions/s1/ports/${row.slug}/health`);
+    expect(await res.json()).toEqual({ status: "down" });
+  });
+
+  test("non-active session → unknown WITHOUT dialing the relay (never wakes a VM)", async () => {
+    const store = fakeStore();
+    const row = await seed(store);
+    let dialed = false;
+    const spyRelay: PortRelayClient = {
+      relay() {
+        dialed = true;
+        return (async function* () {})();
+      },
+    };
+    const app = makePortsRoute({
+      store,
+      getSession: asUser("owner"),
+      resolveOwner: ownedBy("owner"),
+      portRelay: spyRelay,
+      sessionStatus: async () => "idle",
+    });
+    const res = await app.request(`/api/v1/sessions/s1/ports/${row.slug}/health`);
+    expect(await res.json()).toEqual({ status: "unknown" });
+    expect(dialed).toBe(false);
+  });
+
+  test("404 for a slug that is not on this session", async () => {
+    const store = fakeStore();
+    const row = await seed(store, "s1");
+    const app = makePortsRoute({
+      store,
+      getSession: asUser("owner"),
+      resolveOwner: ownedBy("owner"),
+      portRelay: fakeRelay("up"),
+      sessionStatus: active,
+    });
+    const res = await app.request(`/api/v1/sessions/s2/ports/${row.slug}/health`);
+    expect(res.status).toBe(404);
   });
 });
