@@ -33,7 +33,7 @@
  *   11–13. SSE + token (Task 20):
  *      11. GET /api/v1/sessions/:id/events with member cookie → ≥1 SSE frame with id:
  *      12. Reconnect with Last-Event-ID → no duplicate (cursor respected)
- *      13. claude-token POST→GET(true)→DELETE→GET(false) with member cookie
+ *      13. harness-env PUT→GET(present)→DELETE→GET(absent) with member cookie
  *
  * Honest skip: tests skip without SMOKE=1 (bun test --cwd orchestrator
  * passes 0 failures even without the stack running).
@@ -662,50 +662,42 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   );
 
   test.skipIf(!SMOKE)(
-    "13/13 claude-token POST→GET(true)→DELETE→GET(false) with member cookie",
+    "13/13 harness-env PUT→GET(present)→DELETE→GET(absent) with member cookie",
     async () => {
-      const tokenEndpoint = `${BASE}/api/v1/me/claude-token`;
-      const headers = {
-        Cookie: memberCookie,
-        "Content-Type": "application/json",
-      };
+      // Assumes the claude harness is registered (so its user_env appears).
+      const ENV = "CLAUDE_CODE_OAUTH_TOKEN";
+      const base = `${BASE}/api/v1/me/harness-env`;
+      type Vars = { vars?: Array<{ envVar: string; present: boolean }> };
+      const present = (b: Vars) => b.vars?.find((v) => v.envVar === ENV)?.present ?? false;
 
-      // POST → 204.
-      const postRes = await fetch(tokenEndpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ token: "sk-ant-oat01-smoke-test-token" }),
+      // PUT → 204.
+      const putRes = await fetch(`${base}/${ENV}`, {
+        method: "PUT",
+        headers: { Cookie: memberCookie, "Content-Type": "application/json" },
+        body: JSON.stringify({ value: "sk-ant-oat01-smoke-test-token" }),
       });
-      expect(postRes.status).toBe(204);
-      console.log("Smoke 13/13a PASS: POST /me/claude-token → 204");
+      expect(putRes.status).toBe(204);
+      console.log(`Smoke 13/13a PASS: PUT /me/harness-env/${ENV} → 204`);
 
-      // GET → has_claude_token: true.
-      const getRes1 = await fetch(tokenEndpoint, {
-        headers: { Cookie: memberCookie },
-      });
+      // GET → the env var is present.
+      const getRes1 = await fetch(base, { headers: { Cookie: memberCookie } });
       expect(getRes1.status).toBe(200);
-      const body1 = (await getRes1.json()) as { has_claude_token?: boolean };
-      expect(body1.has_claude_token).toBe(true);
-      console.log("Smoke 13/13b PASS: GET /me/claude-token → {has_claude_token:true}");
+      expect(present((await getRes1.json()) as Vars)).toBe(true);
+      console.log("Smoke 13/13b PASS: GET /me/harness-env → present:true");
 
       // DELETE → 204.
-      const delRes = await fetch(tokenEndpoint, {
+      const delRes = await fetch(`${base}/${ENV}`, {
         method: "DELETE",
         headers: { Cookie: memberCookie },
       });
       expect(delRes.status).toBe(204);
-      console.log("Smoke 13/13c PASS: DELETE /me/claude-token → 204");
+      console.log("Smoke 13/13c PASS: DELETE → 204");
 
-      // GET → has_claude_token: false.
-      const getRes2 = await fetch(tokenEndpoint, {
-        headers: { Cookie: memberCookie },
-      });
+      // GET → no longer present.
+      const getRes2 = await fetch(base, { headers: { Cookie: memberCookie } });
       expect(getRes2.status).toBe(200);
-      const body2 = (await getRes2.json()) as { has_claude_token?: boolean };
-      expect(body2.has_claude_token).toBe(false);
-      console.log(
-        "Smoke 13/13 PASS: DELETE confirmed; GET → {has_claude_token:false}",
-      );
+      expect(present((await getRes2.json()) as Vars)).toBe(false);
+      console.log("Smoke 13/13 PASS: DELETE confirmed; GET → present:false");
     },
   );
 

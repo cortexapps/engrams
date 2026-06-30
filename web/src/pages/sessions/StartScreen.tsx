@@ -34,6 +34,7 @@ import { useProfiles } from "../../hooks/useProfiles";
 import { useIntegrationCatalog } from "../../hooks/useIntegrations";
 import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
+import { useHarnessEnv } from "../../hooks/useHarnessEnv";
 import { useTasksAsSessionList } from "../../hooks/useTasks";
 import {
   SessionHarnessControls,
@@ -106,6 +107,7 @@ export function StartScreen() {
   const { data: catalog } = useIntegrationCatalog();
   const { data: images } = useEnabledImages(true);
   const { data: harnesses } = useHarnessCatalog(true);
+  const { data: harnessEnvVars } = useHarnessEnv(true);
   const { data: taskList } = useTasksAsSessionList();
   const createTaskMutation = useMutation(createTask);
 
@@ -237,7 +239,18 @@ export function StartScreen() {
     });
   }, [hasProfilesError, refetchProfiles]);
 
-  const showTokenNudge = !isAdmin && !principal.has_claude_token;
+  // ADR 0063 B3: nudge to set the selected harness's user credential when the
+  // profile will inject it (includeUserTokens) but the user hasn't saved it.
+  const effectiveHarnessName =
+    harnessOverride.harness ??
+    selected?.harness ??
+    (harnesses?.length === 1 ? harnesses[0]?.name : undefined);
+  const effectiveHarness = harnesses?.find((h) => h.name === effectiveHarnessName);
+  const effectiveUserEnv = effectiveHarness?.descriptor?.auth?.userEnv;
+  const userEnvMissing =
+    !!effectiveUserEnv &&
+    (harnessEnvVars?.some((v) => v.envVar === effectiveUserEnv && !v.present) ?? false);
+  const showTokenNudge = !isAdmin && !!selected?.includeUserTokens && userEnvMissing;
   const noProfiles = !profilesPending && !profilesError && profiles.length === 0;
 
   return (
@@ -256,13 +269,14 @@ export function StartScreen() {
             <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5 rounded-lg border bg-secondary/60 px-3 py-2 text-sm">
               <span className="flex items-center gap-2">
                 <KeyRound className="size-4 shrink-0 text-instrument-caution" />
-                No Claude Code token saved — built-in Claude tasks need one.
+                No <code className="font-mono">{effectiveUserEnv}</code> saved —{" "}
+                {effectiveHarness?.descriptor?.label || effectiveHarnessName} sessions need it.
               </span>
               <Link
                 to="/settings/tokens"
                 className="shrink-0 font-medium underline underline-offset-4"
               >
-                Add token
+                Add credential
               </Link>
             </div>
           )}
