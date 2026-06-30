@@ -18,7 +18,22 @@ export PATH="$here/bin:$PATH"
 
 DISPLAY_NUM="${ENGRAM_BROWSER_DISPLAY:-99}"
 export DISPLAY=":$DISPLAY_NUM"
-GEOMETRY="${ENGRAM_BROWSER_GEOMETRY:-1280x800x24}"
+# Xvfb's framebuffer is FIXED at this size for the VM's lifetime — it can't grow
+# past its startup geometry, and in practice Xvfb+x11vnc do NOT honor the noVNC
+# client's resize-to-panel request (the framebuffer stays put), so we don't
+# depend on dynamic resize. Instead chrome fills this fixed framebuffer
+# completely (see --window-size on the chrome launch below), and the noVNC tab
+# scales it to fit its panel (scaleViewport). Aspect differences between this
+# framebuffer and the panel show up as letterbox bars. Override via
+# ENGRAM_BROWSER_GEOMETRY.
+GEOMETRY="${ENGRAM_BROWSER_GEOMETRY:-1440x1080x24}"
+# Split WxHxDEPTH so chrome can be sized to exactly the framebuffer below — the
+# WM maximize hint (--start-maximized) raced/failed, leaving chrome at its
+# default ~half-width size with the rest of the framebuffer showing as black
+# desktop. An explicit --window-size is deterministic.
+FB_W="${GEOMETRY%%x*}"
+_geom_rest="${GEOMETRY#*x}"
+FB_H="${_geom_rest%%x*}"
 VNC_PORT="${ENGRAM_BROWSER_VNC_PORT:-5900}"
 PROFILE_DIR="$(mktemp -d /tmp/engram-browser-profile.XXXXXX)"
 
@@ -79,8 +94,8 @@ done
             --no-sandbox \
             --no-first-run --no-default-browser-check \
             --disable-infobars \
-            --start-maximized \
             --window-position=0,0 \
+            --window-size="$FB_W,$FB_H" \
             "${ENGRAM_BROWSER_HOMEPAGE:-about:blank}" || true
         # chrome exited; pause so a hard launch failure can't hot-loop, then
         # bring it back up on the same display.
