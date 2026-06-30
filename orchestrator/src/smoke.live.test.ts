@@ -332,7 +332,8 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
     async () => {
       expect(adminCookie).toBeTruthy(); // test 7 must have run
 
-      // Pick a no-harness enabled image (admin view) to back the profile.
+      // Pick any enabled image (admin view) to back the profile. ADR 0062:
+      // an image carries no harness identity — harness is a per-session choice.
       const imagesRes = await rpc(
         "engram.app.v1.ImageService",
         "ListEnabledImages",
@@ -341,12 +342,12 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
       );
       expect(imagesRes.status).toBe(200);
       const imagesBody = (await imagesRes.json()) as {
-        images?: Array<{ id?: string; imageUri?: string; harnessName?: string }>;
+        images?: Array<{ id?: string; imageUri?: string }>;
       };
-      const noHarnessImage = (imagesBody.images ?? []).find((img) => !img.harnessName);
-      if (!noHarnessImage?.id) {
+      const enabledImage = (imagesBody.images ?? [])[0];
+      if (!enabledImage?.id) {
         throw new Error(
-          "No no-harness image found in ListEnabledImages — bake/enable one first " +
+          "No enabled image found in ListEnabledImages — bake/enable one first " +
             "(deploy/dev/integration-session.sh)",
         );
       }
@@ -358,7 +359,7 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
           name: `smoke-profile-${Date.now()}`,
           description: "ephemeral smoke profile",
           icon: "box",
-          imageId: noHarnessImage.id,
+          imageId: enabledImage.id,
           includeUserTokens: false,
           envVars: {},
         },

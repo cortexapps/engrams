@@ -51,7 +51,6 @@ function makeProtoImage(
     manifestDigest: "sha256:abc",
     manifestName: "cortex-api",
     manifestDescription: "",
-    harnessName: "",
     lastRefreshedAt: new Date().toISOString(),
     createdAt: new Date().toISOString(),
     captureEnv,
