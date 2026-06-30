@@ -1100,15 +1100,19 @@ jobs:
           CLAUDE_VERSION: ${{ steps.claude_cli.outputs.version }}
         run: |
           # Stage into a known, repo-relative path so upload-artifact
-          # has a stable input. The staged directory IS the contents
-          # of /opt/engram/harness/ the baker will extract on the
-          # image side: entry binary at `harness`, bundled `claude`
-          # CLI alongside, and an `artifact.toml` descriptor.
+          # has a stable input. The staged directory is the harness pack:
+          # entry binary at `harness`, bundled `claude` CLI alongside, and
+          # the ADR 0063 `harness.toml` descriptor (read by RegisterHarness,
+          # which pulls this artifact + packs it into the catalog). The
+          # legacy `artifact.toml` is still staged transitionally until the
+          # bake-time injection path is removed (ADR 0062 A4b).
           STAGE="$PWD/var/harness-claude-stage"
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
           cp -p target/x86_64-unknown-linux-musl/release/engram-harness-claude "$STAGE/harness"
           cp -p /tmp/claude "$STAGE/claude"
+          # ADR 0062/0063: the canonical harness descriptor (committed, reviewed).
+          cp -p deploy/harness-claude/harness.toml "$STAGE/harness.toml"
           cat > "$STAGE/artifact.toml" <<EOF
           name = "claude"
           version = "${HARNESS_VERSION}"
@@ -1829,11 +1833,18 @@ jobs:
             --to "$TAG"
           # Catalog override: the in-baker
           # `engram-image-builder::BuiltinCatalog::with_overrides_from_env`
-          # picks this up and redirects `[harness] builtin = "claude"`
-          # resolution to the local registry. Exported via $GITHUB_ENV
-          # so subsequent steps (the bake) inherit it.
+          # picks this up and redirects any legacy `[harness] builtin =
+          # "claude"` resolution to the local registry. Exported via
+          # $GITHUB_ENV so subsequent steps (the bake) inherit it. (ADR
+          # 0062: demo-claude is now harness-free, so the baker no longer
+          # consumes this; the e2e registers the harness via the catalog
+          # instead — see ENGRAM_E2E_HARNESS_OCI_REF below.)
           echo "ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO=${LOCAL_REPO}" >> "$GITHUB_ENV"
           echo "Catalog override set: ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO=${LOCAL_REPO}"
+          # ADR 0062: the exact OCI ref the e2e agent tests RegisterHarness
+          # with (the coordinator pulls it + packs the catalog generation).
+          echo "ENGRAM_E2E_HARNESS_OCI_REF=${TAG}" >> "$GITHUB_ENV"
+          echo "Harness OCI ref for e2e: ENGRAM_E2E_HARNESS_OCI_REF=${TAG}"
 
       - name: Bake demo image + capture URI
         run: |
