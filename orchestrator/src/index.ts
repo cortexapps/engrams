@@ -6,6 +6,7 @@ import { log } from "./log.ts";
 import { buildServer } from "./server.ts";
 import health from "./routes/health.ts";
 import authRoute from "./routes/auth.ts";
+import authConfigRoute from "./routes/auth-config.ts";
 import eventsRoute from "./routes/events.ts";
 import artifactsRoute from "./routes/artifacts.ts";
 import portsRoute from "./routes/ports.ts";
@@ -66,6 +67,9 @@ app.use(makePreviewProxyMiddleware());
 // Mount routes.
 app.route("/", health);
 app.route("/", authRoute);
+// Public auth posture for the SPA login page (which doors are open). Sits
+// alongside the better-auth mount; unauthenticated by design (pre-login).
+app.route("/", authConfigRoute);
 // ADR 0051 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/harness-env).
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
