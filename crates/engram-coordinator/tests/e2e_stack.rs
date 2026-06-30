@@ -29,10 +29,10 @@
 //! `test-e2e-stack` in `.github/workflows/ci.yml` brings up the stack
 //! (`tilt-up-ci.sh` + `integration-bake-demo.sh`), runs these tests via
 //! `cargo nextest --run-ignored`, and tears down on completion. ADR 0062: the
-//! harness is no longer baked into the image — the agent tests register the
-//! built-in `claude` harness into the catalog (`ensure_harness_registered`,
-//! from the harness-claude OCI artifact at `ENGRAM_E2E_HARNESS_OCI_REF`) and the
-//! session selects `harness = "claude"`, mounted on `dyn_0`.
+//! harness is no longer baked into the image — the built-in `claude` harness
+//! rides the host-image `current_bundles` stamp (the e2e "Stage RO skill bundles"
+//! step stamps `harness-claude` alongside `skills`/`sentinel`), and the agent
+//! tests just select `harness = "claude"`, mounted on `dyn_0`. No registration.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -40,7 +40,6 @@ use std::time::Duration;
 use engram_core::SessionId;
 use engram_protocol::app;
 use engram_protocol::app::fleet_service_client::FleetServiceClient;
-use engram_protocol::app::harness_catalog_service_client::HarnessCatalogServiceClient;
 use engram_protocol::app::session_service_client::SessionServiceClient;
 use serde_json::Value;
 use tonic::codegen::InterceptedService;
@@ -114,17 +113,12 @@ impl tonic::service::Interceptor for BearerFn {
 
 type SessClient = SessionServiceClient<InterceptedService<Channel, BearerFn>>;
 type FleetClient = FleetServiceClient<InterceptedService<Channel, BearerFn>>;
-type HarnessClient = HarnessCatalogServiceClient<InterceptedService<Channel, BearerFn>>;
 
 /// gRPC driver for the live coordinator. Holds one shared channel and the
 /// service clients the tests exercise.
 struct Driver {
     sess: SessClient,
     fleet: FleetClient,
-    harness_cat: HarnessClient,
-    /// Set once `ensure_harness_registered` has registered the Claude harness,
-    /// so repeated agent-session creates don't re-pull + re-pack the catalog.
-    harness_registered: bool,
 }
 
 impl Driver {
@@ -146,38 +140,8 @@ impl Driver {
 
         let interceptor = BearerFn { token };
         let sess = SessionServiceClient::with_interceptor(channel.clone(), interceptor.clone());
-        let fleet = FleetServiceClient::with_interceptor(channel.clone(), interceptor.clone());
-        let harness_cat = HarnessCatalogServiceClient::with_interceptor(channel, interceptor);
-        Self {
-            sess,
-            fleet,
-            harness_cat,
-            harness_registered: false,
-        }
-    }
-
-    /// ADR 0062: register the built-in `claude` harness into the catalog so an
-    /// agent session can select it. The coordinator pulls the harness-claude OCI
-    /// artifact the CI lane re-published to the local registry, validates its
-    /// `harness.toml`, and packs the catalog generation. Idempotent + done once
-    /// per Driver (RegisterHarness is upsert-by-name).
-    async fn ensure_harness_registered(&mut self) {
-        if self.harness_registered {
-            return;
-        }
-        let oci_ref = std::env::var("ENGRAM_E2E_HARNESS_OCI_REF").expect(
-            "ENGRAM_E2E_HARNESS_OCI_REF must be set — the local-registry ref of the \
-             harness-claude OCI artifact the CI lane re-published",
-        );
-        self.harness_cat
-            .register_harness(app::RegisterHarnessRequest {
-                name: "claude".to_string(),
-                oci_ref,
-                owner: "e2e".to_string(),
-            })
-            .await
-            .expect("RegisterHarness (claude)");
-        self.harness_registered = true;
+        let fleet = FleetServiceClient::with_interceptor(channel, interceptor);
+        Self { sess, fleet }
     }
 
     fn image_uri() -> String {
@@ -281,9 +245,9 @@ impl Driver {
         api_key: &str,
         prompt: Option<&str>,
     ) -> SessionId {
-        // ADR 0062: the harness is selected per session from the catalog (not
-        // baked into the image), so register it before the agent create.
-        self.ensure_harness_registered().await;
+        // ADR 0062: the built-in `claude` harness rides the host-image
+        // current_bundles stamp (staged by the e2e "Stage RO skill bundles"
+        // step), so the session just selects it by name — no registration.
         let mut harness_env = HashMap::new();
         harness_env.insert("ANTHROPIC_API_KEY".to_string(), api_key.to_string());
         let req = app::CreateSessionRequest {
@@ -747,7 +711,7 @@ async fn e2e_session_has_mounted_skills_bundle() {
 }
 
 #[tokio::test]
-#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + ENGRAM_E2E_HARNESS_OCI_REF (the registered Claude harness)"]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + the harness-claude bundle in the host stamp"]
 async fn e2e_cold_session_claude_harness_can_exec_ls() {
     // Raw Exec hits the sandbox directly — the Claude harness is bound but
     // unused. Use a bogus key so a future regression that races a harness

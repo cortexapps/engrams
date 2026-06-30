@@ -656,6 +656,37 @@ jobs:
       - name: Install squashfs-tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
 
+      # ADR 0062: the built-in claude harness rides the stamp as `bundle-harness-claude`.
+      # Build its tree (the engram-harness-claude musl binary + the pinned claude CLI —
+      # the same recipe as ci.yml's bake-harness-claude-artifact) so it packs + publishes
+      # alongside the other bundles below.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ''
+          target: x86_64-unknown-linux-musl
+      - name: Install build deps (musl-tools, protoc)
+        run: sudo apt-get install -y -qq --no-install-recommends musl-tools protobuf-compiler
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Same musl release deps as ci.yml's bake-harness-claude-artifact.
+          shared-key: release-musl-bake
+      - name: Stage harness-claude tree
+        run: |
+          set -euo pipefail
+          # Keep CLAUDE_VERSION in lockstep with ci.yml's bake-harness-claude-artifact.
+          CLAUDE_VERSION=2.1.185
+          cargo build --release --target x86_64-unknown-linux-musl -p engram-harness-claude
+          curl -fsSL --retry 3 \
+            "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
+            -o /tmp/claude
+          chmod +x /tmp/claude
+          STAGE="$PWD/var/harness-claude-stage"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp -p target/x86_64-unknown-linux-musl/release/engram-harness-claude "$STAGE/harness"
+          cp -p /tmp/claude "$STAGE/claude"
+          cp -p deploy/harness-claude/harness.toml "$STAGE/harness.toml"
+
       - name: Build bundles
         run: |
           set -euo pipefail
@@ -673,6 +704,8 @@ jobs:
           # integrations-cli (ADR 0058): glibc Docker build (gh + datadog-ci +
           # deps), then squashfs.
           deploy/bundles/integrations-cli/build.sh dist/integrations-cli.squashfs
+          # ADR 0062: the built-in claude harness (tree staged above).
+          deploy/bundles/harness-claude/build.sh var/harness-claude-stage dist/harness-claude.squashfs
           ls -l dist/
 
       - name: Log in to GHCR
@@ -691,7 +724,7 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${SHA:0:7}"
-          for name in sentinel skills playwright integrations-cli; do
+          for name in sentinel skills playwright integrations-cli harness-claude; do
             REPO="ghcr.io/${{ github.repository }}/bundle-$name"
             # `oras pull <repo>:<sha>` drops <name>.squashfs into cwd verbatim.
             oras push "$REPO:$SHA" \
