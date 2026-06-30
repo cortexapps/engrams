@@ -62,6 +62,18 @@ service ShellRelayService {
   rpc Relay(stream RelayShellRequest) returns (stream RelayShellResponse);
 }
 
+// ADR 0064: raw-byte port relay — the orchestrator→coordinator app-tier
+// bridge for vanity-subdomain preview tunnels. Like ShellRelayService it
+// is bidi + browser-uncallable, kept off the UI surface; it carries
+// opaque TCP bytes (the orchestrator HTTP-proxies a preview request
+// through it, coordinator → host → guest port). Distinct from
+// host_service.proto's ProxyPort (this is the app tier in front of it).
+service PortRelayService {
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc Relay(stream RelayPortRequest) returns (stream RelayPortResponse);
+}
+
 message ListSessionsRequest {}
 
 message ListSessionsResponse {
@@ -541,3 +553,33 @@ message ShellClose {
   uint32 code = 1;
   string reason = 2;
 }
+
+// ---------------------------------------------------------------------
+// PortRelayService messages (ADR 0064).
+// ---------------------------------------------------------------------
+
+// Raw opaque bytes; no frame-kind taxonomy (cf. RelayShell*). Request
+// and response are separate types (RPC_REQUEST_RESPONSE_UNIQUE) and
+// mark directionality.
+message RelayPortRequest {
+  oneof frame {
+    PortOpen open = 1; // first client frame: which session + which port
+    bytes data = 2;
+    PortClose close = 3;
+  }
+}
+
+message RelayPortResponse {
+  oneof frame {
+    bytes data = 1;
+    PortClose close = 2;
+  }
+}
+
+message PortOpen {
+  string session_id = 1;
+  uint32 port = 2; // guest TCP port to reach (1..=65535)
+}
+
+// Clean teardown sentinel (see ProxyPortClose in host_service.proto).
+message PortClose {}
