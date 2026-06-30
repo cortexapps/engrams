@@ -39,6 +39,7 @@ import { ImagesPanel } from "./components/settings/ImagesPanel";
 import { ProfilePanel } from "./components/settings/ProfilePanel";
 import { RegistriesPanel } from "./components/settings/RegistriesPanel";
 import { SecretsPanel } from "./components/settings/SecretsPanel";
+import { HarnessesPanel } from "./components/settings/HarnessesPanel";
 import { IntegrationsPanel } from "./components/settings/IntegrationsPanel";
 import { IntegrationDetail } from "./components/integrations/IntegrationDetail";
 import { TokensPanel } from "./components/settings/TokensPanel";
@@ -212,6 +213,12 @@ const secretsRoute = createRoute({
   beforeLoad: requireAdmin,
   component: SecretsPanel,
 });
+const harnessesRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "harnesses",
+  beforeLoad: requireAdmin,
+  component: HarnessesPanel,
+});
 const integrationsRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "integrations",
@@ -268,6 +275,7 @@ export const routeTree = rootRoute.addChildren([
       tokensRoute,
       membersRoute,
       secretsRoute,
+      harnessesRoute,
       integrationsRoute,
       integrationDetailRoute,
       profilesRoute,
