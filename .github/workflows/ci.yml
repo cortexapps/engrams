@@ -1691,65 +1691,44 @@ jobs:
             | sudo bash
           tilt version
 
-      # ADR 0027 → 0035 → 0055: stage the RO skill bundles CONTENT-ADDRESSED
-      # (<sha256>.squashfs + current.json stamp) — the same shape the FC-host
-      # image bake / `just bundles-squashfs` produces.
-      #
-      # MUST run BEFORE the stack comes up: the host-agent reads current.json
+      # ADR 0027 → 0035 → 0055 → 0062: the e2e host-agent reads its RO bundles
+      # from var/shared (Tiltfile sets ENGRAM_BUNDLE_DIR there), CONTENT-ADDRESSED
+      # (<sha256>.squashfs + a current.json stamp) and staged by `just
+      # bundles-squashfs` when tilt brings the stack up — the host reads the stamp
       # ONCE at startup (host_agent/src/lib.rs read_stamp) and reports the same
-      # current_bundles on every heartbeat, exactly like prod (the Packer bake
-      # stages the stamp into the host image before the agent starts). The coord
-      # resolves a session's selected_skills names against that reported catalog.
+      # current_bundles on every heartbeat, exactly like prod's Packer-baked stamp.
+      # The coord resolves a session's selected_skills + harness against that.
+      # `bundles-squashfs` stages `sentinel` (MANDATORY — base-snapshot capture
+      # resolves every reserved dyn-* slot to its sha) + `skills` (the catalog skill
+      # `e2e_session_has_mounted_skills_bundle` asserts).
       #
-      # ADR 0055: the `sentinel` bundle is MANDATORY — base-snapshot capture
-      # attaches RESERVED_SLOTS reserved dyn-* drives, all resolved to the
-      # sentinel sha from this stamp; without it every enable 500s (loudly, by
-      # design). `skills` is the catalog skill `e2e_session_has_mounted_skills_bundle`
-      # selects + asserts: the coord resolves "skills" -> its sha, patch_drives
-      # it into a reserved slot, the init shim mounts it at /opt/engram/dyn/<i>
-      # (the owned 6.1 kernel has squashfs), and agentd wires share-file.
-      # (playwright is omitted — heavy chromium build, and no test selects it.)
-      # ADR 0062: the built-in `claude` harness rides the stamp like a skill.
-      # Download its tree (entry binary + claude CLI, built by
-      # `bake-harness-claude-artifact`) so the stage step below packs it into a
-      # squashfs and stamps `harness-claude`. No RegisterHarness — the coordinator
-      # resolves the built-in from the stamp + its embedded descriptor.
+      # ADR 0062: the built-in `claude` harness rides that same stamp. Its tree
+      # (entry binary + claude CLI) is BUILT, not committed, so download it (from
+      # `bake-harness-claude-artifact`) and hand it to `bundles-squashfs` via
+      # ENGRAM_HARNESS_CLAUDE_TREE (next step) — it packs `harness-claude` into the
+      # stamp alongside skills/sentinel. No RegisterHarness; the coordinator
+      # resolves the built-in from the host's current_bundles + its embedded
+      # descriptor.
       - name: Download harness-claude artifact
         uses: actions/download-artifact@v4
         with:
           name: harness-claude-artifact
           path: var/harness-claude-stage
 
-      - name: Restore +x on the harness binaries
+      - name: Restore +x on the harness binaries + hand the tree to tilt
         run: |
           # upload/download-artifact's ZIP drops Unix mode bits; the guest execs
           # /opt/engram/dyn/0/harness, so it must stay executable in the squashfs.
           chmod +x var/harness-claude-stage/harness var/harness-claude-stage/claude
           ls -la var/harness-claude-stage/
+          # Point `just bundles-squashfs` (tilt runs it next) at this downloaded
+          # tree so it packs `harness-claude` into var/shared's stamp.
+          echo "ENGRAM_HARNESS_CLAUDE_TREE=$PWD/var/harness-claude-stage" >> "$GITHUB_ENV"
 
-      - name: Stage RO bundles (skills + built-in harness, ADR 0055/0062)
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
-          sudo mkdir -p /var/lib/engram/shared
-          stamp="{"
-          sep=""
-          stage_one() {  # stage_one <stamp-name> <squashfs>
-            local sha
-            sha="$(sha256sum "$2" | cut -d' ' -f1)"
-            sudo install -m 0644 "$2" "/var/lib/engram/shared/$sha.squashfs"
-            stamp="$stamp$sep\"$1\": \"$sha\""
-            sep=", "
-          }
-          for name in sentinel skills; do
-            deploy/bundles/"$name"/build.sh "/tmp/$name.squashfs"
-            stage_one "$name" "/tmp/$name.squashfs"
-          done
-          # The built-in claude harness (its tree comes from the artifact above).
-          deploy/bundles/harness-claude/build.sh var/harness-claude-stage /tmp/harness-claude.squashfs
-          stage_one "harness-claude" /tmp/harness-claude.squashfs
-          echo "$stamp}" | sudo tee /var/lib/engram/shared/current.json >/dev/null
-          ls -l /var/lib/engram/shared/
-          cat /var/lib/engram/shared/current.json
+      # `just bundles-squashfs` (the tilt `bundles` resource) packs the RO bundles
+      # with mksquashfs, so squashfs-tools must be on PATH before the stack comes up.
+      - name: Install squashfs-tools (for bundles-squashfs)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
 
       - name: Bring up prod-shape stack (tilt)
         env:

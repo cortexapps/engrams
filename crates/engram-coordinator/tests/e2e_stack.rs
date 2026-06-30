@@ -658,8 +658,8 @@ async fn e2e_cold_session_no_harness_can_exec_ls() {
 ///
 /// Baked skills are retired and skills are now profile-selected, so the session
 /// is created with `selected_skills = ["skills"]`. The e2e-stack lane stages the
-/// content-addressed `skills` + `sentinel` bundles under
-/// `/var/lib/engram/shared`, so this exercises the WHOLE ADR 0055 chain
+/// content-addressed `skills` + `sentinel` bundles into `var/shared` (the dir the
+/// host-agent reads, via `just bundles-squashfs`), so this exercises the WHOLE ADR 0055 chain
 /// end-to-end: capture attaches the reserved sentinel slots → the coord resolves
 /// `"skills"` → its staged sha and `patch_drive`s it into a reserved slot in the
 /// paused restore window → the init shim mounts it at `/opt/engram/dyn/<i>` (the
@@ -669,7 +669,7 @@ async fn e2e_cold_session_no_harness_can_exec_ls() {
 /// assertion targets the stable wired paths. Integrated counterpart to the
 /// `engram-session-bundles` unit tests + the `aux_ro_drive` FC mechanism test.
 #[tokio::test]
-#[ignore = "requires the e2e-stack lane (stages the skills + sentinel RO bundles at /var/lib/engram/shared)"]
+#[ignore = "requires the e2e-stack lane (stages the skills + sentinel RO bundles into var/shared)"]
 async fn e2e_session_has_mounted_skills_bundle() {
     let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
