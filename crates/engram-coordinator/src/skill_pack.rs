@@ -13,7 +13,6 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use engram_mount_manifest::MountManifest;
 use sha2::{Digest, Sha256};
@@ -376,41 +375,16 @@ fn sanitize_rel(path: &Path) -> Result<PathBuf, PackError> {
     Ok(out)
 }
 
-/// Pack `tree` into a squashfs (reproducible flags) and return its bytes.
+/// Pack `tree` into a squashfs (reproducible flags) and return its bytes, via
+/// the shared [`crate::squashfs`] packer the harness catalog also uses.
 fn mksquashfs(tree: &Path) -> Result<Vec<u8>, PackError> {
-    let out_dir = tempfile::tempdir().map_err(|e| PackError::Internal(format!("tempdir: {e}")))?;
-    let out_path = out_dir.path().join("skill.squashfs");
-    // Determinism (so identical content → identical sha, making re-registration
-    // idempotent): `-all-root` (root-owned, as the guest mounts RO), `-no-xattrs`,
-    // `-comp zstd` (matching the P1 `deploy/bundles/*/build.sh` recipes), and a
-    // pinned `SOURCE_DATE_EPOCH` so mksquashfs clamps every timestamp to a fixed
-    // value (the prod coordinator container has no ambient epoch; the nix dev
-    // shell sets its own, so we override to a constant either way). We must NOT
-    // also pass `-mkfs-time`/`-all-time` — mksquashfs refuses both at once.
-    let output = Command::new("mksquashfs")
-        .arg(tree)
-        .arg(&out_path)
-        .args(["-comp", "zstd", "-all-root", "-noappend", "-no-xattrs"])
-        .env("SOURCE_DATE_EPOCH", "0")
-        .output()
-        .map_err(|e| {
-            PackError::Internal(format!(
-                "spawn mksquashfs (is squashfs-tools installed?): {e}"
-            ))
-        })?;
-    if !output.status.success() {
-        return Err(PackError::Internal(format!(
-            "mksquashfs exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    std::fs::read(&out_path).map_err(|e| PackError::Internal(format!("read squashfs: {e}")))
+    crate::squashfs::pack_dir(tree).map_err(PackError::Internal)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn tar_with(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());

@@ -34,7 +34,9 @@ pub struct SkillEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountManifest {
     /// [`Self::KIND_SKILL`] (wire it) | [`Self::KIND_SENTINEL`]
-    /// (reserved-but-unused slot; the guest skips it).
+    /// (reserved-but-unused slot; the guest skips it) | [`Self::KIND_HARNESS`]
+    /// (the ADR 0062 harness catalog on `dyn_0`; the guest skips it — the
+    /// harness is `exec`'d by the coordinator's `argv`, not activated here).
     pub kind: String,
     /// Skills this bundle carries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -50,6 +52,22 @@ impl MountManifest {
     pub const KIND_SKILL: &'static str = "skill";
     /// The tiny placeholder every reserved-but-unused slot carries at capture.
     pub const KIND_SENTINEL: &'static str = "sentinel";
+    /// The ADR 0062 harness catalog squashfs (mounted on `dyn_0`). The guest
+    /// skips it during `activate()` — every registered harness lives under
+    /// `<name>/` in the squashfs and is `exec`'d via the coordinator-built
+    /// `argv[0] = /opt/engram/dyn/0/<name>/<exec>`, never wired as a skill.
+    pub const KIND_HARNESS: &'static str = "harness";
+
+    /// The `mount.json` written at the root of the harness catalog squashfs
+    /// (ADR 0062 §5). It declares only the kind — the harnesses are
+    /// argv-selected, so the guest needs no per-harness wiring metadata here.
+    pub fn harness_catalog() -> Self {
+        Self {
+            kind: Self::KIND_HARNESS.to_string(),
+            skills: Vec::new(),
+            provides_askpass: None,
+        }
+    }
 
     /// The manifest the coordinator's P2 packer generates for an uploaded skill:
     /// a single markdown/file skill (no bins, no env gate, no askpass) whose
@@ -79,6 +97,12 @@ impl MountManifest {
     /// `true` for a reserved-but-unused slot the guest should skip.
     pub fn is_sentinel(&self) -> bool {
         self.kind == Self::KIND_SENTINEL
+    }
+
+    /// `true` for the harness catalog slot the guest should skip during
+    /// `activate()` (the harness is `exec`'d via `argv`, not wired as a skill).
+    pub fn is_harness(&self) -> bool {
+        self.kind == Self::KIND_HARNESS
     }
 }
 
@@ -140,5 +164,17 @@ mod tests {
         let m: MountManifest = serde_json::from_str(r#"{"kind":"sentinel"}"#).unwrap();
         assert!(m.is_sentinel());
         assert!(m.skills.is_empty());
+    }
+
+    #[test]
+    fn harness_catalog_serializes_to_kind_only_and_is_skipped() {
+        let m = MountManifest::harness_catalog();
+        assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"kind":"harness"}"#);
+        assert!(m.is_harness());
+        assert!(!m.is_sentinel());
+        // Round-trips, and the guest recognizes it as the harness catalog.
+        let back: MountManifest = serde_json::from_str(r#"{"kind":"harness"}"#).unwrap();
+        assert!(back.is_harness());
+        assert!(back.skills.is_empty());
     }
 }

@@ -24,6 +24,7 @@ pub mod error;
 pub mod evac_resumer;
 pub mod evacuation;
 pub mod grpc_app;
+pub mod harness_pack;
 pub mod harness_paths;
 pub mod host_registry;
 pub mod idle_detect_backstop;
@@ -42,6 +43,7 @@ pub mod scheduler;
 pub mod session_boot;
 pub mod skill_pack;
 pub mod snapshot_blob_gc;
+pub mod squashfs;
 pub mod state;
 
 pub use config::CoordinatorConfig;
