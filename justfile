@@ -331,6 +331,27 @@ bundles-vz:
         stamp="$stamp$sep\"$name\": \"$sha\""
         sep=", "
     done
+    # ADR 0062: the built-in `claude` harness rides the stamp like a skill (key
+    # `harness-claude`, mounted on dyn_0). Unlike the bundles above its tree (the
+    # engram-harness-claude entry binary + the bundled `claude` CLI) is pre-built
+    # and handed in via ENGRAM_HARNESS_CLAUDE_TREE, exactly as `bundles-squashfs`
+    # does for FC — the only difference is the pack format (erofs, not squashfs).
+    # Skipped when unset, so a no-harness VZ dev stack still boots; a local
+    # `just dev` that wants the built-in claude points this at a staged tree.
+    if [ -n "${ENGRAM_HARNESS_CLAUDE_TREE:-}" ]; then
+        [ -x "$ENGRAM_HARNESS_CLAUDE_TREE/harness" ] || {
+            echo "ENGRAM_HARNESS_CLAUDE_TREE=$ENGRAM_HARNESS_CLAUDE_TREE is missing an executable 'harness' entry binary" >&2
+            exit 1
+        }
+        out="var/shared/.harness-claude.build.erofs"
+        rm -f "$out"
+        # -b 4096: match the guest page size (see the loop above).
+        mkfs.erofs -b 4096 "$out" "$ENGRAM_HARNESS_CLAUDE_TREE" >/dev/null
+        sha="$(sha256_of "$out")"
+        mv "$out" "var/shared/$sha.erofs"
+        stamp="$stamp$sep\"harness-claude\": \"$sha\""
+        sep=", "
+    fi
     echo "$stamp}" > var/shared/current.json
     cat var/shared/current.json
 
