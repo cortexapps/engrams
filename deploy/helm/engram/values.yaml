@@ -449,15 +449,20 @@ orchestrator:
   # an unset block leaves that auth path fully inert.
   #
   #   email+password  → set NOTHING here (dev / simple deploys)
-  #   IAP             → set auth.iap.audience (GCP IAP in front of the Ingress)
+  #   IAP             → set auth.iap.audiences (GCP IAP in front of the Ingress)
   #   OIDC            → set auth.oidc.{issuer,clientId,clientSecret} ("Sign in
   #                     with your IdP"; yields real user names via the `profile`
   #                     scope, which stock GCP IAP can't supply)
   auth:
-    # IAP — GCP Identity-Aware Proxy bridge. Set `audience` to enable; the
-    # bridge is fully inert (zero header reads) when empty.
+    # IAP — GCP Identity-Aware Proxy bridge. Add one or more trusted audiences
+    # to enable; the bridge is fully inert (zero header reads) when empty. A
+    # SET because the orchestrator can sit behind more than one IAP-protected
+    # GCP backend service (e.g. the app's web Ingress AND the ADR 0064 preview
+    # Gateway), and a GCP IAP audience IS the backend-service resource — there
+    # is no single audience shared across backends. Rendered to IAP_AUDIENCES
+    # (comma-joined); verification accepts an assertion matching ANY entry.
     iap:
-      audience: ""    # /projects/<PROJECT_NUMBER>/apps/<APP_ID> (or backendServices form)
+      audiences: []    # e.g. [/projects/<NUM>/global/backendServices/<ID>, …]
       # Override the IAP JWKS endpoint (default in config.ts points at gstatic).
       # Leave empty in prod.
       jwksUrl: ""

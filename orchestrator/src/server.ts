@@ -74,7 +74,7 @@ export function buildServer(app: Hono, routes: RouteRegistrar = () => {}, nodeWs
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     // IAP bridge runs first — before /rpc vs Hono dispatch — so it covers
     // every HTTP entry path. See iap-bridge.ts for placement rationale.
-    // When IAP_AUDIENCE is unset this is a synchronous no-op.
+    // When IAP_AUDIENCES is empty this is a synchronous no-op.
     iapBridge(req, res, () => {
       const url = req.url ?? "/";
 
