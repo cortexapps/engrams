@@ -207,6 +207,60 @@ dev:
 dev-down:
     tilt down
 
+# Reclaim all dev sandbox disk — the dev analog of the production lifecycle
+# GC. Two stages:
+#
+#   1. Reap every session the coordinator tracks via the production
+#      DeleteSession path (terminate -> destroy bound sandbox). There is no
+#      fleet-wide reap RPC — the prod idle detector evicts one session at a
+#      time (ADR 0034) — so this loops `session delete` over `session list`.
+#      Idempotent: an already-terminal session deletes as a no-op.
+#   2. Sweep orphaned local sandbox rootfs files. The host-agent teardown
+#      reconciler (ADR 0050 E) only reaps sandboxes it still TRACKS; rootfs
+#      files leaked by a killed / branch-switched host-agent are invisible to
+#      it and pile up (hundreds of MiB each). This removes any
+#      `<sandbox>.rootfs.ext4` (+ its vsock sockets) NOT owned by a session
+#      that is still live — the live set is re-read AFTER stage 1, so a
+#      session created concurrently is never swept.
+#
+# Checkpoints (snapshots) are reclaimed by the coordinator's snapshot/chunk
+# GC once their owning sessions are gone; the warm-pool base snapshot an
+# enabled image clones from is preserved (re-captured on image re-enable).
+#
+# Use it to reclaim disk or get a clean slate before a re-bake. Talks to the
+# coordinator app-gRPC via ENGRAM_APP_GRPC_ADDR / ENGRAM_APP_GRPC_TOKEN (dev
+# defaults below); the stack must be up.
+reap-sessions:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
+    sandboxes_dir="${ENGRAM_HOST_SANDBOX_DIR:-var/host-sandboxes}"
+    cargo build --quiet -p engram-cli
+    cli="$(cargo metadata --format-version=1 --no-deps \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])')/debug/engram-cli"
+    # 1. Reap every live session via the production DeleteSession path.
+    ids="$("$cli" --json session list \
+        | python3 -c 'import sys,json;print("\n".join(s["id"] for s in json.load(sys.stdin)["sessions"]))')"
+    count=0
+    for id in $ids; do
+        printf '==> reaping %s ... ' "$id"
+        if "$cli" session delete "$id" >/dev/null 2>&1; then echo deleted; count=$((count+1)); else echo "(skipped)"; fi
+    done
+    echo "reaped $count live session(s)."
+    # 2. Sweep orphaned rootfs files no still-live session owns.
+    live=" $("$cli" --json session list \
+        | python3 -c 'import sys,json;print(" ".join(s["sandbox_id"] for s in json.load(sys.stdin)["sessions"] if s.get("sandbox_id")))') "
+    shopt -s nullglob
+    swept=0
+    for f in "$sandboxes_dir"/*.rootfs.ext4; do
+        sb="$(basename "$f")"; sb="${sb%.rootfs.ext4}"
+        case "$live" in *" $sb "*) continue ;; esac
+        rm -f "$f" "$sandboxes_dir/$sb".vsock_*
+        swept=$((swept+1))
+    done
+    echo "swept $swept orphaned sandbox rootfs file(s)."
+    echo "reap-sessions: done. Checkpoints GC in the background once their sessions are gone."
+
 # Build the Claude harness from source, publish it to the local OCI
 # registry, and bake deploy/demo-claude/ against it — pushing the image
 # to localhost:5001 (the registry `just dev` runs). Arch + transport are
@@ -293,7 +347,14 @@ bundles-vz:
     # playwright/integrations-cli/browser need Docker and are best-effort
     # (skipped on failure), exactly as `just bundles` already degrades.
     for name in sentinel skills playwright integrations-cli browser; do
-        tree="$(mktemp -d)"
+        # Stage under the repo (absolute, $HOME-rooted), NOT `mktemp -d`: the
+        # Docker-built bundles (playwright/browser) bind-mount this dir into the
+        # build container, and Docker Desktop on macOS does not share the
+        # /var/folders path `mktemp -d` returns — the container's writes never
+        # reach the host, silently producing an empty bundle. A path under the
+        # repo (in $HOME) is shared, so the bind mount propagates.
+        tree="$PWD/var/shared/.$name.stage"
+        rm -rf "$tree"; mkdir -p "$tree"
         if ! "deploy/bundles/$name/build.sh" --stage "$tree"; then
             echo "$name bundle stage failed; skipping (sessions degrade gracefully)" >&2
             rm -rf "$tree"
