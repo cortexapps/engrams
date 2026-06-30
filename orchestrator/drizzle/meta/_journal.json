@@ -78,6 +78,13 @@
       "when": 1782788903473,
       "tag": "0010_cheerful_bishop",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1782843095437,
+      "tag": "0011_profile_harness_required",
+      "breakpoints": true
     }
   ]
 }

@@ -83,6 +83,19 @@ describe("SessionProfileEditor (create)", () => {
     expect(create.mock.calls[0][0]).toMatchObject({ name: "Backend Agent", imageId: "i1" });
   });
 
+  // ADR 0063: a profile ALWAYS names a concrete harness (no "inherit deployment
+  // default") — a new profile defaults to the first registered harness, so the
+  // create payload carries it (and the Model/Effort selectors have a descriptor).
+  it("defaults a new profile to the first registered harness (never null)", async () => {
+    render(<SessionProfileEditor mode="create" />);
+    fireEvent.change(screen.getByLabelText(/profile name/i), {
+      target: { value: "Harnessed" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0]).toMatchObject({ harness: "claude" });
+  });
+
   it("includes the deny-default network + extra allowed hosts in the payload (ADR 0057)", async () => {
     render(<SessionProfileEditor mode="create" />);
     fireEvent.change(screen.getByLabelText(/profile name/i), { target: { value: "Net Agent" } });

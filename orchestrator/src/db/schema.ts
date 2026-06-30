@@ -111,9 +111,11 @@ export const profile = pgTable("profile", {
   imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
   // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
   // this profile's sessions run, with default model + effort (catalog option
-  // ids). All nullable: null harness falls back to the deployment default, null
-  // model/effort to the harness descriptor's defaults. Overridable per session.
-  harness: text("harness"),
+  // ids). `harness` is REQUIRED — a profile always names a concrete harness (the
+  // "inherit deployment default" semantics were superseded; existing rows were
+  // backfilled to `claude`). model/effort stay nullable → the harness
+  // descriptor's defaults. All overridable per session.
+  harness: text("harness").notNull(),
   model: text("model"),
   effort: text("effort"),
   includeUserTokens: boolean("include_user_tokens").notNull().default(false),

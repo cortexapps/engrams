@@ -189,7 +189,7 @@ function makeFakeProfiles(opts?: {
     description: "",
     icon: "Bot",
     imageId: opts?.imageId ?? "img-1",
-    harness: null,
+    harness: "claude",
     model: null,
     effort: null,
     includeUserTokens: opts?.includeUserTokens ?? false,
@@ -666,6 +666,7 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
       description: "",
       icon: "Bot",
       imageId: "img-1",
+      harness: "claude",
       includeUserTokens: false,
       envVars: {},
     });
