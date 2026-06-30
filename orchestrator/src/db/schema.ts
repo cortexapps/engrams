@@ -109,6 +109,13 @@ export const profile = pgTable("profile", {
   description: text("description").notNull().default(""),
   icon: text("icon").notNull().default("Bot"), // lucide icon name
   imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
+  // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
+  // this profile's sessions run, with default model + effort (catalog option
+  // ids). All nullable: null harness falls back to the deployment default, null
+  // model/effort to the harness descriptor's defaults. Overridable per session.
+  harness: text("harness"),
+  model: text("model"),
+  effort: text("effort"),
   includeUserTokens: boolean("include_user_tokens").notNull().default(false),
   envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
   // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.

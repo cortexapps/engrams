@@ -93,6 +93,7 @@ async function expectErr(p: Promise<unknown>, code: Code) {
 
 const archived: ProfileRow = {
   id: "arch", name: "Archived", description: "", icon: "Bot", imageId: "img-1",
+  harness: null, model: null, effort: null,
   includeUserTokens: false, envVars: { K: "V" }, skills: [], capabilities: [], createdAt: new Date(0), updatedAt: new Date(0),
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
   isDefault: false,

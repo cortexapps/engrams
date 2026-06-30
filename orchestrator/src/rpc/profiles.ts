@@ -28,7 +28,10 @@ import {
   type ProfileNetwork,
   type ProfileSecret,
 } from "../db/schema.ts";
-import { images as defaultImages } from "../control-plane/client.ts";
+import {
+  images as defaultImages,
+  harnessCatalog as defaultHarnessCatalog,
+} from "../control-plane/client.ts";
 import {
   defaultCatalog,
   selectableSkillNames,
@@ -50,6 +53,19 @@ export interface ImagesClient {
   }>;
 }
 
+/** Subset of HarnessCatalogService used here (ADR 0062/0063 catalog validation). */
+export interface HarnessCatalogClient {
+  listHarnesses(req: Record<string, never>): Promise<{
+    harnesses: Array<{
+      name: string;
+      descriptor?: {
+        models?: Array<{ id: string }>;
+        effort?: Array<{ id: string }>;
+      };
+    }>;
+  }>;
+}
+
 export type GetSession = (
   headers: Headers,
 ) => Promise<{ user: { id: string; role?: string | null; email?: string | null } } | null>;
@@ -58,6 +74,7 @@ export interface ProfileDeps {
   getSession?: GetSession;
   store?: ProfileStore;
   images?: ImagesClient;
+  harnessCatalog?: HarnessCatalogClient;
   mountCatalog?: MountCatalogClient;
   connectors?: CustomConnectorSource;
 }
@@ -95,6 +112,11 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     // ADR 0060: the org default profile (member-visible — describes selection,
     // not a secret).
     isDefault: row.isDefault,
+    // ADR 0062/0063: default harness/model/effort — member-visible (they
+    // describe a selection, not a secret).
+    harness: row.harness ?? undefined,
+    model: row.model ?? undefined,
+    effort: row.effort ?? undefined,
     archived: row.deletedAt != null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -177,6 +199,8 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     ((headers) => auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
   const store: ProfileStore = deps?.store ?? makeProfileStore(getDb());
   const images: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
+  const harnessCatalog: HarnessCatalogClient =
+    deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
   const mountCatalog: MountCatalogClient = deps?.mountCatalog ?? defaultCatalog();
   // Lazy default: construct the store (and thus touch getDb()) only when a
   // handler actually reads connectors, so importing/registering without a DB
@@ -189,6 +213,45 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     const resp = await images.listEnabledImages({});
     if (!resp.images.some((i) => i.id === imageId)) {
       throw new ConnectError("image_id is not an enabled image", Code.InvalidArgument);
+    }
+  }
+
+  /**
+   * ADR 0062/0063: validate a profile's default harness/model/effort against the
+   * live catalog. A null harness inherits the deployment default (nothing to
+   * check); a set harness must be registered, and a set model/effort id must
+   * exist in that harness's descriptor enum. The coordinator re-checks at
+   * session-create, but failing here keeps a profile from referencing a harness
+   * (or model/effort) the editor wouldn't have offered.
+   */
+  async function assertHarnessValid(
+    harness: string | null,
+    model: string | null,
+    effort: string | null,
+  ): Promise<void> {
+    if (harness == null && model == null && effort == null) return;
+    if (harness == null) {
+      throw new ConnectError(
+        "model/effort require a harness selection on the profile",
+        Code.InvalidArgument,
+      );
+    }
+    const { harnesses } = await harnessCatalog.listHarnesses({});
+    const descriptor = harnesses.find((h) => h.name === harness)?.descriptor;
+    if (!descriptor) {
+      throw new ConnectError(`harness "${harness}" is not in the catalog`, Code.InvalidArgument);
+    }
+    if (model != null && !(descriptor.models ?? []).some((m) => m.id === model)) {
+      throw new ConnectError(
+        `model "${model}" is not valid for harness "${harness}"`,
+        Code.InvalidArgument,
+      );
+    }
+    if (effort != null && !(descriptor.effort ?? []).some((e) => e.id === effort)) {
+      throw new ConnectError(
+        `effort "${effort}" is not valid for harness "${harness}"`,
+        Code.InvalidArgument,
+      );
     }
   }
 
@@ -268,6 +331,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
+      await assertHarnessValid(req.harness ?? null, req.model ?? null, req.effort ?? null);
       await assertSkillsValid(req.skills ?? []);
       assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
       const network = normalizeNetwork(req.network);
@@ -286,6 +350,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         network,
         secrets,
         isDefault: req.isDefault,
+        harness: req.harness ?? null,
+        model: req.model ?? null,
+        effort: req.effort ?? null,
       });
       return { profile: toProto(row, true) };
     },
@@ -296,6 +363,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
+      await assertHarnessValid(req.harness ?? null, req.model ?? null, req.effort ?? null);
       await assertSkillsValid(req.skills ?? []);
       assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
       const network = normalizeNetwork(req.network);
@@ -314,6 +382,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         network,
         secrets,
         isDefault: req.isDefault,
+        harness: req.harness ?? null,
+        model: req.model ?? null,
+        effort: req.effort ?? null,
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
       return { profile: toProto(row, true) };
