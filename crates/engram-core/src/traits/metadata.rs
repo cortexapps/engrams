@@ -1582,10 +1582,11 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0035 §5: the bundle pin set — every `(drive_id, sha256)`
     /// some `snapshots.aux_bundles` row references, **∪ every live
     /// `mount_catalog` skill** (ADR 0055 P2, so a registered-but-currently-unused
-    /// uploaded skill stays staged + survives GC) **∪ the current harness catalog
-    /// generation** (ADR 0062, so a fresh session can always mount `dyn_0`). The
-    /// union (plus the hosts' reported current generations) is what the GC keeps
-    /// and what heartbeat acks advertise as `live_bundles`.
+    /// uploaded skill stays staged + survives GC) **∪ every live `harness_catalog`
+    /// row** (ADR 0062, so a registered-but-currently-unused *custom* harness's
+    /// squashfs stays staged — built-ins ride the host-image stamp and need no
+    /// pin). The union (plus the hosts' reported current generations) is what the
+    /// GC keeps and what heartbeat acks advertise as `live_bundles`.
     async fn bundle_pin_set(&self) -> Result<Vec<crate::types::sandbox::AuxBundleRef>, MetaError> {
         Ok(Vec::new())
     }
@@ -1669,26 +1670,6 @@ pub trait MetadataStore: Send + Sync {
     /// whether a live row was deleted.
     async fn soft_delete_harness(&self, _name: &str) -> Result<bool, MetaError> {
         Ok(false)
-    }
-
-    /// Upsert the current harness catalog generation — the packed catalog
-    /// squashfs sha that mounts on `dyn_0` (ADR 0062 §5). Re-set on every
-    /// registration change; pinned by [`Self::bundle_pin_set`] so a fresh
-    /// session can always mount it.
-    async fn set_harness_catalog_generation(
-        &self,
-        _sha256: &str,
-        _size_bytes: i64,
-    ) -> Result<(), MetaError> {
-        Err(MetaError::Db(
-            "set_harness_catalog_generation is not supported by this MetadataStore".into(),
-        ))
-    }
-
-    /// The current harness catalog generation `(sha256, size_bytes)`, or `None`
-    /// before any harness is registered.
-    async fn harness_catalog_generation(&self) -> Result<Option<(String, i64)>, MetaError> {
-        Ok(None)
     }
 
     /// ADR 0035 §5: idempotent candidate upsert; `first_seen_at`

@@ -154,8 +154,8 @@ fn catalog_skill_from_row(
 }
 
 /// ADR 0062: a `harness_catalog` row → the shared `CatalogHarness`. The tuple is
-/// `(id, owner, name, oci_ref, manifest_digest, descriptor_toml, tree_sha256,
-/// tree_size_bytes, created_at)`.
+/// `(id, owner, name, oci_ref, manifest_digest, descriptor_toml, squashfs_sha256,
+/// squashfs_size_bytes, created_at)`.
 type HarnessRow = (
     String,
     String,
@@ -176,8 +176,8 @@ fn catalog_harness_from_row(row: HarnessRow) -> engram_core::types::CatalogHarne
         oci_ref,
         manifest_digest,
         descriptor_toml,
-        tree_sha256,
-        tree_size_bytes,
+        squashfs_sha256,
+        squashfs_size_bytes,
         created_at,
     ) = row;
     engram_core::types::CatalogHarness {
@@ -187,8 +187,8 @@ fn catalog_harness_from_row(row: HarnessRow) -> engram_core::types::CatalogHarne
         oci_ref,
         manifest_digest,
         descriptor_toml,
-        tree_sha256,
-        tree_size_bytes,
+        squashfs_sha256,
+        squashfs_size_bytes,
         created_at,
     }
 }
@@ -196,7 +196,7 @@ fn catalog_harness_from_row(row: HarnessRow) -> engram_core::types::CatalogHarne
 /// The `RETURNING`/`SELECT` column list for a `harness_catalog` row, in
 /// [`HarnessRow`] order.
 const HARNESS_ROW_COLS: &str =
-    "id, owner, name, oci_ref, manifest_digest, descriptor_toml, tree_sha256, tree_size_bytes, created_at";
+    "id, owner, name, oci_ref, manifest_digest, descriptor_toml, squashfs_sha256, squashfs_size_bytes, created_at";
 
 /// ADR 0048: per-host placement inputs. `alloc_mib` is the host-measured
 /// RAM headroom (`<= 0` = unmeasured); `cpu_budget` is `total_vcpus ×
@@ -4365,7 +4365,7 @@ impl MetadataStore for PostgresStore {
              UNION
              SELECT name, sha256 FROM mount_catalog WHERE deleted_at IS NULL
              UNION
-             SELECT 'dyn_0', sha256 FROM harness_catalog_generation WHERE id = TRUE",
+             SELECT name, squashfs_sha256 FROM harness_catalog WHERE deleted_at IS NULL",
         )
         .fetch_all(&self.pool)
         .await
@@ -4504,15 +4504,15 @@ impl MetadataStore for PostgresStore {
     ) -> Result<engram_core::types::CatalogHarness, MetaError> {
         let row = sqlx::query_as::<_, HarnessRow>(&format!(
             "INSERT INTO harness_catalog
-                 (owner, name, oci_ref, manifest_digest, descriptor_toml, tree_sha256, tree_size_bytes)
+                 (owner, name, oci_ref, manifest_digest, descriptor_toml, squashfs_sha256, squashfs_size_bytes)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (name) WHERE deleted_at IS NULL
              DO UPDATE SET owner = EXCLUDED.owner,
                            oci_ref = EXCLUDED.oci_ref,
                            manifest_digest = EXCLUDED.manifest_digest,
                            descriptor_toml = EXCLUDED.descriptor_toml,
-                           tree_sha256 = EXCLUDED.tree_sha256,
-                           tree_size_bytes = EXCLUDED.tree_size_bytes
+                           squashfs_sha256 = EXCLUDED.squashfs_sha256,
+                           squashfs_size_bytes = EXCLUDED.squashfs_size_bytes
              RETURNING {HARNESS_ROW_COLS}"
         ))
         .bind(reg.owner)
@@ -4520,8 +4520,8 @@ impl MetadataStore for PostgresStore {
         .bind(reg.oci_ref)
         .bind(reg.manifest_digest)
         .bind(reg.descriptor_toml)
-        .bind(reg.tree_sha256)
-        .bind(reg.tree_size_bytes)
+        .bind(reg.squashfs_sha256)
+        .bind(reg.squashfs_size_bytes)
         .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4555,8 +4555,8 @@ impl MetadataStore for PostgresStore {
         Ok(row.map(catalog_harness_from_row))
     }
 
-    /// ADR 0062: soft-delete a catalog harness. The caller re-packs the catalog
-    /// from the remaining live rows and updates the generation.
+    /// ADR 0062: soft-delete a custom catalog harness. Its squashfs leaves the
+    /// pin set (`bundle_pin_set`) and the bundle GC reclaims it once unpinned.
     async fn soft_delete_harness(&self, name: &str) -> Result<bool, MetaError> {
         let res = sqlx::query(
             "UPDATE harness_catalog SET deleted_at = now()
@@ -4567,39 +4567,6 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         Ok(res.rows_affected() > 0)
-    }
-
-    /// ADR 0062: upsert the singleton harness catalog generation row.
-    async fn set_harness_catalog_generation(
-        &self,
-        sha256: &str,
-        size_bytes: i64,
-    ) -> Result<(), MetaError> {
-        sqlx::query(
-            "INSERT INTO harness_catalog_generation (id, sha256, size_bytes, updated_at)
-             VALUES (TRUE, $1, $2, now())
-             ON CONFLICT (id) DO UPDATE
-                 SET sha256 = EXCLUDED.sha256,
-                     size_bytes = EXCLUDED.size_bytes,
-                     updated_at = now()",
-        )
-        .bind(sha256)
-        .bind(size_bytes)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    /// ADR 0062: the current harness catalog generation, or `None` if unset.
-    async fn harness_catalog_generation(&self) -> Result<Option<(String, i64)>, MetaError> {
-        let row = sqlx::query_as::<_, (String, i64)>(
-            "SELECT sha256, size_bytes FROM harness_catalog_generation WHERE id = TRUE",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(row)
     }
 
     /// ADR 0035 §5: sticky-first-seen candidate upsert (bundle

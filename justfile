@@ -260,6 +260,21 @@ bundles-squashfs:
         stamp="$stamp$sep\"$name\": \"$sha\""
         sep=", "
     done
+    # ADR 0062: the built-in `claude` harness rides the stamp like a skill, but
+    # unlike the committed/container-built bundles above its tree (the
+    # engram-harness-claude entry binary + the bundled `claude` CLI) is BUILT, not
+    # assembled here — so it's staged from a pre-built tree dir handed in via
+    # ENGRAM_HARNESS_CLAUDE_TREE (the e2e sets this to the downloaded harness-claude
+    # artifact). Skipped when unset, so a no-harness dev stack still boots; a local
+    # `just dev` that wants the built-in claude points this at a staged tree.
+    if [ -n "${ENGRAM_HARNESS_CLAUDE_TREE:-}" ]; then
+        tmp="var/shared/.harness-claude.build.squashfs"
+        deploy/bundles/harness-claude/build.sh "$ENGRAM_HARNESS_CLAUDE_TREE" "$tmp"
+        sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
+        mv "$tmp" "var/shared/$sha.squashfs"
+        stamp="$stamp$sep\"harness-claude\": \"$sha\""
+        sep=", "
+    fi
     echo "$stamp}" > var/shared/current.json
     cat var/shared/current.json
 

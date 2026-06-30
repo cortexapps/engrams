@@ -1,9 +1,9 @@
 //! Shared `mksquashfs` invocation for content-addressed read-only bundles.
 //!
 //! Both the ADR 0055 uploaded-skill packer ([`crate::skill_pack`]) and the ADR
-//! 0062 harness-catalog packer ([`crate::harness_pack`]) stage a tree and pack
-//! it through here, so identical content yields an identical sha256 (the content
-//! address `bundles/sha256/<sha>`) regardless of which producer built it.
+//! 0062 custom-harness registration ([`crate::harness_catalog`]) stage a tree and
+//! pack it through here, so identical content yields an identical sha256 (the
+//! content address `bundles/sha256/<sha>`) regardless of which producer built it.
 
 use std::path::Path;
 use std::process::Command;

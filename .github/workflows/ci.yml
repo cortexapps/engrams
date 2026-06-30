@@ -1544,15 +1544,14 @@ jobs:
       - web
       - cross-musl-linux
       - artifacts-e2e-stack
-      # ADR 0021 P0: this lane bakes `deploy/demo-claude/`, which
-      # resolves `[harness] builtin = "claude"` through the catalog.
-      # The job below provides the harness artifact as a workflow
-      # artifact (uploaded on every run regardless of branch). The
-      # `Pull harness-claude artifact + republish locally` step
-      # downloads it and points the baker at localhost via
-      # `ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO`, so the in-PR binary is
-      # what gets tested rather than whatever tag GHCR happens to
-      # serve.
+      # ADR 0062: the demo image is harness-free. The built-in `claude`
+      # harness rides the host `current_bundles` stamp instead — the job
+      # below builds its tree (entry binary + claude CLI) and uploads it as
+      # a workflow artifact (on every run, regardless of branch). The
+      # "Download harness-claude artifact" + "Stage RO bundles" steps pack
+      # that tree into a squashfs and stamp `harness-claude`, so the in-PR
+      # harness binary is what the agent tests exec — no registration, no
+      # local-registry republish.
       - bake-harness-claude-artifact
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
@@ -1692,40 +1691,44 @@ jobs:
             | sudo bash
           tilt version
 
-      # ADR 0027 → 0035 → 0055: stage the RO skill bundles CONTENT-ADDRESSED
-      # (<sha256>.squashfs + current.json stamp) — the same shape the FC-host
-      # image bake / `just bundles-squashfs` produces.
-      #
-      # MUST run BEFORE the stack comes up: the host-agent reads current.json
+      # ADR 0027 → 0035 → 0055 → 0062: the e2e host-agent reads its RO bundles
+      # from var/shared (Tiltfile sets ENGRAM_BUNDLE_DIR there), CONTENT-ADDRESSED
+      # (<sha256>.squashfs + a current.json stamp) and staged by `just
+      # bundles-squashfs` when tilt brings the stack up — the host reads the stamp
       # ONCE at startup (host_agent/src/lib.rs read_stamp) and reports the same
-      # current_bundles on every heartbeat, exactly like prod (the Packer bake
-      # stages the stamp into the host image before the agent starts). The coord
-      # resolves a session's selected_skills names against that reported catalog.
+      # current_bundles on every heartbeat, exactly like prod's Packer-baked stamp.
+      # The coord resolves a session's selected_skills + harness against that.
+      # `bundles-squashfs` stages `sentinel` (MANDATORY — base-snapshot capture
+      # resolves every reserved dyn-* slot to its sha) + `skills` (the catalog skill
+      # `e2e_session_has_mounted_skills_bundle` asserts).
       #
-      # ADR 0055: the `sentinel` bundle is MANDATORY — base-snapshot capture
-      # attaches RESERVED_SLOTS reserved dyn-* drives, all resolved to the
-      # sentinel sha from this stamp; without it every enable 500s (loudly, by
-      # design). `skills` is the catalog skill `e2e_session_has_mounted_skills_bundle`
-      # selects + asserts: the coord resolves "skills" -> its sha, patch_drives
-      # it into a reserved slot, the init shim mounts it at /opt/engram/dyn/<i>
-      # (the owned 6.1 kernel has squashfs), and agentd wires share-file.
-      # (playwright is omitted — heavy chromium build, and no test selects it.)
-      - name: Stage RO skill bundles (ADR 0055)
+      # ADR 0062: the built-in `claude` harness rides that same stamp. Its tree
+      # (entry binary + claude CLI) is BUILT, not committed, so download it (from
+      # `bake-harness-claude-artifact`) and hand it to `bundles-squashfs` via
+      # ENGRAM_HARNESS_CLAUDE_TREE (next step) — it packs `harness-claude` into the
+      # stamp alongside skills/sentinel. No RegisterHarness; the coordinator
+      # resolves the built-in from the host's current_bundles + its embedded
+      # descriptor.
+      - name: Download harness-claude artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: harness-claude-artifact
+          path: var/harness-claude-stage
+
+      - name: Restore +x on the harness binaries + hand the tree to tilt
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
-          sudo mkdir -p /var/lib/engram/shared
-          stamp="{"
-          sep=""
-          for name in sentinel skills; do
-            deploy/bundles/"$name"/build.sh "/tmp/$name.squashfs"
-            sha="$(sha256sum "/tmp/$name.squashfs" | cut -d' ' -f1)"
-            sudo install -m 0644 "/tmp/$name.squashfs" "/var/lib/engram/shared/$sha.squashfs"
-            stamp="$stamp$sep\"$name\": \"$sha\""
-            sep=", "
-          done
-          echo "$stamp}" | sudo tee /var/lib/engram/shared/current.json >/dev/null
-          ls -l /var/lib/engram/shared/
-          cat /var/lib/engram/shared/current.json
+          # upload/download-artifact's ZIP drops Unix mode bits; the guest execs
+          # /opt/engram/dyn/0/harness, so it must stay executable in the squashfs.
+          chmod +x var/harness-claude-stage/harness var/harness-claude-stage/claude
+          ls -la var/harness-claude-stage/
+          # Point `just bundles-squashfs` (tilt runs it next) at this downloaded
+          # tree so it packs `harness-claude` into var/shared's stamp.
+          echo "ENGRAM_HARNESS_CLAUDE_TREE=$PWD/var/harness-claude-stage" >> "$GITHUB_ENV"
+
+      # `just bundles-squashfs` (the tilt `bundles` resource) packs the RO bundles
+      # with mksquashfs, so squashfs-tools must be on PATH before the stack comes up.
+      - name: Install squashfs-tools (for bundles-squashfs)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
 
       - name: Bring up prod-shape stack (tilt)
         env:
@@ -1776,76 +1779,10 @@ jobs:
               --username "${{ github.actor }}" \
               --password-stdin
 
-      # ADR 0021 P0: pull the harness-claude artifact built by the
-      # upstream `bake-harness-claude-artifact` job, re-publish to
-      # the integration test's local registry (the `registry:2`
-      # container `tilt up` brought up on port 5001), and let the
-      # catalog override route the demo-claude bake to it.
-      #
-      # Why this shape (vs pulling from GHCR):
-      # - Tests THIS PR's harness binary, not whatever tag main
-      #   happened to publish last.
-      # - Closes the catch-22 where a PR that bumps HARNESS_VERSION
-      #   couldn't bake because the new tag didn't exist in GHCR yet.
-      # - Never publishes a PR-built binary to a production-consumed
-      #   GHCR namespace.
-      - name: Pull harness-claude artifact + republish locally
-        env:
-          LOCAL_REPO: localhost:5001/cortexapps/engrams/harness-claude
-        run: |
-          mkdir -p var/harness-claude-stage
-        # ↑ ensure target exists for download-artifact's path: arg.
-
-      - name: Download harness-claude workflow artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: harness-claude-artifact
-          path: var/harness-claude-stage
-
-      - name: Restore +x on staged binaries
-        run: |
-          # actions/upload-artifact@v4 zips the staged directory and
-          # actions/download-artifact@v4 unzips it — the ZIP format
-          # only carries Unix mode bits as a non-standard extension
-          # that some unzip implementations drop. Without this, the
-          # baker happily packs the harness into the rootfs as
-          # mode 0644, FC boots fine, and agentd's `SpawnHarness`
-          # blows up with `Permission denied (os error 13)` when it
-          # tries to exec /opt/engram/harness/harness.
-          #
-          # Belt-and-braces fix: re-set +x on both binaries before
-          # we hand the staged dir to `engram-publish-builtin-harness`.
-          # The artifact.toml descriptor stays at the default 0644.
-          chmod +x var/harness-claude-stage/harness var/harness-claude-stage/claude
-          ls -la var/harness-claude-stage/
-
-      - name: Republish harness-claude to local registry + export catalog override
-        env:
-          LOCAL_REPO: localhost:5001/cortexapps/engrams/harness-claude
-        run: |
-          TAG="${LOCAL_REPO}:${HARNESS_VERSION}-${HARNESS_PLATFORM}"
-          echo "Republishing harness-claude to $TAG"
-          # `engram-publish-builtin-harness` was downloaded with the
-          # other e2e binaries in the Download e2e binaries step
-          # above.
-          ./target/release/engram-publish-builtin-harness \
-            --from var/harness-claude-stage \
-            --to "$TAG"
-          # Catalog override: the in-baker
-          # `engram-image-builder::BuiltinCatalog::with_overrides_from_env`
-          # picks this up and redirects any legacy `[harness] builtin =
-          # "claude"` resolution to the local registry. Exported via
-          # $GITHUB_ENV so subsequent steps (the bake) inherit it. (ADR
-          # 0062: demo-claude is now harness-free, so the baker no longer
-          # consumes this; the e2e registers the harness via the catalog
-          # instead — see ENGRAM_E2E_HARNESS_OCI_REF below.)
-          echo "ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO=${LOCAL_REPO}" >> "$GITHUB_ENV"
-          echo "Catalog override set: ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO=${LOCAL_REPO}"
-          # ADR 0062: the exact OCI ref the e2e agent tests RegisterHarness
-          # with (the coordinator pulls it + packs the catalog generation).
-          echo "ENGRAM_E2E_HARNESS_OCI_REF=${TAG}" >> "$GITHUB_ENV"
-          echo "Harness OCI ref for e2e: ENGRAM_E2E_HARNESS_OCI_REF=${TAG}"
-
+      # ADR 0062: the built-in claude harness is no longer registered or pushed
+      # to a local registry — its tree was downloaded + packed into the host stamp
+      # before the stack came up (see "Download harness-claude artifact" + the
+      # stage step above), so the coordinator resolves it from `current_bundles`.
       - name: Bake demo image + capture URI
         run: |
           IMAGE_URI=$(bash deploy/dev/integration-bake-demo.sh)
