@@ -53,12 +53,20 @@ import { abilityFor } from "../authz/ability.ts";
 import { auth } from "../auth/better-auth.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
-import { sessions as defaultSessions, images as defaultImages } from "../control-plane/client.ts";
+import {
+  sessions as defaultSessions,
+  images as defaultImages,
+  harnessCatalog as defaultHarnessCatalog,
+} from "../control-plane/client.ts";
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import type { ImagesClient } from "./profiles.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
-import { createTaskWithSession, type Db } from "./task-create.ts";
+import {
+  createTaskWithSession,
+  type Db,
+  type HarnessCatalogClient,
+} from "./task-create.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
@@ -91,6 +99,10 @@ export interface SessionsClient {
     // from the profile's capabilities + connector config (a JSON string). The
     // coordinator persists it + resolves its secret_refs host-side.
     integrationPolicyJson?: string;
+    // ADR 0062/0063: the selected harness (catalog name) the coordinator mounts
+    // on dyn_0 + execs (proto CreateSessionRequest.harness). Resolved from
+    // session override ?? profile ?? deployment default.
+    harness?: string;
   }): Promise<{ sessionId: string; status: string; imageVersion: string; kind: string }>;
   listSessions(req: Record<string, never>): Promise<{ sessions: Array<{ session?: Session | undefined }> }>;
   getSession(req: { sessionId: string }): Promise<{ session?: Session | undefined }>;
@@ -108,6 +120,7 @@ export type GetSession = (
 export interface TaskDeps {
   getSession?: GetSession;
   sessions?: SessionsClient;
+  harnessCatalog?: HarnessCatalogClient;
   /** Per-user KEK-sealed session secret store (ADR 0051 Drip A). */
   secrets?: UserSecretStore;
   /** Admin-curated session profiles (ADR 0052). */
@@ -356,6 +369,8 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
     deps?.secrets ?? makeUserSecretStore(getDbFn());
   const profiles: ProfileStore = deps?.profiles ?? makeProfileStore(getDbFn());
   const imagesClient: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
+  const harnessCatalogClient: HarnessCatalogClient =
+    deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
   // Lazy default (see profiles.ts): touch getDb() only when a handler reads
   // connectors, so registering without a DB doesn't throw.
   const connectors: CustomConnectorSource = deps?.connectors ?? { list: () => makeConnectorStore(getDbFn()).list() };
@@ -388,6 +403,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           profiles,
           images: imagesClient,
           connectors,
+          harnessCatalog: harnessCatalogClient,
           sessions: sessionsClient,
           secrets: resolveSecrets(),
           db: getDbFn(),
@@ -398,6 +414,9 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           profileId: req.profileId,
           title: req.title ?? null,
           ...(req.prompt != null ? { prompt: req.prompt } : {}),
+          ...(req.harness != null ? { harness: req.harness } : {}),
+          ...(req.model != null ? { model: req.model } : {}),
+          ...(req.effort != null ? { effort: req.effort } : {}),
         },
       );
 

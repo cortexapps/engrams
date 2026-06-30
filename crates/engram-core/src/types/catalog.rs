@@ -37,3 +37,63 @@ pub struct CatalogSkill {
     pub size_bytes: i64,
     pub created_at: DateTime<Utc>,
 }
+
+/// ADR 0062: one live row of the `harness_catalog` table — a registered,
+/// OCI-sourced **custom** agent harness. (Built-in harnesses ride the host-image
+/// `current_bundles` stamp + the coordinator's embedded descriptor and never
+/// have a row here — see `crate::types::harness` + the coordinator's
+/// `builtin_harness` module.)
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogHarness {
+    /// Stable catalog id (uuid string).
+    pub id: String,
+    /// Registering principal. Attribution / GC ownership / quota — **not** an
+    /// access boundary (the catalog is org-shared, like skills).
+    pub owner: String,
+    /// Logical harness name, used verbatim on the `CreateSessionRequest.harness`
+    /// wire. UNIQUE among live rows.
+    pub name: String,
+    /// The source OCI artifact reference the harness was registered from.
+    pub oci_ref: String,
+    /// The OCI manifest digest resolved at pull time (audit trail).
+    pub manifest_digest: String,
+    /// The harness's `harness.toml` content (ADR 0063). Parsed into a
+    /// [`HarnessDescriptor`](crate::types::harness::HarnessDescriptor) for the
+    /// orchestrator-facing projection + the coordinator's launch contract.
+    pub descriptor_toml: String,
+    /// Content address of this harness's own RO squashfs (its BlobStorage key is
+    /// `bundles/sha256/<squashfs_sha256>`). The session mounts it on `dyn_0`; the
+    /// host materializes it on demand exactly like an uploaded skill.
+    pub squashfs_sha256: String,
+    /// Size of the squashfs in bytes.
+    pub squashfs_size_bytes: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+impl CatalogHarness {
+    /// Parse the stored `harness.toml` into a typed descriptor.
+    pub fn descriptor(&self) -> Result<crate::types::harness::HarnessDescriptor, String> {
+        crate::types::harness::HarnessDescriptor::parse(&self.descriptor_toml)
+    }
+}
+
+/// The fields needed to register (upsert) a harness — bundled so
+/// `MetadataStore::register_harness` keeps a lean signature.
+#[derive(Clone, Copy, Debug)]
+pub struct HarnessRegistration<'a> {
+    /// Attribution / GC ownership (org-shared catalog).
+    pub owner: &'a str,
+    /// Logical harness name (UNIQUE among live rows).
+    pub name: &'a str,
+    /// Source OCI artifact reference.
+    pub oci_ref: &'a str,
+    /// OCI manifest digest resolved at pull time.
+    pub manifest_digest: &'a str,
+    /// The harness's `harness.toml` content (ADR 0063).
+    pub descriptor_toml: &'a str,
+    /// Content address of this harness's own RO squashfs (blob key
+    /// `bundles/sha256/<squashfs_sha256>`).
+    pub squashfs_sha256: &'a str,
+    /// Size of the squashfs in bytes.
+    pub squashfs_size_bytes: i64,
+}

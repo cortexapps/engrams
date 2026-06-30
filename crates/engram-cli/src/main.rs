@@ -129,16 +129,17 @@ enum SessionCmd {
         /// Example: `--image ghcr.io/cortex/api:warm-2026-04`
         #[arg(long)]
         image: String,
-        /// Boot the image as a pure dev VM — leave the baked harness
-        /// (if any) resident-but-undriven. Default is to drive the
-        /// image's harness (ADR 0021 P1.3 replaced the per-session
-        /// harness selection: which harness an image runs is now an
-        /// image property).
+        /// Boot the image as a pure dev VM — no harness driven; interact
+        /// via shell / exec.
         #[arg(long, default_value_t = false)]
         dev_vm: bool,
-        /// Initial prompt for the agent. Only meaningful in the
-        /// default (agent) mode against an image that has a baked
-        /// harness; the API rejects with INVALID_ARGUMENT if a prompt is
+        /// ADR 0062: the catalog harness to run (a `HarnessCatalogService`
+        /// name, e.g. "claude"). Required for an agent session; ignored with
+        /// `--dev-vm`. Run `engram harness list` to see the catalog.
+        #[arg(long)]
+        harness: Option<String>,
+        /// Initial prompt for the agent. Only meaningful in the default
+        /// (agent) mode; the API rejects with INVALID_ARGUMENT if a prompt is
         /// supplied alongside `--dev-vm`.
         #[arg(long)]
         prompt: Option<String>,
@@ -343,15 +344,6 @@ enum ImageCmd {
         #[arg(long, value_parser = parse_transport, default_value = "vsock")]
         transport: engram_image_builder::Transport,
 
-        /// Guest platform to resolve a built-in `[harness]` artifact for
-        /// (`harness-<name>:<ver>-<platform>`). The harness runs inside
-        /// the guest, so this is the rootfs's arch. Defaults to the
-        /// host's arch — correct for the dev bake recipes, which
-        /// cross-compile the rootfs for the host. Set explicitly only
-        /// when baking cross-arch. Accepts `linux-x86_64` | `linux-arm64`.
-        #[arg(long, value_parser = parse_harness_platform)]
-        harness_platform: Option<engram_image_builder::Platform>,
-
         /// Push the baked image to a Docker registry as an Engram OCI
         /// artifact. Accepts either `host/repo` (auto-appends the
         /// produced tag) or `host/repo:tag`. Format must be `ext4`.
@@ -363,10 +355,6 @@ enum ImageCmd {
         #[arg(long)]
         push: Option<String>,
     },
-}
-
-fn parse_harness_platform(s: &str) -> Result<engram_image_builder::Platform, String> {
-    engram_image_builder::Platform::parse(s)
 }
 
 fn parse_transport(s: &str) -> Result<engram_image_builder::Transport, String> {
@@ -543,7 +531,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 format,
                 inject_agent,
                 transport,
-                harness_platform,
                 push,
             },
     } = &cli.cmd
@@ -557,7 +544,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             *format,
             inject_agent.as_deref(),
             *transport,
-            *harness_platform,
             push.as_deref(),
         )
         .await;
@@ -569,8 +555,19 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             SessionCmd::Create {
                 image,
                 dev_vm,
+                harness,
                 prompt,
-            } => session_create(&mut c, image, *dev_vm, prompt.as_deref(), cli.json).await,
+            } => {
+                session_create(
+                    &mut c,
+                    image,
+                    *dev_vm,
+                    prompt.as_deref(),
+                    harness.as_deref(),
+                    cli.json,
+                )
+                .await
+            }
             SessionCmd::List => session_list(&mut c, cli.json).await,
             SessionCmd::Get { id } => session_get(&mut c, id, cli.json).await,
             SessionCmd::Exec {
@@ -780,6 +777,7 @@ async fn session_create(
     image: &str,
     dev_vm: bool,
     prompt: Option<&str>,
+    harness: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
     let req = app::CreateSessionRequest {
@@ -798,6 +796,9 @@ async fn session_create(
         harness_env: HashMap::new(),
         // Admin CLI doesn't correlate optimistic UI; let the coord mint.
         prompt_id: None,
+        // ADR 0062: the selected catalog harness (required for an agent session;
+        // ignored for --dev-vm). `engram harness list` shows the catalog.
+        harness: harness.map(str::to_string),
     };
     let resp = c.sess.create_session(req).await?.into_inner();
     if json {
@@ -1131,7 +1132,6 @@ async fn image_build(
     format: Format,
     inject_agent: Option<&Path>,
     transport: engram_image_builder::Transport,
-    harness_platform: Option<engram_image_builder::Platform>,
     push: Option<&str>,
 ) -> Result<(), CliError> {
     let resolved_tag = tag
@@ -1170,21 +1170,14 @@ async fn image_build(
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
         std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(chunk_root));
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    // One OCI client for both built-in harness pulls (during `build`,
-    // when `engram.toml` carries `[harness] builtin = ...`) and the
-    // optional registry push afterwards. Auth resolves from the
-    // standard docker config — `docker login <registry>` upstream,
+    // OCI client for the optional registry push afterwards. Auth resolves
+    // from the standard docker config — `docker login <registry>` upstream,
     // or any docker/login-action equivalent in CI; with no config the
-    // resolver returns no creds and pull/push fall through to
-    // anonymous (matches public/local-registry behaviour).
+    // resolver returns no creds and push falls through to anonymous
+    // (matches public/local-registry behaviour).
     let oci =
         engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::DockerConfigResolver::new()));
-    let mut builder = Builder::new(docker, chunk_store).with_oci(oci);
-    // Default is the host's arch (Builder::host); only override when the
-    // operator asked for a cross-arch bake.
-    if let Some(platform) = harness_platform {
-        builder = builder.with_harness_platform(platform);
-    }
+    let builder = Builder::new(docker, chunk_store).with_oci(oci);
     let outcome = builder
         .build(&req)
         .await
@@ -1390,7 +1383,6 @@ async fn image_list(c: &mut Clients, json: bool) -> Result<(), CliError> {
                     "manifest_digest": img.manifest_digest,
                     "manifest_name": img.manifest_name,
                     "manifest_description": img.manifest_description,
-                    "harness_name": img.harness_name,
                     "last_refreshed_at": img.last_refreshed_at,
                     "created_at": img.created_at,
                 })

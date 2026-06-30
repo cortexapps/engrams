@@ -1,34 +1,35 @@
 /**
- * /api/v1/me/claude-token routes (ADR 0051).
+ * /api/v1/me/harness-env routes (ADR 0063 B3).
  *
- * The orchestrator OWNS the user's Claude harness token in its OWN Postgres
- * (the `user_session_secrets` table, KEK-envelope sealed at rest under the env
- * var name CLAUDE_CODE_OAUTH_TOKEN) — replacing the coordinator's per-user
- * sealed SecretService vault (Drip A). At session-create the token is opened and
- * passed to the control plane via `CreateSession.harness_env`.
+ * The orchestrator OWNS the user's harness identity secrets in its OWN Postgres
+ * (the `user_session_secrets` table, keyed by `(userId, envVarName)`, KEK-envelope
+ * sealed at rest — ADR 0051 Drip A). These are the *human* credentials a harness
+ * needs, declared by each registered harness's descriptor as `auth.user_env`
+ * (e.g. Claude Code → `CLAUDE_CODE_OAUTH_TOKEN`). There is no longer any
+ * Claude-specific "claude token" concept — the settings page is just the list of
+ * env vars the registered harnesses ask for, and the user fills them in.
+ *
+ * At session-create the selected harness's `user_env` value is opened and passed
+ * to the control plane via `CreateSession.harness_env` (see rpc/task-create.ts).
  *
  * Routes:
- *   POST   /api/v1/me/claude-token  — { token } → store.put(userId, token) → 204
- *   GET    /api/v1/me/claude-token  — store.has(userId)    → { has_claude_token: bool }
- *   DELETE /api/v1/me/claude-token  — store.delete(userId) → 204
+ *   GET    /api/v1/me/harness-env          — the catalog's `user_env` union, each
+ *                                            with which harnesses ask for it +
+ *                                            whether the caller has set it.
+ *   PUT    /api/v1/me/harness-env/:envVar  — { value } → store.put → 204.
+ *   DELETE /api/v1/me/harness-env/:envVar  — store.delete → 204.
  *
- * The key is ALWAYS the session's user id — never client-supplied. The token
- * plaintext is NEVER logged.
- *
- * JSON shapes mirror the coordinator's MeResponse.has_claude_token field and
- * the web's saveClaudeToken/fetchMe expectations (web/src/api.ts,
- * web/src/types.ts).
+ * The key is ALWAYS the session's user id — never client-supplied. `:envVar` must
+ * be a `user_env` some registered harness declares (else 404) so a client can't
+ * seal arbitrary names. The secret plaintext is NEVER logged.
  *
  * Injectable deps for tests: see makeMeRoute(deps).
  */
 
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
-import {
-  makeUserSecretStore,
-  CLAUDE_OAUTH_ENV_VAR,
-  type UserSecretStore,
-} from "../db/user-secrets.ts";
+import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
+import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
 import { auth } from "../auth/better-auth.ts";
 import type { GetSession } from "./guard.ts";
 
@@ -36,9 +37,28 @@ import type { GetSession } from "./guard.ts";
 // Types
 // ---------------------------------------------------------------------------
 
+/** The catalog read surface the route needs: each harness's `user_env` (the
+ *  human credential env-var name) + a display label. Structurally satisfied by
+ *  the generated HarnessCatalogService connect client. */
+export interface HarnessCatalogReader {
+  listHarnesses(req: Record<string, never>): Promise<{
+    harnesses: Array<{
+      name: string;
+      descriptor?: { label?: string; auth?: { userEnv?: string } };
+    }>;
+  }>;
+}
+
+/** One harness that asks for a given env var (for the settings-page list). */
+interface HarnessRef {
+  name: string;
+  label: string;
+}
+
 /** Injectable deps for the /me route. */
 export interface MeDeps {
   secrets?: UserSecretStore;
+  harnessCatalog?: HarnessCatalogReader;
   getSession?: GetSession;
 }
 
@@ -48,10 +68,12 @@ export interface MeDeps {
 
 export function makeMeRoute(deps?: MeDeps): Hono {
   const app = new Hono();
-  // The store is constructed lazily by default so importing this module does
-  // not require ORCHESTRATOR_DATABASE_URL at import time (tests inject a fake).
-  const resolveStore = (): UserSecretStore =>
-    deps?.secrets ?? makeUserSecretStore();
+  // The store + catalog are resolved lazily by default so importing this module
+  // does not require ORCHESTRATOR_DATABASE_URL / a live control plane at import
+  // time (tests inject fakes).
+  const resolveStore = (): UserSecretStore => deps?.secrets ?? makeUserSecretStore();
+  const resolveCatalog = (): HarnessCatalogReader =>
+    deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogReader);
 
   const resolveSession: GetSession =
     deps?.getSession ??
@@ -61,9 +83,7 @@ export function makeMeRoute(deps?: MeDeps): Hono {
       } as Parameters<typeof auth.api.getSession>[0]));
 
   /** Resolve the authenticated user or throw 401. */
-  async function requireUser(
-    headers: Headers,
-  ): Promise<{ id: string; role: string }> {
+  async function requireUser(headers: Headers): Promise<{ id: string; role: string }> {
     const session = await resolveSession(headers);
     if (!session) {
       throw new HTTPException(401, { message: "unauthenticated" });
@@ -71,47 +91,71 @@ export function makeMeRoute(deps?: MeDeps): Hono {
     return { id: session.user.id, role: session.user.role ?? "user" };
   }
 
-  // POST /api/v1/me/claude-token — upsert the user's token in our own store.
-  // body: { token: string }
-  // response: 204 No Content (mirrors coordinator save_claude_token)
-  app.post("/api/v1/me/claude-token", async (c) => {
-    const user = await requireUser(c.req.raw.headers);
+  /** The `user_env` union across the registered harnesses → who asks for each,
+   *  in catalog order. The map's keys are the only env-var names the PUT/DELETE
+   *  routes will seal (defends against sealing arbitrary names). */
+  async function userEnvUnion(): Promise<Map<string, HarnessRef[]>> {
+    const { harnesses } = await resolveCatalog().listHarnesses({});
+    const union = new Map<string, HarnessRef[]>();
+    for (const h of harnesses) {
+      const envVar = h.descriptor?.auth?.userEnv;
+      if (!envVar) continue;
+      const refs = union.get(envVar) ?? [];
+      refs.push({ name: h.name, label: h.descriptor?.label || h.name });
+      union.set(envVar, refs);
+    }
+    return union;
+  }
 
-    let body: { token?: unknown };
+  // GET /api/v1/me/harness-env — the env vars the registered harnesses ask for,
+  // each with whether the caller has set it. This is the settings-page list.
+  app.get("/api/v1/me/harness-env", async (c) => {
+    const user = await requireUser(c.req.raw.headers);
+    const store = resolveStore();
+    const union = await userEnvUnion();
+    const vars = await Promise.all(
+      [...union.entries()].map(async ([envVar, harnesses]) => ({
+        envVar,
+        harnesses,
+        present: await store.has(user.id, envVar),
+      })),
+    );
+    return c.json({ vars });
+  });
+
+  // PUT /api/v1/me/harness-env/:envVar — seal the value under (userId, envVar).
+  // body: { value: string }. 404 if no registered harness declares :envVar.
+  app.put("/api/v1/me/harness-env/:envVar", async (c) => {
+    const user = await requireUser(c.req.raw.headers);
+    const envVar = c.req.param("envVar");
+    if (!(await userEnvUnion()).has(envVar)) {
+      throw new HTTPException(404, { message: `no registered harness declares ${envVar}` });
+    }
+
+    let body: { value?: unknown };
     try {
-      body = (await c.req.json()) as { token?: unknown };
+      body = (await c.req.json()) as { value?: unknown };
     } catch {
       throw new HTTPException(400, { message: "invalid JSON body" });
     }
-
-    const token =
-      typeof body.token === "string" ? body.token.trim() : undefined;
-    if (!token) {
-      throw new HTTPException(400, { message: "token must not be empty" });
+    const value = typeof body.value === "string" ? body.value.trim() : undefined;
+    if (!value) {
+      throw new HTTPException(400, { message: "value must not be empty" });
     }
 
-    // NEVER log the token. Stored KEK-envelope sealed under CLAUDE_CODE_OAUTH_TOKEN.
-    await resolveStore().put(user.id, CLAUDE_OAUTH_ENV_VAR, token);
-
-    // Mirror coordinator: 204 No Content.
+    // NEVER log the value. Stored KEK-envelope sealed under the env-var name.
+    await resolveStore().put(user.id, envVar, value);
     return new Response(null, { status: 204 });
   });
 
-  // GET /api/v1/me/claude-token — { has_claude_token: bool }
-  // Mirrors the has_claude_token field of MeResponse (principal.rs).
-  app.get("/api/v1/me/claude-token", async (c) => {
+  // DELETE /api/v1/me/harness-env/:envVar — clear it (idempotent).
+  app.delete("/api/v1/me/harness-env/:envVar", async (c) => {
     const user = await requireUser(c.req.raw.headers);
-
-    const exists = await resolveStore().has(user.id, CLAUDE_OAUTH_ENV_VAR);
-    return c.json({ has_claude_token: exists });
-  });
-
-  // DELETE /api/v1/me/claude-token — 204 No Content.
-  app.delete("/api/v1/me/claude-token", async (c) => {
-    const user = await requireUser(c.req.raw.headers);
-
-    await resolveStore().delete(user.id, CLAUDE_OAUTH_ENV_VAR);
-
+    const envVar = c.req.param("envVar");
+    if (!(await userEnvUnion()).has(envVar)) {
+      throw new HTTPException(404, { message: `no registered harness declares ${envVar}` });
+    }
+    await resolveStore().delete(user.id, envVar);
     return new Response(null, { status: 204 });
   });
 

@@ -92,7 +92,10 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
                 Err(_) => continue, // unmounted slot / no manifest
             };
             match serde_json::from_slice::<MountManifest>(&bytes) {
-                Ok(m) if m.is_sentinel() => {} // reserved-but-unused slot
+                // Reserved-but-unused slot, or the ADR 0062 harness catalog on
+                // dyn_0 (the harness is exec'd via the coordinator's argv, not
+                // wired as a skill here).
+                Ok(m) if m.is_sentinel() || m.is_harness() => {}
                 Ok(m) => bundles.push((slot, m)),
                 Err(e) => report.warnings.push(format!(
                     "bad mount.json at {}: {e}",

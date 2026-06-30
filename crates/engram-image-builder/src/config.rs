@@ -105,15 +105,6 @@ impl EngramRepoConfig {
         let manifest = value
             .try_into::<ImageManifest>()
             .map_err(|e| BuildError::Config(format!("manifest fields: {e}")))?;
-        // A `[harness]` table is author-facing; enforce the shape rules
-        // (builtin xor name/exec, absolute exec, no baker-only fields)
-        // here so a malformed block fails the bake up front rather than
-        // shipping an image that can't launch its agent.
-        if let Some(harness) = &manifest.harness {
-            harness
-                .validate_source()
-                .map_err(|e| BuildError::Config(format!("[harness]: {e}")))?;
-        }
         // A `[warm]` hook with an empty argv has nothing to run — fail the
         // bake here rather than shipping an image whose enable aborts at
         // base-snapshot capture (warm hooks are fail-loud).
@@ -249,122 +240,6 @@ mod tests {
         assert_eq!(cfg.build.dockerfile, "Dockerfile");
         assert_eq!(cfg.build.context, ".");
         assert!(cfg.build.build_secrets.is_empty());
-    }
-
-    #[test]
-    fn parse_engram_toml_rejects_stale_harness_array_block() {
-        // ADR 0021 baked exactly one harness per image, so `harness`
-        // is a singular table, not an array. The pre-0021
-        // `[[harness]]` array-of-tables shape fails to deserialize
-        // into the singular field, surfacing stale engram.toml files
-        // at bake rather than silently shipping an inert image. The
-        // accepted singular form is exercised below.
-        let res = EngramRepoConfig::parse(
-            r#"
-            name = "claude-oauth"
-
-            [[harness]]
-            name = "claude"
-            guest_path = "/sbin/engram-harness-claude"
-            "#,
-        );
-        assert!(
-            res.is_err(),
-            "stale [[harness]] array block must be rejected"
-        );
-    }
-
-    #[test]
-    fn parse_engram_toml_accepts_builtin_harness() {
-        let cfg = EngramRepoConfig::parse(
-            r#"
-            name = "demo-claude"
-
-            [harness]
-            builtin = "claude"
-            version = "v1.2.3"
-            "#,
-        )
-        .unwrap();
-        let h = cfg.manifest.harness.expect("harness parsed");
-        assert_eq!(h.builtin.as_deref(), Some("claude"));
-        assert_eq!(h.version.as_deref(), Some("v1.2.3"));
-    }
-
-    #[test]
-    fn parse_engram_toml_rejects_builtin_without_version() {
-        // Built-ins must pin a version explicitly — no rolling defaults.
-        let res = EngramRepoConfig::parse(
-            r#"
-            name = "demo-claude"
-
-            [harness]
-            builtin = "claude"
-            "#,
-        );
-        let err = format!("{:?}", res.unwrap_err());
-        assert!(
-            err.contains("version"),
-            "error must mention the missing version pin: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_engram_toml_rejects_custom_with_version() {
-        // `version` is only meaningful for built-ins.
-        let res = EngramRepoConfig::parse(
-            r#"
-            name = "x"
-
-            [harness]
-            name = "my-agent"
-            exec = "/opt/my-agent/harness"
-            version = "v0.1.0"
-            "#,
-        );
-        assert!(
-            res.is_err(),
-            "custom harness must not carry a version field"
-        );
-    }
-
-    #[test]
-    fn parse_engram_toml_accepts_custom_harness() {
-        let cfg = EngramRepoConfig::parse(
-            r#"
-            name = "my-img"
-
-            [harness]
-            name = "my-agent"
-            exec = "/opt/my-agent/harness"
-            args = ["--serve"]
-            "#,
-        )
-        .unwrap();
-        let h = cfg.manifest.harness.expect("harness parsed");
-        assert_eq!(h.exec.as_deref(), Some("/opt/my-agent/harness"));
-        assert_eq!(h.args, vec!["--serve"]);
-    }
-
-    #[test]
-    fn parse_engram_toml_rejects_ambiguous_harness_shape() {
-        // builtin + exec together — validate_source must reject at
-        // bake time so a confused engram.toml doesn't ship.
-        let res = EngramRepoConfig::parse(
-            r#"
-            name = "x"
-
-            [harness]
-            builtin = "claude"
-            exec = "/opt/x/harness"
-            "#,
-        );
-        let err = res.unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("[harness]"),
-            "error must point at [harness]: {msg}"
-        );
     }
 
     #[test]

@@ -800,6 +800,15 @@ impl HostClient for HostRegistry {
         backend.proxy_shell(sandbox_id).await
     }
 
+    async fn proxy_port(
+        &self,
+        sandbox_id: SandboxId,
+        port: u16,
+    ) -> Result<engram_core::types::port::PortTunnel, SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.proxy_port(sandbox_id, port).await
+    }
+
     fn set_harness_sink(&self, sink: engram_core::traits::HarnessSink) {
         // Fan out to every registered host. `LocalHostClient` wires
         // it onto its inner VMM backend; `RemoteHostClient`'s default

@@ -50,7 +50,7 @@ the image + create/drive a session with `just integration-session`
 
 ## The full Claude-through-the-filter chain
 
-A Claude session against the `demo-claude` image (whose `engram.toml`
+A Claude session against the `demo` image (whose `engram.toml`
 sets `network.allow_hosts = [..., "api.anthropic.com", ...]`) exercises
 the whole split + proxy path. With a bogus `ANTHROPIC_API_KEY`, within
 ~30 s the SSE event stream surfaces an `agent_message` (`role=assistant`)

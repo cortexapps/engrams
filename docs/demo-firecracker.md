@@ -114,8 +114,8 @@ rather than an APFS clone.
 /dev-vm ssh '
 SID=$(curl -s -X POST http://localhost:8090/sessions \
   -H "content-type: application/json" \
-  -d "{\"image\":\"localhost:5001/demo-claude:warm-1\",
-       \"harness\":{\"kind\":\"builtin\",\"name\":\"claude\"}}" | jq -r .session_id)
+  -d "{\"image\":\"localhost:5001/demo:warm-1\",
+       \"harness\":\"claude\"}" | jq -r .session_id)
 
 # Idle eviction → hot auto-resume. The default soft TTL is 5 min
 # (ADR 0039 follow-up #20) so it doesn't evict interactive sessions

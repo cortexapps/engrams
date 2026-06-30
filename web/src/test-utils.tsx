@@ -33,14 +33,13 @@ interface TestRouterContext {
   auth: AuthState;
 }
 
-/** Default test principal: a local admin with a saved token, matching the
- * dev synthetic admin. Override via `renderWithProviders({ principal })`. */
+/** Default test principal: a local admin matching the dev synthetic admin.
+ * Override via `renderWithProviders({ principal })`. */
 const DEFAULT_PRINCIPAL: Principal = {
   email: "dev@engram.local",
   display_name: "Local Admin",
   role: "admin",
   is_admin: true,
-  has_claude_token: true,
   can_sign_out: true,
 };
 
@@ -178,7 +177,6 @@ export function renderWithProviders(
     principal,
     isAdmin: principal.is_admin,
     ability: abilityFor({ id: "test-user-id", role: principal.is_admin ? "admin" : "user" }),
-    refresh: () => {},
   };
 
   const resolvedTransport = transport ?? testTransport;

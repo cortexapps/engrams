@@ -30,16 +30,18 @@ use tonic::service::Interceptor;
 use tonic::transport::Channel;
 
 use crate::grpc::host_service_client::HostServiceClient;
+use crate::grpc::proxy_port_message::Body as ProxyPortBody;
 use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     AnswerHarnessQuestionRequest, ApplyEgressPolicyRequest, BindHarnessSessionRequest,
     BuildBaseSnapshotRequest, CreateSandboxRequest, DequeueHarnessQueuedPromptRequest,
     EditHarnessQueuedPromptRequest, Empty, ExecStartRequest, GuestIpResponse,
     InterruptHarnessRequest, MigrationExportRef, MigrationFetchRequest, MigrationItem,
-    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, RehandshakeHarnessRequest,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    StartAgentRequest, StringList, UnbindHarnessSessionRequest,
+    ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
+    ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
+    ReapMaterializeDirRequest, RehandshakeHarnessRequest, RestoreBaseForSessionRequest,
+    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest, StringList,
+    UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -1058,6 +1060,76 @@ impl GrpcHostClient {
 
         Ok(tunnel)
     }
+
+    /// ADR 0064: open a bidi ProxyPort stream to the host. Sends the
+    /// initial `Open` carrying `sandbox_id` + `port`, then returns a
+    /// `PortTunnel` whose channels the caller bridges to the orchestrator
+    /// preview connection. Raw-byte sibling of [`Self::proxy_shell`].
+    pub async fn proxy_port(
+        &self,
+        sandbox_id: SandboxId,
+        port: u16,
+    ) -> Result<engram_core::types::port::PortTunnel, SandboxError> {
+        use engram_core::types::port::PortTunnel;
+        use futures::StreamExt;
+
+        let (tunnel, ends) = PortTunnel::pair();
+        let engram_core::types::port::PortTunnelEnds {
+            mut outbound_rx,
+            inbound_tx,
+        } = ends;
+
+        // First message is always `Open` — the only place sandbox_id +
+        // port live. Subsequent messages are pure `Data` chunks.
+        let sandbox_bytes = sandbox_id.as_uuid().as_bytes().to_vec();
+        let port_u32 = u32::from(port);
+
+        let out_stream = async_stream::stream! {
+            yield ProxyPortMessage {
+                body: Some(ProxyPortBody::Open(ProxyPortOpen {
+                    sandbox_id: sandbox_bytes,
+                    port: port_u32,
+                })),
+            };
+            while let Some(buf) = outbound_rx.recv().await {
+                yield ProxyPortMessage {
+                    body: Some(ProxyPortBody::Data(ProxyPortData { data: buf.to_vec() })),
+                };
+            }
+        };
+
+        let mut inbound_stream = self
+            .inner
+            .clone()
+            .proxy_port(out_stream)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+
+        // Pump inbound (host → us) into the tunnel's inbound channel.
+        tokio::spawn(async move {
+            while let Some(next) = inbound_stream.next().await {
+                let msg = match next {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "proxy_port client recv error");
+                        break;
+                    }
+                };
+                match msg.body {
+                    Some(ProxyPortBody::Data(d)) => {
+                        if inbound_tx.send(d.data.into()).await.is_err() {
+                            break; // caller dropped the tunnel
+                        }
+                    }
+                    // Close / empty / a stray Open echoed back: stop pumping.
+                    _ => break,
+                }
+            }
+        });
+
+        Ok(tunnel)
+    }
 }
 
 /// Translate a [`ShellFrame`] into the corresponding `ProxyShellBody`
@@ -1385,6 +1457,14 @@ impl HostClient for GrpcHostClient {
         sandbox_id: SandboxId,
     ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
         Self::proxy_shell(self, sandbox_id).await
+    }
+
+    async fn proxy_port(
+        &self,
+        sandbox_id: SandboxId,
+        port: u16,
+    ) -> Result<engram_core::types::port::PortTunnel, SandboxError> {
+        Self::proxy_port(self, sandbox_id, port).await
     }
 
     // harness_dial + set_harness_sink use the trait defaults — gRPC

@@ -1,4 +1,4 @@
-import { KeyRound, Lock, Plug, Users, UserCircle, IdCard } from "lucide-react";
+import { KeyRound, Lock, Plug, Users, UserCircle, IdCard, Cpu } from "lucide-react";
 import { Link, Outlet, useRouterState } from "@tanstack/react-router";
 import { useAbility } from "../../auth/AuthProvider";
 import {
@@ -25,6 +25,7 @@ const ORG: NavItem[] = [
   { to: "/settings/members", label: "Members", icon: Users },
   { to: "/settings/secrets", label: "Secrets", icon: Lock },
   { to: "/settings/integrations", label: "Integrations", icon: Plug },
+  { to: "/settings/harnesses", label: "Harnesses", icon: Cpu },
   { to: "/settings/profiles", label: "Profiles", icon: IdCard },
 ];
 

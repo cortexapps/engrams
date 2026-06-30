@@ -107,9 +107,13 @@ playwright_sha="$(stage_bundle playwright)"
 # ADR 0058: the integration CLI toolbox (gh + datadog-ci), profile-selected
 # when a connector with a bundled `cli` facet is enabled.
 integrations_cli_sha="$(stage_bundle integrations-cli)"
+# ADR 0062: the built-in `claude` harness rides the stamp like a skill — the coord
+# resolves the built-in's squashfs from this stamp (key `harness-claude`) + its
+# embedded descriptor, mounts it on dyn_0, and the session execs it. No registration.
+harness_claude_sha="$(stage_bundle harness-claude)"
 # Stamp: logical name -> sha256, matching AuxRoDrive::CURRENT_STAMP / read_stamp().
-printf '{"sentinel":"%s","skills":"%s","playwright":"%s","integrations-cli":"%s"}\n' \
-  "$sentinel_sha" "$skills_sha" "$playwright_sha" "$integrations_cli_sha" \
+printf '{"sentinel":"%s","skills":"%s","playwright":"%s","integrations-cli":"%s","harness-claude":"%s"}\n' \
+  "$sentinel_sha" "$skills_sha" "$playwright_sha" "$integrations_cli_sha" "$harness_claude_sha" \
   > "$BUNDLES_OUT/current.json"
 
 echo "==> staged into ${OUT}:"

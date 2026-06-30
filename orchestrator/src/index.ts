@@ -8,6 +8,7 @@ import health from "./routes/health.ts";
 import authRoute from "./routes/auth.ts";
 import eventsRoute from "./routes/events.ts";
 import artifactsRoute from "./routes/artifacts.ts";
+import portsRoute from "./routes/ports.ts";
 import connectorLogoRoute from "./routes/connector-logo.ts";
 import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
@@ -18,6 +19,8 @@ import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 // Side-effect import: registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
+import { makePreviewProxyMiddleware } from "./routes/preview-proxy.ts";
+import { makePreviewUpgradeHandler } from "./routes/preview-ws.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
 import { registerTasks } from "./rpc/tasks.ts";
@@ -55,12 +58,20 @@ wss.options.handleProtocols = (protocols: Set<string>) =>
 const httpLog = log.child({ component: "http" });
 app.use(honoLogger((message) => httpLog.info(message)));
 
+// ADR 0064 P2b: live-host preview reverse-proxy. Mounted FIRST so a request to
+// `<slug>.<previewBaseDomain>` is resolved + tunneled to the guest port before
+// the normal app routes see it; non-preview hosts fall straight through.
+app.use(makePreviewProxyMiddleware());
+
 // Mount routes.
 app.route("/", health);
 app.route("/", authRoute);
-// ADR 0051 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/claude-token).
+// ADR 0051 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/harness-env).
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
+// ADR 0064 P2a: live-host port-exposure registry (CRUD). The edge reverse-proxy
+// that serves the minted slugs lands in P2b.
+app.route("/", portsRoute);
 // Connector logos (redesign): orchestrator-owned brand marks, served for <img>.
 app.route("/", connectorLogoRoute);
 app.route("/", meRoute);
@@ -125,6 +136,8 @@ const server = buildServer(
   // injectWebSocket is included for completeness but the custom upgrade handler
   // is used instead of calling nodeWs.injectWebSocket(server).
   { upgradeWebSocket, wss, injectWebSocket },
+  // ADR 0064 P2b-ws: preview WS-upgrade hook — checked before the shell path.
+  makePreviewUpgradeHandler(),
 );
 
 // ADR 0060: inject the SlackThreadWorkflow's seams (the Slack provider

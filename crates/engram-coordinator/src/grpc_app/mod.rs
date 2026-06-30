@@ -13,11 +13,13 @@
 pub mod auth;
 mod convert;
 mod fleet;
+mod harness_catalog;
 mod image;
 mod integration_op;
 mod mint;
 mod mount_catalog;
 mod org_secret;
+mod port_relay;
 mod session;
 mod shell_relay;
 
@@ -29,11 +31,13 @@ use engram_protocol::app;
 use tonic::Status;
 
 pub use fleet::AppFleetService;
+pub use harness_catalog::AppHarnessCatalogService;
 pub use image::AppImageService;
 pub use integration_op::AppIntegrationOpService;
 pub use mint::AppMintService;
 pub use mount_catalog::AppMountCatalogService;
 pub use org_secret::AppOrgSecretService;
+pub use port_relay::AppPortRelayService;
 pub use session::AppSessionService;
 pub use shell_relay::AppShellRelayService;
 
@@ -155,6 +159,13 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
                 },
             ),
         )
+        // ADR 0064: raw-byte port relay for vanity-subdomain preview tunnels.
+        .add_service(app::port_relay_service_server::PortRelayServiceServer::new(
+            port_relay::AppPortRelayService {
+                state: state.clone(),
+                auth: auth.clone(),
+            },
+        ))
         .add_service(app::fleet_service_server::FleetServiceServer::new(
             AppFleetService {
                 state: state.clone(),
@@ -179,6 +190,18 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
                 },
             )
             .max_decoding_message_size(80 * 1024 * 1024),
+        )
+        // ADR 0062: the harness catalog — registry of selectable agent harnesses.
+        // RegisterHarness carries only strings (name + oci_ref + owner); the OCI
+        // pull + tree-blob + re-pack happen coordinator-side, so the default
+        // decode cap is fine (unlike RegisterSkill's binary upload).
+        .add_service(
+            app::harness_catalog_service_server::HarnessCatalogServiceServer::new(
+                AppHarnessCatalogService {
+                    state: state.clone(),
+                    auth: auth.clone(),
+                },
+            ),
         )
         // ADR 0057 C3: the read-only mint-kind registry (Plane-A form metadata).
         .add_service(app::mint_service_server::MintServiceServer::new(
@@ -403,9 +426,11 @@ mod convention {
         ("mod.rs", include_str!("mod.rs")),
         ("session.rs", include_str!("session.rs")),
         ("shell_relay.rs", include_str!("shell_relay.rs")),
+        ("port_relay.rs", include_str!("port_relay.rs")),
         ("fleet.rs", include_str!("fleet.rs")),
         ("image.rs", include_str!("image.rs")),
         ("mount_catalog.rs", include_str!("mount_catalog.rs")),
+        ("harness_catalog.rs", include_str!("harness_catalog.rs")),
         ("org_secret.rs", include_str!("org_secret.rs")),
         ("mint.rs", include_str!("mint.rs")),
         ("integration_op.rs", include_str!("integration_op.rs")),

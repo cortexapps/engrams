@@ -89,7 +89,7 @@ pub async fn open_shell_tunnel_at(
 
     let upstream = match &netns_name {
         None => connect_ttyd_cold(request).await?,
-        Some(ns) => connect_ttyd_in_netns(ns, &guest_ip, request).await?,
+        Some(ns) => connect_ttyd_in_netns(ns, &guest_ip, port, request).await?,
     };
 
     pump_websocket_through_tunnel(upstream, ends);
@@ -215,6 +215,7 @@ async fn connect_ttyd_cold(
 async fn connect_ttyd_in_netns(
     netns_name: &str,
     guest_ip: &str,
+    port: u16,
     build_request: impl Fn() -> Result<
         tokio_tungstenite::tungstenite::handshake::client::Request,
         SandboxError,
@@ -225,7 +226,7 @@ async fn connect_ttyd_in_netns(
 > {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (netns_name, guest_ip, build_request);
+        let _ = (netns_name, guest_ip, port, build_request);
         Err(SandboxError::Vm(
             "proxy_shell: per-VM netns dial requires Linux (got non-Linux host)".into(),
         ))
@@ -242,7 +243,7 @@ async fn connect_ttyd_in_netns(
         let deadline = std::time::Instant::now() + TTYD_DIAL_DEADLINE;
         let mut backoff = TTYD_BACKOFF_START;
         loop {
-            let stream = match connect_tcp_in_netns_linux(netns_name, guest_ip).await {
+            let stream = match connect_tcp_in_netns_linux(netns_name, guest_ip, port).await {
                 Ok(s) => s,
                 Err(e) => {
                     let msg = format!("{e}");
@@ -273,13 +274,22 @@ async fn connect_ttyd_in_netns(
     }
 }
 
+/// Open a raw `tokio::net::TcpStream` to `guest_ip:port` from *inside*
+/// `netns_name` (a warm-restored sandbox's per-VM netns). Made
+/// `pub(crate)` and port-parameterized so ADR 0064's
+/// [`crate::proxy_port`] reuses the same `setns(2)` dance for arbitrary
+/// guest ports — not just ttyd. (Before ADR 0064 this hardcoded
+/// `TTYD_PORT` and ignored its caller's port; harmless in prod where the
+/// shell always dials 7681, but a latent mismatch with the cold path —
+/// now it honours `port`.)
 #[cfg(target_os = "linux")]
-async fn connect_tcp_in_netns_linux(
+pub(crate) async fn connect_tcp_in_netns_linux(
     netns_name: &str,
     guest_ip: &str,
+    port: u16,
 ) -> Result<TcpStream, SandboxError> {
     let netns_path = format!("/var/run/netns/{netns_name}");
-    let guest_addr = format!("{guest_ip}:{TTYD_PORT}");
+    let guest_addr = format!("{guest_ip}:{port}");
 
     // We need to:
     //   1. open /proc/self/ns/net to remember root netns.
