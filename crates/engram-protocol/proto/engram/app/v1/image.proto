@@ -41,10 +41,11 @@ message EnabledImageSummary {
   // fails to parse (the row stays listed so an operator can disable it).
   optional string manifest_name = 4;
   optional string manifest_description = 5;
-  // ADR 0021: name of the harness baked into this image, or unset for a
-  // harness-less image. Drives the session-create form (e.g. show the
-  // Claude OAuth/API-key picker iff "claude").
-  optional string harness_name = 6;
+  // ADR 0062: retired `harness_name` (field 6). The image carries no harness
+  // identity now — harnesses are a per-session selection (the harness catalog),
+  // decoupled from image choice. Reserved so the field number is never reused.
+  reserved 6;
+  reserved "harness_name";
   // ISO-8601.
   string last_refreshed_at = 7;
   // ISO-8601.

@@ -357,13 +357,6 @@ export interface EnabledImageSummary {
   manifest_digest: string;
   manifest_name: string | null;
   manifest_description: string | null;
-  /**
-   * ADR 0021: name of the harness baked into this image (lifted
-   * from `manifest.harness.name`), or null for a harness-less image.
-   * The session-create form reads this to decide whether to show the
-   * Claude OAuth/API-key picker, etc.
-   */
-  harness_name: string | null;
   last_refreshed_at: string;
   created_at: string;
   /**

@@ -228,12 +228,12 @@ impl Driver {
         self.create_session_retrying(req, "dev_vm + skills").await
     }
 
-    /// ADR 0021 P1.3: drive the image's baked harness. `mode = agent` is
-    /// the default but set explicitly so the test stays correct if defaults
-    /// shift. The image referenced by `ENGRAM_E2E_IMAGE_URI` must carry a
-    /// `[harness] builtin = "claude"` block (the CI bake of
-    /// `deploy/demo-claude/` does); coord reads the harness contract from
-    /// `manifest.toml`, so the request no longer names the harness.
+    /// ADR 0062: drive the built-in `claude` harness, selected per session by
+    /// name (`CreateSessionRequest.harness`). `mode = agent` is the default but
+    /// set explicitly so the test stays correct if defaults shift. The image
+    /// (`ENGRAM_E2E_IMAGE_URI`) carries NO harness — `claude` rides the host
+    /// `current_bundles` stamp (staged by the e2e "Stage RO skill bundles" step)
+    /// and mounts on dyn_0.
     ///
     /// ADR 0051: the bogus Anthropic token is injected via `harness_env`
     /// (the orchestrator's trusted identity-injection channel), which the
@@ -260,9 +260,8 @@ impl Driver {
             secrets: HashMap::new(),
             harness_env,
             prompt_id: None,
-            // ADR 0062: an agent session selects a catalog harness. The e2e must
-            // register a "claude" harness (RegisterHarness) before this path can
-            // boot an agent — wired in the e2e harness-seeding follow-up.
+            // The built-in `claude` needs no registration — it resolves from the
+            // host `current_bundles` stamp (∪ the catalog) by name.
             harness: Some("claude".to_string()),
         };
         self.create_session_retrying(req, "claude").await

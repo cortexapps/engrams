@@ -223,6 +223,18 @@ harness/skills). The **built-in-via-stamp + embedded-descriptor** model in this 
 the earlier packed-"catalog generation" drive in favor of per-harness bundles — is the A5 follow-up
 (this revision).
 
+**A4b — the clean-break dead-code sweep.** With the harness now per-session, the old
+"harness-baked-into-the-image" machinery was retired wholesale: `engram_core::HarnessManifest` +
+`ImageManifest.harness`, the baker's `inject_builtin_harness` / `BuiltinCatalog` / `Platform`
+(`engram-image-builder::harness`) and the `engram-cli` `--harness-platform` wiring, and the
+image-level `EnabledImageSummary.harness_name` (app `image.proto` field 6 reserved; dropped from
+the registry type, the coordinator converter, the CLI, and the web `EnabledImageSummary` +
+`useEnabledImages`). The chat-picker never actually gated on `harness_name` (the gating was only
+ever a doc comment), so every enabled image stays selectable — harness is the session's choice.
+The two demo images (`demo`, `demo-claude`), now byte-identical workspace images under this model,
+collapse to a single **`demo`** (the bake scripts, CI bake matrix, the rebake detector, the e2e,
+and the docs repoint to it; prod enables `demo` + disables `demo-claude` post-merge).
+
 A small dev-parity follow-up stages the built-in harness on the macOS VZ backend too: `just
 bundles-vz` now packs the `ENGRAM_HARNESS_CLAUDE_TREE` as a content-addressed **erofs** under the
 `harness-claude` stamp key (the FC `bundles-squashfs` path already did this as squashfs; VZ stages

@@ -88,7 +88,7 @@ Three process classes, four storage primitives, three wire surfaces.
                                     │     bundle.json +   │
                                     │     optional        │
                                     │     rootfs.ext4)    │
-                                    │  - harness packs    │
+                                    │  - harness bundles  │
                                     └─────────────────────┘
 ```
 
@@ -302,7 +302,7 @@ End-to-end exec round-trip:
 ```bash
 # The control plane is app-gRPC (ADR 0051); drive it with the `engram` CLI.
 # Enable an image first (one-time; replace with your bake's URI —
-# e.g. localhost:5001/demo-claude:warm-1):
+# e.g. localhost:5001/demo:warm-1):
 engram image enable --uri localhost:5001/cortex/api:warm-1
 
 SID=$(engram session create --image localhost:5001/cortex/api:warm-1)
