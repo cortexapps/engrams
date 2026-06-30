@@ -88,7 +88,17 @@ export function SessionThread({
   //     lands in true conversation order (below the turn it was queued behind).
   // Either way the entry is pruned once the run starts (consumed) or the message
   // is dequeued.
-  const [pending, setPending] = useState<{ promptId: string; text: string; queued: boolean }[]>([]);
+  //
+  // Each entry is tagged with the `sessionId` it was sent to. `SessionThread` is
+  // intentionally NOT remounted on a session switch (the sessions rail navigates
+  // by path param only), so this single `pending` array is shared across every
+  // session the user visits in one page load — the `sessionId` tag is what keeps
+  // an optimistic bubble pinned to its origin session instead of bleeding into
+  // every other session's transcript. (Surviving navigation away-and-back is the
+  // point; it's reset only on a full page load.)
+  const [pending, setPending] = useState<
+    { sessionId: string; promptId: string; text: string; queued: boolean }[]
+  >([]);
 
   // ADR 0052: full prompt text by prompt_id, retained for the session so the
   // ↑-recall / rail can show the COMPLETE text even after the optimistic
@@ -132,7 +142,11 @@ export function SessionThread({
   const messages = useMemo(() => {
     const optimistic: ThreadMessageLike[] = pending
       .filter(
-        (e) => !e.queued && !consumedPromptIds.has(e.promptId) && !queuedPromptIds.has(e.promptId),
+        (e) =>
+          e.sessionId === sessionId &&
+          !e.queued &&
+          !consumedPromptIds.has(e.promptId) &&
+          !queuedPromptIds.has(e.promptId),
       )
       .map((e) => ({
         role: "user",
@@ -141,7 +155,7 @@ export function SessionThread({
         metadata: { custom: { pending: true } },
       }));
     return optimistic.length ? [...serverMessages, ...optimistic] : serverMessages;
-  }, [serverMessages, pending, consumedPromptIds, queuedPromptIds]);
+  }, [serverMessages, pending, consumedPromptIds, queuedPromptIds, sessionId]);
 
   // The composer's queued-message rail (Claude-Code style): everything submitted
   // but not yet consumed into the conversation. Server-confirmed queue first
@@ -157,6 +171,7 @@ export function SessionThread({
     }
     for (const e of pending) {
       if (
+        e.sessionId !== sessionId ||
         !e.queued ||
         seen.has(e.promptId) ||
         consumedPromptIds.has(e.promptId) ||
@@ -167,7 +182,7 @@ export function SessionThread({
       items.push({ promptId: e.promptId, text: e.text });
     }
     return items;
-  }, [queue, pending, consumedPromptIds, dequeuedPromptIds]);
+  }, [queue, pending, consumedPromptIds, dequeuedPromptIds, sessionId]);
 
   // ADR 0051 Task 24: sendPrompt + interrupt move to the connect-query
   // useMutation so they flow via the gated passthrough (/rpc/…) rather than
@@ -240,7 +255,7 @@ export function SessionThread({
       // `queued` is the client's optimistic guess (was a run in flight when we
       // sent?) — it routes the bubble to the rail vs. inline until the server's
       // prompt_queued / run_started confirms which it is.
-      setPending((p) => [...p, { promptId, text, queued: isRunning }]);
+      setPending((p) => [...p, { sessionId, promptId, text, queued: isRunning }]);
       sentTextRef.current.set(promptId, text);
       sendPromptMutation.mutateAsync({ sessionId, text, promptId }).catch((err) => {
         // Send failed: drop the optimistic entry so it isn't stuck.
