@@ -54,6 +54,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,9 +89,7 @@ fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
 }
 
 fn preflight() -> Option<PathBuf> {
-    let nbd_path = PathBuf::from(
-        std::env::var("ENGRAM_TEST_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()),
-    );
+    let nbd_path = common::nbd_test_device();
     if !nbd_path.exists() {
         eprintln!(
             "SKIP: {} not present — run `sudo modprobe nbd nbds_max=4`",

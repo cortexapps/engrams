@@ -10,7 +10,26 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// The NBD device this test process should drive. Defaults to
+/// `/dev/nbd{NEXTEST_TEST_GLOBAL_SLOT}` so concurrent nextest slots take
+/// DISJOINT devices — the only host-global resource the NBD tests share —
+/// letting the CI batch run at `--test-threads>1`. The batch `modprobe`s
+/// `nbds_max=16`, so every slot's device exists. An explicit
+/// `ENGRAM_TEST_NBD_DEVICE` still overrides for a manual single run, and
+/// production (one host, slot unset → 0) resolves to `/dev/nbd0`, unchanged.
+pub fn nbd_test_device() -> PathBuf {
+    if let Ok(dev) = std::env::var("ENGRAM_TEST_NBD_DEVICE") {
+        return PathBuf::from(dev);
+    }
+    let slot: u32 = std::env::var("NEXTEST_TEST_GLOBAL_SLOT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    PathBuf::from(format!("/dev/nbd{slot}"))
+}
 
 /// Poll `TcpStream::connect(addr)` on a 20 ms tick until it succeeds (the
 /// listener is bound and accepting) or `timeout` elapses. Returns whether
