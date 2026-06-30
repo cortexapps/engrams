@@ -223,6 +223,12 @@ harness/skills). The **built-in-via-stamp + embedded-descriptor** model in this 
 the earlier packed-"catalog generation" drive in favor of per-harness bundles — is the A5 follow-up
 (this revision).
 
+A small dev-parity follow-up stages the built-in harness on the macOS VZ backend too: `just
+bundles-vz` now packs the `ENGRAM_HARNESS_CLAUDE_TREE` as a content-addressed **erofs** under the
+`harness-claude` stamp key (the FC `bundles-squashfs` path already did this as squashfs; VZ stages
+erofs per ADR 0061). This is just the "harness path is the skills path" consequence applied to the
+VZ recipe — the recipe had simply omitted the harness bundle.
+
 ## Consequences
 
 - Per-session harness selection returns, with **no cold-boot regression** (and a likely small
