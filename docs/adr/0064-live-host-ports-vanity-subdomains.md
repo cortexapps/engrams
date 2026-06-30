@@ -105,15 +105,30 @@ WebSocket-upgrade, and gRPC all pass through transparently:
 
 ## Phasing
 
-- **P1 (this change):** the Rust data path — `ProxyPort`/`PortRelay` protos, `PortTunnel`
+- **P1 (landed, PR #478):** the Rust data path — `ProxyPort`/`PortRelay` protos, `PortTunnel`
   core types + `HostClient::proxy_port`, host-agent `proxy_port.rs` + server/client, the
-  coordinator `port_relay.rs` service, and tests (unit byte round-trip + a netns/FC
-  integration test wired into `ci.yml`).
-- **P2:** orchestrator slug registry + reverse-proxy edge handler + auth (owner/admin/share)
-  + web "Expose port" UI.
+  coordinator `port_relay.rs` service, and tests (unit byte round-trip + the `grpc_proxy_port`
+  in-process wire test).
+- **P2a (this change):** orchestrator port-exposure registry — the `port_exposure` table +
+  migration, the tri-word slug generator, the data-access store, the CRUD route
+  (`/api/v1/sessions/:id/ports`, owner/admin guarded), and the `portRelay` control-plane
+  client. The edge proxy that serves the slugs lands in P2b, so the returned `url` is the
+  eventual address, not yet reachable.
+- **P2b:** the edge reverse-proxy data plane — Host-based routing on `<slug>.<previewDomain>`,
+  the HTTP-over-`PortRelay` transport (a custom `http.Agent`/Duplex), WebSocket-upgrade
+  passthrough, and auth (owner/admin/share-token).
+- **P2c:** web "Expose port" UI on the session detail page.
 - **P3:** engrams-internal wildcard DNS + wildcard cert (GCP Certificate Manager + DNS auth)
   + ingress, behind IAP; prod validation.
 - **P4 (optional):** declarative `profile.portExposures`.
+
+> Pitfall (P1 CI, fixed): the P1 proto change touched the TS-generated `session.proto` but
+> the Rust-only P1 commit didn't regenerate/commit the checked-in TS bindings → the `buf`
+> codegen-drift gate failed; and CI's clippy (floating `stable` = 1.96) flagged a
+> `doc_lazy_continuation` (a doc line starting with `+ ` reads as a markdown bullet) that the
+> stale local clippy (1.95) missed. Both fixed on the P1 branch. Lesson: run clippy via the
+> pinned toolchain (`rustup update stable` / `nix develop`), and regenerate TS bindings
+> (`just gen-proto`) in the same change as any `engram/app/**` proto edit.
 
 ## Consequences / open items
 

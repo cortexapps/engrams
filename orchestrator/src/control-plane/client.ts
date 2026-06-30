@@ -12,7 +12,11 @@
 import { createClient } from "@connectrpc/connect";
 import { controlPlaneTransport } from "./transport.ts";
 
-import { SessionService, ShellRelayService } from "../gen/engram/app/v1/session_pb.ts";
+import {
+  SessionService,
+  ShellRelayService,
+  PortRelayService,
+} from "../gen/engram/app/v1/session_pb.ts";
 import { ImageService } from "../gen/engram/app/v1/image_pb.ts";
 import { FleetService } from "../gen/engram/app/v1/fleet_pb.ts";
 import { MountCatalogService } from "../gen/engram/app/v1/mount_catalog_pb.ts";
@@ -26,6 +30,9 @@ export const sessions = createClient(SessionService, controlPlaneTransport);
 
 /** ShellRelayService client — bidi shell relay stream. */
 export const shellRelay = createClient(ShellRelayService, controlPlaneTransport);
+
+/** PortRelayService client — bidi raw-byte port relay stream (ADR 0064). */
+export const portRelay = createClient(PortRelayService, controlPlaneTransport);
 
 /** ImageService client — image prefetch/disable/list. */
 export const images = createClient(ImageService, controlPlaneTransport);
