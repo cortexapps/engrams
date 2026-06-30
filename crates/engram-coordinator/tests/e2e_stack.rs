@@ -150,6 +150,42 @@ impl Driver {
         )
     }
 
+    /// `CreateSession`, retrying while the coordinator returns `Unavailable`.
+    ///
+    /// That code is the explicitly-retryable "no host can place this yet"
+    /// signal — a freshly-registered host hasn't finished staging the RO bundle
+    /// the session selects ("not staged on this host (catalog materialize
+    /// gap?) — Retry shortly"), or no host has dialed in at all. In production
+    /// the create path requeues on exactly this; a synchronous e2e create has
+    /// no requeue, so it must mirror the real client's retry contract or it
+    /// flakes against the host's startup bundle-staging window. Any other code
+    /// (including a deadline-exceeded `Unavailable`) panics with the status.
+    async fn create_session_retrying(
+        &mut self,
+        req: app::CreateSessionRequest,
+        label: &str,
+    ) -> SessionId {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match self.sess.create_session(req.clone()).await {
+                Ok(resp) => {
+                    return resp
+                        .into_inner()
+                        .session_id
+                        .parse()
+                        .expect("session_id is a SessionId");
+                }
+                Err(status)
+                    if status.code() == tonic::Code::Unavailable
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(status) => panic!("CreateSession ({label}): {status:?}"),
+            }
+        }
+    }
+
     /// ADR 0021 P1.3: drive the image as a pure dev VM. Whether the image
     /// has a baked `[harness]` block is irrelevant — `mode = dev_vm` tells
     /// coord to skip `resolve_harness` and pass an empty-argv `AgentSpec`
@@ -167,13 +203,7 @@ impl Driver {
             harness_env: HashMap::new(),
             prompt_id: None,
         };
-        let resp = self
-            .sess
-            .create_session(req)
-            .await
-            .expect("CreateSession (dev_vm)")
-            .into_inner();
-        resp.session_id.parse().expect("session_id is a SessionId")
+        self.create_session_retrying(req, "dev_vm").await
     }
 
     /// ADR 0055: a `dev_vm`-mode session that mounts the named profile skills.
@@ -192,13 +222,7 @@ impl Driver {
             harness_env: HashMap::new(),
             prompt_id: None,
         };
-        let resp = self
-            .sess
-            .create_session(req)
-            .await
-            .expect("CreateSession (dev_vm + skills)")
-            .into_inner();
-        resp.session_id.parse().expect("session_id is a SessionId")
+        self.create_session_retrying(req, "dev_vm + skills").await
     }
 
     /// ADR 0021 P1.3: drive the image's baked harness. `mode = agent` is
@@ -231,13 +255,7 @@ impl Driver {
             harness_env,
             prompt_id: None,
         };
-        let resp = self
-            .sess
-            .create_session(req)
-            .await
-            .expect("CreateSession (claude)")
-            .into_inner();
-        resp.session_id.parse().expect("session_id is a SessionId")
+        self.create_session_retrying(req, "claude").await
     }
 
     /// `SessionService.Exec` — server-streaming `ExecOutput`. Drains the
