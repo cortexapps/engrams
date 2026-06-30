@@ -58,6 +58,16 @@ fn harness_to_summary(h: &engram_core::types::CatalogHarness) -> app::HarnessSum
     }
 }
 
+/// A built-in harness → `HarnessSummary`, so `claude` shows up in the read surface
+/// (the orchestrator/web pickers) without any catalog row.
+fn builtin_to_summary(b: &crate::builtin_harness::BuiltinHarness) -> app::HarnessSummary {
+    let descriptor = b.descriptor().ok().as_ref().map(descriptor_to_proto);
+    app::HarnessSummary {
+        name: b.name.to_string(),
+        descriptor,
+    }
+}
+
 // EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
 #[tonic::async_trait]
 impl app::harness_catalog_service_server::HarnessCatalogService for AppHarnessCatalogService {
@@ -91,9 +101,13 @@ impl app::harness_catalog_service_server::HarnessCatalogService for AppHarnessCa
             .list_harnesses()
             .await
             .map_err(|e| into_status(ApiError::from(e)))?;
-        Ok(Response::new(app::ListHarnessesResponse {
-            harnesses: rows.iter().map(harness_to_summary).collect(),
-        }))
+        // Built-ins first (no catalog row), then custom uploads.
+        let harnesses = crate::builtin_harness::builtin_harnesses()
+            .iter()
+            .map(builtin_to_summary)
+            .chain(rows.iter().map(harness_to_summary))
+            .collect();
+        Ok(Response::new(app::ListHarnessesResponse { harnesses }))
     }
 
     async fn get_harness(
@@ -102,18 +116,24 @@ impl app::harness_catalog_service_server::HarnessCatalogService for AppHarnessCa
     ) -> Result<Response<app::GetHarnessResponse>, Status> {
         self.auth.check(&req)?;
         let name = req.into_inner().name;
-        let row = self
-            .state
-            .services
-            .meta
-            .get_harness_by_name(&name)
-            .await
-            .map_err(|e| into_status(ApiError::from(e)))?
-            .ok_or_else(|| {
-                into_status(ApiError::NotFound(format!("harness `{name}` not found")))
-            })?;
+        // Built-ins resolve from the embedded registry, not the catalog.
+        let summary = if let Some(b) = crate::builtin_harness::builtin(&name) {
+            builtin_to_summary(b)
+        } else {
+            let row = self
+                .state
+                .services
+                .meta
+                .get_harness_by_name(&name)
+                .await
+                .map_err(|e| into_status(ApiError::from(e)))?
+                .ok_or_else(|| {
+                    into_status(ApiError::NotFound(format!("harness `{name}` not found")))
+                })?;
+            harness_to_summary(&row)
+        };
         Ok(Response::new(app::GetHarnessResponse {
-            harness: Some(harness_to_summary(&row)),
+            harness: Some(summary),
         }))
     }
 

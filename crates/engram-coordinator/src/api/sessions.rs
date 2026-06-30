@@ -1716,40 +1716,49 @@ pub(crate) async fn resolve_harness(
         ));
     };
 
-    // Resolve the selected harness's launch contract from the catalog…
-    let row = state
+    // Resolve the harness to (descriptor, squashfs sha) — mirroring
+    // resolve_selected_skills' "fleet stamp ∪ catalog" lookup. A built-in rides the
+    // host-image `current_bundles` stamp + an embedded descriptor; a custom harness
+    // rides the `harness_catalog` (its own squashfs, materialized like an uploaded
+    // skill). Built-ins win, so a custom row can never shadow one.
+    let (descriptor, harness_sha) = if let Some(builtin) = crate::builtin_harness::builtin(name) {
+        let descriptor = builtin.descriptor().map_err(|e| {
+            ApiError::Internal(format!("built-in harness `{name}` descriptor: {e}"))
+        })?;
+        let sha = fleet_bundle_catalog(state)
+            .await?
+            .get(builtin.stamp_key)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "built-in harness `{name}` squashfs (`{}`) is not staged on any host yet",
+                    builtin.stamp_key
+                ))
+            })?;
+        (descriptor, sha)
+    } else if let Some(row) = state
         .services
         .meta
         .get_harness_by_name(name)
         .await
         .map_err(|e| ApiError::Internal(format!("harness catalog lookup for `{name}`: {e}")))?
-        .ok_or_else(|| {
-            ApiError::BadRequest(format!("harness `{name}` is not registered in the catalog"))
+    {
+        let descriptor = row.descriptor().map_err(|e| {
+            ApiError::Internal(format!(
+                "stored harness.toml for `{name}` failed to parse: {e}"
+            ))
         })?;
-    let descriptor = row.descriptor().map_err(|e| {
-        ApiError::Internal(format!(
-            "stored harness.toml for `{name}` failed to parse: {e}"
-        ))
-    })?;
-    // …and the current catalog generation — what `dyn_0` mounts. Identical for
-    // every session at this catalog version (the dedup-across-sessions drive).
-    let (generation_sha, _size) = state
-        .services
-        .meta
-        .harness_catalog_generation()
-        .await
-        .map_err(|e| ApiError::Internal(format!("harness catalog generation: {e}")))?
-        .ok_or_else(|| {
-            ApiError::Internal(
-                "no harness catalog generation is staged — register a harness first".into(),
-            )
-        })?;
+        (descriptor, row.squashfs_sha256)
+    } else {
+        return Err(ApiError::BadRequest(format!(
+            "harness `{name}` is not a built-in and is not registered in the catalog"
+        )));
+    };
 
-    // argv[0] = the selected harness's entry within the catalog mount on dyn_0.
+    // argv[0] = the harness's launch entry within its own squashfs on dyn_0.
     let exec = format!(
-        "{}/{}/{}",
+        "{}/{}",
         AuxRoDrive::slot_guest_mount(AuxRoDrive::HARNESS_SLOT_INDEX).display(),
-        name,
         descriptor.exec_path(),
     );
 
@@ -1812,7 +1821,7 @@ pub(crate) async fn resolve_harness(
         drive_id: AuxRoDrive::slot_drive_id(AuxRoDrive::HARNESS_SLOT_INDEX),
         guest_mount: AuxRoDrive::slot_guest_mount(AuxRoDrive::HARNESS_SLOT_INDEX),
         fs_type: "squashfs".into(),
-        sha256: Some(generation_sha),
+        sha256: Some(harness_sha),
     };
     Ok(Some((agent, mount)))
 }
