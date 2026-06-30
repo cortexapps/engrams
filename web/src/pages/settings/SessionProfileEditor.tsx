@@ -98,6 +98,9 @@ const schema = z.object({
   allowHostsText: z.string(),
   allowPatternsText: z.string(),
   secretRows: z.array(z.custom<SecretRow>()),
+  // ADR 0064 P4: guest ports auto-exposed (private) for every session started
+  // from this profile.
+  portExposures: z.array(z.number()),
 });
 type ProfileFormValues = z.infer<typeof schema>;
 
@@ -117,6 +120,7 @@ const EMPTY: ProfileFormValues = {
   allowHostsText: "",
   allowPatternsText: "",
   secretRows: [],
+  portExposures: [],
 };
 
 export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
@@ -152,6 +156,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const harnessDescriptor = harnesses?.find((h) => h.name === harness)?.descriptor;
   const envRows = watch("envRows");
   const secretRows = watch("secretRows");
+  const portExposures = watch("portExposures");
   const allowHostsText = watch("allowHostsText");
   const allowPatternsText = watch("allowPatternsText");
 
@@ -175,6 +180,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       allowHostsText: (p.network?.allowHosts ?? []).join("\n"),
       allowPatternsText: (p.network?.allowHostPatterns ?? []).join("\n"),
       secretRows: wireToSecretRows(p.secrets ?? []),
+      portExposures: p.portExposures ?? [],
     });
     if ((p.network?.allowHosts ?? []).length || (p.network?.allowHostPatterns ?? []).length)
       setNetOpen(true);
@@ -258,6 +264,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         allowHostPatterns: linesOf(vals.allowPatternsText),
       },
       secrets: secretRowsToWire(vals.secretRows),
+      portExposures: vals.portExposures,
     };
     try {
       if (mode === "edit" && editingId) {
@@ -671,7 +678,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               />
               <Text variant="label">Advanced</Text>
               <span className="text-[0.76rem] text-muted-foreground">
-                skills · environment · custom secrets · user token
+                skills · environment · ports · custom secrets · user token
               </span>
             </button>
             {advanced && (
@@ -689,6 +696,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                   setIncludeUserTokens={(b) =>
                     setValue("includeUserTokens", b, { shouldDirty: true })
                   }
+                  portExposures={portExposures}
+                  setPortExposures={(p) => setValue("portExposures", p, { shouldDirty: true })}
                 />
               </CardContent>
             )}
@@ -784,6 +793,8 @@ function Advanced({
   orgSecretNames,
   includeUserTokens,
   setIncludeUserTokens,
+  portExposures,
+  setPortExposures,
 }: {
   skillCatalog: Skill[];
   skills: string[];
@@ -795,12 +806,32 @@ function Advanced({
   orgSecretNames: string[];
   includeUserTokens: boolean;
   setIncludeUserTokens: (b: boolean) => void;
+  portExposures: number[];
+  setPortExposures: (p: number[]) => void;
 }) {
   const uploadSkill = useUploadSkill();
   const [skillName, setSkillName] = useState("");
   const [skillDesc, setSkillDesc] = useState("");
   const [skillFile, setSkillFile] = useState<File | null>(null);
   const [uploadErr, setUploadErr] = useState<string | null>(null);
+  const [portInput, setPortInput] = useState("");
+  const [portErr, setPortErr] = useState<string | null>(null);
+
+  const addPort = () => {
+    const p = Number(portInput);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) {
+      setPortErr("Enter a port between 1 and 65535");
+      return;
+    }
+    if (portExposures.includes(p)) {
+      setPortErr(`Port ${p} is already added`);
+      setPortInput("");
+      return;
+    }
+    setPortErr(null);
+    setPortExposures([...portExposures, p].sort((a, b) => a - b));
+    setPortInput("");
+  };
 
   const onUploadSkill = async () => {
     if (!skillName.trim() || !skillFile) {
@@ -899,6 +930,72 @@ function Advanced({
         <div className="mt-2">
           <EnvVarsEditor rows={envRows} onChange={setEnvRows} />
         </div>
+      </div>
+
+      {/* auto-exposed ports (ADR 0064 P4) */}
+      <div>
+        <Text variant="label">Auto-exposed ports</Text>
+        <p className="mt-1 text-[0.74rem] text-muted-foreground">
+          Guest ports every session from this profile exposes as private live-host previews (e.g. a
+          dev server on 3000). Manage individual previews from a session's Diagnostics → Ports.
+        </p>
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          {portExposures.length === 0 && (
+            <span className="text-[0.74rem] text-muted-foreground">
+              None — sessions expose nothing by default.
+            </span>
+          )}
+          {portExposures.map((p) => (
+            <span
+              key={p}
+              data-testid={`port-chip-${p}`}
+              className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 font-mono text-xs"
+            >
+              :{p}
+              <button
+                type="button"
+                aria-label={`remove port ${p}`}
+                data-testid={`port-remove-${p}`}
+                className="text-muted-foreground hover:text-foreground"
+                onClick={() => setPortExposures(portExposures.filter((n) => n !== p))}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <Input
+            type="number"
+            min={1}
+            max={65535}
+            placeholder="port (e.g. 3000)"
+            className="w-36"
+            value={portInput}
+            data-testid="port-add-input"
+            onChange={(e) => setPortInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addPort();
+              }
+            }}
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            data-testid="port-add-btn"
+            onClick={addPort}
+          >
+            Add
+          </Button>
+        </div>
+        {portErr && (
+          <p className="mt-1 text-sm text-destructive" data-testid="port-add-error">
+            {portErr}
+          </p>
+        )}
       </div>
 
       {/* custom secrets */}
