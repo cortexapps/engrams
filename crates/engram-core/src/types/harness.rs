@@ -32,6 +32,10 @@ pub struct HarnessDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 
+    /// Human-readable one-liner for the admin Harnesses tab (ADR 0063 §6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
     /// **Launch contract (coordinator-internal; omitted from the proto
     /// projection).** Entry path within this harness's catalog subtree —
     /// `argv[0]` is `/opt/engram/dyn/0/<name>/<exec>` (ADR 0062 §3). Defaults to

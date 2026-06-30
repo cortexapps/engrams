@@ -29,6 +29,7 @@ fn descriptor_to_proto(
     app::HarnessDescriptor {
         name: d.name.clone(),
         label: d.label.clone(),
+        description: d.description.clone(),
         auth: Some(app::HarnessAuth {
             org_env: d.auth.org_env.clone(),
             user_env: d.auth.user_env.clone(),
@@ -55,6 +56,7 @@ fn harness_to_summary(h: &engram_core::types::CatalogHarness) -> app::HarnessSum
     app::HarnessSummary {
         name: h.name.clone(),
         descriptor,
+        built_in: false,
     }
 }
 
@@ -65,6 +67,7 @@ fn builtin_to_summary(b: &crate::builtin_harness::BuiltinHarness) -> app::Harnes
     app::HarnessSummary {
         name: b.name.to_string(),
         descriptor,
+        built_in: true,
     }
 }
 

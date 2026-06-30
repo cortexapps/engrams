@@ -144,6 +144,8 @@ export const POLICY: Record<string, PolicyEntry> = {
   // ------------------------------------------------------------------
   "HarnessCatalogService.ListHarnesses": { action: "read", subject: "Harness" },
   "HarnessCatalogService.GetHarness": { action: "read", subject: "Harness" },
+  "HarnessCatalogService.RegisterHarness": { action: "manage", subject: "all" },
+  "HarnessCatalogService.DeleteHarness": { action: "manage", subject: "all" },
 
   // ------------------------------------------------------------------
   // FleetService — every method is admin-only

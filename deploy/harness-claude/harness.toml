@@ -9,6 +9,7 @@
 
 name  = "claude"
 label = "Claude Code"
+description = "Anthropic's Claude Code agent. Needs an ANTHROPIC_API_KEY org secret for programmatic runs; human runs use a per-user Claude token."
 
 # Launch contract (coordinator-internal): the entry binary at the root of this
 # harness's squashfs. argv[0] = /opt/engram/dyn/0/harness; the SDK dial flags

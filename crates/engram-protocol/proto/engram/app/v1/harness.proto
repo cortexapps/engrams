@@ -51,6 +51,10 @@ message HarnessSummary {
   string name = 1;
   // Projection of the harness's harness.toml (ADR 0063).
   HarnessDescriptor descriptor = 2;
+  // True for a platform built-in (rides the fleet stamp + an embedded
+  // descriptor; never a catalog row). Built-ins can't be deleted — the admin
+  // Harnesses tab hides the delete affordance for them.
+  bool built_in = 3;
 }
 
 // Mirrors engram_core::types::HarnessDescriptor (ADR 0063). All env values are
@@ -61,6 +65,8 @@ message HarnessDescriptor {
   HarnessAuth auth = 3;
   repeated HarnessOption models = 4;
   repeated HarnessOption effort = 5;
+  // Human-readable one-liner for the admin Harnesses tab.
+  optional string description = 6;
 }
 
 // Credential env-var names. A credential is one var, so these are single

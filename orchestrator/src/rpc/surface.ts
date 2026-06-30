@@ -58,9 +58,10 @@ export const SURFACE: PassthroughSpec[] = [
   },
   {
     service: HarnessCatalogService,
-    // ADR 0063: the catalog read surface drives the profile/launch selectors.
-    // Member-readable (config, not secrets — see policy-map). Write methods are
-    // intentionally excluded here until the admin Harnesses tab forwards them.
-    methods: ["ListHarnesses", "GetHarness"],
+    // ADR 0063: the read surface (ListHarnesses/GetHarness) drives the
+    // profile/launch selectors (member-readable); the write surface
+    // (RegisterHarness/DeleteHarness) backs the admin Harnesses tab (admin-only).
+    // See policy-map for the per-method gating.
+    methods: ["ListHarnesses", "GetHarness", "RegisterHarness", "DeleteHarness"],
   },
 ];
