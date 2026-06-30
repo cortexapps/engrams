@@ -155,17 +155,21 @@ impl Driver {
     /// That code is the explicitly-retryable "no host can place this yet"
     /// signal — a freshly-registered host hasn't finished staging the RO bundle
     /// the session selects ("not staged on this host (catalog materialize
-    /// gap?) — Retry shortly"), or no host has dialed in at all. In production
-    /// the create path requeues on exactly this; a synchronous e2e create has
-    /// no requeue, so it must mirror the real client's retry contract or it
-    /// flakes against the host's startup bundle-staging window. Any other code
-    /// (including a deadline-exceeded `Unavailable`) panics with the status.
+    /// gap?) — Retry shortly"), or no host has dialed in at all. The host
+    /// accepts session creates as soon as it registers, but stages the
+    /// `skills` / `sentinel` bundles in the background; on a cold CI runner
+    /// pulling them from GHCR that window can exceed a minute, so the deadline
+    /// is generous (3 min) with a 2 s poll. In production the create path
+    /// requeues on exactly this `Unavailable`; a synchronous e2e create has no
+    /// requeue, so it must mirror the real client's retry contract or it flakes
+    /// against the staging window. Any other code (including a deadline-exceeded
+    /// `Unavailable`) panics with the status.
     async fn create_session_retrying(
         &mut self,
         req: app::CreateSessionRequest,
         label: &str,
     ) -> SessionId {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
         loop {
             match self.sess.create_session(req.clone()).await {
                 Ok(resp) => {
@@ -179,7 +183,7 @@ impl Driver {
                     if status.code() == tonic::Code::Unavailable
                         && tokio::time::Instant::now() < deadline =>
                 {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 Err(status) => panic!("CreateSession ({label}): {status:?}"),
             }
