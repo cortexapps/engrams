@@ -16,6 +16,25 @@ vi.mock("../../hooks/useEnabledImages", () => ({
     isLoading: false,
   }),
 }));
+// The harness/model/effort dropdowns read the catalog; mock the hook so the
+// editor needs no QueryClient/transport (ADR 0062/0063).
+vi.mock("../../hooks/useHarnessCatalog", () => ({
+  useHarnessCatalog: () => ({
+    data: [
+      {
+        name: "claude",
+        descriptor: {
+          label: "Claude Code",
+          models: [
+            { id: "opus", label: "Claude Opus 4.8", default: true, env: {} },
+            { id: "sonnet", label: "Claude Sonnet 4.6", default: false, env: {} },
+          ],
+          effort: [{ id: "high", label: "High", default: false, env: {} }],
+        },
+      },
+    ],
+  }),
+}));
 const uploadSkill = vi.hoisted(() => vi.fn().mockResolvedValue({ skill: { name: "x" } }));
 vi.mock("../../hooks/useSkills", () => ({
   useSkills: () => ({
