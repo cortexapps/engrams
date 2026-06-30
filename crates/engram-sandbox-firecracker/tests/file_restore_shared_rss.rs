@@ -171,10 +171,13 @@ async fn file_backend_siblings_share_clean_pages() {
         vms.push(id);
     }
 
-    // Wait until every sibling's read loop has faulted the common working set
-    // in (RSS > blob) — the condition the measurement below asserts on —
-    // rather than a fixed sweep delay.
-    wait_all_resident(work.path(), &vms, Duration::from_secs(30)).await;
+    // Let each sibling's read loop sweep the blob a few times so the common
+    // working set is faulted in EVERYWHERE and the shared-page accounting
+    // (Pss << Rss) stabilizes. Polling "all RSS > blob" returns too early: a
+    // sibling crosses the threshold before all three have faulted the SAME
+    // pages, so the strict per-sibling sharing assertion below would see
+    // pre-stabilization numbers. No cheap host signal for "sharing settled".
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // ---- 4. Measure ----
     let mut total_rss = 0u64;
@@ -346,7 +349,9 @@ async fn file_backend_base_create_shares_residency_memfile() {
         latencies_ms.push(ms);
         vms.push(id);
     }
-    wait_all_resident(work.path(), &vms, Duration::from_secs(30)).await;
+    // Fixed settle so sharing (Pss << Rss) stabilizes before the strict
+    // assertion — see the note in file_backend_siblings_share_clean_pages.
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // ---- Measure density + latency ----
     let mut total_rss = 0u64;
@@ -825,20 +830,6 @@ async fn wait_blob_resident(work: &Path, id: &str, timeout: Duration) {
         fc_pid_opt(work, id)
             .and_then(rss_kb_opt)
             .is_some_and(|rss| rss > BLOB_MIB * 1024)
-    })
-    .await;
-}
-
-/// Wait until EVERY sibling's read loop has faulted the common working set in
-/// (RSS > blob) — the condition the density measurement asserts on — instead
-/// of a fixed "let them sweep" delay.
-async fn wait_all_resident<I: std::fmt::Display>(work: &Path, ids: &[I], timeout: Duration) {
-    common::poll_until(timeout, Duration::from_secs(1), || {
-        ids.iter().all(|id| {
-            fc_pid_opt(work, &id.to_string())
-                .and_then(rss_kb_opt)
-                .is_some_and(|rss| rss > BLOB_MIB * 1024)
-        })
     })
     .await;
 }

@@ -609,34 +609,30 @@ async fn e2e_shell_warm_via_pooled_backend() {
         .expect("vm_internal_ip must resolve");
     let ns = netns.clone().expect("warm sandbox netns");
     assert!(
-        common::poll_until_async(
-            Duration::from_secs(15),
-            Duration::from_millis(100),
-            || {
-                let ns = ns.clone();
-                let warm_vm_ip = warm_vm_ip.clone();
-                async move {
-                    tokio::task::spawn_blocking(move || {
-                        std::process::Command::new("ip")
-                            .args([
-                                "netns",
-                                "exec",
-                                &ns,
-                                "bash",
-                                "-c",
-                                &format!(
-                                    "timeout 2 bash -c 'echo > /dev/tcp/{warm_vm_ip}/{TTYD_PORT}'"
-                                ),
-                            ])
-                            .output()
-                            .map(|o| o.status.success())
-                            .unwrap_or(false)
-                    })
-                    .await
-                    .unwrap_or(false)
-                }
-            },
-        )
+        common::poll_until_async(Duration::from_secs(15), Duration::from_millis(100), || {
+            let ns = ns.clone();
+            let warm_vm_ip = warm_vm_ip.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("ip")
+                        .args([
+                            "netns",
+                            "exec",
+                            &ns,
+                            "bash",
+                            "-c",
+                            &format!(
+                                "timeout 2 bash -c 'echo > /dev/tcp/{warm_vm_ip}/{TTYD_PORT}'"
+                            ),
+                        ])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false)
+                })
+                .await
+                .unwrap_or(false)
+            }
+        },)
         .await,
         "ttyd not reachable in the warm VM netns within 15s"
     );

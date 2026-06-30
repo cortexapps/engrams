@@ -123,13 +123,11 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
     };
 
     let original_id = backend.create(spec).await.expect("create");
-    // Poll the serial console (firecracker.log) for the kernel banner instead of
-    // sleeping a fixed interval before snapshotting the source VM.
-    let orig_log = work
-        .path()
-        .join(original_id.to_string())
-        .join("firecracker.log");
-    common::wait_for_log_contains(&orig_log, &["Linux version"], Duration::from_secs(15)).await;
+    // Fixed settle before snapshot. The substrate tests re-capture VMs restored
+    // from this snapshot, and a too-early (kernel-banner) snapshot leaves the
+    // restored VM too fragile to re-snapshot (FC socket gone). Let early boot
+    // finish — there's no cheap host signal for "settled enough to re-snapshot".
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(original_id).await.expect("snapshot");
     let snap_dir = backend.snapshot_path_for(metadata.id);
 
@@ -262,13 +260,17 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
     };
     // Poll list() until both siblings appear rather than sleeping a fixed window;
     // the assertion below stays as the failure signal.
-    common::poll_until_async(Duration::from_secs(5), Duration::from_millis(200), || async {
-        let mut listed = backend.list().await.expect("list");
-        listed.sort();
-        let mut expect = vec![restored_id, sibling_id];
-        expect.sort();
-        listed == expect
-    })
+    common::poll_until_async(
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+        || async {
+            let mut listed = backend.list().await.expect("list");
+            listed.sort();
+            let mut expect = vec![restored_id, sibling_id];
+            expect.sort();
+            listed == expect
+        },
+    )
     .await;
     let mut listed = backend.list().await.expect("list");
     listed.sort();
@@ -365,13 +367,11 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
 
     // Source VM -> snapshot -> chunked manifest (the substrate's source).
     let original_id = backend.create(spec).await.expect("create");
-    // Poll the serial console (firecracker.log) for the kernel banner instead of
-    // sleeping a fixed interval before snapshotting the source VM.
-    let orig_log = work
-        .path()
-        .join(original_id.to_string())
-        .join("firecracker.log");
-    common::wait_for_log_contains(&orig_log, &["Linux version"], Duration::from_secs(15)).await;
+    // Fixed settle before snapshot. The substrate tests re-capture VMs restored
+    // from this snapshot, and a too-early (kernel-banner) snapshot leaves the
+    // restored VM too fragile to re-snapshot (FC socket gone). Let early boot
+    // finish — there's no cheap host signal for "settled enough to re-snapshot".
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(original_id).await.expect("snapshot");
     let snap_dir = backend.snapshot_path_for(metadata.id);
 
@@ -497,13 +497,17 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
         .expect("restore FROM the capture-of-substrate snapshot");
     // Poll list() until both VMs appear rather than sleeping a fixed window; the
     // assertion below stays as the failure signal.
-    common::poll_until_async(Duration::from_secs(5), Duration::from_millis(200), || async {
-        let mut listed = backend.list().await.expect("list");
-        listed.sort();
-        let mut expect = vec![substrate_vm, revived];
-        expect.sort();
-        listed == expect
-    })
+    common::poll_until_async(
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+        || async {
+            let mut listed = backend.list().await.expect("list");
+            listed.sort();
+            let mut expect = vec![substrate_vm, revived];
+            expect.sort();
+            listed == expect
+        },
+    )
     .await;
     let mut listed = backend.list().await.expect("list");
     listed.sort();
