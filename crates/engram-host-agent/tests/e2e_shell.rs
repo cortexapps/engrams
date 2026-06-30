@@ -49,6 +49,15 @@ use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, For
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::time::{sleep, timeout};
 
+mod common;
+
+/// ttyd's listening port. The bake's init shim launches `ttyd -W -p 7681`
+/// in the background, and the FC backend's `start_shell` returns the same
+/// value; used only by the readiness gates below (the tunnel dial still
+/// takes the port from `start_shell`, so a wrong-port regression there is
+/// not masked).
+const TTYD_PORT: u16 = 7681;
+
 /// FC test artifact discovery — duplicates the helper in
 /// `engram-sandbox-firecracker/tests/common/` because Rust can't
 /// share `tests/common/` across crates and adding a workspace-
@@ -254,10 +263,13 @@ async fn bake_shell_rootfs(repo: &str) -> PathBuf {
 }
 
 /// Wait up to `deadline` for `pooled.guest_ip(id)` to return Some.
-/// The FC backend's `guest_ip` answers as soon as the in-VM agentd
-/// is reachable on vsock; on a cold boot this typically takes
-/// a few seconds (kernel + init + agentd). The poll cadence is
-/// fast (200ms) so the test isn't dominated by sleep slack.
+/// Note: the FC backend answers `guest_ip` from the backend net
+/// fast-path (the allocated VM IP), so it resolves almost immediately
+/// and does NOT prove the guest has booted or that any in-VM listener
+/// (agentd, ttyd) is up. The real boot/ttyd readiness gate is the
+/// bounded TCP-connect poll at each call site below, not this call. The
+/// 200ms cadence just keeps slack low for the rare case where the net
+/// allocation isn't recorded the instant after `create`/`restore`.
 async fn wait_for_guest_ip(
     pooled: &PooledBackend,
     id: engram_core::SandboxId,
@@ -477,12 +489,24 @@ async fn e2e_shell_cold_via_pooled_backend() {
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
 
-    // ---- 4. Wait for in-VM agentd to come up so guest_ip resolves
-    //         AND the bake's init has had a chance to spawn ttyd. ----
+    // ---- 4. Wait for the VM's network slot, then gate on ttyd's TCP
+    //         listener actually binding. `guest_ip` resolves immediately
+    //         from the backend net fast-path (it does NOT prove boot), so
+    //         the real readiness gate is this root-netns TCP-connect poll
+    //         to ttyd, which the bake's init shim launches in the
+    //         background. ----
     let _guest_ip = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30)).await;
-    // Give ttyd a couple seconds to bind after the bake's init
-    // shim launches it in the background.
-    sleep(Duration::from_secs(2)).await;
+    let vm_ip = pooled
+        .vm_internal_ip(sandbox_id)
+        .await
+        .expect("vm_internal_ip must resolve");
+    let ttyd_addr: std::net::SocketAddr = format!("{vm_ip}:{TTYD_PORT}")
+        .parse()
+        .expect("ttyd addr parses");
+    assert!(
+        common::wait_tcp_bound(ttyd_addr, Duration::from_secs(15)).await,
+        "ttyd never bound {ttyd_addr} in the cold VM within 15s"
+    );
 
     // ---- 5. Open the shell tunnel via PooledBackend ----
     let tunnel = open_tunnel_via_pooled(&pooled, sandbox_id).await;
@@ -531,10 +555,23 @@ async fn e2e_shell_warm_via_pooled_backend() {
         aux_ro_drives: Vec::new(),
     };
 
-    // ---- Cold create + wait for VM to be ready ----
+    // ---- Cold create + wait for the VM, then gate on ttyd binding
+    //      before snapshot. `guest_ip` resolves immediately from the
+    //      backend net fast-path, so this root-netns TCP poll is the real
+    //      gate ensuring the snapshot captures a bound ttyd listen socket. ----
     let cold_id = pooled.create(spec).await.expect("create");
     let _ = wait_for_guest_ip(&pooled, cold_id, Duration::from_secs(30)).await;
-    sleep(Duration::from_secs(2)).await; // ttyd bind window
+    let cold_vm_ip = pooled
+        .vm_internal_ip(cold_id)
+        .await
+        .expect("vm_internal_ip must resolve");
+    let cold_ttyd_addr: std::net::SocketAddr = format!("{cold_vm_ip}:{TTYD_PORT}")
+        .parse()
+        .expect("ttyd addr parses");
+    assert!(
+        common::wait_tcp_bound(cold_ttyd_addr, Duration::from_secs(15)).await,
+        "ttyd never bound in the cold VM (pre-snapshot) within 15s"
+    );
 
     // ---- Snapshot + destroy the cold instance ----
     let metadata = pooled.snapshot(cold_id).await.expect("snapshot");
@@ -547,20 +584,61 @@ async fn e2e_shell_warm_via_pooled_backend() {
     //      to the netns'd 10.200.0.x. ----
     let warm_id = pooled.restore(metadata).await.expect("restore");
     let _ = wait_for_guest_ip(&pooled, warm_id, Duration::from_secs(30)).await;
-    // ttyd's TCP listen socket should survive the snapshot/restore
-    // (FC restores the kernel state including sockets). But give a
-    // small probe window in case ttyd needs a tick to re-arm.
-    sleep(Duration::from_secs(2)).await;
 
     // Sanity: confirm netns_name_for returns Some — if it doesn't,
     // PooledBackend isn't forwarding and the tunnel dial would dial
-    // from root netns. We fail loud here with a clear message
-    // rather than letting the dial time out.
+    // from root netns. We fail loud here with a clear message rather
+    // than letting the dial time out. Checked BEFORE the ttyd gate so
+    // this clearer message wins for the forwarding-bug class (otherwise
+    // a None netns would silently downgrade the gate to a root probe).
     let netns = pooled.netns_name_for(warm_id).await;
     assert!(
         netns.is_some(),
         "PooledBackend.netns_name_for returned None for a warm-restored sandbox — \
          the forwarding to inner FC backend isn't wired up (prod 2026-05-20 bug class)",
+    );
+
+    // ttyd's TCP listen socket should survive the snapshot/restore (FC
+    // restores kernel socket state) but may need a tick to re-arm.
+    // `guest_ip` resolves immediately from the backend net fast-path, so
+    // gate on the in-netns `/dev/tcp` probe — the same network path
+    // `open_shell_tunnel_at`'s dial takes — instead of a fixed sleep.
+    let warm_vm_ip = pooled
+        .vm_internal_ip(warm_id)
+        .await
+        .expect("vm_internal_ip must resolve");
+    let ns = netns.clone().expect("warm sandbox netns");
+    assert!(
+        common::poll_until_async(
+            Duration::from_secs(15),
+            Duration::from_millis(100),
+            || {
+                let ns = ns.clone();
+                let warm_vm_ip = warm_vm_ip.clone();
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        std::process::Command::new("ip")
+                            .args([
+                                "netns",
+                                "exec",
+                                &ns,
+                                "bash",
+                                "-c",
+                                &format!(
+                                    "timeout 2 bash -c 'echo > /dev/tcp/{warm_vm_ip}/{TTYD_PORT}'"
+                                ),
+                            ])
+                            .output()
+                            .map(|o| o.status.success())
+                            .unwrap_or(false)
+                    })
+                    .await
+                    .unwrap_or(false)
+                }
+            },
+        )
+        .await,
+        "ttyd not reachable in the warm VM netns within 15s"
     );
 
     let tunnel = open_tunnel_via_pooled(&pooled, warm_id).await;

@@ -85,7 +85,17 @@ async fn serial_restore_from_one_canonical_n_times() {
 
     // Step 1: Create source + let it settle + snapshot + destroy.
     let source_id = backend.create(spec).await.expect("create source");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the source kernel to boot (banner on the serial console
+    // funneled to firecracker.log) rather than a fixed settle sleep.
+    let _ = common::wait_for_log_contains(
+        &work
+            .path()
+            .join(source_id.to_string())
+            .join("firecracker.log"),
+        &["Linux version"],
+        Duration::from_secs(15),
+    )
+    .await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
     backend.destroy(source_id).await.expect("destroy source");
 
@@ -177,7 +187,17 @@ async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
     };
 
     let source_id = backend.create(spec).await.expect("create source");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the source kernel to boot (banner on the serial console
+    // funneled to firecracker.log) rather than a fixed settle sleep.
+    let _ = common::wait_for_log_contains(
+        &work
+            .path()
+            .join(source_id.to_string())
+            .join("firecracker.log"),
+        &["Linux version"],
+        Duration::from_secs(15),
+    )
+    .await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
     backend.destroy(source_id).await.expect("destroy source");
     let source_vsock = work.path().join(format!("{source_id}.vsock"));
@@ -280,7 +300,17 @@ async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
     };
 
     let source_id = backend.create(spec).await.expect("create source");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the source kernel to boot (banner on the serial console
+    // funneled to firecracker.log) rather than a fixed settle sleep.
+    let _ = common::wait_for_log_contains(
+        &work
+            .path()
+            .join(source_id.to_string())
+            .join("firecracker.log"),
+        &["Linux version"],
+        Duration::from_secs(15),
+    )
+    .await;
     let metadata = backend.snapshot(source_id).await.expect("snapshot source");
     backend.destroy(source_id).await.expect("destroy source");
 

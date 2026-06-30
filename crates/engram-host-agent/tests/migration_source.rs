@@ -33,6 +33,8 @@ use engram_sandbox_firecracker::{
 };
 use futures::StreamExt;
 
+mod common;
+
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
 async fn migration_capture_freezes_abort_resumes_commit_destroys() {
@@ -233,7 +235,10 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         serve_inner,
         None,
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        common::wait_tcp_bound(addr, std::time::Duration::from_secs(5)).await,
+        "source HostService did not bind {addr} within 5s"
+    );
 
     let vm2 = pooled.create(spec).await.expect("create vm2");
     let _ = exec(&pooled, vm2, "true").await;

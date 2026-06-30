@@ -48,6 +48,8 @@ use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_A
 use parking_lot::Mutex;
 use tokio::time::sleep;
 
+mod common;
+
 /// Hosts the egress proxy is allowed to forward to. api.anthropic.com
 /// is what the real Claude Code CLI dials; we allow it so the proxy
 /// intercepts cleanly. statsig.anthropic.com is the telemetry host
@@ -337,7 +339,14 @@ async fn spawn_real_proxy() -> (u16, String, Arc<engram_egress_proxy::Registry>)
     tokio::spawn(async move {
         let _ = proxy.run().await;
     });
-    sleep(Duration::from_millis(200)).await;
+    // Gate on the proxy's TCP intercept listener actually binding
+    // (`Proxy::run` binds `bind_addr` = proxy_bind) instead of a fixed
+    // sleep. The bind is on 0.0.0.0; probe it via loopback.
+    let proxy_probe = std::net::SocketAddr::from(([127, 0, 0, 1], proxy_port));
+    assert!(
+        common::wait_tcp_bound(proxy_probe, Duration::from_secs(5)).await,
+        "egress proxy did not bind port {proxy_port} within 5s"
+    );
     (proxy_port, ca_pem, registry)
 }
 
@@ -714,6 +723,14 @@ async fn e2e_harness_warm_via_pooled_backend() {
 
     let warm_id = pooled.restore(metadata).await.expect("restore");
     let _ = wait_for_guest_ip(&pooled, warm_id, Duration::from_secs(30)).await;
+    // INTENTIONAL fixed settle (not converted to a poll): this gates on the
+    // warm-restore network path — per-VM netns + SNAT + warm-path REDIRECT —
+    // being fully wired before the harness's first outbound dials the proxy.
+    // `guest_ip` returns immediately from the backend net fast-path and so
+    // doesn't prove that path is live, and there's no clean host-side
+    // readiness signal for it short of an in-netns probe of the proxy (which
+    // would itself need the proxy registration this test only does below).
+    // A too-eager poll would flake the egress assertion, so keep the margin.
     sleep(Duration::from_secs(2)).await;
 
     // Register WITH the SNAT'd guest_ip (Fix 3 territory). For

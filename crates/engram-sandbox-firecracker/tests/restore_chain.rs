@@ -115,7 +115,17 @@ async fn chained_restore_snapshot_lineage_holds() {
     // Cold create + settle + snapshot S1 + destroy. `metadata` is the
     // snapshot we restore the first hop from.
     let source_id = backend.create(spec).await.expect("create source");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the source kernel to boot (banner on the serial console
+    // funneled to firecracker.log) rather than a fixed settle sleep.
+    let _ = common::wait_for_log_contains(
+        &work
+            .path()
+            .join(source_id.to_string())
+            .join("firecracker.log"),
+        &["Linux version"],
+        Duration::from_secs(15),
+    )
+    .await;
     let mut metadata = backend.snapshot(source_id).await.expect("snapshot source");
     backend.destroy(source_id).await.expect("destroy source");
 
@@ -167,6 +177,11 @@ async fn chained_restore_snapshot_lineage_holds() {
         // path tracks the live id and this snapshot's recomputed
         // source_harness_canonical matches what the next hop's
         // load_snapshot opens — no ENOENT on harness/<ancestor>.ext4.
+        //
+        // Kept as a fixed sleep (not a marker poll): this is a RESUMED
+        // VM, which does not re-emit the "Linux version" kernel banner,
+        // and there's no in-guest agentd to signal readiness — so there
+        // is no cleanly pollable settle marker here.
         tokio::time::sleep(Duration::from_secs(2)).await;
         metadata = backend
             .snapshot(restored)
