@@ -208,14 +208,11 @@ impl AuxRoDrive {
     pub fn blob_key(sha256: &str) -> String {
         format!("bundles/sha256/{sha256}")
     }
-
-    /// Host path of the resolved generation, or `None` while the drive is
-    /// still symbolic.
-    pub fn staged_path(&self) -> Option<PathBuf> {
-        self.sha256
-            .as_ref()
-            .map(|sha| PathBuf::from(Self::SHARED_DIR).join(Self::staged_file_name(sha)))
-    }
+    // NOTE: there is deliberately no `staged_path()` here. A staged generation's
+    // host path is `<bundle_dir>/<staged_file_name>`, and `bundle_dir` is per-host
+    // (ENGRAM_BUNDLE_DIR / the SHARED_DIR default) — it lives on the backend, the
+    // single source of truth (`SandboxBackend::bundle_dir`). Hardcoding SHARED_DIR
+    // here is exactly the ADR 0062 trap; build the path from the backend's dir.
 }
 
 /// ADR 0035: identity of one bundle generation a snapshot references —

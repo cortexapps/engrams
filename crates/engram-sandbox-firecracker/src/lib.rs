@@ -2586,12 +2586,14 @@ impl FirecrackerBackend {
         // so a later eviction snapshot pins the skill (resume re-attaches it).
         // Only the fresh-create flavor carries selections; resume passes none.
         for sel in &selected_mounts {
-            let staged = sel.staged_path().ok_or_else(|| {
-                SandboxError::Snapshot(format!(
-                    "ADR 0055 selected skill for slot {} has no content sha",
-                    sel.drive_id,
-                ))
-            })?;
+            // ADR 0062: resolve via the backend's `bundle_dir` (config) — the
+            // single source of truth — NOT a hardcoded SHARED_DIR. The sentinel
+            // swap just above already uses `config.bundle_dir`; this used to read
+            // `AuxRoDrive::staged_path()` (hardcoded SHARED_DIR), which only
+            // matched while the FC config silently defaulted there too. On a
+            // dev/e2e host (ENGRAM_BUNDLE_DIR) it checked the wrong dir and every
+            // selected skill/harness 404'd "not staged".
+            let staged = self.staged_bundle_path(sel)?;
             if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
                 return Err(SandboxError::Snapshot(format!(
                     "ADR 0055 selected skill {} for slot {} is not staged on this \
