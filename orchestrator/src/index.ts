@@ -20,6 +20,7 @@ import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
 import { makePreviewProxyMiddleware } from "./routes/preview-proxy.ts";
+import { makePreviewUpgradeHandler } from "./routes/preview-ws.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
 import { registerTasks } from "./rpc/tasks.ts";
@@ -135,6 +136,8 @@ const server = buildServer(
   // injectWebSocket is included for completeness but the custom upgrade handler
   // is used instead of calling nodeWs.injectWebSocket(server).
   { upgradeWebSocket, wss, injectWebSocket },
+  // ADR 0064 P2b-ws: preview WS-upgrade hook — checked before the shell path.
+  makePreviewUpgradeHandler(),
 );
 
 // ADR 0060: inject the SlackThreadWorkflow's seams (the Slack provider
