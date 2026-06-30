@@ -461,6 +461,35 @@ describe("IAP bridge — valid JWT → user + session (DB-gated)", () => {
   );
 
   test.skipIf(!dbReachable)(
+    "first-time user: get-session resolves on the SAME bridged request (no /login bounce)",
+    async () => {
+      // Regression: a brand-new IAP user's very first orchestrator request is
+      // the SPA's GET /api/auth/get-session with NO better-auth cookie. The
+      // bridge mints the session and must inject the cookie into THIS request
+      // so get-session returns the user — otherwise the SPA sees a null session
+      // and redirects to /login (the cookie only lands on the *next* request).
+      const email = `iap-first-${Date.now()}@example.com`;
+      const jwt = await signIapJwt(email);
+
+      const res = await fetch(`${baseUrl}/api/auth/get-session`, {
+        headers: {
+          "x-goog-iap-jwt-assertion": jwt,
+          origin: "http://localhost:5173",
+        },
+      });
+
+      expect(res.status).toBe(200);
+      // The bridge still sets the cookie on the response for subsequent requests.
+      expect((res.headers.getSetCookie?.() ?? []).length).toBeGreaterThan(0);
+      // And the SAME request must already resolve to the freshly-created user.
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body["user"]).toBeTruthy();
+      const user = body["user"] as Record<string, unknown>;
+      expect((user["email"] as string).toLowerCase()).toBe(email.toLowerCase());
+    },
+  );
+
+  test.skipIf(!dbReachable)(
     "second request with same email re-uses existing user (idempotent JIT-create)",
     async () => {
       const email = `iap-idem-${Date.now()}@example.com`;
