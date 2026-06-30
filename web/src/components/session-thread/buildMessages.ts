@@ -315,6 +315,16 @@ export function buildMessages(
   // pre-scan so the generic card is re-rendered as a rich diff in place; a
   // failed edit emits NO file_changed and keeps its generic (error) card.
   const fileChangesByToolCallId = new Map<string, FileChangeArgs>();
+  // prod session 68c70a65: a `prompt_id` user echo is HELD and rendered at its
+  // consuming `run_started{prompt_id}` (below). That relies on the echo being
+  // seen BEFORE its run_started — true when the coordinator appends the echo
+  // ahead of the forward, but a `SendPrompt` forwarded before the echo lands
+  // inverts them (run_started first), so `heldUserText` is still empty when the
+  // run_started renders and the echo (held next) never renders → the user's
+  // turn vanishes. Pre-scanning the echo text by prompt_id makes the render
+  // order-independent: run_started finds it whether the echo came before or
+  // after. (A recalled prompt has no run_started, so it still never renders.)
+  const userEchoByPromptId = new Map<string, string>();
   for (const { event } of events) {
     if (event.type === "user_question") questionToolCallIds.add(event.tool_call_id);
     else if (event.type === "question_answered")
@@ -324,6 +334,8 @@ export function buildMessages(
         path: event.path,
         change: event.change,
       });
+    else if (event.type === "agent_message" && event.role === "user" && event.prompt_id)
+      userEchoByPromptId.set(event.prompt_id, event.text);
   }
 
   for (const indexed of events) {
@@ -342,7 +354,12 @@ export function buildMessages(
           // it's right where it was sent. Text from the held echo (full text),
           // falling back to the queue summary.
           const held = heldUserText.get(ev.prompt_id);
-          const text = held?.text ?? queued.get(ev.prompt_id) ?? "";
+          // Fall back to the pre-scanned echo (prod 68c70a65): when the echo was
+          // appended AFTER this run_started, `heldUserText` is empty here but the
+          // pre-scan still has the text, so the user turn renders instead of
+          // vanishing.
+          const text =
+            held?.text ?? userEchoByPromptId.get(ev.prompt_id) ?? queued.get(ev.prompt_id) ?? "";
           if (text) {
             out.push({
               role: "user",

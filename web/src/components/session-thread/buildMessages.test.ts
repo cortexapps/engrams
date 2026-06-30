@@ -510,6 +510,48 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
     // Surfaced via `queue` for the rail.
     expect(queue.map((q) => q.promptId)).toContain("p2");
   });
+
+  // prod session 68c70a65: the coordinator's SendPrompt path can append the
+  // harness's run_started BEFORE the user echo — it forwards the prompt (which
+  // starts the run) and only then emits the echo, so for an idle follow-up the
+  // two invert. The held echo is then never consumed (its run_started already
+  // passed) and the user turn used to vanish. The prompt_id pre-scan keeps it.
+  test("a prompt_id user echo logged AFTER its run_started still renders (forward-before-echo inversion, 68c70a65)", () => {
+    const { messages } = buildMessages(
+      indexed([
+        // INVERTED: run_started lands first (lower idx)…
+        { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p1", at: AT },
+        // …then the user echo it consumes.
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "are you there?",
+          prompt_id: "p1",
+          at: AT,
+        },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "yes!",
+          at: AT2,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    // The follow-up turn must NOT vanish: it renders, keyed by its prompt_id.
+    const user = real(messages).find((m) => m.role === "user");
+    expect(user).toMatchObject({
+      role: "user",
+      id: "p1",
+      content: [{ type: "text", text: "are you there?" }],
+    });
+  });
 });
 
 describe("buildMessages — ADR 0052 queue (type-ahead recall/cancel)", () => {
