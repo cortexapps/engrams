@@ -912,19 +912,18 @@ jobs:
       # regardless of the device's permission bits, mirroring the
       # root-required FC tests below. `env "PATH=$PATH"` re-adds the
       # cargo/rustc PATH that sudo scrubs; `-E` preserves
-      # FC_TEST_KERNEL/FC_TEST_ROOTFS.
+      # ENGRAM_TEST_NBD_DEVICE + FC_TEST_KERNEL/FC_TEST_ROOTFS.
       #
-      # `--test-threads=4`: the only host-global resource these tests share
-      # is the NBD device, and `common::nbd_test_device()` now partitions it
-      # per nextest slot (`/dev/nbd{NEXTEST_TEST_GLOBAL_SLOT}`; the modprobe
-      # above set nbds_max=16, so slots 0-3 all exist). The backend CID/pool
-      # are already slot-keyed and everything else is per-process, so we no
-      # longer pin ENGRAM_TEST_NBD_DEVICE — pinning would force every slot
-      # onto the same /dev/nbd0 and defeat the parallelism. nbd_chunked_disk
-      # (the only one booting a real microVM) is the long pole; the rest
-      # overlap it.
+      # Stays `--test-threads=1`. Per-slot `/dev/nbd{N}` keying fixes the
+      # device collision, but nbd_netlink_reconfigure's parked-IO assertion
+      # is coupled to a dead-connection timeout that -j4 CPU contention
+      # pushes past its window (it timed out under parallelism in CI). The
+      # contention can't be slot-partitioned away, so this batch stays
+      # serial; the dedup below is the win that doesn't risk a flake.
       - name: NBD chunked-disk + netlink tests (Linux + KVM + nbd, root)
         if: steps.nbd_setup.outputs.available == 'true'
+        env:
+          ENGRAM_TEST_NBD_DEVICE: /dev/nbd0
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-host-agent \
@@ -935,7 +934,7 @@ jobs:
             --test nbd_shutdown_final_flush \
             --run-ignored ignored-only \
             --no-fail-fast \
-            --test-threads=4
+            --test-threads=1
 
       # Root-required tests: host_startup applies real iptables rules,
       # proxy_e2e provisions a TAP device and runs the full

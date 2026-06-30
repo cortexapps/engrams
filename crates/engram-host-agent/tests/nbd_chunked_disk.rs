@@ -40,8 +40,6 @@
 
 #![cfg(target_os = "linux")]
 
-mod common;
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -79,7 +77,9 @@ fn preflight() -> Option<(PathBuf, PathBuf, PathBuf)> {
         eprintln!("SKIP: /dev/kvm not present");
         return None;
     }
-    let nbd_path = common::nbd_test_device();
+    let nbd_path = PathBuf::from(
+        std::env::var("ENGRAM_TEST_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()),
+    );
     if !nbd_path.exists() {
         eprintln!(
             "SKIP: {} not present — run `sudo modprobe nbd nbds_max=4`",
@@ -470,7 +470,9 @@ async fn disk_only_cold_boot_via_rootfs_manifest_override() {
 async fn high_offset_write_reads_back_through_the_device() {
     use std::io::{Read, Seek, SeekFrom, Write};
 
-    let nbd_path = common::nbd_test_device();
+    let nbd_path = PathBuf::from(
+        std::env::var("ENGRAM_TEST_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()),
+    );
     if !nbd_path.exists() {
         eprintln!("SKIP: {} not present", nbd_path.display());
         return;
