@@ -114,9 +114,19 @@ WebSocket-upgrade, and gRPC all pass through transparently:
   (`/api/v1/sessions/:id/ports`, owner/admin guarded), and the `portRelay` control-plane
   client. The edge proxy that serves the slugs lands in P2b, so the returned `url` is the
   eventual address, not yet reachable.
-- **P2b:** the edge reverse-proxy data plane — Host-based routing on `<slug>.<previewDomain>`,
-  the HTTP-over-`PortRelay` transport (a custom `http.Agent`/Duplex), WebSocket-upgrade
-  passthrough, and auth (owner/admin/share-token).
+- **P2b (this change):** the edge reverse-proxy data plane for **HTTP** — Host-based routing
+  on `<slug>.<previewBaseDomain>` (a Hono middleware mounted first), auth (owner / admin /
+  share-token), and the HTTP-over-`PortRelay` transport. The transport went through a design
+  change: a custom `http.request({ createConnection })` Duplex does **not** work under Bun
+  (Bun routes `http.request` through `fetch` and ignores `createConnection`, dialing the host
+  for real → ECONNREFUSED). The shipped design stands up a one-shot **loopback `net.Server`**
+  that raw-pipes a real local socket into a `PortRelay`-backed Duplex and `fetch()`es that
+  local port — web types end to end, only Bun-supported APIs. Covered by a fake-relay e2e
+  test that exercises the whole path on the Bun runtime.
+- **P2b-ws:** WebSocket-upgrade passthrough (Vite HMR etc.). Split out because Bun's node:http
+  `upgrade` handler can't write to the raw socket (see `orchestrator/src/server.ts` — the
+  `socket.write`/`end` no-op bug), so raw WS passthrough needs its own approach + live
+  validation. HTTP previews (page loads, assets, SSE, API) work without it.
 - **P2c:** web "Expose port" UI on the session detail page.
 - **P3:** engrams-internal wildcard DNS + wildcard cert (GCP Certificate Manager + DNS auth)
   + ingress, behind IAP; prod validation.
