@@ -25,6 +25,8 @@ import type { ImagesClient } from "../rpc/profiles.ts";
 // The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
 // the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
 const USER_ENV = "CLAUDE_CODE_OAUTH_TOKEN";
+// The claude harness's declared `auth.org_env` (programmatic credential, B4).
+const ORG_ENV = "ANTHROPIC_API_KEY";
 
 const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   id: "p1",
@@ -56,7 +58,7 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
       {
         name: "claude",
         descriptor: {
-          auth: { userEnv: USER_ENV },
+          auth: { userEnv: USER_ENV, orgEnv: ORG_ENV },
           models: [
             { id: "opus", default: true, env: { ANTHROPIC_MODEL: "claude-opus-4-8" } },
             { id: "sonnet", default: false, env: { ANTHROPIC_MODEL: "claude-sonnet-4-6" } },
@@ -114,6 +116,35 @@ describe("compileSessionCreateInput", () => {
     const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), customDeps);
     expect(inp.harnessEnv?.OPENCODE_TOKEN).toBe("tok-123");
     expect(inp.harnessEnv?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+  });
+
+  // ADR 0063 B4: strict-by-run-type credentials.
+  test("human (chat) task injects user_env and no org_env secret", async () => {
+    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
+      type: "chat",
+    });
+    expect(inp.harnessEnv?.[USER_ENV]).toBe("tok");
+    const policy = inp.integrationPolicyJson
+      ? (JSON.parse(inp.integrationPolicyJson) as { secrets?: Array<{ env_var: string }> })
+      : { secrets: [] };
+    expect((policy.secrets ?? []).some((s) => s.env_var === ORG_ENV)).toBe(false);
+  });
+
+  test("programmatic task injects org_env into the policy, not the user token", async () => {
+    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
+      type: "slack_thread",
+    });
+    // No per-user token for a programmatic task — strict by run type.
+    expect(inp.harnessEnv?.[USER_ENV]).toBeUndefined();
+    // The org secret rides the policy as a literal secret-inject (resolved host-side).
+    const policy = JSON.parse(inp.integrationPolicyJson!) as {
+      secrets?: Array<{ secret_ref: string; env_var: string; mode: string }>;
+    };
+    expect((policy.secrets ?? []).find((s) => s.env_var === ORG_ENV)).toMatchObject({
+      secret_ref: ORG_ENV,
+      env_var: ORG_ENV,
+      mode: "literal",
+    });
   });
 
   test("passes the prompt through when set", async () => {

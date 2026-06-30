@@ -85,6 +85,11 @@ export interface SessionCompileDeps {
 
 export interface SessionCompileOpts {
   prompt?: string;
+  /** The task type ("chat" = human/interactive; anything else = programmatic,
+   *  e.g. "slack_thread"). Drives the strict-by-run-type credential pick (ADR
+   *  0063 B4): human → the harness's `user_env` (per-user token); programmatic →
+   *  its `org_env` (org secret, resolved host-side). Default "chat". */
+  type?: string;
   /** ADR 0063 B2: per-session override of the profile's default harness / model /
    *  effort. Unset = use the profile's default. */
   harness?: string;
@@ -124,13 +129,19 @@ export async function compileSessionCreateInput(
   const { harnesses } = await deps.harnessCatalog.listHarnesses({});
   const descriptor = harnesses.find((h) => h.name === selectedHarness)?.descriptor;
 
+  // Strict-by-run-type credentials (ADR 0063 B4): a human (chat) task carries
+  // the user's per-user token; a programmatic task carries the org secret. They
+  // are mutually exclusive — never both.
+  const isHuman = (opts.type ?? "chat") === "chat";
+
   // Harness env, lowest → highest precedence: user token < CLI dummy env <
   // profile env_vars < model env < effort env < trigger extras. NEVER log values.
   const harness: Record<string, string> = {};
   // The human credential env-var name is the selected harness's declared
   // `user_env` (ADR 0063 — no longer the hardcoded CLAUDE_CODE_OAUTH_TOKEN).
+  // Injected ONLY for human tasks; programmatic tasks use `org_env` (below).
   const userEnv = descriptor?.auth?.userEnv;
-  if (profile.includeUserTokens && userEnv) {
+  if (profile.includeUserTokens && isHuman && userEnv) {
     try {
       const userToken = await deps.resolveUserToken(userEnv);
       if (userToken) harness[userEnv] = userToken;
@@ -164,6 +175,24 @@ export async function compileSessionCreateInput(
     network: profile.network,
     secrets: profile.secrets,
   });
+  // ADR 0063 B4: a programmatic task (cron / Slack / API) authenticates the
+  // harness with the ORG credential, not a per-user token. The org-secret value
+  // never leaves the coordinator (ADR 0057), so we can't read it here — instead
+  // append a literal secret-inject naming the org secret (named after the env
+  // var by convention; admins create an org secret `ANTHROPIC_API_KEY`). It
+  // ships in integration_policy_json and is resolved host-side by
+  // resolve_policy_secrets; an unresolvable ref is skipped+warned there (the
+  // session still boots).
+  const orgEnv = descriptor?.auth?.orgEnv;
+  if (!isHuman && orgEnv) {
+    policy.secrets.push({
+      secret_ref: orgEnv,
+      env_var: orgEnv,
+      mode: "literal",
+      allow_hosts: [],
+      allow_host_patterns: [],
+    });
+  }
   const integrationPolicyJson = policyHasContent(policy) ? JSON.stringify(policy) : undefined;
 
   // Profile skills ∪ the shared integrations-cli bundle (one dyn_* slot).
@@ -257,6 +286,7 @@ export async function createTaskWithSession(
       resolveUserToken: (envVar) => deps.secrets.get(params.ownerUserId, envVar),
     },
     {
+      type: params.type,
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
       ...(params.harness != null ? { harness: params.harness } : {}),
       ...(params.model != null ? { model: params.model } : {}),
