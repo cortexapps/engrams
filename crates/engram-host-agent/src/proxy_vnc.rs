@@ -1,7 +1,8 @@
 //! ADR 0064: host-agent half of the VNC tunnel. Mirrors `proxy_shell` but the
 //! upstream is a RAW TCP connection to the in-guest x11vnc (no WebSocket
 //! handshake). RFB bytes ride `ShellFrame::Binary`; the auth-gated relay does
-//! websockify's job. Cold path dials `127.0.0.1:5900` directly; warm path reuses
+//! websockify's job. Cold path dials the guest's routable IP (`vm_internal_ip`,
+//! e.g. `192.168.64.2:5900`) directly; warm path reuses
 //! `proxy_shell::connect_tcp_in_netns_linux` (setns) for the per-VM netns.
 //!
 //! The async surface is [`open_vnc_tunnel_at`] — it dials x11vnc, then spawns

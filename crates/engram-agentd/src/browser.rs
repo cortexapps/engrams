@@ -1,13 +1,16 @@
 //! In-guest browser (Xvfb + chromium + x11vnc) lifecycle (ADR 0064).
 //!
 //! Mirrors [`crate::shell`]: lazy spawn on the first
-//! [`StartBrowser`][crate::proto::WireRequest::StartBrowser], a real TCP
+//! [`StartBrowser`][crate::proto::WireRequest::StartBrowser], an RFB-banner
 //! probe to `127.0.0.1:5900` before replying so the host's `proxy_vnc` dial
-//! finds a listener, and respawn only if the prior launcher exited. The
-//! launcher (`engram-browser`, symlinked onto PATH by the `browser` bundle's
-//! activation — see ADR 0064 P0.1/P0.2) brings up the whole stack (Xvfb +
-//! openbox + chromium + x11vnc) in its own process group via `setsid`, so
-//! [`stop_browser`] reaps it with a single `killpg`.
+//! finds x11vnc actually *serving* RFB (not merely a bare TCP listener), and
+//! respawn only if the prior launcher exited. The launcher (`engram-browser`,
+//! symlinked onto PATH by the `browser` bundle's activation — see ADR 0064
+//! P0.1/P0.2) brings up the whole stack (Xvfb + openbox + chromium + x11vnc) in
+//! its own process group via `setsid`, so [`stop_browser`] reaps it with a
+//! single `killpg`. The launcher's stdout/stderr are drained to tracing (never
+//! left on an undrained pipe) so chromium's continuous logging can't fill the
+//! OS pipe buffer and block — and thereby freeze — the whole stack.
 //!
 //! Like the shell, the state is process-wide (one browser stack per VM) behind
 //! a tokio `Mutex` so concurrent `StartBrowser` calls serialize on the spawn
@@ -18,11 +21,11 @@ use std::io;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 /// Default RFB port the in-VM x11vnc binds. The host's `proxy_vnc` uses the
 /// matching `engram_host_agent::proxy_vnc::VNC_PORT` (Task P1.2).
@@ -99,9 +102,10 @@ pub async fn start_browser(
 
     // Path 1: we have a child handle but the port isn't accepting (Path 0
     // already ruled out a live listener). Whether the launcher exited, is
-    // wedged, or was asked to move ports, drop the stale handle (its
-    // `kill_on_drop` reaps the corpse) and fall through to a fresh spawn.
-    if let Some(handle) = guard.as_mut() {
+    // wedged, or was asked to move ports, tear the whole old group down (see
+    // `terminate_group` — `kill_on_drop` alone would orphan the chromium
+    // respawn loop) and fall through to a fresh spawn.
+    if let Some(mut handle) = guard.take() {
         if handle.port != port {
             tracing::info!(
                 old = handle.port,
@@ -120,7 +124,7 @@ pub async fn start_browser(
                 Err(e) => tracing::warn!(port, error = %e, "browser try_wait failed; restarting"),
             }
         }
-        let _ = guard.take();
+        terminate_group(&mut handle).await;
     }
 
     let bin = std::env::var("ENGRAM_BROWSER_BIN")
@@ -143,9 +147,21 @@ pub async fn start_browser(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| io::Error::new(e.kind(), format!("spawn browser launcher ({bin}): {e}")))?;
+
+    // Drain the launcher's stdout/stderr so chromium's continuous output can't
+    // fill the 64 KiB OS pipe buffer and block — and thereby freeze — the whole
+    // stack (Xvfb/openbox/chromium/x11vnc all inherit the launcher's fds). The
+    // drain tasks self-terminate on EOF when stop_browser / kill_on_drop reaps
+    // the group, so they need no separate shutdown.
+    if let Some(out) = child.stdout.take() {
+        drain_launcher_output(out, "stdout");
+    }
+    if let Some(err) = child.stderr.take() {
+        drain_launcher_output(err, "stderr");
+    }
 
     *guard = Some(BrowserHandle { child, port });
 
@@ -167,25 +183,34 @@ pub async fn start_browser(
 pub async fn stop_browser() -> io::Result<()> {
     let mut guard = state().await.lock().await;
     if let Some(mut handle) = guard.take() {
-        // `nix` is a Linux-only dependency of this crate (the guest is always
-        // Linux); gate the killpg on linux specifically rather than `unix` so
-        // the macOS cross-compile — where `cfg(unix)` is true but `nix` is
-        // absent — still builds. The kill_on_drop / SIGKILL path below covers
-        // the leader on every platform.
-        #[cfg(target_os = "linux")]
-        if let Some(pid) = handle.child.id() {
-            // Negative pid == process group: the launcher is the group leader
-            // (via process_group(0) at spawn). ESRCH (group already gone) is
-            // fine — this is best-effort.
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-        }
-        let _ = handle.child.kill().await; // SIGKILL backstop on the leader
-        let _ = handle.child.wait().await;
+        terminate_group(&mut handle).await;
     }
     Ok(())
+}
+
+/// SIGTERM the launcher's whole process group, then SIGKILL the leader as a
+/// backstop, and reap it. Shared by `stop_browser` and `start_browser`'s
+/// restart path: `kill_on_drop` alone only SIGKILLs the group *leader*, which
+/// on a respawn would orphan the backgrounded children — Xvfb, openbox, and
+/// especially the chromium respawn loop, which would otherwise keep relaunching
+/// chrome forever. killpg reaps the whole stack as a unit.
+async fn terminate_group(handle: &mut BrowserHandle) {
+    // `nix` is a Linux-only dependency of this crate (the guest is always
+    // Linux); gate the killpg on linux specifically rather than `unix` so the
+    // macOS cross-compile — where `cfg(unix)` is true but `nix` is absent —
+    // still builds. The SIGKILL path below covers the leader on every platform.
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = handle.child.id() {
+        // Negative pid == process group: the launcher is the group leader (via
+        // process_group(0) at spawn). ESRCH (group already gone) is fine —
+        // this is best-effort.
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+    }
+    let _ = handle.child.kill().await; // SIGKILL backstop on the leader
+    let _ = handle.child.wait().await;
 }
 
 async fn wait_until_ready(port: u16) -> io::Result<()> {
@@ -203,18 +228,81 @@ async fn wait_until_ready(port: u16) -> io::Result<()> {
     Err(last_err.unwrap_or_else(|| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("x11vnc did not accept on 127.0.0.1:{port} within {READY_DEADLINE:?}"),
+            format!("x11vnc did not serve RFB on 127.0.0.1:{port} within {READY_DEADLINE:?}"),
         )
     }))
 }
 
+/// Length of the RFB ProtocolVersion banner ("RFB 003.008\n") x11vnc sends the
+/// instant a viewer connects, before reading anything (RFC 6143 §7.1.1).
+const RFB_BANNER_LEN: usize = 12;
+/// How long to wait for that banner before treating the listener as not-ready.
+/// x11vnc emits it on accept, so this only has to absorb scheduler jitter.
+const RFB_BANNER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Probe that x11vnc is genuinely serving RFB on `port` — not merely that
+/// *something* accepted the TCP connection.
+///
+/// A bare connect is too weak: the original ADR 0064 break (the host dialing
+/// the guest's routable IP while x11vnc bound loopback) and any future
+/// "port accepts but no bytes flow" wedge both pass a connect yet serve
+/// nothing — the user sees the VNC tab close with "no messages over the
+/// endpoint". So we read x11vnc's opening RFB banner: a real byte exchange that
+/// proves the server is alive and speaking the protocol. We don't complete the
+/// handshake; closing after the banner is the same as any viewer that hangs up
+/// mid-negotiation, which `-forever` x11vnc tolerates.
 async fn probe_ready(port: u16) -> io::Result<()> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
-    // A successful connect is sufficient — x11vnc accepts immediately and
-    // waits for the RFB handshake. We don't speak RFB here; closing cleanly
-    // is fine.
+    let mut banner = [0u8; RFB_BANNER_LEN];
+    match timeout(RFB_BANNER_TIMEOUT, stream.read_exact(&mut banner)).await {
+        Ok(Ok(_)) => {}
+        // Short read / connection reset before the full banner → not ready.
+        Ok(Err(e)) => return Err(e),
+        Err(_elapsed) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no RFB banner from 127.0.0.1:{port} within {RFB_BANNER_TIMEOUT:?}"),
+            ));
+        }
+    }
     let _ = stream.shutdown().await;
+    if !banner.starts_with(b"RFB ") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("listener on 127.0.0.1:{port} did not speak RFB (banner {banner:?})"),
+        ));
+    }
     Ok(())
+}
+
+/// Forward a launcher pipe (stdout/stderr) to tracing, line by line, until EOF.
+///
+/// The reason this exists is the *read*, not the log: chromium writes to stderr
+/// continuously, and if agentd left these pipes undrained the OS pipe buffer
+/// would fill and block every writer that inherited the launcher's fds —
+/// freezing the browser stack. Reading here empties the pipe; the `debug!` is a
+/// bonus (even with that level disabled the read still drains). The task ends
+/// on EOF — when the launcher group is reaped its write ends close — so it
+/// needs no separate shutdown signal.
+fn drain_launcher_output<R>(reader: R, stream: &'static str)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    tracing::debug!(target: "engram_agentd::browser", stream, "{line}")
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::debug!(stream, error = %e, "browser log drain ended on read error");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Kill the cached browser handle, if any. Test-only — production relies on
@@ -230,9 +318,10 @@ mod tests {
     use super::*;
 
     /// Spawn a fake launcher (a tiny python TCP listener that binds the VNC
-    /// port and accepts in a loop) and assert the full "spawn → bind → probe →
-    /// ready" sequence works, then that a second call sees the stack already
-    /// up and reports `spawned = false`.
+    /// port, accepts in a loop, and replies with x11vnc's RFB ProtocolVersion
+    /// banner so `probe_ready`'s banner read succeeds) and assert the full
+    /// "spawn → bind → probe → ready" sequence works, then that a second call
+    /// sees the stack already up and reports `spawned = false`.
     ///
     /// `python3` is present in the `just test-linux` `rust:bookworm` image
     /// (Python 3.11). If it's somehow absent the test skips rather than
@@ -259,16 +348,28 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
 
-        // Fake launcher: bind the VNC port and accept connections forever so
-        // both agentd's internal probe AND the test's re-probe succeed (a
-        // backlog-1 listen that never accepts would refuse the second connect).
+        // Fake launcher: bind the VNC port and accept connections forever,
+        // replying with x11vnc's 12-byte RFB ProtocolVersion banner so
+        // `probe_ready`'s banner read succeeds. Accepting in a loop lets both
+        // agentd's internal probe AND the test's re-probe connect (a backlog-1
+        // listen that never accepts would refuse the second connect). A
+        // python-shebang script keeps the source as plain, correctly-indented
+        // python — no inline `-c` escaping.
         let script = format!(
-            "#!/bin/sh\nexec python3 -c \"import socket\n\
-             s=socket.socket()\n\
-             s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n\
-             s.bind(('127.0.0.1',{port}))\n\
-             s.listen(16)\n\
-             while True:\n    c,_=s.accept(); c.close()\"\n"
+            r#"#!/usr/bin/env python3
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", {port}))
+s.listen(16)
+while True:
+    try:
+        c, _ = s.accept()
+        c.sendall(b"RFB 003.008\n")
+        c.close()
+    except Exception:
+        pass
+"#
         );
         let dir = tempfile::tempdir().unwrap();
         let launcher = dir.path().join("engram-browser");

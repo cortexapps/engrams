@@ -86,7 +86,7 @@ macOS-host-16K / guest-4K block-size gotcha from ADR 0061), mounted per-session 
 | `chromium` (**full**, with UI) | the browser the human drives — *not* the headless-shell the playwright bundle ships |
 | `openbox` (minimal WM, no panel/menu) | window focus + auto-maximize so Chrome fills the framebuffer; nothing about it is user-visible |
 | `x11vnc` | RFB server bound to **`0.0.0.0:5900`** (all interfaces, like ttyd — *not* `-localhost`; see the reachability pitfall), `-forever -shared`, `-xrandr` for resize |
-| `engram-browser` (launcher script) | brings up `Xvfb → openbox → x11vnc → chromium` in order; position-independent (self-locates from `$0` like the playwright wrappers), surfaced on `PATH` via `mount.json` |
+| `engram-browser` (launcher script) | brings up `Xvfb → openbox → chromium → x11vnc` in order (chromium under a respawn supervisor — relaunched if it exits); position-independent (self-locates from `$0` like the playwright wrappers), surfaced on `PATH` via `mount.json` |
 | `xkbcomp` + `xkb-data` (`/usr/share/X11/xkb`) | XKB keyboard stack Xvfb needs to compile a keymap at boot — see the pitfall below |
 | NSS modules (`libsoftokn3`, `libfreebl3`, `libnssckbi` + `.chk`) | chromium `dlopen`s these for its cert DB/crypto — not `DT_NEEDED`, so the `ldd`-walk misses them — see the pitfall below |
 
@@ -122,7 +122,12 @@ sufficient* — x11vnc serves the banner even when chromium is dead, so the bann
 tab shows a blank/closing screen. A complete check confirms **chromium itself stays alive and
 paints** (no `FATAL` in the launcher log, the chrome process group survives past startup), not just
 that the port accepts. The FC `e2e_vnc` test asserts the banner; the chromium-liveness gap is why
-this regressed after the xkb fix landed.
+this regressed after the xkb fix landed. **As-built mitigation:** rather than try to *detect* a dead
+chromium (which agentd can't act on cheaply — x11vnc is still up, so the port still accepts and a
+re-probe stays green), the launcher *supervises* chromium in a respawn loop, so closing the last tab
+or a crash relaunches it within ~1 s without disturbing x11vnc or the live VNC connection. agentd's
+readiness probe still requires the RFB banner (a real byte exchange, not a bare accept); chromium
+liveness is held at the source by the supervisor.
 
 **Pitfall (the bind address — the one that survives every bundle fix).** Even with a perfectly
 self-contained bundle and a chromium that runs and paints, the tab still shows "connection closed
@@ -138,8 +143,8 @@ vmnet posture ttyd already depends on), so this does not widen exposure beyond t
 shell. Diagnostic that pinpointed it: from inside the guest, `curl telnet://127.0.0.1:5900` returned
 the banner while `curl telnet://<guest_ip>:5900` was refused and `curl http://<guest_ip>:7681`
 (ttyd) succeeded — proving the stack was healthy and the *only* fault was the bind address. (The
-`proxy_vnc.rs` module doc-comment claiming the cold path "dials `127.0.0.1:5900`" is stale — the
-caller passes `vm_internal_ip`.)
+`proxy_vnc.rs` module doc-comment that claimed the cold path "dials `127.0.0.1:5900`" was stale — the
+caller passes `vm_internal_ip` — and is corrected in this change.)
 
 Chrome runs with its **normal full UI** (address bar + tabs — deliberately *not* `--kiosk`, since the
 human needs to navigate), sized to the framebuffer, with first-run/default-browser prompts
@@ -157,13 +162,22 @@ A new `WireRequest::StartBrowser` variant, modeled 1:1 on `WireRequest::StartShe
 (`crates/engram-agentd/src/shell.rs`):
 
 - **Lazy:** nothing browser-related runs at boot. The launcher is exec'd on the first `StartBrowser`,
-  and the call blocks until `:5900` accepts a TCP connection (the same readiness-probe +
-  spawn-timeout logic ttyd uses), so the relay only dials a port that's provably bound.
-- **Idempotent / respawn:** subsequent calls re-probe and respawn only if the prior process exited,
-  guarded by a process-wide `tokio::Mutex` so concurrent calls serialize on the spawn decision
-  (mirrors the ttyd mutex — one browser stack per VM).
-- **No console blocking:** the launcher's stdout/stderr redirect to `/var/log/engram/browser.log`,
-  not `/dev/console` (the same hazard the harness and ttyd paths already avoid).
+  and the call blocks until x11vnc is provably serving on `:5900` (the same readiness-probe +
+  spawn-timeout shape ttyd uses), so the relay only dials a port that's provably up.
+- **Readiness = a real RFB banner (as-built, hardening).** The probe doesn't merely TCP-connect — it
+  reads x11vnc's 12-byte RFB ProtocolVersion banner (`RFB 003.00x\n`). A bare accept is too weak: a
+  wedged x11vnc, or the original loopback-bind bug, accepts the connection yet serves zero bytes —
+  the exact "no messages over the endpoint" symptom — so "ready" must mean "actually speaking RFB".
+- **Idempotent / respawn:** subsequent calls re-probe and respawn only if the prior stack stopped
+  serving, guarded by a process-wide `tokio::Mutex` so concurrent calls serialize on the spawn
+  decision (mirrors the ttyd mutex — one browser stack per VM). A respawn tears the *whole* old
+  process group down with `killpg` (not just the leader via `kill_on_drop`), so it never orphans the
+  launcher's backgrounded children — Xvfb, openbox, and the chromium respawn loop.
+- **Drained, not console-blocked (as-built, hardening).** agentd pipes the launcher's stdout/stderr
+  and drains them to tracing. (The earlier plan named a `/var/log/engram/browser.log` redirect; the
+  load-bearing property is that they're *drained at all*.) chromium logs to stderr continuously and
+  the whole stack inherits the launcher's fds, so an undrained 64 KiB pipe fills and blocks every
+  writer — freezing the display.
 
 A `DEFAULT_VNC_PORT = 5900` constant sits beside `DEFAULT_TTYD_PORT`.
 
@@ -180,7 +194,8 @@ The relay is generalized at **both** seams so the byte-stream it carries is para
 - **`session.proto` (`ShellRelayService.Relay`):** the open frame of `RelayShellRequest` gains the
   same target.
 - **host-agent `proxy_shell.rs`:** the *upstream* becomes pluggable — a WebSocket client for
-  `SHELL` (dial ttyd `:7681`, today) or a **raw-TCP client** for `VNC` (dial `127.0.0.1:5900`, new).
+  `SHELL` (dial ttyd `:7681`, today) or a **raw-TCP client** for `VNC` (dial the guest's x11vnc on
+  `:5900`, new).
   The frame pump (`ProxyShellMessage` ↔ upstream, cold-direct vs warm-netns) is shared; only upstream
   construction differs. RFB bytes ride the existing `binary` frame variant. For `VNC` the handler
   sends `StartBrowser` to agentd (and waits for readiness) before dialing, mirroring how it ensures

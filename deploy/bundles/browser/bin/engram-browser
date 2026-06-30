@@ -53,17 +53,40 @@ done
 # 2) Minimal WM so chromium gets focus + maximizes. No root menu / no panel.
 "$here/bin/openbox" &
 
-# 3) Chromium, full UI, sized to the framebuffer, no first-run prompts. The VM
-# is the isolation boundary, so --no-sandbox. Renderer shm uses the guest's
-# real /dev/shm (engram-init mounts it), so we do NOT disable dev-shm.
-"$here/chrome/chrome" \
-    --user-data-dir="$PROFILE_DIR" \
-    --no-sandbox \
-    --no-first-run --no-default-browser-check \
-    --disable-infobars \
-    --start-maximized \
-    --window-position=0,0 \
-    "${ENGRAM_BROWSER_HOMEPAGE:-about:blank}" &
+# 3) Chromium under a respawn supervisor. Full UI, sized to the framebuffer, no
+# first-run prompts. The VM is the isolation boundary, so --no-sandbox. Renderer
+# shm uses the guest's real /dev/shm (engram-init mounts it), so we do NOT
+# disable dev-shm.
+#
+# Why supervised: the framebuffer shows ONLY chrome, so if the user closes the
+# last tab (chromium exits) or chrome crashes, a one-shot launch would strand
+# the VNC tab on the empty openbox desktop with no way back — and agentd can't
+# recover it either, because x11vnc is still up and its port still accepts, so
+# the next StartBrowser re-probes green and never respawns. So relaunch chrome
+# here whenever it exits, reusing the same profile (tabs/cookies survive) and
+# without disturbing x11vnc or the live VNC connection. Clear the inherited
+# cleanup trap in the subshell so a group SIGTERM (StopBrowser killpg) just
+# terminates it cleanly instead of re-entering `kill 0`.
+(
+    trap - TERM INT EXIT
+    while true; do
+        # A crash can leave a stale singleton lock that blocks relaunch with
+        # "profile appears to be in use"; the profile is single-tenant and
+        # ephemeral, so clear it before each (re)launch.
+        rm -f "$PROFILE_DIR"/Singleton* 2>/dev/null || true
+        "$here/chrome/chrome" \
+            --user-data-dir="$PROFILE_DIR" \
+            --no-sandbox \
+            --no-first-run --no-default-browser-check \
+            --disable-infobars \
+            --start-maximized \
+            --window-position=0,0 \
+            "${ENGRAM_BROWSER_HOMEPAGE:-about:blank}" || true
+        # chrome exited; pause so a hard launch failure can't hot-loop, then
+        # bring it back up on the same display.
+        sleep 1
+    done
+) &
 
 # 4) x11vnc last (so the display + a client window exist). It MUST bind all
 # interfaces (x11vnc's default) — NOT loopback. The host-agent's proxy_vnc dials
