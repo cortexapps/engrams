@@ -86,7 +86,7 @@ macOS-host-16K / guest-4K block-size gotcha from ADR 0061), mounted per-session 
 | `chromium` (**full**, with UI) | the browser the human drives — *not* the headless-shell the playwright bundle ships |
 | `openbox` (minimal WM, no panel/menu) | window focus + auto-maximize so Chrome fills the framebuffer; nothing about it is user-visible |
 | `x11vnc` | RFB server bound to **`0.0.0.0:5900`** (all interfaces, like ttyd — *not* `-localhost`; see the reachability pitfall), `-forever -shared`, `-xrandr` for resize |
-| `engram-browser` (launcher script) | brings up `Xvfb → openbox → chromium → x11vnc` in order (chromium under a respawn supervisor — relaunched if it exits); position-independent (self-locates from `$0` like the playwright wrappers), surfaced on `PATH` via `mount.json` |
+| `engram-browser` (launcher script) | brings up `Xvfb → openbox → chromium → x11vnc` in order (chromium under a respawn supervisor — relaunched if it exits); **drops to the unprivileged `engram-browser` uid via `setpriv` before any of them start** (see §7); position-independent (self-locates from `$0` like the playwright wrappers), surfaced on `PATH` via `mount.json` |
 | `xkbcomp` + `xkb-data` (`/usr/share/X11/xkb`) | XKB keyboard stack Xvfb needs to compile a keymap at boot — see the pitfall below |
 | NSS modules (`libsoftokn3`, `libfreebl3`, `libnssckbi` + `.chk`) | chromium `dlopen`s these for its cert DB/crypto — not `DT_NEEDED`, so the `ldd`-walk misses them — see the pitfall below |
 
@@ -149,8 +149,11 @@ caller passes `vm_internal_ip` — and is corrected in this change.)
 Chrome runs with its **normal full UI** (address bar + tabs — deliberately *not* `--kiosk`, since the
 human needs to navigate), sized to the framebuffer, with first-run/default-browser prompts
 suppressed and `--user-data-dir` under the writable tmpfs (`/tmp`); renderer shared memory uses the
-already-mounted `/dev/shm`. With no desktop, file manager, or terminal present and Chrome the only
-client, the VNC framebuffer shows **only the browser** — "nothing else" by construction.
+already-mounted `/dev/shm`. It runs **unprivileged with its sandbox enabled** — the launcher has
+already dropped to the `engram-browser` uid and `--no-sandbox` is gone — so a page the human
+navigates to can't escalate beyond a confined, secret-free process (see §7). With no desktop, file
+manager, or terminal present and Chrome the only client, the VNC framebuffer shows **only the
+browser** — "nothing else" by construction.
 
 The bundle is mounted only on sessions whose **profile enables it** (ADR 0053), via the same
 `session_env`-gated activation the `skills`/`playwright` bundles use. A session without the bundle
@@ -237,8 +240,10 @@ A fourth tab beside `TRANSCRIPT` / `SHELL` / `RAW` in `SessionDetail`, shown onl
 open and **stay mounted across tab switches** (`display:none` preserves the canvas + socket). It uses
 the `@novnc/novnc` `RFB` client (pure JS, self-contained — compatible with the strict CSP), pointed
 at the `/vnc` WebSocket, with a "Launch Browser" call-to-action that opens the connection (→ lazy
-spawn). noVNC remote-resize is enabled (`x11vnc -randr` + Xvfb RANDR) so Chrome's viewport tracks the
-panel size.
+spawn). noVNC scales the fixed remote framebuffer to the panel (`scaleViewport`); it also *requests*
+remote-resize (`resizeSession`), but Xvfb+x11vnc don't honor it in practice — the framebuffer stays
+at the launcher's startup geometry — so Chrome is sized to that fixed framebuffer and aspect
+differences with the panel show as letterbox bars (see the Decisions note).
 
 ### 6. Lifecycle & snapshot
 
@@ -269,6 +274,43 @@ bloat snapshots and violate the small-snapshot assumptions behind eviction durab
   *could* type `file://` into Chrome to read guest files, but that is no broader than the `SHELL` tab
   the same owner already has. Access is restricted to the session owner (or admin) by the existing
   guard.
+- **Page/renderer containment (as-built hardening).** The preceding bullets bound *who can reach* the
+  browser; this bounds *what a page rendered in it can reach inside the VM*. The original bring-up ran
+  the whole stack — chromium included — **as root**, with the full `session_env` (every secret) handed
+  to it as environment variables. For a tab pointed at arbitrary, untrusted sites that opens two
+  exfiltration paths if a page lands a renderer exploit: (1) read any file or open any socket in the
+  VM as root, and (2) lift the session's tokens straight out of the browser process's
+  `/proc/self/environ`. Closing both, on three axes:
+  - **Unprivileged — and the image needs nothing.** The bundle's launcher drops the whole stack to an
+    unprivileged uid (`engram-browser`, default `9000`, overridable via `ENGRAM_BROWSER_UID/GID`)
+    **before** bringing up any of Xvfb/openbox/chromium/x11vnc. No user is baked into the guest image:
+    the launcher, running as root for only its first few lines, creates the uid's `$HOME` + a transient
+    `/etc/passwd` entry (the per-session rootfs is writable + ephemeral) and symlinks the bundled
+    `xkbcomp` onto the X server's hard-coded `/usr/bin/xkbcomp` (the one root-only step), then re-exec's
+    itself unprivileged via **`setpriv --reuid --regid --clear-groups --inh-caps=-all
+    --bounding-set=-all`** — and **`setpriv` ships inside the bundle**, so enabling the `browser` skill
+    carries everything it needs and the image stays generic. The drop lives in the launcher, not
+    agentd, for two reasons: the workspace is `unsafe_code = "forbid"`, so agentd can neither `pre_exec`
+    a `setgroups`/`setgid`/`setuid` sequence nor use the nightly-only `CommandExt::groups` (safe stable
+    Rust can set uid/gid but cannot *clear supplementary groups*, which we require); and the launcher is
+    the only actor that knows the bundle's mount path for the xkbcomp symlink. A renderer compromise is
+    now confined to an unprivileged uid with no supplementary groups, no inheritable caps, and an empty
+    capability bounding set.
+  - **Chromium sandbox ON.** `--no-sandbox` is **removed** (and with it `--test-type`, which existed
+    only to silence the bad-flags warning `--no-sandbox` raised). chromium uses its normal namespace
+    (zygote) sandbox — running unprivileged is precisely what lets it. The guest kernel ships every
+    prerequisite — `CONFIG_NAMESPACES / USER_NS / PID_NS / NET_NS`, `CONFIG_SECCOMP[_FILTER]` (verified
+    in `deploy/kernel/microvm-kernel-ci-x86_64-6.1.config`) — and is a mainline build with no Debian
+    `unprivileged_userns_clone=0` patch, so unprivileged user namespaces are permitted and **no setuid
+    `chrome-sandbox` binary is needed**. (The VZ dev guest runs a different kernel; userns there is a
+    verification step, not an assumption — production drives the design.)
+  - **No secrets in the browser env.** agentd no longer passes the browser `session_env`; it passes a
+    strict **allowlist** — `PATH`, locale (`LANG`/`LANGUAGE`/`LC_*`/`TZ`), and the `ENGRAM_BROWSER_*`
+    knobs — and drops the rest. A denylist would be wrong: `session_env` is an opaque flat map from the
+    coordinator, so any *new* secret key would leak by default. The browser needs nothing secret —
+    egress is **transparent** (host iptables REDIRECTs guest tcp/443 + DNS to the proxy; there is no
+    `*_PROXY` var to forward) and the egress-proxy CA is trusted at the OS level (`cacerts.rs`), both
+    independent of the browser's environment.
 
 ---
 
@@ -298,6 +340,12 @@ bloat snapshots and violate the small-snapshot assumptions behind eviction durab
   VZ parity check on macOS.
 - **orchestrator** `/vnc` guard test (owner allowed, non-owner `404`, unauth `401`).
 - **web** `BrowserPane` lint/render; **bundle** build smoke mirroring the playwright bundle.
+- **Hardening (§7) gates** — an agentd unit test pins the env allowlist (secrets dropped, `PATH` /
+  locale / `ENGRAM_BROWSER_*` kept). Live (FC + VZ): chromium boots **as `engram-browser`, not root**
+  with the **sandbox engaged** (e.g. `chrome://sandbox` reports the namespace sandbox, no
+  `--no-sandbox` fallback in the launcher log); a renderer cannot read a root-owned token file; and
+  `/proc/<chrome-pid>/environ` carries **no** session secret. userns availability on the VZ guest
+  kernel is verified as part of this lane.
 
 ## Rollout / phases
 
@@ -312,8 +360,14 @@ raw-TCP upstream; (P2) orchestrator `/vnc` route + capability flag; (P3) web `BR
   egress policy; the operator sets the bundle and the egress allowlist independently.
 - **Single advertised viewer.** `x11vnc -shared` technically permits multiple connections, but we do
   not advertise or design for multi-viewer; concurrent viewers are treated as undefined for now.
-- **Resolution tracks the panel via RANDR** (`x11vnc -randr` + Xvfb RANDR + noVNC remote-resize)
-  rather than a fixed framebuffer.
+- **Fixed framebuffer + client-side scaling (as-built).** The original plan was for the resolution to
+  track the panel via RANDR + noVNC remote-resize; that didn't survive contact. Xvfb+x11vnc do **not**
+  honor noVNC's `resizeSession` (the framebuffer reads back unchanged at its startup size over a raw
+  RFB handshake), and Xvfb can't grow past its `-screen` startup geometry anyway. So the framebuffer
+  is **fixed** at the launcher's startup geometry (default `1440x1080`, override
+  `ENGRAM_BROWSER_GEOMETRY`); chromium is sized to fill it (`--window-size`, not `--start-maximized`,
+  which raced the WM) and noVNC `scaleViewport` scales it to the panel, with aspect differences shown
+  as letterbox bars.
 
 ## References
 

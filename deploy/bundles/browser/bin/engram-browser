@@ -5,16 +5,75 @@
 # (readlink -f follows the PATH symlink) — never a fixed mount path.
 #
 # Brings up, in order: Xvfb (virtual display :99) → openbox (focus/maximize,
-# no panel/menu) → x11vnc (RFB on 127.0.0.1:5900) → chromium (full UI, sized to
-# the framebuffer). No desktop/file-manager/terminal — the framebuffer shows
-# only Chrome. setsid puts the whole stack in its own process group so agentd
-# can reap it as a unit (StopBrowser → killpg).
+# no panel/menu) → x11vnc (RFB on 0.0.0.0:5900, reachable by the host's
+# proxy_vnc) → chromium (full UI, sized to the framebuffer). No
+# desktop/file-manager/terminal — the framebuffer shows only Chrome. The whole
+# stack shares one process group so agentd can reap it as a unit
+# (StopBrowser → killpg).
+#
+# Security (ADR 0064 §7): the human points this browser at arbitrary, untrusted
+# sites, so the stack runs UNPRIVILEGED with chromium's sandbox ON. The script
+# starts as root only long enough for the few root-only steps (the xkbcomp
+# symlink; the unprivileged uid's $HOME + /etc/passwd entry), then re-exec's
+# itself via setpriv as a non-root, capless uid that holds none of the
+# session's secrets.
 set -eu
 here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
+self="$(readlink -f -- "$0")"
 
 export LD_LIBRARY_PATH="$here/lib:${LD_LIBRARY_PATH:-}"
 export FONTCONFIG_FILE="$here/fonts.conf"
 export PATH="$here/bin:$PATH"
+
+# --- Privilege drop (ADR 0064 §7) -------------------------------------------
+# Drop HERE, in the bundle's own launcher, rather than in agentd: the workspace
+# is forbid(unsafe_code), so agentd can neither pre_exec a setgroups/setgid/
+# setuid sequence nor use the nightly-only CommandExt::groups (safe stable Rust
+# can set uid/gid but can NOT clear supplementary groups, which we require); and
+# this script is the only actor that knows the bundle's mount path for the
+# root-only xkbcomp symlink. setpriv ships inside the bundle, so the guest image
+# needs nothing. uid/gid default to a dedicated, collision-unlikely value; the
+# control plane may override via ENGRAM_BROWSER_UID/GID.
+BROWSER_UID="${ENGRAM_BROWSER_UID:-9000}"
+BROWSER_GID="${ENGRAM_BROWSER_GID:-9000}"
+BROWSER_USER=engram-browser
+BROWSER_HOME=/tmp/engram-browser-home
+
+if [ "$(id -u)" = 0 ]; then
+    # Xvfb execs a HARD-CODED /usr/bin/xkbcomp (the X server's compiled-in path;
+    # -xkbdir relocates only the DATA, not the binary), and a minimal glibc base
+    # need not ship one — point it at the bundled binary. The per-session guest
+    # rootfs is writable + ephemeral, so this and the /etc/passwd line below are
+    # safe and need no cleanup.
+    ln -sf "$here/bin/xkbcomp" /usr/bin/xkbcomp 2>/dev/null || true
+    # The X socket dir must exist + be world-writable so the non-root Xvfb can
+    # create /tmp/.X11-unix/X$DISPLAY_NUM.
+    mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+    # chromium/Xvfb/x11vnc call getpwuid(); give the uid a writable $HOME and a
+    # passwd entry so a no-such-user lookup can not surprise the stack at runtime.
+    mkdir -p "$BROWSER_HOME"
+    chown "$BROWSER_UID:$BROWSER_GID" "$BROWSER_HOME"
+    chmod 700 "$BROWSER_HOME"
+    if ! grep -q ":x:$BROWSER_UID:" /etc/passwd 2>/dev/null; then
+        printf '%s:x:%s:%s::%s:/usr/sbin/nologin\n' \
+            "$BROWSER_USER" "$BROWSER_UID" "$BROWSER_GID" "$BROWSER_HOME" >> /etc/passwd
+        grep -q ":x:$BROWSER_GID:" /etc/group 2>/dev/null \
+            || printf '%s:x:%s:\n' "$BROWSER_USER" "$BROWSER_GID" >> /etc/group
+    fi
+    # Re-exec the rest as the unprivileged user: real uid+gid, no supplementary
+    # groups, no inheritable caps, empty capability bounding set. --clear-groups
+    # is exactly the bit safe stable Rust can not express. We deliberately do
+    # NOT pass --no-new-privs: it would block chromium's setuid-sandbox fallback
+    # on a kernel without unprivileged userns, and the namespace sandbox sets
+    # no_new_privs itself anyway.
+    exec "$here/bin/setpriv" \
+        --reuid="$BROWSER_UID" --regid="$BROWSER_GID" \
+        --clear-groups --inh-caps=-all --bounding-set=-all \
+        -- "$self" "$@"
+fi
+
+# --- everything below runs as the unprivileged engram-browser user ----------
+export HOME="$BROWSER_HOME"
 
 DISPLAY_NUM="${ENGRAM_BROWSER_DISPLAY:-99}"
 export DISPLAY=":$DISPLAY_NUM"
@@ -47,12 +106,6 @@ cleanup() {
 }
 trap cleanup TERM INT EXIT
 
-# Xvfb compiles its keymap at startup by exec'ing a HARD-CODED /usr/bin/xkbcomp
-# (the X server's compiled-in path; -xkbdir relocates only the DATA, not the
-# binary). A minimal glibc base need not ship xkbcomp, so point that path at the
-# bundled one. Idempotent; the per-session guest rootfs is writable + ephemeral.
-ln -sf "$here/bin/xkbcomp" /usr/bin/xkbcomp 2>/dev/null || true
-
 # 1) Virtual X display. +extension RANDR enables x11vnc -xrandr live resize.
 # -xkbdir points the server at the bundle's relocated XKB data (build.sh copies
 # /usr/share/X11/xkb -> $here/share/X11/xkb); without it the server can't
@@ -69,9 +122,9 @@ done
 "$here/bin/openbox" &
 
 # 3) Chromium under a respawn supervisor. Full UI, sized to the framebuffer, no
-# first-run prompts. The VM is the isolation boundary, so --no-sandbox. Renderer
-# shm uses the guest's real /dev/shm (engram-init mounts it), so we do NOT
-# disable dev-shm.
+# first-run prompts. Runs unprivileged with its sandbox ON (see the drop above +
+# the chrome flags below). Renderer shm uses the guest's real /dev/shm
+# (engram-init mounts it), so we do NOT disable dev-shm.
 #
 # Why supervised: the framebuffer shows ONLY chrome, so if the user closes the
 # last tab (chromium exits) or chrome crashes, a one-shot launch would strand
@@ -89,14 +142,13 @@ done
         # "profile appears to be in use"; the profile is single-tenant and
         # ephemeral, so clear it before each (re)launch.
         rm -f "$PROFILE_DIR"/Singleton* 2>/dev/null || true
-        # --test-type suppresses chrome's "unsupported command-line flag:
-        # --no-sandbox" warning bar — a bad-flags SECURITY prompt that
-        # --disable-infobars does NOT cover. --no-sandbox is intentional: the VM
-        # is the isolation boundary, so chrome's own sandbox is redundant here.
+        # Chrome runs with its SANDBOX ON (ADR 0064 §7) — no --no-sandbox. The
+        # launcher already dropped to a non-root uid, which is precisely what
+        # lets chromium use its namespace (zygote) sandbox, so an exploited
+        # renderer is confined. (--test-type is gone too — it only existed to
+        # silence the bad-flags warning that --no-sandbox raised.)
         "$here/chrome/chrome" \
             --user-data-dir="$PROFILE_DIR" \
-            --no-sandbox \
-            --test-type \
             --no-first-run --no-default-browser-check \
             --disable-infobars \
             --window-position=0,0 \

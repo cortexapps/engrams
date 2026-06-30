@@ -33,7 +33,7 @@ build_tree() {
         apt-get update -qq
         apt-get install -y -qq --no-install-recommends \
             chromium xvfb x11vnc openbox fonts-liberation ca-certificates \
-            x11-xkb-utils xkb-data
+            x11-xkb-utils xkb-data util-linux
         rm -rf /var/lib/apt/lists/*
 
         mkdir -p /out/chrome /out/bin /out/lib /out/fonts
@@ -72,6 +72,16 @@ build_tree() {
         # minimal glibc base does not ship it; the launcher symlinks it onto
         # the hard-coded /usr/bin/xkbcomp the X server invokes.
         cp -L "$(command -v xkbcomp)" /out/bin/xkbcomp
+        # setpriv: the launcher drops the whole stack to an unprivileged uid
+        # with this (ADR 0064 §7) before bringing chromium up, so a renderer
+        # compromise in an untrusted page is confined to a non-root, capless,
+        # secret-free process. Shipping it IN the bundle (rather than relying on
+        # the guest image) keeps the browser skill self-contained and the image
+        # generic. setpriv (util-linux) is a hard requirement, so fail loud if
+        # the package layout ever stops providing it.
+        setpriv_bin="$(command -v setpriv)" \
+            || { echo "FATAL: setpriv (util-linux) not found — the browser can not drop privileges" >&2; exit 1; }
+        cp -L "$setpriv_bin" /out/bin/setpriv
         cp /launcher /out/bin/engram-browser
         chmod 0755 /out/bin/*
 
@@ -88,6 +98,7 @@ build_tree() {
         collect /out/bin/x11vnc
         collect /out/bin/openbox
         collect /out/bin/xkbcomp
+        collect /out/bin/setpriv
 
         # NSS crypto modules. chromium dlopen()s libsoftokn3 (its PKCS#11
         # softoken), its libfreebl3 math backend, and the libnssckbi trust
@@ -142,6 +153,10 @@ build_tree() {
         # unexpectedly" the VNC tab shows.
         [ -x /out/bin/xkbcomp ] && [ -d /out/share/X11/xkb ] \
             || { echo "FATAL: xkb keyboard stack missing (xkbcomp/xkb-data)" >&2; exit 1; }
+        # setpriv is what drops the stack off root (ADR 0064 §7); a bundle
+        # missing it would silently run the browser as root, so fail loud.
+        [ -x /out/bin/setpriv ] \
+            || { echo "FATAL: setpriv missing — the browser can not drop privileges" >&2; exit 1; }
 
         cp /usr/share/fonts/truetype/liberation/*.ttf /out/fonts/ 2>/dev/null || true
         cat > /out/fonts.conf <<"FONTS"

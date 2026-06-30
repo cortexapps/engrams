@@ -69,6 +69,39 @@ pub struct BrowserOutcome {
     pub spawned: bool,
 }
 
+/// The environment a freshly-spawned browser stack is allowed to inherit.
+///
+/// The browser renders pages the human navigates to — untrusted code — so it
+/// must never carry the session's secrets in its process environment: a
+/// renderer compromise reads `/proc/self/environ`, and chromium spawns helpers
+/// that inherit it (ADR 0064 §7). agentd is the only layer that holds
+/// `session_env`, so the scrub lives here.
+///
+/// This is an **allowlist**, not a denylist. `session_env` is an opaque flat map
+/// from the coordinator (image `[env]` + arbitrary secrets), so a denylist would
+/// leak any *new* secret key by default. The browser needs nothing secret —
+/// egress is transparent (host iptables REDIRECT; no `*_PROXY` var to forward)
+/// and the egress-proxy CA is trusted at the OS level — so we keep only locale,
+/// `PATH`, and the launcher's own `ENGRAM_BROWSER_*` knobs.
+fn browser_env(session_env: &HashMap<String, String>) -> HashMap<String, String> {
+    session_env
+        .iter()
+        .filter(|(k, _)| is_browser_safe_key(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Whether `key` is safe to hand the (untrusted-content) browser stack — see
+/// [`browser_env`]. Conservative: anything not matched here is dropped.
+fn is_browser_safe_key(key: &str) -> bool {
+    // Non-secret keys the X/chromium stack legitimately uses.
+    matches!(key, "PATH" | "LANG" | "LANGUAGE" | "TZ")
+        // Locale categories: LC_ALL, LC_CTYPE, LC_TIME, …
+        || key.starts_with("LC_")
+        // Launcher knobs: geometry, homepage, display, vnc port, uid/gid.
+        || key.starts_with("ENGRAM_BROWSER_")
+}
+
 /// Ensure the browser stack is running and x11vnc is accepting on `port`.
 ///
 /// On the first call this spawns the launcher at `ENGRAM_BROWSER_BIN` (or
@@ -79,11 +112,11 @@ pub struct BrowserOutcome {
 /// host can dial x11vnc with confidence right after this returns.
 ///
 /// `session_env` is the durable session environment (image `[env]` + secrets +
-/// session id) the host carried in on `SpawnHarness`. It's applied to the
-/// launcher so chromium starts in the same environment the harness and the
-/// shell see (proxy vars, toolchain PATH, …). Only the fresh-spawn path uses
-/// it; a re-probe of an already-running stack leaves the existing process
-/// untouched.
+/// session id) the host carried in on `SpawnHarness`. Unlike the shell, the
+/// browser is **not** handed this wholesale — it renders untrusted pages, so
+/// [`browser_env`] scrubs it to a non-secret allowlist before the launcher sees
+/// it (ADR 0064 §7). Only the fresh-spawn path uses it; a re-probe of an
+/// already-running stack leaves the existing process untouched.
 pub async fn start_browser(
     port: u16,
     session_env: HashMap<String, String>,
@@ -132,10 +165,12 @@ pub async fn start_browser(
     tracing::info!(%bin, port, "spawning browser stack");
 
     let mut cmd = Command::new(&bin);
-    cmd.env("ENGRAM_BROWSER_VNC_PORT", port.to_string())
-        // The session env (proxy, secrets, toolchain PATH) on top of agentd's
-        // inherited boot env; chromium and the rest of the stack inherit it.
-        .envs(&session_env)
+    // The browser renders untrusted pages, so it must NOT inherit the session's
+    // secrets — hand it only the non-secret allowlist (`browser_env`), not the
+    // full `session_env`. agentd's chosen VNC port is set *after* so a stray
+    // ENGRAM_BROWSER_VNC_PORT carried in the env can't shadow it.
+    cmd.envs(browser_env(&session_env))
+        .env("ENGRAM_BROWSER_VNC_PORT", port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -411,5 +446,69 @@ while True:
             !again.spawned,
             "second call should see the stack already up (spawned = false)"
         );
+    }
+
+    #[test]
+    fn browser_env_drops_secrets_keeps_allowlisted() {
+        let mut env = HashMap::new();
+        // Secrets / arbitrary session keys — every one must be dropped.
+        env.insert("ENGRAM_FORGE_TOKEN".into(), "secret".into());
+        env.insert("ENGRAM_UPLOAD_TOKEN".into(), "secret".into());
+        env.insert("ANTHROPIC_API_KEY".into(), "sk-secret".into());
+        env.insert("AWS_SECRET_ACCESS_KEY".into(), "secret".into());
+        env.insert("RUSTC_WRAPPER".into(), "sccache".into());
+        // Allowlisted, non-secret — must survive with values intact.
+        env.insert("PATH".into(), "/usr/bin".into());
+        env.insert("LANG".into(), "C.UTF-8".into());
+        env.insert("LC_CTYPE".into(), "C.UTF-8".into());
+        env.insert("TZ".into(), "UTC".into());
+        env.insert("ENGRAM_BROWSER_GEOMETRY".into(), "1440x1080x24".into());
+        env.insert("ENGRAM_BROWSER_UID".into(), "9000".into());
+
+        let scrubbed = browser_env(&env);
+
+        for secret in [
+            "ENGRAM_FORGE_TOKEN",
+            "ENGRAM_UPLOAD_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "RUSTC_WRAPPER",
+        ] {
+            assert!(
+                !scrubbed.contains_key(secret),
+                "secret {secret} leaked into the browser env"
+            );
+        }
+        assert_eq!(scrubbed.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(scrubbed.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(
+            scrubbed.get("LC_CTYPE").map(String::as_str),
+            Some("C.UTF-8")
+        );
+        assert_eq!(scrubbed.get("TZ").map(String::as_str), Some("UTC"));
+        assert_eq!(
+            scrubbed.get("ENGRAM_BROWSER_GEOMETRY").map(String::as_str),
+            Some("1440x1080x24")
+        );
+        assert_eq!(
+            scrubbed.get("ENGRAM_BROWSER_UID").map(String::as_str),
+            Some("9000")
+        );
+        // Exactly the six allowlisted keys, nothing else.
+        assert_eq!(scrubbed.len(), 6);
+    }
+
+    #[test]
+    fn is_browser_safe_key_rejects_lookalikes() {
+        // Prefix/exact discipline: a key that merely contains an allowed
+        // substring must not slip through.
+        assert!(!is_browser_safe_key("MYPATH"));
+        assert!(!is_browser_safe_key("PATHX"));
+        assert!(!is_browser_safe_key("ENGRAM_TOKEN")); // not the ENGRAM_BROWSER_ prefix
+        assert!(!is_browser_safe_key("XLC_ALL")); // LC_ not at the start
+        assert!(is_browser_safe_key("PATH"));
+        assert!(is_browser_safe_key("LANGUAGE"));
+        assert!(is_browser_safe_key("LC_ALL"));
+        assert!(is_browser_safe_key("ENGRAM_BROWSER_HOMEPAGE"));
     }
 }
