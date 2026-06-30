@@ -16,6 +16,7 @@ import {
   type SessionCompileDeps,
   type CreateTaskDeps,
   type TaskSessionsClient,
+  type HarnessCatalogClient,
   type Db,
 } from "../rpc/task-create.ts";
 import { CLAUDE_OAUTH_ENV_VAR } from "../db/user-secrets.ts";
@@ -44,9 +45,29 @@ const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   ...over,
 });
 
+// A catalog with one harness ("claude"): opus default + sonnet model, high effort.
+// The compiler maps the resolved model/effort id → these env vars (ADR 0063 §1).
+const fakeHarnessCatalog = (): HarnessCatalogClient => ({
+  listHarnesses: async () => ({
+    harnesses: [
+      {
+        name: "claude",
+        descriptor: {
+          models: [
+            { id: "opus", default: true, env: { ANTHROPIC_MODEL: "claude-opus-4-8" } },
+            { id: "sonnet", default: false, env: { ANTHROPIC_MODEL: "claude-sonnet-4-6" } },
+          ],
+          effort: [{ id: "high", default: true, env: { MAX_THINKING_TOKENS: "32000" } }],
+        },
+      },
+    ],
+  }),
+});
+
 const deps = (token: string | null = null, images = [{ id: "img-1", imageUri: "uri-1" }]): SessionCompileDeps => ({
   images: { listEnabledImages: async () => ({ images }) } as unknown as ImagesClient,
   connectors: { list: async () => [] },
+  harnessCatalog: fakeHarnessCatalog(),
   resolveUserToken: async () => token,
 });
 
@@ -78,6 +99,36 @@ describe("compileSessionCreateInput", () => {
 
   test("throws if the profile image is no longer enabled", async () => {
     await expect(compileSessionCreateInput(profile(), deps(null, []))).rejects.toThrow(/no longer enabled/);
+  });
+
+  // ADR 0063 B2: harness / model / effort resolution + env mapping.
+  test("defaults to the deployment harness + descriptor default model/effort env", async () => {
+    const inp = await compileSessionCreateInput(profile(), deps());
+    expect(inp.harness).toBe("claude");
+    expect(inp.harnessEnv).toMatchObject({
+      ANTHROPIC_MODEL: "claude-opus-4-8",
+      MAX_THINKING_TOKENS: "32000",
+    });
+  });
+
+  test("profile default harness/model resolve when no override", async () => {
+    const inp = await compileSessionCreateInput(profile({ harness: "claude", model: "sonnet" }), deps());
+    expect(inp.harness).toBe("claude");
+    expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
+  });
+
+  test("per-session model override beats the profile default", async () => {
+    const inp = await compileSessionCreateInput(profile({ model: "opus" }), deps(), { model: "sonnet" });
+    expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
+  });
+
+  test("an explicit model picker wins over a stale ANTHROPIC_MODEL in env_vars", async () => {
+    const inp = await compileSessionCreateInput(
+      profile({ envVars: { ANTHROPIC_MODEL: "stale" } }),
+      deps(),
+      { model: "sonnet" },
+    );
+    expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
   });
 });
 
@@ -121,6 +172,7 @@ const createDeps = (sessions: TaskSessionsClient, db: Db, active = true): Create
   profiles: fakeProfiles(active),
   images: { listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }) } as unknown as ImagesClient,
   connectors: { list: async () => [] },
+  harnessCatalog: fakeHarnessCatalog(),
   sessions,
   secrets: { get: async () => null },
   db,
