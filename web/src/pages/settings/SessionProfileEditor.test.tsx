@@ -16,6 +16,25 @@ vi.mock("../../hooks/useEnabledImages", () => ({
     isLoading: false,
   }),
 }));
+// The harness/model/effort dropdowns read the catalog; mock the hook so the
+// editor needs no QueryClient/transport (ADR 0062/0063).
+vi.mock("../../hooks/useHarnessCatalog", () => ({
+  useHarnessCatalog: () => ({
+    data: [
+      {
+        name: "claude",
+        descriptor: {
+          label: "Claude Code",
+          models: [
+            { id: "opus", label: "Claude Opus 4.8", default: true, env: {} },
+            { id: "sonnet", label: "Claude Sonnet 4.6", default: false, env: {} },
+          ],
+          effort: [{ id: "high", label: "High", default: false, env: {} }],
+        },
+      },
+    ],
+  }),
+}));
 const uploadSkill = vi.hoisted(() => vi.fn().mockResolvedValue({ skill: { name: "x" } }));
 vi.mock("../../hooks/useSkills", () => ({
   useSkills: () => ({
@@ -62,6 +81,19 @@ describe("SessionProfileEditor (create)", () => {
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
     expect(create.mock.calls[0][0]).toMatchObject({ name: "Backend Agent", imageId: "i1" });
+  });
+
+  // ADR 0063: a profile ALWAYS names a concrete harness (no "inherit deployment
+  // default") — a new profile defaults to the first registered harness, so the
+  // create payload carries it (and the Model/Effort selectors have a descriptor).
+  it("defaults a new profile to the first registered harness (never null)", async () => {
+    render(<SessionProfileEditor mode="create" />);
+    fireEvent.change(screen.getByLabelText(/profile name/i), {
+      target: { value: "Harnessed" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0]).toMatchObject({ harness: "claude" });
   });
 
   it("includes the deny-default network + extra allowed hosts in the payload (ADR 0057)", async () => {

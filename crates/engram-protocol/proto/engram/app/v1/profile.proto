@@ -59,6 +59,13 @@ message Profile {
   // its session with this. At most one active default (the store clears the
   // prior when one is set).
   bool is_default = 15;
+  // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
+  // + default model/effort (catalog option ids) for this profile's sessions.
+  // Empty = inherit (deployment-default harness; the harness descriptor's
+  // default model/effort). Overridable per session at create.
+  optional string harness = 16;
+  optional string model = 17;
+  optional string effort = 18;
 }
 
 // ADR 0057: a profile's egress network allow-list. `default` is the posture for
@@ -125,6 +132,10 @@ message CreateProfileRequest {
   repeated ProfileSecret secrets = 10;
   // ADR 0060: mark this the org default (clears any prior default).
   bool is_default = 11;
+  // ADR 0062/0063: default harness / model / effort (see Profile).
+  optional string harness = 12;
+  optional string model = 13;
+  optional string effort = 14;
 }
 
 message CreateProfileResponse {
@@ -148,6 +159,10 @@ message UpdateProfileRequest {
   repeated ProfileSecret secrets = 11;
   // ADR 0060: mark this the org default (clears any prior default).
   bool is_default = 12;
+  // ADR 0062/0063: default harness / model / effort (see Profile).
+  optional string harness = 13;
+  optional string model = 14;
+  optional string effort = 15;
 }
 
 message UpdateProfileResponse {

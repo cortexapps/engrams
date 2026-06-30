@@ -115,15 +115,27 @@ pub(crate) async fn resolve_resume_agent_and_policy(
     // coord restarts and replicas.
     let mut session_env = resume_base_env.clone();
     session_env.insert("ENGRAM_SESSION_ID".into(), id.to_string());
-    let mut agent = crate::api::sessions::resolve_harness(
+    // ADR 0062: the harness comes from the session's persisted selection (not the
+    // baked manifest). The dyn_0 catalog mount is re-anchored from the eviction
+    // snapshot's aux_bundles, so we use only the AgentSpec here (the argv still
+    // points at /opt/engram/dyn/0/<name>/<exec>); the returned mount is dropped.
+    let selected_harness = state
+        .services
+        .meta
+        .get_session_harness(id)
+        .await
+        .ok()
+        .flatten();
+    let (mut agent, _harness_mount) = crate::api::sessions::resolve_harness(
         state,
-        b.manifest.harness.as_ref(),
+        selected_harness.as_deref(),
         session.mode,
         id,
         None,
         session_env,
         b.manifest.workdir.clone(),
     )
+    .await
     .ok()
     .flatten()?;
     crate::api::sessions::inject_harness_env(state, id, &mut agent.env).await;

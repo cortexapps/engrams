@@ -380,6 +380,30 @@ impl HostClient for LocalHostClient {
         Ok(tunnel)
     }
 
+    async fn proxy_port(
+        &self,
+        sandbox_id: SandboxId,
+        port: u16,
+    ) -> Result<engram_core::types::port::PortTunnel, SandboxError> {
+        // ADR 0064: dial an arbitrary guest TCP port and bridge raw
+        // bytes through a PortTunnel pair. Same netns selection as
+        // `proxy_shell` (cold vs warm), but NO `start_shell` step — the
+        // service on `port` is a dev server the agent/user runs, not
+        // something the host spawns on demand. `vm_internal_ip` (not
+        // `guest_ip`) for the same reason as `proxy_shell`: the dial
+        // happens inside the per-VM netns, where the guest is at its
+        // in-VM eth0 IP, not the netns veth.
+        let guest_ip = self
+            .sandbox
+            .vm_internal_ip(sandbox_id)
+            .await
+            .ok_or_else(|| SandboxError::Vm("proxy_port: vm_internal_ip unavailable".into()))?;
+        let netns_name = self.sandbox.netns_name_for(sandbox_id).await;
+        let (tunnel, ends) = engram_core::types::port::PortTunnel::pair();
+        crate::proxy_port::open_tcp_tunnel_at(guest_ip, port, netns_name, ends).await?;
+        Ok(tunnel)
+    }
+
     fn harness_dial(&self) -> HarnessDial {
         self.sandbox.harness_dial()
     }

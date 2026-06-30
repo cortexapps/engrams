@@ -1301,6 +1301,27 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
+    /// ADR 0062: persist the session's selected harness name (the catalog key)
+    /// so the queue scanner + resume can reconstruct which harness to mount on
+    /// `dyn_0` + exec. `None` for a dev-VM session.
+    async fn set_session_harness(
+        &self,
+        session_id: SessionId,
+        harness: Option<&str>,
+    ) -> Result<(), MetaError> {
+        let _ = (session_id, harness);
+        Ok(())
+    }
+
+    /// ADR 0062: the session's persisted harness selection, or `None`.
+    async fn get_session_harness(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, MetaError> {
+        let _ = session_id;
+        Ok(None)
+    }
+
     // ----------------------------------------------------------------
     // ADR 0016 §A.1.5c — cross-replica per-session op lease.
     // Serializes mutually-exclusive session-lifecycle ops (idle
@@ -1561,9 +1582,11 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0035 §5: the bundle pin set — every `(drive_id, sha256)`
     /// some `snapshots.aux_bundles` row references, **∪ every live
     /// `mount_catalog` skill** (ADR 0055 P2, so a registered-but-currently-unused
-    /// uploaded skill stays staged + survives GC). The union (plus the hosts'
-    /// reported current generations) is what the GC keeps and what heartbeat
-    /// acks advertise as `live_bundles`.
+    /// uploaded skill stays staged + survives GC) **∪ every live `harness_catalog`
+    /// row** (ADR 0062, so a registered-but-currently-unused *custom* harness's
+    /// squashfs stays staged — built-ins ride the host-image stamp and need no
+    /// pin). The union (plus the hosts' reported current generations) is what the
+    /// GC keeps and what heartbeat acks advertise as `live_bundles`.
     async fn bundle_pin_set(&self) -> Result<Vec<crate::types::sandbox::AuxBundleRef>, MetaError> {
         Ok(Vec::new())
     }
@@ -1611,6 +1634,41 @@ pub trait MetadataStore: Send + Sync {
     /// the pin set lets the existing bundle GC reclaim its blob after the grace
     /// window (upload-path GC). Returns whether a live row was deleted.
     async fn soft_delete_skill(&self, _name: &str) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+
+    // ----------------------------------------------------------------
+    // ADR 0062 — the harness catalog (`harness_catalog`).
+
+    /// Register (upsert by `name`) a harness into the catalog. `owner` is
+    /// attribution only — the catalog is org-shared (like skills). Returns the
+    /// live row.
+    async fn register_harness(
+        &self,
+        _reg: crate::types::HarnessRegistration<'_>,
+    ) -> Result<crate::types::CatalogHarness, MetaError> {
+        Err(MetaError::Db(
+            "register_harness is not supported by this MetadataStore".into(),
+        ))
+    }
+
+    /// Every live catalog harness (newest first) — for the orchestrator's
+    /// `ListHarnesses` listing + profile-editor validation.
+    async fn list_harnesses(&self) -> Result<Vec<crate::types::CatalogHarness>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Resolve one harness name to its live catalog row, if any.
+    async fn get_harness_by_name(
+        &self,
+        _name: &str,
+    ) -> Result<Option<crate::types::CatalogHarness>, MetaError> {
+        Ok(None)
+    }
+
+    /// Soft-delete a catalog harness by name (sets `deleted_at`). Returns
+    /// whether a live row was deleted.
+    async fn soft_delete_harness(&self, _name: &str) -> Result<bool, MetaError> {
         Ok(false)
     }
 

@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// The harness catalog (ADR 0062): the registry of selectable agent harnesses,
+// each a fleet-staged read-only squashfs bundle plus a harness.toml descriptor
+// (ADR 0063). The caller is the single trusted orchestrator (bearer-authed); it
+// reads this to drive the session-create harness/model/effort pickers and to
+// derive the harness's env contract (formerly hardcoded to Claude). The harness
+// is chosen per session, not baked into the image.
+//
+// Registration is an admin op: the coordinator pulls the OCI artifact, extracts
+// its tree, validates its harness.toml, upserts the catalog row, and re-packs
+// the single catalog squashfs (all live harnesses) that mounts on dyn_0.
+service HarnessCatalogService {
+  // Register (upsert by name) a harness from an OCI artifact reference. The
+  // coordinator pulls + validates + re-packs synchronously and returns the row.
+  rpc RegisterHarness(RegisterHarnessRequest) returns (RegisterHarnessResponse);
+  rpc ListHarnesses(ListHarnessesRequest) returns (ListHarnessesResponse);
+  rpc GetHarness(GetHarnessRequest) returns (GetHarnessResponse);
+  rpc DeleteHarness(DeleteHarnessRequest) returns (DeleteHarnessResponse);
+}
+
+message RegisterHarnessRequest {
+  // Logical harness name (a single safe path segment; becomes the catalog
+  // subtree, the argv path component, and the wire value). UNIQUE org-wide.
+  string name = 1;
+  // The OCI artifact reference to pull (the harness tree + its harness.toml).
+  // Built-in and custom harnesses are uniform — both are OCI artifacts.
+  string oci_ref = 2;
+  // Registering principal (attribution / GC ownership only; org-shared catalog).
+  string owner = 3;
+}
+
+message RegisterHarnessResponse {
+  HarnessSummary harness = 1;
+}
+
+message ListHarnessesRequest {}
+
+// Every registered harness, newest first.
+message ListHarnessesResponse {
+  repeated HarnessSummary harnesses = 1;
+}
+
+// One catalog harness. The fleet-staging internals (squashfs sha256 + launch
+// contract) are coordinator-private; clients get the name and the descriptor
+// that drives the UI and env derivation.
+message HarnessSummary {
+  // Stable harness id == catalog key == CreateSessionRequest.harness.
+  string name = 1;
+  // Projection of the harness's harness.toml (ADR 0063).
+  HarnessDescriptor descriptor = 2;
+  // True for a platform built-in (rides the fleet stamp + an embedded
+  // descriptor; never a catalog row). Built-ins can't be deleted — the admin
+  // Harnesses tab hides the delete affordance for them.
+  bool built_in = 3;
+}
+
+// Mirrors engram_core::types::HarnessDescriptor (ADR 0063). All env values are
+// config (model ids, flags) — never secrets — so they are safe on the wire.
+message HarnessDescriptor {
+  string name = 1;
+  optional string label = 2;
+  HarnessAuth auth = 3;
+  repeated HarnessOption models = 4;
+  repeated HarnessOption effort = 5;
+  // Human-readable one-liner for the admin Harnesses tab.
+  optional string description = 6;
+}
+
+// Credential env-var names. A credential is one var, so these are single
+// strings, not per-option maps.
+message HarnessAuth {
+  // Env var for the programmatic/org credential (e.g. an API key); injected
+  // host-side from an org secret on programmatic runs (ADR 0063 §4).
+  optional string org_env = 1;
+  // Env var for the human/interactive credential (e.g. an OAuth token);
+  // injected from the per-user token store on human runs.
+  optional string user_env = 2;
+}
+
+// One model or effort option; env is the var(s) that select it.
+message HarnessOption {
+  // Stable option id the wire carries (e.g. "opus").
+  string id = 1;
+  optional string label = 2;
+  // The default option when none is selected (at most one per enum).
+  bool default = 3;
+  // Env vars this option sets, merged into the session's harness env.
+  map<string, string> env = 4;
+}
+
+message GetHarnessRequest {
+  // By logical name.
+  string name = 1;
+}
+
+message GetHarnessResponse {
+  HarnessSummary harness = 1;
+}
+
+message DeleteHarnessRequest {
+  // By logical name (soft-delete → the bundle GC reclaims unused generations).
+  string name = 1;
+}
+
+message DeleteHarnessResponse {
+  // Whether a live row was deleted (idempotent: deleting an absent harness is
+  // false, not an error).
+  bool deleted = 1;
+}

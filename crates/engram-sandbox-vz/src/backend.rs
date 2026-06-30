@@ -424,6 +424,12 @@ fn warn_vz_ignores_allow_hosts_once(network: &engram_core::types::NetworkPolicy)
 
 #[async_trait]
 impl SandboxBackend for VzBackend {
+    fn bundle_dir(&self) -> &std::path::Path {
+        // Same dir VZ stages + attaches `<sha>.erofs` from, so the heartbeat
+        // reports exactly what restore will attach (ADR 0062).
+        &self.cfg.bundle_dir
+    }
+
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         warn_vz_ignores_allow_hosts_once(&spec.network);
         let bake_rootfs = spec.rootfs_source.clone().ok_or_else(|| {

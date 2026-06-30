@@ -209,6 +209,7 @@ describe("profile table (ADR 0052)", () => {
           description: "d",
           icon: "Bot",
           imageId: "img-logical-id",
+          harness: "claude",
           includeUserTokens: true,
           envVars: { ANTHROPIC_MODEL: "claude-opus-4-8" },
         });

@@ -16,11 +16,17 @@ import {
   type SessionCompileDeps,
   type CreateTaskDeps,
   type TaskSessionsClient,
+  type HarnessCatalogClient,
   type Db,
 } from "../rpc/task-create.ts";
-import { CLAUDE_OAUTH_ENV_VAR } from "../db/user-secrets.ts";
 import type { ProfileRow, ProfileStore } from "../db/profiles.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
+
+// The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
+// the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
+const USER_ENV = "CLAUDE_CODE_OAUTH_TOKEN";
+// The claude harness's declared `auth.org_env` (programmatic credential, B4).
+const ORG_ENV = "ANTHROPIC_API_KEY";
 
 const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   id: "p1",
@@ -28,6 +34,9 @@ const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   description: "",
   icon: "Bot",
   imageId: "img-1",
+  harness: "claude",
+  model: null,
+  effort: null,
   includeUserTokens: false,
   envVars: {},
   skills: [],
@@ -41,9 +50,30 @@ const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   ...over,
 });
 
+// A catalog with one harness ("claude"): opus default + sonnet model, high effort.
+// The compiler maps the resolved model/effort id → these env vars (ADR 0063 §1).
+const fakeHarnessCatalog = (): HarnessCatalogClient => ({
+  listHarnesses: async () => ({
+    harnesses: [
+      {
+        name: "claude",
+        descriptor: {
+          auth: { userEnv: USER_ENV, orgEnv: ORG_ENV },
+          models: [
+            { id: "opus", default: true, env: { ANTHROPIC_MODEL: "claude-opus-4-8" } },
+            { id: "sonnet", default: false, env: { ANTHROPIC_MODEL: "claude-sonnet-4-6" } },
+          ],
+          effort: [{ id: "high", default: true, env: { MAX_THINKING_TOKENS: "32000" } }],
+        },
+      },
+    ],
+  }),
+});
+
 const deps = (token: string | null = null, images = [{ id: "img-1", imageUri: "uri-1" }]): SessionCompileDeps => ({
   images: { listEnabledImages: async () => ({ images }) } as unknown as ImagesClient,
   connectors: { list: async () => [] },
+  harnessCatalog: fakeHarnessCatalog(),
   resolveUserToken: async () => token,
 });
 
@@ -63,9 +93,58 @@ describe("compileSessionCreateInput", () => {
 
   test("user token injected only when includeUserTokens", async () => {
     const off = await compileSessionCreateInput(profile({ includeUserTokens: false }), deps("tok"));
-    expect(off.harnessEnv?.[CLAUDE_OAUTH_ENV_VAR]).toBeUndefined();
+    expect(off.harnessEnv?.[USER_ENV]).toBeUndefined();
     const on = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"));
-    expect(on.harnessEnv?.[CLAUDE_OAUTH_ENV_VAR]).toBe("tok");
+    expect(on.harnessEnv?.[USER_ENV]).toBe("tok");
+  });
+
+  test("injects the user token under the harness's declared user_env, not a hardcoded name", async () => {
+    const customDeps: SessionCompileDeps = {
+      images: {
+        listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }),
+      } as unknown as ImagesClient,
+      connectors: { list: async () => [] },
+      harnessCatalog: {
+        listHarnesses: async () => ({
+          harnesses: [
+            { name: "claude", descriptor: { auth: { userEnv: "OPENCODE_TOKEN" }, models: [], effort: [] } },
+          ],
+        }),
+      },
+      resolveUserToken: async (envVar) => (envVar === "OPENCODE_TOKEN" ? "tok-123" : null),
+    };
+    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), customDeps);
+    expect(inp.harnessEnv?.OPENCODE_TOKEN).toBe("tok-123");
+    expect(inp.harnessEnv?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+  });
+
+  // ADR 0063 B4: strict-by-run-type credentials.
+  test("human (chat) task injects user_env and no org_env secret", async () => {
+    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
+      type: "chat",
+    });
+    expect(inp.harnessEnv?.[USER_ENV]).toBe("tok");
+    const policy = inp.integrationPolicyJson
+      ? (JSON.parse(inp.integrationPolicyJson) as { secrets?: Array<{ env_var: string }> })
+      : { secrets: [] };
+    expect((policy.secrets ?? []).some((s) => s.env_var === ORG_ENV)).toBe(false);
+  });
+
+  test("programmatic task injects org_env into the policy, not the user token", async () => {
+    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
+      type: "slack_thread",
+    });
+    // No per-user token for a programmatic task — strict by run type.
+    expect(inp.harnessEnv?.[USER_ENV]).toBeUndefined();
+    // The org secret rides the policy as a literal secret-inject (resolved host-side).
+    const policy = JSON.parse(inp.integrationPolicyJson!) as {
+      secrets?: Array<{ secret_ref: string; env_var: string; mode: string }>;
+    };
+    expect((policy.secrets ?? []).find((s) => s.env_var === ORG_ENV)).toMatchObject({
+      secret_ref: ORG_ENV,
+      env_var: ORG_ENV,
+      mode: "literal",
+    });
   });
 
   test("passes the prompt through when set", async () => {
@@ -75,6 +154,36 @@ describe("compileSessionCreateInput", () => {
 
   test("throws if the profile image is no longer enabled", async () => {
     await expect(compileSessionCreateInput(profile(), deps(null, []))).rejects.toThrow(/no longer enabled/);
+  });
+
+  // ADR 0063 B2: harness / model / effort resolution + env mapping.
+  test("defaults to the deployment harness + descriptor default model/effort env", async () => {
+    const inp = await compileSessionCreateInput(profile(), deps());
+    expect(inp.harness).toBe("claude");
+    expect(inp.harnessEnv).toMatchObject({
+      ANTHROPIC_MODEL: "claude-opus-4-8",
+      MAX_THINKING_TOKENS: "32000",
+    });
+  });
+
+  test("profile default harness/model resolve when no override", async () => {
+    const inp = await compileSessionCreateInput(profile({ harness: "claude", model: "sonnet" }), deps());
+    expect(inp.harness).toBe("claude");
+    expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
+  });
+
+  test("per-session model override beats the profile default", async () => {
+    const inp = await compileSessionCreateInput(profile({ model: "opus" }), deps(), { model: "sonnet" });
+    expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
+  });
+
+  test("an explicit model picker wins over a stale ANTHROPIC_MODEL in env_vars", async () => {
+    const inp = await compileSessionCreateInput(
+      profile({ envVars: { ANTHROPIC_MODEL: "stale" } }),
+      deps(),
+      { model: "sonnet" },
+    );
+    expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
   });
 });
 
@@ -118,6 +227,7 @@ const createDeps = (sessions: TaskSessionsClient, db: Db, active = true): Create
   profiles: fakeProfiles(active),
   images: { listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }) } as unknown as ImagesClient,
   connectors: { list: async () => [] },
+  harnessCatalog: fakeHarnessCatalog(),
   sessions,
   secrets: { get: async () => null },
   db,

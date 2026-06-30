@@ -66,15 +66,14 @@ CONTAINER_BINS = {
     "engram-host-operator",
     "engram-uffd-handler",
 }
-# Binaries baked INTO session images at image-build time by
-# engram-image-builder::inject_builtin_harness (pulled from the
-# harness-claude GHCR pack, written to /sbin/engram-harness-claude). The
-# dev-engrams + demo-claude images bake this in — they do NOT pull it at
-# runtime — so a change to the harness binary (or anything in its release
-# closure) must re-bake those images. It is in NEITHER container nor host
-# closure, so without this lane a harness-only change shipped nothing: the
-# dev-engrams rebake never fired (the bug this fixes). It gates only the
-# dev_image lane below — the demo image bakes every push regardless.
+# The built-in claude harness binary. ADR 0062: it is NOT baked into any
+# image — it rides the fleet `current_bundles` stamp (the
+# `bake-harness-claude-artifact` job publishes the harness-claude artifact;
+# node-assets stages it onto hosts). A change to the harness binary (or
+# anything in its release closure) must republish that artifact + re-bake the
+# dev_image lane (whose `just dev` stages the harness from source). It is in
+# NEITHER the container nor the host closure, so without this lane a
+# harness-only change shipped nothing (the bug this gate fixes).
 SESSION_HARNESS_BINS = {"engram-harness-claude"}
 # The ops CLI + the in-guest agent injected into session images at bake time.
 # OSS publishes them once as the `cli-tools` GHCR artifact (publish-cli-tools);
@@ -85,9 +84,9 @@ SESSION_HARNESS_BINS = {"engram-harness-claude"}
 CLI_TOOLS_BINS = {"engram-cli", "engram-agentd"}
 # The binaries the `test-e2e-stack` lane builds + boots: coord + host-agent
 # (the stack), cli (drives enable/registry), agentd (injected into the demo
-# image), and harness-claude (baked into demo-claude). A change anywhere in
-# their release closure means the e2e lane could behave differently, so run
-# it. Gates the (expensive, non-required) e2e lane — see `e2e` below.
+# image), and harness-claude (staged into the host bundle stamp; ADR 0062). A
+# change anywhere in their release closure means the e2e lane could behave
+# differently, so run it. Gates the (expensive, non-required) e2e lane.
 E2E_BINS = {
     "engram-coordinator",
     "engram-host-agent",
@@ -142,7 +141,6 @@ FC_FORK_PATHS = ["third_party/firecracker", ".gitmodules"]
 E2E_PATHS = [
     "deploy/dev/",
     "Tiltfile",
-    "deploy/demo-claude/",
     "deploy/demo/",
     "deploy/bundles/",
     ".github/workflows/ci.yml",

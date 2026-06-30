@@ -22,6 +22,12 @@ export interface ProfileRow {
   description: string;
   icon: string;
   imageId: string;
+  // ADR 0062/0063: default harness (catalog name) — REQUIRED (a profile always
+  // names a concrete harness) + default model/effort (catalog option ids; null =
+  // the harness descriptor's default).
+  harness: string;
+  model: string | null;
+  effort: string | null;
   includeUserTokens: boolean;
   envVars: Record<string, string>;
   // ADR 0055: dynamic skill bundle names this profile's sessions mount.
@@ -43,6 +49,9 @@ export interface ProfileInput {
   description: string;
   icon: string;
   imageId: string;
+  harness: string;
+  model: string | null;
+  effort: string | null;
   includeUserTokens: boolean;
   envVars: Record<string, string>;
   skills: string[];
@@ -78,6 +87,9 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     description: r.description,
     icon: r.icon,
     imageId: r.imageId,
+    harness: r.harness,
+    model: r.model ?? null,
+    effort: r.effort ?? null,
     includeUserTokens: r.includeUserTokens,
     envVars: (r.envVars ?? {}) as Record<string, string>,
     skills: (r.skills ?? []) as string[],

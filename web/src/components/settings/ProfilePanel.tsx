@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { Check, X } from "lucide-react";
 import { useAuth } from "../../auth/AuthProvider";
+import { useHarnessEnv } from "../../hooks/useHarnessEnv";
 import { PageHeading } from "../page-heading";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -21,7 +22,7 @@ export function ProfilePanel() {
         "Curate images & registry credentials",
         "Manage members & their roles",
       ]
-    : ["Launch & manage your own tasks", "Save your own Claude Code token"];
+    : ["Launch & manage your own tasks", "Save your own harness credentials"];
   const cannot = isAdmin
     ? []
     : ["The Operator section (fleet, storage, images, registries): admin only"];
@@ -52,18 +53,7 @@ export function ProfilePanel() {
             )}
           </Row>
           <Row label="Tokens">
-            {principal.has_claude_token ? (
-              <span className="text-sm">
-                Claude Code saved · managed under{" "}
-                <Link to="/settings/tokens" className="underline">
-                  Tokens
-                </Link>
-              </span>
-            ) : (
-              <Link to="/settings/tokens" className="text-sm underline">
-                None saved — add one under Tokens →
-              </Link>
-            )}
+            <TokensSummary />
           </Row>
         </CardContent>
       </Card>
@@ -88,6 +78,24 @@ export function ProfilePanel() {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+/** The user's harness-credential coverage (ADR 0063): "N of M saved". */
+function TokensSummary() {
+  const { data: vars } = useHarnessEnv(true);
+  const total = vars?.length ?? 0;
+  const saved = vars?.filter((v) => v.present).length ?? 0;
+  if (total === 0) {
+    return <span className="text-sm text-muted-foreground">No harness credentials required</span>;
+  }
+  return (
+    <span className="text-sm">
+      {saved} of {total} saved · managed under{" "}
+      <Link to="/settings/tokens" className="underline">
+        Tokens
+      </Link>
+    </span>
   );
 }
 
