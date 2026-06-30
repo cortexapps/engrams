@@ -17,6 +17,7 @@
 import { SessionService } from "../gen/engram/app/v1/session_pb.ts";
 import { FleetService } from "../gen/engram/app/v1/fleet_pb.ts";
 import { ImageService } from "../gen/engram/app/v1/image_pb.ts";
+import { HarnessCatalogService } from "../gen/engram/app/v1/harness_pb.ts";
 import type { PassthroughSpec } from "./passthrough.ts";
 
 /**
@@ -34,6 +35,10 @@ const SESSION_EXCLUDED: ReadonlySet<string> = new Set([
  * - SessionService: all methods except StreamEvents/GetArtifact.
  * - FleetService: all methods (all admin-only).
  * - ImageService: all methods.
+ * - HarnessCatalogService: read methods (ListHarnesses/GetHarness) so the
+ *   dashboard can populate the harness/model/effort selectors (ADR 0063). The
+ *   admin write methods (RegisterHarness/DeleteHarness) are added by the
+ *   Harnesses tab.
  */
 export const SURFACE: PassthroughSpec[] = [
   {
@@ -50,5 +55,12 @@ export const SURFACE: PassthroughSpec[] = [
   {
     service: ImageService,
     // No filter — all 10 methods forwarded.
+  },
+  {
+    service: HarnessCatalogService,
+    // ADR 0063: the catalog read surface drives the profile/launch selectors.
+    // Member-readable (config, not secrets — see policy-map). Write methods are
+    // intentionally excluded here until the admin Harnesses tab forwards them.
+    methods: ["ListHarnesses", "GetHarness"],
   },
 ];

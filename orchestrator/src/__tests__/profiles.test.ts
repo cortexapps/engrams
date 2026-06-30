@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 
 import { buildServer } from "../server.ts";
 import { registerProfiles } from "../rpc/profiles.ts";
-import type { ProfileDeps, ImagesClient, GetSession } from "../rpc/profiles.ts";
+import type { ProfileDeps, ImagesClient, GetSession, HarnessCatalogClient } from "../rpc/profiles.ts";
 import type { ProfileRow, ProfileStore, ProfileInput } from "../db/profiles.ts";
 import { ProfileService } from "../gen/engram/app/v1/profile_pb.ts";
 import type { MountCatalogClient } from "../skills/catalog.ts";
@@ -47,6 +47,24 @@ const fakeImages = (ids: string[]): ImagesClient => ({
   },
 });
 
+/** Minimal catalog so `assertHarnessValid` can resolve the required harness +
+ *  validate model/effort ids (ADR 0063 — a profile always names a harness). */
+const fakeHarnessCatalog = (): HarnessCatalogClient => ({
+  async listHarnesses() {
+    return {
+      harnesses: [
+        {
+          name: "claude",
+          descriptor: {
+            models: [{ id: "opus", default: true }, { id: "sonnet", default: false }],
+            effort: [{ id: "high", default: true }],
+          },
+        },
+      ],
+    };
+  },
+});
+
 /** In-memory ProfileStore for the authz/field-filter matrix (no DB). */
 function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
   const rows = new Map<string, ProfileRow>(seed.map((r) => [r.id, r]));
@@ -76,7 +94,11 @@ function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
 async function spawn(deps: ProfileDeps) {
   const app = new Hono();
   app.notFound((c) => c.json({ error: "not found" }, 404));
-  const srv = buildServer(app, (router) => registerProfiles(router, deps));
+  // ADR 0063: a profile always validates its harness against the catalog —
+  // default to the fake so tests don't reach the live (coord) client. Specific
+  // tests can still override.
+  const withCatalog: ProfileDeps = { harnessCatalog: fakeHarnessCatalog(), ...deps };
+  const srv = buildServer(app, (router) => registerProfiles(router, withCatalog));
   const url = await new Promise<string>((res) =>
     srv.listen(0, "127.0.0.1", () => res(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`)),
   );
@@ -93,7 +115,7 @@ async function expectErr(p: Promise<unknown>, code: Code) {
 
 const archived: ProfileRow = {
   id: "arch", name: "Archived", description: "", icon: "Bot", imageId: "img-1",
-  harness: null, model: null, effort: null,
+  harness: "claude", model: null, effort: null,
   includeUserTokens: false, envVars: { K: "V" }, skills: [], capabilities: [], createdAt: new Date(0), updatedAt: new Date(0),
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
   isDefault: false,
@@ -154,7 +176,7 @@ describe("ProfileService — auth + field filtering", () => {
     const s = await spawn({ getSession: makeGetSession("a", "admin"), store: makeFakeStore(), images: fakeImages(["img-1"]) });
     try {
       const r = await s.client.createProfile({
-        name: "New", description: "d", icon: "Rocket", imageId: "img-1", includeUserTokens: true, envVars: { ANTHROPIC_MODEL: "claude-opus-4-8" },
+        name: "New", description: "d", icon: "Rocket", imageId: "img-1", harness: "claude", includeUserTokens: true, envVars: { ANTHROPIC_MODEL: "claude-opus-4-8" },
       });
       expect(r.profile!.archived).toBe(false);
       expect(r.profile!.envVars).toEqual({ ANTHROPIC_MODEL: "claude-opus-4-8" });
@@ -170,7 +192,7 @@ describe("ProfileService — auth + field filtering", () => {
     });
     try {
       await expectErr(
-        s.client.createProfile({ name: "x", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {}, skills: ["nope"] }),
+        s.client.createProfile({ name: "x", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {}, skills: ["nope"] }),
         Code.InvalidArgument,
       );
     } finally { await s.close(); }
@@ -183,7 +205,7 @@ describe("ProfileService — auth + field filtering", () => {
     });
     try {
       const r = await s.client.createProfile({
-        name: "Skilled", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {}, skills: ["skills", "my-linter"],
+        name: "Skilled", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {}, skills: ["skills", "my-linter"],
       });
       expect(r.profile!.skills).toEqual(["skills", "my-linter"]);
     } finally { await s.close(); }
@@ -196,7 +218,7 @@ describe("ProfileService — auth + field filtering", () => {
     });
     try {
       await expectErr(
-        s.client.createProfile({ name: "x", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {}, capabilities: ["github"] }),
+        s.client.createProfile({ name: "x", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {}, capabilities: ["github"] }),
         Code.InvalidArgument,
       );
     } finally { await s.close(); }
@@ -209,7 +231,7 @@ describe("ProfileService — auth + field filtering", () => {
     });
     try {
       const r = await s.client.createProfile({
-        name: "Capable", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {},
+        name: "Capable", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
         capabilities: ["github:issues:write", "datadog:metrics:read@idx-1"],
       });
       expect(r.profile!.capabilities).toEqual(["github:issues:write", "datadog:metrics:read@idx-1"]);

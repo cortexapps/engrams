@@ -22,9 +22,10 @@ export interface ProfileRow {
   description: string;
   icon: string;
   imageId: string;
-  // ADR 0062/0063: default harness (catalog name) + default model/effort (catalog
-  // option ids). null = inherit (deployment default / descriptor default).
-  harness: string | null;
+  // ADR 0062/0063: default harness (catalog name) — REQUIRED (a profile always
+  // names a concrete harness) + default model/effort (catalog option ids; null =
+  // the harness descriptor's default).
+  harness: string;
   model: string | null;
   effort: string | null;
   includeUserTokens: boolean;
@@ -48,7 +49,7 @@ export interface ProfileInput {
   description: string;
   icon: string;
   imageId: string;
-  harness: string | null;
+  harness: string;
   model: string | null;
   effort: string | null;
   includeUserTokens: boolean;
@@ -86,7 +87,7 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     description: r.description,
     icon: r.icon,
     imageId: r.imageId,
-    harness: r.harness ?? null,
+    harness: r.harness,
     model: r.model ?? null,
     effort: r.effort ?? null,
     includeUserTokens: r.includeUserTokens,

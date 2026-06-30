@@ -22,7 +22,7 @@ const profileRow = (): ProfileRow => ({
   description: "",
   icon: "Bot",
   imageId: "img-1",
-  harness: null,
+  harness: "claude",
   model: null,
   effort: null,
   includeUserTokens: false,

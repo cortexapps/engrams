@@ -186,6 +186,14 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       setValue("imageId", images[0]!.id);
   }, [mode, images, form, setValue]);
 
+  // ADR 0063: a profile always names a CONCRETE harness (no "inherit deployment
+  // default"). Default to the first registered harness in create mode once the
+  // catalog loads — don't clobber a hydrated choice.
+  useEffect(() => {
+    if (mode === "create" && !form.getValues("harness") && harnesses && harnesses.length > 0)
+      setValue("harness", harnesses[0]!.name);
+  }, [mode, harnesses, form, setValue]);
+
   const network = useMemo(
     () => ({
       default: "deny" as const,
@@ -396,9 +404,9 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                 <Field>
                   <FieldLabel htmlFor="harness-select">Harness</FieldLabel>
                   <Select
-                    value={field.value ?? "__inherit__"}
+                    value={field.value ?? undefined}
                     onValueChange={(v) => {
-                      field.onChange(v === "__inherit__" ? null : v);
+                      field.onChange(v);
                       // model/effort are enums on the harness — reset them when
                       // the harness changes so a stale option can't survive.
                       setValue("model", null);
@@ -410,10 +418,9 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                       data-testid="harness-select"
                       className="w-full"
                     >
-                      <SelectValue placeholder="Default (deployment)" />
+                      <SelectValue placeholder="Select a harness…" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="__inherit__">Default (deployment)</SelectItem>
                       {(harnesses ?? []).map((h) => (
                         <SelectItem key={h.name} value={h.name}>
                           {h.descriptor?.label || h.name}

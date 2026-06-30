@@ -217,24 +217,20 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   }
 
   /**
-   * ADR 0062/0063: validate a profile's default harness/model/effort against the
-   * live catalog. A null harness inherits the deployment default (nothing to
-   * check); a set harness must be registered, and a set model/effort id must
-   * exist in that harness's descriptor enum. The coordinator re-checks at
-   * session-create, but failing here keeps a profile from referencing a harness
-   * (or model/effort) the editor wouldn't have offered.
+   * ADR 0062/0063: validate a profile's harness/model/effort against the live
+   * catalog. A profile ALWAYS names a concrete harness (no "inherit deployment
+   * default" — superseded) that must be registered; model/effort stay optional
+   * (null = the harness's own default), but a set id must exist in that harness's
+   * descriptor enum. The coordinator re-checks at session-create, but failing
+   * here keeps a profile from referencing something the editor wouldn't offer.
    */
   async function assertHarnessValid(
     harness: string | null,
     model: string | null,
     effort: string | null,
-  ): Promise<void> {
-    if (harness == null && model == null && effort == null) return;
+  ): Promise<string> {
     if (harness == null) {
-      throw new ConnectError(
-        "model/effort require a harness selection on the profile",
-        Code.InvalidArgument,
-      );
+      throw new ConnectError("a profile must select a harness", Code.InvalidArgument);
     }
     const { harnesses } = await harnessCatalog.listHarnesses({});
     const descriptor = harnesses.find((h) => h.name === harness)?.descriptor;
@@ -253,6 +249,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         Code.InvalidArgument,
       );
     }
+    return harness;
   }
 
   /**
@@ -331,7 +328,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
-      await assertHarnessValid(req.harness ?? null, req.model ?? null, req.effort ?? null);
+      const harness = await assertHarnessValid(req.harness ?? null, req.model ?? null, req.effort ?? null);
       await assertSkillsValid(req.skills ?? []);
       assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
       const network = normalizeNetwork(req.network);
@@ -350,7 +347,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         network,
         secrets,
         isDefault: req.isDefault,
-        harness: req.harness ?? null,
+        harness,
         model: req.model ?? null,
         effort: req.effort ?? null,
       });
@@ -363,7 +360,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
-      await assertHarnessValid(req.harness ?? null, req.model ?? null, req.effort ?? null);
+      const harness = await assertHarnessValid(req.harness ?? null, req.model ?? null, req.effort ?? null);
       await assertSkillsValid(req.skills ?? []);
       assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
       const network = normalizeNetwork(req.network);
@@ -382,7 +379,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         network,
         secrets,
         isDefault: req.isDefault,
-        harness: req.harness ?? null,
+        harness,
         model: req.model ?? null,
         effort: req.effort ?? null,
       });
