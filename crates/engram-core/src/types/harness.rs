@@ -32,6 +32,18 @@ pub struct HarnessDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 
+    /// **Launch contract (coordinator-internal; omitted from the proto
+    /// projection).** Entry path within this harness's catalog subtree —
+    /// `argv[0]` is `/opt/engram/dyn/0/<name>/<exec>` (ADR 0062 §3). Defaults to
+    /// `harness` when unset (see [`HarnessDescriptor::exec_path`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<String>,
+
+    /// **Launch contract (coordinator-internal).** Extra argv appended after the
+    /// SDK-standard dial flags when the host launches the harness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+
     /// Credential env-var names (see [`HarnessAuth`]).
     #[serde(default)]
     pub auth: HarnessAuth,
@@ -91,6 +103,10 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl HarnessDescriptor {
+    /// Default entry name within a harness's catalog subtree when `exec` is
+    /// unset.
+    pub const DEFAULT_EXEC: &'static str = "harness";
+
     /// Parse + validate a `harness.toml` source string.
     pub fn parse(toml_src: &str) -> Result<Self, String> {
         let descriptor: HarnessDescriptor = toml::from_str(toml_src).map_err(|e| e.to_string())?;
@@ -103,6 +119,15 @@ impl HarnessDescriptor {
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("harness.toml: name must not be empty".into());
+        }
+        // The exec entry is joined under the harness's catalog subtree, so it
+        // must be a relative path that can't escape it.
+        if let Some(exec) = &self.exec {
+            if exec.is_empty() || exec.starts_with('/') || exec.split('/').any(|c| c == "..") {
+                return Err(format!(
+                    "harness.toml: exec must be a non-empty relative path within the harness tree, got {exec:?}"
+                ));
+            }
         }
         if let Some(v) = &self.auth.org_env {
             validate_env_name(v).map_err(|e| format!("harness.toml [auth] org_env: {e}"))?;
@@ -146,6 +171,13 @@ impl HarnessDescriptor {
     /// Display label, falling back to the harness id.
     pub fn display_label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.name)
+    }
+
+    /// The entry path within the harness's catalog subtree (the launch
+    /// contract's `exec`, or `harness` by default). Joined under
+    /// `/opt/engram/dyn/0/<name>/` to form `argv[0]` (ADR 0062 §3).
+    pub fn exec_path(&self) -> &str {
+        self.exec.as_deref().unwrap_or(Self::DEFAULT_EXEC)
     }
 }
 
@@ -329,5 +361,34 @@ name = "x"
 bogus = "nope"
 "#;
         assert!(HarnessDescriptor::parse(src).is_err());
+    }
+
+    #[test]
+    fn exec_path_defaults_and_overrides() {
+        let d = HarnessDescriptor::parse(r#"name = "x""#).unwrap();
+        assert_eq!(d.exec_path(), "harness");
+        assert!(d.args.is_empty());
+
+        let d = HarnessDescriptor::parse(
+            r#"
+name = "x"
+exec = "bin/run"
+args = ["--serve", "--quiet"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(d.exec_path(), "bin/run");
+        assert_eq!(d.args, vec!["--serve", "--quiet"]);
+    }
+
+    #[test]
+    fn rejects_unsafe_exec_paths() {
+        for bad in ["/abs/path", "../escape", "a/../../b", ""] {
+            let src = format!("name = \"x\"\nexec = {bad:?}");
+            assert!(
+                HarnessDescriptor::parse(&src).is_err(),
+                "exec {bad:?} should be rejected"
+            );
+        }
     }
 }
