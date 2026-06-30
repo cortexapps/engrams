@@ -13,6 +13,7 @@
 pub mod auth;
 mod convert;
 mod fleet;
+mod harness_catalog;
 mod image;
 mod integration_op;
 mod mint;
@@ -29,6 +30,7 @@ use engram_protocol::app;
 use tonic::Status;
 
 pub use fleet::AppFleetService;
+pub use harness_catalog::AppHarnessCatalogService;
 pub use image::AppImageService;
 pub use integration_op::AppIntegrationOpService;
 pub use mint::AppMintService;
@@ -179,6 +181,18 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
                 },
             )
             .max_decoding_message_size(80 * 1024 * 1024),
+        )
+        // ADR 0062: the harness catalog — registry of selectable agent harnesses.
+        // RegisterHarness carries only strings (name + oci_ref + owner); the OCI
+        // pull + tree-blob + re-pack happen coordinator-side, so the default
+        // decode cap is fine (unlike RegisterSkill's binary upload).
+        .add_service(
+            app::harness_catalog_service_server::HarnessCatalogServiceServer::new(
+                AppHarnessCatalogService {
+                    state: state.clone(),
+                    auth: auth.clone(),
+                },
+            ),
         )
         // ADR 0057 C3: the read-only mint-kind registry (Plane-A form metadata).
         .add_service(app::mint_service_server::MintServiceServer::new(
@@ -406,6 +420,7 @@ mod convention {
         ("fleet.rs", include_str!("fleet.rs")),
         ("image.rs", include_str!("image.rs")),
         ("mount_catalog.rs", include_str!("mount_catalog.rs")),
+        ("harness_catalog.rs", include_str!("harness_catalog.rs")),
         ("org_secret.rs", include_str!("org_secret.rs")),
         ("mint.rs", include_str!("mint.rs")),
         ("integration_op.rs", include_str!("integration_op.rs")),
