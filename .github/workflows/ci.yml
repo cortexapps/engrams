@@ -913,6 +913,13 @@ jobs:
       # root-required FC tests below. `env "PATH=$PATH"` re-adds the
       # cargo/rustc PATH that sudo scrubs; `-E` preserves
       # ENGRAM_TEST_NBD_DEVICE + FC_TEST_KERNEL/FC_TEST_ROOTFS.
+      #
+      # Stays `--test-threads=1`. Per-slot `/dev/nbd{N}` keying fixes the
+      # device collision, but nbd_netlink_reconfigure's parked-IO assertion
+      # is coupled to a dead-connection timeout that -j4 CPU contention
+      # pushes past its window (it timed out under parallelism in CI). The
+      # contention can't be slot-partitioned away, so this batch stays
+      # serial; the dedup below is the win that doesn't risk a flake.
       - name: NBD chunked-disk + netlink tests (Linux + KVM + nbd, root)
         if: steps.nbd_setup.outputs.available == 'true'
         env:
@@ -941,22 +948,24 @@ jobs:
       # permission errors. Docker buildx scratchpad (~/.docker/buildx)
       # also gets touched by proxy_e2e's image bake; cleanup includes
       # it.
-      - name: Firecracker `#[ignore]` tests (root — host_startup, snapshot_net, patch_drive_swap, aux_ro_drive, netns_isolation, warm_proxy_chain, proxy_e2e)
+      - name: Firecracker `#[ignore]` tests (root — host_startup, snapshot_net, patch_drive_swap, netns_isolation, warm_proxy_chain, proxy_e2e)
         run: |
           # ADR 0021 P1.6: `proxy_e2e` came back in the e2e
           # resurrection — baked-in harness path, CA delivered via
           # `InstallHostCa` vsock RPC instead of the retired
           # `.engram-host/ca.pem` substrate file. `option_d_warm_lease`
           # stays deleted (it was specifically about option-D).
-          # ADR 0027: `aux_ro_drive` exercises the read-only bundle
-          # drive (skills / playwright squashfs) surviving snapshot +
-          # restore by presence — needs sudo mount like patch_drive_swap.
+          # `aux_ro_drive` is NOT in this list: it self-isolates (raw FC
+          # spawn, per-process tempdir + auto loop device, its own `sudo
+          # mount`) and already runs in the unprivileged `--test-threads=4`
+          # batch above, so listing it here too was pure duplication on the
+          # serial path (~4 tests x ~20s). Dropped; ADR 0027 coverage is
+          # unchanged (same tests, still run, just once).
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-sandbox-firecracker \
             --test host_startup \
             --test snapshot_net \
             --test patch_drive_swap \
-            --test aux_ro_drive \
             --test netns_isolation \
             --test warm_proxy_chain \
             --test proxy_e2e \
