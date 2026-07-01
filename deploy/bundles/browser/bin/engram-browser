@@ -5,7 +5,7 @@
 # (readlink -f follows the PATH symlink) — never a fixed mount path.
 #
 # Brings up, in order: Xvfb (virtual display :99) → openbox (focus/maximize,
-# no panel/menu) → x11vnc (RFB on 0.0.0.0:5900, reachable by the host's
+# no panel/menu) → x11vnc (RFB on 127.0.0.1:5900, reached over the ADR-0066
 # proxy_vnc) → chromium (full UI, sized to the framebuffer). No
 # desktop/file-manager/terminal — the framebuffer shows only Chrome. The whole
 # stack shares one process group so agentd can reap it as a unit
@@ -175,15 +175,15 @@ done
     done
 ) &
 
-# 4) x11vnc last (so the display + a client window exist). It MUST bind all
-# interfaces (x11vnc's default) — NOT loopback. The host-agent's proxy_vnc dials
-# the VM's routable IP (vm_internal_ip, e.g. 192.168.64.2:5900) from OUTSIDE the
-# guest, exactly like the shell's ttyd which binds 0.0.0.0:7681. `-localhost`
-# binds 127.0.0.1 only, so the host's dial to guest_ip:5900 is refused, no RFB
-# bytes ever flow, and the VNC tab shows "connection closed unexpectedly". The
-# per-VM network is the isolation boundary (prod FC: a per-VM netns reachable
-# only by the host-agent; VZ dev: the same vmnet posture ttyd already relies on),
-# so binding all interfaces here matches the shell rather than widening exposure.
+# 4) x11vnc last (so the display + a client window exist). Bind LOOPBACK
+# (`-localhost` → 127.0.0.1:5900). ADR 0066 has agentd dial 127.0.0.1:5900
+# in-guest and splice RFB over the vsock relay — that's what makes loopback-only
+# viable (#498 needed 0.0.0.0 only because the OLD mechanism dialed `guest_ip`
+# from outside, and a guest_ip dial can't reach a loopback listener). 0.0.0.0
+# would still WORK with the relay; loopback is a least-exposure choice: RFB never
+# listens on the guest network, so the only route to it is the auth-gated relay
+# (belt to the per-VM-netns suspenders, and it matters more on the less-isolated
+# VZ dev network). `lo` must be up — the relay dials 127.0.0.1 regardless of bind.
 # -forever: survive client disconnects (refresh grace handled host-side).
 # -xrandr: track RANDR resolution changes for noVNC remote resize (x11vnc's flag
 # is -xrandr, NOT -randr — an unrecognized option makes x11vnc abort before
@@ -193,4 +193,5 @@ done
 exec "$here/bin/x11vnc" \
     -display "$DISPLAY" \
     -rfbport "$VNC_PORT" \
+    -localhost \
     -forever -shared -noxdamage -nopw -quiet -xrandr
