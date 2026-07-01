@@ -211,6 +211,23 @@ pub trait SandboxBackend: Send + Sync {
         })
     }
 
+    /// ADR 0066: open a raw duplex byte stream to the in-guest `engram-agentd`
+    /// vsock listener on `port` (e.g. `PROXY_PORT_VSOCK_PORT`). VM backends
+    /// (FC, VZ) return a connected vsock stream; the caller writes the relay
+    /// header, reads the ack, and splices bytes. Backends with no VM boundary
+    /// (Process — the guest's `127.0.0.1` *is* the host's loopback) return
+    /// `None`, and the caller dials the loopback port directly instead.
+    ///
+    /// Default: `None` (no vsock). Reuses the same owned `HarnessByteStream`
+    /// the harness/forge/upload sinks already carry.
+    async fn open_guest_stream(
+        &self,
+        _id: SandboxId,
+        _port: u32,
+    ) -> Result<Option<HarnessByteStream>, SandboxError> {
+        Ok(None)
+    }
+
     /// Snapshot a running sandbox. ADR 0007 Phase 6: the backend
     /// chooses its own local staging directory (per
     /// [`Self::snapshot_path_for`]) — coord doesn't dictate where

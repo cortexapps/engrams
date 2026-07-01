@@ -189,6 +189,19 @@ impl SandboxBackend for ProcessBackend {
         .await
     }
 
+    /// ADR 0066: Process has no VM boundary — agentd runs as a host subprocess,
+    /// so a preview's target port is already on the host's `127.0.0.1`. Return
+    /// `None` so the host-agent dials the loopback port directly (no vsock
+    /// relay, none exists here). Explicit for discoverability; matches the
+    /// trait default.
+    async fn open_guest_stream(
+        &self,
+        _id: SandboxId,
+        _port: u32,
+    ) -> Result<Option<engram_core::traits::sandbox::HarnessByteStream>, SandboxError> {
+        Ok(None)
+    }
+
     async fn exec_stream(
         &self,
         id: SandboxId,

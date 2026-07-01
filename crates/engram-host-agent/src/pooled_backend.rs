@@ -4601,6 +4601,16 @@ impl SandboxBackend for PooledBackend {
         self.inner.exec_stream(id, cmd).await
     }
 
+    // ADR 0066: the port relay reaches agentd through the wrapped backend's
+    // vsock (FC) — load-bearing in prod, where `self.inner` is FC.
+    async fn open_guest_stream(
+        &self,
+        id: SandboxId,
+        port: u32,
+    ) -> Result<Option<engram_core::traits::sandbox::HarnessByteStream>, SandboxError> {
+        self.inner.open_guest_stream(id, port).await
+    }
+
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         // ADR 0045 D5: composed form — capture, then run the post phase
         // inline holding the capture lock (the periodic-checkpoint and
