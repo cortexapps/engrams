@@ -31,8 +31,9 @@ fi
 
 REGISTRY="localhost:5001"
 
-# Dev bakes cross-compile the rootfs for the host's own arch. Transport
-# depends on the backend (VZ uses virtio-console; Firecracker/process use vsock).
+# Dev bakes cross-compile the rootfs for the host's own arch. Every
+# backend uses the vsock transport (ADR 0066 Phase 2 migrated VZ off
+# virtio-console onto real vsock).
 case "$(uname -m)" in
     arm64 | aarch64)
         TARGET=aarch64-unknown-linux-musl
@@ -47,7 +48,13 @@ case "$(uname -m)" in
         exit 1
         ;;
 esac
-if [ "$backend" = "vz" ]; then TRANSPORT=console; else TRANSPORT=vsock; fi
+# All backends now use the vsock transport. VZ migrated off the
+# virtio-console bridge onto Apple's real VZVirtioSocketDevice in ADR
+# 0066 Phase 2 — the Kata guest kernel VZ boots ships
+# CONFIG_VIRTIO_VSOCKETS=y, so vsock works there just like it does on
+# Firecracker (and it muxes concurrent streams per port, so the port
+# relay is head-of-line-free).
+TRANSPORT=vsock
 
 rustup target add "$TARGET" >/dev/null 2>&1 || true
 

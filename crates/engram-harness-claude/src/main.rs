@@ -110,9 +110,9 @@ mod adapter {
 
         /// In-VM transport port on the host. Used when the harness
         /// runs inside a microVM — `engram-transport` reads
-        /// `ENGRAM_TRANSPORT` (vsock|console) and dials accordingly.
-        /// Mutually exclusive with `--connect`. `--vsock-host` is a
-        /// deprecated alias kept for back-compat with FC bakes.
+        /// `ENGRAM_TRANSPORT` (vsock) and dials accordingly. Mutually
+        /// exclusive with `--connect`. `--vsock-host` is a deprecated
+        /// alias kept for back-compat with FC bakes.
         #[arg(long = "port", alias = "vsock-host", env = "ENGRAM_HARNESS_VSOCK_HOST")]
         pub vsock_host: Option<u32>,
 
@@ -202,9 +202,8 @@ mod adapter {
             "claude harness starting",
         );
 
-        // CLI dispatch: TCP loopback (Process backend) vs in-VM
-        // transport (FC vsock or VZ virtio-console — selected by
-        // ENGRAM_TRANSPORT).
+        // CLI dispatch: TCP loopback (Process backend) vs in-VM vsock
+        // transport (FC + VZ, selected by ENGRAM_TRANSPORT).
         if !((cli.connect.is_some()) ^ (cli.vsock_host.is_some())) {
             tracing::error!("provide exactly one of --connect or --port");
             return ExitCode::from(2);

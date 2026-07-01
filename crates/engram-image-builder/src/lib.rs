@@ -101,19 +101,19 @@ pub struct AgentInjection {
     pub init_script: Option<PathBuf>,
 }
 
-/// Which `engram-transport` implementation the in-VM binaries
-/// should select at runtime. Set on [`AgentInjection`] at bake time;
-/// the default init shim writes `ENGRAM_TRANSPORT=<value>` into the
-/// rootfs so `engram-transport::from_env` picks the right impl.
+/// Which `engram-transport` implementation the in-VM binaries should
+/// select at runtime. Set on [`AgentInjection`] at bake time; the
+/// default init shim writes `ENGRAM_TRANSPORT=<value>` into the rootfs
+/// so `engram-transport::from_env` picks the right impl.
+///
+/// Both backends now use `Vsock` — VZ migrated off virtio-console onto
+/// Apple's real `VZVirtioSocketDevice` in ADR 0066 Phase 2. The enum
+/// stays a seam for a future non-vsock backend.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Transport {
-    /// AF_VSOCK (Linux + Firecracker). Default — matches every FC
-    /// bake we've shipped.
+    /// AF_VSOCK — the transport for both Firecracker and VZ.
     #[default]
     Vsock,
-    /// virtio-console (Apple Virtualization.framework on
-    /// macOS). Selected by the vz-bake-* recipes.
-    Console,
 }
 
 impl Transport {
@@ -122,7 +122,6 @@ impl Transport {
     pub fn env_value(self) -> &'static str {
         match self {
             Self::Vsock => "vsock",
-            Self::Console => "console",
         }
     }
 
@@ -131,10 +130,7 @@ impl Transport {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "vsock" => Ok(Self::Vsock),
-            "console" | "virtio-console" => Ok(Self::Console),
-            other => Err(format!(
-                "invalid transport: {other} (expected vsock|console)"
-            )),
+            other => Err(format!("invalid transport: {other} (expected vsock)")),
         }
     }
 }
