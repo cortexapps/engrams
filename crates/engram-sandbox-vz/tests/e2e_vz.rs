@@ -315,20 +315,24 @@ async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
     let id = backend.create(spec(&env.rootfs)).await.expect("create");
     await_agent(&backend, id).await;
 
-    // An echo server on 127.0.0.1:ECHO and a black-hole server on
-    // 127.0.0.1:SINK that accepts but never replies (a stand-in for a
-    // persistent HMR WebSocket / noVNC stream). `setsid … &` detaches both
-    // so the exec returns while they keep running (reparented to agentd).
+    // Bring loopback up (the relay dials 127.0.0.1; a minimal guest may leave
+    // `lo` down), then start a concurrent echo server on 127.0.0.1:ECHO and a
+    // black-hole on 127.0.0.1:SINK that accepts but never replies (stands in for
+    // a persistent HMR WebSocket / noVNC stream). socat `fork` gives each
+    // connection its own handler, so any HOL we observe is the relay's, not the
+    // server's. `setsid … &` detaches both so the exec returns while they keep
+    // running (reparented to agentd).
     const ECHO: u16 = 3111;
     const SINK: u16 = 3112;
     let (_, code) = exec(
         &backend,
         id,
         &format!(
-            "setsid node -e 'require(\"net\").createServer(c=>c.pipe(c)).listen({ECHO},\"127.0.0.1\")' \
-               >/dev/null 2>&1 & \
-             setsid node -e 'require(\"net\").createServer(()=>{{}}).listen({SINK},\"127.0.0.1\")' \
-               >/dev/null 2>&1 & \
+            "ip link set lo up 2>/dev/null; \
+             setsid socat TCP-LISTEN:{ECHO},bind=127.0.0.1,fork,reuseaddr EXEC:cat \
+               </dev/null >/dev/null 2>&1 & \
+             setsid socat TCP-LISTEN:{SINK},bind=127.0.0.1,fork,reuseaddr EXEC:'sleep 3600' \
+               </dev/null >/dev/null 2>&1 & \
              sleep 1"
         ),
     )
