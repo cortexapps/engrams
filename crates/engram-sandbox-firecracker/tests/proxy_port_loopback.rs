@@ -14,10 +14,14 @@
 //!   1. **loopback reach** (the regression): an echo server bound to
 //!      `127.0.0.1` round-trips bytes — proving the relay reaches guest
 //!      loopback, which `guest_ip:port` never could.
-//!   2. **no head-of-line blocking**: N concurrent forwarded connections to a
-//!      bulk source; one reader stalls, the rest must still drain at full speed
-//!      (statistically indistinguishable from a no-stall run).
-//!   3. **throughput**: reports MB/s for a single large transfer (informational).
+//!   2. **no head-of-line blocking**: with one connection backed up (its source
+//!      wants to push a lot but its reader parks), the others must each still
+//!      read a small chunk and finish under a tight bound.
+//!
+//! Small + fast on purpose: HOL-freedom is a *completion* property, so it's
+//! proven with tiny reads + a tight bound — never a big transfer (that only
+//! measures throughput, which is slow and inflates the FC lane; benchmark
+//! throughput ad hoc on the dev VM, never in CI).
 //!
 //! Heavy (~40 s on the dev VM). Same preconditions as `forge_loopback`; run via
 //! `scripts/run-boot-test.sh proxy_port_loopback`.
@@ -43,12 +47,21 @@ use common::{fc_preflight, require_bin};
 
 /// Guest loopback port for the echo (correctness) server.
 const ECHO_PORT: u16 = 9090;
-/// Guest loopback port for the bulk-source (HOL + throughput) server.
+/// Guest loopback port for the backed-up-source (HOL) server.
 const SOURCE_PORT: u16 = 9091;
-/// Bytes each bulk connection sources. 64 MiB × N keeps the test heavy enough to
-/// expose serialization but bounded for CI.
-const SOURCE_BYTES: usize = 64 * 1024 * 1024;
-/// Concurrent forwarded connections in the HOL test.
+/// Size of the source stream socat offers per connection. Large enough that the
+/// "hog" connection (which reads a little then parks) stays genuinely backed up
+/// — a full credit window in flight — but nobody drains it, so it costs ~nothing.
+const SOURCE_STREAM_BYTES: usize = 32 * 1024 * 1024;
+/// Bytes each ACTIVE connection reads in the HOL test. Deliberately small:
+/// HOL-freedom is a *completion* property, so proving it needs little data. A
+/// large transfer would just measure throughput and inflate the FC lane —
+/// measure throughput ad hoc on the dev VM, never in CI.
+const ACTIVE_READ_BYTES: usize = 256 * 1024;
+/// Tight ceiling for the active reads while one peer is backed up: they move
+/// only ~2 MiB total, so seconds is plenty. A HOL regression hangs here instead.
+const HOL_ACTIVE_DEADLINE: Duration = Duration::from_secs(15);
+/// Concurrent forwarded connections in the HOL test (1 backed-up + N-1 active).
 const HOL_CONNS: usize = 8;
 
 #[tokio::test]
@@ -171,7 +184,7 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
         sandbox_id,
         &format!(
             "setsid socat TCP-LISTEN:{SOURCE_PORT},bind=127.0.0.1,fork,reuseaddr \
-             EXEC:'head -c {SOURCE_BYTES} /dev/zero' </dev/null >/dev/null 2>&1 &"
+             EXEC:'head -c {SOURCE_STREAM_BYTES} /dev/zero' </dev/null >/dev/null 2>&1 &"
         ),
     )
     .await;
@@ -190,14 +203,19 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
     drop(echo);
 
     // ---- 5. Assertion 2: no head-of-line blocking. ----
-    // Open HOL_CONNS bulk connections. One reads only a few KiB then parks
-    // (holds its stream). The rest must each drain the full SOURCE_BYTES fast —
-    // if a stalled connection could stall the shared virtio-vsock device, the
-    // active readers would slow or hang behind it.
-    let mut stalled = relay_connect(&backend, sandbox_id, SOURCE_PORT).await;
+    // One "hog" connection: its source wants to push a lot, but the client reads
+    // a few KiB then parks — so it stays backed up (a full credit window in
+    // flight), the realistic HOL threat. The other connections must each read a
+    // small chunk and finish under a TIGHT bound while the hog is parked; if a
+    // backed-up connection could stall the shared virtio-vsock device, they'd
+    // hang. Kept small on purpose (see ACTIVE_READ_BYTES): proving HOL-freedom is
+    // a completion assertion, not a throughput benchmark.
+    let mut hog = relay_connect(&backend, sandbox_id, SOURCE_PORT).await;
     let mut sink = [0u8; 4096];
-    stalled.read_exact(&mut sink).await.expect("stalled primes");
-    // …then never read again (stream held live below).
+    hog.read_exact(&mut sink)
+        .await
+        .expect("hog primes then parks");
+    // …hog held live below, backed up.
 
     let mut active = Vec::new();
     for _ in 0..HOL_CONNS - 1 {
@@ -207,42 +225,26 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
     let mut handles = Vec::new();
     for mut conn in active {
         handles.push(tokio::spawn(async move {
-            let n = drain_to_eof(&mut conn).await;
-            assert_eq!(n, SOURCE_BYTES, "active connection must drain in full");
+            let mut buf = vec![0u8; ACTIVE_READ_BYTES];
+            conn.read_exact(&mut buf)
+                .await
+                .expect("active connection must make progress while a peer is backed up");
+            // drop `conn` → its source is torn down; no full drain needed.
         }));
     }
-    // Generous ceiling: 512 MiB of vsock loopback finishes in seconds; a HOL
-    // regression makes this hang until the outer nextest timeout instead.
     for h in handles {
-        tokio::time::timeout(Duration::from_secs(60), h)
+        tokio::time::timeout(HOL_ACTIVE_DEADLINE, h)
             .await
-            .expect("an active connection hung — HOL regression?")
+            .expect("an active connection hung behind the backed-up peer — HOL regression?")
             .expect("active connection task panicked");
     }
-    let elapsed = start.elapsed();
-    let mb = (SOURCE_BYTES * (HOL_CONNS - 1)) as f64 / (1024.0 * 1024.0);
     eprintln!(
-        "HOL: {} active connections drained {:.0} MiB in {:?} ({:.0} MiB/s aggregate) \
-         while 1 stalled",
+        "HOL: {} active connections each read {} KiB in {:?} while 1 stayed backed up",
         HOL_CONNS - 1,
-        mb,
-        elapsed,
-        mb / elapsed.as_secs_f64(),
+        ACTIVE_READ_BYTES / 1024,
+        start.elapsed(),
     );
-    drop(stalled); // release the parked connection
-
-    // ---- 6. Assertion 3: single-connection throughput (informational). ----
-    let mut solo = relay_connect(&backend, sandbox_id, SOURCE_PORT).await;
-    let t = Instant::now();
-    let n = drain_to_eof(&mut solo).await;
-    assert_eq!(n, SOURCE_BYTES);
-    let solo_mb = SOURCE_BYTES as f64 / (1024.0 * 1024.0);
-    eprintln!(
-        "throughput: single connection {:.0} MiB in {:?} ({:.0} MiB/s)",
-        solo_mb,
-        t.elapsed(),
-        solo_mb / t.elapsed().as_secs_f64(),
-    );
+    drop(hog);
 
     backend.destroy(sandbox_id).await.expect("destroy sandbox");
 }
@@ -265,19 +267,6 @@ async fn relay_connect(
     let ack: RelayAck = read_msg(&mut stream).await.expect("read RelayAck");
     assert!(ack.ok, "relay NAK for 127.0.0.1:{target_port}: {ack:?}");
     stream
-}
-
-/// Read a stream to EOF, returning the byte count.
-async fn drain_to_eof<S: AsyncReadExt + Unpin>(stream: &mut S) -> usize {
-    let mut total = 0usize;
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => return total,
-            Ok(n) => total += n,
-            Err(e) => panic!("read error after {total} bytes: {e}"),
-        }
-    }
 }
 
 /// `exec` a `sh -c` one-liner in the guest and assert it exits 0.
