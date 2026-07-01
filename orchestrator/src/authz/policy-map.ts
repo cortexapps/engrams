@@ -115,6 +115,14 @@ export const POLICY: Record<string, PolicyEntry> = {
     subject: "Session",
     sessionIdField: "sessionId",
   },
+  // ADR 0065: bring up the in-guest browser stack for the session — the same
+  // interactive-access bar as the shell/VNC tab (owner-or-admin), so it mirrors
+  // Exec's `shell` action.
+  "SessionService.EnsureBrowser": {
+    action: "shell",
+    subject: "Session",
+    sessionIdField: "sessionId",
+  },
   // Admin-only SessionService methods
   "SessionService.Snapshot": { action: "manage", subject: "all" },
   "SessionService.EvictLocal": { action: "manage", subject: "all" },

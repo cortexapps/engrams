@@ -222,7 +222,7 @@ describe("ProfileService — auth + field filtering", () => {
     });
     try {
       const r = await s.client.createProfile({
-        name: "Browsable", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {}, skills: ["browser"],
+        name: "Browsable", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {}, skills: ["browser"],
       });
       expect(r.profile!.skills).toEqual(["browser"]);
     } finally { await s.close(); }

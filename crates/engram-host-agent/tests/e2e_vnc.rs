@@ -49,9 +49,9 @@ use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
 };
 use engram_host_agent::pooled_backend::PooledBackend;
-use tokio::io::AsyncReadExt;
 use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
+use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
 // Shared FC e2e harness floor (preflight / root-check / host-state cleanup /
