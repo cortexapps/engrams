@@ -1019,12 +1019,13 @@ jobs:
       # ADR 0062: the harness is a per-session bundle mounted on dyn_0
       # (no longer baked into the rootfs); the CA via `InstallHostCa`
       # vsock RPC.
-      - name: True-e2e tests (root — e2e_shell, e2e_harness)
+      - name: True-e2e tests (root — e2e_shell, e2e_harness, e2e_vnc)
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-host-agent \
             --test e2e_shell \
             --test e2e_harness \
+            --test e2e_vnc \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
