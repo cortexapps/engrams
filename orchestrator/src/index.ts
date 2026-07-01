@@ -20,6 +20,7 @@ import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 // Side-effect import: registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
+import { makeVncRoute } from "./routes/vnc.ts";
 import { makePreviewProxyMiddleware } from "./routes/preview-proxy.ts";
 import { makePreviewUpgradeHandler } from "./routes/preview-ws.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
@@ -98,6 +99,12 @@ app.route("/", slackInteractivityRoute);
 const { app: shellApp, injectUpgrade } = makeShellRoute();
 injectUpgrade(upgradeWebSocket);
 app.route("/", shellApp);
+
+// ADR 0065/0066: VNC WebSocket route (browser tab → noVNC → EnsureBrowser +
+// raw RFB over the port relay).
+const { app: vncApp, injectUpgrade: injectVncUpgrade } = makeVncRoute();
+injectVncUpgrade(upgradeWebSocket);
+app.route("/", vncApp);
 
 // Default 404 for unmatched Hono paths.
 app.notFound((c) => c.json({ error: "not found" }, 404));
