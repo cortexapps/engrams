@@ -33,10 +33,10 @@ const COPY_BUF: usize = 256 * 1024;
 /// Host-protecting backstop on concurrent forwarded connections (defence in
 /// depth — the coordinator enforces the real per-session cap of 256, and a
 /// guest serves exactly one session, so this is never reached in normal
-/// operation). Matches that cap: each connection costs 2 fds (the vsock stream
-/// + the loopback dial), so 256 stays well under the default `RLIMIT_NOFILE`
-/// with no need to raise it. Bounds guest fds/tasks if a bug or abusive caller
-/// opens connections without limit.
+/// operation). It matches that cap; at two fds per connection (the vsock stream
+/// and the loopback dial) it stays well under the default `RLIMIT_NOFILE`, so no
+/// raise is needed. Bounds guest fds/tasks if a bug or abusive caller opens
+/// connections without limit.
 const MAX_INFLIGHT: usize = 256;
 
 /// Bind the relay listener and serve forwarded connections until the transport
@@ -193,6 +193,10 @@ mod tests {
         let mut got = [0u8; 4];
         host.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"ping");
+        // Close the vsock side so the relay's `copy_bidirectional` sees EOF on
+        // the guest→loopback direction and returns (otherwise it waits forever
+        // for more host bytes and the test hangs).
+        drop(host);
         let _ = relay.await;
     }
 

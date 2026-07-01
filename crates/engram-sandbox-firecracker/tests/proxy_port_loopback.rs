@@ -82,8 +82,11 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(
         src.path().join("Dockerfile"),
+        // `iproute2` for `ip link set lo up` — this minimal test image's default
+        // init doesn't bring up loopback, and the relay dials `127.0.0.1` (prod
+        // guest images bring `lo` up; dev servers there bind loopback fine).
         "FROM debian:bookworm-slim\n\
-         RUN apt-get update && apt-get install -y --no-install-recommends socat coreutils \
+         RUN apt-get update && apt-get install -y --no-install-recommends socat coreutils iproute2 \
          && rm -rf /var/lib/apt/lists/*\n\
          RUN mkdir -p /workspace\n",
     )
@@ -150,6 +153,10 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
     wait_for_agent(&backend, sandbox_id, Duration::from_secs(30))
         .await
         .expect("agent never came up — see firecracker.log under work_dir");
+    // Bring up loopback — the relay dials `127.0.0.1`, and this minimal image's
+    // default init leaves `lo` down (a `127.0.0.1` connect otherwise fails with
+    // "Network unreachable"). Prod guest images bring `lo` up already.
+    exec_ok(&backend, sandbox_id, "ip link set lo up").await;
     exec_ok(
         &backend,
         sandbox_id,
