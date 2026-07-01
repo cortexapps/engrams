@@ -1,22 +1,38 @@
-# ADR 0064 — In-guest browser sharing (Xvfb + VNC)
+# ADR 0065 — Live in-guest browser: one shared headful Chrome + VNC (unified)
 
 Status: **Proposed**
 
-> Builds directly on the shell-tunnel work (ADR 0014 issue #6, `ProxyShell`), the dynamic
-> per-session mount mechanism ([ADR 0055](0055-dynamic-per-session-directory-mounts.md)) and the
-> erofs bundle packaging from [ADR 0061](0061-vz-builtin-skills-erofs.md). Interacts with the
-> egress proxy ([ADR 0006](0006-host-agent-egress-proxy.md)), session profiles
-> ([ADR 0053](0053-session-profiles.md)) and eviction durability
-> ([ADR 0028](0028-eviction-durability-under-host-roll.md) /
-> [ADR 0034](0034-idle-eviction-state-machine.md)).
-> Numbered 0064 by request (0063 reserved by an in-flight branch).
+> **Renumbered 0064 → 0065.** This began as PR #498's `0064-in-guest-browser-vnc.md`, but `0064`
+> landed on main as the generic-ports ADR (`0064-live-host-ports-vanity-subdomains.md`). A parallel
+> CDP-screencast proposal briefly held `0065` (PR #503); it was **closed** in favor of this VNC
+> decision, freeing the number. This ADR is the **live-browser decision of record**.
+>
+> **What changed vs #498-as-built (the delta reviewers should see):** the browser is now **shared by
+> the agent and the human**. One headful Chrome runs with `--remote-debugging-port`; the **agent**
+> drives it over CDP (`playwright-cli connectOverCDP`) and the **human** views + controls the *same*
+> Chrome over VNC — so the human **watches the agent navigate** and can grab the mouse/keyboard. #498
+> ran the human a *separate* browser from the agent's headless one; unifying them is the load-bearing
+> change and roughly **halves** the in-guest cost (one Chrome, not two). The stack stays lazy +
+> ephemeral + never-snapshotted, so sessions that never open it cost nothing. CDP screencast (the
+> closed #503) is the considered/deferred lighter alternative (§Alternatives).
+>
+> Builds on the shell-tunnel work (ADR 0014 issue #6, `ProxyShell`), the **generic inbound port
+> tunnel** ([ADR 0064](0064-live-host-ports-vanity-subdomains.md) — `ProxyPort`/`PortRelayService`,
+> the transport this migrates onto, §3), the dynamic per-session mount mechanism
+> ([ADR 0055](0055-dynamic-per-session-directory-mounts.md)), the erofs bundle packaging from
+> [ADR 0061](0061-vz-builtin-skills-erofs.md), the egress proxy ([ADR 0006](0006-host-agent-egress-proxy.md)),
+> session profiles ([ADR 0053](0053-session-profiles.md)) and eviction durability
+> ([ADR 0028](0028-eviction-durability-under-host-roll.md) / [ADR 0034](0034-idle-eviction-state-machine.md)).
 
 ## TL;DR
 
-We want a user to click **"Launch Browser"** in a session and get a real, interactive Chrome —
-running *inside that session's microVM* — rendered live in the engrams UI. The human drives it
-(clicks, types, navigates); the agent is not involved. The VM exposes **only** the browser window,
-nothing else.
+We want a user to open a **Browser** tab in a session and get a real, interactive Chrome — running
+*inside that session's microVM* — rendered live in the engrams UI. It is **one shared browser**: the
+**agent** drives it over CDP (the same Chrome, via `--remote-debugging-port`) while the **human**
+views and controls it over VNC, so the human **watches the agent's real clicks land** and can take
+the mouse/keyboard at any time. The tab doubles as the session's **web surface** — it also opens the
+session's exposed dev-server ports (ADR 0064) as real tabs, each with a **pop-out ↗** to the user's
+own browser (§8). The VM exposes only the browser, nothing else.
 
 The pleasant surprise: we have almost all the plumbing already. The **shell tab** (ADR 0014 issue
 \#6) tunnels an in-guest WebSocket server (`ttyd`) out to the browser through a gRPC bidi relay with
@@ -159,6 +175,32 @@ The bundle is mounted only on sessions whose **profile enables it** (ADR 0053), 
 `session_env`-gated activation the `skills`/`playwright` bundles use. A session without the bundle
 has no `engram-browser` on `PATH` and no `BROWSER` tab.
 
+### 1a. One shared Chrome — agent over CDP (drive), human over VNC (view + control)
+
+The load-bearing change over #498-as-built. The launcher starts Chrome with
+`--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --remote-allow-origins=*` (bound so
+the port is reachable from the host-agent, same posture as x11vnc's RFB port — see the bind-address
+pitfall). Then:
+
+- **Agent drives it.** The `playwright` skill's `playwright-cli` is repointed via
+  `connectOverCDP(http://127.0.0.1:9222)` (a `browser.cdpEndpoint` in its `cli.config.json`) so it
+  attaches to *this* Chrome instead of launching its own headless one. The agent's `open`/`click`/
+  `fill`/`snapshot` now act on the shared, human-visible browser.
+- **Human views + controls it** over VNC exactly as below (x11vnc → noVNC). Because it is the same
+  Chrome, the human sees the agent's real navigation and clicks; noVNC is not view-only, so the human
+  can take the mouse/keyboard at any time. **v1 has no takeover/pause protocol** — concurrent human
+  and agent input can perturb each other, which is accepted for v1 (the ADR-0030 interrupt-based pause
+  is a future refinement).
+- **Orchestrator metadata client.** VNC carries pixels, not structure. The orchestrator additionally
+  attaches a *read-mostly* CDP client to the same `:9222` (via the ADR-0064 tunnel) for `Target.*`
+  tab/URL state — used to drive the exposed-ports rail, the "pop-out this tab ↗" affordance, and to
+  open port-tabs (§8). It is **not** the display path and never proxies raw CDP to the web.
+
+**Capability = the headful superset of `playwright`.** `browser` is a distinct bundle/skill (it pulls
+the heavy X stack, so plain `playwright` profiles stay headless/light); the `browser` bundle also
+ships `playwright-cli` pointed at `:9222`. If a profile selects both, `browser` wins — the agent uses
+the shared headful instance.
+
 ### 2. Lazy spawn — `engram-agentd` `StartBrowser`
 
 A new `WireRequest::StartBrowser` variant, modeled 1:1 on `WireRequest::StartShell`
@@ -210,6 +252,16 @@ misnamed. We deliberately **keep the names** for this change to avoid churn acro
 and TypeScript stubs on both sides of the wire; a rename to `GuestStream…` is a clean-up candidate
 for a follow-up commit. Only the `target` field + raw-TCP upstream are functional here.
 
+**Transport migration (reconciliation with the landed generic ports).** #498 forked before ADR 0064's
+generic **`ProxyPort` / `PortRelayService`** landed on main — a raw-byte guest-port tunnel that already
+carries arbitrary TCP (it serves the live-host port previews). RFB is "just port 5900," so the VNC
+display **migrates onto `ProxyPort`** and the bespoke `proxy_vnc` upstream + the `ShellTarget`/
+`ProxyTarget` discriminant on the shell relay are **removed** (the generic primitive *subsumes* the
+second target enum — "subsume, don't sit alongside"). The orchestrator `/vnc` route becomes a
+websockify over the `ProxyPort` tunnel (noVNC WebSocket ⇄ raw RFB TCP). This is the largest divergence
+from #498's original transport design and is what resolves the head-on conflict between #498's
+relay/proto changes and the generic-ports work now on main.
+
 ### 4. Orchestrator — `/vnc` route + capability gating
 
 A new `GET /api/v1/sessions/:id/vnc` WebSocket route, a near-copy of `routes/shell.ts`: **the same
@@ -251,12 +303,16 @@ The browser stack is **ephemeral and never part of a snapshot** — Chrome's res
 bloat snapshots and violate the small-snapshot assumptions behind eviction durability (ADR 0028 /
 0034). Concretely:
 
-- **Spawn:** lazily, on the first `/vnc` connect.
-- **Teardown:** when the viewer WebSocket closes, agentd reaps the stack after a short **grace
-  window** (so a page refresh reconnects to the same Chrome rather than relaunching).
-- **Idle-eviction:** an idle session has no viewer attached, so the grace timer has already reaped
-  the stack before the idle threshold; as a belt-and-suspenders the pre-snapshot path also kills it.
-- **Resume:** after restore, the next connect launches a fresh stack.
+- **Spawn:** lazily, on the first agent `playwright-cli` use *or* the first `/vnc` connect (whichever
+  comes first; idempotent).
+- **Teardown (revised for the shared model):** viewer disconnect must **not** reap the browser — the
+  *agent* may still be driving it. Teardown is therefore **not** per-viewer; it happens at the
+  **snapshot-capture preamble and on idle-eviction** (the coordinator calls `stop_browser`). A viewer
+  disconnect only releases the tunnel's idle-evict lease pin. (#498 reaped 30 s after the RFB viewer
+  dropped; that is wrong once the agent shares the browser.)
+- **Idle-eviction:** when the session goes idle, `stop_browser` reaps the whole stack before the
+  snapshot, so a live Chrome is never frozen into a snapshot (RAM bloat + dead sockets on restore).
+- **Resume:** after restore, the next agent use or viewer connect launches a fresh stack.
 
 ### 7. Egress & security
 
@@ -312,6 +368,25 @@ bloat snapshots and violate the small-snapshot assumptions behind eviction durab
     `*_PROXY` var to forward) and the egress-proxy CA is trusted at the OS level (`cacerts.rs`), both
     independent of the browser's environment.
 
+### 8. The session's web surface — exposed ports as tabs (ADR 0064 fusion)
+
+The Browser tab is the session's whole web surface, fusing the live-host port exposures (ADR 0064):
+
+- **Rail.** `web/src/components/ports/ExposedPortsSection.tsx` relocates from the Diagnostics drawer to
+  a rail beside the browser (the component's own header comment already anticipates this). It keeps its
+  liveness dot, `shareUrl()` external ↗ link, and expose/revoke controls.
+- **Auto-open exposed HTTP ports as real tabs.** On browser open, each exposed port that answers the
+  HTTP liveness probe opens as a real Chrome tab at `http://localhost:<port>` (initial tabs via Chrome
+  launch args; ports exposed mid-session via the orchestrator's CDP metadata client
+  `Target.createTarget`). Non-HTTP ports (a DB port) stay as rail links only. The agent's own
+  navigation adds further tabs — so watching the agent and seeing your running services live in one
+  surface.
+- **Two views of every port.** The **in-guest tab** (`localhost:<port>`) is the shared, in-egress,
+  watch-the-agent view; the **pop-out ↗** (`shareUrl()`, the ADR-0064 vanity preview URL) opens the
+  port in the user's *own* browser — full fidelity + shareable, outside the session view. A "pop out
+  *this* tab ↗" action reads the focused tab's URL from the CDP metadata client and maps it to the
+  slug.
+
 ---
 
 ## Alternatives considered
@@ -327,6 +402,18 @@ bloat snapshots and violate the small-snapshot assumptions behind eviction durab
   exactly this.
 - **`--kiosk` Chrome.** *Rejected:* hides the address bar and tabs — unusable for a human who needs
   to navigate. We run full Chrome UI with no window manager chrome instead.
+- **Headless Chrome + CDP `Page.startScreencast` (the closed PR #503).** Lighter in-guest (no
+  Xvfb/x11vnc; event-driven; idle ≈ free) and it made the shared-instance model natural. *Rejected as
+  the default* because the day-one fidelity floor requires **native `<select>` dropdowns, native
+  dialogs, file pickers, and the browser's own right-click menu** — a native `<select>` popup is a
+  *separate OS window* that CDP screencast cannot capture even headful (screencast taps the page's
+  compositor surface, not the OS framebuffer), so CDP would have to *synthesize* each one (the
+  fiddliest, most breakable part of that path). Full-framebuffer VNC renders them for real. CDP
+  screencast is retained as the deferred lighter path for when in-guest **density** (not fidelity)
+  becomes the binding constraint; its detailed design is salvageable from the closed #503.
+- **A *separate* human browser (as #498 shipped).** *Rejected:* two Chromes (the agent's headless +
+  the human's headful) is the real weight cost, and the human never watches the agent. Unifying to one
+  shared Chrome (§1a) removes both problems.
 
 ## Testing & CI
 
@@ -349,10 +436,30 @@ bloat snapshots and violate the small-snapshot assumptions behind eviction durab
 
 ## Rollout / phases
 
-To be filled in as the work lands; flip to **Accepted** with the commit chain at the end. Expected
-shape: (P0) bundle + agentd `StartBrowser`; (P1) relay generalization (`target` field) + host-agent
-raw-TCP upstream; (P2) orchestrator `/vnc` route + capability flag; (P3) web `BROWSER` tab + noVNC;
-(P4) FC/VZ integration tests + CI wiring.
+Evolves #498's branch (`adr-0064-in-guest-browser-vnc`) — most of §1/§2/§5–§7 (bundle, `StartBrowser`,
+noVNC pane, security hardening) is reused intact; the deltas are unification (§1a), the transport
+migration (§3), the shared-model lifecycle (§6), and the ports fusion (§8). Flip to **Accepted** with
+the commit chain at the end. Stacked phases (one PR each, worktree per phase):
+
+- **P0 — Spike & measure (throwaway).** One headful Chrome + `--remote-debugging-port`; confirm the
+  agent's `connectOverCDP` driving and x11vnc capturing the *same* display coexist; measure RSS / idle
+  vs active CPU / snapshot-size delta vs the headless baseline. Validate whether openbox can be dropped
+  (focus/maximize) — keep it if not. Lock the bundle.
+- **P1 — Unify (§1a).** Chrome with the debug port; repoint `playwright-cli` via `connectOverCDP`;
+  `browser.rs` readiness = `/json/version` (Chrome opens the socket before DevTools is live). Agent +
+  human drive one Chrome; a `playwright-cli open` is visible in the VNC pane.
+- **P2 — Transport migration (§3).** Route RFB over the generic `ProxyPort`; `/vnc` becomes a
+  websockify over the tunnel; delete `proxy_vnc` + the `ShellTarget=VNC` discriminant. (This is also
+  where the branch reconciles with the generic-ports work on main.)
+- **P3 — Shared-model lifecycle (§6).** `stop_browser` at snapshot/idle-evict, not viewer-disconnect;
+  re-lazy-start on resume; viewer disconnect releases the lease pin only.
+- **P4 — Capability.** `browser` as the headful superset of `playwright`; `ProfileSnapshot.skills`
+  gating (reused from #498); catalog + picker copy.
+- **P5 — Ports fusion (§8).** Relocate `ExposedPortsSection` into the Browser panel; the CDP metadata
+  client (`orchestrator/src/browser/cdp-meta.ts`); auto-open exposed HTTP ports as tabs; pop-out ↗.
+- **P6 — e2e + CI.** Extend `e2e_vnc` to assert the **shared** browser (agent drive + VNC capture of
+  the same Chrome + a real RFB frame, per the liveness lesson); FC + VZ; wired into `ci.yml`'s
+  `--test` list.
 
 ## Decisions on the secondary questions
 
