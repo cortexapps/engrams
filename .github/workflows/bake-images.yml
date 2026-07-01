@@ -727,8 +727,7 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${SHA:0:7}"
-          for name in sentinel skills playwright integrations-cli browser; do
-          for name in sentinel skills playwright integrations-cli harness-claude; do
+          for name in sentinel skills playwright integrations-cli browser harness-claude; do
             REPO="ghcr.io/${{ github.repository }}/bundle-$name"
             # `oras pull <repo>:<sha>` drops <name>.squashfs into cwd verbatim.
             oras push "$REPO:$SHA" \
