@@ -698,14 +698,12 @@ jobs:
           deploy/bundles/sentinel/build.sh dist/sentinel.squashfs
           # skills: pure pack of our wrapper scripts + SKILL.md.
           deploy/bundles/skills/build.sh dist/skills.squashfs
-          # playwright: glibc Docker build (chromium-headless-shell + node +
-          # @playwright/mcp + deps), then squashfs.
-          deploy/bundles/playwright/build.sh dist/playwright.squashfs
           # integrations-cli (ADR 0058): glibc Docker build (gh + datadog-ci +
           # deps), then squashfs.
           deploy/bundles/integrations-cli/build.sh dist/integrations-cli.squashfs
-          # browser (ADR 0064): glibc Docker build (chromium + Xvfb + x11vnc +
-          # openbox + deps), then squashfs.
+          # browser (ADR 0064/0065): glibc Docker build (chromium + Xvfb + x11vnc
+          # + openbox + node + playwright-cli, pointed at that Chrome over CDP),
+          # then squashfs. Subsumes the retired headless `playwright` bundle.
           deploy/bundles/browser/build.sh dist/browser.squashfs
           # ADR 0062: the built-in claude harness (tree staged above).
           deploy/bundles/harness-claude/build.sh var/harness-claude-stage dist/harness-claude.squashfs
@@ -727,7 +725,7 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${SHA:0:7}"
-          for name in sentinel skills playwright integrations-cli browser harness-claude; do
+          for name in sentinel skills integrations-cli browser harness-claude; do
             REPO="ghcr.io/${{ github.repository }}/bundle-$name"
             # `oras pull <repo>:<sha>` drops <name>.squashfs into cwd verbatim.
             oras push "$REPO:$SHA" \

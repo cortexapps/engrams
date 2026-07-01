@@ -4,7 +4,7 @@
 # claude harness — mounted on dyn_0, exec'd as /opt/engram/dyn/0/harness).
 #
 # Unlike every other bundle's build.sh — which assembles its own tree (committed
-# files for skills/sentinel; container-fetched binaries for playwright/
+# files for skills/sentinel; container-fetched binaries for browser/
 # integrations-cli) — this one takes the tree as an ARGUMENT. The harness tree
 # (the `harness` entry binary, the engram-harness-claude crate, + the bundled
 # `claude` CLI) is produced by a separate build (the bake-harness-claude-artifact

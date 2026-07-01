@@ -182,10 +182,12 @@ The load-bearing change over #498-as-built. The launcher starts Chrome with
 agent reaches CDP in-guest directly, and the orchestrator reaches it through the ADR-0066 vsock relay
 (§3), so this full remote-control protocol is never exposed on the guest network. Then:
 
-- **Agent drives it.** The `playwright` skill's `playwright-cli` is repointed via
-  `connectOverCDP(http://127.0.0.1:9222)` (a `browser.cdpEndpoint` in its `cli.config.json`) so it
-  attaches to *this* Chrome instead of launching its own headless one. The agent's `open`/`click`/
-  `fill`/`snapshot` now act on the shared, human-visible browser.
+- **Agent drives it.** The `browser` bundle now ships `playwright-cli` itself (see the Capability note
+  below), configured via `browser.cdpEndpoint` in its `cli.config.json` to `connectOverCDP(http://
+  127.0.0.1:9222)` — it attaches to *this* Chrome instead of launching a headless one (the bundle
+  ships **no** headless-shell). Its wrapper runs `engram-browser --ensure` first (§6) so the shared
+  stack is up before it connects. The agent's `open`/`click`/`fill`/`snapshot` now act on the shared,
+  human-visible browser.
 - **Human views + controls it** over VNC exactly as below (x11vnc → noVNC). Because it is the same
   Chrome, the human sees the agent's real navigation and clicks; noVNC is not view-only, so the human
   can take the mouse/keyboard at any time. **v1 has no takeover/pause protocol** — concurrent human
@@ -196,35 +198,39 @@ agent reaches CDP in-guest directly, and the orchestrator reaches it through the
   tab/URL state — used to drive the exposed-ports rail, the "pop-out this tab ↗" affordance, and to
   open port-tabs (§8). It is **not** the display path and never proxies raw CDP to the web.
 
-**Capability = the headful superset of `playwright`.** `browser` is a distinct bundle/skill (it pulls
-the heavy X stack, so plain `playwright` profiles stay headless/light); the `browser` bundle also
-ships `playwright-cli` pointed at `:9222`. If a profile selects both, `browser` wins — the agent uses
-the shared headful instance.
+**Capability = one merged `browser` bundle — the `playwright` bundle is retired (decided with the
+user).** Rather than keep a separate headless `playwright` skill alongside, the `browser` bundle is
+now the single browser capability: it ships the headful Chrome + Xvfb + x11vnc + openbox **and**
+`playwright-cli` + the `show-your-work` skill, with `playwright-cli` pointed at that Chrome over CDP
+(no headless-shell). So selecting `browser` gives the human a browser to drive over VNC *and* the
+agent the SAME browser to drive programmatically, in one pick — `show-your-work` is worded so the
+agent discovers it drives the live, human-watched browser. Trade-off accepted: a simpler catalog at
+the cost of every browser profile carrying the full X stack — but the stack is **lazy** (nothing runs
+until first use, §6), so a profile that never opens the browser pays nothing.
 
-### 2. Lazy spawn — `engram-agentd` `StartBrowser`
+### 2. Lazy spawn — two audiences, one stack, reaped by a pidfile
 
-A new `WireRequest::StartBrowser` variant, modeled 1:1 on `WireRequest::StartShell`
-(`crates/engram-agentd/src/shell.rs`):
+Nothing browser-related runs at boot. The stack comes up **lazily on first use by *either*
+audience** — the merge (§1a) means the agent, not just the human, can trigger it:
 
-- **Lazy:** nothing browser-related runs at boot. The launcher is exec'd on the first `StartBrowser`,
-  and the call blocks until x11vnc is provably serving on `:5900` (the same readiness-probe +
-  spawn-timeout shape ttyd uses), so the relay only dials a port that's provably up.
-- **Readiness = a real RFB banner (as-built, hardening).** The probe doesn't merely TCP-connect — it
-  reads x11vnc's 12-byte RFB ProtocolVersion banner (`RFB 003.00x\n`). A bare accept is too weak: a
-  wedged x11vnc, or the original loopback-bind bug, accepts the connection yet serves zero bytes —
-  the exact "no messages over the endpoint" symptom — so "ready" must mean "actually speaking RFB".
-- **Idempotent / respawn:** subsequent calls re-probe and respawn only if the prior stack stopped
-  serving, guarded by a process-wide `tokio::Mutex` so concurrent calls serialize on the spawn
-  decision (mirrors the ttyd mutex — one browser stack per VM). A respawn tears the *whole* old
-  process group down with `killpg` (not just the leader via `kill_on_drop`), so it never orphans the
-  launcher's backgrounded children — Xvfb, openbox, and the chromium respawn loop.
-- **Drained, not console-blocked (as-built, hardening).** agentd pipes the launcher's stdout/stderr
-  and drains them to tracing. (The earlier plan named a `/var/log/engram/browser.log` redirect; the
-  load-bearing property is that they're *drained at all*.) chromium logs to stderr continuously and
-  the whole stack inherits the launcher's fds, so an undrained 64 KiB pipe fills and blocks every
-  writer — freezing the display.
+- **Human path:** `EnsureBrowser` (§4) → coord `StartBrowser` → `engram-agentd`'s `start_browser`.
+- **Agent path:** the bundled `playwright-cli` wrapper runs `engram-browser --ensure` before it
+  `connectOverCDP`s.
 
-A `DEFAULT_VNC_PORT = 5900` constant sits beside `DEFAULT_TTYD_PORT`.
+Both call the **same idempotent launcher entrypoint**, `engram-browser --ensure`: it probes, and if
+the stack is down brings the whole thing up **detached in its own process group** (`setsid`), records
+that pgid in a **pidfile** (`/tmp/engram-browser.pgid`), and waits until x11vnc accepts. It is
+`flock`-guarded so the two triggers cannot double-spawn. `start_browser` runs `--ensure` and then
+confirms readiness with a **real RFB banner** read on `:5900` — a bare accept is too weak: a wedged
+x11vnc (or the original loopback-bind bug) accepts yet serves zero bytes, the "no messages over the
+endpoint" symptom, so "ready" must mean "actually speaking RFB".
+
+Because the *agent* can spawn the stack, agentd holds **no child handle**. Teardown (§6) therefore
+reaps by the **pidfile** — `killpg` the recorded group — so it works whoever brought the stack up.
+This **replaces** #498-as-built's child-handle `killpg` + drained-pipe model: the detached stack
+redirects its own output, so there is no inherited pipe for agentd to drain, and the "register with
+agentd" contract is simply the pidfile (no in-guest control verb). A `DEFAULT_VNC_PORT = 5900`
+constant sits beside `DEFAULT_TTYD_PORT`; the pidfile path is `ENGRAM_BROWSER_PIDFILE`-overridable.
 
 ### 3. The tunnel — generalize the relay to carry any guest stream (Approach A)
 
@@ -459,9 +465,16 @@ the commit chain at the end. Stacked phases (one PR each, worktree per phase):
   agent's `connectOverCDP` driving and x11vnc capturing the *same* display coexist; measure RSS / idle
   vs active CPU / snapshot-size delta vs the headless baseline. Validate whether openbox can be dropped
   (focus/maximize) — keep it if not. Lock the bundle.
-- **P1 — Unify (§1a).** Chrome with the debug port; repoint `playwright-cli` via `connectOverCDP`;
-  `browser.rs` readiness = `/json/version` (Chrome opens the socket before DevTools is live). Agent +
-  human drive one Chrome; a `playwright-cli open` is visible in the VNC pane.
+- **P1 — Unify + merge (§1a, §2, §6) — this PR, stacked on the merged #498.** **Merge** `playwright`
+  into `browser` (retire the separate bundle, decided with the user): the `browser` bundle ships
+  `playwright-cli` (`cdpEndpoint`→`:9222`, **no** headless-shell) + `show-your-work`. Add the
+  two-audience lazy lifecycle — `engram-browser --ensure` (flock + detached + pidfile) called by both
+  the human `StartBrowser` path and the agent's `playwright-cli` wrapper — and **reap-by-pidfile** at
+  teardown. Readiness stays the RFB banner: the earlier `/json/version` CDP gate was dropped (DevTools
+  lags x11vnc on FC and made the spawn flaky; the agent's `connectOverCDP` retries CDP itself). *Dev-vm
+  acceptance gate:* a `playwright-cli open` lands in the *same* window the human sees over VNC (Chrome
+  default context, not a fresh Playwright context), and the stack reaps at idle. Folds in **P4**
+  (capability) — there is no longer a separate `playwright` skill to gate.
 - **P2 — Transport migration (§3).** Route RFB over the generic `ProxyPort`; `/vnc` becomes a
   websockify over the tunnel; delete `proxy_vnc` + the `ShellTarget=VNC` discriminant. (This is also
   where the branch reconciles with the generic-ports work on main.)

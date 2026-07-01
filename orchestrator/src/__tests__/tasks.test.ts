@@ -1123,14 +1123,14 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      profiles: makeFakeProfiles({ skills: ["skills", "playwright"] }),
+      profiles: makeFakeProfiles({ skills: ["skills", "browser"] }),
       images: fakeImages(),
       db: okDb(),
     });
     try {
       const client = makeClient(srv.serverUrl);
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
-      expect(fakeSessions.createReqs[0]?.selectedSkills).toEqual(["skills", "playwright"]);
+      expect(fakeSessions.createReqs[0]?.selectedSkills).toEqual(["skills", "browser"]);
     } finally {
       await srv.close();
     }

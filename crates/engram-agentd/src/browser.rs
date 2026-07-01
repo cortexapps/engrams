@@ -1,29 +1,24 @@
 //! In-guest browser (Xvfb + chromium + x11vnc) lifecycle (ADR 0065).
 //!
-//! Mirrors [`crate::shell`]: lazy spawn on the first
-//! [`StartBrowser`][crate::proto::WireRequest::StartBrowser], an RFB-banner
-//! probe to `127.0.0.1:5900` before replying so the ADR-0066 relay's
-//! guest-loopback dial finds x11vnc actually *serving* RFB (not a bare listener), and
-//! respawn only if the prior launcher exited. The launcher (`engram-browser`,
-//! symlinked onto PATH by the `browser` bundle's activation — see ADR 0065
-//! P0.1/P0.2) brings up the whole stack (Xvfb + openbox + chromium + x11vnc) in
-//! its own process group via `setsid`, so [`stop_browser`] reaps it with a
-//! single `killpg`. The launcher's stdout/stderr are drained to tracing (never
-//! left on an undrained pipe) so chromium's continuous logging can't fill the
-//! OS pipe buffer and block — and thereby freeze — the whole stack.
-//!
-//! Like the shell, the state is process-wide (one browser stack per VM) behind
-//! a tokio `Mutex` so concurrent `StartBrowser` calls serialize on the spawn
-//! decision rather than racing each other into two launcher processes.
+//! ONE shared stack serves two audiences — the human over VNC and the agent
+//! over CDP — so it can be brought up by EITHER: the human `EnsureBrowser` path
+//! (this module's [`start_browser`]) or the agent's `playwright-cli` wrapper
+//! (`engram-browser --ensure`). Both call the SAME idempotent launcher, which
+//! brings the whole stack up detached in its own process group (`setsid`) and
+//! records that pgid in a pidfile. So agentd holds no child handle;
+//! [`stop_browser`] reaps by the pidfile (`killpg`), and the reap is correct
+//! whoever spawned the stack (ADR 0065). `start_browser` still reads x11vnc's
+//! RFB banner on `127.0.0.1:5900` before replying so the ADR-0066 relay's
+//! guest-loopback dial finds x11vnc actually *serving* (not a bare listener).
 
 use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
@@ -47,19 +42,26 @@ const READY_DEADLINE: Duration = Duration::from_secs(20);
 const READY_PROBE_START: Duration = Duration::from_millis(100);
 const READY_PROBE_MAX: Duration = Duration::from_millis(800);
 
-/// Per-agent process state. Lazy because agentd in dev/test environments (no
-/// browser bundle activated, no requirement for a VNC tab) shouldn't even
-/// allocate a Mutex unless the host asks for one.
-static BROWSER: tokio::sync::OnceCell<Mutex<Option<BrowserHandle>>> =
-    tokio::sync::OnceCell::const_new();
+/// Agentd-side serialization for `start_browser`: two concurrent `StartBrowser`
+/// RPCs shouldn't both shell out to the launcher (the launcher's own flock +
+/// idempotent `--ensure` make that safe regardless; this just avoids a redundant
+/// subprocess). Lazy — dev/test agentd with no browser bundle never allocates
+/// it. No stack handle is cached: the launcher records the stack's process-group
+/// id in a pidfile and [`stop_browser`] reaps by THAT (ADR 0065), so the reap
+/// works whether the human path or the agent's `playwright-cli` brought it up.
+static BROWSER: tokio::sync::OnceCell<Mutex<()>> = tokio::sync::OnceCell::const_new();
 
-struct BrowserHandle {
-    child: Child,
-    port: u16,
+async fn start_lock() -> &'static Mutex<()> {
+    BROWSER.get_or_init(|| async { Mutex::new(()) }).await
 }
 
-async fn state() -> &'static Mutex<Option<BrowserHandle>> {
-    BROWSER.get_or_init(|| async { Mutex::new(None) }).await
+/// Pidfile the launcher records the stack's process-group id into — must match
+/// the launcher default (`deploy/bundles/browser/bin/engram-browser`). Override
+/// in lockstep via `ENGRAM_BROWSER_PIDFILE`.
+const DEFAULT_BROWSER_PIDFILE: &str = "/tmp/engram-browser.pgid";
+
+fn browser_pidfile() -> String {
+    std::env::var("ENGRAM_BROWSER_PIDFILE").unwrap_or_else(|_| DEFAULT_BROWSER_PIDFILE.to_string())
 }
 
 /// Outcome of a `start_browser` call. `spawned` distinguishes "the agent just
@@ -122,11 +124,11 @@ pub async fn start_browser(
     port: u16,
     session_env: HashMap<String, String>,
 ) -> io::Result<BrowserOutcome> {
-    let mut guard = state().await.lock().await;
+    let _serialize = start_lock().await.lock().await;
 
-    // Path 0: the port is already accepting — either this agentd spawned the
-    // stack on a prior call, or something restored it. Don't try to spawn (a
-    // second x11vnc would fail with EADDRINUSE); report `spawned = false`.
+    // Path 0: x11vnc is already serving on `port` — the stack is up (this
+    // agentd on a prior call, a restore, or the agent's `playwright-cli` via
+    // `engram-browser --ensure`). Don't re-trigger; report `spawned = false`.
     if probe_ready(port).await.is_ok() {
         return Ok(BrowserOutcome {
             port,
@@ -134,76 +136,42 @@ pub async fn start_browser(
         });
     }
 
-    // Path 1: we have a child handle but the port isn't accepting (Path 0
-    // already ruled out a live listener). Whether the launcher exited, is
-    // wedged, or was asked to move ports, tear the whole old group down (see
-    // `terminate_group` — `kill_on_drop` alone would orphan the chromium
-    // respawn loop) and fall through to a fresh spawn.
-    if let Some(mut handle) = guard.take() {
-        if handle.port != port {
-            tracing::info!(
-                old = handle.port,
-                new = port,
-                "browser port change requested; restarting"
-            );
-        } else {
-            match handle.child.try_wait() {
-                Ok(None) => tracing::warn!(
-                    port,
-                    "browser launcher still alive but port not accepting; restarting"
-                ),
-                Ok(Some(status)) => {
-                    tracing::warn!(port, exit = ?status, "browser launcher exited; restarting")
-                }
-                Err(e) => tracing::warn!(port, error = %e, "browser try_wait failed; restarting"),
-            }
-        }
-        terminate_group(&mut handle).await;
-    }
-
+    // Bring the stack up via the launcher's idempotent `--ensure`: it (re)probes
+    // and, if down, brings the whole stack up DETACHED in its own process group,
+    // records that pgid in the pidfile, and waits until x11vnc accepts before
+    // exiting. So this is the SAME entrypoint the agent's `playwright-cli`
+    // wrapper calls — one shared stack, and `stop_browser` reaps it by the
+    // pidfile regardless of which audience triggered it (ADR 0065). The stack is
+    // NOT our child (it reparents to agentd, pid 1); we only wait on the
+    // short-lived `--ensure` process, then confirm the RFB banner the host's VNC
+    // dial relies on.
     let bin = std::env::var("ENGRAM_BROWSER_BIN")
         .unwrap_or_else(|_| DEFAULT_BROWSER_LAUNCHER.to_string());
-    tracing::info!(%bin, port, "spawning browser stack");
+    tracing::info!(%bin, port, "ensuring browser stack");
 
-    let mut cmd = Command::new(&bin);
-    // The browser renders untrusted pages, so it must NOT inherit the session's
-    // secrets — hand it only the non-secret allowlist (`browser_env`), not the
-    // full `session_env`. agentd's chosen VNC port is set *after* so a stray
-    // ENGRAM_BROWSER_VNC_PORT carried in the env can't shadow it.
-    cmd.envs(browser_env(&session_env))
+    let out = Command::new(&bin)
+        .arg("--ensure")
+        // The browser renders untrusted pages, so hand it only the non-secret
+        // allowlist (`browser_env`), never the full `session_env`. Set the VNC
+        // port *after* so a stray ENGRAM_BROWSER_VNC_PORT can't shadow it.
+        .envs(browser_env(&session_env))
         .env("ENGRAM_BROWSER_VNC_PORT", port.to_string())
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // agentd can exit cleanly; the launcher shouldn't survive it.
-        // kill_on_drop sends SIGKILL to the leader when the handle drops.
-        .kill_on_drop(true);
-    // Own process group so stop_browser can killpg the whole stack (the
-    // launcher re-parents the children it spawns under this leader).
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| io::Error::new(e.kind(), format!("spawn browser launcher ({bin}): {e}")))?;
-
-    // Drain the launcher's stdout/stderr so chromium's continuous output can't
-    // fill the 64 KiB OS pipe buffer and block — and thereby freeze — the whole
-    // stack (Xvfb/openbox/chromium/x11vnc all inherit the launcher's fds). The
-    // drain tasks self-terminate on EOF when stop_browser / kill_on_drop reaps
-    // the group, so they need no separate shutdown.
-    if let Some(out) = child.stdout.take() {
-        drain_launcher_output(out, "stdout");
+        .output()
+        .await
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("run browser launcher ({bin} --ensure): {e}"),
+            )
+        })?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "engram-browser --ensure failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
-    if let Some(err) = child.stderr.take() {
-        drain_launcher_output(err, "stderr");
-    }
-
-    *guard = Some(BrowserHandle { child, port });
-
-    // Drop the guard while waiting so other StartBrowser callers see the new
-    // handle immediately and don't serialize behind our probe loop.
-    drop(guard);
 
     wait_until_ready(port).await?;
 
@@ -213,41 +181,45 @@ pub async fn start_browser(
     })
 }
 
-/// Tear down the browser stack: `killpg` the launcher's process group
-/// (SIGTERM) so Xvfb/openbox/chromium/x11vnc all reap together, then a SIGKILL
-/// backstop on the leader. Idempotent — a no-op when nothing is running.
+/// Tear down the browser stack by the pidfile the launcher recorded: `killpg`
+/// its process group (SIGTERM, then a SIGKILL backstop) so Xvfb/openbox/
+/// chromium/x11vnc all reap together, then unlink the pidfile. Reaps regardless
+/// of who spawned the stack — the human `EnsureBrowser` path or the agent's
+/// `playwright-cli` `--ensure` — since agentd holds no handle either way (ADR
+/// 0065). Idempotent: no pidfile → nothing registered → no-op.
 pub async fn stop_browser() -> io::Result<()> {
-    let mut guard = state().await.lock().await;
-    if let Some(mut handle) = guard.take() {
-        terminate_group(&mut handle).await;
+    let _serialize = start_lock().await.lock().await;
+    let pidfile = browser_pidfile();
+    let contents = match tokio::fs::read_to_string(&pidfile).await {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    if let Ok(pgid) = contents.trim().parse::<i32>() {
+        terminate_pgid(pgid).await;
     }
+    // Clear the registration so a later probe-miss doesn't reap a recycled pgid.
+    let _ = tokio::fs::remove_file(&pidfile).await;
     Ok(())
 }
 
-/// SIGTERM the launcher's whole process group, then SIGKILL the leader as a
-/// backstop, and reap it. Shared by `stop_browser` and `start_browser`'s
-/// restart path: `kill_on_drop` alone only SIGKILLs the group *leader*, which
-/// on a respawn would orphan the backgrounded children — Xvfb, openbox, and
-/// especially the chromium respawn loop, which would otherwise keep relaunching
-/// chrome forever. killpg reaps the whole stack as a unit.
-async fn terminate_group(handle: &mut BrowserHandle) {
-    // `nix` is a Linux-only dependency of this crate (the guest is always
-    // Linux); gate the killpg on linux specifically rather than `unix` so the
-    // macOS cross-compile — where `cfg(unix)` is true but `nix` is absent —
-    // still builds. The SIGKILL path below covers the leader on every platform.
-    #[cfg(target_os = "linux")]
-    if let Some(pid) = handle.child.id() {
-        // Negative pid == process group: the launcher is the group leader (via
-        // process_group(0) at spawn). ESRCH (group already gone) is fine —
-        // this is best-effort.
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        );
-    }
-    let _ = handle.child.kill().await; // SIGKILL backstop on the leader
-    let _ = handle.child.wait().await;
+/// SIGTERM then (after a grace) SIGKILL the stack's whole process group. The
+/// launcher put every process — Xvfb/openbox/chromium/x11vnc — in this one
+/// group via `setsid`, so this reaps the stack as a unit. Once their launcher
+/// exits the group reparents to agentd (pid 1), whose init reaping collects the
+/// corpses; we hold no `Child` to wait on. ESRCH (group already gone) is fine.
+#[cfg(target_os = "linux")]
+async fn terminate_pgid(pgid: i32) {
+    let pid = nix::unistd::Pid::from_raw(pgid);
+    let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGTERM);
+    sleep(Duration::from_millis(300)).await;
+    let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
 }
+
+/// `nix` is a Linux-only dep of this crate (the guest is always Linux); on the
+/// macOS cross-compile — where `cfg(unix)` holds but `nix` is absent — reaping
+/// is a no-op (there is no in-guest stack there).
+#[cfg(not(target_os = "linux"))]
+async fn terminate_pgid(_pgid: i32) {}
 
 /// Wait until x11vnc is serving RFB on `port` — that's "the browser stack is
 /// up". The CDP debug port (`:9222`) chromium exposes for the agent's
@@ -317,39 +289,8 @@ async fn probe_ready(port: u16) -> io::Result<()> {
     Ok(())
 }
 
-/// Forward a launcher pipe (stdout/stderr) to tracing, line by line, until EOF.
-///
-/// The reason this exists is the *read*, not the log: chromium writes to stderr
-/// continuously, and if agentd left these pipes undrained the OS pipe buffer
-/// would fill and block every writer that inherited the launcher's fds —
-/// freezing the browser stack. Reading here empties the pipe; the `debug!` is a
-/// bonus (even with that level disabled the read still drains). The task ends
-/// on EOF — when the launcher group is reaped its write ends close — so it
-/// needs no separate shutdown signal.
-fn drain_launcher_output<R>(reader: R, stream: &'static str)
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    tracing::debug!(target: "engram_agentd::browser", stream, "{line}")
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::debug!(stream, error = %e, "browser log drain ended on read error");
-                    break;
-                }
-            }
-        }
-    });
-}
-
-/// Kill the cached browser handle, if any. Test-only — production relies on
-/// `kill_on_drop` (and `stop_browser`) but `cargo test` shares the `OnceCell`
-/// across cases in one process, so a test needs an explicit reset.
+/// Reset the browser stack between tests — `cargo test` shares the `OnceCell`
+/// and the pidfile across cases in one process, so a test explicitly reaps.
 #[cfg(test)]
 pub async fn shutdown_for_tests() -> io::Result<()> {
     stop_browser().await
@@ -368,6 +309,12 @@ mod tests {
     /// `python3` is present in the `just test-linux` `rust:bookworm` image
     /// (Python 3.11). If it's somehow absent the test skips rather than
     /// failing spuriously — but the canonical lane has it.
+    ///
+    /// Linux-only: the reap goes through `terminate_pgid`, which is a `nix`
+    /// `killpg` (a no-op on the macOS cross-build, where `nix` is absent) — and
+    /// the browser stack is a Linux-guest feature that never runs on macOS
+    /// agentd anyway. The workspace macOS lane excludes it; the Linux lane runs it.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn start_browser_spawns_launcher_and_probes_port() {
         use std::os::unix::fs::PermissionsExt;
@@ -390,60 +337,97 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
 
-        // Fake launcher: bind the VNC port and accept connections forever,
-        // replying with x11vnc's 12-byte RFB ProtocolVersion banner so
-        // `probe_ready`'s banner read succeeds. Accepting in a loop lets both
-        // agentd's internal probe AND the test's re-probe connect (a backlog-1
-        // listen that never accepts would refuse the second connect). A
-        // python-shebang script keeps the source as plain, correctly-indented
-        // python — no inline `-c` escaping.
+        // Fake launcher speaking the real `--ensure` contract (ADR 0065): if the
+        // port already accepts it's a no-op; otherwise it forks a DETACHED
+        // (`setsid`) listener that replies with x11vnc's 12-byte RFB banner, and
+        // records that detached process's pgid (== its pid after setsid) in the
+        // pidfile — exactly what agentd's `stop_browser` reads to `killpg`.
+        // Accepting in a loop lets both agentd's probe and the test's re-probe
+        // connect. A python-shebang script keeps the source plain (no `-c`
+        // escaping).
         let script = format!(
             r#"#!/usr/bin/env python3
-import socket
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", {port}))
-s.listen(16)
-while True:
+import os, sys, socket, time
+PORT = {port}
+PIDFILE = os.environ["ENGRAM_BROWSER_PIDFILE"]
+
+def up():
     try:
-        c, _ = s.accept()
-        c.sendall(b"RFB 003.008\n")
-        c.close()
-    except Exception:
-        pass
+        socket.create_connection(("127.0.0.1", PORT), timeout=0.2).close()
+        return True
+    except OSError:
+        return False
+
+def serve():
+    os.setsid()                       # detached: own session/group, pgid == pid
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", PORT))
+    s.listen(16)
+    while True:
+        try:
+            c, _ = s.accept(); c.sendall(b"RFB 003.008\n"); c.close()
+        except Exception:
+            pass
+
+if sys.argv[1:2] == ["--ensure"]:
+    if up():
+        sys.exit(0)                   # already up: idempotent no-op
+    pid = os.fork()
+    if pid == 0:
+        os.close(0); os.close(1); os.close(2)
+        serve(); os._exit(0)
+    with open(PIDFILE, "w") as f:
+        f.write(str(pid))             # register the detached stack's pgid
+    for _ in range(200):
+        if up():
+            sys.exit(0)
+        time.sleep(0.05)
+    sys.exit(1)
+sys.exit(0)
 "#
         );
         let dir = tempfile::tempdir().unwrap();
         let launcher = dir.path().join("engram-browser");
         std::fs::write(&launcher, script).unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pidfile = dir.path().join("browser.pgid");
 
-        // Scope the env var so we don't pollute sibling tests.
-        let prev = std::env::var("ENGRAM_BROWSER_BIN").ok();
+        // Scope both env vars so we don't pollute sibling tests.
+        let prev_bin = std::env::var("ENGRAM_BROWSER_BIN").ok();
+        let prev_pid = std::env::var("ENGRAM_BROWSER_PIDFILE").ok();
         std::env::set_var("ENGRAM_BROWSER_BIN", &launcher);
-        // Ensure no stale handle from a prior run leaks in.
+        std::env::set_var("ENGRAM_BROWSER_PIDFILE", &pidfile);
+        // Ensure no stale stack from a prior run leaks in.
         let _ = shutdown_for_tests().await;
 
         let out = start_browser(port, HashMap::new()).await;
 
-        // Second call should observe the listener already up (spawned=false)
-        // — but only attempt it if the first succeeded.
+        // Second call should observe the stack already up (spawned=false) — but
+        // only attempt it if the first succeeded.
         let again = if out.is_ok() {
             Some(start_browser(port, HashMap::new()).await)
         } else {
             None
         };
 
-        // Always tear down + restore env before asserting so a panic can't
-        // leak the fake launcher into a sibling test.
+        // Tear down via the pidfile-reap path, then confirm the detached stack
+        // is actually gone (the port stops accepting).
         let _ = shutdown_for_tests().await;
-        if let Some(p) = prev {
-            std::env::set_var("ENGRAM_BROWSER_BIN", p);
-        } else {
-            std::env::remove_var("ENGRAM_BROWSER_BIN");
+        sleep(Duration::from_millis(400)).await;
+        let reaped = TcpStream::connect(("127.0.0.1", port)).await.is_err();
+
+        // Restore env before asserting so a panic can't leak into a sibling.
+        match prev_bin {
+            Some(p) => std::env::set_var("ENGRAM_BROWSER_BIN", p),
+            None => std::env::remove_var("ENGRAM_BROWSER_BIN"),
+        }
+        match prev_pid {
+            Some(p) => std::env::set_var("ENGRAM_BROWSER_PIDFILE", p),
+            None => std::env::remove_var("ENGRAM_BROWSER_PIDFILE"),
         }
 
-        let out = out.expect("first start_browser should spawn + probe ready");
+        let out = out.expect("first start_browser should ensure + probe ready");
         assert_eq!(out.port, port);
         assert!(out.spawned, "first call should report spawned = true");
 
@@ -452,6 +436,11 @@ while True:
         assert!(
             !again.spawned,
             "second call should see the stack already up (spawned = false)"
+        );
+
+        assert!(
+            reaped,
+            "stop_browser should have killpg'd the pidfile's group; port still accepts"
         );
     }
 

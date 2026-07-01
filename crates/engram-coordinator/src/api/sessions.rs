@@ -1928,7 +1928,7 @@ mod tests {
     fn assign_skill_slots_maps_caps_and_rejects() {
         use engram_core::types::sandbox::AuxRoDrive;
         let catalog: std::collections::HashMap<&str, &str> =
-            [("skills", "sha_a"), ("playwright", "sha_b")]
+            [("skills", "sha_a"), ("browser", "sha_b")]
                 .into_iter()
                 .collect();
 
@@ -1937,7 +1937,7 @@ mod tests {
 
         // ADR 0062: slot 0 is the harness, so skills start at dyn_1. Two skills
         // → two drives at dyn_1 / dyn_2 with the catalog shas, in request order.
-        let mounts = assign_skill_slots(&catalog, &["skills".into(), "playwright".into()]).unwrap();
+        let mounts = assign_skill_slots(&catalog, &["skills".into(), "browser".into()]).unwrap();
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].drive_id, AuxRoDrive::slot_drive_id(1));
         assert_eq!(mounts[0].guest_mount, AuxRoDrive::slot_guest_mount(1));

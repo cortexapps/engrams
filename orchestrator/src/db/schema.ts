@@ -123,7 +123,7 @@ export const profile = pgTable("profile", {
   includeUserTokens: boolean("include_user_tokens").notNull().default(false),
   envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
   // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
-  // ["skills", "playwright"]). Resolved by the coordinator to reserved-slot
+  // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
   // mounts at session create. Empty = base session (no skills).
   skills: jsonb("skills").$type<string[]>().notNull().default([]),
   // ADR 0056: integration capabilities ("provider:action[@resource]") this

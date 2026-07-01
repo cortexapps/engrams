@@ -117,7 +117,7 @@ HOST_BASE_PATHS = ["deploy/packer/", "deploy/otel/"]
 # coarse behavior `web/` has always had).
 IMAGES_PATHS = ["docker/", "web/", "orchestrator/", "deploy/migrations/"] + BINARY_COMMON
 TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
-# ADR 0027: the RO session bundles (skills / playwright). A change here means
+# ADR 0027: the RO session bundles (skills / browser / …). A change here means
 # the bundle artifacts must be rebuilt + republished, and the FC-host image
 # re-baked to pull the new squashfs. Independent of the Rust/OS lanes.
 BUNDLES_PATHS = ["deploy/bundles/"]
