@@ -27,6 +27,7 @@ import type { IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 import { WebSocketServer, type WebSocket as WsConn, type RawData } from "ws";
 
+import { ConnectError, Code } from "@connectrpc/connect";
 import { config } from "../config.ts";
 import { portRelay as defaultPortRelay } from "../control-plane/client.ts";
 import {
@@ -51,6 +52,17 @@ function safeCloseCode(code: number): number {
     return 1000;
   }
   return code;
+}
+
+/** ADR 0066: map a relay-tunnel failure to a WebSocket close code/reason. The
+ * coordinator returns `resource_exhausted` when a session is at its concurrent
+ * preview-connection cap → 1013 "Try Again Later" (retryable); anything else is
+ * a generic 1011 upstream failure. */
+function previewWsCloseFor(err: unknown): [number, string] {
+  if (err instanceof ConnectError && err.code === Code.ResourceExhausted) {
+    return [1013, "too many concurrent preview connections"];
+  }
+  return [1011, "preview upstream error"];
 }
 
 /** Build the `server.on("upgrade")` hook. Returns `true` if it handled the
@@ -161,6 +173,10 @@ function bridgeClientToGuest(
   clientWs.on("close", closeGuest);
   clientWs.on("error", closeGuest);
 
+  // Captured from the relay tunnel so the terminal close path can signal the
+  // coordinator's `resource_exhausted` (preview-connection cap, ADR 0066) as a
+  // retryable 1013 rather than a generic 1011.
+  let tunnelError: unknown;
   const server = net.createServer((sock) => {
     server.close(); // one connection per upgrade
     const tunnel = tunnelSocket(relay, sessionId, port, abort.signal);
@@ -171,12 +187,15 @@ function bridgeClientToGuest(
       tunnel.destroy();
     };
     sock.on("error", tearDown);
-    tunnel.on("error", tearDown);
+    tunnel.on("error", (err) => {
+      tunnelError = err;
+      tearDown();
+    });
   });
 
   server.on("error", () => {
     try {
-      clientWs.close(1011, "preview proxy error");
+      clientWs.close(...previewWsCloseFor(tunnelError));
     } catch {
       /* already closing */
     }
@@ -208,7 +227,14 @@ function bridgeClientToGuest(
     };
     gw.onclose = (ev: CloseEvent) => {
       try {
-        clientWs.close(safeCloseCode(ev.code), ev.reason);
+        // If the relay tunnel itself errored (e.g. the preview-connection cap),
+        // the guest WS closes abnormally (1006) — surface the tunnel's mapped
+        // code instead of the opaque 1006 so the client can distinguish it.
+        if (tunnelError !== undefined) {
+          clientWs.close(...previewWsCloseFor(tunnelError));
+        } else {
+          clientWs.close(safeCloseCode(ev.code), ev.reason);
+        }
       } catch {
         /* noop */
       }
@@ -220,7 +246,7 @@ function bridgeClientToGuest(
     };
     gw.onerror = () => {
       try {
-        clientWs.close(1011, "preview upstream error");
+        clientWs.close(...previewWsCloseFor(tunnelError));
       } catch {
         /* noop */
       }
