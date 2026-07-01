@@ -53,17 +53,22 @@ struct PortLeaseGuard {
     host: Arc<dyn engram_core::traits::HostClient>,
     sandbox_id: engram_core::SandboxId,
     released: bool,
+    /// ADR 0066: the per-session preview slot, released when this guard drops
+    /// (i.e. on every connection-exit path, exactly with the pin).
+    _preview: Option<crate::state::PreviewPermit>,
 }
 
 impl PortLeaseGuard {
     fn new(
         host: Arc<dyn engram_core::traits::HostClient>,
         sandbox_id: engram_core::SandboxId,
+        preview: Option<crate::state::PreviewPermit>,
     ) -> Self {
         Self {
             host,
             sandbox_id,
             released: false,
+            _preview: preview,
         }
     }
 
@@ -143,6 +148,21 @@ impl app::port_relay_service_server::PortRelayService for AppPortRelayService {
                 ))
             })?;
 
+        // ADR 0066: fail fast if this session is already at its concurrent-
+        // preview-connection cap — before auto-resume, sandbox resolution, or
+        // touching the host/guest. The permit is held for the connection's
+        // lifetime by the bridge's lease guard (released on every exit path);
+        // on any early return here it drops and releases immediately.
+        let preview_permit = self
+            .state
+            .preview_conns
+            .try_acquire(session_id)
+            .ok_or_else(|| {
+                Status::resource_exhausted(format!(
+                    "session {session_id} is at its concurrent preview-connection cap"
+                ))
+            })?;
+
         // ---- 2. Session lifecycle: ensure active (auto-resume Idle) --
         crate::api::snapshot::ensure_active(&self.state, session_id)
             .await
@@ -175,8 +195,9 @@ impl app::port_relay_service_server::PortRelayService for AppPortRelayService {
         let tunnel = match host.proxy_port(sandbox_id, port).await {
             Ok(t) => t,
             Err(e) => {
-                // Release the pin we just acquired before returning.
-                let guard = PortLeaseGuard::new(host.clone(), sandbox_id);
+                // Release the pin we just acquired before returning. The preview
+                // permit drops with `preview_permit` at the return below.
+                let guard = PortLeaseGuard::new(host.clone(), sandbox_id, None);
                 guard.release();
                 return Err(Status::unavailable(format!(
                     "proxy_port tunnel open failed: {e}"
@@ -185,7 +206,9 @@ impl app::port_relay_service_server::PortRelayService for AppPortRelayService {
         };
 
         // ---- 5. Bridge: inbound gRPC ↔ PortTunnel -------------------
-        let lease = PortLeaseGuard::new(host.clone(), sandbox_id);
+        // The lease guard now also owns the preview slot for the connection's
+        // lifetime (released on every exit path, exactly with the pin).
+        let lease = PortLeaseGuard::new(host.clone(), sandbox_id, Some(preview_permit));
         let relay_stream = build_relay_stream(session_id, sandbox_id, host, inbound, tunnel, lease);
 
         Ok(Response::new(Box::pin(relay_stream)))
