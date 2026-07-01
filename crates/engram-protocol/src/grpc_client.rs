@@ -30,16 +30,18 @@ use tonic::service::Interceptor;
 use tonic::transport::Channel;
 
 use crate::grpc::host_service_client::HostServiceClient;
+use crate::grpc::proxy_port_message::Body as ProxyPortBody;
 use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     AnswerHarnessQuestionRequest, ApplyEgressPolicyRequest, BindHarnessSessionRequest,
     BuildBaseSnapshotRequest, CreateSandboxRequest, DequeueHarnessQueuedPromptRequest,
     EditHarnessQueuedPromptRequest, Empty, ExecStartRequest, GuestIpResponse,
     InterruptHarnessRequest, MigrationExportRef, MigrationFetchRequest, MigrationItem,
-    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ProxyTarget, ReapMaterializeDirRequest,
-    RehandshakeHarnessRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, StartAgentRequest, StringList, UnbindHarnessSessionRequest,
+    ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
+    ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
+    ReapMaterializeDirRequest, RehandshakeHarnessRequest, RestoreBaseForSessionRequest,
+    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest, StringList,
+    UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -1015,9 +1017,6 @@ impl GrpcHostClient {
             yield ProxyShellMessage {
                 body: Some(ProxyShellBody::Open(ProxyShellOpen {
                     sandbox_id: sandbox_bytes,
-                    // ADR 0064: existing shell relay path; default discriminant.
-                    // P1.4 threads a real target through for the VNC stream.
-                    target: ProxyTarget::Shell as i32,
                 })),
             };
             while let Some(frame) = outbound_rx.recv().await {
@@ -1062,36 +1061,39 @@ impl GrpcHostClient {
         Ok(tunnel)
     }
 
-    /// ADR 0064: open a bidi ProxyShell stream to the host for the VNC target.
-    /// Identical to [`proxy_shell`](Self::proxy_shell) except the initial Open
-    /// frame carries `target: ProxyTarget::Vnc` — the host-agent's gRPC server
-    /// reads it and dials x11vnc instead of ttyd. The frame-pumping is verbatim.
-    pub async fn proxy_vnc(
+    /// ADR 0064: open a bidi ProxyPort stream to the host. Sends the
+    /// initial `Open` carrying `sandbox_id` + `port`, then returns a
+    /// `PortTunnel` whose channels the caller bridges to the orchestrator
+    /// preview connection. Raw-byte sibling of [`Self::proxy_shell`].
+    pub async fn proxy_port(
         &self,
         sandbox_id: SandboxId,
-    ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
-        use engram_core::types::shell::ShellTunnel;
+        port: u16,
+    ) -> Result<engram_core::types::port::PortTunnel, SandboxError> {
+        use engram_core::types::port::PortTunnel;
         use futures::StreamExt;
 
-        let (tunnel, ends) = ShellTunnel::pair();
-        let engram_core::types::shell::ShellTunnelEnds {
+        let (tunnel, ends) = PortTunnel::pair();
+        let engram_core::types::port::PortTunnelEnds {
             mut outbound_rx,
             inbound_tx,
         } = ends;
 
+        // First message is always `Open` — the only place sandbox_id +
+        // port live. Subsequent messages are pure `Data` chunks.
         let sandbox_bytes = sandbox_id.as_uuid().as_bytes().to_vec();
+        let port_u32 = u32::from(port);
 
         let out_stream = async_stream::stream! {
-            yield ProxyShellMessage {
-                body: Some(ProxyShellBody::Open(ProxyShellOpen {
+            yield ProxyPortMessage {
+                body: Some(ProxyPortBody::Open(ProxyPortOpen {
                     sandbox_id: sandbox_bytes,
-                    // ADR 0064: VNC target — host dials x11vnc raw TCP on :5900.
-                    target: ProxyTarget::Vnc as i32,
+                    port: port_u32,
                 })),
             };
-            while let Some(frame) = outbound_rx.recv().await {
-                yield ProxyShellMessage {
-                    body: Some(shell_frame_to_proxy_body(frame)),
+            while let Some(buf) = outbound_rx.recv().await {
+                yield ProxyPortMessage {
+                    body: Some(ProxyPortBody::Data(ProxyPortData { data: buf.to_vec() })),
                 };
             }
         };
@@ -1099,7 +1101,7 @@ impl GrpcHostClient {
         let mut inbound_stream = self
             .inner
             .clone()
-            .proxy_shell(out_stream)
+            .proxy_port(out_stream)
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -1110,20 +1112,18 @@ impl GrpcHostClient {
                 let msg = match next {
                     Ok(m) => m,
                     Err(e) => {
-                        tracing::warn!(error = %e, "proxy_vnc client recv error");
+                        tracing::warn!(error = %e, "proxy_port client recv error");
                         break;
                     }
                 };
-                let sf = match proxy_body_to_shell_frame(msg.body) {
-                    Ok(Some(sf)) => sf,
-                    Ok(None) => continue, // body=None or Open echoed back (server bug; drop)
-                    Err(e) => {
-                        tracing::warn!(error = %e, "proxy_vnc decode error");
-                        break;
+                match msg.body {
+                    Some(ProxyPortBody::Data(d)) => {
+                        if inbound_tx.send(d.data.into()).await.is_err() {
+                            break; // caller dropped the tunnel
+                        }
                     }
-                };
-                if inbound_tx.send(sf).await.is_err() {
-                    break;
+                    // Close / empty / a stray Open echoed back: stop pumping.
+                    _ => break,
                 }
             }
         });
@@ -1459,11 +1459,12 @@ impl HostClient for GrpcHostClient {
         Self::proxy_shell(self, sandbox_id).await
     }
 
-    async fn proxy_vnc(
+    async fn proxy_port(
         &self,
         sandbox_id: SandboxId,
-    ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
-        Self::proxy_vnc(self, sandbox_id).await
+        port: u16,
+    ) -> Result<engram_core::types::port::PortTunnel, SandboxError> {
+        Self::proxy_port(self, sandbox_id, port).await
     }
 
     // harness_dial + set_harness_sink use the trait defaults — gRPC

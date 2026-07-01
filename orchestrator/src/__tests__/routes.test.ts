@@ -565,49 +565,30 @@ function makeFakeSecretStore(): UserSecretStore & { store: Record<string, string
   };
 }
 
-describe("/me/claude-token route", () => {
-  test("10: POST without session → 401", async () => {
-    const meRoute = makeMeRoute({
-      secrets: makeFakeSecretStore(),
-      getSession: makeGetSession(null),
-    });
-
-    const app = new Hono();
-    app.route("/", meRoute);
-    app.notFound((c) => c.json({ error: "not found" }, 404));
-    app.onError((err, c) => {
-      if ("status" in err && typeof err.status === "number") {
-        return c.json({ error: err.message }, err.status as 401);
-      }
-      return c.json({ error: String(err) }, 500);
-    });
-
-    const { baseUrl, server } = await startServer(app);
-    try {
-      const res = await fetch(`${baseUrl}/api/v1/me/claude-token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: "sk-ant-test" }),
-      });
-      expect(res.status).toBe(401);
-      console.log("Test 10 PASS: POST /me/claude-token without session → 401");
-    } finally {
-      await stopServer(server);
-    }
+describe("/me/harness-env route", () => {
+  // The harness env var under test: the claude harness's declared user_env.
+  const ENV = "CLAUDE_CODE_OAUTH_TOKEN";
+  const fakeHarnessCatalog = () => ({
+    listHarnesses: async () => ({
+      harnesses: [{ name: "claude", descriptor: { label: "Claude Code", auth: { userEnv: ENV } } }],
+    }),
   });
+  type EnvVarsBody = {
+    vars: Array<{ envVar: string; harnesses: Array<{ name: string; label: string }>; present: boolean }>;
+  };
 
-  test("11: POST/GET/DELETE round-trip — correct JSON shapes", async () => {
+  /** Build the /me app with an error mapper that surfaces HTTPException codes. */
+  const meApp = (member: string | null) => {
     const meRoute = makeMeRoute({
       secrets: makeFakeSecretStore(),
-      getSession: makeGetSession(MEMBER_A),
+      harnessCatalog: fakeHarnessCatalog(),
+      getSession: makeGetSession(member),
     });
-
     const app = new Hono();
     app.route("/", meRoute);
     app.notFound((c) => c.json({ error: "not found" }, 404));
     app.onError((err, c) => {
       if ("status" in err && typeof err.status === "number") {
-        // Use a raw Response to avoid Hono's ContentfulStatusCode type constraint.
         return new Response(JSON.stringify({ error: err.message }), {
           status: err.status,
           headers: { "Content-Type": "application/json" },
@@ -615,49 +596,74 @@ describe("/me/claude-token route", () => {
       }
       return c.json({ error: String(err) }, 500);
     });
+    return app;
+  };
 
-    const { baseUrl, server } = await startServer(app);
+  test("10: GET without session → 401", async () => {
+    const { baseUrl, server } = await startServer(meApp(null));
     try {
-      // GET before POST → has_claude_token: false
-      const getRes1 = await fetch(`${baseUrl}/api/v1/me/claude-token`);
-      expect(getRes1.status).toBe(200);
-      const body1 = (await getRes1.json()) as { has_claude_token: boolean };
-      expect(body1.has_claude_token).toBe(false);
-
-      // POST → 204
-      const postRes = await fetch(`${baseUrl}/api/v1/me/claude-token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: "sk-ant-oat01-test-token" }),
-      });
-      expect(postRes.status).toBe(204);
-
-      // GET after POST → has_claude_token: true
-      const getRes2 = await fetch(`${baseUrl}/api/v1/me/claude-token`);
-      expect(getRes2.status).toBe(200);
-      const body2 = (await getRes2.json()) as { has_claude_token: boolean };
-      expect(body2.has_claude_token).toBe(true);
-
-      // DELETE → 204
-      const delRes = await fetch(`${baseUrl}/api/v1/me/claude-token`, {
-        method: "DELETE",
-      });
-      expect(delRes.status).toBe(204);
-
-      // GET after DELETE → has_claude_token: false
-      const getRes3 = await fetch(`${baseUrl}/api/v1/me/claude-token`);
-      expect(getRes3.status).toBe(200);
-      const body3 = (await getRes3.json()) as { has_claude_token: boolean };
-      expect(body3.has_claude_token).toBe(false);
-
-      console.log("Test 11 PASS: POST→GET(true)→DELETE→GET(false) round-trip");
+      const res = await fetch(`${baseUrl}/api/v1/me/harness-env`);
+      expect(res.status).toBe(401);
     } finally {
       await stopServer(server);
     }
   });
 
-  test("12: token value never appears in console output", async () => {
-    const SECRET_TOKEN = "sk-ant-oat01-super-secret-never-logged-12345";
+  test("11: GET lists the catalog user_env union; PUT/DELETE flips present", async () => {
+    const { baseUrl, server } = await startServer(meApp(MEMBER_A));
+    try {
+      // GET before PUT → the var is listed (with the asking harness), present:false.
+      const g1 = await fetch(`${baseUrl}/api/v1/me/harness-env`);
+      expect(g1.status).toBe(200);
+      const b1 = (await g1.json()) as EnvVarsBody;
+      expect(b1.vars).toHaveLength(1);
+      expect(b1.vars[0]).toMatchObject({ envVar: ENV, present: false });
+      expect(b1.vars[0]!.harnesses[0]).toMatchObject({ name: "claude", label: "Claude Code" });
+
+      // PUT → 204.
+      const put = await fetch(`${baseUrl}/api/v1/me/harness-env/${ENV}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: "sk-ant-oat01-test-token" }),
+      });
+      expect(put.status).toBe(204);
+
+      // GET after PUT → present:true.
+      const g2 = await fetch(`${baseUrl}/api/v1/me/harness-env`);
+      const b2 = (await g2.json()) as EnvVarsBody;
+      expect(b2.vars[0]).toMatchObject({ envVar: ENV, present: true });
+
+      // DELETE → 204, then GET → present:false.
+      const del = await fetch(`${baseUrl}/api/v1/me/harness-env/${ENV}`, { method: "DELETE" });
+      expect(del.status).toBe(204);
+      const g3 = await fetch(`${baseUrl}/api/v1/me/harness-env`);
+      const b3 = (await g3.json()) as EnvVarsBody;
+      expect(b3.vars[0]).toMatchObject({ envVar: ENV, present: false });
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  test("12: PUT/DELETE for an env var no harness declares → 404", async () => {
+    const { baseUrl, server } = await startServer(meApp(MEMBER_A));
+    try {
+      const put = await fetch(`${baseUrl}/api/v1/me/harness-env/NOT_A_HARNESS_ENV`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: "x" }),
+      });
+      expect(put.status).toBe(404);
+      const del = await fetch(`${baseUrl}/api/v1/me/harness-env/NOT_A_HARNESS_ENV`, {
+        method: "DELETE",
+      });
+      expect(del.status).toBe(404);
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  test("13: value never appears in console output", async () => {
+    const SECRET = "sk-ant-oat01-super-secret-never-logged-12345";
 
     // Spy on all console methods.
     const logMessages: string[] = [];
@@ -666,7 +672,6 @@ describe("/me/claude-token route", () => {
     const originalError = console.error;
     const originalInfo = console.info;
     const originalDebug = console.debug;
-
     const capture = (...args: unknown[]) => {
       logMessages.push(args.map(String).join(" "));
     };
@@ -677,44 +682,25 @@ describe("/me/claude-token route", () => {
     console.debug = capture;
 
     try {
-      const meRoute = makeMeRoute({
-        secrets: makeFakeSecretStore(),
-        getSession: makeGetSession(MEMBER_A),
-      });
-
-      const app = new Hono();
-      app.route("/", meRoute);
-      app.notFound((c) => c.json({ error: "not found" }, 404));
-
-      const { baseUrl, server } = await startServer(app);
+      const { baseUrl, server } = await startServer(meApp(MEMBER_A));
       try {
-        await fetch(`${baseUrl}/api/v1/me/claude-token`, {
-          method: "POST",
+        await fetch(`${baseUrl}/api/v1/me/harness-env/${ENV}`, {
+          method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token: SECRET_TOKEN }),
+          body: JSON.stringify({ value: SECRET }),
         });
       } finally {
         await stopServer(server);
       }
-
-      // Assert the secret token was never logged.
       for (const msg of logMessages) {
-        expect(msg).not.toContain(SECRET_TOKEN);
+        expect(msg).not.toContain(SECRET);
       }
-
+    } finally {
       console.log = originalLog;
       console.warn = originalWarn;
       console.error = originalError;
       console.info = originalInfo;
       console.debug = originalDebug;
-      console.log("Test 12 PASS: token value never appeared in console output");
-    } catch (err) {
-      console.log = originalLog;
-      console.warn = originalWarn;
-      console.error = originalError;
-      console.info = originalInfo;
-      console.debug = originalDebug;
-      throw err;
     }
   });
 });

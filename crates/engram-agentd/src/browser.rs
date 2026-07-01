@@ -2,8 +2,8 @@
 //!
 //! Mirrors [`crate::shell`]: lazy spawn on the first
 //! [`StartBrowser`][crate::proto::WireRequest::StartBrowser], an RFB-banner
-//! probe to `127.0.0.1:5900` before replying so the host's `proxy_vnc` dial
-//! finds x11vnc actually *serving* RFB (not merely a bare TCP listener), and
+//! probe to `127.0.0.1:5900` before replying so the ADR-0066 relay's
+//! guest-loopback dial finds x11vnc actually *serving* RFB (not a bare listener), and
 //! respawn only if the prior launcher exited. The launcher (`engram-browser`,
 //! symlinked onto PATH by the `browser` bundle's activation — see ADR 0064
 //! P0.1/P0.2) brings up the whole stack (Xvfb + openbox + chromium + x11vnc) in
@@ -27,8 +27,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
-/// Default RFB port the in-VM x11vnc binds. The host's `proxy_vnc` uses the
-/// matching `engram_host_agent::proxy_vnc::VNC_PORT` (Task P1.2).
+/// Default RFB port the in-VM x11vnc binds — loopback (ADR 0066). The
+/// orchestrator reaches it over the vsock port relay (`PROXY_PORT_VSOCK_PORT`):
+/// agentd dials `127.0.0.1:5900` in-guest and splices RFB bytes.
 pub const DEFAULT_VNC_PORT: u16 = 5900;
 
 /// Default CDP debug port chromium exposes for the SHARED-browser model

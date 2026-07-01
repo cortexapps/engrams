@@ -656,6 +656,37 @@ jobs:
       - name: Install squashfs-tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
 
+      # ADR 0062: the built-in claude harness rides the stamp as `bundle-harness-claude`.
+      # Build its tree (the engram-harness-claude musl binary + the pinned claude CLI —
+      # the same recipe as ci.yml's bake-harness-claude-artifact) so it packs + publishes
+      # alongside the other bundles below.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ''
+          target: x86_64-unknown-linux-musl
+      - name: Install build deps (musl-tools, protoc)
+        run: sudo apt-get install -y -qq --no-install-recommends musl-tools protobuf-compiler
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Same musl release deps as ci.yml's bake-harness-claude-artifact.
+          shared-key: release-musl-bake
+      - name: Stage harness-claude tree
+        run: |
+          set -euo pipefail
+          # Keep CLAUDE_VERSION in lockstep with ci.yml's bake-harness-claude-artifact.
+          CLAUDE_VERSION=2.1.185
+          cargo build --release --target x86_64-unknown-linux-musl -p engram-harness-claude
+          curl -fsSL --retry 3 \
+            "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
+            -o /tmp/claude
+          chmod +x /tmp/claude
+          STAGE="$PWD/var/harness-claude-stage"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp -p target/x86_64-unknown-linux-musl/release/engram-harness-claude "$STAGE/harness"
+          cp -p /tmp/claude "$STAGE/claude"
+          cp -p deploy/harness-claude/harness.toml "$STAGE/harness.toml"
+
       - name: Build bundles
         run: |
           set -euo pipefail
@@ -676,6 +707,8 @@ jobs:
           # browser (ADR 0064): glibc Docker build (chromium + Xvfb + x11vnc +
           # openbox + deps), then squashfs.
           deploy/bundles/browser/build.sh dist/browser.squashfs
+          # ADR 0062: the built-in claude harness (tree staged above).
+          deploy/bundles/harness-claude/build.sh var/harness-claude-stage dist/harness-claude.squashfs
           ls -l dist/
 
       - name: Log in to GHCR
@@ -695,6 +728,7 @@ jobs:
           set -euo pipefail
           SHORT="${SHA:0:7}"
           for name in sentinel skills playwright integrations-cli browser; do
+          for name in sentinel skills playwright integrations-cli harness-claude; do
             REPO="ghcr.io/${{ github.repository }}/bundle-$name"
             # `oras pull <repo>:<sha>` drops <name>.squashfs into cwd verbatim.
             oras push "$REPO:$SHA" \
@@ -733,7 +767,13 @@ jobs:
   # the downstream FC-host bakes pull that GHCR artifact, so firing
   # them without it would 404 on the pull.
   notify:
-    needs: [detect, bake, publish-host-binaries, publish-bundles]
+    # publish-node-assets is in `needs` purely for ORDERING: the bundles
+    # dispatch below rolls the host fleet onto the node-assets image, and
+    # engrams-internal's deploy resolves node-assets to THIS sha — which only
+    # exists once publish-node-assets has pushed it. It is deliberately NOT in
+    # the failure guards below: a node-assets bake failure must not block
+    # engrams-changed / engrams-tf-changed (those don't roll node-assets content).
+    needs: [detect, bake, publish-host-binaries, publish-bundles, publish-node-assets]
     if: |
       always() &&
       github.event_name == 'push' &&
@@ -772,6 +812,8 @@ jobs:
           TF_CHANGED: ${{ needs.detect.outputs.tf_or_helm }}
           BUNDLES_CHANGED: ${{ needs.detect.outputs.bundles }}
           DEV_IMAGE_CHANGED: ${{ needs.detect.outputs.dev_image }}
+          # Gate the bundles dispatch on the node-assets bake (see below).
+          NODE_ASSETS_RESULT: ${{ needs.publish-node-assets.result }}
         run: |
           set -euo pipefail
           fire() {
@@ -805,8 +847,22 @@ jobs:
           # ADR 0027: a bundle change republished the squashfs artifacts above;
           # the FC-host image must re-bake to pull them onto every host. The
           # engrams-internal handler for this re-stages /var/lib/engram/shared.
+          #
+          # This MUST wait for publish-node-assets: that job bakes the node-assets
+          # image (pulling bundle-*:main) that the host fleet rolls onto, and it
+          # finishes AFTER publish-bundles. engrams-internal's deploy resolves
+          # node-assets to THIS sha; firing before the image exists made it
+          # resolve the STALE node-assets, so the fleet silently never picked up
+          # the new bundle (observed: f65f6927, the NSS-softoken bundle fix).
+          # notify now lists publish-node-assets in `needs`, so by here the image
+          # is published — fire only once it actually succeeded.
           if [[ "$BUNDLES_CHANGED" == "true" ]]; then
-            fire engrams-bundles-changed
+            if [[ "$NODE_ASSETS_RESULT" == "success" ]]; then
+              fire engrams-bundles-changed
+            else
+              echo "::error::bundles changed but publish-node-assets=$NODE_ASSETS_RESULT — the new node-assets image is absent, so a deploy would roll the fleet onto the stale one. Not firing engrams-bundles-changed."
+              exit 1
+            fi
           fi
           # ADR 0027: auto-rebake the dev-engrams dogfood session image when
           # any source it builds moved. This only triggers the bake; ENABLING

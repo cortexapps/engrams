@@ -393,6 +393,25 @@ orchestrator:
   # public https URL in any OIDC deploy, or the IdP redirect lands nowhere.
   publicUrl: ""
 
+  # ADR 0064 — live-host port previews. The wildcard base domain under which a
+  # session's exposed guest port is served at `<slug>.<baseDomain>`
+  # (ORCHESTRATOR_PREVIEW_BASE_DOMAIN). Empty ⇒ the env var is omitted and the
+  # orchestrator uses its dev default (`lvh.me:<port>`, which only resolves to
+  # 127.0.0.1 locally), so the feature is inert in a stock deploy. To enable in
+  # a real deployment set this to e.g. "preview.example.com" AND, in your values
+  # overlay, also:
+  #   - add a `*.<baseDomain>` host to web.ingress.hosts whose "/" path retargets
+  #     `service:` at the orchestrator (the same per-path retarget the Slack
+  #     webhooks use) — the orchestrator matches the Host header and tunnels to
+  #     the session's guest port;
+  #   - provision a wildcard TLS cert for `*.<baseDomain>` + a wildcard DNS
+  #     record pointing at the web Ingress IP;
+  #   - keep it behind your auth wall (e.g. the IAP BackendConfig). The
+  #     orchestrator additionally enforces a per-exposure owner/admin/share-token
+  #     check, so a leaked slug alone grants nothing.
+  preview:
+    baseDomain: ""
+
   # TRUSTED_ORIGINS — comma-joined here from this list; better-auth CORS /
   # CSRF origin allowlist (the browser origins that may call the API).
   trustedOrigins: []
@@ -449,15 +468,20 @@ orchestrator:
   # an unset block leaves that auth path fully inert.
   #
   #   email+password  → set NOTHING here (dev / simple deploys)
-  #   IAP             → set auth.iap.audience (GCP IAP in front of the Ingress)
+  #   IAP             → set auth.iap.audiences (GCP IAP in front of the Ingress)
   #   OIDC            → set auth.oidc.{issuer,clientId,clientSecret} ("Sign in
   #                     with your IdP"; yields real user names via the `profile`
   #                     scope, which stock GCP IAP can't supply)
   auth:
-    # IAP — GCP Identity-Aware Proxy bridge. Set `audience` to enable; the
-    # bridge is fully inert (zero header reads) when empty.
+    # IAP — GCP Identity-Aware Proxy bridge. Add one or more trusted audiences
+    # to enable; the bridge is fully inert (zero header reads) when empty. A
+    # SET because the orchestrator can sit behind more than one IAP-protected
+    # GCP backend service (e.g. the app's web Ingress AND the ADR 0064 preview
+    # Gateway), and a GCP IAP audience IS the backend-service resource — there
+    # is no single audience shared across backends. Rendered to IAP_AUDIENCES
+    # (comma-joined); verification accepts an assertion matching ANY entry.
     iap:
-      audience: ""    # /projects/<PROJECT_NUMBER>/apps/<APP_ID> (or backendServices form)
+      audiences: []    # e.g. [/projects/<NUM>/global/backendServices/<ID>, …]
       # Override the IAP JWKS endpoint (default in config.ts points at gstatic).
       # Leave empty in prod.
       jwksUrl: ""

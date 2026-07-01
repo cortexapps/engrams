@@ -3,6 +3,7 @@
 // completed run (non-busy) so no loop animation / Web-Animations path mounts
 // under jsdom.
 
+import { useState } from "react";
 import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -19,6 +20,42 @@ const AT2 = "2026-06-02T12:00:18.000Z";
 
 function indexed(events: SessionEvent[]): IndexedEvent[] {
   return events.map((event, idx) => ({ idx, event }));
+}
+
+// Regression harness for the cross-session optimistic-bubble bleed: the sessions
+// rail navigates by path param only, so `SessionThread` is NOT remounted on a
+// session switch — its optimistic `pending` array is shared across every session
+// visited in one page load. This flips `sessionId` on a SINGLE instance (no
+// `key` → no remount), exactly mirroring that navigation; each pending entry must
+// be scoped to the session it was sent to.
+function NavHarness() {
+  const [sid, setSid] = useState("session-A");
+  return (
+    <>
+      <button onClick={() => setSid("session-A")}>nav-A</button>
+      <button onClick={() => setSid("session-B")}>nav-B</button>
+      <SessionThread
+        sessionId={sid}
+        status="idle"
+        events={
+          sid === "session-A"
+            ? []
+            : indexed([
+                { type: "run_started", run_id: "rb", prompt_summary: null, at: AT },
+                {
+                  type: "agent_message",
+                  run_id: "rb",
+                  message_id: "ab",
+                  role: "assistant",
+                  text: "B's own reply",
+                  at: AT,
+                },
+                { type: "run_completed", run_id: "rb", ok: true, at: AT2 },
+              ])
+        }
+      />
+    </>
+  );
 }
 
 describe("SessionThread", () => {
@@ -232,5 +269,30 @@ describe("SessionThread", () => {
     });
     // Optimistic receipt: the form is replaced while the answer round-trips.
     await waitFor(() => expect(screen.getByText("saving…")).toBeTruthy());
+  });
+
+  // Regression: an idle send to session A must not bleed its optimistic bubble
+  // into session B when the same (un-remounted) SessionThread navigates there,
+  // and the bubble must reappear on returning to A (it survives navigation; it's
+  // reset only on a full page load).
+  test("an optimistic prompt is scoped to its session: no cross-session bleed, survives nav-back", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<NavHarness />);
+
+    // Send an idle prompt while viewing session A (⌘/Ctrl+↵ submits).
+    const input = await screen.findByLabelText("Message input");
+    await user.click(input);
+    await user.type(input, "bleed-probe-A");
+    await user.keyboard("{Control>}{Enter}{/Control}");
+    await waitFor(() => expect(screen.getByText("bleed-probe-A")).toBeTruthy());
+
+    // Navigate to session B (same instance, no remount): the bubble must NOT bleed.
+    await user.click(screen.getByText("nav-B"));
+    await waitFor(() => expect(screen.getByText("B's own reply")).toBeTruthy());
+    expect(screen.queryByText("bleed-probe-A")).toBeNull();
+
+    // Back to A: the optimistic bubble is still there.
+    await user.click(screen.getByText("nav-A"));
+    await waitFor(() => expect(screen.getByText("bleed-probe-A")).toBeTruthy());
   });
 });

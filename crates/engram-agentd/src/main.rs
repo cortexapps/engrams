@@ -7,14 +7,10 @@
 //!   to the same UDS path our process bound).
 //! - `--port <PORT>` — host↔guest transport listener (Linux-only),
 //!   selected at runtime by [`engram_transport::from_env`] reading
-//!   `ENGRAM_TRANSPORT`. Two impls:
-//!   - `vsock` (default; Firecracker production path) — listens on
-//!     AF_VSOCK port `<PORT>`, host dials via FC's vsock proxy.
-//!   - `console` (VZ on Apple Silicon) — opens
-//!     `/dev/hvc<N>` for the well-known port mapping; host pairs
-//!     bytes via VZVirtioConsoleDevice + NSFileHandle. See
-//!     `crates/engram-transport/src/console.rs` for the port→hvc
-//!     map.
+//!   `ENGRAM_TRANSPORT`. One impl: `vsock` — listens on AF_VSOCK port
+//!   `<PORT>`. Both backends dial it: Firecracker via its vsock proxy,
+//!   VZ via `VZVirtioSocketDevice.connectToPort` (ADR 0066 Phase 2, which
+//!   retired VZ's earlier virtio-console transport).
 //!
 //! On SIGTERM/SIGINT the accept loop stops taking new connections;
 //! in-flight execs continue until they exit naturally (no
@@ -131,7 +127,7 @@ fn main() -> ExitCode {
 enum Listen {
     Unix(PathBuf),
     /// `--port <PORT>` — listen via the transport selected by
-    /// `ENGRAM_TRANSPORT` (vsock or virtio-console).
+    /// `ENGRAM_TRANSPORT` (vsock).
     Transport(u32),
 }
 
@@ -190,7 +186,7 @@ fn parse_args() -> Result<Args, String> {
                      [--token <T>]\n\n\
                      In-guest exec daemon. Accepts WireExecRequest frames,\n\
                      runs commands, streams stdout/stderr/exit back.\n\n\
-                     `--port` listens via ENGRAM_TRANSPORT (vsock|console).\n\
+                     `--port` listens via ENGRAM_TRANSPORT (vsock).\n\
                      `--vsock-port` is a deprecated alias retained for FC bakes.\n\n\
                      With --token, the host must send a WireHandshake with\n\
                      the matching token before WireExecRequest is accepted.\n\
@@ -337,11 +333,9 @@ async fn run_unix(
     }
 }
 
-/// Listen via the runtime-selected transport (vsock or
-/// virtio-console). Each accepted connection is handed to a fresh
-/// `serve_connection` task; vsock yields concurrent streams as
-/// expected, console reopens `/dev/hvcN` per accept and effectively
-/// serializes (one exec at a time per port).
+/// Listen via the runtime-selected transport (vsock). Each accepted
+/// connection is handed to a fresh `serve_connection` task; vsock yields
+/// concurrent streams, so multiple exec / control RPCs run in parallel.
 async fn run_transport(
     port: u32,
     token: Option<String>,
@@ -352,6 +346,15 @@ async fn run_transport(
     let mut listener = transport.listen(port).await?;
     let kind = std::env::var("ENGRAM_TRANSPORT").unwrap_or_else(|_| "vsock".into());
     tracing::info!(port, transport = %kind, "engram-agentd listening");
+
+    // ADR 0066: the vsock port relay for live-preview port-forwarding. Its own
+    // detached listener on PROXY_PORT_VSOCK_PORT (1030), dialed host→guest per
+    // forwarded browser connection. Spawned BEFORE the readiness handshake so
+    // 1030 is bound before the host takes a base snapshot — restored VMs are
+    // dial-ready. Best-effort + self-contained (it binds its own listener, no
+    // ready-port dependency). NOT spawned from `run_unix`: Process dev has no VM
+    // boundary, so the host dials the guest's 127.0.0.1 directly.
+    tokio::spawn(engram_agentd::port_relay::run_port_relay());
 
     // ADR 0015 M1: dial the host on the readiness port. The host
     // blocks on `accept()` here in its `start_agent` — replacing the
@@ -378,15 +381,15 @@ async fn run_transport(
     // listener cover this window. On a fast boot the first dial succeeds, so this
     // costs nothing; restored sandboxes don't re-run this path at all (the host
     // pre-sets agent_ready), so the restore tail is untouched.
-    // Skip the readiness handshake on transports without a ready port
-    // (virtio-console / VZ). There's no ready-port device to dial, the host's
-    // `wait_agent_ready` is FC-only, and spinning ~90s on the impossible dial
-    // before `accept()` lets early host requests pile up on the single console
-    // byte stream and desync (host reads a GuestIp reply for its SpawnHarness).
-    // Going straight to the accept loop lets agentd serve RPCs immediately.
+    //
+    // Both vsock backends listen on the ready port: FC via `wait_agent_ready`,
+    // VZ via the `vsock_bridge` drain listener (ADR 0066 Phase 2). The retired
+    // virtio-console transport had no ready-port device, which is why this used
+    // to be gated on `supports_ready_port()`; with vsock everywhere the dial
+    // always has a listener, so we always run the handshake.
     let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     let mut attempt: u32 = 0;
-    while transport.supports_ready_port() {
+    loop {
         attempt += 1;
         match transport
             .dial(engram_agentd::ENGRAM_AGENTD_READY_PORT)

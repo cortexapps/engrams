@@ -13,8 +13,8 @@
 //! ```
 //!
 //! The Tiltfile configures the coordinator with bearer `dev-app-grpc-token`
-//! (overridable via `ENGRAM_APP_GRPC_TOKENS`). These smokes discover a
-//! no-harness image via `ImageService.ListEnabledImages` over gRPC and then
+//! (overridable via `ENGRAM_APP_GRPC_TOKENS`). These smokes discover an
+//! enabled image via `ImageService.ListEnabledImages` over gRPC and then
 //! drive session lifecycle / exec / snapshot / shell-relay over gRPC.
 //!
 //! ADR 0051 Drip E: the coordinator's REST surface is gone — `StreamEvents`
@@ -57,12 +57,13 @@ fn bearer_interceptor(
     }
 }
 
-/// Discover a no-harness image via `ImageService.ListEnabledImages` over gRPC.
+/// Discover an enabled image via `ImageService.ListEnabledImages` over gRPC.
 ///
-/// Returns the image URI (e.g. `"localhost:5001/demo:warm"`) or `None` when
-/// no no-harness image is enabled. The smoke prints a skip notice in that
-/// case.
-async fn find_no_harness_image(addr: &str, token: &str) -> Option<String> {
+/// Returns the first image's URI (e.g. `"localhost:5001/demo:warm"`) or `None`
+/// when nothing is enabled. ADR 0062: an image carries no harness identity, so
+/// any enabled image works — these smokes create the session as `dev_vm`
+/// (`harness: None`). Prints a skip notice when the list is empty.
+async fn find_enabled_image(addr: &str, token: &str) -> Option<String> {
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .expect("valid gRPC endpoint")
         .connect_timeout(std::time::Duration::from_secs(5));
@@ -87,17 +88,14 @@ async fn find_no_harness_image(addr: &str, token: &str) -> Option<String> {
         }
     };
 
-    for img in &resp.images {
-        if img.harness_name.as_deref().unwrap_or("").is_empty() {
-            println!("smoke: using no-harness image {:?}", img.image_uri);
-            return Some(img.image_uri.clone());
-        }
+    if let Some(img) = resp.images.first() {
+        println!("smoke: using enabled image {:?}", img.image_uri);
+        return Some(img.image_uri.clone());
     }
 
     println!(
-        "SKIP: no enabled image with harness_name=null found ({} images checked). \
-         Enable a no-harness image first (e.g. `just enable-image localhost:5001/demo:warm`).",
-        resp.images.len()
+        "SKIP: no enabled image found. \
+         Enable one first (e.g. `just enable-image localhost:5001/demo:warm`)."
     );
     None
 }
@@ -110,7 +108,7 @@ async fn stream_events_smoke() {
     let Some((addr, token)) = grpc_addr_and_token() else {
         return;
     };
-    let Some(image_uri) = find_no_harness_image(&addr, &token).await else {
+    let Some(image_uri) = find_enabled_image(&addr, &token).await else {
         return;
     };
 
@@ -133,11 +131,14 @@ async fn stream_events_smoke() {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
         image_uri: image_uri.clone(),
-        mode: String::new(),
+        mode: "dev_vm".to_string(),
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses an enabled image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -255,7 +256,7 @@ async fn session_crud_smoke() {
     let Some((addr, token)) = grpc_addr_and_token() else {
         return;
     };
-    let Some(image_uri) = find_no_harness_image(&addr, &token).await else {
+    let Some(image_uri) = find_enabled_image(&addr, &token).await else {
         return;
     };
 
@@ -276,11 +277,14 @@ async fn session_crud_smoke() {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
         image_uri: image_uri.clone(),
-        mode: String::new(),
+        mode: "dev_vm".to_string(),
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses an enabled image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -378,7 +382,7 @@ async fn exec_streaming_smoke() {
     let Some((addr, token)) = grpc_addr_and_token() else {
         return;
     };
-    let Some(image_uri) = find_no_harness_image(&addr, &token).await else {
+    let Some(image_uri) = find_enabled_image(&addr, &token).await else {
         return;
     };
 
@@ -402,6 +406,9 @@ async fn exec_streaming_smoke() {
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses an enabled image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -500,7 +507,7 @@ async fn snapshot_evict_resume_smoke() {
     let Some((addr, token)) = grpc_addr_and_token() else {
         return;
     };
-    let Some(image_uri) = find_no_harness_image(&addr, &token).await else {
+    let Some(image_uri) = find_enabled_image(&addr, &token).await else {
         return;
     };
 
@@ -524,6 +531,9 @@ async fn snapshot_evict_resume_smoke() {
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses an enabled image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -634,7 +644,7 @@ async fn get_artifact_not_found_smoke() {
     let Some((addr, token)) = grpc_addr_and_token() else {
         return;
     };
-    let Some(image_uri) = find_no_harness_image(&addr, &token).await else {
+    let Some(image_uri) = find_enabled_image(&addr, &token).await else {
         return;
     };
 
@@ -658,6 +668,9 @@ async fn get_artifact_not_found_smoke() {
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses an enabled image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -707,7 +720,7 @@ async fn shell_relay_smoke() {
     let Some((addr, token)) = grpc_addr_and_token() else {
         return;
     };
-    let Some(image_uri) = find_no_harness_image(&addr, &token).await else {
+    let Some(image_uri) = find_enabled_image(&addr, &token).await else {
         return;
     };
 
@@ -733,6 +746,9 @@ async fn shell_relay_smoke() {
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
+        // ADR 0062: this smoke uses an enabled image; under the new model an
+        // agent-mode create needs a catalog harness, so these run as dev_vm.
+        harness: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = session_client
@@ -755,7 +771,6 @@ async fn shell_relay_smoke() {
             .try_send(app::RelayShellRequest {
                 frame: Some(app::relay_shell_request::Frame::Open(app::ShellOpen {
                     session_id: session_id.clone(),
-                    target: app::ShellTarget::Shell as i32,
                 })),
             })
             .expect("buffer open frame (channel is empty)");

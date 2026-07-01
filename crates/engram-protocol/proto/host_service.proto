@@ -181,6 +181,21 @@ service HostService {
   // 1.7.8 rejects with a TCP-RST).
   rpc ProxyShell(stream ProxyShellMessage) returns (stream ProxyShellMessage);
 
+  // ADR 0064: bidi RAW-BYTE port tunnel — the protocol-agnostic
+  // generalization of ProxyShell. Where ProxyShell carries WS frames
+  // to a pinned ttyd:7681, ProxyPort carries opaque TCP bytes to an
+  // ARBITRARY guest port, so a dev server (HTTP/1.1, h2c, WebSocket
+  // upgrade, gRPC) the agent started is reachable from the web.
+  //
+  // First client message MUST be `ProxyPortMessage.open` carrying
+  // `sandbox_id` + `port`; subsequent messages from either side are
+  // `data` (a byte chunk) or `close`. Same Open-is-a-distinct-oneof-arm
+  // discipline as ProxyShell so the open sentinel can never be mistaken
+  // for payload bytes. The host dials `guest_ip:port` inside the right
+  // network namespace (cold: host root; warm: the per-VM netns) and
+  // shuttles raw bytes both ways.
+  rpc ProxyPort(stream ProxyPortMessage) returns (stream ProxyPortMessage);
+
   // ---- pool warming ----
   // Lightweight no-op that forces TCP+H2 handshake when called on a
   // freshly built `Channel::connect_lazy`. Coord pods fire one of
@@ -558,19 +573,8 @@ message ProxyShellMessage {
   }
 }
 
-// ADR 0064: which in-guest service the host-agent dials for this stream.
-// PROXY_TARGET_SHELL (0, default) = ttyd WebSocket on :7681. PROXY_TARGET_VNC
-// = x11vnc raw TCP on :5900 (RFB bytes ride the `binary` frame variant).
-enum ProxyTarget {
-  PROXY_TARGET_SHELL = 0;
-  PROXY_TARGET_VNC = 1;
-}
-
 message ProxyShellOpen {
   bytes sandbox_id = 1;
-  // ADR 0064: shell (default) vs vnc. Defaulting to 0=SHELL preserves the
-  // existing wire behavior for older callers and already-serialized frames.
-  ProxyTarget target = 2;
 }
 
 message ProxyShellText {
@@ -595,6 +599,43 @@ message ProxyShellClose {
   uint32 code = 1;
   string reason = 2;
 }
+
+// --- ADR 0064: ProxyPort ---
+//
+// Raw-byte sibling of ProxyShellMessage. `open` is sent exactly once
+// by the coord at stream start (carrying which sandbox + which port to
+// dial); `data` is a byte chunk in either direction; `close` is a
+// clean half/full teardown. There is no text/ping/pong distinction —
+// this is an opaque TCP pipe, so framing/keepalive is the inner
+// protocol's concern. Data chunks are bounded (~64 KiB) by the pump so
+// each message stays well under tonic's 4 MiB default.
+
+message ProxyPortMessage {
+  oneof body {
+    // Coord → host, sent exactly once at stream start. The host MUST
+    // reject a stream that opens with any other variant, and MUST
+    // reject any subsequent Open.
+    ProxyPortOpen open = 1;
+    // Bidirectional from this point on: coord → host is bytes bound
+    // for the guest socket; host → coord is bytes the guest produced.
+    ProxyPortData data = 2;
+    ProxyPortClose close = 3;
+  }
+}
+
+message ProxyPortOpen {
+  bytes sandbox_id = 1; // 16-byte UUID
+  uint32 port = 2;      // guest TCP port to dial (1..=65535)
+}
+
+message ProxyPortData {
+  bytes data = 1;
+}
+
+// Clean teardown sentinel. No fields — TCP carries no close code, and
+// channel/stream closure is the EOF signal; this variant just lets one
+// side say "I'm done writing" explicitly when it has no trailing data.
+message ProxyPortClose {}
 
 // --- ADR 0016 Phase A: CowState / CowStateAll ---
 

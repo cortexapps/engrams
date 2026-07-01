@@ -131,11 +131,15 @@ export const auth = betterAuth({
     }),
     { provider: "pg" },
   ),
-  // Dev/self-hosted door. NOTE: public sign-up = open registration.
-  // Acceptable in dev only; production posture (disable sign-up /
-  // allowlist) is decided in Task 22 — do not deploy past Phase 4
-  // without it.
-  emailAndPassword: { enabled: true },
+  // Email/password is the dev/self-hosted door. It is DISABLED whenever the
+  // orchestrator runs behind GCP IAP (IAP_AUDIENCES set): IAP is then the sole
+  // identity source and the bridge mints sessions from the verified assertion,
+  // so a parallel password door (open registration + a credential to phish or
+  // brute-force) is pure attack surface. When IAP is off (dev / self-hosted)
+  // this stays enabled, and public sign-up = open registration — acceptable in
+  // dev only. The web Login page reads the same posture via /api/v1/auth-config
+  // so it doesn't render a password form that the server would reject.
+  emailAndPassword: { enabled: config.iapAudiences.length === 0 },
   // Encrypt better-auth's stored OAuth access/refresh/id tokens at rest
   // (the `account` table columns). NOTE: this uses the BETTER_AUTH_SECRET
   // (the framework's own encryption mechanism) — NOT the shared engrams KEK.

@@ -25,6 +25,7 @@ export type Subjects =
   | "Session"
   | "EnabledImage"
   | "Profile"
+  | "Harness"
   | "Fleet"
   | "Registry"
   | "all";
@@ -71,6 +72,11 @@ export function abilityFor(user: AbilityUser): AppAbility {
   // Profiles: every member reads the picker menu; mutations are admin-only
   // (manage("all")). ADR 0052 §6.
   can("read", "Profile");
+
+  // Harness catalog (ADR 0063): the harness/model/effort selectors every member
+  // sees are config (model ids, flags — never secrets), so the catalog is
+  // readable; register/delete are admin-only (manage("all") below).
+  can("read", "Harness");
 
   // Admin override.
   if (user.role === "admin") can("manage", "all");

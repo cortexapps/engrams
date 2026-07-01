@@ -27,6 +27,7 @@ use crate::traits::sandbox::{ForgeSink, HarnessDial, HarnessSink, UploadSink};
 use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::image::WarmConfig;
+use crate::types::port::PortTunnel;
 use crate::types::sandbox::{AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
@@ -429,33 +430,48 @@ pub trait HostClient: Send + Sync {
         Err(SandboxError::NotFound)
     }
 
-    /// ADR 0064: VNC analog of [`proxy_shell`](Self::proxy_shell) — open a
-    /// raw-RFB tunnel to the in-guest `x11vnc` (`:5900`) instead of the ttyd
-    /// WebSocket (`:7681`). Returns the same [`ShellTunnel`] frame pair; only
-    /// the upstream and the on-the-wire `target` (`ProxyTarget::Vnc`) differ.
-    /// RFB bytes ride `ShellFrame::Binary`; the auth-gated relay does
-    /// websockify's job.
-    ///
-    /// Default impl errors with `NotFound`: only the host-agent's local impl
-    /// and the routing impls (`GrpcHostClient`, `HostRegistry`) override it —
-    /// every test/spy `HostClient` inherits this default, exactly as for
-    /// `proxy_shell`.
-    async fn proxy_vnc(&self, sandbox_id: SandboxId) -> Result<ShellTunnel, SandboxError> {
+    /// ADR 0065: bring up the ephemeral in-guest browser stack (Xvfb + x11vnc +
+    /// headful chromium with the CDP debug port) and return the VNC port. The
+    /// coordinator calls this before opening a relay tunnel to x11vnc :5900
+    /// (ADR 0066); the browser is reached over the vsock port relay, not a
+    /// direct dial. Default `NotFound` — only host-agent impls own a browser.
+    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
         let _ = sandbox_id;
         Err(SandboxError::NotFound)
     }
 
-    /// ADR 0064: tear down the ephemeral in-guest browser stack (Xvfb +
-    /// x11vnc) for `sandbox_id`. The host-agent's gRPC server calls this a
-    /// short grace after the last VNC viewer disconnects (see
-    /// `vnc_grace::VncGrace`). Backend analog of
-    /// [`SandboxBackend::stop_browser`]; `LocalHostClient` forwards to its
-    /// inner backend. Default no-op (`Ok(())`): only the host-agent's local
-    /// impl actually owns a browser process — every other impl inherits this,
-    /// matching the `SandboxBackend` default.
+    /// ADR 0065: tear down the in-guest browser stack. Called at the snapshot /
+    /// idle-eviction boundary (the browser is ephemeral and never snapshotted),
+    /// NOT on viewer disconnect — the agent may still be driving the shared
+    /// browser over CDP. Default no-op; only host-agent impls own a browser.
     async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let _ = sandbox_id;
         Ok(())
+    }
+
+    /// ADR 0064: open a bidi RAW-BYTE tunnel to an arbitrary guest TCP
+    /// `port` for `sandbox_id` (a dev server the agent started). The
+    /// raw-byte sibling of [`Self::proxy_shell`]: the returned
+    /// [`PortTunnel`] is a pair of mpsc channels — `outbound` (caller →
+    /// guest socket) and `inbound` (guest socket → caller) — and either
+    /// channel closing tears the tunnel down.
+    ///
+    /// Unlike `proxy_shell` there is no host-side `start_shell` step: the
+    /// service on `port` is user/agent-managed, not host-spawned, so the
+    /// host just dials `guest_ip:port` in the right netns (a short
+    /// connection-refused retry covers the just-started race).
+    ///
+    /// Default errors with `NotFound`: only host-agent implementations
+    /// proxy ports. The Local impl dials inside the per-VM netns; the
+    /// gRPC client impl opens a `ProxyPort` bidi stream and bridges the
+    /// channels with the wire `data`/`close` frames.
+    async fn proxy_port(
+        &self,
+        sandbox_id: SandboxId,
+        port: u16,
+    ) -> Result<PortTunnel, SandboxError> {
+        let _ = (sandbox_id, port);
+        Err(SandboxError::NotFound)
     }
 
     /// How a harness process inside this host's sandboxes dials back

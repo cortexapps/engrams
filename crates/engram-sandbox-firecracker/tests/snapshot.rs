@@ -71,11 +71,19 @@ async fn snapshot_then_restore_round_trips_microvm() {
     // Step 1: create
     let original_id = backend.create(spec).await.expect("create");
 
-    // Step 2: let the kernel finish early-boot before snapshotting.
-    // Snapshotting too early can capture a half-initialised state
-    // that hangs on resume; 2s is conservative for a static rootfs
-    // and keeps the test fast.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Step 2: let the kernel reach early-boot before snapshotting —
+    // snapshotting a half-initialised VM can hang on resume. Poll the serial
+    // console for the kernel banner instead of a fixed 2s; fails fast on a
+    // boot panic.
+    let _ = common::wait_for_log_contains(
+        &work
+            .path()
+            .join(original_id.to_string())
+            .join("firecracker.log"),
+        &["Linux version"],
+        Duration::from_secs(15),
+    )
+    .await;
 
     // Step 3: snapshot (ADR 0007 Phase 6: backend owns staging)
     let metadata = backend.snapshot(original_id).await.expect("snapshot");

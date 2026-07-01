@@ -62,6 +62,18 @@ service ShellRelayService {
   rpc Relay(stream RelayShellRequest) returns (stream RelayShellResponse);
 }
 
+// ADR 0064: raw-byte port relay — the orchestrator→coordinator app-tier
+// bridge for vanity-subdomain preview tunnels. Like ShellRelayService it
+// is bidi + browser-uncallable, kept off the UI surface; it carries
+// opaque TCP bytes (the orchestrator HTTP-proxies a preview request
+// through it, coordinator → host → guest port). Distinct from
+// host_service.proto's ProxyPort (this is the app tier in front of it).
+service PortRelayService {
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc Relay(stream RelayPortRequest) returns (stream RelayPortResponse);
+}
+
 message ListSessionsRequest {}
 
 message ListSessionsResponse {
@@ -102,8 +114,8 @@ message Session {
 
 message CreateSessionRequest {
   string image_uri = 1;
-  // engram_core SessionMode, snake_case: "agent" (run the image's baked
-  // harness) | "dev_vm" (no harness driven; interact via shell / exec).
+  // engram_core SessionMode, snake_case: "agent" (run the selected harness) |
+  // "dev_vm" (no harness driven; interact via shell / exec).
   string mode = 2;
   optional string prompt = 3;
   reserved 4; // was harness_secret_id (SecretService); removed in ADR 0051 Drip A.
@@ -144,6 +156,11 @@ message CreateSessionRequest {
   // host-side and the host proxy enforces the gate + injection. Carries secret
   // *refs*, never values. Empty = no integration policy.
   string integration_policy_json = 10;
+  // ADR 0062: the selected harness name (a HarnessCatalogService catalog key).
+  // The coordinator mounts the current catalog generation on dyn_0 and execs
+  // /opt/engram/dyn/0/<harness>/<exec>. Required for an agent-mode session;
+  // unset/ignored for dev_vm. Selection is per session, not baked into the image.
+  optional string harness = 11;
 }
 
 message CreateSessionResponse {
@@ -528,20 +545,41 @@ message RelayShellResponse {
   }
 }
 
-// ADR 0064: mirrors host_service.proto ProxyTarget across the orchestrator↔
-// coordinator hop. SHELL_TARGET_SHELL (0, default) preserves the existing
-// wire behavior for older callers and already-serialized frames.
-enum ShellTarget {
-  SHELL_TARGET_SHELL = 0;
-  SHELL_TARGET_VNC = 1;
-}
-
 message ShellOpen {
   string session_id = 1;
-  ShellTarget target = 2;
 }
 
 message ShellClose {
   uint32 code = 1;
   string reason = 2;
 }
+
+// ---------------------------------------------------------------------
+// PortRelayService messages (ADR 0064).
+// ---------------------------------------------------------------------
+
+// Raw opaque bytes; no frame-kind taxonomy (cf. RelayShell*). Request
+// and response are separate types (RPC_REQUEST_RESPONSE_UNIQUE) and
+// mark directionality.
+message RelayPortRequest {
+  oneof frame {
+    PortOpen open = 1; // first client frame: which session + which port
+    bytes data = 2;
+    PortClose close = 3;
+  }
+}
+
+message RelayPortResponse {
+  oneof frame {
+    bytes data = 1;
+    PortClose close = 2;
+  }
+}
+
+message PortOpen {
+  string session_id = 1;
+  uint32 port = 2; // guest TCP port to reach (1..=65535)
+}
+
+// Clean teardown sentinel (see ProxyPortClose in host_service.proto).
+message PortClose {}

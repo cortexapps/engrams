@@ -28,13 +28,16 @@ data:
   {{- with .Values.orchestrator.publicUrl }}
   ORCHESTRATOR_PUBLIC_URL: {{ . | quote }}
   {{- end }}
+  {{- with .Values.orchestrator.preview.baseDomain }}
+  ORCHESTRATOR_PREVIEW_BASE_DOMAIN: {{ . | quote }}
+  {{- end }}
   CONTROL_PLANE_GRPC_URL: {{ .Values.orchestrator.controlPlane.grpcUrl | default (printf "http://%s" $coordGrpc) | quote }}
   CONTROL_PLANE_HTTP_URL: {{ .Values.orchestrator.controlPlane.httpUrl | default (printf "http://%s" $coordHttp) | quote }}
   {{- with .Values.orchestrator.trustedOrigins }}
   TRUSTED_ORIGINS: {{ join "," . | quote }}
   {{- end }}
-  {{- with .Values.orchestrator.auth.iap.audience }}
-  IAP_AUDIENCE: {{ . | quote }}
+  {{- with .Values.orchestrator.auth.iap.audiences }}
+  IAP_AUDIENCES: {{ join "," . | quote }}
   {{- end }}
   {{- with .Values.orchestrator.auth.iap.jwksUrl }}
   IAP_JWKS_URL: {{ . | quote }}

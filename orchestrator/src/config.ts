@@ -55,13 +55,27 @@ export interface Config {
    */
   kekMasterKey: string;
   /**
-   * IAP_AUDIENCE — GCP IAP audience string (e.g. /projects/PROJECT_NUM/apps/APP_ID).
-   * When unset the IAP bridge is fully inert (zero overhead, no header reads).
-   * Set this in production when the orchestrator sits behind GCP IAP.
+   * IAP_AUDIENCES — the SET of GCP IAP audiences the orchestrator trusts
+   * (comma-separated in the env). Each audience is a backend-service / app
+   * resource string (e.g. /projects/PROJECT_NUM/global/backendServices/ID). An
+   * assertion verifies if its `aud` matches ANY entry.
+   *
+   * Why a set, not one value: the orchestrator sits behind MORE THAN ONE
+   * IAP-protected GCP backend service, and a GCP IAP audience IS the backend
+   * service resource — there is no way to share one audience across backends.
+   * The app enters via the classic web Ingress backend; live-host port previews
+   * (ADR 0064) enter via a DEDICATED Gateway backend (required for the wildcard
+   * `*.preview` Certificate Manager cert, which the classic Ingress can't hold).
+   * Two IAP front doors → two audiences, both trusted here. Verification stays
+   * uniform (same JWKS / issuer / ES256); only the accepted `aud` set differs —
+   * the auth layer NEVER branches on Host or path.
+   *
+   * Empty (env unset) → the IAP bridge is fully inert (zero overhead, no header
+   * reads). Set in production when the orchestrator sits behind GCP IAP.
    * This is the production door story: IAP bridge + disabled public sign-up
-   * (see Task 22 comment chain) replace password auth in prod.
+   * replace password auth in prod.
    */
-  iapAudience: string | undefined;
+  iapAudiences: string[];
   /**
    * IAP_JWKS_URL — override the GCP IAP JWKS endpoint URL.
    * Default: https://www.gstatic.com/iap/verify/public_key-jwk (ES256 keys,
@@ -78,6 +92,16 @@ export interface Config {
    * scope, which stock GCP IAP can't supply).
    */
   oidc: OidcConfig | undefined;
+  /**
+   * ORCHESTRATOR_PREVIEW_BASE_DOMAIN — the wildcard base under which live-host
+   * port previews are served (ADR 0064): a preview URL is
+   * `<scheme>://<slug>.<previewBaseDomain>`. Prod sets
+   * `preview.engrams.cortex.io` (behind the IAP wall, *443*). Dev default is
+   * `lvh.me:<port>` — `*.lvh.me` resolves to 127.0.0.1, so the preview hits this
+   * same orchestrator over plain http with no DNS/cert setup. The edge proxy
+   * (P2b) also matches inbound Host headers against this to route previews.
+   */
+  previewBaseDomain: string;
   /**
    * ORCHESTRATOR_ADMIN_EMAILS — comma-separated bootstrap-admin allowlist.
    * Restores the pre-ADR-0051 `auth.bootstrapAdmins` Helm value: matching
@@ -168,10 +192,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     return "";
   })();
 
-  // OPTIONAL: IAP bridge config. When IAP_AUDIENCE is unset the bridge is
-  // fully inert in dev (no overhead, no header reads). Set in prod only.
-  // No test placeholder needed — unset is valid and means "inert".
-  const iapAudience = env["IAP_AUDIENCE"] || undefined;
+  // OPTIONAL: IAP bridge config. IAP_AUDIENCES is a comma-separated SET of
+  // trusted audiences (see the Config.iapAudiences doc for why it's a set).
+  // Empty → the bridge is fully inert in dev (no overhead, no header reads).
+  // No test placeholder needed — empty is valid and means "inert".
+  const iapAudiences = (env["IAP_AUDIENCES"] ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
   const iapJwksUrl = optional(
     "IAP_JWKS_URL",
     "https://www.gstatic.com/iap/verify/public_key-jwk",
@@ -201,6 +229,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     };
   }
 
+  // OPTIONAL: preview base domain for live-host port URLs (ADR 0064). Dev
+  // default `lvh.me:<port>` resolves `*.lvh.me` → 127.0.0.1 → this orchestrator.
+  const previewBaseDomain = optional("ORCHESTRATOR_PREVIEW_BASE_DOMAIN", `lvh.me:${port}`);
+
   // OPTIONAL: bootstrap-admin allowlist (restores `auth.bootstrapAdmins`).
   // Parsed + normalised (trim/lowercase/de-dup) here; empty when unset, which
   // makes the better-auth promotion hooks fully inert. No test placeholder
@@ -229,9 +261,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     trustedOrigins,
     betterAuthSecret,
     kekMasterKey,
-    iapAudience,
+    iapAudiences,
     iapJwksUrl,
     oidc,
+    previewBaseDomain,
     adminEmails,
   };
 }

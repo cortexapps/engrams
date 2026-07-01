@@ -79,7 +79,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest};
-use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::traits::sandbox::{HarnessByteStream, SandboxBackend};
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
@@ -2586,12 +2586,14 @@ impl FirecrackerBackend {
         // so a later eviction snapshot pins the skill (resume re-attaches it).
         // Only the fresh-create flavor carries selections; resume passes none.
         for sel in &selected_mounts {
-            let staged = sel.staged_path().ok_or_else(|| {
-                SandboxError::Snapshot(format!(
-                    "ADR 0055 selected skill for slot {} has no content sha",
-                    sel.drive_id,
-                ))
-            })?;
+            // ADR 0062: resolve via the backend's `bundle_dir` (config) — the
+            // single source of truth — NOT a hardcoded SHARED_DIR. The sentinel
+            // swap just above already uses `config.bundle_dir`; this used to read
+            // `AuxRoDrive::staged_path()` (hardcoded SHARED_DIR), which only
+            // matched while the FC config silently defaulted there too. On a
+            // dev/e2e host (ENGRAM_BUNDLE_DIR) it checked the wrong dir and every
+            // selected skill/harness 404'd "not staged".
+            let staged = self.staged_bundle_path(sel)?;
             if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
                 return Err(SandboxError::Snapshot(format!(
                     "ADR 0055 selected skill {} for slot {} is not staged on this \
@@ -4044,6 +4046,25 @@ impl SandboxBackend for FirecrackerBackend {
         Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd).await
     }
 
+    /// ADR 0066: connect to the in-guest agentd relay listener on `port`
+    /// (host→guest via the FC vsock CONNECT handshake, same primitive exec uses
+    /// on 1024). Reuses `connect_fc_vsock`'s post-restore muxer-settle retry, so
+    /// this is dial-ready cold and warm alike (the vsock UDS is a host-root
+    /// path, not netns-scoped). The host-agent writes the `RelayConnect` header
+    /// and splices from here.
+    async fn open_guest_stream(
+        &self,
+        id: SandboxId,
+        port: u32,
+    ) -> Result<Option<HarnessByteStream>, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.vsock_uds_path.clone()
+        };
+        let conn = Self::connect_fc_vsock(&vsock_uds_path, port).await?;
+        Ok(Some(Box::pin(conn)))
+    }
+
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         self.snapshot_with_type(id, client::SnapshotType::Full)
             .await
@@ -4519,6 +4540,12 @@ impl SandboxBackend for FirecrackerBackend {
     /// `FirecrackerConfig.stub_harness_path` (`ENGRAM_STUB_HARNESS_PATH`).
     fn stub_harness_path(&self) -> Option<std::path::PathBuf> {
         self.config.stub_harness_path.clone()
+    }
+
+    fn bundle_dir(&self) -> &std::path::Path {
+        // The one dir `read_bundle_stamp` + `resolve_aux_drive` read from, so
+        // the host-agent heartbeat reports exactly what restore will attach.
+        &self.config.bundle_dir
     }
 
     fn restore_memory_is_lazy_for(&self, fresh: bool) -> bool {
@@ -6138,11 +6165,10 @@ mod tests {
         // A UDS at the FC API socket path that accepts but never replies,
         // so `FirecrackerClient::put_action(SendCtrlAltDel)` blocks inside
         // `tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, ..)` — i.e. the
-        // cancellable window the bug lives in. Bound under a short
-        // `/tmp` path because UDS paths are capped at SUN_LEN (~104B) and
-        // the per-test tempdir + sandbox-id filename overflow it.
-        let sock_dir =
-            std::path::PathBuf::from("/tmp").join(format!("eng196-{}", std::process::id()));
+        // cancellable window the bug lives in. Rooted in the shared short
+        // socket dir because UDS paths are capped at SUN_LEN (~104B) and the
+        // per-test tempdir + sandbox-id filename overflow it.
+        let sock_dir = engram_core::socket::short_socket_dir();
         std::fs::create_dir_all(&sock_dir).unwrap();
         let socket = sock_dir.join("fc.sock");
         let _ = std::fs::remove_file(&socket);

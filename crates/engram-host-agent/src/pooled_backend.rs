@@ -22,7 +22,7 @@ use engram_chunk_store::{ChunkCache, ChunkStore};
 use engram_core::traits::SandboxBackend;
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::image::WarmConfig;
-use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{AgentSpec, AuxBundleRef, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
 use tokio::fs;
@@ -455,10 +455,11 @@ pub struct PooledBackend {
     /// manifest share the materialized file (and VZ's per-sandbox
     /// APFS clonefile / FC's NBD-on-the-shared-path work on top).
     materialize_dir: Option<PathBuf>,
-    /// ADR 0035: fleet-canonical staged-bundle dir
-    /// (`<drive_id>-<sha256>.squashfs` + the bake's `current.json`).
-    /// Defaults to `AuxRoDrive::SHARED_DIR`; tests inject a tempdir
-    /// via `with_bundle_dir`.
+    /// ADR 0035/0062: staged-bundle dir (`<sha256>.squashfs` + the bake's
+    /// `current.json`). NOT set independently — `new()` copies it from
+    /// `inner.bundle_dir()`, so it always equals the dir the inner backend reads
+    /// generations from (the single source of truth; `ENGRAM_BUNDLE_DIR` or the
+    /// `SHARED_DIR` default).
     bundle_dir: PathBuf,
     /// Optional NVMe-backed LRU cache fronting the chunk store.
     /// When wired, chunk reads during materialization go through
@@ -1077,6 +1078,36 @@ impl PooledBackend {
                 );
             }
         }
+        // ADR 0062: a fresh create's SELECTED mounts (the catalog harness on
+        // dyn_0, per-session skills) are pins too, but they are NOT in the
+        // snapshot's `aux_bundles`, so the block above doesn't cover them. The
+        // baked skills/sentinel are pre-staged on the host image, but a
+        // catalog-PUBLISHED generation (the harness, ADR 0062) has no local
+        // stage on a host that hasn't prefetched it yet — materialize it here
+        // too, or FC's `load_snapshot` opens a `dyn_*` path the host never
+        // staged ("selected skill <sha> … is not staged on this host (catalog
+        // materialize gap?)"). Symbolic mounts (`sha256 == None`) are resolved
+        // inside the backend, not staged from blob — skip them. Empty for
+        // resumes (they carry no fresh selections), so this is a no-op there.
+        let selected_refs: Vec<AuxBundleRef> = selected_mounts
+            .iter()
+            .filter_map(|m| {
+                m.sha256.as_ref().map(|sha| AuxBundleRef {
+                    drive_id: m.drive_id.clone(),
+                    sha256: sha.clone(),
+                })
+            })
+            .collect();
+        if !selected_refs.is_empty() {
+            if let Some(cs) = self.chunk_store.as_ref() {
+                crate::bundles::BundleStore::new(
+                    cs.blob_storage().clone(),
+                    self.bundle_dir.clone(),
+                )
+                .materialize_if_missing(&selected_refs)
+                .await?;
+            }
+        }
         // ADR 0035 §3: fresh creates swap aux bundles to the host's
         // current generation inside the backend; resumes keep the pin.
         //
@@ -1175,6 +1206,12 @@ impl PooledBackend {
     }
 
     pub fn new(inner: Arc<dyn SandboxBackend>) -> Self {
+        // ADR 0062: the bundle dir is the INNER backend's — never set
+        // independently. The PooledBackend materializes pinned generations into
+        // the exact dir the inner backend reads them from, so there's a single
+        // source of truth (the backend config, set once from ENGRAM_BUNDLE_DIR /
+        // the SHARED_DIR default) and no way to make them disagree.
+        let bundle_dir = inner.bundle_dir().to_path_buf();
         Self {
             inner,
             image_cache: None,
@@ -1182,7 +1219,7 @@ impl PooledBackend {
             session_bindings: Arc::new(DashMap::new()),
             chunk_store: None,
             materialize_dir: None,
-            bundle_dir: PathBuf::from(engram_core::types::sandbox::AuxRoDrive::SHARED_DIR),
+            bundle_dir,
             chunk_cache: None,
             materialize_lock: Mutex::new(()),
             oci_client: None,
@@ -2792,13 +2829,6 @@ impl PooledBackend {
         self
     }
 
-    /// ADR 0035: override the staged-bundle dir (tests). Production
-    /// keeps the fleet-canonical default.
-    pub fn with_bundle_dir(mut self, dir: PathBuf) -> Self {
-        self.bundle_dir = dir;
-        self
-    }
-
     /// Attach an NVMe-backed `ChunkCache`. Optional; chains on top
     /// of `with_chunk_store`. Production hosts wire one to
     /// amortise repeated chunk reads across manifests; dev /
@@ -4370,6 +4400,12 @@ impl SandboxBackend for PooledBackend {
         self.inner.restore_memory_is_lazy_for(fresh)
     }
 
+    fn bundle_dir(&self) -> &std::path::Path {
+        // Delegates to the inner backend — the one source of truth this wrapper
+        // also materializes into (`self.bundle_dir`, copied from here in `new`).
+        self.inner.bundle_dir()
+    }
+
     async fn guest_memory_stats(&self) -> Option<engram_core::traits::sandbox::GuestMemoryStats> {
         self.inner.guest_memory_stats().await
     }
@@ -4563,6 +4599,16 @@ impl SandboxBackend for PooledBackend {
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
         self.inner.exec_stream(id, cmd).await
+    }
+
+    // ADR 0066: the port relay reaches agentd through the wrapped backend's
+    // vsock (FC) — load-bearing in prod, where `self.inner` is FC.
+    async fn open_guest_stream(
+        &self,
+        id: SandboxId,
+        port: u32,
+    ) -> Result<Option<engram_core::traits::sandbox::HarnessByteStream>, SandboxError> {
+        self.inner.open_guest_stream(id, port).await
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {

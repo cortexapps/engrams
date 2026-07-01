@@ -361,50 +361,81 @@ impl HostClient for LocalHostClient {
         // script (prod session 73fe33a3 on 2026-05-20 saw the host
         // dial 48s after lease and still hit Connection refused).
         let port = self.sandbox.start_shell(sandbox_id).await?;
-        // `vm_internal_ip` not `guest_ip`. `guest_ip` returns the
-        // SNAT'd IP for warm-restored sandboxes (used by the
-        // egress-proxy registry) — but the shell-tab dial happens
-        // INSIDE the per-VM netns, where ttyd is at the VM's
-        // in-VM eth0 IP (the bake CIDR's guest octet), NOT the
-        // netns's veth IP. Using `guest_ip` here dials the netns's
-        // own veth and misses the VM (caught by
-        // `crates/engram-host-agent/tests/e2e_shell.rs::e2e_shell_warm`).
-        let guest_ip = self
-            .sandbox
-            .vm_internal_ip(sandbox_id)
-            .await
-            .ok_or_else(|| SandboxError::Vm("proxy_shell: vm_internal_ip unavailable".into()))?;
-        let netns_name = self.sandbox.netns_name_for(sandbox_id).await;
         let (tunnel, ends) = engram_core::types::shell::ShellTunnel::pair();
-        crate::proxy_shell::open_shell_tunnel_at(guest_ip, port, netns_name, ends).await?;
+        // ADR 0066: reach ttyd via the in-guest agentd relay (FC; VZ after its
+        // Phase 2 real-vsock migration) — the ttyd WebSocket handshake + frames
+        // ride the relay stream to the guest's `127.0.0.1:port`. Backends without
+        // a vsock relay (Process; VZ pre-Phase-2) return `None` and fall back to
+        // a direct `guest_ip` WebSocket dial. Only FC ever had a per-VM netns,
+        // and FC now always takes the relay, so the direct path is netns-free.
+        match self
+            .sandbox
+            .open_guest_stream(sandbox_id, engram_harness_proto::PROXY_PORT_VSOCK_PORT)
+            .await?
+        {
+            Some(stream) => {
+                crate::proxy_shell::open_shell_tunnel_via_relay(stream, port, ends).await?
+            }
+            None => {
+                let guest_ip = self
+                    .sandbox
+                    .vm_internal_ip(sandbox_id)
+                    .await
+                    .ok_or_else(|| {
+                        SandboxError::Vm("proxy_shell: vm_internal_ip unavailable".into())
+                    })?;
+                crate::proxy_shell::open_shell_tunnel_at(guest_ip, port, ends).await?;
+            }
+        }
         Ok(tunnel)
     }
 
-    async fn proxy_vnc(
+    async fn proxy_port(
         &self,
         sandbox_id: SandboxId,
-    ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
-        // ADR 0064: VNC analog of `proxy_shell`. `start_browser` (P1.2) asks
-        // agentd to bring up the in-guest browser stack (Xvfb + x11vnc) and
-        // returns the VNC port; we then dial it in the right netns and bridge
-        // raw RFB bytes through a ShellTunnel pair. Same `vm_internal_ip`
-        // (not `guest_ip`) reasoning as `proxy_shell`: x11vnc binds the VM's
-        // in-VM eth0 IP inside the per-VM netns, not the netns veth IP.
-        let port = self.sandbox.start_browser(sandbox_id).await?;
-        let guest_ip = self
+        port: u16,
+    ) -> Result<engram_core::types::port::PortTunnel, SandboxError> {
+        let (tunnel, ends) = engram_core::types::port::PortTunnel::pair();
+        // ADR 0066: FC (and, after its Phase 2 migration, VZ) reach the dev
+        // server through the in-guest agentd relay, which dials the guest's own
+        // `127.0.0.1` — reaching loopback-bound dev servers (Vite, the Tilt UI,
+        // `next dev`) that the old `guest_ip` dial can't. Backends with no vsock
+        // relay (Process; VZ until Phase 2) return `None` from
+        // `open_guest_stream`, and we dial the guest's reachable IP directly:
+        // Process => `127.0.0.1` (agentd is a host subprocess); VZ => the in-VM
+        // eth0 IP. Only FC ever had a per-VM netns, and FC now always takes the
+        // vsock path, so the direct path is netns-free.
+        match self
             .sandbox
-            .vm_internal_ip(sandbox_id)
-            .await
-            .ok_or_else(|| SandboxError::Vm("proxy_vnc: vm_internal_ip unavailable".into()))?;
-        let netns_name = self.sandbox.netns_name_for(sandbox_id).await;
-        let (tunnel, ends) = engram_core::types::shell::ShellTunnel::pair();
-        crate::proxy_vnc::open_vnc_tunnel_at(guest_ip, port, netns_name, ends).await?;
+            .open_guest_stream(sandbox_id, engram_harness_proto::PROXY_PORT_VSOCK_PORT)
+            .await?
+        {
+            Some(stream) => crate::proxy_port::open_vsock_tunnel_at(stream, port, ends).await?,
+            None => {
+                let guest_ip = self
+                    .sandbox
+                    .vm_internal_ip(sandbox_id)
+                    .await
+                    .ok_or_else(|| {
+                        SandboxError::Vm("proxy_port: vm_internal_ip unavailable".into())
+                    })?;
+                crate::proxy_port::open_tcp_tunnel_at(guest_ip, port, ends).await?;
+            }
+        }
         Ok(tunnel)
+    }
+
+    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        // ADR 0065: bring up the in-guest browser stack (Xvfb + x11vnc +
+        // headful chromium with the CDP debug port) and return the VNC port.
+        // The orchestrator reaches x11vnc :5900 (and CDP :9222) over the
+        // ADR-0066 vsock port relay — the guest binds loopback, agentd dials it.
+        self.sandbox.start_browser(sandbox_id).await
     }
 
     async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        // ADR 0064: forward to the inner backend. Called by the gRPC server's
-        // grace timer after the last VNC viewer disconnects.
+        // ADR 0065: forward to the inner backend. Teardown is at the snapshot /
+        // idle-eviction boundary (the browser is ephemeral, never snapshotted).
         self.sandbox.stop_browser(sandbox_id).await
     }
 

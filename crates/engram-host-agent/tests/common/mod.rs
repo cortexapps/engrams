@@ -1,25 +1,59 @@
-//! Helpers shared by the host-agent's true-e2e FC integration tests
-//! (`e2e_shell`, `e2e_vnc`). Lives at `tests/common/mod.rs` (cargo's standard
-//! pattern for shared test-only code) so each `tests/<name>.rs` brings it in
-//! via `mod common;`.
+//! Shared readiness-polling helpers for the engram-host-agent integration
+//! tests. These replace fixed `tokio::time::sleep` "settle" windows with
+//! bounded polling so the serial CI suite isn't paying a blind margin on
+//! every synchronization point (and so a too-tight margin can't flake).
 //!
-//! Extracted from `e2e_shell.rs` when `e2e_vnc.rs` (ADR 0064) landed needing
-//! the exact same preflight / root-check / host-state cleanup / guest-IP poll.
-//! These four are the harness floor every "boot a real FC sandbox through
-//! `PooledBackend`" test sits on; the per-test bake (ttyd vs the browser
-//! bundle) stays in each test file because the rootfs shape differs.
-//!
-//! Linux-only, like the tests that use it: the whole crate's FC tests are
-//! `#![cfg(target_os = "linux")]`, so this module never compiles on macOS.
+//! Each top-level file in `tests/` is its own crate, so only the helpers a
+//! given test binary actually calls are reachable from it — hence the
+//! module-wide `dead_code` allow.
+#![allow(dead_code)]
 
-#![allow(dead_code)] // Each test only uses a subset of helpers.
-
-use std::path::PathBuf;
-use std::time::Duration;
-
-use engram_core::traits::sandbox::SandboxBackend; // brings `guest_ip` into scope
+use engram_core::traits::sandbox::SandboxBackend;
 use engram_host_agent::pooled_backend::PooledBackend;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
+
+/// Poll `TcpStream::connect(addr)` on a 20 ms tick until it succeeds (the
+/// listener is bound and accepting) or `timeout` elapses. Returns whether
+/// the address became connectable. Modeled on the in-crate precedent in
+/// `grpc_pause_resume.rs::boot_grpc_server` (and `boot.rs`'s socket poll).
+pub async fn wait_tcp_bound(addr: SocketAddr, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Generic bounded async poll: call `pred` every `interval` until it
+/// resolves `true` or `timeout` elapses. Returns whether the predicate
+/// became true in time. Intended for exec-based predicates (e.g. polling a
+/// guest file via the test's `exec` helper) where each probe is itself
+/// async.
+pub async fn poll_until_async<F, Fut>(timeout: Duration, interval: Duration, mut pred: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if pred().await {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
 
 /// FC test artifact discovery — duplicates the helper in
 /// `engram-sandbox-firecracker/tests/common/` because Rust can't share

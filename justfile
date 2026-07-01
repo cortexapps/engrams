@@ -235,12 +235,35 @@ reap-sessions:
     set -euo pipefail
     export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
     sandboxes_dir="${ENGRAM_HOST_SANDBOX_DIR:-var/host-sandboxes}"
+    # Disk usage of the sandbox dir in KiB (0 if it doesn't exist yet). `du -k`
+    # is portable across macOS/Linux and reports actual allocated blocks, so
+    # the before/after diff is the real disk reclaimed (sparse-aware). Never
+    # fails the recipe under `set -e` — a missing dir just reports 0.
+    dir_kb() {
+        local kb=0
+        [ -d "$1" ] && kb="$(du -sk "$1" 2>/dev/null | awk '{print $1}')" || true
+        echo "${kb:-0}"
+    }
+    # KiB -> human-readable, matching `du -h` style.
+    human_kb() {
+        awk -v kb="${1:-0}" 'BEGIN{
+            if (kb >= 1048576) printf "%.2f GB", kb/1048576;
+            else if (kb >= 1024) printf "%.1f MB", kb/1024;
+            else printf "%d KB", kb;
+        }'
+    }
+    echo "==> starting reaper"
+    echo "==> building engram-cli"
     cargo build --quiet -p engram-cli
     cli="$(cargo metadata --format-version=1 --no-deps \
         | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])')/debug/engram-cli"
+    before_kb="$(dir_kb "$sandboxes_dir")"; before_kb="${before_kb:-0}"
     # 1. Reap every live session via the production DeleteSession path.
+    echo "==> loading sessions from the coordinator"
     ids="$("$cli" --json session list \
         | python3 -c 'import sys,json;print("\n".join(s["id"] for s in json.load(sys.stdin)["sessions"]))')"
+    total=0; for id in $ids; do total=$((total+1)); done
+    echo "found $total live session(s)"
     count=0
     for id in $ids; do
         printf '==> reaping %s ... ' "$id"
@@ -248,6 +271,7 @@ reap-sessions:
     done
     echo "reaped $count live session(s)."
     # 2. Sweep orphaned rootfs files no still-live session owns.
+    echo "==> sweeping orphaned sandbox rootfs files"
     live=" $("$cli" --json session list \
         | python3 -c 'import sys,json;print(" ".join(s["sandbox_id"] for s in json.load(sys.stdin)["sessions"] if s.get("sandbox_id")))') "
     shopt -s nullglob
@@ -259,6 +283,13 @@ reap-sessions:
         swept=$((swept+1))
     done
     echo "swept $swept orphaned sandbox rootfs file(s)."
+    after_kb="$(dir_kb "$sandboxes_dir")"; after_kb="${after_kb:-0}"
+    reclaimed_kb=$(( before_kb > after_kb ? before_kb - after_kb : 0 ))
+    if [ "$reclaimed_kb" -gt 0 ]; then
+        echo "reclaimed $(human_kb "$reclaimed_kb") of dev sandbox disk."
+    else
+        echo "no dev sandbox disk reclaimed (already clean)."
+    fi
     echo "reap-sessions: done. Checkpoints GC in the background once their sessions are gone."
 
 # Build the Claude harness from source, publish it to the local OCI
@@ -316,6 +347,21 @@ bundles-squashfs:
         stamp="$stamp$sep\"$name\": \"$sha\""
         sep=", "
     done
+    # ADR 0062: the built-in `claude` harness rides the stamp like a skill, but
+    # unlike the committed/container-built bundles above its tree (the
+    # engram-harness-claude entry binary + the bundled `claude` CLI) is BUILT, not
+    # assembled here — so it's staged from a pre-built tree dir handed in via
+    # ENGRAM_HARNESS_CLAUDE_TREE (the e2e sets this to the downloaded harness-claude
+    # artifact). Skipped when unset, so a no-harness dev stack still boots; a local
+    # `just dev` that wants the built-in claude points this at a staged tree.
+    if [ -n "${ENGRAM_HARNESS_CLAUDE_TREE:-}" ]; then
+        tmp="var/shared/.harness-claude.build.squashfs"
+        deploy/bundles/harness-claude/build.sh "$ENGRAM_HARNESS_CLAUDE_TREE" "$tmp"
+        sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
+        mv "$tmp" "var/shared/$sha.squashfs"
+        stamp="$stamp$sep\"harness-claude\": \"$sha\""
+        sep=", "
+    fi
     echo "$stamp}" > var/shared/current.json
     cat var/shared/current.json
 
@@ -379,6 +425,27 @@ bundles-vz:
         stamp="$stamp$sep\"$name\": \"$sha\""
         sep=", "
     done
+    # ADR 0062: the built-in `claude` harness rides the stamp like a skill (key
+    # `harness-claude`, mounted on dyn_0). Unlike the bundles above its tree (the
+    # engram-harness-claude entry binary + the bundled `claude` CLI) is pre-built
+    # and handed in via ENGRAM_HARNESS_CLAUDE_TREE, exactly as `bundles-squashfs`
+    # does for FC — the only difference is the pack format (erofs, not squashfs).
+    # Skipped when unset, so a no-harness VZ dev stack still boots; a local
+    # `just dev` that wants the built-in claude points this at a staged tree.
+    if [ -n "${ENGRAM_HARNESS_CLAUDE_TREE:-}" ]; then
+        [ -x "$ENGRAM_HARNESS_CLAUDE_TREE/harness" ] || {
+            echo "ENGRAM_HARNESS_CLAUDE_TREE=$ENGRAM_HARNESS_CLAUDE_TREE is missing an executable 'harness' entry binary" >&2
+            exit 1
+        }
+        out="var/shared/.harness-claude.build.erofs"
+        rm -f "$out"
+        # -b 4096: match the guest page size (see the loop above).
+        mkfs.erofs -b 4096 "$out" "$ENGRAM_HARNESS_CLAUDE_TREE" >/dev/null
+        sha="$(sha256_of "$out")"
+        mv "$out" "var/shared/$sha.erofs"
+        stamp="$stamp$sep\"harness-claude\": \"$sha\""
+        sep=", "
+    fi
     echo "$stamp}" > var/shared/current.json
     cat var/shared/current.json
 

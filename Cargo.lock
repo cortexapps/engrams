@@ -1731,7 +1731,6 @@ name = "engram-transport"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "libc",
  "tokio",
  "tokio-vsock",
  "tracing",

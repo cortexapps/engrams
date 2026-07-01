@@ -34,6 +34,7 @@ import {
 
 import { useProfile, useCreateProfile, useUpdateProfile } from "../../hooks/useProfiles";
 import { useEnabledImages } from "../../hooks/useEnabledImages";
+import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import { useSkills, useUploadSkill } from "../../hooks/useSkills";
 import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
 import {
@@ -84,6 +85,11 @@ const schema = z.object({
   description: z.string(),
   icon: z.string(),
   imageId: z.string().min(1, "Select an image"),
+  // ADR 0062/0063: default harness (catalog name) + model/effort (option ids).
+  // null = inherit the deployment / descriptor default.
+  harness: z.string().nullable(),
+  model: z.string().nullable(),
+  effort: z.string().nullable(),
   isDefault: z.boolean(),
   includeUserTokens: z.boolean(),
   skills: z.array(z.string()),
@@ -92,6 +98,9 @@ const schema = z.object({
   allowHostsText: z.string(),
   allowPatternsText: z.string(),
   secretRows: z.array(z.custom<SecretRow>()),
+  // ADR 0064 P4: guest ports auto-exposed (private) for every session started
+  // from this profile.
+  portExposures: z.array(z.number()),
 });
 type ProfileFormValues = z.infer<typeof schema>;
 
@@ -100,6 +109,9 @@ const EMPTY: ProfileFormValues = {
   description: "",
   icon: "Bot",
   imageId: "",
+  harness: null,
+  model: null,
+  effort: null,
   isDefault: false,
   includeUserTokens: false,
   skills: [],
@@ -108,6 +120,7 @@ const EMPTY: ProfileFormValues = {
   allowHostsText: "",
   allowPatternsText: "",
   secretRows: [],
+  portExposures: [],
 };
 
 export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
@@ -116,6 +129,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const editingId = mode === "edit" ? params.id : undefined;
   const { data: existing } = useProfile(editingId);
   const { data: images } = useEnabledImages(true);
+  const { data: harnesses } = useHarnessCatalog(true);
   const { data: skillCatalog } = useSkills();
   const { data: orgSecretNames } = useOrgSecretNames();
   const { views } = useConnectorViews();
@@ -136,8 +150,13 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const skills = watch("skills");
   const includeUserTokens = watch("includeUserTokens");
   const imageId = watch("imageId");
+  // ADR 0062/0063: the selected harness's descriptor drives the model/effort
+  // option lists (they're enums on the harness, not free-form).
+  const harness = watch("harness");
+  const harnessDescriptor = harnesses?.find((h) => h.name === harness)?.descriptor;
   const envRows = watch("envRows");
   const secretRows = watch("secretRows");
+  const portExposures = watch("portExposures");
   const allowHostsText = watch("allowHostsText");
   const allowPatternsText = watch("allowPatternsText");
 
@@ -150,6 +169,9 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       description: p.description,
       icon: p.icon,
       imageId: p.imageId,
+      harness: p.harness ?? null,
+      model: p.model ?? null,
+      effort: p.effort ?? null,
       isDefault: p.isDefault,
       includeUserTokens: p.includeUserTokens,
       skills: p.skills ?? [],
@@ -158,6 +180,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       allowHostsText: (p.network?.allowHosts ?? []).join("\n"),
       allowPatternsText: (p.network?.allowHostPatterns ?? []).join("\n"),
       secretRows: wireToSecretRows(p.secrets ?? []),
+      portExposures: p.portExposures ?? [],
     });
     if ((p.network?.allowHosts ?? []).length || (p.network?.allowHostPatterns ?? []).length)
       setNetOpen(true);
@@ -168,6 +191,14 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
     if (mode === "create" && !form.getValues("imageId") && images && images.length > 0)
       setValue("imageId", images[0]!.id);
   }, [mode, images, form, setValue]);
+
+  // ADR 0063: a profile always names a CONCRETE harness (no "inherit deployment
+  // default"). Default to the first registered harness in create mode once the
+  // catalog loads — don't clobber a hydrated choice.
+  useEffect(() => {
+    if (mode === "create" && !form.getValues("harness") && harnesses && harnesses.length > 0)
+      setValue("harness", harnesses[0]!.name);
+  }, [mode, harnesses, form, setValue]);
 
   const network = useMemo(
     () => ({
@@ -219,6 +250,9 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       description: vals.description,
       icon: vals.icon,
       imageId: vals.imageId,
+      harness: vals.harness ?? undefined,
+      model: vals.model ?? undefined,
+      effort: vals.effort ?? undefined,
       isDefault: vals.isDefault,
       includeUserTokens: vals.includeUserTokens,
       skills: vals.skills,
@@ -230,6 +264,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         allowHostPatterns: linesOf(vals.allowPatternsText),
       },
       secrets: secretRowsToWire(vals.secretRows),
+      portExposures: vals.portExposures,
     };
     try {
       if (mode === "edit" && editingId) {
@@ -368,6 +403,101 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                 </Field>
               )}
             />
+
+            <Controller
+              control={control}
+              name="harness"
+              render={({ field }) => (
+                <Field>
+                  <FieldLabel htmlFor="harness-select">Harness</FieldLabel>
+                  <Select
+                    value={field.value ?? undefined}
+                    onValueChange={(v) => {
+                      field.onChange(v);
+                      // model/effort are enums on the harness — reset them when
+                      // the harness changes so a stale option can't survive.
+                      setValue("model", null);
+                      setValue("effort", null);
+                    }}
+                  >
+                    <SelectTrigger
+                      id="harness-select"
+                      data-testid="harness-select"
+                      className="w-full"
+                    >
+                      <SelectValue placeholder="Select a harness…" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {(harnesses ?? []).map((h) => (
+                        <SelectItem key={h.name} value={h.name}>
+                          {h.descriptor?.label || h.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <FieldDescription>
+                    The agent harness sessions run. Sessions can override it at create — e.g. Claude
+                    Code for planning, a smaller model for execution.
+                  </FieldDescription>
+                </Field>
+              )}
+            />
+
+            <div className="grid grid-cols-2 gap-3">
+              <Controller
+                control={control}
+                name="model"
+                render={({ field }) => (
+                  <Field>
+                    <FieldLabel htmlFor="model-select">Model</FieldLabel>
+                    <Select
+                      value={field.value ?? "__inherit__"}
+                      onValueChange={(v) => field.onChange(v === "__inherit__" ? null : v)}
+                      disabled={!harnessDescriptor || harnessDescriptor.models.length === 0}
+                    >
+                      <SelectTrigger id="model-select" className="w-full">
+                        <SelectValue placeholder="Default" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__inherit__">Default</SelectItem>
+                        {(harnessDescriptor?.models ?? []).map((m) => (
+                          <SelectItem key={m.id} value={m.id}>
+                            {m.label || m.id}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                )}
+              />
+
+              <Controller
+                control={control}
+                name="effort"
+                render={({ field }) => (
+                  <Field>
+                    <FieldLabel htmlFor="effort-select">Effort</FieldLabel>
+                    <Select
+                      value={field.value ?? "__inherit__"}
+                      onValueChange={(v) => field.onChange(v === "__inherit__" ? null : v)}
+                      disabled={!harnessDescriptor || harnessDescriptor.effort.length === 0}
+                    >
+                      <SelectTrigger id="effort-select" className="w-full">
+                        <SelectValue placeholder="Default" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__inherit__">Default</SelectItem>
+                        {(harnessDescriptor?.effort ?? []).map((e) => (
+                          <SelectItem key={e.id} value={e.id}>
+                            {e.label || e.id}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                )}
+              />
+            </div>
           </Section>
 
           <Section
@@ -548,7 +678,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               />
               <Text variant="label">Advanced</Text>
               <span className="text-[0.76rem] text-muted-foreground">
-                skills · environment · custom secrets · user token
+                skills · environment · ports · custom secrets · user token
               </span>
             </button>
             {advanced && (
@@ -566,6 +696,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                   setIncludeUserTokens={(b) =>
                     setValue("includeUserTokens", b, { shouldDirty: true })
                   }
+                  portExposures={portExposures}
+                  setPortExposures={(p) => setValue("portExposures", p, { shouldDirty: true })}
                 />
               </CardContent>
             )}
@@ -661,6 +793,8 @@ function Advanced({
   orgSecretNames,
   includeUserTokens,
   setIncludeUserTokens,
+  portExposures,
+  setPortExposures,
 }: {
   skillCatalog: Skill[];
   skills: string[];
@@ -672,12 +806,32 @@ function Advanced({
   orgSecretNames: string[];
   includeUserTokens: boolean;
   setIncludeUserTokens: (b: boolean) => void;
+  portExposures: number[];
+  setPortExposures: (p: number[]) => void;
 }) {
   const uploadSkill = useUploadSkill();
   const [skillName, setSkillName] = useState("");
   const [skillDesc, setSkillDesc] = useState("");
   const [skillFile, setSkillFile] = useState<File | null>(null);
   const [uploadErr, setUploadErr] = useState<string | null>(null);
+  const [portInput, setPortInput] = useState("");
+  const [portErr, setPortErr] = useState<string | null>(null);
+
+  const addPort = () => {
+    const p = Number(portInput);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) {
+      setPortErr("Enter a port between 1 and 65535");
+      return;
+    }
+    if (portExposures.includes(p)) {
+      setPortErr(`Port ${p} is already added`);
+      setPortInput("");
+      return;
+    }
+    setPortErr(null);
+    setPortExposures([...portExposures, p].sort((a, b) => a - b));
+    setPortInput("");
+  };
 
   const onUploadSkill = async () => {
     if (!skillName.trim() || !skillFile) {
@@ -776,6 +930,72 @@ function Advanced({
         <div className="mt-2">
           <EnvVarsEditor rows={envRows} onChange={setEnvRows} />
         </div>
+      </div>
+
+      {/* auto-exposed ports (ADR 0064 P4) */}
+      <div>
+        <Text variant="label">Auto-exposed ports</Text>
+        <p className="mt-1 text-[0.74rem] text-muted-foreground">
+          Guest ports every session from this profile exposes as private live-host previews (e.g. a
+          dev server on 3000). Manage individual previews from a session's Diagnostics → Ports.
+        </p>
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          {portExposures.length === 0 && (
+            <span className="text-[0.74rem] text-muted-foreground">
+              None — sessions expose nothing by default.
+            </span>
+          )}
+          {portExposures.map((p) => (
+            <span
+              key={p}
+              data-testid={`port-chip-${p}`}
+              className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 font-mono text-xs"
+            >
+              :{p}
+              <button
+                type="button"
+                aria-label={`remove port ${p}`}
+                data-testid={`port-remove-${p}`}
+                className="text-muted-foreground hover:text-foreground"
+                onClick={() => setPortExposures(portExposures.filter((n) => n !== p))}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <Input
+            type="number"
+            min={1}
+            max={65535}
+            placeholder="port (e.g. 3000)"
+            className="w-36"
+            value={portInput}
+            data-testid="port-add-input"
+            onChange={(e) => setPortInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addPort();
+              }
+            }}
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            data-testid="port-add-btn"
+            onClick={addPort}
+          >
+            Add
+          </Button>
+        </div>
+        {portErr && (
+          <p className="mt-1 text-sm text-destructive" data-testid="port-add-error">
+            {portErr}
+          </p>
+        )}
       </div>
 
       {/* custom secrets */}

@@ -21,6 +21,7 @@ use engram_core::traits::HostClient;
 use engram_core::SandboxError;
 use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
+use engram_protocol::grpc::proxy_port_message::Body as ProxyPortBody;
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
     AnswerHarnessQuestionRequest, ApplyEgressPolicyRequest, BindHarnessSessionRequest,
@@ -29,11 +30,12 @@ use engram_protocol::grpc::{
     DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty, ExecExit, ExecFrame,
     ExecStartRequest, GuestIpResponse, InterruptHarnessRequest, ListSandboxesResponse,
     MigrationCaptureResponse, MigrationExportRef, MigrationFetchRequest, MigrationFrame,
-    MigrationPresetupResponse, PostCopyCaptureResponse, ProxyShellBinary, ProxyShellClose,
-    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ProxyTarget,
-    ReapMaterializeDirRequest, ReapMaterializeDirResponse, RehandshakeHarnessRequest,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SnapshotBeginResponse, SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    MigrationPresetupResponse, PostCopyCaptureResponse, ProxyPortData, ProxyPortMessage,
+    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing, ProxyShellPong,
+    ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
+    RehandshakeHarnessRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -63,19 +65,11 @@ fn link_remote_parent<T>(span: &tracing::Span, req: &Request<T>) {
 pub struct HostServiceImpl {
     inner: Arc<dyn HostClient>,
     admin: Option<Arc<dyn HostAdminHandler>>,
-    /// ADR 0064: cancellable teardown timers for the ephemeral browser stack.
-    /// A VNC viewer connect cancels any pending teardown; a disconnect
-    /// schedules `stop_browser` after a grace that the next connect cancels.
-    vnc_grace: crate::vnc_grace::VncGrace,
 }
 
 impl HostServiceImpl {
     pub fn new(inner: Arc<dyn HostClient>) -> Self {
-        Self {
-            inner,
-            admin: None,
-            vnc_grace: crate::vnc_grace::VncGrace::new(),
-        }
+        Self { inner, admin: None }
     }
 
     pub fn with_admin_handler(mut self, admin: Arc<dyn HostAdminHandler>) -> Self {
@@ -113,6 +107,8 @@ impl HostService for HostServiceImpl {
     type ExecStartStream = Pin<Box<dyn Stream<Item = Result<ExecFrame, Status>> + Send + 'static>>;
     type ProxyShellStream =
         Pin<Box<dyn Stream<Item = Result<ProxyShellMessage, Status>> + Send + 'static>>;
+    type ProxyPortStream =
+        Pin<Box<dyn Stream<Item = Result<ProxyPortMessage, Status>> + Send + 'static>>;
 
     async fn ping(&self, _req: Request<Empty>) -> Result<Response<Empty>, Status> {
         Ok(Response::new(Empty {}))
@@ -965,14 +961,8 @@ impl HostService for HostServiceImpl {
             .map_err(|_| Status::deadline_exceeded("proxy_shell: no first message within 5s"))?
             .ok_or_else(|| Status::cancelled("proxy_shell: client closed before first message"))?
             .map_err(|e| Status::internal(format!("proxy_shell: recv first message: {e}")))?;
-        let (sandbox_id, target) = match first.body {
-            Some(ProxyShellBody::Open(open)) => (
-                decode_sandbox_id(&open.sandbox_id)?,
-                // prost enum accessor → ProxyTarget (defaults to Shell for an
-                // out-of-range/unset discriminant, preserving old-caller wire
-                // behavior).
-                open.target(),
-            ),
+        let sandbox_id = match first.body {
+            Some(ProxyShellBody::Open(open)) => decode_sandbox_id(&open.sandbox_id)?,
             Some(other) => {
                 return Err(Status::invalid_argument(format!(
                     "proxy_shell: first message must be Open, got {}",
@@ -986,19 +976,11 @@ impl HostService for HostServiceImpl {
             }
         };
 
-        // ADR 0064: a (re)connecting VNC viewer cancels any pending teardown so
-        // a page refresh never races the previous stream's grace timer (the
-        // old stream's disconnect would otherwise kill the browser the
-        // reconnected viewer is actively using).
-        if matches!(target, ProxyTarget::Vnc) {
-            self.vnc_grace.cancel(sandbox_id);
-        }
-
-        let tunnel = match target {
-            ProxyTarget::Vnc => self.inner.proxy_vnc(sandbox_id).await,
-            _ => self.inner.proxy_shell(sandbox_id).await,
-        }
-        .map_err(sandbox_to_status)?;
+        let tunnel = self
+            .inner
+            .proxy_shell(sandbox_id)
+            .await
+            .map_err(sandbox_to_status)?;
         let engram_core::types::shell::ShellTunnel {
             outbound: tunnel_outbound,
             inbound: mut tunnel_inbound,
@@ -1012,12 +994,6 @@ impl HostService for HostServiceImpl {
         // the tunnel pump then writes to ttyd). Open is rejected
         // here too — it's a stream-handshake variant, not data.
         let out_tx_for_open_reject = out_tx.clone();
-        // ADR 0064: clone the teardown registry + backend handle into the drain
-        // task so we can schedule a grace teardown when the VNC viewer
-        // disconnects (the drain loop ending IS the disconnect). `self` is
-        // borrowed by the handler and not available in the spawned task.
-        let vnc_grace = self.vnc_grace.clone();
-        let backend = self.inner.clone();
         tokio::spawn(async move {
             while let Some(next) = inbound.next().await {
                 let msg = match next {
@@ -1048,22 +1024,6 @@ impl HostService for HostServiceImpl {
             // Client closed; drop the tunnel outbound so the
             // tunnel's pump tears down.
             drop(tunnel_outbound);
-
-            // ADR 0064: reap the ephemeral browser stack a short grace after the
-            // VNC viewer disconnects; a reconnect within the grace cancels this
-            // (see the cancel-on-connect above). Shell streams have no such
-            // backing process, so this is VNC-only.
-            if matches!(target, ProxyTarget::Vnc) {
-                vnc_grace.schedule(
-                    sandbox_id,
-                    std::time::Duration::from_secs(30),
-                    move || async move {
-                        if let Err(e) = backend.stop_browser(sandbox_id).await {
-                            tracing::debug!(%sandbox_id, error = %e, "browser teardown after grace");
-                        }
-                    },
-                );
-            }
         });
 
         // Tunnel inbound (ttyd → us) drains here; we forward each
@@ -1081,6 +1041,118 @@ impl HostService for HostServiceImpl {
 
         let out_stream = tokio_stream::wrappers::ReceiverStream::new(out_rx);
         Ok(Response::new(Box::pin(out_stream) as Self::ProxyShellStream))
+    }
+
+    /// ADR 0064: bidi RAW-BYTE port tunnel — `proxy_shell`'s sibling.
+    /// Same handshake discipline (the FIRST message MUST be
+    /// `ProxyPortOpen{sandbox_id, port}`; any other first variant, or a
+    /// later `Open`, is `InvalidArgument`), but the payload is opaque
+    /// `Data` byte chunks plus a `Close` sentinel — no WS frame
+    /// taxonomy, because this is a plain TCP pipe to a dev server.
+    async fn proxy_port(
+        &self,
+        req: Request<tonic::Streaming<ProxyPortMessage>>,
+    ) -> Result<Response<Self::ProxyPortStream>, Status> {
+        let mut inbound = req.into_inner();
+
+        use futures::StreamExt;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.next())
+            .await
+            .map_err(|_| Status::deadline_exceeded("proxy_port: no first message within 5s"))?
+            .ok_or_else(|| Status::cancelled("proxy_port: client closed before first message"))?
+            .map_err(|e| Status::internal(format!("proxy_port: recv first message: {e}")))?;
+        let (sandbox_id, port) = match first.body {
+            Some(ProxyPortBody::Open(open)) => {
+                let sid = decode_sandbox_id(&open.sandbox_id)?;
+                let port = u16::try_from(open.port)
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or_else(|| {
+                        Status::invalid_argument(format!(
+                            "proxy_port: port {} out of range (1..=65535)",
+                            open.port
+                        ))
+                    })?;
+                (sid, port)
+            }
+            Some(_) => {
+                return Err(Status::invalid_argument(
+                    "proxy_port: first message must be Open",
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "proxy_port: first message has empty body",
+                ));
+            }
+        };
+
+        let tunnel = self
+            .inner
+            .proxy_port(sandbox_id, port)
+            .await
+            .map_err(sandbox_to_status)?;
+        let engram_core::types::port::PortTunnel {
+            outbound: tunnel_outbound,
+            inbound: mut tunnel_inbound,
+        } = tunnel;
+
+        // mpsc carrying byte chunks out to the gRPC client.
+        let (out_tx, out_rx) = mpsc::channel::<Result<ProxyPortMessage, Status>>(64);
+
+        // gRPC inbound (client → us): forward Data into the tunnel
+        // outbound; Close / client-disconnect tears the tunnel down. An
+        // Open after the handshake is a protocol error (typed status, so
+        // the client surfaces a clean error rather than an opaque close).
+        let out_tx_for_reject = out_tx.clone();
+        tokio::spawn(async move {
+            while let Some(next) = inbound.next().await {
+                let msg = match next {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "proxy_port: client recv error");
+                        break;
+                    }
+                };
+                match msg.body {
+                    Some(ProxyPortBody::Data(d)) => {
+                        if tunnel_outbound.send(d.data.into()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(ProxyPortBody::Close(_)) | None => break,
+                    Some(ProxyPortBody::Open(_)) => {
+                        let _ = out_tx_for_reject
+                            .send(Err(Status::invalid_argument(
+                                "proxy_port: Open only valid as the first message",
+                            )))
+                            .await;
+                        break;
+                    }
+                }
+            }
+            // Client closed; drop the tunnel outbound so the host pump
+            // half-closes the guest socket and tears down.
+            drop(tunnel_outbound);
+        });
+
+        // Tunnel inbound (guest → us): forward each byte chunk to the
+        // gRPC client as a Data message.
+        tokio::spawn(async move {
+            while let Some(chunk) = tunnel_inbound.recv().await {
+                let msg = ProxyPortMessage {
+                    body: Some(ProxyPortBody::Data(ProxyPortData {
+                        data: chunk.to_vec(),
+                    })),
+                };
+                if out_tx.send(Ok(msg)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let out_stream = tokio_stream::wrappers::ReceiverStream::new(out_rx);
+        Ok(Response::new(Box::pin(out_stream) as Self::ProxyPortStream))
     }
 }
 

@@ -244,85 +244,34 @@ async fn open_tunnel_via_pooled(pooled: &PooledBackend, id: engram_core::Sandbox
     // a stale default-7681 would coincidentally still dial-to-
     // listener; the strongest assertion that the forwarding
     // works is the unit test in pooled_backend.rs::tests.
-    // Use `vm_internal_ip` not `guest_ip` — same reason
-    // `host_client::proxy_shell` does. `guest_ip` for warm
-    // sandboxes returns the SNAT slot (10.200.0.6 by default),
-    // which is wrong for the shell-tab dial (which happens inside
-    // the netns and needs the VM's eth0 IP, 10.200.0.2 by default).
-    let guest_ip = pooled
-        .vm_internal_ip(id)
+    let (tunnel, ends) = ShellTunnel::pair();
+    // ADR 0066: the FC/warm shell path now rides the vsock relay (mirrors
+    // host_client::proxy_shell). `open_guest_stream` delegates through the
+    // PooledBackend to FC's vsock: `Some` => relay the ttyd WebSocket to the
+    // guest's `127.0.0.1:port`; `None` => direct `guest_ip` dial (Process / VZ
+    // pre-Phase-2).
+    match pooled
+        .open_guest_stream(id, engram_harness_proto::PROXY_PORT_VSOCK_PORT)
         .await
-        .expect("vm_internal_ip must resolve");
-    let netns_name = pooled.netns_name_for(id).await;
-    eprintln!("--- opening shell tunnel: guest_ip={guest_ip} port={port} netns={netns_name:?} ---");
-
-    // Diagnostic: probe both layers BEFORE the WS dial so a
-    // failure points at the right thing.
-    if let Some(ns) = netns_name.as_deref() {
-        let dump = std::process::Command::new("ip")
-            .args(["netns", "exec", ns, "ip", "-brief", "addr"])
-            .output();
-        if let Ok(o) = dump {
-            eprintln!(
-                "--- netns {ns} addrs ---\n{}--- end ---",
-                String::from_utf8_lossy(&o.stdout),
-            );
+        .expect("open_guest_stream must not error")
+    {
+        Some(stream) => {
+            eprintln!("--- opening shell tunnel via vsock relay: port={port} ---");
+            engram_host_agent::proxy_shell::open_shell_tunnel_via_relay(stream, port, ends)
+                .await
+                .expect("relay shell tunnel must succeed");
         }
-        // Ping VM via TAP — if this fails, the netns routing is
-        // broken; if it succeeds the VM is up + reachable and any
-        // TCP failure below means a userspace listener problem.
-        let ping = std::process::Command::new("ip")
-            .args([
-                "netns", "exec", ns, "timeout", "3", "ping", "-c", "1", "-W", "2", &guest_ip,
-            ])
-            .output();
-        if let Ok(o) = ping {
-            eprintln!(
-                "--- ping {guest_ip} from {ns}: status={} ---\n{}--- end ---",
-                o.status,
-                String::from_utf8_lossy(&o.stdout),
-            );
-        }
-        // TCP probe from inside the netns. This is the same
-        // network path open_shell_tunnel_at's dial takes.
-        let tcp_probe = std::process::Command::new("ip")
-            .args([
-                "netns",
-                "exec",
-                ns,
-                "bash",
-                "-c",
-                &format!("timeout 3 bash -c 'echo > /dev/tcp/{guest_ip}/{port}' && echo TCP_OK || echo TCP_CLOSED"),
-            ])
-            .output();
-        if let Ok(o) = tcp_probe {
-            eprintln!(
-                "--- /dev/tcp/{guest_ip}/{port} from {ns}: status={} ---\n{}{}--- end ---",
-                o.status,
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr),
-            );
-        }
-    } else {
-        match tokio::time::timeout(
-            Duration::from_secs(3),
-            tokio::net::TcpStream::connect((guest_ip.as_str(), port)),
-        )
-        .await
-        {
-            Ok(Ok(s)) => {
-                drop(s);
-                eprintln!("--- tcp probe → connect OK to {guest_ip}:{port} ---");
-            }
-            Ok(Err(e)) => eprintln!("--- tcp probe → connect error: {e} ---"),
-            Err(_) => eprintln!("--- tcp probe → timeout after 3s ---"),
+        None => {
+            let guest_ip = pooled
+                .vm_internal_ip(id)
+                .await
+                .expect("vm_internal_ip must resolve");
+            eprintln!("--- opening shell tunnel (cold dial): guest_ip={guest_ip} port={port} ---");
+            engram_host_agent::proxy_shell::open_shell_tunnel_at(guest_ip, port, ends)
+                .await
+                .expect("cold shell tunnel must succeed");
         }
     }
-
-    let (tunnel, ends) = ShellTunnel::pair();
-    engram_host_agent::proxy_shell::open_shell_tunnel_at(guest_ip, port, netns_name, ends)
-        .await
-        .expect("open_shell_tunnel_at must succeed");
     tunnel
 }
 

@@ -123,6 +123,10 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
     };
 
     let original_id = backend.create(spec).await.expect("create");
+    // Fixed settle before snapshot. The substrate tests re-capture VMs restored
+    // from this snapshot, and a too-early (kernel-banner) snapshot leaves the
+    // restored VM too fragile to re-snapshot (FC socket gone). Let early boot
+    // finish — there's no cheap host signal for "settled enough to re-snapshot".
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(original_id).await.expect("snapshot");
     let snap_dir = backend.snapshot_path_for(metadata.id);
@@ -220,20 +224,29 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         "base shm sized to guest memory"
     );
 
-    // Give the guest a moment to fault pages through the handler, then
-    // prove the handler populated the base (canonical chunks pwritten —
-    // the shared-install path, not private COPYs).
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the guest to fault pages through the handler, then prove the
+    // handler populated the base (canonical chunks pwritten — the shared-install
+    // path, not private COPYs). Poll the SEEK_DATA predicate instead of sleeping;
+    // the assertion below stays as the failure signal.
+    common::poll_until(Duration::from_secs(10), Duration::from_millis(200), || {
+        first_data_at(&base_file, 0).is_some()
+    })
+    .await;
     assert!(
         first_data_at(&base_file, 0).is_some(),
         "base shm has no data extents — canonical faults did not go through \
          the shared install path"
     );
 
-    // Handler log sanity: substrate mode announced itself.
+    // Handler log sanity: substrate mode announced itself. Poll the handler log
+    // for the startup line rather than reading it once.
     let restored_jail = work.path().join(restored_id.to_string());
-    let log_content =
-        std::fs::read_to_string(restored_jail.join("uffd-handler.log")).unwrap_or_default();
+    let log_content = common::wait_for_log_contains(
+        &restored_jail.join("uffd-handler.log"),
+        &["substrate base shm ready"],
+        Duration::from_secs(10),
+    )
+    .await;
     assert!(
         log_content.contains("substrate base shm ready"),
         "expected substrate-mode startup line in handler log, got: {log_content}"
@@ -245,7 +258,20 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         Ok(id) => id,
         Err(e) => dump_logs_and_panic("restore #2 (sibling)", format!("{e:?}"), work.path()),
     };
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Poll list() until both siblings appear rather than sleeping a fixed window;
+    // the assertion below stays as the failure signal.
+    common::poll_until_async(
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+        || async {
+            let mut listed = backend.list().await.expect("list");
+            listed.sort();
+            let mut expect = vec![restored_id, sibling_id];
+            expect.sort();
+            listed == expect
+        },
+    )
+    .await;
     let mut listed = backend.list().await.expect("list");
     listed.sort();
     let mut expect = vec![restored_id, sibling_id];
@@ -341,6 +367,10 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
 
     // Source VM -> snapshot -> chunked manifest (the substrate's source).
     let original_id = backend.create(spec).await.expect("create");
+    // Fixed settle before snapshot. The substrate tests re-capture VMs restored
+    // from this snapshot, and a too-early (kernel-banner) snapshot leaves the
+    // restored VM too fragile to re-snapshot (FC socket gone). Let early boot
+    // finish — there's no cheap host signal for "settled enough to re-snapshot".
     tokio::time::sleep(Duration::from_secs(2)).await;
     let metadata = backend.snapshot(original_id).await.expect("snapshot");
     let snap_dir = backend.snapshot_path_for(metadata.id);
@@ -386,6 +416,10 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
         .restore(restore_metadata.clone())
         .await
         .expect("restore #1 onto the substrate");
+    // Irreducible open-loop churn window (NOT a readiness wait): let the guest
+    // COW-dirty pages over the MAP_PRIVATE base. There is no host-observable lower
+    // bound to poll toward — the downstream diff-size check is an UPPER bound that
+    // even zero churn satisfies, so this stays a fixed sleep.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // 1. FULL capture OF the substrate VM (the eviction direction).
@@ -406,6 +440,9 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
 
     // 2. DIFF capture: the KVM dirty log over the MAP_PRIVATE backing must
     //    see only the COW writes since the Full capture reset the bitmap.
+    // Irreducible open-loop churn window (NOT a readiness wait): nothing
+    // host-observable to poll toward; the diff-size assertion is an upper bound
+    // that even zero churn satisfies, so this stays a fixed sleep.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let diff = backend
         .snapshot_diff(substrate_vm)
@@ -458,7 +495,20 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
         .restore(meta2)
         .await
         .expect("restore FROM the capture-of-substrate snapshot");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Poll list() until both VMs appear rather than sleeping a fixed window; the
+    // assertion below stays as the failure signal.
+    common::poll_until_async(
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+        || async {
+            let mut listed = backend.list().await.expect("list");
+            listed.sort();
+            let mut expect = vec![substrate_vm, revived];
+            expect.sort();
+            listed == expect
+        },
+    )
+    .await;
     let mut listed = backend.list().await.expect("list");
     listed.sort();
     let mut expect = vec![substrate_vm, revived];

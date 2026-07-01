@@ -12,6 +12,7 @@
 #![allow(dead_code)] // Each test only uses a subset of helpers.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use engram_core::types::sandbox::ExecEvent;
 use futures::StreamExt;
@@ -152,4 +153,108 @@ pub fn which(bin: &str) -> Option<PathBuf> {
         .split(':')
         .map(|p| Path::new(p).join(bin))
         .find(|p| p.is_file())
+}
+
+// ---------------------------------------------------------------------------
+// Readiness polling.
+//
+// These tests boot real microVMs, but a microVM boots in ~0.3s and a
+// snapshot/restore round-trips in ~1s. The slow way to wait for that work is
+// a fixed `sleep` sized for the worst case; the fast way is to poll the
+// observable the test already cares about and return the instant it holds.
+// `boot.rs` proves the pattern (it polls the API socket and finishes in
+// 0.34s). The helpers below generalize it so the rest of the suite can stop
+// sleeping. Bound the worst case with a generous ceiling; pay only the real
+// latency in the common case.
+//
+// NB: most of these guests boot the public ubuntu rootfs to `init=/bin/bash`
+// with no in-guest agentd, so `wait_agent_ready` is not available — the
+// host-observable signals are the FC API socket, the serial console (funneled
+// to a log file), and `/proc` gauges.
+// ---------------------------------------------------------------------------
+
+/// Poll a synchronous predicate every `interval` until it returns `true`, or
+/// `timeout` elapses. Returns whether the condition was met. The drop-in
+/// replacement for a fixed `sleep` whose purpose was "wait for X to become
+/// true" where X is a cheap fs / `/proc` / in-memory check.
+pub async fn poll_until(
+    timeout: Duration,
+    interval: Duration,
+    mut pred: impl FnMut() -> bool,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if pred() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// [`poll_until`] for an async predicate — e.g. a `backend.list()`-shaped
+/// condition that has to `.await`.
+pub async fn poll_until_async<F, Fut>(timeout: Duration, interval: Duration, mut pred: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if pred().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Poll until `path` (a Firecracker API socket) is bound, or `timeout`
+/// elapses. Promoted from `boot.rs` so the raw-`spawn_firecracker` tests can
+/// drop their fixed post-spawn sleeps. 50ms ticks.
+pub async fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
+    poll_until(timeout, Duration::from_millis(50), || path.exists()).await
+}
+
+/// Poll `path` until its contents contain ANY of `needles`, or `timeout`
+/// elapses. Returns the final contents (a missing file reads as empty) so the
+/// caller can build a useful assertion message on a miss.
+///
+/// Firecracker funnels the guest serial console (`console=ttyS0`) plus its own
+/// stderr into one log file — `firecracker.log` under the jail dir for
+/// backend-managed VMs, or the file the raw `spawn_firecracker` tests redirect
+/// into — so a kernel- or guest-emitted marker is observable here without an
+/// in-guest agent.
+pub async fn wait_for_log_contains(path: &Path, needles: &[&str], timeout: Duration) -> String {
+    let mut last = String::new();
+    let met = poll_until(timeout, Duration::from_millis(100), || {
+        last = std::fs::read_to_string(path).unwrap_or_default();
+        needles.iter().any(|n| last.contains(n))
+    })
+    .await;
+    let _ = met;
+    last
+}
+
+/// Like [`wait_for_log_contains`], but waits until `needle` appears at least
+/// `count` times — the post-resume read-loop assertions count distinct marker
+/// lines. Returns the final contents.
+pub async fn wait_for_log_count(
+    path: &Path,
+    needle: &str,
+    count: usize,
+    timeout: Duration,
+) -> String {
+    let mut last = String::new();
+    let met = poll_until(timeout, Duration::from_millis(100), || {
+        last = std::fs::read_to_string(path).unwrap_or_default();
+        last.matches(needle).count() >= count
+    })
+    .await;
+    let _ = met;
+    last
 }

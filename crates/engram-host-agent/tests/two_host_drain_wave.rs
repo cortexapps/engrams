@@ -45,6 +45,8 @@ use engram_sandbox_firecracker::{
 };
 use futures::StreamExt;
 
+mod common;
+
 /// How many live sessions to pack off host A. Two is enough to prove the
 /// wave drains a host holding MORE than one session to fully empty, while
 /// bounding CI cost (2 fresh boots on A + 2 restores on B).
@@ -98,7 +100,10 @@ async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
     let server = tokio::spawn(async move {
         let _ = engram_host_agent::grpc_server::boot(addr, inner, None).await;
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        common::wait_tcp_bound(addr, std::time::Duration::from_secs(5)).await,
+        "host gRPC server did not bind {addr} within 5s"
+    );
     HostStack {
         pooled,
         addr,
@@ -247,7 +252,24 @@ async fn drain_wave_teleports_every_session_off_host_a() {
             )
             .await
             .expect("start mid-run harness on A");
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Wait for the harness to write its pid file rather than blind-sleeping.
+        assert!(
+            common::poll_until_async(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(50),
+                || {
+                    let pooled = host_a.pooled.clone();
+                    async move {
+                        !exec(&pooled, vm, "cat /dev/shm/harness-pid 2>/dev/null")
+                            .await
+                            .trim()
+                            .is_empty()
+                    }
+                },
+            )
+            .await,
+            "session {i}: harness pid file never appeared on A within 5s"
+        );
         let harness_pid = exec(&host_a.pooled, vm, "cat /dev/shm/harness-pid")
             .await
             .trim()
@@ -337,7 +359,26 @@ async fn drain_wave_teleports_every_session_off_host_a() {
             "session {i}: the moved harness is REATTACHED (same pid), not respawned"
         );
         let hb1 = exec(&host_b.pooled, moved, "cat /dev/shm/harness-heartbeat").await;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Poll for the heartbeat to advance past hb1 instead of blind-sleeping.
+        let hb1_val = hb1.trim().to_string();
+        assert!(
+            common::poll_until_async(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(50),
+                || {
+                    let pooled = host_b.pooled.clone();
+                    let hb1_val = hb1_val.clone();
+                    async move {
+                        exec(&pooled, moved, "cat /dev/shm/harness-heartbeat")
+                            .await
+                            .trim()
+                            != hb1_val.as_str()
+                    }
+                },
+            )
+            .await,
+            "session {i}: the harness heartbeat never advanced on B within 5s"
+        );
         let hb2 = exec(&host_b.pooled, moved, "cat /dev/shm/harness-heartbeat").await;
         assert_ne!(
             hb1.trim(),

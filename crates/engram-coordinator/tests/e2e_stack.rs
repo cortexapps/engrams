@@ -28,10 +28,11 @@
 //! All tests are `#[ignore]`'d and gated by env vars. The CI lane
 //! `test-e2e-stack` in `.github/workflows/ci.yml` brings up the stack
 //! (`tilt-up-ci.sh` + `integration-bake-demo.sh`), runs these tests via
-//! `cargo nextest --run-ignored`, and tears down on completion. ADR 0021
-//! P1.5 retired the separate `harness add` step — the harness is baked
-//! into the image at `/opt/engram/harness/` and the coord reads the launch
-//! contract from `manifest.toml`.
+//! `cargo nextest --run-ignored`, and tears down on completion. ADR 0062: the
+//! harness is no longer baked into the image — the built-in `claude` harness
+//! rides the host-image `current_bundles` stamp (the e2e "Stage RO skill bundles"
+//! step stamps `harness-claude` alongside `skills`/`sentinel`), and the agent
+//! tests just select `harness = "claude"`, mounted on `dyn_0`. No registration.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -114,7 +115,7 @@ type SessClient = SessionServiceClient<InterceptedService<Channel, BearerFn>>;
 type FleetClient = FleetServiceClient<InterceptedService<Channel, BearerFn>>;
 
 /// gRPC driver for the live coordinator. Holds one shared channel and the
-/// two service clients the tests exercise.
+/// service clients the tests exercise.
 struct Driver {
     sess: SessClient,
     fleet: FleetClient,
@@ -150,6 +151,42 @@ impl Driver {
         )
     }
 
+    /// `CreateSession`, retrying while the coordinator returns `Unavailable`.
+    ///
+    /// That code is the explicitly-retryable "no host can place this yet"
+    /// signal — a freshly-registered host hasn't finished staging the RO bundle
+    /// the session selects ("not staged on this host (catalog materialize
+    /// gap?) — Retry shortly"), or no host has dialed in at all. In production
+    /// the create path requeues on exactly this; a synchronous e2e create has
+    /// no requeue, so it must mirror the real client's retry contract or it
+    /// flakes against the host's startup bundle-staging window. Any other code
+    /// (including a deadline-exceeded `Unavailable`) panics with the status.
+    async fn create_session_retrying(
+        &mut self,
+        req: app::CreateSessionRequest,
+        label: &str,
+    ) -> SessionId {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match self.sess.create_session(req.clone()).await {
+                Ok(resp) => {
+                    return resp
+                        .into_inner()
+                        .session_id
+                        .parse()
+                        .expect("session_id is a SessionId");
+                }
+                Err(status)
+                    if status.code() == tonic::Code::Unavailable
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(status) => panic!("CreateSession ({label}): {status:?}"),
+            }
+        }
+    }
+
     /// ADR 0021 P1.3: drive the image as a pure dev VM. Whether the image
     /// has a baked `[harness]` block is irrelevant — `mode = dev_vm` tells
     /// coord to skip `resolve_harness` and pass an empty-argv `AgentSpec`
@@ -166,14 +203,9 @@ impl Driver {
             secrets: HashMap::new(),
             harness_env: HashMap::new(),
             prompt_id: None,
+            harness: None,
         };
-        let resp = self
-            .sess
-            .create_session(req)
-            .await
-            .expect("CreateSession (dev_vm)")
-            .into_inner();
-        resp.session_id.parse().expect("session_id is a SessionId")
+        self.create_session_retrying(req, "dev_vm").await
     }
 
     /// ADR 0055: a `dev_vm`-mode session that mounts the named profile skills.
@@ -191,22 +223,17 @@ impl Driver {
             secrets: HashMap::new(),
             harness_env: HashMap::new(),
             prompt_id: None,
+            harness: None,
         };
-        let resp = self
-            .sess
-            .create_session(req)
-            .await
-            .expect("CreateSession (dev_vm + skills)")
-            .into_inner();
-        resp.session_id.parse().expect("session_id is a SessionId")
+        self.create_session_retrying(req, "dev_vm + skills").await
     }
 
-    /// ADR 0021 P1.3: drive the image's baked harness. `mode = agent` is
-    /// the default but set explicitly so the test stays correct if defaults
-    /// shift. The image referenced by `ENGRAM_E2E_IMAGE_URI` must carry a
-    /// `[harness] builtin = "claude"` block (the CI bake of
-    /// `deploy/demo-claude/` does); coord reads the harness contract from
-    /// `manifest.toml`, so the request no longer names the harness.
+    /// ADR 0062: drive the built-in `claude` harness, selected per session by
+    /// name (`CreateSessionRequest.harness`). `mode = agent` is the default but
+    /// set explicitly so the test stays correct if defaults shift. The image
+    /// (`ENGRAM_E2E_IMAGE_URI`) carries NO harness — `claude` rides the host
+    /// `current_bundles` stamp (staged by the e2e "Stage RO skill bundles" step)
+    /// and mounts on dyn_0.
     ///
     /// ADR 0051: the bogus Anthropic token is injected via `harness_env`
     /// (the orchestrator's trusted identity-injection channel), which the
@@ -218,6 +245,9 @@ impl Driver {
         api_key: &str,
         prompt: Option<&str>,
     ) -> SessionId {
+        // ADR 0062: the built-in `claude` harness rides the host-image
+        // current_bundles stamp (staged by the e2e "Stage RO skill bundles"
+        // step), so the session just selects it by name — no registration.
         let mut harness_env = HashMap::new();
         harness_env.insert("ANTHROPIC_API_KEY".to_string(), api_key.to_string());
         let req = app::CreateSessionRequest {
@@ -230,14 +260,11 @@ impl Driver {
             secrets: HashMap::new(),
             harness_env,
             prompt_id: None,
+            // The built-in `claude` needs no registration — it resolves from the
+            // host `current_bundles` stamp (∪ the catalog) by name.
+            harness: Some("claude".to_string()),
         };
-        let resp = self
-            .sess
-            .create_session(req)
-            .await
-            .expect("CreateSession (claude)")
-            .into_inner();
-        resp.session_id.parse().expect("session_id is a SessionId")
+        self.create_session_retrying(req, "claude").await
     }
 
     /// `SessionService.Exec` — server-streaming `ExecOutput`. Drains the
@@ -630,8 +657,8 @@ async fn e2e_cold_session_no_harness_can_exec_ls() {
 ///
 /// Baked skills are retired and skills are now profile-selected, so the session
 /// is created with `selected_skills = ["skills"]`. The e2e-stack lane stages the
-/// content-addressed `skills` + `sentinel` bundles under
-/// `/var/lib/engram/shared`, so this exercises the WHOLE ADR 0055 chain
+/// content-addressed `skills` + `sentinel` bundles into `var/shared` (the dir the
+/// host-agent reads, via `just bundles-squashfs`), so this exercises the WHOLE ADR 0055 chain
 /// end-to-end: capture attaches the reserved sentinel slots → the coord resolves
 /// `"skills"` → its staged sha and `patch_drive`s it into a reserved slot in the
 /// paused restore window → the init shim mounts it at `/opt/engram/dyn/<i>` (the
@@ -641,7 +668,7 @@ async fn e2e_cold_session_no_harness_can_exec_ls() {
 /// assertion targets the stable wired paths. Integrated counterpart to the
 /// `engram-session-bundles` unit tests + the `aux_ro_drive` FC mechanism test.
 #[tokio::test]
-#[ignore = "requires the e2e-stack lane (stages the skills + sentinel RO bundles at /var/lib/engram/shared)"]
+#[ignore = "requires the e2e-stack lane (stages the skills + sentinel RO bundles into var/shared)"]
 async fn e2e_session_has_mounted_skills_bundle() {
     let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
@@ -683,7 +710,7 @@ async fn e2e_session_has_mounted_skills_bundle() {
 }
 
 #[tokio::test]
-#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a Claude harness pack baked into the demo image"]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + the harness-claude bundle in the host stamp"]
 async fn e2e_cold_session_claude_harness_can_exec_ls() {
     // Raw Exec hits the sandbox directly — the Claude harness is bound but
     // unused. Use a bogus key so a future regression that races a harness

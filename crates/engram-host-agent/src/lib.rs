@@ -43,14 +43,13 @@ pub mod live_attach;
 pub mod metrics;
 pub mod orphan_reap;
 pub mod pooled_backend;
+pub mod proxy_port;
 pub mod proxy_shell;
-pub mod proxy_vnc;
 pub mod resource;
 pub mod snapshot;
 pub mod teardown_reconcile;
 pub mod trace_scope;
 pub mod util;
-mod vnc_grace;
 
 pub use config::HostAgentConfig;
 
@@ -1017,7 +1016,15 @@ impl HostAgent {
             // (hosts are immutable; only a host-agent pod restart changes it). The
             // supervisor consumes the ack's `live_bundles` pin set:
             // prefetch missing pinned generations, sweep unpinned ones.
-            let bundle_dir = bundles::bundle_dir_from_env();
+            // ADR 0062: read the stamp from the BACKEND's bundle dir — its
+            // single source of truth (`SandboxBackend::bundle_dir`) — so the
+            // `current_bundles` this host advertises is, by construction, the
+            // exact dir restore will attach generations from. (Previously this
+            // re-resolved `bundle_dir_from_env()` independently of the FC
+            // config, which silently defaulted elsewhere — a host could then
+            // advertise a sha it couldn't attach.) The supervisor materializes
+            // pinned generations into the same dir.
+            let bundle_dir = self.sandbox.bundle_dir().to_path_buf();
             let current_bundles = bundles::read_stamp(&bundle_dir).await;
             let live_bundles_tx = self.chunk_store.as_ref().map(|(cs, _)| {
                 bundles::spawn_supervisor(

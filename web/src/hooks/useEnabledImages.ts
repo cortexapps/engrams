@@ -17,7 +17,6 @@ function protoImageToLegacy(img: ProtoEnabledImageSummary): EnabledImageSummary 
     manifest_digest: img.manifestDigest,
     manifest_name: img.manifestName ?? null,
     manifest_description: img.manifestDescription ?? null,
-    harness_name: img.harnessName ?? null,
     last_refreshed_at: img.lastRefreshedAt,
     created_at: img.createdAt,
     // Flatten the proto `value` oneof: secretRef → "secret_ref", everything

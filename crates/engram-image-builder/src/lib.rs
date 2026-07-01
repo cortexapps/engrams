@@ -28,7 +28,6 @@ pub mod blob;
 pub mod config;
 pub mod docker;
 pub mod ext4;
-pub mod harness;
 
 use std::path::{Path, PathBuf};
 
@@ -37,7 +36,6 @@ use engram_core::types::ImageManifest;
 pub use config::{BuildConfig, EngramRepoConfig};
 pub use docker::{DockerCli, DockerRunner};
 pub use ext4::{recommended_size, Ext4Error, Ext4Packer, Mke2fsPacker};
-pub use harness::{BuiltinCatalog, Platform};
 
 /// Output format the baker should produce.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -103,19 +101,19 @@ pub struct AgentInjection {
     pub init_script: Option<PathBuf>,
 }
 
-/// Which `engram-transport` implementation the in-VM binaries
-/// should select at runtime. Set on [`AgentInjection`] at bake time;
-/// the default init shim writes `ENGRAM_TRANSPORT=<value>` into the
-/// rootfs so `engram-transport::from_env` picks the right impl.
+/// Which `engram-transport` implementation the in-VM binaries should
+/// select at runtime. Set on [`AgentInjection`] at bake time; the
+/// default init shim writes `ENGRAM_TRANSPORT=<value>` into the rootfs
+/// so `engram-transport::from_env` picks the right impl.
+///
+/// Both backends now use `Vsock` — VZ migrated off virtio-console onto
+/// Apple's real `VZVirtioSocketDevice` in ADR 0066 Phase 2. The enum
+/// stays a seam for a future non-vsock backend.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Transport {
-    /// AF_VSOCK (Linux + Firecracker). Default — matches every FC
-    /// bake we've shipped.
+    /// AF_VSOCK — the transport for both Firecracker and VZ.
     #[default]
     Vsock,
-    /// virtio-console (Apple Virtualization.framework on
-    /// macOS). Selected by the vz-bake-* recipes.
-    Console,
 }
 
 impl Transport {
@@ -124,7 +122,6 @@ impl Transport {
     pub fn env_value(self) -> &'static str {
         match self {
             Self::Vsock => "vsock",
-            Self::Console => "console",
         }
     }
 
@@ -133,10 +130,7 @@ impl Transport {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "vsock" => Ok(Self::Vsock),
-            "console" | "virtio-console" => Ok(Self::Console),
-            other => Err(format!(
-                "invalid transport: {other} (expected vsock|console)"
-            )),
+            other => Err(format!("invalid transport: {other} (expected vsock)")),
         }
     }
 }
@@ -471,43 +465,22 @@ pub struct Builder<D: DockerRunner, P: Ext4Packer = Mke2fsPacker> {
     docker: D,
     packer: P,
     chunk_store: engram_chunk_store::ChunkStore,
-    /// OCI client for built-in harness pulls (ADR 0021) and registry
-    /// pushes. Optional so tests that exercise only the local bake
-    /// pipeline don't have to construct one; absence is surfaced as a
-    /// clear error when an operation actually needs it.
+    /// OCI client for registry pushes. Optional so tests that exercise
+    /// only the local bake pipeline don't have to construct one; absence
+    /// is surfaced as a clear error when a push actually needs it.
     oci: Option<engram_oci::OciClient>,
-    /// Built-in harness catalog used when `engram.toml` carries
-    /// `[harness] builtin = "..."`. Defaulted to
-    /// [`BuiltinCatalog::default_catalog`]; tests can override.
-    catalog: BuiltinCatalog,
-    /// Guest platform a built-in harness artifact is resolved for
-    /// (`harness-claude:<ver>-<platform>`). The harness runs inside the
-    /// guest, so this is the rootfs's arch, not the host's. Defaults to
-    /// [`Platform::host`] — correct for the dev bake recipes, which
-    /// cross-compile the rootfs for the host's own arch. Override with
-    /// [`Self::with_harness_platform`] for cross-arch bakes.
-    harness_platform: Platform,
 }
 
 impl<D: DockerRunner> Builder<D, Mke2fsPacker> {
     /// Default constructor: real `mke2fs` packer for `Format::Ext4`,
     /// caller-supplied chunk store. Call [`Self::with_oci`] afterwards
-    /// to attach the OCI client needed for built-in harness pulls and
-    /// registry pushes.
+    /// to attach the OCI client needed for registry pushes.
     pub fn new(docker: D, chunk_store: engram_chunk_store::ChunkStore) -> Self {
         Self {
             docker,
             packer: Mke2fsPacker::default(),
             chunk_store,
             oci: None,
-            // Default catalog + env-driven overrides. CI lanes that
-            // publish a just-built harness artifact to a local
-            // registry export `ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO=…`
-            // before invoking the baker; production leaves the env
-            // unset and falls through to the GHCR repos hardcoded in
-            // `default_catalog`. See `with_overrides_from_env`.
-            catalog: BuiltinCatalog::default_catalog().with_overrides_from_env(),
-            harness_platform: Platform::host(),
         }
     }
 }
@@ -521,35 +494,14 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             packer,
             chunk_store,
             oci: None,
-            catalog: BuiltinCatalog::default_catalog(),
-            harness_platform: Platform::host(),
         }
     }
 
     /// Attach the OCI client. Required for [`Self::push_to_registry`]
-    /// (image push) and for any bake whose `engram.toml` declares a
-    /// built-in harness (the baker pulls + extracts the published
-    /// artifact). Returns `self` so it composes with
+    /// (image push). Returns `self` so it composes with
     /// `Builder::new(...).with_oci(...)`.
     pub fn with_oci(mut self, oci: engram_oci::OciClient) -> Self {
         self.oci = Some(oci);
-        self
-    }
-
-    /// Override the built-in harness catalog. Test-facing — production
-    /// uses [`BuiltinCatalog::default_catalog`] (wired by `Builder::new`).
-    pub fn with_catalog(mut self, catalog: BuiltinCatalog) -> Self {
-        self.catalog = catalog;
-        self
-    }
-
-    /// Override the guest platform built-in harness artifacts are
-    /// resolved for. Defaults to [`Platform::host`]; the bake recipes
-    /// set this from the detected backend's guest arch (e.g. `--harness-
-    /// platform linux-arm64` for a VZ image). Returns `self` so it
-    /// composes with the other `with_*` builders.
-    pub fn with_harness_platform(mut self, platform: Platform) -> Self {
-        self.harness_platform = platform;
         self
     }
 
@@ -673,34 +625,13 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // rootfs the user described in their Dockerfile is the base;
         // we just overlay our agent / bootstrap on top.
         //
-        // Harness (ADR 0021): exactly one harness baked per image, or
-        // none. Built-ins come from the OCI catalog and are injected
-        // here; custom harnesses ride in via the author's Dockerfile
-        // and we only validate that `exec` is actually on disk.
+        // ADR 0062: the image bakes NO harness. Harnesses are a per-session
+        // selection mounted on `dyn_0` from their own squashfs bundle (the
+        // harness catalog), so there is nothing harness-specific to inject
+        // here — only the agent / bootstrap overlay below.
         let mut effective_manifest = cfg.to_manifest();
         if let Some(injection) = &req.agent_injection {
             inject_agent(&rootfs_dir, injection).await?;
-        }
-        if let Some(source_harness) = effective_manifest.harness.clone() {
-            if source_harness.builtin.is_some() {
-                let oci = self.oci.as_ref().ok_or_else(|| {
-                    BuildError::Config(
-                        "[harness] builtin = \"...\" requires an OCI client — call Builder::with_oci(...)"
-                            .into(),
-                    )
-                })?;
-                let resolved = harness::inject_builtin_harness(
-                    &rootfs_dir,
-                    oci,
-                    &self.catalog,
-                    &source_harness,
-                    self.harness_platform,
-                )
-                .await?;
-                effective_manifest.harness = Some(resolved);
-            } else {
-                harness::validate_custom_harness(&rootfs_dir, &effective_manifest).await?;
-            }
         }
 
         // ADR 0027: the share-file skill + the git forge glue is no

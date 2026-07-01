@@ -115,6 +115,10 @@ async fn chained_restore_snapshot_lineage_holds() {
     // Cold create + settle + snapshot S1 + destroy. `metadata` is the
     // snapshot we restore the first hop from.
     let source_id = backend.create(spec).await.expect("create source");
+    // Fixed settle before S1. This test RE-snapshots a VM restored from S1, so
+    // S1 must capture a fully-settled guest; a bare kernel-banner poll snapshots
+    // too early and the restored VM is then too fragile to re-snapshot (FC
+    // socket gone). Let early boot finish.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let mut metadata = backend.snapshot(source_id).await.expect("snapshot source");
     backend.destroy(source_id).await.expect("destroy source");
@@ -167,6 +171,11 @@ async fn chained_restore_snapshot_lineage_holds() {
         // path tracks the live id and this snapshot's recomputed
         // source_harness_canonical matches what the next hop's
         // load_snapshot opens — no ENOENT on harness/<ancestor>.ext4.
+        //
+        // Kept as a fixed sleep (not a marker poll): this is a RESUMED
+        // VM, which does not re-emit the "Linux version" kernel banner,
+        // and there's no in-guest agentd to signal readiness — so there
+        // is no cleanly pollable settle marker here.
         tokio::time::sleep(Duration::from_secs(2)).await;
         metadata = backend
             .snapshot(restored)

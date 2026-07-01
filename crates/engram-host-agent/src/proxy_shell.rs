@@ -1,42 +1,33 @@
-//! ADR 0014 issue #6: host-agent half of the ProxyShell tunnel.
+//! ADR 0014 issue #6 + ADR 0066: host-agent half of the ProxyShell tunnel.
 //!
-//! Coord pods in GKE have no route to the per-VM `guest_ip`
-//! (10.200.0.x lives behind a TAP on the FC host VM, or behind a
-//! per-VM netns for warm-restored sandboxes), so the pre-M1.16
-//! `ws://<guest_ip>:7681/ws` direct-WebSocket from coord/api/shell.rs
-//! always times out from prod. This module is the host-agent half of
-//! the fix: dial ttyd in the right network namespace and shuttle
-//! WebSocket frames across a bidi gRPC stream the coord opens.
+//! Coord pods in GKE have no route to the per-VM `guest_ip`, so the pre-M1.16
+//! `ws://<guest_ip>:7681/ws` direct-WebSocket from coord/api/shell.rs always
+//! timed out from prod. This module is the host-agent half of the fix: reach
+//! ttyd in the guest and shuttle WebSocket frames across a bidi gRPC stream the
+//! coord opens.
 //!
-//! The async surface is `open_shell_tunnel` — it spawns two pump
-//! tasks (browser→ttyd and ttyd→browser via the `ShellTunnelEnds`
-//! channels) and returns immediately. Lifetime is owned by the
-//! caller's `ShellTunnel`: when the outbound channel closes (browser
-//! disconnect) or the inbound channel's receiver is dropped (caller
-//! gave up), both pumps notice and exit.
+//! The async surface is [`open_shell_tunnel_via_relay`] /
+//! [`open_shell_tunnel_at`] — each spawns two pump tasks (browser→ttyd and
+//! ttyd→browser via the `ShellTunnelEnds` channels) and returns immediately.
+//! Lifetime is owned by the caller's `ShellTunnel`: when the outbound channel
+//! closes (browser disconnect) or the inbound channel's receiver is dropped,
+//! both pumps notice and exit.
 //!
-//! Netns entry strategy:
-//!
-//! - **Cold path (`netns_name == None`)**: connect via
-//!   `tokio_tungstenite::connect_async` directly. Same wire shape
-//!   the pre-M1.16 coord used; the host can reach the VM's `/30`
-//!   from its root netns.
-//! - **Warm path (`netns_name == Some(_)`, Linux only)**: open a TCP
-//!   socket from inside the target netns via `setns(CLONE_NEWNET)`
-//!   on a dedicated worker thread (Tokio's blocking pool), restore
-//!   root netns, then hand the connected `TcpStream` back to async
-//!   land and run the WebSocket handshake over it. The kernel only
-//!   honours the calling thread's netns at `socket(2)` time — once
-//!   the FD exists it has its netns burned in.
+//! Guest reach (ADR 0066): the ttyd WebSocket handshake + frames ride the
+//! **vsock port relay** — the in-guest agentd dials `127.0.0.1:7681` (ttyd) and
+//! splices raw bytes, so ttyd is reachable regardless of how it binds, cold or
+//! warm, with no per-VM-netns dial (retired — only FC ever had one, and FC now
+//! always takes the relay). Backends without a vsock relay (Process; VZ until
+//! its Phase 2 real-vsock migration) fall back to [`open_shell_tunnel_at`],
+//! which dials `guest_ip:port` directly with `tokio_tungstenite::connect_async`.
 
 use std::time::Duration;
 
 use bytes::Bytes;
 use engram_core::error::SandboxError;
+use engram_core::traits::sandbox::HarnessByteStream;
 use engram_core::types::shell::{ShellClose, ShellFrame, ShellTunnelEnds};
 use futures::{SinkExt, StreamExt};
-#[cfg(target_os = "linux")]
-use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{protocol::CloseFrame, Message};
 
@@ -52,57 +43,86 @@ const TTYD_DIAL_DEADLINE: Duration = Duration::from_secs(8);
 const TTYD_BACKOFF_START: Duration = Duration::from_millis(100);
 const TTYD_BACKOFF_MAX: Duration = Duration::from_millis(800);
 
-/// Open a shell tunnel from this host to the in-guest `ttyd` for
-/// `guest_ip`, running the WebSocket dial inside `netns_name` if
-/// `Some` (warm-restored sandbox) or on the host root if `None`
-/// (cold sandbox). Convenience wrapper around [`open_shell_tunnel_at`]
-/// that pins the port to [`TTYD_PORT`] — production callers want
-/// that; tests parameterize it.
-pub async fn open_shell_tunnel(
-    guest_ip: String,
-    netns_name: Option<String>,
+/// ADR 0066: open a shell tunnel to the guest's ttyd over the vsock relay —
+/// reach ttyd on the guest's `127.0.0.1:port` via the in-guest agentd relay (the
+/// ttyd WebSocket handshake + frames ride the raw relay stream). `stream` is a
+/// fresh vsock connection to the relay listener (from
+/// `SandboxBackend::open_guest_stream`). Used by FC (and VZ after its Phase 2
+/// real-vsock migration). `start_shell` has already ensured ttyd is listening
+/// before we get here, so there's no boot-race retry to do — the relay's own
+/// short connection-refused retry is a safety margin.
+pub async fn open_shell_tunnel_via_relay(
+    mut stream: HarnessByteStream,
+    port: u16,
     ends: ShellTunnelEnds,
 ) -> Result<(), SandboxError> {
-    open_shell_tunnel_at(guest_ip, TTYD_PORT, netns_name, ends).await
+    engram_harness_proto::write_msg(
+        &mut stream,
+        &engram_harness_proto::RelayConnect { target_port: port },
+    )
+    .await
+    .map_err(|e| SandboxError::Vm(format!("proxy_shell: write relay header: {e}").into()))?;
+    let ack: engram_harness_proto::RelayAck = engram_harness_proto::read_msg(&mut stream)
+        .await
+        .map_err(|e| SandboxError::Vm(format!("proxy_shell: read relay ack: {e}").into()))?;
+    if !ack.ok {
+        return Err(SandboxError::Vm(
+            format!(
+                "proxy_shell: guest relay could not reach ttyd on 127.0.0.1:{port}: {}",
+                ack.error.unwrap_or_default()
+            )
+            .into(),
+        ));
+    }
+    let (ws, _resp) = tokio_tungstenite::client_async(ttyd_request(port)?, stream)
+        .await
+        .map_err(|e| SandboxError::Vm(format!("ttyd ws handshake over relay: {e}").into()))?;
+    pump_websocket_through_tunnel(ws, ends);
+    Ok(())
 }
 
-/// Same as [`open_shell_tunnel`] but takes an explicit port. Used by
-/// the test harness so it can hit a fake ttyd on an arbitrary
-/// localhost port; production callers go through `open_shell_tunnel`
-/// with the pinned [`TTYD_PORT`].
+/// Cold-path shell tunnel: dial ttyd at `guest_ip:port` directly over a
+/// WebSocket, with a connection-refused retry. Used only by backends WITHOUT a
+/// vsock relay: the Process backend (`guest_ip` is `127.0.0.1`) and VZ until its
+/// Phase 2 real-vsock migration. FC goes through [`open_shell_tunnel_via_relay`],
+/// so the old per-VM-netns dial (only FC ever had one) is retired.
 pub async fn open_shell_tunnel_at(
     guest_ip: String,
     port: u16,
-    netns_name: Option<String>,
     ends: ShellTunnelEnds,
 ) -> Result<(), SandboxError> {
     let target = format!("ws://{guest_ip}:{port}/ws");
-    let request = || {
-        let mut req = target
-            .as_str()
-            .into_client_request()
-            .map_err(|e| SandboxError::Vm(format!("bad ttyd url: {e}").into()))?;
-        req.headers_mut()
-            .insert("sec-websocket-protocol", "tty".parse().unwrap());
-        Ok::<_, SandboxError>(req)
-    };
-
-    let upstream = match &netns_name {
-        None => connect_ttyd_cold(request).await?,
-        Some(ns) => connect_ttyd_in_netns(ns, &guest_ip, request).await?,
-    };
-
+    let upstream = connect_ttyd_cold(|| ttyd_request_from(&target)).await?;
     pump_websocket_through_tunnel(upstream, ends);
     Ok(())
+}
+
+/// Build the ttyd WebSocket handshake request (carrying the `tty` subprotocol
+/// ttyd requires) for a guest-loopback `port` — the relay path's target.
+fn ttyd_request(
+    port: u16,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, SandboxError> {
+    ttyd_request_from(&format!("ws://127.0.0.1:{port}/ws"))
+}
+
+/// Build the ttyd handshake request from an explicit `ws://…/ws` URL.
+fn ttyd_request_from(
+    url: &str,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, SandboxError> {
+    let mut req = url
+        .into_client_request()
+        .map_err(|e| SandboxError::Vm(format!("bad ttyd url: {e}").into()))?;
+    req.headers_mut()
+        .insert("sec-websocket-protocol", "tty".parse().unwrap());
+    Ok(req)
 }
 
 /// Spawn the two pump tasks (outbound: caller → ws, inbound: ws →
 /// caller) that move WS messages across the [`ShellTunnelEnds`].
 /// Returns immediately; the pumps run until either side closes.
 ///
-/// Extracted from [`open_shell_tunnel`] so tests can drive it over
-/// any in-memory WebSocket without going through the URL formatter
-/// (which hardcodes ttyd's :7681).
+/// Split out from the tunnel openers so tests can drive it over any in-memory
+/// WebSocket without a real ttyd dial.
 pub(crate) fn pump_websocket_through_tunnel<S>(
     upstream: tokio_tungstenite::WebSocketStream<S>,
     ends: ShellTunnelEnds,
@@ -205,130 +225,6 @@ async fn connect_ttyd_cold(
             }
         }
     }
-}
-
-/// Warm-path dial: open a TCP socket inside `netns_name` via
-/// `setns(2)`, then run the WebSocket handshake over the resulting
-/// `tokio::net::TcpStream`. Linux only — non-Linux returns a clean
-/// SandboxError so the rest of the system surfaces a 503 rather
-/// than panicking.
-async fn connect_ttyd_in_netns(
-    netns_name: &str,
-    guest_ip: &str,
-    build_request: impl Fn() -> Result<
-        tokio_tungstenite::tungstenite::handshake::client::Request,
-        SandboxError,
-    >,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    SandboxError,
-> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (netns_name, guest_ip, build_request);
-        Err(SandboxError::Vm(
-            "proxy_shell: per-VM netns dial requires Linux (got non-Linux host)".into(),
-        ))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // ADR 0014 issue #6 follow-up: retry connection-refused for
-        // up to TTYD_DIAL_DEADLINE, same shape as the cold path. ttyd
-        // inside the warm-restored guest takes a few seconds to bind
-        // :7681 — the same boot-race the cold path retries against.
-        // Without this, the dashboard's first SHELL-tab click after
-        // a fresh warm-lease races ttyd's bind and the user sees
-        // "abnormal close" (observed on session 9d9fef3e, 2026-05-20).
-        let deadline = std::time::Instant::now() + TTYD_DIAL_DEADLINE;
-        let mut backoff = TTYD_BACKOFF_START;
-        loop {
-            let stream = match connect_tcp_in_netns_linux(netns_name, guest_ip, TTYD_PORT).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let msg = format!("{e}");
-                    let refused = msg.contains("Connection refused");
-                    if !refused || std::time::Instant::now() >= deadline {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(TTYD_BACKOFF_MAX);
-                    continue;
-                }
-            };
-            // TCP connect succeeded — now do the WS handshake. If the
-            // handshake itself fails it's a different problem (ttyd
-            // emitted a non-WS reply, etc.) and retrying connect-refused
-            // wouldn't help, so we just surface the error.
-            //
-            // Wrap as MaybeTlsStream::Plain so the WS handshake
-            // produces a `WebSocketStream<MaybeTlsStream<TcpStream>>`
-            // matching the cold path's return type exactly.
-            let wrapped = tokio_tungstenite::MaybeTlsStream::Plain(stream);
-            let request = build_request()?;
-            let (ws, _resp) = tokio_tungstenite::client_async(request, wrapped)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("ttyd ws handshake: {e}").into()))?;
-            return Ok(ws);
-        }
-    }
-}
-
-/// Open a TCP socket to `guest_ip:port` from inside `netns_name` via
-/// `setns(2)` on a blocking worker thread, then adopt the connected
-/// FD back into tokio. Shared by the shell path (ttyd) and the VNC
-/// path (`proxy_vnc`, ADR 0064) — both need the same per-VM netns
-/// entry, differing only by destination port.
-#[cfg(target_os = "linux")]
-pub(crate) async fn connect_tcp_in_netns_linux(
-    netns_name: &str,
-    guest_ip: &str,
-    port: u16,
-) -> Result<TcpStream, SandboxError> {
-    let netns_path = format!("/var/run/netns/{netns_name}");
-    let guest_addr = format!("{guest_ip}:{port}");
-
-    // We need to:
-    //   1. open /proc/self/ns/net to remember root netns.
-    //   2. open `netns_path` to get the target ns fd.
-    //   3. setns(target) on a dedicated worker thread.
-    //   4. std::net::TcpStream::connect inside target.
-    //   5. setns(root) to restore.
-    //   6. hand the FD back to tokio.
-    //
-    // Steps 1-5 all need to run on the same thread (setns affects
-    // the calling thread's netns). Step 6 happens on the tokio
-    // runtime after spawn_blocking returns.
-
-    let netns_path_clone = netns_path.clone();
-    let guest_addr_clone = guest_addr.clone();
-    let std_stream = tokio::task::spawn_blocking(move || -> Result<std::net::TcpStream, String> {
-        use nix::sched::{setns, CloneFlags};
-        let root = std::fs::File::open("/proc/self/ns/net")
-            .map_err(|e| format!("open /proc/self/ns/net: {e}"))?;
-        let target = std::fs::File::open(&netns_path_clone)
-            .map_err(|e| format!("open {netns_path_clone}: {e}"))?;
-        // nix 0.31 takes anything that implements AsFd — passing
-        // `&File` works (File implements AsFd) and keeps both fds
-        // alive across the restore call.
-        setns(&target, CloneFlags::CLONE_NEWNET).map_err(|e| format!("setns(target): {e}"))?;
-        let stream_result = std::net::TcpStream::connect(&guest_addr_clone)
-            .map_err(|e| format!("connect {guest_addr_clone}: {e}"));
-        // Always restore root netns, even on connect failure — the
-        // blocking worker thread is reused and we mustn't leave it
-        // pinned to a guest netns.
-        let restore =
-            setns(&root, CloneFlags::CLONE_NEWNET).map_err(|e| format!("setns(root): {e}"));
-        let stream = stream_result?;
-        restore?;
-        stream.set_nonblocking(true).map_err(|e| e.to_string())?;
-        Ok(stream)
-    })
-    .await
-    .map_err(|e| SandboxError::Vm(format!("netns connect worker panicked: {e}").into()))?
-    .map_err(|e| SandboxError::Vm(format!("netns connect: {e}").into()))?;
-
-    TcpStream::from_std(std_stream)
-        .map_err(|e| SandboxError::Vm(format!("adopt netns TcpStream into tokio: {e}").into()))
 }
 
 #[cfg(test)]
@@ -482,7 +378,7 @@ mod tests {
         });
 
         let (tunnel, ends) = ShellTunnel::pair();
-        open_shell_tunnel_at(addr.ip().to_string(), addr.port(), None, ends)
+        open_shell_tunnel_at(addr.ip().to_string(), addr.port(), ends)
             .await
             .expect("open tunnel");
 
@@ -515,7 +411,7 @@ mod tests {
         // and tolerate up to TTYD_DIAL_DEADLINE here.
         let err = tokio::time::timeout(
             Duration::from_secs(12),
-            open_shell_tunnel_at("127.0.0.1".into(), 1, None, ends),
+            open_shell_tunnel_at("127.0.0.1".into(), 1, ends),
         )
         .await
         .expect("dial timed out test-side")

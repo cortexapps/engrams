@@ -211,6 +211,23 @@ pub trait SandboxBackend: Send + Sync {
         })
     }
 
+    /// ADR 0066: open a raw duplex byte stream to the in-guest `engram-agentd`
+    /// vsock listener on `port` (e.g. `PROXY_PORT_VSOCK_PORT`). VM backends
+    /// (FC, VZ) return a connected vsock stream; the caller writes the relay
+    /// header, reads the ack, and splices bytes. Backends with no VM boundary
+    /// (Process — the guest's `127.0.0.1` *is* the host's loopback) return
+    /// `None`, and the caller dials the loopback port directly instead.
+    ///
+    /// Default: `None` (no vsock). Reuses the same owned `HarnessByteStream`
+    /// the harness/forge/upload sinks already carry.
+    async fn open_guest_stream(
+        &self,
+        _id: SandboxId,
+        _port: u32,
+    ) -> Result<Option<HarnessByteStream>, SandboxError> {
+        Ok(None)
+    }
+
     /// Snapshot a running sandbox. ADR 0007 Phase 6: the backend
     /// chooses its own local staging directory (per
     /// [`Self::snapshot_path_for`]) — coord doesn't dictate where
@@ -443,6 +460,26 @@ pub trait SandboxBackend: Send + Sync {
     /// returns a path.
     fn stub_harness_path(&self) -> Option<PathBuf> {
         None
+    }
+
+    /// ADR 0035/0062: the directory this backend reads its RO bundle stamp
+    /// (`current.json`) and staged `<sha>.squashfs` generations from — i.e.
+    /// where `restore_fresh` resolves a selected skill/harness sha to a file
+    /// and `build_base_snapshot` reads the sentinel.
+    ///
+    /// This is the SINGLE SOURCE OF TRUTH for "where this host's bundles live":
+    /// the host-agent reports `current_bundles` by reading the stamp from THIS
+    /// path (see `HostAgent::run`), so the heartbeat's advertised catalog is, by
+    /// construction, the exact dir the backend will later attach from. The trap
+    /// this closes (ADR 0062): the heartbeat and the FC backend used to resolve
+    /// the dir independently (the reporter from `ENGRAM_BUNDLE_DIR`, the FC
+    /// config from a hardcoded default), so a host could advertise a sha it
+    /// couldn't attach. Route every consumer through this accessor instead.
+    ///
+    /// Defaults to the fleet-canonical [`AuxRoDrive::SHARED_DIR`]; FC/VZ return
+    /// their configured dir (production: the default; dev/e2e: `ENGRAM_BUNDLE_DIR`).
+    fn bundle_dir(&self) -> &std::path::Path {
+        std::path::Path::new(crate::types::sandbox::AuxRoDrive::SHARED_DIR)
     }
 
     /// ADR 0020 Route B: whether `restore` serves guest memory lazily

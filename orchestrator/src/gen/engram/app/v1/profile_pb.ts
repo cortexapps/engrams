@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/profile.proto.
  */
 export const file_engram_app_v1_profile: GenFile = /*@__PURE__*/
-  fileDesc("ChtlbmdyYW0vYXBwL3YxL3Byb2ZpbGUucHJvdG8SDWVuZ3JhbS5hcHAudjEirwMKB1Byb2ZpbGUSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIMCgRpY29uGAQgASgJEhAKCGltYWdlX2lkGAUgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBiABKAgSNQoIZW52X3ZhcnMYByADKAsyIy5lbmdyYW0uYXBwLnYxLlByb2ZpbGUuRW52VmFyc0VudHJ5EhAKCGFyY2hpdmVkGAggASgIEhIKCmNyZWF0ZWRfYXQYCSABKAkSEgoKdXBkYXRlZF9hdBgKIAEoCRIOCgZza2lsbHMYCyADKAkSFAoMY2FwYWJpbGl0aWVzGAwgAygJEi4KB25ldHdvcmsYDSABKAsyHS5lbmdyYW0uYXBwLnYxLlByb2ZpbGVOZXR3b3JrEi0KB3NlY3JldHMYDiADKAsyHC5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTZWNyZXQSEgoKaXNfZGVmYXVsdBgPIAEoCBouCgxFbnZWYXJzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASJTCg5Qcm9maWxlTmV0d29yaxIPCgdkZWZhdWx0GAEgASgJEhMKC2FsbG93X2hvc3RzGAIgAygJEhsKE2FsbG93X2hvc3RfcGF0dGVybnMYAyADKAkibQoNUHJvZmlsZVNlY3JldBILCgNyZWYYASABKAkSDwoHZW52X3ZhchgCIAEoCRIMCgRtb2RlGAMgASgJEhMKC2FsbG93X2hvc3RzGAQgAygJEhsKE2FsbG93X2hvc3RfcGF0dGVybnMYBSADKAkibgoPUHJvZmlsZVNuYXBzaG90EgoKAmlkGAEgASgJEgwKBG5hbWUYAiABKAkSDAoEaWNvbhgDIAEoCRIQCghhcmNoaXZlZBgEIAEoCBIRCglpbWFnZV91cmkYBSABKAkSDgoGc2tpbGxzGAYgAygJIi8KE0xpc3RQcm9maWxlc1JlcXVlc3QSGAoQaW5jbHVkZV9hcmNoaXZlZBgBIAEoCCJAChRMaXN0UHJvZmlsZXNSZXNwb25zZRIoCghwcm9maWxlcxgBIAMoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSIfChFHZXRQcm9maWxlUmVxdWVzdBIKCgJpZBgBIAEoCSI9ChJHZXRQcm9maWxlUmVzcG9uc2USJwoHcHJvZmlsZRgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSKDAwoUQ3JlYXRlUHJvZmlsZVJlcXVlc3QSDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRIMCgRpY29uGAMgASgJEhAKCGltYWdlX2lkGAQgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBSABKAgSQgoIZW52X3ZhcnMYBiADKAsyMC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVByb2ZpbGVSZXF1ZXN0LkVudlZhcnNFbnRyeRIOCgZza2lsbHMYByADKAkSFAoMY2FwYWJpbGl0aWVzGAggAygJEi4KB25ldHdvcmsYCSABKAsyHS5lbmdyYW0uYXBwLnYxLlByb2ZpbGVOZXR3b3JrEi0KB3NlY3JldHMYCiADKAsyHC5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTZWNyZXQSEgoKaXNfZGVmYXVsdBgLIAEoCBouCgxFbnZWYXJzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASJAChVDcmVhdGVQcm9maWxlUmVzcG9uc2USJwoHcHJvZmlsZRgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSKPAwoUVXBkYXRlUHJvZmlsZVJlcXVlc3QSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIMCgRpY29uGAQgASgJEhAKCGltYWdlX2lkGAUgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBiABKAgSQgoIZW52X3ZhcnMYByADKAsyMC5lbmdyYW0uYXBwLnYxLlVwZGF0ZVByb2ZpbGVSZXF1ZXN0LkVudlZhcnNFbnRyeRIOCgZza2lsbHMYCCADKAkSFAoMY2FwYWJpbGl0aWVzGAkgAygJEi4KB25ldHdvcmsYCiABKAsyHS5lbmdyYW0uYXBwLnYxLlByb2ZpbGVOZXR3b3JrEi0KB3NlY3JldHMYCyADKAsyHC5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTZWNyZXQSEgoKaXNfZGVmYXVsdBgMIAEoCBouCgxFbnZWYXJzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASJAChVVcGRhdGVQcm9maWxlUmVzcG9uc2USJwoHcHJvZmlsZRgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSIiChREZWxldGVQcm9maWxlUmVxdWVzdBIKCgJpZBgBIAEoCSIXChVEZWxldGVQcm9maWxlUmVzcG9uc2Uy0AMKDlByb2ZpbGVTZXJ2aWNlElcKDExpc3RQcm9maWxlcxIiLmVuZ3JhbS5hcHAudjEuTGlzdFByb2ZpbGVzUmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuTGlzdFByb2ZpbGVzUmVzcG9uc2USUQoKR2V0UHJvZmlsZRIgLmVuZ3JhbS5hcHAudjEuR2V0UHJvZmlsZVJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkdldFByb2ZpbGVSZXNwb25zZRJaCg1DcmVhdGVQcm9maWxlEiMuZW5ncmFtLmFwcC52MS5DcmVhdGVQcm9maWxlUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuQ3JlYXRlUHJvZmlsZVJlc3BvbnNlEloKDVVwZGF0ZVByb2ZpbGUSIy5lbmdyYW0uYXBwLnYxLlVwZGF0ZVByb2ZpbGVSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5VcGRhdGVQcm9maWxlUmVzcG9uc2USWgoNRGVsZXRlUHJvZmlsZRIjLmVuZ3JhbS5hcHAudjEuRGVsZXRlUHJvZmlsZVJlcXVlc3QaJC5lbmdyYW0uYXBwLnYxLkRlbGV0ZVByb2ZpbGVSZXNwb25zZWIGcHJvdG8z");
+  fileDesc("ChtlbmdyYW0vYXBwL3YxL3Byb2ZpbGUucHJvdG8SDWVuZ3JhbS5hcHAudjEipwQKB1Byb2ZpbGUSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIMCgRpY29uGAQgASgJEhAKCGltYWdlX2lkGAUgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBiABKAgSNQoIZW52X3ZhcnMYByADKAsyIy5lbmdyYW0uYXBwLnYxLlByb2ZpbGUuRW52VmFyc0VudHJ5EhAKCGFyY2hpdmVkGAggASgIEhIKCmNyZWF0ZWRfYXQYCSABKAkSEgoKdXBkYXRlZF9hdBgKIAEoCRIOCgZza2lsbHMYCyADKAkSFAoMY2FwYWJpbGl0aWVzGAwgAygJEi4KB25ldHdvcmsYDSABKAsyHS5lbmdyYW0uYXBwLnYxLlByb2ZpbGVOZXR3b3JrEi0KB3NlY3JldHMYDiADKAsyHC5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTZWNyZXQSEgoKaXNfZGVmYXVsdBgPIAEoCBIUCgdoYXJuZXNzGBAgASgJSACIAQESEgoFbW9kZWwYESABKAlIAYgBARITCgZlZmZvcnQYEiABKAlIAogBARIWCg5wb3J0X2V4cG9zdXJlcxgTIAMoDRouCgxFbnZWYXJzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4AUIKCghfaGFybmVzc0IICgZfbW9kZWxCCQoHX2VmZm9ydCJTCg5Qcm9maWxlTmV0d29yaxIPCgdkZWZhdWx0GAEgASgJEhMKC2FsbG93X2hvc3RzGAIgAygJEhsKE2FsbG93X2hvc3RfcGF0dGVybnMYAyADKAkibQoNUHJvZmlsZVNlY3JldBILCgNyZWYYASABKAkSDwoHZW52X3ZhchgCIAEoCRIMCgRtb2RlGAMgASgJEhMKC2FsbG93X2hvc3RzGAQgAygJEhsKE2FsbG93X2hvc3RfcGF0dGVybnMYBSADKAkibgoPUHJvZmlsZVNuYXBzaG90EgoKAmlkGAEgASgJEgwKBG5hbWUYAiABKAkSDAoEaWNvbhgDIAEoCRIQCghhcmNoaXZlZBgEIAEoCBIRCglpbWFnZV91cmkYBSABKAkSDgoGc2tpbGxzGAYgAygJIi8KE0xpc3RQcm9maWxlc1JlcXVlc3QSGAoQaW5jbHVkZV9hcmNoaXZlZBgBIAEoCCJAChRMaXN0UHJvZmlsZXNSZXNwb25zZRIoCghwcm9maWxlcxgBIAMoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSIfChFHZXRQcm9maWxlUmVxdWVzdBIKCgJpZBgBIAEoCSI9ChJHZXRQcm9maWxlUmVzcG9uc2USJwoHcHJvZmlsZRgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSL7AwoUQ3JlYXRlUHJvZmlsZVJlcXVlc3QSDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRIMCgRpY29uGAMgASgJEhAKCGltYWdlX2lkGAQgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBSABKAgSQgoIZW52X3ZhcnMYBiADKAsyMC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVByb2ZpbGVSZXF1ZXN0LkVudlZhcnNFbnRyeRIOCgZza2lsbHMYByADKAkSFAoMY2FwYWJpbGl0aWVzGAggAygJEi4KB25ldHdvcmsYCSABKAsyHS5lbmdyYW0uYXBwLnYxLlByb2ZpbGVOZXR3b3JrEi0KB3NlY3JldHMYCiADKAsyHC5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTZWNyZXQSEgoKaXNfZGVmYXVsdBgLIAEoCBIUCgdoYXJuZXNzGAwgASgJSACIAQESEgoFbW9kZWwYDSABKAlIAYgBARITCgZlZmZvcnQYDiABKAlIAogBARIWCg5wb3J0X2V4cG9zdXJlcxgPIAMoDRouCgxFbnZWYXJzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4AUIKCghfaGFybmVzc0IICgZfbW9kZWxCCQoHX2VmZm9ydCJAChVDcmVhdGVQcm9maWxlUmVzcG9uc2USJwoHcHJvZmlsZRgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSKHBAoUVXBkYXRlUHJvZmlsZVJlcXVlc3QSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIMCgRpY29uGAQgASgJEhAKCGltYWdlX2lkGAUgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBiABKAgSQgoIZW52X3ZhcnMYByADKAsyMC5lbmdyYW0uYXBwLnYxLlVwZGF0ZVByb2ZpbGVSZXF1ZXN0LkVudlZhcnNFbnRyeRIOCgZza2lsbHMYCCADKAkSFAoMY2FwYWJpbGl0aWVzGAkgAygJEi4KB25ldHdvcmsYCiABKAsyHS5lbmdyYW0uYXBwLnYxLlByb2ZpbGVOZXR3b3JrEi0KB3NlY3JldHMYCyADKAsyHC5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTZWNyZXQSEgoKaXNfZGVmYXVsdBgMIAEoCBIUCgdoYXJuZXNzGA0gASgJSACIAQESEgoFbW9kZWwYDiABKAlIAYgBARITCgZlZmZvcnQYDyABKAlIAogBARIWCg5wb3J0X2V4cG9zdXJlcxgQIAMoDRouCgxFbnZWYXJzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4AUIKCghfaGFybmVzc0IICgZfbW9kZWxCCQoHX2VmZm9ydCJAChVVcGRhdGVQcm9maWxlUmVzcG9uc2USJwoHcHJvZmlsZRgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSIiChREZWxldGVQcm9maWxlUmVxdWVzdBIKCgJpZBgBIAEoCSIXChVEZWxldGVQcm9maWxlUmVzcG9uc2Uy0AMKDlByb2ZpbGVTZXJ2aWNlElcKDExpc3RQcm9maWxlcxIiLmVuZ3JhbS5hcHAudjEuTGlzdFByb2ZpbGVzUmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuTGlzdFByb2ZpbGVzUmVzcG9uc2USUQoKR2V0UHJvZmlsZRIgLmVuZ3JhbS5hcHAudjEuR2V0UHJvZmlsZVJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkdldFByb2ZpbGVSZXNwb25zZRJaCg1DcmVhdGVQcm9maWxlEiMuZW5ncmFtLmFwcC52MS5DcmVhdGVQcm9maWxlUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuQ3JlYXRlUHJvZmlsZVJlc3BvbnNlEloKDVVwZGF0ZVByb2ZpbGUSIy5lbmdyYW0uYXBwLnYxLlVwZGF0ZVByb2ZpbGVSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5VcGRhdGVQcm9maWxlUmVzcG9uc2USWgoNRGVsZXRlUHJvZmlsZRIjLmVuZ3JhbS5hcHAudjEuRGVsZXRlUHJvZmlsZVJlcXVlc3QaJC5lbmdyYW0uYXBwLnYxLkRlbGV0ZVByb2ZpbGVSZXNwb25zZWIGcHJvdG8z");
 
 /**
  * An admin-curated bundle of session-launch inputs (ADR §1).
@@ -129,6 +129,33 @@ export type Profile = Message<"engram.app.v1.Profile"> & {
    * @generated from field: bool is_default = 15;
    */
   isDefault: boolean;
+
+  /**
+   * ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
+   * + default model/effort (catalog option ids) for this profile's sessions.
+   * Empty = inherit (deployment-default harness; the harness descriptor's
+   * default model/effort). Overridable per session at create.
+   *
+   * @generated from field: optional string harness = 16;
+   */
+  harness?: string;
+
+  /**
+   * @generated from field: optional string model = 17;
+   */
+  model?: string;
+
+  /**
+   * @generated from field: optional string effort = 18;
+   */
+  effort?: string;
+
+  /**
+   * ADR 0064: guest ports auto-exposed (private) for every session from this profile.
+   *
+   * @generated from field: repeated uint32 port_exposures = 19;
+   */
+  portExposures: number[];
 };
 
 /**
@@ -412,6 +439,30 @@ export type CreateProfileRequest = Message<"engram.app.v1.CreateProfileRequest">
    * @generated from field: bool is_default = 11;
    */
   isDefault: boolean;
+
+  /**
+   * ADR 0062/0063: default harness / model / effort (see Profile).
+   *
+   * @generated from field: optional string harness = 12;
+   */
+  harness?: string;
+
+  /**
+   * @generated from field: optional string model = 13;
+   */
+  model?: string;
+
+  /**
+   * @generated from field: optional string effort = 14;
+   */
+  effort?: string;
+
+  /**
+   * ADR 0064: guest ports auto-exposed (private) for every session from this profile.
+   *
+   * @generated from field: repeated uint32 port_exposures = 15;
+   */
+  portExposures: number[];
 };
 
 /**
@@ -509,6 +560,30 @@ export type UpdateProfileRequest = Message<"engram.app.v1.UpdateProfileRequest">
    * @generated from field: bool is_default = 12;
    */
   isDefault: boolean;
+
+  /**
+   * ADR 0062/0063: default harness / model / effort (see Profile).
+   *
+   * @generated from field: optional string harness = 13;
+   */
+  harness?: string;
+
+  /**
+   * @generated from field: optional string model = 14;
+   */
+  model?: string;
+
+  /**
+   * @generated from field: optional string effort = 15;
+   */
+  effort?: string;
+
+  /**
+   * ADR 0064: guest ports auto-exposed (private) for every session from this profile.
+   *
+   * @generated from field: repeated uint32 port_exposures = 16;
+   */
+  portExposures: number[];
 };
 
 /**

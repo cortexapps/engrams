@@ -66,19 +66,21 @@ the machine):
 
 ```bash
 just bake-demo     # builds the Claude harness for arm64, bakes
-                   # deploy/demo-claude/, pushes localhost:5001/demo-claude:warm-1
+                   # deploy/demo/, pushes localhost:5001/demo:warm-1
 ```
 
 `bake-demo` (arch detected from the backend probe — `linux-arm64` on VZ):
-1. Cross-compiles `engram-agentd` + `engram-harness-claude` for
-   `aarch64-unknown-linux-musl` and downloads the matching `claude` CLI.
-2. Publishes the harness artifact to the local registry and points the
-   baker's catalog at it (so it builds from your tree, not GHCR).
-3. `docker build --platform linux/arm64` a debian-slim base with the
+1. Cross-compiles `engram-agentd` for `aarch64-unknown-linux-musl`.
+2. `docker build --platform linux/arm64` a debian-slim base with the
    agent injected + the `/sbin/engram-init` shim; converts to ext4 via
    `mke2fs` (PATH-prepended from `/opt/homebrew/opt/e2fsprogs/sbin`).
-4. Pushes `localhost:5001/demo-claude:warm-1` (the registry `just dev`
+3. Pushes `localhost:5001/demo:warm-1` (the registry `just dev`
    runs). Enable it with `engram image enable …` or `just integration-session`.
+
+ADR 0062: the image bakes NO harness. The built-in `claude` harness rides
+the fleet `current_bundles` stamp — on VZ, `just dev`/`just bundles-vz`
+packs it as an erofs (`ENGRAM_HARNESS_CLAUDE_TREE`) and the coordinator
+resolves it per session, mounting it on `dyn_0`.
 
 VZ requires disk images to be 512-byte aligned. The bake pads
 automatically; a stale unpadded ext4 will fail `create()` with VZ
@@ -104,10 +106,10 @@ recipe still exists, used by `just vz-test`.)
 ```bash
 # The control plane is app-gRPC (ADR 0051); drive it with the `engram` CLI.
 # Pre-req: enable an image (one-time):
-engram image enable --uri localhost:5001/demo-claude:warm-1
+engram image enable --uri localhost:5001/demo:warm-1
 
-# Create a session driving the image's baked claude harness.
-SID=$(engram session create --image localhost:5001/demo-claude:warm-1)
+# Create a session selecting the built-in claude harness (ADR 0062).
+SID=$(engram session create --image localhost:5001/demo:warm-1 --harness claude)
 
 # Watch the chat-shaped wire.
 engram session logs "$SID" --since 0

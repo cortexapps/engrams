@@ -21,8 +21,8 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import { log as rootLog } from "../log.ts";
 import type { ProfileRow, ProfileStore } from "../db/profiles.ts";
+import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
 import type { ImagesClient } from "./profiles.ts";
-import { CLAUDE_OAUTH_ENV_VAR } from "../db/user-secrets.ts";
 import { evictOwnerCacheEntry } from "../authz/resolve.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import * as schema from "../db/schema.ts";
@@ -53,11 +53,32 @@ export interface SessionCreateInput {
   selectedSkills?: string[];
   capabilities?: string[];
   integrationPolicyJson?: string;
+  /** ADR 0062/0063: the selected harness (catalog name) the coordinator mounts
+   *  + execs (the proto `CreateSessionRequest.harness`). Resolved from the
+   *  per-session override ?? profile ?? deployment default. */
+  harness?: string;
+}
+
+/** One harness's catalog descriptor (the bits the compiler needs): the model +
+ *  effort enums map an option id → the env vars that select it (ADR 0063 §1). */
+export interface HarnessDescriptorView {
+  /** The env-var names the harness authenticates with (ADR 0063 §1): `userEnv`
+   *  is the human credential (per-user token, injected for human tasks);
+   *  `orgEnv` is the programmatic credential (B4, host-side resolved). */
+  auth?: { userEnv?: string; orgEnv?: string };
+  models: Array<{ id: string; default: boolean; env: Record<string, string> }>;
+  effort: Array<{ id: string; default: boolean; env: Record<string, string> }>;
+}
+export interface HarnessCatalogClient {
+  listHarnesses(req: Record<string, never>): Promise<{
+    harnesses: Array<{ name: string; descriptor?: HarnessDescriptorView }>;
+  }>;
 }
 
 export interface SessionCompileDeps {
   images: ImagesClient;
   connectors: CustomConnectorSource;
+  harnessCatalog: HarnessCatalogClient;
   /** Resolve the owner's harness token for `envVar` (e.g. CLAUDE_CODE_OAUTH_TOKEN),
    *  or null. Only called when the profile sets includeUserTokens. */
   resolveUserToken: (envVar: string) => Promise<string | null>;
@@ -65,10 +86,24 @@ export interface SessionCompileDeps {
 
 export interface SessionCompileOpts {
   prompt?: string;
+  /** The task type ("chat" = human/interactive; anything else = programmatic,
+   *  e.g. "slack_thread"). Drives the strict-by-run-type credential pick (ADR
+   *  0063 B4): human → the harness's `user_env` (per-user token); programmatic →
+   *  its `org_env` (org secret, resolved host-side). Default "chat". */
+  type?: string;
+  /** ADR 0063 B2: per-session override of the profile's default harness / model /
+   *  effort. Unset = use the profile's default. */
+  harness?: string;
+  model?: string;
+  effort?: string;
   /** Extra harness env merged LAST (highest precedence) — e.g. the trigger's
    *  ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060). */
   extraHarnessEnv?: Record<string, string>;
 }
+
+/** The deployment's fallback harness when neither the session nor the profile
+ *  selects one (the canonical built-in). */
+const DEFAULT_HARNESS = "claude";
 
 /**
  * Compile a CreateSession request from an active profile. Throws
@@ -89,13 +124,28 @@ export async function compileSessionCreateInput(
     );
   }
 
+  // ADR 0062/0063: resolve the effective harness/model/effort (per-session
+  // override < profile default < deployment/descriptor default).
+  const selectedHarness = opts.harness ?? profile.harness ?? DEFAULT_HARNESS;
+  const { harnesses } = await deps.harnessCatalog.listHarnesses({});
+  const descriptor = harnesses.find((h) => h.name === selectedHarness)?.descriptor;
+
+  // Strict-by-run-type credentials (ADR 0063 B4): a human (chat) task carries
+  // the user's per-user token; a programmatic task carries the org secret. They
+  // are mutually exclusive — never both.
+  const isHuman = (opts.type ?? "chat") === "chat";
+
   // Harness env, lowest → highest precedence: user token < CLI dummy env <
-  // profile env_vars < trigger extras. NEVER log values.
+  // profile env_vars < model env < effort env < trigger extras. NEVER log values.
   const harness: Record<string, string> = {};
-  if (profile.includeUserTokens) {
+  // The human credential env-var name is the selected harness's declared
+  // `user_env` (ADR 0063 — no longer the hardcoded CLAUDE_CODE_OAUTH_TOKEN).
+  // Injected ONLY for human tasks; programmatic tasks use `org_env` (below).
+  const userEnv = descriptor?.auth?.userEnv;
+  if (profile.includeUserTokens && isHuman && userEnv) {
     try {
-      const userToken = await deps.resolveUserToken(CLAUDE_OAUTH_ENV_VAR);
-      if (userToken) harness[CLAUDE_OAUTH_ENV_VAR] = userToken;
+      const userToken = await deps.resolveUserToken(userEnv);
+      if (userToken) harness[userEnv] = userToken;
     } catch (secretErr) {
       console.warn("[task-create] user token lookup failed — booting without it", secretErr);
     }
@@ -105,6 +155,18 @@ export async function compileSessionCreateInput(
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
   if (cliPlan.enabled.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(cliPlan.enabled);
   for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
+  // ADR 0063: the selected model/effort map to env vars via the harness
+  // descriptor (an explicit picker wins over a stale ANTHROPIC_MODEL in env_vars).
+  if (descriptor) {
+    const modelId =
+      opts.model ?? profile.model ?? descriptor.models.find((m) => m.default)?.id ?? descriptor.models[0]?.id;
+    const effortId =
+      opts.effort ?? profile.effort ?? descriptor.effort.find((e) => e.default)?.id ?? descriptor.effort[0]?.id;
+    const modelEnv = descriptor.models.find((m) => m.id === modelId)?.env ?? {};
+    const effortEnv = descriptor.effort.find((e) => e.id === effortId)?.env ?? {};
+    for (const [k, v] of Object.entries(modelEnv)) harness[k] = v;
+    for (const [k, v] of Object.entries(effortEnv)) harness[k] = v;
+  }
   for (const [k, v] of Object.entries(opts.extraHarnessEnv ?? {})) harness[k] = v;
   const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
@@ -114,6 +176,24 @@ export async function compileSessionCreateInput(
     network: profile.network,
     secrets: profile.secrets,
   });
+  // ADR 0063 B4: a programmatic task (cron / Slack / API) authenticates the
+  // harness with the ORG credential, not a per-user token. The org-secret value
+  // never leaves the coordinator (ADR 0057), so we can't read it here — instead
+  // append a literal secret-inject naming the org secret (named after the env
+  // var by convention; admins create an org secret `ANTHROPIC_API_KEY`). It
+  // ships in integration_policy_json and is resolved host-side by
+  // resolve_policy_secrets; an unresolvable ref is skipped+warned there (the
+  // session still boots).
+  const orgEnv = descriptor?.auth?.orgEnv;
+  if (!isHuman && orgEnv) {
+    policy.secrets.push({
+      secret_ref: orgEnv,
+      env_var: orgEnv,
+      mode: "literal",
+      allow_hosts: [],
+      allow_host_patterns: [],
+    });
+  }
   const integrationPolicyJson = policyHasContent(policy) ? JSON.stringify(policy) : undefined;
 
   // Profile skills ∪ the shared integrations-cli bundle (one dyn_* slot).
@@ -122,6 +202,7 @@ export async function compileSessionCreateInput(
   return {
     imageUri: image.imageUri,
     mode: "agent",
+    harness: selectedHarness,
     ...(opts.prompt != null ? { prompt: opts.prompt } : {}),
     ...(harnessEnv != null ? { harnessEnv } : {}),
     ...(selectedSkills.length > 0 ? { selectedSkills } : {}),
@@ -146,10 +227,14 @@ export interface CreateTaskDeps {
   profiles: ProfileStore;
   images: ImagesClient;
   connectors: CustomConnectorSource;
+  harnessCatalog: HarnessCatalogClient;
   sessions: TaskSessionsClient;
   /** Resolve `envVar` for the OWNER (e.g. the Claude OAuth token), or null. */
   secrets: { get(userId: string, envVar: string): Promise<string | null> };
   db: Db;
+  /** ADR 0064: port-exposure store for auto-minting `profile.portExposures`.
+   *  Defaults to a Drizzle store over `db` when omitted. */
+  portExposures?: PortExposureStore;
 }
 
 export interface CreateTaskParams {
@@ -161,6 +246,10 @@ export interface CreateTaskParams {
   profileId: string;
   title?: string | null;
   prompt?: string;
+  /** ADR 0063 B2: per-session override of the profile's harness / model / effort. */
+  harness?: string;
+  model?: string;
+  effort?: string;
   /** Type-specific trigger ref recorded on the task row (operator-visible). */
   source?: Record<string, unknown>;
   /** Extra harness env merged LAST — e.g. the trigger's
@@ -197,10 +286,15 @@ export async function createTaskWithSession(
     {
       images: deps.images,
       connectors: deps.connectors,
+      harnessCatalog: deps.harnessCatalog,
       resolveUserToken: (envVar) => deps.secrets.get(params.ownerUserId, envVar),
     },
     {
+      type: params.type,
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
+      ...(params.harness != null ? { harness: params.harness } : {}),
+      ...(params.model != null ? { model: params.model } : {}),
+      ...(params.effort != null ? { effort: params.effort } : {}),
       ...(params.extraHarnessEnv ? { extraHarnessEnv: params.extraHarnessEnv } : {}),
     },
   );
@@ -236,6 +330,29 @@ export async function createTaskWithSession(
       );
     }
     throw err;
+  }
+
+  // ADR 0064: auto-mint one private port-exposure per port the profile declares.
+  // Best-effort — an exposure failure must NOT fail the task (the session is
+  // already live + persisted); log and continue so the rest still land.
+  if (profile.portExposures.length > 0) {
+    const store = deps.portExposures ?? makePortExposureStore(deps.db);
+    for (const port of profile.portExposures) {
+      try {
+        await store.createOrGet({
+          sessionId: created.sessionId,
+          port,
+          label: "",
+          ownerUserId: params.ownerUserId,
+          visibility: "private",
+        });
+      } catch (e) {
+        log.warn(
+          { sessionId: created.sessionId, port, err: e },
+          "task-create: auto-expose port failed (continuing)",
+        );
+      }
+    }
   }
 
   // A just-created session must not be served a stale null from the owner

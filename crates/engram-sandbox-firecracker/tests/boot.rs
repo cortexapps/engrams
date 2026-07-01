@@ -22,7 +22,6 @@
 
 mod common;
 
-use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -60,9 +59,10 @@ async fn boot_microvm_and_capture_kernel_banner() {
     let mut stdout = fc.stdout.take().expect("piped stdout");
     let mut stderr = fc.stderr.take().expect("piped stderr");
 
-    wait_for_socket(&socket, Duration::from_secs(5))
-        .await
-        .expect("API socket did not appear; firecracker likely crashed");
+    assert!(
+        common::wait_for_socket(&socket, Duration::from_secs(5)).await,
+        "API socket did not appear; firecracker likely crashed"
+    );
 
     // ---- configure + start -----------------------------------------
     let client = FirecrackerClient::new(&socket);
@@ -138,21 +138,4 @@ async fn boot_microvm_and_capture_kernel_banner() {
         serial.chars().take(2000).collect::<String>(),
         stderr_buf.chars().take(2000).collect::<String>(),
     );
-}
-
-async fn wait_for_socket(path: &Path, budget: Duration) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        if path.exists() {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "socket {} did not appear within {:?}",
-                path.display(),
-                budget
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }

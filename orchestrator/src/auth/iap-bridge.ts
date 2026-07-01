@@ -9,21 +9,24 @@
  *
  *   1. Verifies the assertion JWT (iss + aud).
  *   2. JIT-creates the better-auth user (role 'user') if absent.
- *   3. Creates a better-auth session and writes the signed session cookie
- *      into the response, so all subsequent requests ride the cookie and the
- *      bridge becomes a no-op.
+ *   3. Creates a better-auth session and writes the signed session cookie into
+ *      BOTH the response (so all subsequent requests ride the cookie and the
+ *      bridge becomes a no-op) AND the incoming request's Cookie header (so the
+ *      downstream get-session/auth-guard resolves the session on THIS request —
+ *      otherwise a first-time user's first request returns a null session and
+ *      the SPA bounces them to /login; see injectRequestSessionCookie).
  *
  * ## Inert posture (dev / local)
  *
  * HEALTH-CHECK EXEMPTION (resolved): GCP load-balancer health checks AND
  * kubelet readiness probes bypass IAP and carry no assertion — with
- * IAP_AUDIENCE set, /healthz would 401 and the backend/pod is marked
+ * IAP_AUDIENCES set, /healthz would 401 and the backend/pod is marked
  * unhealthy. `iapBridge` now short-circuits `/healthz` before any IAP logic
  * (see the top of the function), so probes always reach the health route.
  *
- * When `IAP_AUDIENCE` is unset the bridge is fully inert — it returns
+ * When `IAP_AUDIENCES` is empty the bridge is fully inert — it returns
  * immediately without touching headers, allocating memory, or reading env.
- * This is the dev-mode default; the Tiltfile does not set IAP_AUDIENCE.
+ * This is the dev-mode default; the Tiltfile does not set IAP_AUDIENCES.
  *
  * ## Production door story
  *
@@ -96,7 +99,7 @@
  *
  * ## Fail-closed
  *
- * When IAP_AUDIENCE is set but the request lacks a valid assertion AND lacks a
+ * When IAP_AUDIENCES is set but the request lacks a valid assertion AND lacks a
  * valid session cookie, the bridge returns 401. Behind IAP every real request
  * carries the header, so a missing assertion means either the request bypassed
  * IAP (forbidden) or the JWT is invalid (also forbidden). We fail closed.
@@ -119,7 +122,7 @@ import { config } from "../config.ts";
  *
  *   1. Health/readiness probes. kubelet readiness probes and GCP LB health
  *      checks hit the orchestrator directly, bypassing IAP, so they carry no
- *      X-Goog-IAP-JWT-Assertion. With IAP_AUDIENCE set the bridge fails closed
+ *      X-Goog-IAP-JWT-Assertion. With IAP_AUDIENCES set the bridge fails closed
  *      (401), which would mark the pod / backend perpetually unhealthy.
  *      /healthz only reports {ok, db}, so it is unauthenticated by design.
  *
@@ -213,15 +216,18 @@ function extractRawSessionCookie(req: IncomingMessage, cookieName: string): stri
 // IAP JWT verification
 // ---------------------------------------------------------------------------
 
-/** Verify the X-Goog-IAP-JWT-Assertion and return the email claim. */
+/** Verify the X-Goog-IAP-JWT-Assertion against the trusted audience set and
+ * return the email claim. `jose` accepts `audience: string[]` and passes if the
+ * token's `aud` matches ANY entry — so one uniform verifier covers every IAP
+ * front door (see Config.iapAudiences for why there's more than one). */
 async function verifyIapJwt(
   jwt: string,
-  audience: string,
+  audiences: string[],
 ): Promise<IapClaims> {
   const jwks = getJwks();
   const { payload } = await jwtVerify(jwt, jwks, {
     issuer: "https://cloud.google.com/iap",
-    audience,
+    audience: audiences,
     algorithms: ["ES256"],
   });
 
@@ -284,25 +290,87 @@ async function jitCreateSession(email: string): Promise<string> {
   return session.token;
 }
 
+/** A freshly-minted better-auth session cookie, in the two forms we need. */
+interface SessionCookie {
+  /** Cookie name (e.g. `better-auth.session_token`). */
+  name: string;
+  /** Signed value (`token.HMAC`) — what both Set-Cookie and the Cookie header carry. */
+  signedValue: string;
+  /** Full `Set-Cookie` header value (name=value + attributes). */
+  setCookieHeader: string;
+}
+
 /**
- * Build a Set-Cookie header value for the better-auth session token.
- * Mirrors what better-auth's setSignedCookie does internally.
+ * Build the better-auth session cookie for a freshly-created session token.
+ * Mirrors what better-auth's setSignedCookie does internally, and also returns
+ * the raw name/value so the bridge can inject it into the *request* (see
+ * `injectRequestSessionCookie`) — not just the response.
  */
-async function buildSessionCookieHeader(token: string): Promise<string> {
+async function buildSessionCookie(token: string): Promise<SessionCookie> {
   const ctx = await auth.$context;
   const secret = ctx.secret;
   const cookieName = ctx.authCookies.sessionToken.name;
   const attrs = ctx.authCookies.sessionToken.attributes;
 
-  const signedToken = await signCookieValue(token, secret);
+  const signedValue = await signCookieValue(token, secret);
 
-  const parts: string[] = [`${cookieName}=${signedToken}`];
+  const parts: string[] = [`${cookieName}=${signedValue}`];
   if (attrs.path) parts.push(`Path=${attrs.path}`);
   if (attrs.httpOnly) parts.push("HttpOnly");
   if (attrs.secure) parts.push("Secure");
   if (attrs.sameSite) parts.push(`SameSite=${attrs.sameSite}`);
   if (attrs.maxAge !== undefined) parts.push(`Max-Age=${attrs.maxAge}`);
-  return parts.join("; ");
+  return { name: cookieName, signedValue, setCookieHeader: parts.join("; ") };
+}
+
+/**
+ * Inject the freshly-minted session cookie into the *incoming request's* Cookie
+ * header so the downstream handler (better-auth's get-session, the Hono auth
+ * guard, a Connect RPC) resolves the session on THIS request — not only on the
+ * next one.
+ *
+ * Without this, a first-time IAP user's very first request (the SPA's
+ * `GET /api/auth/get-session`) carries no better-auth cookie: the bridge writes
+ * Set-Cookie on the *response*, but get-session reads the *request* cookie,
+ * finds none, and returns a null session. The SPA then bounces the user to
+ * /login even though the bridge just authenticated them. Returning users carry
+ * the cookie and avoid this, which is why the bug is new-user-only.
+ *
+ * Any pre-existing cookie of the same name (a stale/other-user session, e.g.
+ * the user-switch case) is dropped so the new session wins unambiguously.
+ *
+ * Both `req.headers.cookie` AND `req.rawHeaders` are updated: @hono/node-server's
+ * getRequestListener builds the Fetch Request's headers from `rawHeaders` (NOT
+ * the parsed `headers` object), so mutating only `headers.cookie` would be
+ * invisible to the Hono/better-auth handler. We rewrite both so every downstream
+ * reader (Hono via rawHeaders, Connect/node code via headers) sees one merged
+ * Cookie header.
+ */
+function injectRequestSessionCookie(req: IncomingMessage, name: string, signedValue: string): void {
+  // node:http collapses multiple Cookie request headers into a single
+  // `headers.cookie` joined with "; ", so this is the full pre-existing set.
+  const existing = req.headers["cookie"] ?? "";
+  const kept = existing
+    .split(";")
+    .map((p) => p.trim())
+    .filter((p) => p && p.slice(0, p.indexOf("=")).trim() !== name);
+  kept.push(`${name}=${signedValue}`);
+  const merged = kept.join("; ");
+
+  req.headers["cookie"] = merged;
+
+  // rawHeaders is a flat [key, value, key, value, ...] array. Drop every Cookie
+  // pair (case-insensitive) and append a single merged one.
+  const raw = req.rawHeaders;
+  if (Array.isArray(raw)) {
+    const rebuilt: string[] = [];
+    for (let i = 0; i + 1 < raw.length; i += 2) {
+      if (raw[i]!.toLowerCase() === "cookie") continue;
+      rebuilt.push(raw[i]!, raw[i + 1]!);
+    }
+    rebuilt.push("cookie", merged);
+    req.rawHeaders = rebuilt;
+  }
 }
 
 /**
@@ -348,7 +416,7 @@ export type BridgeNext = () => void;
  * It calls `next()` when the request should proceed, or writes a 401 and
  * returns (without calling `next`) when the bridge rejects the request.
  *
- * When IAP_AUDIENCE is unset this is a synchronous no-op (calls next() inline).
+ * When IAP_AUDIENCES is empty this is a synchronous no-op (calls next() inline).
  *
  * @param req  Incoming HTTP request.
  * @param res  Server response (used to write Set-Cookie / 401).
@@ -370,13 +438,13 @@ export async function iapBridge(
     return;
   }
 
-  // INERT PATH: IAP_AUDIENCE unset → bridge is fully off.
-  if (!config.iapAudience) {
+  // INERT PATH: IAP_AUDIENCES empty → bridge is fully off.
+  if (config.iapAudiences.length === 0) {
     next();
     return;
   }
 
-  const audience = config.iapAudience;
+  const audiences = config.iapAudiences;
 
   // ---------------------------------------------------------------------------
   // Fast path: check existing session cookie first (avoid JWT verification).
@@ -436,7 +504,7 @@ export async function iapBridge(
 
   let claims: IapClaims;
   try {
-    claims = await verifyIapJwt(iapJwt, audience);
+    claims = await verifyIapJwt(iapJwt, audiences);
   } catch (err) {
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "invalid IAP assertion" }));
@@ -454,9 +522,13 @@ export async function iapBridge(
     return;
   }
 
-  // Write the session cookie into the response.
-  const cookieHeader = await buildSessionCookieHeader(token);
-  res.setHeader("Set-Cookie", cookieHeader);
+  // Write the session cookie into the response (for subsequent requests) AND
+  // into this request (so the downstream get-session/auth-guard resolves the
+  // session on THIS request — see injectRequestSessionCookie for the new-user
+  // /login-bounce bug this prevents).
+  const cookie = await buildSessionCookie(token);
+  res.setHeader("Set-Cookie", cookie.setCookieHeader);
+  injectRequestSessionCookie(req, cookie.name, cookie.signedValue);
 
   next();
 }

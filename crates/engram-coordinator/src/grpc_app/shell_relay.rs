@@ -132,14 +132,8 @@ impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService
             .ok_or_else(|| Status::invalid_argument("relay stream ended before open frame"))?
             .map_err(|e| Status::internal(format!("relay recv open: {e}")))?;
 
-        let (session_id_str, target) = match first.frame {
-            // `o.target()` is the prost enum accessor (ADR 0064): VNC viewers
-            // set `SHELL_TARGET_VNC`, shell tabs leave it at the 0 default.
-            // It borrows `o`, so read it before moving `session_id` out.
-            Some(app::relay_shell_request::Frame::Open(o)) => {
-                let target = o.target();
-                (o.session_id, target)
-            }
+        let session_id_str = match first.frame {
+            Some(app::relay_shell_request::Frame::Open(o)) => o.session_id,
             other => {
                 return Err(Status::invalid_argument(format!(
                     "first relay frame must be open, got {:?}",
@@ -181,15 +175,8 @@ impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService
             );
         }
 
-        // ---- 4. proxy_{shell,vnc} → open host tunnel -----------------
-        // ADR 0064: a VNC viewer rides the same relay (and the same
-        // `acquire_shell` idle-eviction pin above) as a shell tab; only the
-        // upstream the host opens differs (in-guest `x11vnc` :5900 vs ttyd
-        // :7681). Both return the same `ShellTunnel`.
-        let open = match target {
-            app::ShellTarget::Vnc => host.proxy_vnc(sandbox_id).await,
-            _ => host.proxy_shell(sandbox_id).await,
-        };
+        // ---- 4. proxy_shell → open host tunnel -----------------------
+        let open = host.proxy_shell(sandbox_id).await;
         let tunnel = match open {
             Ok(t) => t,
             Err(e) => {

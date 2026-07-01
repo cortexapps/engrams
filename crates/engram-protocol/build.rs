@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/engram/app/v1/fleet.proto",
         "proto/engram/app/v1/image.proto",
         "proto/engram/app/v1/mount_catalog.proto",
+        "proto/engram/app/v1/harness.proto",
         "proto/engram/app/v1/org_secret.proto",
         "proto/engram/app/v1/mint.proto",
         "proto/engram/app/v1/integration_op.proto",

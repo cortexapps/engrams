@@ -195,8 +195,15 @@ async fn snapshot_restore_round_trips_per_vm_network() {
     // 1. create — provisions the TAP + reserves the /30
     let original_id = backend.create(spec).await.expect("create");
 
-    // 2. let early-boot settle so the snapshot captures coherent state
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // 2. let early-boot settle so the snapshot captures coherent state — poll the
+    //    serial console (funneled to firecracker.log) for the kernel banner. The
+    //    assertions below are host-side TAP/netns/manifest; boot-started is a fine,
+    //    faster coherency proxy than a fixed sleep.
+    let fc_log = work
+        .path()
+        .join(original_id.to_string())
+        .join("firecracker.log");
+    common::wait_for_log_contains(&fc_log, &["Linux version"], Duration::from_secs(15)).await;
 
     // 3. snapshot — manifest should carry the net info
     // ADR 0007 Phase 6: backend owns its staging dir.

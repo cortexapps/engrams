@@ -49,6 +49,15 @@ import { iapBridge } from "./auth/iap-bridge.ts";
 
 export type RouteRegistrar = (router: ConnectRouter) => void;
 
+/** ADR 0064 P2b-ws: a preview WS-upgrade hook. Returns `true` if it handled the
+ * upgrade (a `<slug>.<previewBaseDomain>` host), `false` to fall through to the
+ * normal (shell) upgrade path. */
+export type PreviewUpgrade = (
+  req: IncomingMessage,
+  socket: Socket,
+  head: Buffer,
+) => Promise<boolean>;
+
 /**
  * Build and return a node:http Server that:
  *   - routes /rpc/* to the Connect adapter (empty routes by default; later
@@ -61,7 +70,12 @@ export type RouteRegistrar = (router: ConnectRouter) => void;
  *   handler (Bun-compatible) is installed instead of nodeWs.injectWebSocket().
  *   See module-level comment for the Bun WS bug workaround.
  */
-export function buildServer(app: Hono, routes: RouteRegistrar = () => {}, nodeWs?: NodeWebSocket) {
+export function buildServer(
+  app: Hono,
+  routes: RouteRegistrar = () => {},
+  nodeWs?: NodeWebSocket,
+  previewUpgrade?: PreviewUpgrade,
+) {
   // requestPathPrefix must match the "/rpc/" seam — handlers register at
   // prefix+requestPath, so a missing prefix causes every real RPC to 404.
   const connectHandler = connectNodeAdapter({ routes, requestPathPrefix: "/rpc" });
@@ -74,7 +88,7 @@ export function buildServer(app: Hono, routes: RouteRegistrar = () => {}, nodeWs
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     // IAP bridge runs first — before /rpc vs Hono dispatch — so it covers
     // every HTTP entry path. See iap-bridge.ts for placement rationale.
-    // When IAP_AUDIENCE is unset this is a synchronous no-op.
+    // When IAP_AUDIENCES is empty this is a synchronous no-op.
     iapBridge(req, res, () => {
       const url = req.url ?? "/";
 
@@ -106,6 +120,11 @@ export function buildServer(app: Hono, routes: RouteRegistrar = () => {}, nodeWs
     //       4404 = Not Found, etc.).  Bun socket.end() is not used at all.
     const { wss } = nodeWs;
     server.on("upgrade", async (request: IncomingMessage, socket: Socket, head: Buffer) => {
+      // ADR 0064 P2b-ws: preview hosts (`<slug>.<previewBaseDomain>`) tunnel the
+      // WS to the session's guest port; non-preview hosts fall through to the
+      // shell path below. Handled here (not via the Hono app) because raw WS
+      // passthrough needs the socket, not a parsed request.
+      if (previewUpgrade && (await previewUpgrade(request, socket, head))) return;
       const url = new URL(request.url ?? "/", "http://localhost");
       const headers = new Headers();
       for (const key in request.headers) {
