@@ -121,6 +121,35 @@ fall through the same three tiers. Runtime mechanics differ
 (block reads vs page faults, prefault behavior); storage
 resolution doesn't.
 
+### Write-through on produce (2026-07-01 amendment)
+
+The read path above populates the local NVMe cache on a miss
+(CDN-fill), but the **write** path did not: `ChunkStore::put_chunk`
+wrote only to BlobStorage. So a host that *produced* a chunk — most
+importantly an **idle-eviction re-chunk of divergent guest memory**
+(`update_for_dirty_ranges_sparse` with `local_sink = None`) — shipped
+it to GCS and discarded the local copy it already had. Every resume
+then re-paged that session's entire divergent working set back from
+GCS at ~110 ms/chunk (measured: ~16 faults/s, a resume stuck in
+`Created` for minutes), **even on the same host that captured it, and
+even though eviction was not the cause** (the cache retains ~18 h of
+chunks; LRU keeps the recent set). The teleport path had already
+solved exactly this for the pause window with a `Some(cache)` local
+sink (ADR 0045 C1); ordinary capture never got it.
+
+Fix: make the write side symmetric with the read side. `ChunkStore`
+gains an optional write-through `ChunkCache`; `put_chunk` populates it
+after the durable BlobStorage write, via the cache's `write_local`
+(the debounced free-floor sweep still enforces the budget — a burst of
+write-throughs does **not** skip eviction, so a disk-pressured host
+can't overshoot the floor; and `hash` is already known, so no
+redundant re-hash). The host-agent wires the same `ChunkCache` its
+UFFD handler + disk daemon read from; the coordinator wires none, so
+`put_chunk` there stays blob-only. Content-addressing makes this safe
+(a write-through copy can never be stale). The read side (`get_chunk`
+seeding a re-chunk) is *not* yet cache-tiered — a possible follow-up,
+but it's a capture-time cost, not the resume-time cost fixed here.
+
 ### Canonical vs per-session
 
 The architectural line is not disk-vs-memory; it's

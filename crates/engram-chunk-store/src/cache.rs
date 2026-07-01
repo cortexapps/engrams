@@ -784,7 +784,14 @@ impl ChunkCache {
         self.write_local(hash, bytes).await
     }
 
-    async fn write_local(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
+    /// Write a *pre-hashed* chunk to the cache with the debounced budget
+    /// sweep — the primitive behind [`Self::put`], minus `put`'s defensive
+    /// re-hash. `pub(crate)` so `ChunkStore::put_chunk`'s write-through can
+    /// populate a chunk it already hashed without re-hashing it (matters on
+    /// no-SHA-NI hosts, ADR 0021) while still enforcing the budget (unlike
+    /// [`Self::put_no_evict`], which skips the sweep). Caller guarantees
+    /// `hash == ChunkHash::of(bytes)`; the read path verifies on GET anyway.
+    pub(crate) async fn write_local(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
         let target = self.path_for(hash);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).await?;
