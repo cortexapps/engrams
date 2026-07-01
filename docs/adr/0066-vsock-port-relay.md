@@ -129,13 +129,81 @@ bridges, where the guest is untrusted).
   `open_vsock_tunnel_at` + `proxy_port` rewrite (retiring `connect_cold`/`connect_in_netns`);
   the per-session cap; the `proxy_port_loopback` FC integration test (HOL + throughput)
   wired into CI. Fixes prod.
-- **P2 — VZ real vsock.** VZ's console-bridge vsock is single-stream-per-port (a persistent
-  HMR WebSocket would starve other connections — HOL blocking). Migrate VZ onto Apple's
-  `VZVirtioSocketDevice` (multi-stream) via `objc2`, retiring the console-bridge shim rather
-  than forking a second mechanism, so macOS parity is HOL-free too.
+- **P2 — VZ real vsock.** *(implemented — see "Phase 2 outcome" below.)* VZ's console-bridge
+  vsock is single-stream-per-port (a persistent HMR WebSocket would starve other connections —
+  HOL blocking). Migrate VZ onto Apple's `VZVirtioSocketDevice` (multi-stream) via `objc2`,
+  retiring the console-bridge shim rather than forking a second mechanism, so macOS parity is
+  HOL-free too.
 - **P3 — shell unification.** Route `proxy_shell` through the same relay (ttyd binds a
   loopback port), retiring `connect_tcp_in_netns_linux`, the shell netns dial, and the
   cold/warm bifurcation — the code-retirement payoff.
+
+### Phase 2 outcome (VZ real vsock)
+
+**The blocker that motivated the console swap was stale.** VZ had been migrated *off*
+`VZVirtioSocketDevice` onto a multi-port virtio-console (commit `bf84dca2`) for exactly one
+reason: "generic arm64 cloud-image kernels ship `CONFIG_VIRTIO_VSOCKETS` as a *module*, which
+can't auto-load before init runs." But the kernel VZ actually boots is the **Kata static arm64
+kernel** (`just pull-kernel` → Linux 6.12.28). Extracting its embedded `IKCONFIG` shows
+`CONFIG_VSOCKETS=y`, `CONFIG_VIRTIO_VSOCKETS=y`, `CONFIG_VIRTIO_VSOCKETS_COMMON=y` — all
+**built-in**. So real vsock works on the guest we ship, and the console detour (single stream
+per port ⇒ HOL blocking on the relay) was buying nothing. Phase 2 reverts to real vsock and
+retires the console mechanism entirely.
+
+**What landed.** `vm.rs` attaches a `VZVirtioSocketDeviceConfiguration` in place of the
+multi-port `VZVirtioConsoleDeviceConfiguration` (the kernel-log serial console is untouched).
+A new `vsock_bridge.rs` (adapted from the pre-`bf84dca2` `vsock_bridge.rs`, whose delegate
+plumbing objc2 0.6 still supports verbatim) provides:
+
+- a `VsockConnector` (device + queue handle) that dials host→guest ports via
+  `connectToPort:completionHandler:` and hands back the connection fd as an
+  `AsyncRead+AsyncWrite` stream — with a boot-race/post-restore retry;
+- the **agentd port (1024)** as a host `UnixListener` that `connectToPort`s per accept
+  (preserving the backend's `UnixStream::connect(<base>_1024)` surface — zero churn in
+  `start_agent`/`exec_stream`/`start_shell`/`guest_ip`), but now one vsock stream per accept,
+  so concurrent control RPCs no longer serialise;
+- **guest→host listeners** on harness (1026) and upload (1029) via a `VZVirtioSocketListener`
+  delegate (`define_class!`), each accepted connection's fd handed *directly* to the sink —
+  no duplex hop;
+- **`SandboxBackend::open_guest_stream`** (the P1 seam VZ inherited as `None`): dials guest
+  vsock 1030 through the `VsockConnector` and returns `Some(stream)`, flipping VZ off the
+  `guest_ip`/eth0 fallback onto the relay. Each forwarded browser connection is its own
+  `connectToPort` stream and `VZVirtioSocketDevice` muxes them freely — **HOL-free, matching
+  FC.**
+
+**Divergences / decisions:**
+
+- **Console retired end-to-end, not just the host bridge.** Because the guest side keyed off
+  `ENGRAM_TRANSPORT=console`, retiring the host `console_bridge.rs` also meant retiring the
+  in-guest `engram-transport::ConsoleTransport`, the `image-builder`/`engram-cli`
+  `Transport::Console` variant, the `Transport::supports_ready_port` trait method (console was
+  its only `false` case), and the `ENGRAM_DIAG_NO_CONSOLE` diagnostic. `bake-demo.sh` now
+  bakes `ENGRAM_TRANSPORT=vsock` for every backend. **A VZ image baked before this change
+  (carrying `ENGRAM_TRANSPORT=console`) will not boot against the vsock-only backend — re-bake
+  is required.** Consistent with the zero-users clean-break policy; the `Transport` enum is
+  left as a single-variant seam rather than churning ~15 FC test call sites.
+- **Ready port (1027): drain, don't gate.** On the vsock transport, agentd dials
+  `ENGRAM_AGENTD_READY_PORT` at startup and writes one fire-and-forget `AgentReady` frame; with
+  no host listener it would spin ~90 s before serving RPCs. VZ registers a *draining* listener
+  on 1027 (reads to EOF and drops) so the guest handshake completes on the first dial. This
+  keeps VZ's existing "first read on the agentd UDS blocks until agentd binds" readiness model
+  rather than adopting FC's `wait_agent_ready` *gating* — a smaller, lower-risk change;
+  FC-parity gating is a possible future enhancement. (The agentd handshake loop dropped its
+  `supports_ready_port()` guard accordingly — vsock always has a listener now.)
+- **Upload simplified to FC's shape.** With real vsock each upload is its own connection, so
+  the console bridge's byte-delimited `upload_pump` serialisation is gone; the upload sink now
+  drives one connection per upload exactly like FC.
+- **Bootstrap port (1025) retired** — it was dead on VZ (never dialed by the host, never bound
+  by the guest, which only listens on 1024).
+
+**Validated:** `cargo clippy` (VZ native + `engram-agentd`/`engram-core`/`engram-transport`/
+harnesses on `aarch64-unknown-linux-musl`, all `-D warnings`), `cargo fmt`, and the unit tests
+for the touched crates. **Not yet validated on hardware:** the live-VM path needs
+`just vz-codesign` + a *freshly-baked vsock* `ENGRAM_VZ_ROOTFS`. A new `#[ignore]`d
+`e2e_vz_port_relay_reaches_loopback_without_hol` test exercises `open_guest_stream` +
+`RelayConnect` round-trip and the HOL-freedom property, but like the existing `e2e_vz`
+lifecycle test it can't run in CI (the macOS runner has no Docker to bake a rootfs — the same
+gap ADR 0032 tracks).
 
 ## Consequences
 
