@@ -4001,7 +4001,12 @@ impl SnapshotFinisher {
             // wire-shape stays compatible without us depending on its
             // private struct.
             let manifest_json = dest.join("manifest.json");
-            patch_fc_manifest_memory_ref(&manifest_json, manifest_ref).await?;
+            patch_fc_manifest_memory_ref(
+                &manifest_json,
+                manifest_ref,
+                self.session_bindings.get(&id).map(|e| *e),
+            )
+            .await?;
             metadata.memory_manifest = Some(manifest_ref);
 
             // ADR 0014: upload state.bin + sidecar to BlobStorage so a
@@ -4345,6 +4350,11 @@ async fn chunk_memory_to_store(
 async fn patch_fc_manifest_memory_ref(
     manifest_json: &std::path::Path,
     memory_manifest: engram_core::types::manifest::ManifestRef,
+    // Tier 2 (resume-prefault fix): the session id, stamped as the
+    // session-stable working-set trace key. `None` on backends/paths with
+    // no bound session leaves the FC-side default (`None`), i.e. today's
+    // per-host manifest keying.
+    trace_lineage: Option<SessionId>,
 ) -> Result<(), SandboxError> {
     let bytes = fs::read(manifest_json).await.map_err(|e| {
         SandboxError::Snapshot(format!(
@@ -4369,6 +4379,19 @@ async fn patch_fc_manifest_memory_ref(
         serde_json::to_value(memory_manifest)
             .map_err(|e| SandboxError::Snapshot(format!("serialize memory_manifest: {e}")))?,
     );
+    // Tier 2 (resume-prefault fix): stamp the session-stable trace key next
+    // to the memory ref. On the next resume the FC backend reads this and
+    // passes `--trace-key <session_id>`, so the handler keys its prefault-
+    // replay by the session (canonical) instead of the fresh per-checkpoint
+    // memory manifest id — which never matches on resume. Same serde-default
+    // JSON-patch approach as the memory ref above.
+    if let Some(session_id) = trace_lineage {
+        obj.insert(
+            "trace_lineage_id".into(),
+            serde_json::to_value(session_id)
+                .map_err(|e| SandboxError::Snapshot(format!("serialize trace_lineage_id: {e}")))?,
+        );
+    }
     let bytes = serde_json::to_vec_pretty(&value)
         .map_err(|e| SandboxError::Snapshot(format!("serialize patched manifest.json: {e}")))?;
     fs::write(manifest_json, bytes).await.map_err(|e| {
@@ -5399,7 +5422,12 @@ impl SandboxBackend for PooledBackend {
             .map_err(|e| SandboxError::Snapshot(format!("migration re-chunk: {e}")))?;
         let mem_ref = chain_ref.next_version();
         let _ = fs::remove_file(&diff_path).await;
-        patch_fc_manifest_memory_ref(&dest.join("manifest.json"), mem_ref).await?;
+        patch_fc_manifest_memory_ref(
+            &dest.join("manifest.json"),
+            mem_ref,
+            self.session_for_sandbox(id),
+        )
+        .await?;
 
         let export_id = crate::migration::MigrationRegistry::mint_export_id();
         // Allowlist the FULL session manifest, not just the chunks new

@@ -19,6 +19,7 @@
 //!   --session-manifest   <uuid>@v<n> \
 //!   [--prefault-trace file:<path>|<host-uuid>] \
 //!   [--publish-trace-host <host-uuid>] \
+//!   [--trace-key <session-uuid>] \
 //!   [--cache-root /var/cache/engram/chunks] \
 //!   [--cache-budget-bytes 214748364800] \
 //!   [--recorder-window-ms 5000]
@@ -145,6 +146,18 @@ mod linux {
         /// clean shutdown. Omit on bake / unit-test runs where no
         /// publishing is wanted.
         pub publish_trace_host: Option<Uuid>,
+        /// Tier 2 (resume-prefault fix): a **session-stable** trace key
+        /// (the session id). When set, both prefault-replay and publish
+        /// key the working-set trace by this id under the *canonical*
+        /// variant (`traces/<trace_key>/canonical.json`) instead of the
+        /// per-checkpoint `session_manifest.manifest_id` — which is minted
+        /// fresh on every snapshot, so a manifest-keyed lookup ALWAYS
+        /// misses on resume (the trace published in life N under M_N is
+        /// never found in life N+1 under M_{N+1}). Keying by the stable
+        /// session id makes life N's recorded hot-set warm life N+1's
+        /// divergent working set. Unset ⇒ base/migration paths keep the
+        /// per-host manifest keying unchanged.
+        pub trace_key: Option<Uuid>,
         /// The per-jail trace file path: write the recorded trace JSON
         /// here on clean shutdown (in addition to / instead of
         /// `--publish-trace-host`'s BlobStorage publish). ADR 0045 C2
@@ -191,6 +204,7 @@ mod linux {
         let mut session_manifest_json: Option<PathBuf> = None;
         let mut prefault_trace: Option<PrefaultTraceSpec> = None;
         let mut publish_trace_host: Option<Uuid> = None;
+        let mut trace_key: Option<Uuid> = None;
         let mut trace_output: Option<PathBuf> = None;
         let mut blob_root: Option<PathBuf> = None;
         let mut cache_root: Option<PathBuf> = None;
@@ -243,6 +257,13 @@ mod linux {
                         Uuid::parse_str(&v)
                             .map_err(|e| format!("--publish-trace-host {v:?}: {e}"))?,
                     );
+                }
+                "--trace-key" => {
+                    let v = argv
+                        .next()
+                        .ok_or_else(|| "--trace-key requires a value".to_string())?;
+                    trace_key =
+                        Some(Uuid::parse_str(&v).map_err(|e| format!("--trace-key {v:?}: {e}"))?);
                 }
                 "--trace-output" => {
                     trace_output =
@@ -349,6 +370,7 @@ mod linux {
             session_manifest_json,
             prefault_trace,
             publish_trace_host,
+            trace_key,
             trace_output,
             blob_root,
             cache_root,
@@ -432,12 +454,19 @@ mod linux {
                     .and_then(|bytes| {
                         serde_json::from_slice(&bytes).map_err(|e| format!("parse trace: {e}"))
                     }),
-                PrefaultTraceSpec::Host(host) => load_trace_via_blob(
-                    blob.clone(),
-                    TraceRef::host(args.session_manifest.manifest_id, *host),
-                )
-                .await
-                .map_err(|e| e.to_string()),
+                PrefaultTraceSpec::Host(host) => {
+                    // Tier 2 (resume-prefault fix): prefer the session-
+                    // stable canonical key when present (the resume path
+                    // threads `--trace-key <session_id>`). The per-
+                    // checkpoint `manifest_id` key below only ever hits for
+                    // base/migration traces — on resume it is a fresh id
+                    // each snapshot, so it would always miss.
+                    let trace_ref =
+                        select_trace_ref(args.trace_key, args.session_manifest.manifest_id, *host);
+                    load_trace_via_blob(blob.clone(), trace_ref)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
             };
             match loaded {
                 Ok(t) => {
@@ -576,9 +605,15 @@ mod linux {
             // Best-effort publish — log and continue rather than
             // propagating, so the --trace-output side effect above
             // sticks even when BlobStorage isn't reachable.
-            if let Err(e) =
-                publish_trace(blob, args.session_manifest.manifest_id, host, &trace).await
-            {
+            //
+            // Tier 2 (resume-prefault fix): publish under the session-
+            // stable canonical key when present, mirroring the replay
+            // lookup so life N's recorded trace lands exactly where life
+            // N+1 looks for it. Base/migration runs (no trace_key) keep
+            // the per-host manifest keying.
+            let trace_ref =
+                select_trace_ref(args.trace_key, args.session_manifest.manifest_id, host);
+            if let Err(e) = publish_trace(blob, trace_ref, &trace).await {
                 tracing::warn!(error = %e, "publish_trace failed; trace_output still written");
             }
         } else if args.trace_output.is_none() {
@@ -647,14 +682,30 @@ mod linux {
             .ok_or_else(|| format!("trace {trace_ref:?} not found"))
     }
 
+    /// Tier 2 (resume-prefault fix): choose the working-set trace key.
+    /// A session-stable `trace_key` (the resume path threads `--trace-key
+    /// <session_id>`) selects the canonical variant so publish and replay
+    /// agree across ALL of a session's checkpoints; without one (base image
+    /// / migration) fall back to the per-host, per-checkpoint manifest key —
+    /// today's behavior, which always missed on resume because the manifest
+    /// id is minted fresh each snapshot.
+    fn select_trace_ref(
+        trace_key: Option<Uuid>,
+        manifest_id: Uuid,
+        fallback_host: Uuid,
+    ) -> TraceRef {
+        match trace_key {
+            Some(key) => TraceRef::canonical(key),
+            None => TraceRef::host(manifest_id, fallback_host),
+        }
+    }
+
     async fn publish_trace(
         blob: Arc<dyn BlobStorage>,
-        manifest_id: Uuid,
-        host_id: Uuid,
+        trace_ref: TraceRef,
         trace: &WorkingSetTrace,
     ) -> Result<(), String> {
         let store = ChunkStore::new(blob);
-        let trace_ref = TraceRef::host(manifest_id, host_id);
         store
             .put_trace(trace_ref, trace)
             .await
@@ -694,4 +745,44 @@ chunks via UFFDIO_ZEROPAGE). No memory.bin file is read.
 
 ENGRAM_BLOB_BACKEND={local,gcs} (default local) picks the chunk
 store's blob backend. ENGRAM_GCS_BUCKET is required when gcs.";
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Tier 2 (resume-prefault fix): a session-stable trace key selects
+        /// the CANONICAL variant keyed by the SESSION id (`traces/<session>/
+        /// canonical.json`), so a resume finds the trace its own prior life
+        /// published — instead of looking under the per-checkpoint memory
+        /// manifest id, which is minted fresh each snapshot and never
+        /// matches. Without a key (base image / migration) it falls back to
+        /// the per-host manifest key, unchanged.
+        #[test]
+        fn select_trace_ref_prefers_session_key() {
+            let session = Uuid::from_u128(1);
+            let manifest = Uuid::from_u128(2);
+            let host = Uuid::from_u128(3);
+
+            let with_key = select_trace_ref(Some(session), manifest, host);
+            assert_eq!(
+                with_key.manifest_id, session,
+                "keyed by session, not manifest"
+            );
+            assert_eq!(
+                with_key.host_id, None,
+                "canonical (no host) so publish==replay"
+            );
+
+            let without_key = select_trace_ref(None, manifest, host);
+            assert_eq!(
+                without_key.manifest_id, manifest,
+                "fallback keeps per-checkpoint key"
+            );
+            assert_eq!(
+                without_key.host_id,
+                Some(host),
+                "fallback keeps per-host key"
+            );
+        }
+    }
 }
