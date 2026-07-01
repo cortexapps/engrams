@@ -2,7 +2,7 @@
 //! backend. Exercises the real prod-shape path through `VzBackend` on an
 //! actual booting microVM and locks in the parity fixes from ADR 0032:
 //!
-//!   - agentd exec over the virtio-console transport (no ready-port stall),
+//!   - agentd exec over the real vsock transport (ADR 0066 Phase 2),
 //!   - durable snapshots — a guest write with NO explicit `sync` survives a
 //!     snapshot → cold-boot restore (the `flush_guest_fs` / agentd `Sync` RPC),
 //!   - cold-boot restore from a clone-snapshot,
@@ -15,9 +15,11 @@
 //!   - `ENGRAM_VZ_KERNEL_PATH` (or `~/.cache/engram-vz-test/vmlinux-arm64`,
 //!     populated by `just pull-kernel`),
 //!   - `ENGRAM_VZ_ROOTFS` — a bootable arm64 ext4 with `engram-agentd` +
-//!     `ttyd` baked in and `ENGRAM_TRANSPORT=console` in its env, i.e. the
+//!     `ttyd` baked in and `ENGRAM_TRANSPORT=vsock` in its env, i.e. the
 //!     output of `just bake-demo` (point the var at the materialized
-//!     `var/host-sandboxes/chunked-rootfs/<manifest>.ext4`).
+//!     `var/host-sandboxes/chunked-rootfs/<manifest>.ext4`). NB: a rootfs
+//!     baked before ADR 0066 Phase 2 carries `ENGRAM_TRANSPORT=console`
+//!     and will NOT boot against this vsock-only backend — re-bake it.
 //!
 //! Run locally:
 //! ```sh
@@ -45,8 +47,10 @@ use engram_core::types::sandbox::{
     CpuLimit, DiskLimit, ExecEvent, ExecRequest, MemoryLimit, SandboxSpec,
 };
 use engram_core::SandboxId;
+use engram_harness_proto::{read_msg, write_msg, RelayAck, RelayConnect, PROXY_PORT_VSOCK_PORT};
 use engram_sandbox_vz::{VzBackend, VzConfig};
 use futures::StreamExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct VzEnv {
     kernel: PathBuf,
@@ -199,8 +203,9 @@ async fn e2e_vz_lifecycle() {
     .expect("VzBackend::new")
     .with_chunk_store(cs);
 
-    // 1. Boot + exec over the console transport (ADR 0032 #3: no ready-port
-    //    stall — exec must answer promptly, not 90s later).
+    // 1. Boot + exec over the real vsock transport (ADR 0066 Phase 2; ADR
+    //    0032 #3: exec must answer promptly, not 90s later — the ready-port
+    //    drain listener keeps the guest handshake from stalling).
     let id = backend.create(spec(&env.rootfs)).await.expect("create");
     await_agent(&backend, id).await;
     let (out, code) = exec(&backend, id, "echo hello-vz && uname -m").await;
@@ -283,4 +288,99 @@ async fn e2e_vz_skill_erofs_attaches() {
     );
 
     backend.destroy(id).await.expect("destroy");
+}
+
+/// ADR 0066 Phase 2: the port relay reaches a dev server bound to the
+/// guest's `127.0.0.1` (which the old `guest_ip`/eth0 dial can't), and a
+/// persistent forwarded connection does NOT head-of-line block a fresh
+/// one — the property real virtio-vsock gives us that the retired
+/// single-stream-per-port console bridge couldn't.
+///
+/// Uses `node` (present in the demo `node:20-slim` base) for the loopback
+/// servers, detached via `setsid` so they survive the exec returning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires macOS + a codesigned binary + a VZ kernel + a vsock ENGRAM_VZ_ROOTFS"]
+async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
+    let env = match vz_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let backend = VzBackend::new(
+        work.path().join("sb"),
+        VzConfig::with_kernel(env.kernel.clone()),
+    )
+    .expect("VzBackend::new");
+
+    let id = backend.create(spec(&env.rootfs)).await.expect("create");
+    await_agent(&backend, id).await;
+
+    // An echo server on 127.0.0.1:ECHO and a black-hole server on
+    // 127.0.0.1:SINK that accepts but never replies (a stand-in for a
+    // persistent HMR WebSocket / noVNC stream). `setsid … &` detaches both
+    // so the exec returns while they keep running (reparented to agentd).
+    const ECHO: u16 = 3111;
+    const SINK: u16 = 3112;
+    let (_, code) = exec(
+        &backend,
+        id,
+        &format!(
+            "setsid node -e 'require(\"net\").createServer(c=>c.pipe(c)).listen({ECHO},\"127.0.0.1\")' \
+               >/dev/null 2>&1 & \
+             setsid node -e 'require(\"net\").createServer(()=>{{}}).listen({SINK},\"127.0.0.1\")' \
+               >/dev/null 2>&1 & \
+             sleep 1"
+        ),
+    )
+    .await;
+    assert_eq!(code, Some(0), "starting loopback servers");
+
+    // 1. Loopback reach (the ADR 0066 regression): round-trip bytes through
+    //    the relay to the 127.0.0.1 echo server.
+    let mut echo = relay_connect(&backend, id, ECHO).await;
+    echo.write_all(b"ping-vz").await.expect("relay write");
+    let mut got = [0u8; 7];
+    echo.read_exact(&mut got).await.expect("relay read");
+    assert_eq!(&got, b"ping-vz", "echo over the loopback relay");
+
+    // 2. No head-of-line blocking: open a relay stream to the black-hole
+    //    server and hold it open (it never replies). A SECOND relay stream
+    //    to the echo server must still round-trip promptly — proving the
+    //    stalled connection didn't monopolise the vsock device.
+    let mut _sink = relay_connect(&backend, id, SINK).await;
+    _sink.write_all(b"stall").await.expect("sink write");
+
+    let round_trip = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut echo2 = relay_connect(&backend, id, ECHO).await;
+        echo2.write_all(b"second").await.expect("relay write 2");
+        let mut got2 = [0u8; 6];
+        echo2.read_exact(&mut got2).await.expect("relay read 2");
+        got2
+    })
+    .await
+    .expect("second relay stream must not be HOL-blocked by the stalled one");
+    assert_eq!(&round_trip, b"second", "second echo while first is stalled");
+
+    backend.destroy(id).await.expect("destroy");
+}
+
+/// Open a relay tunnel to `guest 127.0.0.1:target_port`: `open_guest_stream`
+/// (vsock connect to the agentd relay) → `RelayConnect` → assert an OK
+/// `RelayAck` → return the spliceable stream.
+async fn relay_connect(
+    backend: &VzBackend,
+    id: SandboxId,
+    target_port: u16,
+) -> engram_core::traits::sandbox::HarnessByteStream {
+    let mut stream = backend
+        .open_guest_stream(id, PROXY_PORT_VSOCK_PORT)
+        .await
+        .expect("open_guest_stream")
+        .expect("VZ open_guest_stream must return Some (real vsock)");
+    write_msg(&mut stream, &RelayConnect { target_port })
+        .await
+        .expect("write RelayConnect");
+    let ack: RelayAck = read_msg(&mut stream).await.expect("read RelayAck");
+    assert!(ack.ok, "relay NAK for 127.0.0.1:{target_port}: {ack:?}");
+    stream
 }

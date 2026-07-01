@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use engram_agentd::{
     read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest, WireResponse,
 };
-use engram_core::traits::sandbox::{HarnessSink, SandboxBackend, UploadSink};
+use engram_core::traits::sandbox::{HarnessByteStream, HarnessSink, SandboxBackend, UploadSink};
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
@@ -30,9 +30,9 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::console_bridge::{port_uds_path, ConsoleBridge};
 use crate::disk::{clone_or_copy, per_sandbox_rootfs_path, SNAPSHOT_ROOTFS_FILENAME};
 use crate::vm::{VmConfig, VzVm};
+use crate::vsock_bridge::{port_uds_path, VsockBridge, VsockConnector};
 
 /// Vsock port engram-agentd binds inside the rootfs. Same number FC
 /// uses; the in-VM binary doesn't know which VMM is hosting it.
@@ -90,14 +90,18 @@ struct VzSandboxState {
     /// (config, devices, queue) once any in-flight dispatched work
     /// completes.
     vm: Arc<VzVm>,
-    /// vsock-as-UDS bridge tasks. Held in a Mutex so `destroy` can
-    /// take it out and call its async `stop`. None after stop.
-    bridge: parking_lot::Mutex<Option<ConsoleBridge>>,
+    /// vsock bridge tasks (agentd UDS pump + guest-initiated listeners).
+    /// Held in a Mutex so `destroy` can take it out and call its async
+    /// `stop`. None after stop.
+    bridge: parking_lot::Mutex<Option<VsockBridge>>,
+    /// Host→guest dialer shared with the bridge's agentd pump. Used by
+    /// `open_guest_stream` (ADR 0066 port relay, guest vsock 1030) — one
+    /// fresh vsock stream per forwarded browser connection.
+    connector: VsockConnector,
     /// `<work_dir>/<sandbox_id>.vsock` — base path. The vsock bridge
-    /// binds `_1024`, `_1025` UDS listeners next to it. Stored on
-    /// the state so future `start_agent` / `exec_stream` calls can
-    /// look up the per-port paths without recomputing them.
-    #[allow(dead_code)]
+    /// binds the `_1024` agentd UDS listener next to it. Stored on the
+    /// state so future `start_agent` / `exec_stream` calls can look up
+    /// the per-port path without recomputing it.
     vsock_uds_path: PathBuf,
     /// Per-sandbox APFS clone of the bake (or snapshot) rootfs.
     /// Created at `create()` / `restore()` time and removed at
@@ -149,8 +153,9 @@ pub struct VzBackend {
     /// in the same way `engram-sandbox-firecracker` does.
     harness_sink: Mutex<Option<HarnessSink>>,
     /// ADR 0026: latest artifact-upload sink (set by `set_upload_sink`).
-    /// The console bridge hands guest-initiated port-1029 uploads to it,
-    /// the same channel `engram-sandbox-firecracker` serves over vsock.
+    /// The vsock bridge hands each guest-initiated port-1029 connection to
+    /// it — one vsock stream per upload, exactly as
+    /// `engram-sandbox-firecracker` serves over vsock.
     upload_sink: Mutex<Option<UploadSink>>,
     /// ADR 0007: when set, `snapshot()` chunks the snapshot rootfs
     /// into this store and populates `SnapshotMetadata.disk_manifest`.
@@ -215,12 +220,11 @@ impl VzBackend {
 
     /// Ask the in-guest agentd to `sync(2)` so dirty page-cache writes
     /// land in the virtio-blk-backed rootfs file before `snapshot()`
-    /// clones it. Best-effort + bounded: the round-trip shares the
-    /// single virtio-console agentd port (1024) with exec, so it
-    /// serializes behind any in-flight exec; a 5 s cap keeps a wedged
-    /// guest from stalling the snapshot indefinitely. On any failure we
-    /// log and proceed — the clone then reflects the last ext4 commit,
-    /// the pre-existing behaviour.
+    /// clones it. Best-effort + bounded: a 5 s cap keeps a wedged guest
+    /// from stalling the snapshot indefinitely (the dial gets its own
+    /// vsock stream to agentd's port 1024, so it doesn't queue behind an
+    /// in-flight exec). On any failure we log and proceed — the clone then
+    /// reflects the last ext4 commit, the pre-existing behaviour.
     async fn flush_guest_fs(&self, id: SandboxId, vsock_uds_path: &Path) {
         let agent_uds = port_uds_path(vsock_uds_path, ENGRAM_AGENTD_PORT);
         let fut = async {
@@ -308,27 +312,34 @@ impl VzBackend {
             vcpus,
         )
         .with_aux_ro_drives(spec.aux_ro_drives.clone(), self.cfg.bundle_dir.clone());
-        let (vm, port_fds) = VzVm::new(vm_cfg)?;
+        let vm = VzVm::new(vm_cfg)?;
         if let Err(e) = vm.start().await {
             let _ = tokio::fs::remove_file(&rootfs_path).await;
             return Err(e.into());
         }
+        let vm = Arc::new(vm);
 
         let vsock_uds_path = self.vsock_uds_path_for(new_id);
 
         let harness_sink = self.harness_sink.lock().clone();
         let upload_sink = self.upload_sink.lock().clone();
-        let bridge =
-            ConsoleBridge::start(vsock_uds_path.clone(), port_fds, harness_sink, upload_sink)
-                .await
-                .map_err(SandboxError::from)?;
+        let (bridge, connector) = VsockBridge::start(
+            vm.raw_clone(),
+            vm.queue_clone(),
+            vsock_uds_path.clone(),
+            harness_sink,
+            upload_sink,
+        )
+        .await
+        .map_err(SandboxError::from)?;
 
         self.sandboxes.insert(
             new_id,
             VzSandboxState {
                 spec,
-                vm: Arc::new(vm),
+                vm,
                 bridge: parking_lot::Mutex::new(Some(bridge)),
+                connector,
                 vsock_uds_path,
                 rootfs_path,
                 guest_ip: Mutex::new(None),
@@ -498,7 +509,7 @@ impl SandboxBackend for VzBackend {
         // capture these are sentinel placeholders (sha = None) and attach
         // nothing; a plain cold-create with resolved drives attaches them.
         .with_aux_ro_drives(spec.aux_ro_drives.clone(), self.cfg.bundle_dir.clone());
-        let (vm, port_fds) = VzVm::new(vm_cfg)?;
+        let vm = VzVm::new(vm_cfg)?;
 
         // Start the VM; if start fails, drop the VM via the early
         // return (no half-registered state in the sandboxes map).
@@ -507,20 +518,22 @@ impl SandboxBackend for VzBackend {
             let _ = tokio::fs::remove_file(&rootfs_path).await;
             return Err(e.into());
         }
+        let vm = Arc::new(vm);
 
         let vsock_uds_path = self.vsock_uds_path_for(id);
 
-        // Wire up the virtio-console UDS bridge. This binds
-        // <vsock_uds>_1024 and <vsock_uds>_1025 immediately so a
-        // subsequent start_agent or exec_stream call can dial
-        // without racing a not-yet-bound window. If a harness sink
-        // is registered, it also pipes port 1026's guest writes
-        // straight to the sink.
+        // Wire up the real-vsock bridge (ADR 0066 Phase 2). This binds the
+        // <vsock_uds>_1024 agentd UDS immediately so a subsequent
+        // start_agent / exec_stream dial can't race a not-yet-bound
+        // window, and registers the guest-initiated listeners (harness
+        // 1026, upload 1029, ready 1027). The returned connector serves
+        // the port relay (guest vsock 1030) via `open_guest_stream`.
         let harness_sink = self.harness_sink.lock().clone();
         let upload_sink = self.upload_sink.lock().clone();
-        let bridge = ConsoleBridge::start(
+        let (bridge, connector) = VsockBridge::start(
+            vm.raw_clone(),
+            vm.queue_clone(),
             vsock_uds_path.clone(),
-            port_fds,
             harness_sink,
             upload_sink,
         )
@@ -539,8 +552,9 @@ impl SandboxBackend for VzBackend {
             id,
             VzSandboxState {
                 spec,
-                vm: Arc::new(vm),
+                vm,
                 bridge: parking_lot::Mutex::new(Some(bridge)),
+                connector,
                 vsock_uds_path,
                 rootfs_path,
                 guest_ip: Mutex::new(None),
@@ -550,13 +564,14 @@ impl SandboxBackend for VzBackend {
     }
 
     async fn start_agent(&self, id: SandboxId, agent: AgentSpec) -> Result<(), SandboxError> {
-        // ADR 0015 M1: one in-VM service, plain connect. VZ binds
-        // the host-side UDS at VM-config time, so `UnixStream::
-        // connect` returns a live stream immediately regardless of
-        // whether agentd in the guest has bound the virtio-console
-        // port yet — the wait happens naturally at the first read,
-        // which blocks until agentd writes the SpawnHarness response.
-        // No retry loop, no deadline knob; the FC path's boot-race
+        // ADR 0015 M1: one in-VM service, plain connect. The vsock
+        // bridge binds the host-side agentd UDS in `VsockBridge::start`
+        // (before `create`/`restore` returns), so `UnixStream::connect`
+        // returns a live stream immediately regardless of whether agentd
+        // in the guest has bound its vsock port yet — the wait happens
+        // naturally at the connectToPort dial-with-retry + the first read,
+        // which blocks until agentd writes the SpawnHarness response. No
+        // host-side retry loop, no deadline knob; the FC path's boot-race
         // problem doesn't exist here.
         //
         // VZ also doesn't use the option-D harness-late-bind path —
@@ -635,6 +650,33 @@ impl SandboxBackend for VzBackend {
         })?;
         let (reader, writer) = tokio::io::split(conn);
         drive_exec_protocol(id, reader, writer, cmd).await
+    }
+
+    /// ADR 0066 Phase 2: dial the in-guest agentd relay on `port` (the
+    /// host-agent calls this with `PROXY_PORT_VSOCK_PORT` = 1030 per
+    /// forwarded browser connection) and hand back the connected vsock
+    /// stream. The host-agent then writes the `RelayConnect` header, reads
+    /// the `RelayAck`, and splices bytes — reaching a dev server bound to
+    /// the guest's `127.0.0.1` (Vite, the Tilt UI, `next dev`) that the old
+    /// `guest_ip`/eth0 dial can't. Each call is its own `connectToPort`
+    /// stream, and `VZVirtioSocketDevice` muxes them freely, so a
+    /// persistent forwarded connection can't head-of-line block others —
+    /// the parity fix over the retired single-stream-per-port console
+    /// bridge. Returning `Some` here flips VZ off the trait-default
+    /// `None`/`guest_ip` fallback and onto the relay path.
+    async fn open_guest_stream(
+        &self,
+        id: SandboxId,
+        port: u32,
+    ) -> Result<Option<HarnessByteStream>, SandboxError> {
+        let connector = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.connector.clone()
+        };
+        let stream = connector.connect_stream(port).await.map_err(|e| {
+            SandboxError::Vm(format!("vz open_guest_stream port {port}: {e}").into())
+        })?;
+        Ok(Some(stream))
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
@@ -840,9 +882,8 @@ impl SandboxBackend for VzBackend {
         let (mut reader, mut writer) = tokio::io::split(conn);
         // `port: None` → agentd's default (7681). Bound the round-trip:
         // ttyd spawn + the in-guest readiness probe are normally
-        // sub-second, and the console port serializes behind any
-        // in-flight exec, so 30 s is generous headroom without hanging
-        // a wedged guest forever.
+        // sub-second, so 30 s is generous headroom without hanging a
+        // wedged guest forever.
         write_msg(&mut writer, &WireRequest::StartShell { port: None })
             .await
             .map_err(|e| SandboxError::Vm(format!("write StartShell: {e}").into()))?;
@@ -879,12 +920,10 @@ impl SandboxBackend for VzBackend {
             live.vsock_uds_path.clone()
         };
         let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
-        // Bound the round-trip — virtio-console doesn't surface clean
-        // close semantics back to host UDS reads, so an agent that
-        // doesn't understand the GuestIp verb (e.g. an older bake)
-        // would otherwise hang the dial here forever. 2s is plenty for
-        // a healthy in-process round trip and short enough that a
-        // dashboard SHELL-tab click sees a prompt 503.
+        // Bound the round-trip — an agent that doesn't understand the
+        // GuestIp verb (e.g. an older bake) would otherwise leave the read
+        // hanging. 2s is plenty for a healthy in-guest round trip and short
+        // enough that a dashboard SHELL-tab click sees a prompt 503.
         let fut = async {
             let conn = UnixStream::connect(&agent_uds).await.ok()?;
             let (mut reader, mut writer) = tokio::io::split(conn);
