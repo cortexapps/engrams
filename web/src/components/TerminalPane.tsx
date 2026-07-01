@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { API_BASE } from "../lib/base";
+import { PaneStatus } from "./PaneStatus";
 
 // In-browser shell tab. Lazy-loads `ghostty-web` (~400 KB WASM) on
 // first mount, opens a WebSocket to `/sessions/:id/shell`, and bridges
@@ -118,6 +119,10 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
     "loading",
   );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // Bumping this tears down the current terminal + socket (effect cleanup) and
+  // re-runs the mount — a real reconnect, driven by the Reconnect button on a
+  // dropped connection. Kept inside the pane so the parent stays out of it.
+  const [reconnectKey, setReconnectKey] = useState(0);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -324,35 +329,29 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
         // ignore
       }
     };
-  }, [sessionId]);
+  }, [sessionId, reconnectKey]);
+
+  const caption = status === "loading" ? "loading terminal renderer…" : "opening shell…";
+  const message =
+    status === "error"
+      ? (errorMessage ?? "shell unavailable")
+      : `shell connection closed${errorMessage ? ` — ${errorMessage}` : ""}`;
 
   return (
-    <section className="flex h-full flex-col px-6 py-4">
-      {status === "loading" && (
-        <p className="mb-3 font-display text-[0.92rem] text-muted-foreground italic">
-          loading terminal renderer…
-        </p>
-      )}
-      {status === "connecting" && (
-        <p className="mb-3 font-display text-[0.92rem] text-muted-foreground italic">
-          opening shell…
-        </p>
-      )}
-      {status === "closed" && (
-        <p className="mb-3 font-display text-[0.92rem] text-muted-foreground italic">
-          shell connection closed{errorMessage ? ` — ${errorMessage}` : ""} — switch tabs and back
-          to reconnect.
-        </p>
-      )}
-      {status === "error" && (
-        <p className="mb-3 font-mono text-[0.78rem] text-destructive">
-          {errorMessage ?? "shell unavailable"}
-        </p>
-      )}
-      <div
-        ref={containerRef}
-        className="relative min-h-0 flex-1 rounded-md border bg-card px-3 py-2"
-      />
+    <section className="flex h-full min-h-0 flex-col p-4">
+      <div className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-card">
+        <div ref={containerRef} className="absolute inset-0 px-3 py-2" />
+        <PaneStatus
+          phase={status}
+          caption={caption}
+          message={message}
+          onReconnect={() => {
+            setErrorMessage(null);
+            setStatus("loading");
+            setReconnectKey((k) => k + 1);
+          }}
+        />
+      </div>
     </section>
   );
 }

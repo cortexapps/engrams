@@ -119,6 +119,11 @@ function driveLoop(layer: SVGGElement, period = 2600): { stop: () => void } {
 
   function strike(trace: Cell[], onDone: () => void) {
     const { path, nodes } = paint(trace);
+    // Headless / jsdom lacks the Web Animations API and SVG geometry
+    // (`getTotalLength`). Paint the trace statically and stop rather than throw.
+    if (typeof path.animate !== "function" || typeof path.getTotalLength !== "function") {
+      return;
+    }
     if (reduce) {
       const a = layer.animate([{ opacity: 0 }, { opacity: 1 }, { opacity: 1 }, { opacity: 0 }], {
         duration: period * 0.9,
@@ -241,6 +246,7 @@ export function EngramMark({
     if (mode === "loop" || !pulseKey || !pathRef.current) return;
     if (prefersReducedMotion()) return;
     const path = pathRef.current;
+    if (typeof path.animate !== "function" || typeof path.getTotalLength !== "function") return;
     const nodes = nodeRefs.current.filter(Boolean) as SVGCircleElement[];
     const grow = period * 0.62;
     const len = path.getTotalLength();
