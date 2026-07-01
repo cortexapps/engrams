@@ -87,6 +87,26 @@ Subsequent restores read the trace and prefault the chunks
 synchronously before unfreezing vCPUs. ~3.7× speedup per REAP
 in published benchmarks.
 
+**Amendment (2026-07-01) — session-stable trace key for idle-resume.**
+The per-`manifest_id` key above only warms restores that *reuse* a manifest
+id: base snapshots (an immutable id, reused across every fresh create) hit,
+but an idle-**resume** never does. Each checkpoint mints a fresh memory
+`ManifestRef` (the diff-chain's `next_version`), so the trace a session
+publishes in life *N* under `M_N` is looked up in life *N+1* under
+`M_{N+1}` — a guaranteed miss. Prefault-on-resume was therefore wired but
+inert. Fix: a session also keys its trace by a **session-stable** id (the
+session id) under the *canonical* variant — `traces/<session_id>/
+canonical.json`. The host-agent stamps `trace_lineage_id = session_id`
+onto the FC sidecar at snapshot-finish (`patch_fc_manifest_memory_ref`, a
+serde-`default` JSON patch — pre-Tier-2 snapshots read back `None`, so
+mixed rolls are safe); on restore the FC backend passes it to the handler
+as `--trace-key`, which keys both replay and publish by it. Base and
+migration paths (no `trace_key`) keep the per-host manifest key unchanged.
+So life *N*'s recorded hot-set now warms life *N+1*'s divergent working set
+before the user's first interaction. Best-effort by construction: diverged
+or GC'd chunks are skipped and unlisted pages still fault on-demand, so a
+stale trace only under-prefaults.
+
 ### Layered architecture
 
 ```

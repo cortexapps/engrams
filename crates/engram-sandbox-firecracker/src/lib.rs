@@ -711,6 +711,18 @@ struct FcSnapshotManifest {
     /// this host use the local recording.
     #[serde(default)]
     trace_host_hint: Option<engram_core::HostId>,
+    /// Tier 2 (resume-prefault fix): a **session-stable** id (the session
+    /// id) that keys this session's working-set trace across ALL of its
+    /// checkpoints. Unlike `memory_manifest` (a fresh `ManifestRef` minted
+    /// every snapshot), this is constant for the session's life, so the
+    /// handler's prefault-replay on resume finds the trace the prior life
+    /// published (`traces/<trace_lineage_id>/canonical.json`) instead of
+    /// looking under a per-checkpoint manifest id that never matches.
+    /// Stamped by the host-agent at snapshot-finish. `None` on base
+    /// snapshots and pre-Tier-2 checkpoints (the handler then falls back to
+    /// the per-host manifest key — today's always-miss-on-resume behavior).
+    #[serde(default)]
+    trace_lineage_id: Option<engram_core::SessionId>,
     /// ADR 0014 M1.11: the exact `path_on_host` the bake's FC
     /// instance PUT /drives'd with as the rootfs. FC's `state.bin`
     /// embeds this path; on cross-host restore the receiver must
@@ -1693,6 +1705,11 @@ impl FirecrackerBackend {
         session_manifest_json: Option<&Path>,
         prefault_trace_host: Option<uuid::Uuid>,
         publish_trace_host: Option<uuid::Uuid>,
+        // Tier 2 (resume-prefault fix): the session-stable trace key (the
+        // session id). When set, the handler keys prefault-replay + publish
+        // by this id under the canonical variant, so a resumed session finds
+        // the trace its own prior life recorded.
+        trace_key: Option<uuid::Uuid>,
         jail_dir: &Path,
         // ADR 0045 C2: post-copy peer mode. The handler dials the
         // source's page server and PARKS until the capture's SEAL; it
@@ -1774,6 +1791,15 @@ impl FirecrackerBackend {
         }
         if let Some(host) = publish_trace_host {
             cmd.arg("--publish-trace-host").arg(host.to_string());
+        }
+        // Tier 2 (resume-prefault fix): the per-session stable trace key.
+        // Keyed under the canonical variant (`traces/<key>/canonical.json`)
+        // for both replay and publish, so life N's recorded working-set
+        // trace lands exactly where life N+1's resume looks — unlike the
+        // per-checkpoint `session_manifest.manifest_id`, which is minted
+        // fresh each snapshot and so always missed on resume.
+        if let Some(key) = trace_key {
+            cmd.arg("--trace-key").arg(key.to_string());
         }
         // ADR 0045 C2 (E2B fold): production spawns default to a
         // PER-JAIL trace file — the migration capture reads it to ship
@@ -2780,6 +2806,11 @@ impl FirecrackerBackend {
                     // the local trace.
                     let prefault_host = manifest.trace_host_hint.map(|hid| hid.as_uuid());
                     let publish_host = self.config.host_id.map(|hid| hid.as_uuid());
+                    // Tier 2 (resume-prefault fix): the session-stable trace
+                    // key from the sidecar. Present on resume/evac restores
+                    // (stamped by the host-agent at snapshot-finish); `None`
+                    // on base snapshots keeps the per-host manifest keying.
+                    let trace_key = manifest.trace_lineage_id.map(|sid| sid.as_uuid());
                     let (handler, uffd_guard) = self
                         .spawn_uffd_handler(
                             &uffd_uds,
@@ -2788,6 +2819,7 @@ impl FirecrackerBackend {
                             migration_manifest.as_deref(),
                             prefault_host,
                             publish_host,
+                            trace_key,
                             jail_dir,
                             peer_spec.as_ref(),
                         )
@@ -5045,6 +5077,10 @@ impl FirecrackerBackend {
             format: MANIFEST_FORMAT_FC.into(),
             memory_manifest,
             trace_host_hint: self.config.host_id,
+            // Tier 2 (resume-prefault fix): the FC backend is session-
+            // agnostic, so it can't know the session id here; the host-agent
+            // patches this to the session id at snapshot-finish.
+            trace_lineage_id: None,
             source_rootfs_canonical,
             source_harness_canonical: None,
             source_vsock_canonical: Some(live.state.vsock_uds_path.clone()),
@@ -5219,6 +5255,9 @@ impl FirecrackerBackend {
             // trace via `--prefault-trace <hint>`. Set from FC
             // config; falls back to None when not wired.
             trace_host_hint: self.config.host_id,
+            // Tier 2 (resume-prefault fix): patched to the session id by the
+            // host-agent at snapshot-finish (session-agnostic here).
+            trace_lineage_id: None,
             // ADR 0014 M1.11: canonical paths embedded in FC's
             // state.bin. Cross-host restore reads these to recreate
             // the EXACT path FC tries to open at load_snapshot
@@ -5625,6 +5664,7 @@ mod tests {
             format: MANIFEST_FORMAT_FC.into(),
             memory_manifest: None,
             trace_host_hint: None,
+            trace_lineage_id: None,
             source_rootfs_canonical: None,
             source_harness_canonical: None,
             source_vsock_canonical: None,
