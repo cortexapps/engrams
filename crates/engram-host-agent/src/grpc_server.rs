@@ -25,14 +25,14 @@ use engram_protocol::grpc::proxy_port_message::Body as ProxyPortBody;
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
     AnswerHarnessQuestionRequest, ApplyEgressPolicyRequest, BindHarnessSessionRequest,
-    BuildBaseSnapshotRequest, BuildBaseSnapshotResponse, CowStateAllResponse, CowStateResponse,
-    CreateSandboxRequest, CreateSandboxResponse, DequeueHarnessQueuedPromptRequest,
-    DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty, ExecExit, ExecFrame,
-    ExecStartRequest, GuestIpResponse, InterruptHarnessRequest, ListSandboxesResponse,
-    MigrationCaptureResponse, MigrationExportRef, MigrationFetchRequest, MigrationFrame,
-    MigrationPresetupResponse, PostCopyCaptureResponse, ProxyPortData, ProxyPortMessage,
-    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing, ProxyShellPong,
-    ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
+    BrowserPortResponse, BuildBaseSnapshotRequest, BuildBaseSnapshotResponse, CowStateAllResponse,
+    CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
+    DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
+    ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse, InterruptHarnessRequest,
+    ListSandboxesResponse, MigrationCaptureResponse, MigrationExportRef, MigrationFetchRequest,
+    MigrationFrame, MigrationPresetupResponse, PostCopyCaptureResponse, ProxyPortData,
+    ProxyPortMessage, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
+    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
     RehandshakeHarnessRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
     SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
     UnbindHarnessSessionRequest,
@@ -735,6 +735,33 @@ impl HostService for HostServiceImpl {
         let id = decode_sandbox_id(&req.into_inner().uuid)?;
         self.inner
             .acquire_shell(id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn start_browser(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<BrowserPortResponse>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        let port = self
+            .inner
+            .start_browser(id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(BrowserPortResponse {
+            port: u32::from(port),
+        }))
+    }
+
+    async fn stop_browser(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<Empty>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        self.inner
+            .stop_browser(id)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))

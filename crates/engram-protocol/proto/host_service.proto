@@ -133,6 +133,13 @@ service HostService {
   // ReleaseShell (rolling deploy, crash, dropped WS).
   rpc RenewShell(SandboxIdMessage) returns (Empty);
 
+  // ADR 0065: bring up / tear down the ephemeral in-guest browser stack
+  // (Xvfb + x11vnc + headful chromium). StartBrowser is idempotent and returns
+  // the RFB port; the coordinator's EnsureBrowser calls it, and the snapshot /
+  // idle-evict path calls StopBrowser so a live Chrome is never snapshotted.
+  rpc StartBrowser(SandboxIdMessage) returns (BrowserPortResponse);
+  rpc StopBrowser(SandboxIdMessage) returns (Empty);
+
   // ---- admin (ADR 0011 follow-up #1: HostAdminHandler folded in) ----
   rpc ReapMaterializeDir(ReapMaterializeDirRequest) returns (ReapMaterializeDirResponse);
 
@@ -205,6 +212,11 @@ service HostService {
 }
 
 message Empty {}
+
+message BrowserPortResponse {
+  // The in-guest RFB port x11vnc is serving on (loopback).
+  uint32 port = 1;
+}
 
 // 16-byte UUID. Same shape as `engram_core::SandboxId`'s underlying
 // `uuid::Uuid::as_bytes()`. Validating that `len(uuid) == 16` is the
