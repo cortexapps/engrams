@@ -1068,6 +1068,7 @@ impl PooledBackend {
                 crate::bundles::BundleStore::new(
                     cs.blob_storage().clone(),
                     self.bundle_dir.clone(),
+                    self.bundle_file_ext(),
                 )
                 .materialize_if_missing(&metadata.aux_bundles)
                 .await?;
@@ -1103,6 +1104,7 @@ impl PooledBackend {
                 crate::bundles::BundleStore::new(
                     cs.blob_storage().clone(),
                     self.bundle_dir.clone(),
+                    self.bundle_file_ext(),
                 )
                 .materialize_if_missing(&selected_refs)
                 .await?;
@@ -1377,6 +1379,7 @@ impl PooledBackend {
             chunk_store: self.chunk_store.clone(),
             chunk_cache: self.chunk_cache.clone(),
             bundle_dir: self.bundle_dir.clone(),
+            bundle_file_ext: self.bundle_file_ext(),
             inflight_snapshots: self.inflight_snapshots.clone(),
             last_snapshot_unix_ms: self.last_snapshot_unix_ms.clone(),
             checkpoint_chains: self.checkpoint_chains.clone(),
@@ -3908,6 +3911,10 @@ pub(crate) struct SnapshotFinisher {
     chunk_store: Option<ChunkStore>,
     chunk_cache: Option<ChunkCache>,
     bundle_dir: PathBuf,
+    /// The backend's staged-bundle extension (squashfs/erofs), so `publish`
+    /// opens the SAME staged filename the backend attaches. Copied from
+    /// `SandboxBackend::bundle_file_ext` at construction (like `bundle_dir`).
+    bundle_file_ext: &'static str,
     inflight_snapshots: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
     checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
@@ -4121,9 +4128,13 @@ impl SnapshotFinisher {
             // ever published. Failure fails the snapshot (a pin nothing
             // can satisfy is worse than a retried eviction).
             if !metadata.aux_bundles.is_empty() {
-                crate::bundles::BundleStore::new(blob.clone(), self.bundle_dir.clone())
-                    .publish(&metadata.aux_bundles)
-                    .await?;
+                crate::bundles::BundleStore::new(
+                    blob.clone(),
+                    self.bundle_dir.clone(),
+                    self.bundle_file_ext,
+                )
+                .publish(&metadata.aux_bundles)
+                .await?;
             }
             Ok::<_, SandboxError>(metadata)
         }
@@ -4494,6 +4505,12 @@ impl SandboxBackend for PooledBackend {
         // Delegates to the inner backend — the one source of truth this wrapper
         // also materializes into (`self.bundle_dir`, copied from here in `new`).
         self.inner.bundle_dir()
+    }
+
+    fn bundle_file_ext(&self) -> &'static str {
+        // Delegates to the inner backend so the BundleStore materializes/sweeps
+        // the SAME filename the backend attaches (squashfs on FC, erofs on VZ).
+        self.inner.bundle_file_ext()
     }
 
     async fn guest_memory_stats(&self) -> Option<engram_core::traits::sandbox::GuestMemoryStats> {

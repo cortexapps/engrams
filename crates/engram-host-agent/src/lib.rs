@@ -1025,10 +1025,11 @@ impl HostAgent {
             // advertise a sha it couldn't attach.) The supervisor materializes
             // pinned generations into the same dir.
             let bundle_dir = self.sandbox.bundle_dir().to_path_buf();
+            let bundle_ext = self.sandbox.bundle_file_ext();
             let current_bundles = bundles::read_stamp(&bundle_dir).await;
             let live_bundles_tx = self.chunk_store.as_ref().map(|(cs, _)| {
                 bundles::spawn_supervisor(
-                    bundles::BundleStore::new(cs.blob_storage().clone(), bundle_dir.clone()),
+                    bundles::BundleStore::new(cs.blob_storage().clone(), bundle_dir.clone(), bundle_ext),
                     current_bundles.clone(),
                 )
             });

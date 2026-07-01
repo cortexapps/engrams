@@ -449,6 +449,13 @@ impl SandboxBackend for VzBackend {
         &self.cfg.bundle_dir
     }
 
+    fn bundle_file_ext(&self) -> &'static str {
+        // VZ stages + attaches erofs (see `staged_erofs_path`); the Kata guest
+        // kernel mounts erofs, not squashfs. The BundleStore must materialize/
+        // sweep `<sha>.erofs`, not the FC-default `<sha>.squashfs`.
+        "erofs"
+    }
+
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         warn_vz_ignores_allow_hosts_once(&spec.network);
         let bake_rootfs = spec.rootfs_source.clone().ok_or_else(|| {

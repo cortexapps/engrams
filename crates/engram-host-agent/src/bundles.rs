@@ -99,15 +99,29 @@ pub fn spawn_supervisor(
 pub struct BundleStore {
     blob: Arc<dyn BlobStorage>,
     dir: PathBuf,
+    /// The staged-bundle file extension for THIS host's backend
+    /// (`SandboxBackend::bundle_file_ext`): `squashfs` on FC, `erofs` on VZ.
+    /// The staged filename (`<sha>.<ext>`) must match what the backend attaches
+    /// (`staged_erofs_path` on VZ), or `materialize_if_missing` misses the
+    /// locally-staged file and faults to BlobStorage.
+    ext: String,
 }
 
 impl BundleStore {
-    pub fn new(blob: Arc<dyn BlobStorage>, dir: PathBuf) -> Self {
-        Self { blob, dir }
+    pub fn new(blob: Arc<dyn BlobStorage>, dir: PathBuf, ext: impl Into<String>) -> Self {
+        Self {
+            blob,
+            dir,
+            ext: ext.into(),
+        }
+    }
+
+    fn staged_file_name(&self, sha256: &str) -> String {
+        format!("{sha256}.{}", self.ext)
     }
 
     pub fn staged_path(&self, r: &AuxBundleRef) -> PathBuf {
-        self.dir.join(AuxRoDrive::staged_file_name(&r.sha256))
+        self.dir.join(self.staged_file_name(&r.sha256))
     }
 
     /// Idempotently publish each referenced generation's bytes to
@@ -174,8 +188,9 @@ impl BundleStore {
         let keep: std::collections::HashSet<String> = live
             .iter()
             .chain(current.iter())
-            .map(|r| AuxRoDrive::staged_file_name(&r.sha256))
+            .map(|r| self.staged_file_name(&r.sha256))
             .collect();
+        let suffix = format!(".{}", self.ext);
         let mut dir = match tokio::fs::read_dir(&self.dir).await {
             Ok(d) => d,
             Err(_) => return, // no staging dir — nothing to sweep
@@ -183,9 +198,10 @@ impl BundleStore {
         while let Ok(Some(entry)) = dir.next_entry().await {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            // Only files matching the staged-generation shape; the
-            // stamp itself and any temp files stay.
-            if !name.ends_with(".squashfs") || keep.contains(name) {
+            // Only files matching the staged-generation shape for this backend's
+            // pack format (<sha>.squashfs on FC, <sha>.erofs on VZ); the stamp
+            // itself and any temp files stay.
+            if !name.ends_with(&suffix) || keep.contains(name) {
                 continue;
             }
             match tokio::fs::remove_file(entry.path()).await {
@@ -278,6 +294,7 @@ mod tests {
         BundleStore::new(
             Arc::new(LocalBlobStorage::new(tmp.path().join("blob"))),
             tmp.path().join("shared"),
+            "squashfs",
         )
     }
 
