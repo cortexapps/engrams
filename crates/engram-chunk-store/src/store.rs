@@ -18,13 +18,20 @@
 //! chunks. (The local NVMe cache has its own free-floor eviction —
 //! see `cache::ChunkCache`.)
 //!
-//! The local NVMe cache (`cache::ChunkCache`) is a separate layer
-//! consumed by adapters; this module's GETs go through the configured
-//! `ChunkResolver` (ADR 0008). The default resolver wraps `BlobStorage`
-//! directly; for chunked-OCI images the host-agent installs a
-//! `TieredChunkResolver` (`BlobStorage → OCI`, with write-through fill)
-//! via [`ChunkStore::with_resolver`]. Writes always go through
-//! `BlobStorage` directly; the tiered story is read-only.
+//! The local NVMe cache (`cache::ChunkCache`) is consumed by adapters,
+//! and — when wired in via [`ChunkStore::with_chunk_cache`] — is also a
+//! **write-through** tier for `put_chunk`: a chunk written durably to
+//! `BlobStorage` is additionally populated into the local cache, so the
+//! host that *produced* it reads it back locally (μs) instead of
+//! re-fetching from the blob store (~110 ms) on the next resume. This is
+//! symmetric with the read side (`TieredChunkResolver`'s populate-on-miss)
+//! and closes the asymmetry that made idle-eviction capture ship the
+//! divergent memory chunks to GCS while discarding the local copy the host
+//! already had (so every resume re-paged its working set from GCS). GETs go
+//! through the configured `ChunkResolver` (ADR 0008); the default resolver
+//! wraps `BlobStorage` directly, and for chunked-OCI images the host-agent
+//! installs a `TieredChunkResolver` (`BlobStorage → OCI`) via
+//! [`ChunkStore::with_resolver`].
 
 use std::sync::Arc;
 
@@ -41,13 +48,19 @@ use crate::working_set::{TraceRef, WorkingSetTrace};
 /// `Arc`s internally); pass clones around freely.
 #[derive(Clone)]
 pub struct ChunkStore {
-    /// Write target for chunks, manifests, and traces. Always
-    /// `BlobStorage` — writes don't have a tiered story.
+    /// Durable write target for chunks, manifests, and traces —
+    /// `BlobStorage`. Always written (the durability tier).
     inner: Arc<dyn BlobStorage>,
     /// Read path for chunks. Defaults to a `BlobStorageResolver`
     /// over `inner`; production may swap in a tiered resolver
     /// (see ADR 0008 Phase 2 — `TieredChunkResolver`).
     resolver: Arc<dyn ChunkResolver>,
+    /// Optional local write-through cache. When set (host-agent), a
+    /// `put_chunk` that durably writes a *new* chunk also populates this
+    /// cache, so the producing host reads it back locally instead of
+    /// re-fetching from `inner`. `None` on the coordinator (no local
+    /// resume-serving cache) — there `put_chunk` is blob-only, unchanged.
+    cache: Option<crate::cache::ChunkCache>,
 }
 
 impl ChunkStore {
@@ -63,7 +76,19 @@ impl ChunkStore {
         Self {
             inner: blob,
             resolver,
+            cache: None,
         }
+    }
+
+    /// Wire a local [`ChunkCache`](crate::cache::ChunkCache) as a
+    /// write-through tier: `put_chunk` will populate it after the durable
+    /// blob write, so the producing host serves the chunk locally on the
+    /// next read/resume. The host-agent passes the same cache its UFFD
+    /// handler + disk daemon read from; the coordinator omits it. Cheap
+    /// clone (the cache is `Arc`-backed).
+    pub fn with_chunk_cache(mut self, cache: crate::cache::ChunkCache) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Replace the chunk-fetch resolver. The host-agent installs a
@@ -101,6 +126,30 @@ impl ChunkStore {
         }
         let bytes = Bytes::copy_from_slice(body);
         let _ = self.inner.put(&key, bytes).await?;
+        // Write-through the local cache (if wired): the host that produced
+        // this chunk should read it back locally (μs) rather than re-fetch
+        // it from the blob store (~110 ms) on the next resume — symmetric
+        // with the read path's populate-on-miss. `write_local` runs the
+        // cache's *debounced* budget sweep, so a burst of write-throughs
+        // (e.g. an idle-eviction re-chunk) enforces the free-space floor at
+        // most once per interval — it does NOT skip eviction the way
+        // `put_no_evict` would, which on a disk-pressured host could overshoot
+        // the floor. LRU then retains these fresh chunks and evicts stale
+        // ones, exactly the set we want warm for the resume. `hash` was just
+        // computed above, so `write_local` skips a redundant re-hash.
+        // Best-effort: the chunk is already durable in `inner`, so a cache
+        // write failure is a missed optimization, never incorrect (reads
+        // fall back to the blob store).
+        if let Some(cache) = &self.cache {
+            if let Err(e) = cache.write_local(hash, body).await {
+                tracing::debug!(
+                    hash = %hash,
+                    error = %e,
+                    "chunk write-through to local cache failed (chunk durable in store; \
+                     reads will fall back to the blob store)",
+                );
+            }
+        }
         tracing::trace!(hash = %hash, bytes = body.len(), "chunk PUT");
         Ok(hash)
     }
@@ -260,6 +309,7 @@ impl ChunkStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::{ChunkCache, ChunkCacheConfig};
     use crate::manifest::{ChunkRef, ManifestKind};
     use engram_storage_local::LocalBlobStorage;
 
@@ -267,6 +317,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         (ChunkStore::new(blob), dir)
+    }
+
+    /// A store with a wired local write-through cache (the host-agent shape),
+    /// returning a handle to the same cache so tests can assert residency.
+    async fn store_with_cache() -> (ChunkStore, ChunkCache, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
+        // free_floor_pct = 0 → the write-through's debounced sweep never
+        // evicts by disk pressure, so this test isolates "did put_chunk
+        // populate the cache" without depending on the test host's free
+        // space (eviction itself is covered by cache.rs's own tests).
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig::from_env_or_default(dir.path().join("cache")),
+            0.0,
+        );
+        let store = ChunkStore::new(blob).with_chunk_cache(cache.clone());
+        (store, cache, dir)
+    }
+
+    #[tokio::test]
+    async fn put_chunk_write_throughs_to_wired_cache() {
+        let (s, cache, _d) = store_with_cache().await;
+        let body = b"a divergent memory page's bytes";
+        let h = s.put_chunk(body).await.unwrap();
+        // The producing host now serves this chunk locally on the next
+        // resume instead of re-fetching it from the blob store.
+        assert!(
+            cache.contains_on_disk(h),
+            "put_chunk must write-through to the wired local cache",
+        );
+    }
+
+    #[tokio::test]
+    async fn put_chunk_without_cache_stays_blob_only() {
+        // The default store() (coordinator shape) has no wired cache —
+        // put_chunk must still succeed and round-trip, just blob-only.
+        let (s, _d) = store().await;
+        let h = s.put_chunk(b"coord-side chunk").await.unwrap();
+        assert_eq!(&s.get_chunk(h).await.unwrap()[..], b"coord-side chunk");
     }
 
     #[tokio::test]

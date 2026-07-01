@@ -445,11 +445,6 @@ async fn main() -> Result<(), HostAgentError> {
     };
     let cloud = Arc::new(StaticCloud::detect().map_err(HostAgentError::Backend)?);
 
-    // ADR 0007: chunk store for the PooledBackend wrapper (materialize +
-    // base-snapshot residency). `blob` was created above the backend
-    // match so the inner VZ backend could share it; reuse it here.
-    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let materialize_dir = cli.work_dir.join("chunked-rootfs");
     // ADR 0007 #3a: NVMe-backed chunk cache. No absolute ceiling by
     // default — a 20% free-space floor (re-probed via `statvfs(2)` on
     // every sweep) governs, filling to ~80% of the cache disk then
@@ -460,6 +455,17 @@ async fn main() -> Result<(), HostAgentError> {
             cli.work_dir.join("chunk-cache"),
         ),
     );
+
+    // ADR 0007: chunk store for the PooledBackend wrapper (materialize +
+    // base-snapshot residency). `blob` was created above the backend
+    // match so the inner VZ backend could share it; reuse it here. Wire the
+    // SAME local cache the UFFD handler + disk daemon read from
+    // (`work_dir/chunk-cache`) as a write-through tier, so a chunk this host
+    // produces — e.g. an idle-eviction re-chunk of divergent memory — is
+    // served locally on the next resume instead of re-fetched from GCS.
+    let chunk_store =
+        engram_chunk_store::ChunkStore::new(blob).with_chunk_cache(chunk_cache.clone());
+    let materialize_dir = cli.work_dir.join("chunked-rootfs");
 
     // OCI auth resolver. The standalone host-agent doesn't have
     // direct DB/KEK access, so it asks the coord to resolve
