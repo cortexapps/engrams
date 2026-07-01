@@ -388,6 +388,39 @@ impl app::session_service_server::SessionService for AppSessionService {
         }))
     }
 
+    /// ADR 0065: ensure the ephemeral in-guest browser stack is up and return
+    /// its RFB port. The orchestrator's `/vnc` route calls this before opening a
+    /// PortRelay tunnel to the guest's `:5900` (ADR 0066). Idempotent —
+    /// `start_browser` re-probes an already-running stack.
+    async fn ensure_browser(
+        &self,
+        req: Request<app::EnsureBrowserRequest>,
+    ) -> Result<Response<app::EnsureBrowserResponse>, Status> {
+        self.auth.check(&req)?;
+        let id = parse_session_id(&req.get_ref().session_id)?;
+        // Auto-resume Idle, then resolve the live sandbox (PG authority, ADR 0047).
+        crate::api::snapshot::ensure_active(&self.state, id)
+            .await
+            .map_err(into_status)?;
+        let sandbox_id = self.state.resolve_sandbox(id).await.ok_or_else(|| {
+            into_status(crate::error::ApiError::Conflict(
+                "session has no live sandbox after auto-resume; \
+                 try `engram session resume <id>` and retry"
+                    .into(),
+            ))
+        })?;
+        let port = self
+            .state
+            .services
+            .host
+            .start_browser(sandbox_id)
+            .await
+            .map_err(|e| Status::unavailable(format!("start_browser: {e}")))?;
+        Ok(Response::new(app::EnsureBrowserResponse {
+            port: u32::from(port),
+        }))
+    }
+
     async fn resume(
         &self,
         req: Request<app::ResumeRequest>,
