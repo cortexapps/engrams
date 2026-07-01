@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ADR 0064: build the opt-in `browser` RO bundle.
+# ADR 0065: build the opt-in `browser` RO bundle.
 #
 # A self-contained glibc tree: chromium (full UI build), Xvfb, x11vnc, openbox,
 # liberation fonts, and ALL their shared-library deps — so it runs on any glibc
@@ -73,7 +73,7 @@ build_tree() {
         # the hard-coded /usr/bin/xkbcomp the X server invokes.
         cp -L "$(command -v xkbcomp)" /out/bin/xkbcomp
         # setpriv: the launcher drops the whole stack to an unprivileged uid
-        # with this (ADR 0064 §7) before bringing chromium up, so a renderer
+        # with this (ADR 0065 §7) before bringing chromium up, so a renderer
         # compromise in an untrusted page is confined to a non-root, capless,
         # secret-free process. Shipping it IN the bundle (rather than relying on
         # the guest image) keeps the browser skill self-contained and the image
@@ -153,7 +153,7 @@ build_tree() {
         # unexpectedly" the VNC tab shows.
         [ -x /out/bin/xkbcomp ] && [ -d /out/share/X11/xkb ] \
             || { echo "FATAL: xkb keyboard stack missing (xkbcomp/xkb-data)" >&2; exit 1; }
-        # setpriv is what drops the stack off root (ADR 0064 §7); a bundle
+        # setpriv is what drops the stack off root (ADR 0065 §7); a bundle
         # missing it would silently run the browser as root, so fail loud.
         [ -x /out/bin/setpriv ] \
             || { echo "FATAL: setpriv missing — the browser can not drop privileges" >&2; exit 1; }

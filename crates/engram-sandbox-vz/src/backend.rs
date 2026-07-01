@@ -911,7 +911,7 @@ impl SandboxBackend for VzBackend {
         }
     }
 
-    /// ADR 0064: ask agentd to ensure the in-guest browser stack (Xvfb +
+    /// ADR 0065: ask agentd to ensure the in-guest browser stack (Xvfb +
     /// openbox + chromium + x11vnc) is running and x11vnc is accepting on its
     /// port. Returns the bound port. Mirrors [`Self::start_shell`]: the host's
     /// `proxy_vnc` (P1.4) calls this just before dialing the guest's raw-TCP
@@ -956,7 +956,7 @@ impl SandboxBackend for VzBackend {
         }
     }
 
-    /// ADR 0064: tear down the in-guest browser stack. Idempotent — a no-op
+    /// ADR 0065: tear down the in-guest browser stack. Idempotent — a no-op
     /// when the sandbox is gone or nothing is running.
     async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
         let vsock_uds_path = {

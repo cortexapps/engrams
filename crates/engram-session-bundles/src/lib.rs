@@ -133,7 +133,7 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
         if let Some(rel) = &manifest.provides_askpass {
             askpass = Some(slot.join(rel));
         }
-        // Bundle-level bins (ADR 0064): launchers a capability bundle puts on
+        // Bundle-level bins (ADR 0065): launchers a capability bundle puts on
         // PATH without being a user-facing agent skill. Wired independently of
         // the per-skill loop below — no skill dir, no `~/.agents/skills` entry.
         wire_bins(&layout, slot, &manifest.bins, &mut report);
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn activate_wires_bundle_level_bins_without_a_skill() {
-        // ADR 0064: the `browser` bundle ships a launcher on PATH but is NOT a
+        // ADR 0065: the `browser` bundle ships a launcher on PATH but is NOT a
         // user-facing agent skill — its mount.json is the flat shape
         // {"kind":"skill","bins":["bin/engram-browser"]}. The bin must land on
         // PATH with no phantom agent skill registered and no warning.

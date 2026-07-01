@@ -389,7 +389,7 @@ async fn relay_connect(
     stream
 }
 
-/// ADR 0064 (P4.2): VZ parity for the in-guest browser. Boots a VZ guest with
+/// ADR 0065 (P4.2): VZ parity for the in-guest browser. Boots a VZ guest with
 /// the **`browser`** erofs bundle attached (`Xvfb` + `openbox` + `chromium` +
 /// `x11vnc` + the `engram-browser` launcher), then calls
 /// [`SandboxBackend::start_browser`] and asserts the bound VNC port — the same

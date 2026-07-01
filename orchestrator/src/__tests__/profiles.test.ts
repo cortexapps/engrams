@@ -212,10 +212,10 @@ describe("ProfileService — auth + field filtering", () => {
     } finally { await s.close(); }
   });
 
-  // ADR 0064: "browser" is a builtin skill (the opt-in in-guest browser). It
+  // ADR 0065: "browser" is a builtin skill (the opt-in in-guest browser). It
   // must validate like any other builtin so a profile can actually select it —
   // the gap that left browserEnabled stuck false even after "adding" it.
-  test("admin CreateProfile accepts the builtin browser skill (ADR 0064)", async () => {
+  test("admin CreateProfile accepts the builtin browser skill (ADR 0065)", async () => {
     const s = await spawn({
       getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
       images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),

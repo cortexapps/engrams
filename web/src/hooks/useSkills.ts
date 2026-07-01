@@ -38,7 +38,7 @@ export const BUILTIN_SKILLS: { name: string; label: string; description: string 
       "chromium-headless-shell + the playwright-cli powering the show-your-work skill. Use an image sized for a browser (≥1 GiB).",
   },
   {
-    // ADR 0064: the opt-in human-driven browser (mirror of the orchestrator's
+    // ADR 0065: the opt-in human-driven browser (mirror of the orchestrator's
     // BUILTIN_SKILLS — keep the two in sync). Selecting it mounts the `browser`
     // bundle and lights up the session's BROWSER tab over noVNC.
     name: "browser",

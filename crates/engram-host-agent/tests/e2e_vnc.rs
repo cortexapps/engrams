@@ -217,7 +217,7 @@ fn browser_aux_drive(sha: String) -> AuxRoDrive {
 /// orchestrator's `/vnc` route drives (`EnsureBrowser` → `start_browser`, then
 /// a `PortRelay`/`open_guest_stream` reach). Going through `PooledBackend` is
 /// what catches the `start_browser` / `open_guest_stream` forwarding bugs (the
-/// ADR 0064/0065 PooledBackend guards).
+/// ADR 0065 PooledBackend guards).
 async fn open_vnc_relay_stream(
     pooled: &PooledBackend,
     id: engram_core::SandboxId,

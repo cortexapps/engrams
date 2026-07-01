@@ -23,7 +23,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import type { Session, ProfileSnapshotView } from "../lib/types";
 
-// The session workspace (ADR 0064 follow-up). The transcript is the primary
+// The session workspace (ADR 0065 follow-up). The transcript is the primary
 // left column; the live shell + browser live in a resizable companion pane on
 // the right (Devin-style), instead of top-level tabs that hid the conversation.
 // Diagnostics + the raw event log moved into that pane too. On phones the pane
@@ -102,7 +102,7 @@ export function SessionDetail() {
   // calming to say).
   const durability = useDurabilitySummary(id, session?.status);
 
-  // The in-guest browser (Xvfb + VNC, ADR 0064) is an optional capability,
+  // The in-guest browser (Xvfb + VNC, ADR 0065) is an optional capability,
   // present iff the session's profile selected the `browser` skill bundle. We
   // read that straight off the profile snapshot the masthead already shows.
   const browserEnabled = (profile?.skills ?? []).includes("browser");

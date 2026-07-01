@@ -1,4 +1,4 @@
-// Render + lazy-import smoke for the BROWSER tab viewer (ADR 0064).
+// Render + lazy-import smoke for the BROWSER tab viewer (ADR 0065).
 //
 // The real `@novnc/novnc` RFB client touches WebSocket + canvas + WASM-ish
 // rendering paths that jsdom can't run, so we mock the module with a stub RFB

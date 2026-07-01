@@ -1,6 +1,6 @@
-# ADR 0064: pinned versions for the opt-in `browser` RO bundle (Xvfb + chromium
+# ADR 0065: pinned versions for the opt-in `browser` RO bundle (Xvfb + chromium
 # + x11vnc + openbox, glibc-linked, self-contained). build.sh reads CHROME-/
 # package versions from apt at build time; this file records intent + the
 # bundle name the coordinator resolves (a profile selects "browser").
 name = "browser"
-description = "Xvfb + chromium (full UI) + x11vnc + openbox, glibc-linked, self-contained. Human-driven browser over VNC (ADR 0064)."
+description = "Xvfb + chromium (full UI) + x11vnc + openbox, glibc-linked, self-contained. Human-driven browser over VNC (ADR 0065)."

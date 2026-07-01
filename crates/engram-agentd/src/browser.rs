@@ -1,11 +1,11 @@
-//! In-guest browser (Xvfb + chromium + x11vnc) lifecycle (ADR 0064).
+//! In-guest browser (Xvfb + chromium + x11vnc) lifecycle (ADR 0065).
 //!
 //! Mirrors [`crate::shell`]: lazy spawn on the first
 //! [`StartBrowser`][crate::proto::WireRequest::StartBrowser], an RFB-banner
 //! probe to `127.0.0.1:5900` before replying so the ADR-0066 relay's
 //! guest-loopback dial finds x11vnc actually *serving* RFB (not a bare listener), and
 //! respawn only if the prior launcher exited. The launcher (`engram-browser`,
-//! symlinked onto PATH by the `browser` bundle's activation — see ADR 0064
+//! symlinked onto PATH by the `browser` bundle's activation — see ADR 0065
 //! P0.1/P0.2) brings up the whole stack (Xvfb + openbox + chromium + x11vnc) in
 //! its own process group via `setsid`, so [`stop_browser`] reaps it with a
 //! single `killpg`. The launcher's stdout/stderr are drained to tracing (never
@@ -32,7 +32,7 @@ use tokio::time::{sleep, timeout};
 /// agentd dials `127.0.0.1:5900` in-guest and splices RFB bytes.
 pub const DEFAULT_VNC_PORT: u16 = 5900;
 
-/// Launcher symlinked onto PATH by the `browser` bundle (ADR 0064). Other
+/// Launcher symlinked onto PATH by the `browser` bundle (ADR 0065). Other
 /// images that bake the launcher into a different prefix can override the
 /// resolved path via `ENGRAM_BROWSER_BIN` in the agent environment.
 const DEFAULT_BROWSER_LAUNCHER: &str = "engram-browser";
@@ -75,7 +75,7 @@ pub struct BrowserOutcome {
 /// The browser renders pages the human navigates to — untrusted code — so it
 /// must never carry the session's secrets in its process environment: a
 /// renderer compromise reads `/proc/self/environ`, and chromium spawns helpers
-/// that inherit it (ADR 0064 §7). agentd is the only layer that holds
+/// that inherit it (ADR 0065 §7). agentd is the only layer that holds
 /// `session_env`, so the scrub lives here.
 ///
 /// This is an **allowlist**, not a denylist. `session_env` is an opaque flat map
@@ -116,7 +116,7 @@ fn is_browser_safe_key(key: &str) -> bool {
 /// session id) the host carried in on `SpawnHarness`. Unlike the shell, the
 /// browser is **not** handed this wholesale — it renders untrusted pages, so
 /// [`browser_env`] scrubs it to a non-secret allowlist before the launcher sees
-/// it (ADR 0064 §7). Only the fresh-spawn path uses it; a re-probe of an
+/// it (ADR 0065 §7). Only the fresh-spawn path uses it; a re-probe of an
 /// already-running stack leaves the existing process untouched.
 pub async fn start_browser(
     port: u16,
@@ -285,7 +285,7 @@ const RFB_BANNER_TIMEOUT: Duration = Duration::from_secs(2);
 /// Probe that x11vnc is genuinely serving RFB on `port` — not merely that
 /// *something* accepted the TCP connection.
 ///
-/// A bare connect is too weak: the original ADR 0064 break (the host dialing
+/// A bare connect is too weak: the original ADR 0065 break (the host dialing
 /// the guest's routable IP while x11vnc bound loopback) and any future
 /// "port accepts but no bytes flow" wedge both pass a connect yet serve
 /// nothing — the user sees the VNC tab close with "no messages over the

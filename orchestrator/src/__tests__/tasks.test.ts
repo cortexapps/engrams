@@ -297,7 +297,7 @@ describe("buildProfileMap — image catalog resilience", () => {
     expect(map.get(PROFILE_ID)!.imageUri).toBe("registry/img-1:latest");
   });
 
-  test("carries the profile's skills onto the snapshot (ADR 0064 browser-tab gate)", async () => {
+  test("carries the profile's skills onto the snapshot (ADR 0065 browser-tab gate)", async () => {
     const map = await buildProfileMap(
       [{ profileId: PROFILE_ID }],
       makeFakeProfiles({ skills: ["skills", "browser"] }),

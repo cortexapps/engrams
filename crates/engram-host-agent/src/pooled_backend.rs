@@ -6196,7 +6196,7 @@ impl SandboxBackend for PooledBackend {
         self.inner.start_shell(id).await
     }
 
-    /// ADR 0064: forward to inner, exactly as `start_shell` does — without
+    /// ADR 0065: forward to inner, exactly as `start_shell` does — without
     /// this the trait default (`Ok(5900)`) would run and the FC/VZ backend's
     /// actual vsock StartBrowser RPC to in-VM agentd would never fire, so
     /// the host's `proxy_vnc` would dial a port nothing started.
@@ -6204,7 +6204,7 @@ impl SandboxBackend for PooledBackend {
         self.inner.start_browser(id).await
     }
 
-    /// ADR 0064: forward to inner (the trait default is a no-op).
+    /// ADR 0065: forward to inner (the trait default is a no-op).
     async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
         self.inner.stop_browser(id).await
     }
@@ -8659,7 +8659,7 @@ mod tests {
             );
         }
 
-        /// ADR 0064 regression guard: PooledBackend.start_browser MUST
+        /// ADR 0065 regression guard: PooledBackend.start_browser MUST
         /// forward to its inner backend. The trait default returns
         /// Ok(5900) WITHOUT touching the inner, so a deleted/regressed
         /// delegate would hand `proxy_vnc` a port (5900) that nothing
@@ -8689,7 +8689,7 @@ mod tests {
             );
         }
 
-        /// ADR 0064 regression guard: PooledBackend.stop_browser MUST
+        /// ADR 0065 regression guard: PooledBackend.stop_browser MUST
         /// forward to its inner backend. The trait default is a no-op, so
         /// a deleted delegate would silently never tear down the in-guest
         /// browser stack (leaking Xvfb/chromium/x11vnc) while reporting

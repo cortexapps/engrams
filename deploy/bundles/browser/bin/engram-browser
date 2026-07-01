@@ -1,5 +1,5 @@
 #!/bin/sh
-# ADR 0064 browser bundle launcher. Self-contained, glibc-linked; runs on any
+# ADR 0065 browser bundle launcher. Self-contained, glibc-linked; runs on any
 # glibc base. ADR 0055: mounts at a dynamic slot (/opt/engram/dyn/<i>) and
 # agentd symlinks this onto PATH, so resolve our real bundle root from $0
 # (readlink -f follows the PATH symlink) — never a fixed mount path.
@@ -11,7 +11,7 @@
 # stack shares one process group so agentd can reap it as a unit
 # (StopBrowser → killpg).
 #
-# Security (ADR 0064 §7): the human points this browser at arbitrary, untrusted
+# Security (ADR 0065 §7): the human points this browser at arbitrary, untrusted
 # sites, so the stack runs UNPRIVILEGED with chromium's sandbox ON. The script
 # starts as root only long enough for the few root-only steps (the xkbcomp
 # symlink; the unprivileged uid's $HOME + /etc/passwd entry), then re-exec's
@@ -25,7 +25,7 @@ export LD_LIBRARY_PATH="$here/lib:${LD_LIBRARY_PATH:-}"
 export FONTCONFIG_FILE="$here/fonts.conf"
 export PATH="$here/bin:$PATH"
 
-# --- Privilege drop (ADR 0064 §7) -------------------------------------------
+# --- Privilege drop (ADR 0065 §7) -------------------------------------------
 # Drop HERE, in the bundle's own launcher, rather than in agentd: the workspace
 # is forbid(unsafe_code), so agentd can neither pre_exec a setgroups/setgid/
 # setuid sequence nor use the nightly-only CommandExt::groups (safe stable Rust
@@ -155,7 +155,7 @@ done
         # "profile appears to be in use"; the profile is single-tenant and
         # ephemeral, so clear it before each (re)launch.
         rm -f "$PROFILE_DIR"/Singleton* 2>/dev/null || true
-        # Chrome runs with its SANDBOX ON (ADR 0064 §7) — no --no-sandbox. The
+        # Chrome runs with its SANDBOX ON (ADR 0065 §7) — no --no-sandbox. The
         # launcher already dropped to a non-root uid, which is precisely what
         # lets chromium use its namespace (zygote) sandbox, so an exploited
         # renderer is confined. (--test-type is gone too — it only existed to

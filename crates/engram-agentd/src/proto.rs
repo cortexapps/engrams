@@ -268,7 +268,7 @@ pub enum WireRequest {
     /// [`crate::browser::DEFAULT_VNC_PORT`], 5900). Lazy + idempotent,
     /// exactly like [`Self::StartShell`]: on first call the agent spawns
     /// the `engram-browser` launcher (shipped + PATH-symlinked by the
-    /// `browser` bundle, ADR 0064); on later calls it re-probes and respawns
+    /// `browser` bundle, ADR 0065); on later calls it re-probes and respawns
     /// only if the stack went away. The agent only replies once a fresh TCP
     /// connect to the loopback `port` succeeds, so the host's `proxy_vnc`
     /// dial finds a listener right after this returns.

@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { API_BASE } from "../lib/base";
 import { PaneStatus } from "./PaneStatus";
 
-// In-browser BROWSER tab (ADR 0064). Lazy-loads `@novnc/novnc` (the RFB
+// In-browser BROWSER tab (ADR 0065). Lazy-loads `@novnc/novnc` (the RFB
 // client is the heavy bit) on first mount, opens a WebSocket to
 // `/sessions/:id/vnc`, and drives the in-guest Xvfb desktop over raw RFB.
 // The orchestrator relay does websockify's job (raw RFB bytes over the
@@ -76,7 +76,7 @@ export function BrowserPane({ sessionId }: BrowserPaneProps) {
         rfb = new mod.default(container, wsUrl, { wsProtocols: [] });
         rfb.viewOnly = false; // the human DRIVES the browser
         rfb.scaleViewport = true;
-        rfb.resizeSession = true; // ADR 0064: resolution tracks the panel via RANDR
+        rfb.resizeSession = true; // ADR 0065: resolution tracks the panel via RANDR
         rfb.addEventListener("connect", () => {
           if (!disposed) setStatus("connected");
         });

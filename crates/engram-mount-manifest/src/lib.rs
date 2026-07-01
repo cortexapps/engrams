@@ -43,7 +43,7 @@ pub struct MountManifest {
     pub skills: Vec<SkillEntry>,
     /// Bundle-level wrapper paths to symlink onto PATH (basename = the PATH
     /// command name), independent of any skill. Used by capability bundles
-    /// (e.g. ADR 0064 `browser`'s `engram-browser` launcher) that expose a
+    /// (e.g. ADR 0065 `browser`'s `engram-browser` launcher) that expose a
     /// tool agentd drives but that is NOT a user-facing agent skill.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bins: Vec<String>,
