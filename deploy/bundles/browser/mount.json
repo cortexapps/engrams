@@ -1,4 +1,7 @@
 {
   "kind": "skill",
-  "bins": ["bin/engram-browser"]
+  "bins": ["bin/engram-browser"],
+  "skills": [
+    { "name": "show-your-work", "bins": ["bin/playwright-cli"] }
+  ]
 }

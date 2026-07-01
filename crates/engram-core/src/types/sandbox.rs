@@ -92,7 +92,7 @@ pub struct SandboxSpec {
 /// of slots ([`Self::RESERVED_SLOTS`], `dyn_0..dyn_{N-1}`), each carrying the
 /// sentinel until a per-session create swaps the selected skill in via
 /// `patch_drive` in the paused restore window. There is no longer a special
-/// "skills" / "playwright" drive — every mount is one content-addressed skill.
+/// "skills" / "browser" drive — every mount is one content-addressed skill.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuxRoDrive {
     /// Firecracker `drive_id`. For ADR 0055 dynamic mounts this is the

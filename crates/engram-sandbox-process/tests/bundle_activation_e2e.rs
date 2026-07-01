@@ -5,7 +5,7 @@
 //! (`create` → `start_agent`) with the RO bundles staged, and asserts the
 //! produced session directory contains everything a harness discovers:
 //! the `~/.claude/skills` tree (share-file always; show-your-work when the
-//! playwright bundle is present), and the `engram-share`/`playwright-cli` wrappers on
+//! browser bundle is present), and the `engram-share`/`playwright-cli` wrappers on
 //! PATH + `/etc/gitconfig`. This is the cross-cutting check that the engine
 //! actually lands skills in sessions — the per-unit behavior is covered by
 //! `engram-session-bundles` tests.
@@ -32,7 +32,7 @@ fn write_exec(path: &Path, body: &str) {
     }
 }
 
-/// Build fake skills + playwright bundle trees mirroring `deploy/bundles/*`.
+/// Build fake skills + browser bundle trees mirroring `deploy/bundles/*`.
 fn stage_fake_bundles(skills: &Path, browser: &Path) {
     write_exec(&skills.join("bin/engram-share"), "#!/bin/sh\n");
     write_exec(&skills.join("bin/git-askpass"), "#!/bin/sh\n");
@@ -58,13 +58,13 @@ fn stage_fake_bundles(skills: &Path, browser: &Path) {
 async fn generated_session_has_skills_and_browser_tooling() {
     let tmp = tempfile::tempdir().unwrap();
     let skills_dir = tmp.path().join("bundles/skills");
-    let browser_dir = tmp.path().join("bundles/playwright");
+    let browser_dir = tmp.path().join("bundles/browser");
     stage_fake_bundles(&skills_dir, &browser_dir);
 
     // Point ProcessBackend's dev staging at the fake bundles. Safe: edition
     // 2021 `set_var` isn't unsafe, and this is the only test in the binary.
     std::env::set_var("ENGRAM_SKILLS_BUNDLE_DIR", &skills_dir);
-    std::env::set_var("ENGRAM_PLAYWRIGHT_BUNDLE_DIR", &browser_dir);
+    std::env::set_var("ENGRAM_BROWSER_BUNDLE_DIR", &browser_dir);
 
     let work = tmp.path().join("work");
     let backend = ProcessBackend::new(&work);
@@ -111,7 +111,7 @@ async fn generated_session_has_skills_and_browser_tooling() {
     );
     assert!(
         cwd.join("root/.agents/skills/show-your-work").is_symlink(),
-        "show-your-work not wired despite playwright bundle present",
+        "show-your-work not wired despite browser bundle present",
     );
 
     // Wrappers on PATH + git wiring. The forge token still wires the askpass +
@@ -136,7 +136,7 @@ async fn generated_session_has_skills_and_browser_tooling() {
     );
 
     // The bundle mounts themselves are symlinked under the session cwd at the
-    // ADR 0055 reserved-slot paths (skills -> dyn/0, playwright -> dyn/1).
+    // ADR 0055 reserved-slot paths (skills -> dyn/0, browser -> dyn/1).
     assert!(cwd.join("opt/engram/dyn/0").is_symlink());
     assert!(cwd.join("opt/engram/dyn/1").is_symlink());
 }

@@ -332,7 +332,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(&tmp);
         let body = b"playwright-generation-7";
-        let r = aux("playwright", body);
+        let r = aux("browser", body);
         s.blob
             .put(
                 &AuxRoDrive::blob_key(&r.sha256),
@@ -448,14 +448,14 @@ mod tests {
         assert!(read_stamp(tmp.path()).await.is_empty());
         tokio::fs::write(
             tmp.path().join(AuxRoDrive::CURRENT_STAMP),
-            br#"{"skills": "abc", "playwright": "def"}"#,
+            br#"{"skills": "abc", "browser": "def"}"#,
         )
         .await
         .unwrap();
         let refs = read_stamp(tmp.path()).await;
         assert_eq!(refs.len(), 2);
         // Sorted by drive_id for deterministic heartbeats.
-        assert_eq!(refs[0].drive_id, "playwright");
+        assert_eq!(refs[0].drive_id, "browser");
         assert_eq!(refs[1].drive_id, "skills");
     }
 }

@@ -77,7 +77,7 @@ spec:
               # ADR 0027: stage the RO session bundles + stamp to the
               # fleet-canonical /var/lib/engram/shared (inside the `work`
               # hostPath the host-agent reads). The host-agent resolves aux RO
-              # drives ([git] -> skills, [browser] -> playwright) against
+              # drives ([git] -> skills, [browser] -> browser) against
               # current.json there. Graceful if a node-assets image predates
               # bundles: the host still serves non-bundle sessions (bundle
               # images fail loudly at capture, the same signal as before).

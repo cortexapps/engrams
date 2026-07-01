@@ -28,12 +28,15 @@ build_tree() {
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         -v "$dest:/out" \
         -v "$here/bin/engram-browser:/launcher:ro" \
+        -v "$here/skills:/skills-src:ro" \
         debian:bookworm-slim bash -euo pipefail -c '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
+        # curl + xz-utils fetch the pinned Node for playwright-cli (ADR 0065);
+        # util-linux carries setpriv AND flock (the launcher --ensure lock).
         apt-get install -y -qq --no-install-recommends \
             chromium xvfb x11vnc openbox fonts-liberation ca-certificates \
-            x11-xkb-utils xkb-data util-linux
+            x11-xkb-utils xkb-data util-linux curl xz-utils
         rm -rf /var/lib/apt/lists/*
 
         mkdir -p /out/chrome /out/bin /out/lib /out/fonts
@@ -58,7 +61,7 @@ build_tree() {
         else
             cp -L "$(readlink -f "$chrome_bin")" /out/chrome/chrome
         fi
-        # Fail loud (like the playwright bundle) if the real ELF is missing —
+        # Fail loud if the real ELF is missing —
         # e.g. $real_dir moved and cp -aL silently produced an empty chrome/.
         # The symlink target / cp fallback above is the binary the launcher
         # invokes; assert it exists and is executable.
@@ -82,11 +85,16 @@ build_tree() {
         setpriv_bin="$(command -v setpriv)" \
             || { echo "FATAL: setpriv (util-linux) not found — the browser can not drop privileges" >&2; exit 1; }
         cp -L "$setpriv_bin" /out/bin/setpriv
+        # flock (util-linux): the launcher --ensure serializes concurrent
+        # bring-ups (the human opening the tab + the agent calling playwright-cli).
+        flock_bin="$(command -v flock)" \
+            || { echo "FATAL: flock (util-linux) not found — --ensure cannot serialize bring-ups" >&2; exit 1; }
+        cp -L "$flock_bin" /out/bin/flock
         cp /launcher /out/bin/engram-browser
         chmod 0755 /out/bin/*
 
         # Collect every .so dep of the binaries into /out/lib so the bundle is
-        # base-image-agnostic (same ldd-walk the playwright bundle uses).
+        # base-image-agnostic (an ldd-walk of each binary).
         collect() {
             ldd "$1" 2>/dev/null | awk "/=>/ {print \$3} /ld-linux/ {print \$1}" \
                 | grep -E "^/" | sort -u | while read -r so; do
@@ -168,6 +176,67 @@ build_tree() {
   <config></config>
 </fontconfig>
 FONTS
+
+        # --- playwright-cli driving the SHARED headful chrome (ADR 0065) ------
+        # The browser skill is the shared browser: the human drives it over VNC
+        # and the AGENT drives the SAME chromium over CDP. So this bundle also
+        # ships the Microsoft playwright-cli, configured to CONNECT to the
+        # headful chrome debug port (cdpEndpoint) rather than launch its own
+        # headless-shell — the agent navigation then lands in the exact window
+        # the human is watching. Node + the CLI are fetched as the retired
+        # playwright bundle did; only the config + wrapper differ.
+        # [NB: single-quoted docker -c block below — NO raw apostrophes anywhere,
+        # including inside the heredocs (a raw quote still ends the outer string).]
+        NODE_VERSION=20.18.1
+        PLAYWRIGHT_CLI_VERSION=0.1.13
+        ARCH="$(dpkg --print-architecture)"
+        case "$ARCH" in
+            amd64) NODE_ARCH=x64 ;;
+            arm64) NODE_ARCH=arm64 ;;
+            *) echo "unsupported arch $ARCH" >&2; exit 1 ;;
+        esac
+        mkdir -p /out/node
+        curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
+            | tar -xJ -C /out/node --strip-components=1
+        export PATH="/out/node/bin:$PATH"
+        # @playwright/cli ONLY — no browser install. cdpEndpoint mode connects to
+        # the running headful chrome, so the CLI needs no local browser of its own.
+        npm install -g --no-audit --no-fund "@playwright/cli@${PLAYWRIGHT_CLI_VERSION}"
+        collect /out/node/bin/node
+        [ -x /out/node/bin/playwright-cli ] \
+            || { echo "FATAL: playwright-cli not installed under /out/node/bin" >&2; exit 1; }
+
+        # CLI config: CONNECT over CDP to the shared chrome on loopback :9222,
+        # never launch. The wrapper points PLAYWRIGHT_MCP_CONFIG here.
+        cat > /out/cli.config.json <<"CFG"
+{
+  "browser": {
+    "cdpEndpoint": "http://127.0.0.1:9222"
+  }
+}
+CFG
+
+        # Wrapper (symlinked onto PATH by activation): ensure the ONE shared
+        # stack is up, then exec the real CLI, which connectOverCDP-s to the
+        # headful chrome the human is watching. Its own quoted heredoc — but the
+        # no-apostrophe rule still applies (outer string is single-quoted).
+        cat > /out/bin/playwright-cli <<"WRAP"
+#!/bin/sh
+here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
+# Bring up (or no-op) the shared headful chrome + x11vnc so the agent drives the
+# exact browser the human watches over VNC (ADR 0065). Best-effort: if the
+# ensure fails, still try to connect (the stack may already be coming up).
+"$here/bin/engram-browser" --ensure || true
+export LD_LIBRARY_PATH="$here/lib:${LD_LIBRARY_PATH:-}"
+export PLAYWRIGHT_MCP_CONFIG="$here/cli.config.json"
+export PATH="$here/node/bin:$PATH"
+exec "$here/node/bin/playwright-cli" "$@"
+WRAP
+        chmod 0755 /out/bin/playwright-cli
+
+        # show-your-work skill (moved here from the retired playwright bundle).
+        mkdir -p /out/skills
+        cp -R /skills-src/show-your-work /out/skills/
 
         # Normalize perms: every file in the RO bundle must be world-readable.
         # The in-guest browser process need not run as the build uid, and some

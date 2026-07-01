@@ -20,12 +20,15 @@ self-locate their runtime from `$0`, never a fixed mount path.
 - **`skills/`** — the built-in skill wrappers (`engram-share`, `git-askpass`)
   + their `SKILL.md`. The unpacked tree *is* this directory.
   Selected by name `skills`.
-- **`playwright/`** — chromium-headless-shell + Node + Microsoft's
-  `@playwright/cli` + all `.so` deps + a `playwright-cli` wrapper + the
-  `show-your-work` skill, built by `build.sh` (glibc; **not** usable on
-  musl/alpine bases — size the selecting profile's image for a browser). The
-  agent drives the browser via the `playwright-cli` CLI (bash) — no MCP server.
-  Selected by name `playwright`.
+- **`browser/`** (ADR 0065) — the shared live browser: chromium (full UI) + Xvfb
+  + x11vnc + openbox + Node + Microsoft's `@playwright/cli` (pointed at that
+  Chrome over CDP — **no** headless-shell) + a `playwright-cli` wrapper + the
+  `show-your-work` skill + all `.so` deps, built by `build.sh` (glibc; **not**
+  usable on musl/alpine bases — size the selecting profile's image for a
+  browser). The human drives it over VNC (BROWSER tab) and the agent drives the
+  SAME Chrome via the `playwright-cli` CLI (bash, no MCP server) — one shared
+  browser. Selected by name `browser`. (Subsumes the retired headless-only
+  `playwright` bundle.)
 - **`sentinel/`** — ADR 0055: the tiny placeholder every reserved dynamic-mount
   slot (`dyn-0..dyn-{RESERVED_SLOTS-1}`) carries at base-snapshot capture, since
   Firecracker needs all drives present at `load_snapshot`. A per-session create
@@ -39,7 +42,7 @@ self-locate their runtime from `$0`, never a fixed mount path.
 # squashfs for the FC host image (CI / bake):
 deploy/bundles/sentinel/build.sh    out/sentinel.squashfs      # MANDATORY (capture)
 deploy/bundles/skills/build.sh      out/skills.squashfs
-deploy/bundles/playwright/build.sh  out/playwright.squashfs    # needs Docker
+deploy/bundles/browser/build.sh     out/browser.squashfs       # needs Docker
 
 # content-addressed staging + current.json stamp for a dev FC host:  `just bundles-squashfs`
 # unpacked trees for local dev (ProcessBackend):  use `just bundles`

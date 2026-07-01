@@ -1,25 +1,30 @@
 ---
 name: show-your-work
-description: Capture screenshots and short screen recordings (with chapter markers) of a web UI you're building, by driving a real headless browser, and surface them in the session for the person who launched it. Use whenever there's something visual to SHOW rather than describe — to solicit mid-task feedback ("does this look right?"), to attach a repro of a bug, or for a final show-and-tell of the feature working. No tokens or setup needed.
+description: Drive a real browser with `playwright-cli` — open pages, click, fill, snapshot the accessibility tree, screenshot, record video — against a web UI you're building. This is the SAME live browser the person who launched the session can open and watch (and take over) in the BROWSER tab, so they see your actions in real time. Use whenever there's something visual to SHOW or verify rather than describe — mid-task feedback ("does this look right?"), a bug repro, a final show-and-tell, or just to check your own UI. No tokens or setup needed.
 ---
 
-# Show your work (screenshots + screen recordings)
+# Drive the browser (`playwright-cli`) — screenshots, recordings, and checking your work
 
 When you've built or changed something with a visual surface — a page, a
-component, a flow, a chart — **show it, don't just describe it.** This session
-can drive a real headless browser against your running app, capture
-screenshots and a short video (with chapter markers), and surface them in the
-conversation the launcher is watching. Good for:
+component, a flow, a chart — **drive the browser and show it, don't just
+describe it.** The tool is **`playwright-cli`** (Microsoft's browser-automation
+CLI), and it's already wired up here: just run it.
+
+**Key thing to know:** `playwright-cli` drives the session's **one shared, live
+Chromium** — the *same* browser the person who launched you can open in the
+**BROWSER tab** and watch you drive (they can even grab the mouse/keyboard).
+It's not a hidden headless instance. So when you `open` a URL or click around,
+your actions are visible to them in real time. Good for:
 
 - **Feedback while you work** — "here's the new dashboard, does the layout look
-  right?" Share a screenshot and keep going.
+  right?" Screenshot it (or tell them to watch the BROWSER tab) and keep going.
 - **Bug repro** — record the exact steps that reproduce an issue.
 - **Final show-and-tell** — a short video of the feature working end to end.
+- **Checking your own work** — snapshot the page to verify what actually rendered.
 
-The tool is **`playwright-cli`** (Microsoft's browser-automation CLI). It's
-pre-configured here — a headless Chromium is wired up; you just drive it. Run
-`playwright-cli --help` (or `playwright-cli <command> --help`) for the full
-reference; the common verbs are below.
+Run `playwright-cli --help` (or `playwright-cli <command> --help`) for the full
+reference; the common verbs are below. (The first command may take a moment
+while the shared browser starts up.)
 
 ## 1. Point it at your running app
 

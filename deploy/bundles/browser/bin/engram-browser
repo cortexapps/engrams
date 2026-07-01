@@ -25,6 +25,75 @@ export LD_LIBRARY_PATH="$here/lib:${LD_LIBRARY_PATH:-}"
 export FONTCONFIG_FILE="$here/fonts.conf"
 export PATH="$here/bin:$PATH"
 
+# --- Lazy, idempotent bring-up + agentd "registration" (ADR 0065) -----------
+# ONE shared stack serves both audiences: the human (agentd StartBrowser) and
+# the agent (the bundled playwright-cli wrapper runs `engram-browser --ensure`
+# before connecting to CDP). `--ensure` is idempotent — x11vnc already serving
+# means the stack is up — and flock-guarded so the two triggers can't
+# double-spawn. The stack runs DETACHED in its own process group; its pgid is
+# recorded in a pidfile, and agentd reaps THAT at snapshot/idle teardown (it
+# need not be the spawner). The pidfile IS the registration — no control verb.
+ENSURE_VNC_PORT="${ENGRAM_BROWSER_VNC_PORT:-5900}"
+# World-accessible tmp path: written by whoever runs --ensure (the agent's uid
+# or, on the human path, agentd as root) and read by agentd (root) to reap. The
+# guest is single-tenant (the VM is the isolation boundary), so a fixed path is
+# safe; override via ENGRAM_BROWSER_PIDFILE.
+BROWSER_PIDFILE="${ENGRAM_BROWSER_PIDFILE:-/tmp/engram-browser.pgid}"
+
+# Is the stack up? Probe x11vnc's RFB port (:5900) via the bundled node (shipped
+# for playwright-cli, so the launcher needs no curl/nc). We gate on RFB, NOT
+# chromium's CDP (:9222): x11vnc is the LAST thing the launcher starts, so RFB
+# accepting means the whole stack is up — and chromium's DevTools socket lags,
+# so gating on it made the spawn flaky (the agent's connectOverCDP retries CDP
+# itself). A bare connect suffices here; agentd adds the RFB-banner check.
+stack_up() {
+    "$here/node/bin/node" -e '
+        const s = require("net").connect(+process.argv[1], "127.0.0.1");
+        s.setTimeout(500);
+        s.on("connect", () => { s.destroy(); process.exit(0); });
+        s.on("error",   () => process.exit(1));
+        s.on("timeout", () => { s.destroy(); process.exit(1); });
+    ' "$ENSURE_VNC_PORT" 2>/dev/null
+}
+
+if [ "${1:-}" = "--ensure" ]; then
+    stack_up && exit 0                      # fast path: already up
+    mkdir -p "$(dirname "$BROWSER_PIDFILE")" 2>/dev/null || true
+    # Serialize concurrent ensures (human opens the tab while the agent calls
+    # playwright-cli) so exactly one brings the stack up. flock ships in the
+    # bundle (util-linux, alongside setpriv); fall back to unlocked if absent.
+    FLOCK=""
+    [ -x "$here/bin/flock" ] && FLOCK="$here/bin/flock"
+    [ -z "$FLOCK" ] && command -v flock >/dev/null 2>&1 && FLOCK="$(command -v flock)"
+    if [ -n "$FLOCK" ]; then
+        exec "$FLOCK" -w 60 "${BROWSER_PIDFILE}.lock" "$self" --ensure-locked
+    fi
+    exec "$self" --ensure-locked
+fi
+
+if [ "${1:-}" = "--ensure-locked" ]; then
+    stack_up && exit 0                      # re-check under the lock
+    # Bring the stack up detached in a fresh session/pgid (setsid) and record
+    # the pgid; when this short-lived --ensure process exits, the stack
+    # reparents to PID 1 (agentd), which reaps it by the pidfile at teardown.
+    setsid "$self" --run >/dev/null 2>&1 &
+    pgid=$!
+    echo "$pgid" > "$BROWSER_PIDFILE"
+    # Return only once x11vnc accepts, so callers can connect immediately; bounded
+    # so a launch failure can't hang the agent.
+    i=0
+    while [ "$i" -lt 200 ]; do
+        stack_up && exit 0
+        kill -0 "$pgid" 2>/dev/null || { echo "engram-browser: stack exited during bring-up" >&2; exit 1; }
+        i=$((i + 1)); sleep 0.1
+    done
+    echo "engram-browser: x11vnc :$ENSURE_VNC_PORT not ready within 20s" >&2
+    exit 1
+fi
+
+# Default (`--run`, or no arg for dev): the full bring-up below, ending as
+# x11vnc. Invoked detached by --ensure-locked (or directly on a dev box).
+
 # --- Privilege drop (ADR 0065 §7) -------------------------------------------
 # Drop HERE, in the bundle's own launcher, rather than in agentd: the workspace
 # is forbid(unsafe_code), so agentd can neither pre_exec a setgroups/setgid/
