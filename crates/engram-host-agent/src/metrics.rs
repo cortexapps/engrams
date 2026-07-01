@@ -97,6 +97,22 @@ pub const HOST_DISK_FREE_BYTES: &str = "engram_host_disk_free_bytes";
 pub const IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL: &str =
     "engram_host_idle_evict_disk_pressure_holds_total";
 
+/// Tier 1 (pressure-aware idle eviction): gauge of free physical RAM as a
+/// percent of `MemTotal`, sampled each idle-evict tick when
+/// `ENGRAM_IDLE_EVICT_PRESSURE_AWARE` is on. Below
+/// `ENGRAM_IDLE_EVICT_MEM_FLOOR_PCT`, soft-idle sandboxes become eligible
+/// for reclamation; above it they stay resident. Alarm on a sustained
+/// approach to the floor.
+pub const HOST_MEM_FREE_PCT: &str = "engram_host_mem_free_pct";
+
+/// Tier 1 (pressure-aware idle eviction): counter incremented by the
+/// number of soft-idle sandboxes the host *declined* to nominate this tick
+/// because free RAM was above the floor (no memory pressure). The win
+/// signal — sustained increments mean warm VMs are being kept resident
+/// (and their next resume is instant) instead of churned through
+/// snapshot+cold-resume. Hard-idle nominations are never counted here.
+pub const IDLE_EVICT_KEPT_RESIDENT_TOTAL: &str = "engram_host_idle_evict_kept_resident_total";
+
 /// ADR 0022 Option A: gauges of summed guest memory across this host's
 /// live FC sandboxes, sampled each heartbeat tick from
 /// `/proc/<pid>/smaps_rollup`. The **density signal**:

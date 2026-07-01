@@ -399,3 +399,55 @@ sandbox mid-tick is a no-op, never a hard error — escalation still catches a
 genuine wedge. Metric: `engram_harness_inplace_reattach_total`. This is the
 fast-path that makes "the VM is alive, just reconnect" the common recovery and
 relegates teardown to the genuinely-unrecoverable tail.
+
+## Addendum (2026-06-30): pressure-aware soft nomination — evict for *density*, not the clock
+
+**Problem (prod-found on the "Cortex Development"/`dev-brain` profile).** The host's
+soft-TTL nomination (`HarnessHub::idle_sandboxes`, L1) fires purely on elapsed idle
+time (`ENGRAM_IDLE_TTL_SECS`, 300 s), regardless of whether the host actually needs
+the RAM back. For big interactive VMs this is pure loss: a 24 GiB `dev-brain` session
+whose user steps away for six minutes gets snapshotted + destroyed, and the next
+message pays a cold resume (a 24 GiB working set faulting back in over the substrate
++ pd-ssd chunk tier — measured 14–38 s, up to 92 s) — **even though the host was at
+~60 % free RAM the whole time.** Eviction exists for *density* (pack more microVMs per
+host by reclaiming idle ones); firing it when there's abundant free memory buys no
+density and only adds latency. This is the same interactive-churn failure ADR 0039
+follow-up #20 softened by raising the TTL 30 s → 300 s; the TTL is a blunt instrument
+for it.
+
+**Change (host-side only; the L1/L3 seam is unchanged).** The eviction driver's soft
+nominations become **demand-driven**: a `Soft`-idle candidate is only pushed to the
+coord when the host is under real **memory** pressure (free RAM below a floor).
+`Hard`-idle candidates (the never-emits-`Idle` backstop) are *always* nominated, and
+the coord's own hard-TTL PG backstop (L3, `idle_detect_backstop`, 30 min) is the
+absolute residency ceiling either way — so suppressing a soft nomination only defers
+reclamation to genuine pressure or the hard TTL, never forever.
+
+- `HarnessHub::idle_sandboxes` now returns an `IdleKind` (`Soft` | `Hard`) per
+  candidate; `Hard` wins when both TTLs have fired.
+- The eviction tick reads host memory in-process (`util::mem_mib` → `/proc/meminfo`,
+  no PG round-trip) and, when the mode is on and free RAM is above the floor, retains
+  only the `Hard` candidates. **Memory, not disk:** eviction frees RAM, so memory is
+  the correct pressure signal — the pre-existing disk floor
+  (`ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES`) stays an orthogonal *brake* on eviction (it
+  *writes* a multi-GiB memory dump), not a reclaim trigger.
+- **Fails open toward eviction:** if `MemTotal` is unreadable (non-Linux, parse
+  failure) the tick behaves as under-pressure, degrading to today's TTL-only behavior
+  rather than silently pinning sessions resident.
+
+**Knobs (both default to today's behavior).** `ENGRAM_IDLE_EVICT_PRESSURE_AWARE`
+(bool, **default off** — ships dark, per-host flip, instant rollback);
+`ENGRAM_IDLE_EVICT_MEM_FLOOR_PCT` (default 15 — reclaim `Soft` candidates only when
+free RAM < 15 % of `MemTotal`). With the switch off, the nomination set is
+byte-identical to before. **Metrics:** `engram_host_mem_free_pct` (gauge, per tick)
+and `engram_host_idle_evict_kept_resident_total` (counter of `Soft` candidates kept
+warm — the win signal; its rise should track a shift in the resume-latency
+distribution toward the warm case).
+
+**Why not just raise the TTL further.** A longer TTL still evicts on a fixed clock and
+still can't tell "host is full, reclaim now" from "host is empty, keep it warm." The
+pressure gate makes eviction track the resource it actually manages; the TTL stays the
+*candidate* signal (how long since idle), pressure is the *reclaim* signal (do we need
+the RAM). This is the ADR 0046 placement-reservation view (`allocatable_mib` already
+counts guest residency) applied to the reclaim side. Scope note: still host-side +
+env-gated; the coord state machine, the scanner, and the legality table are untouched.
