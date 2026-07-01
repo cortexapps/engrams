@@ -183,6 +183,24 @@ impl AuxRoDrive {
         PathBuf::from(format!("/opt/engram/dyn/{i}"))
     }
 
+    /// Inverse of [`Self::slot_drive_id`]: the reserved slot index this drive
+    /// targets, parsed from its `dyn_<i>` [`Self::drive_id`]. `None` if the id
+    /// isn't a reserved-slot id.
+    ///
+    /// A backend whose *attach order* fixes the guest `dyn/<i>` index must sort
+    /// by this. FC keeps `dyn/<i> == slot i` structurally (all `RESERVED_SLOTS`
+    /// attached as sentinels at capture, in slot order, then `patch_drive`d by
+    /// `drive_id`), so its `selected_mounts` order is irrelevant. VZ instead
+    /// attaches only the *resolved* drives, compacting them onto `/dev/vdb..` in
+    /// slice order — so it must attach slot-ascending, or the harness (slot 0,
+    /// `exec`'d at the FIXED `/opt/engram/dyn/0/harness`) lands at the wrong
+    /// `dyn/<i>` whenever skills (slots 1..) are also selected (ADR 0062).
+    pub fn slot_index(&self) -> Option<usize> {
+        self.drive_id
+            .strip_prefix("dyn_")
+            .and_then(|i| i.parse().ok())
+    }
+
     /// A symbolic reserved slot for capture: slot `i` at its generic guest
     /// path, content unresolved (`sha256 = None`) until the FC backend stamps
     /// the sentinel (capture) or the selected skill (per-session swap).
@@ -420,6 +438,26 @@ mod tests {
         let bytes = bincode::serialize(&some).expect("bincode encode Some");
         let back: AgentSpec = bincode::deserialize(&bytes).expect("bincode decode Some");
         assert_eq!(back.host_ca_pem, some.host_ca_pem);
+    }
+
+    /// `slot_index` is the inverse of `slot_drive_id` for every reserved slot,
+    /// and rejects non-slot ids. VZ's slot-ordered attach relies on this to put
+    /// the harness (slot 0) at `dyn/0` (ADR 0062).
+    #[test]
+    fn slot_index_round_trips_slot_drive_id() {
+        for i in 0..AuxRoDrive::RESERVED_SLOTS {
+            let drive = AuxRoDrive::reserved_slot(i);
+            assert_eq!(drive.slot_index(), Some(i), "slot {i} round-trip");
+        }
+        // A non-slot drive_id (e.g. the ext4 CA drive is never an AuxRoDrive,
+        // but be defensive) yields None rather than a bogus slot.
+        let bogus = AuxRoDrive {
+            drive_id: "rootfs".into(),
+            guest_mount: PathBuf::from("/"),
+            fs_type: "ext4".into(),
+            sha256: None,
+        };
+        assert_eq!(bogus.slot_index(), None);
     }
 
     fn spec_with_aux_drives(drives: Vec<AuxRoDrive>) -> SandboxSpec {
