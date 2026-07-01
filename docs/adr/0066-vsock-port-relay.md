@@ -196,14 +196,40 @@ plumbing objc2 0.6 still supports verbatim) provides:
 - **Bootstrap port (1025) retired** — it was dead on VZ (never dialed by the host, never bound
   by the guest, which only listens on 1024).
 
-**Validated:** `cargo clippy` (VZ native + `engram-agentd`/`engram-core`/`engram-transport`/
-harnesses on `aarch64-unknown-linux-musl`, all `-D warnings`), `cargo fmt`, and the unit tests
-for the touched crates. **Not yet validated on hardware:** the live-VM path needs
-`just vz-codesign` + a *freshly-baked vsock* `ENGRAM_VZ_ROOTFS`. A new `#[ignore]`d
-`e2e_vz_port_relay_reaches_loopback_without_hol` test exercises `open_guest_stream` +
-`RelayConnect` round-trip and the HOL-freedom property, but like the existing `e2e_vz`
-lifecycle test it can't run in CI (the macOS runner has no Docker to bake a rootfs — the same
-gap ADR 0032 tracks).
+**Pitfalls found in hardware validation** (the live-VM path was authored blind — none of these
+are visible to `cargo test`/CI, which can't boot a VZ VM):
+
+- **vsock UDS paths overflow `SUN_LEN`.** The per-port host UDS (`<base>.vsock_<port>`) was
+  rooted under the backend's `work_dir`. On macOS `sockaddr_un.sun_path` is 104 B, and a deep
+  `work_dir` (a git-worktree checkout, a long `$HOME`, or `$TMPDIR` = `/var/folders/…`) plus the
+  36-char sandbox-UUID filename overflows it — `bind` fails with "path must be shorter than
+  SUN_LEN" before the VM even boots. Pre-existing (the pre-`bf84dca2` vsock used the same scheme;
+  the console detour bound no UDS and masked it) and it hits real `just dev`, not only tests.
+  Fixed by rooting the socket in a short `/tmp` dir via a new shared
+  `engram_core::socket::short_socket_dir()` — one tested SUN_LEN-safe primitive the FC
+  integration tests now share too (retiring their ad-hoc `/tmp` copy).
+- **`VZVirtioSocketListener::setDelegate:` is a weak property.** The guest→host listeners
+  (ready 1027, harness 1026, upload 1029) attached a delegate but the bridge stored only the
+  *port numbers* — the delegate objects dropped after registration, so their weak refs went nil
+  and `shouldAcceptNewConnection:` was never called. Every guest-initiated connection was
+  silently rejected: agentd's ready-port dial never landed, so it spun its full 90 s deadline
+  before serving RPCs (host→guest worked fine, so exec/`guest_ip` eventually succeeded — just
+  ~90 s late, tripping the 60 s `await_agent`). Fixed by holding the listeners + delegates alive
+  on the `VsockBridge` for its lifetime. (The pre-`bf84dca2` bridge kept a `Retained` ref; the
+  re-port lost it — this is *why* the "drain, don't gate" ready handshake above needs the
+  delegate to actually fire.)
+- **The demo image has no `node`.** The relay test started its loopback echo/black-hole servers
+  with `node -e`, but `deploy/demo` is `debian-slim` (git/curl/ttyd only). Switched to `socat`
+  (matching the FC `proxy_port_loopback` test) + `ip link set lo up`, and added `socat`/`iproute2`
+  to the demo image.
+
+**Validated on hardware:** `just vz-codesign` + a freshly-baked vsock `ENGRAM_VZ_ROOTFS`, then
+`cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only` — `e2e_vz_lifecycle` (core
+real-vsock lifecycle) and `e2e_vz_port_relay_reaches_loopback_without_hol` (the relay +
+HOL-freedom property) both pass on a live VZ VM. Plus `cargo clippy` (VZ native +
+`engram-core`/FC on `aarch64-unknown-linux-musl`, `-D warnings`), `cargo fmt`, and unit tests.
+The two `e2e_vz` tests stay `#[ignore]` — they can't run in CI (the macOS runner has no Docker
+to bake a rootfs, the gap ADR 0032 tracks), so they serve as a local pre-merge gate.
 
 ## Consequences
 
