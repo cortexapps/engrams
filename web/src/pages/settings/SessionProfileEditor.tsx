@@ -169,9 +169,13 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       description: p.description,
       icon: p.icon,
       imageId: p.imageId,
-      harness: p.harness ?? null,
-      model: p.model ?? null,
-      effort: p.effort ?? null,
+      // Normalize legacy empty strings to null: a pre-ADR-0063 profile can carry
+      // harness/model/effort = "" (inherit), and `?? null` wouldn't catch "" —
+      // leaving the form to submit "" (→ `harness "" is not in the catalog`).
+      // The default-harness effect below then fills a concrete harness to edit.
+      harness: p.harness || null,
+      model: p.model || null,
+      effort: p.effort || null,
       isDefault: p.isDefault,
       includeUserTokens: p.includeUserTokens,
       skills: p.skills ?? [],
@@ -186,6 +190,20 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       setNetOpen(true);
   }, [existing, reset]);
 
+  // Drop any selected skill that no longer exists in the current set — a retired
+  // bundle (e.g. the old headless `playwright`, now folded into `browser`) or an
+  // uploaded skill later deleted. Otherwise a skill with no toggle rides hidden
+  // in the form and fails validation on save (`unknown skill(s): …`). Prune once
+  // the catalog has loaded (guarded so a not-yet-loaded catalog can't wipe a
+  // valid selection).
+  useEffect(() => {
+    if (!skillCatalog) return;
+    const known = new Set(skillCatalog.map((s) => s.name));
+    const current = form.getValues("skills");
+    const pruned = current.filter((s) => known.has(s));
+    if (pruned.length !== current.length) setValue("skills", pruned);
+  }, [skillCatalog, existing, form, setValue]);
+
   // Default to the first enabled image in create mode (don't clobber a choice).
   useEffect(() => {
     if (mode === "create" && !form.getValues("imageId") && images && images.length > 0)
@@ -193,12 +211,15 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   }, [mode, images, form, setValue]);
 
   // ADR 0063: a profile always names a CONCRETE harness (no "inherit deployment
-  // default"). Default to the first registered harness in create mode once the
-  // catalog loads — don't clobber a hydrated choice.
+  // default"). Default to the first registered harness whenever none is set —
+  // in create mode, AND when editing a legacy (pre-0063) profile whose harness
+  // is empty, so save doesn't fail with `harness "" is not in the catalog`. Runs
+  // after the edit hydrate (deps include `existing`); it won't clobber a concrete
+  // hydrated harness.
   useEffect(() => {
-    if (mode === "create" && !form.getValues("harness") && harnesses && harnesses.length > 0)
+    if (!form.getValues("harness") && harnesses && harnesses.length > 0)
       setValue("harness", harnesses[0]!.name);
-  }, [mode, harnesses, form, setValue]);
+  }, [mode, harnesses, form, setValue, existing]);
 
   const network = useMemo(
     () => ({
