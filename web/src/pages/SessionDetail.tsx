@@ -159,6 +159,28 @@ export function SessionDetail() {
     else transcriptRef.current?.collapse();
   };
 
+  // ADR 0065: when the AGENT boots the shared browser, surface it. The agent
+  // runs `playwright-cli` (whose wrapper brings the stack up via
+  // `engram-browser --ensure`), so the first such exec is our signal to open the
+  // pane on the BROWSER tab — the human then watches the agent drive the same
+  // Chrome live. Fires once (ref guard) and only when the browser capability is
+  // present; we don't reopen if the human subsequently collapses the pane.
+  const autoOpenedBrowserRef = useRef(false);
+  useEffect(() => {
+    if (!browserEnabled || autoOpenedBrowserRef.current) return;
+    const agentBootedBrowser = events.some(
+      (ie) =>
+        ie.event.type === "exec_started" &&
+        ie.event.command.join(" ").includes("playwright-cli"),
+    );
+    if (agentBootedBrowser) {
+      autoOpenedBrowserRef.current = true;
+      openPane("browser");
+    }
+    // openPane reads refs + isMobile; events/browserEnabled are the reactive inputs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [events, browserEnabled]);
+
   // `]` toggles the pane — but never while typing (composer, shell textarea).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
