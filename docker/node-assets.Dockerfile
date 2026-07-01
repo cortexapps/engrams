@@ -16,7 +16,7 @@
 FROM busybox:1.36
 COPY firecracker /assets/firecracker
 COPY vmlinux /assets/vmlinux
-# ADR 0027: the skills/playwright squashfs + current.json stamp the host-agent
+# ADR 0027: the skills/browser squashfs + current.json stamp the host-agent
 # stages to /var/lib/engram/shared.
 COPY bundles /assets/bundles
 RUN chmod 0755 /assets/firecracker && chmod 0644 /assets/vmlinux \

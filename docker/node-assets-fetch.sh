@@ -71,7 +71,7 @@ fi
 file "$OUT/vmlinux" | grep -q "ELF 64-bit" || { echo "kernel is not an ELF binary:" >&2; file "$OUT/vmlinux" >&2; exit 1; }
 
 # ── RO session bundles (ADR 0027 → 0055 → 0058) ─────────────────────────────
-# The sentinel + skills + playwright + integrations-cli squashfs bundles + the current.json stamp
+# The sentinel + skills + integrations-cli + browser + harness-claude squashfs bundles + the current.json stamp
 # (logical name -> sha256). The host-agent reads these from
 # /var/lib/engram/shared at startup; the engram-host-fleet init container copies
 # them out of this image. ADR 0055: skills are profile-selected per session — the
@@ -103,17 +103,20 @@ stage_bundle() {  # stage_bundle <name>; echoes the staged sha256 on stdout
 # reserved dyn-* slot to its sha, so a fleet without it can't capture any base.
 sentinel_sha="$(stage_bundle sentinel)"
 skills_sha="$(stage_bundle skills)"
-playwright_sha="$(stage_bundle playwright)"
-# ADR 0058: the integration CLI toolbox (gh + datadog-ci), profile-selected
-# when a connector with a bundled `cli` facet is enabled.
+# ADR 0058: the integration CLI toolbox (gh + datadog-ci + connector CLIs),
+# profile-selected when a connector with a bundled `cli` facet is enabled.
 integrations_cli_sha="$(stage_bundle integrations-cli)"
+# ADR 0064/0065: the shared headful browser (chromium + Xvfb + x11vnc + the
+# playwright-cli driving it over CDP), opt-in per session. Subsumes the retired
+# `playwright` bundle.
+browser_sha="$(stage_bundle browser)"
 # ADR 0062: the built-in `claude` harness rides the stamp like a skill — the coord
 # resolves the built-in's squashfs from this stamp (key `harness-claude`) + its
 # embedded descriptor, mounts it on dyn_0, and the session execs it. No registration.
 harness_claude_sha="$(stage_bundle harness-claude)"
 # Stamp: logical name -> sha256, matching AuxRoDrive::CURRENT_STAMP / read_stamp().
-printf '{"sentinel":"%s","skills":"%s","playwright":"%s","integrations-cli":"%s","harness-claude":"%s"}\n' \
-  "$sentinel_sha" "$skills_sha" "$playwright_sha" "$integrations_cli_sha" "$harness_claude_sha" \
+printf '{"sentinel":"%s","skills":"%s","integrations-cli":"%s","browser":"%s","harness-claude":"%s"}\n' \
+  "$sentinel_sha" "$skills_sha" "$integrations_cli_sha" "$browser_sha" "$harness_claude_sha" \
   > "$BUNDLES_OUT/current.json"
 
 echo "==> staged into ${OUT}:"

@@ -539,7 +539,7 @@ jobs:
   # chart stages onto each K8s node via a host-agent pod init container. Stock
   # K8s nodes carry none of these. Gated on the images lane (docker/ changes,
   # incl. node-assets.Dockerfile / node-assets-fetch.sh) OR the bundles lane (a
-  # skills/playwright change must reach the hosts) — and ordered AFTER
+  # skills/browser change must reach the hosts) — and ordered AFTER
   # publish-bundles so the bundle-*:main tags node-assets-fetch.sh pulls are
   # this run's.
   publish-node-assets:
@@ -633,7 +633,7 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.list }}
 
-  # ADR 0027: build the RO session bundles (skills, playwright) and publish
+  # ADR 0027: build the RO session bundles (skills, browser, …) and publish
   # each as an OCI artifact to GHCR, mirroring publish-host-binaries. The
   # FC-host image bake (engrams-internal) pulls them and stages each at the
   # fleet-canonical /var/lib/engram/shared/<name>.squashfs symlink.
