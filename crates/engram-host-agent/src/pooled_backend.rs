@@ -1385,6 +1385,73 @@ impl PooledBackend {
         }
     }
 
+    /// Publish this sandbox's per-jail working-set trace to the blob store
+    /// under the session-stable **canonical** key, so the session's NEXT
+    /// resume finds it and prefaults its working set (the replay side landed
+    /// with the Tier 2 `--trace-key` fix in #517).
+    ///
+    /// Why the host-agent publishes it (not the handler): the `engram-uffd-
+    /// handler` only `put_trace`s on a clean fault-loop exit, but eviction
+    /// **SIGKILLs** the handler (`engram-sandbox-firecracker` `destroy`,
+    /// ADR 0044 K2 — no `kill_on_drop`) before that runs, so in prod NO trace
+    /// was ever published and prefault-on-resume was inert regardless of the
+    /// key. The handler *does* write the per-jail `working-set-trace.json`
+    /// periodically (the ADR 0045 C2 migration rider dump); we lift that
+    /// same file into the blob store at capture time, when the handler is
+    /// still alive and the file is present.
+    ///
+    /// **Detached + best-effort:** spawned off the (latency-critical, ADR
+    /// 0045 D5) capture path so a GCS `put_trace` never blocks the
+    /// user-visible eviction. A no bound session / no chunk store / absent /
+    /// empty / corrupt trace is a silent no-op — the handler's on-demand
+    /// fault path is the backstop. Idempotent: re-publishing the same
+    /// canonical key is a harmless overwrite (a session runs one place at a
+    /// time, so there are no concurrent writers).
+    fn spawn_trace_publish(&self, id: SandboxId) {
+        let Some(session_id) = self.session_bindings.get(&id).map(|e| *e) else {
+            return; // no bound session → no canonical key to publish under
+        };
+        let Some(trace_path) = self.working_set_trace_path(id) else {
+            return; // backend has no per-jail trace (VZ / process)
+        };
+        let Some(chunk_store) = self.chunk_store.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let bytes = match tokio::fs::read(&trace_path).await {
+                Ok(b) => b,
+                Err(_) => return, // handler never wrote it / already torn down
+            };
+            let trace: engram_chunk_store::working_set::WorkingSetTrace =
+                match serde_json::from_slice(&bytes) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::debug!(sandbox_id = %id, error = %e, "working-set trace parse failed; not published");
+                        return;
+                    }
+                };
+            if trace.chunks.is_empty() {
+                return; // nothing to prefault — don't publish an empty trace
+            }
+            let n = trace.chunks.len();
+            let trace_ref =
+                engram_chunk_store::working_set::TraceRef::canonical(session_id.as_uuid());
+            match chunk_store.put_trace(trace_ref, &trace).await {
+                Ok(()) => tracing::info!(
+                    sandbox_id = %id,
+                    session_id = %session_id,
+                    chunks = n,
+                    "published session working-set trace (resume prefault)",
+                ),
+                Err(e) => tracing::warn!(
+                    sandbox_id = %id,
+                    error = %e,
+                    "publish session working-set trace failed (best-effort)",
+                ),
+            }
+        });
+    }
+
     /// ADR 0045 D5: pause + drain + FC capture. Returns the held capture
     /// lock (the caller decides whether the post phase runs inline or in
     /// a background task — the lock must span it either way, so a
@@ -4639,6 +4706,11 @@ impl SandboxBackend for PooledBackend {
         // inline holding the capture lock (the periodic-checkpoint and
         // drain flavor; eviction uses snapshot_begin/snapshot_wait).
         let (_capture_guard, cap) = self.capture_phase(id).await?;
+        // Lift the per-jail working-set trace into the blob store under the
+        // session-canonical key so the next resume prefaults it (#517 keyed
+        // the replay; the handler can't publish it itself — SIGKILLed on
+        // destroy). Detached + best-effort; never blocks the capture.
+        self.spawn_trace_publish(id);
         self.finisher().finish(id, cap).await
     }
 
@@ -4653,6 +4725,9 @@ impl SandboxBackend for PooledBackend {
         id: SandboxId,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
         let (capture_guard, cap) = self.capture_phase(id).await?;
+        // Publish the working-set trace for the next resume's prefault (see
+        // `spawn_trace_publish`); detached, never blocks the eviction.
+        self.spawn_trace_publish(id);
         // Idempotent re-pause; best-effort (a failure leaves the orphan
         // running until destroy, which is today's behavior).
         if let Err(e) = self.inner.pause(id).await {
