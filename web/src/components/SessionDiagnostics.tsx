@@ -1,5 +1,4 @@
 import { type ReactNode, useState } from "react";
-import { Activity } from "lucide-react";
 import { useSessionCowState } from "../hooks/useCowState";
 import { useSessionCheckpoints } from "../hooks/useCheckpoints";
 import { useHosts } from "../hooks/useHosts";
@@ -11,14 +10,6 @@ import { relativeTime } from "../pages/sessions/session-format";
 import { SessionCowState } from "./CowState";
 import { DurabilityTimeline } from "./DurabilityTimeline";
 import { MetricRow } from "./MetricRow";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-  SheetTrigger,
-} from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -29,22 +20,29 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { CheckpointSummary, CowStateView, Session, SessionState } from "../lib/types";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import type {
+  CheckpointSummary,
+  CowStateView,
+  IndexedEvent,
+  Session,
+  SessionState,
+} from "../lib/types";
 
 // The session's operator/forensic surface, kept OUT of the developer's way.
 // A standing right rail spent the work surface's width, all session, on data
 // the 90%-case developer never reads (chunk-level COW telemetry, the recovery
-// ladder, admin live-ops). It now lives behind one button:
+// ladder, admin live-ops). It splits into two:
 //
 //   - DurabilityReadout — the only durability the developer sees inline: a
 //     calm "is my work safe" telltale (glyph + word), driven by
 //     useDurabilitySummary. Honest about every lifecycle state; silent rather
 //     than alarming when telemetry is absent.
-//   - DiagnosticsDrawer — on demand, for everyone: the full COW gauges + the
-//     checkpoint ladder + the image/created/events facts, with the admin-only
-//     teleport / pause-resume controls gated INSIDE (a non-admin's drawer is a
-//     read-only durability ledger). Full-width on mobile, so phones finally see
-//     this data (the old rail was desktop-only). (ADR 0052 follow-up)
+//   - DiagnosticsPanel — a view inside the work pane: the full COW gauges + the
+//     checkpoint ladder + the image/created/events facts + the raw event
+//     stream, with the admin-only teleport / pause-resume controls gated INSIDE
+//     (a non-admin sees a read-only durability ledger). It sits beside Shell +
+//     Browser in the same resizable pane rather than in its own drawer.
 
 // ---------------------------------------------------------------------------
 // Durability telltale
@@ -191,46 +189,43 @@ function SectionLabel({ children }: { children: ReactNode }) {
   );
 }
 
-export function DiagnosticsDrawer({
+export function DiagnosticsPanel({
   session,
   sessionId,
-  eventCount,
+  events,
 }: {
-  session: Session;
+  session: Session | undefined;
   sessionId: string;
-  eventCount: number;
+  events: IndexedEvent[];
 }) {
+  const eventCount = events.length;
   return (
-    <Sheet>
-      <SheetTrigger asChild>
-        <Button variant="outline" size="sm">
-          <Activity />
-          Diagnostics
-        </Button>
-      </SheetTrigger>
-      {/* Full-width on phones (the old rail was desktop-only), a fixed panel on
-          sm+. gap-0 so the sections own their own rhythm. */}
-      <SheetContent side="right" className="w-full gap-0 sm:max-w-md">
-        <SheetHeader className="shrink-0 border-b px-5">
-          <SheetTitle className="font-display text-base font-semibold tracking-tight">
-            Diagnostics
-          </SheetTitle>
-          <SheetDescription>
-            Durability, recovery checkpoints, and live operations for this session.
-          </SheetDescription>
-        </SheetHeader>
+    // Two views: the calm operator readout, and the raw append-only event
+    // stream (moved off the transcript's top tabs — the forensic surface lives
+    // with the rest of the diagnostics).
+    <Tabs defaultValue="overview" className="flex h-full min-h-0 flex-col gap-0">
+      <div className="shrink-0 border-b px-4 pt-2.5">
+        <TabsList variant="line">
+          <TabsTrigger value="overview">Overview</TabsTrigger>
+          <TabsTrigger value="raw" data-testid="diagnostics-tab-raw">
+            Raw events
+          </TabsTrigger>
+        </TabsList>
+      </div>
 
-        <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-5">
-          {/* "Show the receipts": the durability detail, in-context beside the
-              session it describes. */}
-          <section>
-            <SectionLabel>durability</SectionLabel>
-            <SessionCowState sessionId={sessionId} />
-            <div className="mt-3">
-              <DurabilityTimeline sessionId={sessionId} />
-            </div>
-          </section>
+      <TabsContent value="overview" className="min-h-0 space-y-6 overflow-y-auto px-4 py-5">
+        {/* "Show the receipts": the durability detail, in-context beside the
+            session it describes. Durability is keyed by id, so it renders even
+            before the session row resolves. */}
+        <section>
+          <SectionLabel>durability</SectionLabel>
+          <SessionCowState sessionId={sessionId} />
+          <div className="mt-3">
+            <DurabilityTimeline sessionId={sessionId} />
+          </div>
+        </section>
 
+        {session && (
           <section className="border-t pt-4">
             <SectionLabel>session</SectionLabel>
             <dl className="space-y-2.5 text-sm">
@@ -249,15 +244,53 @@ export function DiagnosticsDrawer({
               />
             </dl>
           </section>
+        )}
 
-          {/* Admin live-ops — self-gating (admin + Active only), so a non-admin
-              sees a clean read-only ledger above and nothing here. */}
-          <TeleportControl session={session} />
-          <PauseResumeControl session={session} />
-        </div>
-      </SheetContent>
-    </Sheet>
+        {/* Admin live-ops — self-gating (admin + Active only), so a non-admin
+            sees a clean read-only ledger above and nothing here. */}
+        {session && <TeleportControl session={session} />}
+        {session && <PauseResumeControl session={session} />}
+      </TabsContent>
+
+      <TabsContent value="raw" className="min-h-0 overflow-hidden">
+        <RawEvents events={events} />
+      </TabsContent>
+    </Tabs>
   );
+}
+
+// The raw append-only event stream — idx · type · a compact one-liner of the
+// body. Forensic detail, so it lives in the Diagnostics drawer rather than the
+// transcript's chrome. Rendered only when its tab is active (Radix unmounts
+// inactive content), so the list isn't built until asked for.
+function RawEvents({ events }: { events: IndexedEvent[] }) {
+  return (
+    <div className="h-full space-y-0.5 overflow-auto px-5 py-4 font-mono text-[0.72rem] text-muted-foreground">
+      {events.map((e) => (
+        <div
+          key={e.idx}
+          data-testid="event-row"
+          className="grid items-baseline gap-3"
+          style={{ gridTemplateColumns: "4ch min-content 1fr" }}
+        >
+          <span className="tabular-nums text-muted-foreground/70">{e.idx}</span>
+          <span className="text-[0.64rem] uppercase tracking-[0.12em]">{e.event.type}</span>
+          <span className="truncate text-foreground/80" title={JSON.stringify(e.event)}>
+            {summarizeRaw(e.event)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function summarizeRaw(ev: unknown): string {
+  // Compact one-liner of any event body — used only in the raw log.
+  const obj = ev as Record<string, unknown>;
+  return Object.entries(obj)
+    .filter(([k]) => k !== "type" && k !== "at")
+    .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+    .join(" ");
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { API_BASE } from "../lib/base";
+import { PaneStatus } from "./PaneStatus";
 
 // In-browser BROWSER tab (ADR 0064). Lazy-loads `@novnc/novnc` (the RFB
 // client is the heavy bit) on first mount, opens a WebSocket to
@@ -35,6 +36,10 @@ export function BrowserPane({ sessionId }: BrowserPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<Status>("loading");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // Bumping this disconnects the current RFB (effect cleanup) and re-runs the
+  // mount — a real reconnect, driven by the Reconnect button on a dropped
+  // connection.
+  const [reconnectKey, setReconnectKey] = useState(0);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -110,35 +115,29 @@ export function BrowserPane({ sessionId }: BrowserPaneProps) {
         // ignore
       }
     };
-  }, [sessionId]);
+  }, [sessionId, reconnectKey]);
+
+  const caption = status === "loading" ? "loading browser viewer…" : "launching browser…";
+  const message =
+    status === "error"
+      ? (errorMessage ?? "browser unavailable")
+      : `browser connection closed${errorMessage ? ` — ${errorMessage}` : ""}`;
 
   return (
-    <section className="flex h-full flex-col px-6 py-4">
-      {status === "loading" && (
-        <p className="mb-3 font-display text-[0.92rem] text-muted-foreground italic">
-          loading browser viewer…
-        </p>
-      )}
-      {status === "connecting" && (
-        <p className="mb-3 font-display text-[0.92rem] text-muted-foreground italic">
-          launching browser…
-        </p>
-      )}
-      {status === "closed" && (
-        <p className="mb-3 font-display text-[0.92rem] text-muted-foreground italic">
-          browser connection closed{errorMessage ? ` — ${errorMessage}` : ""} — switch tabs and back
-          to relaunch.
-        </p>
-      )}
-      {status === "error" && (
-        <p className="mb-3 font-mono text-[0.78rem] text-destructive">
-          {errorMessage ?? "browser unavailable"}
-        </p>
-      )}
-      <div
-        ref={containerRef}
-        className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-card"
-      />
+    <section className="flex h-full min-h-0 flex-col p-4">
+      <div className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-card">
+        <div ref={containerRef} className="absolute inset-0" />
+        <PaneStatus
+          phase={status}
+          caption={caption}
+          message={message}
+          onReconnect={() => {
+            setErrorMessage(null);
+            setStatus("loading");
+            setReconnectKey((k) => k + 1);
+          }}
+        />
+      </div>
     </section>
   );
 }
