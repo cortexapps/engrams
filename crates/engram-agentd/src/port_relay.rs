@@ -31,9 +31,13 @@ const BACKOFF_MAX: Duration = Duration::from_millis(500);
 const COPY_BUF: usize = 256 * 1024;
 
 /// Host-protecting backstop on concurrent forwarded connections (defence in
-/// depth — the coordinator enforces the real per-session cap). Bounds guest
-/// fds/tasks if a bug or an abusive page opens connections without limit.
-const MAX_INFLIGHT: usize = 512;
+/// depth — the coordinator enforces the real per-session cap of 256, and a
+/// guest serves exactly one session, so this is never reached in normal
+/// operation). Matches that cap: each connection costs 2 fds (the vsock stream
+/// + the loopback dial), so 256 stays well under the default `RLIMIT_NOFILE`
+/// with no need to raise it. Bounds guest fds/tasks if a bug or abusive caller
+/// opens connections without limit.
+const MAX_INFLIGHT: usize = 256;
 
 /// Bind the relay listener and serve forwarded connections until the transport
 /// errors. Best-effort: on a transport without a [`PROXY_PORT_VSOCK_PORT`]
@@ -104,7 +108,14 @@ where
             // interactive writes (WS control frames, chunked boundaries) don't
             // eat ~40 ms stalls.
             let _ = loopback.set_nodelay(true);
-            write_msg(&mut stream, &RelayAck { ok: true, error: None }).await?;
+            write_msg(
+                &mut stream,
+                &RelayAck {
+                    ok: true,
+                    error: None,
+                },
+            )
+            .await?;
             tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut loopback, COPY_BUF, COPY_BUF)
                 .await
                 .map(|_| ())
@@ -167,9 +178,14 @@ mod tests {
         let (mut host, guest) = tokio::io::duplex(4096);
         let relay = tokio::spawn(serve_relay_connection(guest));
 
-        write_msg(&mut host, &RelayConnect { target_port: target })
-            .await
-            .unwrap();
+        write_msg(
+            &mut host,
+            &RelayConnect {
+                target_port: target,
+            },
+        )
+        .await
+        .unwrap();
         let ack: RelayAck = read_msg(&mut host).await.unwrap();
         assert!(ack.ok, "ack should be ok: {ack:?}");
 

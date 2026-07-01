@@ -1,13 +1,15 @@
-//! ADR 0064: host-agent half of the ProxyPort tunnel — the raw-byte,
-//! arbitrary-port generalization of [`crate::proxy_shell`].
+//! ADR 0064 + ADR 0066: host-agent half of the ProxyPort tunnel — the
+//! raw-byte, arbitrary-port path that shuttles opaque bytes across a
+//! [`PortTunnel`]. No WS framing, no ttyd handshake — the bytes are whatever
+//! the inner protocol speaks (HTTP/1.1, h2c, a WebSocket upgrade, gRPC).
 //!
-//! Dials a guest TCP `port` (a dev server the agent started) in the
-//! right network namespace and shuttles opaque bytes across a
-//! [`PortTunnel`]. Cold sandboxes dial from the host root netns; warm-
-//! restored sandboxes dial from inside their per-VM netns (Linux only)
-//! via [`crate::proxy_shell::connect_tcp_in_netns_linux`]. No WS
-//! framing, no ttyd handshake — the bytes are whatever the inner
-//! protocol speaks (HTTP/1.1, h2c, a WebSocket upgrade, gRPC).
+//! ADR 0066: the guest hop reaches the dev server on the guest's **`127.0.0.1`**
+//! via the in-guest agentd relay ([`open_vsock_tunnel_at`]) — so a server bound
+//! to loopback (Vite, the Tilt UI) is reachable, which the old `guest_ip`
+//! network dial could not. [`open_tcp_tunnel_at`] survives only for backends
+//! without a vsock relay (the Process backend; VZ until its Phase 2 real-vsock
+//! migration), dialing `guest_ip:port` directly with no per-VM netns — only FC
+//! ever had a netns dial, and FC now always takes the relay.
 
 use std::time::Duration;
 
@@ -244,7 +246,10 @@ mod tests {
             assert_eq!(hdr.target_port, 3000);
             engram_harness_proto::write_msg(
                 &mut agentd,
-                &engram_harness_proto::RelayAck { ok: true, error: None },
+                &engram_harness_proto::RelayAck {
+                    ok: true,
+                    error: None,
+                },
             )
             .await
             .unwrap();
@@ -256,7 +261,9 @@ mod tests {
 
         let stream: HarnessByteStream = Box::pin(host_end);
         let (tunnel, ends) = PortTunnel::pair();
-        open_vsock_tunnel_at(stream, 3000, ends).await.expect("open");
+        open_vsock_tunnel_at(stream, 3000, ends)
+            .await
+            .expect("open");
 
         let PortTunnel {
             outbound,

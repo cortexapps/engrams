@@ -103,8 +103,10 @@ A preview page opens many connections (HTTP/1.1 without keep-alive, plus WebSock
 malicious page could open thousands, each costing host + guest fds and an agentd task. The
 coord enforces a **per-session concurrent-forwarded-connection cap** (default 256, matching
 the host-agent gRPC `concurrency_limit_per_connection`, env-overridable); on exhaustion it
-returns `resource_exhausted`, which the orchestrator maps to a clean **503**. Agentd holds a
-defense-in-depth global cap on its 1030 accept loop and raises `RLIMIT_NOFILE` at startup.
+returns `resource_exhausted`, which the orchestrator maps to a clean **503** (WebSocket
+**1013**). Agentd holds a matching defense-in-depth global cap (256) on its 1030 accept loop
+— a guest serves exactly one session, so it's never reached in normal operation, and at 2
+fds per connection it stays well under the default `RLIMIT_NOFILE` (no raise needed).
 
 ### Failure & lifecycle
 

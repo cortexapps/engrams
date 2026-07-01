@@ -34,9 +34,7 @@ use std::time::{Duration, Instant};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-use engram_harness_proto::{
-    read_msg, write_msg, RelayAck, RelayConnect, PROXY_PORT_VSOCK_PORT,
-};
+use engram_harness_proto::{read_msg, write_msg, RelayAck, RelayConnect, PROXY_PORT_VSOCK_PORT};
 use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -178,7 +176,10 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
     echo.write_all(b"ping-0066").await.expect("write echo");
     let mut got = [0u8; 9];
     echo.read_exact(&mut got).await.expect("read echo");
-    assert_eq!(&got, b"ping-0066", "echo round-trip over the loopback relay");
+    assert_eq!(
+        &got, b"ping-0066",
+        "echo round-trip over the loopback relay"
+    );
     drop(echo);
 
     // ---- 5. Assertion 2: no head-of-line blocking. ----

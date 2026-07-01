@@ -402,9 +402,13 @@ impl HostClient for LocalHostClient {
         {
             Some(stream) => crate::proxy_port::open_vsock_tunnel_at(stream, port, ends).await?,
             None => {
-                let guest_ip = self.sandbox.vm_internal_ip(sandbox_id).await.ok_or_else(|| {
-                    SandboxError::Vm("proxy_port: vm_internal_ip unavailable".into())
-                })?;
+                let guest_ip = self
+                    .sandbox
+                    .vm_internal_ip(sandbox_id)
+                    .await
+                    .ok_or_else(|| {
+                        SandboxError::Vm("proxy_port: vm_internal_ip unavailable".into())
+                    })?;
                 crate::proxy_port::open_tcp_tunnel_at(guest_ip, port, ends).await?;
             }
         }
