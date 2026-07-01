@@ -129,13 +129,107 @@ bridges, where the guest is untrusted).
   `open_vsock_tunnel_at` + `proxy_port` rewrite (retiring `connect_cold`/`connect_in_netns`);
   the per-session cap; the `proxy_port_loopback` FC integration test (HOL + throughput)
   wired into CI. Fixes prod.
-- **P2 — VZ real vsock.** VZ's console-bridge vsock is single-stream-per-port (a persistent
-  HMR WebSocket would starve other connections — HOL blocking). Migrate VZ onto Apple's
-  `VZVirtioSocketDevice` (multi-stream) via `objc2`, retiring the console-bridge shim rather
-  than forking a second mechanism, so macOS parity is HOL-free too.
+- **P2 — VZ real vsock.** *(implemented — see "Phase 2 outcome" below.)* VZ's console-bridge
+  vsock is single-stream-per-port (a persistent HMR WebSocket would starve other connections —
+  HOL blocking). Migrate VZ onto Apple's `VZVirtioSocketDevice` (multi-stream) via `objc2`,
+  retiring the console-bridge shim rather than forking a second mechanism, so macOS parity is
+  HOL-free too.
 - **P3 — shell unification.** Route `proxy_shell` through the same relay (ttyd binds a
   loopback port), retiring `connect_tcp_in_netns_linux`, the shell netns dial, and the
   cold/warm bifurcation — the code-retirement payoff.
+
+### Phase 2 outcome (VZ real vsock)
+
+**The blocker that motivated the console swap was stale.** VZ had been migrated *off*
+`VZVirtioSocketDevice` onto a multi-port virtio-console (commit `bf84dca2`) for exactly one
+reason: "generic arm64 cloud-image kernels ship `CONFIG_VIRTIO_VSOCKETS` as a *module*, which
+can't auto-load before init runs." But the kernel VZ actually boots is the **Kata static arm64
+kernel** (`just pull-kernel` → Linux 6.12.28). Extracting its embedded `IKCONFIG` shows
+`CONFIG_VSOCKETS=y`, `CONFIG_VIRTIO_VSOCKETS=y`, `CONFIG_VIRTIO_VSOCKETS_COMMON=y` — all
+**built-in**. So real vsock works on the guest we ship, and the console detour (single stream
+per port ⇒ HOL blocking on the relay) was buying nothing. Phase 2 reverts to real vsock and
+retires the console mechanism entirely.
+
+**What landed.** `vm.rs` attaches a `VZVirtioSocketDeviceConfiguration` in place of the
+multi-port `VZVirtioConsoleDeviceConfiguration` (the kernel-log serial console is untouched).
+A new `vsock_bridge.rs` (adapted from the pre-`bf84dca2` `vsock_bridge.rs`, whose delegate
+plumbing objc2 0.6 still supports verbatim) provides:
+
+- a `VsockConnector` (device + queue handle) that dials host→guest ports via
+  `connectToPort:completionHandler:` and hands back the connection fd as an
+  `AsyncRead+AsyncWrite` stream — with a boot-race/post-restore retry;
+- the **agentd port (1024)** as a host `UnixListener` that `connectToPort`s per accept
+  (preserving the backend's `UnixStream::connect(<base>_1024)` surface — zero churn in
+  `start_agent`/`exec_stream`/`start_shell`/`guest_ip`), but now one vsock stream per accept,
+  so concurrent control RPCs no longer serialise;
+- **guest→host listeners** on harness (1026) and upload (1029) via a `VZVirtioSocketListener`
+  delegate (`define_class!`), each accepted connection's fd handed *directly* to the sink —
+  no duplex hop;
+- **`SandboxBackend::open_guest_stream`** (the P1 seam VZ inherited as `None`): dials guest
+  vsock 1030 through the `VsockConnector` and returns `Some(stream)`, flipping VZ off the
+  `guest_ip`/eth0 fallback onto the relay. Each forwarded browser connection is its own
+  `connectToPort` stream and `VZVirtioSocketDevice` muxes them freely — **HOL-free, matching
+  FC.**
+
+**Divergences / decisions:**
+
+- **Console retired end-to-end, not just the host bridge.** Because the guest side keyed off
+  `ENGRAM_TRANSPORT=console`, retiring the host `console_bridge.rs` also meant retiring the
+  in-guest `engram-transport::ConsoleTransport`, the `image-builder`/`engram-cli`
+  `Transport::Console` variant, the `Transport::supports_ready_port` trait method (console was
+  its only `false` case), and the `ENGRAM_DIAG_NO_CONSOLE` diagnostic. `bake-demo.sh` now
+  bakes `ENGRAM_TRANSPORT=vsock` for every backend. **A VZ image baked before this change
+  (carrying `ENGRAM_TRANSPORT=console`) will not boot against the vsock-only backend — re-bake
+  is required.** Consistent with the zero-users clean-break policy; the `Transport` enum is
+  left as a single-variant seam rather than churning ~15 FC test call sites.
+- **Ready port (1027): drain, don't gate.** On the vsock transport, agentd dials
+  `ENGRAM_AGENTD_READY_PORT` at startup and writes one fire-and-forget `AgentReady` frame; with
+  no host listener it would spin ~90 s before serving RPCs. VZ registers a *draining* listener
+  on 1027 (reads to EOF and drops) so the guest handshake completes on the first dial. This
+  keeps VZ's existing "first read on the agentd UDS blocks until agentd binds" readiness model
+  rather than adopting FC's `wait_agent_ready` *gating* — a smaller, lower-risk change;
+  FC-parity gating is a possible future enhancement. (The agentd handshake loop dropped its
+  `supports_ready_port()` guard accordingly — vsock always has a listener now.)
+- **Upload simplified to FC's shape.** With real vsock each upload is its own connection, so
+  the console bridge's byte-delimited `upload_pump` serialisation is gone; the upload sink now
+  drives one connection per upload exactly like FC.
+- **Bootstrap port (1025) retired** — it was dead on VZ (never dialed by the host, never bound
+  by the guest, which only listens on 1024).
+
+**Pitfalls found in hardware validation** (the live-VM path was authored blind — none of these
+are visible to `cargo test`/CI, which can't boot a VZ VM):
+
+- **vsock UDS paths overflow `SUN_LEN`.** The per-port host UDS (`<base>.vsock_<port>`) was
+  rooted under the backend's `work_dir`. On macOS `sockaddr_un.sun_path` is 104 B, and a deep
+  `work_dir` (a git-worktree checkout, a long `$HOME`, or `$TMPDIR` = `/var/folders/…`) plus the
+  36-char sandbox-UUID filename overflows it — `bind` fails with "path must be shorter than
+  SUN_LEN" before the VM even boots. Pre-existing (the pre-`bf84dca2` vsock used the same scheme;
+  the console detour bound no UDS and masked it) and it hits real `just dev`, not only tests.
+  Fixed by rooting the socket in a short `/tmp` dir via a new shared
+  `engram_core::socket::short_socket_dir()` — one tested SUN_LEN-safe primitive the FC
+  integration tests now share too (retiring their ad-hoc `/tmp` copy).
+- **`VZVirtioSocketListener::setDelegate:` is a weak property.** The guest→host listeners
+  (ready 1027, harness 1026, upload 1029) attached a delegate but the bridge stored only the
+  *port numbers* — the delegate objects dropped after registration, so their weak refs went nil
+  and `shouldAcceptNewConnection:` was never called. Every guest-initiated connection was
+  silently rejected: agentd's ready-port dial never landed, so it spun its full 90 s deadline
+  before serving RPCs (host→guest worked fine, so exec/`guest_ip` eventually succeeded — just
+  ~90 s late, tripping the 60 s `await_agent`). Fixed by holding the listeners + delegates alive
+  on the `VsockBridge` for its lifetime. (The pre-`bf84dca2` bridge kept a `Retained` ref; the
+  re-port lost it — this is *why* the "drain, don't gate" ready handshake above needs the
+  delegate to actually fire.)
+- **The demo image has no `node`.** The relay test started its loopback echo/black-hole servers
+  with `node -e`, but `deploy/demo` is `debian-slim` (git/curl/ttyd only). Switched to `socat`
+  (matching the FC `proxy_port_loopback` test) + `ip link set lo up`, and added `socat`/`iproute2`
+  to the demo image.
+
+**Validated on hardware:** `just vz-codesign` + a freshly-baked vsock `ENGRAM_VZ_ROOTFS`, then
+`cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only` — `e2e_vz_lifecycle` (core
+real-vsock lifecycle) and `e2e_vz_port_relay_reaches_loopback_without_hol` (the relay +
+HOL-freedom property) both pass on a live VZ VM. Plus `cargo clippy` (VZ native +
+`engram-core`/FC on `aarch64-unknown-linux-musl`, `-D warnings`), `cargo fmt`, and unit tests.
+The two `e2e_vz` tests stay `#[ignore]` — they can't run in CI (the macOS runner has no Docker
+to bake a rootfs, the gap ADR 0032 tracks), so they serve as a local pre-merge gate.
 
 ## Consequences
 

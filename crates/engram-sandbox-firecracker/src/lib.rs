@@ -6083,11 +6083,10 @@ mod tests {
         // A UDS at the FC API socket path that accepts but never replies,
         // so `FirecrackerClient::put_action(SendCtrlAltDel)` blocks inside
         // `tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, ..)` — i.e. the
-        // cancellable window the bug lives in. Bound under a short
-        // `/tmp` path because UDS paths are capped at SUN_LEN (~104B) and
-        // the per-test tempdir + sandbox-id filename overflow it.
-        let sock_dir =
-            std::path::PathBuf::from("/tmp").join(format!("eng196-{}", std::process::id()));
+        // cancellable window the bug lives in. Rooted in the shared short
+        // socket dir because UDS paths are capped at SUN_LEN (~104B) and the
+        // per-test tempdir + sandbox-id filename overflow it.
+        let sock_dir = engram_core::socket::short_socket_dir();
         std::fs::create_dir_all(&sock_dir).unwrap();
         let socket = sock_dir.join("fc.sock");
         let _ = std::fs::remove_file(&socket);

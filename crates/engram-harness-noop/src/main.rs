@@ -28,9 +28,9 @@ struct Cli {
 
     /// In-VM transport port on the host. Used when the harness runs
     /// inside a microVM — `engram-transport` reads `ENGRAM_TRANSPORT`
-    /// (vsock|console) and dials accordingly. Mutually exclusive
-    /// with `--connect`. `--vsock-host` is a deprecated alias kept
-    /// for back-compat with existing FC bakes.
+    /// (vsock) and dials accordingly. Mutually exclusive with
+    /// `--connect`. `--vsock-host` is a deprecated alias kept for
+    /// back-compat with existing FC bakes.
     #[arg(long = "port", alias = "vsock-host", env = "ENGRAM_HARNESS_VSOCK_HOST")]
     vsock_host: Option<u32>,
 
@@ -101,7 +101,7 @@ async fn main() -> ExitCode {
     // Dial the hub. Two flavors:
     //   --connect host:port  → TCP loopback (ProcessBackend dev)
     //   --port <port>        → in-VM transport selected by
-    //                          ENGRAM_TRANSPORT (vsock|console)
+    //                          ENGRAM_TRANSPORT (vsock)
     // clap rejects "neither" / "both" via `conflicts_with`; the
     // outer match here covers the two valid shapes.
     let outcome = match (cli.connect.as_deref(), cli.vsock_host) {
@@ -142,10 +142,9 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Dial the host on `port` via the runtime-selected transport (vsock
-/// or virtio-console — see `engram-transport`). Linux-only; on
-/// non-Linux hosts `engram_transport::from_env` returns
-/// `ErrorKind::Unsupported`.
+/// Dial the host on `port` via the runtime-selected transport (vsock —
+/// see `engram-transport`). Linux-only; on non-Linux hosts
+/// `engram_transport::from_env` returns `ErrorKind::Unsupported`.
 async fn dial_transport_and_run(
     port: u32,
     cfg: NoopConfig,

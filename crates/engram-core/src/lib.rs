@@ -6,6 +6,7 @@
 //! (`engram-coordinator`, `engram-host-agent`).
 
 pub mod error;
+pub mod socket;
 pub mod traits;
 pub mod types;
 

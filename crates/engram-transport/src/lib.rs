@@ -2,52 +2,45 @@
 //!
 //! The in-VM binaries (`engram-agentd`, `engram-harness-noop`,
 //! `engram-harness-claude`) use this crate's `Transport` trait to
-//! bind / dial without knowing which VMM is hosting the VM. Two
-//! impls ship: `VsockTransport` for Firecracker on Linux/KVM and
-//! `ConsoleTransport` (virtio-console) for Apple Virtualization
-//! on macOS.
+//! bind / dial without knowing which VMM is hosting the VM. One impl
+//! ships: `VsockTransport` (virtio-vsock), used by **both** backends.
 //!
-//! # Why two transports
+//! # Why vsock everywhere
 //!
 //! - **Firecracker** exposes virtio-vsock as its only host↔guest
 //!   programmatic channel. (FC also has a 16550A serial UART, but no
-//!   virtio-console device — see the FAQ.) Production Linux/KVM
-//!   deployments select [`Transport::Vsock`].
+//!   virtio-console device — see the FAQ.)
 //!
-//! - **Apple Virtualization.framework (VZ)** supports both, but
-//!   vsock requires the guest kernel to ship `CONFIG_VIRTIO_VSOCKETS=y`
-//!   built-in — and the standard arm64 cloud-image kernels (Ubuntu,
-//!   etc.) ship it as a *module* that the kernel can't auto-load
-//!   before init runs. Multi-port virtio-console is universally
-//!   compiled in. macOS dev/CI selects [`Transport::Console`].
+//! - **Apple Virtualization.framework (VZ)** exposes a real
+//!   `VZVirtioSocketDevice`. VZ briefly bridged these channels over a
+//!   multi-port virtio-console (single byte stream per port → head-of-line
+//!   blocking on the ADR 0066 port relay) because generic arm64
+//!   cloud-image kernels ship `CONFIG_VIRTIO_VSOCKETS` as a *module*.
+//!   But the Kata guest kernel VZ actually boots (`just pull-kernel`)
+//!   ships it built-in, so ADR 0066 Phase 2 migrated VZ back to real
+//!   vsock — the console transport is retired.
 //!
 //! # Selection
 //!
 //! The [`from_env`] factory reads `ENGRAM_TRANSPORT` (default
-//! `vsock`). The `engram-init` shim that the bake pipeline injects
-//! sets the env at boot time — fc-bake-* recipes set it to `vsock`,
-//! vz-bake-* to `console`. No CLI flag — the in-VM binaries don't
-//! know the policy; they just call `from_env()`.
+//! `vsock`). The `engram-init` shim the bake pipeline injects sets
+//! `ENGRAM_TRANSPORT=vsock`. The knob stays a seam for a future
+//! non-vsock backend; today it only accepts `vsock`.
 //!
 //! # Wire-protocol implications
 //!
 //! vsock yields a fresh stream per [`Listener::accept`] call, so
-//! `engram-agentd` can serve multiple concurrent exec calls
-//! (one task per connection). Virtio-console has one byte stream per
-//! port — [`Listener::accept`] yields the stream once and subsequent
-//! accepts return EOF. For Engram's actual usage (one harness adapter
-//! per session, sequential coord-driven commands) one-at-a-time
-//! suffices; agentd's per-connection loop becomes a per-stream
-//! WireRequest loop.
+//! `engram-agentd` serves multiple concurrent connections (one task
+//! per connection) with no head-of-line blocking — the property the
+//! ADR 0066 port relay depends on.
 //!
 //! # Cross-platform shell
 //!
-//! Both impls are Linux-only. On macOS / other hosts the crate
-//! compiles to an empty shell — the in-VM binaries themselves are
-//! Linux-only too (the workspace's `engram-agentd` /
-//! `engram-harness-*` binaries already wrap their `main` in
-//! `#[cfg(target_os = "linux")]`), so this just keeps
-//! `cargo check --workspace` green on Apple Silicon.
+//! The impl is Linux-only. On macOS / other hosts the crate compiles
+//! to an empty shell — the in-VM binaries themselves are Linux-only
+//! too (the workspace's `engram-agentd` / `engram-harness-*` binaries
+//! already wrap their `main` in `#[cfg(target_os = "linux")]`), so
+//! this just keeps `cargo check --workspace` green on Apple Silicon.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
@@ -58,12 +51,8 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[cfg(target_os = "linux")]
-mod console;
-#[cfg(target_os = "linux")]
 mod vsock;
 
-#[cfg(target_os = "linux")]
-pub use console::ConsoleTransport;
 #[cfg(target_os = "linux")]
 pub use vsock::VsockTransport;
 
@@ -95,40 +84,22 @@ pub trait Transport: Send + Sync {
 
     /// Bind a listener on `port`. Used by `engram-agentd` (1024).
     async fn listen(&self, port: u32) -> io::Result<Box<dyn Listener>>;
-
-    /// Whether this transport supports the agentd readiness handshake —
-    /// the guest→host dial on `ENGRAM_AGENTD_READY_PORT` that unblocks the
-    /// host's `wait_agent_ready` (FC's per-sandbox `agent_ready` watch).
-    ///
-    /// `true` for vsock (the host listens on the ready port and FC gates
-    /// snapshot/start on it). `false` for virtio-console: the bridge
-    /// configures exactly the data ports it needs (agentd/bootstrap/harness)
-    /// and there is no ready-port device, so a dial can never connect. On
-    /// console the host's `wait_agent_ready` is FC-only (returns
-    /// `InvalidSpec`, caught upstream), so the handshake is pure waste —
-    /// worse, agentd would spin ~90s retrying the impossible dial before it
-    /// ever `accept()`s, leaving early host requests to pile up on the
-    /// single console byte stream and desync. Skipping it lets agentd serve
-    /// RPCs immediately.
-    fn supports_ready_port(&self) -> bool {
-        true
-    }
 }
 
 /// Build a [`Transport`] from the `ENGRAM_TRANSPORT` env var.
 ///
-/// Defaults to `vsock` if unset — back-compat with FC bakes that
-/// don't set the env. The `engram-init` shim baked by VZ images
-/// sets `ENGRAM_TRANSPORT=console` explicitly.
+/// Defaults to `vsock` if unset. Every bake sets `ENGRAM_TRANSPORT=vsock`;
+/// the knob stays a seam for a future non-vsock backend but today only
+/// `vsock` is valid (the virtio-console transport was retired in ADR 0066
+/// Phase 2).
 #[cfg(target_os = "linux")]
 pub fn from_env() -> io::Result<Box<dyn Transport>> {
     let raw = std::env::var("ENGRAM_TRANSPORT").unwrap_or_else(|_| "vsock".into());
     match raw.as_str() {
         "vsock" => Ok(Box::new(VsockTransport)),
-        "console" => Ok(Box::new(ConsoleTransport::new())),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unknown ENGRAM_TRANSPORT={other:?}; expected vsock|console"),
+            format!("unknown ENGRAM_TRANSPORT={other:?}; expected vsock"),
         )),
     }
 }
@@ -139,7 +110,7 @@ pub fn from_env() -> io::Result<Box<dyn Transport>> {
 pub fn from_env() -> io::Result<Box<dyn Transport>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "engram-transport requires Linux (vsock + virtio-console are kernel features)",
+        "engram-transport requires Linux (vsock is a kernel feature)",
     ))
 }
 
@@ -161,12 +132,11 @@ mod tests {
         // The doc-test above is the actual coverage.
     }
 
-    /// Smoke: VsockTransport and ConsoleTransport both impl Send+Sync
-    /// so they can ride in `Box<dyn Transport>`.
+    /// Smoke: VsockTransport impls Send+Sync so it can ride in
+    /// `Box<dyn Transport>`.
     #[test]
     fn transports_are_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<VsockTransport>();
-        assert_send_sync::<ConsoleTransport>();
     }
 }

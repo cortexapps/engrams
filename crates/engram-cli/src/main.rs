@@ -334,13 +334,10 @@ enum ImageCmd {
         /// select at runtime. The init shim writes
         /// `ENGRAM_TRANSPORT=<value>` into the rootfs.
         ///
-        /// `vsock` (default): AF_VSOCK on Linux, used by the
-        /// Firecracker production path. Requires
-        /// `CONFIG_VIRTIO_VSOCKETS=y` in the guest kernel.
-        ///
-        /// `console`: virtio-console on Apple Virtualization.framework,
-        /// used by the vz-bake-* recipes. Universally available in
-        /// every Linux kernel.
+        /// `vsock` (default, only value): AF_VSOCK on Linux, used by
+        /// both the Firecracker and VZ backends. Requires
+        /// `CONFIG_VIRTIO_VSOCKETS=y` in the guest kernel (the FC-owned
+        /// kernel and the Kata VZ kernel both ship it built-in).
         #[arg(long, value_parser = parse_transport, default_value = "vsock")]
         transport: engram_image_builder::Transport,
 

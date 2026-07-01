@@ -4,15 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "In-guest host↔guest byte-stream transport. Two impls: vsock (Firecracker) and virtio-console (Apple Virtualization.framework). Selected at runtime via ENGRAM_TRANSPORT."
-
-# Workspace forbids `unsafe_code`, but the console transport needs
-# raw libc::open/read/write to bypass tokio::fs::File's
-# state-machine — that wrapper stalled mid-stream on virtio-console
-# char devices during bring-up. All unsafe is contained in the
-# console.rs Linux impl with SAFETY comments.
-[lints.rust]
-unsafe_code = "allow"
+description = "In-guest host↔guest byte-stream transport over virtio-vsock (Firecracker + Apple Virtualization). Selected at runtime via ENGRAM_TRANSPORT."
 
 [dependencies]
 async-trait.workspace = true
@@ -20,9 +12,8 @@ tokio.workspace = true
 tracing.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
-# vsock is a Linux-only kernel feature. Both transports compile only
-# on Linux; on macOS / other hosts the crate is an empty shell so the
+# vsock is a Linux-only kernel feature. The transport compiles only on
+# Linux; on macOS / other hosts the crate is an empty shell so the
 # workspace cargo check stays green everywhere.
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.7"
-libc = "0.2"

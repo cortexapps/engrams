@@ -19,7 +19,7 @@ FROM tsl0922/ttyd:1.7.8 AS ttyd-source
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git ca-certificates curl \
+        git ca-certificates curl socat iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ttyd-source /usr/bin/ttyd /usr/local/bin/ttyd
