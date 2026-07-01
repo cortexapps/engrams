@@ -979,12 +979,14 @@ mod tests {
     }
 
     #[test]
-    fn vsock_uds_path_uses_sandbox_id_under_work_dir() {
+    fn vsock_uds_path_roots_socket_in_short_sun_len_safe_dir() {
         // Path construction doesn't need a real kernel; we only need
         // the existence check in `new` to pass, so a tempfile is fine.
         let kernel = tempfile::NamedTempFile::new().unwrap();
         let cfg = VzConfig::with_kernel(kernel.path());
-        let work = std::env::temp_dir().join("engram-vz-test-paths");
+        // A deliberately deep work_dir: the whole point is that the socket path
+        // does NOT track it (that would overflow SUN_LEN).
+        let work = std::env::temp_dir().join("engram-vz-test-paths/a/very/deep/nested/work/dir");
         std::fs::create_dir_all(&work).unwrap();
         let backend = match VzBackend::new(&work, cfg) {
             Ok(b) => b,
@@ -992,11 +994,25 @@ mod tests {
         };
         let sid = SandboxId::new();
         let path = backend.vsock_uds_path_for(sid);
-        assert_eq!(path.parent().unwrap(), work);
-        assert!(path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .ends_with(".vsock"));
+        // Rooted in the short SUN_LEN-safe dir (engram_core::socket), NOT under
+        // the deep work_dir.
+        assert_eq!(
+            path.parent().unwrap(),
+            engram_core::socket::short_socket_dir()
+        );
+        assert_ne!(path.parent().unwrap(), work);
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            format!("{sid}.vsock")
+        );
+        // The property this exists for: the longest per-port bind path we
+        // derive stays within SUN_LEN even though work_dir is deep.
+        let per_port = port_uds_path(&path, 1030);
+        assert!(
+            per_port.as_os_str().len() <= engram_core::socket::SUN_PATH_MAX,
+            "per-port UDS {} is {}B, over the SUN_LEN cap",
+            per_port.display(),
+            per_port.as_os_str().len(),
+        );
     }
 }
