@@ -178,9 +178,9 @@ has no `engram-browser` on `PATH` and no `BROWSER` tab.
 ### 1a. One shared Chrome — agent over CDP (drive), human over VNC (view + control)
 
 The load-bearing change over #498-as-built. The launcher starts Chrome with
-`--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --remote-allow-origins=*` (bound so
-the port is reachable from the host-agent, same posture as x11vnc's RFB port — see the bind-address
-pitfall). Then:
+`--remote-debugging-port=9222 --remote-allow-origins='*'`, bound **loopback** (chromium's default): the
+agent reaches CDP in-guest directly, and the orchestrator reaches it through the ADR-0066 vsock relay
+(§3), so this full remote-control protocol is never exposed on the guest network. Then:
 
 - **Agent drives it.** The `playwright` skill's `playwright-cli` is repointed via
   `connectOverCDP(http://127.0.0.1:9222)` (a `browser.cdpEndpoint` in its `cli.config.json`) so it
@@ -261,6 +261,20 @@ second target enum — "subsume, don't sit alongside"). The orchestrator `/vnc` 
 websockify over the `ProxyPort` tunnel (noVNC WebSocket ⇄ raw RFB TCP). This is the largest divergence
 from #498's original transport design and is what resolves the head-on conflict between #498's
 relay/proto changes and the generic-ports work now on main.
+
+**The guest hop is the ADR-0066 vsock relay.** `ProxyPort` originally reached the guest by dialing
+`guest_ip:PORT`, which cannot reach a `127.0.0.1`-bound listener (a confirmed prod bug for Vite/Tilt).
+[ADR 0066](0066-vsock-port-relay.md) replaces that hop: the host-agent opens a vsock connection to an
+in-guest `agentd` relay (vsock :1030), which dials `127.0.0.1:PORT` itself and splices bytes (one
+vsock stream per connection, no head-of-line blocking). So both browser ports **bind loopback** —
+x11vnc drops to `-localhost` (retiring #498's hard-won `0.0.0.0`/dial-`guest_ip` mechanism and its
+bind-address pitfall, §7) and the CDP port stays on chromium's loopback default — strictly safer:
+nothing on the guest network. The cold/warm per-VM-netns dial bifurcation goes away too (the vsock UDS
+is one host-root path, identical cold and warm). RFB :5900 and CDP :9222 are just two ordinary
+per-connection port-forwards over the relay. **Sequencing:** rebuild the VNC transport on this relay
+only after rebasing onto current main (which carries `ProxyPort`) and once ADR 0066 Phase 1 lands;
+until ADR 0066 Phase 2 migrates VZ to a real multi-stream `VZVirtioSocketDevice`, VZ's
+`open_guest_stream` is `None` and falls back to the `guest_ip` dial (so VZ e2e targets post-Phase-2).
 
 ### 4. Orchestrator — `/vnc` route + capability gating
 
