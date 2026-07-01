@@ -1005,6 +1005,36 @@ pub(crate) mod tests {
         }
     }
 
+    /// ADR 0066: the preview-connection limiter caps per session, keeps
+    /// sessions independent, frees on release, and prunes idle entries.
+    #[test]
+    fn preview_limiter_caps_per_session_and_prunes() {
+        let lim = Arc::new(PreviewConnLimiter::new(2));
+        let s = SessionId::new();
+
+        let p1 = lim.try_acquire(s).expect("1st slot");
+        let p2 = lim.try_acquire(s).expect("2nd slot");
+        assert!(lim.try_acquire(s).is_none(), "3rd exceeds the cap of 2");
+
+        // A different session has its own independent cap.
+        assert!(
+            lim.try_acquire(SessionId::new()).is_some(),
+            "other session is independent",
+        );
+
+        // Releasing a slot frees capacity for the same session.
+        drop(p1);
+        let p3 = lim.try_acquire(s).expect("slot freed after release");
+
+        // Dropping a session's last permit prunes its map entry (no leak).
+        drop(p2);
+        drop(p3);
+        assert!(
+            !lim.per_session.contains_key(&s),
+            "idle session entry should be pruned",
+        );
+    }
+
     #[test]
     fn run_interrupted_maps_from_harness_with_stable_kind() {
         // ADR 0030: the harness RunInterrupted event maps to the coord
