@@ -231,4 +231,76 @@ mod tests {
             other => panic!("expected SandboxError::Vm, got {other:?}"),
         }
     }
+
+    /// `open_vsock_tunnel_at`: write the header, read an OK ack from a fake
+    /// agentd, then raw bytes round-trip through the `PortTunnel` (the ADR 0066
+    /// guest hop, with the vsock stream stubbed by an in-memory duplex).
+    #[tokio::test]
+    async fn open_vsock_tunnel_at_round_trips_after_ack() {
+        let (host_end, mut agentd) = tokio::io::duplex(4096);
+        let fake = tokio::spawn(async move {
+            let hdr: engram_harness_proto::RelayConnect =
+                engram_harness_proto::read_msg(&mut agentd).await.unwrap();
+            assert_eq!(hdr.target_port, 3000);
+            engram_harness_proto::write_msg(
+                &mut agentd,
+                &engram_harness_proto::RelayAck { ok: true, error: None },
+            )
+            .await
+            .unwrap();
+            let mut buf = vec![0u8; 64];
+            let n = agentd.read(&mut buf).await.unwrap();
+            agentd.write_all(&buf[..n]).await.unwrap();
+            let _ = agentd.shutdown().await;
+        });
+
+        let stream: HarnessByteStream = Box::pin(host_end);
+        let (tunnel, ends) = PortTunnel::pair();
+        open_vsock_tunnel_at(stream, 3000, ends).await.expect("open");
+
+        let PortTunnel {
+            outbound,
+            mut inbound,
+        } = tunnel;
+        outbound.send(Bytes::from_static(b"ping")).await.unwrap();
+        let mut got = Vec::new();
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(Duration::from_secs(2), inbound.recv()).await
+        {
+            got.extend_from_slice(&chunk);
+            if got == b"ping" {
+                break;
+            }
+        }
+        assert_eq!(got, b"ping");
+        let _ = fake.await;
+    }
+
+    /// A NAK ack (`ok:false`, dev server unreachable) → `open_vsock_tunnel_at`
+    /// errors synchronously (→ clean 502), and never spawns the pump.
+    #[tokio::test]
+    async fn open_vsock_tunnel_at_errors_on_nak() {
+        let (host_end, mut agentd) = tokio::io::duplex(4096);
+        let fake = tokio::spawn(async move {
+            let _: engram_harness_proto::RelayConnect =
+                engram_harness_proto::read_msg(&mut agentd).await.unwrap();
+            engram_harness_proto::write_msg(
+                &mut agentd,
+                &engram_harness_proto::RelayAck {
+                    ok: false,
+                    error: Some("connection refused".into()),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let stream: HarnessByteStream = Box::pin(host_end);
+        let (_tunnel, ends) = PortTunnel::pair();
+        let err = open_vsock_tunnel_at(stream, 3000, ends)
+            .await
+            .expect_err("nak must surface as error");
+        assert!(matches!(err, SandboxError::Vm(_)), "got {err:?}");
+        let _ = fake.await;
+    }
 }

@@ -142,3 +142,58 @@ async fn dial_loopback(port: u16) -> std::io::Result<TcpStream> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Header → loopback dial → ack → bytes round-trip. Drives
+    /// `serve_relay_connection` over an in-memory duplex (the "host" side) with
+    /// a real `127.0.0.1` echo server standing in for the guest dev server.
+    #[tokio::test]
+    async fn relay_dials_loopback_and_round_trips() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let n = s.read(&mut buf).await.unwrap();
+            s.write_all(&buf[..n]).await.unwrap();
+            let _ = s.shutdown().await;
+        });
+
+        let (mut host, guest) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(serve_relay_connection(guest));
+
+        write_msg(&mut host, &RelayConnect { target_port: target })
+            .await
+            .unwrap();
+        let ack: RelayAck = read_msg(&mut host).await.unwrap();
+        assert!(ack.ok, "ack should be ok: {ack:?}");
+
+        host.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        host.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ping");
+        let _ = relay.await;
+    }
+
+    /// Nothing listening on the target → NAK (`ok:false`) after the dial
+    /// budget, so the host surfaces a clean error (→ 502) rather than a hang.
+    /// (Takes ~`DIAL_DEADLINE` since port 1 refuses and we retry.)
+    #[tokio::test]
+    async fn relay_naks_when_nothing_listening() {
+        let (mut host, guest) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(serve_relay_connection(guest));
+
+        write_msg(&mut host, &RelayConnect { target_port: 1 })
+            .await
+            .unwrap();
+        let ack: RelayAck = read_msg(&mut host).await.unwrap();
+        assert!(!ack.ok, "ack should be a NAK for a refused port");
+        assert!(ack.error.is_some());
+        let _ = relay.await;
+    }
+}
