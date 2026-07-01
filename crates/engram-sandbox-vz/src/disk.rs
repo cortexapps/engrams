@@ -148,9 +148,10 @@ fn clone_or_copy_blocking(src: &Path, dst: &Path) -> Result<(), DiskError> {
 }
 
 /// Compute the per-sandbox rootfs path under the backend's
-/// `work_dir`. The bridge's vsock UDS files use `<sid>.vsock_*`;
-/// the rootfs uses `<sid>.rootfs.ext4` to keep them under one
-/// directory without a per-sandbox subdir explosion.
+/// `work_dir`, named `<sid>.rootfs.ext4` — flat, without a
+/// per-sandbox subdir explosion. (The bridge's `<sid>.vsock_*` UDS
+/// files live in a short SUN_LEN-safe dir, not here; see
+/// `engram_core::socket`.)
 pub(crate) fn per_sandbox_rootfs_path(
     work_dir: &Path,
     sandbox_id: engram_core::types::ids::SandboxId,

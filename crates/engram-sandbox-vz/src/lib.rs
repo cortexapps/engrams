@@ -4,7 +4,8 @@
 //! This is the sister to `engram-sandbox-firecracker` for hosts that
 //! can't run KVM. It mirrors FC's external surface — real virtio-vsock
 //! (`VZVirtioSocketDevice`, ADR 0066 Phase 2) with agentd exposed as a
-//! UDS file at `<work_dir>/<sid>.vsock_1024`, the harness/upload/relay
+//! UDS file at `<short-socket-dir>/<sid>.vsock_1024` (rooted short of
+//! SUN_LEN, see `engram_core::socket`), the harness/upload/relay
 //! channels served over the same vsock device, SpawnHarness handshake
 //! against agentd, harness sink fanout, snapshot/restore — so the rest
 //! of the stack runs unchanged when the coordinator picks

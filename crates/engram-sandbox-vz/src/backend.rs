@@ -98,10 +98,12 @@ struct VzSandboxState {
     /// `open_guest_stream` (ADR 0066 port relay, guest vsock 1030) — one
     /// fresh vsock stream per forwarded browser connection.
     connector: VsockConnector,
-    /// `<work_dir>/<sandbox_id>.vsock` — base path. The vsock bridge
-    /// binds the `_1024` agentd UDS listener next to it. Stored on the
-    /// state so future `start_agent` / `exec_stream` calls can look up
-    /// the per-port path without recomputing it.
+    /// `<short-socket-dir>/<sandbox_id>.vsock` — base path (see
+    /// `engram_core::socket`; kept short, not under `work_dir`, so the
+    /// per-port `_<port>` UDS bind paths stay within SUN_LEN even when
+    /// `work_dir` is deep). The vsock bridge binds the `_1024` agentd UDS
+    /// listener next to it. Stored on the state so future `start_agent` /
+    /// `exec_stream` calls can look up the per-port path without recomputing it.
     vsock_uds_path: PathBuf,
     /// Per-sandbox APFS clone of the bake (or snapshot) rootfs.
     /// Created at `create()` / `restore()` time and removed at
@@ -205,7 +207,13 @@ impl VzBackend {
     }
 
     fn vsock_uds_path_for(&self, id: SandboxId) -> PathBuf {
-        self.work_dir.join(format!("{id}.vsock"))
+        // vsock UDS bind paths are capped at SUN_LEN (~104B on macOS). `work_dir`
+        // can be deep (a git-worktree checkout, a long $HOME), and the per-port
+        // `<id>.vsock_<port>` filename adds ~47B, so root the socket in a short
+        // /tmp dir rather than under `work_dir`. See `engram_core::socket`.
+        let dir = engram_core::socket::short_socket_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{id}.vsock"))
     }
 
     /// ADR 0007 Phase 6: per-snapshot staging dir, owned by the
