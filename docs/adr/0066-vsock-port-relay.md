@@ -1,6 +1,8 @@
 # ADR 0066: vsock port relay — reach the guest's `127.0.0.1` for live previews
 
-**Status:** Proposed (2026-06-30). ADR 0064 gave us a raw-byte guest-port tunnel, but the
+**Status:** Accepted (2026-07-01) — shipped in three PRs merged to `main`: P1 (FC + Process
+relay) #512 (`80d914ab`), P2 (VZ real vsock) #514 (`0a3fe3d4`), P3 (shell unification) #513
+(`0b9ca1da`). ADR 0064 gave us a raw-byte guest-port tunnel, but the
 host-agent reaches the guest by dialing **`guest_ip:PORT` over the guest's network
 interface**. That reaches only servers bound to `0.0.0.0`/`::`; a dev server bound to
 **`127.0.0.1`** — the default for Vite, the Tilt UI, `next dev`, CRA, Rails, Flask — is
@@ -128,15 +130,15 @@ bridges, where the guest is untrusted).
   directly, already correct since Process agentd is a host subprocess); host-agent
   `open_vsock_tunnel_at` + `proxy_port` rewrite (retiring `connect_cold`/`connect_in_netns`);
   the per-session cap; the `proxy_port_loopback` FC integration test (HOL + throughput)
-  wired into CI. Fixes prod.
-- **P2 — VZ real vsock.** *(implemented — see "Phase 2 outcome" below.)* VZ's console-bridge
+  wired into CI. Fixes prod. **(Shipped #512.)**
+- **P2 — VZ real vsock (shipped #514).** *(see "Phase 2 outcome" below.)* VZ's console-bridge
   vsock is single-stream-per-port (a persistent HMR WebSocket would starve other connections —
   HOL blocking). Migrate VZ onto Apple's `VZVirtioSocketDevice` (multi-stream) via `objc2`,
   retiring the console-bridge shim rather than forking a second mechanism, so macOS parity is
   HOL-free too.
 - **P3 — shell unification.** Route `proxy_shell` through the same relay (ttyd binds a
   loopback port), retiring `connect_tcp_in_netns_linux`, the shell netns dial, and the
-  cold/warm bifurcation — the code-retirement payoff.
+  cold/warm bifurcation — the code-retirement payoff. **(Shipped #513.)**
 
 ### Phase 2 outcome (VZ real vsock)
 
