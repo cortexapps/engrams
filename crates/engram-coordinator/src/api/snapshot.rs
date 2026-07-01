@@ -297,6 +297,10 @@ pub(crate) async fn snapshot_core(
         // for the on-disk location. Cross-host durability flows
         // through the chunked manifests on `SnapshotMetadata`, not
         // through the local path.
+        // ADR 0065: the in-guest browser stack is ephemeral and must never be
+        // frozen into a snapshot (Chrome RAM + dead sockets on resume). Reap it
+        // best-effort before the capture; the next EnsureBrowser re-lazy-starts it.
+        let _ = st.services.host.stop_browser(sandbox_id).await;
         let metadata = st.services.host.snapshot(sandbox_id).await?;
 
         let now = Utc::now();

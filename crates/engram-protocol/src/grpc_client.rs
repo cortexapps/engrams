@@ -794,6 +794,31 @@ impl GrpcHostClient {
         Ok(())
     }
 
+    pub async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .start_browser(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(resp.into_inner().port as u16)
+    }
+
+    pub async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
+        };
+        self.inner
+            .clone()
+            .stop_browser(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
     pub async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let req = SandboxIdMessage {
             uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
@@ -1442,6 +1467,14 @@ impl HostClient for GrpcHostClient {
 
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         Self::acquire_shell(self, sandbox_id).await
+    }
+
+    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        Self::start_browser(self, sandbox_id).await
+    }
+
+    async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Self::stop_browser(self, sandbox_id).await
     }
 
     async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {

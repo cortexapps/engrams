@@ -791,6 +791,19 @@ pub trait SandboxBackend: Send + Sync {
         Ok(7681)
     }
 
+    /// ADR 0065: ensure the in-guest browser stack is running and x11vnc is
+    /// bound, returning the port. FC/VZ override to send `StartBrowser` over
+    /// the agentd channel; the dev ProcessBackend has no real guest and
+    /// inherits this default (the feature is gated to FC/VZ profiles).
+    async fn start_browser(&self, _id: SandboxId) -> Result<u16, SandboxError> {
+        Ok(5900)
+    }
+
+    /// ADR 0065: tear down the in-guest browser stack. Default no-op.
+    async fn stop_browser(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot.
     /// `None` for backends without an NBD-chunked disk view
     /// (Process, VZ-without-NBD, FC before its NBD attach lands) —

@@ -36,6 +36,10 @@ service SessionService {
   rpc Exec(ExecRequest) returns (stream ExecOutput);
   rpc GetLog(GetLogRequest) returns (GetLogResponse);
   rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+  // ADR 0065: bring up the ephemeral in-guest browser stack (x11vnc + headful
+  // chromium) for a session and return the VNC port. The orchestrator calls
+  // this before opening a PortRelay tunnel to the guest's :5900 (ADR 0066).
+  rpc EnsureBrowser(EnsureBrowserRequest) returns (EnsureBrowserResponse);
   rpc Resume(ResumeRequest) returns (ResumeResponse);
   rpc EvictLocal(EvictLocalRequest) returns (EvictLocalResponse);
   // ADR 0051: the explicit admin trigger for the idle-eviction primitive
@@ -384,6 +388,15 @@ message SnapshotResponse {
   optional uint64 size_bytes = 3;
   // Human-readable diagnostic; not machine-parsed, not stable.
   string note = 4;
+}
+
+message EnsureBrowserRequest {
+  string session_id = 1;
+}
+message EnsureBrowserResponse {
+  // The in-guest RFB port x11vnc is serving on (loopback); the orchestrator
+  // opens a PortRelay tunnel to it (ADR 0066).
+  uint32 port = 1;
 }
 
 message ResumeRequest {

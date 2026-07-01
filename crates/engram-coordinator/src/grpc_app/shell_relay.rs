@@ -176,14 +176,15 @@ impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService
         }
 
         // ---- 4. proxy_shell → open host tunnel -----------------------
-        let tunnel = match host.proxy_shell(sandbox_id).await {
+        let open = host.proxy_shell(sandbox_id).await;
+        let tunnel = match open {
             Ok(t) => t,
             Err(e) => {
                 // Release the pin we just acquired before returning.
                 let guard = ShellLeaseGuard::new(host.clone(), sandbox_id);
                 guard.release();
                 return Err(Status::unavailable(format!(
-                    "proxy_shell tunnel open failed: {e}"
+                    "proxy tunnel open failed: {e}"
                 )));
             }
         };

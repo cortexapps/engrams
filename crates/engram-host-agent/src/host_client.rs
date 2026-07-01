@@ -425,6 +425,20 @@ impl HostClient for LocalHostClient {
         Ok(tunnel)
     }
 
+    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        // ADR 0065: bring up the in-guest browser stack (Xvfb + x11vnc +
+        // headful chromium with the CDP debug port) and return the VNC port.
+        // The orchestrator reaches x11vnc :5900 (and CDP :9222) over the
+        // ADR-0066 vsock port relay — the guest binds loopback, agentd dials it.
+        self.sandbox.start_browser(sandbox_id).await
+    }
+
+    async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        // ADR 0065: forward to the inner backend. Teardown is at the snapshot /
+        // idle-eviction boundary (the browser is ephemeral, never snapshotted).
+        self.sandbox.stop_browser(sandbox_id).await
+    }
+
     fn harness_dial(&self) -> HarnessDial {
         self.sandbox.harness_dial()
     }

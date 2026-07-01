@@ -95,6 +95,10 @@ export interface ProfileSnapshotView {
   icon: string;
   archived: boolean;
   imageUri: string;
+  /** ADR 0064: the profile's selected skill bundle names. The session's
+   * optional capabilities are derived from these (e.g. the BROWSER tab shows
+   * iff this includes "browser"). */
+  skills: string[];
 }
 
 /** ADR 0031: a session list row — the session plus the owner's identity

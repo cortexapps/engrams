@@ -263,6 +263,30 @@ pub enum WireRequest {
     /// baked agentd that predates the variant, the decode fails and the
     /// host's flush degrades to best-effort/logged — by design.)
     Sync,
+    /// Ensure the in-guest browser stack (Xvfb + openbox + chromium +
+    /// x11vnc) is running and x11vnc is bound to `port` (defaults to
+    /// [`crate::browser::DEFAULT_VNC_PORT`], 5900). Lazy + idempotent,
+    /// exactly like [`Self::StartShell`]: on first call the agent spawns
+    /// the `engram-browser` launcher (shipped + PATH-symlinked by the
+    /// `browser` bundle, ADR 0065); on later calls it re-probes and respawns
+    /// only if the stack went away. The agent only replies once a fresh TCP
+    /// connect to the loopback `port` succeeds, so the host's `proxy_vnc`
+    /// dial finds a listener right after this returns.
+    ///
+    /// Replies [`WireResponse::BrowserReady`] on success, or
+    /// [`WireResponse::Error`] if the spawn or the port probe fails
+    /// (no launcher on PATH, x11vnc never bound, etc.).
+    /// Appended last: see the APPEND-ONLY note above.
+    StartBrowser {
+        /// Optional port override. `None` → 5900.
+        port: Option<u16>,
+    },
+    /// Tear down the browser stack: the agent `killpg`s the launcher's
+    /// process group so Xvfb/openbox/chromium/x11vnc all reap together.
+    /// Idempotent — a no-op when nothing is running. Replies
+    /// [`WireResponse::BrowserStopped`].
+    /// Appended last: see the APPEND-ONLY note above.
+    StopBrowser,
 }
 
 /// Body of [`WireRequest::SpawnHarness`]. ADR 0021 P1.4 dropped the
@@ -354,6 +378,20 @@ pub enum WireResponse {
     /// guest's dirty page cache is now on the virtio-blk disk.
     /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
     Synced,
+    /// Reply to [`WireRequest::StartBrowser`]. x11vnc is alive AND a TCP
+    /// probe to `127.0.0.1:port` from inside the VM completed successfully —
+    /// when the host dials the guest IP on this same port immediately
+    /// afterward, it should find a listener. `spawned` is true if this call
+    /// started the stack, false if it was already running and only re-probed.
+    /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
+    BrowserReady {
+        port: u16,
+        spawned: bool,
+    },
+    /// Reply to [`WireRequest::StopBrowser`] — the browser stack has been
+    /// torn down (or there was nothing running).
+    /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
+    BrowserStopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

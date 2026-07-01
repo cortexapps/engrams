@@ -655,6 +655,9 @@ jobs:
         uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      # `just` runs the `bundles-squashfs` recipe that stages the `browser`
+      # squashfs the e2e_vnc test mounts (ADR 0064).
+      - uses: taiki-e/install-action@just
 
       # /dev/kvm is mode 0660 root:kvm by default on hosted runners;
       # relax to 0666 so the runner user can boot microVMs without
@@ -670,11 +673,13 @@ jobs:
 
       # `mke2fs` (e2fsprogs) is needed by the exec_real_vm test for
       # ext4 packing. `musl-tools` is for the static agentd build that
-      # the same test bakes into the rootfs.
-      - name: Install build deps (musl-tools, e2fsprogs)
+      # the same test bakes into the rootfs. `squashfs-tools` (mksquashfs)
+      # is for `just bundles-squashfs`, which stages the `browser` bundle
+      # the e2e_vnc test mounts (ADR 0064).
+      - name: Install build deps (musl-tools, e2fsprogs, squashfs-tools)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq musl-tools e2fsprogs
+          sudo apt-get install -y -qq musl-tools e2fsprogs squashfs-tools
 
       # Stock firecracker — matches the deployed fork's upstream base (v1.16.0)
       # so the existing FC suite + the stock<->fork compat test exercise the
@@ -986,18 +991,41 @@ jobs:
       # cache as the steps above. Net new runtime ~80s for the
       # harness pair + ~70s for the shell pair, well within the
       # existing FC job budget.
+      # ADR 0064: stage the `browser` squashfs bundle the e2e_vnc test
+      # mounts. `just bundles-squashfs` content-addresses every bundle
+      # (<sha>.squashfs + current.json) under the repo's var/shared/ — the
+      # same shape the FC-host image bake produces under /var/lib/engram/shared.
+      # e2e_vnc points FirecrackerConfig.bundle_dir at var/shared/ and reads
+      # the `browser` sha from current.json, so this MUST run before it.
+      # The browser build needs Docker (chromium + Xvfb + x11vnc, glibc-linked),
+      # which Blacksmith runners provide; the other bundles in the recipe
+      # degrade gracefully if their build skips (e2e_vnc only needs `browser`).
+      - name: Stage browser bundle for e2e_vnc (ADR 0064)
+        run: |
+          just bundles-squashfs
+          ls -l var/shared/
+          cat var/shared/current.json
+          # `bundles-squashfs` `|| continue`s past a failed bundle build, so it
+          # always exits 0. If the `browser` build failed, current.json has no
+          # `browser` key, e2e_vnc prints `SKIP:` and the lane stays GREEN — the
+          # VNC e2e never runs. Fail loud here so a broken browser bundle FAILS
+          # the job before the FC test invocation. (python3 is preinstalled on
+          # the ubuntu runner; jq is not.)
+          python3 -c 'import json,sys; d=json.load(open("var/shared/current.json")); sys.exit(0 if "browser" in d else 1)' || { echo "FATAL: browser bundle missing from current.json — e2e_vnc would silently skip" >&2; exit 1; }
+
       # True-e2e tests (engram-host-agent crate): real bake + real
       # FC microVM + PooledBackend + real proxy + (for harness)
       # real Claude CLI + real api.anthropic.com 401 round-trip.
       # ADR 0062: the harness is a per-session bundle mounted on dyn_0
       # (no longer baked into the rootfs); the CA via `InstallHostCa`
       # vsock RPC.
-      - name: True-e2e tests (root — e2e_shell, e2e_harness)
+      - name: True-e2e tests (root — e2e_shell, e2e_harness, e2e_vnc)
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-host-agent \
             --test e2e_shell \
             --test e2e_harness \
+            --test e2e_vnc \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

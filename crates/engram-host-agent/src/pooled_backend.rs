@@ -6299,6 +6299,19 @@ impl SandboxBackend for PooledBackend {
         self.inner.start_shell(id).await
     }
 
+    /// ADR 0065: forward to inner, exactly as `start_shell` does — without
+    /// this the trait default (`Ok(5900)`) would run and the FC/VZ backend's
+    /// actual vsock StartBrowser RPC to in-VM agentd would never fire, so
+    /// the host's `proxy_vnc` would dial a port nothing started.
+    async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+        self.inner.start_browser(id).await
+    }
+
+    /// ADR 0065: forward to inner (the trait default is a no-op).
+    async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
+        self.inner.stop_browser(id).await
+    }
+
     async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
         self.inner.netns_name_for(id).await
     }
@@ -8634,12 +8647,15 @@ mod tests {
         /// surface.
         struct SpyInner {
             start_shell_calls: Mutex<Vec<SandboxId>>,
+            start_browser_calls: Mutex<Vec<SandboxId>>,
+            stop_browser_calls: Mutex<Vec<SandboxId>>,
             netns_name_for_calls: Mutex<Vec<SandboxId>>,
             guest_ip_calls: Mutex<Vec<SandboxId>>,
             /// Non-default response values so we can verify the
             /// forward returned the inner's value, not the trait
             /// default.
             shell_port: u16,
+            browser_port: u16,
             netns_name: Option<String>,
             guest_ip_value: Option<String>,
         }
@@ -8647,12 +8663,17 @@ mod tests {
             fn new() -> Self {
                 Self {
                     start_shell_calls: Mutex::new(Vec::new()),
+                    start_browser_calls: Mutex::new(Vec::new()),
+                    stop_browser_calls: Mutex::new(Vec::new()),
                     netns_name_for_calls: Mutex::new(Vec::new()),
                     guest_ip_calls: Mutex::new(Vec::new()),
                     // Pick non-default values so a "trait default ran
                     // instead of our override" failure shows up as a
                     // value mismatch, not just a counter mismatch.
                     shell_port: 31337,
+                    // Non-default browser port (the trait default is 5900);
+                    // a fall-through would return 5900 with a zero counter.
+                    browser_port: 45900,
                     netns_name: Some("engr-vm-spytest".into()),
                     guest_ip_value: Some("10.200.0.42".into()),
                 }
@@ -8688,6 +8709,14 @@ mod tests {
             async fn start_shell(&self, id: SandboxId) -> Result<u16, SandboxError> {
                 self.start_shell_calls.lock().push(id);
                 Ok(self.shell_port)
+            }
+            async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+                self.start_browser_calls.lock().push(id);
+                Ok(self.browser_port)
+            }
+            async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
+                self.stop_browser_calls.lock().push(id);
+                Ok(())
             }
             async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
                 self.netns_name_for_calls.lock().push(id);
@@ -8730,6 +8759,57 @@ mod tests {
             assert_eq!(
                 port, inner.shell_port,
                 "must return inner's port (proves the forward, not the default)",
+            );
+        }
+
+        /// ADR 0065 regression guard: PooledBackend.start_browser MUST
+        /// forward to its inner backend. The trait default returns
+        /// Ok(5900) WITHOUT touching the inner, so a deleted/regressed
+        /// delegate would hand `proxy_vnc` a port (5900) that nothing
+        /// started — exactly the start_shell failure class this module
+        /// memorializes, applied to the VNC path.
+        #[tokio::test]
+        async fn pooled_backend_forwards_start_browser_to_inner() {
+            let inner = Arc::new(SpyInner::new());
+            let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
+            let id = SandboxId::new();
+            let port = pooled.start_browser(id).await.unwrap();
+
+            // Inner.start_browser received the sandbox id.
+            let calls = inner.start_browser_calls.lock().clone();
+            assert_eq!(
+                calls,
+                vec![id],
+                "PooledBackend.start_browser must forward to inner; got {} calls",
+                calls.len(),
+            );
+            // The returned port is the inner's value, NOT the trait
+            // default (5900). A fall-through would return 5900 and leave
+            // the inner's counter at 0.
+            assert_eq!(
+                port, inner.browser_port,
+                "must return inner's port (proves the forward, not the 5900 default)",
+            );
+        }
+
+        /// ADR 0065 regression guard: PooledBackend.stop_browser MUST
+        /// forward to its inner backend. The trait default is a no-op, so
+        /// a deleted delegate would silently never tear down the in-guest
+        /// browser stack (leaking Xvfb/chromium/x11vnc) while reporting
+        /// success — and the inner's counter would stay at 0.
+        #[tokio::test]
+        async fn pooled_backend_forwards_stop_browser_to_inner() {
+            let inner = Arc::new(SpyInner::new());
+            let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
+            let id = SandboxId::new();
+            pooled.stop_browser(id).await.unwrap();
+
+            let calls = inner.stop_browser_calls.lock().clone();
+            assert_eq!(
+                calls,
+                vec![id],
+                "PooledBackend.stop_browser must forward to inner; got {} calls",
+                calls.len(),
             );
         }
 

@@ -80,6 +80,15 @@ export const getLog = SessionService.method.getLog;
 export const snapshot = SessionService.method.snapshot;
 
 /**
+ * ADR 0065: bring up the ephemeral in-guest browser stack (x11vnc + headful
+ * chromium) for a session and return the VNC port. The orchestrator calls
+ * this before opening a PortRelay tunnel to the guest's :5900 (ADR 0066).
+ *
+ * @generated from rpc engram.app.v1.SessionService.EnsureBrowser
+ */
+export const ensureBrowser = SessionService.method.ensureBrowser;
+
+/**
  * @generated from rpc engram.app.v1.SessionService.Resume
  */
 export const resume = SessionService.method.resume;

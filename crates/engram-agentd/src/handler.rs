@@ -160,6 +160,35 @@ where
             write_msg(&mut writer, &resp).await?;
             return Ok(());
         }
+        WireRequest::StartBrowser { port } => {
+            let port = port.unwrap_or(crate::browser::DEFAULT_VNC_PORT);
+            // The browser stack inherits the same durable session env as the
+            // harness and `/exec`, so chromium sees the image's proxy/secret
+            // env (mirrors the StartShell arm above).
+            let resp = match crate::browser::start_browser(port, supervisor.session_env()).await {
+                Ok(outcome) => WireResponse::BrowserReady {
+                    port: outcome.port,
+                    spawned: outcome.spawned,
+                },
+                Err(e) => WireResponse::Error {
+                    kind: format!("{:?}", e.kind()),
+                    message: format!("start_browser: {e}"),
+                },
+            };
+            write_msg(&mut writer, &resp).await?;
+            return Ok(());
+        }
+        WireRequest::StopBrowser => {
+            let resp = match crate::browser::stop_browser().await {
+                Ok(()) => WireResponse::BrowserStopped,
+                Err(e) => WireResponse::Error {
+                    kind: format!("{:?}", e.kind()),
+                    message: format!("stop_browser: {e}"),
+                },
+            };
+            write_msg(&mut writer, &resp).await?;
+            return Ok(());
+        }
         WireRequest::SpawnHarness(req) => {
             let resp = match supervisor.spawn(req).await {
                 Ok(pid) => WireResponse::HarnessSpawned { pid },

@@ -782,6 +782,16 @@ impl HostClient for HostRegistry {
         backend.acquire_shell(sandbox_id).await
     }
 
+    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.start_browser(sandbox_id).await
+    }
+
+    async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.stop_browser(sandbox_id).await
+    }
+
     async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.release_shell(sandbox_id).await

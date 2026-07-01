@@ -14,6 +14,7 @@
 //!
 //! `main.rs` ties them together with a CLI for the in-guest binary.
 
+pub mod browser;
 pub mod cacerts;
 pub mod clock;
 pub mod forge;

@@ -388,3 +388,88 @@ async fn relay_connect(
     assert!(ack.ok, "relay NAK for 127.0.0.1:{target_port}: {ack:?}");
     stream
 }
+
+/// ADR 0065 (P4.2): VZ parity for the in-guest browser. Boots a VZ guest with
+/// the **`browser`** erofs bundle attached (`Xvfb` + `openbox` + `chromium` +
+/// `x11vnc` + the `engram-browser` launcher), then calls
+/// [`SandboxBackend::start_browser`] and asserts the bound VNC port — the same
+/// lazy-spawn path the host's `proxy_vnc` drives before dialing the guest's
+/// raw-TCP `:5900`. This mirrors [`e2e_vz_skill_erofs_attaches`] (the ADR 0061
+/// erofs harness) but with the browser bundle and the `start_browser` lazy
+/// spawn instead of a manual mount-and-read.
+///
+/// Point `ENGRAM_VZ_SKILL_EROFS` at the **browser** bundle's
+/// `var/shared/<sha>.erofs` (built by `just bundles-vz` for the `browser`
+/// bundle); the guest mounts it at `/opt/engram/dyn/0` (auto-mount via the
+/// init shim, or the same `mount -t erofs /dev/vdb` fallback the sibling test
+/// uses) so `engram-browser` lands on `PATH`.
+///
+/// # Scope
+///
+/// This asserts the **lazy-spawn → port** half of the chain — that the bundle
+/// mounts on VZ and agentd brings x11vnc up and reports its port. The
+/// end-to-end **RFB `RFB 003.` banner** through the relay is exercised by the
+/// FC e2e (`engram-host-agent/tests/e2e_vnc.rs`, P4.1), which has the
+/// host-agent `proxy_vnc` wiring this `SandboxBackend`-only harness lacks
+/// (there is no `HostClient`/relay here to open a `proxy_vnc` tunnel against).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "VZ live: macOS + codesigned binary + VZ kernel + ENGRAM_VZ_ROOTFS + the browser ENGRAM_VZ_SKILL_EROFS"]
+async fn e2e_vz_browser_bundle_mounts_and_starts() {
+    let env = match vz_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let (bundle_dir, sha) = match skill_erofs_preflight() {
+        Some(x) => x,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let blob = Arc::new(engram_storage_local::LocalBlobStorage::new(
+        work.path().join("blob"),
+    ));
+    let cs = engram_chunk_store::ChunkStore::new(blob);
+    let backend = VzBackend::new(
+        work.path().join("sb"),
+        VzConfig::with_kernel(env.kernel.clone()).with_bundle_dir(bundle_dir),
+    )
+    .expect("VzBackend::new")
+    .with_chunk_store(cs);
+
+    let id = backend
+        .create(spec_with_skill(&env.rootfs, &sha))
+        .await
+        .expect("create");
+    await_agent(&backend, id).await;
+
+    // Lazy-spawn the in-guest browser stack. agentd execs `engram-browser`
+    // (Xvfb → openbox → x11vnc → chromium) on first call and blocks until
+    // x11vnc accepts on its port, mirroring the ttyd readiness probe.
+    let port = backend
+        .start_browser(id)
+        .await
+        .expect("start_browser spawns the browser stack and x11vnc binds");
+    assert_eq!(
+        port, 5900,
+        "x11vnc default VNC port (DEFAULT_VNC_PORT); the host's proxy_vnc \
+         dials this guest port",
+    );
+
+    // Idempotent re-probe: a second call must find the live stack and return
+    // the same port without relaunching (the agentd spawn mutex / respawn
+    // guard), the same property `start_shell` has for ttyd.
+    let port2 = backend
+        .start_browser(id)
+        .await
+        .expect("start_browser is idempotent against a live stack");
+    assert_eq!(port2, 5900, "re-probe returns the same bound port");
+
+    // Teardown is explicit + idempotent (the cancellable VncGrace registry
+    // drives the real disconnect path; stop_browser is the belt-and-suspenders
+    // pre-snapshot kill).
+    backend
+        .stop_browser(id)
+        .await
+        .expect("stop_browser tears the stack down");
+
+    backend.destroy(id).await.expect("destroy");
+}

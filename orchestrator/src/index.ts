@@ -20,6 +20,7 @@ import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 // Side-effect import: registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
+import { makeVncRoute } from "./routes/vnc.ts";
 import { makePreviewProxyMiddleware } from "./routes/preview-proxy.ts";
 import { makePreviewUpgradeHandler } from "./routes/preview-ws.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
@@ -49,10 +50,14 @@ const app = new Hono();
 // so injectWebSocket can install the upgrade handler on the node:http server.
 const { upgradeWebSocket, injectWebSocket, wss } = createNodeWebSocket({ app });
 
-// Echo 'tty' subprotocol — browsers hard-fail without this.
-// handleProtocols is read by ws's handleUpgrade on each connection.
+// Subprotocol selection, read by ws's handleUpgrade on each connection.
+// The /shell client offers 'tty' (xterm.js hard-fails without it echoed back).
+// The /vnc noVNC client offers no subprotocol (modern) or 'binary' (older), so
+// echo 'binary' when offered and otherwise select none (return false → no
+// subprotocol selected, the upgrade still proceeds per RFC 6455). The 'tty'
+// branch stays first so the shell path is unaffected.
 wss.options.handleProtocols = (protocols: Set<string>) =>
-  protocols.has("tty") ? "tty" : false;
+  protocols.has("tty") ? "tty" : protocols.has("binary") ? "binary" : false;
 
 // Request logging (hono/logger) routed through pino, so every HTTP leg — the
 // Slack webhooks included — logs `<-- METHOD path` / `--> METHOD path status ms`.
@@ -94,6 +99,12 @@ app.route("/", slackInteractivityRoute);
 const { app: shellApp, injectUpgrade } = makeShellRoute();
 injectUpgrade(upgradeWebSocket);
 app.route("/", shellApp);
+
+// ADR 0065/0066: VNC WebSocket route (browser tab → noVNC → EnsureBrowser +
+// raw RFB over the port relay).
+const { app: vncApp, injectUpgrade: injectVncUpgrade } = makeVncRoute();
+injectVncUpgrade(upgradeWebSocket);
+app.route("/", vncApp);
 
 // Default 404 for unmatched Hono paths.
 app.notFound((c) => c.json({ error: "not found" }, 404));

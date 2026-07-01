@@ -1,0 +1,197 @@
+#!/bin/sh
+# ADR 0065 browser bundle launcher. Self-contained, glibc-linked; runs on any
+# glibc base. ADR 0055: mounts at a dynamic slot (/opt/engram/dyn/<i>) and
+# agentd symlinks this onto PATH, so resolve our real bundle root from $0
+# (readlink -f follows the PATH symlink) — never a fixed mount path.
+#
+# Brings up, in order: Xvfb (virtual display :99) → openbox (focus/maximize,
+# no panel/menu) → x11vnc (RFB on 127.0.0.1:5900, reached over the ADR-0066
+# proxy_vnc) → chromium (full UI, sized to the framebuffer). No
+# desktop/file-manager/terminal — the framebuffer shows only Chrome. The whole
+# stack shares one process group so agentd can reap it as a unit
+# (StopBrowser → killpg).
+#
+# Security (ADR 0065 §7): the human points this browser at arbitrary, untrusted
+# sites, so the stack runs UNPRIVILEGED with chromium's sandbox ON. The script
+# starts as root only long enough for the few root-only steps (the xkbcomp
+# symlink; the unprivileged uid's $HOME + /etc/passwd entry), then re-exec's
+# itself via setpriv as a non-root, capless uid that holds none of the
+# session's secrets.
+set -eu
+here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
+self="$(readlink -f -- "$0")"
+
+export LD_LIBRARY_PATH="$here/lib:${LD_LIBRARY_PATH:-}"
+export FONTCONFIG_FILE="$here/fonts.conf"
+export PATH="$here/bin:$PATH"
+
+# --- Privilege drop (ADR 0065 §7) -------------------------------------------
+# Drop HERE, in the bundle's own launcher, rather than in agentd: the workspace
+# is forbid(unsafe_code), so agentd can neither pre_exec a setgroups/setgid/
+# setuid sequence nor use the nightly-only CommandExt::groups (safe stable Rust
+# can set uid/gid but can NOT clear supplementary groups, which we require); and
+# this script is the only actor that knows the bundle's mount path for the
+# root-only xkbcomp symlink. setpriv ships inside the bundle, so the guest image
+# needs nothing. uid/gid default to a dedicated, collision-unlikely value; the
+# control plane may override via ENGRAM_BROWSER_UID/GID.
+BROWSER_UID="${ENGRAM_BROWSER_UID:-9000}"
+BROWSER_GID="${ENGRAM_BROWSER_GID:-9000}"
+BROWSER_USER=engram-browser
+BROWSER_HOME=/tmp/engram-browser-home
+
+if [ "$(id -u)" = 0 ]; then
+    # Xvfb execs a HARD-CODED /usr/bin/xkbcomp (the X server's compiled-in path;
+    # -xkbdir relocates only the DATA, not the binary), and a minimal glibc base
+    # need not ship one — point it at the bundled binary. The per-session guest
+    # rootfs is writable + ephemeral, so this and the /etc/passwd line below are
+    # safe and need no cleanup.
+    ln -sf "$here/bin/xkbcomp" /usr/bin/xkbcomp 2>/dev/null || true
+    # The X socket dir must exist + be world-writable so the non-root Xvfb can
+    # create /tmp/.X11-unix/X$DISPLAY_NUM.
+    mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+    # chromium/Xvfb/x11vnc call getpwuid(); give the uid a writable $HOME and a
+    # passwd entry so a no-such-user lookup can not surprise the stack at runtime.
+    mkdir -p "$BROWSER_HOME"
+    chown "$BROWSER_UID:$BROWSER_GID" "$BROWSER_HOME"
+    chmod 700 "$BROWSER_HOME"
+    if ! grep -q ":x:$BROWSER_UID:" /etc/passwd 2>/dev/null; then
+        printf '%s:x:%s:%s::%s:/usr/sbin/nologin\n' \
+            "$BROWSER_USER" "$BROWSER_UID" "$BROWSER_GID" "$BROWSER_HOME" >> /etc/passwd
+        grep -q ":x:$BROWSER_GID:" /etc/group 2>/dev/null \
+            || printf '%s:x:%s:\n' "$BROWSER_USER" "$BROWSER_GID" >> /etc/group
+    fi
+    # Re-exec the rest as the unprivileged user: real uid+gid, no supplementary
+    # groups, no inheritable caps, empty capability bounding set. --clear-groups
+    # is exactly the bit safe stable Rust can not express. We deliberately do
+    # NOT pass --no-new-privs: it would block chromium's setuid-sandbox fallback
+    # on a kernel without unprivileged userns, and the namespace sandbox sets
+    # no_new_privs itself anyway.
+    exec "$here/bin/setpriv" \
+        --reuid="$BROWSER_UID" --regid="$BROWSER_GID" \
+        --clear-groups --inh-caps=-all --bounding-set=-all \
+        -- "$self" "$@"
+fi
+
+# --- everything below runs as the unprivileged engram-browser user ----------
+export HOME="$BROWSER_HOME"
+
+DISPLAY_NUM="${ENGRAM_BROWSER_DISPLAY:-99}"
+export DISPLAY=":$DISPLAY_NUM"
+# Xvfb's framebuffer is FIXED at this size for the VM's lifetime — it can't grow
+# past its startup geometry, and in practice Xvfb+x11vnc do NOT honor the noVNC
+# client's resize-to-panel request (the framebuffer stays put), so we don't
+# depend on dynamic resize. Instead chrome fills this fixed framebuffer
+# completely (see --window-size on the chrome launch below), and the noVNC tab
+# scales it to fit its panel (scaleViewport). Aspect differences between this
+# framebuffer and the panel show up as letterbox bars. Override via
+# ENGRAM_BROWSER_GEOMETRY.
+GEOMETRY="${ENGRAM_BROWSER_GEOMETRY:-1440x1080x24}"
+# Split WxHxDEPTH so chrome can be sized to exactly the framebuffer below — the
+# WM maximize hint (--start-maximized) raced/failed, leaving chrome at its
+# default ~half-width size with the rest of the framebuffer showing as black
+# desktop. An explicit --window-size is deterministic.
+FB_W="${GEOMETRY%%x*}"
+_geom_rest="${GEOMETRY#*x}"
+FB_H="${_geom_rest%%x*}"
+VNC_PORT="${ENGRAM_BROWSER_VNC_PORT:-5900}"
+# ADR 0065 §1a / ADR 0066 — the SHARED-browser CDP debug port. Chrome exposes
+# CDP here so (a) the agent's in-guest playwright-cli drives THIS chrome via
+# connectOverCDP(127.0.0.1:9222) and (b) the orchestrator attaches a read-mostly
+# metadata client (Target.* tab/URL state for the exposed-ports rail). Bound
+# LOOPBACK (chromium's default — we pass no --remote-debugging-address): the
+# agent reaches it in-guest directly, and the orchestrator reaches it through the
+# ADR 0066 vsock port relay (in-guest agentd dials 127.0.0.1 and splices), so a
+# full remote-control protocol is never exposed on the guest network. This is the
+# same ADR-0066 posture that lets x11vnc drop to -localhost (retiring the
+# original 0.0.0.0 + dial-guest_ip mechanism). --remote-allow-origins='*' still
+# clears Chrome >=111's DevTools Origin check (independent of bind address).
+# Override port via ENGRAM_BROWSER_CDP_PORT.
+CDP_PORT="${ENGRAM_BROWSER_CDP_PORT:-9222}"
+PROFILE_DIR="$(mktemp -d /tmp/engram-browser-profile.XXXXXX)"
+
+cleanup() {
+    # Disarm first: `kill 0` signals the WHOLE process group — including this
+    # shell — so without clearing the traps the delivered TERM/INT re-enters
+    # cleanup and recurses until the shell aborts ("Maximum function recursion
+    # depth reached"). Clear, then kill the group (Xvfb/openbox/chromium).
+    trap - TERM INT EXIT
+    kill 0 2>/dev/null || true
+}
+trap cleanup TERM INT EXIT
+
+# 1) Virtual X display. +extension RANDR enables x11vnc -xrandr live resize.
+# -xkbdir points the server at the bundle's relocated XKB data (build.sh copies
+# /usr/share/X11/xkb -> $here/share/X11/xkb); without it the server can't
+# compile a keymap and aborts before any client can connect.
+"$here/bin/Xvfb" "$DISPLAY" -screen 0 "$GEOMETRY" +extension RANDR -nolisten tcp \
+    -xkbdir "$here/share/X11/xkb" &
+# Wait for the X socket before starting clients.
+for _ in $(seq 1 100); do
+    [ -S "/tmp/.X11-unix/X$DISPLAY_NUM" ] && break
+    sleep 0.05
+done
+
+# 2) Minimal WM so chromium gets focus + maximizes. No root menu / no panel.
+"$here/bin/openbox" &
+
+# 3) Chromium under a respawn supervisor. Full UI, sized to the framebuffer, no
+# first-run prompts. Runs unprivileged with its sandbox ON (see the drop above +
+# the chrome flags below). Renderer shm uses the guest's real /dev/shm
+# (engram-init mounts it), so we do NOT disable dev-shm.
+#
+# Why supervised: the framebuffer shows ONLY chrome, so if the user closes the
+# last tab (chromium exits) or chrome crashes, a one-shot launch would strand
+# the VNC tab on the empty openbox desktop with no way back — and agentd can't
+# recover it either, because x11vnc is still up and its port still accepts, so
+# the next StartBrowser re-probes green and never respawns. So relaunch chrome
+# here whenever it exits, reusing the same profile (tabs/cookies survive) and
+# without disturbing x11vnc or the live VNC connection. Clear the inherited
+# cleanup trap in the subshell so a group SIGTERM (StopBrowser killpg) just
+# terminates it cleanly instead of re-entering `kill 0`.
+(
+    trap - TERM INT EXIT
+    while true; do
+        # A crash can leave a stale singleton lock that blocks relaunch with
+        # "profile appears to be in use"; the profile is single-tenant and
+        # ephemeral, so clear it before each (re)launch.
+        rm -f "$PROFILE_DIR"/Singleton* 2>/dev/null || true
+        # Chrome runs with its SANDBOX ON (ADR 0065 §7) — no --no-sandbox. The
+        # launcher already dropped to a non-root uid, which is precisely what
+        # lets chromium use its namespace (zygote) sandbox, so an exploited
+        # renderer is confined. (--test-type is gone too — it only existed to
+        # silence the bad-flags warning that --no-sandbox raised.)
+        "$here/chrome/chrome" \
+            --user-data-dir="$PROFILE_DIR" \
+            --no-first-run --no-default-browser-check \
+            --disable-infobars \
+            --remote-debugging-port="$CDP_PORT" \
+            --remote-allow-origins='*' \
+            --window-position=0,0 \
+            --window-size="$FB_W,$FB_H" \
+            "${ENGRAM_BROWSER_HOMEPAGE:-about:blank}" || true
+        # chrome exited; pause so a hard launch failure can't hot-loop, then
+        # bring it back up on the same display.
+        sleep 1
+    done
+) &
+
+# 4) x11vnc last (so the display + a client window exist). Bind LOOPBACK
+# (`-localhost` → 127.0.0.1:5900). ADR 0066 has agentd dial 127.0.0.1:5900
+# in-guest and splice RFB over the vsock relay — that's what makes loopback-only
+# viable (#498 needed 0.0.0.0 only because the OLD mechanism dialed `guest_ip`
+# from outside, and a guest_ip dial can't reach a loopback listener). 0.0.0.0
+# would still WORK with the relay; loopback is a least-exposure choice: RFB never
+# listens on the guest network, so the only route to it is the auth-gated relay
+# (belt to the per-VM-netns suspenders, and it matters more on the less-isolated
+# VZ dev network). `lo` must be up — the relay dials 127.0.0.1 regardless of bind.
+# -forever: survive client disconnects (refresh grace handled host-side).
+# -xrandr: track RANDR resolution changes for noVNC remote resize (x11vnc's flag
+# is -xrandr, NOT -randr — an unrecognized option makes x11vnc abort before
+# binding the RFB port). exec so this process becomes x11vnc; agentd reaps the
+# whole group via killpg, and x11vnc handles its own signals (the shell trap
+# above only covers the pre-exec bring-up).
+exec "$here/bin/x11vnc" \
+    -display "$DISPLAY" \
+    -rfbport "$VNC_PORT" \
+    -localhost \
+    -forever -shared -noxdamage -nopw -quiet -xrandr

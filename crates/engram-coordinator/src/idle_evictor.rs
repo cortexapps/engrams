@@ -222,6 +222,10 @@ pub async fn evict_session_to_state(
     // Hosts that don't support the split (pre-D5, non-FC) surface
     // InvalidSpec and fall through to the composed path too.
     if target_state == SessionState::Idle {
+        // ADR 0065: reap the ephemeral in-guest browser stack before the eviction
+        // snapshot so a live Chrome is never frozen into it (re-lazy-started on
+        // the next EnsureBrowser after resume). Best-effort; never blocks eviction.
+        let _ = state.services.host.stop_browser(sandbox_id).await;
         match state.services.host.snapshot_begin(sandbox_id).await {
             Ok(snapshot_id) => {
                 finish_eviction_background(state, session_id, sandbox_id, snapshot_id, _guard)

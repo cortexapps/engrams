@@ -430,6 +430,25 @@ pub trait HostClient: Send + Sync {
         Err(SandboxError::NotFound)
     }
 
+    /// ADR 0065: bring up the ephemeral in-guest browser stack (Xvfb + x11vnc +
+    /// headful chromium with the CDP debug port) and return the VNC port. The
+    /// coordinator calls this before opening a relay tunnel to x11vnc :5900
+    /// (ADR 0066); the browser is reached over the vsock port relay, not a
+    /// direct dial. Default `NotFound` — only host-agent impls own a browser.
+    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        let _ = sandbox_id;
+        Err(SandboxError::NotFound)
+    }
+
+    /// ADR 0065: tear down the in-guest browser stack. Called at the snapshot /
+    /// idle-eviction boundary (the browser is ephemeral and never snapshotted),
+    /// NOT on viewer disconnect — the agent may still be driving the shared
+    /// browser over CDP. Default no-op; only host-agent impls own a browser.
+    async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let _ = sandbox_id;
+        Ok(())
+    }
+
     /// ADR 0064: open a bidi RAW-BYTE tunnel to an arbitrary guest TCP
     /// `port` for `sandbox_id` (a dev server the agent started). The
     /// raw-byte sibling of [`Self::proxy_shell`]: the returned
