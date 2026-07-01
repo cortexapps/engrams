@@ -94,6 +94,19 @@ FB_W="${GEOMETRY%%x*}"
 _geom_rest="${GEOMETRY#*x}"
 FB_H="${_geom_rest%%x*}"
 VNC_PORT="${ENGRAM_BROWSER_VNC_PORT:-5900}"
+# ADR 0065 §1a / ADR 0066 — the SHARED-browser CDP debug port. Chrome exposes
+# CDP here so (a) the agent's in-guest playwright-cli drives THIS chrome via
+# connectOverCDP(127.0.0.1:9222) and (b) the orchestrator attaches a read-mostly
+# metadata client (Target.* tab/URL state for the exposed-ports rail). Bound
+# LOOPBACK (chromium's default — we pass no --remote-debugging-address): the
+# agent reaches it in-guest directly, and the orchestrator reaches it through the
+# ADR 0066 vsock port relay (in-guest agentd dials 127.0.0.1 and splices), so a
+# full remote-control protocol is never exposed on the guest network. This is the
+# same ADR-0066 posture that lets x11vnc drop to -localhost (retiring the
+# original 0.0.0.0 + dial-guest_ip mechanism). --remote-allow-origins='*' still
+# clears Chrome >=111's DevTools Origin check (independent of bind address).
+# Override port via ENGRAM_BROWSER_CDP_PORT.
+CDP_PORT="${ENGRAM_BROWSER_CDP_PORT:-9222}"
 PROFILE_DIR="$(mktemp -d /tmp/engram-browser-profile.XXXXXX)"
 
 cleanup() {
@@ -151,6 +164,8 @@ done
             --user-data-dir="$PROFILE_DIR" \
             --no-first-run --no-default-browser-check \
             --disable-infobars \
+            --remote-debugging-port="$CDP_PORT" \
+            --remote-allow-origins='*' \
             --window-position=0,0 \
             --window-size="$FB_W,$FB_H" \
             "${ENGRAM_BROWSER_HOMEPAGE:-about:blank}" || true

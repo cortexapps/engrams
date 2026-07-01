@@ -31,6 +31,22 @@ use tokio::time::{sleep, timeout};
 /// matching `engram_host_agent::proxy_vnc::VNC_PORT` (Task P1.2).
 pub const DEFAULT_VNC_PORT: u16 = 5900;
 
+/// Default CDP debug port chromium exposes for the SHARED-browser model
+/// (ADR 0065 §1a): the agent drives this same chrome via `connectOverCDP` and
+/// the orchestrator attaches a read-mostly metadata client. The launcher binds
+/// it all-interfaces; override via `ENGRAM_BROWSER_CDP_PORT`.
+pub const DEFAULT_CDP_PORT: u16 = 9222;
+
+/// The CDP port to gate readiness on, honoring the launcher's
+/// `ENGRAM_BROWSER_CDP_PORT` override so the probe and the launcher never
+/// disagree.
+fn cdp_port() -> u16 {
+    std::env::var("ENGRAM_BROWSER_CDP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_CDP_PORT)
+}
+
 /// Launcher symlinked onto PATH by the `browser` bundle (ADR 0064). Other
 /// images that bake the launcher into a different prefix can override the
 /// resolved path via `ENGRAM_BROWSER_BIN` in the agent environment.
@@ -248,13 +264,23 @@ async fn terminate_group(handle: &mut BrowserHandle) {
     let _ = handle.child.wait().await;
 }
 
+/// Wait until the SHARED browser stack is fully serving: x11vnc speaking RFB on
+/// `port` (the human's VNC view) AND chromium's CDP endpoint answering on the
+/// debug port (the agent's `connectOverCDP` + the orchestrator's metadata
+/// client — ADR 0065 §1a). Both are gated because x11vnc is the *last* thing the
+/// launcher starts but chromium's DevTools socket can lag its window, so an
+/// RFB-only wait could return before the agent can attach.
 async fn wait_until_ready(port: u16) -> io::Result<()> {
+    let cdp = cdp_port();
     let deadline = Instant::now() + READY_DEADLINE;
     let mut backoff = READY_PROBE_START;
     let mut last_err: Option<io::Error> = None;
     while Instant::now() < deadline {
         match probe_ready(port).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => match probe_cdp_ready(cdp).await {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            },
             Err(e) => last_err = Some(e),
         }
         sleep(backoff).await;
@@ -263,7 +289,7 @@ async fn wait_until_ready(port: u16) -> io::Result<()> {
     Err(last_err.unwrap_or_else(|| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("x11vnc did not serve RFB on 127.0.0.1:{port} within {READY_DEADLINE:?}"),
+            format!("browser stack not ready within {READY_DEADLINE:?} (RFB :{port} + CDP :{cdp})"),
         )
     }))
 }
@@ -305,6 +331,51 @@ async fn probe_ready(port: u16) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("listener on 127.0.0.1:{port} did not speak RFB (banner {banner:?})"),
+        ));
+    }
+    Ok(())
+}
+
+/// How long to wait for the CDP endpoint's HTTP response before treating it as
+/// not-ready. Chromium answers `/json/version` the instant DevTools is listening.
+const CDP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Probe that chromium's CDP endpoint is genuinely serving on `port` — a real
+/// `GET /json/version` returning `200`, not merely that the socket accepts
+/// (parallel to [`probe_ready`]'s RFB-banner check for x11vnc).
+///
+/// The agent attaches with `connectOverCDP`, which first fetches
+/// `/json/version` for the `webSocketDebuggerUrl`, and the orchestrator's
+/// metadata client does the same; gating on a live 200 here means
+/// `start_browser` only returns once both can actually attach. A bare TCP
+/// connect is too weak — chromium opens the debug socket a beat before its HTTP
+/// handler answers.
+async fn probe_cdp_ready(port: u16) -> io::Result<()> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    // `Host: localhost` satisfies chromium's DevTools DNS-rebind guard, which
+    // rejects a request whose Host is neither localhost nor an IP literal.
+    stream
+        .write_all(b"GET /json/version HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let mut buf = [0u8; 256];
+    let n = match timeout(CDP_PROBE_TIMEOUT, stream.read(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(e),
+        Err(_elapsed) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no CDP response from 127.0.0.1:{port} within {CDP_PROBE_TIMEOUT:?}"),
+            ));
+        }
+    };
+    let _ = stream.shutdown().await;
+    // Status line is "HTTP/1.1 200 OK"; a 404/426 means the socket is up but
+    // DevTools isn't answering `/json` yet.
+    let head = &buf[..n];
+    if !head.starts_with(b"HTTP/1.") || !head.windows(4).any(|w| w == b" 200") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("CDP endpoint on 127.0.0.1:{port} not ready (response head {head:?})"),
         ));
     }
     Ok(())
