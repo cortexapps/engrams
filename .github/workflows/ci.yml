@@ -1865,17 +1865,23 @@ jobs:
       - name: Run engram-sandbox-vz unit tests (default)
         if: always()
         run: cargo nextest run -p engram-sandbox-vz --no-fail-fast
-      # Pull the Kata arm64 kernel into the path the #[ignore]'d live smoke reads.
+      # The ignored VZ tests split two ways here:
+      #  - `config_validation_surfaces_clear_error_without_entitlement` builds a
+      #    VZ config and asserts `validateWithError:` surfaces a clear error. It
+      #    never boots a VM, but it *does* stat a kernel + rootfs file, skipping
+      #    if either is missing — so the pulled kernel + the empty placeholder
+      #    below let it actually run.
+      #  - the `e2e_vz_*` smokes DO boot a real VM, so they skip in CI: they need
+      #    a Docker-baked vsock rootfs passed via ENGRAM_VZ_ROOTFS (unset here),
+      #    which the macOS runner can't produce (ADR 0032). Those run locally as
+      #    a `just vz-test` pre-merge gate.
       - name: Pull VZ kernel (Kata arm64)
         if: always()
         run: bash crates/engram-sandbox-vz/scripts/pull-kernel.sh
-      # The live smoke wants a rootfs file on disk; it never boots the VM
-      # (validateWithError: only records the URL), so an empty file clears the
-      # existence guard.
-      - name: Stage rootfs placeholder
+      - name: Stage rootfs placeholder (for the non-booting config-validation test)
         if: always()
         run: touch /tmp/engram-vz-rootfs.ext4
-      - name: Run live VZ smoke (--ignored)
+      - name: Run ignored VZ tests (config validation runs; e2e_vz smokes skip)
         if: always()
         run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast
       - name: Workspace check (catches downstream-of-VZ regressions)
