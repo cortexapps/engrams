@@ -266,6 +266,16 @@ pub(crate) struct VsockBridge {
     queue: DispatchRetained<DispatchQueue>,
     /// Ports we registered a `VZVirtioSocketListener` on (unregistered on stop).
     registered_listener_ports: Vec<u32>,
+    /// The guest-initiated listeners and their delegates, held alive for the
+    /// bridge's lifetime. `VZVirtioSocketListener::setDelegate:` is a **weak**
+    /// property, so if we let the delegate drop after registration it
+    /// deallocates, the listener's delegate ref goes nil, and
+    /// `should_accept` is never called — every guest-initiated connection
+    /// (ready 1027, harness 1026, upload 1029) is then silently rejected and
+    /// agentd spins its full ready-port deadline. Keeping both here is what
+    /// keeps the accept path live.
+    _listeners: Vec<Sendable<Retained<VZVirtioSocketListener>>>,
+    _delegates: Vec<Sendable<Retained<VsockListenerDelegate>>>,
 }
 
 impl VsockBridge {
@@ -295,6 +305,10 @@ impl VsockBridge {
 
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
         let mut registered_listener_ports: Vec<u32> = Vec::new();
+        // Held alive for the bridge's lifetime — see the struct field docs
+        // (`setDelegate:` is weak; dropping these silently kills the accept path).
+        let mut kept_listeners: Vec<Sendable<Retained<VZVirtioSocketListener>>> = Vec::new();
+        let mut kept_delegates: Vec<Sendable<Retained<VsockListenerDelegate>>> = Vec::new();
 
         // Host-initiated agentd port: bind the UDS first so the backend's
         // start_agent / exec_stream dial doesn't race a not-yet-bound
@@ -336,24 +350,33 @@ impl VsockBridge {
             let delegate = VsockListenerDelegate::new(conn_tx);
             // SAFETY: VZVirtioSocketListener::new returns a freshly
             // retained, non-nil instance; we attach our delegate before
-            // handing it to the device.
-            let listener = unsafe {
+            // handing it to the device. `setDelegate:` is a WEAK property, so
+            // we pass a clone and keep our own retained ref in `kept_delegates`
+            // below — otherwise the delegate deallocates and the listener stops
+            // accepting.
+            let listener: Retained<VZVirtioSocketListener> = unsafe {
                 let listener = VZVirtioSocketListener::new();
                 listener.setDelegate(Some(&objc2::runtime::ProtocolObject::from_retained(
-                    delegate,
+                    delegate.clone(),
                 )));
                 listener
             };
+            // Wrap in `Sendable` before the `.await` below so no raw ObjC
+            // `Retained` (non-Send) crosses the await boundary.
+            let listener = Sendable(listener);
+            let delegate = Sendable(delegate);
             // setSocketListener:forPort: must run on the VM's queue.
             run_on_queue(&queue, {
                 let device = device.clone();
-                let listener = Sendable(listener);
+                let listener = listener.clone();
                 move || unsafe {
                     device.setSocketListener_forPort(&listener, port);
                 }
             })
             .await;
             registered_listener_ports.push(port);
+            kept_listeners.push(listener);
+            kept_delegates.push(delegate);
             tasks.push(tokio::spawn(guest_listener_consumer(conn_rx, delivery)));
         }
 
@@ -364,6 +387,8 @@ impl VsockBridge {
                 device,
                 queue,
                 registered_listener_ports,
+                _listeners: kept_listeners,
+                _delegates: kept_delegates,
             },
             connector,
         ))
