@@ -221,7 +221,20 @@ pub async fn evict_session_to_state(
     // the evac scanner resumes from the row, so it must be durable first.
     // Hosts that don't support the split (pre-D5, non-FC) surface
     // InvalidSpec and fall through to the composed path too.
-    if target_state == SessionState::Idle {
+    // ADR 0045 D5's optimistic-Idle-before-durable fast path is only sound
+    // when a prior recoverable checkpoint (or a `live_disk_manifest`) exists
+    // to fall back to on a finalize failure. A FRESH session's *first*
+    // eviction has none: a finalize failure there marks it Idle with zero
+    // snapshot rows, and the resume path then finds nothing and marks it
+    // Dead (`snapshot_invalidated`) — prod session 2881dfe4 lost a fresh
+    // dev-brain on its first eviction. For that no-fallback case, require
+    // durable-before-Idle via the composed path below: it records + commits
+    // the row BEFORE marking Idle, and on a capture failure returns `Err`
+    // WITHOUT unbinding — so the session stays Evicting with its guest still
+    // owned and alive (the capture-unwind resumes it in place), and the
+    // eviction scanner retries on its next tick, instead of stranding it
+    // Idle-with-no-snapshot for teardown-reconcile to reap.
+    if target_state == SessionState::Idle && has_recoverable_fallback(state, session_id).await {
         match state.services.host.snapshot_begin(sandbox_id).await {
             Ok(snapshot_id) => {
                 finish_eviction_background(state, session_id, sandbox_id, snapshot_id, _guard)
@@ -428,13 +441,36 @@ pub async fn evict_session_to_state(
     Ok(EvictOutcome::Evacuated)
 }
 
+/// Does this session have a prior durable state to fall back to if the D5
+/// finalize fails? The D5 fast path marks the session `Idle` before its
+/// snapshot upload is durable, betting a finalize failure can recover from a
+/// PRIOR recoverable checkpoint — true for any session that's been
+/// checkpointed at least once, false for a fresh session's very first
+/// eviction. Fall back to either a `live_disk_manifest` (disk-only
+/// recoverable, the ADR 0016 Phase B publish) or a `recoverable` snapshot
+/// row. **Conservative on error** → `false` → the safe durable-before-Idle
+/// composed path (never risk losing the session over a transient PG blip).
+async fn has_recoverable_fallback(state: &SharedState, id: SessionId) -> bool {
+    if let Ok(s) = state.services.meta.get_session(id).await {
+        if s.live_disk_manifest.is_some() {
+            return true;
+        }
+    }
+    match state.services.meta.list_snapshots_for_session(id).await {
+        Ok(rows) => rows.iter().any(|r| r.recoverable),
+        Err(_) => false,
+    }
+}
+
 /// ADR 0045 D5: the fast-path tail of an idle eviction. The capture has
 /// landed (`snapshot_begin` returned), so: mark the session Idle NOW —
 /// user-visible teardown ends here — then spawn the finalize task that
 /// awaits the host's background upload under the touched lease and only
 /// then writes the snapshot row, commits, and destroys. Failure anywhere
-/// in finalize = no row + abort + destroy: resume falls back to the
-/// prior checkpoint.
+/// in finalize = no row + abort + destroy. This path only runs when
+/// [`has_recoverable_fallback`] holds, so "no row" is safe: resume falls
+/// back to the prior checkpoint. (A fresh session with no fallback takes
+/// the composed durable-before-Idle path instead.)
 async fn finish_eviction_background(
     state: &SharedState,
     session_id: SessionId,
@@ -1374,7 +1410,12 @@ mod tests {
             mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
-            live_disk_manifest: None,
+            // A prior recoverable state (live_disk_manifest) exists, so the D5
+            // optimistic-Idle-before-durable fast path is safe — a finalize
+            // failure would fall back to it. (A no-fallback session takes the
+            // composed durable-before-Idle path instead; see
+            // `no_fallback_eviction_records_durable_row_before_idle`.)
+            live_disk_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta, gate) = d5_state(session, sandbox_root.path(), false);
@@ -1417,8 +1458,12 @@ mod tests {
         .await;
     }
 
-    /// Finalize failure: no row is ever written (resume falls back to the
-    /// prior checkpoint) and the sandbox is still destroyed.
+    /// D5 finalize failure WITH a prior-checkpoint fallback: no row is ever
+    /// written (resume falls back to the prior checkpoint) and the sandbox is
+    /// still destroyed. The `live_disk_manifest` fallback is precisely what
+    /// makes it safe to have marked the session Idle before the upload
+    /// resolved — without it the eviction must take the composed
+    /// durable-before-Idle path (see the no-fallback test below).
     #[tokio::test]
     async fn d5_eviction_upload_failure_writes_no_row_and_destroys() {
         let session_id = engram_core::SessionId::new();
@@ -1431,7 +1476,7 @@ mod tests {
             mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
-            live_disk_manifest: None,
+            live_disk_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta, gate) = d5_state(session, sandbox_root.path(), true);
@@ -1459,6 +1504,56 @@ mod tests {
             "a failed finalize must never write a snapshot row"
         );
         // Session stays Idle (resume falls back to the prior checkpoint).
+        assert_eq!(meta.session.lock().status, SessionState::Idle);
+    }
+
+    /// A FRESH session's first eviction — no prior checkpoint and no
+    /// `live_disk_manifest` to fall back to — must NOT take D5's optimistic
+    /// Idle-before-durable fast path: a finalize failure there would strand
+    /// it Idle-with-no-row and the resume path would then mark it Dead
+    /// (`snapshot_invalidated` — the prod loss of session 2881dfe4). The gate
+    /// routes it to the composed durable-before-Idle path instead, which
+    /// records the snapshot row BEFORE marking Idle, so the session is always
+    /// recoverable.
+    #[tokio::test]
+    async fn no_fallback_eviction_records_durable_row_before_idle() {
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:no-fallback".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            // No fallback — the fresh-session first-eviction case.
+            live_disk_manifest: None,
+        };
+        let sandbox_root = TempDir::new().unwrap();
+        // `fail_wait` is irrelevant: the composed path doesn't use the D5
+        // snapshot_begin/snapshot_wait split at all.
+        let (state, meta, _gate) = d5_state(session, sandbox_root.path(), false);
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        evict_session_to_state(&state, session_id, sandbox_id, SessionState::Idle)
+            .await
+            .expect("evict");
+
+        // The composed path recorded a DURABLE snapshot row (D5 on a fresh
+        // session would have marked Idle with no row) — so the session is
+        // recoverable, not lost.
+        assert!(
+            !meta.snapshots.lock().is_empty(),
+            "no-fallback eviction must record a durable snapshot row via the composed path, \
+             not strand the session Idle-with-no-row",
+        );
         assert_eq!(meta.session.lock().status, SessionState::Idle);
     }
 
