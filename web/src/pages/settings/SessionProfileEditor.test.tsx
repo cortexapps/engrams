@@ -39,7 +39,7 @@ const uploadSkill = vi.hoisted(() => vi.fn().mockResolvedValue({ skill: { name: 
 vi.mock("../../hooks/useSkills", () => ({
   useSkills: () => ({
     data: [
-      { name: "playwright", label: "Browser (Playwright)", description: "browser", builtin: true },
+      { name: "browser", label: "Browser", description: "browser", builtin: true },
       { name: "my-linter", label: "my-linter", description: "lint", builtin: false },
     ],
   }),
@@ -136,10 +136,10 @@ describe("SessionProfileEditor (create)", () => {
       target: { value: "Browser Agent" },
     });
     openAdvanced();
-    fireEvent.click(screen.getByTestId("skill-playwright"));
+    fireEvent.click(screen.getByTestId("skill-browser"));
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
-    expect(create.mock.calls[0][0].skills).toEqual(["playwright"]);
+    expect(create.mock.calls[0][0].skills).toEqual(["browser"]);
   });
 
   it("adding a port includes portExposures in the create payload (ADR 0064 P4)", async () => {

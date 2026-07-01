@@ -32,19 +32,15 @@ export const BUILTIN_SKILLS: { name: string; label: string; description: string 
     description: "share-file and the git credential wiring.",
   },
   {
-    name: "playwright",
-    label: "Browser (Playwright)",
-    description:
-      "chromium-headless-shell + the playwright-cli powering the show-your-work skill. Use an image sized for a browser (≥1 GiB).",
-  },
-  {
-    // ADR 0065: the opt-in human-driven browser (mirror of the orchestrator's
-    // BUILTIN_SKILLS — keep the two in sync). Selecting it mounts the `browser`
-    // bundle and lights up the session's BROWSER tab over noVNC.
+    // ADR 0065: the single browser capability (mirror of the orchestrator's
+    // BUILTIN_SKILLS — keep the two in sync). One shared Chromium: the human
+    // drives it over VNC in the BROWSER tab, the agent drives the SAME browser
+    // via playwright-cli + show-your-work. (The old headless-only `playwright`
+    // skill is retired into this.)
     name: "browser",
-    label: "Browser (interactive)",
+    label: "Browser",
     description:
-      "Full Chromium UI you drive over VNC from the session's BROWSER tab (Xvfb + x11vnc + openbox). Use an image sized for a browser (≥1 GiB).",
+      "One shared Chromium the human drives over VNC (BROWSER tab) and the agent drives via playwright-cli + show-your-work — same browser, so the human watches the agent live. Use an image sized for a browser (≥1 GiB).",
   },
 ];
 
