@@ -79,7 +79,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest};
-use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::traits::sandbox::{HarnessByteStream, SandboxBackend};
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
@@ -4044,6 +4044,25 @@ impl SandboxBackend for FirecrackerBackend {
         // here, agentd genuinely went away after readiness signal —
         // surface the error rather than masking with retries.
         Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd).await
+    }
+
+    /// ADR 0066: connect to the in-guest agentd relay listener on `port`
+    /// (host→guest via the FC vsock CONNECT handshake, same primitive exec uses
+    /// on 1024). Reuses `connect_fc_vsock`'s post-restore muxer-settle retry, so
+    /// this is dial-ready cold and warm alike (the vsock UDS is a host-root
+    /// path, not netns-scoped). The host-agent writes the `RelayConnect` header
+    /// and splices from here.
+    async fn open_guest_stream(
+        &self,
+        id: SandboxId,
+        port: u32,
+    ) -> Result<Option<HarnessByteStream>, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.vsock_uds_path.clone()
+        };
+        let conn = Self::connect_fc_vsock(&vsock_uds_path, port).await?;
+        Ok(Some(Box::pin(conn)))
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {

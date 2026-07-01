@@ -78,7 +78,13 @@ Firecracker path; VZ exists to exercise that path on macOS, not to fork it.
 - **Unit/integration**: `cargo nextest run -p <crate>` (in `just check`).
 - **Firecracker integration** (`crates/engram-sandbox-firecracker/tests/`): `#[ignore]`'d,
   Linux+KVM only; run in CI on KVM runners. New FC/NBD regression tests **must** be wired
-  into `ci.yml`'s `--test` list (not gated as local-only) or they never run.
+  into `ci.yml`'s `--test` list (not gated as local-only) or they never run. **Size a test
+  to the property it asserts, not to realism — minimize CI time.** Prove a
+  correctness/isolation/head-of-line-freedom property with the least data, iterations, and
+  wall-time that still demonstrates it (a small, tightly-bounded exercise); scaling it up
+  (big transfers, many rounds, long sleeps) only measures throughput/load, which is slow on
+  the 2-vcpu microVM, gets flagged SLOW, and reinflates the FC lane we worked to trim.
+  Measure scale/throughput ad hoc on the dev VM, never in a CI test.
 - **e2e stack** (`test-e2e-stack`): boots the full prod-shape stack — the only lane that
   exercises the coordinator HTTP/gRPC path end to end. Never delete e2e coverage without a
   replacement landing in the same change.

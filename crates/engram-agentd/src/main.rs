@@ -353,6 +353,15 @@ async fn run_transport(
     let kind = std::env::var("ENGRAM_TRANSPORT").unwrap_or_else(|_| "vsock".into());
     tracing::info!(port, transport = %kind, "engram-agentd listening");
 
+    // ADR 0066: the vsock port relay for live-preview port-forwarding. Its own
+    // detached listener on PROXY_PORT_VSOCK_PORT (1030), dialed host→guest per
+    // forwarded browser connection. Spawned BEFORE the readiness handshake so
+    // 1030 is bound before the host takes a base snapshot — restored VMs are
+    // dial-ready. Best-effort + self-contained (it binds its own listener, no
+    // ready-port dependency). NOT spawned from `run_unix`: Process dev has no VM
+    // boundary, so the host dials the guest's 127.0.0.1 directly.
+    tokio::spawn(engram_agentd::port_relay::run_port_relay());
+
     // ADR 0015 M1: dial the host on the readiness port. The host
     // blocks on `accept()` here in its `start_agent` — replacing the
     // pre-M1 boot-race CONNECT-then-retry against port 1024. Order

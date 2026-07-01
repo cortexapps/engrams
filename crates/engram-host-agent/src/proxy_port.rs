@@ -1,18 +1,21 @@
-//! ADR 0064: host-agent half of the ProxyPort tunnel — the raw-byte,
-//! arbitrary-port generalization of [`crate::proxy_shell`].
+//! ADR 0064 + ADR 0066: host-agent half of the ProxyPort tunnel — the
+//! raw-byte, arbitrary-port path that shuttles opaque bytes across a
+//! [`PortTunnel`]. No WS framing, no ttyd handshake — the bytes are whatever
+//! the inner protocol speaks (HTTP/1.1, h2c, a WebSocket upgrade, gRPC).
 //!
-//! Dials a guest TCP `port` (a dev server the agent started) in the
-//! right network namespace and shuttles opaque bytes across a
-//! [`PortTunnel`]. Cold sandboxes dial from the host root netns; warm-
-//! restored sandboxes dial from inside their per-VM netns (Linux only)
-//! via [`crate::proxy_shell::connect_tcp_in_netns_linux`]. No WS
-//! framing, no ttyd handshake — the bytes are whatever the inner
-//! protocol speaks (HTTP/1.1, h2c, a WebSocket upgrade, gRPC).
+//! ADR 0066: the guest hop reaches the dev server on the guest's **`127.0.0.1`**
+//! via the in-guest agentd relay ([`open_vsock_tunnel_at`]) — so a server bound
+//! to loopback (Vite, the Tilt UI) is reachable, which the old `guest_ip`
+//! network dial could not. [`open_tcp_tunnel_at`] survives only for backends
+//! without a vsock relay (the Process backend; VZ until its Phase 2 real-vsock
+//! migration), dialing `guest_ip:port` directly with no per-VM netns — only FC
+//! ever had a netns dial, and FC now always takes the relay.
 
 use std::time::Duration;
 
 use bytes::Bytes;
 use engram_core::error::SandboxError;
+use engram_core::traits::sandbox::HarnessByteStream;
 use engram_core::types::port::PortTunnelEnds;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -31,22 +34,53 @@ const PORT_BACKOFF_MAX: Duration = Duration::from_millis(500);
 /// per-method message-size bump is needed.
 const READ_CHUNK: usize = 64 * 1024;
 
-/// Open a raw-byte tunnel from this host to `guest_ip:port`, dialing
-/// inside `netns_name` when `Some` (warm-restored sandbox) or on the
-/// host root when `None` (cold sandbox). Spawns the bidi pump and
-/// returns once connected; the pump lives until either tunnel end
-/// closes. Convenience surface mirrored on
-/// [`crate::proxy_shell::open_shell_tunnel_at`].
+/// ADR 0066: open a raw-byte tunnel to the guest's `127.0.0.1:target_port` via
+/// the in-guest agentd relay. `stream` is a fresh vsock connection to the relay
+/// listener (from `SandboxBackend::open_guest_stream`); we send the
+/// [`RelayConnect`](engram_harness_proto::RelayConnect) header and read the
+/// [`RelayAck`](engram_harness_proto::RelayAck) — so a dev server that isn't
+/// listening surfaces as a synchronous error (a clean 502), preserving ADR
+/// 0064's fail-fast contract — then splice through the unchanged pump. The
+/// guest reaches loopback-bound dev servers the host's `guest_ip` dial cannot.
+pub async fn open_vsock_tunnel_at(
+    mut stream: HarnessByteStream,
+    target_port: u16,
+    ends: PortTunnelEnds,
+) -> Result<(), SandboxError> {
+    engram_harness_proto::write_msg(
+        &mut stream,
+        &engram_harness_proto::RelayConnect { target_port },
+    )
+    .await
+    .map_err(|e| SandboxError::Vm(format!("proxy_port: write relay header: {e}").into()))?;
+    let ack: engram_harness_proto::RelayAck = engram_harness_proto::read_msg(&mut stream)
+        .await
+        .map_err(|e| SandboxError::Vm(format!("proxy_port: read relay ack: {e}").into()))?;
+    if !ack.ok {
+        return Err(SandboxError::Vm(
+            format!(
+                "proxy_port: guest relay could not reach 127.0.0.1:{target_port}: {}",
+                ack.error.unwrap_or_default()
+            )
+            .into(),
+        ));
+    }
+    pump_tcp_through_tunnel(stream, ends);
+    Ok(())
+}
+
+/// Open a raw-byte tunnel by dialing `guest_ip:port` directly (host root netns,
+/// no per-VM netns). Used only by backends **without** a vsock relay: the
+/// Process backend (`guest_ip` is `127.0.0.1` — agentd is a host subprocess)
+/// and VZ until its Phase 2 real-vsock migration (`guest_ip` is the in-VM eth0
+/// IP). FC never reaches this path — `open_guest_stream` always hands it the
+/// vsock relay — so the old per-VM-netns dial (only FC ever had one) is retired.
 pub async fn open_tcp_tunnel_at(
     guest_ip: String,
     port: u16,
-    netns_name: Option<String>,
     ends: PortTunnelEnds,
 ) -> Result<(), SandboxError> {
-    let stream = match &netns_name {
-        None => connect_cold(&guest_ip, port).await?,
-        Some(ns) => connect_in_netns(ns, &guest_ip, port).await?,
-    };
+    let stream = connect_cold(&guest_ip, port).await?;
     pump_tcp_through_tunnel(stream, ends);
     Ok(())
 }
@@ -69,41 +103,6 @@ async fn connect_cold(guest_ip: &str, port: u16) -> Result<TcpStream, SandboxErr
                 }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(PORT_BACKOFF_MAX);
-            }
-        }
-    }
-}
-
-/// Warm-path dial: open the TCP socket inside the per-VM netns. Linux
-/// only — a non-Linux host can't have a netns sandbox, so a
-/// `Some(netns)` there is a clean error (mirrors `proxy_shell`).
-async fn connect_in_netns(
-    netns_name: &str,
-    guest_ip: &str,
-    port: u16,
-) -> Result<TcpStream, SandboxError> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (netns_name, guest_ip, port);
-        Err(SandboxError::Vm(
-            "proxy_port: per-VM netns dial requires Linux (got non-Linux host)".into(),
-        ))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let deadline = std::time::Instant::now() + PORT_DIAL_DEADLINE;
-        let mut backoff = PORT_BACKOFF_START;
-        loop {
-            match crate::proxy_shell::connect_tcp_in_netns_linux(netns_name, guest_ip, port).await {
-                Ok(s) => return Ok(s),
-                Err(e) => {
-                    let refused = format!("{e}").contains("Connection refused");
-                    if !refused || std::time::Instant::now() >= deadline {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(PORT_BACKOFF_MAX);
-                }
             }
         }
     }
@@ -189,7 +188,7 @@ mod tests {
         });
 
         let (tunnel, ends) = PortTunnel::pair();
-        open_tcp_tunnel_at(addr.ip().to_string(), addr.port(), None, ends)
+        open_tcp_tunnel_at(addr.ip().to_string(), addr.port(), ends)
             .await
             .expect("open tunnel");
 
@@ -224,7 +223,7 @@ mod tests {
         let (_tunnel, ends) = PortTunnel::pair();
         let err = tokio::time::timeout(
             Duration::from_secs(8),
-            open_tcp_tunnel_at("127.0.0.1".into(), 1, None, ends),
+            open_tcp_tunnel_at("127.0.0.1".into(), 1, ends),
         )
         .await
         .expect("dial timed out test-side")
@@ -233,5 +232,82 @@ mod tests {
             SandboxError::Vm(_) => {}
             other => panic!("expected SandboxError::Vm, got {other:?}"),
         }
+    }
+
+    /// `open_vsock_tunnel_at`: write the header, read an OK ack from a fake
+    /// agentd, then raw bytes round-trip through the `PortTunnel` (the ADR 0066
+    /// guest hop, with the vsock stream stubbed by an in-memory duplex).
+    #[tokio::test]
+    async fn open_vsock_tunnel_at_round_trips_after_ack() {
+        let (host_end, mut agentd) = tokio::io::duplex(4096);
+        let fake = tokio::spawn(async move {
+            let hdr: engram_harness_proto::RelayConnect =
+                engram_harness_proto::read_msg(&mut agentd).await.unwrap();
+            assert_eq!(hdr.target_port, 3000);
+            engram_harness_proto::write_msg(
+                &mut agentd,
+                &engram_harness_proto::RelayAck {
+                    ok: true,
+                    error: None,
+                },
+            )
+            .await
+            .unwrap();
+            let mut buf = vec![0u8; 64];
+            let n = agentd.read(&mut buf).await.unwrap();
+            agentd.write_all(&buf[..n]).await.unwrap();
+            let _ = agentd.shutdown().await;
+        });
+
+        let stream: HarnessByteStream = Box::pin(host_end);
+        let (tunnel, ends) = PortTunnel::pair();
+        open_vsock_tunnel_at(stream, 3000, ends)
+            .await
+            .expect("open");
+
+        let PortTunnel {
+            outbound,
+            mut inbound,
+        } = tunnel;
+        outbound.send(Bytes::from_static(b"ping")).await.unwrap();
+        let mut got = Vec::new();
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(Duration::from_secs(2), inbound.recv()).await
+        {
+            got.extend_from_slice(&chunk);
+            if got == b"ping" {
+                break;
+            }
+        }
+        assert_eq!(got, b"ping");
+        let _ = fake.await;
+    }
+
+    /// A NAK ack (`ok:false`, dev server unreachable) → `open_vsock_tunnel_at`
+    /// errors synchronously (→ clean 502), and never spawns the pump.
+    #[tokio::test]
+    async fn open_vsock_tunnel_at_errors_on_nak() {
+        let (host_end, mut agentd) = tokio::io::duplex(4096);
+        let fake = tokio::spawn(async move {
+            let _: engram_harness_proto::RelayConnect =
+                engram_harness_proto::read_msg(&mut agentd).await.unwrap();
+            engram_harness_proto::write_msg(
+                &mut agentd,
+                &engram_harness_proto::RelayAck {
+                    ok: false,
+                    error: Some("connection refused".into()),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let stream: HarnessByteStream = Box::pin(host_end);
+        let (_tunnel, ends) = PortTunnel::pair();
+        let err = open_vsock_tunnel_at(stream, 3000, ends)
+            .await
+            .expect_err("nak must surface as error");
+        assert!(matches!(err, SandboxError::Vm(_)), "got {err:?}");
+        let _ = fake.await;
     }
 }

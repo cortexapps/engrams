@@ -558,6 +558,80 @@ impl Default for SessionEventBus {
     }
 }
 
+/// ADR 0066: a per-session, per-replica cap on concurrent live preview
+/// (port-forward) connections. A preview page legitimately opens dozens of
+/// connections (HTTP/1.1 without keep-alive + WebSockets); this bounds a
+/// runaway or abusive one and fails fast at the coordinator — returning
+/// `resource_exhausted` (→ a 503 at the orchestrator) before a would-be-capped
+/// connection consumes host→guest fds. A backstop, not a hard global quota: it
+/// counts only this replica's connections, and agentd holds a per-guest
+/// backstop of its own.
+pub struct PreviewConnLimiter {
+    per_session: DashMap<SessionId, Arc<tokio::sync::Semaphore>>,
+    cap: usize,
+}
+
+impl PreviewConnLimiter {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            per_session: DashMap::new(),
+            cap,
+        }
+    }
+
+    /// `ENGRAM_PREVIEW_MAX_CONNS_PER_SESSION` (default 256, matching the
+    /// host-agent gRPC `concurrency_limit_per_connection`).
+    pub fn from_env() -> Self {
+        let cap = std::env::var("ENGRAM_PREVIEW_MAX_CONNS_PER_SESSION")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(256);
+        Self::new(cap)
+    }
+
+    /// Claim a slot for `session`. `Some(permit)` holds it until dropped
+    /// (released on every relay exit path); `None` means the session is at its
+    /// cap. The map entry is pruned when a session's last permit drops, so the
+    /// map only ever holds sessions with live previews.
+    pub fn try_acquire(self: &Arc<Self>, session: SessionId) -> Option<PreviewPermit> {
+        let sem = self
+            .per_session
+            .entry(session)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.cap)))
+            .value()
+            .clone();
+        let permit = sem.try_acquire_owned().ok()?;
+        Some(PreviewPermit {
+            limiter: Arc::clone(self),
+            session,
+            permit: Some(permit),
+        })
+    }
+}
+
+/// Held for the lifetime of one live preview connection; releases the slot on
+/// drop and prunes the session's map entry when it was the last one.
+pub struct PreviewPermit {
+    limiter: Arc<PreviewConnLimiter>,
+    session: SessionId,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for PreviewPermit {
+    fn drop(&mut self) {
+        // Release the slot FIRST so `available_permits` reflects this drop,
+        // THEN prune the entry iff no live previews remain for the session.
+        // `remove_if` is atomic per key: a concurrent `try_acquire` either
+        // keeps the entry (it holds a permit → predicate false) or re-creates a
+        // fresh one after removal — never a lost or double-counted slot.
+        drop(self.permit.take());
+        self.limiter.per_session.remove_if(&self.session, |_, sem| {
+            sem.available_permits() >= self.limiter.cap
+        });
+    }
+}
+
 pub struct AppState {
     pub cfg: CoordinatorConfig,
     pub services: Services,
@@ -616,6 +690,10 @@ pub struct AppState {
     /// lifetime on every replica). A miss loads + unseals from PG;
     /// cleared at terminal alongside the row.
     pub git_broker_tokens: Arc<dashmap::DashMap<SessionId, String>>,
+    /// ADR 0066: per-session, per-replica cap on concurrent live preview
+    /// (port-forward) connections. Kept here (not on `Services`) so the many
+    /// test `Services` literals don't need touching.
+    pub preview_conns: Arc<PreviewConnLimiter>,
     /// ADR 0056: the configured provider integrations (GitHub App, etc) —
     /// subsumes the old single `forge`. Set on `main`'s run path via
     /// `run_with_registry_and_local`; empty in tests and when `--git-forge`
@@ -679,6 +757,7 @@ impl AppState {
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
             pod_id: Arc::new(resolve_pod_id()),
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
+            preview_conns: Arc::new(PreviewConnLimiter::from_env()),
             integrations: crate::integrations::IntegrationBroker::new(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
         }
@@ -924,6 +1003,36 @@ pub(crate) mod tests {
         SessionEvent::Evicted {
             at: chrono::Utc::now(),
         }
+    }
+
+    /// ADR 0066: the preview-connection limiter caps per session, keeps
+    /// sessions independent, frees on release, and prunes idle entries.
+    #[test]
+    fn preview_limiter_caps_per_session_and_prunes() {
+        let lim = Arc::new(PreviewConnLimiter::new(2));
+        let s = SessionId::new();
+
+        let p1 = lim.try_acquire(s).expect("1st slot");
+        let p2 = lim.try_acquire(s).expect("2nd slot");
+        assert!(lim.try_acquire(s).is_none(), "3rd exceeds the cap of 2");
+
+        // A different session has its own independent cap.
+        assert!(
+            lim.try_acquire(SessionId::new()).is_some(),
+            "other session is independent",
+        );
+
+        // Releasing a slot frees capacity for the same session.
+        drop(p1);
+        let p3 = lim.try_acquire(s).expect("slot freed after release");
+
+        // Dropping a session's last permit prunes its map entry (no leak).
+        drop(p2);
+        drop(p3);
+        assert!(
+            !lim.per_session.contains_key(&s),
+            "idle session entry should be pruned",
+        );
     }
 
     #[test]

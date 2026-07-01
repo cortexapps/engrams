@@ -385,22 +385,33 @@ impl HostClient for LocalHostClient {
         sandbox_id: SandboxId,
         port: u16,
     ) -> Result<engram_core::types::port::PortTunnel, SandboxError> {
-        // ADR 0064: dial an arbitrary guest TCP port and bridge raw
-        // bytes through a PortTunnel pair. Same netns selection as
-        // `proxy_shell` (cold vs warm), but NO `start_shell` step — the
-        // service on `port` is a dev server the agent/user runs, not
-        // something the host spawns on demand. `vm_internal_ip` (not
-        // `guest_ip`) for the same reason as `proxy_shell`: the dial
-        // happens inside the per-VM netns, where the guest is at its
-        // in-VM eth0 IP, not the netns veth.
-        let guest_ip = self
-            .sandbox
-            .vm_internal_ip(sandbox_id)
-            .await
-            .ok_or_else(|| SandboxError::Vm("proxy_port: vm_internal_ip unavailable".into()))?;
-        let netns_name = self.sandbox.netns_name_for(sandbox_id).await;
         let (tunnel, ends) = engram_core::types::port::PortTunnel::pair();
-        crate::proxy_port::open_tcp_tunnel_at(guest_ip, port, netns_name, ends).await?;
+        // ADR 0066: FC (and, after its Phase 2 migration, VZ) reach the dev
+        // server through the in-guest agentd relay, which dials the guest's own
+        // `127.0.0.1` — reaching loopback-bound dev servers (Vite, the Tilt UI,
+        // `next dev`) that the old `guest_ip` dial can't. Backends with no vsock
+        // relay (Process; VZ until Phase 2) return `None` from
+        // `open_guest_stream`, and we dial the guest's reachable IP directly:
+        // Process => `127.0.0.1` (agentd is a host subprocess); VZ => the in-VM
+        // eth0 IP. Only FC ever had a per-VM netns, and FC now always takes the
+        // vsock path, so the direct path is netns-free.
+        match self
+            .sandbox
+            .open_guest_stream(sandbox_id, engram_harness_proto::PROXY_PORT_VSOCK_PORT)
+            .await?
+        {
+            Some(stream) => crate::proxy_port::open_vsock_tunnel_at(stream, port, ends).await?,
+            None => {
+                let guest_ip = self
+                    .sandbox
+                    .vm_internal_ip(sandbox_id)
+                    .await
+                    .ok_or_else(|| {
+                        SandboxError::Vm("proxy_port: vm_internal_ip unavailable".into())
+                    })?;
+                crate::proxy_port::open_tcp_tunnel_at(guest_ip, port, ends).await?;
+            }
+        }
         Ok(tunnel)
     }
 

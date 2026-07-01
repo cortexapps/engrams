@@ -651,6 +651,41 @@ pub enum UploadResponse {
     Error { message: String },
 }
 
+// ---- ADR 0066: port relay (host→guest) ---------------------------------
+//
+// Unlike the forge (1028) / upload (1029) bridges — guest→host dials by an
+// untrusted guest, so token-gated — the port relay is host→guest: the
+// host-agent dials the in-guest agentd on `PROXY_PORT_VSOCK_PORT`, sends one
+// [`RelayConnect`] frame naming the guest TCP port, reads one [`RelayAck`],
+// then the connection carries the raw dev-server bytes (no further framing).
+// agentd dials `127.0.0.1:target_port` INSIDE the guest — reaching loopback-
+// bound dev servers (Vite, Tilt, `next dev`) the host's `guest_ip` dial
+// cannot. One vsock connection per forwarded TCP connection (no muxing) →
+// no head-of-line blocking (ADR 0066).
+
+/// Vsock port the in-guest agentd relay listener binds (host→guest).
+/// Distinct from agentd exec (1024), harness (1026), agentd ready (1027),
+/// forge (1028), and upload (1029) so the guest can demux at accept time.
+pub const PROXY_PORT_VSOCK_PORT: u32 = 1030;
+
+/// First frame the host-agent sends on a relay connection: the guest TCP
+/// port to dial on `127.0.0.1`. [`read_msg`] consumes exactly this frame
+/// (via `read_exact`), so the raw byte stream that follows is untouched.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayConnect {
+    pub target_port: u16,
+}
+
+/// agentd's reply after attempting the `127.0.0.1:target_port` dial, sent
+/// before any bytes are spliced. `ok: false` (with `error`) lets the host
+/// surface "dev server unreachable" as a synchronous `proxy_port` error →
+/// a clean 502, preserving ADR 0064's fail-fast contract.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayAck {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
 // ---- Framing -----------------------------------------------------------
 
 /// Read one length-prefixed bincode frame. Mirrors

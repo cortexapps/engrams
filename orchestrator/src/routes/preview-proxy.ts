@@ -31,6 +31,7 @@ import net from "node:net";
 import { Duplex } from "node:stream";
 import type { Context, MiddlewareHandler } from "hono";
 import { create } from "@bufbuild/protobuf";
+import { ConnectError, Code } from "@connectrpc/connect";
 import {
   RelayPortRequestSchema,
   type RelayPortRequest,
@@ -255,6 +256,10 @@ function proxyHttp(
   const signal = c.req.raw.signal;
 
   return new Promise<Response>((resolve) => {
+    // Captured from the relay tunnel so the terminal error path can distinguish
+    // the coordinator's `resource_exhausted` (session at its preview-connection
+    // cap, ADR 0066) → 503, from a generic upstream failure → 502.
+    let tunnelError: unknown;
     const server = net.createServer((sock) => {
       // Exactly one connection per request — stop accepting immediately.
       server.close();
@@ -266,12 +271,13 @@ function proxyHttp(
         tunnel.destroy();
       };
       sock.on("error", tearDown);
-      tunnel.on("error", tearDown);
+      tunnel.on("error", (err) => {
+        tunnelError = err;
+        tearDown();
+      });
     });
 
-    server.on("error", () =>
-      resolve(new Response("preview proxy error", { status: 502 })),
-    );
+    server.on("error", () => resolve(previewErrorResponse(tunnelError)));
 
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
@@ -301,10 +307,24 @@ function proxyHttp(
         )
         .catch(() => {
           server.close();
-          resolve(new Response("preview upstream error", { status: 502 }));
+          resolve(previewErrorResponse(tunnelError));
         });
     });
   });
+}
+
+/**
+ * Map a relay-tunnel failure to an HTTP status. The coordinator returns
+ * `resource_exhausted` (ADR 0066) when a session is at its concurrent
+ * preview-connection cap — surface that as a **503** (retryable) rather than a
+ * generic **502**, so the browser/UI can distinguish "too many open previews"
+ * from "the guest server is down."
+ */
+function previewErrorResponse(err: unknown): Response {
+  if (err instanceof ConnectError && err.code === Code.ResourceExhausted) {
+    return new Response("too many concurrent preview connections", { status: 503 });
+  }
+  return new Response("preview upstream error", { status: 502 });
 }
 
 // ---------------------------------------------------------------------------

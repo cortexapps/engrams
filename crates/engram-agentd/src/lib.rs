@@ -19,6 +19,7 @@ pub mod clock;
 pub mod forge;
 pub mod handler;
 pub mod harness_supervisor;
+pub mod port_relay;
 pub mod proto;
 pub mod remount;
 pub mod share;
