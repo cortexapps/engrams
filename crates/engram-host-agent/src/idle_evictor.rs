@@ -116,6 +116,75 @@ pub fn disk_pressure_check(work_dir: &std::path::Path, floor_bytes: u64) -> (boo
     (allow, free)
 }
 
+/// Tier 1 (pressure-aware idle eviction): master switch, read from
+/// `ENGRAM_IDLE_EVICT_PRESSURE_AWARE`. **Default OFF** — when unset (or
+/// not `1`/`true`) the host nominates every soft-idle candidate exactly
+/// as it always has (TTL-only), so this ships dark and flips per-host via
+/// env with an instant rollback.
+///
+/// When ON, a *soft*-idle sandbox is only nominated for eviction while the
+/// host is under real memory pressure (see [`mem_pressure_check`]); *hard*-
+/// idle sandboxes and the coord's own hard-TTL backstop are unaffected.
+/// The rationale: eviction snapshots + destroys a warm VM to reclaim
+/// **RAM**, and on a host with abundant free memory that just trades an
+/// instant warm resume for a slow cold one with no density benefit — the
+/// exact churn ADR 0039 follow-up #20 already softened via the 5-min TTL.
+/// This makes the reclaim demand-driven instead of purely time-driven.
+pub fn pressure_aware_from_env() -> bool {
+    std::env::var("ENGRAM_IDLE_EVICT_PRESSURE_AWARE")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Default free-RAM floor (percent of `MemTotal`) below which soft-idle
+/// sandboxes become eligible for reclamation under pressure-aware mode.
+/// 15 % leaves generous headroom above OOM while still reclaiming before
+/// the host genuinely runs out — the 10 s evict tick then has room to
+/// shed the least-recently-active sessions.
+pub const DEFAULT_MEM_FLOOR_PCT: u8 = 15;
+
+/// Read `ENGRAM_IDLE_EVICT_MEM_FLOOR_PCT` — falls through to
+/// [`DEFAULT_MEM_FLOOR_PCT`]. Only consulted when
+/// [`pressure_aware_from_env`] is on.
+pub fn mem_floor_pct_from_env() -> u8 {
+    std::env::var("ENGRAM_IDLE_EVICT_MEM_FLOOR_PCT")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(DEFAULT_MEM_FLOOR_PCT)
+}
+
+/// Is the host under memory pressure? Eviction frees **RAM** (the disk
+/// floor above is an orthogonal *brake*, not this signal), so soft-idle
+/// reclamation should only fire when free RAM has dropped below the floor.
+/// Reads `MemTotal`/`MemAvailable` via [`crate::util::mem_mib`] (in-proc
+/// `/proc/meminfo`, no PG round-trip). Returns `(under_pressure, free_pct)`.
+///
+/// **Fails OPEN toward eviction**: if `MemTotal` reads as 0 (non-Linux, or
+/// a `/proc/meminfo` parse failure) we report `(true, None)` so a read
+/// error degrades pressure-aware mode back to today's TTL-only behavior
+/// rather than silently pinning soft-idle sessions resident forever —
+/// mirroring [`disk_pressure_check`]'s fail-open stance.
+pub fn mem_pressure_check(floor_pct: u8) -> (bool, Option<f32>) {
+    let (total_mib, used_mib) = crate::util::mem_mib();
+    mem_pressure_from(total_mib, used_mib, floor_pct)
+}
+
+/// Pure core of [`mem_pressure_check`], split out so the policy is unit-
+/// testable without a live `/proc/meminfo` (which differs by host and is
+/// `(0, 0)` on non-Linux). `total_mib == 0` (unreadable) fails open.
+pub(crate) fn mem_pressure_from(
+    total_mib: u64,
+    used_mib: u64,
+    floor_pct: u8,
+) -> (bool, Option<f32>) {
+    if total_mib == 0 {
+        return (true, None);
+    }
+    let free_mib = total_mib.saturating_sub(used_mib);
+    let free_pct = (free_mib as f32 / total_mib as f32) * 100.0;
+    (free_pct < f32::from(floor_pct), Some(free_pct))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +265,59 @@ mod tests {
         let (allow, free) = disk_pressure_check(dir.path(), u64::MAX);
         assert!(!allow, "must block when free < floor");
         assert!(free.unwrap() > 0, "but free reading still surfaces");
+    }
+
+    // ── Tier 1: pressure-aware idle eviction ────────────────────────────
+
+    /// Unreadable memory (`MemTotal == 0`: non-Linux or a parse failure)
+    /// fails OPEN toward eviction — `(under_pressure = true, None)` — so a
+    /// read error degrades to today's TTL-only behavior instead of pinning
+    /// soft-idle sessions resident forever. Mirrors the disk fail-open.
+    #[test]
+    fn mem_pressure_from_fails_open_when_total_unknown() {
+        let (under, pct) = mem_pressure_from(0, 0, 15);
+        assert!(under, "unreadable RAM must fail open toward eviction");
+        assert!(pct.is_none());
+    }
+
+    /// Abundant free RAM (well above the floor) → no pressure, so soft-idle
+    /// sandboxes stay resident. 64 GiB host, 26 GiB used ≈ 59 % free ≫ 15 %.
+    #[test]
+    fn mem_pressure_from_no_pressure_when_free_above_floor() {
+        let (under, pct) = mem_pressure_from(64_304, 26_456, 15);
+        assert!(!under, "59% free is not pressure at a 15% floor");
+        let p = pct.unwrap();
+        assert!((55.0..65.0).contains(&p), "free_pct ~59, got {p}");
+    }
+
+    /// Scarce free RAM (below the floor) → pressure, so soft-idle sandboxes
+    /// become reclaim candidates. 64 GiB host, 60 GiB used ≈ 6 % free < 15 %.
+    #[test]
+    fn mem_pressure_from_pressure_when_free_below_floor() {
+        let (under, pct) = mem_pressure_from(64_304, 60_000, 15);
+        assert!(under, "6% free is pressure at a 15% floor");
+        assert!(pct.unwrap() < 15.0);
+    }
+
+    /// A floor of 0 never reports pressure (free_pct is always ≥ 0) — a
+    /// clean off-switch equivalent to "reclaim only at the hard TTL".
+    #[test]
+    fn mem_pressure_from_floor_zero_never_pressures() {
+        let (under, _) = mem_pressure_from(64_304, 64_000, 0);
+        assert!(!under, "floor 0 must never pressure");
+    }
+
+    /// Without an env override, the master switch defaults OFF (historical
+    /// TTL-only behavior) and the floor defaults to
+    /// [`DEFAULT_MEM_FLOOR_PCT`]. Skips if the shell sets the vars, keeping
+    /// the test race-free (never mutates process-global env).
+    #[test]
+    fn pressure_env_defaults_off_and_floor_default() {
+        if std::env::var("ENGRAM_IDLE_EVICT_PRESSURE_AWARE").is_err() {
+            assert!(!pressure_aware_from_env(), "must default OFF");
+        }
+        if std::env::var("ENGRAM_IDLE_EVICT_MEM_FLOOR_PCT").is_err() {
+            assert_eq!(mem_floor_pct_from_env(), DEFAULT_MEM_FLOOR_PCT);
+        }
     }
 }

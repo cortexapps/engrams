@@ -1261,6 +1261,13 @@ impl HostAgent {
             // future leak class we haven't anticipated.
             let eviction_work_dir = self.cfg.work_dir.clone();
             let eviction_floor_bytes = idle_evictor::disk_floor_bytes_from_env();
+            // Tier 1 (pressure-aware idle eviction): default-off. When on,
+            // soft-idle sandboxes are only nominated under real memory
+            // pressure (< mem floor % free) — a warm VM stays resident on
+            // a host with RAM to spare instead of paying snapshot+cold-
+            // resume churn. Hard-idle sandboxes always proceed.
+            let eviction_pressure_aware = idle_evictor::pressure_aware_from_env();
+            let eviction_mem_floor_pct = idle_evictor::mem_floor_pct_from_env();
             let eviction_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(idle_evictor::DEFAULT_POLL_INTERVAL);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1330,14 +1337,48 @@ impl HostAgent {
                     // The session lease blocks the pipeline anyway;
                     // this keeps the nominations (and the lease-handoff
                     // race window) out entirely.
-                    pairs.retain(|(_, sb)| eviction_pooled.migration_role(*sb).is_none());
+                    pairs.retain(|(_, sb, _)| eviction_pooled.migration_role(*sb).is_none());
+                    // Tier 1 (pressure-aware idle eviction): with the mode
+                    // on and the host NOT under memory pressure, drop the
+                    // `Soft` candidates — keep the warm VMs resident and
+                    // let a live human resume instantly instead of paying a
+                    // cold restore. `Hard` candidates (the never-emits-Idle
+                    // backstop) always survive, and the coord's own hard-TTL
+                    // backstop remains the absolute residency ceiling. When
+                    // the mode is off this whole block is skipped, so the
+                    // nomination set is byte-identical to the historical
+                    // TTL-only behavior.
+                    if eviction_pressure_aware {
+                        let (under_pressure, free_pct) =
+                            idle_evictor::mem_pressure_check(eviction_mem_floor_pct);
+                        if let Some(pct) = free_pct {
+                            ::metrics::gauge!(crate::metrics::HOST_MEM_FREE_PCT)
+                                .set(f64::from(pct));
+                        }
+                        if !under_pressure {
+                            let before = pairs.len();
+                            pairs.retain(|(_, _, kind)| *kind == crate::harness::IdleKind::Hard);
+                            let kept = before - pairs.len();
+                            if kept > 0 {
+                                ::metrics::counter!(crate::metrics::IDLE_EVICT_KEPT_RESIDENT_TOTAL)
+                                    .increment(kept as u64);
+                                tracing::debug!(
+                                    host_id = %host_id,
+                                    kept,
+                                    free_pct = ?free_pct,
+                                    floor_pct = eviction_mem_floor_pct,
+                                    "idle-evict: kept soft-idle sandboxes resident (no memory pressure)",
+                                );
+                            }
+                        }
+                    }
                     if pairs.is_empty() {
                         continue;
                     }
-                    let sandbox_ids: Vec<SandboxId> = pairs.iter().map(|(_, sb)| *sb).collect();
+                    let sandbox_ids: Vec<SandboxId> = pairs.iter().map(|(_, sb, _)| *sb).collect();
                     let candidates: Vec<coord_client::IdleCandidate> = pairs
                         .into_iter()
-                        .map(|(session_id, sandbox_id)| coord_client::IdleCandidate {
+                        .map(|(session_id, sandbox_id, _)| coord_client::IdleCandidate {
                             session_id,
                             sandbox_id,
                             idle_since: None,

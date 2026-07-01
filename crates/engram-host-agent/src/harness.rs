@@ -74,6 +74,23 @@ const SEND_PROMPT_ATTACH_WAIT_SECS: u64 = 10;
 /// idle eviction shouldn't stall on a stuck agent.
 pub const IDLE_DRAIN_GRACE_SECS: u32 = 10;
 
+/// Why a sandbox is an idle-eviction candidate this tick.
+///
+/// The soft path fires on `last_idle_at` (the adapter emitted `Idle` and
+/// stayed quiet past the soft TTL) — an ordinary think-pause candidate.
+/// The hard path fires on `last_event_at` (the sandbox went fully silent
+/// past the hard TTL) — the backstop for adapters that never emit `Idle`.
+/// [`crate::idle_evictor`]'s pressure-aware gate uses this: a `Soft`
+/// candidate is only reclaimed under real memory pressure, while a `Hard`
+/// candidate is always nominated (`Hard` wins when both fire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleKind {
+    /// Idle past the soft TTL — a reclaim candidate only under memory pressure.
+    Soft,
+    /// Silent past the hard TTL — always nominated (the never-emits-`Idle` backstop).
+    Hard,
+}
+
 /// Slack added on top of [`IDLE_DRAIN_GRACE_SECS`] when waiting for the
 /// harness's vsock connection to drop after a drain — covers the harness
 /// reap + process exit + the host reader-loop observing EOF and tearing
@@ -800,7 +817,7 @@ impl HarnessHub {
         &self,
         soft_ttl: std::time::Duration,
         hard_ttl: std::time::Duration,
-    ) -> Vec<(SessionId, SandboxId)> {
+    ) -> Vec<(SessionId, SandboxId, IdleKind)> {
         let now = Utc::now();
         let soft_cutoff = now
             - chrono::Duration::from_std(soft_ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
@@ -837,8 +854,12 @@ impl HarnessHub {
                 .get(sandbox_id)
                 .map(|at| *at <= hard_cutoff)
                 .unwrap_or(false);
-            if soft || hard {
-                out.push((handle.session_id, *sandbox_id));
+            // `Hard` wins when both fire: a silent-past-hard-TTL session
+            // must be nominated regardless of memory pressure.
+            if hard {
+                out.push((handle.session_id, *sandbox_id, IdleKind::Hard));
+            } else if soft {
+                out.push((handle.session_id, *sandbox_id, IdleKind::Soft));
             }
         }
         out
@@ -1844,6 +1865,52 @@ mod tests {
         assert_eq!(aged.len(), 1);
         assert_eq!(aged[0].0, session_id);
         assert_eq!(aged[0].1, sandbox_id);
+    }
+
+    /// Tier 1 (pressure-aware idle eviction): the pressure gate must tell a
+    /// soft-idle candidate (reclaim only under memory pressure) from a
+    /// hard-idle one (always nominated — the never-emits-`Idle` backstop),
+    /// and `Hard` must win when both TTLs have fired.
+    #[tokio::test]
+    async fn idle_sandboxes_classifies_soft_vs_hard() {
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        let _harness_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(harness_side);
+            write_msg(
+                &mut hw,
+                &HarnessAttach {
+                    session_id,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
+            write_msg(&mut hw, &HarnessFrame::Event(HarnessEvent::Idle))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        assert!(
+            wait_until(|| hub.last_event_at(sandbox_id).is_some()).await,
+            "Idle event should reach the hub",
+        );
+
+        // Soft TTL fired, hard TTL far in the future → `Soft`.
+        let soft = hub.idle_sandboxes(Duration::from_millis(0), Duration::from_secs(3600));
+        assert_eq!(soft.len(), 1);
+        assert_eq!(soft[0].2, IdleKind::Soft);
+
+        // Both TTLs fired (zero hard TTL) → `Hard` wins.
+        let hard = hub.idle_sandboxes(Duration::from_millis(0), Duration::from_millis(0));
+        assert_eq!(hard.len(), 1);
+        assert_eq!(hard[0].2, IdleKind::Hard, "Hard wins when both fire");
     }
 
     #[tokio::test]

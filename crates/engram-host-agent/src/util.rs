@@ -106,7 +106,7 @@ fn disk_mib(path: &Path) -> (u64, u64) {
 /// — the kernel's own estimate of memory the workload can't reclaim.
 /// `(0, 0)` on non-Linux or any parse failure.
 #[cfg(target_os = "linux")]
-fn mem_mib() -> (u64, u64) {
+pub(crate) fn mem_mib() -> (u64, u64) {
     let text = match std::fs::read_to_string("/proc/meminfo") {
         Ok(t) => t,
         Err(_) => return (0, 0),
@@ -126,7 +126,7 @@ fn mem_mib() -> (u64, u64) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn mem_mib() -> (u64, u64) {
+pub(crate) fn mem_mib() -> (u64, u64) {
     (0, 0)
 }
 
