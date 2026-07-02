@@ -54,6 +54,11 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         }),
         _ => None,
     };
+    // Issue #535 (b): migration 0077's TEXT[] NOT NULL DEFAULT '{}' column.
+    // Missing-column-tolerant (defaults empty) so a SELECT that doesn't
+    // project it (e.g. `list_evacuating_sessions`/`list_evicting_sessions`,
+    // which don't need it) still decodes.
+    let selected_skills: Vec<String> = row.try_get("selected_skills").unwrap_or_default();
     Ok(Session {
         id: SessionId(id),
         status: parse_session_state(&status)?,
@@ -64,6 +69,7 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         created_at,
         last_active_at,
         live_disk_manifest,
+        selected_skills,
     })
 }
 

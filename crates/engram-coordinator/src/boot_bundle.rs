@@ -269,16 +269,24 @@ mod tests {
         ) -> Result<engram_core::types::Session, MetaError> {
             unimplemented!()
         }
-        async fn list_active_sessions(&self) -> Result<Vec<engram_core::types::Session>, MetaError> {
+        async fn list_active_sessions(
+            &self,
+        ) -> Result<Vec<engram_core::types::Session>, MetaError> {
             unimplemented!()
         }
-        async fn create_session_created(
+        async fn transition_session_created(
             &self,
             _: engram_core::SessionId,
-            _: engram_core::types::SessionSpec,
-            _: HostId,
             _: engram_core::SandboxId,
         ) -> Result<(), MetaError> {
+            unimplemented!()
+        }
+        async fn reserve_and_persist_create(
+            &self,
+            _: engram_core::traits::SessionCreateWriteSet,
+            _: &[HostId],
+            _: usize,
+        ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
             unimplemented!()
         }
         async fn transition_session(

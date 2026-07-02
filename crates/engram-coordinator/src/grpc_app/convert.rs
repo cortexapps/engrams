@@ -40,6 +40,7 @@ pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session 
         created_at,
         last_active_at,
         live_disk_manifest: _, // Internal coord state (ADR 0016 Phase B); not on the wire shape.
+        selected_skills: _,    // Internal coord state (issue #535); not on the wire shape.
     } = s;
     app::Session {
         id: id.to_string(),
@@ -746,6 +747,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         }
     }
 

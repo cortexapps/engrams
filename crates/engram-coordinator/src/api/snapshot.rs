@@ -2280,6 +2280,7 @@ mod evicting_gate_tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         }
     }
 
@@ -2559,6 +2560,7 @@ mod evicting_gate_tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         }
     }
 

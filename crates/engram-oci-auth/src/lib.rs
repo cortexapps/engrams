@@ -207,13 +207,19 @@ mod tests {
         async fn create_session(&self, _: SessionSpec) -> Result<SessionId, MetaError> {
             unreachable!()
         }
-        async fn create_session_created(
+        async fn transition_session_created(
             &self,
             _: SessionId,
-            _: SessionSpec,
-            _: engram_core::HostId,
             _: engram_core::SandboxId,
         ) -> Result<(), MetaError> {
+            unreachable!()
+        }
+        async fn reserve_and_persist_create(
+            &self,
+            _: engram_core::traits::SessionCreateWriteSet,
+            _: &[engram_core::HostId],
+            _: usize,
+        ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
             unreachable!()
         }
         async fn get_session(&self, _: SessionId) -> Result<Session, MetaError> {

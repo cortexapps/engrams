@@ -187,14 +187,18 @@ fn short_hash(s: &str) -> String {
     format!("{:08x}", h.finish() & 0xffff_ffff)
 }
 
-/// Seal the per-request `secrets` overrides under the deployment KEK
-/// and persist them keyed by `session_id`. Plaintext is JSON-encoded.
-/// Caller is expected to have validated `overrides` is non-empty.
-pub(crate) async fn persist_session_secrets(
+/// Seal the per-request `secrets` overrides under the deployment KEK —
+/// PURE crypto, no PG write. Issue #535 (b): the async KEK seal has no
+/// place inside `reserve_and_persist_create`'s DB transaction, so it
+/// happens here, BEFORE that call, and the sealed row rides
+/// `SessionCreateWriteSet::sealed_secrets` into the transaction instead of
+/// a separate post-insert `upsert_session_secrets` write. Caller is
+/// expected to have validated `overrides` is non-empty.
+pub(crate) async fn seal_session_secrets(
     state: &SharedState,
     session_id: SessionId,
     overrides: &HashMap<String, String>,
-) -> Result<(), ApiError> {
+) -> Result<engram_core::types::registry::SessionSecrets, ApiError> {
     let plaintext = serde_json::to_vec(overrides)
         .map_err(|e| ApiError::Internal(format!("serialize session secrets: {e}")))?;
     let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
@@ -202,16 +206,14 @@ pub(crate) async fn persist_session_secrets(
         .seal(&plaintext)
         .await
         .map_err(|e| ApiError::Internal(format!("seal session secrets: {e}")))?;
-    let row = engram_core::types::registry::SessionSecrets {
+    Ok(engram_core::types::registry::SessionSecrets {
         session_id,
         wrapped_dek: sealed.wrapped_dek,
         nonce: sealed.nonce.to_vec(),
         ciphertext: sealed.ciphertext,
         key_id: sealed.key_id,
         created_at: chrono::Utc::now(),
-    };
-    state.services.meta.upsert_session_secrets(row).await?;
-    Ok(())
+    })
 }
 
 /// Material returned by [`resume_manifest_bundle`] — everything the
@@ -623,11 +625,20 @@ pub(crate) async fn create_session_core(
     result
 }
 
-/// The shared reserve → queue-or-boot → detached-disposition path. Both
-/// create entry points (axum + gRPC) hand it a fully-resolved
+/// The shared reserve-and-persist → queue-or-boot → detached-disposition
+/// path. Both create entry points (axum + gRPC) hand it a fully-resolved
 /// [`PreparedBoot`]; the hardening (ADR 0046 best-fit reservation, ADR 0048
 /// queue-on-no-capacity, issue #210 boot detachment, panic backstop) lives
 /// here once.
+///
+/// Issue #535 (b): `reserve_and_persist_create` commits the ENTIRE write-set
+/// — the row (placed or queued) plus every satellite (secrets, capabilities,
+/// integration policy, harness, selected skills) — in ONE transaction,
+/// before any host RPC. The FK-ordering bug class (a satellite write that
+/// silently no-ops because the row doesn't exist yet — the ADR 0051
+/// forge-token regression) is dead by construction: nothing downstream of
+/// this call can observe a partially-written session, so `boot_on_reserved_
+/// host` no longer does ANY satellite writes of its own.
 async fn boot_prepared(
     state: &SharedState,
     prepared: crate::session_boot::PreparedBoot,
@@ -642,7 +653,10 @@ async fn boot_prepared(
     let session_id = inputs.session_id;
     let base_snapshot_id = inputs.base_snapshot_id;
 
-    // -------- Reserve a host (ADR 0046 best-fit, ADR 0048 2D) --------
+    // -------- Candidates (ADR 0046 best-fit, ADR 0048 2D) --------
+    // Issue #535 (a) "conscious divergence": kept as its own scan (unlike the
+    // manifest/fleet-catalog reads folded into the boot bundle) — placement
+    // needs a heartbeat-fresh host view, not a cached one.
     let ctx = crate::placement::ScheduleContext {
         repo: &image_repo,
         image_version: &image_tag,
@@ -656,27 +670,73 @@ async fn boot_prepared(
     let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
         .await
         .map_err(engram_core::SandboxError::from)?;
-    let host_id = match state
+
+    // -------- Seal secrets + serialize the policy BEFORE the transaction --------
+    // Issue #535 (b): the KEK seal is async crypto with no place inside a DB
+    // transaction — do it here, once, and hand the SEALED row (not the
+    // plaintext) to `reserve_and_persist_create`.
+    let sealed_secrets = match inputs.deferred_session_secrets.as_ref() {
+        Some(overrides) => Some(seal_session_secrets(state, session_id, overrides).await?),
+        None => None,
+    };
+    let integration_policy_json = match inputs.integration_policy.as_ref() {
+        Some(policy) => Some(
+            serde_json::to_string(policy)
+                .map_err(|e| ApiError::Internal(format!("serialize integration policy: {e}")))?,
+        ),
+        None => None,
+    };
+
+    let write_set = engram_core::traits::SessionCreateWriteSet {
+        session_id,
+        spec: inputs.spec.clone(),
+        mem_budget_mib: memory_mib as i64,
+        cpu_budget_vcpus: cpu_budget_vcpus as i32,
+        sealed_secrets,
+        capabilities: inputs.capabilities.clone(),
+        integration_policy_json,
+        selected_harness: inputs.selected_harness.clone(),
+        selected_skills: inputs.selected_skills.clone(),
+        queue_prompt: inputs.prompt.clone(),
+    };
+
+    let disposition = state
         .services
         .meta
-        .reserve_placement(
-            session_id,
-            &inputs.spec,
-            memory_mib as i64,
-            cpu_budget_vcpus as i32,
-            &candidates.hosts,
-            candidates.affinity_len,
-        )
+        .reserve_and_persist_create(write_set, &candidates.hosts, candidates.affinity_len)
         .await
-        .map_err(|e| ApiError::Internal(format!("reserve_placement: {e}")))?
-    {
-        Some(h) => h,
-        // ADR 0048: no host fits → QUEUE (FIFO) instead of 503. The queue
-        // scanner re-attempts placement as capacity frees / the fleet
-        // scales up, and drives the same boot path once a host fits.
-        None => {
-            return enqueue_create(state, inputs, &image_tag).await;
+        .map_err(|e| ApiError::Internal(format!("reserve_and_persist_create: {e}")))?;
+
+    let host_id = match disposition {
+        // ADR 0048: no host fits → QUEUE (FIFO) instead of 503 — the row +
+        // every satellite already committed above, so there is nothing left
+        // to persist here; just tell the caller. The queue scanner
+        // re-attempts placement as capacity frees / the fleet scales up, and
+        // drives the same boot path (`prepare_from_row` → `boot_on_reserved_
+        // host`) once a host fits.
+        engram_core::traits::CreateDisposition::Queued => {
+            if let Err(e) = state
+                .emit(
+                    session_id,
+                    SessionEvent::StatusChanged {
+                        from: SessionState::Pending,
+                        to: SessionState::Queued,
+                        at: chrono::Utc::now(),
+                    },
+                )
+                .await
+            {
+                tracing::warn!(%session_id, error = %e, "emit pending→queued failed; continuing");
+            }
+            tracing::info!(%session_id, "no capacity — session queued for placement (ADR 0048)");
+            return Ok(CreateSessionResponse {
+                session_id,
+                status: SessionState::Queued.as_str(),
+                image_version: image_tag,
+                kind: "queued",
+            });
         }
+        engram_core::traits::CreateDisposition::Placed(host_id) => host_id,
     };
 
     // -------- Boot on the reserved host --------
@@ -684,13 +744,13 @@ async fn boot_prepared(
     // Issue #210: DETACH the boot pipeline from the cancellable request
     // future. `boot_on_reserved_host` makes a LIVE sandbox in
     // `restore_base_on_host` (session_boot.rs) and only later records it via
-    // `create_session_created`; the compensating `host.destroy` runs solely
-    // on the row-insert `Err` arm, never on a dropped future. Awaited INLINE,
-    // a client disconnect between the restore and the insert (a slow restore,
-    // up to a 240s deadline) drops the future: a running sandbox is left with
-    // no recorded binding AND the disposition below — which releases the
-    // `pending` reservation / fails the session — never runs, so the reserved
-    // capacity stays pinned too.
+    // `transition_session_created`; the compensating `host.destroy` runs
+    // solely on that update's `Err` arm, never on a dropped future. Awaited
+    // INLINE, a client disconnect between the restore and the update (a slow
+    // restore, up to a 240s deadline) drops the future: a running sandbox is
+    // left with no recorded binding AND the disposition below — which
+    // releases the `pending` reservation / fails the session — never runs,
+    // so the reserved capacity stays pinned too.
     //
     // Mirror the resume lane (and ADR 0034 / the #208 teleport detachment):
     // run the boot AND its full disposition in a `tokio::spawn`ed task so the
@@ -702,10 +762,10 @@ async fn boot_prepared(
         match crate::session_boot::boot_on_reserved_host(&st, inputs, host_id).await {
             Ok(()) => Ok(()),
             Err(crate::session_boot::BootError::NotStarted(e)) => {
-                // The sandbox never came up (or was torn down on the insert
-                // failure); release the reservation row so the host's free
-                // capacity is restored at once (reconcile would also reap it).
-                // No Failed transition — nothing usable ever existed.
+                // The sandbox never came up; release the reservation row so
+                // the host's free capacity is restored at once (reconcile
+                // would also reap it). No Failed transition — nothing usable
+                // ever existed.
                 if let Err(de) = st.services.meta.delete_pending_session(session_id).await {
                     tracing::warn!(%session_id, error = %de,
                         "delete_pending_session after boot failure failed; reconcile will reap");
@@ -740,101 +800,6 @@ async fn boot_prepared(
         // ADR 0020: every session is a base-snapshot restore now.
         kind: "restored",
     })
-}
-
-/// ADR 0048: enqueue a create that found no capacity. INSERTs the row at
-/// `queued` (carrying the budgets + prompt the scanner reconstructs from),
-/// seals any per-request secret overrides now the FK is satisfiable, emits
-/// `Pending → Queued`, and returns 201 `{status:"queued"}`. The handler
-/// NEVER blocks — the `queue_scanner` owns the continuation.
-async fn enqueue_create(
-    state: &SharedState,
-    inputs: crate::session_boot::BootInputs,
-    image_tag: &str,
-) -> Result<CreateSessionResponse, ApiError> {
-    let session_id = inputs.session_id;
-    state
-        .services
-        .meta
-        .enqueue_session_create(
-            session_id,
-            &inputs.spec,
-            // The budgets the scanner will reserve with — same values create
-            // computed, so the queued demand signal is exact.
-            resolved_budget_mib(&inputs),
-            resolved_budget_vcpus(&inputs),
-            inputs.prompt.as_deref(),
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("enqueue_session_create: {e}")))?;
-    // Seal per-request overrides now the row (FK target) exists.
-    if let Some(overrides) = inputs.deferred_session_secrets.as_ref() {
-        if let Err(e) = persist_session_secrets(state, session_id, overrides).await {
-            tracing::warn!(%session_id, error = %e,
-                "queued session secrets persist failed; resume/boot will lose overrides");
-        }
-    }
-    // ADR 0056: bind capabilities now the FK target exists, so they're durable
-    // while queued — the scanner's boot re-prepare carries an empty set and the
-    // boot-path bind is a no-op (it won't clobber these).
-    if let Err(e) = state
-        .services
-        .meta
-        .bind_session_capabilities(session_id, &inputs.capabilities)
-        .await
-    {
-        tracing::warn!(%session_id, error = %e,
-            "queued session capabilities bind failed; the broker will see none on boot");
-    }
-    // ADR 0056 (B′): persist the integration policy now the FK target exists, so
-    // the scanner's boot re-prepare (prepare_from_row) reads it back and injects.
-    crate::session_boot::persist_integration_policy(
-        state,
-        session_id,
-        inputs.integration_policy.as_ref(),
-    )
-    .await;
-    // ADR 0062: persist the selected harness now the FK target exists, so the
-    // scanner's boot re-prepare (prepare_from_row) reconstructs it.
-    if let Err(e) = state
-        .services
-        .meta
-        .set_session_harness(session_id, inputs.selected_harness.as_deref())
-        .await
-    {
-        tracing::warn!(%session_id, error = %e,
-            "queued session harness persist failed; the scanner's boot won't find it");
-    }
-    if let Err(e) = state
-        .emit(
-            session_id,
-            SessionEvent::StatusChanged {
-                from: SessionState::Pending,
-                to: SessionState::Queued,
-                at: chrono::Utc::now(),
-            },
-        )
-        .await
-    {
-        tracing::warn!(%session_id, error = %e, "emit pending→queued failed; continuing");
-    }
-    tracing::info!(%session_id, "no capacity — session queued for placement (ADR 0048)");
-    Ok(CreateSessionResponse {
-        session_id,
-        status: SessionState::Queued.as_str(),
-        image_version: image_tag.to_string(),
-        kind: "queued",
-    })
-}
-
-/// The session's memory budget, recovered from the env baked into
-/// `BootInputs` (it isn't stored separately — `resolved_memory_mib`
-/// is the source of truth, recomputed identically by the scanner).
-fn resolved_budget_mib(inputs: &crate::session_boot::BootInputs) -> i64 {
-    inputs.memory_mib as i64
-}
-fn resolved_budget_vcpus(inputs: &crate::session_boot::BootInputs) -> i32 {
-    inputs.cpu_budget_vcpus as i32
 }
 
 /// ADR 0051: resolve a session's boot inputs for the app-gRPC create. The
@@ -935,13 +900,18 @@ pub(crate) async fn prepare_from_row(
         overrides,
         session.id,
         bundle,
-        // ADR 0055 TODO(P1-D): queued sessions don't yet carry dynamic mounts
-        // (they'd need persisting in the queue row); the scanner boots them
-        // with base skills only.
-        Vec::new(),
+        // Issue #535 (b): fixes the ADR 0055 TODO(P1-D) gap — `selected_skills`
+        // is now persisted at create/enqueue time (`reserve_and_persist_
+        // create`), so the re-prepare reconstructs the actual selection
+        // instead of dropping to base skills. Re-resolved against the
+        // (possibly newer) fleet catalog below — the sha may have rolled
+        // while queued, which is the correct semantic.
+        session.selected_skills.clone(),
         // ADR 0056: a queued session's capabilities were already bound to
-        // `session_capabilities` at enqueue (the row existed); the re-prepare
-        // carries an empty set so the boot-path bind is a no-op, preserving them.
+        // `session_capabilities` at create/enqueue (issue #535 (b): now in
+        // the SAME transaction as the row); the re-prepare carries an empty
+        // set purely because `capabilities` is no longer read by the boot
+        // pipeline at all (see `BootInputs::capabilities` docs).
         Vec::new(),
         // ADR 0056 (B′): the integration policy persisted at create/enqueue,
         // re-read above so the queued boot re-injects on the new host.
@@ -1246,13 +1216,12 @@ async fn prepare_inner(
             egress_secrets,
             network,
             selected_mounts,
+            selected_skills,
             capabilities,
             integration_policy,
             selected_harness,
             deferred_session_secrets,
             prompt: prompt.filter(|s| !s.is_empty()),
-            memory_mib,
-            cpu_budget_vcpus,
         },
         memory_mib,
         cpu_budget_vcpus,

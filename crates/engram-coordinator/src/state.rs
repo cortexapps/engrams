@@ -1414,14 +1414,20 @@ pub(crate) mod tests {
         ) -> Result<engram_core::SessionId, MetaError> {
             unreachable!("create_session not used in state tests")
         }
-        async fn create_session_created(
+        async fn transition_session_created(
             &self,
             _: engram_core::SessionId,
-            _: SessionSpec,
-            _: engram_core::HostId,
             _: engram_core::SandboxId,
         ) -> Result<(), MetaError> {
-            unreachable!("create_session_created not used in state tests")
+            unreachable!("transition_session_created not used in state tests")
+        }
+        async fn reserve_and_persist_create(
+            &self,
+            _: engram_core::traits::SessionCreateWriteSet,
+            _: &[engram_core::HostId],
+            _: usize,
+        ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
+            unreachable!("reserve_and_persist_create not used in state tests")
         }
         async fn get_session(&self, id: engram_core::SessionId) -> Result<Session, MetaError> {
             let s = self.session.lock();
@@ -1939,6 +1945,7 @@ pub(crate) mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
@@ -2000,6 +2007,7 @@ pub(crate) mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         (session_id, Arc::new(MiniMeta::new(session)))
     }

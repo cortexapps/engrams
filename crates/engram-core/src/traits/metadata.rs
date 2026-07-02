@@ -35,6 +35,47 @@ pub enum DisableEnabledImageOutcome {
     Blocked(Vec<(SessionId, String)>),
 }
 
+/// Issue #535 (b): the durable write-set for a new session — one logical
+/// fact ("this session exists with these secrets/capabilities/policy/
+/// harness/skills") passed to [`MetadataStore::reserve_and_persist_create`]
+/// to commit in a single transaction, before any host RPC.
+#[derive(Clone, Debug)]
+pub struct SessionCreateWriteSet {
+    pub session_id: SessionId,
+    pub spec: SessionSpec,
+    pub mem_budget_mib: i64,
+    pub cpu_budget_vcpus: i32,
+    /// KEK-sealed BEFORE this call — async crypto has no place inside a DB
+    /// transaction. `None` when there are no per-request secret overrides.
+    pub sealed_secrets: Option<SessionSecrets>,
+    /// ADR 0056: profile-granted capabilities, already parsed + validated.
+    pub capabilities: Vec<Capability>,
+    /// ADR 0056 (B′): the compiled integration policy, pre-serialized to
+    /// JSON (mirrors `bind_session_integration_policy`'s wire shape).
+    pub integration_policy_json: Option<String>,
+    /// ADR 0062: the selected harness catalog key.
+    pub selected_harness: Option<String>,
+    /// ADR 0055 TODO(P1-D) fix: the profile-selected skill names, persisted
+    /// so a queued create's boot re-prepare (`prepare_from_row`) can
+    /// reconstruct the selection instead of silently dropping it.
+    pub selected_skills: Vec<String>,
+    /// The durable prompt for the queued/wire delivery path
+    /// (`sessions.queue_prompt`) — populated for BOTH dispositions now, so
+    /// a `Queued` outcome needs no second write to carry it.
+    pub queue_prompt: Option<String>,
+}
+
+/// Outcome of [`MetadataStore::reserve_and_persist_create`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateDisposition {
+    /// A candidate host fit both budgets; the row is `pending` on this
+    /// host, ready for `boot_on_reserved_host`.
+    Placed(HostId),
+    /// No candidate fit; the row is `queued` for the scanner, carrying the
+    /// identical satellites its later re-prepare will find.
+    Queued,
+}
+
 /// Track A: an `Active` session the desync watchdog flagged as wedged —
 /// the harness event stream desynced from the run state machine, leaving
 /// the session stuck without reaching a clean idle resting state.
@@ -101,11 +142,15 @@ pub trait MetadataStore: Send + Sync {
     /// reason we don't do that today: SessionSpec doesn't carry
     /// vm_spec / harness resolution context, and capturing it
     /// requires schema work that's bigger than the v1 fix.
-    async fn create_session_created(
+    ///
+    /// Issue #535 (c): flip an already-`pending` row (committed by
+    /// [`MetadataStore::reserve_and_persist_create`] before any host RPC
+    /// ran) to `Created`, binding `sandbox_id`. Replaces the old
+    /// `create_session_created`'s INSERT-or-UPDATE upsert — the row is now
+    /// GUARANTEED to already exist, so this is a single `UPDATE`.
+    async fn transition_session_created(
         &self,
         session_id: SessionId,
-        spec: SessionSpec,
-        host_id: HostId,
         sandbox_id: SandboxId,
     ) -> Result<(), MetaError>;
 
@@ -132,28 +177,51 @@ pub trait MetadataStore: Send + Sync {
         Ok(0)
     }
 
-    /// ADR 0046/0048: atomically pick a host from `candidates` (ranked — the
-    /// affinity/readiness order) and reserve BOTH `mem_budget_mib` and
-    /// `cpu_budget_vcpus` on it, returning the chosen host, or `None` when no
-    /// candidate fits both dimensions (RAM: `allocatable − reserved`; CPU:
-    /// `total_vcpus × overcommit − reserved`). The Postgres impl runs under
-    /// `SELECT … FROM hosts … FOR UPDATE` so concurrent placers (any
-    /// coordinator replica) serialize and a burst can't overcommit; it inserts
-    /// a `pending`, sandbox-less session row as the reservation — later
-    /// finalized by `create_session_created` (an upsert) after boot, or
-    /// released by `delete_pending_session` on boot failure. Default impl (mock
-    /// stores) just returns the first candidate, no capacity check or row insert.
-    async fn reserve_placement(
+    /// Issue #535 (b): the ENTIRE session write-set — one logical fact
+    /// ("this session exists with these secrets/capabilities/policy/
+    /// harness/skills") — committed in ONE transaction, before any host RPC.
+    /// Subsumes the old `reserve_placement` (ADR 0046/0048 atomic pick-a-
+    /// host-from-`candidates` + reserve both `mem_budget_mib` and
+    /// `cpu_budget_vcpus`, RAM: `allocatable − reserved`, CPU: `total_vcpus
+    /// × overcommit − reserved`) AND `enqueue_session_create` (the no-
+    /// capacity fallback) AND the satellite writes both the boot path and
+    /// the enqueue path used to make SEPARATELY, after the row already
+    /// existed, each individually warn-and-continue: `persist_session_
+    /// secrets`, `bind_session_capabilities`, `bind_session_integration_
+    /// policy`, `set_session_harness`.
+    ///
+    /// Returns [`CreateDisposition::Placed`] (a candidate fit — the row is
+    /// `pending` on that host, ready for `boot_on_reserved_host`) or
+    /// [`CreateDisposition::Queued`] (none fit — the row is `queued` for the
+    /// scanner, carrying the identical satellites so its later re-prepare
+    /// finds them). The FK-ordering bug class (minting a broker token or
+    /// binding a capability before the row exists silently no-ops — the
+    /// ADR 0051 forge-token regression) is dead by construction: nothing
+    /// downstream of this call can observe a partially-written session.
+    ///
+    /// The Postgres impl extends `reserve_placement`'s `FOR UPDATE`
+    /// transaction (concurrent placers, any replica, serialize on the
+    /// candidate host rows) to also insert the satellite rows in the SAME
+    /// transaction. The KEK seal (async crypto) and any external credential
+    /// mint are NOT this call's concern — they happen before
+    /// (`ws.sealed_secrets` arrives pre-sealed) or after (broker-token mint,
+    /// deferred to the boot pipeline where the FK is already satisfiable).
+    ///
+    /// No default: unlike the old `reserve_placement`'s "just pick a
+    /// candidate, don't reserve anything" fallback, this call's job now
+    /// includes the row insert — there's no harmless no-op shape for that
+    /// (mirrors why the old `create_session_created` it partly replaces was
+    /// also required). Every `MetadataStore` impl must decide honestly: a
+    /// mock that never exercises the create path can `unreachable!()`, like
+    /// it already does for other unexercised trait surface; one that does
+    /// (the coordinator's HTTP/gRPC integration-test mocks) implements the
+    /// real in-memory equivalent.
+    async fn reserve_and_persist_create(
         &self,
-        _session_id: SessionId,
-        _spec: &SessionSpec,
-        _mem_budget_mib: i64,
-        _cpu_budget_vcpus: i32,
+        ws: SessionCreateWriteSet,
         candidates: &[HostId],
-        _affinity_len: usize,
-    ) -> Result<Option<HostId>, MetaError> {
-        Ok(candidates.first().copied())
-    }
+        affinity_len: usize,
+    ) -> Result<CreateDisposition, MetaError>;
 
     /// ADR 0046: release a reservation whose boot failed, by deleting its
     /// `pending`, sandbox-less row. Default impl (mocks) is a no-op.
@@ -162,21 +230,6 @@ pub trait MetadataStore: Send + Sync {
     }
 
     // ---- ADR 0048: session queue ----
-
-    /// Insert a create that found no capacity as a `queued` row (host_id
-    /// NULL, the budgets the scanner will reserve with, `queued_at` =
-    /// NOW(), `queue_origin = 'create'`, the initial prompt). The queue
-    /// scanner re-attempts placement FIFO. Default impl (mocks) no-op.
-    async fn enqueue_session_create(
-        &self,
-        _id: SessionId,
-        _spec: &SessionSpec,
-        _mem_budget_mib: i64,
-        _cpu_budget_vcpus: i32,
-        _prompt: Option<&str>,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
 
     /// Park an `Idle` session that hit no capacity on resume back in the
     /// queue (`Idle → queued`, `queue_origin = 'resume'`). Default no-op.
@@ -192,7 +245,7 @@ pub trait MetadataStore: Send + Sync {
 
     /// Atomically re-attempt placement for a `queued` session: pick a
     /// host from `candidates` (same best-fit 2D logic as
-    /// `reserve_placement`) and, if one fits, flip the row
+    /// `reserve_and_persist_create`'s placement leg) and, if one fits, flip the row
     /// `queued → pending` with the host bound + `last_active_at` bumped,
     /// returning the host. `None` = nothing fit (stay queued) or the row
     /// already left `queued` (lost a race). Default impl (mocks): place
@@ -338,7 +391,7 @@ pub trait MetadataStore: Send + Sync {
 
     /// ADR 0047/0048: per-host reserved budget (Σ `mem_budget_mib` AND
     /// Σ `cpu_budget_vcpus` over the memory-reserving session states) —
-    /// the read-side twin of `reserve_placement`'s aggregate, for the
+    /// the read-side twin of `reserve_and_persist_create`'s aggregate, for the
     /// capacity-soft resume/evac picker and the fleet view. Default impl
     /// (mocks): empty map (no reservations).
     async fn per_host_reserved(
