@@ -17,6 +17,17 @@
 //! everything except VM→proxy and VM→DNS, plus standard hard-isolation
 //! drops (RFC1918, link-local, loopback, inter-VM). Per-VM
 //! provisioning is now just TAP creation.
+//!
+//! **Invariant: two deliberate subprocess spawns per happy-path
+//! restore.** Everything in the per-VM netns leg is netlink/ioctl
+//! except `ip netns add` (owns the `/var/run/netns/<name>` bind-mount
+//! bookkeeping the teardown cascade and the ADR 0044 K2 `ip netns
+//! attach` reattach both key on) and the in-ns iptables SNAT rule
+//! (packet-filter engine, not a spawn-elimination candidate without
+//! an nftables migration). Firecracker itself is exec'd directly
+//! and `setns`'d in via `pre_exec` — no `ip netns exec` wrapper fork.
+//! Any future addition to this leg that shells out is a regression
+//! against this contract (ADR 0020 P4).
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
