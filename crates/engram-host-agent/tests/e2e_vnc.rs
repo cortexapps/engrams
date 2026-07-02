@@ -57,7 +57,7 @@ use tokio::time::timeout;
 // Shared FC e2e harness floor (preflight / root-check / host-state cleanup /
 // guest-IP poll) — the same module `e2e_shell` uses.
 mod common;
-use common::{cleanup_host_state, fc_preflight, require_root, wait_for_guest_ip};
+use common::{cleanup_host_state, fc_preflight, require_root, wait_for_guest_endpoints};
 
 /// Where `just bundles-squashfs` stages the content-addressed squashfs bundles
 /// (`<sha>.squashfs` + `current.json`) in the repo checkout. The FC backend's
@@ -305,8 +305,8 @@ async fn e2e_vnc_cold_via_pooled_backend() {
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
 
-    // ---- 4. Wait for in-VM agentd (guest_ip resolves once vsock answers) ----
-    let _guest_ip = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30)).await;
+    // ---- 4. Wait for in-VM agentd (guest_endpoints resolves once vsock answers) ----
+    let _endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
 
     // ---- 5. Activate the bundle: a readiness-probe SpawnHarness (empty argv)
     //         runs agentd's `engram_session_bundles::activate`, which mounts +

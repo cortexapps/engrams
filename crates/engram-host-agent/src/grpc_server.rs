@@ -556,7 +556,10 @@ impl HostService for HostServiceImpl {
         req: Request<SandboxIdMessage>,
     ) -> Result<Response<GuestIpResponse>, Status> {
         let id = decode_sandbox_id(&req.into_inner().uuid)?;
-        let ip = self.inner.guest_ip(id).await;
+        // The proto's GuestIpResponse.ip is unchanged (optional v4
+        // dotted-quad string) — stringify the now-typed Ipv4Addr here,
+        // at the wire boundary, rather than change the wire shape.
+        let ip = self.inner.guest_ip(id).await.map(|ip| ip.to_string());
         Ok(Response::new(GuestIpResponse { ip }))
     }
 

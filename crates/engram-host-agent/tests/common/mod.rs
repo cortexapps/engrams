@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::endpoints::GuestEndpoints;
 use engram_host_agent::pooled_backend::PooledBackend;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -155,24 +156,24 @@ pub fn cleanup_host_state() {
     }
 }
 
-/// Wait up to `deadline` for `pooled.guest_ip(id)` to return Some. The FC
-/// backend's `guest_ip` answers as soon as the in-VM agentd is reachable on
+/// Wait up to `deadline` for `pooled.guest_endpoints(id)` to return Some.
+/// The FC backend answers as soon as the in-VM agentd is reachable on
 /// vsock; on a cold boot this typically takes a few seconds (kernel + init +
 /// agentd). The poll cadence is fast (200ms) so the test isn't dominated by
 /// sleep slack.
-pub async fn wait_for_guest_ip(
+pub async fn wait_for_guest_endpoints(
     pooled: &PooledBackend,
     id: engram_core::SandboxId,
     deadline: Duration,
-) -> String {
+) -> GuestEndpoints {
     let start = std::time::Instant::now();
     loop {
-        if let Some(ip) = pooled.guest_ip(id).await {
-            return ip;
+        if let Some(endpoints) = pooled.guest_endpoints(id).await {
+            return endpoints;
         }
         assert!(
             start.elapsed() < deadline,
-            "guest_ip never resolved within {deadline:?}",
+            "guest_endpoints never resolved within {deadline:?}",
         );
         sleep(Duration::from_millis(200)).await;
     }

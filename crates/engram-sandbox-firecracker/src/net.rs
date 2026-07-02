@@ -692,8 +692,8 @@ pub fn veth_names_for(sandbox_id: SandboxId) -> (String, String) {
 
 /// Per-VM netns bookkeeping. Persisted on `LiveSandbox` so
 /// `destroy()` can reverse provisioning. `host_reachable_ip()`
-/// is the value the egress proxy registry and `guest_ip()` both
-/// expose.
+/// is the value the egress proxy registry uses and that
+/// `guest_endpoints().egress_identity` exposes.
 #[derive(Clone, Debug)]
 pub struct NetnsSetup {
     /// `engr-vm-<id>` — also resolves to `/var/run/netns/engr-vm-<id>`.
