@@ -210,6 +210,31 @@ pub(crate) async fn send_prompt_core(
         prompt_id
     };
 
+    // Issue #527 Phase 1: the durable "the user asked at time T" receipt —
+    // the FIRST PG write of this function, before the auto-resume below.
+    // The auto-resume can take tens to hundreds of seconds (a cold FC
+    // restore); without a receipt written before it starts, the earliest
+    // durable trace of "the user asked for something" post-dates the
+    // resume, and every prompt→first-token latency number becomes a lower
+    // bound reconstructed from the `idle→created` transition. This event
+    // is coordinator-authoritative and stays true across a guest-state
+    // rewind (the user genuinely did send the prompt), so
+    // `rewind_session_to_cursor` excludes `prompt_received` from its
+    // tombstone UPDATE. Best-effort like the user-echo emit below: an emit
+    // failure logs + proceeds — we never 500 the caller over telemetry.
+    if let Err(e) = state
+        .emit(
+            id,
+            SessionEvent::PromptReceived {
+                prompt_id: prompt_id.clone(),
+                at: chrono::Utc::now(),
+            },
+        )
+        .await
+    {
+        tracing::warn!(session_id = %id, error = %e, "emit prompt_received event failed");
+    }
+
     // Auto-resume (Idle → FC snapshot), HOLD through any in-flight move,
     // and resolve the live sandbox. Shared verbatim with `answer_question_core`.
     let sandbox_id = ensure_active_and_resolve(state, id).await?;

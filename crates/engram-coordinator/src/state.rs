@@ -946,6 +946,23 @@ fn harness_event_sink(
             let session_event = SessionEvent::from_harness(ev, Utc::now());
             let kind = session_event.kind();
 
+            // Issue #527 Phase 1: a run-started with a client prompt_id is
+            // the consuming end of the `prompt_received` receipt — captured
+            // here (before `session_event` moves into the published
+            // `IndexedEvent` below) so the post-append lookup below can join
+            // it against the receipt row and record prompt→run-start
+            // latency. `None` for the env-seeded initial prompt, which
+            // never gets a receipt.
+            let run_started_prompt_id = if let SessionEvent::HarnessRunStarted {
+                prompt_id: Some(pid),
+                ..
+            } = &session_event
+            {
+                Some(pid.clone())
+            } else {
+                None
+            };
+
             // Drop a back-to-back duplicate `harness_idle`. The
             // upstream TTL bookkeeping in HarnessHub::reader_loop
             // already saw the event, so suppressing it here only
@@ -992,6 +1009,42 @@ fn harness_event_sink(
             match meta.append_session_event(session_id, kind, payload).await {
                 Ok(idx) => {
                     last_kind.insert(session_id, kind);
+
+                    // Issue #527 Phase 1: join this run-start against its
+                    // `prompt_received` receipt (one PG lookup per run-start —
+                    // runs are low-rate, acceptable per-event cost) and
+                    // record the true prompt→run-start latency. Skip
+                    // silently when there's no receipt (env-seeded initial
+                    // prompt) rather than treating it as an error.
+                    if let Some(pid) = &run_started_prompt_id {
+                        match meta.prompt_received_at(session_id, pid).await {
+                            Ok(Some(received_at)) => {
+                                let secs =
+                                    (Utc::now() - received_at).num_milliseconds() as f64 / 1000.0;
+                                if secs >= 0.0 {
+                                    metrics::histogram!(
+                                        crate::metrics::PROMPT_TO_RUN_STARTED_SECONDS
+                                    )
+                                    .record(secs);
+                                } else {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        prompt_id = %pid,
+                                        "prompt_received_at is after run_started; \
+                                         skipping negative-duration sample",
+                                    );
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!(
+                                session_id = %session_id,
+                                prompt_id = %pid,
+                                error = %e,
+                                "prompt_received_at lookup failed",
+                            ),
+                        }
+                    }
+
                     events.publish(
                         session_id,
                         IndexedEvent {
