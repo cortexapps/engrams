@@ -39,7 +39,7 @@ message Profile {
   // ISO-8601.
   string updated_at = 10;
   // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
-  // ["skills", "playwright"]). The coordinator resolves each to a reserved-slot
+  // ["skills", "browser"]). The coordinator resolves each to a reserved-slot
   // mount at session create. Empty = base session (no skills).
   repeated string skills = 11;
   // ADR 0056: integration capabilities ("provider:action[@resource]") this

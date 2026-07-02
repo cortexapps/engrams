@@ -198,7 +198,7 @@ export type CreateSessionRequest = Message<"engram.app.v1.CreateSessionRequest">
   harnessEnv: { [key: string]: string };
 
   /**
-   * ADR 0055: profile-selected skill bundle names (e.g. "skills", "playwright").
+   * ADR 0055: profile-selected skill bundle names (e.g. "skills", "browser").
    * The coordinator resolves each to its staged content sha (from the fleet's
    * current bundles), assigns a reserved slot (dyn_0..), and patch_drives it in
    * during the paused restore window; the guest reads each mount's mount.json to

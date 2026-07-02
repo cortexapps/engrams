@@ -139,7 +139,7 @@ message CreateSessionRequest {
   // silently lose its token). Honored regardless of SecretMode: this is NOT a
   // user override, it is the trusted orchestrator's identity injection. NEVER logged.
   map<string, string> harness_env = 6;
-  // ADR 0055: profile-selected skill bundle names (e.g. "skills", "playwright").
+  // ADR 0055: profile-selected skill bundle names (e.g. "skills", "browser").
   // The coordinator resolves each to its staged content sha (from the fleet's
   // current bundles), assigns a reserved slot (dyn_0..), and patch_drives it in
   // during the paused restore window; the guest reads each mount's mount.json to
