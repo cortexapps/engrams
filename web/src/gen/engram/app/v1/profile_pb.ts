@@ -86,7 +86,7 @@ export type Profile = Message<"engram.app.v1.Profile"> & {
 
   /**
    * ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
-   * ["skills", "playwright"]). The coordinator resolves each to a reserved-slot
+   * ["skills", "browser"]). The coordinator resolves each to a reserved-slot
    * mount at session create. Empty = base session (no skills).
    *
    * @generated from field: repeated string skills = 11;

@@ -40,7 +40,7 @@ export const BUILTIN_SKILLS: { name: string; label: string; description: string 
     name: "browser",
     label: "Browser",
     description:
-      "One shared Chromium the human drives over VNC (BROWSER tab) and the agent drives via playwright-cli + show-your-work — same browser, so the human watches the agent live. Use an image sized for a browser (≥1 GiB).",
+      "One shared Chromium the human drives over VNC (BROWSER tab) and the agent drives programmatically — same browser, so the human watches the agent live. Use an image sized for a browser (≥1 GiB).",
   },
 ];
 
