@@ -1471,15 +1471,16 @@ impl FirecrackerBackend {
         // Post-`load_snapshot`, FC's vsock muxer has a brief window where it
         // accepts a host CONNECT and returns OK, then closes the connection
         // before the guest's accept-loop wakes — surfacing as `early eof` on
-        // the CONNECT-response read 3-5 ms in (the same window InstallHostCa
-        // documents and retries). It widens with the device count a restore
-        // has to kick (ADR 0027 added the RO bundle drive), which tipped the
-        // previously-lucky post-resume `/exec` dial into it. The CONNECT
-        // handshake is PRE-APPLICATION — no bytes have reached the guest
-        // service yet — so re-dialing is safe for every caller (exec, forge,
-        // upload, shell tunnel, CA). Retry EOF/RST-shaped handshake failures
-        // with a short backoff; a genuinely-dead agentd EOFs every attempt
-        // and the final error propagates.
+        // the CONNECT-response read 3-5 ms in (the same window `start_agent`'s
+        // `SpawnHarness` first-contact retry documents, one layer up). It
+        // widens with the device count a restore has to kick (ADR 0027 added
+        // the RO bundle drive), which tipped the previously-lucky post-resume
+        // `/exec` dial into it. The CONNECT handshake is PRE-APPLICATION — no
+        // bytes have reached the guest service yet — so re-dialing is safe
+        // for every caller (exec, forge, upload, shell tunnel, harness spawn
+        // + CA). Retry EOF/RST-shaped handshake failures with a short
+        // backoff; a genuinely-dead agentd EOFs every attempt and the final
+        // error propagates.
         // The muxer-settle window is usually a few ms, but on a cold boot,
         // under CI load, or with more restore-time devices (ADR 0027 added a
         // RO bundle drive) it can stretch well past the old flat 5×50 ms
@@ -4689,143 +4690,73 @@ impl SandboxBackend for FirecrackerBackend {
             live.state.vsock_uds_path.clone()
         };
 
-        // ADR 0021 P1.2: deliver the per-host egress-proxy CA via
-        // `InstallHostCa` over vsock as soon as agentd is reachable,
-        // before any harness spawn. Replaces the pre-0021 path where
-        // the CA rode in on the harness drive. Idempotent — agentd's
-        // `last_pem` cache makes a resume-with-same-cert a zero-I/O
-        // hot path, and an empty PEM is a server-side no-op. The
-        // legacy drive-based install in
-        // `engram_agentd::harness_supervisor::inject_egress_proxy_ca`
-        // remains in place until P1.5 retires the drive.
-        if let Some(pem) = agent.host_ca_pem.as_deref() {
-            if !pem.is_empty() {
-                let req = engram_agentd::WireRequest::InstallHostCa(
-                    engram_agentd::InstallHostCaRequest {
-                        cert_pem: pem.to_string(),
-                    },
-                );
-                // Restore-side settle: a warm-restored sandbox's
-                // `agent_ready` watch is pre-set to true (see
-                // `restore_in_jail`), so `wait_agent_ready` above
-                // returned instantly. But FC's vsock muxer has a
-                // brief window post-`load_snapshot` where it accepts
-                // a host `CONNECT`/returns `OK`, then closes the
-                // connection before agentd's accept-loop task wakes
-                // and drains the request bytes. Host then sees
-                // `read InstallHostCa response: early eof` 3-5 ms
-                // after the `CONNECT/OK` round-trip (vs the 140-180 ms
-                // a successful install takes). Surfaced by PR #40 e2e_
-                // stack on cold-snapshot-during-startup-fix landings.
-                // Cold paths don't hit this — the agentd dial of
-                // AgentReady gates `wait_agent_ready`, and by the
-                // time AgentReady fires the muxer has settled.
-                //
-                // Retry the full connect → write → read sequence on
-                // an EOF-shaped error, up to ~5 attempts with 50ms
-                // backoff. Each attempt is independent (fresh
-                // connect, fresh CONNECT verb, fresh write/read) so
-                // double-send is structurally impossible —
-                // agentd's `InstallHostCa` handler is idempotent
-                // (writes the same PEM to the same path; the
-                // `last_pem` cache short-circuits on identical
-                // input). A genuinely broken agentd surfaces as
-                // EOF every attempt; the final attempt's error
-                // propagates with the attempt count for
-                // diagnosis.
-                let max_attempts: u32 = 5;
-                let mut attempt: u32 = 0;
-                let resp = loop {
-                    attempt += 1;
-                    let span = tracing::info_span!("fc.install_host_ca", attempt);
-                    let inner = async {
-                        let mut conn =
-                            Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
-                        engram_agentd::write_msg(&mut conn, &req)
-                            .await
-                            .map_err(|e| {
-                                SandboxError::Vm(format!("write InstallHostCa: {e}").into())
-                            })?;
-                        let resp = engram_agentd::read_msg(&mut conn).await.map_err(|e| {
-                            SandboxError::Vm(format!("read InstallHostCa response: {e}").into())
-                        })?;
-                        Ok::<_, SandboxError>(resp)
-                    };
-                    match tracing::Instrument::instrument(inner, span).await {
-                        Ok(r) => break r,
-                        Err(e) => {
-                            // Only retry EOF/RST-shaped errors. Other
-                            // failures (write failures, bincode decode
-                            // errors, protocol mismatches) are
-                            // structural — retrying won't help.
-                            let msg = format!("{e}");
-                            let retryable = msg.contains("early eof")
-                                || msg.contains("unexpected end of file")
-                                || msg.contains("connection reset")
-                                || msg.contains("broken pipe");
-                            if !retryable || attempt >= max_attempts {
-                                return Err(SandboxError::Vm(
-                                    format!("InstallHostCa failed after {attempt} attempt(s): {e}")
-                                        .into(),
-                                ));
-                            }
-                            tracing::debug!(
-                                sandbox_id = %id,
-                                attempt,
-                                error = %e,
-                                "InstallHostCa transient failure; retrying after 50 ms (vsock muxer settle)",
-                            );
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                    }
-                };
-                match resp {
-                    engram_agentd::WireResponse::InstallHostCaAck { changed } => {
-                        // ADR 0045 C1 instrumentation: the cross-host CA
-                        // install is the prime suspect for the in-guest
-                        // handshake tail on a teleport (the dest's CA
-                        // differs, so the guest-side hot path misses and
-                        // the full bundle regeneration runs). INFO so the
-                        // breakdown is greppable per sandbox.
-                        tracing::info!(
-                            sandbox_id = %id,
-                            attempt,
-                            changed,
-                            elapsed_ms = phase_start.elapsed().as_millis() as u64,
-                            wait_ready_ms = t_ready,
-                            "host CA install ack",
-                        );
-                    }
-                    engram_agentd::WireResponse::Error { kind, message } => {
-                        return Err(SandboxError::Vm(
-                            format!("InstallHostCa rejected ({kind}): {message}").into(),
-                        ));
-                    }
-                    other => {
-                        return Err(SandboxError::Vm(
-                            format!("InstallHostCa: unexpected response: {other:?}").into(),
-                        ));
-                    }
-                }
-            }
-        }
-
         // ADR 0021 P1.4: no harness drive — argv points at a path
         // inside the rootfs (the image manifest's `[harness] exec`).
         // The `harness_substrate` / `harness_pack_uri` plumbing on
         // SandboxSpec stays (always-None on the new coord path)
         // until P1.5 retires it together with option-D.
+        //
+        // 2026-07 core-ops fold: this single frame also carries the
+        // per-host egress-proxy CA (ADR 0021 P1). agentd installs it
+        // (if present) before spawning, so there is exactly ONE
+        // host→guest first-contact RPC per `start_agent` instead of
+        // two — the CA-specific retry ladder that used to precede
+        // this call is gone; its bounded first-contact retry moves
+        // to wrap this round trip instead (below). Idempotent —
+        // agentd's `last_pem` cache makes a resume-with-same-cert a
+        // zero-I/O hot path, and an empty/`None` PEM is a no-op.
         let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
             session_env: agent.session_env.into_iter().collect(),
+            host_ca_pem: agent.host_ca_pem,
         });
 
         // Harness spawn: connect to agentd-1024 and round-trip SpawnHarness.
-        // Separate span so the (usually fast) spawn is distinct from the wait.
+        //
+        // This is now the ONLY host→guest first-contact RPC `start_agent`
+        // makes, so it inherits the bounded EOF-retry the CA-install verb
+        // used to have — not as a CA-specific bandage, but as a first-
+        // contact guard against the FC vsock-muxer settle race. Restored
+        // sandboxes pre-set `agent_ready` to `true` (`restore_in_jail`),
+        // so `wait_agent_ready` above returns instantly, but FC's vsock
+        // muxer has a brief window post-`load_snapshot` where it accepts a
+        // host `CONNECT`/returns `OK`, then closes the connection before
+        // agentd's accept-loop task wakes and drains the request bytes —
+        // surfacing as `read SpawnHarness response: early eof` 3-5 ms
+        // after the `CONNECT/OK` round trip. Cold paths don't hit this:
+        // the agentd dial of `AgentReady` gates `wait_agent_ready`, and by
+        // the time `AgentReady` fires the muxer has settled.
+        //
+        // SpawnHarness is safe to retry: `HarnessSupervisor::spawn`
+        // serialises on a mutex and reattaches a still-live previous
+        // child (SIGUSR1 reconnect nudge) rather than killing it, so a
+        // lost-but-actually-delivered attempt just gets reattached by the
+        // retry, not double-spawned. Each attempt is a fresh connect,
+        // fresh write, fresh read, so double-send is structurally
+        // impossible to distinguish from — and structurally harmless
+        // either way.
+        //
+        // Deliberately NO deadline on the round trip: prod has observed a
+        // 299 s handshake that eventually succeeded under guest CPU/IO
+        // starvation during UFFD/NBD page-in — a deadline would convert
+        // that slow-but-successful case into a hard failure. Starvation
+        // itself is a separate concern (prefault-admission-control, not
+        // this fold) to fix at the source.
+        //
+        // The true fix for the underlying muxer race lives in the
+        // vendored FC fork (`third_party/firecracker`), not here — this
+        // retry only bounds the blast radius of a race we can't close
+        // from the host side (see `connect_fc_vsock`'s doc comment and
+        // `harness_supervisor.rs`'s SIGUSR1 comment for why agentd can't
+        // signal its own resume over an already-held vsock connection).
+        let max_attempts: u32 = 5;
+        let mut attempt: u32 = 0;
         let t_spawn = std::time::Instant::now();
-        let resp: engram_agentd::WireResponse = tracing::Instrument::instrument(
-            async {
+        let resp: engram_agentd::WireResponse = loop {
+            attempt += 1;
+            let span = tracing::info_span!("fc.spawn_harness", attempt);
+            let inner = async {
                 let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
                 // ADR 0045 C1 tail diagnosis: split the handshake into
                 // host-visible sub-legs — a slow CONNECT means the guest
@@ -4834,6 +4765,7 @@ impl SandboxBackend for FirecrackerBackend {
                 // itself is stuck past accept.
                 tracing::info!(
                     sandbox_id = %id,
+                    attempt,
                     connect_ms = t_spawn.elapsed().as_millis() as u64,
                     "spawn-harness vsock connected",
                 );
@@ -4850,17 +4782,47 @@ impl SandboxBackend for FirecrackerBackend {
                 // is why single-crate check + workspace clippy passed but the
                 // integration `-p` build failed.
                 Ok::<_, SandboxError>(resp)
-            },
-            tracing::info_span!("fc.spawn_harness"),
-        )
-        .await?;
+            };
+            match tracing::Instrument::instrument(inner, span).await {
+                Ok(r) => break r,
+                Err(e) => {
+                    // Only retry EOF/RST-shaped errors — the muxer-settle
+                    // signature. Other failures (write failures, bincode
+                    // decode errors, protocol mismatches, connection
+                    // refused) are structural — retrying won't help, and
+                    // `Connection refused` in particular stays a
+                    // non-retryable, terminal class (the FC process
+                    // itself isn't accepting; out of scope for this fold).
+                    let msg = format!("{e}");
+                    let retryable = msg.contains("early eof")
+                        || msg.contains("unexpected end of file")
+                        || msg.contains("connection reset")
+                        || msg.contains("broken pipe");
+                    if !retryable || attempt >= max_attempts {
+                        return Err(SandboxError::Vm(
+                            format!("SpawnHarness failed after {attempt} attempt(s): {e}").into(),
+                        ));
+                    }
+                    tracing::debug!(
+                        sandbox_id = %id,
+                        attempt,
+                        error = %e,
+                        "SpawnHarness transient failure; retrying after 50 ms (vsock muxer settle)",
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
         match resp {
-            engram_agentd::WireResponse::HarnessSpawned { pid } => {
+            engram_agentd::WireResponse::HarnessSpawned { pid, ca_changed } => {
                 let elapsed = phase_start.elapsed().as_secs_f64();
                 tracing::info!(
                     sandbox_id = %id,
                     elapsed_ms = (elapsed * 1000.0) as u64,
+                    wait_ready_ms = t_ready,
                     pid = ?pid,
+                    ca_changed = ?ca_changed,
+                    attempt,
                     "fc agent handshake complete",
                 );
                 // Slow-handshake forensics without a jail shell: surface

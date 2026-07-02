@@ -18,8 +18,7 @@
 //! month's base snapshot runs last month's agentd). The `WireRequest`
 //! doc comment in `src/proto.rs` spells out the "APPEND-ONLY" rule but
 //! nothing enforced it until this test: inserting a variant mid-enum
-//! shifts every later index and the host's `SpawnHarness` decodes as the
-//! old agentd's `InstallHostCa`.
+//! shifts every later index and desyncs the pair.
 //!
 //! This test pins the exact bytes (`golden/<name>.bin`) plus, for every
 //! enum, the `u32` variant index in `bytes[0..4]`. Reordering a variant
@@ -46,8 +45,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use engram_agentd::proto::{
-    AgentReady, InstallHostCaRequest, SpawnHarnessRequest, WireDownloadResponse, WireExecEvent,
-    WireExecRequest, WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
+    AgentReady, SpawnHarnessRequest, WireDownloadResponse, WireExecEvent, WireExecRequest,
+    WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
 };
 use serde::Serialize;
 
@@ -120,6 +119,7 @@ fn spawn_harness() -> SpawnHarnessRequest {
         argv: vec!["/opt/engram/harness/harness".into()],
         env: HashMap::from([("ENGRAM_HARNESS_CWD".into(), "/workspace".into())]),
         session_env: HashMap::new(),
+        host_ca_pem: Some("-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".into()),
     }
 }
 
@@ -141,9 +141,6 @@ fn wire_request_golden_and_variant_indices() {
     };
     let start_shell = WireRequest::StartShell { port: Some(7681) };
     let spawn = WireRequest::SpawnHarness(spawn_harness());
-    let install_ca = WireRequest::InstallHostCa(InstallHostCaRequest {
-        cert_pem: "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".into(),
-    });
     let start_browser = WireRequest::StartBrowser { port: Some(5900) };
 
     assert_golden("request_exec", &exec);
@@ -155,7 +152,6 @@ fn wire_request_golden_and_variant_indices() {
     assert_golden("request_guest_ip", &WireRequest::GuestIp);
     assert_golden("request_start_shell", &start_shell);
     assert_golden("request_spawn_harness", &spawn);
-    assert_golden("request_install_host_ca", &install_ca);
     assert_golden("request_sync", &WireRequest::Sync);
     assert_golden("request_start_browser", &start_browser);
     assert_golden("request_stop_browser", &WireRequest::StopBrowser);
@@ -169,10 +165,12 @@ fn wire_request_golden_and_variant_indices() {
     assert_variant_index(&WireRequest::GuestIp, 6, "WireRequest::GuestIp");
     assert_variant_index(&start_shell, 7, "WireRequest::StartShell");
     assert_variant_index(&spawn, 8, "WireRequest::SpawnHarness");
-    assert_variant_index(&install_ca, 9, "WireRequest::InstallHostCa");
-    assert_variant_index(&WireRequest::Sync, 10, "WireRequest::Sync");
-    assert_variant_index(&start_browser, 11, "WireRequest::StartBrowser");
-    assert_variant_index(&WireRequest::StopBrowser, 12, "WireRequest::StopBrowser");
+    // 2026-07 core-ops fold: the former standalone CA-install verb
+    // (index 9) was deleted; Sync/StartBrowser/StopBrowser shift down
+    // one index each.
+    assert_variant_index(&WireRequest::Sync, 9, "WireRequest::Sync");
+    assert_variant_index(&start_browser, 10, "WireRequest::StartBrowser");
+    assert_variant_index(&WireRequest::StopBrowser, 11, "WireRequest::StopBrowser");
 }
 
 // ---- WireResponse ------------------------------------------------------
@@ -193,8 +191,10 @@ fn wire_response_golden_and_variant_indices() {
         port: 7681,
         spawned: true,
     };
-    let harness_spawned = WireResponse::HarnessSpawned { pid: Some(42) };
-    let ca_ack = WireResponse::InstallHostCaAck { changed: true };
+    let harness_spawned = WireResponse::HarnessSpawned {
+        pid: Some(42),
+        ca_changed: Some(true),
+    };
     let error = WireResponse::Error {
         kind: "NotFound".into(),
         message: "no such file".into(),
@@ -212,7 +212,6 @@ fn wire_response_golden_and_variant_indices() {
     assert_golden("response_guest_ip", &guest_ip);
     assert_golden("response_shell_ready", &shell_ready);
     assert_golden("response_harness_spawned", &harness_spawned);
-    assert_golden("response_install_host_ca_ack", &ca_ack);
     assert_golden("response_error", &error);
     assert_golden("response_synced", &WireResponse::Synced);
     assert_golden("response_browser_ready", &browser_ready);
@@ -226,13 +225,15 @@ fn wire_response_golden_and_variant_indices() {
     assert_variant_index(&guest_ip, 5, "WireResponse::GuestIp");
     assert_variant_index(&shell_ready, 6, "WireResponse::ShellReady");
     assert_variant_index(&harness_spawned, 7, "WireResponse::HarnessSpawned");
-    assert_variant_index(&ca_ack, 8, "WireResponse::InstallHostCaAck");
-    assert_variant_index(&error, 9, "WireResponse::Error");
-    assert_variant_index(&WireResponse::Synced, 10, "WireResponse::Synced");
-    assert_variant_index(&browser_ready, 11, "WireResponse::BrowserReady");
+    // 2026-07 core-ops fold: the former standalone CA-install ack
+    // (index 8) was deleted; Error/Synced/BrowserReady/BrowserStopped
+    // shift down one index each.
+    assert_variant_index(&error, 8, "WireResponse::Error");
+    assert_variant_index(&WireResponse::Synced, 9, "WireResponse::Synced");
+    assert_variant_index(&browser_ready, 10, "WireResponse::BrowserReady");
     assert_variant_index(
         &WireResponse::BrowserStopped,
-        12,
+        11,
         "WireResponse::BrowserStopped",
     );
 }
@@ -332,12 +333,6 @@ fn regen_golden() {
         "request_spawn_harness",
         &WireRequest::SpawnHarness(spawn_harness()),
     );
-    write(
-        "request_install_host_ca",
-        &WireRequest::InstallHostCa(InstallHostCaRequest {
-            cert_pem: "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".into(),
-        }),
-    );
     write("request_sync", &WireRequest::Sync);
     write(
         "request_start_browser",
@@ -376,11 +371,10 @@ fn regen_golden() {
     );
     write(
         "response_harness_spawned",
-        &WireResponse::HarnessSpawned { pid: Some(42) },
-    );
-    write(
-        "response_install_host_ca_ack",
-        &WireResponse::InstallHostCaAck { changed: true },
+        &WireResponse::HarnessSpawned {
+            pid: Some(42),
+            ca_changed: Some(true),
+        },
     );
     write(
         "response_error",
