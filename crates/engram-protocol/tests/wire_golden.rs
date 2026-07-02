@@ -327,7 +327,7 @@ fn wire_version_pinned() {
     // signal that a payload shape changed; pin it so a payload change
     // without a bump (or vice-versa) is a conscious decision.
     assert_eq!(
-        WIRE_VERSION, 7,
+        WIRE_VERSION, 8,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
