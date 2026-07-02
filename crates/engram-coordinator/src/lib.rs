@@ -44,6 +44,8 @@ pub mod scheduler;
 pub mod session_boot;
 pub mod skill_pack;
 pub mod snapshot_blob_gc;
+#[cfg(test)]
+mod span_parenting_tests;
 pub mod squashfs;
 pub mod state;
 

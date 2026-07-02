@@ -24,6 +24,7 @@ use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{Session, SessionState};
 use engram_core::{MetaError, SandboxError, SandboxId, SessionId};
 use serde::Serialize;
+use tracing::Instrument;
 
 use crate::error::ApiError;
 use crate::placement::ScheduleContext;
@@ -286,137 +287,146 @@ pub(crate) async fn snapshot_core(
     // body in a `tokio::spawn`ed task that MOVES the lease in, so the
     // capture always runs to a terminal arm regardless of the request's
     // fate, and the handler only awaits the JoinHandle to relay the result.
+    // ADR 0019 / telemetry restoration (#526): re-parent this detached
+    // capture body onto the request span (`Span::current()` at spawn time)
+    // so it's a child of the manual-capture trace instead of an orphaned
+    // root — span context only, the #213 detach-for-cancellation-safety
+    // task lifetime is unchanged.
     let st = state.clone();
-    let handle = tokio::spawn(async move {
-        let lease = lease;
-        let _heartbeat = lease.spawn_heartbeat(std::time::Duration::from_secs(60));
+    let capture_span = tracing::Span::current();
+    let handle = tokio::spawn(
+        async move {
+            let lease = lease;
+            let _heartbeat = lease.spawn_heartbeat(std::time::Duration::from_secs(60));
 
-        // ADR 0007 Phase 6: backend owns its staging dir. Coord no
-        // longer pre-allocates a path — the backend's
-        // `snapshot_path_for(metadata.id)` is the canonical reference
-        // for the on-disk location. Cross-host durability flows
-        // through the chunked manifests on `SnapshotMetadata`, not
-        // through the local path.
-        // ADR 0065: the in-guest browser stack is ephemeral and must never be
-        // frozen into a snapshot (Chrome RAM + dead sockets on resume). Reap it
-        // best-effort before the capture; the next EnsureBrowser re-lazy-starts it.
-        let _ = st.services.host.stop_browser(sandbox_id).await;
-        let metadata = st.services.host.snapshot(sandbox_id).await?;
+            // ADR 0007 Phase 6: backend owns its staging dir. Coord no
+            // longer pre-allocates a path — the backend's
+            // `snapshot_path_for(metadata.id)` is the canonical reference
+            // for the on-disk location. Cross-host durability flows
+            // through the chunked manifests on `SnapshotMetadata`, not
+            // through the local path.
+            // ADR 0065: the in-guest browser stack is ephemeral and must never be
+            // frozen into a snapshot (Chrome RAM + dead sockets on resume). Reap it
+            // best-effort before the capture; the next EnsureBrowser re-lazy-starts it.
+            let _ = st.services.host.stop_browser(sandbox_id).await;
+            let metadata = st.services.host.snapshot(sandbox_id).await?;
 
-        let now = Utc::now();
-        // Record the host that wrote this snapshot to its local disk so
-        // the resume path's snapshot-affinity scheduler can route back to
-        // it (zero-cost hot-tier hit). ADR 0007: durability lives in the
-        // chunk store (`disk_manifest` / `memory_manifest`); the local dir
-        // is a per-host cache the same-host fast-resume reads from.
-        let host_id = st.host_registry.host_of(sandbox_id);
-        let events_cursor = st
-            .services
-            .meta
-            .latest_event_idx_at_or_before(id, now)
-            .await
-            .unwrap_or_default();
-        // Issue #213: write the row `recoverable = false` FIRST, then flip
-        // to true only after `commit_snapshot` succeeds. This makes the
-        // phantom state ("PG says recoverable but the blobs were never
-        // committed / got aborted") unrepresentable: even if this task is
-        // somehow torn down between `record_snapshot` and the post-commit
-        // flip, the worst residue is a `recoverable = false` row, which
-        // resume / reconcile already treat as "don't trust" and skip — the
-        // safe direction. The previous code computed `recoverable` from a
-        // pre-commit HEAD and stored true before committing, so a dropped
-        // commit left a `recoverable = true` row over uncommitted artifacts.
-        let record = SnapshotRecord {
-            id: metadata.id,
-            session_id: Some(id),
-            host_id,
-            image_version: metadata.image_version.clone(),
-            size_bytes: metadata.size_bytes,
-            created_at: metadata.created_at,
-            last_accessed_at: now,
-            // ADR 0007: chunked manifests are the durability primitive.
-            // FC backends produce both fields via the PooledBackend wrap;
-            // VZ produces disk_manifest only; Process produces neither.
-            disk_manifest: metadata.disk_manifest,
-            memory_manifest: metadata.memory_manifest,
-            recoverable: false,
-            // ADR 0035: pin the generations this snapshot's device model
-            // references (host-reported; reflects any fresh-create swap).
-            aux_bundles: metadata.aux_bundles.clone(),
-            // ADR 0028 A.log: best-effort cursor at the capture instant
-            // (the guest pauses inside the snapshot RPC; sub-second skew
-            // accepted, documented on `latest_event_idx_at_or_before`).
-            events_cursor,
-        };
-        st.services.meta.record_snapshot(record.clone()).await?;
+            let now = Utc::now();
+            // Record the host that wrote this snapshot to its local disk so
+            // the resume path's snapshot-affinity scheduler can route back to
+            // it (zero-cost hot-tier hit). ADR 0007: durability lives in the
+            // chunk store (`disk_manifest` / `memory_manifest`); the local dir
+            // is a per-host cache the same-host fast-resume reads from.
+            let host_id = st.host_registry.host_of(sandbox_id);
+            let events_cursor = st
+                .services
+                .meta
+                .latest_event_idx_at_or_before(id, now)
+                .await
+                .unwrap_or_default();
+            // Issue #213: write the row `recoverable = false` FIRST, then flip
+            // to true only after `commit_snapshot` succeeds. This makes the
+            // phantom state ("PG says recoverable but the blobs were never
+            // committed / got aborted") unrepresentable: even if this task is
+            // somehow torn down between `record_snapshot` and the post-commit
+            // flip, the worst residue is a `recoverable = false` row, which
+            // resume / reconcile already treat as "don't trust" and skip — the
+            // safe direction. The previous code computed `recoverable` from a
+            // pre-commit HEAD and stored true before committing, so a dropped
+            // commit left a `recoverable = true` row over uncommitted artifacts.
+            let record = SnapshotRecord {
+                id: metadata.id,
+                session_id: Some(id),
+                host_id,
+                image_version: metadata.image_version.clone(),
+                size_bytes: metadata.size_bytes,
+                created_at: metadata.created_at,
+                last_accessed_at: now,
+                // ADR 0007: chunked manifests are the durability primitive.
+                // FC backends produce both fields via the PooledBackend wrap;
+                // VZ produces disk_manifest only; Process produces neither.
+                disk_manifest: metadata.disk_manifest,
+                memory_manifest: metadata.memory_manifest,
+                recoverable: false,
+                // ADR 0035: pin the generations this snapshot's device model
+                // references (host-reported; reflects any fresh-create swap).
+                aux_bundles: metadata.aux_bundles.clone(),
+                // ADR 0028 A.log: best-effort cursor at the capture instant
+                // (the guest pauses inside the snapshot RPC; sub-second skew
+                // accepted, documented on `latest_event_idx_at_or_before`).
+                events_cursor,
+            };
+            st.services.meta.record_snapshot(record.clone()).await?;
 
-        // ADR 0034 durability: the live sandbox keeps running, so commit
-        // the host's in-flight snapshot now — otherwise the periodic
-        // checkpoint driver's next tick calls `abort_prior_inflight_snapshot`
-        // and deletes this snapshot's state.bin/sidecar from BlobStorage
-        // within one interval.
-        let committed = match st.services.host.commit_snapshot(sandbox_id).await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(
-                    session_id = %id,
-                    sandbox_id = %sandbox_id,
-                    error = %e,
-                    "snapshot: commit_snapshot failed; leaving snapshot row \
-                     recoverable=false (resume-time verification would catch it anyway)",
-                );
-                false
-            }
-        };
-
-        // Issue #213: flip `recoverable=true` ONLY after the artifacts are
-        // committed AND HEAD-verifiable. ADR 0009 Phase 2: HEAD-verify the
-        // chunked manifests are durable in BlobStorage before promoting.
-        // Backends that produced no manifest (Process; VZ memory) stay
-        // false, which means a sandbox-loss reconcile will Dead them —
-        // correct, since there's no chunked artifact to resume from.
-        if committed {
-            let recoverable = verify_snapshot_recoverable(
-                st.services.blob.as_ref(),
-                metadata.disk_manifest.as_ref(),
-                metadata.memory_manifest.as_ref(),
-            )
-            .await;
-            if recoverable {
-                let mut promoted = record;
-                promoted.recoverable = true;
-                if let Err(e) = st.services.meta.record_snapshot(promoted).await {
+            // ADR 0034 durability: the live sandbox keeps running, so commit
+            // the host's in-flight snapshot now — otherwise the periodic
+            // checkpoint driver's next tick calls `abort_prior_inflight_snapshot`
+            // and deletes this snapshot's state.bin/sidecar from BlobStorage
+            // within one interval.
+            let committed = match st.services.host.commit_snapshot(sandbox_id).await {
+                Ok(()) => true,
+                Err(e) => {
                     tracing::warn!(
                         session_id = %id,
-                        snapshot_id = %metadata.id,
+                        sandbox_id = %sandbox_id,
                         error = %e,
-                        "snapshot: failed to promote recoverable=true after commit; \
-                         row stays recoverable=false (resume-time verification will \
-                         re-promote on the next capture)",
+                        "snapshot: commit_snapshot failed; leaving snapshot row \
+                         recoverable=false (resume-time verification would catch it anyway)",
                     );
+                    false
+                }
+            };
+
+            // Issue #213: flip `recoverable=true` ONLY after the artifacts are
+            // committed AND HEAD-verifiable. ADR 0009 Phase 2: HEAD-verify the
+            // chunked manifests are durable in BlobStorage before promoting.
+            // Backends that produced no manifest (Process; VZ memory) stay
+            // false, which means a sandbox-loss reconcile will Dead them —
+            // correct, since there's no chunked artifact to resume from.
+            if committed {
+                let recoverable = verify_snapshot_recoverable(
+                    st.services.blob.as_ref(),
+                    metadata.disk_manifest.as_ref(),
+                    metadata.memory_manifest.as_ref(),
+                )
+                .await;
+                if recoverable {
+                    let mut promoted = record;
+                    promoted.recoverable = true;
+                    if let Err(e) = st.services.meta.record_snapshot(promoted).await {
+                        tracing::warn!(
+                            session_id = %id,
+                            snapshot_id = %metadata.id,
+                            error = %e,
+                            "snapshot: failed to promote recoverable=true after commit; \
+                             row stays recoverable=false (resume-time verification will \
+                             re-promote on the next capture)",
+                        );
+                    }
                 }
             }
+
+            st.emit(
+                id,
+                SessionEvent::SnapshotTaken {
+                    snapshot_id: metadata.id,
+                    size_bytes: metadata.size_bytes,
+                    at: now,
+                },
+            )
+            .await?;
+
+            // Snapshot does NOT change session state — the live sandbox keeps
+            // running. evict_local is the explicit "drop from RAM" action.
+            Ok::<_, ApiError>(SnapshotResponse {
+                session_id: id,
+                snapshot_id: Some(metadata.id.to_string()),
+                size_bytes: Some(metadata.size_bytes),
+                note: "snapshot recorded; live sandbox still running",
+            })
         }
-
-        st.emit(
-            id,
-            SessionEvent::SnapshotTaken {
-                snapshot_id: metadata.id,
-                size_bytes: metadata.size_bytes,
-                at: now,
-            },
-        )
-        .await?;
-
-        // Snapshot does NOT change session state — the live sandbox keeps
-        // running. evict_local is the explicit "drop from RAM" action.
-        Ok::<_, ApiError>(SnapshotResponse {
-            session_id: id,
-            snapshot_id: Some(metadata.id.to_string()),
-            size_bytes: Some(metadata.size_bytes),
-            note: "snapshot recorded; live sandbox still running",
-        })
-    });
+        .instrument(capture_span),
+    );
 
     handle.await.map_err(|join_err| {
         ApiError::Internal(format!("snapshot pipeline task panicked: {join_err}"))
@@ -669,8 +679,14 @@ pub(crate) async fn resume_session(
     // pipeline always runs to a terminal arm — regardless of the request's
     // fate. The handler awaits the JoinHandle only to OBSERVE the result for
     // the connected client; a disconnect drops that await, not the work.
+    //
+    // ADR 0019 / telemetry restoration (#526): re-parent this detached
+    // resume body onto the request span so it stitches under the caller's
+    // trace instead of exporting as a childless root (span context only).
     let st = state.clone();
-    let handle = tokio::spawn(async move {
+    let resume_span = tracing::Span::current();
+    let handle = tokio::spawn(
+        async move {
         // Hold the lease for the WHOLE pipeline by moving it in here.
         let lease = lease;
         // Issue #212: the resume pipeline is a straight-line sequence of
@@ -728,7 +744,8 @@ pub(crate) async fn resume_session(
                 other.as_str()
             ))),
         }
-    });
+    }
+    .instrument(resume_span));
 
     handle.await.map_err(|join_err| {
         // The pipeline task panicked. It did NOT release the lease cleanly
@@ -1731,66 +1748,74 @@ pub(crate) async fn evict_local_core(state: &SharedState, id: SessionId) -> Resu
     // body in a `tokio::spawn`ed task that MOVES the lease in, so the
     // teardown always runs to a terminal arm regardless of the request's
     // fate, and the handler only awaits the JoinHandle to relay the result.
+    //
+    // ADR 0019 / telemetry restoration (#526): re-parent this detached
+    // evict body onto the request span so it stitches under the caller's
+    // trace instead of exporting as a childless root (span context only).
     let st = state.clone();
-    let handle = tokio::spawn(async move {
-        let lease = lease;
-        let _heartbeat = lease.spawn_heartbeat(std::time::Duration::from_secs(60));
-        let now = Utc::now();
+    let evict_span = tracing::Span::current();
+    let handle = tokio::spawn(
+        async move {
+            let lease = lease;
+            let _heartbeat = lease.spawn_heartbeat(std::time::Duration::from_secs(60));
+            let now = Utc::now();
 
-        // Issue #213: PG-FIRST, matching the eviction pipeline's documented
-        // discipline (idle_evictor.rs:289-339). The reconciler treats
-        // `sandbox_id IS NOT NULL` + `host.running_sandboxes ∌ sandbox_id`
-        // (Active status) as an orphan to recover via HostLost→Idle. If
-        // `destroy()` ran before the transition (as it used to), a heartbeat
-        // landing in that window would race ahead and flip the session to
-        // Idle via the recovery path, leaving this handler's later
-        // `transition(Idle→Idle)` to fail. Clearing `sandbox_id` and
-        // flipping to Idle FIRST means reconcile's active-only guard no-ops
-        // by the time the host reports the sandbox gone.
-        if let Err(e) = st.services.meta.assign_session_sandbox(id, None).await {
-            tracing::warn!(
-                session_id = %id,
-                error = %e,
-                "evict_local: assign_session_sandbox(None) failed",
-            );
-        }
-        let prev = st
-            .services
-            .meta
-            .transition_session(id, SessionState::Idle)
-            .await?;
-
-        // Now that the session is Idle, destroy the sandbox. Resolve it
-        // from the row we read under the lease (PG authority, ADR 0047) so
-        // teardown works on any replica. Best-effort: the PG state is
-        // already correct; a failed destroy is cleaned up by the host's
-        // orphan_reap — the sandbox is the cache, not the source of truth.
-        if let Some(sandbox_id) = session.sandbox_id {
-            if let Err(e) = st.services.host.destroy(sandbox_id).await {
+            // Issue #213: PG-FIRST, matching the eviction pipeline's documented
+            // discipline (idle_evictor.rs:289-339). The reconciler treats
+            // `sandbox_id IS NOT NULL` + `host.running_sandboxes ∌ sandbox_id`
+            // (Active status) as an orphan to recover via HostLost→Idle. If
+            // `destroy()` ran before the transition (as it used to), a heartbeat
+            // landing in that window would race ahead and flip the session to
+            // Idle via the recovery path, leaving this handler's later
+            // `transition(Idle→Idle)` to fail. Clearing `sandbox_id` and
+            // flipping to Idle FIRST means reconcile's active-only guard no-ops
+            // by the time the host reports the sandbox gone.
+            if let Err(e) = st.services.meta.assign_session_sandbox(id, None).await {
                 tracing::warn!(
                     session_id = %id,
-                    sandbox_id = %sandbox_id,
                     error = %e,
-                    "evict_local: destroy failed after Idle transition; orphan_reap \
-                     will clean up",
+                    "evict_local: assign_session_sandbox(None) failed",
                 );
             }
-            // ADR 0006: the host-agent unregisters its local proxy
-            // entry as part of `destroy`. No coordinator-side cleanup.
-        }
+            let prev = st
+                .services
+                .meta
+                .transition_session(id, SessionState::Idle)
+                .await?;
 
-        st.emit(id, SessionEvent::Evicted { at: now }).await?;
-        st.emit(
-            id,
-            SessionEvent::StatusChanged {
-                from: prev,
-                to: SessionState::Idle,
-                at: now,
-            },
-        )
-        .await?;
-        Ok::<_, ApiError>(())
-    });
+            // Now that the session is Idle, destroy the sandbox. Resolve it
+            // from the row we read under the lease (PG authority, ADR 0047) so
+            // teardown works on any replica. Best-effort: the PG state is
+            // already correct; a failed destroy is cleaned up by the host's
+            // orphan_reap — the sandbox is the cache, not the source of truth.
+            if let Some(sandbox_id) = session.sandbox_id {
+                if let Err(e) = st.services.host.destroy(sandbox_id).await {
+                    tracing::warn!(
+                        session_id = %id,
+                        sandbox_id = %sandbox_id,
+                        error = %e,
+                        "evict_local: destroy failed after Idle transition; orphan_reap \
+                         will clean up",
+                    );
+                }
+                // ADR 0006: the host-agent unregisters its local proxy
+                // entry as part of `destroy`. No coordinator-side cleanup.
+            }
+
+            st.emit(id, SessionEvent::Evicted { at: now }).await?;
+            st.emit(
+                id,
+                SessionEvent::StatusChanged {
+                    from: prev,
+                    to: SessionState::Idle,
+                    at: now,
+                },
+            )
+            .await?;
+            Ok::<_, ApiError>(())
+        }
+        .instrument(evict_span),
+    );
 
     handle.await.map_err(|join_err| {
         ApiError::Internal(format!("evict_local pipeline task panicked: {join_err}"))
