@@ -456,14 +456,17 @@ pub trait HostClient: Send + Sync {
     /// channel closing tears the tunnel down.
     ///
     /// Unlike `proxy_shell` there is no host-side `start_shell` step: the
-    /// service on `port` is user/agent-managed, not host-spawned, so the
-    /// host just dials `guest_ip:port` in the right netns (a short
-    /// connection-refused retry covers the just-started race).
+    /// service on `port` is user/agent-managed, not host-spawned. ADR
+    /// 0066: reached via the in-guest agentd vsock relay when the
+    /// backend has one (FC; VZ after Phase 2), else a direct
+    /// `dial_ip:port` dial (a short connection-refused retry covers
+    /// the just-started race).
     ///
     /// Default errors with `NotFound`: only host-agent implementations
-    /// proxy ports. The Local impl dials inside the per-VM netns; the
-    /// gRPC client impl opens a `ProxyPort` bidi stream and bridges the
-    /// channels with the wire `data`/`close` frames.
+    /// proxy ports. The Local impl relays through the guest's vsock
+    /// port relay or falls back to a direct dial; the gRPC client impl
+    /// opens a `ProxyPort` bidi stream and bridges the channels with
+    /// the wire `data`/`close` frames.
     async fn proxy_port(
         &self,
         sandbox_id: SandboxId,

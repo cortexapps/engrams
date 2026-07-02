@@ -693,7 +693,7 @@ impl HostClient for HostRegistry {
         Ok(all)
     }
 
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+    async fn guest_ip(&self, id: SandboxId) -> Option<std::net::Ipv4Addr> {
         let (_, backend) = self.resolve_owner(id).await.ok()?;
         backend.guest_ip(id).await
     }
