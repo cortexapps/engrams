@@ -1124,6 +1124,30 @@ pub(crate) mod tests {
         assert_eq!(ev.kind(), "run_interrupted");
     }
 
+    /// Issue #527 Phase 1: `PromptReceived` is coordinator-native (never
+    /// constructed via `from_harness`), serialises under the stable
+    /// `prompt_received` kind the tombstone-exclusion query in
+    /// `engram-postgres` and the `MetadataStore::prompt_received_at`
+    /// lookup key on, and round-trips through serde untouched.
+    #[test]
+    fn prompt_received_has_stable_kind_and_round_trips() {
+        let ev = SessionEvent::PromptReceived {
+            prompt_id: "p-1".into(),
+            at: chrono::Utc::now(),
+        };
+        assert_eq!(ev.kind(), "prompt_received");
+
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(json["type"], "prompt_received");
+        assert_eq!(json["prompt_id"], "p-1");
+
+        let back: SessionEvent = serde_json::from_value(json).expect("deserialize");
+        match back {
+            SessionEvent::PromptReceived { prompt_id, .. } => assert_eq!(prompt_id, "p-1"),
+            other => panic!("expected PromptReceived, got {other:?}"),
+        }
+    }
+
     #[test]
     fn user_question_and_answer_map_from_harness_with_stable_kinds() {
         // ADR 0054: the interactive question/answer harness events map to
@@ -2046,6 +2070,54 @@ pub(crate) mod tests {
                 "harness_idle".to_string(),
             ],
         );
+    }
+
+    /// Issue #527 Phase 1: a `run_started{prompt_id}` whose matching
+    /// `prompt_received` receipt row doesn't exist (`MiniMeta`'s default
+    /// `prompt_received_at` — see `MetadataStore`'s default impl — returns
+    /// `Ok(None)`, mirroring the env-seeded initial prompt, which never
+    /// gets a receipt) must not panic and must still append the
+    /// `run_started` event normally. The `engram_prompt_to_run_started_seconds`
+    /// join is best-effort telemetry, never load-bearing for delivery.
+    #[tokio::test]
+    async fn harness_event_sink_skips_metric_when_no_receipt_row_exists() {
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            status: engram_core::types::SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:no-receipt".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        };
+        let mini = Arc::new(MiniMeta::new(session));
+        let meta: Arc<dyn MetadataStore> = mini.clone();
+        let sandbox_id = engram_core::SandboxId::new();
+
+        let bus = Arc::new(SessionEventBus::default());
+        let sink = super::harness_event_sink(bus, meta);
+
+        sink(
+            session_id,
+            sandbox_id,
+            HarnessEvent::RunStarted {
+                run_id: "run-1".into(),
+                prompt_summary: None,
+                prompt_id: Some("p-missing".into()),
+            },
+        )
+        .await;
+
+        let events = mini.events.lock();
+        assert_eq!(
+            events.len(),
+            1,
+            "run_started must append even though its receipt lookup misses",
+        );
+        assert_eq!(events[0].kind, "run_started");
     }
 
     // -- ADR 0016 Phase B: live_disk_manifest + chunk_generation -------

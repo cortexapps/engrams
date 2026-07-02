@@ -528,4 +528,137 @@ mod tests {
             "a non-unbound error must not trigger a reattach",
         );
     }
+
+    // -- Issue #527 Phase 1: prompt_received emit ordering --------------
+
+    /// Self-contained `AppState` fixture (the `evicting_gate_tests` pattern
+    /// in `api/snapshot.rs` — not reused across files because test binaries
+    /// / modules can't cheaply share private test-only fns) backed by
+    /// `MiniMeta` so assertions can inspect the exact `session_events`
+    /// order `send_prompt_core` produced.
+    fn build_state_for_session(
+        session: engram_core::types::Session,
+    ) -> (
+        SharedState,
+        Arc<crate::state::tests::MiniMeta>,
+        tempfile::TempDir,
+    ) {
+        use crate::config::CoordinatorConfig;
+        use crate::host_registry::HostRegistry;
+        use crate::state::tests::MiniMeta;
+        use crate::state::AppState;
+        use crate::Services;
+        use engram_cloud_mock::MockCloud;
+        use engram_core::traits::SandboxBackend;
+        use engram_secrets_dev::InMemorySecretStore;
+
+        let local = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SandboxBackend> = Arc::new(
+            engram_sandbox_process::ProcessBackend::new(local.path().join("sandboxes")),
+        );
+        let meta = Arc::new(MiniMeta::new(session));
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
+        let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
+            engram_host_agent::LocalHostClient::with_noop_hub(backend.clone()),
+        );
+        host_registry.register(engram_core::HostId::new(), local_host);
+        let blobs_dir =
+            std::env::temp_dir().join(format!("engram-blobs-test-prompt-{}", uuid::Uuid::new_v4()));
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                blobs_dir.clone(),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(blobs_dir),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = CoordinatorConfig {
+            local_path: local.path().to_path_buf(),
+            ..CoordinatorConfig::default()
+        };
+        let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
+        (state, meta, local)
+    }
+
+    fn dead_session(id: SessionId) -> engram_core::types::Session {
+        engram_core::types::Session {
+            id,
+            status: engram_core::types::SessionState::Dead,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:prompt-receipt".into(),
+            mode: engram_core::types::session::SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        }
+    }
+
+    /// The structural invariant this issue exists to create: `prompt_received`
+    /// is written as the FIRST PG side-effect of `send_prompt_core`, before
+    /// `ensure_active_and_resolve` (the auto-resume). A `Dead` session makes
+    /// `ensure_active_and_resolve` fail immediately with no further side
+    /// effects (no resume attempt, no user-echo) — so if the receipt survives
+    /// as the sole recorded event, it proves the emit happens unconditionally
+    /// up front rather than being contingent on a successful delivery.
+    #[tokio::test]
+    async fn prompt_received_is_recorded_even_when_auto_resume_fails_outright() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(dead_session(id));
+
+        let err = send_prompt_core(&state, id, String::new(), "hello".into())
+            .await
+            .expect_err("a Dead session cannot auto-resume");
+        assert!(
+            matches!(err, ApiError::Gone(_)),
+            "expected the Dead-session Gone mapping, got {err:?}",
+        );
+
+        let events = mini.events.lock();
+        assert_eq!(
+            events.len(),
+            1,
+            "prompt_received must be recorded even though auto-resume (and \
+             therefore the user-echo + delivery) never ran",
+        );
+        assert_eq!(events[0].kind, "prompt_received");
+        let recorded_prompt_id = events[0].payload["prompt_id"]
+            .as_str()
+            .expect("prompt_id string field");
+        assert!(
+            !recorded_prompt_id.is_empty(),
+            "an empty caller prompt_id must be minted before the receipt is written",
+        );
+    }
+
+    /// A caller-supplied `prompt_id` (the web's client-minted id) is carried
+    /// verbatim into the receipt — not re-minted — so it joins cleanly
+    /// against the same id's `run_started` event.
+    #[tokio::test]
+    async fn prompt_received_carries_the_caller_supplied_prompt_id() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(dead_session(id));
+
+        let _ = send_prompt_core(&state, id, "client-pid-42".into(), "hello".into()).await;
+
+        let events = mini.events.lock();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "prompt_received");
+        assert_eq!(events[0].payload["prompt_id"], "client-pid-42");
+    }
 }
