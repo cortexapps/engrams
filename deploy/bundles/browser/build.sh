@@ -227,6 +227,15 @@ here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
 # exact browser the human watches over VNC (ADR 0065). Best-effort: if the
 # ensure fails, still try to connect (the stack may already be coming up).
 "$here/bin/engram-browser" --ensure || true
+# `--ensure` gates on x11vnc RFB (:5900), which comes up a beat BEFORE chromium
+# finishes binding its CDP endpoint (:9222). playwright-cli connectOverCDP fails
+# fast on that gap (one-shot GET /json/version -> ECONNREFUSED, no retry; ADR
+# 0065: RFB readiness is necessary-but-not-sufficient — the chromium-liveness
+# gap), so block until CDP actually answers before handing off. The wait lives in
+# the launcher (--wait-cdp) so --ensure stays RFB-only for the human/VNC path.
+# Best-effort: on timeout it returns 0 and we still exec, so the CLI surfaces the
+# real error rather than us swallowing it.
+"$here/bin/engram-browser" --wait-cdp || true
 export LD_LIBRARY_PATH="$here/lib:${LD_LIBRARY_PATH:-}"
 export PLAYWRIGHT_MCP_CONFIG="$here/cli.config.json"
 export PATH="$here/node/bin:$PATH"
