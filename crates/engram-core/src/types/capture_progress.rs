@@ -128,6 +128,22 @@ impl CaptureFailureKind {
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::WarmExecTransport)
     }
+
+    /// Inverse of [`Self::as_str`] — round-trips the snake_case wire/DB
+    /// representation. `None` for anything unrecognized (a future kind a
+    /// newer host emits that this coordinator doesn't know about yet);
+    /// callers fall back to a generic classification rather than erroring.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "warm_exit_non_zero" => Self::WarmExitNonZero,
+            "warm_stall" => Self::WarmStall,
+            "warm_stage_deadline" => Self::WarmStageDeadline,
+            "warm_global_timeout" => Self::WarmGlobalTimeout,
+            "warm_exec_transport" => Self::WarmExecTransport,
+            "snapshot_failed" => Self::SnapshotFailed,
+            _ => return None,
+        })
+    }
 }
 
 impl std::fmt::Display for CaptureFailureKind {

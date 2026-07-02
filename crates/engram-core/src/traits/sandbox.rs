@@ -552,11 +552,16 @@ pub trait SandboxBackend: Send + Sync {
     /// already resolved any secret refs) merged over the manifest `[env]`
     /// into the warm hook's exec environment. Empty for an image with no
     /// capture_env or no warm hook.
+    ///
+    /// `progress` (issue #539) receives [`crate::types::CaptureProgress`]
+    /// events for the call's lifetime — see the matching doc on
+    /// [`crate::traits::HostClient::build_base_snapshot`].
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
         _warm: Option<WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _progress: tokio::sync::mpsc::Sender<crate::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `build_base_snapshot` (needs the pooled chunk-store wrapper)".into(),

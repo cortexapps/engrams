@@ -1174,6 +1174,28 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// Issue #539: persist one `CaptureProgress` event from the streaming
+    /// `BuildBaseSnapshot` RPC onto the job row — the live capture-phase
+    /// counterpart to [`Self::update_enable_job_progress`] (which only
+    /// covers the materialize step). ALSO renews the claim
+    /// (`claimed_at = NOW()`), which is what lets `enable_scanner` delete
+    /// its blind capture-lease-renewal ticker: the host's >=30s keepalive
+    /// is well under the 300s lease, and a transport death stops renewals
+    /// exactly when a peer should legitimately re-claim.
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    async fn update_enable_job_capture_progress(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        progress: &crate::types::CaptureProgress,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant, progress);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
     /// Move the job's state forward (also renews the claim, clears
     /// `error` on non-failed targets, and releases the claim on
     /// terminal states).

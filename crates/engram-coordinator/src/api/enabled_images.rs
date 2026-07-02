@@ -271,6 +271,10 @@ pub(crate) async fn capture_and_record_base_snapshot(
     state: &SharedState,
     row: &EnabledImage,
     manifest: &ImageManifest,
+    // Issue #539: live `CaptureProgress` events for the whole call.
+    // Unused (no events sent) on the content/digest-reuse fast paths
+    // below — no host RPC is made there, so there's nothing to report.
+    progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
 ) -> Result<
     (
         engram_core::types::SnapshotId,
@@ -466,14 +470,25 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // process (e.g. a gradle daemon) is captured into the base snapshot.
     // A warm failure is fail-loud — it surfaces here as a capture error
     // and aborts the enable.
+    //
+    // Issue #539: `progress` receives live `CaptureProgress` events for
+    // the call's lifetime — the caller (`enable_scanner::advance_one`)
+    // drains it into a fenced `enable_jobs` write per event.
     let meta = host
-        .build_base_snapshot(spec, manifest.warm.clone(), capture_env)
+        .build_base_snapshot(spec, manifest.warm.clone(), capture_env, progress)
         .await
-        .map_err(|e| {
-            ApiError::Internal(format!(
-                "base snapshot capture for `{}` failed on host {host_id}: {e}",
+        .map_err(|e| match e {
+            engram_core::SandboxError::CaptureFailed(failure) => ApiError::CaptureFailed {
+                kind: failure.kind,
+                message: format!(
+                    "base snapshot capture for `{}` failed on host {host_id}: {failure}",
+                    row.image_uri
+                ),
+            },
+            other => ApiError::Internal(format!(
+                "base snapshot capture for `{}` failed on host {host_id}: {other}",
                 row.image_uri
-            ))
+            )),
         })?;
 
     // A base snapshot is only useful if its chunked manifests are
