@@ -359,23 +359,6 @@ async fn main() -> Result<(), HostAgentError> {
             // images, pre-D4 session-keyed leftovers). Live files are
             // protected by the handlers' open fds; see base_shm_gc.
             let _base_shm_gc = engram_host_agent::base_shm_gc::spawn(fc_cfg.uffd_base_dir.clone());
-            // ADR 0014 M1.12: each FC host maintains a 16 MiB empty
-            // ext4 stub harness that warm-pool restore points the
-            // harness symlink at. Content-identical to the one the
-            // bake produces, so no transfer needed — every host
-            // mke2fs's its own at startup. `swap_harness_drive`
-            // re-points the symlink at the session's real harness
-            // ext4 at warm-lease.
-            let stub_path = cli.work_dir.join(".stub-harness.ext4");
-            let stub_abs = engram_host_agent::ensure_stub_harness(&stub_path)
-                .await
-                .map_err(|e| {
-                    HostAgentError::Config(format!(
-                        "materialize stub harness at {}: {e}",
-                        stub_path.display()
-                    ))
-                })?;
-            fc_cfg.stub_harness_path = Some(stub_abs);
             let fc = Arc::new(engram_sandbox_firecracker::FirecrackerBackend::new(
                 cli.work_dir.clone(),
                 fc_cfg,

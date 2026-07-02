@@ -353,17 +353,6 @@ pub struct FirecrackerConfig {
     /// cache so residency prefetch warms what the handler reads —
     /// ADR 0021 P2) when the backend is built via `FirecrackerBackend::new`.
     pub uffd_cache_root: Option<PathBuf>,
-    /// ADR 0014 M1.12 (option D): host-local stub harness ext4 used
-    /// as the symlink target for warm-pool restores. State.bin
-    /// embeds the bake's harness substrate path, which doesn't exist
-    /// on the receiver; `restore_canonical_symlinks` redirects both
-    /// host-canonical and source-canonical harness paths at this
-    /// local file instead. Required to be present + a real ext4 so
-    /// FC `load_snapshot` can open it as a virtio-blk device. Caller
-    /// (host-agent on startup, image-builder during bake) is
-    /// responsible for materializing the file. The session's real
-    /// harness is patched in via `swap_harness_drive` at warm-lease.
-    pub stub_harness_path: Option<PathBuf>,
     /// ADR 0014 M1.14: bake-side override for the UFFD handler's
     /// blob root. The bake's chunk store lives at
     /// `<images_dir>/store/` rather than the runtime convention
@@ -581,7 +570,6 @@ impl FirecrackerConfig {
             track_dirty_pages: false,
             host_id: None,
             uffd_cache_root: None,
-            stub_harness_path: None,
             uffd_blob_root: None,
             // Host-passthrough by default. Prod (`engram-coordinator`)
             // and the bake (`engram-image-builder`) both opt in to a
@@ -2735,12 +2723,7 @@ impl FirecrackerBackend {
             // it. On failure `fc_guard` (SIGKILL FC) and `netns_guard` (tear
             // the netns down) fire on drop — no manual cleanup needed.
             tracing::Instrument::instrument(
-                restore_canonical_symlinks(
-                    &self.work_dir,
-                    sandbox_id,
-                    manifest,
-                    self.config.stub_harness_path.as_deref(),
-                ),
+                restore_canonical_symlinks(&self.work_dir, sandbox_id, manifest),
                 tracing::info_span!("fc.restore_symlinks"),
             )
             .await?;
@@ -3337,13 +3320,6 @@ fn snapshot_create_timeout(mem_mib: u32) -> Duration {
 ///
 /// Both point at the same `rootfs_target`. Idempotent.
 ///
-/// `stub_harness_override`, when `Some`, replaces `manifest.spec.
-/// harness_substrate` as the symlink target — used by warm-pool
-/// restore where the bake's stub.ext4 path doesn't exist on the
-/// receiver, but a content-identical host-local stub does. M1.12's
-/// `swap_harness_drive` re-points the symlink at the session's real
-/// harness ext4 at warm-lease time, so the stub only needs to be
-/// openable as a block device by `load_snapshot`.
 /// ADR 0048: per-host lock keyed by a base snapshot's `source_rootfs_canonical`
 /// path. Restores that descend from the SAME base share this path (FC opens the
 /// rootfs at the state.bin-embedded absolute path, and there's no load-time
@@ -3362,7 +3338,6 @@ async fn restore_canonical_symlinks(
     work_dir: &Path,
     new_sandbox_id: SandboxId,
     manifest: &FcSnapshotManifest,
-    stub_harness_override: Option<&Path>,
 ) -> Result<(), SandboxError> {
     for parent in paths::canonical_parent_dirs(work_dir) {
         tokio::fs::create_dir_all(&parent).await.map_err(|e| {
@@ -3415,7 +3390,6 @@ async fn restore_canonical_symlinks(
     // harness binary lives in the rootfs at the manifest-declared
     // `[harness] exec` path, so there's nothing for the host to
     // re-point.
-    let _ = (stub_harness_override, new_sandbox_id, work_dir);
 
     Ok(())
 }
@@ -4566,14 +4540,6 @@ impl SandboxBackend for FirecrackerBackend {
     // option-D. The harness lives in the rootfs now, so there's no
     // host file backing a virtio-blk drive to swap.
 
-    /// ADR 0020 P1: the host-local stub harness ext4 the base-snapshot
-    /// capture attaches as `/dev/vdb` so the snapshot carries a harness
-    /// drive slot to re-point per session at restore. From
-    /// `FirecrackerConfig.stub_harness_path` (`ENGRAM_STUB_HARNESS_PATH`).
-    fn stub_harness_path(&self) -> Option<std::path::PathBuf> {
-        self.config.stub_harness_path.clone()
-    }
-
     fn bundle_dir(&self) -> &std::path::Path {
         // The one dir `read_bundle_stamp` + `resolve_aux_drive` read from, so
         // the host-agent heartbeat reports exactly what restore will attach.
@@ -5489,7 +5455,6 @@ mod tests {
             egress_dns_port: None,
             host_id: None,
             uffd_cache_root: None,
-            stub_harness_path: None,
             uffd_blob_root: None,
             cpu_template: None,
             bundle_dir: dir.path().join("bundles"),
