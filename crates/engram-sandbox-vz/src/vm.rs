@@ -427,6 +427,29 @@ pub(crate) fn staged_erofs_path(bundle_dir: &std::path::Path, sha: &str) -> std:
     bundle_dir.join(format!("{sha}.erofs"))
 }
 
+/// ADR 0062: order aux RO drives by ascending reserved slot for attach.
+///
+/// The guest init shim mounts each attached bundle device at a *sequential*
+/// `/opt/engram/dyn/<i>` in `/dev/vd*` enumeration order (i.e. attach order) —
+/// it reads no slot metadata. On FC that still yields `dyn/<i> == slot i`
+/// because the base snapshot attaches all `RESERVED_SLOTS` as sentinels in slot
+/// order and `patch_drive` swaps by `drive_id`. VZ has no sentinel pool: it
+/// attaches only the *resolved* drives, so attach order alone decides the guest
+/// index. The coordinator pushes the harness (slot 0) LAST in `selected_mounts`
+/// (after the skills, slots 1..), so a naive slice-order attach lands the
+/// harness at `dyn/<n_skills>` while the coordinator `exec`s the FIXED
+/// `/opt/engram/dyn/0/harness` → `spawn ... No such file or directory`.
+/// Sorting by slot restores slot order, so slot 0 (harness) is always attached
+/// first and mounts at `dyn/0`. Skills are `mount.json`-discovered and thus
+/// position-independent, but staying in slot order keeps them deterministic too.
+/// Drives without a parseable slot sort last (defensive; every real aux drive
+/// carries a `dyn_<i>` id). Stable sort preserves relative order within a slot.
+pub(crate) fn aux_drives_in_slot_order(drives: &[AuxRoDrive]) -> Vec<&AuxRoDrive> {
+    let mut ordered: Vec<&AuxRoDrive> = drives.iter().collect();
+    ordered.sort_by_key(|d| d.slot_index().unwrap_or(usize::MAX));
+    ordered
+}
+
 /// Build a fully-configured `VZVirtualMachineConfiguration` for
 /// `cfg`. Linux boot, virtio-block rootfs, a `VZVirtioSocketDevice`
 /// (real virtio-vsock) for the host↔guest control/harness/relay
@@ -490,14 +513,19 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
         );
         storage.push(Retained::cast_unchecked(block_dev));
 
-        // ADR 0061: attach each resolved skill bundle as a read-only erofs
-        // virtio-blk image, in slice order (/dev/vdb, /dev/vdc, …). The
-        // guest init shim RO-mounts each at /opt/engram/dyn/<i> and agentd
-        // reads its mount.json to wire the skill. Sentinel slots (sha =
-        // None) are skipped, so base-snapshot capture (whose spec carries
-        // only `reserved_slot` placeholders) attaches nothing and the base
-        // snapshot stays skill-agnostic.
-        for drive in &cfg.aux_ro_drives {
+        // ADR 0061/0062: attach each resolved bundle as a read-only erofs
+        // virtio-blk image. Order by ascending reserved slot (NOT the
+        // coordinator's slice order, which pushes the harness last) so the
+        // harness (slot 0) is attached first and the guest init shim mounts it
+        // at /opt/engram/dyn/0 — the FIXED path the coordinator `exec`s. The
+        // guest indexes dyn/<i> by attach order alone, so slice order would
+        // strand the harness at dyn/<n_skills>. See `aux_drives_in_slot_order`.
+        // The guest RO-mounts each device at /opt/engram/dyn/<i>; agentd reads
+        // its mount.json to wire skills (harness is `exec`'d, not wired).
+        // Sentinel slots (sha = None) are skipped, so base-snapshot capture
+        // (whose spec carries only `reserved_slot` placeholders) attaches
+        // nothing and the base snapshot stays skill-agnostic.
+        for drive in aux_drives_in_slot_order(&cfg.aux_ro_drives) {
             let Some(sha) = drive.sha256.as_deref() else {
                 continue;
             };
@@ -709,6 +737,38 @@ mod tests {
     fn staged_erofs_path_is_content_keyed() {
         let p = super::staged_erofs_path(std::path::Path::new("/var/shared"), "abc123");
         assert_eq!(p, std::path::PathBuf::from("/var/shared/abc123.erofs"));
+    }
+
+    /// ADR 0062 regression: the coordinator builds `selected_mounts` as
+    /// `[skill@dyn_1, skill@dyn_2, harness@dyn_0]` (harness pushed LAST). VZ's
+    /// attach order fixes the guest `dyn/<i>` index, so it must attach
+    /// slot-ascending — otherwise the harness lands at `dyn/2` and the
+    /// coordinator's `exec /opt/engram/dyn/0/harness` hits ENOENT. This pins the
+    /// harness (slot 0) to the front regardless of input order.
+    #[test]
+    fn aux_drives_attach_in_slot_order_harness_first() {
+        let skill1 = AuxRoDrive {
+            sha256: Some("s1".into()),
+            ..AuxRoDrive::reserved_slot(1)
+        };
+        let skill2 = AuxRoDrive {
+            sha256: Some("s2".into()),
+            ..AuxRoDrive::reserved_slot(2)
+        };
+        let harness = AuxRoDrive {
+            sha256: Some("hh".into()),
+            ..AuxRoDrive::reserved_slot(0)
+        };
+        // Coordinator order: skills first, harness last.
+        let input = vec![skill1, skill2, harness];
+        let ordered = super::aux_drives_in_slot_order(&input);
+        let slots: Vec<_> = ordered.iter().map(|d| d.slot_index()).collect();
+        assert_eq!(slots, vec![Some(0), Some(1), Some(2)], "slot-ascending");
+        assert_eq!(
+            ordered[0].sha256.as_deref(),
+            Some("hh"),
+            "harness attaches first → guest dyn/0"
+        );
     }
 
     #[test]

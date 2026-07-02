@@ -305,15 +305,14 @@ bake-demo:
 pull-kernel:
     bash deploy/dev/pull-kernel.sh
 
-# Stage the ADR 0027 RO bundles (skills, playwright) as UNPACKED trees
-# under var/bundles/ for the dev ProcessBackend, which symlinks them in
-# instead of mounting a squashfs. `skills` is a plain copy; `playwright`
-# needs Docker (glibc browser build) and is best-effort — skip it and only
-# skills get wired (no browser tooling in dev). Re-run after editing a skill.
+# Stage the ADR 0027 RO bundles (skills, integrations-cli, browser) as
+# UNPACKED trees under var/bundles/ for the dev ProcessBackend, which symlinks
+# them in instead of mounting a squashfs. `skills` is a plain copy;
+# `integrations-cli`/`browser` need Docker (glibc builds) and are best-effort —
+# skip them and only skills get wired (no browser tooling in dev). Re-run after
+# editing a skill.
 bundles:
     deploy/bundles/skills/build.sh --stage var/bundles/skills
-    deploy/bundles/playwright/build.sh --stage var/bundles/playwright \
-        || echo "playwright bundle skipped (needs Docker) — dev sessions get skills only"
     deploy/bundles/integrations-cli/build.sh --stage var/bundles/integrations-cli \
         || echo "integrations-cli bundle skipped (needs Docker) — dev sessions get no integration CLIs"
     deploy/bundles/browser/build.sh --stage var/bundles/browser \
@@ -332,10 +331,10 @@ bundles-squashfs:
     mkdir -p var/shared
     stamp="{"
     sep=""
-    # ADR 0055: `sentinel` rides every reserved dyn-* slot; skills/playwright/
+    # ADR 0055: `sentinel` rides every reserved dyn-* slot; skills/
     # integrations-cli/browser are catalog skills swapped in per session. Files
     # are content-keyed (<sha>.squashfs); the stamp maps logical name -> sha.
-    for name in sentinel skills playwright integrations-cli browser; do
+    for name in sentinel skills integrations-cli browser; do
         tmp="var/shared/.$name.build.squashfs"
         if ! "deploy/bundles/$name/build.sh" "$tmp"; then
             echo "$name bundle build failed; skipping (sessions degrade gracefully)" >&2
@@ -385,16 +384,29 @@ bundles-vz:
         if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1;
         else shasum -a 256 "$1" | cut -d' ' -f1; fi
     }
+    # Reproducible erofs pack (the VZ analog of _pack.sh's SOURCE_DATE_EPOCH
+    # squashfs). mkfs.erofs embeds a RANDOM fs UUID + the wallclock build time by
+    # default, so the SAME tree packs to a DIFFERENT sha every run — which churns
+    # every bundle's content-address on each `just bundles-vz`, repoints
+    # current.json, restarts the host-agent, and strands base snapshots that
+    # pinned the prior generation ("bundle materialize: blob not found"). Pin the
+    # UUID, timestamp (-T0, --all-time is the default), and uid/gid (RO in-guest,
+    # so ownership is irrelevant) so identical content always yields the same sha.
+    # -b 4096: match the guest page size (macOS host pages are 16K, guest is 4K).
+    pack_erofs() {  # pack_erofs <out.erofs> <tree-dir>
+        mkfs.erofs -b 4096 -T 0 -U 00000000-0000-0000-0000-000000000000 \
+            --force-uid=0 --force-gid=0 "$1" "$2" >/dev/null
+    }
     mkdir -p var/shared
     stamp="{"
     sep=""
-    # `sentinel` rides every reserved dyn slot at capture; skills/playwright/
+    # `sentinel` rides every reserved dyn slot at capture; skills/
     # integrations-cli/browser are catalog skills swapped in per session.
-    # playwright/integrations-cli/browser need Docker and are best-effort
+    # integrations-cli/browser need Docker and are best-effort
     # (skipped on failure), exactly as `just bundles` already degrades.
-    for name in sentinel skills playwright integrations-cli browser; do
+    for name in sentinel skills integrations-cli browser; do
         # Stage under the repo (absolute, $HOME-rooted), NOT `mktemp -d`: the
-        # Docker-built bundles (playwright/browser) bind-mount this dir into the
+        # Docker-built bundles (integrations-cli/browser) bind-mount this dir into the
         # build container, and Docker Desktop on macOS does not share the
         # /var/folders path `mktemp -d` returns — the container's writes never
         # reach the host, silently producing an empty bundle. A path under the
@@ -408,13 +420,7 @@ bundles-vz:
         fi
         out="var/shared/.$name.build.erofs"
         rm -f "$out"
-        # -b 4096: force a 4 KiB erofs block size. mkfs.erofs defaults the
-        # block size to the HOST page size, which on macOS/Apple Silicon is
-        # 16 KiB (blkszbits 14). The Linux guest kernel uses 4 KiB pages and
-        # erofs requires block size <= page size, so a 16 KiB-block image
-        # fails to mount in-guest ("blkszbits 14 isn't supported"). 4 KiB
-        # matches the guest and mounts everywhere.
-        if ! mkfs.erofs -b 4096 "$out" "$tree" >/dev/null; then
+        if ! pack_erofs "$out" "$tree"; then
             echo "$name erofs pack failed; skipping" >&2
             rm -rf "$tree" "$out"
             continue
@@ -426,25 +432,70 @@ bundles-vz:
         sep=", "
     done
     # ADR 0062: the built-in `claude` harness rides the stamp like a skill (key
-    # `harness-claude`, mounted on dyn_0). Unlike the bundles above its tree (the
-    # engram-harness-claude entry binary + the bundled `claude` CLI) is pre-built
-    # and handed in via ENGRAM_HARNESS_CLAUDE_TREE, exactly as `bundles-squashfs`
-    # does for FC — the only difference is the pack format (erofs, not squashfs).
-    # Skipped when unset, so a no-harness VZ dev stack still boots; a local
-    # `just dev` that wants the built-in claude points this at a staged tree.
-    if [ -n "${ENGRAM_HARNESS_CLAUDE_TREE:-}" ]; then
-        [ -x "$ENGRAM_HARNESS_CLAUDE_TREE/harness" ] || {
-            echo "ENGRAM_HARNESS_CLAUDE_TREE=$ENGRAM_HARNESS_CLAUDE_TREE is missing an executable 'harness' entry binary" >&2
+    # `harness-claude`, mounted on dyn_0, exec'd as /opt/engram/dyn/0/harness).
+    # Its tree — the engram-harness-claude entry binary + the pinned `claude` CLI
+    # + the committed harness.toml descriptor — is the ONE bundle not assembled by
+    # a build.sh: CI hands it in pre-built via ENGRAM_HARNESS_CLAUDE_TREE (the
+    # `bake-harness-claude-artifact` job's downloaded artifact). A local VZ
+    # `just dev` has no such artifact, so when the var is unset we build the tree
+    # HERE for the arm64 Kata guest (mirroring `bake-demo`'s cross-compile), then
+    # pack it exactly like FC's `bundles-squashfs` — only the format differs
+    # (erofs, not squashfs). Without this the fleet stamp never carries
+    # `harness-claude` and `POST /sessions` 400s with "built-in harness `claude`
+    # squashfs (`harness-claude`) is not staged on any host yet".
+    harness_tree="${ENGRAM_HARNESS_CLAUDE_TREE:-}"
+    if [ -z "$harness_tree" ]; then
+        # PINNED — keep in lockstep with ci.yml's bake-harness-claude-artifact:
+        # 2.1.185 is the newest CLI that still offers AskUserQuestion headlessly
+        # (cortexapps/engrams#431); bump deliberately and re-verify AUQ. The VZ
+        # guest is arm64 Linux (Kata kernel), so build the musl harness + fetch
+        # the linux-arm64 CLI for that arch (mirrors bake-demo's case).
+        CLAUDE_VERSION=2.1.185
+        case "$(uname -m)" in
+            arm64 | aarch64) htarget=aarch64-unknown-linux-musl; carch=linux-arm64 ;;
+            x86_64 | amd64)  htarget=x86_64-unknown-linux-musl;   carch=linux-x64  ;;
+            *) echo "harness-claude: unsupported arch $(uname -m); skipping" >&2; htarget="" ;;
+        esac
+        if [ -n "$htarget" ]; then
+            # Best-effort like the Docker bundles above: a cross-build/download
+            # failure (e.g. not in `nix develop`, no musl cross toolchain) warns
+            # and skips so `just dev` still comes up — just without built-in claude.
+            tree="$PWD/var/shared/.harness-claude.stage"
+            cache="var/shared/.cache/claude-$CLAUDE_VERSION-$carch"
+            ok=1
+            cargo build --release --target "$htarget" -p engram-harness-claude || ok=0
+            if [ "$ok" = 1 ] && [ ! -x "$cache" ]; then
+                mkdir -p "$(dirname "$cache")"
+                curl -fsSL --retry 3 \
+                    "https://downloads.claude.ai/claude-code-releases/$CLAUDE_VERSION/$carch/claude" \
+                    -o "$cache" && chmod +x "$cache" || ok=0
+            fi
+            if [ "$ok" = 1 ]; then
+                rm -rf "$tree"; mkdir -p "$tree"
+                cp -p "target/$htarget/release/engram-harness-claude" "$tree/harness"
+                cp -p "$cache" "$tree/claude"
+                cp -p deploy/harness-claude/harness.toml "$tree/harness.toml"
+                harness_tree="$tree"
+            else
+                echo "harness-claude local build failed; skipping (dev stack boots without the built-in claude)" >&2
+            fi
+        fi
+    fi
+    if [ -n "$harness_tree" ]; then
+        [ -x "$harness_tree/harness" ] || {
+            echo "harness tree $harness_tree is missing an executable 'harness' entry binary" >&2
             exit 1
         }
         out="var/shared/.harness-claude.build.erofs"
         rm -f "$out"
-        # -b 4096: match the guest page size (see the loop above).
-        mkfs.erofs -b 4096 "$out" "$ENGRAM_HARNESS_CLAUDE_TREE" >/dev/null
+        pack_erofs "$out" "$harness_tree"
         sha="$(sha256_of "$out")"
         mv "$out" "var/shared/$sha.erofs"
         stamp="$stamp$sep\"harness-claude\": \"$sha\""
         sep=", "
+        # Drop the locally-built stage tree (keep the download cache); CI's
+        # externally-provided ENGRAM_HARNESS_CLAUDE_TREE is left untouched.
+        [ "$harness_tree" = "$PWD/var/shared/.harness-claude.stage" ] && rm -rf "$harness_tree"
     fi
     echo "$stamp}" > var/shared/current.json
     cat var/shared/current.json

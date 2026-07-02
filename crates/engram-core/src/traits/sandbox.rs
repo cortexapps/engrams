@@ -482,6 +482,20 @@ pub trait SandboxBackend: Send + Sync {
         std::path::Path::new(crate::types::sandbox::AuxRoDrive::SHARED_DIR)
     }
 
+    /// The on-disk extension of this backend's staged bundle files
+    /// (`<bundle_dir>/<sha256>.<ext>`). FC packs squashfs; VZ packs erofs (its
+    /// Kata guest kernel has `CONFIG_EROFS_FS` but no `CONFIG_SQUASHFS`). The
+    /// host-agent's `BundleStore` materializes/sweeps generations by this name,
+    /// so it MUST match what the backend actually attaches (`bundle_dir` + this)
+    /// — otherwise a restore looks for `<sha>.squashfs`, misses the staged
+    /// `<sha>.erofs`, and faults to BlobStorage ("blob not found"). The blob
+    /// KEY (`AuxRoDrive::blob_key`) stays extension-free — BlobStorage is keyed
+    /// by content sha, so only the local staged filename carries the extension.
+    /// Defaults to squashfs; VZ overrides to erofs.
+    fn bundle_file_ext(&self) -> &'static str {
+        "squashfs"
+    }
+
     /// ADR 0020 Route B: whether `restore` serves guest memory lazily
     /// (UFFD, chunk-native) rather than from a materialized
     /// `memory.bin`. When `true`, the wrapping `PooledBackend` skips

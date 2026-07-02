@@ -23,10 +23,23 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 build_tree() {
     local dest="$1"
-    rm -rf "$dest"; mkdir -p "$dest"
-    docker run --rm \
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    # DO NOT bind-mount the OUTPUT dir. The Docker daemon may run in a Lima/Colima
+    # VM reached over reverse-sshfs (macOS dev), where a bind-mounted /out is
+    # unreliable two ways: a freshly created host dir is not yet visible in the VM
+    # when `docker run -v` fires (mkdir /out/* -> "No such file or directory"),
+    # and GNU tar's deferred symlink pass fails on the sshfs mount (node ships
+    # npm/npx as symlinks -> "Cannot open: Permission denied"). Instead the
+    # container builds the tree in its OWN overlayfs /out (mkdir + symlinks behave
+    # normally), then we `docker cp` the finished tree to the host — docker cp
+    # writes host-side through the CLI, with no sshfs in the path. Read-only INPUT
+    # mounts of existing committed files are fine (sshfs serves existing files
+    # reliably; only newly created dirs race). Works identically on a native host.
+    local cname=engram-bundle-build-browser
+    docker rm -f "$cname" >/dev/null 2>&1 || true
+    docker run --name "$cname" \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-        -v "$dest:/out" \
         -v "$here/bin/engram-browser:/launcher:ro" \
         -v "$here/skills:/skills-src:ro" \
         debian:bookworm-slim bash -euo pipefail -c '
@@ -195,6 +208,9 @@ FONTS
             arm64) NODE_ARCH=arm64 ;;
             *) echo "unsupported arch $ARCH" >&2; exit 1 ;;
         esac
+        # /out is the container overlayfs (not a bind mount; see build_tree),
+        # so node ships its bin/npm|npx symlinks straight in with no sshfs
+        # deferred-symlink failure.
         mkdir -p /out/node
         curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
             | tar -xJ -C /out/node --strip-components=1
@@ -247,18 +263,17 @@ WRAP
         chmod -R a+rX /out
         chown -R "$HOST_UID:$HOST_GID" /out
     '
+    # Copy the finished tree out of the container onto the host (host-side via
+    # the CLI — no sshfs), then drop the container.
+    docker cp "$cname:/out/." "$dest/"
+    docker rm -f "$cname" >/dev/null 2>&1 || true
     cp "$here/mount.json" "$dest/"
-    # Fail loud if the container's /out never reached the host $dest. The
-    # in-container guard above sees a populated /out, but a `docker run -v`
-    # bind mount whose host path Docker can't share (classically a macOS
-    # mktemp dir under /var/folders, which Docker Desktop does NOT propagate)
-    # leaves the HOST tree with only the mount.json we just cp'd — a silently
-    # empty bundle that still packs + stamps. Assert the launcher landed on
-    # the host side so an unshared $dest errors here instead of shipping an
-    # empty browser bundle (callers must stage under a Docker-shared path —
-    # an absolute path under $HOME, never /var/folders).
+    # Fail loud if the tree never reached the host — e.g. the container built an
+    # empty /out, or docker cp copied nothing. Assert the launcher landed so a
+    # broken build errors here instead of shipping a silently empty bundle that
+    # still packs + stamps.
     [ -x "$dest/bin/engram-browser" ] || {
-        echo "FATAL: $dest/bin/engram-browser missing after build — the docker bind mount did not propagate to the host. Stage under a Docker-shared path (absolute, under \$HOME), not /var/folders." >&2
+        echo "FATAL: $dest/bin/engram-browser missing after build — the container tree did not reach the host." >&2
         exit 1
     }
 }
