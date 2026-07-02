@@ -2818,6 +2818,34 @@ impl MetadataStore for PostgresStore {
         rows.iter().map(row::persisted_event_from_row).collect()
     }
 
+    async fn prompt_received_at(
+        &self,
+        session_id: SessionId,
+        prompt_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
+        // Issue #527 Phase 1: the receipt row is coordinator-authoritative
+        // and excluded from the rewind tombstone (see
+        // `rewind_session_to_cursor` below), so it is always the live head
+        // for this `prompt_id` — DESC LIMIT 1 is defensive (a prompt_id is
+        // minted fresh per SendPrompt, so duplicates are not expected on
+        // the happy path) rather than load-bearing.
+        let row = sqlx::query(
+            r#"
+            SELECT created_at FROM session_events
+             WHERE session_id = $1 AND kind = 'prompt_received' AND payload->>'prompt_id' = $2
+             ORDER BY idx DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(prompt_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| sqlx::Row::try_get(&r, "created_at").map_err(db_err))
+            .transpose()
+    }
+
     async fn rewind_session_to_cursor(
         &self,
         session_id: SessionId,
@@ -2897,11 +2925,25 @@ impl MetadataStore for PostgresStore {
             .collect();
 
         // Tombstone the rolled-back span (audit-preserving) and count it.
+        //
+        // Issue #527 Phase 1: `prompt_received` is excluded — it is a
+        // coordinator-authoritative fact ("the user asked at time T") that
+        // stays true across a guest-state rewind (the resume rewinds the
+        // HARNESS's view of the world, not whether the user sent the
+        // prompt). Without this exclusion, every resume-with-rollback would
+        // tombstone the receipt row and inflate `rolled_back` by one,
+        // masking the real signal this issue exists to measure.
+        //
+        // Merge-coordination note (see issue #527 Guardrails): if a sibling
+        // change extends this same UPDATE with its own lifecycle-kind
+        // exclusion list, merge into one `AND kind NOT IN (...)` predicate
+        // rather than stacking separate `AND kind <>` clauses.
         let tombstoned = sqlx::query(
             r#"
             UPDATE session_events
                SET rewound_at = NOW()
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
+               AND kind <> 'prompt_received'
             "#,
         )
         .bind(session_id.as_uuid())

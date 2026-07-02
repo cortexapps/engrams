@@ -958,6 +958,26 @@ pub trait MetadataStore: Send + Sync {
         Ok(crate::types::event::RewindSummary::default())
     }
 
+    /// Issue #527 Phase 1: look up the durable `prompt_received` receipt
+    /// timestamp for a given `prompt_id` — the coordinator-authoritative
+    /// "the user asked at time T" fact, written as the first PG side-effect
+    /// of `send_prompt_core` (before auto-resume). Used by the harness-event
+    /// sink to compute `engram_prompt_to_run_started_seconds` when the
+    /// matching `HarnessRunStarted{prompt_id}` lands. Returns `Ok(None)`
+    /// when no receipt exists — the env-seeded initial prompt carries no
+    /// `prompt_id` and never gets one, so this is an expected, non-error
+    /// case the caller skips silently rather than treating as a bug.
+    ///
+    /// Default `Ok(None)` so mocks without an event log are a clean no-op
+    /// (they simply never emit the derived histogram).
+    async fn prompt_received_at(
+        &self,
+        _session_id: SessionId,
+        _prompt_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
+        Ok(None)
+    }
+
     // ---- file artifacts (ADR 0026) ----
 
     /// Record a shared file artifact for a session. `id` is the

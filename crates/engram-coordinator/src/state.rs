@@ -34,6 +34,23 @@ pub enum SessionEvent {
         to: SessionState,
         at: DateTime<Utc>,
     },
+    /// Issue #527 Phase 1: the durable "the user asked at time T" fact.
+    /// Emitted as the FIRST PG write of `send_prompt_core`, before
+    /// `ensure_active_and_resolve` (the auto-resume) — unlike the
+    /// user-echo `HarnessAgentMessage`, which is deliberately ordered
+    /// AFTER the resume to satisfy ADR 0052 type-ahead rendering. This
+    /// event exists purely for measurement: it is the receipt anchor
+    /// `engram_prompt_to_run_started_seconds` joins against
+    /// `run_started{prompt_id}` to compute true prompt→first-token
+    /// latency, replacing the `idle→created` proxy (which is a lower
+    /// bound because it post-dates the resume). Coordinator-authoritative
+    /// — stays true across a guest-state rewind, so
+    /// `rewind_session_to_cursor` excludes this kind from its tombstone
+    /// UPDATE (the user genuinely did send the prompt).
+    PromptReceived {
+        prompt_id: String,
+        at: DateTime<Utc>,
+    },
     /// `POST /sessions/:id/exec*` started a new command. `exec_id` is
     /// the sandbox-side identifier; downstream Stdout/Stderr/Exit
     /// events for this run carry the same value so multiplexed clients
@@ -333,6 +350,7 @@ impl SessionEvent {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::StatusChanged { .. } => "status_changed",
+            Self::PromptReceived { .. } => "prompt_received",
             Self::ExecStarted { .. } => "exec_started",
             Self::ExecCompleted { .. } => "exec_completed",
             Self::Stdout { .. } => "stdout",
