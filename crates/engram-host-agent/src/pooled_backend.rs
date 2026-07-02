@@ -570,8 +570,11 @@ pub struct PooledBackend {
     /// chain advances are not).
     capture_locks: Arc<DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
     /// ADR 0045 D5: per-sandbox background upload tasks spawned by
-    /// `snapshot_begin` / `migration_finish_restore`, awaited by
-    /// `snapshot_wait`.
+    /// `migration_finish_restore`, awaited by `snapshot_wait`. Issue
+    /// #529: `snapshot_begin`'s eviction flavor no longer inserts here —
+    /// it doesn't use the wait/RPC-routing shape at all anymore (see
+    /// `pending_finalizes` below); this map now serves the migration
+    /// restore flavor exclusively.
     ///
     /// Issue #221: the result is stored as a cloneable, retryable
     /// [`SharedSnapshotResult`] (not a raw `JoinHandle`). The
@@ -580,6 +583,25 @@ pub struct PooledBackend {
     /// await and a retry, and two concurrent waiters. The entry is
     /// removed only on successful consumption / supersession / destroy.
     snapshot_waits: Arc<DashMap<SandboxId, SnapshotWait>>,
+    /// Issue #529: `sandbox_id → snapshot_id` for an in-flight (durably
+    /// persisted, not-yet-terminal) eviction finalize job. Seeded from
+    /// disk at startup (`resume_pending_finalizes`) and on every fresh
+    /// `snapshot_begin`; cleared only when the job reaches its terminal
+    /// stage or is quarantined. Makes `snapshot_begin` idempotent under
+    /// an eviction-scanner retry storm: re-observe the pending
+    /// `snapshot_id` instead of re-capturing.
+    pending_finalizes: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
+    /// Issue #529: a weak self-reference, set once via `set_self_ref`
+    /// right after construction (see `lib.rs`, alongside
+    /// `Arc::new(p)`) — so a detached eviction finalize job, which only
+    /// has `EvictionFinalizer` (a bundle of Arc-cloned fields, built from
+    /// `&self`), can still reach the FULL `PooledBackend::destroy` (egress
+    /// unregister, NBD slot release, checkpoint-chain teardown — not just
+    /// the inner backend's VM teardown) at its terminal stage, without
+    /// threading an owned `Arc<PooledBackend>` through `snapshot_begin`'s
+    /// `&self` signature. `Weak` so holding a clone can never keep the
+    /// backend alive past its natural lifetime.
+    self_ref: Arc<std::sync::OnceLock<std::sync::Weak<PooledBackend>>>,
     /// ADR 0045 C1: open live-migration exports (frozen sandboxes
     /// serving a move). See `crate::migration`.
     migrations: Arc<crate::migration::MigrationRegistry>,
@@ -1240,6 +1262,8 @@ impl PooledBackend {
             checkpoint_chains: Arc::new(DashMap::new()),
             capture_locks: Arc::new(DashMap::new()),
             snapshot_waits: Arc::new(DashMap::new()),
+            pending_finalizes: Arc::new(DashMap::new()),
+            self_ref: Arc::new(std::sync::OnceLock::new()),
             migrations: Arc::new(crate::migration::MigrationRegistry::default()),
             inline_disk_manifests: Arc::new(DashMap::new()),
             migrate_peer: Arc::new(std::sync::OnceLock::new()),
@@ -1385,6 +1409,72 @@ impl PooledBackend {
             checkpoint_chains: self.checkpoint_chains.clone(),
             checkpoint_dir: self.checkpoint_dir.clone(),
             session_bindings: self.session_bindings.clone(),
+        }
+    }
+
+    /// Issue #529: install the weak self-reference `snapshot_begin`'s
+    /// spawned finalize job upgrades to reach the full `destroy()` at its
+    /// terminal stage. MUST be called exactly once, immediately after
+    /// `Arc::new(p)` — before that, `eviction_finalizer()` builds a bundle
+    /// whose `self_ref` can never upgrade, and any finalize job it drives
+    /// silently skips its own destroy call (logged, not fatal — the
+    /// teardown reconcile / orphan_reap backstop it, but it's a real gap).
+    /// A second call is a startup-order bug; logged and ignored rather
+    /// than panicking (mirrors `set_migrate_peer_server`).
+    pub fn set_self_ref(&self, arc: &Arc<PooledBackend>) {
+        if self.self_ref.set(Arc::downgrade(arc)).is_err() {
+            tracing::warn!("PooledBackend self_ref already set; ignoring duplicate");
+        }
+    }
+
+    /// Issue #529: the eviction finalize bundle, or `None` when
+    /// checkpointing is disabled (`checkpoint_dir` unset) — the same gate
+    /// `snapshot_begin` checks before ever constructing one.
+    pub(crate) fn eviction_finalizer(&self) -> Option<crate::eviction_finalize::EvictionFinalizer> {
+        let checkpoint_dir = self.checkpoint_dir.clone()?;
+        Some(crate::eviction_finalize::EvictionFinalizer {
+            chunk_store: self.chunk_store.clone(),
+            chunk_cache: self.chunk_cache.clone(),
+            bundle_dir: self.bundle_dir.clone(),
+            bundle_file_ext: self.bundle_file_ext(),
+            checkpoint_dir,
+            pending_finalizes: self.pending_finalizes.clone(),
+            self_ref: self.self_ref.clone(),
+            max_attempts: crate::eviction_finalize::max_attempts(),
+        })
+    }
+
+    /// Issue #529: re-drive every un-acked eviction finalize record at
+    /// host-agent startup — the whole crash story. A host-agent pod roll
+    /// mid-upload now DELAYS the commit by one restart; it cannot lose
+    /// it. Called from `lib.rs` alongside the checkpoint driver spawn,
+    /// with the SAME `Arc<PooledBackend>` used there (so `set_self_ref`
+    /// must have run first).
+    pub async fn resume_pending_finalizes(self: &Arc<Self>) {
+        let Some(finalizer) = self.eviction_finalizer() else {
+            return;
+        };
+        let records =
+            crate::eviction_finalize::EvictionFinalizeRecord::load_all(&finalizer.finalize_dir())
+                .await;
+        if records.is_empty() {
+            return;
+        }
+        tracing::info!(
+            count = records.len(),
+            "re-driving eviction finalize records from disk (host-agent startup, issue #529)",
+        );
+        for record in records {
+            finalizer
+                .pending_finalizes
+                .insert(record.sandbox_id, record.snapshot_id);
+            metrics::counter!(crate::metrics::EVICTION_FINALIZE_REDRIVEN_TOTAL).increment(1);
+            let capture_lock = self.capture_lock(record.sandbox_id);
+            let f = finalizer.clone();
+            tokio::spawn(async move {
+                let guard = capture_lock.lock_owned().await;
+                crate::eviction_finalize::run_eviction_finalize(f, record, guard).await;
+            });
         }
     }
 
@@ -4400,7 +4490,7 @@ impl SnapshotFinisher {
 }
 
 /// zero chunks + zero bytes of object storage.
-async fn chunk_memory_to_store(
+pub(crate) async fn chunk_memory_to_store(
     chunk_store: &ChunkStore,
     memory_bin: &std::path::Path,
     cache: Option<&ChunkCache>,
@@ -4438,7 +4528,7 @@ async fn chunk_memory_to_store(
 /// shape is the wire contract between the two crates, and FC
 /// deserializes via `#[serde(default)]` so JSON-level patches stay
 /// compatible without a circular dependency.
-async fn patch_fc_manifest_memory_ref(
+pub(crate) async fn patch_fc_manifest_memory_ref(
     manifest_json: &std::path::Path,
     memory_manifest: engram_core::types::manifest::ManifestRef,
     // Tier 2 (resume-prefault fix): the session id, stamped as the
@@ -4744,16 +4834,51 @@ impl SandboxBackend for PooledBackend {
         self.finisher().finish(id, cap).await
     }
 
-    /// ADR 0045 D5: the eviction flavor. Runs the capture, re-pauses the
-    /// guest (it's being torn down — today's pipeline already discards
-    /// post-capture execution; this just stops it burning CPU during the
-    /// background upload), and spawns the post phase (chunk + upload +
-    /// chain bookkeeping) as a detached task that `snapshot_wait` awaits.
-    /// The coordinator may mark the session Idle as soon as this returns.
+    /// ADR 0045 D5 (rewritten for issue #529): the eviction flavor. Runs
+    /// the capture, re-pauses the guest (it's being torn down), then
+    /// makes the finalize inputs DURABLE — the drained NBD disk chunks
+    /// (if any) to `<dest>/disk-pending/`, then an
+    /// [`crate::eviction_finalize::EvictionFinalizeRecord`] to
+    /// `<checkpoint_dir>/finalize/<snapshot_id>.json` — and only THEN
+    /// returns. From here the finalize is a host-owned job
+    /// (`eviction_finalize::run_eviction_finalize`, spawned below) that
+    /// never touches the sandbox, the coordinator, or this call's
+    /// stack again: it is a pure function of what was just persisted,
+    /// re-drivable by a fresh host-agent process
+    /// (`resume_pending_finalizes`) if this one dies mid-upload. The
+    /// coordinator may mark the session Idle as soon as this returns —
+    /// unlike the pre-#529 shape, that's now safe: the row will land via
+    /// the heartbeat reconcile regardless of what happens to the
+    /// coordinator or this process next.
+    ///
+    /// Gate: VZ/Process (`!supports_diff_checkpoints()`) and hosts with
+    /// checkpointing disabled (`checkpoint_dir` unset) surface
+    /// `InvalidSpec` — the coordinator's caller falls through to the
+    /// composed `snapshot()` pipeline (`idle_evictor.rs`).
     async fn snapshot_begin(
         &self,
         id: SandboxId,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        if !self.inner.supports_diff_checkpoints() || self.checkpoint_dir.is_none() {
+            return Err(SandboxError::InvalidSpec(
+                "host-durable eviction finalize requires diff-checkpoint support and a wired \
+                 checkpoint_dir"
+                    .into(),
+            ));
+        }
+        // Idempotency: a scanner-retried eviction (coord-side timeout /
+        // 409 / restart before the coordinator's own row-watcher noticed
+        // completion) re-observes the still-in-flight finalize's
+        // snapshot_id instead of re-capturing and racing itself.
+        if let Some(existing) = self.pending_finalizes.get(&id) {
+            return Ok(*existing);
+        }
+        let Some(session_id) = self.session_bindings.get(&id).map(|e| *e) else {
+            return Err(SandboxError::InvalidSpec(
+                "host-durable eviction finalize requires a session-bound sandbox".into(),
+            ));
+        };
+
         let (capture_guard, cap) = self.capture_phase(id).await?;
         // Publish the working-set trace for the next resume's prefault (see
         // `spawn_trace_publish`); detached, never blocks the eviction.
@@ -4763,26 +4888,112 @@ impl SandboxBackend for PooledBackend {
         if let Err(e) = self.inner.pause(id).await {
             tracing::debug!(sandbox_id = %id, error = %e, "post-capture re-pause failed (benign)");
         }
-        let snapshot_id = cap.metadata.id;
-        let finisher = self.finisher();
-        let handle = tokio::spawn(async move {
-            // The capture lock rides into the task: checkpoints stay
-            // locked out until the upload completes (chain bookkeeping
-            // is not concurrent-safe per sandbox).
-            let _capture_guard = capture_guard;
-            finisher.finish(id, cap).await
+
+        let SnapshotCapture {
+            metadata,
+            dest,
+            chain_prev,
+            paused_at,
+            mut unwind,
+        } = cap;
+        let snapshot_id = metadata.id;
+
+        // Extract + durably persist the drained disk-flush chunks (if
+        // any) BEFORE returning. See `PendingDiskFlush::into_chunks` and
+        // the module-level deviation note in `eviction_finalize.rs`: we
+        // never call `flush_upload` on this handle — the sandbox is
+        // about to be destroyed, so there is no live reader left for its
+        // rebase side effect to matter to.
+        #[cfg(target_os = "linux")]
+        let disk_pending_record = match (unwind.disk_backend.take(), unwind.disk_pending.take()) {
+            (Some(backend), Some(pending)) => {
+                let base_manifest = backend.manifest_ref().await;
+                let chunk_size = backend.chunk_size();
+                let total_bytes = backend.total_bytes();
+                let chunks = pending.into_chunks();
+                if let Err(e) =
+                    crate::eviction_finalize::persist_disk_pending_chunks(&dest, &chunks).await
+                {
+                    // The guest was already resumed by `capture_phase`
+                    // (its `inner.snapshot`/`snapshot_diff` brought it
+                    // back) — defusing is correct, not a stuck-paused
+                    // guest. Clean up `dest` so this failure doesn't leak
+                    // the multi-GiB local staging dir on every retry.
+                    unwind.defuse();
+                    drop(unwind);
+                    match tokio::fs::remove_dir_all(&dest).await {
+                        Ok(_) => {}
+                        Err(rm_err) => tracing::warn!(
+                            sandbox_id = %id, dest = %dest.display(), error = %rm_err,
+                            "snapshot_begin: disk-pending persist failed AND orphan dir cleanup failed",
+                        ),
+                    }
+                    return Err(SandboxError::Snapshot(format!(
+                        "persist disk-pending chunks: {e}"
+                    )));
+                }
+                Some(crate::eviction_finalize::DiskPendingRecord {
+                    base_manifest,
+                    chunk_size,
+                    total_bytes,
+                    chunks: chunks.iter().map(|(idx, hash, _)| (*idx, *hash)).collect(),
+                })
+            }
+            _ => None,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let disk_pending_record: Option<crate::eviction_finalize::DiskPendingRecord> = None;
+
+        // Ownership of the capture's recovery state transfers to the
+        // finalize record + the spawned job from here — the same
+        // "defuse the instant something durable/owned takes over" rule
+        // `finish()` follows.
+        unwind.defuse();
+        drop(unwind);
+
+        let record = crate::eviction_finalize::EvictionFinalizeRecord {
+            snapshot_id,
+            session_id,
+            sandbox_id: id,
+            image_version: metadata.image_version.clone(),
+            size_bytes: metadata.size_bytes,
+            paused_at,
+            captured_at: metadata.created_at,
+            dest: dest.clone(),
+            chain_prev_ref: chain_prev.map(|(r, _)| r),
+            disk_pending: disk_pending_record,
+            aux_bundles: metadata.aux_bundles.clone(),
+            stage: crate::eviction_finalize::FinalizeStage::default(),
+            attempts: 0,
+            disk_manifest: None,
+            memory_manifest: None,
+        };
+        let Some(finalizer) = self.eviction_finalizer() else {
+            // Gated above; unreachable in practice (checkpoint_dir just
+            // got checked), but never destroy a fresh capture on a
+            // defensive None — clean up and fail loudly instead.
+            let _ = tokio::fs::remove_dir_all(&dest).await;
+            return Err(SandboxError::InvalidSpec(
+                "checkpoint_dir disappeared between the gate check and record construction".into(),
+            ));
+        };
+        record
+            .persist(&finalizer.finalize_dir())
+            .await
+            .map_err(|e| {
+                SandboxError::Snapshot(format!("persist eviction finalize record: {e}"))
+            })?;
+        metrics::counter!(crate::metrics::EVICTION_FINALIZE_PERSISTED_TOTAL).increment(1);
+        self.pending_finalizes.insert(id, snapshot_id);
+
+        tokio::spawn(async move {
+            // The capture lock rides into the task: periodic checkpoints
+            // stay locked out until the finalize completes (chain
+            // bookkeeping is not concurrent-safe per sandbox) — same
+            // guarantee the pre-#529 shape gave, now held for the whole
+            // (re-drivable) job instead of just one process's attempt.
+            crate::eviction_finalize::run_eviction_finalize(finalizer, record, capture_guard).await;
         });
-        if let Some(prior) = self
-            .snapshot_waits
-            .insert(id, SnapshotWait::from_handle(handle))
-        {
-            // A prior begin whose wait never came (coordinator died).
-            // Don't await it (it may still be uploading) — just abort the
-            // backing task; its artifacts are covered by the inflight
-            // tracking + abort-prior path on the next snapshot.
-            prior.abort.abort();
-            tracing::warn!(sandbox_id = %id, "snapshot_begin superseded an unconsumed prior wait");
-        }
         Ok(snapshot_id)
     }
 
@@ -9596,5 +9807,515 @@ mod tests {
             matches!(cancelled, Ok(Err(_))),
             "destroy must abort the backing upload task (got {cancelled:?})",
         );
+    }
+
+    // ---- Issue #529: host-durable eviction finalize ----
+    use crate::checkpoint::CheckpointRecord;
+    use parking_lot::Mutex as PlMutex;
+    use std::path::Path;
+
+    /// A `BlobStorage` whose FIRST `put_streaming` blocks until
+    /// released — used to freeze a spawned eviction finalize job
+    /// mid-leg so a test can observe it still pending, deterministically
+    /// (not racing the job's own completion).
+    struct GateFirstPut {
+        inner: engram_storage_local::LocalBlobStorage,
+        gate: Arc<tokio::sync::Notify>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl engram_core::traits::BlobStorage for GateFirstPut {
+        async fn put_streaming(
+            &self,
+            key: &str,
+            body: engram_core::traits::ByteStream,
+        ) -> Result<u64, engram_core::error::BlobError> {
+            if !self.armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.gate.notified().await;
+            }
+            self.inner.put_streaming(key, body).await
+        }
+        async fn get_streaming(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::ByteStream, engram_core::error::BlobError> {
+            self.inner.get_streaming(key).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::error::BlobError> {
+            self.inner.head(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), engram_core::error::BlobError> {
+            self.inner.delete(key).await
+        }
+        async fn list_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<String>, engram_core::error::BlobError> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    /// A minimal FC-shaped capture backend for the eviction-finalize
+    /// tests: `supports_diff_checkpoints() -> true` (the gate
+    /// `snapshot_begin` checks before ever routing here) and a
+    /// `snapshot` that writes the same three artifacts real FC leaves in
+    /// its staging dir (memory.bin, state.bin, manifest.json) — the
+    /// `SnapshotFinisher`/`eviction_finalize` legs' contract.
+    #[derive(Clone)]
+    struct FakeCaptureBackend {
+        payload: Vec<u8>,
+        staging_root: PathBuf,
+        destroy_calls: Arc<PlMutex<Vec<SandboxId>>>,
+    }
+    impl FakeCaptureBackend {
+        fn dir_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+            self.staging_root.join(id.to_string())
+        }
+        async fn write_capture(&self, dest: &Path) {
+            tokio::fs::create_dir_all(dest).await.unwrap();
+            tokio::fs::write(dest.join("memory.bin"), &self.payload)
+                .await
+                .unwrap();
+            tokio::fs::write(dest.join("state.bin"), b"state-bin-placeholder")
+                .await
+                .unwrap();
+            let manifest = serde_json::json!({
+                "sandbox_id": uuid::Uuid::new_v4(),
+                "created_at": chrono::Utc::now(),
+                "spec": {
+                    "image": "test:1", "rootfs_source": null, "image_uri": null,
+                    "harness_pack_uri": null, "cpu": {"vcpus": 1}, "memory": {"max_mib": 64},
+                    "disk": {"max_gib": 1}, "ttl": null, "env": {}, "workdir": null,
+                    "harness_substrate": null, "network": {}
+                },
+                "format": "fc"
+            });
+            tokio::fs::write(
+                dest.join("manifest.json"),
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    #[async_trait]
+    impl SandboxBackend for FakeCaptureBackend {
+        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn exec_stream(
+            &self,
+            _: SandboxId,
+            _: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        fn supports_diff_checkpoints(&self) -> bool {
+            true
+        }
+        async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+            let snapshot_id = engram_core::SnapshotId::new();
+            let dest = self.dir_for(snapshot_id);
+            self.write_capture(&dest).await;
+            Ok(SnapshotMetadata {
+                id: snapshot_id,
+                size_bytes: self.payload.len() as u64,
+                created_at: chrono::Utc::now(),
+                image_version: "test:1".into(),
+                disk_manifest: None,
+                memory_manifest: None,
+                base_memory_manifest: None,
+                migration_source: None,
+                source_sandbox_id: None,
+                state_blob_key: None,
+                sidecar_blob_key: None,
+                rootfs_blob_key: None,
+                working_set_blob_key: None,
+                aux_bundles: vec![],
+                paused_at: None,
+            })
+        }
+        fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+            self.dir_for(id)
+        }
+        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.destroy_calls.lock().push(id);
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            Ok(Vec::new())
+        }
+        async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+            Ok(())
+        }
+    }
+
+    fn finalize_payload() -> Vec<u8> {
+        let mut bytes = vec![0u8; 64 * 1024];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ((i % 200) + 1) as u8; // skip zero so chunks aren't elided
+        }
+        bytes
+    }
+
+    /// `PooledBackend` wired with a chunk store + checkpoint_dir + the
+    /// `FakeCaptureBackend`, ready to exercise `snapshot_begin`. The
+    /// `gate`'d blob storage lets a test freeze the spawned finalize job
+    /// mid-upload; `None` runs it to completion unobstructed.
+    async fn finalize_test_backend(
+        gate: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        Arc<PooledBackend>,
+        ChunkStore,
+        PathBuf,
+        Arc<PlMutex<Vec<SandboxId>>>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob"));
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = match gate {
+            Some(gate) => Arc::new(GateFirstPut {
+                inner: local,
+                gate,
+                armed: std::sync::atomic::AtomicBool::new(false),
+            }),
+            None => Arc::new(local),
+        };
+        let cs = ChunkStore::new(blob);
+        let destroy_calls = Arc::new(PlMutex::new(Vec::new()));
+        let inner: Arc<dyn SandboxBackend> = Arc::new(FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: tmp.path().join("fc-snaps"),
+            destroy_calls: destroy_calls.clone(),
+        });
+        let checkpoint_dir = tmp.path().join("checkpoints");
+        let materialize_dir = tmp.path().join("materialized");
+        let p = PooledBackend::new(inner)
+            .with_chunk_store(cs.clone(), materialize_dir)
+            .with_checkpoint_dir(checkpoint_dir.clone());
+        let arc = Arc::new(p);
+        arc.set_self_ref(&arc);
+        std::mem::forget(tmp); // keep the staging dirs alive for the test
+        (arc, cs, checkpoint_dir, destroy_calls)
+    }
+
+    /// Acceptance criterion #7: an eviction-scanner retry storm against
+    /// a mid-finalize sandbox must NOT re-capture — `snapshot_begin`
+    /// re-observes the pending `snapshot_id`. Gated so the first call's
+    /// background job can't race to completion before the second call.
+    #[tokio::test]
+    async fn snapshot_begin_is_idempotent_under_a_pending_finalize() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (pooled, _cs, _ckpt_dir, _destroy_calls) =
+            finalize_test_backend(Some(gate.clone())).await;
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        pooled.session_bindings.insert(sandbox_id, session_id);
+
+        let first = pooled
+            .snapshot_begin(sandbox_id)
+            .await
+            .expect("first begin");
+        let second = pooled
+            .snapshot_begin(sandbox_id)
+            .await
+            .expect("second begin (retry storm)");
+        assert_eq!(
+            first, second,
+            "a pending finalize must be re-observed, not re-captured"
+        );
+
+        // Let the frozen job run to completion so it doesn't outlive the
+        // test's temp dirs.
+        gate.notify_one();
+    }
+
+    /// `snapshot_begin` persists the `EvictionFinalizeRecord` (durably,
+    /// to `<checkpoint_dir>/finalize/`) BEFORE it returns — the core
+    /// durability-boundary-moves-earlier claim. Gated so the assertion
+    /// runs while the job is still frozen mid-leg, not racing its own
+    /// (fast, local-disk) completion.
+    #[tokio::test]
+    async fn snapshot_begin_persists_the_finalize_record_before_returning() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (pooled, _cs, ckpt_dir, _destroy_calls) =
+            finalize_test_backend(Some(gate.clone())).await;
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        pooled.session_bindings.insert(sandbox_id, session_id);
+
+        let snapshot_id = pooled.snapshot_begin(sandbox_id).await.expect("begin");
+        assert!(
+            pooled.pending_finalizes.contains_key(&sandbox_id),
+            "pending_finalizes must be set before snapshot_begin returns",
+        );
+        let record_path = ckpt_dir
+            .join("finalize")
+            .join(format!("{snapshot_id}.json"));
+        let bytes = tokio::fs::read(&record_path)
+            .await
+            .expect("finalize record must be on disk before snapshot_begin returns");
+        let record: crate::eviction_finalize::EvictionFinalizeRecord =
+            serde_json::from_slice(&bytes).expect("finalize record must parse");
+        assert_eq!(record.sandbox_id, sandbox_id);
+        assert_eq!(record.session_id, session_id);
+        // The gate freezes the job inside the memory leg (the first
+        // blob PUT), so by construction the disk leg — synchronous,
+        // no blob I/O — is the furthest it can have progressed; not
+        // asserting an exact stage here avoids racing the job's own
+        // (legitimately fast, local-disk) advancement past `Captured`.
+        assert!(
+            matches!(
+                record.stage,
+                crate::eviction_finalize::FinalizeStage::Captured
+                    | crate::eviction_finalize::FinalizeStage::DiskUploaded
+            ),
+            "unexpected stage {:?} while the job is gated in the memory leg",
+            record.stage,
+        );
+
+        gate.notify_one();
+    }
+
+    /// The full happy path: `snapshot_begin` on an FC-shaped capture
+    /// eventually (without the coordinator ever touching it again)
+    /// produces a durable `CheckpointRecord { kind: EvictionFinal }`,
+    /// deletes its `EvictionFinalizeRecord`, clears `pending_finalizes`,
+    /// and best-effort destroys the sandbox.
+    #[tokio::test]
+    async fn snapshot_begin_completes_and_produces_an_eviction_final_checkpoint() {
+        let (pooled, cs, ckpt_dir, destroy_calls) = finalize_test_backend(None).await;
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        pooled.session_bindings.insert(sandbox_id, session_id);
+
+        let snapshot_id = pooled.snapshot_begin(sandbox_id).await.expect("begin");
+
+        let records_dir = ckpt_dir.join("records");
+        let record_path = records_dir.join(format!("{snapshot_id}.json"));
+        wait_for("eviction-final checkpoint record", || record_path.exists()).await;
+
+        let bytes = tokio::fs::read(&record_path).await.unwrap();
+        let record: CheckpointRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record.snapshot_id, snapshot_id);
+        assert_eq!(record.sandbox_id, sandbox_id);
+        assert_eq!(record.session_id, session_id);
+        assert_eq!(
+            record.kind,
+            engram_protocol::heartbeat::CheckpointKind::EvictionFinal
+        );
+        let memory_ref = record
+            .memory_manifest
+            .expect("a captured memory.bin must chunk to a manifest");
+        let manifest = cs.get_manifest(memory_ref).await.unwrap();
+        assert_eq!(manifest.total_bytes, finalize_payload().len() as u64);
+
+        let finalize_record_path = ckpt_dir
+            .join("finalize")
+            .join(format!("{snapshot_id}.json"));
+        assert!(
+            !finalize_record_path.exists(),
+            "the in-flight finalize record must be deleted on completion"
+        );
+        assert!(
+            !pooled.pending_finalizes.contains_key(&sandbox_id),
+            "pending_finalizes must be cleared on completion"
+        );
+        wait_for("best-effort destroy", || {
+            destroy_calls.lock().contains(&sandbox_id)
+        })
+        .await;
+    }
+
+    /// Issue #529 crash recovery: a record persisted by a PRIOR host-agent
+    /// process (the sandbox is gone — never `create()`d in this test)
+    /// is picked up by `resume_pending_finalizes` and driven to the same
+    /// durable `CheckpointRecord { kind: EvictionFinal }` outcome.
+    #[tokio::test]
+    async fn resume_pending_finalizes_redrives_a_record_with_the_sandbox_absent() {
+        let (pooled, cs, ckpt_dir, _destroy_calls) = finalize_test_backend(None).await;
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let snapshot_id = engram_core::SnapshotId::new();
+
+        // Hand-craft the on-disk state a crashed `snapshot_begin` would
+        // have left: the FC staging dir (memory.bin/state.bin/manifest.json)
+        // plus the durable EvictionFinalizeRecord pointing at it —
+        // entirely independent of any live sandbox or RAM state.
+        let dest = tmp_dest_for(&ckpt_dir, snapshot_id);
+        let backend = FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: dest.parent().unwrap().to_path_buf(),
+            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+        };
+        backend.write_capture(&dest).await;
+
+        let record = crate::eviction_finalize::EvictionFinalizeRecord {
+            snapshot_id,
+            session_id,
+            sandbox_id,
+            image_version: "test:1".into(),
+            size_bytes: finalize_payload().len() as u64,
+            paused_at: chrono::Utc::now(),
+            captured_at: chrono::Utc::now(),
+            dest,
+            chain_prev_ref: None,
+            disk_pending: None,
+            aux_bundles: vec![],
+            stage: crate::eviction_finalize::FinalizeStage::Captured,
+            attempts: 0,
+            disk_manifest: None,
+            memory_manifest: None,
+        };
+        record
+            .persist(&ckpt_dir.join("finalize"))
+            .await
+            .expect("persist finalize record");
+
+        pooled.resume_pending_finalizes().await;
+
+        let record_path = ckpt_dir.join("records").join(format!("{snapshot_id}.json"));
+        wait_for("redriven eviction-final checkpoint record", || {
+            record_path.exists()
+        })
+        .await;
+        let bytes = tokio::fs::read(&record_path).await.unwrap();
+        let checkpoint: CheckpointRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(checkpoint.sandbox_id, sandbox_id);
+        assert_eq!(
+            checkpoint.kind,
+            engram_protocol::heartbeat::CheckpointKind::EvictionFinal
+        );
+        let memory_ref = checkpoint.memory_manifest.expect("memory manifest set");
+        let manifest = cs.get_manifest(memory_ref).await.unwrap();
+        assert_eq!(manifest.total_bytes, finalize_payload().len() as u64);
+    }
+
+    fn tmp_dest_for(checkpoint_dir: &Path, id: engram_core::SnapshotId) -> PathBuf {
+        checkpoint_dir
+            .parent()
+            .unwrap()
+            .join("fc-snaps-redrive")
+            .join(id.to_string())
+    }
+
+    async fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// A `BlobStorage` whose PUTs always fail — drives the finalize
+    /// quarantine path.
+    struct AlwaysFailPut;
+    #[async_trait]
+    impl engram_core::traits::BlobStorage for AlwaysFailPut {
+        async fn put_streaming(
+            &self,
+            _key: &str,
+            _body: engram_core::traits::ByteStream,
+        ) -> Result<u64, engram_core::error::BlobError> {
+            Err(engram_core::error::BlobError::Protocol(
+                "injected put failure (test)".into(),
+            ))
+        }
+        async fn get_streaming(
+            &self,
+            _key: &str,
+        ) -> Result<engram_core::traits::ByteStream, engram_core::error::BlobError> {
+            Err(engram_core::error::BlobError::Protocol(
+                "injected get failure (test)".into(),
+            ))
+        }
+        async fn head(
+            &self,
+            _key: &str,
+        ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::error::BlobError> {
+            Err(engram_core::error::BlobError::Protocol(
+                "injected head failure (test)".into(),
+            ))
+        }
+        async fn delete(&self, _key: &str) -> Result<(), engram_core::error::BlobError> {
+            Ok(())
+        }
+        async fn list_prefix(
+            &self,
+            _prefix: &str,
+        ) -> Result<Vec<String>, engram_core::error::BlobError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Acceptance criterion #5: a finalize that fails terminally is
+    /// quarantined with a metric + WARN/ERROR — never silent — after
+    /// `ENGRAM_EVICTION_FINALIZE_MAX_ATTEMPTS` attempts. Set to 1 so the
+    /// test quarantines on the very first failure (no backoff sleep).
+    #[tokio::test]
+    async fn finalize_quarantines_after_max_attempts() {
+        // SAFETY (test-only): cargo-nextest runs each test in its own
+        // process, so this process-global env var doesn't leak across
+        // tests.
+        std::env::set_var("ENGRAM_EVICTION_FINALIZE_MAX_ATTEMPTS", "1");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(AlwaysFailPut);
+        let cs = ChunkStore::new(blob);
+        let destroy_calls = Arc::new(PlMutex::new(Vec::new()));
+        let inner: Arc<dyn SandboxBackend> = Arc::new(FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: tmp.path().join("fc-snaps"),
+            destroy_calls: destroy_calls.clone(),
+        });
+        let checkpoint_dir = tmp.path().join("checkpoints");
+        let p = PooledBackend::new(inner)
+            .with_chunk_store(cs, tmp.path().join("materialized"))
+            .with_checkpoint_dir(checkpoint_dir.clone());
+        let pooled = Arc::new(p);
+        pooled.set_self_ref(&pooled);
+
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        pooled.session_bindings.insert(sandbox_id, session_id);
+
+        let snapshot_id = pooled.snapshot_begin(sandbox_id).await.expect("begin");
+
+        let quarantined_path = checkpoint_dir
+            .join("finalize")
+            .join("failed")
+            .join(format!("{snapshot_id}.json"));
+        wait_for("quarantined finalize record", || quarantined_path.exists()).await;
+
+        let in_flight_path = checkpoint_dir
+            .join("finalize")
+            .join(format!("{snapshot_id}.json"));
+        assert!(
+            !in_flight_path.exists(),
+            "the in-flight record must be gone once quarantined"
+        );
+        assert!(
+            !pooled.pending_finalizes.contains_key(&sandbox_id),
+            "pending_finalizes must be cleared on quarantine"
+        );
+        // No CheckpointRecord — never falsely claim durability on the
+        // path that gave up.
+        let checkpoint_path = checkpoint_dir
+            .join("records")
+            .join(format!("{snapshot_id}.json"));
+        assert!(
+            !checkpoint_path.exists(),
+            "a quarantined finalize must never produce a checkpoint record"
+        );
+
+        std::env::remove_var("ENGRAM_EVICTION_FINALIZE_MAX_ATTEMPTS");
+        std::mem::forget(tmp);
     }
 }

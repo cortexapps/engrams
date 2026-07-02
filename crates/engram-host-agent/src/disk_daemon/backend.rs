@@ -150,6 +150,26 @@ pub struct PendingDiskFlush {
     flush_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
+impl PendingDiskFlush {
+    /// Issue #529: the eviction finalize flavor persists these drained
+    /// chunks to `<dest>/disk-pending/` BEFORE `snapshot_begin` returns
+    /// (durability boundary moves earlier), then re-reads them from disk
+    /// in the (possibly re-driven, possibly cross-process) background
+    /// finalize job — it never calls `flush_upload` on this handle
+    /// directly, so there's no live-backend rebase to preserve and
+    /// nothing left to serialize once these bytes are extracted. Consumes
+    /// `self`, dropping the flush-pipeline guard immediately.
+    ///
+    /// Its only caller is `PooledBackend::snapshot_begin`'s
+    /// `#[cfg(target_os = "linux")]` disk-pending block (NBD is
+    /// Linux-only) — `#[cfg]`'d rather than `#[allow(dead_code)]`'d so a
+    /// non-Linux build doesn't carry an unreachable-by-construction method.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn into_chunks(self) -> Vec<(usize, ChunkHash, Bytes)> {
+        self.new_chunks
+    }
+}
+
 /// ADR 0045 C2 disk post-copy: the frozen source's sealed disk state
 /// — every chunk whose guest-visible content differs from the
 /// published base manifest (dirty buffer + pending-uploads tier),

@@ -277,6 +277,7 @@ async fn abandon_during_in_flight_restore_does_not_disconnect_survivor() {
         rootfs_blob_key: None,
         working_set_blob_key: None,
         aux_bundles: vec![],
+        paused_at: None,
     };
 
     // Drive `restore` in a task. It will MOVE its NBD state into a detached
