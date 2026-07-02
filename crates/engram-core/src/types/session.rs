@@ -67,10 +67,9 @@ pub enum SessionState {
     /// drain (`POST /api/admin/sessions/:id/evacuate` or
     /// `POST /api/admin/hosts/:id/drain`) — ADR 0044 K3. As of ADR
     /// 0045 Phase A the dead-host detector no longer routes here (the
-    /// reactive auto-evac is retired); the `HostLost → Evacuating`
-    /// edge is kept legal but unused (a future post-copy phase may
-    /// reuse it). Sandbox + host bindings are nulled out same as
-    /// `Idle` — the session is recoverable but not running.
+    /// reactive auto-evac is retired), and `HostLost → Evacuating` is
+    /// no longer a legal edge. Sandbox + host bindings are nulled out
+    /// same as `Idle` — the session is recoverable but not running.
     Evacuating,
     /// ADR 0034: durable idle-eviction intent marker. The candidates
     /// handler (or the PG detection backstop) transitions
@@ -177,7 +176,7 @@ impl SessionState {
     ///              | Completed | Dead
     /// Idle        -> Created (resume) | Dead | Completed | Queued (resume
     ///                hit no capacity, ADR 0048)
-    /// HostLost    -> Created | Idle | Evacuating | Dead | Completed
+    /// HostLost    -> Created | Idle | Dead | Completed
     /// Evacuating  -> Created (scanner resumes on peer)
     ///              | Idle (scanner exhausted retries; user /resume)
     ///              | Dead (terminal; chunks gone)
@@ -215,7 +214,7 @@ impl SessionState {
                 Idle | HostLost | Evacuating | Evicting | Failed | Completed | Dead
             ),
             Idle => matches!(target, Created | Dead | Completed | Queued),
-            HostLost => matches!(target, Created | Idle | Evacuating | Dead | Completed),
+            HostLost => matches!(target, Created | Idle | Dead | Completed),
             Evacuating => matches!(target, Created | Idle | Dead | Completed),
             Evicting => matches!(target, Idle | HostLost | Dead | Completed),
             Failed | Completed | Dead => false,
@@ -567,7 +566,6 @@ mod tests {
             (Idle, Completed),
             (HostLost, Created),
             (HostLost, Idle),
-            (HostLost, Evacuating),
             (HostLost, Dead),
             (HostLost, Completed),
             (Evacuating, Created),
