@@ -627,12 +627,41 @@ pub async fn provision_with_named_tap(
     vm_cidr: VmCidr,
     tap_name: &str,
 ) -> Result<NetSetup, NetError> {
-    let host_addr = format!("{}/30", vm_cidr.host());
+    let (conn, handle, _) = rtnetlink::new_connection()
+        .map_err(|e| netlink_err("host netlink socket", e.to_string()))?;
+    let conn_task = tokio::spawn(conn);
 
-    let _ = run_cmd("ip", &["link", "delete", tap_name]).await;
-    run_cmd("ip", &["tuntap", "add", tap_name, "mode", "tap"]).await?;
-    run_cmd("ip", &["addr", "add", &host_addr, "dev", tap_name]).await?;
-    run_cmd("ip", &["link", "set", "dev", tap_name, "up"]).await?;
+    // Existence-gated pre-clean (same pattern as the warm netns leg):
+    // only issue a netlink delete when a leftover TAP is actually
+    // there, instead of unconditionally shelling out to `ip link
+    // delete`.
+    if let Ok(idx) = link_index(&handle, tap_name).await {
+        let _ = handle.link().del(idx).execute().await;
+    }
+
+    // `TUNSETIFF`/`TUNSETPERSIST` bind to the CALLING THREAD's netns.
+    // This function only ever runs in host root (bake / cold-create —
+    // see `provision`'s doc comment), so it can call
+    // `create_persistent_tap` directly; contrast the warm leg's
+    // netns'd call to the same helper inside a dedicated setns'd
+    // thread in `provision_netns_inner`.
+    create_persistent_tap(tap_name)?;
+
+    let tap_idx = link_index(&handle, tap_name).await?;
+    handle
+        .address()
+        .add(tap_idx, std::net::IpAddr::V4(vm_cidr.host()), 30)
+        .execute()
+        .await
+        .map_err(|e| netlink_err("tap addr", e.to_string()))?;
+    handle
+        .link()
+        .set(rtnetlink::LinkUnspec::new_with_index(tap_idx).up().build())
+        .execute()
+        .await
+        .map_err(|e| netlink_err("tap up", e.to_string()))?;
+    drop(handle);
+    conn_task.abort();
 
     Ok(NetSetup {
         vm_cidr,
