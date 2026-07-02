@@ -1029,7 +1029,11 @@ impl HostAgent {
             let current_bundles = bundles::read_stamp(&bundle_dir).await;
             let live_bundles_tx = self.chunk_store.as_ref().map(|(cs, _)| {
                 bundles::spawn_supervisor(
-                    bundles::BundleStore::new(cs.blob_storage().clone(), bundle_dir.clone(), bundle_ext),
+                    bundles::BundleStore::new(
+                        cs.blob_storage().clone(),
+                        bundle_dir.clone(),
+                        bundle_ext,
+                    ),
                     current_bundles.clone(),
                 )
             });
