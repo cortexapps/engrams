@@ -209,13 +209,37 @@ enum PlaceOutcome {
 /// candidates, then atomically flip `queued → pending` on a fitting host.
 async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
     let (repo, tag) = engram_core::types::session::split_image_ref(&q.session.image);
+    // ADR 0036 amendment (issue #538): same digest gate the live create
+    // path applies (`api/sessions.rs::boot_prepared`) — a queued create is
+    // still a CREATE, so it must not place onto a host that hasn't staged
+    // this image's base snapshot. Tolerant lookup (`get_enabled_image_any`,
+    // matching `prepare_from_row`): a lookup miss/failure degrades to no
+    // digest gate rather than wedging the sweep — `place_queued_session`
+    // still enforces capacity, and `boot_placed_create`'s `prepare_from_row`
+    // will 404 on a genuinely-gone image right after.
+    let required_image_digest = match state
+        .services
+        .meta
+        .get_enabled_image_any(&q.session.image)
+        .await
+    {
+        Ok(Some(row)) => Some(engram_protocol::heartbeat::ManifestDigest::new(
+            row.manifest_digest,
+        )),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::debug!(session_id = %q.session.id, error = %e,
+                "queue-scanner: enabled-image lookup failed for digest gate; placing without it");
+            None
+        }
+    };
     let ctx = crate::placement::ScheduleContext {
         repo,
         image_version: tag,
         prefer_snapshot_id: None,
         memory_mib: Some(q.mem_budget_mib.max(0) as u32),
         cpu_budget_vcpus: Some(q.cpu_budget_vcpus.max(0) as u32),
-        required_image_digest: None,
+        required_image_digest,
         exclude_host: None,
         prefer_host: None,
     };
@@ -312,6 +336,16 @@ async fn boot_placed_create(
 /// `Some(false)` = none (stay queued), `None` = transient read error.
 async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<bool> {
     let (repo, tag) = engram_core::types::session::split_image_ref(&q.session.image);
+    // ADR 0036 amendment (issue #538): deliberately `None`, NOT the
+    // create-path digest gate. This is the RESUME-origin arm (a session
+    // that was Idle and got queued for capacity, ADR 0048 C7) — resume
+    // places by snapshot affinity, not base-image residency, same as
+    // every other resume/evac/admin call site (`api/snapshot.rs`,
+    // `evacuation.rs`, `api/admin.rs`). The issue text that seeded this
+    // change named `queue_scanner.rs:218,321` together, but 321 is this
+    // function, not the create-origin `place_create` above (218) — gating
+    // it would incorrectly block a resume's re-queue check on base-image
+    // prestage status for a session that already has its own snapshot.
     let ctx = crate::placement::ScheduleContext {
         repo,
         image_version: tag,

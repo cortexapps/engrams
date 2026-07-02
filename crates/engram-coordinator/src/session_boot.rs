@@ -100,6 +100,13 @@ pub(crate) struct PreparedBoot {
     pub cpu_budget_vcpus: u32,
     pub image_repo: String,
     pub image_tag: String,
+    /// ADR 0036 amendment (issue #538): the enabled image's OCI manifest
+    /// digest, so the reserve-side `ScheduleContext.required_image_digest`
+    /// gates placement onto hosts that have actually prefetched this
+    /// image's base snapshot — the per-host half of the fleet chunk-
+    /// prestage invariant (the enable-scanner's `prestaging` stage is the
+    /// other half).
+    pub manifest_digest: String,
 }
 
 /// Why a boot failed, carrying the caller-facing error and — crucially —

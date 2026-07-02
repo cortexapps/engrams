@@ -638,18 +638,32 @@ async fn boot_prepared(
         cpu_budget_vcpus,
         image_repo,
         image_tag,
+        manifest_digest,
     } = prepared;
     let session_id = inputs.session_id;
     let base_snapshot_id = inputs.base_snapshot_id;
 
     // -------- Reserve a host (ADR 0046 best-fit, ADR 0048 2D) --------
+    //
+    // ADR 0036 amendment (issue #538): gate the candidate pool on the
+    // image's manifest digest, the per-host half of the fleet chunk-
+    // prestage invariant (the enable-scanner's `prestaging` stage is the
+    // other half — an `enabled_images` row only exists once the eligible
+    // fleet has staged it). `candidates_for` never surfaces
+    // `PickError::ImageNotReady` — a digest match that filters every host
+    // out just yields empty `RankedCandidates`, so `reserve_placement`
+    // returns `None` below and this falls into the SAME queue arm a
+    // capacity miss does. A straggler host that hasn't staged yet simply
+    // isn't in the ranked pool; its next heartbeat un-gates it.
     let ctx = crate::placement::ScheduleContext {
         repo: &image_repo,
         image_version: &image_tag,
         prefer_snapshot_id: Some(base_snapshot_id),
         memory_mib: Some(memory_mib),
         cpu_budget_vcpus: Some(cpu_budget_vcpus),
-        required_image_digest: None,
+        required_image_digest: Some(engram_protocol::heartbeat::ManifestDigest::new(
+            manifest_digest,
+        )),
         exclude_host: None,
         prefer_host: None,
     };
@@ -1242,6 +1256,9 @@ async fn prepare_inner(
     }
     let memory_mib = resolved_memory_mib(&manifest);
     let cpu_budget_vcpus = resolved_vcpus(&manifest);
+    // ADR 0036 amendment (issue #538): carried so `boot_prepared` can gate
+    // the reserve-side `ScheduleContext` on `required_image_digest`.
+    let manifest_digest = enabled.manifest_digest.clone();
 
     Ok(crate::session_boot::PreparedBoot {
         inputs: crate::session_boot::BootInputs {
@@ -1266,6 +1283,7 @@ async fn prepare_inner(
         cpu_budget_vcpus,
         image_repo,
         image_tag,
+        manifest_digest,
     })
 }
 /// ADR 0051: fetch a session by id (gRPC `GetSession`). 404 on unknown id.
