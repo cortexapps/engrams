@@ -37,6 +37,10 @@ pub(crate) struct BootInputs {
     pub spec: SessionSpec,
     /// The image's base snapshot to restore from.
     pub base_snapshot_id: SnapshotId,
+    /// Issue #535 (a): the snapshot row itself, resolved ONCE at boot-bundle
+    /// fill time (bake or cache-refresh) rather than per create — subsumes
+    /// the `get_snapshot` call `boot_on_reserved_host` used to make here.
+    pub base_snapshot: engram_core::types::SnapshotRecord,
     /// The env baked into the restored sandbox (manifest `[env]` +
     /// resolved secrets + `ENGRAM_SESSION_ID`). Also the placeholder
     /// source for the egress policy.
@@ -130,6 +134,7 @@ pub(crate) async fn boot_on_reserved_host(
         session_id,
         spec,
         base_snapshot_id,
+        base_snapshot: record,
         spec_env,
         mut agent,
         session_env,
@@ -151,19 +156,9 @@ pub(crate) async fn boot_on_reserved_host(
     let image_ref = spec.image.clone();
 
     // ---- restore the base snapshot on the reserved host ----
-    let record = match state.services.meta.get_snapshot(base_snapshot_id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return Err(BootError::NotStarted(ApiError::Internal(format!(
-                "enabled image references base snapshot {base_snapshot_id} but its row is gone"
-            ))));
-        }
-        Err(e) => {
-            return Err(BootError::NotStarted(ApiError::Internal(format!(
-                "get_snapshot {base_snapshot_id} for base restore: {e}"
-            ))));
-        }
-    };
+    // Issue #535 (a): `record` (== `base_snapshot`) arrived pre-resolved on
+    // `BootInputs` from the boot-bundle cache — no per-create `get_snapshot`
+    // round trip on this path any more.
     let metadata = engram_core::types::snapshot::SnapshotMetadata {
         base_memory_manifest: None,
         migration_source: None,

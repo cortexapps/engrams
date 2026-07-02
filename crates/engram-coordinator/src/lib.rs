@@ -12,6 +12,7 @@ use engram_core::traits::{BlobStorage, CloudBackend, HostClient, MetadataStore, 
 pub mod api;
 pub mod base_snapshot_retention;
 pub mod blob;
+pub mod boot_bundle;
 pub mod builtin_harness;
 pub mod bundle_gc;
 pub mod checkpoint_retention;
@@ -190,6 +191,7 @@ pub async fn run_with_registry_and_local(
         state.events.clone(),
         state.host_registry.clone(),
         state.integrations.clone(),
+        state.boot_bundles.clone(),
     );
 
     // Phase 3d follow-up: dead-host auto-detector. Opens its own

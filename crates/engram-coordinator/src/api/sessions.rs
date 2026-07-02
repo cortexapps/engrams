@@ -848,19 +848,21 @@ pub(crate) async fn prepare_from_grpc(
     identity_env: HashMap<String, String>,
     req: &CreateSessionRequest,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
-    let enabled = state
-        .services
-        .meta
-        .get_enabled_image(&req.image)
-        .await
-        .map_err(|e| ApiError::Internal(format!("enabled_images lookup: {e}")))?
-        .ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "image `{}` is not enabled. Operators enable images via \
-                 POST /api/enabled-images before sessions can reference them.",
-                req.image
-            ))
-        })?;
+    // Issue #535 (a): the cache always resolves the soft-delete-TOLERANT
+    // (`_any`) view — this, the strict live-create path, rejects a
+    // soft-deleted row itself instead of forking the cache's fill logic
+    // (the queued path's `prepare_from_row` accepts it below).
+    let bundle = state
+        .boot_bundles
+        .bundle_for(state.services.meta.as_ref(), &req.image)
+        .await?;
+    if bundle.enabled.soft_deleted_at.is_some() {
+        return Err(ApiError::BadRequest(format!(
+            "image `{}` is not enabled. Operators enable images via \
+             POST /api/enabled-images before sessions can reference them.",
+            req.image
+        )));
+    }
     prepare_inner(
         state,
         identity_env,
@@ -869,7 +871,7 @@ pub(crate) async fn prepare_from_grpc(
         req.prompt.clone(),
         req.secrets.clone(),
         SessionId::new(),
-        enabled,
+        bundle,
         req.selected_skills.clone(),
         req.capabilities.clone(),
         req.integration_policy.clone(),
@@ -895,18 +897,14 @@ pub(crate) async fn prepare_from_row(
             "prepare_from_row: secret overrides unavailable; continuing without them");
             None
         });
-    let enabled = state
-        .services
-        .meta
-        .get_enabled_image_any(&session.image)
-        .await
-        .map_err(|e| ApiError::Internal(format!("enabled_images lookup: {e}")))?
-        .ok_or_else(|| {
-            ApiError::Internal(format!(
-                "queued session `{}` image `{}` has no enabled_images row (lineage gone)",
-                session.id, session.image
-            ))
-        })?;
+    // Issue #535 (a): the queued path stays tolerant of a soft-deleted image
+    // (the lineage is still pinned) — the cache's `_any` fill is exactly this.
+    // Propagate the cache's own error verbatim (missing row / bad manifest /
+    // missing snapshot each carry a distinct message already).
+    let bundle = state
+        .boot_bundles
+        .bundle_for(state.services.meta.as_ref(), &session.image)
+        .await?;
     // ADR 0056 (B′): re-read the persisted integration policy so the queued
     // boot re-injects (build_egress_policy resolves its refs again on the new
     // host). A malformed/absent blob → None (no injection).
@@ -936,7 +934,7 @@ pub(crate) async fn prepare_from_row(
         prompt,
         overrides,
         session.id,
-        enabled,
+        bundle,
         // ADR 0055 TODO(P1-D): queued sessions don't yet carry dynamic mounts
         // (they'd need persisting in the queue row); the scanner boots them
         // with base skills only.
@@ -1026,22 +1024,14 @@ async fn resolve_selected_skills(
 pub(crate) async fn fleet_bundle_catalog(
     state: &SharedState,
 ) -> Result<std::collections::HashMap<String, String>, ApiError> {
-    let hosts = state
-        .services
-        .meta
-        .list_active_hosts()
-        .await
-        .map_err(|e| ApiError::Internal(format!("list_active_hosts for skill resolve: {e}")))?;
-    Ok(hosts
-        .iter()
-        .find(|h| !h.current_bundles.is_empty())
-        .map(|h| {
-            h.current_bundles
-                .iter()
-                .map(|b| (b.drive_id.clone(), b.sha256.clone()))
-                .collect()
-        })
-        .unwrap_or_default())
+    // Issue #535 (a): read-through the cache instead of a fresh
+    // `list_active_hosts` scan every call — invalidated by `pg_listener` on
+    // an actual `current_bundles` stamp change (host roll), not per create.
+    let catalog = state
+        .boot_bundles
+        .fleet_catalog(state.services.meta.as_ref())
+        .await?;
+    Ok((*catalog).clone())
 }
 
 /// Pure half of skill resolution (no I/O): assign each selected skill name to a
@@ -1090,7 +1080,10 @@ async fn prepare_inner(
     prompt: Option<String>,
     secret_overrides: Option<HashMap<String, String>>,
     session_id: SessionId,
-    enabled: engram_core::types::EnabledImage,
+    // Issue #535 (a): the per-enabled-image boot bundle (manifest already
+    // parsed, base snapshot already fetched) — a read-through cache fill,
+    // not per-create I/O. `Arc` because the cache hands out shared handles.
+    bundle: std::sync::Arc<crate::boot_bundle::BootBundle>,
     // ADR 0055: profile-selected skill names; resolved to reserved-slot mounts.
     selected_skills: Vec<String>,
     // ADR 0056: profile-granted "provider:action[@resource]" capability strings.
@@ -1122,11 +1115,9 @@ async fn prepare_inner(
         let (r, t) = split_image_ref(image_uri);
         (r.to_string(), t.to_string())
     };
-    let manifest: ImageManifest = toml::from_str(&enabled.manifest_toml).map_err(|e| {
-        ApiError::Internal(format!(
-            "stored manifest for {image_uri} failed to parse: {e}"
-        ))
-    })?;
+    // Issue #535 (a): the manifest was parsed ONCE at bundle-fill time (bake
+    // or cache-refresh), not per create — no `toml::from_str` on this path.
+    let manifest = &bundle.manifest;
     // ADR 0062: the harness is no longer baked into the image — it's selected
     // per session and resolved from the catalog below (`resolve_harness`). The
     // image's `[harness]` block, if any legacy one survives, is ignored here.
@@ -1225,12 +1216,10 @@ async fn prepare_inner(
         .unwrap_or_default();
 
     // -------- Base snapshot + budgets --------
-    let base_snapshot_id = enabled.base_snapshot_id.ok_or_else(|| {
-        ApiError::Internal(format!(
-            "enabled image `{image_uri}` has no base snapshot — re-enable it \
-             (POST /api/enabled-images) to capture one"
-        ))
-    })?;
+    // Issue #535 (a): the record was fetched ONCE at bundle-fill time
+    // (`bundle_for` already errors if the enabled image has no base
+    // snapshot) — no per-create `get_snapshot` on this path.
+    let base_snapshot_id = bundle.base_snapshot.id;
     // ADR 0055: resolve the profile's selected skill names to reserved-slot
     // mounts against the fleet's staged bundles (name -> sha). Capped at
     // RESERVED_SLOTS; an unknown skill name is a 400.
@@ -1240,14 +1229,17 @@ async fn prepare_inner(
     if let Some(mount) = harness_mount {
         selected_mounts.push(mount);
     }
-    let memory_mib = resolved_memory_mib(&manifest);
-    let cpu_budget_vcpus = resolved_vcpus(&manifest);
+    // Issue #535 (a): already resolved at bundle-fill time; reuse rather
+    // than recompute (identical inputs, so identical outputs).
+    let memory_mib = bundle.memory_mib;
+    let cpu_budget_vcpus = bundle.cpu_budget_vcpus;
 
     Ok(crate::session_boot::PreparedBoot {
         inputs: crate::session_boot::BootInputs {
             session_id,
             spec,
             base_snapshot_id,
+            base_snapshot: bundle.base_snapshot.clone(),
             spec_env,
             agent,
             session_env,

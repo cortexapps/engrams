@@ -3166,6 +3166,17 @@ impl MetadataStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        // Issue #535 (a): wake every coordinator replica's boot-bundle cache so
+        // a re-bake/re-enable is visible on the next create without waiting
+        // out the cache's TTL. NOTIFY is transactional — issuing it here (vs.
+        // after commit on a separate connection, like org_secret_changed) means
+        // it's delivered iff this transaction actually commits, and no
+        // separate best-effort round trip is needed.
+        sqlx::query("SELECT pg_notify('enabled_image_changed', $1)")
+            .bind(&image.image_uri)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
     }
@@ -3331,6 +3342,14 @@ impl MetadataStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        // Issue #535 (a): see the identical NOTIFY in `upsert_enabled_image` —
+        // a soft-delete also has to invalidate a cached bundle so create-time
+        // strictness (rejecting a disabled image) takes effect immediately.
+        sqlx::query("SELECT pg_notify('enabled_image_changed', $1)")
+            .bind(image_uri)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(DisableEnabledImageOutcome::Disabled)
     }
@@ -3348,6 +3367,12 @@ impl MetadataStore for PostgresStore {
         if res.rows_affected() == 0 {
             return Err(MetaError::NotFound);
         }
+        // Issue #535 (a): best-effort NOTIFY (mirrors org_secret_changed's
+        // delete path — no open transaction to ride here).
+        let _ = sqlx::query("SELECT pg_notify('enabled_image_changed', $1)")
+            .bind(image_uri)
+            .execute(&self.pool)
+            .await;
         Ok(())
     }
 
