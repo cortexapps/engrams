@@ -90,6 +90,30 @@ pub const OCI_PULL_BYTES: &str = "engram_oci_pull_bytes";
 /// increments, and ops can page on the cross-over before disk fills.
 pub const HOST_DISK_FREE_BYTES: &str = "engram_host_disk_free_bytes";
 
+/// ADR 0067: gauge of `fs_free - fs_total * ENGRAM_KUBELET_EVICT_PCT/100`
+/// on the host's `work_dir` mount — how far free disk sits above the
+/// kubelet's ephemeral-storage hard-eviction line. Sampled every
+/// heartbeat tick (`UtilizationProbe::sample`), independent of the
+/// chunk-cache budget: this alarms on TOTAL disk pressure (snapshots,
+/// memfiles, the OCI cache, anything sharing the mount), not just the
+/// cache's own slice. Negative or shrinking toward zero means the
+/// kubelet is about to evict this host-agent pod — page BEFORE that
+/// happens, since the eviction itself is the amplifier (pod churn
+/// orphans the local chunk cache, forcing every subsequent resume onto
+/// the ADR-0028 disk-only cold-recovery path).
+pub const HOST_DISK_HEADROOM_TO_KUBELET_BYTES: &str = "engram_host_disk_headroom_to_kubelet_bytes";
+
+/// ADR 0067: gauge of summed on-disk bytes of every per-template base
+/// memfile the image-prefetch supervisor has materialized (ADR 0022
+/// Option A residency) — these are unevictable disk (mlock'd, reclaimed
+/// only on image-disable), so they're part of the same "floor the
+/// budget can't touch" accounting as pinned chunk bytes. Sampled each
+/// image-prefetch reconcile tick. `generation-purge` (a later item in
+/// the 2026-07 overhaul) deletes File-mode memfiles entirely, taking
+/// this term to zero — this gauge exists to measure that, not to grow
+/// more machinery around it.
+pub const HOST_BASE_MEMFILE_BYTES: &str = "engram_host_base_memfile_bytes";
+
 /// ADR 0014 issue #4: counter incremented each time the idle-evict
 /// tick observes free disk below the floor and skips pushing
 /// candidates. Sustained increments mean a snowballing snapshot

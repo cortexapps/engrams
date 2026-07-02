@@ -445,16 +445,28 @@ async fn main() -> Result<(), HostAgentError> {
     };
     let cloud = Arc::new(StaticCloud::detect().map_err(HostAgentError::Backend)?);
 
-    // ADR 0007 #3a: NVMe-backed chunk cache. No absolute ceiling by
-    // default — a 20% free-space floor (re-probed via `statvfs(2)` on
-    // every sweep) governs, filling to ~80% of the cache disk then
-    // LRU-evicting. Operators may set an optional absolute ceiling via
-    // `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`, which then wins over the floor.
+    // ADR 0067: NVMe-backed chunk cache with a disk-derived absolute
+    // budget by default (min(60% of the cache disk, 80% — the same
+    // margin the free-space floor holds below the kubelet eviction
+    // line); ~179 GB on the 298.1 GB prod disk that used to grow
+    // unbounded). Operators may override via `ENGRAM_CHUNK_CACHE_
+    // BUDGET_BYTES` (wins outright) or `ENGRAM_CHUNK_CACHE_DISK_FRACTION`
+    // (adjusts the fraction the default derives from). The 20%
+    // free-space floor still governs independently and re-probes every
+    // sweep.
     let chunk_cache = engram_chunk_store::ChunkCache::new(
         engram_chunk_store::cache::ChunkCacheConfig::from_env_or_default(
             cli.work_dir.join("chunk-cache"),
         ),
     );
+    // ADR 0067: periodic enforcement independent of populate traffic —
+    // this is the host-agent's ONE cache-eviction policy per host (the
+    // UFFD handler shares this directory but builds its own cache with
+    // eviction disabled; see engram-uffd-handler). Held for the process
+    // lifetime, same pattern as `_base_shm_gc` below.
+    let _chunk_cache_sweeper = chunk_cache.spawn_sweeper(std::time::Duration::from_secs(
+        engram_chunk_store::cache::resolve_sweep_interval_secs(),
+    ));
 
     // ADR 0007: chunk store for the PooledBackend wrapper (materialize +
     // base-snapshot residency). `blob` was created above the backend
