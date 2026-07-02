@@ -249,9 +249,9 @@ async fn netns_provision_isolates_two_warm_slots_from_one_snapshot() {
     );
 
     // 5. Distinct host-side SNAT IPs. This is what the egress proxy
-    //    registry indexes by and what `guest_ip()` returns for the
-    //    dashboard shell tab — collide them and N>1 warm slots all
-    //    look like one session to the host stack.
+    //    registry indexes by and what `guest_endpoints().egress_identity`
+    //    returns — collide them and N>1 warm slots all look like one
+    //    session to the host stack.
     assert_ne!(
         setup1.snat_cidr.guest(),
         setup2.snat_cidr.guest(),
