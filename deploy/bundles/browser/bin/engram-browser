@@ -91,6 +91,38 @@ if [ "${1:-}" = "--ensure-locked" ]; then
     exit 1
 fi
 
+if [ "${1:-}" = "--wait-cdp" ]; then
+    # Agent path only (the bundled playwright-cli wrapper calls this after
+    # --ensure). --ensure returns on the x11vnc RFB gate (:5900), but chromium
+    # binds its CDP endpoint (:9222) a beat later — and playwright-cli
+    # connectOverCDP fails fast on that gap (one-shot GET /json/version ->
+    # ECONNREFUSED, with no retry of its own), which is the ADR-0065
+    # "RFB readiness is necessary-but-not-sufficient" chromium-liveness gap. So
+    # block until CDP actually answers a /json/version (HTTP 200) before letting
+    # the CLI connect. Bounded (~20s); on timeout exit 0 anyway so the wrapper
+    # still execs the CLI and surfaces the real error instead of us swallowing it.
+    # The human/VNC path never calls this, so --ensure stays RFB-only (gating it
+    # on the laggy CDP socket is what made spawn flaky — ADR 0065).
+    CDP_PORT="${ENGRAM_BROWSER_CDP_PORT:-9222}"
+    "$here/node/bin/node" -e '
+        const http = require("http");
+        const port = +process.argv[1];
+        const deadline = Date.now() + 20000;
+        const retry = () => { if (Date.now() > deadline) process.exit(0); else setTimeout(tick, 200); };
+        const tick = () => {
+            const req = http.get({ host: "127.0.0.1", port, path: "/json/version", timeout: 1000 }, (res) => {
+                res.resume();
+                if (res.statusCode === 200) process.exit(0);
+                retry();
+            });
+            req.on("error", retry);
+            req.on("timeout", () => { req.destroy(); retry(); });
+        };
+        tick();
+    ' "$CDP_PORT" 2>/dev/null || true
+    exit 0
+fi
+
 # Default (`--run`, or no arg for dev): the full bring-up below, ending as
 # x11vnc. Invoked detached by --ensure-locked (or directly on a dev box).
 
