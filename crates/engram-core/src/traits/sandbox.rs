@@ -382,6 +382,24 @@ pub trait SandboxBackend: Send + Sync {
         false
     }
 
+    /// Issue #530 item i: does this backend serve the split
+    /// pause-then-background-upload eviction (`HostClient::snapshot_begin`
+    /// / `snapshot_wait`), or only the composed, synchronous
+    /// [`Self::snapshot`]? Declared, not probed: the idle-eviction ladder
+    /// used to infer "unsupported" from `snapshot_begin` returning
+    /// `InvalidSpec`, which can't distinguish "this backend never had the
+    /// split path" from "it does, and just failed" — a declared-capable
+    /// backend whose `snapshot_begin` errors should be a hard, scanner-
+    /// retryable failure, not a silent fall-through to the composed path.
+    /// Only Firecracker (`PooledBackend`, ADR 0045 D5) overrides this to
+    /// `true`; VZ has no coherent memory checkpoint to split
+    /// (`supports_diff_checkpoints` above) and Process has no snapshots
+    /// at all, so both keep the composed path by declaration, matching
+    /// today's behavior exactly. Default `false`.
+    fn supports_split_eviction(&self) -> bool {
+        false
+    }
+
     /// ADR 0018 commit 12m: pause the VM without taking a snapshot.
     /// Idempotent — calling on an already-paused VM is a no-op
     /// success. Used by [`crate::traits::host_client`]-side

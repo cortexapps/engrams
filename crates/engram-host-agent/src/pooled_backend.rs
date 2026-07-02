@@ -5862,6 +5862,16 @@ impl SandboxBackend for PooledBackend {
         self.inner.supports_diff_checkpoints()
     }
 
+    // Issue #530 item i: `snapshot_begin`'s capture_phase above rides
+    // the same coherent diff-checkpoint machinery `supports_diff_checkpoints`
+    // gates — a PooledBackend over FC serves the split eviction path; over
+    // VZ/Process it doesn't (VZ has no coherent memory checkpoint at all,
+    // ADR 0003; Process has no snapshots), so this declares exactly the
+    // existing distinguisher rather than inventing a new one.
+    fn supports_split_eviction(&self) -> bool {
+        self.inner.supports_diff_checkpoints()
+    }
+
     /// ADR 0018 commit 12m: forward pause to the wrapped backend.
     /// PooledBackend doesn't have its own pause concept — it just
     /// delegates to whatever VMM is underneath. Used by our own
