@@ -388,6 +388,17 @@ export interface EnableJob {
   error: string | null;
   created_at: string;
   updated_at: string;
+  /** Issue #539: live/last capture progress. `capture_phase` is
+   * "boot" | "warm" | "snapshot" while `state === "capturing"`; unset
+   * outside a capture. `warm_stage` is the current (or, on a failed
+   * job, last-known) [warm]-hook stage name. `output_tail` is the
+   * rolling last 16 KiB of the hook's combined stdout+stderr —
+   * populated on success AND failure, so a failed job's diagnosis
+   * needs no host-log access. */
+  capture_phase: string | null;
+  warm_stage: string | null;
+  warm_stage_started_at: string | null;
+  output_tail: string | null;
 }
 
 export interface ListEnableJobsResponse {
