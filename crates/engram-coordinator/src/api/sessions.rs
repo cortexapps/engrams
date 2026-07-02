@@ -106,6 +106,12 @@ pub(crate) fn cold_boot_spec(
 /// secret's `allow_hosts` (the guest never holds the value). A ref that doesn't
 /// resolve is skipped + warn-logged — the session still boots, that one secret
 /// is just absent (mirrors `resolve_inject_entries`).
+///
+/// Issue #535 (c): the per-secret `SecretStore` round trips are independent
+/// (no secret's resolution depends on another's), so they run concurrently
+/// via `join_all` instead of one-at-a-time — the result folds back into the
+/// SAME order-insensitive (env map + entries vec) shape a serial loop would
+/// have produced.
 pub(crate) async fn resolve_policy_secrets(
     state: &SharedState,
     policy: Option<&engram_core::types::IntegrationPolicy>,
@@ -121,13 +127,16 @@ pub(crate) async fn resolve_policy_secrets(
         return (env, entries);
     };
     let schema = engram_core::types::image::SecretSchema::default();
-    for s in &policy.secrets {
-        let value = match state
-            .services
-            .secrets
-            .get(ctx, &s.secret_ref, &schema)
-            .await
-        {
+    let resolved = futures::future::join_all(policy.secrets.iter().map(|s| {
+        let schema = &schema;
+        async move {
+            let result = state.services.secrets.get(ctx, &s.secret_ref, schema).await;
+            (s, result)
+        }
+    }))
+    .await;
+    for (s, result) in resolved {
+        let value = match result {
             Ok(Some(v)) => v,
             Ok(None) => {
                 tracing::warn!(secret_ref = %s.secret_ref, env_var = %s.env_var,
@@ -871,8 +880,9 @@ pub(crate) async fn prepare_from_row(
         .bundle_for(state.services.meta.as_ref(), &session.image)
         .await?;
     // ADR 0056 (B′): re-read the persisted integration policy so the queued
-    // boot re-injects (build_egress_policy resolves its refs again on the new
-    // host). A malformed/absent blob → None (no injection).
+    // boot re-injects (`resolve_inject_entries` resolves its refs again on the
+    // new host, via `boot_on_reserved_host`'s overlapped env/egress leg).
+    // A malformed/absent blob → None (no injection).
     let integration_policy = match state
         .services
         .meta

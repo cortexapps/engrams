@@ -48,9 +48,11 @@ pub(crate) struct BootInputs {
     /// The resolved harness to spawn. `None` for dev-VM / harness-less
     /// images — a readiness-probe `AgentSpec` is synthesized from
     /// `session_env`. The per-spawn forge/upload broker tokens are NOT
-    /// injected here: their PG rows FK to `sessions.id`, which doesn't
-    /// exist until `create_session_created` runs in `boot_on_reserved_host`,
-    /// so the injection is deferred to there (after the row materializes).
+    /// injected here: minting is a per-spawn, not a durable, write, so it's
+    /// deferred to `boot_on_reserved_host`'s overlapped env/egress leg
+    /// (issue #535 (c)) — the FK it needs (`sessions.id`) has been
+    /// satisfiable since `reserve_and_persist_create` committed, well
+    /// before `prepare_inner` even returns this struct.
     pub agent: Option<AgentSpec>,
     /// The durable session env agentd applies to harness, `/exec`, and
     /// the shell. Used to synthesize the readiness-probe agent when
@@ -171,10 +173,25 @@ pub(crate) async fn boot_on_reserved_host(
     // integration policy's inject `secret_ref`s.
     let image_ref = spec.image.clone();
 
-    // ---- restore the base snapshot on the reserved host ----
-    // Issue #535 (a): `record` (== `base_snapshot`) arrived pre-resolved on
-    // `BootInputs` from the boot-bundle cache — no per-create `get_snapshot`
-    // round trip on this path any more.
+    // Issue #535 (c): overlap the two independent legs of the boot instead
+    // of serializing them behind the restore RPC.
+    //
+    // - Restore leg: `restore_base_on_host` — the ~0.4-0.7s VM-side work.
+    // - Env/egress leg: mint the per-spawn forge/upload broker token
+    //   (`inject_harness_env`) + resolve the integration policy's Plane-B
+    //   injections (`resolve_inject_entries`, which can round-trip an
+    //   external provider API for a mint-mode connector). BOTH need only
+    //   `session_id` / `image_ref` / `integration_policy` — none of them
+    //   touch the sandbox, and the session row has existed (at `pending`)
+    //   since `reserve_and_persist_create` committed, well before this
+    //   function ever ran, so the broker-token FK has been satisfiable the
+    //   whole time. This is where the external mint round trip moves OFF
+    //   the serial tail (fully-lazy minting at first proxied use is
+    //   explicitly out of scope — this is overlap only).
+    //
+    // A restore failure discards whatever the env/egress leg produced —
+    // cheap, and no different from today's "resolve then maybe fail later"
+    // shape.
     let metadata = engram_core::types::snapshot::SnapshotMetadata {
         base_memory_manifest: None,
         migration_source: None,
@@ -197,12 +214,21 @@ pub(crate) async fn boot_on_reserved_host(
         working_set_blob_key: None,
         aux_bundles: record.aux_bundles,
     };
+    let restore_leg = state.host_registry.restore_base_on_host(
+        host_id,
+        metadata,
+        spec_env.clone(),
+        selected_mounts,
+    );
+    let env_egress_leg = async {
+        if let Some(a) = agent.as_mut() {
+            crate::api::sessions::inject_harness_env(state, session_id, &mut a.env).await;
+        }
+        resolve_inject_entries(state, session_id, integration_policy.as_ref(), &image_ref).await
+    };
+    let (restore_result, injects) = tokio::join!(restore_leg, env_egress_leg);
 
-    let sandbox_id = match state
-        .host_registry
-        .restore_base_on_host(host_id, metadata, spec_env.clone(), selected_mounts)
-        .await
-    {
+    let sandbox_id = match restore_result {
         Ok(sb) => sb,
         Err(e) => {
             return Err(BootError::NotStarted(map_restore_error(e)));
@@ -232,26 +258,17 @@ pub(crate) async fn boot_on_reserved_host(
         return Err(BootError::NotStarted(e.into()));
     }
 
-    // Inject the per-spawn forge/upload broker tokens NOW the session row is
-    // `created`. These mint a `session_broker_tokens` row that FKs to
-    // `sessions.id` — the row has existed (at `pending`) since `reserve_and_
-    // persist_create` committed, well before this point, so the FK has been
-    // satisfiable for a while; the mint is placed here (not earlier, in
-    // `prepare_inner`) only because it's a per-spawn, not a durable, write —
-    // no reason to run it before we know the sandbox will actually boot.
-    if let Some(a) = agent.as_mut() {
-        crate::api::sessions::inject_harness_env(state, session_id, &mut a.env).await;
-    }
-
-    // Egress policy from the resolved guest IP (None on backends without one).
-    let egress_policy = build_egress_policy(
+    // Egress policy from the resolved guest IP (None on backends without
+    // one) + the injects/observes already resolved by the overlapped leg.
+    let observes = build_observe_entries(integration_policy.as_ref());
+    let egress_policy = assemble_egress_policy(
         state,
         session_id,
         sandbox_id,
         egress_secrets,
         &network,
-        &image_ref,
-        integration_policy.as_ref(),
+        injects,
+        observes,
     )
     .await;
 
@@ -382,17 +399,23 @@ fn map_restore_error(e: engram_core::SandboxError) -> ApiError {
     }
 }
 
-/// Build the per-session egress policy from the resolved guest IP, or
-/// `None` when the backend exposes no guest IP (process backend / some
-/// VZ configs) — the caller synthesizes an unspecified-IP fallback.
-async fn build_egress_policy(
+/// Issue #535 (c): the SANDBOX-INDEPENDENT half of what `build_egress_
+/// policy` used to compute inline — `injects` (`resolve_inject_entries`,
+/// which can round-trip an external mint provider) and `observes` are both
+/// resolved by the overlapped env/egress leg in `boot_on_reserved_host`,
+/// concurrently with the restore RPC, since neither needs a `sandbox_id`.
+/// This function is the remaining sandbox-DEPENDENT half: fetch `guest_ip`
+/// and assemble the final policy. `None` when the backend exposes no guest
+/// IP (process backend / some VZ configs) — the caller synthesizes an
+/// unspecified-IP fallback.
+async fn assemble_egress_policy(
     state: &SharedState,
     session_id: SessionId,
     sandbox_id: SandboxId,
     egress_secrets: Vec<engram_core::types::egress::EgressSecretEntry>,
     network: &engram_core::types::image::NetworkPolicy,
-    image: &str,
-    integration_policy: Option<&engram_core::types::IntegrationPolicy>,
+    injects: Vec<engram_core::types::egress::EgressInjectEntry>,
+    observes: Vec<engram_core::types::egress::EgressObserveEntry>,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
     let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
@@ -406,8 +429,8 @@ async fn build_egress_policy(
         // ADR 0057: precomputed in `prepare_inner`/resume from the policy secrets
         // (broker entries only; literals are already in the guest env).
         secrets: egress_secrets,
-        injects: resolve_inject_entries(state, session_id, integration_policy, image).await,
-        observes: build_observe_entries(integration_policy),
+        injects,
+        observes,
         // ADR 0057: per-secret mode replaces a session-level mode; the proxy
         // substitutes per `EgressSecretEntry`. Kept Broker for the (vestigial)
         // wire field — substitution is driven by the entries, not this flag.
