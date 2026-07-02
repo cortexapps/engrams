@@ -254,6 +254,12 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
 /// `Queued → Pending`, runs the shared boot pipeline, and on failure
 /// requeues (NotStarted, still `pending`) or fails (Started, reached
 /// `created`). `lease` is held for the whole boot.
+///
+/// ADR 0019 / telemetry restoration (#526): this runs on a scanner
+/// `JoinSet` task with no request span to inherit — an explicit root
+/// (carrying `session_id`) so its spans correlate instead of exporting
+/// as disconnected roots.
+#[tracing::instrument(name = "queue_scanner.boot_placed_create", skip_all, fields(session_id = %q.session.id, %host_id))]
 async fn boot_placed_create(
     state: &SharedState,
     q: QueuedSession,
