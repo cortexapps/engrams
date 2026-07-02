@@ -990,7 +990,7 @@ impl FirecrackerBackend {
             .map_err(|e| SandboxError::Snapshot(format!("read manifest: {e}")))?;
         let manifest: FcSnapshotManifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| SandboxError::Snapshot(format!("manifest parse: {e}")))?;
-        if !matches!(manifest.format.as_str(), MANIFEST_FORMAT_FC | "") {
+        if manifest.format.as_str() != MANIFEST_FORMAT_FC {
             return Err(SandboxError::Snapshot(format!(
                 "manifest format {:?} is not 'fc' — cross-VMM restore not supported",
                 manifest.format,
@@ -1059,11 +1059,8 @@ impl FirecrackerBackend {
 
         // Reject cross-VMM restores fast: a VZ blob (`format == "vz"`)
         // would otherwise reach load_snapshot and fail with a
-        // confusing FC parse error on state.bin. Empty string accepted
-        // for snapshots written before the format field landed; once
-        // those have rotated out a future cleanup can drop the empty
-        // case.
-        if !matches!(manifest.format.as_str(), MANIFEST_FORMAT_FC | "") {
+        // confusing FC parse error on state.bin.
+        if manifest.format.as_str() != MANIFEST_FORMAT_FC {
             return Err(SandboxError::Snapshot(format!(
                 "manifest format {:?} is not 'fc' — cross-VMM restore not supported",
                 manifest.format,
