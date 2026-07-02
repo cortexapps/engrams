@@ -56,6 +56,38 @@ spec:
       # delete` should still let in-flight captures finish.
       terminationGracePeriodSeconds: 120
       initContainers:
+        {{- if and .Values.otel.enabled .Values.otel.collector.enabled }}
+        # ADR 0019 / telemetry restoration (#526): OTel Collector as a k8s
+        # NATIVE sidecar (init container with restartPolicy: Always), mirroring
+        # the coord chart's pattern exactly. Starts before host-agent and runs
+        # for the pod's lifetime, receiving OTLP on localhost:4317 (and, under
+        # hostNetwork, node-wide 0.0.0.0:4317 — reachable by the uffd-handler
+        # and, once the guest firewall pinhole lands, the in-guest agentd) and
+        # forwarding to Cloud Trace. Crucially it has NO readinessProbe, so —
+        # same guardrail as the coord sidecar — a crashing collector can never
+        # pull the host-agent out of Ready (the 2026-05-27 coord incident this
+        # pattern exists to prevent). Config from an existing ConfigMap (key
+        # config.yaml), created from deploy/otel/collector-gcp.yaml.
+        - name: otel-collector
+          image: {{ .Values.otel.collector.image | quote }}
+          restartPolicy: Always
+          args: ["--config", "/etc/otelcol/config.yaml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+          volumeMounts:
+            - name: otel-config
+              mountPath: /etc/otelcol
+              readOnly: true
+          resources:
+            {{- toYaml .Values.otel.collector.resources | nindent 12 }}
+        {{- end }}
         # ADR 0044 K2 / GAP 2: stage firecracker + the guest kernel out of
         # the node-assets image into a shared emptyDir. Stock K8s nodes have
         # neither (the GCE/Packer node image baked them in); this is the K8s
@@ -158,6 +190,21 @@ spec:
                   name: {{ .Values.egress.caEnvSecret }}
                   key: {{ .Values.egress.caEnvKeyKey }}
             {{- end }}
+            {{- if .Values.otel.enabled }}
+            # ADR 0019 / telemetry restoration (#526): export host-agent spans
+            # (chunk.fetch, host.restore_base_for_session, restore.*, ...) to
+            # the in-pod otelcol sidecar (which forwards to Cloud Trace).
+            # engram-telemetry is a no-op if unset. The uffd-handler, spawned
+            # by this container without env_clear, inherits this too.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.otel.endpoint | quote }}
+            {{- end }}
+            {{- /* ENGRAM_GUEST_OTEL_ENDPOINT (in-guest agentd export) is
+                   deliberately NOT wired here — it depends on a guest->
+                   collector firewall pinhole (net.rs) that doesn't exist
+                   yet. Out of scope for #526 (phase 2 / prototype-first,
+                   tracked as a follow-up); wiring the env without the
+                   pinhole would just be a silently-unreachable dial. */}}
             {{- with .Values.hostAgent.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -188,3 +235,8 @@ spec:
         - {name: engram-assets, emptyDir: {}}
         - {name: work, hostPath: {path: {{ .Values.storage.workDirHostPath | quote }}, type: DirectoryOrCreate}}
         - {name: cgroup, hostPath: {path: /sys/fs/cgroup, type: Directory}}
+        {{- if and .Values.otel.enabled .Values.otel.collector.enabled }}
+        - name: otel-config
+          configMap:
+            name: {{ required "otel.collector.configMap is required when the otel collector is enabled" .Values.otel.collector.configMap }}
+        {{- end }}
