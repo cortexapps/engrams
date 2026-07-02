@@ -206,6 +206,18 @@ async fn main() -> Result<(), HostAgentError> {
 
     let cli = Cli::parse();
 
+    // ADR 0067: dedicated-volume mountpoint gate. When the chart pairs
+    // `storage.dedicatedDevice` with `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT
+    // =true`, `work_dir` MUST resolve to a distinct filesystem from `/`
+    // — otherwise the chunk cache, snapshots, and memfiles silently
+    // land on the boot disk instead of the dedicated volume an operator
+    // provisioned specifically to take that load off the kubelet's
+    // nodefs signal (the base-shm-startup-race failure class: a rolled
+    // pod starting before node-prep's mount is visible). Fail loud
+    // BEFORE touching work_dir or registering with the coordinator —
+    // never come up silently wrong.
+    require_work_dir_mountpoint_or_exit(&cli.work_dir)?;
+
     // Bind the metrics port first. It's the Prometheus scrape target
     // (k8s ServiceMonitor scrapes it); binding early means metrics are
     // available as soon as the process is up.
@@ -683,6 +695,76 @@ fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Option<S
     Some(format!("http://127.0.0.1:{grpc_port}"))
 }
 
+/// Env var: ADR 0067's dedicated-volume mountpoint gate. See
+/// [`require_work_dir_mountpoint_or_exit`].
+const WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR: &str = "ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT";
+
+/// ADR 0067: when `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT` is truthy
+/// (`1`/`true`, case-insensitive), hard-fail unless `work_dir` resolves
+/// to a distinct filesystem from `/` — i.e. a dedicated volume is
+/// actually mounted there, not just a directory on the boot disk. The
+/// chart sets this env var only when `storage.dedicatedDevice` is
+/// configured, so this is a paired guard: "you told me to expect a
+/// dedicated volume; prove it's mounted before I start writing to it."
+///
+/// Compares `st_dev` (`stat(2)`'s device id — the same primitive `df`
+/// uses to detect a mount boundary), not a mount-table parse, so it
+/// works identically whether `work_dir` itself or an ancestor is the
+/// actual mountpoint. `work_dir` may not exist yet on a freshly-imaged
+/// host (the caller creates it downstream); this walks up to the
+/// nearest existing ancestor rather than treating a stat ENOENT as a
+/// gate failure — a missing directory says nothing about which
+/// filesystem it WOULD land on.
+///
+/// No-op (returns `Ok`) when the env var is unset/false — today's
+/// default, zero behavior change until a chart opts in.
+fn require_work_dir_mountpoint_or_exit(work_dir: &std::path::Path) -> Result<(), HostAgentError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let required = std::env::var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR)
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    if !required {
+        return Ok(());
+    }
+
+    let root_dev = std::fs::metadata("/")
+        .map_err(|e| {
+            HostAgentError::Config(format!(
+                "{WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR}=true but could not stat /: {e}"
+            ))
+        })?
+        .dev();
+
+    let mut probe = work_dir.to_path_buf();
+    let work_dev = loop {
+        match std::fs::metadata(&probe) {
+            Ok(meta) => break meta.dev(),
+            Err(_) if probe.pop() => continue,
+            Err(_) => {
+                return Err(HostAgentError::Config(format!(
+                    "{WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR}=true but no ancestor of {} exists to \
+                     probe for a mountpoint",
+                    work_dir.display(),
+                )));
+            }
+        }
+    };
+
+    if work_dev == root_dev {
+        return Err(HostAgentError::Config(format!(
+            "{WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR}=true but {} is on the SAME filesystem as / \
+             (st_dev {work_dev} == {root_dev}) — the dedicated volume isn't mounted there yet \
+             (or storage.dedicatedDevice is misconfigured). Refusing to start: coming up on the \
+             boot disk here would silently defeat the whole point of the dedicated volume — \
+             cache/snapshot/memfile writes would count against the SAME kubelet nodefs signal \
+             ADR 0067's headroom gauge and budget exist to keep clear.",
+            work_dir.display(),
+        )));
+    }
+    Ok(())
+}
+
 /// Initialise the global tracing subscriber (+ optional OpenTelemetry
 /// OTLP export; ADR 0019).
 ///
@@ -824,5 +906,72 @@ mod tests {
         // Persisted, so the next start on the same work_dir reuses it.
         let second = resolve_host_id(tmp.path(), None);
         assert_eq!(first, second);
+    }
+
+    // ---- ADR 0067: require_work_dir_mountpoint_or_exit ----
+
+    // Tests poke a process-global env var; serialize (mirrors the
+    // ENV_LOCK pattern used elsewhere in this repo, e.g.
+    // engram-chunk-store's cache.rs tests).
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn mountpoint_gate_is_a_noop_when_env_unset() {
+        let _g = env_guard();
+        std::env::remove_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR);
+        // A tempdir under the system temp dir is on the SAME filesystem
+        // as `/` on every CI/dev box this test runs on — if the gate
+        // fired unconditionally this would fail. It must not, since the
+        // env var is unset.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(require_work_dir_mountpoint_or_exit(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn mountpoint_gate_rejects_same_filesystem_as_root_when_required() {
+        let _g = env_guard();
+        std::env::set_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR, "true");
+        let tmp = tempfile::tempdir().unwrap();
+        let result = require_work_dir_mountpoint_or_exit(tmp.path());
+        std::env::remove_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR);
+        assert!(
+            result.is_err(),
+            "a tempdir under the system temp dir shares /'s filesystem on every CI/dev box; \
+             the gate must reject it when required",
+        );
+    }
+
+    #[test]
+    fn mountpoint_gate_walks_up_to_nearest_existing_ancestor() {
+        // work_dir itself doesn't exist yet (fresh host, created
+        // downstream) — the gate must probe the nearest existing
+        // ancestor instead of erroring on ENOENT.
+        let _g = env_guard();
+        std::env::set_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR, "true");
+        let tmp = tempfile::tempdir().unwrap();
+        let not_yet_created = tmp.path().join("sandboxes").join("work");
+        let result = require_work_dir_mountpoint_or_exit(&not_yet_created);
+        std::env::remove_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR);
+        // Same filesystem as / (tempdir), so it's still a rejection —
+        // the point of this test is that it errors on the FILESYSTEM
+        // check, not on a "no such file" stat failure.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mountpoint_gate_accepts_env_var_case_insensitively_and_via_1() {
+        let _g = env_guard();
+        std::env::set_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR, "TRUE");
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(require_work_dir_mountpoint_or_exit(tmp.path()).is_err());
+        std::env::set_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR, "1");
+        assert!(require_work_dir_mountpoint_or_exit(tmp.path()).is_err());
+        std::env::set_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR, "false");
+        assert!(require_work_dir_mountpoint_or_exit(tmp.path()).is_ok());
+        std::env::remove_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR);
     }
 }
