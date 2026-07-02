@@ -259,7 +259,7 @@ pub trait HostClient: Send + Sync {
     /// `(session_id, sandbox_id, guest_ip)` and upserts.
     async fn apply_egress_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError>;
 
-    async fn guest_ip(&self, id: SandboxId) -> Option<String>;
+    async fn guest_ip(&self, id: SandboxId) -> Option<std::net::Ipv4Addr>;
 
     // ---- harness routing ----
     /// Tell this host that an upcoming harness connection identifying
@@ -420,9 +420,8 @@ pub trait HostClient: Send + Sync {
     ///
     /// Default impl errors with `NotFound`: only host-agent
     /// implementations actually proxy shells. The Local impl in the
-    /// host-agent opens a WebSocket to `ws://<guest_ip>:7681/ws`
-    /// inside the right network namespace (per
-    /// [`SandboxBackend::netns_name_for`]) and bridges; the gRPC
+    /// host-agent opens a WebSocket to `ws://<dial_ip>:7681/ws` (per
+    /// [`SandboxBackend::guest_endpoints`]) and bridges; the gRPC
     /// client impl opens a gRPC bidi stream and bridges the channels
     /// with the wire frames.
     async fn proxy_shell(&self, sandbox_id: SandboxId) -> Result<ShellTunnel, SandboxError> {
