@@ -255,4 +255,69 @@ fails with a clear error until re-baked.
 3. Deterministic ext4 builds.
 4. Base-snapshot capture reuse by disk-manifest content.
 
+## Amendment (2026-07-02): fleet chunk prestage — a fifth pipeline stage (interim, issue #538)
+
+**Problem this amendment closes.** `ready` in this ADR means
+coordinator-local: chunks durable in GCS, the base snapshot captured, the
+`enabled_images` row upserted. It says nothing about whether any *serving
+host* has actually pulled the base snapshot's chunks onto local NVMe. The
+per-host image-prefetch supervisor (ADR 0015 M5) and the placement digest
+gate (`ScheduleContext.required_image_digest`) already exist to make that
+distinction — but nothing wired them together, and every production call
+site passed `required_image_digest: None`. The result: the instant an
+enable job reaches `ready`, the coordinator and the first user create both
+learn about the new digest at the same heartbeat tick, and the create
+usually wins — 90–118 s of on-demand GCS chunk pulls inside the create
+handler, or (observed 3-for-3 in a sampled prod week) outright failure.
+
+**The fix.** A fourth, non-terminal job state —
+`pending → materializing → capturing → prestaging → ready | failed` — sits
+between capture and the `enabled_images` upsert. While `prestaging`, the
+heartbeat ack advertises the freshly-captured base snapshot as
+`prestage_images` (alongside the existing `enabled_images`); every host's
+prefetch supervisor treats the union as one set to warm, pin, and report
+ready — no changes to the supervisor itself. The scanner polls
+`ready_images` on every *eligible* host (schedulable ∧ a new heartbeat bit,
+`stages_images`, that's true only when the host's prefetch supervisor
+actually spawned) until all are staged or a deadline
+(`ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS`, default 1200 s) — recording
+`staged`/`timed_out`/`unschedulable` per host on the job row
+(`prestage_hosts`) either way. Only then does the `enabled_images` upsert
+run, making the digest visible to session-create — which now passes
+`required_image_digest: Some(...)` on the create path, so even a straggler
+host that missed the window can't serve a cold first restore (it's simply
+not in the ranked candidate pool; a create that ranks to zero hosts queues,
+exactly like a capacity miss, rather than 503ing).
+
+**Why "interim."** This deliberately keeps the *binary* per-host
+readiness gate and re-institutionalizes O(image) × fleet staging from GCS
+on every re-bake — every eligible host re-pulls the full chunk set. At
+today's fleet size (2 KVM nodes) that's an acceptable price to delete a
+reproducible first-create-after-refresh failure mode with near-zero new
+machinery (the prefetch supervisor and the digest gate already existed;
+this only sequences the enable flip to happen after the fleet warms, not
+at the same instant the first user session tries to boot). The recorded
+end state — **graded readiness**: hosts report a per-image resident
+*fraction* rather than a boolean, placement *ranks* by that fraction and
+hard-gates only on {manifest + `state.bin` + shm-base + capture-recorded
+hot set resident}, with the tail lazy-filled preferably from peers rather
+than every host re-pulling from GCS — is out of scope here and lives in the
+epic that retires this stage (`epic-gcs-free-resume`). When it lands, the
+binary prestage wait, the `prestage_images` advertisement, and the
+all-hosts-blocking loop are deleted in favor of resident-fraction ranking;
+the `prestage_hosts` audit column and the `stages_images` capability bit
+(which folds into a typed capability vector, `capability-vector-readiness`)
+survive into that world.
+
+**Dev/Process-backend story.** A host whose `SandboxBackend` never spawns
+the prefetch supervisor (no `chunk_store`/`chunk_cache` configured — every
+Process-backend dev host) reports `stages_images = false` and is exempt by
+construction: a fleet with zero eligible hosts passes the prestage stage
+vacuously (logged, not silent). `just dev` + enable + create is unchanged.
+
+Migration 0077 adds `enable_jobs.prestage_ref` / `.prestage_hosts` and
+`hosts.stages_images`. Resume/evac/admin placement are NOT gated on
+`required_image_digest` — they place by snapshot affinity, a different
+invariant this amendment doesn't touch.
+
 Commit chain recorded here as phases land.
