@@ -72,6 +72,7 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
+        stages_images: false,
     })
     .await
     .expect("upsert host");
@@ -89,6 +90,7 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
             current_bundles: Vec::new(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
+            stages_images: false,
         },
     )
     .await

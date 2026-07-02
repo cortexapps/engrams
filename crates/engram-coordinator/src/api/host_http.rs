@@ -166,6 +166,10 @@ pub async fn register(
         // The first heartbeat persists the version the scheduler filters
         // on; carry it here so the in-memory record is consistent.
         wire_version: req.wire_version,
+        // ADR 0036 amendment (issue #538): scheduling state, same as
+        // `wire_version` above — the first heartbeat persists the real
+        // value; `upsert_host` doesn't write this column at all.
+        stages_images: false,
     };
     state.services.meta.upsert_host(record).await?;
 
@@ -327,6 +331,14 @@ pub struct HeartbeatRequest {
     /// mid-roll, which the placement filter tolerates.
     #[serde(default)]
     pub wire_version: u32,
+    /// ADR 0036 amendment (issue #538): true iff this host's image-prefetch
+    /// supervisor is spawned (`chunk_store` + `chunk_cache` configured). The
+    /// enable scanner's prestage stage waits only on hosts reporting this —
+    /// a fleet with zero eligible staging hosts passes the stage vacuously.
+    /// `#[serde(default)]` → `false` from a pre-0538 host-agent mid-roll,
+    /// the safe/exempt posture.
+    #[serde(default)]
+    pub stages_images: bool,
 }
 
 #[derive(Serialize)]
@@ -342,6 +354,15 @@ pub struct HeartbeatResponse {
     /// `ready_images` and pulls missing chunks.
     #[serde(default)]
     pub enabled_images: Vec<EnabledImageRef>,
+    /// ADR 0036 amendment (issue #538): base-snapshot refs of images
+    /// currently in the `prestaging` enable-job stage — advertised so
+    /// eligible hosts warm them via the SAME prefetch supervisor path as
+    /// `enabled_images` (the supervisor consumes the deduped union), before
+    /// the enable scanner's `enabled_images` upsert makes the digest
+    /// visible to session-create. `#[serde(default)]` for interop: a
+    /// pre-0538 host-agent ignores the field.
+    #[serde(default)]
+    pub prestage_images: Vec<EnabledImageRef>,
     /// ADR 0035 §5: the bundle pin set (every generation some
     /// snapshot row references). Drives the host's bundle
     /// prefetch + sweep supervisor. Always present — the host side
@@ -488,6 +509,7 @@ pub async fn heartbeat(
         current_bundles: hb.current_bundles.clone(),
         total_vcpus: hb.total_vcpus,
         wire_version: hb.wire_version,
+        stages_images: hb.stages_images,
     };
     if let Err(e) = state
         .services
@@ -509,6 +531,31 @@ pub async fn heartbeat(
         Ok(rows) => enabled_image_refs_from_rows(rows),
         Err(e) => {
             tracing::debug!(host_id = %host_id, error = %e, "list_enabled_images failed");
+            Vec::new()
+        }
+    };
+
+    // ADR 0036 amendment (issue #538): ship the base-snapshot refs of
+    // every enable job currently `prestaging`, so eligible hosts warm them
+    // BEFORE the scanner's `enabled_images` upsert makes the digest
+    // visible to session-create. Best-effort, same posture as
+    // `enabled_images` above — a PG hiccup degrades to no prestage work
+    // for this tick; the scanner's poll loop just sees one more empty
+    // heartbeat and keeps waiting. A row that fails to deserialize (wire
+    // skew mid-roll) is skipped + logged rather than failing the whole ack.
+    let prestage_images = match state.services.meta.list_prestaging_refs().await {
+        Ok(raw) => raw
+            .into_iter()
+            .filter_map(|v| match serde_json::from_value::<EnabledImageRef>(v) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(host_id = %host_id, error = %e, "prestage_ref failed to deserialize; skipping");
+                    None
+                }
+            })
+            .collect(),
+        Err(e) => {
+            tracing::debug!(host_id = %host_id, error = %e, "list_prestaging_refs failed");
             Vec::new()
         }
     };
@@ -583,6 +630,7 @@ pub async fn heartbeat(
         server_time: Utc::now(),
         revoked_sessions: Vec::new(),
         enabled_images,
+        prestage_images,
         live_bundles,
         acked_checkpoints,
     }))
@@ -595,42 +643,48 @@ pub async fn heartbeat(
 fn enabled_image_refs_from_rows(
     rows: Vec<engram_core::types::EnabledImage>,
 ) -> Vec<EnabledImageRef> {
-    rows.into_iter()
-        .filter_map(|row| {
-            // base_snapshot_disk_manifest is NOT NULL (migration 0042), so a
-            // persisted row always has it — the Option is only the build-then-
-            // stamp shape. Defensively skip (rather than panic) the impossible
-            // None so one malformed row can't break the whole advertisement.
-            let Some(base_snapshot_disk_manifest) = row.base_snapshot_disk_manifest else {
-                tracing::error!(
-                    image_uri = %row.image_uri,
-                    "enabled image has no base_snapshot_disk_manifest (NOT NULL invariant violated); not advertising",
-                );
-                return None;
-            };
-            // ADR 0022 Option A: base_snapshot_id is NOT NULL (migration 0038);
-            // same defensive skip — the host needs it to key the per-template
-            // memfile residency path.
-            let Some(base_snapshot_id) = row.base_snapshot_id else {
-                tracing::error!(
-                    image_uri = %row.image_uri,
-                    "enabled image has no base_snapshot_id (NOT NULL invariant violated); not advertising",
-                );
-                return None;
-            };
-            // ADR 0021 P2 (memory residency): nullable since migration 0049.
-            // `None` for cold-boot backends (VZ) that capture a disk-only base
-            // snapshot — advertise the row anyway; the host's prefetch warms
-            // only the disk tier when memory is absent.
-            Some(EnabledImageRef {
-                image_uri: row.image_uri,
-                manifest_digest: ManifestDigest(row.manifest_digest),
-                base_snapshot_id,
-                base_snapshot_disk_manifest,
-                base_snapshot_memory_manifest: row.base_snapshot_memory_manifest,
-            })
-        })
-        .collect()
+    rows.iter().filter_map(enabled_image_ref).collect()
+}
+
+/// ADR 0036 amendment (issue #538): the single-row half of
+/// [`enabled_image_refs_from_rows`]'s projection, shared with
+/// `enable_scanner`'s `Prestaging`-stage advertisement so the two build
+/// paths can't drift — a row the enable scanner just captured (about to be
+/// upserted) and a row already live in `enabled_images` project to the
+/// SAME wire shape.
+pub(crate) fn enabled_image_ref(row: &engram_core::types::EnabledImage) -> Option<EnabledImageRef> {
+    // base_snapshot_disk_manifest is NOT NULL on a persisted row (migration
+    // 0042); the Option here is only the build-then-stamp shape.
+    // Defensively skip (rather than panic) the impossible None so one
+    // malformed row can't break the whole advertisement.
+    let Some(base_snapshot_disk_manifest) = row.base_snapshot_disk_manifest else {
+        tracing::error!(
+            image_uri = %row.image_uri,
+            "enabled image has no base_snapshot_disk_manifest (NOT NULL invariant violated); not advertising",
+        );
+        return None;
+    };
+    // ADR 0022 Option A: base_snapshot_id is NOT NULL (migration 0038); same
+    // defensive skip — the host needs it to key the per-template memfile
+    // residency path.
+    let Some(base_snapshot_id) = row.base_snapshot_id else {
+        tracing::error!(
+            image_uri = %row.image_uri,
+            "enabled image has no base_snapshot_id (NOT NULL invariant violated); not advertising",
+        );
+        return None;
+    };
+    // ADR 0021 P2 (memory residency): nullable since migration 0049. `None`
+    // for cold-boot backends (VZ) that capture a disk-only base snapshot —
+    // advertise the row anyway; the host's prefetch warms only the disk
+    // tier when memory is absent.
+    Some(EnabledImageRef {
+        image_uri: row.image_uri.clone(),
+        manifest_digest: ManifestDigest(row.manifest_digest.clone()),
+        base_snapshot_id,
+        base_snapshot_disk_manifest,
+        base_snapshot_memory_manifest: row.base_snapshot_memory_manifest,
+    })
 }
 
 // ---- POST /api/hosts/:id/auth/resolve-registry ----

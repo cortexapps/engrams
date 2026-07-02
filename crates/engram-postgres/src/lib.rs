@@ -2171,7 +2171,7 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    ready_images, local_snapshots, current_bundles,
-                   cordoned, total_vcpus, wire_version,
+                   cordoned, total_vcpus, wire_version, stages_images,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
@@ -2244,6 +2244,7 @@ impl MetadataStore for PostgresStore {
                       current_bundles = $14,
                       total_vcpus = $15,
                       wire_version = $16,
+                      stages_images = $17,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
@@ -2264,6 +2265,7 @@ impl MetadataStore for PostgresStore {
         .bind(current_bundles)
         .bind(hb.total_vcpus as i32)
         .bind(hb.wire_version as i32)
+        .bind(hb.stages_images)
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -2304,7 +2306,7 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    ready_images, local_snapshots, current_bundles,
-                   cordoned, total_vcpus, wire_version,
+                   cordoned, total_vcpus, wire_version, stages_images,
                    last_heartbeat_at, status, host_addr
               FROM hosts
              -- Only `ready` hosts are strike-out candidates. A `draining`
@@ -3405,7 +3407,7 @@ impl MetadataStore for PostgresStore {
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
             DO NOTHING
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(Uuid::new_v4())
@@ -3420,7 +3422,7 @@ impl MetadataStore for PostgresStore {
         }
         let existing = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              WHERE image_uri = $1 AND state NOT IN ('ready', 'failed')
             "#,
@@ -3440,7 +3442,7 @@ impl MetadataStore for PostgresStore {
                     VALUES ($1, $2, $3, $4)
                     ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
                     DO NOTHING
-                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, prestage_hosts, created_at, updated_at
                     "#,
                 )
                 .bind(Uuid::new_v4())
@@ -3462,7 +3464,7 @@ impl MetadataStore for PostgresStore {
 
     async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
         let row = sqlx::query(
-            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
+            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -3474,7 +3476,7 @@ impl MetadataStore for PostgresStore {
     async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              ORDER BY created_at DESC
              LIMIT $1
@@ -3509,7 +3511,7 @@ impl MetadataStore for PostgresStore {
                     LIMIT $3
                       FOR UPDATE SKIP LOCKED
              )
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(claimant)
@@ -3650,7 +3652,7 @@ impl MetadataStore for PostgresStore {
                SET state = 'pending', attempts = 0, error = NULL,
                    claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
              WHERE id = $1 AND state = 'failed'
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -3667,6 +3669,90 @@ impl MetadataStore for PostgresStore {
                 None => Err(MetaError::NotFound),
             },
         }
+    }
+
+    // ---- ADR 0036 amendment: fleet chunk prestage (issue #538) ----
+
+    async fn begin_enable_job_prestage(
+        &self,
+        id: Uuid,
+        claimant: &str,
+        prestage_ref: serde_json::Value,
+    ) -> Result<(), MetaError> {
+        // Stamp the wire-shape ref the heartbeat ack advertises to hosts,
+        // and flip to `prestaging` in the SAME fenced write (mirrors
+        // `set_enable_job_state`: renews the claim, fenced by `claimed_by`
+        // — #232 semantics — so a stale pod can't advertise a ref for a
+        // job a peer now owns).
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET state = 'prestaging',
+                   prestage_ref = $3,
+                   claimed_at = NOW(),
+                   updated_at = NOW()
+             WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(id)
+        .bind(claimant)
+        .bind(prestage_ref)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(self.enable_job_fence_miss(id, claimant).await);
+        }
+        Ok(())
+    }
+
+    async fn set_enable_job_prestage_hosts(
+        &self,
+        id: Uuid,
+        claimant: &str,
+        outcomes: serde_json::Value,
+    ) -> Result<(), MetaError> {
+        // Written once at the end of the prestage wait — the audit /
+        // dashboard record of per-host staged|timed_out|unschedulable
+        // outcomes. Fenced by `claimed_by` (#232): a stale pod's stragglers
+        // must not overwrite a peer's in-progress or completed record.
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET prestage_hosts = $3,
+                   claimed_at = NOW(),
+                   updated_at = NOW()
+             WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(id)
+        .bind(claimant)
+        .bind(outcomes)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(self.enable_job_fence_miss(id, claimant).await);
+        }
+        Ok(())
+    }
+
+    async fn list_prestaging_refs(&self) -> Result<Vec<serde_json::Value>, MetaError> {
+        // Raw JSON out — engram-core (and this store) must not depend on
+        // engram-protocol (the wire-type crate depends on core, not the
+        // reverse); the coordinator's heartbeat handler deserializes each
+        // value into `EnabledImageRef`, matching the existing dependency
+        // direction rather than laundering a stringly type here.
+        let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+            r#"
+            SELECT prestage_ref FROM enable_jobs
+             WHERE state = 'prestaging' AND prestage_ref IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|(v,)| v).collect())
     }
 
     async fn upsert_session_secrets(&self, secrets: SessionSecrets) -> Result<(), MetaError> {

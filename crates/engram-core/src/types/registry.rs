@@ -338,8 +338,8 @@ impl From<EnabledImage> for EnabledImageSummary {
 
 /// ADR 0036: state of an async image-enable job. The coordinator's
 /// `enable_scanner` drives `Pending → Materializing → Capturing →
-/// Ready`, with `Failed` as the give-up terminal after its retry
-/// budget. See migration 0052.
+/// Prestaging → Ready`, with `Failed` as the give-up terminal after its
+/// retry budget. See migration 0052 (+ 0077 for `Prestaging`, issue #538).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnableJobState {
@@ -350,6 +350,12 @@ pub enum EnableJobState {
     Materializing,
     /// Chunks durable; capture VM boots + snapshots on a host.
     Capturing,
+    /// ADR 0036 amendment (issue #538, INTERIM): the base snapshot is
+    /// captured and advertised as a `prestage_images` heartbeat-ack entry;
+    /// the scanner waits for every eligible (`stages_images`) host to
+    /// report the digest in `ready_images`, or a deadline, before the
+    /// `enabled_images` upsert makes the digest visible to session-create.
+    Prestaging,
     /// Terminal: enabled_images row upserted; image usable.
     Ready,
     /// Terminal: retry budget exhausted; `error` says why. An admin
@@ -363,6 +369,7 @@ impl EnableJobState {
             Self::Pending => "pending",
             Self::Materializing => "materializing",
             Self::Capturing => "capturing",
+            Self::Prestaging => "prestaging",
             Self::Ready => "ready",
             Self::Failed => "failed",
         }
@@ -402,8 +409,19 @@ pub struct EnableJob {
     /// [`CaptureEnvEntry`].
     #[serde(default)]
     pub capture_env: Vec<CaptureEnvEntry>,
+    /// ADR 0036 amendment (issue #538): per-host prestage outcome map,
+    /// written once at the end of the `Prestaging` stage —
+    /// `{"<host-uuid>": {"outcome": "staged"|"timed_out"|"unschedulable",
+    /// "waited_ms": <u64>}}`. `{}` before the stage runs (or for jobs that
+    /// predate this column / never had an eligible staging fleet).
+    #[serde(default = "default_prestage_hosts")]
+    pub prestage_hosts: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_prestage_hosts() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 #[cfg(test)]

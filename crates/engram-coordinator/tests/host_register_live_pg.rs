@@ -60,6 +60,7 @@ fn host(id: HostId, hostname: &str, addr: &str) -> HostRecord {
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
+        stages_images: false,
     }
 }
 

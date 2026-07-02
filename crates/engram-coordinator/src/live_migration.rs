@@ -1125,6 +1125,7 @@ mod tests {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                stages_images: false,
             });
         meta.snapshots
             .lock()
@@ -1315,6 +1316,7 @@ mod tests {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                stages_images: false,
             });
         meta.snapshots
             .lock()
@@ -1602,6 +1604,7 @@ mod tests {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                stages_images: false,
             });
         meta.snapshots
             .lock()

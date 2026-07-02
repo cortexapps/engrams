@@ -72,6 +72,7 @@ async fn ensure_host(meta: &Arc<dyn MetadataStore>, host_id: HostId) {
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
+        stages_images: false,
     })
     .await
     .expect("upsert_host");

@@ -656,6 +656,7 @@ mod tests {
                     cordoned: false,
                     total_vcpus: 0,
                     wire_version: 0,
+                    stages_images: false,
                 });
         }
 

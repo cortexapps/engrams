@@ -121,6 +121,9 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let total_vcpus: i32 = row.try_get("total_vcpus").map_err(col_err)?;
     // Issue #229: the host's reported bincode wire version (migration 0066).
     let wire_version: i32 = row.try_get("wire_version").map_err(col_err)?;
+    // Issue #538: whether this host runs the image-prefetch supervisor
+    // (migration 0077).
+    let stages_images: bool = row.try_get("stages_images").map_err(col_err)?;
     Ok(HostRecord {
         id: HostId(id),
         hostname: row.try_get("hostname").map_err(col_err)?,
@@ -149,6 +152,7 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         cordoned,
         total_vcpus: total_vcpus.max(0) as u32,
         wire_version: wire_version.max(0) as u32,
+        stages_images,
     })
 }
 
@@ -430,6 +434,7 @@ pub(crate) fn parse_enable_job_state(s: &str) -> Result<EnableJobState, MetaErro
         "pending" => EnableJobState::Pending,
         "materializing" => EnableJobState::Materializing,
         "capturing" => EnableJobState::Capturing,
+        "prestaging" => EnableJobState::Prestaging,
         "ready" => EnableJobState::Ready,
         "failed" => EnableJobState::Failed,
         other => {
@@ -445,6 +450,8 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
     let chunks_total: Option<i32> = row.try_get("chunks_total").map_err(col_err)?;
     let chunks_done: i32 = row.try_get("chunks_done").map_err(col_err)?;
     let attempts: i32 = row.try_get("attempts").map_err(col_err)?;
+    // Migration 0077: NOT NULL DEFAULT '{}'::jsonb, so every row has it.
+    let prestage_hosts: serde_json::Value = row.try_get("prestage_hosts").map_err(col_err)?;
     Ok(EnableJob {
         id: row.try_get("id").map_err(col_err)?,
         image_uri: row.try_get("image_uri").map_err(col_err)?,
@@ -455,6 +462,7 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
         attempts: attempts.max(0) as u32,
         error: row.try_get("error").map_err(col_err)?,
         capture_env: capture_env_from_row(row, "capture_env")?,
+        prestage_hosts,
         created_at: row.try_get("created_at").map_err(col_err)?,
         updated_at: row.try_get("updated_at").map_err(col_err)?,
     })
@@ -539,6 +547,7 @@ mod tests {
             ("pending", EnableJobState::Pending),
             ("materializing", EnableJobState::Materializing),
             ("capturing", EnableJobState::Capturing),
+            ("prestaging", EnableJobState::Prestaging),
             ("ready", EnableJobState::Ready),
             ("failed", EnableJobState::Failed),
         ];

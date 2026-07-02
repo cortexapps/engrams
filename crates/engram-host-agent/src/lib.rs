@@ -1193,17 +1193,36 @@ impl HostAgent {
                         // coordinator drains us off scheduling on a skew
                         // (mixed-version fleet mid rolling deploy).
                         wire_version: engram_protocol::WIRE_VERSION,
+                        // ADR 0036 amendment (issue #538): true iff the
+                        // image-prefetch supervisor actually spawned
+                        // (chunk_store + chunk_cache configured — see the
+                        // gating a few hundred lines up). The scanner's
+                        // prestage stage waits only on hosts reporting this.
+                        stages_images: enabled_images_tx.is_some(),
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {
                             if let Some(tx) = enabled_images_tx.as_ref() {
+                                // ADR 0036 amendment (issue #538): the
+                                // supervisor watches the UNION of
+                                // enabled + prestaging images — it needs
+                                // zero changes to warm a prestaging
+                                // image, since from its point of view
+                                // that's just another image to fetch,
+                                // pin, and report ready. The coordinator's
+                                // enable-scanner is the one reading
+                                // `ready_images` back out during its wait.
+                                let union = image_prefetch::union_image_refs(
+                                    &resp.enabled_images,
+                                    &resp.prestage_images,
+                                );
                                 // send_modify avoids notifying on
                                 // no-op (same set as last tick).
                                 tx.send_if_modified(|cur| {
-                                    if *cur == resp.enabled_images {
+                                    if *cur == union {
                                         false
                                     } else {
-                                        *cur = resp.enabled_images;
+                                        *cur = union;
                                         true
                                     }
                                 });

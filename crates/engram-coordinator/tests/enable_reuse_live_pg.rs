@@ -493,6 +493,7 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
+        stages_images: false,
     })
     .await
     .expect("hosts row");

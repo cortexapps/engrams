@@ -794,6 +794,7 @@ impl TestFixture {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                stages_images: false,
             },
         );
         let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));

@@ -603,6 +603,7 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         // at capture); it is not surfaced on the job's API response — the
         // operator sees it on EnabledImageSummary.
         capture_env: _,
+        prestage_hosts,
         created_at,
         updated_at,
     } = j;
@@ -617,6 +618,10 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         error: error.clone(),
         created_at: created_at.to_rfc3339(),
         updated_at: updated_at.to_rfc3339(),
+        // ADR 0036 amendment (issue #538): JSON-encoded per-host prestage
+        // outcome map. `prestage_hosts` is NOT NULL DEFAULT '{}'::jsonb
+        // (migration 0077), so `to_string()` always yields valid JSON.
+        prestage_hosts: prestage_hosts.to_string(),
     }
 }
 
