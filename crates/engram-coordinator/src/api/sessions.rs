@@ -1178,7 +1178,6 @@ async fn prepare_inner(
         selected_harness.as_deref(),
         mode,
         session_id,
-        prompt.as_deref(),
         session_env.clone(),
         manifest.workdir.clone(),
     )
@@ -1666,7 +1665,6 @@ pub(crate) async fn resolve_harness(
     selected_harness: Option<&str>,
     session_mode: SessionMode,
     session_id: SessionId,
-    initial_prompt: Option<&str>,
     session_env: HashMap<String, String>,
     workdir: Option<String>,
 ) -> Result<
@@ -1736,11 +1734,11 @@ pub(crate) async fn resolve_harness(
     // Harness-only extras, layered on top of `session_env` for the harness
     // child. `session_env` already carries ENGRAM_SESSION_ID + the image env +
     // secrets, so they aren't repeated here; the forge broker token is added by
-    // the caller (per-spawn, kept out of the cached env).
+    // the caller (per-spawn, kept out of the cached env). Issue #535 (d): the
+    // initial prompt no longer rides env — it's delivered as a harness-
+    // protocol `Prompt` frame after boot, identically to a follow-up
+    // `SendPrompt` (see `session_boot::boot_on_reserved_host`).
     let mut env: HashMap<String, String> = HashMap::new();
-    if let Some(prompt) = initial_prompt {
-        env.insert("ENGRAM_INITIAL_PROMPT".into(), prompt.to_string());
-    }
     // The manifest `workdir` reaches agentd as a reserved env entry so the
     // harness child starts there instead of `/`. See `HARNESS_CWD_ENV` for why
     // this isn't a wire-struct field.

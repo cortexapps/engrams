@@ -131,7 +131,6 @@ pub(crate) async fn resolve_resume_agent_and_policy(
         selected_harness.as_deref(),
         session.mode,
         id,
-        None,
         session_env,
         b.manifest.workdir.clone(),
     )

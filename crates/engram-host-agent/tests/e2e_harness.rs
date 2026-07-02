@@ -368,18 +368,28 @@ async fn wait_for_guest_ip(
     }
 }
 
-/// Set up a HarnessSink that captures events into a shared Vec.
-/// Returns the sink + the Vec. Mirrors harness_loopback's sink
-/// pattern: handshake (read attach, ack ok) then drain frames.
+/// Set up a HarnessSink that captures events into a shared Vec, and can also
+/// push `HarnessCommand`s down to the attached harness (issue #535 (d): the
+/// initial prompt now arrives over the wire instead of an env var, so this
+/// test needs to actually deliver one — a hand-rolled minimal stand-in for
+/// the real `HarnessHub`, since this test drives `SandboxBackend` directly
+/// with no coordinator/hub in the loop).
+/// Returns the sink + the collected-events Vec + a command sender. Mirrors
+/// harness_loopback's sink pattern: handshake (read attach, ack ok) then
+/// drain frames, now also forwarding any queued commands to the writer half.
 fn capture_sink() -> (
     engram_core::traits::HarnessSink,
     Arc<Mutex<Vec<engram_harness_proto::HarnessEvent>>>,
+    tokio::sync::mpsc::Sender<engram_harness_proto::HarnessCommand>,
 ) {
     let collected: Arc<Mutex<Vec<engram_harness_proto::HarnessEvent>>> =
         Arc::new(Mutex::new(Vec::new()));
     let collected_for_sink = collected.clone();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<engram_harness_proto::HarnessCommand>(4);
+    let cmd_rx = Arc::new(tokio::sync::Mutex::new(cmd_rx));
     let sink: engram_core::traits::HarnessSink = Arc::new(move |mut stream| {
         let collected = collected_for_sink.clone();
+        let cmd_rx = cmd_rx.clone();
         tokio::spawn(async move {
             let (mut reader, mut writer) = tokio::io::split(stream.as_mut());
             let _attach: engram_harness_proto::HarnessAttach =
@@ -398,18 +408,35 @@ fn capture_sink() -> (
                 eprintln!("--- sink ack write failed: {e} ---");
                 return;
             }
-            while let Ok(frame) =
-                engram_harness_proto::read_msg::<_, engram_harness_proto::HarnessFrame>(&mut reader)
-                    .await
-            {
-                if let engram_harness_proto::HarnessFrame::Event(ev) = frame {
-                    eprintln!("--- captured HarnessEvent: {ev:?} ---");
-                    collected.lock().push(ev);
+            let mut cmd_rx = cmd_rx.lock().await;
+            loop {
+                tokio::select! {
+                    frame = engram_harness_proto::read_msg::<_, engram_harness_proto::HarnessFrame>(&mut reader) => {
+                        match frame {
+                            Ok(engram_harness_proto::HarnessFrame::Event(ev)) => {
+                                eprintln!("--- captured HarnessEvent: {ev:?} ---");
+                                collected.lock().push(ev);
+                            }
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    Some(cmd) = cmd_rx.recv() => {
+                        if let Err(e) = engram_harness_proto::write_msg(
+                            &mut writer,
+                            &engram_harness_proto::HarnessFrame::Command(cmd),
+                        )
+                        .await
+                        {
+                            eprintln!("--- sink command write failed: {e} ---");
+                            break;
+                        }
+                    }
                 }
             }
         });
     });
-    (sink, collected)
+    (sink, collected, cmd_tx)
 }
 
 /// Run one Claude harness session against api.anthropic.com (with a
@@ -422,6 +449,7 @@ async fn drive_harness(
     session_id: engram_core::SessionId,
     ca_pem: &str,
     captured: Arc<Mutex<Vec<engram_harness_proto::HarnessEvent>>>,
+    cmd_tx: tokio::sync::mpsc::Sender<engram_harness_proto::HarnessCommand>,
 ) {
     let port = engram_harness_proto::HARNESS_VSOCK_PORT.to_string();
     // ADR 0021 P1.5: harness lives in the rootfs at /opt/engram/harness/
@@ -435,7 +463,6 @@ async fn drive_harness(
         session_id.to_string(),
     ];
     let mut env: HashMap<String, String> = HashMap::new();
-    env.insert("ENGRAM_INITIAL_PROMPT".into(), "say hi briefly".into());
     // Bogus token — Claude API will 401. We're not testing API
     // semantics; we're testing the chain works end-to-end. A 401
     // proves the request was issued, the response was received,
@@ -475,6 +502,21 @@ async fn drive_harness(
         )
         .await
         .expect("start_agent");
+
+    // Issue #535 (d): deliver the initial prompt over the wire — the same
+    // `HarnessCommand::Prompt` frame path a follow-up `SendPrompt` rides in
+    // production (`deliver_prompt`), not an env var. `cmd_tx` queues into
+    // the sink's forwarder regardless of whether the harness has attached
+    // yet (bounded channel, no receiver required to enqueue); once the
+    // harness's own vsock dial completes the handshake, the sink's select
+    // loop picks this up and writes it.
+    cmd_tx
+        .send(engram_harness_proto::HarnessCommand::Prompt {
+            prompt_id: uuid::Uuid::new_v4().to_string(),
+            text: "say hi briefly".to_string(),
+        })
+        .await
+        .expect("queue initial prompt over the wire");
 
     // Wait for the run to terminate, not just start. RunStarted
     // proves bootstrap exec'd the harness and the vsock attach
@@ -621,7 +663,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
     fc.host_startup().await.expect("host_startup");
     let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
 
-    let (sink, captured) = capture_sink();
+    let (sink, captured, cmd_tx) = capture_sink();
     fc.set_harness_sink(sink);
 
     let spec = SandboxSpec {
@@ -663,7 +705,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
         observes: Vec::new(),
     });
 
-    drive_harness(&pooled, sandbox_id, session_id, &ca_pem, captured).await;
+    drive_harness(&pooled, sandbox_id, session_id, &ca_pem, captured, cmd_tx).await;
 
     pooled.destroy(sandbox_id).await.expect("destroy");
     cleanup_host_state();
@@ -694,7 +736,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
     fc.host_startup().await.expect("host_startup");
     let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
 
-    let (sink, captured) = capture_sink();
+    let (sink, captured, cmd_tx) = capture_sink();
     fc.set_harness_sink(sink);
 
     let spec = SandboxSpec {
@@ -757,7 +799,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
         observes: Vec::new(),
     });
 
-    drive_harness(&pooled, warm_id, session_id, &ca_pem, captured).await;
+    drive_harness(&pooled, warm_id, session_id, &ca_pem, captured, cmd_tx).await;
 
     pooled.destroy(warm_id).await.expect("destroy warm");
     cleanup_host_state();
@@ -821,7 +863,7 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
     fc.host_startup().await.expect("host_startup");
     let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
 
-    let (sink, captured) = capture_sink();
+    let (sink, captured, _cmd_tx) = capture_sink();
     fc.set_harness_sink(sink);
 
     let spec = SandboxSpec {
