@@ -228,6 +228,14 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// migration capture for the `hot_chunks` rider.
 pub const WORKING_SET_TRACE_FILE: &str = "working-set-trace.json";
 
+/// ADR 0019 / telemetry restoration (#526): per-jail prefault-
+/// effectiveness snapshot filename, written by the uffd-handler as a
+/// sibling of [`WORKING_SET_TRACE_FILE`] in the same jail dir. Must
+/// stay in sync with `engram_uffd_handler::runtime::PREFAULT_STATS_FILE`
+/// (duplicated, not shared, by design — the two binaries don't depend
+/// on each other; the filename is the contract).
+pub const PREFAULT_STATS_FILE: &str = "prefault-stats.json";
+
 /// ADR 0045 C2: the peer-mode handler's one-way control socket
 /// (Sealed/DrainProgress/DrainDone/PeerLost), bound in the jail dir.
 pub const UFFD_CONTROL_SOCK_FILE: &str = "uffd-control.sock";
@@ -4127,6 +4135,14 @@ impl SandboxBackend for FirecrackerBackend {
                 .join(id.to_string())
                 .join(WORKING_SET_TRACE_FILE),
         )
+    }
+
+    /// ADR 0019 / telemetry restoration (#526): the per-jail prefault
+    /// stats sibling of `working_set_trace_path`, written by the
+    /// uffd-handler at the end of `prefault_from_trace` (or, for the
+    /// no-trace case, from its own startup path).
+    fn prefault_stats_path(&self, id: SandboxId) -> Option<PathBuf> {
+        Some(self.work_dir.join(id.to_string()).join(PREFAULT_STATS_FILE))
     }
 
     /// ADR 0045 C2: trait forwarding to the inherent composition (the

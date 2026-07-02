@@ -2273,6 +2273,23 @@ impl PooledBackend {
                         cache.put_no_evict(hash, &current).await.map_err(|e| {
                             SandboxError::Snapshot(format!("stage chunk {hash}: {e}"))
                         })?;
+                        // ADR 0019 / telemetry restoration (#526): the
+                        // peer half of the peer-vs-GCS fill split — this
+                        // chunk filled the local cache from the migration
+                        // SOURCE host, not BlobStorage. Baseline meter for
+                        // epic-gcs-free-resume's "GCS-free by policy"
+                        // claim (the `source="gcs"` half lives at
+                        // `engram-chunk-store::cache`'s leader-persist arm).
+                        metrics::counter!(
+                            "engram_chunk_fill_total",
+                            "source" => "peer",
+                        )
+                        .increment(1);
+                        metrics::counter!(
+                            "engram_chunk_fill_bytes_total",
+                            "source" => "peer",
+                        )
+                        .increment(current.len() as u64);
                     }
                     // C1 prestage never requests the post-copy disk
                     // items (those ride the C2 fetch poller).
@@ -4481,12 +4498,106 @@ async fn patch_fc_manifest_memory_ref(
     Ok(())
 }
 
-/// Pick a stable name for the harness substrate's mount-root
-/// subdirectory. Tries: (1) the env-injected
-/// `ENGRAM_SESSION_HARNESS_NAME` hint set by `resolve_harness` —
 // ADR 0021 P1.5: `harness_name_for_substrate` / `harness_name_from_uri`
-// retired with the substrate. The in-VM harness path comes from the
-// image manifest's `[harness] exec` now, not a URI suffix.
+// retired with the substrate (the in-VM harness path comes from the
+// image manifest's `[harness] exec` now, not a URI suffix) — this used
+// to be their doc comment; dead code, cleaned up incidentally while
+// touching this section for #526 (a dangling doc comment here newly
+// tripped `clippy::empty_line_after_doc_comments` against the struct
+// below once one was inserted after it).
+
+/// ADR 0019 / telemetry restoration (#526): the on-disk shape of the
+/// uffd-handler's `prefault-stats.json` (`PrefaultStats` in
+/// `engram-uffd-handler::runtime`), duck-typed here rather than shared
+/// via a cross-crate dependency — the file format is the contract
+/// between the two binaries, not a Rust type (the writer is Linux-only
+/// internally; this reader must build on every host-agent target).
+/// `#[serde(default)]` on the count fields means a stats file that only
+/// carries `trace_loaded` (shouldn't happen from this repo's writer,
+/// but keeps a future schema-superset — e.g. `prefault-admission-
+/// control`'s convergent gate file — from breaking this reader) still
+/// parses.
+#[derive(Debug, serde::Deserialize)]
+struct PrefaultStatsFile {
+    trace_loaded: bool,
+    #[serde(default)]
+    installed: usize,
+    #[serde(default)]
+    skipped: usize,
+}
+
+/// The three effectiveness outcomes `engram_resume_prefault_total` is
+/// labeled with. See the module doc on [`crate::metrics::RESUME_PREFAULT_TOTAL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefaultOutcome {
+    /// A trace was requested + loaded, and the prefault ran.
+    /// `installed == 0` is itself worth alarming on downstream (a
+    /// stale/mismatched trace) but is still a "replayed" outcome, not
+    /// an error — the counter split lives in `RESUME_PREFAULT_CHUNKS_TOTAL`.
+    Replayed { installed: usize, skipped: usize },
+    /// No trace was requested/loaded for this resume (base image,
+    /// migration dest with no prior life, or the prior life's publish
+    /// never landed) — expected, not an error.
+    NoTrace,
+    /// A stats file was expected (this backend has a
+    /// `prefault_stats_path`) but wasn't there — the alarm condition.
+    /// This is the exact class of bug that went inert 3x silently
+    /// (d0e5ecf3, cf6e4d32, 7c2a7226): the handler died, or the wiring
+    /// silently didn't fire, and nothing said so.
+    StatsMissing,
+}
+
+impl PrefaultOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Replayed { .. } => "replayed",
+            Self::NoTrace => "no_trace",
+            Self::StatsMissing => "stats_missing",
+        }
+    }
+}
+
+/// Pure stats-file-bytes → outcome mapping (the testable half of the
+/// read). `None` input means the file didn't exist / couldn't be read
+/// (both collapse to `StatsMissing` — a read error other than "not
+/// found" is just as much an alarm as absence). A corrupt/unparseable
+/// file (the atomic temp+rename write should prevent partial reads, but
+/// defend anyway) is treated the same way.
+fn classify_prefault_outcome(stats_bytes: Option<&[u8]>) -> PrefaultOutcome {
+    let Some(bytes) = stats_bytes else {
+        return PrefaultOutcome::StatsMissing;
+    };
+    match serde_json::from_slice::<PrefaultStatsFile>(bytes) {
+        Ok(s) if s.trace_loaded => PrefaultOutcome::Replayed {
+            installed: s.installed,
+            skipped: s.skipped,
+        },
+        Ok(_) => PrefaultOutcome::NoTrace,
+        Err(_) => PrefaultOutcome::StatsMissing,
+    }
+}
+
+/// Emit `engram_resume_prefault_total` + `engram_resume_prefault_chunks_total`
+/// for one resume's prefault outcome.
+fn emit_prefault_metrics(outcome: PrefaultOutcome) {
+    metrics::counter!(
+        crate::metrics::RESUME_PREFAULT_TOTAL,
+        "outcome" => outcome.label(),
+    )
+    .increment(1);
+    if let PrefaultOutcome::Replayed { installed, skipped } = outcome {
+        metrics::counter!(
+            crate::metrics::RESUME_PREFAULT_CHUNKS_TOTAL,
+            "result" => "installed",
+        )
+        .increment(installed as u64);
+        metrics::counter!(
+            crate::metrics::RESUME_PREFAULT_CHUNKS_TOTAL,
+            "result" => "skipped",
+        )
+        .increment(skipped as u64);
+    }
+}
 
 #[async_trait]
 impl SandboxBackend for PooledBackend {
@@ -5852,6 +5963,10 @@ impl SandboxBackend for PooledBackend {
         self.inner.working_set_trace_path(id)
     }
 
+    fn prefault_stats_path(&self, id: SandboxId) -> Option<std::path::PathBuf> {
+        self.inner.prefault_stats_path(id)
+    }
+
     fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> std::path::PathBuf {
         self.inner.snapshot_path_for(snapshot_id)
     }
@@ -5987,6 +6102,22 @@ impl SandboxBackend for PooledBackend {
                     self.seed_checkpoint_chain_sparse(id, memory_ref).await;
                 }
             }
+        }
+        // ADR 0019 / telemetry restoration (#526): read the uffd-handler's
+        // per-jail prefault-effectiveness snapshot and emit the
+        // `engram_resume_prefault_*` counters. Best-effort + non-fatal by
+        // construction: a read/parse failure just classifies as
+        // `stats_missing` (the alarm condition) rather than failing the
+        // restore — this is a diagnostic surface, never load-bearing.
+        if let Some(stats_path) = self.prefault_stats_path(id) {
+            let stats_bytes = fs::read(&stats_path).await.ok();
+            let outcome = classify_prefault_outcome(stats_bytes.as_deref());
+            tracing::info!(
+                sandbox_id = %id,
+                outcome = outcome.label(),
+                "resume prefault effectiveness",
+            );
+            emit_prefault_metrics(outcome);
         }
         Ok(id)
     }
@@ -6810,6 +6941,56 @@ mod tests {
     use crate::image_cache::ImageBundle;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
+
+    /// ADR 0019 / telemetry restoration (#526): the stats-file → outcome
+    /// mapping `restore()` drives `engram_resume_prefault_total` off.
+    /// Covers the three labeled outcomes, the alarm shape (absent file),
+    /// and defensive handling of an unparseable file.
+    #[test]
+    fn classify_prefault_outcome_covers_all_three_labels() {
+        // Absent file (read failed / never written) => the alarm.
+        assert_eq!(
+            classify_prefault_outcome(None),
+            PrefaultOutcome::StatsMissing
+        );
+
+        // trace_loaded: false => expected "nothing to replay" case.
+        let no_trace = br#"{"trace_loaded":false,"chunks_in_trace":0,"installed":0,"skipped":0,"duration_ms":3}"#;
+        assert_eq!(
+            classify_prefault_outcome(Some(no_trace)),
+            PrefaultOutcome::NoTrace
+        );
+
+        // trace_loaded: true => replayed, carrying installed/skipped.
+        let replayed = br#"{"trace_loaded":true,"chunks_in_trace":10,"installed":8,"skipped":2,"duration_ms":42}"#;
+        assert_eq!(
+            classify_prefault_outcome(Some(replayed)),
+            PrefaultOutcome::Replayed {
+                installed: 8,
+                skipped: 2
+            }
+        );
+
+        // Corrupt/unparseable bytes => treated the same as absent (a
+        // handler that died mid-write is just as much an alarm as one
+        // that never wrote at all).
+        assert_eq!(
+            classify_prefault_outcome(Some(b"not json")),
+            PrefaultOutcome::StatsMissing
+        );
+
+        // Extra/superset fields (the prefault-admission-control
+        // convergence schema, e.g. a `trace_source` field) must not
+        // break parsing — #[serde(default)] + no `deny_unknown_fields`.
+        let superset = br#"{"trace_loaded":true,"chunks_in_trace":1,"installed":1,"skipped":0,"duration_ms":1,"trace_source":"canonical"}"#;
+        assert_eq!(
+            classify_prefault_outcome(Some(superset)),
+            PrefaultOutcome::Replayed {
+                installed: 1,
+                skipped: 0
+            }
+        );
+    }
 
     fn warm_with(network: Option<engram_core::types::image::NetworkPolicy>) -> WarmConfig {
         WarmConfig {

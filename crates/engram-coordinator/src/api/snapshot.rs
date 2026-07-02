@@ -1078,6 +1078,21 @@ fn effective_resume_disk_manifest(
     }
 }
 
+/// ADR 0019 / telemetry restoration (#526): classify a resume's
+/// placement against the snapshot record's capturing host — the
+/// `engram_session_resume_total{placement=...}` label. Pure so it's
+/// unit-testable without a live scheduler.
+fn resume_placement_label(
+    record_host_id: Option<engram_core::HostId>,
+    chosen_host_id: engram_core::HostId,
+) -> &'static str {
+    match record_host_id {
+        Some(prior) if prior == chosen_host_id => "same_host",
+        Some(_) => "cross_host",
+        None => "unknown_prior_host",
+    }
+}
+
 /// Outcome of [`finish_resume_to_active`]. The session is either
 /// fully back at `Active` (`Active`) or the rebuilt VM is bound at
 /// `Created` because the harness rebuild failed (`CreatedHarnessFailed`).
@@ -1518,6 +1533,14 @@ async fn resume_from_fc_snapshot(
         }
         Err(e) => return Err(ApiError::from(e)),
     };
+    // ADR 0019 / telemetry restoration (#526): same-host vs cross-host
+    // resume split — the baseline for "how often does snapshot affinity
+    // actually land the hot-tier hit it's meant to."
+    ::metrics::counter!(
+        crate::metrics::SESSION_RESUME_PLACEMENT_TOTAL,
+        "placement" => resume_placement_label(record.host_id, host_id),
+    )
+    .increment(1);
     bind_resumed_session(&state, id, host_id, new_sandbox_id).await?;
     // ADR 0015 M2: resume re-runs the create-shape transitions on
     // the new sandbox — Idle → Created (now that a host + sandbox
@@ -2232,6 +2255,32 @@ mod effective_resume_disk_manifest_tests {
     #[test]
     fn both_none_passes_through() {
         assert_eq!(effective_resume_disk_manifest(None, None), None);
+    }
+}
+
+/// ADR 0019 / telemetry restoration (#526): `resume_placement_label`
+/// covers all three `engram_session_resume_total{placement=...}` values.
+#[cfg(test)]
+mod resume_placement_label_tests {
+    use super::*;
+
+    #[test]
+    fn same_host_when_chosen_matches_record() {
+        let h = engram_core::HostId::new();
+        assert_eq!(resume_placement_label(Some(h), h), "same_host");
+    }
+
+    #[test]
+    fn cross_host_when_chosen_differs_from_record() {
+        let recorded = engram_core::HostId::new();
+        let chosen = engram_core::HostId::new();
+        assert_eq!(resume_placement_label(Some(recorded), chosen), "cross_host");
+    }
+
+    #[test]
+    fn unknown_prior_host_when_record_has_no_host() {
+        let chosen = engram_core::HostId::new();
+        assert_eq!(resume_placement_label(None, chosen), "unknown_prior_host");
     }
 }
 
