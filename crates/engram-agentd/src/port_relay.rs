@@ -4,7 +4,7 @@
 //! forwarded browser connection, sends a [`RelayConnect`] naming the guest TCP
 //! port, and we dial `127.0.0.1:target_port` *inside* the guest and splice raw
 //! bytes. That reaches loopback-bound dev servers (Vite, the Tilt UI, `next
-//! dev`) that the host's `guest_ip` dial cannot.
+//! dev`) that a direct dial_ip dial cannot.
 //!
 //! **No head-of-line blocking:** one vsock connection per forwarded TCP
 //! connection, one task per connection, no shared state on the data path. The
