@@ -3,20 +3,27 @@
 //! just from a live HTTP request.
 //!
 //! `create_session` does request-parse → resolve (manifest / secrets /
-//! env / harness) → reserve a host → **boot on that host**. This module
-//! owns the last step — everything after a host is reserved:
-//! restore the base snapshot → persist the `Created` row → bind routing
-//! → ship egress → `start_agent` → `Active` + events. Both the create
-//! handler and the queue scanner build a [`BootInputs`] and call
-//! [`boot_on_reserved_host`], so the launch env, the egress policy, and
-//! the lifecycle events can't drift between the two paths.
+//! env / harness, from the boot-bundle cache — issue #535 (a)) →
+//! transactionally reserve-and-persist the WHOLE write-set (issue #535
+//! (b)) → **boot on that host**. This module owns the last step —
+//! everything after a host is reserved AND the row/satellites already
+//! committed: overlap the restore RPC with the sandbox-independent
+//! env/egress leg (issue #535 (c)) → flip the row to `Created` + bind
+//! `sandbox_id` → ship egress → `start_agent` → `Active` + events →
+//! deliver the (possibly initial) prompt over the wire (issue #535 (d)).
+//! Both the create handler and the queue scanner build a [`BootInputs`]
+//! and call [`boot_on_reserved_host`], so the launch env, the egress
+//! policy, and the lifecycle events can't drift between the two paths.
 //!
 //! Failure disposition is the CALLER's, not this module's: a boot can
 //! fail [`BootError::NotStarted`] (sandbox never came up / was torn down,
 //! the row is still `pending` — requeue or release the reservation) or
 //! [`BootError::Started`] (the sandbox booted but a later step failed,
 //! the row reached `Created` — terminal, fail the session). The create
-//! handler maps these to 503/500; the scanner to requeue/Failed.
+//! handler maps these to 503/500; the scanner to requeue/Failed. A
+//! prompt-delivery failure past the reattach budget is also `Started`
+//! (terminal) — a session that can't receive the prompt that created it
+//! is broken.
 
 use std::collections::HashMap;
 
@@ -227,6 +234,12 @@ pub(crate) async fn boot_on_reserved_host(
         resolve_inject_entries(state, session_id, integration_policy.as_ref(), &image_ref).await
     };
     let (restore_result, injects) = tokio::join!(restore_leg, env_egress_leg);
+    // Issue #535 (observability): `coord_finalize` starts HERE — restore
+    // returned, whatever its outcome. The phase ends at the Active
+    // transition below (a failure returns before recording it — this phase
+    // measures the successful tail only, matching `coord_prepare`'s
+    // success-path framing).
+    let finalize_start = std::time::Instant::now();
 
     let sandbox_id = match restore_result {
         Ok(sb) => sb,
@@ -357,6 +370,12 @@ pub(crate) async fn boot_on_reserved_host(
     {
         tracing::warn!(%session_id, error = %e, "emit created→active failed; continuing");
     }
+
+    // Issue #535 (observability): `coord_finalize` ends here — restore
+    // returned → Active, the coordinator-owned tail after the host handed
+    // back a live sandbox.
+    ::metrics::histogram!(crate::metrics::SESSION_BOOT_SECONDS, "phase" => "coord_finalize")
+        .record(finalize_start.elapsed().as_secs_f64());
 
     // Issue #535 (d): the initial prompt rides the harness-protocol `Prompt`
     // frame — the SAME `deliver_prompt` path (echo-then-forward,

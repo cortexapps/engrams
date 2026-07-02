@@ -625,7 +625,7 @@ pub(crate) async fn create_session_core(
             return result;
         }
     };
-    let result = boot_prepared(state, prepared).await;
+    let result = boot_prepared(state, prepared, start).await;
     let kind = match &result {
         Ok(body) => body.kind,
         Err(_) => "unknown",
@@ -651,6 +651,11 @@ pub(crate) async fn create_session_core(
 async fn boot_prepared(
     state: &SharedState,
     prepared: crate::session_boot::PreparedBoot,
+    // Issue #535 (observability): `create_session_core`'s entry instant, so
+    // the `coord_prepare` phase covers everything from the RPC landing
+    // through the write-set commit — the coordinator-owned serial prefix
+    // ahead of the (now-concurrent, host-side) restore work.
+    create_start: std::time::Instant,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
         inputs,
@@ -766,6 +771,12 @@ async fn boot_prepared(
     // sandbox is always recorded or torn down and the reservation is always
     // released, regardless of the request's fate. The handler awaits the
     // JoinHandle only to shape the connected client's response.
+    //
+    // Issue #535 (observability): `coord_prepare` ends HERE — everything
+    // from `create_session_core` entry through the write-set commit, right
+    // before the restore RPC dispatches inside the spawned task.
+    metrics::histogram!(crate::metrics::SESSION_BOOT_SECONDS, "phase" => "coord_prepare")
+        .record(create_start.elapsed().as_secs_f64());
     let st = state.clone();
     let boot_handle = tokio::spawn(async move {
         match crate::session_boot::boot_on_reserved_host(&st, inputs, host_id).await {
@@ -1163,13 +1174,17 @@ async fn prepare_inner(
         Some(deferred_map)
     };
 
-    // The forge/upload broker-token injection is NOT done here: it mints a
-    // `session_broker_tokens` row that FKs to `sessions.id`, which doesn't
-    // exist until `create_session_created` runs in `boot_on_reserved_host`.
-    // Doing it now (before the row) fails the FK and is silently swallowed —
-    // the git-credential-injection regression on the gRPC create path. The
-    // git config rides `BootInputs` so the deferred injection can stamp the
-    // forge owner once the row is live.
+    // The forge/upload broker-token injection is NOT done here: minting is a
+    // per-spawn, not a durable, write, so it's deferred to `boot_on_reserved_
+    // host`'s overlapped env/egress leg (issue #535 (c)) — by the time that
+    // runs, the row has existed since `reserve_and_persist_create` committed
+    // the whole write-set transactionally (issue #535 (b)), so the FK it
+    // mints against (`session_broker_tokens` → `sessions.id`) is always
+    // satisfiable. This used to be a hazard here (the pre-#535 shape minted
+    // straight off `prepare_inner`, before any row existed at all — the
+    // git-credential-injection regression on the gRPC create path); it's
+    // dead by construction now, not by convention. The git config rides
+    // `BootInputs` so the deferred injection can stamp the forge owner.
     // ADR 0062: resolve the per-session harness from the catalog → the AgentSpec
     // the backend execs + the `dyn_0` mount carrying the current catalog
     // generation. `None` for a dev VM (no harness, dyn_0 stays sentinel).

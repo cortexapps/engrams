@@ -86,15 +86,27 @@ pub fn init(addr: SocketAddr) {
 
 /// Histogram. Time from `POST /sessions` handler entry to the
 /// handler returning the SessionCreated response. Labels:
-/// - `phase`: emitted today only as `total` (end-to-end including
-///   scheduling, host gRPC, in-VM boot, and the harness
-///   handshake). Per-sub-phase emissions live on the host-agent
-///   under `engram_sandbox_boot_seconds` (matching `phase` taxonomy:
-///   `image_resolve` / `materialize` / `fc_boot` / `agent_handshake`
-///   / `warm_lease`) because the coord delegates each phase to the
-///   host over gRPC; the coord stack frame only has the rollup to
-///   time. Comparing coord-`total` against the sum of host-side
-///   phases surfaces network and scheduler overhead.
+/// - `phase`:
+///   - `total` (default/pre-existing): end-to-end including scheduling,
+///     host gRPC, in-VM boot, and the harness handshake. Per-sub-phase
+///     emissions live on the host-agent under `engram_sandbox_boot_seconds`
+///     (matching `phase` taxonomy: `image_resolve` / `materialize` /
+///     `fc_boot` / `agent_handshake` / `warm_lease`) because the coord
+///     delegates each phase to the host over gRPC; the coord stack frame
+///     only has the rollup to time. Comparing coord-`total` against the
+///     sum of host-side phases surfaces network and scheduler overhead.
+///   - `coord_prepare` (issue #535): `create_session_core` entry through
+///     `reserve_and_persist_create`'s commit — the serial coordinator-side
+///     prefix ahead of the (now-concurrent, host-side) restore work.
+///     Recorded on the Placed path only (a Queued disposition never
+///     dispatches a restore).
+///   - `coord_finalize` (issue #535): the restore RPC returning through the
+///     `created → active` transition — the coordinator-owned tail after
+///     the host hands back a live sandbox. Success path only (an error
+///     returns before recording it). These two together are the
+///     measurable target for the issue's "coordinator serial tail" claim;
+///     `total` minus (`coord_prepare` + `coord_finalize`) is the actual
+///     host-side restore RPC wall time.
 /// - `outcome`: `success` / `bad_request` / `image_not_enabled` /
 ///   `scheduling_rejected` / `internal`.
 /// - `kind`: `restored` (booted via base-snapshot restore — the
