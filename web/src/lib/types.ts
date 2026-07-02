@@ -371,8 +371,16 @@ export interface EnabledImageSummary {
   capture_env: CaptureEnvVar[];
 }
 
-/** ADR 0036: state of an async image-enable job. */
-export type EnableJobState = "pending" | "materializing" | "capturing" | "ready" | "failed";
+/** ADR 0036: state of an async image-enable job. `prestaging` (issue
+ * #538, ADR 0036 amendment) is a new non-terminal value between
+ * `capturing` and `ready` — the fleet chunk-prestage wait. */
+export type EnableJobState =
+  | "pending"
+  | "materializing"
+  | "capturing"
+  | "prestaging"
+  | "ready"
+  | "failed";
 
 /** ADR 0036: one row of `GET /api/enable-jobs` — an asynchronous
  * image enable in flight (or terminal). `chunks_done/chunks_total`
@@ -388,6 +396,11 @@ export interface EnableJob {
   error: string | null;
   created_at: string;
   updated_at: string;
+  /** ADR 0036 amendment (issue #538): per-host prestage outcome map,
+   * JSON-encoded (`{"<host-uuid>": {"outcome":
+   * "staged"|"timed_out"|"unschedulable", "waited_ms": <u64>}}`). `"{}"`
+   * until the prestage stage runs. */
+  prestage_hosts: string;
 }
 
 export interface ListEnableJobsResponse {

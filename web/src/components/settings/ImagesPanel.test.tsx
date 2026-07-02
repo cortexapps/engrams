@@ -70,6 +70,8 @@ function makeProtoJob(imageUri: string, state = "materializing"): ProtoEnableJob
     error: undefined,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    // ADR 0036 amendment (issue #538): "{}" until the prestage stage runs.
+    prestageHosts: "{}",
   };
 }
 
@@ -270,6 +272,21 @@ describe("ImagesPanel RPC contract", () => {
     await waitFor(() => {
       const matches = screen.getAllByText("ghcr.io/cortex/api:warm-1");
       expect(matches).toHaveLength(1);
+    });
+  });
+
+  test("prestaging job renders the fleet chunk-prestage label", async () => {
+    // ADR 0036 amendment (issue #538): the enable pipeline gained a new
+    // non-terminal state between "capturing" and "ready". The dashboard
+    // must render it with its own label, not fall through to "unknown".
+    const { transport } = installCapturingTransport(
+      [makeProtoImage("ghcr.io/cortex/api:warm-1")],
+      [makeProtoJob("ghcr.io/cortex/api:warm-1", "prestaging")],
+    );
+    renderWithProviders(<ImagesPanel />, { transport });
+
+    await waitFor(() => {
+      expect(screen.getByText(/staging chunks to hosts/i)).toBeTruthy();
     });
   });
 

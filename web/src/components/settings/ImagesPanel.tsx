@@ -523,7 +523,8 @@ function EnableImageDialog({
 // ---------- Enable-job progress (ADR 0036) ---------------------------
 //
 // Real progress from the server: the coordinator's scanner drives the
-// job through pending → materializing → capturing → ready, updating
+// job through pending → materializing → capturing → prestaging → ready
+// (ADR 0036 amendment / issue #538 added "prestaging"), updating
 // chunks_done/chunks_total as it materializes. We render a thin bar +
 // the state label; failed jobs keep their error visible with a retry
 // affordance.
@@ -532,6 +533,9 @@ const JOB_STATE_LABEL: Record<EnableJob["state"], string> = {
   pending: "queued",
   materializing: "materializing chunks",
   capturing: "capturing canonical snapshot",
+  // ADR 0036 amendment (issue #538): the fleet chunk-prestage wait — every
+  // eligible host warms the base snapshot before the image is usable.
+  prestaging: "staging chunks to hosts",
   ready: "ready",
   failed: "failed",
 };
