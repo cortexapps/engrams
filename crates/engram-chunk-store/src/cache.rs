@@ -436,7 +436,21 @@ impl ChunkCache {
         // populate; trust on read. (Atomic temp+rename means a present file is
         // never torn; post-write bit-rot is left to PD/local-SSD durability.)
         let path = self.path_for(hash);
-        if let Some(bytes) = read_if_present(&path).await? {
+        // ADR 0019 / telemetry restoration (#526): NVMe-tier hit latency was
+        // previously unmeasured — `engram_chunk_fetch_seconds` only had a
+        // `blobstorage` arm (the miss path below), so there was no signal
+        // for "the fast tier got slow" (a saturated NVMe device, ext4
+        // fragmentation, etc). Time the read regardless of hit/miss; a miss
+        // here is a fast negative stat (no file), not a meaningful latency
+        // sample, so only record on a hit.
+        let nvme_read_start = std::time::Instant::now();
+        let nvme_read = read_if_present(&path).await?;
+        if let Some(bytes) = nvme_read {
+            metrics::histogram!(
+                "engram_chunk_fetch_seconds",
+                "tier" => "nvme",
+            )
+            .record(nvme_read_start.elapsed().as_secs_f64());
             // ADR 0014 M1.15: local NVMe hit. Don't differentiate
             // singleflight-piggyback from true cache hit here —
             // the user-visible win is the same.
@@ -556,6 +570,26 @@ impl ChunkCache {
                     metrics::counter!(
                         "engram_chunk_cache_bytes_total",
                         "tier" => "blobstorage",
+                    )
+                    .increment(bytes.len() as u64);
+                    // ADR 0019 / telemetry restoration (#526): the baseline
+                    // meter for epic-gcs-free-resume's "GCS-free by policy"
+                    // claim — every chunk that fills the local cache from
+                    // BlobStorage (as opposed to a peer-fill, recorded at the
+                    // host-agent's MigrationFetch destination pull loop)
+                    // counts here. `source="gcs"` names the fetch backend
+                    // this closure resolves to in practice (BlobStorage is
+                    // GCS in every deployed configuration); a non-GCS
+                    // BlobStorage impl would still be the correct label for
+                    // "the cold tier", not a peer.
+                    metrics::counter!(
+                        "engram_chunk_fill_total",
+                        "source" => "gcs",
+                    )
+                    .increment(1);
+                    metrics::counter!(
+                        "engram_chunk_fill_bytes_total",
+                        "source" => "gcs",
                     )
                     .increment(bytes.len() as u64);
                 }
@@ -1250,6 +1284,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body0_actual.len(), 4 * 1024);
+    }
+
+    /// ADR 0019 / telemetry restoration (#526): `get`'s NVMe-hit arm now
+    /// times `read_if_present` (`engram_chunk_fetch_seconds{tier="nvme"}`)
+    /// before returning — this must be pure instrumentation, not a
+    /// semantic change. Round-trip a chunk through a genuine miss (fetcher
+    /// fires, bytes land via `write_local`) and then a genuine NVMe hit
+    /// (fetcher must NOT fire again), and assert both arms still return the
+    /// exact, hash-verified bytes.
+    #[tokio::test]
+    async fn nvme_hit_latency_timing_does_not_change_returned_bytes() {
+        let (cache, store, _b, _c) = setup(1024 * 1024 * 1024).await;
+        let body = vec![7u8; 8 * 1024];
+        let hash = store.put_chunk(&body).await.unwrap();
+
+        // Miss: fetcher fires, populates the local cache.
+        let via_miss = cache_get_from(&cache, &store, hash).await.unwrap();
+        assert_eq!(via_miss.as_ref(), body.as_slice());
+        assert!(
+            cache.contains(hash).await,
+            "chunk must be cached after the miss fetch"
+        );
+
+        // Hit: must return the SAME verified bytes via the now-timed
+        // read_if_present path, and must NOT re-invoke the fetcher.
+        let via_hit = cache
+            .get(hash, || async {
+                panic!("fetcher must not fire on an NVMe cache hit");
+                #[allow(unreachable_code)]
+                Ok(Bytes::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(via_hit.as_ref(), body.as_slice());
     }
 
     /// Regression: two `ChunkCache`s over the SAME cache_root — modeling
