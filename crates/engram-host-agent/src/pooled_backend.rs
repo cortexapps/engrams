@@ -3965,6 +3965,13 @@ impl SnapshotFinisher {
         unwind.defuse();
         drop(unwind);
         let mut metadata = metadata;
+        // Issue #529: stamp the exact pause instant unconditionally — the
+        // coord's composed eviction path resolves the session_events
+        // coherence cursor from this instead of its own wall-clock `now`
+        // sampled after the (possibly multi-second) post phase below,
+        // closing the skew that made a clean evict→resume rewind the
+        // coordinator's own lifecycle events (median 4, prod evidence).
+        metadata.paused_at = Some(paused_at);
         let post = async {
             // ADR 0038 B3: the guest has resumed (inner.snapshot above
             // brought it back). Upload the drained disk chunks to GCS +
@@ -6994,6 +7001,7 @@ mod tests {
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
                     aux_bundles: vec![],
+                    paused_at: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -7752,6 +7760,7 @@ mod tests {
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
                     aux_bundles: vec![],
+                    paused_at: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -7891,6 +7900,7 @@ mod tests {
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
                     aux_bundles: vec![],
+                    paused_at: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -8030,6 +8040,7 @@ mod tests {
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
                     aux_bundles: vec![],
+                    paused_at: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -8265,6 +8276,7 @@ mod tests {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            paused_at: None,
         };
         pooled.restore(metadata.clone()).await.unwrap();
 
@@ -8394,6 +8406,7 @@ mod tests {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            paused_at: None,
         };
         let _ = pooled.restore(metadata).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
@@ -9129,6 +9142,7 @@ mod tests {
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
                     aux_bundles: vec![],
+                    paused_at: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -9398,6 +9412,7 @@ mod tests {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: Vec::new(),
+            paused_at: None,
         }
     }
 

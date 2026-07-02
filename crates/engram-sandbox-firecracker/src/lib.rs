@@ -5409,6 +5409,11 @@ impl FirecrackerBackend {
                     })
                 })
                 .collect(),
+            // Issue #529: the bare FC backend doesn't know the eviction/
+            // checkpoint pause instant — `PooledBackend::SnapshotFinisher`
+            // stamps it from `SnapshotCapture::paused_at` after this
+            // returns (same layering as `memory_manifest` above).
+            paused_at: None,
         })
     }
 }
@@ -5695,6 +5700,7 @@ mod tests {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            paused_at: None,
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
@@ -5810,6 +5816,7 @@ mod tests {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            paused_at: None,
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {

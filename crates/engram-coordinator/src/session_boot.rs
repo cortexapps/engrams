@@ -185,6 +185,8 @@ pub(crate) async fn boot_on_reserved_host(
         // always falls back to full-manifest memory-chunk prefetch.
         working_set_blob_key: None,
         aux_bundles: record.aux_bundles,
+        // Issue #529: restore-side reconstruction, not a fresh capture.
+        paused_at: None,
     };
 
     let sandbox_id = match state

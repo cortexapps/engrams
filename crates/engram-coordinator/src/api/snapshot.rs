@@ -1468,6 +1468,8 @@ async fn resume_from_fc_snapshot(
         // ADR 0035: resume keeps the pinned generations (no swap); the
         // host materializes any the receiving host is missing.
         aux_bundles: record.aux_bundles.clone(),
+        // Issue #529: restore-side reconstruction, not a fresh capture.
+        paused_at: None,
     };
     let (host_id, new_sandbox_id) = match crate::placement::restore_for_session(
         state.services.meta.as_ref(),

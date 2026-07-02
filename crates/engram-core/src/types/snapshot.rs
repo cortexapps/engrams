@@ -97,6 +97,17 @@ pub struct SnapshotMetadata {
     /// bundle-GC pin set. Empty for snapshots without aux drives.
     #[serde(default)]
     pub aux_bundles: Vec<super::sandbox::AuxBundleRef>,
+    /// Issue #529: the pause instant the host captured — set by
+    /// `SnapshotFinisher::finish` from `SnapshotCapture::paused_at`.
+    /// The coord's composed eviction path resolves the `session_events`
+    /// coherence cursor from THIS (the exact pause instant) instead of
+    /// its own wall-clock `now` sampled after the capture completes,
+    /// closing the skew that made the cursor land past the coord's own
+    /// `Evicted`/`StatusChanged` events. `None` for backends that don't
+    /// set it (pre-wire-bump hosts during a mixed roll; the composed
+    /// path falls back to `now`, unchanged from today).
+    #[serde(default)]
+    pub paused_at: Option<DateTime<Utc>>,
 }
 
 /// Persisted row in the `snapshots` table.

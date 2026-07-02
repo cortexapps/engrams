@@ -252,15 +252,22 @@ pub async fn evict_session_to_state(
 
     let host_id = state.host_registry.host_of(sandbox_id);
     let now = Utc::now();
-    // ADR 0028 A.log: the event-log leg of the coherence triple. The
-    // guest paused (then gets destroyed) during the capture, so "the
-    // newest event as of now" is the cursor at the pause instant up
-    // to a sub-second skew. Best-effort: a lookup failure degrades to
-    // NULL ("no rewind information"), never fails the eviction.
+    // ADR 0028 A.log / issue #529: the event-log leg of the coherence
+    // triple. Resolve the cursor from the host's EXACT pause instant
+    // (`metadata.paused_at`, stamped in `SnapshotFinisher::finish`) when
+    // present — this closes the skew a coordinator wall-clock `now`
+    // sampled AFTER the (possibly multi-second) capture/upload
+    // introduces, which is what made a clean evict→resume roll back the
+    // coordinator's own lifecycle events (rewind is now also kind-scoped
+    // to guest-derived events; the two fixes are complementary — this
+    // one shrinks the skew window, that one makes the skew harmless).
+    // `unwrap_or(now)` is the pre-#529 behavior, preserved for backends
+    // that don't set it (a mixed wire-version roll; VZ/Process's raw,
+    // unwrapped-by-PooledBackend snapshot() calls).
     let events_cursor = state
         .services
         .meta
-        .latest_event_idx_at_or_before(session_id, now)
+        .latest_event_idx_at_or_before(session_id, metadata.paused_at.unwrap_or(now))
         .await
         .unwrap_or_default();
     let record = SnapshotRecord {
