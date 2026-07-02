@@ -194,5 +194,68 @@ the ADR-bookend habit:
    reservation-safe (re-binding an existing `idle` row) is a tracked fast-follow
    — the incident this fixes was create-bursts.
 
+## Addendum (2026-07-01, issue #540): the host RAM ledger amends the formula
+
+The implementation-note-1 formula (`allocatable = MemAvailable + Σ guest-resident
+PSS`) silently assumed **every resident guest byte belongs to a session holding a
+reservation** — true only because, at the time, the only RAM-resident sandboxes
+were running VMs in a `host_memory_reserving_states()` status. Two gaps this
+missed, both closed by issue #540's `engram-host-agent::ram_ledger` module:
+
+1. **Base-shm (ADR 0045 substrate) was resident but unattributed.** The per-image
+   base-shm tmpfs holds many GiB of host RAM per enabled image, forever, and
+   nothing charged it explicitly — it happened to net out of `MemAvailable`
+   (tmpfs/shmem pages sit on the anon LRU, excluded from that kernel figure), but
+   there was no gauge, no reservation, and no charge during the minutes-long
+   prewarm window between an enable and the write actually landing.
+2. **The epic-parking-ladder invariant.** A parked-paused VM (ladder rungs 2-3)
+   is RAM-resident but its session no longer holds a reservation. Adding its PSS
+   back into `allocatable_mib` — as the pre-#540 formula would, since it added
+   back *all* guest PSS — double-counts that RAM as both occupied (by the parked
+   VM) and free (for a new placement).
+
+**The amended formula**, computed once per heartbeat tick by
+`RamLedgerSnapshot::allocatable_mib()`:
+
+```
+allocatable = MemAvailable + Σ PSS(reservation-backed, non-parked VMs) − pending base-shm charges
+```
+
+`MemAvailable` still nets out the daemon/OS/chunk-cache/populated-tmpfs baseline
+automatically. The added-back PSS term is now **explicitly scoped** to VMs whose
+session holds a coordinator memory reservation (the host-side proxy is a
+per-sandbox `parked: bool` flag the ladder will set); a parked VM's PSS is never
+added back, closing gap 2. `image_prefetch` registers a base-shm prewarm's
+expected byte charge in the ledger's pending-charge registry *before* writing, so
+the charge lands within one heartbeat tick of prewarm start instead of minutes
+later when the multi-GiB write finishes, closing gap 1.
+
+**The structural invariant** the ledger makes explicit: *a host-resident
+sandbox's PSS is added back into `allocatable_mib` iff its session holds a
+coordinator memory reservation.* Everything else resident (base-shm, a future
+parked VM, a future NVMe-retained memfile) is charged to a named bucket and never
+silently folded into "free."
+
+**No sharing discount.** Prod observed `rss ≈ pss` (12.39 GB ≈ 12.39 GB) for the
+one running sandbox measured on 2026-07-01 — no page-sharing benefit was in
+effect (the VM booted via cold recovery). The ledger charges every resident
+bucket at its full measured PSS; nothing multiplies a bucket by a sharing
+discount. Density math that wants a sharing credit must first observe
+`Σpss/Σrss < 1.0` on the existing `engram_sandbox_guest_pss_bytes` /
+`_rss_bytes` gauges before claiming one.
+
+This also fixes a fourth, previously undocumented view: the idle-evictor's
+pressure gate used to read its own private `/proc/meminfo` sample
+(`mem_pressure_check`, now deleted) instead of the heartbeat's numbers — so the
+scheduler and the evictor could structurally disagree about how much RAM the
+host had. Both now read the same per-tick `RamLedgerSnapshot` (heartbeat via a
+direct call, the evictor via a `tokio::sync::watch` channel), so `allocatable_mib`
+and the pressure gate's `free_pct` can never diverge.
+
+See `crates/engram-host-agent/src/ram_ledger.rs` for the implementation; the
+per-category attribution rides the wire as `HostUtilization.{base_shm_mib,
+parked_pss_mib, running_pss_mib}` (migration 0077) and the
+`engram_host_ram_ledger_mib{category=...}` gauge family.
+
 [#147]: https://github.com/cortexapps/engrams/issues/147
 [#148]: https://github.com/cortexapps/engrams/issues/148
