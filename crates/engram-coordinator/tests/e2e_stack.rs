@@ -375,6 +375,38 @@ impl Driver {
     }
 
     /// `SessionService.GetCowState`. ADR 0016 Phase A diagnostic. Returns
+    /// `SessionService.ListSessionEvents` — unary, paginated, unfiltered
+    /// read of the persistent event log (ADR 0060). Issue #529: used to
+    /// assert a clean evict→resume cycle emits no `recovered_from_checkpoint`
+    /// (the rewind, now kind-scoped to guest-derived events, no-ops on the
+    /// coordinator's own lifecycle events). Pages until `next_after_idx`
+    /// stops advancing — the session histories these tests produce are
+    /// small, so one or two pages cover it.
+    async fn list_events(&mut self, sid: SessionId) -> Vec<app::SessionEvent> {
+        let mut out = Vec::new();
+        let mut after_idx: Option<i64> = None;
+        loop {
+            let req = app::ListSessionEventsRequest {
+                session_id: sid.to_string(),
+                after_idx,
+                limit: Some(500),
+            };
+            let resp = self
+                .sess
+                .list_session_events(req)
+                .await
+                .expect("ListSessionEvents")
+                .into_inner();
+            let got_any = !resp.events.is_empty();
+            out.extend(resp.events);
+            if !got_any || Some(resp.next_after_idx) == after_idx {
+                break;
+            }
+            after_idx = Some(resp.next_after_idx);
+        }
+        out
+    }
+
     /// `Some(state)` when the sandbox is NBD-tracked (Phase B's chunked-disk
     /// pipeline live), `None` when the host fell back to materialize-to-file
     /// (no nbd.ko, no nbd_pool, etc.). Used by Phase B tests as a runtime
@@ -1133,6 +1165,35 @@ async fn e2e_resume_preserves_disk_and_memory() {
             .await,
         "session should be Active after resume",
     );
+
+    // Issue #529: a clean evict→resume cycle must emit NO
+    // `recovered_from_checkpoint` event. Pre-#529, `rewind_session_to_cursor`
+    // tombstoned every event kind past the cursor — including the
+    // coordinator's own `evicted`/`status_changed`/`snapshot_taken` facts
+    // this exact cycle appends — so `apply_rung1_rewind` always saw
+    // `rolled_back > 0` and emitted the event even on a perfectly clean
+    // cycle (prod evidence: 45/45 sampled resumes). The rewind is now
+    // scoped to guest-derived kinds only, so this session (no guest
+    // activity between snapshot and evict) must roll back nothing.
+    let events = driver.list_events(sid).await;
+    assert!(
+        !events.iter().any(|e| e.kind == "recovered_from_checkpoint"),
+        "a clean evict→resume cycle must not emit recovered_from_checkpoint \
+         (kind-scoped rewind regression) — events: {:?}",
+        events.iter().map(|e| &e.kind).collect::<Vec<_>>(),
+    );
+    // The lifecycle facts themselves must still be on the record (rewind
+    // scoping excludes them from tombstoning, not from ever being
+    // appended) — a sanity check that this evict→resume cycle actually
+    // ran, so the assertion above isn't vacuously true on a no-op.
+    for expected_kind in ["evicted", "snapshot_taken"] {
+        assert!(
+            events.iter().any(|e| e.kind == expected_kind),
+            "expected a `{expected_kind}` event from the evict→resume cycle; \
+             got kinds: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>(),
+        );
+    }
 
     // Disk survived byte-identical.
     let readback = driver.exec(sid, "cat /var/sentinel.txt").await;
