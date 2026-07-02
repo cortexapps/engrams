@@ -1031,12 +1031,18 @@ async fn provision_netns_inner(
 pub async fn teardown_netns(setup: &NetnsSetup, allocator: &parking_lot::Mutex<NetworkAllocator>) {
     // `ip netns delete` cascades: it removes the TAP, veth-B, and
     // the netns's iptables tables in one shot. veth-A in host root
-    // is auto-cleaned by the kernel when its peer disappears.
-    if let Err(e) = run_cmd("ip", &["netns", "delete", &setup.netns_name]).await {
-        tracing::debug!(netns = %setup.netns_name, error = %e, "netns delete failed");
-        // Fall through; veth-A may still need explicit cleanup.
+    // is auto-cleaned by the kernel when its peer disappears, so the
+    // explicit veth delete below only needs to run when the netns
+    // delete itself failed (belt-and-braces for a partial-failure
+    // state) — on the happy path this leg is a syscall-free no-op.
+    match run_cmd("ip", &["netns", "delete", &setup.netns_name]).await {
+        Ok(()) => {}
+        Err(e) => {
+            tracing::debug!(netns = %setup.netns_name, error = %e, "netns delete failed");
+            // Fall through; veth-A may still need explicit cleanup.
+            let _ = run_cmd("ip", &["link", "delete", &setup.veth_host]).await;
+        }
     }
-    let _ = run_cmd("ip", &["link", "delete", &setup.veth_host]).await;
     allocator.lock().free(setup.snat_cidr);
     // Deliberately do NOT free the bake CIDR (`setup.vm_cidr`).
     // Multiple concurrent warm restores from the same template share
