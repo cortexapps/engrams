@@ -2170,6 +2170,7 @@ impl MetadataStore for PostgresStore {
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
+                   util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
                    ready_images, local_snapshots, current_bundles,
                    cordoned, total_vcpus, wire_version,
                    last_heartbeat_at, status, host_addr
@@ -2244,6 +2245,9 @@ impl MetadataStore for PostgresStore {
                       current_bundles = $14,
                       total_vcpus = $15,
                       wire_version = $16,
+                      util_base_shm_mib = $17,
+                      util_parked_pss_mib = $18,
+                      util_running_pss_mib = $19,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
@@ -2264,6 +2268,11 @@ impl MetadataStore for PostgresStore {
         .bind(current_bundles)
         .bind(hb.total_vcpus as i32)
         .bind(hb.wire_version as i32)
+        // Issue #540: base_shm_pending_mib has no column (transient,
+        // already folded into allocatable_mib above) — not bound here.
+        .bind(hb.utilization.base_shm_mib as i64)
+        .bind(hb.utilization.parked_pss_mib as i64)
+        .bind(hb.utilization.running_pss_mib as i64)
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -2303,6 +2312,7 @@ impl MetadataStore for PostgresStore {
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
+                   util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
                    ready_images, local_snapshots, current_bundles,
                    cordoned, total_vcpus, wire_version,
                    last_heartbeat_at, status, host_addr

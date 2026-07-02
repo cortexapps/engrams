@@ -154,3 +154,49 @@ pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lo
 /// are expected under load (eviction + periodic contend); a flat zero
 /// after deploy would mean the skip path isn't exercised.
 pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";
+
+/// Issue #540 (host RAM ledger): gauge of host RAM (MiB) attributed to
+/// one named bucket, sampled once per heartbeat tick from
+/// `ram_ledger::RamLedgerSnapshot`. Label `category`:
+/// - `running_vms` — Σ PSS of reservation-backed (non-parked) FC
+///   sandboxes (`RamLedgerSnapshot::running_vm_pss_mib`).
+/// - `parked_paused` — Σ PSS of parked-but-resident sandboxes
+///   (epic-parking-ladder rungs 2-3; always 0 until the ladder lands).
+/// - `base_shm` — measured (`st_blocks`) bytes on the per-image base
+///   shm tmpfs.
+/// - `base_shm_pending` — registered-but-not-yet-materialized prewarm
+///   charges; the reason `allocatable_mib` dips during a prewarm
+///   window instead of after it.
+/// - `parked_local_memfiles` — NVMe-resident retained memfiles (rung
+///   3); disk-side, gauge-only here (chunk-cache-disk-budget owns
+///   charging it), always 0 until that ladder rung exists.
+///
+/// Together these buckets are the attribution `allocatable_mib` never
+/// had: every MiB is charged to exactly one category here.
+pub const HOST_RAM_LEDGER_MIB: &str = "engram_host_ram_ledger_mib";
+
+/// Issue #540: gauge mirroring `HostUtilization.allocatable_mib` —
+/// the same number placement reads off the heartbeat, emitted at the
+/// same tick as [`HOST_RAM_LEDGER_MIB`] so the two can never disagree
+/// (one snapshot, one emission site).
+pub const HOST_RAM_ALLOCATABLE_MIB: &str = "engram_host_ram_allocatable_mib";
+
+/// Issue #540: total capacity (MiB) of the `ENGRAM_FC_UFFD_BASE_DIR`
+/// tmpfs — the fixed `uffdBaseTmpfsSize` cap (helm
+/// `firecracker.uffdBaseTmpfsSize`, default 32 GiB) node-prep mounts.
+/// Surfaces the ceiling the 2026-06-28 `pwrite ... No space left on
+/// device` prewarm failure hit, with nothing measuring it beforehand.
+pub const HOST_BASE_SHM_TMPFS_TOTAL_MIB: &str = "engram_host_base_shm_tmpfs_total_mib";
+/// Issue #540: measured (`st_blocks`) bytes actually allocated on the
+/// base-shm tmpfs — companion to
+/// [`HOST_BASE_SHM_TMPFS_TOTAL_MIB`] for a used/total ratio.
+pub const HOST_BASE_SHM_TMPFS_USED_MIB: &str = "engram_host_base_shm_tmpfs_used_mib";
+
+/// Issue #540: counter incremented each time `image_prefetch`'s
+/// base-shm prewarm arm skips the multi-GiB write attempt because the
+/// tmpfs headroom pre-check found insufficient free space
+/// (`reason="tmpfs_headroom"` — the only reason today, kept as a label
+/// for future skip causes). Prewarm's existing warn-and-continue
+/// failure posture is unchanged: a skip here still falls back to the
+/// handler's lazy per-fault path.
+pub const BASE_SHM_PREWARM_SKIPPED_TOTAL: &str = "engram_base_shm_prewarm_skipped_total";

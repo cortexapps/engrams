@@ -331,6 +331,10 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         cpu_budget_vcpus,
         reserved_vcpus,
         free_vcpus,
+        // Issue #540: the RAM ledger's attribution fields.
+        util_base_shm_mib,
+        util_parked_pss_mib,
+        util_running_pss_mib,
     } = v;
     app::HostView {
         id: id.to_string(),
@@ -356,6 +360,9 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         cpu_budget_vcpus: *cpu_budget_vcpus,
         reserved_vcpus: *reserved_vcpus,
         free_vcpus: *free_vcpus,
+        util_base_shm_mib: *util_base_shm_mib,
+        util_parked_pss_mib: *util_parked_pss_mib,
+        util_running_pss_mib: *util_running_pss_mib,
     }
 }
 

@@ -103,6 +103,14 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let util_mem_used_mib: i64 = row.try_get("util_mem_used_mib").map_err(col_err)?;
     let util_cpu_pct: f32 = row.try_get("util_cpu_pct").map_err(col_err)?;
     let util_allocatable_mib: i64 = row.try_get("allocatable_mib").map_err(col_err)?;
+    // Issue #540 (host RAM ledger attribution, migration 0077).
+    // `base_shm_pending_mib` has no PG column (transient host-local
+    // state, already folded into `util_allocatable_mib` above) — it
+    // stays 0 across a DB round-trip; the host's own `/metrics` is the
+    // source of truth for it.
+    let util_base_shm_mib: i64 = row.try_get("util_base_shm_mib").map_err(col_err)?;
+    let util_parked_pss_mib: i64 = row.try_get("util_parked_pss_mib").map_err(col_err)?;
+    let util_running_pss_mib: i64 = row.try_get("util_running_pss_mib").map_err(col_err)?;
     let status: String = row.try_get("status").map_err(col_err)?;
     let last_heartbeat_at: DateTime<Utc> = row.try_get("last_heartbeat_at").map_err(col_err)?;
     let cloud_metadata: HostMetadata =
@@ -139,6 +147,10 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
             mem_used_mib: util_mem_used_mib.max(0) as u64,
             allocatable_mib: util_allocatable_mib.max(0) as u64,
             cpu_pct: util_cpu_pct.max(0.0),
+            base_shm_mib: util_base_shm_mib.max(0) as u64,
+            base_shm_pending_mib: 0,
+            parked_pss_mib: util_parked_pss_mib.max(0) as u64,
+            running_pss_mib: util_running_pss_mib.max(0) as u64,
         },
         status: parse_host_status(&status)?,
         last_heartbeat_at,
