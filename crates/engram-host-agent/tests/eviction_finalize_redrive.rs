@@ -269,10 +269,9 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
     // host-owned and re-drivable. ----
     let records_dir = pooled_b.checkpoint_records_dir().expect("records dir");
     let checkpoint_path = records_dir.join(format!("{snapshot_id}.json"));
-    wait_for(
-        "eviction-final checkpoint record after re-drive",
-        || checkpoint_path.exists(),
-    )
+    wait_for("eviction-final checkpoint record after re-drive", || {
+        checkpoint_path.exists()
+    })
     .await;
     let bytes = tokio::fs::read(&checkpoint_path).await.unwrap();
     let checkpoint: CheckpointRecord = serde_json::from_slice(&bytes).unwrap();
@@ -322,7 +321,12 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         .restore(metadata)
         .await
         .expect("restore from the redriven eviction-final checkpoint");
-    let out = exec(&pooled_b, restored, "sha256sum /dev/shm/marker | cut -d' ' -f1").await;
+    let out = exec(
+        &pooled_b,
+        restored,
+        "sha256sum /dev/shm/marker | cut -d' ' -f1",
+    )
+    .await;
     assert_eq!(
         out.trim(),
         marker_sum,
