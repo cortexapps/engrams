@@ -54,6 +54,13 @@ pub fn init(addr: SocketAddr) {
     // so this Full() rule beats the Suffix("_seconds") default.
     let eviction_buckets = &[1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 180.0, 300.0];
 
+    // ADR 0036 amendment (issue #538): the prestage wait is minutes-class
+    // (dev-brain-sized images pull ~33 GB through a 16-permit semaphore) —
+    // same regime as eviction, needs its own spread for the same reason.
+    let prestage_buckets = &[
+        1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1200.0, 1800.0,
+    ];
+
     let builder = PrometheusBuilder::new()
         .with_http_listener(addr)
         .set_buckets_for_metric(
@@ -61,6 +68,11 @@ pub fn init(addr: SocketAddr) {
             eviction_buckets,
         )
         .expect("install eviction histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(ENABLE_PRESTAGE_SECONDS.to_string()),
+            prestage_buckets,
+        )
+        .expect("install prestage histogram buckets")
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Suffix("_seconds".to_string()),
             buckets,
@@ -221,3 +233,21 @@ pub const QUEUE_OUTCOME_TOTAL: &str = "engram_queue_outcome_total";
 /// No `host_id` label — the cardinality convention above forbids
 /// per-host labels; the paired `warn!` carries the id for forensics.
 pub const HEARTBEAT_PERSIST_FAILURES_TOTAL: &str = "engram_heartbeat_persist_failures_total";
+
+/// Histogram (ADR 0036 amendment, issue #538). Wall time of the enable
+/// scanner's `prestaging` stage — the fleet chunk-prestage wait between
+/// base-snapshot capture and the `enabled_images` upsert. Labels:
+/// `outcome` = `complete` (every eligible host staged) / `partial`
+/// (deadline hit with ≥1 staged) / `empty_fleet` (vacuous pass, no
+/// eligible hosts) / `timeout_zero` (deadline hit with 0 staged —
+/// transient, retried under the attempts budget). Minutes-class for a
+/// large image; the per-image SLO canary is the end-to-end guard that
+/// first-create-after-refresh stays inside budget.
+pub const ENABLE_PRESTAGE_SECONDS: &str = "engram_enable_prestage_seconds";
+
+/// Counter (ADR 0036 amendment, issue #538). Per-host prestage outcomes
+/// recorded at the end of each `prestaging` stage. Labels: `outcome` =
+/// `staged` / `timed_out` / `unschedulable`. No `host_id` label — the
+/// cardinality convention above forbids per-host labels; the durable
+/// per-host record lives on the `enable_jobs.prestage_hosts` column.
+pub const ENABLE_PRESTAGE_HOST_OUTCOMES_TOTAL: &str = "engram_enable_prestage_host_outcomes_total";
