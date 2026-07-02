@@ -819,12 +819,28 @@ async fn provision_netns_inner(
     let netns_name = netns_name_for(sandbox_id);
     let (veth_host, veth_ns) = veth_names_for(sandbox_id);
 
+    // Host-root netlink handle, created up front so the idempotency
+    // pre-clean below can use it instead of shelling out.
+    let (conn, handle, _) = rtnetlink::new_connection()
+        .map_err(|e| netlink_err("host netlink socket", e.to_string()))?;
+    let conn_task = tokio::spawn(conn);
+
     // Idempotency: a leftover netns or veth from a prior failed
-    // provision would block the additive commands below. Best-
-    // effort cleanup first; both `delete` calls are no-ops when
-    // nothing's there.
-    let _ = run_cmd("ip", &["netns", "delete", &netns_name]).await;
-    let _ = run_cmd("ip", &["link", "delete", &veth_host]).await;
+    // provision would block the additive commands below. On the
+    // happy path neither exists, so both legs are existence-gated
+    // rather than unconditional spawns:
+    //   - the netns bind-mount is a `Path::exists` stat (no syscall
+    //     equivalent — `ip netns add`'s bookkeeping is filesystem,
+    //     not netlink); only shell out to `ip netns delete` when a
+    //     leftover is actually there.
+    //   - the host-side veth is a `link_index` netlink lookup; only
+    //     issue a netlink `link().del()` when it's found.
+    if netns_path_for(sandbox_id).exists() {
+        let _ = run_cmd("ip", &["netns", "delete", &netns_name]).await;
+    }
+    if let Ok(idx) = link_index(&handle, &veth_host).await {
+        let _ = handle.link().del(idx).execute().await;
+    }
 
     // `ip netns add` stays a subprocess: it owns the
     // /var/run/netns/<name> bind-mount bookkeeping that the teardown
@@ -833,13 +849,10 @@ async fn provision_netns_inner(
     // the ~12 subprocess spawns this replaces (worst offenders: the
     // `ip netns exec` forks) were ~90 ms of every sandbox boot AND
     // the teleport dest pipeline (ADR 0045 C2 lever 3; ADR 0020 P4
-    // measured the same leg on the cold path).
+    // measured the same leg on the cold path). This is now down to
+    // exactly two deliberate spawns on the happy path: `ip netns
+    // add` here and the in-ns iptables SNAT rule below.
     run_cmd("ip", &["netns", "add", &netns_name]).await?;
-
-    // Host-root netlink handle.
-    let (conn, handle, _) = rtnetlink::new_connection()
-        .map_err(|e| netlink_err("host netlink socket", e.to_string()))?;
-    let conn_task = tokio::spawn(conn);
 
     // veth pair: A in host root (gets the SNAT-slot host octet),
     // B moved into the netns.
