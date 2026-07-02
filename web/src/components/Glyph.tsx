@@ -4,7 +4,7 @@ import type { SessionState } from "../lib/types";
 // Status glyphs in the margin — these stand in for colored dots. The
 // shape carries the meaning, not the color.
 //
-//   ●  active            ◐  created / guest_ready (starting)
+//   ●  active            ◐  created (starting)
 //   ◌  idle              ○  pending
 //   ⚠  host_lost         ✓  completed
 //   ✕  dead              !  failed
@@ -50,7 +50,6 @@ function glyphFor(status: SessionState): string {
     case "queued":
       return "○";
     case "created":
-    case "guest_ready":
       return "◐";
     case "active":
       return "●";
@@ -78,7 +77,6 @@ function toneFor(status: SessionState): string {
     case "pending":
     case "queued":
     case "created":
-    case "guest_ready":
     // Transitional suspend/relocate: faded like idle — on their way there
     // (or back to active), not in trouble.
     case "evicting":

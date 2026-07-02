@@ -552,7 +552,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT AS reserved_vcpus
             FROM sessions
             WHERE host_id = ANY($1)
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
               -- A `pending` row older than 10 min is a crash-orphaned
               -- reservation (a boot never takes that long); don't let it leak
@@ -1005,7 +1005,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT AS reserved_vcpus
             FROM sessions
             WHERE host_id = ANY($1)
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
               AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
             GROUP BY host_id
@@ -1129,7 +1129,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT
             FROM sessions
             WHERE host_id IS NOT NULL
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
               -- ADR 0048: gate on last_active_at, not created_at — a session
               -- can sit `queued` for many minutes before `place_queued_session`
@@ -1196,7 +1196,7 @@ impl MetadataStore for PostgresStore {
                 SELECT host_id, SUM(mem_budget_mib) AS reserved
                 FROM sessions
                 WHERE host_id IS NOT NULL
-                  AND status IN ('pending','created','guest_ready','active',
+                  AND status IN ('pending','created','active',
                                  'evacuating','evicting')
                   -- ADR 0048: gate on last_active_at, not created_at — a session
               -- can sit `queued` for many minutes before `place_queued_session`
@@ -1234,7 +1234,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
             FROM sessions
-            WHERE status IN ('pending','created','guest_ready','active',
+            WHERE status IN ('pending','created','active',
                              'idle','evacuating','evicting')
             "#,
         )
@@ -1430,7 +1430,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT COUNT(*)::BIGINT FROM sessions
             WHERE host_id = $1
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
             "#,
         )
