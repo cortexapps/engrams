@@ -232,6 +232,30 @@ redirects its own output, so there is no inherited pipe for agentd to drain, and
 agentd" contract is simply the pidfile (no in-guest control verb). A `DEFAULT_VNC_PORT = 5900`
 constant sits beside `DEFAULT_TTYD_PORT`; the pidfile path is `ENGRAM_BROWSER_PIDFILE`-overridable.
 
+**Amendment (issue #567) — the restored-wedge case: readiness must be two-sided, and detection must
+trigger repair.** A VM snapshot/restore can resurrect x11vnc in a state where its listen socket
+still *accepts* but it never sends the RFB ProtocolVersion banner — exactly the "accepts yet serves
+zero bytes" wedge the banner probe exists to catch. As originally built the wedge was *detected* but
+never *repaired*: agentd's banner probe failed, but the launcher `--ensure` it then shelled out to
+guarded on a **bare TCP connect** (`stack_up()`), which the wedged listener passes — so `--ensure`
+concluded "already up", no-op'd, and `start_browser` timed out against the same wedge on every
+retry (the Browser tab stayed dead until the VM was recreated). The fix is two-sided, one side per
+audience:
+
+- **agentd (`start_browser`):** when the initial probe fails, **force-stop the recorded pgid** (the
+  `stop_browser` reap, factored into a lock-held `stop_browser_locked` — `start_browser` already
+  holds the start lock and the mutex is not reentrant) *before* running `--ensure`, so a
+  wedged-but-accepting stack is actually replaced instead of no-op'd. Best-effort: a cold start (no
+  pidfile) is a no-op, and a failed reap still falls through to `--ensure`.
+- **launcher (`stack_up()`):** gate on the **RFB banner** (buffer to ≥ 12 bytes, first four must be
+  `RFB `, one overall 2 s deadline mirroring agentd's `RFB_BANNER_TIMEOUT`) instead of a bare
+  connect, so the agent's `playwright-cli` path — which calls `engram-browser --ensure` directly and
+  never passes through agentd's probe — detects the wedge too.
+
+Deploy split: the launcher half ships by **republishing the bundle** (no rebake); the agentd half
+rides an **agentd/image rebake**. Periodic checkpoints deliberately do *not* stop a live browser;
+recovery-on-wedge is the chosen posture (the checkpoint-path gap is tracked separately).
+
 ### 3. The tunnel — generalize the relay to carry any guest stream (Approach A)
 
 The relay is generalized at **both** seams so the byte-stream it carries is parameterized by a

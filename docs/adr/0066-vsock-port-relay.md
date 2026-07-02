@@ -122,6 +122,26 @@ teardown ride `copy_bidirectional`'s EOF handling + vsock RST. No relay auth in 
 host→guest is the trusted direction (unlike the token-gated guest→host forge/upload
 bridges, where the guest is untrusted).
 
+**Restore can kill the listener itself, not just in-flight tunnels (issue #567).** The
+"restore resets in-flight tunnels" story above assumed the 1030 listener stayed up across
+the resume; in practice a Firecracker restore's vsock re-kick can also surface an
+`accept()` error on the listener, and the original `run_port_relay` returned for good on
+the first one — killing Shell + Browser for the guest's *remaining life*, not just the
+tunnels open at restore time. `run_relay_loop`'s accept loop now treats a transient error
+as survivable: back off (100 ms doubling to a 1 s cap) and keep accepting, resetting the
+backoff on the next successful accept. A listener that keeps failing past
+`MAX_CONSECUTIVE_ACCEPT_ERRORS` (8) is treated as dead rather than retried forever — it
+logs and returns so its caller can rebind fresh. That caller, `run_port_relay_with`, is a
+thin supervisor around one `Arc<Semaphore>` (kept alive across rebinds, since a connection
+admitted under a since-dead listener still holds its permit): it re-`listen()`s after the
+accept loop gives up, backing off (500 ms doubling to a 5 s cap) only when `listen()`
+itself fails and only once it has bound successfully at least once — a transport that has
+*never* bound 1030 (an old image with no vsock device) still fails fast, preserving the
+original best-effort "relay disabled" behavior. Each rebind's accept loop runs inside its
+own `tokio::spawn`, awaited via its `JoinHandle`, so a panic in the loop is caught as a
+`JoinError` and just triggers another rebind instead of taking down the task `main.rs`
+spawned this from.
+
 ### Phases (each a PR on its own worktree)
 
 - **P1 — production fix (Firecracker + Process).** harness-proto consts + `RelayConnect`/

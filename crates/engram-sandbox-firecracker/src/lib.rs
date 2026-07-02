@@ -1544,9 +1544,12 @@ impl FirecrackerBackend {
         let mut line = Vec::with_capacity(32);
         let mut byte = [0u8; 1];
         loop {
-            conn.read_exact(&mut byte)
-                .await
-                .map_err(|e| vm_err(format!("read FC vsock CONNECT response: {e}")))?;
+            conn.read_exact(&mut byte).await.map_err(|e| {
+                vm_err(format!(
+                    "read FC vsock CONNECT response: {}",
+                    describe_relay_connect_failure(port, &e)
+                ))
+            })?;
             line.push(byte[0]);
             if byte[0] == b'\n' {
                 break;
@@ -3295,6 +3298,53 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
     SandboxError::Vm(msg.into().into())
 }
 
+/// #567 / prod session 8174b7aa: an agentd RPC recv that hits a bare
+/// early EOF (zero bytes back) is indistinguishable, on the wire,
+/// from agentd crashing mid-call -- but it's *exactly* what an older
+/// guest agentd produces when the host sends a `WireRequest` variant
+/// the guest predates: the frame fails to bincode-decode, `serve_
+/// connection` returns before writing anything, and the connection
+/// just drops (engram-agentd's typed-NAK fix only helps once the
+/// guest image is re-baked). Appends both plausible causes to an
+/// EOF-shaped recv error so an operator doesn't have to already know
+/// this incident's history to triage it; every other error passes
+/// through untouched -- this is purely additive context, not a new
+/// error path.
+fn describe_agentd_rpc_recv_failure(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        format!(
+            "{e} -- agentd closed the stream without a response: guest \
+             agentd may predate this request (host/guest version skew: \
+             re-bake + RefreshImage) or crashed mid-call"
+        )
+    } else {
+        e.to_string()
+    }
+}
+
+/// #567: the FC vsock CONNECT handshake for the ADR-0066 port relay
+/// (guest port [`engram_harness_proto::PROXY_PORT_VSOCK_PORT`])
+/// failing with an early EOF means nothing accepted the CONNECT
+/// inside the guest -- either this agentd predates the relay
+/// listener entirely (host/guest version skew), or a once-live relay
+/// died (the dead-relay bug #567's other fixes target). Gated on the
+/// relay port specifically: `connect_fc_vsock_once` is shared by
+/// every guest port (exec included), and the same read failing on
+/// agentd's exec port (1024) means something else entirely.
+fn describe_relay_connect_failure(port: u32, e: &std::io::Error) -> String {
+    if port == engram_harness_proto::PROXY_PORT_VSOCK_PORT
+        && e.kind() == std::io::ErrorKind::UnexpectedEof
+    {
+        format!(
+            "{e} -- no listener on the guest relay port: guest agentd may \
+             predate the ADR-0066 relay (version skew: re-bake + \
+             RefreshImage), or the relay died (#567)"
+        )
+    } else {
+        e.to_string()
+    }
+}
+
 /// Timeout for `PUT /snapshot/create`. The call flushes the full guest
 /// memory to memory.bin synchronously, so its duration scales with guest
 /// RAM. A flat 60s fit small VMs but tripped on large warm images — the
@@ -4444,9 +4494,16 @@ impl SandboxBackend for FirecrackerBackend {
             engram_agentd::write_msg(&mut conn, &WireRequest::StartShell { port: None })
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_shell: send: {e}").into()))?;
-            let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("start_shell: recv: {e}").into()))?;
+            let resp: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(
+                        format!(
+                            "start_shell: recv: {}",
+                            describe_agentd_rpc_recv_failure(&e)
+                        )
+                        .into(),
+                    )
+                })?;
             match resp {
                 engram_agentd::WireResponse::ShellReady { port, spawned } => {
                     tracing::info!(
@@ -4491,9 +4548,16 @@ impl SandboxBackend for FirecrackerBackend {
             engram_agentd::write_msg(&mut conn, &WireRequest::StartBrowser { port: None })
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_browser: send: {e}").into()))?;
-            let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("start_browser: recv: {e}").into()))?;
+            let resp: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(
+                        format!(
+                            "start_browser: recv: {}",
+                            describe_agentd_rpc_recv_failure(&e)
+                        )
+                        .into(),
+                    )
+                })?;
             match resp {
                 engram_agentd::WireResponse::BrowserReady { port, spawned } => {
                     tracing::info!(
@@ -4539,9 +4603,16 @@ impl SandboxBackend for FirecrackerBackend {
             engram_agentd::write_msg(&mut conn, &WireRequest::StopBrowser)
                 .await
                 .map_err(|e| SandboxError::Vm(format!("stop_browser: send: {e}").into()))?;
-            let _: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("stop_browser: recv: {e}").into()))?;
+            let _: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(
+                        format!(
+                            "stop_browser: recv: {}",
+                            describe_agentd_rpc_recv_failure(&e)
+                        )
+                        .into(),
+                    )
+                })?;
             Ok(())
         };
         // A wedged guest must never hang teardown — bound the round-trip at
@@ -5427,6 +5498,74 @@ mod tests {
         );
         // Monotonic in memory.
         assert!(snapshot_create_timeout(16 * 1024) < big);
+    }
+
+    // ---- #567 version-skew message enrichment ----------------------
+
+    #[test]
+    fn agentd_rpc_recv_failure_names_version_skew_on_eof() {
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof");
+        let msg = describe_agentd_rpc_recv_failure(&e);
+        assert!(
+            msg.starts_with("early eof"),
+            "must preserve the existing leading text so log-grep muscle \
+             memory keeps working: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("skew"),
+            "must name host/guest version skew: {msg}"
+        );
+        assert!(msg.contains("RefreshImage"), "must name the remedy: {msg}");
+    }
+
+    #[test]
+    fn agentd_rpc_recv_failure_passes_through_non_eof_errors() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let msg = describe_agentd_rpc_recv_failure(&e);
+        assert_eq!(
+            msg,
+            e.to_string(),
+            "non-EOF errors must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn relay_connect_failure_names_version_skew_for_relay_port_eof() {
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof");
+        let msg = describe_relay_connect_failure(engram_harness_proto::PROXY_PORT_VSOCK_PORT, &e);
+        assert!(
+            msg.starts_with("early eof"),
+            "must preserve the existing leading text: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("skew"),
+            "must name host/guest version skew: {msg}"
+        );
+        assert!(
+            msg.contains("#567"),
+            "must name the dead-relay alternative: {msg}"
+        );
+    }
+
+    #[test]
+    fn relay_connect_failure_passes_through_for_non_relay_ports() {
+        // The same read fails for unrelated reasons on agentd's exec
+        // port (1024) -- relay-specific wording there would misname
+        // the cause.
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof");
+        let msg = describe_relay_connect_failure(ENGRAM_AGENTD_PORT, &e);
+        assert_eq!(
+            msg,
+            e.to_string(),
+            "non-relay ports must not get relay-specific wording"
+        );
+    }
+
+    #[test]
+    fn relay_connect_failure_passes_through_for_non_eof_errors() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let msg = describe_relay_connect_failure(engram_harness_proto::PROXY_PORT_VSOCK_PORT, &e);
+        assert_eq!(msg, e.to_string());
     }
 
     // ADR 0044 K2: node-cgroup escape helpers. A tempdir stands in for the

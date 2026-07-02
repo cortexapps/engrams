@@ -45,14 +45,28 @@ BROWSER_PIDFILE="${ENGRAM_BROWSER_PIDFILE:-/tmp/engram-browser.pgid}"
 # chromium's CDP (:9222): x11vnc is the LAST thing the launcher starts, so RFB
 # accepting means the whole stack is up — and chromium's DevTools socket lags,
 # so gating on it made the spawn flaky (the agent's connectOverCDP retries CDP
-# itself). A bare connect suffices here; agentd adds the RFB-banner check.
+# itself). A bare connect is NOT enough (issue #567): a VM snapshot/restore can
+# resurrect a WEDGED x11vnc whose listen socket still accepts but never sends
+# the RFB ProtocolVersion banner — a bare connect passes that wedge, --ensure
+# concludes "already up" and no-ops, and the agent's playwright-cli path (which
+# never goes through agentd's banner probe) stays stuck until the VM is
+# recreated. So require the 12-byte banner ("RFB 003.008\n" — sent immediately
+# on accept, though not necessarily in one segment) within an overall 2s
+# deadline from connect (mirroring agentd's RFB_BANNER_TIMEOUT), so a silent
+# wedge fails in bounded time instead of hanging the ensure.
 stack_up() {
     "$here/node/bin/node" -e '
         const s = require("net").connect(+process.argv[1], "127.0.0.1");
-        s.setTimeout(500);
-        s.on("connect", () => { s.destroy(); process.exit(0); });
-        s.on("error",   () => process.exit(1));
-        s.on("timeout", () => { s.destroy(); process.exit(1); });
+        const done = (code) => { s.destroy(); process.exit(code); };
+        setTimeout(() => done(1), 2000);      // one connect+banner deadline
+        let buf = Buffer.alloc(0);
+        s.on("data", (d) => {
+            buf = Buffer.concat([buf, d]);
+            if (buf.length >= 12)
+                done(buf.slice(0, 4).toString("latin1") === "RFB " ? 0 : 1);
+        });
+        s.on("error", () => done(1));
+        s.on("close", () => done(1));         // hung up before a full banner
     ' "$ENSURE_VNC_PORT" 2>/dev/null
 }
 
