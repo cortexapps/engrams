@@ -453,7 +453,9 @@ async fn stale_claimant_writes_are_fenced_off() {
 #[tokio::test]
 #[ignore]
 async fn capture_progress_is_fenced_renews_lease_and_survives_failure() {
-    use engram_core::types::{CaptureFailureKind, CapturePhase, CaptureProgress, WarmStageOutcome, WarmStageRecord};
+    use engram_core::types::{
+        CaptureFailureKind, CapturePhase, CaptureProgress, WarmStageOutcome, WarmStageRecord,
+    };
 
     let Some(meta) = connect().await else { return };
     let uri = unique_uri("capture-progress");
