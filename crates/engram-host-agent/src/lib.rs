@@ -1167,6 +1167,7 @@ impl HostAgent {
                             aux_bundles: r.aux_bundles.clone(),
                             paused_at: r.paused_at,
                             captured_at: r.captured_at,
+                            kind: r.kind,
                         })
                         .collect();
                     let utilization = util_probe.sample(&util_work_dir, guest_pss_mib);

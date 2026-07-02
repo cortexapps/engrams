@@ -969,7 +969,7 @@ mod tests {
         async fn record_snapshot(
             &self,
             _: engram_core::types::snapshot::SnapshotRecord,
-        ) -> Result<(), engram_core::MetaError> {
+        ) -> Result<bool, engram_core::MetaError> {
             unreachable!()
         }
         async fn list_snapshots_for_session(

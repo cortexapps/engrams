@@ -4267,6 +4267,12 @@ impl SnapshotFinisher {
             aux_bundles: metadata.aux_bundles.clone(),
             paused_at,
             captured_at: metadata.created_at,
+            // This is `advance_checkpoint_state` — the composed
+            // `snapshot()`/periodic-checkpoint path. The eviction flavor's
+            // OWN terminal record write (`run_eviction_finalize`) stamps
+            // `EvictionFinal` explicitly; this call site never runs for it
+            // (it uses `snapshot_begin`, not `snapshot()`).
+            kind: engram_protocol::heartbeat::CheckpointKind::Periodic,
         };
         if let Err(e) = record.persist(&records_dir).await {
             tracing::warn!(

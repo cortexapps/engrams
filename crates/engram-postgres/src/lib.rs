@@ -2392,7 +2392,7 @@ impl MetadataStore for PostgresStore {
             .collect::<Result<Vec<_>, MetaError>>()
     }
 
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
+    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
         // ADR 0007: single-tier durability. Every snapshot row
         // references chunked manifests in `BlobStorage` via the
         // `disk_manifest_*` / `memory_manifest_*` quartet. The
@@ -2407,7 +2407,13 @@ impl MetadataStore for PostgresStore {
         // chunks; with the bump, the sweep's post-collection
         // generation read catches the divergence and restarts.
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        sqlx::query(
+        // Issue #529: `RETURNING (xmax = 0)` tells the caller whether this
+        // call INSERTed a fresh row or UPDATEd an existing one — Postgres's
+        // standard idiom for "was this an insert". The heartbeat reconcile
+        // uses it to emit `SnapshotTaken` exactly once, on the row's first
+        // landing, regardless of which coord (if any) survived the
+        // original capture.
+        let row = sqlx::query(
             r#"
             INSERT INTO snapshots
                 (id, session_id, host_id,
@@ -2430,6 +2436,7 @@ impl MetadataStore for PostgresStore {
                 -- recorded with a cursor, or vice versa).
                 events_cursor           = COALESCE(EXCLUDED.events_cursor, snapshots.events_cursor),
                 updated_at              = NOW()
+            RETURNING (xmax = 0) AS inserted
             "#,
         )
         .bind(snap.id.as_uuid())
@@ -2449,15 +2456,16 @@ impl MetadataStore for PostgresStore {
                 .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
         )
         .bind(snap.events_cursor)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
+        let inserted: bool = sqlx::Row::try_get(&row, "inserted").map_err(db_err)?;
         sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        Ok(())
+        Ok(inserted)
     }
 
     async fn prune_session_snapshots(

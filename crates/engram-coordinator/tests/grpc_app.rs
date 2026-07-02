@@ -254,8 +254,12 @@ impl MetadataStore for MockMetadataStore {
         Ok(affected)
     }
 
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
-        self.snapshots_by_id.lock().insert(snap.id, snap.clone());
+    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
+        let inserted = self
+            .snapshots_by_id
+            .lock()
+            .insert(snap.id, snap.clone())
+            .is_none();
         if let Some(sid) = snap.session_id {
             let mut by_session = self.snapshots.lock();
             let rows = by_session.entry(sid).or_default();
@@ -265,7 +269,7 @@ impl MetadataStore for MockMetadataStore {
                 rows.push(snap);
             }
         }
-        Ok(())
+        Ok(inserted)
     }
 
     async fn get_snapshot(

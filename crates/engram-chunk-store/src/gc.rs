@@ -332,8 +332,8 @@ mod tests {
         async fn record_snapshot(
             &self,
             _snap: engram_core::types::SnapshotRecord,
-        ) -> Result<(), MetaError> {
-            Ok(())
+        ) -> Result<bool, MetaError> {
+            Ok(true)
         }
         async fn list_snapshots_for_session(
             &self,

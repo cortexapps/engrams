@@ -751,7 +751,13 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError>;
 
     // ---- snapshots ----
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError>;
+    /// Idempotent upsert (`ON CONFLICT (id) DO UPDATE`) keyed by
+    /// `snap.id`. Returns `true` iff this call INSERTed a fresh row,
+    /// `false` on a re-record of an existing one — issue #529: the
+    /// heartbeat reconcile uses this to emit `SnapshotTaken` exactly
+    /// once, on the row's first landing, regardless of which coord (if
+    /// any) survived the original capture.
+    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError>;
     async fn list_snapshots_for_session(
         &self,
         sid: SessionId,
