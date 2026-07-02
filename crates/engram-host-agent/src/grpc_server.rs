@@ -1359,6 +1359,13 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         SandboxError::WireSkew { host, coord } => {
             Status::failed_precondition(engram_protocol::wire::wire_skew_message(host, coord))
         }
+        // Issue #539: the streaming `build_base_snapshot` handler pattern-
+        // matches this variant itself and emits a structured `CaptureFailed`
+        // stream frame instead of a gRPC error status (so the kind/stage/
+        // tail survive). This arm only fires if some future caller routes
+        // a `CaptureFailed` through a non-streaming RPC — fall back to a
+        // plain internal status rather than losing the error.
+        SandboxError::CaptureFailed(failure) => Status::internal(failure.to_string()),
     }
 }
 
