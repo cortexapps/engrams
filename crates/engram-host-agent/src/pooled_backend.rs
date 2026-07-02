@@ -6298,6 +6298,18 @@ impl SandboxBackend for PooledBackend {
         self.inner.list().await
     }
 
+    /// ADR 0068: proxy to the wrapped backend, same as every other
+    /// capability method here — `FirecrackerBackend` overrides the
+    /// trait default with the ground-truth manifest check; VZ/Process
+    /// inherit the default (list-membership mirror). The pool itself
+    /// tracks no independent liveness signal worth adding here.
+    async fn probe_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        self.inner.probe_sandbox(id).await
+    }
+
     async fn guest_ip(&self, id: SandboxId) -> Option<String> {
         self.inner.guest_ip(id).await
     }

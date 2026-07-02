@@ -167,6 +167,17 @@ pub struct SnapshotRecord {
     /// tombstoning".
     #[serde(default)]
     pub events_cursor: Option<i64>,
+    /// ADR 0068: the capturing host's `firecracker --snapshot-version`
+    /// at capture time (migration 0077), copied from
+    /// `hosts.capabilities ->> 'fc_snapshot_version'` when the
+    /// recording host is known. `None` on pre-0068 rows, VZ/Process
+    /// captures, and captures recorded without a known host. Placement
+    /// (`host_meets_capabilities`) requires an exact match against the
+    /// restoring host's reported version when both are `Some` — the
+    /// value that closes the cross-`SNAPSHOT_VERSION` restore-corruption
+    /// class at placement time instead of at guest-boot failure.
+    #[serde(default)]
+    pub fc_snapshot_version: Option<String>,
 }
 
 /// ADR 0045 C1: the destination-side rider on a migration restore's

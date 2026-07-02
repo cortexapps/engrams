@@ -517,6 +517,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
             recoverable,
             // Template artifact — no session, no event log.
             events_cursor: None,
+            fc_snapshot_version: None,
         })
         .await?;
 

@@ -347,6 +347,7 @@ pub(crate) async fn snapshot_core(
             // (the guest pauses inside the snapshot RPC; sub-second skew
             // accepted, documented on `latest_event_idx_at_or_before`).
             events_cursor,
+            fc_snapshot_version: None,
         };
         st.services.meta.record_snapshot(record.clone()).await?;
 
@@ -1337,6 +1338,15 @@ async fn resume_from_fc_snapshot(
         // chunk cache + per-image base shm are warm — the capturing
         // host first, else wherever the session last ran.
         prefer_host: record.host_id.or(session.host_id),
+        // ADR 0068: a memory-manifest snapshot restores via the FC UFFD
+        // substrate; a candidate host must also match the snapshot's
+        // capture-time `fc_snapshot_version` when both are known — the
+        // cross-`SNAPSHOT_VERSION` restore-corruption class this issue
+        // closes at placement instead of at guest-boot failure.
+        caps: crate::placement::CapabilityRequirements {
+            needs_uffd_substrate: record.memory_manifest.is_some(),
+            fc_snapshot_version: record.fc_snapshot_version.clone(),
+        },
     };
 
     // ADR 0048 C7: if NO host can take this resume (the fleet is fully
@@ -1998,6 +2008,7 @@ mod recoverable_tests {
             recoverable: true,
             aux_bundles: Vec::new(),
             events_cursor: None,
+            fc_snapshot_version: None,
         }
     }
 

@@ -100,6 +100,10 @@ pub(crate) struct PreparedBoot {
     pub cpu_budget_vcpus: u32,
     pub image_repo: String,
     pub image_tag: String,
+    /// ADR 0068: the enabled image's base snapshot carries a memory
+    /// manifest — this create needs a host reporting a healthy FC UFFD
+    /// substrate (`placement::CapabilityRequirements::needs_uffd_substrate`).
+    pub needs_uffd_substrate: bool,
 }
 
 /// Why a boot failed, carrying the caller-facing error and — crucially —

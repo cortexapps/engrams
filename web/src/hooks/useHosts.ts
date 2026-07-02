@@ -18,6 +18,7 @@ function protoHostToLegacy(h: ProtoHostView): HostView {
     util_mem_used_mib: Number(h.utilMemUsedMib),
     util_cpu_pct: h.utilCpuPct,
     last_heartbeat_at: h.lastHeartbeatAt,
+    failing_capabilities: h.failingCapabilities,
   };
 }
 

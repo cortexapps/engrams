@@ -638,6 +638,7 @@ async fn boot_prepared(
         cpu_budget_vcpus,
         image_repo,
         image_tag,
+        needs_uffd_substrate,
     } = prepared;
     let session_id = inputs.session_id;
     let base_snapshot_id = inputs.base_snapshot_id;
@@ -652,6 +653,15 @@ async fn boot_prepared(
         required_image_digest: None,
         exclude_host: None,
         prefer_host: None,
+        // ADR 0068: a fresh create with an FC memory-manifest base
+        // snapshot needs a host with a healthy UFFD substrate. No
+        // `fc_snapshot_version` constraint on create — that pairing
+        // only matters for RESTORING a previously-captured snapshot
+        // (resume/evac), not for booting from the base template.
+        caps: crate::placement::CapabilityRequirements {
+            needs_uffd_substrate,
+            fc_snapshot_version: None,
+        },
     };
     let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
         .await
@@ -1266,6 +1276,11 @@ async fn prepare_inner(
         cpu_budget_vcpus,
         image_repo,
         image_tag,
+        // ADR 0068: this create restores the enabled image's base
+        // snapshot — the placement gate needs the UFFD substrate iff
+        // that base snapshot carries a memory manifest (an FC image;
+        // VZ/Process enabled-image rows never set this).
+        needs_uffd_substrate: enabled.base_snapshot_memory_manifest.is_some(),
     })
 }
 /// ADR 0051: fetch a session by id (gRPC `GetSession`). 404 on unknown id.

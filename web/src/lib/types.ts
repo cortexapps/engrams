@@ -162,6 +162,11 @@ export interface HostView {
   util_mem_used_mib: number;
   util_cpu_pct: number;
   last_heartbeat_at: string;
+  /** ADR 0068: names of the capability-vector fields currently
+   *  `Failed` (or `Unknown` once the host has reported a real
+   *  vector) — empty on a healthy host. Kills the "no capacity with
+   *  free hosts" mystery mode at the fleet view. */
+  failing_capabilities: string[];
 }
 
 export interface ListHostsResponse {

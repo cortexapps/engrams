@@ -10,6 +10,27 @@ use serde::{Deserialize, Serialize};
 use super::ids::SandboxId;
 use super::image::NetworkPolicy;
 
+/// ADR 0068 probe-before-host_lost: the answer to "is this specific
+/// sandbox actually there", from GROUND TRUTH — not the in-memory
+/// sandbox map `SandboxBackend::list()` reads (that map, or its
+/// heartbeat-carried mirror `running_sandboxes`, being wrong is exactly
+/// the desync `reconcile::flip_missing` uses this to rescue sessions
+/// from). On FC: `process_alive` comes from the persisted per-sandbox
+/// manifest (the same three-axis pid/start-time/comm identity the
+/// survivor-reattach pass already trusts), read independently of the
+/// in-memory map. On VZ/Process (no orphan-VM mode exists there): the
+/// live child-process handle IS the ground truth, so both fields
+/// mirror it — see `SandboxBackend::probe_sandbox`'s default impl.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SandboxProbe {
+    /// Present in the backend's in-memory sandbox map (`list()`
+    /// membership).
+    pub known_to_backend: bool,
+    /// The VMM process for this sandbox is alive on this host, checked
+    /// independently of `known_to_backend`.
+    pub process_alive: bool,
+}
+
 /// Spec for creating a sandbox via `SandboxBackend::create`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxSpec {

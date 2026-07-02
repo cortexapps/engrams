@@ -92,6 +92,13 @@ impl HostClient for LocalHostClient {
         self.sandbox.list().await
     }
 
+    async fn probe_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        self.sandbox.probe_sandbox(id).await
+    }
+
     async fn exec_stream(
         &self,
         id: SandboxId,

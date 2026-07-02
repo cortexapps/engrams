@@ -12,7 +12,7 @@ use crate::types::egress::SessionEgressPolicy;
 use crate::types::ids::SandboxId;
 use crate::types::image::WarmConfig;
 use crate::types::sandbox::{
-    AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxSpec,
+    AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
 };
 use crate::types::snapshot::SnapshotMetadata;
 
@@ -718,6 +718,25 @@ pub trait SandboxBackend: Send + Sync {
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError>;
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError>;
+
+    /// ADR 0068 probe-before-host_lost: ground-truth liveness for ONE
+    /// sandbox. Default impl (VZ/Process — neither backend has an
+    /// orphan-VM mode: the process IS the sandbox, so the live
+    /// in-memory map member already is ground truth) reports
+    /// `known_to_backend` from `list()` membership and mirrors it into
+    /// `process_alive`. FC overrides this with an INDEPENDENT check —
+    /// reading the persisted per-sandbox manifest's three-axis pid
+    /// identity (the same one the survivor-reattach pass trusts)
+    /// rather than trusting the in-memory map, since the in-memory map
+    /// (or its heartbeat-carried mirror `running_sandboxes`) being
+    /// wrong is exactly the desync this probe exists to catch.
+    async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+        let known_to_backend = self.list().await?.contains(&id);
+        Ok(SandboxProbe {
+            known_to_backend,
+            process_alive: known_to_backend,
+        })
+    }
 
     /// IPv4 address the *host* can use to reach a TCP service running
     /// inside this sandbox's guest. Used by the `GET /sessions/:id/shell`

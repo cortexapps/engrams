@@ -56,6 +56,12 @@ impl HostClient for FakeHost {
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         unreachable!()
     }
+    async fn probe_sandbox(
+        &self,
+        _: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        unreachable!()
+    }
     async fn exec_stream(&self, _: SandboxId, _: ExecRequest) -> Result<ExecStream, SandboxError> {
         unreachable!()
     }

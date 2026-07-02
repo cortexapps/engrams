@@ -140,6 +140,16 @@ function HostCard({
         <CardTitle className="font-mono text-base">{host.id}</CardTitle>
         <div className="flex items-center gap-3">
           <Badge variant={statusVariant(host.status)}>{host.status}</Badge>
+          {host.failing_capabilities.length > 0 && (
+            <Badge
+              variant="destructive"
+              title={`Failing capabilities: ${host.failing_capabilities.join(", ")}`}
+            >
+              {host.failing_capabilities.length === 1
+                ? host.failing_capabilities[0]
+                : `${host.failing_capabilities.length} caps failing`}
+            </Badge>
+          )}
           {host.status === "ready" && (
             <AlertDialog>
               <AlertDialogTrigger asChild>

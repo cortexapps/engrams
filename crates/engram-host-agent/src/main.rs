@@ -234,6 +234,13 @@ async fn main() -> Result<(), HostAgentError> {
         grpc_listen_addr,
         grpc_advertise_addr,
         migrate_peer_listen_addr,
+        // ADR 0068: detection stays here, above the cfg-gated backend
+        // match below — `capabilities::probe_all` reads this string
+        // rather than re-deriving it from a downcast.
+        backend_name: match cli.sandbox_backend {
+            BackendChoice::Firecracker => "firecracker".to_string(),
+            BackendChoice::Vz => "vz".to_string(),
+        },
         ..HostAgentConfig::default()
     };
 

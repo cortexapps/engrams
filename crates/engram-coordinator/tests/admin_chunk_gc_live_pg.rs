@@ -212,6 +212,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
             recoverable: true,
             aux_bundles: vec![],
             events_cursor: None,
+            fc_snapshot_version: None,
         })
         .await
         .expect("seed base snapshot");
@@ -276,6 +277,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
             recoverable: true,
             aux_bundles: vec![],
             events_cursor: None,
+            fc_snapshot_version: None,
         })
         .await
         .expect("record snapshot");
@@ -373,6 +375,7 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
             recoverable: true,
             aux_bundles: vec![],
             events_cursor: None,
+            fc_snapshot_version: None,
         })
         .await
         .expect("seed base snapshot");
@@ -515,6 +518,7 @@ async fn promote_skips_candidate_that_became_repinned() {
             recoverable: true,
             aux_bundles: vec![],
             events_cursor: None,
+            fc_snapshot_version: None,
         })
         .await
         .expect("seed base snapshot");
@@ -703,6 +707,7 @@ async fn non_recoverable_snapshots_do_not_pin() {
             recoverable: false, // ← the load-bearing field
             aux_bundles: vec![],
             events_cursor: None,
+            fc_snapshot_version: None,
         })
         .await
         .expect("record snapshot");
@@ -789,6 +794,7 @@ async fn base_snapshot_memfile_pinned_even_when_snapshot_not_recoverable() {
             recoverable: false, // ← the load-bearing field
             aux_bundles: vec![],
             events_cursor: None,
+            fc_snapshot_version: None,
         })
         .await
         .expect("seed non-recoverable base snapshot");

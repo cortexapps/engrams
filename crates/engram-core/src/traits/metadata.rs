@@ -691,6 +691,26 @@ pub trait MetadataStore: Send + Sync {
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError>;
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
 
+    /// ADR 0068: `hosts.capabilities.fc_snapshot_version` for one host —
+    /// the value the eviction pipeline and the checkpoint-advert
+    /// reconcile stamp onto a freshly-recorded `snapshots` row so
+    /// placement can later pair a restore against the exact FC
+    /// snapshot-data-format version that captured it. Default derives
+    /// from `list_active_hosts()` (an O(active hosts) scan is fine for
+    /// a per-capture call, which already round-trips several times);
+    /// `None` when the host isn't found or hasn't reported a version.
+    async fn fc_snapshot_version_for_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Option<String>, MetaError> {
+        Ok(self
+            .list_active_hosts()
+            .await?
+            .into_iter()
+            .find(|h| h.id == host_id)
+            .and_then(|h| h.capabilities.fc_snapshot_version))
+    }
+
     /// Record a heartbeat from `host_id`: bump `last_heartbeat_at` to
     /// NOW(), set the host-reported `status`, and persist the full
     /// [`HostHeartbeat`] payload — capacity, utilization, and (ADR

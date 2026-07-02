@@ -516,17 +516,18 @@ async fn prefetch_one(
     // memfile exists, so the first session restores against a warm file.
     base_memfile: Option<PathBuf>,
 ) -> Result<WarmedManifest, PrefetchError> {
-    // ADR 0045 substrate readiness gate. A memory-bearing (FC) image restores
-    // Uffd-against-the-shared-base-shm, which REQUIRES the uffd base dir to be
-    // a tmpfs/shmem mount — `UFFDIO_REGISTER MINOR` (canonical-page sharing)
-    // is shmem-only. On a freshly-rolled K8s node, node-prep mounts that tmpfs
-    // minutes AFTER the host-agent starts; until then the path is a plain
-    // container-overlay dir, and a base-shm restore there faults with
-    // "register memory ... userfaultfd ... System error", silently dropping
-    // fresh-host capacity. Withhold readiness — fail the prefetch so the image
-    // is NOT marked ready and the coordinator places no substrate session here
-    // — until the mount is visible. The 30s reconcile retries, so this
-    // self-heals once node-prep lands the mount.
+    // ADR 0045 substrate ordering (narrowed by ADR 0068). A memory-bearing
+    // (FC) image restores Uffd-against-the-shared-base-shm, which requires
+    // the uffd base dir to be a tmpfs/shmem mount before this prefetch
+    // writes the shared base memfile there — mounting a tmpfs UNDER an
+    // already-open memfile would orphan the write. This early return stays
+    // to preserve that ordering (prewarm-after-mount); it is no longer the
+    // scheduling gate — `capabilities::probe_base_shm_tmpfs` re-probes the
+    // same statfs on every heartbeat and the coordinator's placement filter
+    // (`host_meets_capabilities`) now withholds UFFD-substrate placements
+    // directly on that vector, so a freshly-rolled K8s node whose node-prep
+    // hasn't mounted the tmpfs yet is excluded from placement itself rather
+    // than failing a restore that already landed there.
     if image.base_snapshot_memory_manifest.is_some() {
         if let Some(base_dir) = engram_sandbox_firecracker::uffd_base_dir_from_env() {
             // Create the dir first so the statfs reflects the real backing fs:
@@ -534,7 +535,7 @@ async fn prefetch_one(
             // not-yet-mounted dedicated mountpoint on the overlay. Mounting a
             // tmpfs over an existing dir later is fine.
             let _ = tokio::fs::create_dir_all(&base_dir).await;
-            if !dir_is_tmpfs(&base_dir) {
+            if !crate::capabilities::dir_is_tmpfs(&base_dir) {
                 return Err(PrefetchError::SubstrateNotReady(format!(
                     "uffd base dir {} is not a tmpfs/shmem mount yet \
                      (node-prep may not have mounted it)",
@@ -780,58 +781,15 @@ impl std::fmt::Display for PrefetchError {
 
 impl std::error::Error for PrefetchError {}
 
-/// Whether `path` is on a tmpfs/shmem mount. The ADR 0045 substrate
-/// requires its base dir to be tmpfs/shmem because `UFFDIO_REGISTER MINOR`
-/// (the canonical-page sharing op) is shmem-only; on a freshly-rolled K8s
-/// node, node-prep mounts that tmpfs minutes after the host-agent starts. A
-/// missing path or a probe error reads as "not tmpfs" (i.e. not ready). On
-/// non-Linux there is no substrate, so this is vacuously true.
-#[cfg(target_os = "linux")]
-fn dir_is_tmpfs(path: &std::path::Path) -> bool {
-    // TMPFS_MAGIC (0x0102_1994) covers tmpfs and shmem (incl. /dev/shm).
-    match nix::sys::statfs::statfs(path) {
-        Ok(s) => s.filesystem_type() == nix::sys::statfs::TMPFS_MAGIC,
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn dir_is_tmpfs(_path: &std::path::Path) -> bool {
-    true
-}
+// ADR 0068: `dir_is_tmpfs` moved to `crate::capabilities` — one probe
+// implementation now feeds both this readiness-ordering early return and
+// the coordinator-visible `base_shm_tmpfs` capability. Its test
+// (`base_shm_tmpfs_rejects_a_plain_tempdir` / the /proc/mounts
+// cross-check) moved with it.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ADR 0045 substrate readiness gate: `dir_is_tmpfs` must positively
-    // identify a real tmpfs mount and reject a non-tmpfs / missing path.
-    // Cross-checked against /proc/mounts so an unusual CI container (where
-    // /dev/shm might not be tmpfs) can't flake the positive assertion.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn dir_is_tmpfs_identifies_shmem_and_rejects_others() {
-        // A non-existent path can't be a mount → not ready (no panic).
-        assert!(!dir_is_tmpfs(std::path::Path::new(
-            "/nonexistent-engram-base-xyz"
-        )));
-
-        let shm_is_tmpfs = std::fs::read_to_string("/proc/mounts")
-            .map(|m| {
-                m.lines().any(|l| {
-                    let mut f = l.split_whitespace();
-                    f.next(); // device
-                    f.next() == Some("/dev/shm") && f.next() == Some("tmpfs")
-                })
-            })
-            .unwrap_or(false);
-        if shm_is_tmpfs {
-            assert!(
-                dir_is_tmpfs(std::path::Path::new("/dev/shm")),
-                "statfs must agree with /proc/mounts that /dev/shm is tmpfs",
-            );
-        }
-    }
 
     // ADR 0022: pin a small (16 KiB) temp file resident — exercises the
     // mmap+mlock+drop path on the Linux CI runner (16 KiB fits even a

@@ -1365,6 +1365,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "userfaultfd",
  "uuid",
  "workspace-hack",
 ]

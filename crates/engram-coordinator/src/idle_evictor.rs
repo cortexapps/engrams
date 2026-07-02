@@ -263,6 +263,19 @@ pub async fn evict_session_to_state(
         .latest_event_idx_at_or_before(session_id, now)
         .await
         .unwrap_or_default();
+    // ADR 0068: stamp the capturing host's FC snapshot-version so a
+    // later restore can be paired against it at placement. Best-effort:
+    // a lookup failure degrades to NULL, same posture as events_cursor
+    // above — never fails the eviction over it.
+    let fc_snapshot_version = match host_id {
+        Some(h) => state
+            .services
+            .meta
+            .fc_snapshot_version_for_host(h)
+            .await
+            .unwrap_or_default(),
+        None => None,
+    };
     let record = SnapshotRecord {
         id: metadata.id,
         session_id: Some(session_id),
@@ -286,6 +299,7 @@ pub async fn evict_session_to_state(
         // ADR 0035: pin the generations this snapshot references.
         aux_bundles: metadata.aux_bundles.clone(),
         events_cursor,
+        fc_snapshot_version,
     };
     if let Err(e) = state.services.meta.record_snapshot(record.clone()).await {
         abort_inflight_snapshot(state, session_id, sandbox_id, "record_snapshot").await;
@@ -560,6 +574,16 @@ async fn finish_eviction_background(
                 return;
             }
         };
+        // ADR 0068: same best-effort stamp as the composed eviction path.
+        let fc_snapshot_version = match host_id {
+            Some(h) => state
+                .services
+                .meta
+                .fc_snapshot_version_for_host(h)
+                .await
+                .unwrap_or_default(),
+            None => None,
+        };
         // Row-only-at-finalize: the first and only insert, while the
         // lease is held — a reaped lease can't fork state because the
         // row never lands without it.
@@ -581,6 +605,7 @@ async fn finish_eviction_background(
             .await,
             aux_bundles: metadata.aux_bundles.clone(),
             events_cursor,
+            fc_snapshot_version,
         };
         if let Err(e) = state.services.meta.record_snapshot(record).await {
             tracing::warn!(session_id = %session_id, error = %e,
@@ -1581,6 +1606,13 @@ mod tests {
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
             }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
             async fn exec_stream(
                 &self,
                 id: engram_core::SandboxId,
@@ -1797,6 +1829,13 @@ mod tests {
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
             }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
             async fn exec_stream(
                 &self,
                 id: engram_core::SandboxId,
@@ -2012,6 +2051,13 @@ mod tests {
             }
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
+            }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
             }
             async fn exec_stream(
                 &self,
@@ -2361,6 +2407,13 @@ mod tests {
             }
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
+            }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
             }
             async fn exec_stream(
                 &self,

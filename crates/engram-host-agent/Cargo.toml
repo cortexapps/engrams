@@ -67,13 +67,15 @@ tokio-util = { version = "0.7", features = ["io"] }
 tonic.workspace = true
 reqwest.workspace = true
 # For the disk-pressure detector's statvfs-based free-space probe.
-# Linux + macOS both expose statvfs; nix's `fs` feature wraps it.
-# `sched` is needed on Linux for ADR 0014 issue #6's ProxyShell
+# Linux + macOS both expose statvfs; nix's `fs` feature wraps it (also
+# `memfd_create`/`ftruncate`, used by ADR 0068's uffd-minor-shmem
+# probe). `sched` is needed on Linux for ADR 0014 issue #6's ProxyShell
 # netns-dial (setns + CloneFlags). `uio` wraps process_vm_readv for
 # ADR 0045 C2's page server (a safe API — no new unsafe in this
-# crate). The extra modules compile to no-ops on non-Linux so the
-# features are portable.
-nix = { version = "0.31", default-features = false, features = ["fs", "sched", "uio"] }
+# crate). `mman` wraps mmap/munmap for the same ADR 0068 probe (a
+# memfd-backed self-test, no guest involved). The extra modules
+# compile to no-ops on non-Linux so the features are portable.
+nix = { version = "0.31", default-features = false, features = ["fs", "mman", "sched", "uio"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 engram-telemetry.workspace = true
@@ -82,6 +84,15 @@ metrics-exporter-prometheus.workspace = true
 uuid.workspace = true
 tempfile = "3"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+# Linux-only: userfaultfd is a Linux kernel surface (ADR 0068's
+# `capabilities::probe_uffd_minor_shmem` self-test). Target-gated the
+# same way `engram-uffd-handler` gates its own copy of this dep, so a
+# workspace-wide `cargo check` on macOS doesn't try to build it.
+[target.'cfg(target_os = "linux")'.dependencies]
+# linux5_13: `RegisterMode::MINOR` — the exact ioctl mode the probe
+# exercises.
+userfaultfd = { version = "0.9", features = ["linux5_13"] }
 
 [dev-dependencies]
 # base_shm_gc tests backdate mtimes
