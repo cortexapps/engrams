@@ -483,6 +483,107 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
     assert_eq!(re.recovery_epoch, 2, "epoch bumps again: 1 → 2");
 }
 
+/// Issue #529: `rewind_session_to_cursor` must NOT tombstone the
+/// coordinator's own eviction/resume lifecycle events — `evicted`,
+/// `status_changed`, `snapshot_taken`, `resumed`,
+/// `recovered_from_checkpoint`. A clean evict→resume cycle appends
+/// exactly this family past the cursor; tombstoning them is what made
+/// every resume look like a rewind even when nothing guest-derived was
+/// lost.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn rewind_is_kind_scoped_to_guest_derived_events() {
+    let Some(meta) = pg().await else { return };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    let cursor = meta
+        .append_session_event(
+            session_id,
+            "agent_message",
+            serde_json::json!({"text": "before eviction"}),
+        )
+        .await
+        .expect("append e0");
+
+    // The exact four-event family a clean D5 evict→resume appends past
+    // the cursor (idle_evictor.rs `Evicted` + `StatusChanged(->idle)` +
+    // `SnapshotTaken`, then the resume's `StatusChanged(->created)`).
+    for (kind, payload) in [
+        ("evicted", serde_json::json!({})),
+        (
+            "status_changed",
+            serde_json::json!({"from": "active", "to": "idle"}),
+        ),
+        (
+            "snapshot_taken",
+            serde_json::json!({"snapshot_id": Uuid::new_v4(), "size_bytes": 1}),
+        ),
+        (
+            "status_changed",
+            serde_json::json!({"from": "idle", "to": "created"}),
+        ),
+    ] {
+        meta.append_session_event(session_id, kind, payload)
+            .await
+            .expect("append lifecycle event");
+    }
+
+    let lifecycle_only = meta
+        .rewind_session_to_cursor(session_id, cursor)
+        .await
+        .expect("rewind over lifecycle-only span");
+    assert_eq!(
+        lifecycle_only.rolled_back, 0,
+        "coordinator lifecycle events must not be tombstoned by a rewind"
+    );
+    assert_eq!(
+        lifecycle_only.recovery_epoch, 0,
+        "no-op rewind (nothing guest-derived rolled back) must not bump the epoch"
+    );
+
+    // Now interleave a genuinely guest-derived event past the same
+    // cursor — that one, and only that one, must be tombstoned.
+    meta.append_session_event(
+        session_id,
+        "agent_message",
+        serde_json::json!({"text": "guest replay candidate"}),
+    )
+    .await
+    .expect("append guest event");
+
+    let mixed = meta
+        .rewind_session_to_cursor(session_id, cursor)
+        .await
+        .expect("rewind over mixed span");
+    assert_eq!(
+        mixed.rolled_back, 1,
+        "only the guest-derived event is tombstoned; lifecycle events are excluded"
+    );
+    assert_eq!(
+        mixed.recovery_epoch, 1,
+        "epoch bumps once real work rolled back"
+    );
+
+    let events = meta
+        .list_session_events_since(session_id, -1, 1000)
+        .await
+        .expect("replay");
+    let lifecycle_rewound = events
+        .iter()
+        .filter(|e| {
+            e.idx > cursor
+                && matches!(
+                    e.kind.as_str(),
+                    "evicted" | "status_changed" | "snapshot_taken"
+                )
+        })
+        .any(|e| e.rewound_at.is_some());
+    assert!(
+        !lifecycle_rewound,
+        "no lifecycle-kind event is ever tombstoned"
+    );
+}
+
 /// ADR 0056 Phase 2: a session's profile-granted capabilities round-trip
 /// through `session_capabilities` — covering the empty no-op, idempotent
 /// re-bind (ON CONFLICT DO NOTHING), and the `resource` '' <-> Option::None

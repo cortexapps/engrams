@@ -2897,11 +2897,25 @@ impl MetadataStore for PostgresStore {
             .collect();
 
         // Tombstone the rolled-back span (audit-preserving) and count it.
+        // Issue #529: exclude coordinator-fact kinds — `status_changed`,
+        // `snapshot_taken`, `evicted`, `resumed`, `recovered_from_checkpoint`.
+        // Those are control-plane bookkeeping the coordinator itself
+        // appended around the eviction/resume boundary; they stay true
+        // regardless of what the guest remembers, so rewinding them was
+        // what made every clean evict→resume "roll back" (median 4
+        // events) even with nothing lost. Everything guest-derived
+        // (run_*, agent_message*, tool_call_*, exec_*, stdout/stderr,
+        // prompt_*, harness_idle, user_question, question_answered,
+        // file_changed, file_shared, integration_asset, …) still rewinds.
         let tombstoned = sqlx::query(
             r#"
             UPDATE session_events
                SET rewound_at = NOW()
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
+               AND kind NOT IN (
+                   'status_changed', 'snapshot_taken', 'evicted',
+                   'resumed', 'recovered_from_checkpoint'
+               )
             "#,
         )
         .bind(session_id.as_uuid())
