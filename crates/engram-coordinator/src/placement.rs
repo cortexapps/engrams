@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use engram_core::traits::{HostClient, MetadataStore};
-use engram_core::types::host::{HostRecord, HostStatus, ReservedBudget};
+use engram_core::types::host::{CapStatus, HostRecord, HostStatus, ReservedBudget};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SnapshotId};
 use engram_protocol::heartbeat::ManifestDigest;
@@ -101,9 +101,14 @@ pub struct CapabilityRequirements {
 ///   listener is up, or has no bundle generation staged, can't safely
 ///   take any session). Each capability `req` actually asks for
 ///   (`needs_uffd_substrate` → `base_shm_tmpfs` + `uffd_minor_shmem` +
-///   `nbd`) must also be `Ok` — `Failed`, `Unknown`, and
-///   `NotApplicable` all fail a *required* capability alike; only a
-///   probe that ran and passed clears the gate.
+///   `nbd`) must be `Ok` **or** `NotApplicable` — `NotApplicable` is
+///   the honest report of an ADR 0022 File-backend host (the substrate
+///   was never configured, so there's nothing to probe): it must not
+///   be treated the same as `Failed`/`Unknown`, or a File-mode fleet
+///   is 100% `NoCapacity` for every memory-manifest placement. Only
+///   `Failed` (probe ran, broke) and `Unknown` (never probed, but
+///   `schema >= 1` so it should have been) fail a *required*
+///   capability.
 /// - `fc_snapshot_version`: when `req` names a version AND the host
 ///   reports one, they must match exactly. Either side being `None`
 ///   imposes no constraint.
@@ -121,14 +126,20 @@ pub fn host_meets_capabilities(
     if !caps.bundle_stamp.is_ok() {
         return Err("bundle_stamp");
     }
+    // A required substrate capability passes when the probe ran and
+    // succeeded (`Ok`) OR when the host honestly reports it doesn't
+    // apply (`NotApplicable` — e.g. an ADR 0022 File-backend host that
+    // never configured the UFFD substrate). Only `Failed`/`Unknown`
+    // withhold placement.
+    let substrate_ok = |c: &CapStatus| matches!(c, CapStatus::Ok(_) | CapStatus::NotApplicable);
     if req.needs_uffd_substrate {
-        if !caps.base_shm_tmpfs.is_ok() {
+        if !substrate_ok(&caps.base_shm_tmpfs) {
             return Err("base_shm_tmpfs");
         }
-        if !caps.uffd_minor_shmem.is_ok() {
+        if !substrate_ok(&caps.uffd_minor_shmem) {
             return Err("uffd_minor_shmem");
         }
-        if !caps.nbd.is_ok() {
+        if !substrate_ok(&caps.nbd) {
             return Err("nbd");
         }
     }
@@ -806,17 +817,12 @@ mod tests {
             );
         }
 
-        /// Every `CapStatus` variant except `Ok` fails a REQUIRED
-        /// capability alike — `Failed`, `Unknown`, and `NotApplicable`
-        /// are not distinguished by the gate (only the fleet-view
-        /// rendering cares which one it was).
+        /// `Failed` (probe ran, broke) and `Unknown` (never probed,
+        /// though `schema >= 1` says it should have been) both fail a
+        /// REQUIRED substrate capability.
         #[test]
-        fn required_uffd_substrate_rejects_failed_unknown_and_not_applicable() {
-            for bad in [
-                CapStatus::Failed("EINVAL".into()),
-                CapStatus::Unknown,
-                CapStatus::NotApplicable,
-            ] {
+        fn required_uffd_substrate_rejects_failed_and_unknown() {
+            for bad in [CapStatus::Failed("EINVAL".into()), CapStatus::Unknown] {
                 let mut h = host(1);
                 h.capabilities = caps_with(
                     CapStatus::Ok(None),
@@ -836,6 +842,36 @@ mod tests {
                     "base_shm_tmpfs={bad:?} must fail a required substrate placement",
                 );
             }
+        }
+
+        /// ADR 0022: `NotApplicable` on the substrate caps is the
+        /// honest report of a File-backend FC host (the UFFD substrate
+        /// was never configured, so there's nothing to probe) — it
+        /// must PASS a required substrate placement, not fail it like
+        /// `Failed`/`Unknown` do. A File-mode fleet must stay
+        /// placeable for memory-manifest restores (finding 1,
+        /// PR #564 review): it serves them via the File-backend path
+        /// instead of UFFD.
+        #[test]
+        fn required_uffd_substrate_passes_when_not_applicable() {
+            let mut h = host(1);
+            h.capabilities = caps_with(
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::NotApplicable,
+                CapStatus::NotApplicable,
+                CapStatus::NotApplicable,
+                None,
+            );
+            let req = CapabilityRequirements {
+                needs_uffd_substrate: true,
+                fc_snapshot_version: None,
+            };
+            assert!(
+                host_meets_capabilities(&h, &req).is_ok(),
+                "a File-mode host (substrate caps NotApplicable) must remain placeable \
+                 for memory-manifest sessions"
+            );
         }
 
         #[test]
