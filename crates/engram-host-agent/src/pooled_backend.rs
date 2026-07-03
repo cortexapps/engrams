@@ -1786,6 +1786,13 @@ impl PooledBackend {
                         cache.put_no_evict(*hash, &current).await.map_err(|e| {
                             SandboxError::Snapshot(format!("land chunk {hash}: {e}"))
                         })?;
+                        // Review finding 3: this loop (the synchronous
+                        // pre-resume divergence pull, ADR 0045 C1) landed
+                        // chunks into the same local cache as
+                        // `migration_prestage`'s loop but left them
+                        // uncounted — undercounting peer-fill volume on
+                        // every warm migration resume.
+                        count_peer_chunk_fill(current.len());
                         landed += 1;
                         current = Vec::new();
                         current_idx = None;
@@ -2280,16 +2287,7 @@ impl PooledBackend {
                         // epic-gcs-free-resume's "GCS-free by policy"
                         // claim (the `source="gcs"` half lives at
                         // `engram-chunk-store::cache`'s leader-persist arm).
-                        metrics::counter!(
-                            "engram_chunk_fill_total",
-                            "source" => "peer",
-                        )
-                        .increment(1);
-                        metrics::counter!(
-                            "engram_chunk_fill_bytes_total",
-                            "source" => "peer",
-                        )
-                        .increment(current.len() as u64);
+                        count_peer_chunk_fill(current.len());
                     }
                     // C1 prestage never requests the post-copy disk
                     // items (those ride the C2 fetch poller).
@@ -4597,6 +4595,28 @@ fn emit_prefault_metrics(outcome: PrefaultOutcome) {
         )
         .increment(skipped as u64);
     }
+}
+
+/// ADR 0019 / telemetry restoration (#526), review findings 3 + 7: the
+/// `source="peer"` half of the peer-vs-GCS cache-fill split
+/// ([`engram_chunk_store::cache::CHUNK_FILL_TOTAL`] — the `source="gcs"`
+/// half lives in `engram-chunk-store::cache`'s leader-persist arm).
+/// Shared by both loops that land migration-sourced chunks into the
+/// local cache via `ChunkCache::put_no_evict`: `migration_prestage`'s
+/// per-item loop and `pull_chunks_from_source`'s divergence pull —
+/// finding 3 was that the latter wrote chunks uncounted, systematically
+/// undercounting peer volume.
+fn count_peer_chunk_fill(bytes: usize) {
+    metrics::counter!(
+        engram_chunk_store::cache::CHUNK_FILL_TOTAL,
+        "source" => "peer",
+    )
+    .increment(1);
+    metrics::counter!(
+        engram_chunk_store::cache::CHUNK_FILL_BYTES_TOTAL,
+        "source" => "peer",
+    )
+    .increment(bytes as u64);
 }
 
 #[async_trait]
