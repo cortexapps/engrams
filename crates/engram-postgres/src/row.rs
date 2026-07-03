@@ -374,33 +374,39 @@ fn capture_env_from_row(
     }
 }
 
-/// Issue #539: `enable_jobs.warm_stages` is a nullable JSONB column (`NULL`
-/// outside/before a capture ever wrote progress) — treat both a missing
-/// column and a SQL `NULL` as "no stage history yet".
+/// Issue #539: `enable_jobs.warm_stages` is a nullable JSONB column —
+/// `NULL` means "no stage history yet" (outside/before a capture ever
+/// wrote progress). Every current query projects this column (added by
+/// migration 0079 alongside the row's other four new columns, all of
+/// which use `.map_err(col_err)` — see `enable_job_from_row`); a missing
+/// column is a real bug (e.g. a future SELECT/RETURNING that forgets it),
+/// not a legacy-row case to default through silently.
 fn warm_stages_from_row(
     row: &PgRow,
 ) -> Result<Vec<engram_core::types::WarmStageRecord>, MetaError> {
-    match row.try_get::<Option<serde_json::Value>, _>("warm_stages") {
-        Ok(Some(v)) => {
-            serde_json::from_value(v).map_err(|e| MetaError::Serialization(e.to_string()))
-        }
-        Ok(None) => Ok(Vec::new()),
-        Err(_) => Ok(Vec::new()),
+    match row
+        .try_get::<Option<serde_json::Value>, _>("warm_stages")
+        .map_err(col_err)?
+    {
+        Some(v) => serde_json::from_value(v).map_err(|e| MetaError::Serialization(e.to_string())),
+        None => Ok(Vec::new()),
     }
 }
 
 fn capture_phase_from_row(
     row: &PgRow,
 ) -> Result<Option<engram_core::types::CapturePhase>, MetaError> {
-    match row.try_get::<Option<String>, _>("capture_phase") {
-        Ok(Some(s)) => Ok(match s.as_str() {
+    match row
+        .try_get::<Option<String>, _>("capture_phase")
+        .map_err(col_err)?
+    {
+        Some(s) => Ok(match s.as_str() {
             "boot" => Some(engram_core::types::CapturePhase::Boot),
             "warm" => Some(engram_core::types::CapturePhase::Warm),
             "snapshot" => Some(engram_core::types::CapturePhase::Snapshot),
             _ => None,
         }),
-        Ok(None) => Ok(None),
-        Err(_) => Ok(None),
+        None => Ok(None),
     }
 }
 
