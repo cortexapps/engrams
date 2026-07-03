@@ -1010,41 +1010,13 @@ fn harness_event_sink(
                 Ok(idx) => {
                     last_kind.insert(session_id, kind);
 
-                    // Issue #527 Phase 1: join this run-start against its
-                    // `prompt_received` receipt (one PG lookup per run-start —
-                    // runs are low-rate, acceptable per-event cost) and
-                    // record the true prompt→run-start latency. Skip
-                    // silently when there's no receipt (env-seeded initial
-                    // prompt) rather than treating it as an error.
-                    if let Some(pid) = &run_started_prompt_id {
-                        match meta.prompt_received_at(session_id, pid).await {
-                            Ok(Some(received_at)) => {
-                                let secs =
-                                    (Utc::now() - received_at).num_milliseconds() as f64 / 1000.0;
-                                if secs >= 0.0 {
-                                    metrics::histogram!(
-                                        crate::metrics::PROMPT_TO_RUN_STARTED_SECONDS
-                                    )
-                                    .record(secs);
-                                } else {
-                                    tracing::warn!(
-                                        session_id = %session_id,
-                                        prompt_id = %pid,
-                                        "prompt_received_at is after run_started; \
-                                         skipping negative-duration sample",
-                                    );
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => tracing::warn!(
-                                session_id = %session_id,
-                                prompt_id = %pid,
-                                error = %e,
-                                "prompt_received_at lookup failed",
-                            ),
-                        }
-                    }
-
+                    // PR #556 review finding #2: publish FIRST. This is the
+                    // live SSE frame the ADR-0052 held user-echo waits on to
+                    // un-hold and render — the metric join below is a
+                    // synchronous PG round-trip that must never sit in front
+                    // of it (worst case: the query's full timeout delays
+                    // every run_started delivery, precisely when a
+                    // contended Postgres makes that delay most costly).
                     events.publish(
                         session_id,
                         IndexedEvent {
@@ -1053,6 +1025,48 @@ fn harness_event_sink(
                             ephemeral: false,
                         },
                     );
+
+                    // Issue #527 Phase 1: join this run-start against its
+                    // `prompt_received` receipt (one PG lookup per run-start —
+                    // runs are low-rate, acceptable per-event cost) and
+                    // record the true prompt→run-start latency. Skip
+                    // silently when there's no receipt (env-seeded initial
+                    // prompt) rather than treating it as an error.
+                    //
+                    // PR #556 review finding #1: the elapsed seconds come
+                    // back already computed PG-side (`NOW() - created_at`,
+                    // one clock) — no coordinator-process `Utc::now()` is
+                    // mixed in, so there's no coordinator/Postgres (or
+                    // cross-replica) clock skew to bias or drop samples.
+                    if let Some(pid) = &run_started_prompt_id {
+                        match meta.prompt_received_seconds_ago(session_id, pid).await {
+                            Ok(Some(secs)) if secs >= 0.0 => {
+                                metrics::histogram!(crate::metrics::PROMPT_TO_RUN_STARTED_SECONDS)
+                                    .record(secs);
+                            }
+                            Ok(Some(secs)) => {
+                                // PG-side computation makes this all but
+                                // unreachable in practice (would require
+                                // Postgres's own clock to step backward
+                                // between the two reads in one query) — kept
+                                // as a defensive guard, not a routine branch.
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    prompt_id = %pid,
+                                    secs,
+                                    "prompt_received_seconds_ago went negative; \
+                                     skipping implausible sample",
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!(
+                                session_id = %session_id,
+                                prompt_id = %pid,
+                                error = %e,
+                                "prompt_received_seconds_ago lookup failed",
+                            ),
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1127,7 +1141,7 @@ pub(crate) mod tests {
     /// Issue #527 Phase 1: `PromptReceived` is coordinator-native (never
     /// constructed via `from_harness`), serialises under the stable
     /// `prompt_received` kind the tombstone-exclusion query in
-    /// `engram-postgres` and the `MetadataStore::prompt_received_at`
+    /// `engram-postgres` and the `MetadataStore::prompt_received_seconds_ago`
     /// lookup key on, and round-trips through serde untouched.
     #[test]
     fn prompt_received_has_stable_kind_and_round_trips() {
@@ -2074,9 +2088,9 @@ pub(crate) mod tests {
 
     /// Issue #527 Phase 1: a `run_started{prompt_id}` whose matching
     /// `prompt_received` receipt row doesn't exist (`MiniMeta`'s default
-    /// `prompt_received_at` — see `MetadataStore`'s default impl — returns
-    /// `Ok(None)`, mirroring the env-seeded initial prompt, which never
-    /// gets a receipt) must not panic and must still append the
+    /// `prompt_received_seconds_ago` — see `MetadataStore`'s default impl —
+    /// returns `Ok(None)`, mirroring the env-seeded initial prompt, which
+    /// never gets a receipt) must not panic and must still append the
     /// `run_started` event normally. The `engram_prompt_to_run_started_seconds`
     /// join is best-effort telemetry, never load-bearing for delivery.
     #[tokio::test]

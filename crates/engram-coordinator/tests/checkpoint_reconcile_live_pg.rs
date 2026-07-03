@@ -559,19 +559,26 @@ async fn rewind_excludes_prompt_received_from_tombstone_and_rolled_back_count() 
     );
 }
 
-/// Issue #527 Phase 1: `prompt_received_at` resolves the receipt row's
-/// `created_at` by `(session_id, prompt_id)` — the join key
+/// Issue #527 Phase 1: `prompt_received_seconds_ago` resolves the receipt
+/// row's age by `(session_id, prompt_id)` — the join key
 /// `engram_prompt_to_run_started_seconds` uses — and correctly returns
 /// `None` for an unknown / never-received prompt_id (the env-seeded
 /// initial prompt's case), never an error.
+///
+/// PR #556 review finding #1: the elapsed seconds are computed PG-side
+/// (`NOW() - created_at`) rather than handed back as a raw `created_at`
+/// timestamp for the caller to diff against its own process clock — this
+/// test asserts the *elapsed* value directly, which is what makes the
+/// live-Postgres assertion below immune to coordinator/test-process clock
+/// skew in the first place.
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn prompt_received_at_resolves_by_prompt_id_and_misses_cleanly() {
+async fn prompt_received_seconds_ago_resolves_by_prompt_id_and_misses_cleanly() {
     let Some(meta) = pg().await else { return };
     let (session_id, _sandbox) = seed_active(&meta).await;
 
     assert!(
-        meta.prompt_received_at(session_id, "never-sent")
+        meta.prompt_received_seconds_ago(session_id, "never-sent")
             .await
             .expect("lookup miss")
             .is_none(),
@@ -587,20 +594,21 @@ async fn prompt_received_at_resolves_by_prompt_id_and_misses_cleanly() {
     .await
     .expect("append receipt");
 
-    let resolved = meta
-        .prompt_received_at(session_id, "p-resolve")
+    let secs_ago = meta
+        .prompt_received_seconds_ago(session_id, "p-resolve")
         .await
         .expect("lookup hit")
         .expect("receipt present");
     assert!(
-        (resolved - before).num_seconds().abs() < 5,
-        "resolved created_at must match the receipt's insertion time",
+        (0.0..5.0).contains(&secs_ago),
+        "receipt was just inserted, so its age must be small and non-negative, \
+         got {secs_ago}",
     );
 
     // A different prompt_id on the same session is a clean miss, not a
     // false-positive match against the sibling receipt.
     assert!(meta
-        .prompt_received_at(session_id, "p-other")
+        .prompt_received_seconds_ago(session_id, "p-other")
         .await
         .expect("lookup miss 2")
         .is_none(),);

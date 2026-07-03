@@ -958,23 +958,30 @@ pub trait MetadataStore: Send + Sync {
         Ok(crate::types::event::RewindSummary::default())
     }
 
-    /// Issue #527 Phase 1: look up the durable `prompt_received` receipt
-    /// timestamp for a given `prompt_id` — the coordinator-authoritative
-    /// "the user asked at time T" fact, written as the first PG side-effect
-    /// of `send_prompt_core` (before auto-resume). Used by the harness-event
-    /// sink to compute `engram_prompt_to_run_started_seconds` when the
+    /// Issue #527 Phase 1: resolve the prompt→run-start latency for a given
+    /// `prompt_id` — the coordinator-authoritative "the user asked at time
+    /// T" receipt's age, written as the first PG side-effect of
+    /// `send_prompt_core` (before auto-resume). Used by the harness-event
+    /// sink to record `engram_prompt_to_run_started_seconds` when the
     /// matching `HarnessRunStarted{prompt_id}` lands. Returns `Ok(None)`
     /// when no receipt exists — the env-seeded initial prompt carries no
     /// `prompt_id` and never gets one, so this is an expected, non-error
     /// case the caller skips silently rather than treating as a bug.
     ///
+    /// PR #556 review finding #1: the elapsed seconds are computed
+    /// PG-side (`NOW() - created_at`, one clock) rather than by handing
+    /// the receipt's `created_at` back for the caller to diff against a
+    /// coordinator-process `Utc::now()` — mixing those two clocks biases
+    /// (or, under skew, silently drops) exactly the samples this metric
+    /// exists to capture.
+    ///
     /// Default `Ok(None)` so mocks without an event log are a clean no-op
     /// (they simply never emit the derived histogram).
-    async fn prompt_received_at(
+    async fn prompt_received_seconds_ago(
         &self,
         _session_id: SessionId,
         _prompt_id: &str,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
+    ) -> Result<Option<f64>, MetaError> {
         Ok(None)
     }
 

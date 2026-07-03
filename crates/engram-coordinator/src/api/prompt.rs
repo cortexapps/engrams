@@ -222,6 +222,19 @@ pub(crate) async fn send_prompt_core(
     // `rewind_session_to_cursor` excludes `prompt_received` from its
     // tombstone UPDATE. Best-effort like the user-echo emit below: an emit
     // failure logs + proceeds — we never 500 the caller over telemetry.
+    //
+    // PR #556 review finding #3: this write lands BEFORE any request
+    // validation below (session state, mid-move HOLD), so a subsequently
+    // rejected `SendPrompt` still leaves a permanent receipt row, and a
+    // client retry of a *retryable* rejection (e.g. the mid-move HOLD's
+    // documented Conflict) that reuses the same `prompt_id` writes a
+    // second one. This is spec-inherited from issue #527's emit-before-
+    // resume + `DESC LIMIT 1` design, not a regression introduced here —
+    // `prompt_received_seconds_ago`'s `ORDER BY idx DESC LIMIT 1` anchors
+    // on the LAST attempt, undercounting latency for the retried case.
+    // Deduplicating retries (or switching to `ASC LIMIT 1` to anchor on
+    // the user-perceived first ask) is left to a follow-up — out of scope
+    // for Phase 1, which only needed *a* durable receipt to exist.
     if let Err(e) = state
         .emit(
             id,

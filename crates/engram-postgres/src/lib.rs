@@ -2818,20 +2818,27 @@ impl MetadataStore for PostgresStore {
         rows.iter().map(row::persisted_event_from_row).collect()
     }
 
-    async fn prompt_received_at(
+    async fn prompt_received_seconds_ago(
         &self,
         session_id: SessionId,
         prompt_id: &str,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
+    ) -> Result<Option<f64>, MetaError> {
         // Issue #527 Phase 1: the receipt row is coordinator-authoritative
         // and excluded from the rewind tombstone (see
         // `rewind_session_to_cursor` below), so it is always the live head
-        // for this `prompt_id` — DESC LIMIT 1 is defensive (a prompt_id is
-        // minted fresh per SendPrompt, so duplicates are not expected on
-        // the happy path) rather than load-bearing.
+        // for this `prompt_id` — DESC LIMIT 1 is defensive against the
+        // retryable-Conflict duplicate-receipt case (a client retry of a
+        // rejected SendPrompt reusing the same `prompt_id` — see PR #556
+        // review finding #3) rather than a happy-path guarantee.
+        //
+        // PR #556 review finding #1: `NOW() - created_at` is computed here,
+        // PG-side, in the same query as the row read — a single clock, so
+        // there's no coordinator-vs-Postgres (or cross-replica) skew to
+        // bias or drop samples.
         let row = sqlx::query(
             r#"
-            SELECT created_at FROM session_events
+            SELECT EXTRACT(EPOCH FROM (NOW() - created_at)) AS secs_ago
+              FROM session_events
              WHERE session_id = $1 AND kind = 'prompt_received' AND payload->>'prompt_id' = $2
              ORDER BY idx DESC
              LIMIT 1
@@ -2842,7 +2849,7 @@ impl MetadataStore for PostgresStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
-        row.map(|r| sqlx::Row::try_get(&r, "created_at").map_err(db_err))
+        row.map(|r| sqlx::Row::try_get::<f64, _>(&r, "secs_ago").map_err(db_err))
             .transpose()
     }
 
