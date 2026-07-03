@@ -476,6 +476,9 @@ impl MetadataStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(MetaError::NotFound);
+        }
         Ok(())
     }
 
