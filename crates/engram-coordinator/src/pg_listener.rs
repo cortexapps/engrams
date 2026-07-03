@@ -87,9 +87,10 @@ async fn run(
     listener.listen("org_secret_changed").await?;
     // Issue #535 (a): boot-bundle cache invalidation. `enabled_image_changed`
     // fires on every enable/soft-delete/delete of an `enabled_images` row;
-    // `fleet_catalog_changed` fires only when a host's `current_bundles`
-    // stamp actually changes (the migration 0077 trigger's WHEN guard), not
-    // on every heartbeat.
+    // `fleet_catalog_changed` fires on every host INSERT (a new host's first
+    // bundle stamp) and, on UPDATE, only when `current_bundles` actually
+    // changes (the migration's UPDATE-trigger WHEN guard) — not on every
+    // heartbeat.
     listener.listen("enabled_image_changed").await?;
     listener.listen("fleet_catalog_changed").await?;
     tracing::info!(
