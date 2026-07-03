@@ -498,13 +498,14 @@ pub(crate) async fn capture_and_record_base_snapshot(
                 "base snapshot capture for `{}` could not reach host {host_id}: {msg}",
                 row.image_uri
             )),
-            engram_core::SandboxError::WireSkew { host: host_wire, coord } => {
-                ApiError::Unavailable(format!(
-                    "base snapshot capture for `{}` hit a WIRE_VERSION skew against host \
+            engram_core::SandboxError::WireSkew {
+                host: host_wire,
+                coord,
+            } => ApiError::Unavailable(format!(
+                "base snapshot capture for `{}` hit a WIRE_VERSION skew against host \
                      {host_id} (host={host_wire}, coord={coord})",
-                    row.image_uri
-                ))
-            }
+                row.image_uri
+            )),
             other => ApiError::Internal(format!(
                 "base snapshot capture for `{}` failed on host {host_id}: {other}",
                 row.image_uri
