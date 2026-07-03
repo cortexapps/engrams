@@ -253,14 +253,24 @@ async fn resume_origin_enqueue_requires_idle() {
 // ─── `placement_changed` NOTIFY wake ───────────────────────────────────
 //
 // These tests share ONE live Postgres with every other live-pg test in
-// this crate (nextest runs each `#[ignore]`'d test as its own process, in
-// parallel), and `run_once`'s placement path reads the FULL `hosts` table
-// (`candidates_for` → `list_active_hosts`, unscoped by test). Sessions
+// this crate, and `run_once`'s placement path reads the FULL `hosts` /
+// `sessions` tables (`candidates_for` → `list_active_hosts`, and the
+// queue sweep itself, are both unscoped by test). nextest's DEFAULT is to
+// run each `#[ignore]`'d test as its own process, in parallel — but this
+// file is NOT safe under that default: `ci.yml`'s "Postgres-gated ignored
+// tests" step runs the whole live-pg group with `--test-threads=1`, and
+// this file's tests actually require that serialization to be correct,
+// not just fast. In particular, `create_origin_timeout_fails_session_and_records_wait`
+// / `resume_origin_timeout_returns_to_idle` run `run_once` with a 1ms
+// timeout, which times out (Failed / Idle) EVERY queued row in the shared
+// database, not just their own — running them concurrently with any other
+// live-pg test that has an in-flight `queued` row would brick it. Sessions
 // that must NOT fit anywhere use a budget (1 TiB / 1000 vcpus) no other
 // test in this suite could accidentally satisfy; sessions that DO need
 // to fit are only asserted by "left `queued`", never by which host they
 // landed on, so accidentally fitting a concurrently-seeded foreign host
-// is harmless.
+// is harmless — but the destructive timeout sweeps above are not, and
+// depend on `--test-threads=1` for correctness, not merely determinism.
 
 /// A budget no live-pg test in this suite seeds a host large enough to
 /// satisfy — the "doesn't fit anywhere, ever" budget. Must stay LARGER
@@ -326,17 +336,40 @@ async fn build_app_state(
     Arc::new(AppState::new_with_registry(cfg, services, registry))
 }
 
-/// A `(mem, cpu)` budget derived from `id` — a fit CLASS no other session
-/// (this test run, a concurrently-running test on the same shared dev
-/// Postgres, or a leftover row from a previous run — this suite doesn't
-/// clean up after itself, matching the rest of this file) could plausibly
-/// share, so a session enqueued with it never contends for host capacity
-/// with an unrelated queue row. Comfortably under every host this file
-/// seeds (smallest is 2048 MiB).
-fn unique_fitting_budget(id: SessionId) -> (i64, i32) {
+/// A `(mem, cpu)` budget derived from `id`, restricted to the disjoint
+/// `[base, base+512)` MiB sub-range the CALLER owns — a fit CLASS no other
+/// session (this test run, a concurrently-running test on the same shared
+/// dev Postgres, or a leftover row from a previous run — this suite
+/// doesn't clean up after itself, matching the rest of this file) could
+/// plausibly share, so a session enqueued with it never contends for host
+/// capacity with an unrelated queue row.
+///
+/// The per-caller `base` matters, not just the per-`id` randomization
+/// within it: `hol_break_is_per_class_not_global`'s `B` is left `queued`
+/// forever whenever its `boot_placed_create` requeue races the test's own
+/// assertions (this harness has no `enabled_images` row, so the boot
+/// always fails and requeues), and this suite never cleans that up. A
+/// single shared range meant a leftover `B` from one run could later
+/// collide with `per_class_fifo_head_block_is_scoped_to_its_class`'s `y1`
+/// class on a rerun against a shared dev Postgres (~1/512 chance per
+/// leftover) and steal its exactly-sized host before `y1` got attempted —
+/// see finding 1 on PR #559. Disjoint ranges make that collision
+/// impossible by construction instead of merely unlikely.
+///
+/// Comfortably under every host this file seeds (smallest is 2048 MiB).
+fn unique_fitting_budget_in(id: SessionId, base: i64) -> (i64, i32) {
     let low = (id.as_uuid().as_u128() & 0xffff) as i64; // 0..=65535
-    (1024 + (low % 512), 1) // 1024..=1535 MiB
+    (base + (low % 512), 1)
 }
+
+/// [`unique_fitting_budget_in`]'s range for `hol_break_is_per_class_not_global`.
+const HOL_BREAK_BUDGET_BASE_MIB: i64 = 1024; // 1024..=1535 MiB
+
+/// [`unique_fitting_budget_in`]'s range for
+/// `per_class_fifo_head_block_is_scoped_to_its_class` — disjoint from
+/// [`HOL_BREAK_BUDGET_BASE_MIB`] by more than the 512-wide span either
+/// draws from.
+const PER_CLASS_FIFO_BUDGET_BASE_MIB: i64 = 2048; // 2048..=2559 MiB
 
 /// Does `session_id`'s durable event log contain a `status_changed` event
 /// whose `to` field is `to`? Durable proof that the scanner attempted (and
@@ -381,13 +414,37 @@ async fn cordon_unmeasured_hosts(meta: &Arc<dyn MetadataStore>) {
     }
 }
 
+/// Shared preamble for the queue-fairness tests below: connect, optionally
+/// cordon unmeasured hosts (`cordon_unmeasured_hosts` — only the tests
+/// asserting something never fits anywhere need this; the timeout and
+/// NOTIFY-wake tests don't), and build a full `AppState` wired to this
+/// same Postgres so `queue_scanner::run_once` (and, for the wake test,
+/// `queue_scanner::spawn`) can be driven directly. Every test below
+/// repeated this same connect+cordon+`build_app_state` preamble verbatim;
+/// extracted to a single fixture helper instead (test-fixture dedupe, per
+/// review on PR #559).
+async fn setup(
+    cordon: bool,
+) -> Option<(
+    Arc<dyn MetadataStore>,
+    Arc<engram_coordinator::AppState>,
+    String,
+)> {
+    let meta = connect().await?;
+    if cordon {
+        cordon_unmeasured_hosts(&meta).await;
+    }
+    let database_url = std::env::var("ENGRAM_TEST_DATABASE_URL").unwrap();
+    let state = build_app_state(meta.clone(), &database_url).await;
+    Some((meta, state, database_url))
+}
+
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn hol_break_is_per_class_not_global() {
-    let Some(meta) = connect().await else { return };
-    cordon_unmeasured_hosts(&meta).await;
-    let database_url = std::env::var("ENGRAM_TEST_DATABASE_URL").unwrap();
-    let state = build_app_state(meta.clone(), &database_url).await;
+    let Some((meta, state, _database_url)) = setup(true).await else {
+        return;
+    };
 
     // Size the host EXACTLY to B's own randomized budget (not a round
     // shared number like 4096) — otherwise a leftover, never-cleaned-up
@@ -396,7 +453,7 @@ async fn hol_break_is_per_class_not_global() {
     // placed onto it by this same sweep, and consume the capacity B
     // needs before the sweep reaches B's class.
     let b = SessionId::new();
-    let (b_mem, b_cpu) = unique_fitting_budget(b);
+    let (b_mem, b_cpu) = unique_fitting_budget_in(b, HOL_BREAK_BUDGET_BASE_MIB);
     let host = seed_ready_host(&meta, b_mem as u64, 8).await;
 
     // A (unfittable, older) then B (fits, newer) — the pre-fix scanner's
@@ -447,18 +504,20 @@ async fn hol_break_is_per_class_not_global() {
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn per_class_fifo_head_block_is_scoped_to_its_class() {
-    let Some(meta) = connect().await else { return };
-    cordon_unmeasured_hosts(&meta).await;
-    let database_url = std::env::var("ENGRAM_TEST_DATABASE_URL").unwrap();
-    let state = build_app_state(meta.clone(), &database_url).await;
+    let Some((meta, state, _database_url)) = setup(true).await else {
+        return;
+    };
 
     // Size the host EXACTLY to Y1's own randomized budget — see the
     // comment in `hol_break_is_per_class_not_global` for why a round
     // shared capacity (e.g. 4096) is vulnerable to an unrelated leftover
     // `queued` row (several other tests in this file use a fixed 4096/2
     // budget and never clean up) stealing the host's capacity mid-sweep.
+    // Draws from a disjoint sub-range from `hol_break`'s own `B` (see
+    // `unique_fitting_budget_in`) so a leftover `B` row from a previous
+    // local run can never collide with this test's class either.
     let y1 = SessionId::new();
-    let (y1_mem, y1_cpu) = unique_fitting_budget(y1);
+    let (y1_mem, y1_cpu) = unique_fitting_budget_in(y1, PER_CLASS_FIFO_BUDGET_BASE_MIB);
     let _host = seed_ready_host(&meta, y1_mem as u64, 8).await;
 
     // Class X: two SAME-budget (unfittable) sessions, x1 older than x2.
@@ -506,9 +565,9 @@ async fn per_class_fifo_head_block_is_scoped_to_its_class() {
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn create_origin_timeout_fails_session_and_records_wait() {
-    let Some(meta) = connect().await else { return };
-    let database_url = std::env::var("ENGRAM_TEST_DATABASE_URL").unwrap();
-    let state = build_app_state(meta.clone(), &database_url).await;
+    let Some((meta, state, _database_url)) = setup(false).await else {
+        return;
+    };
 
     let sid = SessionId::new();
     meta.enqueue_session_create(sid, &spec(), UNFITTABLE_MEM_MIB, UNFITTABLE_CPU_VCPUS, None)
@@ -547,9 +606,9 @@ async fn create_origin_timeout_fails_session_and_records_wait() {
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn resume_origin_timeout_returns_to_idle() {
-    let Some(meta) = connect().await else { return };
-    let database_url = std::env::var("ENGRAM_TEST_DATABASE_URL").unwrap();
-    let state = build_app_state(meta.clone(), &database_url).await;
+    let Some((meta, state, _database_url)) = setup(false).await else {
+        return;
+    };
 
     // Drive a fresh session to Idle via the legal FSM chain (no real boot
     // needed — transition_session is a pure DB flip), then park it back
@@ -692,9 +751,9 @@ async fn notify_placement_changed_fires_at_every_site() {
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn scanner_wakes_on_notify_and_places_within_the_wake_not_the_fallback() {
-    let Some(meta) = connect().await else { return };
-    let database_url = std::env::var("ENGRAM_TEST_DATABASE_URL").unwrap();
-    let state = build_app_state(meta.clone(), &database_url).await;
+    let Some((meta, state, database_url)) = setup(false).await else {
+        return;
+    };
 
     // A dedicated, distinctively oversized host so no OTHER
     // concurrently-running test's host could accidentally satisfy the
