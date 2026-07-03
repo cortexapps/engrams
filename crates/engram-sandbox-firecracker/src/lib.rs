@@ -674,9 +674,10 @@ struct FcSnapshotManifest {
     /// Tag mirroring `VzSnapshotManifest::format` so a cross-VMM
     /// restore (FC pulling a VZ blob, or vice versa) fails fast with
     /// a clear message instead of a confusing parse error inside
-    /// load_snapshot. Defaults to empty for snapshots written before
-    /// this field landed; `restore` accepts both `"fc"` and `""` for
-    /// backwards compat.
+    /// load_snapshot. `restore` requires this to be exactly `"fc"` —
+    /// the old empty-format backwards-compat acceptance (for snapshots
+    /// written before this field landed) was retired; every manifest
+    /// on disk now postdates the field.
     #[serde(default)]
     format: String,
     /// ADR 0007 / Phase 5: chunked memory manifest ref. Populated by
