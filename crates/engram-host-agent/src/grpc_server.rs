@@ -748,13 +748,21 @@ impl HostService for HostServiceImpl {
         req: Request<SandboxIdMessage>,
     ) -> Result<Response<BrowserPortResponse>, Status> {
         let id = decode_sandbox_id(&req.into_inner().uuid)?;
-        let port = self
+        let start = self
             .inner
             .start_browser(id)
             .await
             .map_err(sandbox_to_status)?;
+        // Issue #569: agentd's chromium-CDP liveness warning — the browser
+        // stack's x11vnc is up (the RPC succeeded) but chrome may be dead or
+        // crash-looping behind it. Log with the sandbox id and forward to the
+        // coordinator; diagnostic only, never a failure.
+        if let Some(warning) = &start.warning {
+            tracing::warn!(sandbox_id = %id, %warning, "start_browser: chromium liveness warning");
+        }
         Ok(Response::new(BrowserPortResponse {
-            port: u32::from(port),
+            port: u32::from(start.port),
+            warning: start.warning,
         }))
     }
 

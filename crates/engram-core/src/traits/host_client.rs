@@ -23,7 +23,7 @@
 use async_trait::async_trait;
 
 use crate::error::SandboxError;
-use crate::traits::sandbox::{ForgeSink, HarnessDial, HarnessSink, UploadSink};
+use crate::traits::sandbox::{BrowserStart, ForgeSink, HarnessDial, HarnessSink, UploadSink};
 use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::image::WarmConfig;
@@ -430,11 +430,13 @@ pub trait HostClient: Send + Sync {
     }
 
     /// ADR 0065: bring up the ephemeral in-guest browser stack (Xvfb + x11vnc +
-    /// headful chromium with the CDP debug port) and return the VNC port. The
-    /// coordinator calls this before opening a relay tunnel to x11vnc :5900
-    /// (ADR 0066); the browser is reached over the vsock port relay, not a
-    /// direct dial. Default `NotFound` — only host-agent impls own a browser.
-    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+    /// headful chromium with the CDP debug port) and return the VNC port plus
+    /// an optional chromium-liveness warning (issue #569 — see
+    /// [`BrowserStart`]). The coordinator calls this before opening a relay
+    /// tunnel to x11vnc :5900 (ADR 0066); the browser is reached over the
+    /// vsock port relay, not a direct dial. Default `NotFound` — only
+    /// host-agent impls own a browser.
+    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<BrowserStart, SandboxError> {
         let _ = sandbox_id;
         Err(SandboxError::NotFound)
     }

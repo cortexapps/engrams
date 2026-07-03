@@ -281,6 +281,16 @@ async fn run(args: Args) -> std::io::Result<()> {
              accepting any host that can reach the listener"
         );
     }
+    // Issue #569: agentd is pid 1 in the guest, and the detached browser
+    // stack (Xvfb/openbox/chromium/x11vnc, ADR 0065) reparents to it on
+    // exit — with nothing reaping those orphans they piled up as zombies
+    // without bound. Spawn once, for the agent's whole lifetime; it never
+    // touches a pid registered in `engram_agentd::reaper`'s tracked-pid set
+    // (the `/exec` child, the harness supervisor's cached child, ttyd), so
+    // it can't steal an exit status a synchronous `try_wait()`/`wait()`
+    // elsewhere is relying on.
+    engram_agentd::reaper::spawn();
+
     // ADR 0015 M1: one supervisor owns the harness child process
     // across the lifetime of the agent. Shared across all
     // serve_connection tasks so a fresh `SpawnHarness` from any

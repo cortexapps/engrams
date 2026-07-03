@@ -211,6 +211,7 @@ where
                 Ok(outcome) => WireResponse::BrowserReady {
                     port: outcome.port,
                     spawned: outcome.spawned,
+                    cdp_warning: outcome.cdp_warning,
                 },
                 Err(e) => WireResponse::Error {
                     kind: format!("{:?}", e.kind()),
@@ -298,9 +299,15 @@ where
         // reach child.wait — we'd otherwise leak the process.
         .kill_on_drop(true);
 
-    let mut child = cmd
-        .spawn()
+    // Issue #569: `spawn_tracked` registers the pid with the reaper's
+    // tracked-pid set atomically with the spawn itself (see `crate::reaper`),
+    // so agentd's init-style zombie reaper never races this handle's own
+    // `child.wait()` for the exit status. `TrackedChild::new` re-asserts the
+    // (already-set) registration and untracks on drop, covering every return
+    // path below (including the timeout branch).
+    let mut child = crate::reaper::spawn_tracked(&mut cmd)
         .map_err(|e| io::Error::new(e.kind(), format!("spawn {:?}: {e}", req.command[0])))?;
+    let _tracked = child.id().map(crate::reaper::TrackedChild::new);
 
     // stdin is fire-and-forget: drain the buffer, then close.
     if let Some(bytes) = req.stdin {

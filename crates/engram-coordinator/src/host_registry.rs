@@ -782,7 +782,10 @@ impl HostClient for HostRegistry {
         backend.acquire_shell(sandbox_id).await
     }
 
-    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+    async fn start_browser(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.start_browser(sandbox_id).await
     }
