@@ -109,6 +109,16 @@ non-cache writers, or a cold-started pod with an empty in-memory pin set, is swe
 one interval regardless of whether anything is being populated. Side benefit: the size/
 free/pinned/budget gauges now refresh every interval instead of only on a populate.
 
+The sweeper deliberately skips `tokio::time::interval`'s immediate t=0 tick and waits a
+full `interval` before its first sweep. A t=0 sweep runs before the image-prefetch
+supervisor's reconcile (which needs a coordinator RPC round trip) has re-established the
+in-memory pin set, so on a host that restarts already over budget it would evict
+pin-blind — oldest-mtime-first, i.e. exactly the boot-staged base-image chunks pinned in
+the prior life — flapping readiness and re-fetching from GCS on every rollout of a host
+sitting at or over budget (the first rollout of this ADR does exactly that: prod caches
+sit ~182 GB against the ~179 GB derived budget). The populate-path debounced sweep still
+bounds growth from writes during that first interval.
+
 ### 3. Single evictor
 
 `ChunkCacheConfig::eviction_enabled` (default `true`) lets a cache populate (write,
@@ -147,10 +157,15 @@ filesystem — never reformats a device with live data) and mounts the device at
 inside the dedicated volume's tree. The chart also sets
 `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT=true`, and the host-agent hard-fails at boot (before
 touching `work_dir` or registering) unless `work_dir` resolves to a distinct filesystem
-from `/` (an `st_dev` comparison, walking up to the nearest existing ancestor since
-`work_dir` may not exist yet on a fresh host) — guarding the base-shm-startup-race failure
-class where a rolled pod starts before the mount is visible and silently shadow-writes the
-boot disk.
+from a boot-disk reference path (`ENGRAM_HOST_ROOT_REF_PATH`, an `st_dev` comparison,
+walking up `work_dir` to the nearest existing ancestor since it may not exist yet on a
+fresh host) — guarding the base-shm-startup-race failure class where a rolled pod starts
+before the mount is visible and silently shadow-writes the boot disk. The reference path
+defaults to `/`, correct on bare metal, but the chart overrides it to a read-only hostPath
+mount of the NODE's `/` at `/mnt/host-root`: the host-agent container's OWN `/` is the
+pod's ephemeral image overlayfs, which is on a distinct device from EVERY hostPath mount
+by construction, so comparing against it would always report "distinct filesystem" and
+the gate would never fire (caught in review — see "Post-review fixes" below).
 
 **Framing, stated explicitly:** the dedicated volume moves *accounting*, not bytes. The
 kubelet's nodefs signal (the boot disk) stops seeing cache growth, so cache pressure can
@@ -193,3 +208,29 @@ the chart half + the boot gate.
   a test-scoped metrics recorder, and the crate's `Gauge` type doesn't expose a `get()`
   accessor. The gauge *values* are a scrape-time/e2e concern, covered by the prod-rollout
   verification step, not a pure unit test.
+
+## Post-review fixes
+
+A deep review pass before undrafting found two real bugs in the shipped mechanics (both
+now fixed, in the commit chain on top of the four listed above) plus a stale coordinator
+comment:
+
+- **Mountpoint gate was vacuous in the K8s DaemonSet it was built for.** The original
+  implementation compared `work_dir`'s `st_dev` against the host-agent container's own
+  `/` — always the pod's image overlayfs, always a distinct device from any hostPath
+  mount, so the gate reported "distinct filesystem" (and returned `Ok`) unconditionally,
+  whether or not the dedicated volume had actually mounted. Fixed by introducing
+  `ENGRAM_HOST_ROOT_REF_PATH` (default `/`, unaffected on bare metal) and having the chart
+  point it at a read-only hostPath mount of the NODE's `/` (`/mnt/host-root`), added to
+  the host-agent DaemonSet only when `storage.dedicatedDevice` is set. The gate's unit
+  tests were also host-layout-dependent (implicitly assumed the test tempdir shares `/`'s
+  filesystem, true on ubuntu CI runners and macOS's APFS firmlinks but false on any Linux
+  box with `/tmp` on tmpfs) — reworked to construct both sides of the comparison
+  explicitly under the same tempdir root, deterministic regardless of host layout.
+- **The sweeper's first tick fired at t=0, before pins exist.** See the "Periodic
+  enforcement" section above — fixed by consuming the interval's immediate first tick
+  before entering the sweep loop, so the first real sweep lands at t=`interval` instead of
+  t=0.
+- `engram-coordinator`'s `--mode=all` wiring comment (dev/e2e single-process path) still
+  claimed the pre-this-ADR "defaults to 200 GiB" budget; updated to describe the
+  disk-derived default and the `create_dir_all` side effect of `from_env_or_default`.
