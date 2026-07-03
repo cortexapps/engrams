@@ -10338,4 +10338,67 @@ mod tests {
         std::env::remove_var("ENGRAM_EVICTION_FINALIZE_MAX_ATTEMPTS");
         std::mem::forget(tmp);
     }
+
+    /// Finding 6: `snapshot_begin`'s own `supports_diff_checkpoints()` gate
+    /// — the only thing keeping a VZ/Process host on the composed
+    /// `snapshot()` pipeline instead of the host-durable eviction finalize
+    /// path — must surface `InvalidSpec` (the coordinator's `idle_evictor`
+    /// falls through to `snapshot()` on exactly that variant). `ProcessBackend`
+    /// doesn't override the trait default (`false`), the same shape VZ is
+    /// (module doc: "Gate: VZ/Process ... surface `InvalidSpec`").
+    #[tokio::test]
+    async fn snapshot_begin_returns_invalidspec_over_a_non_diff_checkpoint_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = ChunkStore::new(blob);
+        let inner = Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
+        assert!(
+            !inner.supports_diff_checkpoints(),
+            "test premise: ProcessBackend must not opt into diff checkpoints"
+        );
+        let pooled = PooledBackend::new(inner)
+            .with_chunk_store(cs, tmp.path().join("materialize"))
+            .with_checkpoint_dir(tmp.path().join("checkpoints"));
+
+        let err = pooled
+            .snapshot_begin(SandboxId::new())
+            .await
+            .expect_err("a non-diff-checkpoint backend must not enter the host-durable path");
+        assert!(
+            matches!(err, SandboxError::InvalidSpec(_)),
+            "expected InvalidSpec (the idle_evictor's composed-path fallback signal), got {err:?}"
+        );
+    }
+
+    /// Finding 6, second half: the same gate's `checkpoint_dir` half. A
+    /// diff-checkpoint-capable backend (FC-shaped) with no `checkpoint_dir`
+    /// wired (checkpointing disabled on this host) must also surface
+    /// `InvalidSpec`, not attempt to persist a finalize record with nowhere
+    /// durable to put it.
+    #[tokio::test]
+    async fn snapshot_begin_returns_invalidspec_without_a_wired_checkpoint_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = ChunkStore::new(blob);
+        let inner: Arc<dyn SandboxBackend> = Arc::new(FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: tmp.path().join("fc-snaps"),
+            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+        });
+        // Deliberately no `.with_checkpoint_dir(..)`.
+        let pooled = PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialize"));
+
+        let err = pooled
+            .snapshot_begin(SandboxId::new())
+            .await
+            .expect_err("no wired checkpoint_dir must not enter the host-durable path");
+        assert!(
+            matches!(err, SandboxError::InvalidSpec(_)),
+            "expected InvalidSpec (the idle_evictor's composed-path fallback signal), got {err:?}"
+        );
+    }
 }
