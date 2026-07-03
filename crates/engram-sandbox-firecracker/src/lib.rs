@@ -4752,10 +4752,18 @@ impl SandboxBackend for FirecrackerBackend {
         // signal its own resume over an already-held vsock connection).
         let max_attempts: u32 = 5;
         let mut attempt: u32 = 0;
-        let t_spawn = std::time::Instant::now();
         let resp: engram_agentd::WireResponse = loop {
             attempt += 1;
             let span = tracing::info_span!("fc.spawn_harness", attempt);
+            // Per-attempt, not per-round-trip: reset at the top of each
+            // iteration so `connect_ms` below measures THIS attempt's
+            // CONNECT leg only. A single Instant hoisted above the loop
+            // would accumulate prior attempts' full connect+write+read
+            // plus their 50 ms backoff sleeps into later attempts'
+            // `connect_ms`, corrupting the sub-leg split the ADR 0045 C1
+            // diagnosis below relies on (a slow CONNECT reading as a
+            // starved guest that was actually just a late retry).
+            let t_attempt = std::time::Instant::now();
             let inner = async {
                 let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
                 // ADR 0045 C1 tail diagnosis: split the handshake into
@@ -4766,7 +4774,7 @@ impl SandboxBackend for FirecrackerBackend {
                 tracing::info!(
                     sandbox_id = %id,
                     attempt,
-                    connect_ms = t_spawn.elapsed().as_millis() as u64,
+                    connect_ms = t_attempt.elapsed().as_millis() as u64,
                     "spawn-harness vsock connected",
                 );
                 engram_agentd::write_msg(&mut conn, &req)
@@ -4816,6 +4824,17 @@ impl SandboxBackend for FirecrackerBackend {
         match resp {
             engram_agentd::WireResponse::HarnessSpawned { pid, ca_changed } => {
                 let elapsed = phase_start.elapsed().as_secs_f64();
+                // `ca_changed` is only authoritative at `attempt == 1`.
+                // agentd's `last_pem` cache is keyed on the PEM content,
+                // not on this round trip: if attempt 1's request landed
+                // and installed a genuinely new CA (changed=true) but the
+                // *response* was lost to a retryable error (connection
+                // reset / broken pipe — not just the early-eof muxer-
+                // settle race), attempt 2 resends the identical PEM, hits
+                // the now-warm cache, and reports changed=false — masking
+                // the ADR 0045 C1 cross-host-resume signal on exactly the
+                // retried-restore path. Treat `ca_changed=false` with
+                // `attempt > 1` as "unknown", not "no rotation happened".
                 tracing::info!(
                     sandbox_id = %id,
                     elapsed_ms = (elapsed * 1000.0) as u64,
