@@ -1173,26 +1173,46 @@ impl HostAgent {
                         &guest_mem.unwrap_or_default(),
                     );
                     ram_ledger_tx_for_heartbeat.send_replace(ram_snapshot);
-                    ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "running_vms")
-                        .set(ram_snapshot.running_vm_pss_mib as f64);
-                    ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "parked_paused")
-                        .set(ram_snapshot.parked_paused_pss_mib as f64);
-                    ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "base_shm")
-                        .set(ram_snapshot.base_shm_mib as f64);
-                    ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "base_shm_pending")
-                        .set(ram_snapshot.base_shm_pending_mib as f64);
-                    ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "parked_local_memfiles")
-                        .set(ram_snapshot.parked_local_memfile_mib as f64);
-                    ::metrics::gauge!(crate::metrics::HOST_RAM_ALLOCATABLE_MIB)
-                        .set(ram_snapshot.allocatable_mib() as f64);
-                    ::metrics::gauge!(crate::metrics::HOST_BASE_SHM_TMPFS_TOTAL_MIB)
-                        .set(ram_snapshot.base_shm_tmpfs_total_mib as f64);
-                    ::metrics::gauge!(crate::metrics::HOST_BASE_SHM_TMPFS_USED_MIB)
-                        .set(ram_snapshot.base_shm_mib as f64);
+                    // Issue #540 review finding 3: gate every ledger gauge
+                    // on `measured` — VZ/Process/non-Linux backends (and a
+                    // genuine `/proc/meminfo` parse failure) never took a
+                    // real sample, so `ram_snapshot` is the all-zero
+                    // default. Emitting that as a value would look like
+                    // "this host has 0 MiB of everything" on a dashboard
+                    // instead of "unmeasured" — matches the acceptance
+                    // criterion's "gauges not emitted" posture.
+                    if ram_snapshot.measured {
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "running_vms")
+                            .set(ram_snapshot.running_vm_pss_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "parked_paused")
+                            .set(ram_snapshot.parked_paused_pss_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "base_shm")
+                            .set(ram_snapshot.base_shm_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "base_shm_pending")
+                            .set(ram_snapshot.base_shm_pending_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "parked_local_memfiles")
+                            .set(ram_snapshot.parked_local_memfile_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_ALLOCATABLE_MIB)
+                            .set(ram_snapshot.allocatable_mib() as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_BASE_SHM_TMPFS_TOTAL_MIB)
+                            .set(ram_snapshot.base_shm_tmpfs_total_mib as f64);
+                        // Issue #540 review finding 5: this is the tmpfs
+                        // mount's own `statfs` used figure (`f_blocks -
+                        // f_bfree`), NOT `base_shm_mib` (this ledger's
+                        // st_blocks walk over known files) — the two can
+                        // legitimately diverge (an unlinked-but-open file,
+                        // a stray subdir) and this gauge exists specifically
+                        // to catch that divergence during an ENOSPC-class
+                        // incident.
+                        ::metrics::gauge!(crate::metrics::HOST_BASE_SHM_TMPFS_USED_MIB)
+                            .set(ram_snapshot.base_shm_tmpfs_used_mib as f64);
+                    }
                     // Issue #540: single emission site for this gauge (was
                     // previously only set inside the idle-evictor's
                     // pressure-aware branch, so it read stale/unset when
-                    // that mode was off). Every tick now, unconditionally.
+                    // that mode was off). Every tick now, unconditionally
+                    // (still gated on `measured` via `free_pct()`'s own
+                    // `None` return).
                     if let Some(pct) = ram_snapshot.free_pct() {
                         ::metrics::gauge!(crate::metrics::HOST_MEM_FREE_PCT).set(f64::from(pct));
                     }

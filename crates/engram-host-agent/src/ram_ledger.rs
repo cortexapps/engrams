@@ -33,7 +33,7 @@
 //! the existing gauges.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use engram_core::traits::sandbox::GuestMemoryStats;
 use engram_core::types::manifest::ManifestRef;
@@ -77,17 +77,33 @@ pub struct RamLedgerSnapshot {
     /// shm dir (`ENGRAM_FC_UFFD_BASE_DIR`). What's actually resident on
     /// the tmpfs right now.
     pub base_shm_mib: u64,
-    /// Registered prewarm charges not yet reflected in
-    /// `base_shm_mib` — i.e. bytes `image_prefetch` has promised to
-    /// write but the pwrite loop hasn't finished (or the file hasn't
-    /// been re-scanned) yet. Subtracted from `allocatable_mib` so
-    /// placement sees the charge within one heartbeat tick of prewarm
-    /// start rather than minutes later when the write completes.
+    /// The UNWRITTEN remainder of registered prewarm charges — i.e.
+    /// bytes `image_prefetch` has promised to write, minus whatever
+    /// `st_blocks` already shows as allocated on that specific target
+    /// file. Netting against the file's own allocated-blocks count
+    /// (rather than charging the full promised total for the whole
+    /// write window) is what keeps this from double-subtracting: as
+    /// the pwrite loop lands pages, `MemAvailable` drops AND this
+    /// figure shrinks by the same amount, instead of `MemAvailable`
+    /// dropping while the full charge stays outstanding. Subtracted
+    /// from `allocatable_mib` so placement sees the charge within one
+    /// heartbeat tick of prewarm start rather than minutes later when
+    /// the write completes.
     pub base_shm_pending_mib: u64,
+    /// `statfs` USED capacity (MiB) of the base-shm tmpfs itself
+    /// (`f_blocks − f_bfree`) — distinct from `base_shm_mib`, which is
+    /// this ledger's own `st_blocks` walk over the regular files it
+    /// knows about. `statfs` sees the tmpfs mount's true occupancy
+    /// (an unlinked-but-open file from a `base_shm_gc` race, a stray
+    /// subdir/temp file, …) that a flat `read_dir` over known files
+    /// cannot — exactly the ENOSPC-class incident this gauge exists to
+    /// debug.
+    pub base_shm_tmpfs_used_mib: u64,
     /// `statfs` total capacity (MiB) of the base-shm tmpfs — the fixed
     /// `uffdBaseTmpfsSize` cap. Surfaces the ceiling before it's hit
     /// (the 2026-06-28 `pwrite ... No space left on device` incident
-    /// class), alongside `base_shm_mib` for a used/total ratio.
+    /// class), alongside `base_shm_tmpfs_used_mib` for a used/total
+    /// ratio.
     pub base_shm_tmpfs_total_mib: u64,
     /// NVMe-resident retained memfiles (epic-parking-ladder rung 3).
     /// DISK-side, gauge-only here — chunk-cache-disk-budget (#528) owns
@@ -135,10 +151,14 @@ impl RamLedgerSnapshot {
 pub struct RamLedger {
     /// Manifest-ref-keyed because a prewarm is per memory manifest —
     /// the same key `image_prefetch` already uses to address the
-    /// base-shm file (`uffd_base_path_in`). Bytes, not MiB, so the
-    /// pending charge is exact until the final MiB rounding in
-    /// `sample`.
-    pending: Mutex<HashMap<ManifestRef, u64>>,
+    /// base-shm file (`uffd_base_path_in`). Value is `(target path,
+    /// expected non-hole bytes)`: the path is what lets `sample` net
+    /// the charge against how much of THAT file is actually allocated
+    /// right now, instead of charging the full total for the entire
+    /// write window (the transient double-charge fix — see
+    /// [`RamLedgerSnapshot::base_shm_pending_mib`]). Expected bytes are
+    /// exact (not MiB-rounded) until the final rounding in `sample`.
+    pending: Mutex<HashMap<ManifestRef, (PathBuf, u64)>>,
 }
 
 impl RamLedger {
@@ -149,11 +169,12 @@ impl RamLedger {
     /// Register an expected base-shm write BEFORE calling
     /// `prewarm_base_shm`, so the very next heartbeat tick charges the
     /// bytes against `allocatable_mib` — the prewarm-charging fix.
-    /// `bytes` is the manifest's non-hole byte total (Σ chunk lengths),
-    /// not `total_bytes` (which includes elided/zero ranges the
-    /// prewarm never writes).
-    pub fn register_pending_base_shm(&self, key: ManifestRef, bytes: u64) {
-        self.pending.lock().insert(key, bytes);
+    /// `path` is the exact file `prewarm_base_shm` is about to write
+    /// (`uffd_base_path_in`); `bytes` is the manifest's non-hole byte
+    /// total (Σ chunk lengths), not `total_bytes` (which includes
+    /// elided/zero ranges the prewarm never writes).
+    pub fn register_pending_base_shm(&self, key: ManifestRef, path: PathBuf, bytes: u64) {
+        self.pending.lock().insert(key, (path, bytes));
     }
 
     /// Settle (remove) a pending charge — call in BOTH the success and
@@ -166,8 +187,35 @@ impl RamLedger {
         self.pending.lock().remove(key);
     }
 
+    /// Σ (expected − already-allocated) over every registered charge —
+    /// the UNWRITTEN remainder, not the raw promised total. Nets each
+    /// charge against its own target file's current `st_blocks` so the
+    /// charge shrinks exactly as fast as `MemAvailable` actually drops
+    /// during the write, instead of remaining fully subtracted for the
+    /// whole multi-minute window (the fix for the transient double-
+    /// charge: a ~19 GiB prewarm at 90% written no longer under-reports
+    /// `allocatable_mib` by ~17 GiB).
+    #[cfg(target_os = "linux")]
+    fn pending_unwritten_bytes(&self) -> u64 {
+        self.pending
+            .lock()
+            .values()
+            .map(|(path, expected)| expected.saturating_sub(file_allocated_bytes(path)))
+            .sum()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn pending_unwritten_bytes(&self) -> u64 {
+        self.pending
+            .lock()
+            .values()
+            .map(|(_, expected)| *expected)
+            .sum()
+    }
+
+    #[cfg(test)]
     fn pending_total_bytes(&self) -> u64 {
-        self.pending.lock().values().sum()
+        self.pending.lock().values().map(|(_, bytes)| *bytes).sum()
     }
 
     /// Build one snapshot: the meminfo read, the guest-PSS split
@@ -184,9 +232,9 @@ impl RamLedger {
         // "unmeasured" from "measured and legitimately idle" — the same
         // heuristic `mem_pressure_from`'s `total_mib == 0` check uses.
         let measured = mem_total_mib > 0;
-        let (base_shm_mib, base_shm_tmpfs_total_mib) = match base_dir {
+        let (base_shm_mib, base_shm_tmpfs_used_mib, base_shm_tmpfs_total_mib) = match base_dir {
             Some(dir) => tmpfs_stat_mib(dir),
-            None => (0, 0),
+            None => (0, 0, 0),
         };
         RamLedgerSnapshot {
             measured,
@@ -195,7 +243,8 @@ impl RamLedger {
             running_vm_pss_mib: guest.pss_bytes / MIB,
             parked_paused_pss_mib: guest.parked_pss_bytes / MIB,
             base_shm_mib,
-            base_shm_pending_mib: self.pending_total_bytes() / MIB,
+            base_shm_pending_mib: self.pending_unwritten_bytes() / MIB,
+            base_shm_tmpfs_used_mib,
             base_shm_tmpfs_total_mib,
             // Rung 3 (parked-local-memfile) is disk-side and doesn't
             // exist yet; chunk-cache-disk-budget (#528) owns it.
@@ -204,37 +253,42 @@ impl RamLedger {
     }
 }
 
-/// `(used_mib, total_mib)` for the base-shm dir: `used` is Σ allocated
-/// blocks (`st_blocks * 512`) over its regular files — the ACTUAL
-/// tmpfs bytes resident, not the sparse `st_size` (a base-shm file is
-/// grow-only and holes stay unwritten). `total` is `statfs`'s
-/// `f_blocks * f_frsize` — the tmpfs's fixed size cap. `(0, 0)` on any
-/// read error (missing dir, permission, non-Linux): fail soft.
+/// `(dir_used_mib, tmpfs_used_mib, tmpfs_total_mib)` for the base-shm
+/// dir. `dir_used_mib` is Σ allocated blocks (`st_blocks * 512`) over
+/// its known regular files — this ledger's own per-file accounting
+/// (`base_shm_mib`), not the sparse `st_size` (a base-shm file is
+/// grow-only and holes stay unwritten). `tmpfs_used_mib`/
+/// `tmpfs_total_mib` are `statfs`'s own `f_blocks − f_bfree` /
+/// `f_blocks` (both `* f_frsize`) — the tmpfs mount's ACTUAL occupancy
+/// and fixed size cap, which can see bytes the dir walk can't (an
+/// unlinked-but-open file, a stray subdir). `(0, 0, 0)` on any read
+/// error (missing dir, permission, non-Linux): fail soft.
 #[cfg(target_os = "linux")]
-fn tmpfs_stat_mib(dir: &Path) -> (u64, u64) {
-    let used_mib = base_shm_used_mib(dir);
-    let total_mib = match nix::sys::statvfs::statvfs(dir) {
+fn tmpfs_stat_mib(dir: &Path) -> (u64, u64, u64) {
+    let dir_used_mib = base_shm_used_mib(dir);
+    let (tmpfs_used_mib, tmpfs_total_mib) = match nix::sys::statvfs::statvfs(dir) {
         Ok(stat) => {
             let frag: u64 = stat.fragment_size();
-            stat.blocks().saturating_mul(frag) / MIB
+            let total_mib = stat.blocks().saturating_mul(frag) / MIB;
+            let free_mib = stat.blocks_free().saturating_mul(frag) / MIB;
+            (total_mib.saturating_sub(free_mib), total_mib)
         }
-        Err(_) => 0,
+        Err(_) => (0, 0),
     };
-    (used_mib, total_mib)
+    (dir_used_mib, tmpfs_used_mib, tmpfs_total_mib)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn tmpfs_stat_mib(_dir: &Path) -> (u64, u64) {
-    (0, 0)
+fn tmpfs_stat_mib(_dir: &Path) -> (u64, u64, u64) {
+    (0, 0, 0)
 }
 
 #[cfg(target_os = "linux")]
 fn base_shm_used_mib(dir: &Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
-    let mut total_blocks: u64 = 0;
+    let mut total_bytes: u64 = 0;
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else {
             continue;
@@ -244,9 +298,26 @@ fn base_shm_used_mib(dir: &Path) -> u64 {
         }
         // `st_blocks` is always in 512-byte units regardless of the
         // filesystem's actual block size (POSIX `stat(2)`).
-        total_blocks = total_blocks.saturating_add(meta.blocks());
+        use std::os::unix::fs::MetadataExt;
+        total_bytes = total_bytes.saturating_add(meta.blocks().saturating_mul(512));
     }
-    total_blocks.saturating_mul(512) / MIB
+    total_bytes / MIB
+}
+
+/// Allocated bytes (`st_blocks * 512`) for one specific file — the
+/// per-charge half of the pending-charge netting fix (see
+/// [`RamLedger::pending_unwritten_bytes`]): unlike `base_shm_used_mib`
+/// (a whole-dir walk), this stats exactly the file a registered
+/// prewarm charge is writing to. `0` on any read error (file not yet
+/// created, permission, non-Linux): fail soft — an unwritten file
+/// correctly nets to "0 written so far", leaving the full charge
+/// outstanding.
+#[cfg(target_os = "linux")]
+fn file_allocated_bytes(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.blocks().saturating_mul(512))
+        .unwrap_or(0)
 }
 
 /// Free MiB on the base-shm tmpfs, for the prewarm headroom pre-check
@@ -286,6 +357,7 @@ mod tests {
             parked_paused_pss_mib: parked,
             base_shm_mib: 0,
             base_shm_pending_mib: pending,
+            base_shm_tmpfs_used_mib: 0,
             base_shm_tmpfs_total_mib: 0,
             parked_local_memfile_mib: 0,
         }
@@ -349,11 +421,17 @@ mod tests {
         let ledger = RamLedger::new();
         let key = ManifestRef::new();
         let empty = GuestMemoryStats::default();
+        // Nonexistent path: `file_allocated_bytes` fails soft to 0, so
+        // the full charge stays outstanding (nothing has been written
+        // yet) — this test is about register/settle bookkeeping, not
+        // the netting-against-written-bytes behavior (covered
+        // separately by `pending_charge_nets_against_bytes_already_written`).
+        let path = PathBuf::from("/nonexistent/engram/ram-ledger-test.mem");
 
         let before = ledger.sample(None, &empty);
         assert_eq!(before.base_shm_pending_mib, 0);
 
-        ledger.register_pending_base_shm(key, 19 * MIB * 1024); // ~19 GiB
+        ledger.register_pending_base_shm(key, path, 19 * MIB * 1024); // ~19 GiB
         let during = ledger.sample(None, &empty);
         assert_eq!(during.base_shm_pending_mib, 19 * 1024);
         assert!(during.allocatable_mib() <= before.allocatable_mib());
@@ -371,6 +449,65 @@ mod tests {
         // must not panic and must leave the pending total unchanged.
         ledger.settle_pending(&ManifestRef::new());
         assert_eq!(ledger.pending_total_bytes(), 0);
+    }
+
+    /// Issue #540 review finding 2: the transient double-charge
+    /// regression test. Before the fix, `base_shm_pending_mib` stayed
+    /// at the full registered charge for the entire write window even
+    /// as bytes actually landed on disk — double-subtracting the
+    /// written fraction from `allocatable_mib` (a ~19 GiB prewarm at
+    /// 90% written under-reported by ~17 GiB). This proves the charge
+    /// nets down as the target file's `st_blocks` grows.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_charge_nets_against_bytes_already_written() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("base.mem");
+        std::fs::File::create(&path).expect("create");
+
+        let ledger = RamLedger::new();
+        let key = ManifestRef::new();
+        let empty = GuestMemoryStats::default();
+
+        // Register a 10 MiB charge before any bytes are written — the
+        // full charge should be outstanding.
+        ledger.register_pending_base_shm(key, path.clone(), 10 * MIB);
+        let before_write = ledger.sample(None, &empty);
+        assert_eq!(
+            before_write.base_shm_pending_mib, 10,
+            "an unwritten file must leave the full charge outstanding"
+        );
+
+        // Write 4 MiB into the SAME file the charge targets — simulates
+        // the pwrite loop landing part of the promised bytes.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen for write");
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&[0xAB; 4 * 1024 * 1024]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let mid_write = ledger.sample(None, &empty);
+        assert!(
+            mid_write.base_shm_pending_mib < before_write.base_shm_pending_mib,
+            "the charge must shrink as bytes actually land: before={} mid={}",
+            before_write.base_shm_pending_mib,
+            mid_write.base_shm_pending_mib,
+        );
+        assert!(
+            mid_write.base_shm_pending_mib <= 6,
+            "≥4 of the 10 MiB charge must be netted out once 4 MiB is on disk, \
+             got {} MiB still pending",
+            mid_write.base_shm_pending_mib,
+        );
+
+        ledger.settle_pending(&key);
+        let after_settle = ledger.sample(None, &empty);
+        assert_eq!(after_settle.base_shm_pending_mib, 0);
     }
 
     #[cfg(target_os = "linux")]
@@ -409,7 +546,49 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn tmpfs_stat_mib_on_missing_dir_fails_soft() {
-        let (used, total) = tmpfs_stat_mib(Path::new("/nonexistent/engram/base-shm-probe"));
-        assert_eq!((used, total), (0, 0));
+        let (dir_used, tmpfs_used, tmpfs_total) =
+            tmpfs_stat_mib(Path::new("/nonexistent/engram/base-shm-probe"));
+        assert_eq!((dir_used, tmpfs_used, tmpfs_total), (0, 0, 0));
+    }
+
+    /// Issue #540 review finding 4: pins the "one source of truth"
+    /// invariant at the mechanism level — a snapshot published on a
+    /// `tokio::sync::watch` channel is what every independent reader
+    /// (heartbeat gauges, `UtilizationProbe::sample`, the idle-
+    /// evictor's pressure gate) actually observes, byte-identical, with
+    /// no reader-side divergence possible. `RamLedgerSnapshot` derives
+    /// `PartialEq`, so this is a genuine equality check, not a
+    /// tautology.
+    #[test]
+    fn ram_ledger_snapshot_round_trips_through_watch_channel() {
+        let ledger = RamLedger::new();
+        let key = ManifestRef::new();
+        ledger.register_pending_base_shm(key, PathBuf::from("/nonexistent/probe.mem"), 4 * MIB);
+        let published = ledger.sample(None, &GuestMemoryStats::default());
+
+        let (tx, mut rx_heartbeat) = tokio::sync::watch::channel(RamLedgerSnapshot::default());
+        let mut rx_evictor = tx.subscribe();
+
+        tx.send_replace(published);
+
+        // Two independent readers, borrowing at different times, must
+        // see the exact same value the writer published — this is what
+        // makes the heartbeat's gauges and the evictor's pressure gate
+        // structurally unable to disagree.
+        assert_eq!(
+            *rx_heartbeat.borrow_and_update(),
+            published,
+            "heartbeat reader must observe exactly what was published"
+        );
+        assert_eq!(
+            *rx_evictor.borrow_and_update(),
+            published,
+            "evictor reader must observe exactly what was published"
+        );
+        assert_eq!(
+            *rx_heartbeat.borrow(),
+            *rx_evictor.borrow(),
+            "two independent watch readers must never diverge"
+        );
     }
 }

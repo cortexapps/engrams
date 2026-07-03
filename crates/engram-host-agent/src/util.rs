@@ -228,6 +228,7 @@ mod tests {
             parked_paused_pss_mib: 12_000,
             base_shm_mib: 5_000,
             base_shm_pending_mib: 1_000,
+            base_shm_tmpfs_used_mib: 5_000,
             base_shm_tmpfs_total_mib: 32_000,
             parked_local_memfile_mib: 0,
         };

@@ -660,7 +660,11 @@ async fn prefetch_one(
                          the handler's lazy path backstops",
                     );
                 } else {
-                    ram_ledger.register_pending_base_shm(memory_ref, pending_bytes);
+                    ram_ledger.register_pending_base_shm(
+                        memory_ref,
+                        base_path.clone(),
+                        pending_bytes,
+                    );
                     let prewarm_result =
                         prewarm_base_shm(&base_path, &memory_manifest, chunk_store, chunk_cache)
                             .await;
