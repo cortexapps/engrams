@@ -1318,7 +1318,7 @@ fn decode_bincode<T: serde::de::DeserializeOwned>(
 /// deterministic, non-retryable classification, so an unknown kind never
 /// accidentally gets the retry treatment reserved for `WarmExecTransport`.
 fn parse_capture_failure_kind(kind: &str) -> engram_core::types::CaptureFailureKind {
-    engram_core::types::CaptureFailureKind::parse(kind).unwrap_or({
+    engram_core::types::CaptureFailureKind::parse(kind).unwrap_or_else(|| {
         tracing::warn!(
             kind,
             "unrecognized CaptureFailureKind on the wire; treating as WarmExitNonZero"
