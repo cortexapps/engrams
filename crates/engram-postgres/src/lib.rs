@@ -500,8 +500,14 @@ impl MetadataStore for PostgresStore {
         } else {
             // Lock the candidate host rows so concurrent placers (any coord
             // replica) serialize on the overlap — a burst can't read the same
-            // pre-insert reserved figure and stack onto one host. Held only
-            // for the pick + insert below (sub-ms).
+            // pre-insert reserved figure and stack onto one host. Issue #535
+            // (b): unlike the old `reserve_placement`, this lock is now held
+            // for the REST of the transaction, not just the pick + insert —
+            // `tx.commit()` is at the bottom of this function, after the
+            // sealed-secrets insert, the per-capability insert loop, and the
+            // integration-policy upsert all run on the same `tx`. A
+            // many-capability create serializes concurrent placers on that
+            // whole multi-round-trip critical section, not a sub-ms window.
             let host_rows = sqlx::query(
                 r#"
                 SELECT id, allocatable_mib, total_vcpus
