@@ -1092,12 +1092,6 @@ mod tests {
         async fn delete_enabled_image(&self, _: &str) -> Result<(), engram_core::MetaError> {
             unreachable!()
         }
-        async fn upsert_session_secrets(
-            &self,
-            _: engram_core::types::registry::SessionSecrets,
-        ) -> Result<(), engram_core::MetaError> {
-            unreachable!()
-        }
         async fn get_session_secrets(
             &self,
             _: engram_core::SessionId,

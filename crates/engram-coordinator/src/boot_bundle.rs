@@ -426,12 +426,6 @@ mod tests {
         async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
             unimplemented!()
         }
-        async fn upsert_session_secrets(
-            &self,
-            _: engram_core::types::SessionSecrets,
-        ) -> Result<(), MetaError> {
-            unimplemented!()
-        }
         async fn get_session_secrets(
             &self,
             _: engram_core::SessionId,

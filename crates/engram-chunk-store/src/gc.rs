@@ -443,12 +443,6 @@ mod tests {
         async fn delete_enabled_image(&self, _uri: &str) -> Result<(), MetaError> {
             Ok(())
         }
-        async fn upsert_session_secrets(
-            &self,
-            _secrets: engram_core::types::SessionSecrets,
-        ) -> Result<(), MetaError> {
-            Ok(())
-        }
         async fn get_session_secrets(
             &self,
             _session_id: SessionId,

@@ -1303,8 +1303,9 @@ pub trait MetadataStore: Send + Sync {
     // sealed blob to rebuild the post-resume harness's launch env;
     // without persistence the in-VM bootstrap respawns a Claude
     // child with no OAuth token and the user gets re-prompted to
-    // log in.
-    async fn upsert_session_secrets(&self, secrets: SessionSecrets) -> Result<(), MetaError>;
+    // log in. The write happens inside `reserve_and_persist_create`'s
+    // transaction (`SessionCreateWriteSet::sealed_secrets`) — there is no
+    // standalone upsert; only `get`/`delete` remain as trait methods.
     async fn get_session_secrets(
         &self,
         session_id: SessionId,
@@ -1360,19 +1361,9 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
-    /// ADR 0062: persist the session's selected harness name (the catalog key)
-    /// so the queue scanner + resume can reconstruct which harness to mount on
-    /// `dyn_0` + exec. `None` for a dev-VM session.
-    async fn set_session_harness(
-        &self,
-        session_id: SessionId,
-        harness: Option<&str>,
-    ) -> Result<(), MetaError> {
-        let _ = (session_id, harness);
-        Ok(())
-    }
-
-    /// ADR 0062: the session's persisted harness selection, or `None`.
+    /// ADR 0062: the session's persisted harness selection, or `None`. The
+    /// write happens inside `reserve_and_persist_create`'s transaction
+    /// (issue #535 (b)) — there is no standalone setter.
     async fn get_session_harness(
         &self,
         session_id: SessionId,

@@ -3772,32 +3772,6 @@ impl MetadataStore for PostgresStore {
         }
     }
 
-    async fn upsert_session_secrets(&self, secrets: SessionSecrets) -> Result<(), MetaError> {
-        sqlx::query(
-            r#"
-            INSERT INTO session_secrets
-                (session_id, wrapped_dek, nonce, ciphertext, key_id, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (session_id) DO UPDATE SET
-                wrapped_dek = EXCLUDED.wrapped_dek,
-                nonce       = EXCLUDED.nonce,
-                ciphertext  = EXCLUDED.ciphertext,
-                key_id      = EXCLUDED.key_id,
-                created_at  = EXCLUDED.created_at
-            "#,
-        )
-        .bind(secrets.session_id.as_uuid())
-        .bind(&secrets.wrapped_dek)
-        .bind(&secrets.nonce)
-        .bind(&secrets.ciphertext)
-        .bind(&secrets.key_id)
-        .bind(secrets.created_at)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
     async fn get_session_secrets(
         &self,
         session_id: SessionId,
@@ -3928,20 +3902,6 @@ impl MetadataStore for PostgresStore {
             Some(r) => Ok(Some(sqlx::Row::try_get(&r, "policy_json").map_err(db_err)?)),
             None => Ok(None),
         }
-    }
-
-    async fn set_session_harness(
-        &self,
-        session_id: SessionId,
-        harness: Option<&str>,
-    ) -> Result<(), MetaError> {
-        sqlx::query("UPDATE sessions SET harness = $1 WHERE id = $2")
-            .bind(harness)
-            .bind(session_id.as_uuid())
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(())
     }
 
     async fn get_session_harness(

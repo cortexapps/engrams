@@ -502,12 +502,6 @@ impl MetadataStore for MockMetadataStore {
         self.enabled.lock().remove(uri);
         Ok(())
     }
-    async fn upsert_session_secrets(
-        &self,
-        _: engram_core::types::SessionSecrets,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
     async fn get_session_secrets(
         &self,
         _: SessionId,
