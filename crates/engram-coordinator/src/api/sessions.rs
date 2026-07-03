@@ -655,9 +655,19 @@ async fn boot_prepared(
         prefer_host: None,
         // ADR 0068: a fresh create with an FC memory-manifest base
         // snapshot needs a host with a healthy UFFD substrate. No
-        // `fc_snapshot_version` constraint on create — that pairing
-        // only matters for RESTORING a previously-captured snapshot
-        // (resume/evac), not for booting from the base template.
+        // `fc_snapshot_version` constraint on create — NOT because a
+        // create is somehow exempt from the cross-`SNAPSHOT_VERSION`
+        // corruption class (a create IS an FC restore of the base
+        // snapshot, ADR 0020; there is no warm pool). Base-template rows
+        // now DO carry a real `fc_snapshot_version`
+        // (`enabled_images.rs::capture_and_record_base_snapshot`), but
+        // this `PreparedBoot` assembly only has `enabled.
+        // base_snapshot_memory_manifest`, not the base row's recorded
+        // version — the query that builds `enabled` would need a new
+        // column threaded through before a create could pair against it.
+        // Deferred as a follow-up; not done here to keep this review-fix
+        // pass scoped to the two `record_snapshot` call sites (PR #564
+        // review findings 2/3).
         caps: crate::placement::CapabilityRequirements {
             needs_uffd_substrate,
             fc_snapshot_version: None,
