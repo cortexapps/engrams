@@ -254,7 +254,7 @@ pub async fn run_with_registry_and_local(
     // POST /api/enabled-images. Lease-claimed per job, so multiple
     // coord pods cooperate instead of duplicating pipelines.
     let _enable_scanner = enable_scanner::spawn(
-        enable_scanner::EnableScannerConfig::default(),
+        enable_scanner::EnableScannerConfig::from_env(),
         state.clone(),
     );
 

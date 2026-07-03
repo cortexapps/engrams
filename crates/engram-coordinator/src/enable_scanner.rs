@@ -97,6 +97,11 @@ pub struct EnableScannerConfig {
     pub prestage_timeout: Duration,
 }
 
+/// Every field here is a pure constant — no I/O. Env resolution
+/// (`ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS`) happens at the use-site via
+/// [`EnableScannerConfig::from_env`], cf. `placement::placement_ttl`
+/// (review finding 6, PR #565: a `Default` impl doing env I/O + silently
+/// swallowing a rejected value is surprising and untestable).
 impl Default for EnableScannerConfig {
     fn default() -> Self {
         Self {
@@ -108,21 +113,41 @@ impl Default for EnableScannerConfig {
             claim_limit: 2,
             max_attempts: 5,
             progress_interval: Duration::from_secs(2),
-            prestage_timeout: prestage_timeout_from_env(),
+            prestage_timeout: DEFAULT_PRESTAGE_TIMEOUT,
         }
     }
 }
 
-/// `ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS`, default 1200 (20 min). A
-/// non-positive/unparseable value falls back to the default rather than
-/// producing a zero-wait or negative-duration timeout.
-fn prestage_timeout_from_env() -> Duration {
-    std::env::var("ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&secs| secs > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(1200))
+const DEFAULT_PRESTAGE_TIMEOUT: Duration = Duration::from_secs(1200);
+
+impl EnableScannerConfig {
+    /// Resolves `ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS` on top of the pure
+    /// [`Default`]. This is the constructor `spawn`'s caller should use in
+    /// production; tests that want the bare constant use `::default()` (or
+    /// `..Default::default()`) directly. Unlike the old `Default` impl, an
+    /// unparseable or non-positive value is NOT silently swallowed — it's
+    /// a config typo (e.g. `=0` plausibly meant "skip the wait"), so it's
+    /// worth a `warn!` on boot rather than a silent 1200s.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(raw) = std::env::var("ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS") {
+            match raw.parse::<u64>() {
+                Ok(secs) if secs > 0 => cfg.prestage_timeout = Duration::from_secs(secs),
+                Ok(_) => tracing::warn!(
+                    raw = %raw,
+                    default_secs = DEFAULT_PRESTAGE_TIMEOUT.as_secs(),
+                    "ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS must be > 0; using the default"
+                ),
+                Err(e) => tracing::warn!(
+                    raw = %raw,
+                    error = %e,
+                    default_secs = DEFAULT_PRESTAGE_TIMEOUT.as_secs(),
+                    "ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS is not a valid u64; using the default"
+                ),
+            }
+        }
+        cfg
+    }
 }
 
 /// Spawn the scanner as a background task. Caller holds the
@@ -1033,5 +1058,57 @@ mod tests {
             .expect("a fully-stamped row must project to a ref");
         assert_eq!(r.image_uri, row.image_uri);
         assert_eq!(r.manifest_digest.as_str(), DIGEST);
+    }
+
+    // ---- review finding 6 (PR #565): `Default` stays pure; env I/O + the
+    // reject-vs-fallback decision live in `from_env` ----
+
+    const PRESTAGE_ENV: &str = "ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS";
+
+    #[test]
+    fn default_is_pure_and_does_not_touch_the_env() {
+        // SAFETY: serial test on a process-global env var (matches the
+        // `chunk_gc::tests` convention for this crate's other `from_env`s).
+        std::env::set_var(PRESTAGE_ENV, "99999");
+        let cfg = EnableScannerConfig::default();
+        std::env::remove_var(PRESTAGE_ENV);
+        assert_eq!(
+            cfg.prestage_timeout, DEFAULT_PRESTAGE_TIMEOUT,
+            "Default must be a pure constant, unaffected by the env"
+        );
+    }
+
+    #[test]
+    fn from_env_unset_uses_the_default() {
+        std::env::remove_var(PRESTAGE_ENV);
+        let cfg = EnableScannerConfig::from_env();
+        assert_eq!(cfg.prestage_timeout, DEFAULT_PRESTAGE_TIMEOUT);
+    }
+
+    #[test]
+    fn from_env_valid_value_overrides_the_default() {
+        std::env::set_var(PRESTAGE_ENV, "45");
+        let cfg = EnableScannerConfig::from_env();
+        std::env::remove_var(PRESTAGE_ENV);
+        assert_eq!(cfg.prestage_timeout, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn from_env_zero_or_garbage_falls_back_to_the_default() {
+        // Zero (plausibly meant "skip the wait") and unparseable garbage
+        // must both fall back rather than producing a zero-wait or
+        // negative-duration timeout — the review flagged the OLD `Default`
+        // impl for swallowing this silently. Falling back is still
+        // correct; the fix is that it's now observable (`warn!`), which
+        // this unit test can't assert on but the reject-path is exercised.
+        for v in ["0", "not-a-number", "-5"] {
+            std::env::set_var(PRESTAGE_ENV, v);
+            let cfg = EnableScannerConfig::from_env();
+            assert_eq!(
+                cfg.prestage_timeout, DEFAULT_PRESTAGE_TIMEOUT,
+                "value {v:?} must fall back to the default, not silently zero/garbage"
+            );
+        }
+        std::env::remove_var(PRESTAGE_ENV);
     }
 }
