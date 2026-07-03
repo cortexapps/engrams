@@ -169,6 +169,14 @@ pub(crate) async fn run_once(
                         // Skip this one; don't starve the rest on a transient.
                         continue;
                     }
+                    PlaceOutcome::ImageGone => {
+                        // `place_create` already terminally failed the
+                        // session (review finding 3) — just release and
+                        // keep sweeping; an image-gone head must not block
+                        // the rest of the queue.
+                        drop(lease);
+                        continue;
+                    }
                 }
             }
             QueueOrigin::Resume => {
@@ -203,6 +211,11 @@ enum PlaceOutcome {
     Placed(engram_core::HostId),
     NoCapacity,
     Error,
+    /// Review finding 3 (PR #565): the image was live when this session
+    /// queued but was disabled while it waited. `place_create` already
+    /// terminally failed the session (image-shaped, not a queue timeout);
+    /// the caller just drops the lease and moves on.
+    ImageGone,
 }
 
 /// Re-attempt placement for a create-origin queued session: rank
@@ -212,22 +225,42 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
     // ADR 0036 amendment (issue #538): same digest gate the live create
     // path applies (`api/sessions.rs::boot_prepared`) — a queued create is
     // still a CREATE, so it must not place onto a host that hasn't staged
-    // this image's base snapshot. Tolerant lookup (`get_enabled_image_any`,
-    // matching `prepare_from_row`): a lookup miss/failure degrades to no
-    // digest gate rather than wedging the sweep — `place_queued_session`
-    // still enforces capacity, and `boot_placed_create`'s `prepare_from_row`
-    // will 404 on a genuinely-gone image right after.
+    // this image's base snapshot.
+    //
+    // Review finding 3 (PR #565): this MUST be the live-only lookup
+    // (`get_enabled_image`, matching the fresh-create path at
+    // `sessions.rs::prepare_from_grpc`), not the tolerant
+    // `get_enabled_image_any` `prepare_from_row` uses. That tolerant
+    // lookup's rationale is the RESUME path's invariant (a session pins its
+    // own lineage, so a soft-deleted image is still fine to resume onto) —
+    // it does not hold for a CREATE that hasn't placed yet. With the
+    // tolerant lookup, disabling an image out from under a queued create
+    // pins `required_image_digest` to a digest every host's prefetch
+    // supervisor has already unpinned (`image_prefetch.rs`), so candidates
+    // are empty on every sweep forever and the session dies at queue
+    // timeout with a misleading capacity-shaped error instead of a crisp
+    // image-shaped one.
     let required_image_digest = match state
         .services
         .meta
-        .get_enabled_image_any(&q.session.image)
+        .get_enabled_image(&q.session.image)
         .await
     {
         Ok(Some(row)) => Some(engram_protocol::heartbeat::ManifestDigest::new(
             row.manifest_digest,
         )),
-        Ok(None) => None,
+        Ok(None) => {
+            // Live lookup miss: the image was disabled while this session
+            // queued. Fail it now, image-shaped, instead of wedging until
+            // the (much longer) queue timeout.
+            return fail_queued_create_image_gone(state, q).await;
+        }
         Err(e) => {
+            // Transient PG error: keep the old degrade-to-no-gate behavior
+            // rather than failing a session over a blip — `place_queued_session`
+            // still enforces capacity, and `boot_placed_create`'s
+            // `prepare_from_row` (tolerant, correctly) will 404 on a
+            // genuinely-gone image right after if this guess was wrong.
             tracing::debug!(session_id = %q.session.id, error = %e,
                 "queue-scanner: enabled-image lookup failed for digest gate; placing without it");
             None
@@ -389,6 +422,46 @@ async fn dequeue_resume(state: &SharedState, q: &QueuedSession) {
         tracing::info!(%session_id, error = %e,
             "queue-scanner: resume after dequeue did not complete (may re-queue)");
     }
+}
+
+/// Review finding 3 (PR #565): fail a queued create whose target image was
+/// disabled while it waited — a crisp image-shaped failure now, instead of
+/// silently degrading the digest gate (which would wedge candidates empty
+/// on every sweep until the much longer queue timeout). Mirrors
+/// `time_out_session`'s `Create` arm: user-visible event before the
+/// terminal flip.
+async fn fail_queued_create_image_gone(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
+    let session_id = q.session.id;
+    if let Err(e) = state
+        .services
+        .meta
+        .append_session_event(
+            session_id,
+            "queue_image_gone",
+            serde_json::json!({
+                "image": q.session.image,
+                "reason": "image was disabled while the session waited for capacity",
+            }),
+        )
+        .await
+    {
+        tracing::warn!(%session_id, error = %e, "queue-scanner: queue_image_gone event failed");
+    }
+    match state
+        .services
+        .meta
+        .transition_session(session_id, SessionState::Failed)
+        .await
+    {
+        Ok(prev) => emit_from(state, session_id, prev, SessionState::Failed).await,
+        Err(e) => tracing::warn!(%session_id, error = %e,
+            "queue-scanner: image-gone Queued→Failed failed"),
+    }
+    ::metrics::counter!(crate::metrics::QUEUE_OUTCOME_TOTAL, "outcome" => "image_gone")
+        .increment(1);
+    tracing::warn!(%session_id, image = %q.session.image,
+        "queue-scanner: queued create's image was disabled while waiting; failing");
+    PlaceOutcome::ImageGone
 }
 
 /// Time out a head-of-queue session: create → `Failed` + a user-visible
