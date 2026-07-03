@@ -147,6 +147,49 @@ async fn events_cursor_round_trips_and_survives_null_rerecord() {
     assert_eq!(back.events_cursor, Some(99));
 }
 
+/// Finding 7 (issue #529 Testing item): `record_snapshot`'s `RETURNING
+/// (xmax = 0) AS inserted` idiom against REAL Postgres — `true` on the
+/// first (INSERT) landing, `false` on every idempotent re-record
+/// (UPDATE via `ON CONFLICT (id) DO UPDATE`). The heartbeat reconcile
+/// uses this bool to emit `SnapshotTaken` exactly once; the mocks
+/// (`state.rs` MiniMeta, `api.rs`, `grpc_app.rs`) hand-roll the same
+/// logic in Rust, so a misreport in the actual SQL has no other red
+/// test.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn record_snapshot_returns_inserted_true_on_insert_false_on_rerecord() {
+    let Some(meta) = pg().await else { return };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    let mut row = checkpoint_row(session_id, Utc::now(), Some(1));
+    let inserted = meta
+        .record_snapshot(row.clone())
+        .await
+        .expect("first record");
+    assert!(inserted, "the first landing of a snapshot id must INSERT");
+
+    // Idempotent re-record of the SAME id (e.g. a heartbeat retry, or the
+    // reconciler re-ingesting a checkpoint the eviction pipeline already
+    // recorded) must UPDATE, not INSERT.
+    row.last_accessed_at = Utc::now();
+    let inserted_again = meta
+        .record_snapshot(row.clone())
+        .await
+        .expect("idempotent re-record");
+    assert!(
+        !inserted_again,
+        "a re-record of an existing snapshot id must UPDATE (xmax != 0), not INSERT again"
+    );
+
+    // A genuinely new snapshot id is, again, an INSERT.
+    let other = checkpoint_row(session_id, Utc::now(), Some(2));
+    let inserted_other = meta.record_snapshot(other).await.expect("second record");
+    assert!(
+        inserted_other,
+        "a distinct snapshot id must INSERT even though a row already exists for the session"
+    );
+}
+
 /// `latest_event_idx_at_or_before` resolves the pause-instant cursor
 /// from real `session_events` rows.
 #[tokio::test]
