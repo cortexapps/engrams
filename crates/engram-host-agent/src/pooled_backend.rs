@@ -7421,10 +7421,7 @@ mod tests {
     /// channel must carry the full (closed) stage history.
     #[tokio::test]
     async fn warm_hook_two_stages_then_exit_zero_succeeds_with_ordered_progress() {
-        use std::sync::{OnceLock, Weak};
-
         struct Probe {
-            weak: OnceLock<Weak<PooledBackend>>,
             staging: PathBuf,
         }
         struct TwoStageMock(Arc<Probe>);
@@ -7506,7 +7503,6 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let probe = Arc::new(Probe {
-            weak: OnceLock::new(),
             staging: tmp.path().join("snaps"),
         });
         let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
@@ -7517,7 +7513,6 @@ mod tests {
         let pooled = Arc::new(
             PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized")),
         );
-        probe.weak.set(Arc::downgrade(&pooled)).ok();
 
         let warm = WarmConfig {
             command: vec!["true".into()],
