@@ -4977,12 +4977,18 @@ impl SandboxBackend for PooledBackend {
                 "checkpoint_dir disappeared between the gate check and record construction".into(),
             ));
         };
-        record
-            .persist(&finalizer.finalize_dir())
-            .await
-            .map_err(|e| {
-                SandboxError::Snapshot(format!("persist eviction finalize record: {e}"))
-            })?;
+        if let Err(e) = record.persist(&finalizer.finalize_dir()).await {
+            // Finding 4: mirror the disk-pending failure arm above and the
+            // `None` arm just before it — a persist failure here must not
+            // leak the multi-GiB local staging dir. The eviction scanner
+            // retries ~30s apart, each attempt minting a fresh snapshot_id
+            // + `dest`; without this cleanup that's an unbounded disk-fill
+            // class on a host whose finalize_dir write path is unhealthy.
+            let _ = tokio::fs::remove_dir_all(&dest).await;
+            return Err(SandboxError::Snapshot(format!(
+                "persist eviction finalize record: {e}"
+            )));
+        }
         metrics::counter!(crate::metrics::EVICTION_FINALIZE_PERSISTED_TOTAL).increment(1);
         self.pending_finalizes.insert(id, snapshot_id);
 
