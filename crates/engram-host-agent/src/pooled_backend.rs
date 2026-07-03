@@ -962,6 +962,20 @@ impl PooledBackend {
                                 }
                                 send_progress(&watchdog, &tail, &last_detail);
                             }
+                            // A conforming `::engram-warm::` line is always
+                            // short. Newline-free output (gradle rich-console
+                            // `\r` redraws, binary noise) would otherwise grow
+                            // this buffer unbounded for the hook's whole
+                            // 10-33 min runtime, and the `position(b'\n')`
+                            // scan above re-walks it on every chunk
+                            // (quadratic). Cap it at the same bound as the
+                            // `OutputTail` ring buffer: past that with no
+                            // newline in sight, it can't be a valid protocol
+                            // line, so drop it — nothing valid is lost, and
+                            // parsing resumes cleanly at the next `\n`.
+                            if pending_stdout.len() > OutputTail::DEFAULT_CAP_BYTES {
+                                pending_stdout.clear();
+                            }
                         }
                         Some(ExecEvent::Stderr(bytes)) => {
                             tail.push(&bytes);
@@ -7413,6 +7427,143 @@ mod tests {
         assert!(
             saw_live_stage,
             "expected a live CaptureProgress event naming the stage before the terminal failure"
+        );
+    }
+
+    /// Review finding 5: a hook that streams newline-free output (gradle
+    /// rich-console `\r` redraws, binary noise) must not grow
+    /// `pending_stdout` unbounded — and, once the cap drops the
+    /// unparseable noise, a real `::engram-warm::` line arriving right
+    /// after must still parse cleanly (the cap doesn't wedge future
+    /// parsing).
+    #[tokio::test]
+    async fn warm_hook_newline_free_noise_does_not_wedge_progress_parsing() {
+        struct Probe {
+            staging: PathBuf,
+        }
+        struct NoiseThenLineMock(Arc<Probe>);
+        #[async_trait]
+        impl SandboxBackend for NoiseThenLineMock {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn exec_stream(
+                &self,
+                id: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                use engram_core::types::sandbox::ExecEvent;
+                // Well past OutputTail::DEFAULT_CAP_BYTES (16 KiB), no
+                // newline anywhere — the exact shape that grew
+                // `pending_stdout` unbounded pre-fix.
+                let noise = vec![b'x'; 64 * 1024];
+                let events = futures::stream::iter(vec![
+                    ExecEvent::Stdout(bytes::Bytes::from(noise)),
+                    ExecEvent::Stdout(bytes::Bytes::from(
+                        "::engram-warm:: event=start stage=after-noise\n",
+                    )),
+                    ExecEvent::Stdout(bytes::Bytes::from(
+                        "::engram-warm:: event=done stage=after-noise\n",
+                    )),
+                    ExecEvent::Exit(Some(0)),
+                ]);
+                Ok(ExecStream {
+                    sandbox_id: id,
+                    exec_id: "exec-noise".into(),
+                    events: Box::pin(events),
+                })
+            }
+            async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                let snapshot_id = engram_core::SnapshotId::new();
+                let dest = self.0.staging.join(snapshot_id.to_string());
+                tokio::fs::create_dir_all(&dest).await.unwrap();
+                tokio::fs::write(dest.join("memory.bin"), vec![7u8; 4096])
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("state.bin"), b"x")
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("manifest.json"), b"{}")
+                    .await
+                    .unwrap();
+                let _ = id;
+                Ok(SnapshotMetadata {
+                    id: snapshot_id,
+                    size_bytes: 4096,
+                    created_at: chrono::Utc::now(),
+                    image_version: "t:1".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                    working_set_blob_key: None,
+                    aux_bundles: vec![],
+                })
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.0.staging.join(id.to_string())
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = Arc::new(Probe {
+            staging: tmp.path().join("snaps"),
+        });
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = engram_chunk_store::ChunkStore::new(blob);
+        let inner: Arc<dyn SandboxBackend> = Arc::new(NoiseThenLineMock(probe));
+        let pooled = Arc::new(
+            PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized")),
+        );
+        let warm = WarmConfig {
+            command: vec!["true".into()],
+            timeout_secs: Some(30),
+            workdir: None,
+            network: None,
+        };
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            pooled.build_base_snapshot(
+                live_spec("warm-noise"),
+                Some(warm),
+                Default::default(),
+                progress_tx,
+            ),
+        )
+        .await
+        .expect("must not hang on unbounded newline-free output");
+
+        result.expect("a hook that exits 0 must succeed even after newline-free noise");
+
+        let mut saw_stage = false;
+        while let Ok(ev) = progress_rx.try_recv() {
+            if ev.warm_stage.as_deref() == Some("after-noise") {
+                saw_stage = true;
+            }
+        }
+        assert!(
+            saw_stage,
+            "the real progress line after the noise must still parse"
         );
     }
 
