@@ -685,11 +685,15 @@ async fn main() -> Result<(), CoordinatorError> {
             // endpoint knows the path). Pulled out below via the
             // `coord_materialize_dir` binding.
             let materialize_dir = cli.local_path.join("chunked-rootfs");
-            // ADR 0007 #3a: NVMe-backed chunk cache. Amortises repeat
-            // reads for chunks shared across manifests (canonical-base
-            // images, fork lineage). Budget defaults to 200 GiB; smaller
-            // hosts (dev VMs, lab boxes) override via
-            // `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`.
+            // ADR 0007 #3a / ADR 0067: NVMe-backed chunk cache. Amortises
+            // repeat reads for chunks shared across manifests (canonical-
+            // base images, fork lineage). `from_env_or_default` derives a
+            // disk-sized default budget (min(60% of the disk backing
+            // `local_path`, 80%) — no more fixed 200 GiB — and, as a side
+            // effect, `create_dir_all`s the cache root to probe the disk
+            // size. Override via `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`
+            // (absolute) or `ENGRAM_CHUNK_CACHE_DISK_FRACTION` (the
+            // fraction the default derives from).
             let chunk_cache = engram_chunk_store::ChunkCache::new(
                 engram_chunk_store::cache::ChunkCacheConfig::from_env_or_default(
                     cli.local_path.join("chunk-cache"),
