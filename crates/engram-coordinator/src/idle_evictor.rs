@@ -1646,7 +1646,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(
@@ -1862,7 +1862,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(
@@ -2079,7 +2079,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(
@@ -2425,7 +2425,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(

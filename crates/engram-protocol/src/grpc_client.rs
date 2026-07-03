@@ -23,6 +23,7 @@ use engram_core::types::sandbox::{
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
 use futures::Stream;
+use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::time::Duration;
 use tonic::service::interceptor::InterceptedService;
@@ -575,12 +576,12 @@ impl GrpcHostClient {
         decode_sandbox_id(&resp.uuid)
     }
 
-    pub async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+    pub async fn guest_ip(&self, id: SandboxId) -> Option<Ipv4Addr> {
         let req = SandboxIdMessage {
             uuid: id.as_uuid().as_bytes().to_vec(),
         };
         let resp: GuestIpResponse = self.inner.clone().guest_ip(req).await.ok()?.into_inner();
-        resp.ip
+        resp.ip.and_then(|s| s.parse().ok())
     }
 
     pub async fn bind_harness_session(
@@ -1395,7 +1396,7 @@ impl HostClient for GrpcHostClient {
         Self::apply_egress_policy(self, policy).await
     }
 
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+    async fn guest_ip(&self, id: SandboxId) -> Option<Ipv4Addr> {
         Self::guest_ip(self, id).await
     }
 

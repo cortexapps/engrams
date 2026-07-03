@@ -80,6 +80,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest};
 use engram_core::traits::sandbox::{HarnessByteStream, SandboxBackend};
+use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
@@ -654,11 +655,12 @@ struct LiveSandbox {
     /// `net::teardown_netns` on this. Mutually exclusive with
     /// `net`: at most one is `Some` per `LiveSandbox`.
     netns: Option<net::NetnsSetup>,
-    /// Cached IPv4 address discovered by querying agentd on first
-    /// `guest_ip` call (mirrors VZ's pattern). Populated lazily
-    /// because the agent's eth0 needs IP_PNP DHCP+kernel boot before
-    /// it can answer.
-    guest_ip: parking_lot::Mutex<Option<String>>,
+    /// Cached guest-network identity, discovered from `net`/`netns`
+    /// state or (lazily) by querying agentd on first
+    /// `guest_endpoints` call (mirrors VZ's pattern). Populated
+    /// lazily in the vsock-fallback case because the agent's eth0
+    /// needs IP_PNP DHCP+kernel boot before it can answer.
+    guest_endpoints: parking_lot::Mutex<Option<GuestEndpoints>>,
     /// ADR 0015 M1: receiver for the agentd-readiness signal.
     /// Switches to `true` when the in-VM agentd successfully dials
     /// `<vsock_uds>_<ENGRAM_AGENTD_READY_PORT>` and writes its
@@ -1221,8 +1223,8 @@ impl FirecrackerBackend {
         // host-agent restart. Verify the netns survived, re-reserve the
         // SNAT `/30` from the host pool (existence-check FIRST so a missing
         // netns doesn't leak a reservation), and rebuild the in-memory
-        // `NetnsSetup` so `destroy()` can later tear it down + `guest_ip()`
-        // resolves to the SNAT IP. Mutually exclusive with `net_setup`.
+        // `NetnsSetup` so `destroy()` can later tear it down + `guest_endpoints()`
+        // resolves `egress_identity` to the SNAT IP. Mutually exclusive with `net_setup`.
         let netns_setup = if let Some(ns_rec) = manifest.netns.as_ref() {
             let netns_path =
                 std::path::PathBuf::from(format!("/var/run/netns/{}", ns_rec.netns_name));
@@ -1348,7 +1350,7 @@ impl FirecrackerBackend {
                 // ADR 0044 K2: warm-restored VMs reattach with their per-VM
                 // netns rehydrated above; cold/host-root VMs leave this None.
                 netns: netns_setup,
-                guest_ip: parking_lot::Mutex::new(None),
+                guest_endpoints: parking_lot::Mutex::new(None),
                 agent_ready: ready_rx,
             },
         );
@@ -1550,9 +1552,12 @@ impl FirecrackerBackend {
         let mut line = Vec::with_capacity(32);
         let mut byte = [0u8; 1];
         loop {
-            conn.read_exact(&mut byte)
-                .await
-                .map_err(|e| vm_err(format!("read FC vsock CONNECT response: {e}")))?;
+            conn.read_exact(&mut byte).await.map_err(|e| {
+                vm_err(format!(
+                    "read FC vsock CONNECT response: {}",
+                    describe_relay_connect_failure(port, &e)
+                ))
+            })?;
             line.push(byte[0]);
             if byte[0] == b'\n' {
                 break;
@@ -2247,7 +2252,7 @@ impl FirecrackerBackend {
                 net: net_setup.cloned(),
                 // Cold create path: VM is in host root netns.
                 netns: None,
-                guest_ip: parking_lot::Mutex::new(None),
+                guest_endpoints: parking_lot::Mutex::new(None),
                 agent_ready: agent_ready_rx,
             },
         );
@@ -3207,7 +3212,7 @@ impl FirecrackerBackend {
                 uffd_pid,
                 net: net_setup,
                 netns: netns_setup,
-                guest_ip: parking_lot::Mutex::new(None),
+                guest_endpoints: parking_lot::Mutex::new(None),
                 agent_ready: ready_rx,
             },
         );
@@ -3299,6 +3304,53 @@ impl FirecrackerBackend {
 
 fn vm_err(msg: impl Into<String>) -> SandboxError {
     SandboxError::Vm(msg.into().into())
+}
+
+/// #567 / prod session 8174b7aa: an agentd RPC recv that hits a bare
+/// early EOF (zero bytes back) is indistinguishable, on the wire,
+/// from agentd crashing mid-call -- but it's *exactly* what an older
+/// guest agentd produces when the host sends a `WireRequest` variant
+/// the guest predates: the frame fails to bincode-decode, `serve_
+/// connection` returns before writing anything, and the connection
+/// just drops (engram-agentd's typed-NAK fix only helps once the
+/// guest image is re-baked). Appends both plausible causes to an
+/// EOF-shaped recv error so an operator doesn't have to already know
+/// this incident's history to triage it; every other error passes
+/// through untouched -- this is purely additive context, not a new
+/// error path.
+fn describe_agentd_rpc_recv_failure(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        format!(
+            "{e} -- agentd closed the stream without a response: guest \
+             agentd may predate this request (host/guest version skew: \
+             re-bake + RefreshImage) or crashed mid-call"
+        )
+    } else {
+        e.to_string()
+    }
+}
+
+/// #567: the FC vsock CONNECT handshake for the ADR-0066 port relay
+/// (guest port [`engram_harness_proto::PROXY_PORT_VSOCK_PORT`])
+/// failing with an early EOF means nothing accepted the CONNECT
+/// inside the guest -- either this agentd predates the relay
+/// listener entirely (host/guest version skew), or a once-live relay
+/// died (the dead-relay bug #567's other fixes target). Gated on the
+/// relay port specifically: `connect_fc_vsock_once` is shared by
+/// every guest port (exec included), and the same read failing on
+/// agentd's exec port (1024) means something else entirely.
+fn describe_relay_connect_failure(port: u32, e: &std::io::Error) -> String {
+    if port == engram_harness_proto::PROXY_PORT_VSOCK_PORT
+        && e.kind() == std::io::ErrorKind::UnexpectedEof
+    {
+        format!(
+            "{e} -- no listener on the guest relay port: guest agentd may \
+             predate the ADR-0066 relay (version skew: re-bake + \
+             RefreshImage), or the relay died (#567)"
+        )
+    } else {
+        e.to_string()
+    }
 }
 
 /// Timeout for `PUT /snapshot/create`. The call flushes the full guest
@@ -4351,44 +4403,67 @@ impl SandboxBackend for FirecrackerBackend {
         Ok(self.sandboxes.iter().map(|r| *r.key()).collect())
     }
 
-    /// IPv4 the host can use to reach a TCP service inside this
-    /// guest (used by the dashboard SHELL tab to dial `ttyd` on
-    /// :7681). Mirrors the VZ pattern: dial agentd via vsock, send
-    /// `WireRequest::GuestIp`, cache the answer. None until the
-    /// guest's eth0 has an address — kernel `ip=` cmdline brings it
-    /// up before init, but the agent has to start before answering.
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+    /// The sandbox's guest-network identity. Mirrors the VZ pattern:
+    /// derive from `net`/`netns` state when we have it (no I/O),
+    /// falling back to an agentd vsock query + cache when we don't.
+    ///
+    /// - Warm-restored (`netns` is `Some`): `egress_identity` is the
+    ///   netns SNAT pool slot (`ns.host_reachable_ip()`) — the value
+    ///   the egress-proxy registry indexes against. `dial_ip` is the
+    ///   bake-time in-VM eth0 address (`ns.vm_cidr.guest()`,
+    ///   `10.200.0.2` by default) — every warm VM shares it because
+    ///   each lives in its own netns; the SHELL tab (pre-ADR-0066)
+    ///   entered the netns before dialing, so it resolved through the
+    ///   TAP to the VM, not the netns's own veth IP. Returning the
+    ///   SNAT slot as the dial target would miss the VM entirely
+    ///   (prod-shape failure mode caught by e2e_shell_warm: `connect
+    ///   10.200.0.6:7681: Connection refused`).
+    /// - Cold-created (`net` is `Some`, no netns indirection):
+    ///   `egress_identity` and `dial_ip` collapse to the same
+    ///   per-sandbox `net.vm_cidr.guest()` — the TAP is in host root,
+    ///   reachable directly. This is also the deterministic fast path
+    ///   (no agentd dial): the /30 allocator already assigned this
+    ///   value, so we skip a ~2s vsock RTT on every fresh-session
+    ///   `notify_session_policy` call — critical because the
+    ///   coord-side policy registration races the agent's boot.
+    /// - Neither `net` nor `netns` (host networking disabled in
+    ///   tests, or a restored legacy pre-M1.16-bake manifest with no
+    ///   net record): fall back to an agentd `WireRequest::GuestIp`
+    ///   vsock query, both IP fields set to the answer.
+    async fn guest_endpoints(&self, id: SandboxId) -> Option<GuestEndpoints> {
         if let Some(live) = self.sandboxes.get(&id) {
-            if let Some(ip) = live.guest_ip.lock().clone() {
-                return Some(ip);
+            if let Some(ep) = live.guest_endpoints.lock().clone() {
+                return Some(ep);
             }
-            // ADR 0014 M1.16: warm-restored VMs all share the
-            // bake-time eth0 IP `10.200.0.2` inside the guest, but
-            // each netns SNATs to a unique-per-VM pool slot on the
-            // host-visible side. Egress proxy registry indexes
-            // against that SNAT'd IP and the dashboard SHELL tab
-            // dials it for ttyd — so this is the value
-            // host-side callers want.
+            let vsock_uds = Some(live.state.vsock_uds_path.clone());
             if let Some(ns) = live.netns.as_ref() {
-                let ip = ns.host_reachable_ip().to_string();
-                *live.guest_ip.lock() = Some(ip.clone());
-                return Some(ip);
+                let ep = GuestEndpoints {
+                    egress_identity: ns.host_reachable_ip(),
+                    dial_ip: ns.vm_cidr.guest(),
+                    netns: Some(ns.netns_name.clone()),
+                    vsock_uds,
+                };
+                *live.guest_endpoints.lock() = Some(ep.clone());
+                return Some(ep);
             }
-            // Fast path: the /30 allocator assigned the guest a
-            // deterministic .2 from the network address. We don't
-            // need to dial agentd to learn what we already know.
-            // Skips a ~2s vsock RTT on every fresh-session
-            // `notify_session_policy` call — critical because the
-            // coord-side policy registration races the agent's boot.
             if let Some(net) = live.net.as_ref() {
-                let ip = net.vm_cidr.guest().to_string();
-                *live.guest_ip.lock() = Some(ip.clone());
-                return Some(ip);
+                let ip = net.vm_cidr.guest();
+                let ep = GuestEndpoints {
+                    egress_identity: ip,
+                    dial_ip: ip,
+                    netns: None,
+                    vsock_uds,
+                };
+                *live.guest_endpoints.lock() = Some(ep.clone());
+                return Some(ep);
             }
         }
-        let vsock_uds_path = {
+        let (vsock_uds_path, vsock_uds) = {
             let live = self.sandboxes.get(&id)?;
-            live.state.vsock_uds_path.clone()
+            (
+                live.state.vsock_uds_path.clone(),
+                Some(live.state.vsock_uds_path.clone()),
+            )
         };
         let fut = async {
             let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
@@ -4404,56 +4479,21 @@ impl SandboxBackend for FirecrackerBackend {
                 _ => None,
             }
         };
-        let ip = tokio::time::timeout(Duration::from_secs(2), fut)
+        let ip_str: Option<String> = tokio::time::timeout(Duration::from_secs(2), fut)
             .await
             .ok()
             .flatten();
-        if let Some(ref s) = ip {
-            if let Some(live) = self.sandboxes.get(&id) {
-                *live.guest_ip.lock() = Some(s.clone());
-            }
+        let ip: std::net::Ipv4Addr = ip_str?.parse().ok()?;
+        let ep = GuestEndpoints {
+            egress_identity: ip,
+            dial_ip: ip,
+            netns: None,
+            vsock_uds,
+        };
+        if let Some(live) = self.sandboxes.get(&id) {
+            *live.guest_endpoints.lock() = Some(ep.clone());
         }
-        ip
-    }
-
-    /// ADR 0014 issue #6: the per-VM netns this sandbox runs inside,
-    /// when warm-restored under the M1.16 netns model. Cold sandboxes
-    /// run with TAPs on host root (`Some(net)`, `None`-netns); warm
-    /// sandboxes run inside `engr-vm-<id>` (`None`-net, `Some(netns)`).
-    /// Returned for ProxyShell so the host-agent can dial ttyd from
-    /// inside the right namespace.
-    async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
-        let live = self.sandboxes.get(&id)?;
-        live.netns.as_ref().map(|ns| ns.netns_name.clone())
-    }
-
-    /// In-VM dial target for the SHELL tab. Returns the IP ttyd is
-    /// bound to inside the guest — distinct from `guest_ip` which
-    /// returns the SNAT slot for warm sandboxes (used by the egress
-    /// proxy registry, NOT for direct ttyd dials).
-    ///
-    /// - Warm-restored sandboxes: every VM inherits the bake's
-    ///   eth0 IP `bake_cidr.guest()` (10.200.0.2 by default). The
-    ///   host's proxy_shell flow enters the per-VM netns before
-    ///   dialing, so 10.200.0.2 resolves through the TAP to the
-    ///   VM.
-    /// - Cold-created sandboxes: no netns indirection; the VM's
-    ///   eth0 is at `vm_cidr.guest()` and reachable from host root
-    ///   via the TAP.
-    async fn vm_internal_ip(&self, id: SandboxId) -> Option<String> {
-        let live = self.sandboxes.get(&id)?;
-        // Warm: TAP is inside the netns, VM eth0 is at the bake
-        // CIDR's guest octet. Every warm VM gets the same value
-        // because they live in separate netnses.
-        if let Some(ns) = live.netns.as_ref() {
-            return Some(ns.vm_cidr.guest().to_string());
-        }
-        // Cold: per-sandbox unique IP from the same pool, in root
-        // netns.
-        if let Some(net) = live.net.as_ref() {
-            return Some(net.vm_cidr.guest().to_string());
-        }
-        None
+        Some(ep)
     }
 
     /// Ask agentd to ensure `ttyd` is running and accepting on its
@@ -4483,9 +4523,16 @@ impl SandboxBackend for FirecrackerBackend {
             engram_agentd::write_msg(&mut conn, &WireRequest::StartShell { port: None })
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_shell: send: {e}").into()))?;
-            let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("start_shell: recv: {e}").into()))?;
+            let resp: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(
+                        format!(
+                            "start_shell: recv: {}",
+                            describe_agentd_rpc_recv_failure(&e)
+                        )
+                        .into(),
+                    )
+                })?;
             match resp {
                 engram_agentd::WireResponse::ShellReady { port, spawned } => {
                     tracing::info!(
@@ -4530,9 +4577,16 @@ impl SandboxBackend for FirecrackerBackend {
             engram_agentd::write_msg(&mut conn, &WireRequest::StartBrowser { port: None })
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_browser: send: {e}").into()))?;
-            let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("start_browser: recv: {e}").into()))?;
+            let resp: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(
+                        format!(
+                            "start_browser: recv: {}",
+                            describe_agentd_rpc_recv_failure(&e)
+                        )
+                        .into(),
+                    )
+                })?;
             match resp {
                 engram_agentd::WireResponse::BrowserReady { port, spawned } => {
                     tracing::info!(
@@ -4578,9 +4632,16 @@ impl SandboxBackend for FirecrackerBackend {
             engram_agentd::write_msg(&mut conn, &WireRequest::StopBrowser)
                 .await
                 .map_err(|e| SandboxError::Vm(format!("stop_browser: send: {e}").into()))?;
-            let _: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("stop_browser: recv: {e}").into()))?;
+            let _: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(
+                        format!(
+                            "stop_browser: recv: {}",
+                            describe_agentd_rpc_recv_failure(&e)
+                        )
+                        .into(),
+                    )
+                })?;
             Ok(())
         };
         // A wedged guest must never hang teardown — bound the round-trip at
@@ -5466,6 +5527,74 @@ mod tests {
         );
         // Monotonic in memory.
         assert!(snapshot_create_timeout(16 * 1024) < big);
+    }
+
+    // ---- #567 version-skew message enrichment ----------------------
+
+    #[test]
+    fn agentd_rpc_recv_failure_names_version_skew_on_eof() {
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof");
+        let msg = describe_agentd_rpc_recv_failure(&e);
+        assert!(
+            msg.starts_with("early eof"),
+            "must preserve the existing leading text so log-grep muscle \
+             memory keeps working: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("skew"),
+            "must name host/guest version skew: {msg}"
+        );
+        assert!(msg.contains("RefreshImage"), "must name the remedy: {msg}");
+    }
+
+    #[test]
+    fn agentd_rpc_recv_failure_passes_through_non_eof_errors() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let msg = describe_agentd_rpc_recv_failure(&e);
+        assert_eq!(
+            msg,
+            e.to_string(),
+            "non-EOF errors must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn relay_connect_failure_names_version_skew_for_relay_port_eof() {
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof");
+        let msg = describe_relay_connect_failure(engram_harness_proto::PROXY_PORT_VSOCK_PORT, &e);
+        assert!(
+            msg.starts_with("early eof"),
+            "must preserve the existing leading text: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("skew"),
+            "must name host/guest version skew: {msg}"
+        );
+        assert!(
+            msg.contains("#567"),
+            "must name the dead-relay alternative: {msg}"
+        );
+    }
+
+    #[test]
+    fn relay_connect_failure_passes_through_for_non_relay_ports() {
+        // The same read fails for unrelated reasons on agentd's exec
+        // port (1024) -- relay-specific wording there would misname
+        // the cause.
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof");
+        let msg = describe_relay_connect_failure(ENGRAM_AGENTD_PORT, &e);
+        assert_eq!(
+            msg,
+            e.to_string(),
+            "non-relay ports must not get relay-specific wording"
+        );
+    }
+
+    #[test]
+    fn relay_connect_failure_passes_through_for_non_eof_errors() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let msg = describe_relay_connect_failure(engram_harness_proto::PROXY_PORT_VSOCK_PORT, &e);
+        assert_eq!(msg, e.to_string());
     }
 
     // ADR 0044 K2: node-cgroup escape helpers. A tempdir stands in for the
@@ -6356,7 +6485,7 @@ mod tests {
                 uffd_pid: None,
                 net: None,
                 netns: None,
-                guest_ip: parking_lot::Mutex::new(None),
+                guest_endpoints: parking_lot::Mutex::new(None),
                 agent_ready,
             },
         );

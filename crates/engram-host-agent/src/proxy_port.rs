@@ -5,10 +5,10 @@
 //!
 //! ADR 0066: the guest hop reaches the dev server on the guest's **`127.0.0.1`**
 //! via the in-guest agentd relay ([`open_vsock_tunnel_at`]) — so a server bound
-//! to loopback (Vite, the Tilt UI) is reachable, which the old `guest_ip`
+//! to loopback (Vite, the Tilt UI) is reachable, which a direct dial_ip
 //! network dial could not. [`open_tcp_tunnel_at`] survives only for backends
 //! without a vsock relay (the Process backend; VZ until its Phase 2 real-vsock
-//! migration), dialing `guest_ip:port` directly with no per-VM netns — only FC
+//! migration), dialing `dial_ip:port` directly with no per-VM netns — only FC
 //! ever had a netns dial, and FC now always takes the relay.
 
 use std::time::Duration;
@@ -41,7 +41,7 @@ const READ_CHUNK: usize = 64 * 1024;
 /// [`RelayAck`](engram_harness_proto::RelayAck) — so a dev server that isn't
 /// listening surfaces as a synchronous error (a clean 502), preserving ADR
 /// 0064's fail-fast contract — then splice through the unchanged pump. The
-/// guest reaches loopback-bound dev servers the host's `guest_ip` dial cannot.
+/// guest reaches loopback-bound dev servers a direct dial_ip dial cannot.
 pub async fn open_vsock_tunnel_at(
     mut stream: HarnessByteStream,
     target_port: u16,
@@ -69,26 +69,26 @@ pub async fn open_vsock_tunnel_at(
     Ok(())
 }
 
-/// Open a raw-byte tunnel by dialing `guest_ip:port` directly (host root netns,
+/// Open a raw-byte tunnel by dialing `dial_ip:port` directly (host root netns,
 /// no per-VM netns). Used only by backends **without** a vsock relay: the
-/// Process backend (`guest_ip` is `127.0.0.1` — agentd is a host subprocess)
-/// and VZ until its Phase 2 real-vsock migration (`guest_ip` is the in-VM eth0
+/// Process backend (`dial_ip` is `127.0.0.1` — agentd is a host subprocess)
+/// and VZ until its Phase 2 real-vsock migration (`dial_ip` is the in-VM eth0
 /// IP). FC never reaches this path — `open_guest_stream` always hands it the
 /// vsock relay — so the old per-VM-netns dial (only FC ever had one) is retired.
 pub async fn open_tcp_tunnel_at(
-    guest_ip: String,
+    dial_ip: String,
     port: u16,
     ends: PortTunnelEnds,
 ) -> Result<(), SandboxError> {
-    let stream = connect_cold(&guest_ip, port).await?;
+    let stream = connect_cold(&dial_ip, port).await?;
     pump_tcp_through_tunnel(stream, ends);
     Ok(())
 }
 
 /// Cold-path dial: raw TCP connect with a short connection-refused
 /// retry (same shape as the shell cold path, shorter deadline).
-async fn connect_cold(guest_ip: &str, port: u16) -> Result<TcpStream, SandboxError> {
-    let addr = format!("{guest_ip}:{port}");
+async fn connect_cold(dial_ip: &str, port: u16) -> Result<TcpStream, SandboxError> {
+    let addr = format!("{dial_ip}:{port}");
     let deadline = std::time::Instant::now() + PORT_DIAL_DEADLINE;
     let mut backoff = PORT_BACKOFF_START;
     loop {

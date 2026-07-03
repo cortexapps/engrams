@@ -350,19 +350,19 @@ async fn spawn_real_proxy() -> (u16, String, Arc<engram_egress_proxy::Registry>)
     (proxy_port, ca_pem, registry)
 }
 
-async fn wait_for_guest_ip(
+async fn wait_for_guest_endpoints(
     pooled: &PooledBackend,
     id: engram_core::SandboxId,
     deadline: Duration,
-) -> String {
+) -> engram_core::types::endpoints::GuestEndpoints {
     let start = std::time::Instant::now();
     loop {
-        if let Some(ip) = pooled.guest_ip(id).await {
-            return ip;
+        if let Some(endpoints) = pooled.guest_endpoints(id).await {
+            return endpoints;
         }
         assert!(
             start.elapsed() < deadline,
-            "guest_ip never resolved within {deadline:?}",
+            "guest_endpoints never resolved within {deadline:?}",
         );
         sleep(Duration::from_millis(200)).await;
     }
@@ -639,18 +639,17 @@ async fn e2e_harness_cold_via_pooled_backend() {
         aux_ro_drives: Vec::new(),
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
-    let _guest_ip = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30)).await;
+    let _endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
 
     // Register the session in the proxy registry. For COLD path
-    // the guest_ip and vm_internal_ip are the same (no SNAT
-    // indirection) so we use guest_ip.
+    // egress_identity and dial_ip are the same (no SNAT indirection)
+    // so we use egress_identity.
     let session_id = engram_core::SessionId::new();
     let guest_ip: std::net::Ipv4Addr = pooled
-        .guest_ip(sandbox_id)
+        .guest_endpoints(sandbox_id)
         .await
-        .expect("guest_ip")
-        .parse()
-        .unwrap();
+        .expect("guest_endpoints")
+        .egress_identity;
     let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
     let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {
@@ -717,34 +716,33 @@ async fn e2e_harness_warm_via_pooled_backend() {
     // `PooledBackend::snapshot` via `inner.wait_agent_ready` — see the
     // comment there for the cold-boot race it guards against.
     let cold_id = pooled.create(spec).await.expect("create");
-    let _ = wait_for_guest_ip(&pooled, cold_id, Duration::from_secs(30)).await;
+    let _ = wait_for_guest_endpoints(&pooled, cold_id, Duration::from_secs(30)).await;
     let metadata = pooled.snapshot(cold_id).await.expect("snapshot");
     pooled.destroy(cold_id).await.expect("destroy cold");
 
     let warm_id = pooled.restore(metadata).await.expect("restore");
-    let _ = wait_for_guest_ip(&pooled, warm_id, Duration::from_secs(30)).await;
+    let _ = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
     // INTENTIONAL fixed settle (not converted to a poll): this gates on the
     // warm-restore network path — per-VM netns + SNAT + warm-path REDIRECT —
     // being fully wired before the harness's first outbound dials the proxy.
-    // `guest_ip` returns immediately from the backend net fast-path and so
-    // doesn't prove that path is live, and there's no clean host-side
+    // `guest_endpoints` returns immediately from the backend net fast-path and
+    // so doesn't prove that path is live, and there's no clean host-side
     // readiness signal for it short of an in-netns probe of the proxy (which
     // would itself need the proxy registration this test only does below).
     // A too-eager poll would flake the egress assertion, so keep the margin.
     sleep(Duration::from_secs(2)).await;
 
-    // Register WITH the SNAT'd guest_ip (Fix 3 territory). For
-    // warm-restored sandboxes guest_ip = snat_cidr.guest() which is
-    // exactly what the proxy's peer.ip() sees post-SNAT. Without
+    // Register WITH the SNAT'd egress_identity (Fix 3 territory). For
+    // warm-restored sandboxes egress_identity = snat_cidr.guest() which
+    // is exactly what the proxy's peer.ip() sees post-SNAT. Without
     // this matching the registry's key, Registry::lookup misses
     // and the proxy drops the harness's outbound.
     let session_id = engram_core::SessionId::new();
     let guest_ip: std::net::Ipv4Addr = pooled
-        .guest_ip(warm_id)
+        .guest_endpoints(warm_id)
         .await
-        .expect("guest_ip")
-        .parse()
-        .unwrap();
+        .expect("guest_endpoints")
+        .egress_identity;
     let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
     let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {
@@ -839,7 +837,7 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
         aux_ro_drives: Vec::new(),
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
-    let _guest_ip = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30)).await;
+    let _endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
 
     // The DevVm-mode AgentSpec: empty argv (resolve_harness → None),
     // empty env, host_ca_pem still delivered (the dev VM can still

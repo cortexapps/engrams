@@ -89,7 +89,49 @@ where
         );
     }
 
-    let req: WireRequest = read_msg(&mut reader).await?;
+    let req: WireRequest = match read_msg(&mut reader).await {
+        Ok(req) => req,
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            // `read_msg` already consumed the full frame (length
+            // prefix + body) before bincode failed to decode it — the
+            // stream is clean, so a reply is safe. This is NOT a
+            // disconnect (that surfaces as `UnexpectedEof` from
+            // `read_exact` and falls to the `Err(e)` arm below,
+            // un-NAK'd): it's a well-framed request this agentd
+            // couldn't parse, which happens when the host and guest
+            // agentd disagree on the `WireRequest` enum — most often
+            // because the guest's agentd is baked into its image and
+            // predates a variant the host just sent (or, less
+            // commonly, speaks a newer protocol than this build
+            // understands).
+            //
+            // Without this, that skew is indistinguishable from
+            // agentd crashing mid-call: prod session 8174b7aa ran a
+            // dev-brain image whose agentd predated
+            // `WireRequest::StartBrowser`; the unknown variant failed
+            // to decode, `serve_connection` returned `Err` having
+            // written zero bytes, and the host only ever logged
+            // `start_browser: recv: early eof` (#567). Best-effort
+            // write — the host may have already torn the connection
+            // down on its end (mirrors the token-mismatch path
+            // above) — then return the original error so logging is
+            // unchanged.
+            let resp = WireResponse::Error {
+                kind: format!("{:?}", e.kind()),
+                message: format!(
+                    "unsupported or malformed request (agentd v{version}): {e} -- \
+                     likely host/guest version skew (this guest's agentd may \
+                     predate a request the host just sent, or speak an older \
+                     protocol than the host expects); remedy: re-bake the \
+                     image and RefreshImage the session",
+                    version = env!("CARGO_PKG_VERSION"),
+                ),
+            };
+            let _ = write_msg(&mut writer, &resp).await;
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
     let exec_req = match req {
         WireRequest::Exec(e) => e,
         WireRequest::Stat { path } => {
@@ -1188,5 +1230,129 @@ mod tests {
             }
             other => panic!("expected Error response, got {other:?}"),
         }
+    }
+
+    // ---- #567 version-skew NAK ------------------------------------
+
+    /// A guest's agentd is baked into its image at build time, so a live
+    /// fleet routinely runs older agentd binaries than the host speaks.
+    /// Prod session 8174b7aa hit this: the guest's agentd predated
+    /// `WireRequest::StartBrowser`, so the request's variant index
+    /// decoded as unknown, `read_msg` failed, and `serve_connection`
+    /// returned `Err` having written zero bytes -- indistinguishable
+    /// from agentd crashing mid-call. The host only ever saw
+    /// `start_browser: recv: early eof`. This test pins that an
+    /// undecodable-but-well-framed request instead gets a typed
+    /// `WireResponse::Error` naming the skew, before the connection
+    /// drops.
+    #[tokio::test]
+    async fn unknown_request_gets_typed_error_not_eof() {
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            serve_connection(
+                server,
+                None,
+                HarnessSupervisor::new(),
+                Arc::new(crate::cacerts::CaCertInstaller::for_tests()),
+            )
+            .await
+        });
+
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+
+        // Hand-craft a frame whose body is a well-formed length prefix
+        // over a bincode enum-variant tag that's out of range for
+        // `WireRequest`. `bincode::serialize`/`deserialize` (the free
+        // functions `read_msg`/`write_msg` use) default to *fixint*
+        // encoding for the free-function API (see
+        // `bincode::config` module docs — the `DefaultOptions` struct
+        // and the top-level functions disagree on this), so a variant
+        // tag is a fixed 4-byte little-endian `u32`. `WireRequest` has
+        // well under 9999 variants, so this frame is exactly what an
+        // agentd that predates a new variant (or one running a newer
+        // protocol than we understand) sees on the wire.
+        let bad_variant: u32 = 9999;
+        let body = bad_variant.to_le_bytes();
+        let len_prefix = (body.len() as u32).to_be_bytes();
+        client_writer.write_all(&len_prefix).await.unwrap();
+        client_writer.write_all(&body).await.unwrap();
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_msg::<_, WireResponse>(&mut client_reader),
+        )
+        .await
+        .expect(
+            "agentd must reply with a typed error instead of silently \
+             dropping the connection (#567 version-skew incident)",
+        )
+        .expect("reply must decode as a WireResponse frame");
+
+        match resp {
+            WireResponse::Error { message, .. } => {
+                assert!(
+                    message.contains(env!("CARGO_PKG_VERSION")),
+                    "message should name agentd's version: {message}"
+                );
+                assert!(
+                    message.to_lowercase().contains("skew"),
+                    "message should name host/guest version skew: {message}"
+                );
+                assert!(
+                    message.contains("RefreshImage"),
+                    "message should name the remedy: {message}"
+                );
+            }
+            other => panic!("expected WireResponse::Error, got {other:?}"),
+        }
+
+        let err = server_task.await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Guard rail for the fix above: an ordinary peer disconnect (host
+    /// crash, connection reset, or simply closing without sending a
+    /// request) must NOT get a NAK written back — there's no
+    /// undecodable frame, just an absent one, and the stream may
+    /// already be gone.
+    #[tokio::test]
+    async fn clean_disconnect_gets_no_reply() {
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            serve_connection(
+                server,
+                None,
+                HarnessSupervisor::new(),
+                Arc::new(crate::cacerts::CaCertInstaller::for_tests()),
+            )
+            .await
+        });
+
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        // Shut down the write half without sending anything -- an
+        // ordinary disconnect. (A bare `drop` doesn't work here: the
+        // split halves share the underlying `DuplexStream` by
+        // reference, so the write direction only actually closes via
+        // an explicit `shutdown()`, not by dropping one handle while
+        // the other's still alive.)
+        client_writer.shutdown().await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("serve_connection must return promptly on a clean disconnect")
+            .unwrap();
+        // Either Ok or Err is acceptable here -- the only thing this
+        // test pins is that no reply is written (below).
+        let _ = result;
+
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), client_reader.read(&mut buf))
+            .await
+            .expect("reading the (absent) reply must not hang")
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "agentd must not write any bytes on a clean disconnect"
+        );
     }
 }

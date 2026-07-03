@@ -18,6 +18,7 @@ use engram_agentd::{
     read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest, WireResponse,
 };
 use engram_core::traits::sandbox::{HarnessByteStream, HarnessSink, SandboxBackend, UploadSink};
+use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
@@ -110,13 +111,13 @@ struct VzSandboxState {
     /// `destroy()`. The clone is what VZ actually attaches; the
     /// originating bake / snapshot file stays intact.
     rootfs_path: PathBuf,
-    /// Cached IPv4 address discovered by querying agentd over the
-    /// existing vsock-bridge transport. Populated on first
-    /// `guest_ip` call (the agent's eth0 takes a moment to come up
-    /// after IP_PNP DHCP, so we don't try at create time). Used by
+    /// Cached guest-network identity, discovered by querying agentd
+    /// over the existing vsock-bridge transport. Populated on first
+    /// `guest_endpoints` call (the agent's eth0 takes a moment to come
+    /// up after IP_PNP DHCP, so we don't try at create time). Used by
     /// the coordinator's `GET /sessions/:id/shell` proxy to dial
     /// `ttyd` running inside the guest.
-    guest_ip: Mutex<Option<String>>,
+    guest_endpoints: Mutex<Option<GuestEndpoints>>,
 }
 
 // ADR 0009 §4 (host-side VM supervision) is FC-only by design. The
@@ -350,7 +351,7 @@ impl VzBackend {
                 connector,
                 vsock_uds_path,
                 rootfs_path,
-                guest_ip: Mutex::new(None),
+                guest_endpoints: Mutex::new(None),
             },
         );
         Ok(new_id)
@@ -572,7 +573,7 @@ impl SandboxBackend for VzBackend {
                 connector,
                 vsock_uds_path,
                 rootfs_path,
-                guest_ip: Mutex::new(None),
+                guest_endpoints: Mutex::new(None),
             },
         );
         Ok(id)
@@ -673,12 +674,12 @@ impl SandboxBackend for VzBackend {
     /// stream. The host-agent then writes the `RelayConnect` header, reads
     /// the `RelayAck`, and splices bytes — reaching a dev server bound to
     /// the guest's `127.0.0.1` (Vite, the Tilt UI, `next dev`) that the old
-    /// `guest_ip`/eth0 dial can't. Each call is its own `connectToPort`
+    /// `dial_ip`/eth0 dial can't. Each call is its own `connectToPort`
     /// stream, and `VZVirtioSocketDevice` muxes them freely, so a
     /// persistent forwarded connection can't head-of-line block others —
     /// the parity fix over the retired single-stream-per-port console
     /// bridge. Returning `Some` here flips VZ off the trait-default
-    /// `None`/`guest_ip` fallback and onto the relay path.
+    /// `None`/`guest_endpoints` fallback and onto the relay path.
     async fn open_guest_stream(
         &self,
         id: SandboxId,
@@ -987,16 +988,18 @@ impl SandboxBackend for VzBackend {
         Ok(())
     }
 
-    /// Discover the guest's primary IPv4 address by asking agentd
-    /// over the vsock-bridge. First successful answer is cached on
-    /// the per-sandbox state; subsequent calls are O(1) memory reads.
+    /// Discover the guest's network identity by asking agentd over
+    /// the vsock-bridge. First successful answer is cached on the
+    /// per-sandbox state; subsequent calls are O(1) memory reads.
     /// Returns `None` if the agent isn't reachable yet (e.g. shell
-    /// requested before bootstrap completes) or reports no
-    /// non-loopback address.
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+    /// requested before bootstrap completes), reports no non-loopback
+    /// address, or reports an address that doesn't parse as IPv4.
+    /// VZ has no netns indirection, so `egress_identity` and
+    /// `dial_ip` are always the same value.
+    async fn guest_endpoints(&self, id: SandboxId) -> Option<GuestEndpoints> {
         if let Some(live) = self.sandboxes.get(&id) {
-            if let Some(ip) = live.guest_ip.lock().clone() {
-                return Some(ip);
+            if let Some(ep) = live.guest_endpoints.lock().clone() {
+                return Some(ep);
             }
         }
         let vsock_uds_path = {
@@ -1018,16 +1021,21 @@ impl SandboxBackend for VzBackend {
                 _ => None,
             }
         };
-        let ip = tokio::time::timeout(Duration::from_secs(2), fut)
+        let ip_str: Option<String> = tokio::time::timeout(Duration::from_secs(2), fut)
             .await
             .ok()
             .flatten();
-        if let Some(ref s) = ip {
-            if let Some(live) = self.sandboxes.get(&id) {
-                *live.guest_ip.lock() = Some(s.clone());
-            }
+        let ip: std::net::Ipv4Addr = ip_str?.parse().ok()?;
+        let ep = GuestEndpoints {
+            egress_identity: ip,
+            dial_ip: ip,
+            netns: None,
+            vsock_uds: Some(vsock_uds_path),
+        };
+        if let Some(live) = self.sandboxes.get(&id) {
+            *live.guest_endpoints.lock() = Some(ep.clone());
         }
-        ip
+        Some(ep)
     }
 }
 
