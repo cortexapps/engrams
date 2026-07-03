@@ -50,6 +50,25 @@ pub fn warm_stall_secs_from_env() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_STALL_SECS))
 }
 
+/// Default keepalive period: how often `run_warm_hook`'s own warm-phase
+/// ticker, and `pooled_backend::spawn_leg_keepalive` (the boot/snapshot
+/// legs), resend the last-known `CaptureProgress` so the coordinator's
+/// fenced write — which doubles as the capture-claim lease renewal —
+/// never goes stale during a leg with no progress traffic of its own.
+/// Overridden by `ENGRAM_CAPTURE_KEEPALIVE_SECS` (test-shrunk only; the
+/// issue #539 acceptance criterion is ">=30s" in production).
+pub const DEFAULT_KEEPALIVE_SECS: u64 = 30;
+
+/// Read `ENGRAM_CAPTURE_KEEPALIVE_SECS` — falls through to
+/// [`DEFAULT_KEEPALIVE_SECS`].
+pub fn capture_keepalive_secs_from_env() -> Duration {
+    std::env::var("ENGRAM_CAPTURE_KEEPALIVE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_KEEPALIVE_SECS))
+}
+
 // ─── progress-line parser ──────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq)]
