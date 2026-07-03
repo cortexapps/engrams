@@ -38,6 +38,13 @@
 //! EXISTING golden file changing bytes is a RED FLAG (you broke the wire
 //! for an old baked agentd); only NEW files are expected.
 //!
+//! 2026-07 core-ops fold: the former standalone CA-install verb was
+//! deleted and later indices renumbered, so these goldens were
+//! deliberately regenerated — a zero-user clean break (see the
+//! APPEND-ONLY note on `WireRequest` in `src/proto.rs`). This is the one
+//! deliberate exception to the RED FLAG rule above; it is not a
+//! precedent for future golden-byte diffs.
+//!
 //! NOTE: every sample uses an EMPTY or SINGLE-entry `HashMap` so the
 //! encoding is deterministic (multi-entry map iteration order is not).
 
