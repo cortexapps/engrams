@@ -973,6 +973,20 @@ impl ChunkCache {
     /// that want to control exactly when a sweep happens call
     /// [`Self::sweep`] directly instead of racing a background timer.
     ///
+    /// Deliberately does NOT sweep at t=0: `tokio::time::interval`'s
+    /// first tick fires immediately, but on a freshly-started host-agent
+    /// pins are in-memory only and haven't been re-established yet (the
+    /// image-prefetch supervisor's reconcile needs a coordinator RPC
+    /// round-trip after registration). A t=0 sweep on a restarted host
+    /// with an over-budget cache would run pin-blind and evict the
+    /// oldest-mtime chunks — exactly the boot-staged base-image chunks
+    /// that were pinned in the prior life — flapping readiness and
+    /// re-fetching from GCS on every rollout of a host that happens to
+    /// sit at or over budget. The first sweep waits one full `interval`
+    /// instead, giving the pin set a chance to repopulate first; the
+    /// populate-path debounced sweep (`sweep_debounce_ms`) still bounds
+    /// growth from writes in the meantime.
+    ///
     /// Mirrors `base_shm_gc::spawn`'s held-handle pattern: the caller
     /// keeps the returned handle alive for the process lifetime (dropping
     /// or aborting it stops the sweeper).
@@ -985,6 +999,11 @@ impl ChunkCache {
             }
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Consume the immediate t=0 tick without sweeping — see the
+            // doc comment above. Every tick after this one is spaced a
+            // full `interval` apart, so the first real sweep lands at
+            // t=interval, not t=0.
+            tick.tick().await;
             loop {
                 tick.tick().await;
                 if let Err(e) = cache.sweep().await {
@@ -2487,6 +2506,48 @@ mod tests {
         assert!(
             !cache.contains(ha).await,
             "the periodic sweeper must evict the over-budget chunk with zero populate traffic",
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_sweeper_does_not_sweep_at_t_zero() {
+        // Regression for the cold-boot pin race: `tokio::time::interval`'s
+        // first tick fires immediately, but at t=0 a freshly-started
+        // host-agent hasn't re-established its pin set yet (that needs a
+        // coordinator RPC round-trip). An immediate sweep would run
+        // pin-blind and evict whatever happens to be oldest — on a real
+        // host, the boot-staged base-image chunks pinned in the prior
+        // life. The sweeper must wait a full interval before its FIRST
+        // sweep, giving the pin set time to repopulate.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: 1, // any populated chunk at all is "over"
+                sweep_debounce_ms: i64::MAX,
+                eviction_enabled: true,
+            },
+            0.0,
+        );
+        let a = b"aaaaaaaaaa";
+        let ha = ChunkHash::of(a);
+        cache.put_no_evict(ha, a).await.unwrap();
+
+        let handle = cache.spawn_sweeper(std::time::Duration::from_millis(200));
+        // Well before the first interval elapses: the chunk must still
+        // be there — a t=0 sweep would have evicted it immediately.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            cache.contains(ha).await,
+            "the sweeper must not evict on its immediate t=0 tick",
+        );
+        // Past the first interval: the (now real) first sweep must have
+        // run and enforced the budget.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.abort();
+        assert!(
+            !cache.contains(ha).await,
+            "the sweeper must still enforce the budget once the first real interval elapses",
         );
     }
 
