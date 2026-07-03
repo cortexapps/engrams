@@ -454,13 +454,25 @@ async fn run_disk_leg(
             record.disk_manifest = Some(published);
         }
     }
+    // Persist the stage bump (with the resolved `disk_manifest` ref)
+    // BEFORE deleting `disk-pending/` — findings 1/3: deleting first made
+    // a crash between delete and persist indistinguishable from "nothing
+    // dirty this round" on redrive (`read_disk_pending_chunks` ENOENTs,
+    // quarantining a snapshot whose manifest may already be durably
+    // published). A failed persist here must not leave `record.stage`
+    // mutated in RAM out from under the on-disk truth, so roll it back on
+    // error — the next attempt re-observes `Captured` and safely redoes
+    // the (idempotent, content-addressed) publish above.
+    let prev_stage = record.stage;
+    record.stage = FinalizeStage::DiskUploaded;
+    if let Err(e) = record.persist(&f.finalize_dir()).await {
+        record.stage = prev_stage;
+        return Err(SandboxError::Snapshot(format!(
+            "persist finalize record: {e}"
+        )));
+    }
     let pending_dir = record.dest.join("disk-pending");
     let _ = tokio::fs::remove_dir_all(&pending_dir).await;
-    record.stage = FinalizeStage::DiskUploaded;
-    record
-        .persist(&f.finalize_dir())
-        .await
-        .map_err(|e| SandboxError::Snapshot(format!("persist finalize record: {e}")))?;
     metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "disk")
         .record(start.elapsed().as_secs_f64());
     Ok(())
@@ -474,6 +486,11 @@ async fn run_memory_leg(
         return Ok(());
     }
     let start = std::time::Instant::now();
+    // The input file to best-effort-delete AFTER the stage bump is
+    // durable (finding 1). `None` when this attempt didn't consume a
+    // fresh on-disk input (nothing to clean up, or the chunk_store leg
+    // is disabled).
+    let mut consumed: Option<PathBuf> = None;
     if let Some(chunk_store) = f.chunk_store.as_ref() {
         let manifest_ref = if let Some(prev_ref) = record.chain_prev_ref {
             let diff_path = record.dest.join("memory.diff");
@@ -490,15 +507,31 @@ async fn run_memory_leg(
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?;
                 let next_ref = prev_ref.next_version();
-                chunk_store
-                    .put_manifest(next_ref, &next)
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("put manifest {next_ref}: {e}")))?;
-                let _ = tokio::fs::remove_file(&diff_path).await;
+                match chunk_store.put_manifest(next_ref, &next).await {
+                    Ok(()) => {}
+                    // Finding 2: `put_manifest` conflicts exactly when the
+                    // (manifest_id, version) key already exists — and we
+                    // always target the deterministic `next_ref`, so a
+                    // conflict here can only mean a prior attempt already
+                    // published this exact content (a crash between that
+                    // `put_manifest` and this leg's stage-bump persist).
+                    // That's idempotent success, not a real race.
+                    Err(engram_chunk_store::ChunkStoreError::VersionConflict {
+                        attempted, ..
+                    }) if attempted == next_ref.version => {}
+                    Err(e) => {
+                        return Err(SandboxError::Snapshot(format!(
+                            "put manifest {next_ref}: {e}"
+                        )))
+                    }
+                }
+                consumed = Some(diff_path);
                 Some(next_ref)
             } else {
-                // Already chunked (and the diff removed) by a prior
-                // attempt that crashed before the stage bump persisted.
+                // No diff on disk and the stage is still `DiskUploaded`
+                // (the guard above already skips this leg once the stage
+                // bump persists) — nothing dirty this round; matches
+                // `finish()`'s behavior for a diff-less capture.
                 None
             }
         } else {
@@ -510,7 +543,7 @@ async fn run_memory_leg(
                     f.chunk_cache.as_ref(),
                 )
                 .await?;
-                let _ = tokio::fs::remove_file(&mem_path).await;
+                consumed = Some(mem_path);
                 Some(mref)
             } else {
                 None
@@ -527,11 +560,29 @@ async fn run_memory_leg(
             record.memory_manifest = Some(mref);
         }
     }
+    // Persist the stage bump (with `memory_manifest`) BEFORE deleting the
+    // consumed input (finding 1) — same durability-ordering fix as the
+    // disk leg. Roll back the in-RAM mutation on a failed persist so a
+    // subsequent retry doesn't believe this stage is durable when it
+    // isn't (it re-observes `DiskUploaded` and safely redoes the
+    // idempotent work above).
+    let prev_stage = record.stage;
+    let prev_memory_manifest = record.memory_manifest;
     record.stage = FinalizeStage::MemoryChunked;
-    record
-        .persist(&f.finalize_dir())
-        .await
-        .map_err(|e| SandboxError::Snapshot(format!("persist finalize record: {e}")))?;
+    if let Err(e) = record.persist(&f.finalize_dir()).await {
+        record.stage = prev_stage;
+        record.memory_manifest = prev_memory_manifest;
+        return Err(SandboxError::Snapshot(format!(
+            "persist finalize record: {e}"
+        )));
+    }
+    // Only now — durably recorded — delete the consumed input. A crash
+    // here just leaks the already-consumed source file; the manifest ref
+    // is already durable and the stage guard skips this leg on redrive,
+    // so it's never re-read.
+    if let Some(p) = consumed {
+        let _ = tokio::fs::remove_file(&p).await;
+    }
     metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "memory")
         .record(start.elapsed().as_secs_f64());
     Ok(())
