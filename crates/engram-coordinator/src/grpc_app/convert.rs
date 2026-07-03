@@ -620,7 +620,7 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         updated_at: updated_at.to_rfc3339(),
         // ADR 0036 amendment (issue #538): JSON-encoded per-host prestage
         // outcome map. `prestage_hosts` is NOT NULL DEFAULT '{}'::jsonb
-        // (migration 0077), so `to_string()` always yields valid JSON.
+        // (migration 0081), so `to_string()` always yields valid JSON.
         prestage_hosts: prestage_hosts.to_string(),
     }
 }

@@ -255,7 +255,7 @@ fails with a clear error until re-baked.
 3. Deterministic ext4 builds.
 4. Base-snapshot capture reuse by disk-manifest content.
 
-## Amendment (2026-07-02): fleet chunk prestage — a fifth pipeline stage (interim, issue #538)
+## Amendment (2026-07-02): fleet chunk prestage — a fourth pipeline stage (interim, issue #538)
 
 **Problem this amendment closes.** `ready` in this ADR means
 coordinator-local: chunks durable in GCS, the base snapshot captured, the
@@ -312,10 +312,15 @@ survive into that world.
 **Dev/Process-backend story.** A host whose `SandboxBackend` never spawns
 the prefetch supervisor (no `chunk_store`/`chunk_cache` configured — every
 Process-backend dev host) reports `stages_images = false` and is exempt by
-construction: a fleet with zero eligible hosts passes the prestage stage
-vacuously (logged, not silent). `just dev` + enable + create is unchanged.
+construction: a fleet where NO host has `stages_images` passes the
+prestage stage vacuously (logged, not silent). `just dev` + enable + create
+is unchanged. A fleet that DOES have staging-capable hosts but finds none
+currently schedulable (e.g. mid a host-agent MIG roll) is a distinct,
+transient case — it keeps polling under the deadline instead of taking
+this vacuous-pass arm (deep-review fix, PR #565 finding 1; see
+`eval_prestage` in `enable_scanner.rs`).
 
-Migration 0077 adds `enable_jobs.prestage_ref` / `.prestage_hosts` and
+Migration 0081 adds `enable_jobs.prestage_ref` / `.prestage_hosts` and
 `hosts.stages_images`. Resume/evac/admin placement are NOT gated on
 `required_image_digest` — they place by snapshot affinity, a different
 invariant this amendment doesn't touch.

@@ -122,7 +122,7 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     // Issue #229: the host's reported bincode wire version (migration 0066).
     let wire_version: i32 = row.try_get("wire_version").map_err(col_err)?;
     // Issue #538: whether this host runs the image-prefetch supervisor
-    // (migration 0077).
+    // (migration 0081).
     let stages_images: bool = row.try_get("stages_images").map_err(col_err)?;
     Ok(HostRecord {
         id: HostId(id),
@@ -450,7 +450,7 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
     let chunks_total: Option<i32> = row.try_get("chunks_total").map_err(col_err)?;
     let chunks_done: i32 = row.try_get("chunks_done").map_err(col_err)?;
     let attempts: i32 = row.try_get("attempts").map_err(col_err)?;
-    // Migration 0077: NOT NULL DEFAULT '{}'::jsonb, so every row has it.
+    // Migration 0081: NOT NULL DEFAULT '{}'::jsonb, so every row has it.
     let prestage_hosts: serde_json::Value = row.try_get("prestage_hosts").map_err(col_err)?;
     Ok(EnableJob {
         id: row.try_get("id").map_err(col_err)?,

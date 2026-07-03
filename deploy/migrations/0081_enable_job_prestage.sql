@@ -1,5 +1,7 @@
--- ADR 0036 amendment: fleet chunk prestage as a terminal enable-job stage
--- (issue #538, INTERIM — see the ADR's "prestage stage (interim)" section).
+-- ADR 0036 amendment: fleet chunk prestage as a NON-terminal enable-job
+-- stage (issue #538, INTERIM — see the ADR's "prestage stage (interim)"
+-- section). Only 'ready' and 'failed' are terminal (EnableJobState::
+-- is_terminal); 'prestaging' sits between 'capturing' and 'ready':
 --   pending → materializing → capturing → prestaging → ready | failed
 -- `state` is TEXT (migration 0052), so the new value needs no DDL; the
 -- partial unique index enable_jobs_active_uri (WHERE state NOT IN

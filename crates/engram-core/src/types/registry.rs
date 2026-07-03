@@ -339,7 +339,7 @@ impl From<EnabledImage> for EnabledImageSummary {
 /// ADR 0036: state of an async image-enable job. The coordinator's
 /// `enable_scanner` drives `Pending → Materializing → Capturing →
 /// Prestaging → Ready`, with `Failed` as the give-up terminal after its
-/// retry budget. See migration 0052 (+ 0077 for `Prestaging`, issue #538).
+/// retry budget. See migration 0052 (+ 0081 for `Prestaging`, issue #538).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnableJobState {

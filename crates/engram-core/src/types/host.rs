@@ -213,7 +213,7 @@ pub struct HostRecord {
     /// spawn it). The enable scanner's prestage stage waits only on hosts
     /// with this bit; a fleet with zero eligible staging hosts passes the
     /// stage vacuously. `#[serde(default)]` → `false` for pre-migration rows
-    /// (the exempt, safe posture). Migration 0077.
+    /// (the exempt, safe posture). Migration 0081.
     #[serde(default)]
     pub stages_images: bool,
 }
