@@ -77,7 +77,12 @@ async fn warm_hook_process_survives_base_snapshot() {
 
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
     let meta = pooled
-        .build_base_snapshot(env.spec(&rootfs), Some(warm), Default::default(), progress_tx)
+        .build_base_snapshot(
+            env.spec(&rootfs),
+            Some(warm),
+            Default::default(),
+            progress_tx,
+        )
         .await
         .expect("base-snapshot capture with a passing warm hook");
 
@@ -188,7 +193,12 @@ async fn warm_hook_nonzero_exit_fails_capture() {
 
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
     let err = pooled
-        .build_base_snapshot(env.spec(&rootfs), Some(warm), Default::default(), progress_tx)
+        .build_base_snapshot(
+            env.spec(&rootfs),
+            Some(warm),
+            Default::default(),
+            progress_tx,
+        )
         .await
         .expect_err("a non-zero warm hook must FAIL the capture (fail-loud)");
     let msg = format!("{err:?}");
