@@ -544,69 +544,12 @@ mod tests {
 
     // -- Issue #527 Phase 1: prompt_received emit ordering --------------
 
-    /// Self-contained `AppState` fixture (the `evicting_gate_tests` pattern
-    /// in `api/snapshot.rs` — not reused across files because test binaries
-    /// / modules can't cheaply share private test-only fns) backed by
-    /// `MiniMeta` so assertions can inspect the exact `session_events`
-    /// order `send_prompt_core` produced.
-    fn build_state_for_session(
-        session: engram_core::types::Session,
-    ) -> (
-        SharedState,
-        Arc<crate::state::tests::MiniMeta>,
-        tempfile::TempDir,
-    ) {
-        use crate::config::CoordinatorConfig;
-        use crate::host_registry::HostRegistry;
-        use crate::state::tests::MiniMeta;
-        use crate::state::AppState;
-        use crate::Services;
-        use engram_cloud_mock::MockCloud;
-        use engram_core::traits::SandboxBackend;
-        use engram_secrets_dev::InMemorySecretStore;
-
-        let local = tempfile::TempDir::new().unwrap();
-        let backend: Arc<dyn SandboxBackend> = Arc::new(
-            engram_sandbox_process::ProcessBackend::new(local.path().join("sandboxes")),
-        );
-        let meta = Arc::new(MiniMeta::new(session));
-        let host_registry = Arc::new(HostRegistry::new(
-            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
-        ));
-        let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
-            engram_host_agent::LocalHostClient::with_noop_hub(backend.clone()),
-        );
-        host_registry.register(engram_core::HostId::new(), local_host);
-        let blobs_dir =
-            std::env::temp_dir().join(format!("engram-blobs-test-prompt-{}", uuid::Uuid::new_v4()));
-        let services = Services {
-            meta: meta.clone(),
-            cloud: Arc::new(MockCloud::new()),
-            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
-            secrets: Arc::new(InMemorySecretStore::new()),
-            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
-                [0u8; 32], "test:v1",
-            )),
-            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
-                engram_oci::AnonymousResolver,
-            ))),
-            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
-            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
-                blobs_dir.clone(),
-            )),
-            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
-                engram_storage_local::LocalBlobStorage::new(blobs_dir),
-            )),
-            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
-            materialize_dir: None,
-        };
-        let cfg = CoordinatorConfig {
-            local_path: local.path().to_path_buf(),
-            ..CoordinatorConfig::default()
-        };
-        let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
-        (state, meta, local)
-    }
+    /// `AppState` fixture backed by `MiniMeta`, so assertions can inspect
+    /// the exact `session_events` order `send_prompt_core` produced.
+    /// Shared with `api::snapshot`'s `evicting_gate_tests` via
+    /// `state::tests::build_state_for_session` (PR #556 review finding #4 —
+    /// same-crate unit test modules share `pub(crate)` fns fine).
+    use crate::state::tests::build_state_for_session;
 
     fn dead_session(id: SessionId) -> engram_core::types::Session {
         engram_core::types::Session {

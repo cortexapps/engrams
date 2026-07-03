@@ -1508,6 +1508,67 @@ pub(crate) mod tests {
         }
     }
 
+    /// Shared `AppState` fixture for tests that need a full `Services`
+    /// wiring backed by [`MiniMeta`] — same-crate unit test modules
+    /// (`api::snapshot`, `api::prompt`, …) share `pub(crate)` fns fine, so
+    /// this retires what used to be a per-file ~60-line copy of the same
+    /// wiring (finding #4, PR #556 review).
+    pub(crate) fn build_state_for_session(
+        session: Session,
+    ) -> (
+        crate::state::SharedState,
+        std::sync::Arc<MiniMeta>,
+        tempfile::TempDir,
+    ) {
+        use crate::config::CoordinatorConfig;
+        use crate::host_registry::HostRegistry;
+        use crate::state::AppState;
+        use crate::Services;
+        use engram_cloud_mock::MockCloud;
+        use engram_core::traits::SandboxBackend;
+        use engram_secrets_dev::InMemorySecretStore;
+
+        let local = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SandboxBackend> = Arc::new(
+            engram_sandbox_process::ProcessBackend::new(local.path().join("sandboxes")),
+        );
+        let meta = Arc::new(MiniMeta::new(session));
+        let host_registry = Arc::new(HostRegistry::new(meta.clone() as Arc<dyn MetadataStore>));
+        let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
+            engram_host_agent::LocalHostClient::with_noop_hub(backend.clone()),
+        );
+        host_registry.register(engram_core::HostId::new(), local_host);
+        let blobs_dir =
+            std::env::temp_dir().join(format!("engram-blobs-test-{}", uuid::Uuid::new_v4()));
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                blobs_dir.clone(),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(blobs_dir),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = CoordinatorConfig {
+            local_path: local.path().to_path_buf(),
+            ..CoordinatorConfig::default()
+        };
+        let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
+        (state, meta, local)
+    }
+
     #[async_trait]
     impl MetadataStore for MiniMeta {
         async fn create_session(

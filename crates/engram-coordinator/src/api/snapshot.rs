@@ -2226,46 +2226,12 @@ mod evicting_gate_tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    /// Shared with `api::prompt`'s emit-ordering tests via
+    /// `state::tests::build_state_for_session` (PR #556 review finding #4 —
+    /// same-crate unit test modules share `pub(crate)` fns fine, so the
+    /// per-file `AppState`/`Services` wiring copy was retired).
     fn build_state_for_session(session: Session) -> (SharedState, TempDir) {
-        let local = TempDir::new().unwrap();
-        let backend: Arc<dyn SandboxBackend> =
-            Arc::new(ProcessBackend::new(local.path().join("sandboxes")));
-        let meta = Arc::new(MiniMeta::new(session));
-        let host_registry = Arc::new(HostRegistry::new(
-            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
-        ));
-        let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
-            engram_host_agent::LocalHostClient::with_noop_hub(backend.clone()),
-        );
-        host_registry.register(engram_core::HostId::new(), local_host);
-        let services = Services {
-            meta: meta.clone(),
-            cloud: Arc::new(MockCloud::new()),
-            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
-            secrets: Arc::new(InMemorySecretStore::new()),
-            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
-                [0u8; 32], "test:v1",
-            )),
-            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
-                engram_oci::AnonymousResolver,
-            ))),
-            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
-            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
-                std::env::temp_dir().join("engram-blobs-test"),
-            )),
-            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
-                engram_storage_local::LocalBlobStorage::new(
-                    std::env::temp_dir().join("engram-blobs-test"),
-                ),
-            )),
-            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
-            materialize_dir: None,
-        };
-        let cfg = CoordinatorConfig {
-            local_path: local.path().to_path_buf(),
-            ..CoordinatorConfig::default()
-        };
-        let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
+        let (state, _mini, local) = crate::state::tests::build_state_for_session(session);
         (state, local)
     }
 
