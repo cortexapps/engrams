@@ -144,10 +144,15 @@ storage:
   # (e.g. /dev/nvme1n1, a GKE local-SSD raw-block device), node-prep
   # formats it (idempotent — only if unformatted) and mounts it at
   # workDirHostPath, and the host-agent DaemonSet gets
-  # ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT=true (refuses to start unless
-  # workDirHostPath is actually a distinct filesystem from / — guards
-  # against a rolled pod starting before the mount is visible and
-  # silently shadow-writing the boot disk). This moves ACCOUNTING, not
+  # ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT=true + a read-only hostPath mount
+  # of the NODE's `/` at /mnt/host-root (ENGRAM_HOST_ROOT_REF_PATH) —
+  # refuses to start unless workDirHostPath is actually a distinct
+  # filesystem from the NODE's boot disk (comparing against the
+  # container's OWN `/`, its ephemeral overlayfs, would always differ
+  # from any hostPath mount and never catch a missing mount — hence the
+  # separate host-root reference mount). Guards against a rolled pod
+  # starting before the mount is visible and silently shadow-writing the
+  # boot disk. This moves ACCOUNTING, not
   # bytes: the dedicated disk still fills, and the budget above (not
   # this) is the mechanism that keeps the fleet off the kubelet's
   # eviction line. Nodepool provisioning of the device itself (e.g. a

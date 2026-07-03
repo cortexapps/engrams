@@ -64,6 +64,13 @@ data:
   # base-shm-startup-race failure class: a rolled pod starting before
   # the mount is visible would otherwise silently write to the boot disk).
   ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT: "true"
+  # ADR 0067 finding 1: the gate must compare workDirHostPath against
+  # the NODE's boot disk, not the host-agent container's own `/` (its
+  # ephemeral image overlayfs, which is on a distinct device from EVERY
+  # hostPath mount by construction — that comparison would always
+  # report "distinct filesystem" and never fire). The DaemonSet mounts
+  # the node's `/` read-only at /mnt/host-root for exactly this check.
+  ENGRAM_HOST_ROOT_REF_PATH: /mnt/host-root
   {{- end }}
   # ADR 0006 + issue #240: the egress proxy is MANDATORY. host-agent
   # always binds it and FAILS TO START if it can't (CA unloadable /

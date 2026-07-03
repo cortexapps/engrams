@@ -208,14 +208,18 @@ async fn main() -> Result<(), HostAgentError> {
 
     // ADR 0067: dedicated-volume mountpoint gate. When the chart pairs
     // `storage.dedicatedDevice` with `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT
-    // =true`, `work_dir` MUST resolve to a distinct filesystem from `/`
-    // — otherwise the chunk cache, snapshots, and memfiles silently
-    // land on the boot disk instead of the dedicated volume an operator
-    // provisioned specifically to take that load off the kubelet's
-    // nodefs signal (the base-shm-startup-race failure class: a rolled
-    // pod starting before node-prep's mount is visible). Fail loud
-    // BEFORE touching work_dir or registering with the coordinator —
-    // never come up silently wrong.
+    // =true`, `work_dir` MUST resolve to a distinct filesystem from the
+    // boot-disk reference path (`ENGRAM_HOST_ROOT_REF_PATH`, default `/`
+    // — bare metal only; the chart points this at a read-only hostPath
+    // mount of the NODE's `/` so the comparison isn't against the
+    // container's own overlayfs, which would always differ and make the
+    // gate vacuous) — otherwise the chunk cache, snapshots, and memfiles
+    // silently land on the boot disk instead of the dedicated volume an
+    // operator provisioned specifically to take that load off the
+    // kubelet's nodefs signal (the base-shm-startup-race failure class:
+    // a rolled pod starting before node-prep's mount is visible). Fail
+    // loud BEFORE touching work_dir or registering with the coordinator
+    // — never come up silently wrong.
     require_work_dir_mountpoint_or_exit(&cli.work_dir)?;
 
     // Bind the metrics port first. It's the Prometheus scrape target
@@ -699,13 +703,30 @@ fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Option<S
 /// [`require_work_dir_mountpoint_or_exit`].
 const WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR: &str = "ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT";
 
+/// Env var: the "boot disk" reference path the gate compares `work_dir`
+/// against. Defaults to `/` — correct bare-metal (or dev/VZ) semantics,
+/// where the process's own root IS the boot disk. **On K8s this must be
+/// overridden.** The host-agent's `/` is the pod's ephemeral overlayfs,
+/// which is on a distinct device from EVERY hostPath mount by
+/// construction — comparing `work_dir` (always a hostPath) against the
+/// container's `/` therefore always reports "distinct filesystem" and
+/// the gate never fires, even when `work_dir` is silently still on the
+/// node's boot disk (finding: this made the gate vacuous in the exact
+/// DaemonSet it was built for). The chart pairs this with
+/// `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT=true`, pointing it at
+/// `/mnt/host-root` — a read-only hostPath mount of the NODE's `/` — so
+/// the comparison is boot-disk-vs-work_dir, not overlayfs-vs-work_dir.
+const HOST_ROOT_REF_PATH_ENV_VAR: &str = "ENGRAM_HOST_ROOT_REF_PATH";
+
 /// ADR 0067: when `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT` is truthy
 /// (`1`/`true`, case-insensitive), hard-fail unless `work_dir` resolves
-/// to a distinct filesystem from `/` — i.e. a dedicated volume is
-/// actually mounted there, not just a directory on the boot disk. The
-/// chart sets this env var only when `storage.dedicatedDevice` is
-/// configured, so this is a paired guard: "you told me to expect a
-/// dedicated volume; prove it's mounted before I start writing to it."
+/// to a distinct filesystem from the boot-disk reference path
+/// (`ENGRAM_HOST_ROOT_REF_PATH`, default `/`) — i.e. a dedicated volume
+/// is actually mounted there, not just a directory on the boot disk.
+/// The chart sets `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT` only when
+/// `storage.dedicatedDevice` is configured, so this is a paired guard:
+/// "you told me to expect a dedicated volume; prove it's mounted before
+/// I start writing to it."
 ///
 /// Compares `st_dev` (`stat(2)`'s device id — the same primitive `df`
 /// uses to detect a mount boundary), not a mount-table parse, so it
@@ -728,10 +749,15 @@ fn require_work_dir_mountpoint_or_exit(work_dir: &std::path::Path) -> Result<(),
         return Ok(());
     }
 
-    let root_dev = std::fs::metadata("/")
+    let root_path = std::env::var(HOST_ROOT_REF_PATH_ENV_VAR)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let root_dev = std::fs::metadata(&root_path)
         .map_err(|e| {
             HostAgentError::Config(format!(
-                "{WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR}=true but could not stat /: {e}"
+                "{WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR}=true but could not stat the boot-disk \
+                 reference path {} ({HOST_ROOT_REF_PATH_ENV_VAR}): {e}",
+                root_path.display(),
             ))
         })?
         .dev();
@@ -753,13 +779,15 @@ fn require_work_dir_mountpoint_or_exit(work_dir: &std::path::Path) -> Result<(),
 
     if work_dev == root_dev {
         return Err(HostAgentError::Config(format!(
-            "{WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR}=true but {} is on the SAME filesystem as / \
-             (st_dev {work_dev} == {root_dev}) — the dedicated volume isn't mounted there yet \
-             (or storage.dedicatedDevice is misconfigured). Refusing to start: coming up on the \
-             boot disk here would silently defeat the whole point of the dedicated volume — \
-             cache/snapshot/memfile writes would count against the SAME kubelet nodefs signal \
-             ADR 0067's headroom gauge and budget exist to keep clear.",
+            "{WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR}=true but {} is on the SAME filesystem as the \
+             boot-disk reference path {} (st_dev {work_dev} == {root_dev}) — the dedicated \
+             volume isn't mounted there yet (or storage.dedicatedDevice is misconfigured). \
+             Refusing to start: coming up on the boot disk here would silently defeat the whole \
+             point of the dedicated volume — cache/snapshot/memfile writes would count against \
+             the SAME kubelet nodefs signal ADR 0067's headroom gauge and budget exist to keep \
+             clear.",
             work_dir.display(),
+            root_path.display(),
         )));
     }
     Ok(())
@@ -936,12 +964,24 @@ mod tests {
         let _g = env_guard();
         std::env::set_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR, "true");
         let tmp = tempfile::tempdir().unwrap();
-        let result = require_work_dir_mountpoint_or_exit(tmp.path());
+        // Both sides live under the same tempdir root, so they're
+        // guaranteed to share a filesystem regardless of host layout —
+        // comparing against the REAL `/` would be a host-layout
+        // assumption (true when TMPDIR sits on the root fs, e.g.
+        // ubuntu runners / macOS's APFS firmlinks; false on any box
+        // with /tmp on tmpfs, e.g. Fedora/Arch defaults).
+        let root_ref = tmp.path().join("root-ref");
+        std::fs::create_dir(&root_ref).unwrap();
+        let work_dir = tmp.path().join("work");
+        std::fs::create_dir(&work_dir).unwrap();
+        std::env::set_var(HOST_ROOT_REF_PATH_ENV_VAR, &root_ref);
+        let result = require_work_dir_mountpoint_or_exit(&work_dir);
         std::env::remove_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR);
+        std::env::remove_var(HOST_ROOT_REF_PATH_ENV_VAR);
         assert!(
             result.is_err(),
-            "a tempdir under the system temp dir shares /'s filesystem on every CI/dev box; \
-             the gate must reject it when required",
+            "work_dir and the test-pinned boot-disk reference path share a filesystem by \
+             construction (both under the same tempdir); the gate must reject it when required",
         );
     }
 
@@ -953,25 +993,36 @@ mod tests {
         let _g = env_guard();
         std::env::set_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR, "true");
         let tmp = tempfile::tempdir().unwrap();
+        let root_ref = tmp.path().join("root-ref");
+        std::fs::create_dir(&root_ref).unwrap();
+        std::env::set_var(HOST_ROOT_REF_PATH_ENV_VAR, &root_ref);
         let not_yet_created = tmp.path().join("sandboxes").join("work");
         let result = require_work_dir_mountpoint_or_exit(&not_yet_created);
         std::env::remove_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR);
-        // Same filesystem as / (tempdir), so it's still a rejection —
-        // the point of this test is that it errors on the FILESYSTEM
-        // check, not on a "no such file" stat failure.
+        std::env::remove_var(HOST_ROOT_REF_PATH_ENV_VAR);
+        // Same filesystem as the test-pinned boot-disk reference path
+        // (both under `tmp`), so it's still a rejection — the point of
+        // this test is that it errors on the FILESYSTEM check, not on a
+        // "no such file" stat failure.
         assert!(result.is_err());
     }
 
     #[test]
     fn mountpoint_gate_accepts_env_var_case_insensitively_and_via_1() {
         let _g = env_guard();
-        std::env::set_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR, "TRUE");
         let tmp = tempfile::tempdir().unwrap();
-        assert!(require_work_dir_mountpoint_or_exit(tmp.path()).is_err());
+        let root_ref = tmp.path().join("root-ref");
+        std::fs::create_dir(&root_ref).unwrap();
+        let work_dir = tmp.path().join("work");
+        std::fs::create_dir(&work_dir).unwrap();
+        std::env::set_var(HOST_ROOT_REF_PATH_ENV_VAR, &root_ref);
+        std::env::set_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR, "TRUE");
+        assert!(require_work_dir_mountpoint_or_exit(&work_dir).is_err());
         std::env::set_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR, "1");
-        assert!(require_work_dir_mountpoint_or_exit(tmp.path()).is_err());
+        assert!(require_work_dir_mountpoint_or_exit(&work_dir).is_err());
         std::env::set_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR, "false");
-        assert!(require_work_dir_mountpoint_or_exit(tmp.path()).is_ok());
+        assert!(require_work_dir_mountpoint_or_exit(&work_dir).is_ok());
         std::env::remove_var(WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR);
+        std::env::remove_var(HOST_ROOT_REF_PATH_ENV_VAR);
     }
 }
