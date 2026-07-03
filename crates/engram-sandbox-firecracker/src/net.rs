@@ -1058,18 +1058,35 @@ async fn provision_netns_inner(
 /// snat slot.
 #[cfg(target_os = "linux")]
 pub async fn teardown_netns(setup: &NetnsSetup, allocator: &parking_lot::Mutex<NetworkAllocator>) {
-    // `ip netns delete` cascades: it removes the TAP, veth-B, and
-    // the netns's iptables tables in one shot. veth-A in host root
-    // is auto-cleaned by the kernel when its peer disappears, so the
-    // explicit veth delete below only needs to run when the netns
-    // delete itself failed (belt-and-braces for a partial-failure
-    // state) — on the happy path this leg is a syscall-free no-op.
-    match run_cmd("ip", &["netns", "delete", &setup.netns_name]).await {
-        Ok(()) => {}
+    // `ip netns delete` cascades: it removes the TAP, veth-B, and the
+    // netns's iptables tables in one shot. But netns destruction
+    // itself is ASYNCHRONOUS — the kernel defers the actual teardown
+    // to the `cleanup_net` workqueue after the last reference drops,
+    // so veth-A in host root (and the /30 it holds) can still be
+    // visible for a nondeterministic window after `ip netns delete`
+    // returns Ok. We can't rely on that cascade before `free()`ing
+    // the snat slot below (issue #536 review, finding 1): a
+    // concurrent provision could get the freed slot while veth-A
+    // still pins it, reopening the exact double-bound-/30 shape of
+    // the prod 2026-05-21 incident documented below. So veth-A gets
+    // an unconditional, SYNCHRONOUS netlink delete first — a
+    // syscall, not a subprocess, so the two-spawn invariant survives.
+    if let Err(e) = run_cmd("ip", &["netns", "delete", &setup.netns_name]).await {
+        tracing::debug!(netns = %setup.netns_name, error = %e, "netns delete failed");
+    }
+    match rtnetlink::new_connection() {
+        Ok((conn, handle, _)) => {
+            let conn_task = tokio::spawn(conn);
+            if let Ok(idx) = link_index(&handle, &setup.veth_host).await {
+                if let Err(e) = handle.link().del(idx).execute().await {
+                    tracing::debug!(veth = %setup.veth_host, error = %e, "veth-A delete failed");
+                }
+            }
+            drop(handle);
+            conn_task.abort();
+        }
         Err(e) => {
-            tracing::debug!(netns = %setup.netns_name, error = %e, "netns delete failed");
-            // Fall through; veth-A may still need explicit cleanup.
-            let _ = run_cmd("ip", &["link", "delete", &setup.veth_host]).await;
+            tracing::debug!(error = %e, "host netlink socket failed; veth-A cleanup skipped");
         }
     }
     allocator.lock().free(setup.snat_cidr);
