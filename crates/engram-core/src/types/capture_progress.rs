@@ -102,6 +102,13 @@ pub enum CaptureFailureKind {
     /// The hook's `WarmConfig::timeout()` elapsed; agentd SIGKILLed the
     /// child in-guest and reported `Exit(None)`.
     WarmGlobalTimeout,
+    /// `Exit(None)` — the child died to a signal — observed WELL BEFORE
+    /// the hook's `timeout()` budget elapsed, so agentd's timeout
+    /// backstop is not the cause (e.g. a guest OOM kill at minute 2 of a
+    /// 55-minute budget). Distinct from `WarmGlobalTimeout` so an
+    /// operator isn't steered to raise `timeout_secs` for a failure
+    /// `timeout_secs` had nothing to do with.
+    WarmKilled,
     /// The exec stream ended (or errored) before an `Exit` event arrived
     /// — a transport-level failure (vsock/gRPC connection lost), not a
     /// deterministic hook outcome. The only retryable kind.
@@ -117,6 +124,7 @@ impl CaptureFailureKind {
             Self::WarmStall => "warm_stall",
             Self::WarmStageDeadline => "warm_stage_deadline",
             Self::WarmGlobalTimeout => "warm_global_timeout",
+            Self::WarmKilled => "warm_killed",
             Self::WarmExecTransport => "warm_exec_transport",
             Self::SnapshotFailed => "snapshot_failed",
         }
@@ -139,6 +147,7 @@ impl CaptureFailureKind {
             "warm_stall" => Self::WarmStall,
             "warm_stage_deadline" => Self::WarmStageDeadline,
             "warm_global_timeout" => Self::WarmGlobalTimeout,
+            "warm_killed" => Self::WarmKilled,
             "warm_exec_transport" => Self::WarmExecTransport,
             "snapshot_failed" => Self::SnapshotFailed,
             _ => return None,

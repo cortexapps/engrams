@@ -1024,15 +1024,28 @@ impl PooledBackend {
                     tail = %tail.render(),
                     "[warm] hook failed; aborting base-snapshot capture",
                 );
-                // A `None` status means agentd SIGKILLed the child at the
-                // in-guest `timeout_ms` backstop (`handler.rs`) — the
-                // deterministic global-timeout outcome. A stream that dies
-                // WITHOUT ever producing an Exit event (handled above,
-                // `None` from `stream.events.next()`) is the distinct,
-                // retryable `WarmExecTransport` case.
+                // A `None` status means the child died to a signal — but
+                // agentd's `timeout_ms` in-guest backstop (`handler.rs`)
+                // is only ONE producer of that. A guest-OOM kill (one of
+                // the failure causes `WarmConfig`'s own docs name) at
+                // minute 2 of a 55-minute budget also reports
+                // `Exit(None)`; labeling it `WarmGlobalTimeout` steers an
+                // operator to raise `timeout_secs` instead of fixing
+                // memory. Gate the timeout label on actually having
+                // reached (near) the declared budget — some slack for
+                // scheduling jitter between agentd's kill and this
+                // observing it — else classify as an unattributed signal
+                // kill. A stream that dies WITHOUT ever producing an Exit
+                // event (handled above, `None` from
+                // `stream.events.next()`) is the distinct, retryable
+                // `WarmExecTransport` case.
+                const TIMEOUT_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
                 let kind = match other {
                     Some(_) => CaptureFailureKind::WarmExitNonZero,
-                    None => CaptureFailureKind::WarmGlobalTimeout,
+                    None if started.elapsed() + TIMEOUT_SLACK >= warm.timeout() => {
+                        CaptureFailureKind::WarmGlobalTimeout
+                    }
+                    None => CaptureFailureKind::WarmKilled,
                 };
                 Err(violation_failure(
                     kind,
@@ -7316,6 +7329,91 @@ mod tests {
         assert!(
             !pooled.is_base_capture(id),
             "the exemption must be cleared after the capture VM is torn down",
+        );
+    }
+
+    /// Review finding 3: `Exit(None)` (the child died to a signal) MUST
+    /// NOT be unconditionally labeled `WarmGlobalTimeout` — that's only
+    /// correct when agentd's `timeout_ms` in-guest backstop actually
+    /// fired. A hook killed by something else (guest OOM, a manual
+    /// `kill -9`) well before its declared `timeout_secs` budget must
+    /// classify as the distinct, unattributed `WarmKilled` kind, or an
+    /// operator gets steered to raise `timeout_secs` for a failure that
+    /// timeout had nothing to do with.
+    #[tokio::test]
+    async fn warm_hook_early_signal_kill_is_not_misclassified_as_global_timeout() {
+        struct EarlySignalKillMock;
+        #[async_trait]
+        impl SandboxBackend for EarlySignalKillMock {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn exec_stream(
+                &self,
+                id: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                // Exit(None) arrives almost immediately — nowhere near
+                // the 30s `timeout_secs` budget below.
+                let events =
+                    futures::stream::iter(vec![engram_core::types::sandbox::ExecEvent::Exit(None)]);
+                Ok(ExecStream {
+                    sandbox_id: id,
+                    exec_id: "exec-early-kill".into(),
+                    events: Box::pin(events),
+                })
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                unreachable!("a killed [warm] hook must fail the capture before snapshot runs")
+            }
+            fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+                unreachable!()
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let inner: Arc<dyn SandboxBackend> = Arc::new(EarlySignalKillMock);
+        let pooled = PooledBackend::new(inner);
+        let warm = WarmConfig {
+            command: vec!["true".into()],
+            // Generous: proves the classification isn't just "we're near
+            // the deadline", it's "we're nowhere near it".
+            timeout_secs: Some(30),
+            workdir: None,
+            network: None,
+        };
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            pooled.build_base_snapshot(
+                live_spec("warm-early-kill"),
+                Some(warm),
+                Default::default(),
+                progress_tx,
+            ),
+        )
+        .await
+        .expect("must not hang");
+
+        let Err(SandboxError::CaptureFailed(failure)) = result else {
+            panic!("expected a structured CaptureFailed error, got {result:?}");
+        };
+        assert_eq!(
+            failure.kind,
+            engram_core::types::CaptureFailureKind::WarmKilled,
+            "an Exit(None) far from the timeout budget must not be labeled WarmGlobalTimeout"
         );
     }
 
