@@ -1242,10 +1242,27 @@ mod tests {
     async fn spawn_harness_installs_ca_before_spawn() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = temp_cacert_paths(&tmp);
+        // Pin the ORDERING, not just eventual existence: the spawned
+        // child stats the bundle path itself, at exec time, and records
+        // what it saw into `marker`. Asserting `paths.bundle.exists()`
+        // only after the response comes back would also pass an
+        // install-AFTER-spawn reordering bug, since both complete before
+        // the reply — this makes the child's own exec-time observation
+        // the assertion.
+        let marker = tmp.path().join("bundle-state-at-exec");
         let cacerts = Arc::new(crate::cacerts::CaCertInstaller::new(paths.clone()));
         let resp = round_trip_with_cacerts(
             WireRequest::SpawnHarness(crate::proto::SpawnHarnessRequest {
-                argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "test -f {} && echo present > {} || echo absent > {}",
+                        paths.bundle.display(),
+                        marker.display(),
+                        marker.display()
+                    ),
+                ],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
                 host_ca_pem: Some(
@@ -1266,9 +1283,17 @@ mod tests {
             }
             other => panic!("expected HarnessSpawned, got {other:?}"),
         }
-        assert!(
-            paths.bundle.exists(),
-            "CA must be installed BEFORE the spawn"
+        // The response only pins that spawn() returned, not that the
+        // detached child finished execing — poll for its marker.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let state = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(
+            state.trim(),
+            "present",
+            "CA bundle must already exist when the spawned child execs"
         );
         let bundle = std::fs::read_to_string(&paths.bundle).unwrap();
         assert!(bundle.contains("AAAA"));
@@ -1321,9 +1346,20 @@ mod tests {
                 .join("usr/local/share/ca-certificates/engram.crt"),
         };
         let cacerts = Arc::new(crate::cacerts::CaCertInstaller::new(paths));
+        // The issue spec required pinning "supervisor never spawned", not
+        // just "the response is an Error" — a regression that spawns the
+        // harness AND still returns Error would pass a message-only
+        // assertion unchanged. Have the argv (which would only ever run
+        // if spawn() were reached) touch a marker, and assert its
+        // absence.
+        let marker = tmp.path().join("spawned.marker");
         let resp = round_trip_with_cacerts(
             WireRequest::SpawnHarness(crate::proto::SpawnHarnessRequest {
-                argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("touch {}", marker.display()),
+                ],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
                 host_ca_pem: Some(
@@ -1344,6 +1380,10 @@ mod tests {
                 "CA install failure must block the spawn with an Error response, got {other:?}"
             ),
         }
+        assert!(
+            !marker.exists(),
+            "supervisor must never spawn when CA install fails"
+        );
     }
 
     #[tokio::test]
