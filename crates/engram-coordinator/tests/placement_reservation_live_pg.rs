@@ -8,7 +8,7 @@
 //! the only coverage of the actual SQL: the transaction, the reserved-set
 //! aggregate, the pending/queued-row insert, the satellite writes (secrets,
 //! capabilities, integration policy, harness, selected skills), the `LEFT
-//! JOIN`/`GREATEST` free computation, and that migrations 0057/0058/0077
+//! JOIN`/`GREATEST` free computation, and that migrations 0057/0058/0082
 //! apply. Pins the incident fix: a create burst SPREADS across hosts and
 //! REJECTS the overflow instead of stacking onto one host (the OOM) — and
 //! (issue #535) that the write-set commits as ONE transaction, not a chain
