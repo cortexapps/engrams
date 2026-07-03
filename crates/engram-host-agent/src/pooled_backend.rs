@@ -6288,6 +6288,20 @@ impl SandboxBackend for PooledBackend {
         // whole reconciliation point). GCS chunks are the durable truth;
         // ADR 0039: the chain is manifest-only now (no local rolling
         // image), so there's nothing on disk to remove here.
+        //
+        // Issue #529: the same invariant covers `eviction_finalize.rs`'s
+        // `EvictionFinalizeRecord`/`CheckpointRecord{kind:EvictionFinal}`
+        // (`<checkpoint_dir>/finalize/`, `.../records/`) and the
+        // `pending_finalizes` idempotency map — none of the three are
+        // touched here. In the normal flow that's moot: `run_terminal`
+        // deletes the `EvictionFinalizeRecord` and clears
+        // `pending_finalizes` itself, strictly BEFORE calling this
+        // `destroy()` (see the ordering in `run_terminal`). Were `destroy`
+        // ever invoked directly on a sandbox with a still-in-flight
+        // finalize (outside that job's own terminal step — not a path any
+        // caller in this repo takes today), the finalize job would keep
+        // running unaffected: it is a pure function of `dest` + the chunk
+        // store, never the live sandbox, and this method deletes neither.
         let _ = self.checkpoint_chains.remove(&id);
         let _ = self.capture_locks.remove(&id);
         // Issue #221: reclaim any unconsumed `snapshot_wait` slot. The
