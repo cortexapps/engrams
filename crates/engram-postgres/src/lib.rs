@@ -2961,8 +2961,12 @@ impl MetadataStore for PostgresStore {
         .rows_affected();
 
         if tombstoned == 0 {
-            // Checkpoint was already the head — no rewind. Don't bump
-            // the epoch (keeps the no-op clean); caller emits nothing.
+            // Checkpoint was already the head — no rewind — OR (PR #556
+            // review finding #5) the only post-cursor rows are excluded
+            // `prompt_received` receipts (see the exclusion above): nothing
+            // user-visible actually rewound either way, so this stays the
+            // correct no-op branch. Don't bump the epoch (keeps the no-op
+            // clean); caller emits nothing.
             tx.rollback().await.map_err(db_err)?;
             return Ok(engram_core::types::event::RewindSummary::default());
         }
