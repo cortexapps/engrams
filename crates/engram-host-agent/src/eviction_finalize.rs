@@ -733,8 +733,17 @@ pub(crate) async fn run_eviction_finalize(
                     "eviction finalize leg failed; will retry with backoff",
                 );
                 if record.attempts >= f.max_attempts {
-                    record.quarantine(&f.finalize_dir()).await;
+                    // Clear the idempotency entry BEFORE the record becomes
+                    // externally observable as quarantined (quarantine()
+                    // writes the finalize/failed/ marker and deletes `dest`).
+                    // The reverse order leaves a window where a racing
+                    // `snapshot_begin` (`pending_finalizes.get`) can hand
+                    // back this snapshot_id as still-in-flight after it's
+                    // already permanently dead — nothing re-drives a
+                    // quarantined record, so that caller would wait out the
+                    // row-watcher deadline for a row that will never land.
                     f.pending_finalizes.remove(&record.sandbox_id);
+                    record.quarantine(&f.finalize_dir()).await;
                     return;
                 }
                 if let Err(persist_err) = record.persist(&f.finalize_dir()).await {
