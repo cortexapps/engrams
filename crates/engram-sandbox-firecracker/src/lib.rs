@@ -4141,7 +4141,20 @@ impl SandboxBackend for FirecrackerBackend {
     /// stats sibling of `working_set_trace_path`, written by the
     /// uffd-handler at the end of `prefault_from_trace` (or, for the
     /// no-trace case, from its own startup path).
+    ///
+    /// `None` unless a uffd-handler actually exists for this sandbox
+    /// (`uffd_pid.is_some()` — populated for `RestoreMode::Uffd`
+    /// restores AND pidfd-reattached Uffd sandboxes, ADR 0044 K2).
+    /// `RestoreMode::File` restores (the default when there's no
+    /// `chunk_store`, and the documented `ENGRAM_FC_RESTORE_MODE=file`
+    /// fleet knob) never spawn a handler, so nothing can ever write
+    /// this file — returning `Some` there would make every File-mode
+    /// resume alarm as `stats_missing`. Trait contract: `None` = "this
+    /// backend/sandbox has no per-sandbox prefault detector" (mirrors
+    /// the VZ/Process default).
     fn prefault_stats_path(&self, id: SandboxId) -> Option<PathBuf> {
+        let live = self.sandboxes.get(&id)?;
+        live.uffd_pid?;
         Some(self.work_dir.join(id.to_string()).join(PREFAULT_STATS_FILE))
     }
 
@@ -6159,6 +6172,61 @@ mod tests {
         be.config.uffd_base_dir = Some(std::path::PathBuf::from("/dev/shm/engram"));
         assert!(be.restore_memory_is_lazy_for(true));
         assert!(be.restore_memory_is_lazy_for(false));
+    }
+
+    /// Review finding 2 regression test: `prefault_stats_path` must be
+    /// `None` for a sandbox with no live uffd-handler — `RestoreMode::File`
+    /// (the config default, and the documented `ENGRAM_FC_RESTORE_MODE=file`
+    /// fleet knob) never spawns one, so nothing could ever write the file;
+    /// returning `Some` there made every File-mode resume falsely alarm as
+    /// `stats_missing`. Keyed off `uffd_pid` (populated for
+    /// `RestoreMode::Uffd` restores AND pidfd-reattached Uffd sandboxes),
+    /// not the backend's static config — a fleet can run both modes.
+    #[test]
+    fn prefault_stats_path_none_without_a_uffd_handler() {
+        let (be, _dir) = backend();
+        let id = SandboxId::new();
+
+        // No entry in `sandboxes` at all (unknown/not-yet-live sandbox).
+        assert_eq!(be.prefault_stats_path(id), None);
+
+        let live_without_uffd = |uffd_pid: Option<u32>| {
+            let (_tx, agent_ready) = tokio::sync::watch::channel(true);
+            LiveSandbox {
+                state: SandboxState {
+                    spec: spec(),
+                    firecracker_socket: be.work_dir.join(id.to_string()).join("fc.sock"),
+                    rootfs_path: be.work_dir.join(id.to_string()).join("rootfs.ext4"),
+                    vsock_cid: 3,
+                    vsock_uds_path: be.work_dir.join(id.to_string()).join("vsock.sock"),
+                    rootfs_canonical: be.work_dir.join(id.to_string()).join("rootfs.ext4"),
+                },
+                child: None,
+                fc_pid: None,
+                uffd_handler: None,
+                uffd_pid,
+                net: None,
+                netns: None,
+                guest_ip: parking_lot::Mutex::new(None),
+                agent_ready,
+            }
+        };
+
+        // Live, but File-mode restore: no uffd_pid → still None.
+        be.sandboxes.insert(id, live_without_uffd(None));
+        assert_eq!(
+            be.prefault_stats_path(id),
+            None,
+            "File-mode sandboxes never spawn a handler; must not alarm as stats_missing",
+        );
+
+        // Live Uffd-mode restore (or a pidfd-reattached one): uffd_pid is
+        // Some → the sibling path resolves.
+        be.sandboxes.insert(id, live_without_uffd(Some(4242)));
+        assert_eq!(
+            be.prefault_stats_path(id),
+            Some(be.work_dir.join(id.to_string()).join(PREFAULT_STATS_FILE)),
+        );
     }
 
     // ADR 0022: the smaps_rollup parser, exercised against the test
