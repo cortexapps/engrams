@@ -91,7 +91,23 @@ touch it anymore).
 The job (`run_eviction_finalize`) runs stage-explicit legs — `Captured →
 DiskUploaded → MemoryChunked → BlobsUploaded → terminal` — each
 idempotent, each persisted before the next runs, so a crash between any
-two legs re-drives from exactly where it left off. Terminal writes the
+two legs re-drives from exactly where it left off. **Within a leg, the
+ordering is load-bearing**: publish to the chunk store, THEN persist the
+stage bump (with the resolved manifest ref), THEN delete the leg's
+on-disk input (`disk-pending/`, `memory.diff`/`memory.bin`) — never the
+reverse. A review pass caught the disk and memory legs doing this
+backwards in the initial cut (delete-then-persist), which made a crash
+in that exact window indistinguishable, on redrive, from "nothing to do
+this round" — silently landing a terminal `CheckpointRecord` with
+`memory_manifest: None`, or quarantining a snapshot whose manifest was
+already durably published. Fixed pre-merge (persist-then-delete in both
+legs, with an in-RAM rollback of the stage/ref on a failed persist so a
+subsequent retry doesn't trust an un-persisted mutation); the memory
+leg's `put_manifest` also gained a `VersionConflict`-at-`next_ref`
+idempotent-success arm for the same reason (`put_manifest` is
+content-blind — a conflict at the exact deterministic ref it always
+targets can only mean a prior, since-crashed attempt already landed the
+same content). Terminal writes the
 *ordinary* `CheckpointRecord { kind: EvictionFinal }` (re-advertised on
 every heartbeat until the coordinator's reconcile acks it into PG — the
 only place the row now lands for this flavor), deletes the finalize
