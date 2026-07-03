@@ -75,6 +75,27 @@ use crate::manifest::ChunkHash;
 /// Default populate-path sweep debounce (see `write_local`).
 pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
 
+/// ADR 0019 / telemetry restoration (#526), review finding 7: the
+/// peer-vs-GCS cache-fill counter, labeled `source="gcs"|"peer"`. This
+/// is the baseline meter for epic-gcs-free-resume's "GCS-free by
+/// policy" claim, so both fill sources must agree on the exact metric
+/// name — a typo in either literal would silently fork the series.
+///
+/// - `source="gcs"`: incremented here, in [`ChunkCache::get`]'s
+///   leader-persist arm, only when `write_local` actually landed the
+///   fetched bytes on disk (a `write_local` failure means the fetch
+///   happened but the cache did NOT fill — see the `write_local`
+///   error-handling comment just above the increment site).
+/// - `source="peer"`: incremented by `engram-host-agent::pooled_backend`
+///   at the two loops that land migration-sourced chunks into this same
+///   cache via [`ChunkCache::put_no_evict`] (the prestage loop and the
+///   `pull_chunks_from_source` divergence pull).
+pub const CHUNK_FILL_TOTAL: &str = "engram_chunk_fill_total";
+
+/// Byte-counted companion to [`CHUNK_FILL_TOTAL`]. Same `source` label,
+/// same two call sites (one here, one in `engram-host-agent`).
+pub const CHUNK_FILL_BYTES_TOTAL: &str = "engram_chunk_fill_bytes_total";
+
 /// Configuration for the on-disk cache.
 ///
 /// Eviction is governed by two independent constraints, whichever bites
@@ -558,40 +579,53 @@ impl ChunkCache {
                     // isn't cached, so every later read re-fetches from GCS —
                     // which presents exactly as "warming ran but reads still
                     // miss". Surface it loudly rather than swallowing (`let _ =`).
-                    if let Err(e) = self.write_local(hash, bytes).await {
-                        tracing::warn!(
-                            hash = %hash,
-                            root = %self.inner.config.root.display(),
-                            bytes = bytes.len(),
-                            error = %e,
-                            "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
-                        );
-                    }
+                    let write_local_ok = match self.write_local(hash, bytes).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                hash = %hash,
+                                root = %self.inner.config.root.display(),
+                                bytes = bytes.len(),
+                                error = %e,
+                                "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
+                            );
+                            false
+                        }
+                    };
+                    // This measures the fetch (bytes pulled from
+                    // BlobStorage), not the fill — it stays unconditional
+                    // even when write_local below fails.
                     metrics::counter!(
                         "engram_chunk_cache_bytes_total",
                         "tier" => "blobstorage",
                     )
                     .increment(bytes.len() as u64);
-                    // ADR 0019 / telemetry restoration (#526): the baseline
-                    // meter for epic-gcs-free-resume's "GCS-free by policy"
-                    // claim — every chunk that fills the local cache from
-                    // BlobStorage (as opposed to a peer-fill, recorded at the
-                    // host-agent's MigrationFetch destination pull loop)
-                    // counts here. `source="gcs"` names the fetch backend
-                    // this closure resolves to in practice (BlobStorage is
-                    // GCS in every deployed configuration); a non-GCS
-                    // BlobStorage impl would still be the correct label for
-                    // "the cold tier", not a peer.
-                    metrics::counter!(
-                        "engram_chunk_fill_total",
-                        "source" => "gcs",
-                    )
-                    .increment(1);
-                    metrics::counter!(
-                        "engram_chunk_fill_bytes_total",
-                        "source" => "gcs",
-                    )
-                    .increment(bytes.len() as u64);
+                    // ADR 0019 / telemetry restoration (#526), review finding
+                    // 4: the baseline meter for epic-gcs-free-resume's
+                    // "GCS-free by policy" claim — every chunk that fills the
+                    // local cache from BlobStorage (as opposed to a
+                    // peer-fill, recorded at the host-agent's MigrationFetch
+                    // destination pull loops) counts here. `source="gcs"`
+                    // names the fetch backend this closure resolves to in
+                    // practice (BlobStorage is GCS in every deployed
+                    // configuration); a non-GCS BlobStorage impl would still
+                    // be the correct label for "the cold tier", not a peer.
+                    // Gated on `write_local_ok`: a fetch whose local persist
+                    // failed did NOT fill the cache — counting it here would
+                    // mask exactly the "warming ran but reads still miss"
+                    // state the write_local warning above exists to catch.
+                    if write_local_ok {
+                        metrics::counter!(
+                            CHUNK_FILL_TOTAL,
+                            "source" => "gcs",
+                        )
+                        .increment(1);
+                        metrics::counter!(
+                            CHUNK_FILL_BYTES_TOTAL,
+                            "source" => "gcs",
+                        )
+                        .increment(bytes.len() as u64);
+                    }
                 }
                 // Notify waiters. Send-failure (their rx dropped)
                 // is benign.
