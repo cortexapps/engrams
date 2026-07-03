@@ -41,19 +41,22 @@ self-verified vector (`schema`, `backend`, `grpc_self_connect`, `base_shm_tmpfs`
 capability a `CapStatus` (`Unknown | Ok(detail) | Failed(msg) | NotApplicable`). Probed by
 the host-agent (`engram-host-agent::capabilities`) once at startup (before the first
 register) and re-probed every heartbeat tick; persisted on `hosts.capabilities` (migration
-0077, JSONB, default `'{}'::jsonb` ⇒ `schema: 0`). `schema == 0` is the soft-pass posture a
+0080, JSONB, default `'{}'::jsonb` ⇒ `schema: 0`). `schema == 0` is the soft-pass posture a
 pre-0068 row or a mid-roll host gets — same shape `wire_version == 0` already had.
 
 The placement gate (`engram-coordinator::placement::host_meets_capabilities`) requires,
 once `schema >= 1`: `grpc_self_connect` + `bundle_stamp` both `Ok` for ANY FC placement;
-`base_shm_tmpfs` + `uffd_minor_shmem` + `nbd` all `Ok` when the placement's
-`CapabilityRequirements::needs_uffd_substrate` is set (derived per call site — the enabled
-image's `base_snapshot_memory_manifest` on create, the snapshot row's `memory_manifest` on
-resume/evac); and an exact `fc_snapshot_version` match when both the snapshot row and the
-candidate host report one. `Failed`, `Unknown`, and `NotApplicable` all fail a *required*
-capability alike.
+`base_shm_tmpfs` + `uffd_minor_shmem` + `nbd` each `Ok` **or** `NotApplicable` when the
+placement's `CapabilityRequirements::needs_uffd_substrate` is set (derived per call site —
+the enabled image's `base_snapshot_memory_manifest` on create, the snapshot row's
+`memory_manifest` on resume/evac); and an exact `fc_snapshot_version` match when both the
+snapshot row and the candidate host report one. `Failed` and `Unknown` fail a *required*
+capability; `NotApplicable` passes it — it's the honest report of an ADR 0022 File-backend
+host (the substrate was never configured, so there's nothing to probe), which can still
+legitimately serve a memory-manifest placement via the File-backend path (see "Post-review
+fixes" below — this was a bug in the original implementation, fixed post-review).
 
-`snapshots.fc_snapshot_version` (migration 0077) records the capturing host's `firecracker
+`snapshots.fc_snapshot_version` (migration 0080) records the capturing host's `firecracker
 --snapshot-version` at eviction-snapshot and checkpoint-advert-reconcile time — this is the
 capture-time pairing key `epic-capture-jobs` decision 9 folds into its cold-base content
 key.
@@ -140,3 +143,53 @@ graphable together.
 - [x] `snapshots.fc_snapshot_version` populated on new eviction snapshots + checkpoint-
       advert rows on FC hosts (wired in `idle_evictor.rs` + `host_http.rs`'s checkpoint
       reconcile).
+
+## Post-review fixes (PR #564)
+
+A deep review pass (`gh api repos/cortexapps/engrams/pulls/564/reviews`) found six
+CONFIRMED issues, all fixed on the same branch before merge:
+
+1. **`host_meets_capabilities` failed `NotApplicable` on the substrate caps** — an ADR 0022
+   File-backend host honestly reports `NotApplicable` for `base_shm_tmpfs`/
+   `uffd_minor_shmem`/`nbd` (nothing to probe, substrate never configured), but the gate
+   treated that the same as `Failed`/`Unknown`, so a File-mode fleet would be 100%
+   `NoCapacity` for every memory-manifest placement — foreclosing the ADR 0022 canary/flip.
+   Fixed: `NotApplicable` now passes a required substrate capability alongside `Ok`; only
+   `Failed`/`Unknown` withhold it. (Checked first whether PR #560's dead-code purge deletes
+   `RestoreMode::File` and makes this moot — as of the fix, #560 had explicitly NOT landed
+   that deletion, so the finding was live and needed a real code fix, not just a
+   landing-order note.)
+2. **Two `record_snapshot` call sites never stamped `fc_snapshot_version`** despite having
+   the host in hand: `api/snapshot.rs::snapshot_core` (API-initiated session snapshots) and
+   `api/enabled_images.rs::capture_and_record_base_snapshot` (base-template capture). Both
+   now do the same best-effort `fc_snapshot_version_for_host` lookup the idle-evictor
+   pipeline already used.
+3. **Misleading comment on `api/sessions.rs`'s create-path gate** — it claimed
+   `fc_snapshot_version` pairing "only matters for RESTORING a previously-captured snapshot
+   ... not for booting from the base template," but a create IS an FC restore of the base
+   snapshot (no warm pool). Rewritten to state the real reason creates stay unconstrained:
+   `PreparedBoot` assembly doesn't thread the base row's recorded version through yet.
+4. **`FC_SNAPSHOT_VERSION`'s `OnceLock` permanently cached a transient probe failure** — a
+   one-off `firecracker --snapshot-version` spawn failure (fork EAGAIN, binary momentarily
+   missing mid-bake) locked in `None` until process restart, silently version-unconstraining
+   every snapshot/restore on that host thereafter. Fixed: only the success path is cached; a
+   failed probe re-spawns (cheap) on the next heartbeat tick and self-heals.
+5. **`exclusion_summary`'s doc comment didn't match its code** — omitted `not_ready` and
+   stated the wrong order. Fixed to match the actual first-match order (and its own unit
+   test).
+6. **Web fleet view dropped `fc_snapshot_version`/`capabilities_schema`** — regenerated into
+   the proto bindings (fields 25/26) but never threaded through `protoHostToLegacy`,
+   `types.ts`, or `Fleet.tsx`, so the operator-facing "one-glance skew display" step 13 asked
+   for was incomplete. Wired through; `Fleet.tsx` now shows a host's reported snapshot
+   version inline and a "caps unreported" badge for `schema == 0` hosts.
+
+Also fixed a CI-only bug (not a review-doc finding, but blocking merge): the
+`cross-compile linux-musl artifacts` job built `engram-host-agent` without the
+`CFLAGS_x86_64_unknown_linux_musl`/`BINDGEN_EXTRA_CLANG_ARGS` env the job already set for
+`engram-uffd-handler`'s step — the new `userfaultfd` dependency (this ADR's UFFD MINOR probe)
+needed the same kernel-UAPI-header wiring the first time it hit the host-agent musl build.
+Hoisted both vars to the job level.
+
+Migration renumbered `0077` → `0080` as part of a six-PR batch-wide collision resolution
+(six sibling PRs in the same 2026-07 core-ops overhaul batch all claimed `0077` from the same
+`main` base); this PR's assigned slot in the land-queue is `0080`.

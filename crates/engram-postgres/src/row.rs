@@ -121,7 +121,7 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let total_vcpus: i32 = row.try_get("total_vcpus").map_err(col_err)?;
     // Issue #229: the host's reported bincode wire version (migration 0066).
     let wire_version: i32 = row.try_get("wire_version").map_err(col_err)?;
-    // ADR 0068 (migration 0077): the self-verified capability vector.
+    // ADR 0068 (migration 0080): the self-verified capability vector.
     // `#[serde(default)]` on every `HostCapabilities` field means a
     // pre-0068 row's `'{}'::jsonb` default decodes cleanly to
     // `schema: 0` — the same soft posture `wire_version == 0` gets.
@@ -203,7 +203,7 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
     // ADR 0028 A.log (migration 0053): the event-log leg of the
     // coherence triple. NULL on pre-0053 rows + template snapshots.
     let events_cursor: Option<i64> = row.try_get("events_cursor").map_err(col_err)?;
-    // ADR 0068 (migration 0077): the capturing host's FC snapshot-version
+    // ADR 0068 (migration 0080): the capturing host's FC snapshot-version
     // pairing key. NULL on pre-0068 rows, VZ/Process captures, and
     // captures recorded without a known host.
     let fc_snapshot_version: Option<String> =

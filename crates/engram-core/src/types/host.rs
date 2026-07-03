@@ -188,7 +188,7 @@ impl CapStatus {
 /// ADR 0068: typed, self-verified host readiness. Probed by the
 /// host-agent at startup (before the first register) and re-asserted on
 /// every heartbeat; persisted as JSONB on the `hosts` row (migration
-/// 0077) and carried as JSON in the register/heartbeat bodies. The
+/// 0080) and carried as JSON in the register/heartbeat bodies. The
 /// host<->coord control plane is HTTP/JSON, so every field is
 /// `#[serde(default)]` — an old host-agent's payload (missing this
 /// struct, or missing individual fields within it) decodes to
@@ -334,7 +334,7 @@ pub struct HostRecord {
     #[serde(default)]
     pub wire_version: u32,
     /// ADR 0068: the host's self-verified capability vector, from the
-    /// most recent register/heartbeat (migration 0077). `schema == 0`
+    /// most recent register/heartbeat (migration 0080). `schema == 0`
     /// for pre-0068 rows / hosts mid-roll — soft-tolerated by the
     /// placement gate, same posture as `wire_version == 0`.
     #[serde(default)]

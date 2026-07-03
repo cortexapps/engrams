@@ -168,7 +168,7 @@ pub struct SnapshotRecord {
     #[serde(default)]
     pub events_cursor: Option<i64>,
     /// ADR 0068: the capturing host's `firecracker --snapshot-version`
-    /// at capture time (migration 0077), copied from
+    /// at capture time (migration 0080), copied from
     /// `hosts.capabilities ->> 'fc_snapshot_version'` when the
     /// recording host is known. `None` on pre-0068 rows, VZ/Process
     /// captures, and captures recorded without a known host. Placement
