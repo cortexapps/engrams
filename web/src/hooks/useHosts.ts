@@ -19,6 +19,8 @@ function protoHostToLegacy(h: ProtoHostView): HostView {
     util_cpu_pct: h.utilCpuPct,
     last_heartbeat_at: h.lastHeartbeatAt,
     failing_capabilities: h.failingCapabilities,
+    fc_snapshot_version: h.fcSnapshotVersion,
+    capabilities_schema: h.capabilitiesSchema,
   };
 }
 
