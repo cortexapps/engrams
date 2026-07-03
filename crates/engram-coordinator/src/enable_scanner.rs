@@ -466,12 +466,32 @@ async fn advance_one(
     let digest = image_ref.manifest_digest.as_str().to_string();
     let deadline = tokio::time::Instant::now() + cfg.prestage_timeout;
     let wait_started = std::time::Instant::now();
+    // Last-known counts from a successful poll, surfaced in the TimedOut
+    // outcome if the deadline is hit inside the error arm below (review
+    // finding 2, PR #565) — a persistent `list_active_hosts` failure
+    // shouldn't discard whatever we last observed.
+    let mut last_seen = (0usize, 0usize); // (staged, eligible)
     let prestage_outcome = loop {
         let hosts = match state.services.meta.list_active_hosts().await {
             Ok(hosts) => hosts,
             Err(e) => {
                 tracing::warn!(%job_id, error = %e, "enable prestage: list_active_hosts failed; retrying");
-                tokio::time::sleep(cfg.poll_interval).await;
+                // A persistent PG read failure must still respect the
+                // documented hard deadline (acceptance criterion 3) instead
+                // of spinning forever — `run_once` drives claimed jobs
+                // sequentially, so a wedged wait here stalls every other
+                // claimed enable job too.
+                if tokio::time::Instant::now() >= deadline {
+                    break PrestageOutcome::TimedOut {
+                        staged: last_seen.0,
+                        eligible: last_seen.1,
+                    };
+                }
+                tokio::time::sleep(
+                    cfg.poll_interval
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await;
                 continue;
             }
         };
@@ -484,6 +504,7 @@ async fn advance_one(
             PrestageEval::Complete => break PrestageOutcome::Complete,
             PrestageEval::EmptyFleet => break PrestageOutcome::EmptyFleet,
             PrestageEval::Waiting { staged, eligible } => {
+                last_seen = (staged, eligible);
                 if tokio::time::Instant::now() >= deadline {
                     break PrestageOutcome::TimedOut { staged, eligible };
                 }
