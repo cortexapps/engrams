@@ -374,7 +374,6 @@ impl Driver {
         self.sess.resume(req).await.expect("Resume");
     }
 
-    /// `SessionService.GetCowState`. ADR 0016 Phase A diagnostic. Returns
     /// `SessionService.ListSessionEvents` — unary, paginated, unfiltered
     /// read of the persistent event log (ADR 0060). Issue #529: used to
     /// assert a clean evict→resume cycle emits no `recovered_from_checkpoint`
@@ -407,6 +406,7 @@ impl Driver {
         out
     }
 
+    /// `SessionService.GetCowState`. ADR 0016 Phase A diagnostic. Returns
     /// `Some(state)` when the sandbox is NBD-tracked (Phase B's chunked-disk
     /// pipeline live), `None` when the host fell back to materialize-to-file
     /// (no nbd.ko, no nbd_pool, etc.). Used by Phase B tests as a runtime
