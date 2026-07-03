@@ -92,12 +92,11 @@ pub trait HostClient: Send + Sync {
     /// [`Self::snapshot_wait`]. Returns the new snapshot's id once the
     /// capture itself has succeeded — the point where the coordinator
     /// may mark the session Idle. Default errs so backends without the
-    /// split path (VZ, Process — see `SandboxBackend::supports_split_
-    /// eviction`) fall back to the composed [`Self::snapshot`]. The
-    /// fleet's hard `WIRE_VERSION` lockstep gate (skewed hosts are
-    /// dropped by `host_wire_version_ok`) means this default is never
-    /// reached because a host is running old code — only because its
-    /// backend genuinely has no split-eviction concept.
+    /// split path (VZ, Process) fall back to the composed
+    /// [`Self::snapshot`]. The fleet's hard `WIRE_VERSION` lockstep gate
+    /// (skewed hosts are dropped by `host_wire_version_ok`) means this
+    /// default is never reached because a host is running old code —
+    /// only because its backend genuinely has no split-eviction concept.
     async fn snapshot_begin(
         &self,
         _id: SandboxId,
