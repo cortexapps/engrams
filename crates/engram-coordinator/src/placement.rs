@@ -287,11 +287,12 @@ fn host_passes_filters(
 /// path).
 ///
 /// One reason per host, first-match order: `excluded` (an explicit
-/// `exclude_host`) → `stale` (heartbeat older than `ttl`) → `cordoned` →
-/// `wire_skew` → `cap:<name>` (a required capability failed) →
-/// `digest_not_ready` (image not prefetched) → `no_fit` (schedulable but
-/// this predicate found nothing else wrong — a capacity-dimension miss
-/// the caller's own fit logic will re-discover).
+/// `exclude_host`) → `not_ready` (`HostStatus != Ready`) → `cordoned` →
+/// `wire_skew` → `stale` (heartbeat older than `ttl`) → `cap:<name>` (a
+/// required capability failed) → `digest_not_ready` (image not
+/// prefetched) → `no_fit` (schedulable but this predicate found nothing
+/// else wrong — a capacity-dimension miss the caller's own fit logic
+/// will re-discover).
 pub fn exclusion_summary(
     hosts: &[HostRecord],
     ctx: &ScheduleContext<'_>,
