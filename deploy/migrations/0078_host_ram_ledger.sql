@@ -13,7 +13,7 @@
 -- `/metrics` (`engram_host_ram_ledger_mib{category="base_shm_pending"}`) —
 -- not durable multi-replica-consistent state PG needs to hold.
 --
--- Additive + serde-defaulted: pre-0077 hosts (and non-Linux dev backends)
+-- Additive + serde-defaulted: pre-0078 hosts (and non-Linux dev backends)
 -- report 0 for all three, same posture as every other util_* column.
 
 ALTER TABLE hosts ADD COLUMN IF NOT EXISTS util_base_shm_mib BIGINT NOT NULL DEFAULT 0;

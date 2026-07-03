@@ -197,7 +197,7 @@ export type HostView = Message<"engram.app.v1.HostView"> & {
   /**
    * Issue #540 (host RAM ledger attribution): measured base-shm tmpfs
    * residency, and the running/parked split of guest PSS. `0` until the
-   * host's first post-0077 heartbeat. `base_shm_pending_mib` is
+   * host's first post-0078 heartbeat. `base_shm_pending_mib` is
    * deliberately absent — it's transient host-local state already
    * folded into `allocatable_mib`, not durable PG state this view reads.
    *

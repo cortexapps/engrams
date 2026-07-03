@@ -103,7 +103,7 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let util_mem_used_mib: i64 = row.try_get("util_mem_used_mib").map_err(col_err)?;
     let util_cpu_pct: f32 = row.try_get("util_cpu_pct").map_err(col_err)?;
     let util_allocatable_mib: i64 = row.try_get("allocatable_mib").map_err(col_err)?;
-    // Issue #540 (host RAM ledger attribution, migration 0077).
+    // Issue #540 (host RAM ledger attribution, migration 0078).
     // `base_shm_pending_mib` has no PG column (transient host-local
     // state, already folded into `util_allocatable_mib` above) — it
     // stays 0 across a DB round-trip; the host's own `/metrics` is the

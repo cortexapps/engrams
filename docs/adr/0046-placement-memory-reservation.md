@@ -254,7 +254,7 @@ and the pressure gate's `free_pct` can never diverge.
 
 See `crates/engram-host-agent/src/ram_ledger.rs` for the implementation; the
 per-category attribution rides the wire as `HostUtilization.{base_shm_mib,
-parked_pss_mib, running_pss_mib}` (migration 0077) and the
+parked_pss_mib, running_pss_mib}` (migration 0078) and the
 `engram_host_ram_ledger_mib{category=...}` gauge family.
 
 [#147]: https://github.com/cortexapps/engrams/issues/147

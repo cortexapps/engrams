@@ -185,7 +185,7 @@ async fn fleet_free_mib_sql_runs_against_real_pg() {
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn ram_ledger_util_columns_round_trip_through_real_pg() {
-    // Issue #540 / migration 0077: `touch_host_heartbeat` writes the RAM
+    // Issue #540 / migration 0078: `touch_host_heartbeat` writes the RAM
     // ledger's attribution columns (util_base_shm_mib, util_parked_pss_mib,
     // util_running_pss_mib), and `list_active_hosts` (row_from_row) reads
     // them back into the SAME `HostRecord.utilization` `reserve_placement`

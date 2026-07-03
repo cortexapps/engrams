@@ -163,7 +163,7 @@ export interface HostView {
   util_cpu_pct: number;
   /** Issue #540 (host RAM ledger attribution): measured base-shm tmpfs
    *  residency, and the running/parked split of guest PSS. 0 until the
-   *  host's first post-0077 heartbeat. */
+   *  host's first post-0078 heartbeat. */
   util_base_shm_mib: number;
   util_parked_pss_mib: number;
   util_running_pss_mib: number;
