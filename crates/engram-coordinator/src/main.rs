@@ -374,16 +374,16 @@ async fn main() -> Result<(), CoordinatorError> {
         CloudBackendChoice::Mock => Arc::new(MockCloud::new()),
     };
 
-    // ADR 0007 orphan-reap admin endpoint needs to know which
-    // local dir the in-process host-agent materializes into. Only
-    // populated for `--mode=all`; in `--mode=coordinator` the
-    // materialized files live on each host and the reap is a
-    // future multi-host RPC.
-    let coord_materialize_dir = if matches!(cli.mode, RunMode::All) {
-        Some(cli.local_path.join("chunked-rootfs"))
-    } else {
-        None
-    };
+    // ADR 0007 orphan-reap admin endpoint needs to know which local
+    // dir an in-process host-agent materializes into. `--mode=all`
+    // is now Process-backend-only (the FC/VZ in-proc arms were
+    // retired, #530 item f) and `ProcessBackend` has no chunk store /
+    // egress / materialize wiring at all — nothing ever writes under
+    // `<local_path>/chunked-rootfs` — so this is unconditionally
+    // `None`. Revisit once a real materialize-dir producer exists in
+    // `--mode=all` (or the admin reaper grows the multi-host fanout
+    // `--mode=coordinator` already needs).
+    let coord_materialize_dir: Option<std::path::PathBuf> = None;
 
     // ADR 0007: blob storage. The Arc backs the chunk store
     // (manifests + content-addressed chunks live here). Hoisting

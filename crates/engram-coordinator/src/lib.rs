@@ -92,11 +92,15 @@ pub struct Services {
     /// `PooledBackend` (materialize-on-create) and the coord's
     /// admin GC endpoint (sweep unreferenced chunks).
     pub chunk_store: engram_chunk_store::ChunkStore,
-    /// ADR 0007: where the in-process host-agent (active in
-    /// `--mode=all`) materializes chunked manifests. `Some` when
-    /// running `--mode=all`; `None` in `--mode=coordinator` (the
-    /// admin reaper endpoint then becomes a multi-host fanout —
-    /// out of scope for this slice).
+    /// ADR 0007: where an in-process host-agent would materialize
+    /// chunked manifests, for the admin orphan-reap endpoint.
+    /// Currently always `None`: `--mode=all`'s only backend is
+    /// `ProcessBackend` (the FC/VZ in-proc arms were retired, #530
+    /// item f), which has no chunk store / materialize wiring, and
+    /// `--mode=coordinator`'s reap would need a multi-host fanout
+    /// that doesn't exist yet. Kept as a field (not deleted) since a
+    /// real `--mode=all` materialize-dir producer would plug back in
+    /// here without a wire change.
     pub materialize_dir: Option<std::path::PathBuf>,
 }
 
