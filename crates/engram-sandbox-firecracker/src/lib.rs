@@ -6336,7 +6336,7 @@ mod tests {
                 uffd_pid,
                 net: None,
                 netns: None,
-                guest_ip: parking_lot::Mutex::new(None),
+                guest_endpoints: parking_lot::Mutex::new(None),
                 agent_ready,
             }
         };
