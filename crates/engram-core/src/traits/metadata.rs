@@ -147,7 +147,13 @@ pub trait MetadataStore: Send + Sync {
     /// [`MetadataStore::reserve_and_persist_create`] before any host RPC
     /// ran) to `Created`, binding `sandbox_id`. Replaces the old
     /// `create_session_created`'s INSERT-or-UPDATE upsert — the row is now
-    /// GUARANTEED to already exist, so this is a single `UPDATE`.
+    /// GUARANTEED to already exist, so this is a single `UPDATE`. The
+    /// UPDATE is still guarded on `status = 'pending'`: a delete or a
+    /// stale-pending requeue can race the in-flight restore RPC that
+    /// precedes this call, so "exists" is not "still pending". Returns
+    /// [`MetaError::NotFound`] if the row is gone or no longer `pending`,
+    /// so the caller's teardown arm runs instead of silently binding
+    /// `sandbox_id` onto an inconsistent row.
     async fn transition_session_created(
         &self,
         session_id: SessionId,

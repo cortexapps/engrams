@@ -457,11 +457,18 @@ impl MetadataStore for PostgresStore {
         // Issue #535 (c): the row is GUARANTEED to already exist (`pending`,
         // committed by `reserve_and_persist_create` before any host RPC ran)
         // — a slim UPDATE replaces the old `create_session_created` upsert.
-        sqlx::query(
+        // But existing != still-`pending`: DeleteSession can remove the row,
+        // or `requeue_stale_pending` can flip it back to `queued`, while the
+        // restore RPC that preceded this call is in flight. Guard on the
+        // expected state and check `rows_affected` so a lost race surfaces
+        // as `NotFound` instead of silently binding `sandbox_id` onto
+        // whatever status the row now has — the caller's `Err` arm tears the
+        // now-orphaned sandbox back down.
+        let res = sqlx::query(
             r#"
             UPDATE sessions
                SET status = 'created', sandbox_id = $2, last_active_at = NOW()
-             WHERE id = $1
+             WHERE id = $1 AND status = 'pending'
             "#,
         )
         .bind(session_id.as_uuid())
