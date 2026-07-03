@@ -934,7 +934,7 @@ impl MetadataStore for PostgresStore {
     async fn enqueue_session_resume(&self, id: SessionId) -> Result<(), MetaError> {
         // Idle → queued (resume origin). Gated on `status='idle'` so a
         // racing resume that already advanced the row is a clean no-op.
-        sqlx::query(
+        let n = sqlx::query(
             r#"
             UPDATE sessions
                SET status = 'queued', queued_at = NOW(), queue_origin = 'resume',
@@ -945,8 +945,19 @@ impl MetadataStore for PostgresStore {
         .bind(id.as_uuid())
         .execute(&self.pool)
         .await
-        .map_err(db_err)?;
-        self.notify_placement_changed("enqueued").await;
+        .map_err(db_err)?
+        .rows_affected();
+        if n > 0 {
+            // Matches `delete_pending_session`'s guard below: only a
+            // session that actually landed in `queued` needs the
+            // fleet-wide scanner wake — the capacity-freed-between-
+            // reserve-and-enqueue race this NOTIFY exists for. The
+            // `status='idle'` no-op path (a racing resume that already
+            // advanced the row) has nothing new for the scanner to place;
+            // waking every replica's scanner into a full sweep for it is
+            // pure overhead.
+            self.notify_placement_changed("enqueued").await;
+        }
         Ok(())
     }
 
