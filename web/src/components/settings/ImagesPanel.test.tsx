@@ -57,7 +57,11 @@ function makeProtoImage(
   };
 }
 
-function makeProtoJob(imageUri: string, state = "materializing"): ProtoEnableJob {
+function makeProtoJob(
+  imageUri: string,
+  state = "materializing",
+  prestageHosts = "{}",
+): ProtoEnableJob {
   return {
     $typeName: "engram.app.v1.EnableJob",
     id: "job-1",
@@ -71,7 +75,7 @@ function makeProtoJob(imageUri: string, state = "materializing"): ProtoEnableJob
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     // ADR 0036 amendment (issue #538): "{}" until the prestage stage runs.
-    prestageHosts: "{}",
+    prestageHosts,
   };
 }
 
@@ -287,6 +291,26 @@ describe("ImagesPanel RPC contract", () => {
 
     await waitFor(() => {
       expect(screen.getByText(/staging chunks to hosts/i)).toBeTruthy();
+    });
+  });
+
+  test("prestage_hosts renders the per-host staged/eligible count on the dashboard", async () => {
+    // review finding 5 (PR #565): prestage_hosts was plumbed through
+    // proto → legacy → types.ts but never rendered — the PR body's "surfaced
+    // on both the dashboard and CLI" claim was false. This pins the fix.
+    const prestageHosts = JSON.stringify({
+      "host-1": { outcome: "staged", waited_ms: 1200 },
+      "host-2": { outcome: "timed_out", waited_ms: 20000 },
+      "host-3": { outcome: "unschedulable" },
+    });
+    const { transport } = installCapturingTransport(
+      [makeProtoImage("ghcr.io/cortex/api:warm-1")],
+      [makeProtoJob("ghcr.io/cortex/api:warm-1", "prestaging", prestageHosts)],
+    );
+    renderWithProviders(<ImagesPanel />, { transport });
+
+    await waitFor(() => {
+      expect(screen.getByText(/1\/2 hosts staged \(1 unschedulable\)/i)).toBeTruthy();
     });
   });
 
