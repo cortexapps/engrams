@@ -616,12 +616,12 @@ pub async fn provision(
     provision_with_named_tap(vm_cidr, &tap_name).await
 }
 
-/// Restore-time variant: the /30 is already reserved (caller passed
-/// the manifest's slot through `NetworkAllocator::reserve`) and the
-/// TAP name comes from the manifest, not the new sandbox's id. The
-/// guest's `state.bin` was snapshotted with the original TAP name on
-/// the virtio-net frontend, so we have to recreate it under the same
-/// name on the host or FC's snapshot load fails.
+/// Cold-create leg (bake / fresh sandbox), NEVER on the session-restore
+/// hot path — restore routes through `provision_netns`/
+/// `provision_netns_inner`'s per-VM netns instead. `provision`'s /30
+/// alloc and the sandbox's own `tap_name_for`-derived name are passed
+/// straight through; this only ever runs in host root, so it can call
+/// `create_persistent_tap` directly (no setns dance).
 #[cfg(target_os = "linux")]
 pub async fn provision_with_named_tap(
     vm_cidr: VmCidr,
