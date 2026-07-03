@@ -6321,7 +6321,10 @@ impl SandboxBackend for PooledBackend {
     /// this the trait default (`Ok(5900)`) would run and the FC/VZ backend's
     /// actual vsock StartBrowser RPC to in-VM agentd would never fire, so
     /// the host's `proxy_vnc` would dial a port nothing started.
-    async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+    async fn start_browser(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         self.inner.start_browser(id).await
     }
 
@@ -8721,9 +8724,15 @@ mod tests {
                 self.start_shell_calls.lock().push(id);
                 Ok(self.shell_port)
             }
-            async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+            async fn start_browser(
+                &self,
+                id: SandboxId,
+            ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
                 self.start_browser_calls.lock().push(id);
-                Ok(self.browser_port)
+                Ok(engram_core::traits::sandbox::BrowserStart {
+                    port: self.browser_port,
+                    warning: None,
+                })
             }
             async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
                 self.stop_browser_calls.lock().push(id);
@@ -8780,7 +8789,7 @@ mod tests {
             let inner = Arc::new(SpyInner::new());
             let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
             let id = SandboxId::new();
-            let port = pooled.start_browser(id).await.unwrap();
+            let start = pooled.start_browser(id).await.unwrap();
 
             // Inner.start_browser received the sandbox id.
             let calls = inner.start_browser_calls.lock().clone();
@@ -8794,7 +8803,7 @@ mod tests {
             // default (5900). A fall-through would return 5900 and leave
             // the inner's counter at 0.
             assert_eq!(
-                port, inner.browser_port,
+                start.port, inner.browser_port,
                 "must return inner's port (proves the forward, not the 5900 default)",
             );
         }

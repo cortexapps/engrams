@@ -444,12 +444,12 @@ async fn e2e_vz_browser_bundle_mounts_and_starts() {
     // Lazy-spawn the in-guest browser stack. agentd execs `engram-browser`
     // (Xvfb → openbox → x11vnc → chromium) on first call and blocks until
     // x11vnc accepts on its port, mirroring the ttyd readiness probe.
-    let port = backend
+    let start = backend
         .start_browser(id)
         .await
         .expect("start_browser spawns the browser stack and x11vnc binds");
     assert_eq!(
-        port, 5900,
+        start.port, 5900,
         "x11vnc default VNC port (DEFAULT_VNC_PORT); the host's proxy_vnc \
          dials this guest port",
     );
@@ -457,11 +457,11 @@ async fn e2e_vz_browser_bundle_mounts_and_starts() {
     // Idempotent re-probe: a second call must find the live stack and return
     // the same port without relaunching (the agentd spawn mutex / respawn
     // guard), the same property `start_shell` has for ttyd.
-    let port2 = backend
+    let start2 = backend
         .start_browser(id)
         .await
         .expect("start_browser is idempotent against a live stack");
-    assert_eq!(port2, 5900, "re-probe returns the same bound port");
+    assert_eq!(start2.port, 5900, "re-probe returns the same bound port");
 
     // Teardown is explicit + idempotent (the cancellable VncGrace registry
     // drives the real disconnect path; stop_browser is the belt-and-suspenders

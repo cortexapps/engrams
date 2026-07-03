@@ -384,9 +384,21 @@ pub enum WireResponse {
     /// afterward, it should find a listener. `spawned` is true if this call
     /// started the stack, false if it was already running and only re-probed.
     /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
+    ///
+    /// `cdp_warning` (issue #569) is `Some` when x11vnc came up but
+    /// chromium's CDP debug port never answered within budget
+    /// (dead/crash-looping chrome) — diagnostic only, never fails the RPC.
+    /// DELIBERATE wire break (2026-07, #569): this field was added to the
+    /// existing variant in place. bincode structs are positional, so a host
+    /// built after this change fails to decode a `BrowserReady` from an
+    /// agentd baked before it (the recv surfaces as the typed "version skew"
+    /// error; remedy: re-bake + RefreshImage). Accepted as a clean break:
+    /// the browser path is already broken on pre-#567/#569 bakes, and that
+    /// fix train re-bakes every image anyway.
     BrowserReady {
         port: u16,
         spawned: bool,
+        cdp_warning: Option<String>,
     },
     /// Reply to [`WireRequest::StopBrowser`] — the browser stack has been
     /// torn down (or there was nothing running).

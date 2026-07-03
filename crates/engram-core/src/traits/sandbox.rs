@@ -92,6 +92,22 @@ pub struct PostCopySourceView {
     pub uffd_base_dir: PathBuf,
 }
 
+/// Result of [`SandboxBackend::start_browser`] /
+/// [`HostClient::start_browser`](crate::traits::HostClient::start_browser).
+///
+/// `port` is the in-guest RFB port x11vnc is serving on (what the caller
+/// dials/relays). `warning` (issue #569) is `Some` when x11vnc came up but
+/// chromium's CDP debug port never answered agentd's bounded probe — chrome
+/// may be dead or crash-looping behind a healthy VNC. Diagnostic only: a
+/// warning never fails the call, and it propagates as log surface up
+/// through the host gRPC layer (deliberately NOT into the app-level
+/// protos / orchestrator / web).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserStart {
+    pub port: u16,
+    pub warning: Option<String>,
+}
+
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
@@ -765,11 +781,16 @@ pub trait SandboxBackend: Send + Sync {
     }
 
     /// ADR 0065: ensure the in-guest browser stack is running and x11vnc is
-    /// bound, returning the port. FC/VZ override to send `StartBrowser` over
-    /// the agentd channel; the dev ProcessBackend has no real guest and
-    /// inherits this default (the feature is gated to FC/VZ profiles).
-    async fn start_browser(&self, _id: SandboxId) -> Result<u16, SandboxError> {
-        Ok(5900)
+    /// bound, returning the port plus an optional chromium-liveness warning
+    /// (issue #569 — see [`BrowserStart`]). FC/VZ override to send
+    /// `StartBrowser` over the agentd channel; the dev ProcessBackend has no
+    /// real guest and inherits this default (the feature is gated to FC/VZ
+    /// profiles).
+    async fn start_browser(&self, _id: SandboxId) -> Result<BrowserStart, SandboxError> {
+        Ok(BrowserStart {
+            port: 5900,
+            warning: None,
+        })
     }
 
     /// ADR 0065: tear down the in-guest browser stack. Default no-op.

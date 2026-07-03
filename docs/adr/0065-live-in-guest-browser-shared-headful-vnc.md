@@ -499,12 +499,17 @@ the commit chain at the end. Stacked phases (one PR each, worktree per phase):
   no CDP). **Post-P1 pitfall (fixed):** the P1 assumption that "the agent's `connectOverCDP` retries CDP
   itself" was *wrong* for `@playwright/cli@0.1.13` — its one-shot `GET /json/version` fails fast on
   `ECONNREFUSED` with no retry. Because chromium binds `:9222` a beat *after* x11vnc binds `:5900` (the
-  launcher starts chrome, then `exec`s x11vnc), `--ensure` returns "ready" while CDP is still coming up,
+  launcher starts chrome, then `exec`s x11vnc *\[amended — ADR 0067 / issue #569: the launcher no
+  longer `exec`s x11vnc; Xvfb and x11vnc each run under supervisor subshells and the main shell stays
+  alive to tear the group down when either dies\]*), `--ensure` returns "ready" while CDP is still coming up,
   and the agent's very first `playwright-cli` invocation dies with `connect ECONNREFUSED 127.0.0.1:9222`
   (prod session `0f0eed74`; a retry a beat later succeeds — this is the chromium-liveness gap §1 warns
   of, on the CDP side). Fix: the CDP wait lives **only in the agent path** — the `playwright-cli` wrapper
   calls a new `engram-browser --wait-cdp` (bounded ~20s poll of `/json/version`) between `--ensure` and
-  the CLI hand-off, so `--ensure`/`StartBrowser` stay RFB-only. *Dev-vm
+  the CLI hand-off, so `--ensure`/`StartBrowser` stay RFB-only. *\[Amended — ADR 0067 / issue #569:
+  StartBrowser's readiness still gates on RFB only, but agentd now also probes CDP as a non-fatal
+  liveness check (1s fast-path on an already-up stack, carried as `BrowserReady.cdp_warning`; async
+  20s watch on a fresh spawn) so a dead chrome behind a healthy x11vnc is at least diagnosed.\]* *Dev-vm
   acceptance gate:* a `playwright-cli open` lands in the *same* window the human sees over VNC (Chrome
   default context, not a fresh Playwright context), and the stack reaps at idle. Folds in **P4**
   (capability) — there is no longer a separate `playwright` skill to gate.

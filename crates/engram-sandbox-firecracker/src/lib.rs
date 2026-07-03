@@ -4529,10 +4529,14 @@ impl SandboxBackend for FirecrackerBackend {
 
     /// ADR 0065: ask agentd to ensure the in-guest browser stack (Xvfb +
     /// openbox + chromium + x11vnc) is running and x11vnc is accepting on its
-    /// port. Returns the bound port. Mirrors [`Self::start_shell`] — the
+    /// port. Returns the bound port plus agentd's optional chromium-CDP
+    /// liveness warning (issue #569). Mirrors [`Self::start_shell`] — the
     /// host's `proxy_vnc` (P1.4) calls this just before dialing the guest's
     /// raw-TCP VNC port, so the connect finds a listener.
-    async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+    async fn start_browser(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or_else(|| {
                 SandboxError::Vm(format!("start_browser: no live sandbox {id}").into())
@@ -4559,14 +4563,22 @@ impl SandboxBackend for FirecrackerBackend {
                     )
                 })?;
             match resp {
-                engram_agentd::WireResponse::BrowserReady { port, spawned } => {
+                engram_agentd::WireResponse::BrowserReady {
+                    port,
+                    spawned,
+                    cdp_warning,
+                } => {
                     tracing::info!(
                         sandbox_id = %id,
                         port,
                         spawned,
+                        cdp_warning = ?cdp_warning,
                         "agentd reports browser ready",
                     );
-                    Ok(port)
+                    Ok(engram_core::traits::sandbox::BrowserStart {
+                        port,
+                        warning: cdp_warning,
+                    })
                 }
                 engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
                     format!("start_browser: agentd error ({kind}): {message}").into(),
@@ -4576,9 +4588,14 @@ impl SandboxBackend for FirecrackerBackend {
                 )),
             }
         };
-        // The browser spawn (Xvfb + chromium cold start) is heavier than
-        // ttyd, and agentd waits up to 20s (READY_DEADLINE) for x11vnc to
-        // accept, so allow 30s of headroom here.
+        // Worst-case serial path inside agentd's start_browser post issue
+        // #569's mutex-hold/CDP-probe fixes: up to a 2s RFB-banner-read
+        // timeout (issue #567's wedge detection) + ~0.3s force-stop grace +
+        // up to 20s (READY_DEADLINE) for the launcher's `--ensure` to bring
+        // x11vnc up + up to a 1s fast CDP probe — call it ~24s worst case.
+        // The fresh-spawn CDP watch itself runs off-path in a detached
+        // background task and never blocks this reply. 30s of headroom here
+        // still comfortably covers it.
         tokio::time::timeout(Duration::from_secs(30), fut)
             .await
             .map_err(|_| SandboxError::Vm("start_browser: timed out waiting for agentd".into()))?
