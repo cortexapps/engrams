@@ -1160,6 +1160,10 @@ impl HostAgent {
                             .set(mem.pss_bytes as f64);
                         ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_RSS_BYTES)
                             .set(mem.rss_bytes as f64);
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PARKED_PSS_BYTES)
+                            .set(mem.parked_pss_bytes as f64);
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PARKED_RSS_BYTES)
+                            .set(mem.parked_rss_bytes as f64);
                     }
                     // Issue #540: one RAM-ledger snapshot per tick — the
                     // meminfo read, the guest-PSS running/parked split

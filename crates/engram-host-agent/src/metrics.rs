@@ -126,6 +126,15 @@ pub const IDLE_EVICT_KEPT_RESIDENT_TOTAL: &str = "engram_host_idle_evict_kept_re
 /// metric a later UI ADR reads). Absent on VZ/non-Linux backends.
 pub const SANDBOX_GUEST_PSS_BYTES: &str = "engram_sandbox_guest_pss_bytes";
 pub const SANDBOX_GUEST_RSS_BYTES: &str = "engram_sandbox_guest_rss_bytes";
+/// Issue #540: the same Σpss/Σrss density signal, but for sandboxes
+/// flagged `parked` (RAM-resident, reservation-free — epic-parking-
+/// ladder rungs 2-3). Always 0 until a backend ever parks a sandbox.
+/// Gauge-only: never folded into `allocatable_mib`. Without these, the
+/// sharing-credit rule (`Σpss/Σrss < 1.0`, ADR 0046) can't be evaluated
+/// for parked residents — exactly the population density math cares
+/// about once the ladder lands.
+pub const SANDBOX_GUEST_PARKED_PSS_BYTES: &str = "engram_sandbox_guest_parked_pss_bytes";
+pub const SANDBOX_GUEST_PARKED_RSS_BYTES: &str = "engram_sandbox_guest_parked_rss_bytes";
 
 /// ADR 0038 B0: histogram of the FC memory-capture (`PUT /snapshot/
 /// create`) wall-clock — the previously-invisible step that hung for

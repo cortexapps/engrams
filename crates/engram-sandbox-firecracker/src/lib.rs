@@ -4629,6 +4629,7 @@ impl SandboxBackend for FirecrackerBackend {
                 if let Some((pss, rss)) = read_smaps_rollup_pss_rss(pid).await {
                     if parked {
                         stats.parked_pss_bytes += pss;
+                        stats.parked_rss_bytes += rss;
                         stats.parked_sampled += 1;
                     } else {
                         stats.pss_bytes += pss;
@@ -6270,6 +6271,10 @@ mod tests {
         assert!(
             stats.parked_pss_bytes > 0,
             "parked PSS must be measured (never assumed 0)"
+        );
+        assert!(
+            stats.parked_rss_bytes > 0,
+            "parked RSS must be measured too, not discarded alongside PSS"
         );
         // The two entries sample the SAME real pid, so the two buckets
         // should be roughly equal — the point is they land in DIFFERENT

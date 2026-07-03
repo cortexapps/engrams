@@ -91,6 +91,14 @@ pub struct GuestMemoryStats {
     /// the flag yet). Never added back into `allocatable_mib` — see
     /// [`GuestMemoryStats::pss_bytes`].
     pub parked_pss_bytes: u64,
+    /// Σ RSS over sandboxes flagged `parked` — measured alongside
+    /// `parked_pss_bytes` (the same `smaps_rollup` read returns both)
+    /// but previously discarded. Without this, the density signal
+    /// (`Σpss/Σrss < 1.0`) can never be evaluated for parked residents
+    /// once the parking ladder lands — the exact population the density
+    /// math cares about. Never folded into `allocatable_mib`; a
+    /// gauge-only figure, same posture as `parked_pss_bytes`.
+    pub parked_rss_bytes: u64,
     /// How many parked sandboxes were successfully sampled.
     pub parked_sampled: u32,
 }
