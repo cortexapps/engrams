@@ -44,7 +44,23 @@ pub struct WarmStageRecord {
     pub started_at: DateTime<Utc>,
     /// `None` while the stage is still open (either currently running, or
     /// abandoned by a capture that failed before closing it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// NO `skip_serializing_if` here even though this rides JSON
+    /// (`enable_jobs.warm_stages`) — `WarmStageRecord` ALSO crosses the
+    /// coord<->host wire as a bincode-positional `Vec<WarmStageRecord>`
+    /// payload (`CaptureProgress.warm_stages_bincode`). `skip_serializing_if`
+    /// on a non-trailing field is silently corrupting for a positional
+    /// format: bincode's derived `Serialize` just omits the field's bytes
+    /// entirely when `ended_at.is_none()` (no placeholder), but the
+    /// derived `Deserialize` unconditionally reads it next in sequence —
+    /// so every record with an OPEN stage (any live, in-progress capture)
+    /// desyncs the byte stream and the following `outcome` field (and
+    /// anything after it in the `Vec`) decodes to garbage or
+    /// `UnexpectedEof`. Caught by the `warm_stages` wire-golden test
+    /// (issue #539 review finding 6) the moment it exercised a record
+    /// with `ended_at: None`. `#[serde(default)]` alone is enough for the
+    /// JSON leg (a legacy row that lacks the key decodes to `None`).
+    #[serde(default)]
     pub ended_at: Option<DateTime<Utc>>,
     pub outcome: WarmStageOutcome,
 }
