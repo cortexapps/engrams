@@ -29,8 +29,11 @@
 //!      heartbeat-ack entry and wait for every eligible (`stages_images`)
 //!      host to report the digest in `ready_images`, or a deadline
 //!      (`ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS`, default 1200 s) — see
-//!      [`eval_prestage`]. A fleet with zero eligible hosts (dev/Process
-//!      backend) passes vacuously.
+//!      [`eval_prestage`]. A fleet where NO host has `stages_images`
+//!      (dev/Process backend) passes vacuously; a fleet that has
+//!      staging-capable hosts but none currently schedulable (e.g. a
+//!      MIG roll blip) keeps polling under the deadline instead — see
+//!      review finding 1 on PR #565.
 //!    - upsert the `enabled_images` row → `ready`.
 //! 3. On any pipeline error: record the failure (bumps `attempts`,
 //!    stores `error`, releases the claim) and leave the job in its
@@ -596,11 +599,19 @@ async fn advance_one(
 enum PrestageEval {
     /// Every eligible host has staged the digest.
     Complete,
-    /// At least one eligible host hasn't staged yet.
+    /// At least one eligible host hasn't staged yet — including the
+    /// transient "zero eligible right now" case (every staging-capable
+    /// host is momentarily unschedulable, e.g. mid host-agent MIG roll)
+    /// via `staged: 0, eligible: 0`. The deadline / zero-staged-timeout
+    /// retry policy applies exactly as it does to a genuine partial wait.
     Waiting { staged: usize, eligible: usize },
-    /// No host in the fleet is eligible to stage (Process/dev fleet, or
-    /// every host is unschedulable right now) — the stage passes
-    /// vacuously rather than wedging on a fleet that will never report.
+    /// No host in the fleet has `stages_images` at all (Process/dev
+    /// fleet) — genuinely nothing will ever report, so the stage passes
+    /// vacuously rather than waiting out the full deadline for nothing.
+    /// Distinct from "staging-capable hosts exist but are transiently
+    /// unschedulable" (review finding 1): that case must NOT take this
+    /// arm, or a MIG-roll blip silently flips the image ready with 0
+    /// hosts actually staged.
     EmptyFleet,
 }
 
@@ -610,18 +621,22 @@ fn eval_prestage(
     now: DateTime<Utc>,
     ttl: Duration,
 ) -> PrestageEval {
+    // Genuinely vacuous iff no host in the fleet even claims to stage
+    // images — a Process/dev fleet. This is independent of schedulability:
+    // a fleet that DOES have staging-capable hosts, all of them transiently
+    // unschedulable, is a `Waiting{0,0}` below, not `EmptyFleet`.
+    if !hosts.iter().any(|h| h.stages_images) {
+        return PrestageEval::EmptyFleet;
+    }
     let eligible: Vec<&HostRecord> = hosts
         .iter()
         .filter(|h| crate::placement::host_is_schedulable(h, now, ttl) && h.stages_images)
         .collect();
-    if eligible.is_empty() {
-        return PrestageEval::EmptyFleet;
-    }
     let staged = eligible
         .iter()
         .filter(|h| h.ready_images.iter().any(|d| d == digest))
         .count();
-    if staged == eligible.len() {
+    if !eligible.is_empty() && staged == eligible.len() {
         PrestageEval::Complete
     } else {
         PrestageEval::Waiting {
@@ -812,10 +827,12 @@ mod tests {
         );
     }
 
-    // Truth-table case 3: zero eligible hosts (dev/Process fleet, or every
-    // host cordoned/dead) → EmptyFleet, the vacuous-pass signal.
+    // Truth-table case 3: no host in the fleet has `stages_images` at all
+    // (dev/Process fleet) → EmptyFleet, the vacuous-pass signal. This is
+    // distinct from "staging-capable hosts exist but none are currently
+    // schedulable" — see case 4a below (review finding 1).
     #[test]
-    fn eval_prestage_no_eligible_hosts_is_empty_fleet() {
+    fn eval_prestage_no_staging_capable_hosts_is_empty_fleet() {
         assert_eq!(
             eval_prestage(&[], DIGEST, Utc::now(), TTL),
             PrestageEval::EmptyFleet
@@ -841,12 +858,26 @@ mod tests {
             PrestageEval::Complete,
             "the cordoned host must not block completion",
         );
+    }
 
+    // Truth-table case 4a (review finding 1, PR #565): every staging-capable
+    // host is transiently unschedulable (e.g. a host-agent MIG roll leaves
+    // heartbeats stale past the placement TTL for a few minutes) — this
+    // must be `Waiting{0,0}`, NOT `EmptyFleet`. `EmptyFleet` vacuously
+    // passes the stage; a fleet that has real staging hosts (just none
+    // reachable this poll) must keep polling under the deadline so the
+    // existing zero-staged-timeout retry policy applies instead of
+    // silently flipping the image ready with 0 hosts actually staged.
+    #[test]
+    fn eval_prestage_all_staging_hosts_transiently_unschedulable_is_waiting_not_empty_fleet() {
         let mut dead = eligible_host(3);
         dead.status = engram_core::types::host::HostStatus::Dead;
         assert_eq!(
             eval_prestage(&[dead], DIGEST, Utc::now(), TTL),
-            PrestageEval::EmptyFleet,
+            PrestageEval::Waiting {
+                staged: 0,
+                eligible: 0
+            },
         );
     }
 
@@ -869,7 +900,9 @@ mod tests {
     }
 
     // Truth-table case 6: a stale heartbeat (host_is_schedulable's freshness
-    // gate) excludes a host the same way cordoning does.
+    // gate) excludes a host the same way cordoning does. When it's the ONLY
+    // staging-capable host, that's the same transient-unschedulable case as
+    // 4a (review finding 1) — `Waiting{0,0}`, not `EmptyFleet`.
     #[test]
     fn eval_prestage_stale_heartbeat_is_excluded() {
         let mut stale = staged(1);
@@ -882,7 +915,10 @@ mod tests {
         );
         assert_eq!(
             eval_prestage(&[stale], DIGEST, Utc::now(), TTL),
-            PrestageEval::EmptyFleet,
+            PrestageEval::Waiting {
+                staged: 0,
+                eligible: 0
+            },
         );
     }
 
