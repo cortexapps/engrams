@@ -291,10 +291,22 @@ pub async fn fc_snapshot_version(firecracker_bin: Option<&Path>) -> Option<Strin
             None
         }
     });
-    // `OnceLock::set` losing a race just means a concurrent caller's
-    // freshly-probed value (identical, since the binary doesn't
-    // change) is discarded in favor of the winner's — harmless.
-    let _ = FC_SNAPSHOT_VERSION.set(version.clone());
+    // Only cache a SUCCESSFUL probe. `version == None` here can be a
+    // transient failure (fork EAGAIN under boot-time load, the binary
+    // momentarily missing mid-thin-layer-bake) — caching it would lock
+    // this host into a permanently unconstrained (`fc_snapshot_version:
+    // None`) posture until process restart: every snapshot it captures
+    // stays version-NULL and every restore onto it stays unconstrained,
+    // invisibly (`None` also legitimately means "not FC", so nothing
+    // downstream distinguishes the two). A `None` re-probe is one cheap
+    // failed subprocess spawn per heartbeat tick and self-heals once the
+    // transient condition clears. `OnceLock::set` losing a race on the
+    // success path just means a concurrent caller's freshly-probed value
+    // (identical, since the binary doesn't change) is discarded in favor
+    // of the winner's — harmless.
+    if let Some(v) = &version {
+        let _ = FC_SNAPSHOT_VERSION.set(Some(v.clone()));
+    }
     version
 }
 
@@ -463,18 +475,18 @@ mod tests {
     async fn fc_snapshot_version_none_when_binary_missing() {
         // A path that doesn't exist. Uses a distinct name so it
         // doesn't collide with the OnceLock cache another test in
-        // this process may have already populated — the cache is
-        // process-global, so assert only the shape (None for a
-        // nonexistent binary is the only claim we can make once ANY
-        // test has run first in the same process, since the lock
-        // then always short-circuits to the cached value).
+        // this process may have already populated.
         let bin = PathBuf::from("/nonexistent/engram-test-firecracker-probe");
-        let v = fc_snapshot_version(Some(&bin)).await;
-        // Either this call populated the cache with None (fresh
-        // process), or a prior test already cached a value — both
-        // are acceptable; the only invariant is "doesn't panic /
-        // hang", exercised by reaching this line at all.
-        let _ = v;
+        assert_eq!(fc_snapshot_version(Some(&bin)).await, None);
+        // A `None` (failed/transient) result must NEVER be cached — only
+        // the success path calls `OnceLock::set`. Calling again with the
+        // same missing binary re-probes (a cheap failed spawn) instead of
+        // short-circuiting to a locked-in `None`; this is the actual
+        // regression the review's finding 4 (OnceLock permanently caching
+        // a transient probe failure) is about, so assert the repeat call
+        // still reaches the real subprocess path and returns None on its
+        // own merits rather than returning early via `.get()`.
+        assert_eq!(fc_snapshot_version(Some(&bin)).await, None);
     }
 
     #[tokio::test]
