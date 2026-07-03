@@ -2,15 +2,25 @@
 # ADR 0065: build the opt-in `browser` RO bundle.
 #
 # A self-contained glibc tree: chromium (full UI build), Xvfb, x11vnc, openbox,
-# liberation fonts, and ALL their shared-library deps — so it runs on any glibc
-# base image without the base carrying browser deps. Built inside a
-# debian:bookworm-slim stage to match the glibc baseline of the standard bases.
+# liberation fonts, and ALL their shared-library deps. It runs on any glibc
+# base image without the base carrying browser deps — NOT via LD_LIBRARY_PATH
+# (issue #569: the kernel always execs the loader baked into each ELF's
+# PT_INTERP, which is the BASE IMAGE's own loader regardless of
+# LD_LIBRARY_PATH — on a base whose glibc differs from bookworm, e.g. Ubuntu
+# 22.04's 2.35, every bundled binary dies before main: chrome SIGBUS,
+# Xvfb/node SIGSEGV). Instead every bundled executable is patchelf'd at build
+# time (see the patchelf step below) to point its own PT_INTERP + DT_RPATH at
+# this bundle's own lib/, so it carries its interpreter with it. Built inside
+# a debian:bookworm-slim stage so the bundled glibc/loader is a fixed, known
+# baseline rather than whatever a given base image happens to ship.
 #
 # Layout produced (ADR 0055: mounted at a dynamic reserved slot
-# /opt/engram/dyn/<i>; the launcher self-locates from $0):
+# /opt/engram/dyn/<i>; the launcher self-locates from $0, and maintains a
+# stable /tmp symlink to it so the patchelf'd, build-time-baked absolute
+# PT_INTERP/DT_RPATH paths below resolve at runtime — see bin/engram-browser):
 #   chrome/      chromium binary + resources
 #   bin/         Xvfb, x11vnc, openbox + the engram-browser launcher
-#   lib/         collected .so deps (LD_LIBRARY_PATH target)
+#   lib/         collected .so deps + the loader (patchelf interpreter/rpath target)
 #   fonts/ + fonts.conf
 #   mount.json   (activate() reads this; declares the engram-browser bin)
 #
@@ -46,10 +56,13 @@ build_tree() {
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
         # curl + xz-utils fetch the pinned Node for playwright-cli (ADR 0065);
-        # util-linux carries setpriv AND flock (the launcher --ensure lock).
+        # util-linux carries setpriv AND flock (the launcher --ensure lock);
+        # patchelf rewrites PT_INTERP/DT_RPATH on every bundled ELF (issue
+        # #569) so the bundle carries its own loader instead of depending on
+        # the one the base image ships.
         apt-get install -y -qq --no-install-recommends \
             chromium xvfb x11vnc openbox fonts-liberation ca-certificates \
-            x11-xkb-utils xkb-data util-linux curl xz-utils
+            x11-xkb-utils xkb-data util-linux curl xz-utils patchelf
         rm -rf /var/lib/apt/lists/*
 
         mkdir -p /out/chrome /out/bin /out/lib /out/fonts
@@ -252,7 +265,20 @@ here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
 # Best-effort: on timeout it returns 0 and we still exec, so the CLI surfaces the
 # real error rather than us swallowing it.
 "$here/bin/engram-browser" --wait-cdp || true
-export LD_LIBRARY_PATH="$here/lib:${LD_LIBRARY_PATH:-}"
+# Fail loud if the stable symlink the patched binaries resolve through does not
+# point at THIS bundle — the launcher calls above are best-effort (|| true), so
+# a failed bring-up (e.g. the symlink is owned by another uid) would otherwise
+# fall through to exec-ing the bundled node against a stale or absent lib tree,
+# a subtle heisenbug (issue #569). $here is the same readlink-f-resolved form
+# the launcher points the symlink at.
+[ "$(readlink /tmp/engram-browser-bundle 2>/dev/null)" = "$here" ] || {
+    echo "playwright-cli: /tmp/engram-browser-bundle does not point at this bundle — browser launcher failed above" >&2
+    exit 1
+}
+# No LD_LIBRARY_PATH here (issue #569): node is patched at build time (see
+# patchelf step above) to find lib/ via its own DT_RPATH, and the --ensure
+# call above is what guarantees the /tmp stable-symlink target DT_RPATH
+# resolves through actually exists before this ever runs.
 export PLAYWRIGHT_MCP_CONFIG="$here/cli.config.json"
 export PATH="$here/node/bin:$PATH"
 exec "$here/node/bin/playwright-cli" "$@"
@@ -262,6 +288,95 @@ WRAP
         # show-your-work skill (moved here from the retired playwright bundle).
         mkdir -p /out/skills
         cp -R /skills-src/show-your-work /out/skills/
+
+        # --- patchelf: bake the bundle loader + rpath into every bundled ----
+        # ELF EXECUTABLE (issue #569; see the header comment above for
+        # why LD_LIBRARY_PATH alone can not fix this). The launcher
+        # (bin/engram-browser) maintains a stable symlink at BUNDLE_LINK
+        # pointing at wherever this bundle is actually mounted (a dynamic ADR
+        # 0055 slot), so an absolute path baked in here at build time still
+        # resolves at runtime regardless of mount slot.
+        #
+        # --set-interpreter: point PT_INTERP at OUR loader (copied into lib/
+        # by the ldd-walk above) instead of the base image loader.
+        # --force-rpath --set-rpath: DT_RPATH, deliberately NOT DT_RUNPATH —
+        # RPATH applies transitively down the whole dependency chain (matters
+        # because the NSS modules above are dlopen()d at runtime, not linked,
+        # so nothing downstream of them would inherit a RUNPATH set only on
+        # chrome itself).
+        #
+        # Only executables are patched, never the .so files collected into
+        # lib/ — a shared library has no PT_INTERP/is never exec()d, so
+        # patching one would be a no-op at best.
+        arch="$(uname -m)"
+        case "$arch" in
+            x86_64)  LOADER=ld-linux-x86-64.so.2 ;;
+            aarch64) LOADER=ld-linux-aarch64.so.1 ;;
+            *) echo "FATAL: unsupported arch $arch for patchelf interpreter selection" >&2; exit 1 ;;
+        esac
+        # Fail loud (like the NSS/xkb guards above): the ldd-walk should have
+        # already copied the loader itself into lib/ (ldd emits the ld-linux
+        # entry alongside every other =>-resolved dep); if it is missing here
+        # every patched binary below would carry a dangling PT_INTERP.
+        [ -e "/out/lib/$LOADER" ] \
+            || { echo "FATAL: loader $LOADER missing from /out/lib — the ldd-walk should have copied it" >&2; exit 1; }
+        BUNDLE_LINK=/tmp/engram-browser-bundle
+        patch_elf() {
+            f="$1"
+            [ -n "$f" ] && [ -e "$f" ] || return 0
+            # Skip symlinks: every real executable in the sweep dirs is patched
+            # as itself, and a symlink either points at one of those (already
+            # covered) or at something that must NOT be patched (node ships
+            # bin/npm + bin/npx as symlinks to .js scripts under lib/).
+            [ ! -h "$f" ] || return 0
+            # Skip non-ELF files gracefully: shell-script wrappers (the
+            # engram-browser + playwright-cli launchers land in bin/ too) and
+            # any wrapped packaging (the real ELF is resolved separately for
+            # those, e.g. chrome/chrome below via readlink -f).
+            magic="$(head -c4 "$f" | od -An -tx1 | tr -d " \n")"
+            [ "$magic" = "7f454c46" ] || return 0
+            # One invocation for both rewrites — patchelf rewrites the whole
+            # (large) ELF per run, so merging halves the work.
+            patchelf --set-interpreter "$BUNDLE_LINK/lib/$LOADER" \
+                --force-rpath --set-rpath "$BUNDLE_LINK/lib" "$f"
+        }
+        # chromium: chrome/chrome may be the relative symlink to chromium (the
+        # bookworm case) or the cp fallback real file; readlink -f always
+        # lands on the actual ELF either way.
+        patch_elf "$(readlink -f /out/chrome/chrome)"
+        # chrome_crashpad_handler: chromium execs it out-of-process by a
+        # relative path next to the main binary. The exact filename has
+        # varied slightly across chromium packagings, so locate it by pattern
+        # rather than hard-code it.
+        crashpad="$(find /out/chrome -maxdepth 1 -iname "*crashpad_handler*" 2>/dev/null | head -1)"
+        patch_elf "$crashpad"
+        # Everything else executable ships in these two dirs; sweep them all
+        # (patch_elf skips scripts/symlinks itself) so a newly bundled binary
+        # can not drift out of the patch list and die on a glibc-skewed base.
+        for f in /out/bin/* /out/node/bin/*; do
+            patch_elf "$f"
+        done
+
+        # One targeted exception to "never patch the .so files": a shared
+        # library carrying its OWN DT_RUNPATH. Per the glibc lookup rules an
+        # object WITH a RUNPATH ignores the inherited executable DT_RPATH for
+        # its own dependency lookups and searches only its RUNPATH (after
+        # LD_LIBRARY_PATH, which we no longer set) — so e.g. libpulse.so.0
+        # (RUNPATH pointing at the pulseaudio subdir of the distro lib dir)
+        # fails to find its bundled libpulsecommon on any base that does not
+        # ship pulseaudio, and chrome dies at load ("libpulsecommon-16.1.so:
+        # cannot open shared object file" — proven in the Ubuntu 22.04 verify
+        # run). The old global LD_LIBRARY_PATH masked exactly this. Rewrite
+        # any such existing RUNPATH/RPATH to a bundle-lib RPATH; libs with no
+        # RUNPATH at all stay untouched (the executable DT_RPATH covers them).
+        for so in /out/lib/*; do
+            [ -f "$so" ] || continue
+            magic="$(head -c4 "$so" | od -An -tx1 | tr -d " \n")"
+            [ "$magic" = "7f454c46" ] || continue
+            existing="$(patchelf --print-rpath "$so" 2>/dev/null || true)"
+            [ -n "$existing" ] || continue
+            patchelf --force-rpath --set-rpath "$BUNDLE_LINK/lib" "$so"
+        done
 
         # Normalize perms: every file in the RO bundle must be world-readable.
         # The in-guest browser process need not run as the build uid, and some
