@@ -376,6 +376,17 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_cross == 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Job-level (not step-scoped): any crate in this lane can pull in a
+    # transitive C dependency that needs the kernel UAPI headers against
+    # the musl sysroot (userfaultfd-sys's build-script shim #includes
+    # <linux/types.h>, absent from musl-gcc's own sysroot). ADR 0068 added
+    # `userfaultfd` to engram-host-agent too (ProbeSandbox's UFFD MINOR
+    # self-test) — step-scoping this only onto engram-uffd-handler left
+    # the host-agent musl build with CFLAGS=None and it failed the same
+    # way uffd-handler used to.
+    env:
+      CFLAGS_x86_64_unknown_linux_musl: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+      BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -435,11 +446,9 @@ jobs:
       # uffd-handler also ships into the FC host image (ADR 0020 Route B),
       # so guard its musl build here too. userfaultfd-sys's C shim needs the
       # kernel uapi headers pointed at via CFLAGS/bindgen (libc-agnostic, so
-      # safe to mix with the musl sysroot).
+      # safe to mix with the musl sysroot) — set at the job level above so
+      # every step in this lane gets it, not just this one.
       - name: build engram-uffd-handler (musl)
-        env:
-          CFLAGS_x86_64_unknown_linux_musl: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
-          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
         run: |
           cargo build \
             --target x86_64-unknown-linux-musl \
