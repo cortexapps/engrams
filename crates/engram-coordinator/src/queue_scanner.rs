@@ -177,6 +177,20 @@ pub fn spawn(
     wake: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Mirrors `evac_resumer::spawn`'s skip-the-first-immediate-tick:
+        // coord just started, so don't sweep at the very first instant.
+        // `wake` still lets a real `placement_changed` NOTIFY (a host
+        // registering, a session enqueuing — all written straight to the
+        // shared Postgres this replica already reads) cut the wait short,
+        // same as every later iteration; only a truly cold, event-free
+        // start (e.g. fleet-wide coordinator restart, no host has
+        // heartbeated to ANY replica yet) rides out the full
+        // `poll_interval` before the first sweep, giving hosts a beat to
+        // land before the scanner judges what fits.
+        tokio::select! {
+            _ = wake.notified() => {}
+            _ = tokio::time::sleep(cfg.poll_interval) => {}
+        }
         loop {
             let retry_needed = match run_once(&cfg, &state).await {
                 Ok(summary) => summary.needs_retry(),
