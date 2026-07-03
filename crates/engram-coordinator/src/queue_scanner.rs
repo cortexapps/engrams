@@ -63,6 +63,10 @@
 //! 5) is a one-shot re-arm: a sweep that requeued or errored a session
 //! schedules a short retry so transient boot/prepare failures keep the
 //! old ≤5s retry latency instead of waiting for the 30s fallback.
+//! `spawn` also parks on the same `wake`-or-`poll_interval` race before
+//! its very first sweep (not just between sweeps) — a beat for hosts to
+//! heartbeat back in on a cold coordinator start, same rationale as
+//! `evac_resumer::spawn`'s skip-the-first-tick.
 
 use std::collections::HashMap;
 use std::sync::Arc;
