@@ -181,6 +181,7 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         rootfs_blob_key: metadata.rootfs_blob_key.clone(),
         working_set_blob_key: metadata.working_set_blob_key.clone(),
         aux_bundles: metadata.aux_bundles.clone(),
+        paused_at: metadata.paused_at,
     };
     let restored_id = match backend.restore(restore_metadata).await {
         Ok(id) => id,
@@ -405,6 +406,7 @@ async fn uffd_restore_succeeds_when_memory_bin_absent_locally() {
         rootfs_blob_key: metadata.rootfs_blob_key.clone(),
         working_set_blob_key: metadata.working_set_blob_key.clone(),
         aux_bundles: metadata.aux_bundles.clone(),
+        paused_at: metadata.paused_at,
     };
     let restored_id = match backend.restore(restore_metadata).await {
         Ok(id) => id,
