@@ -2837,7 +2837,7 @@ impl MetadataStore for PostgresStore {
         // bias or drop samples.
         let row = sqlx::query(
             r#"
-            SELECT EXTRACT(EPOCH FROM (NOW() - created_at)) AS secs_ago
+            SELECT EXTRACT(EPOCH FROM (NOW() - created_at))::float8 AS secs_ago
               FROM session_events
              WHERE session_id = $1 AND kind = 'prompt_received' AND payload->>'prompt_id' = $2
              ORDER BY idx DESC
