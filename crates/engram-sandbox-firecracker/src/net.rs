@@ -17,6 +17,17 @@
 //! everything except VM→proxy and VM→DNS, plus standard hard-isolation
 //! drops (RFC1918, link-local, loopback, inter-VM). Per-VM
 //! provisioning is now just TAP creation.
+//!
+//! **Invariant: two deliberate subprocess spawns per happy-path
+//! restore.** Everything in the per-VM netns leg is netlink/ioctl
+//! except `ip netns add` (owns the `/var/run/netns/<name>` bind-mount
+//! bookkeeping the teardown cascade and the ADR 0044 K2 `ip netns
+//! attach` reattach both key on) and the in-ns iptables SNAT rule
+//! (packet-filter engine, not a spawn-elimination candidate without
+//! an nftables migration). Firecracker itself is exec'd directly
+//! and `setns`'d in via `pre_exec` — no `ip netns exec` wrapper fork.
+//! Any future addition to this leg that shells out is a regression
+//! against this contract (ADR 0020 P4).
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -605,23 +616,52 @@ pub async fn provision(
     provision_with_named_tap(vm_cidr, &tap_name).await
 }
 
-/// Restore-time variant: the /30 is already reserved (caller passed
-/// the manifest's slot through `NetworkAllocator::reserve`) and the
-/// TAP name comes from the manifest, not the new sandbox's id. The
-/// guest's `state.bin` was snapshotted with the original TAP name on
-/// the virtio-net frontend, so we have to recreate it under the same
-/// name on the host or FC's snapshot load fails.
+/// Cold-create leg (bake / fresh sandbox), NEVER on the session-restore
+/// hot path — restore routes through `provision_netns`/
+/// `provision_netns_inner`'s per-VM netns instead. `provision`'s /30
+/// alloc and the sandbox's own `tap_name_for`-derived name are passed
+/// straight through; this only ever runs in host root, so it can call
+/// `create_persistent_tap` directly (no setns dance).
 #[cfg(target_os = "linux")]
 pub async fn provision_with_named_tap(
     vm_cidr: VmCidr,
     tap_name: &str,
 ) -> Result<NetSetup, NetError> {
-    let host_addr = format!("{}/30", vm_cidr.host());
+    let (conn, handle, _) = rtnetlink::new_connection()
+        .map_err(|e| netlink_err("host netlink socket", e.to_string()))?;
+    let conn_task = tokio::spawn(conn);
 
-    let _ = run_cmd("ip", &["link", "delete", tap_name]).await;
-    run_cmd("ip", &["tuntap", "add", tap_name, "mode", "tap"]).await?;
-    run_cmd("ip", &["addr", "add", &host_addr, "dev", tap_name]).await?;
-    run_cmd("ip", &["link", "set", "dev", tap_name, "up"]).await?;
+    // Existence-gated pre-clean (same pattern as the warm netns leg):
+    // only issue a netlink delete when a leftover TAP is actually
+    // there, instead of unconditionally shelling out to `ip link
+    // delete`.
+    if let Ok(idx) = link_index(&handle, tap_name).await {
+        let _ = handle.link().del(idx).execute().await;
+    }
+
+    // `TUNSETIFF`/`TUNSETPERSIST` bind to the CALLING THREAD's netns.
+    // This function only ever runs in host root (bake / cold-create —
+    // see `provision`'s doc comment), so it can call
+    // `create_persistent_tap` directly; contrast the warm leg's
+    // netns'd call to the same helper inside a dedicated setns'd
+    // thread in `provision_netns_inner`.
+    create_persistent_tap(tap_name)?;
+
+    let tap_idx = link_index(&handle, tap_name).await?;
+    handle
+        .address()
+        .add(tap_idx, std::net::IpAddr::V4(vm_cidr.host()), 30)
+        .execute()
+        .await
+        .map_err(|e| netlink_err("tap addr", e.to_string()))?;
+    handle
+        .link()
+        .set(rtnetlink::LinkUnspec::new_with_index(tap_idx).up().build())
+        .execute()
+        .await
+        .map_err(|e| netlink_err("tap up", e.to_string()))?;
+    drop(handle);
+    conn_task.abort();
 
     Ok(NetSetup {
         vm_cidr,
@@ -808,12 +848,28 @@ async fn provision_netns_inner(
     let netns_name = netns_name_for(sandbox_id);
     let (veth_host, veth_ns) = veth_names_for(sandbox_id);
 
+    // Host-root netlink handle, created up front so the idempotency
+    // pre-clean below can use it instead of shelling out.
+    let (conn, handle, _) = rtnetlink::new_connection()
+        .map_err(|e| netlink_err("host netlink socket", e.to_string()))?;
+    let conn_task = tokio::spawn(conn);
+
     // Idempotency: a leftover netns or veth from a prior failed
-    // provision would block the additive commands below. Best-
-    // effort cleanup first; both `delete` calls are no-ops when
-    // nothing's there.
-    let _ = run_cmd("ip", &["netns", "delete", &netns_name]).await;
-    let _ = run_cmd("ip", &["link", "delete", &veth_host]).await;
+    // provision would block the additive commands below. On the
+    // happy path neither exists, so both legs are existence-gated
+    // rather than unconditional spawns:
+    //   - the netns bind-mount is a `Path::exists` stat (no syscall
+    //     equivalent — `ip netns add`'s bookkeeping is filesystem,
+    //     not netlink); only shell out to `ip netns delete` when a
+    //     leftover is actually there.
+    //   - the host-side veth is a `link_index` netlink lookup; only
+    //     issue a netlink `link().del()` when it's found.
+    if netns_path_for(sandbox_id).exists() {
+        let _ = run_cmd("ip", &["netns", "delete", &netns_name]).await;
+    }
+    if let Ok(idx) = link_index(&handle, &veth_host).await {
+        let _ = handle.link().del(idx).execute().await;
+    }
 
     // `ip netns add` stays a subprocess: it owns the
     // /var/run/netns/<name> bind-mount bookkeeping that the teardown
@@ -822,13 +878,10 @@ async fn provision_netns_inner(
     // the ~12 subprocess spawns this replaces (worst offenders: the
     // `ip netns exec` forks) were ~90 ms of every sandbox boot AND
     // the teleport dest pipeline (ADR 0045 C2 lever 3; ADR 0020 P4
-    // measured the same leg on the cold path).
+    // measured the same leg on the cold path). This is now down to
+    // exactly two deliberate spawns on the happy path: `ip netns
+    // add` here and the in-ns iptables SNAT rule below.
     run_cmd("ip", &["netns", "add", &netns_name]).await?;
-
-    // Host-root netlink handle.
-    let (conn, handle, _) = rtnetlink::new_connection()
-        .map_err(|e| netlink_err("host netlink socket", e.to_string()))?;
-    let conn_task = tokio::spawn(conn);
 
     // veth pair: A in host root (gets the SNAT-slot host octet),
     // B moved into the netns.
@@ -1005,14 +1058,37 @@ async fn provision_netns_inner(
 /// snat slot.
 #[cfg(target_os = "linux")]
 pub async fn teardown_netns(setup: &NetnsSetup, allocator: &parking_lot::Mutex<NetworkAllocator>) {
-    // `ip netns delete` cascades: it removes the TAP, veth-B, and
-    // the netns's iptables tables in one shot. veth-A in host root
-    // is auto-cleaned by the kernel when its peer disappears.
+    // `ip netns delete` cascades: it removes the TAP, veth-B, and the
+    // netns's iptables tables in one shot. But netns destruction
+    // itself is ASYNCHRONOUS — the kernel defers the actual teardown
+    // to the `cleanup_net` workqueue after the last reference drops,
+    // so veth-A in host root (and the /30 it holds) can still be
+    // visible for a nondeterministic window after `ip netns delete`
+    // returns Ok. We can't rely on that cascade before `free()`ing
+    // the snat slot below (issue #536 review, finding 1): a
+    // concurrent provision could get the freed slot while veth-A
+    // still pins it, reopening the exact double-bound-/30 shape of
+    // the prod 2026-05-21 incident documented below. So veth-A gets
+    // an unconditional, SYNCHRONOUS netlink delete first — a
+    // syscall, not a subprocess, so the two-spawn invariant survives.
     if let Err(e) = run_cmd("ip", &["netns", "delete", &setup.netns_name]).await {
         tracing::debug!(netns = %setup.netns_name, error = %e, "netns delete failed");
-        // Fall through; veth-A may still need explicit cleanup.
     }
-    let _ = run_cmd("ip", &["link", "delete", &setup.veth_host]).await;
+    match rtnetlink::new_connection() {
+        Ok((conn, handle, _)) => {
+            let conn_task = tokio::spawn(conn);
+            if let Ok(idx) = link_index(&handle, &setup.veth_host).await {
+                if let Err(e) = handle.link().del(idx).execute().await {
+                    tracing::debug!(veth = %setup.veth_host, error = %e, "veth-A delete failed");
+                }
+            }
+            drop(handle);
+            conn_task.abort();
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "host netlink socket failed; veth-A cleanup skipped");
+        }
+    }
     allocator.lock().free(setup.snat_cidr);
     // Deliberately do NOT free the bake CIDR (`setup.vm_cidr`).
     // Multiple concurrent warm restores from the same template share

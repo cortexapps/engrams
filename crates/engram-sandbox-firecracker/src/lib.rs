@@ -1577,12 +1577,12 @@ impl FirecrackerBackend {
     /// On any error after this call, the caller drops the Child —
     /// `kill_on_drop=true` cleans up.
     ///
-    /// `netns_name`: when `Some`, FC is spawned via
-    /// `ip netns exec <name> firecracker …` so the process (and
-    /// any TAP it opens via `host_dev_name`) lives inside that
-    /// netns. ADR 0014 M1.16 warm-restore path passes the
-    /// per-VM netns here; cold path passes `None` and FC stays
-    /// in host root, as today.
+    /// `netns_name`: when `Some`, FC is exec'd directly and `setns`'d
+    /// into that netns from a `pre_exec` closure (no `ip netns exec`
+    /// wrapper fork) so the process (and any TAP it opens via
+    /// `host_dev_name`) lives inside it. ADR 0014 M1.16 warm-restore
+    /// path passes the per-VM netns here; cold path passes `None`
+    /// and FC stays in host root, as today.
     async fn spawn_firecracker(
         &self,
         jail_dir: &Path,
@@ -1605,24 +1605,51 @@ impl FirecrackerBackend {
             .try_clone()
             .map_err(|e| vm_err(format!("dup log fd: {e}")))?;
 
-        let fc_bin = self.config.firecracker_bin.to_string_lossy().into_owned();
         let socket_arg = socket.to_string_lossy().into_owned();
-        let mut cmd = match netns_name {
+        let mut cmd = Command::new(&self.config.firecracker_bin);
+        cmd.args(["--api-sock", &socket_arg]);
+
+        // `_ns_file` must stay alive (open, in this parent process)
+        // across the `cmd.spawn()` call below — `spawn()` forks
+        // synchronously, and the child's duplicated fd table is only
+        // valid for fds still open in the parent at that instant. It
+        // can be (and is, implicitly) dropped once `spawn()` returns.
+        #[cfg(target_os = "linux")]
+        let _ns_file = match netns_name {
             Some(ns) => {
-                // `ip netns exec` forks + setns(CLONE_NEWNET) + exec
-                // the given command — the FC child (and its eventual
-                // PUT /network-interfaces host_dev_name lookup) all
-                // resolve TAP names inside this netns.
-                let mut c = Command::new("ip");
-                c.args(["netns", "exec", ns, &fc_bin, "--api-sock", &socket_arg]);
-                c
+                let ns_path = format!("/var/run/netns/{ns}");
+                let ns_file = std::fs::File::open(&ns_path)
+                    .map_err(|e| vm_err(format!("open netns {ns} ({ns_path}): {e}")))?;
+                use std::os::unix::io::AsRawFd;
+                let ns_fd = ns_file.as_raw_fd();
+                // SAFETY: this closure runs in the forked child between
+                // `fork()` and `exec()`, when the child is guaranteed
+                // single-threaded — the constraint `pre_exec` documents.
+                // `setns(2)` only touches this process's own namespace
+                // membership and, like `close(2)`, is async-signal-safe,
+                // so calling it here (instead of e.g. allocating) is
+                // sound. `ns_fd` is valid for the duration of the fork
+                // because `ns_file` is held alive in the caller's scope
+                // (`_ns_file`, bound below) past the `spawn()` call.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if libc::setns(ns_fd, libc::CLONE_NEWNET) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                Some(ns_file)
             }
-            None => {
-                let mut c = Command::new(&self.config.firecracker_bin);
-                c.args(["--api-sock", &socket_arg]);
-                c
-            }
+            None => None,
         };
+        #[cfg(not(target_os = "linux"))]
+        if netns_name.is_some() {
+            return Err(vm_err(
+                "netns-scoped Firecracker spawn requires Linux".to_string(),
+            ));
+        }
+
         // ADR 0044 K2: NO `kill_on_drop` — a live FC must survive the
         // host-agent process exiting (detach + reattach). The
         // create-window backstop is the explicit `SpawnKillGuard` armed
