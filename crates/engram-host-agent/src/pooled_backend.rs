@@ -7069,6 +7069,12 @@ mod tests {
     async fn migration_fetch_rejects_unlisted_hash_and_bad_export_id() {
         use engram_core::types::snapshot::MigrationItem;
         use futures::StreamExt;
+        // A near-full dev/CI disk trips the cache's default free-space
+        // floor and evicts the chunk this test `cache.put`s below before
+        // `migration_fetch` can serve it. Nextest runs each test in its
+        // own process, so this env override is safe (see
+        // two_host_drain_wave.rs / migration_source.rs).
+        std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
         let tmp = tempfile::tempdir().unwrap();
         let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
             engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
@@ -8406,6 +8412,13 @@ mod tests {
         use engram_chunk_store::{
             cache::ChunkCacheConfig, ChunkCache, ChunkStore, ManifestKind, ManifestRef,
         };
+
+        // A near-full dev/CI disk trips the cache's default free-space
+        // floor and evicts the chunks the first `materialize_chunked_rootfs`
+        // warms below before the second (store-deleted) call can read them
+        // back. Nextest runs each test in its own process, so this env
+        // override is safe (see two_host_drain_wave.rs / migration_source.rs).
+        std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
 
         let tmp = tempfile::tempdir().unwrap();
         let blob_root = tmp.path().join("blob");
