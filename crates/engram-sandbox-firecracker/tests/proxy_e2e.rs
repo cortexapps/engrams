@@ -309,20 +309,19 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         aux_ro_drives: Vec::new(),
     };
     let sandbox_id = backend.create(spec).await.expect("create");
-    // Poll for guest_ip — the in-VM agent takes a few seconds to
+    // Poll for guest_endpoints — the in-VM agent takes a few seconds to
     // bind on vsock and answer the GuestIp RPC after kernel boot.
-    let mut guest_ip_str = None;
+    let mut endpoints = None;
     for _ in 0..30 {
-        if let Some(ip) = backend.guest_ip(sandbox_id).await {
-            guest_ip_str = Some(ip);
+        if let Some(ep) = backend.guest_endpoints(sandbox_id).await {
+            endpoints = Some(ep);
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let guest_ip = guest_ip_str
-        .expect("guest_ip should be reachable within 15s")
-        .parse::<std::net::Ipv4Addr>()
-        .expect("ipv4");
+    let guest_ip = endpoints
+        .expect("guest_endpoints should be reachable within 15s")
+        .egress_identity;
 
     // ---- 7. Register the session with the proxy ----
     let secret = engram_egress_proxy::SecretEntry {

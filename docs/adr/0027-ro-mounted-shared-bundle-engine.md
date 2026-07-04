@@ -78,7 +78,12 @@ read-only virtio-blk drives. Two bundles, two consumers:
   a `playwright-cli` wrapper + the `show-your-work` skill. The wrapper bakes in
   the runtime env (`LD_LIBRARY_PATH`, `PLAYWRIGHT_MCP_CONFIG` → a config pinning
   `chromium-headless-shell` + `--no-sandbox`, fontconfig, bundle node), so the
-  agent runs `playwright-cli open <url>` with **zero flags**.
+  agent runs `playwright-cli open <url>` with **zero flags**. *\[Amended — the
+  successor `browser` bundle (ADR 0065) no longer relies on `LD_LIBRARY_PATH`
+  at all: every bundled ELF is patchelf'd at build time with its own
+  `PT_INTERP`/`DT_RPATH` pointing through a stable `/tmp` symlink — see
+  ADR 0067 (issue #569) for why the env-var approach broke on glibc-skewed
+  base images.\]*
 
 **Fleet-canonical path, presence re-anchor.** Unlike the per-sandbox rootfs
 (id-keyed canonical-symlink so a cross-host restore re-points cleanly), a bundle

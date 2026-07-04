@@ -182,7 +182,7 @@ impl HostClient for FakeBackend {
     ) -> Result<(), SandboxError> {
         unreachable!()
     }
-    async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
+    async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
         None
     }
     async fn bind_session(&self, _session_id: SessionId, _sandbox_id: SandboxId) {}

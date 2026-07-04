@@ -659,7 +659,7 @@ pub enum UploadResponse {
 // [`RelayConnect`] frame naming the guest TCP port, reads one [`RelayAck`],
 // then the connection carries the raw dev-server bytes (no further framing).
 // agentd dials `127.0.0.1:target_port` INSIDE the guest — reaching loopback-
-// bound dev servers (Vite, Tilt, `next dev`) the host's `guest_ip` dial
+// bound dev servers (Vite, Tilt, `next dev`) a direct dial_ip dial
 // cannot. One vsock connection per forwarded TCP connection (no muxing) →
 // no head-of-line blocking (ADR 0066).
 

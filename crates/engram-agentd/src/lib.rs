@@ -22,6 +22,7 @@ pub mod handler;
 pub mod harness_supervisor;
 pub mod port_relay;
 pub mod proto;
+pub mod reaper;
 pub mod remount;
 pub mod share;
 pub mod shell;

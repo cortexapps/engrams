@@ -467,7 +467,7 @@ starting at 108 ms (overlapping), the ~107 ms UFFD spawn fully hidden under the
 netns→spawn chain → ~100 ms off the critical path. `reserve_netns` (~91 ms) is now
 the long pole → that's **Phase 4's** target.
 
-## Phase 4 — Cheapen the netns leg (`reserve_netns` ~91 ms) — REFRAMED, PARKED
+## Phase 4 — Cheapen the netns leg (`reserve_netns` ~91 ms) — REFRAMED, (a) SHIPPED
 
 P3 left `reserve_netns` (~91 ms) as the restore long pole. The original framing —
 "pre-allocate a netns+TAP+SNAT pool, E2B `network/pool.go` shape (New=32 /
@@ -521,10 +521,35 @@ double-bound `/30` → wrong-VM shell; see `teardown_netns:883`). Slot *reuse*
 multiplies that hazard; E2B avoids it structurally via (1). Don't bolt reuse onto
 the current model.
 
-**Status: PARKED** (2026-05-29). Low absolute yield (~40–60 ms) on a path the
-warm substrate (~516 ms) and the agent first-token gap still dominate. Resume
-with **(a) the netlink swap** as a self-contained, measured change — not as "a
-pool."
+**Status: (a) SHIPPED, (b)/(c) still PARKED** (updated 2026-07-01; originally
+2026-05-29). This section's "Status: PARKED" line stood stale for over a month
+after (a) actually landed — corrected here rather than left dangling.
+
+**(a) landed 2026-06-12** as `5a5d2a6c` ("perf(net): netlink-first netns
+provisioning — ~12 subprocess spawns become syscalls"), lever 3 of the ADR
+0045 restore-tail campaign: `provision_netns_inner` measured `netns_provision_ms`
+**90 → 20 ms in prod**. `ip netns add` (bind-mount bookkeeping the teardown
+cascade and K2 `ip netns attach` both key on) and the in-ns iptables SNAT rule
+stayed subprocesses by design; veth/addr/route/TAP moved to `rtnetlink` +
+`TUNSETIFF`/`TUNSETPERSIST` ioctls, matching E2B's netlink-first approach.
+
+A residual ~20 ms of incidental (not structural) subprocess spawns was closed
+out separately (issue #536): unconditional idempotency pre-clean spawns
+(existence/`link_index`-gated instead), the `ip netns exec` wrapper around the
+Firecracker spawn itself (direct exec + `pre_exec` `setns`), the unconditional
+teardown veth delete (now conditional on the netns delete having failed), and
+the cold-create `provision_with_named_tap` path (unified onto
+`create_persistent_tap` + `rtnetlink`, for uniformity — it's off the
+session-restore hot path). The netns leg now performs exactly **two**
+deliberate subprocess spawns on the happy path: `ip netns add` and the in-ns
+iptables SNAT rule.
+
+**(b) constant in-namespace identity and (c) the pool remain explicitly NOT
+pursued.** Low absolute remaining yield on a path the warm substrate (~516 ms)
+and the agent first-token gap still dominate, and the shared-`bake_cidr` reuse
+hazard (`teardown_netns` leak-rather-than-collide comment, prod 2026-05-21)
+only gets worse under slot reuse — the pool's real value in E2B's model. If
+ever resumed, (b) is a bake-side prerequisite for (c); neither is scheduled.
 
 ## Phase 5 — N>1 concurrent restores per base (throughput, not latency)
 
