@@ -199,9 +199,19 @@ fn wire_response_golden_and_variant_indices() {
         kind: "NotFound".into(),
         message: "no such file".into(),
     };
+    // Issue #569 (2026-07): `cdp_warning` was added to `BrowserReady` IN
+    // PLACE — a deliberate wire break (see the variant's doc comment in
+    // proto.rs). The `response_browser_ready` golden bytes changed with it;
+    // both cdp_warning arms are pinned so the Option encoding stays fixed.
     let browser_ready = WireResponse::BrowserReady {
         port: 5900,
         spawned: true,
+        cdp_warning: None,
+    };
+    let browser_ready_with_warning = WireResponse::BrowserReady {
+        port: 5900,
+        spawned: true,
+        cdp_warning: Some("chromium CDP (:9222) not responding".into()),
     };
 
     assert_golden("response_stat", &stat);
@@ -216,6 +226,10 @@ fn wire_response_golden_and_variant_indices() {
     assert_golden("response_error", &error);
     assert_golden("response_synced", &WireResponse::Synced);
     assert_golden("response_browser_ready", &browser_ready);
+    assert_golden(
+        "response_browser_ready_with_warning",
+        &browser_ready_with_warning,
+    );
     assert_golden("response_browser_stopped", &WireResponse::BrowserStopped);
 
     assert_variant_index(&stat, 0, "WireResponse::Stat");
@@ -395,6 +409,15 @@ fn regen_golden() {
         &WireResponse::BrowserReady {
             port: 5900,
             spawned: true,
+            cdp_warning: None,
+        },
+    );
+    write(
+        "response_browser_ready_with_warning",
+        &WireResponse::BrowserReady {
+            port: 5900,
+            spawned: true,
+            cdp_warning: Some("chromium CDP (:9222) not responding".into()),
         },
     );
     write("response_browser_stopped", &WireResponse::BrowserStopped);

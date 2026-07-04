@@ -18,6 +18,7 @@ use engram_agentd::{
     read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest, WireResponse,
 };
 use engram_core::traits::sandbox::{HarnessByteStream, HarnessSink, SandboxBackend, UploadSink};
+use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
@@ -110,13 +111,13 @@ struct VzSandboxState {
     /// `destroy()`. The clone is what VZ actually attaches; the
     /// originating bake / snapshot file stays intact.
     rootfs_path: PathBuf,
-    /// Cached IPv4 address discovered by querying agentd over the
-    /// existing vsock-bridge transport. Populated on first
-    /// `guest_ip` call (the agent's eth0 takes a moment to come up
-    /// after IP_PNP DHCP, so we don't try at create time). Used by
+    /// Cached guest-network identity, discovered by querying agentd
+    /// over the existing vsock-bridge transport. Populated on first
+    /// `guest_endpoints` call (the agent's eth0 takes a moment to come
+    /// up after IP_PNP DHCP, so we don't try at create time). Used by
     /// the coordinator's `GET /sessions/:id/shell` proxy to dial
     /// `ttyd` running inside the guest.
-    guest_ip: Mutex<Option<String>>,
+    guest_endpoints: Mutex<Option<GuestEndpoints>>,
 }
 
 // ADR 0009 §4 (host-side VM supervision) is FC-only by design. The
@@ -350,7 +351,7 @@ impl VzBackend {
                 connector,
                 vsock_uds_path,
                 rootfs_path,
-                guest_ip: Mutex::new(None),
+                guest_endpoints: Mutex::new(None),
             },
         );
         Ok(new_id)
@@ -572,7 +573,7 @@ impl SandboxBackend for VzBackend {
                 connector,
                 vsock_uds_path,
                 rootfs_path,
-                guest_ip: Mutex::new(None),
+                guest_endpoints: Mutex::new(None),
             },
         );
         Ok(id)
@@ -673,12 +674,12 @@ impl SandboxBackend for VzBackend {
     /// stream. The host-agent then writes the `RelayConnect` header, reads
     /// the `RelayAck`, and splices bytes — reaching a dev server bound to
     /// the guest's `127.0.0.1` (Vite, the Tilt UI, `next dev`) that the old
-    /// `guest_ip`/eth0 dial can't. Each call is its own `connectToPort`
+    /// `dial_ip`/eth0 dial can't. Each call is its own `connectToPort`
     /// stream, and `VZVirtioSocketDevice` muxes them freely, so a
     /// persistent forwarded connection can't head-of-line block others —
     /// the parity fix over the retired single-stream-per-port console
     /// bridge. Returning `Some` here flips VZ off the trait-default
-    /// `None`/`guest_ip` fallback and onto the relay path.
+    /// `None`/`guest_endpoints` fallback and onto the relay path.
     async fn open_guest_stream(
         &self,
         id: SandboxId,
@@ -920,12 +921,14 @@ impl SandboxBackend for VzBackend {
 
     /// ADR 0065: ask agentd to ensure the in-guest browser stack (Xvfb +
     /// openbox + chromium + x11vnc) is running and x11vnc is accepting on its
-    /// port. Returns the bound port. Mirrors [`Self::start_shell`]: the host's
-    /// `proxy_vnc` (P1.4) calls this just before dialing the guest's raw-TCP
-    /// VNC port, so the connect finds a listener. agentd carries the browser
-    /// bundle + the StartBrowser handler in every bake, so this is a
-    /// host-side-only change.
-    async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+    /// port. Returns the bound port plus agentd's optional chromium-CDP
+    /// liveness warning (issue #569). Mirrors [`Self::start_shell`]: the
+    /// host's `proxy_vnc` (P1.4) calls this just before dialing the guest's
+    /// raw-TCP VNC port, so the connect finds a listener.
+    async fn start_browser(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.vsock_uds_path.clone()
@@ -941,9 +944,15 @@ impl SandboxBackend for VzBackend {
             )
         })?;
         let (mut reader, mut writer) = tokio::io::split(conn);
-        // `port: None` → agentd's default (5900). agentd waits up to 20s
-        // (READY_DEADLINE) for x11vnc to accept, and the browser cold start
-        // (Xvfb + chromium) is heavier than ttyd, so allow 45s here.
+        // `port: None` → agentd's default (5900). Worst-case serial path
+        // inside agentd's start_browser post issue #569's mutex-hold/
+        // CDP-probe fixes: up to a 2s RFB-banner-read timeout (issue #567's
+        // wedge detection) + ~0.3s force-stop grace + up to 20s
+        // (READY_DEADLINE) for the launcher's `--ensure` to bring x11vnc up
+        // + up to a 1s fast CDP probe — call it ~24s worst case (the
+        // fresh-spawn CDP watch itself runs off-path in a detached
+        // background task and never blocks this reply). 45s here still
+        // comfortably covers it.
         write_msg(&mut writer, &WireRequest::StartBrowser { port: None })
             .await
             .map_err(|e| SandboxError::Vm(format!("write StartBrowser: {e}").into()))?;
@@ -953,7 +962,12 @@ impl SandboxBackend for VzBackend {
                 .map_err(|_| SandboxError::Vm("StartBrowser timed out after 45s".into()))?
                 .map_err(|e| SandboxError::Vm(format!("read StartBrowser response: {e}").into()))?;
         match resp {
-            WireResponse::BrowserReady { port, .. } => Ok(port),
+            WireResponse::BrowserReady {
+                port, cdp_warning, ..
+            } => Ok(engram_core::traits::sandbox::BrowserStart {
+                port,
+                warning: cdp_warning,
+            }),
             WireResponse::Error { kind, message } => Err(SandboxError::Vm(
                 format!("StartBrowser rejected ({kind}): {message}").into(),
             )),
@@ -987,16 +1001,18 @@ impl SandboxBackend for VzBackend {
         Ok(())
     }
 
-    /// Discover the guest's primary IPv4 address by asking agentd
-    /// over the vsock-bridge. First successful answer is cached on
-    /// the per-sandbox state; subsequent calls are O(1) memory reads.
+    /// Discover the guest's network identity by asking agentd over
+    /// the vsock-bridge. First successful answer is cached on the
+    /// per-sandbox state; subsequent calls are O(1) memory reads.
     /// Returns `None` if the agent isn't reachable yet (e.g. shell
-    /// requested before bootstrap completes) or reports no
-    /// non-loopback address.
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+    /// requested before bootstrap completes), reports no non-loopback
+    /// address, or reports an address that doesn't parse as IPv4.
+    /// VZ has no netns indirection, so `egress_identity` and
+    /// `dial_ip` are always the same value.
+    async fn guest_endpoints(&self, id: SandboxId) -> Option<GuestEndpoints> {
         if let Some(live) = self.sandboxes.get(&id) {
-            if let Some(ip) = live.guest_ip.lock().clone() {
-                return Some(ip);
+            if let Some(ep) = live.guest_endpoints.lock().clone() {
+                return Some(ep);
             }
         }
         let vsock_uds_path = {
@@ -1018,16 +1034,21 @@ impl SandboxBackend for VzBackend {
                 _ => None,
             }
         };
-        let ip = tokio::time::timeout(Duration::from_secs(2), fut)
+        let ip_str: Option<String> = tokio::time::timeout(Duration::from_secs(2), fut)
             .await
             .ok()
             .flatten();
-        if let Some(ref s) = ip {
-            if let Some(live) = self.sandboxes.get(&id) {
-                *live.guest_ip.lock() = Some(s.clone());
-            }
+        let ip: std::net::Ipv4Addr = ip_str?.parse().ok()?;
+        let ep = GuestEndpoints {
+            egress_identity: ip,
+            dial_ip: ip,
+            netns: None,
+            vsock_uds: Some(vsock_uds_path),
+        };
+        if let Some(live) = self.sandboxes.get(&id) {
+            *live.guest_endpoints.lock() = Some(ep.clone());
         }
-        ip
+        Some(ep)
     }
 }
 

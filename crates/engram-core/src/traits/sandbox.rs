@@ -9,6 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::error::SandboxError;
 use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
+use crate::types::endpoints::GuestEndpoints;
 use crate::types::ids::SandboxId;
 use crate::types::image::WarmConfig;
 use crate::types::sandbox::{
@@ -112,6 +113,22 @@ pub struct PostCopySourceView {
     pub uffd_base_dir: PathBuf,
 }
 
+/// Result of [`SandboxBackend::start_browser`] /
+/// [`HostClient::start_browser`](crate::traits::HostClient::start_browser).
+///
+/// `port` is the in-guest RFB port x11vnc is serving on (what the caller
+/// dials/relays). `warning` (issue #569) is `Some` when x11vnc came up but
+/// chromium's CDP debug port never answered agentd's bounded probe — chrome
+/// may be dead or crash-looping behind a healthy VNC. Diagnostic only: a
+/// warning never fails the call, and it propagates as log surface up
+/// through the host gRPC layer (deliberately NOT into the app-level
+/// protos / orchestrator / web).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserStart {
+    pub port: u16,
+    pub warning: Option<String>,
+}
+
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
@@ -173,7 +190,7 @@ pub trait SandboxBackend: Send + Sync {
 
     /// Push per-session egress policy to the backend. The
     /// coordinator calls this after `create_for_session` returns,
-    /// once the sandbox's `guest_ip` is known and before
+    /// once the sandbox's `guest_endpoints` is known and before
     /// `start_agent` dispatches — so the harness can't make
     /// network calls before the local proxy knows the policy.
     /// WS-frame ordering between this notify and the subsequent
@@ -740,63 +757,21 @@ pub trait SandboxBackend: Send + Sync {
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError>;
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError>;
 
-    /// IPv4 address the *host* can use to reach a TCP service running
-    /// inside this sandbox's guest. Used by the `GET /sessions/:id/shell`
-    /// proxy to dial `ttyd` on the guest. Returns `None` if:
+    /// The sandbox's guest-network identity — a single coherent value
+    /// replacing the retired `guest_ip` / `netns_name_for` /
+    /// `vm_internal_ip` accessor triple (the "three-IP accident").
+    /// See [`GuestEndpoints`] for what each field means and why they
+    /// can differ (netns SNAT slot vs. in-VM eth0 address vs. the
+    /// namespace to dial from — real FC network mechanism, now
+    /// expressed as named fields instead of sibling methods a caller
+    /// had to choose among).
     ///
-    /// - the sandbox isn't running yet (no agent up to ask),
-    /// - the backend has no host→guest IP routing wired (FC today),
-    /// - the agent reported no eligible non-loopback address.
-    ///
-    /// Default returns `None` so backends that don't yet implement
-    /// host→guest IP discovery (FC) inherit a clean "shell unavailable"
-    /// surface.
-    async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
+    /// `None` if the sandbox isn't running, the backend has no
+    /// host→guest routing wired yet, or the guest hasn't reported an
+    /// address (VZ pre-agentd-answer). Default `None`, matching the
+    /// old `guest_ip` default: "shell/egress unavailable".
+    async fn guest_endpoints(&self, _id: SandboxId) -> Option<GuestEndpoints> {
         None
-    }
-
-    /// ADR 0014 issue #6: name of the Linux network namespace the
-    /// sandbox's TCP services live behind, if any. Returned for
-    /// warm-restored Firecracker sandboxes that run inside a per-VM
-    /// `engr-vm-<id>` netns (ADR 0014 M1.16); the host-agent's
-    /// ProxyShell handler enters this namespace before dialing
-    /// ttyd. `None` for sandboxes whose network is on the host root
-    /// (cold FC path before unification, plus all backends without
-    /// a netns model: VZ, Process). Default returns None so other
-    /// backends inherit the "dial on host root" semantics unchanged.
-    async fn netns_name_for(&self, _id: SandboxId) -> Option<String> {
-        None
-    }
-
-    /// In-VM dial target for the SHELL tab.
-    ///
-    /// `guest_ip` returns the IP the host-side egress-proxy registry
-    /// uses to identify the session — for warm-restored sandboxes
-    /// that's the netns SNAT slot (e.g. 10.200.0.6), the IP the
-    /// host SEES traffic coming from after netns POSTROUTING SNAT.
-    /// That's the right value for the egress proxy.
-    ///
-    /// The SHELL tab needs a different IP: the in-VM `eth0`
-    /// address that ttyd is bound to. For warm-restored sandboxes
-    /// inside a per-VM netns, every VM gets the bake-time
-    /// `10.200.0.2` (the bake CIDR's guest octet), and the host's
-    /// `proxy_shell` flow enters the netns before dialing — so it
-    /// dials `10.200.0.2:7681` *through the TAP*, not the netns's
-    /// own veth IP. Returning `guest_ip` (the SNAT slot) here
-    /// would dial the veth and miss the VM entirely (prod-shape
-    /// failure mode caught by e2e_shell_warm: `connect 10.200.0.6:
-    /// 7681: Connection refused` because nothing's bound on the
-    /// netns's veth IP).
-    ///
-    /// For cold-created sandboxes there's no netns + SNAT
-    /// indirection: the VM's eth0 is on a TAP in root netns, so
-    /// `guest_ip` and `vm_internal_ip` collapse to the same value.
-    ///
-    /// Default returns the same value as `guest_ip`, matching the
-    /// behaviour of pre-M1.16 backends and any future backend that
-    /// doesn't need the distinction.
-    async fn vm_internal_ip(&self, id: SandboxId) -> Option<String> {
-        self.guest_ip(id).await
     }
 
     /// How a harness process inside this backend's sandbox dials
@@ -827,11 +802,16 @@ pub trait SandboxBackend: Send + Sync {
     }
 
     /// ADR 0065: ensure the in-guest browser stack is running and x11vnc is
-    /// bound, returning the port. FC/VZ override to send `StartBrowser` over
-    /// the agentd channel; the dev ProcessBackend has no real guest and
-    /// inherits this default (the feature is gated to FC/VZ profiles).
-    async fn start_browser(&self, _id: SandboxId) -> Result<u16, SandboxError> {
-        Ok(5900)
+    /// bound, returning the port plus an optional chromium-liveness warning
+    /// (issue #569 — see [`BrowserStart`]). FC/VZ override to send
+    /// `StartBrowser` over the agentd channel; the dev ProcessBackend has no
+    /// real guest and inherits this default (the feature is gated to FC/VZ
+    /// profiles).
+    async fn start_browser(&self, _id: SandboxId) -> Result<BrowserStart, SandboxError> {
+        Ok(BrowserStart {
+            port: 5900,
+            warning: None,
+        })
     }
 
     /// ADR 0065: tear down the in-guest browser stack. Default no-op.
