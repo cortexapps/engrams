@@ -65,6 +65,11 @@ static SHELL: tokio::sync::OnceCell<Mutex<Option<ShellHandle>>> =
 struct ShellHandle {
     child: Child,
     port: u16,
+    /// Issue #569: registers `child`'s pid with the reaper's tracked-pid
+    /// set for as long as this handle lives — untracks on drop (handle
+    /// replaced on respawn, or torn down in tests), so agentd's init-style
+    /// zombie reaper never races this module's own `try_wait()`/`kill()`.
+    _tracked: crate::reaper::TrackedChild,
 }
 
 async fn state() -> &'static Mutex<Option<ShellHandle>> {
@@ -169,7 +174,8 @@ pub async fn start_shell(
 
     tracing::info!(%bin, %shell_bin, port, "spawning ttyd");
 
-    let child = Command::new(&bin)
+    let mut cmd = Command::new(&bin);
+    cmd
         // -W = read-write terminal (default is read-only).
         // -p <port> = bind port.
         // Final positional arg = command to exec on connect.
@@ -184,11 +190,24 @@ pub async fn start_shell(
         // The agent itself can exit cleanly; ttyd shouldn't survive
         // it. kill_on_drop ensures the Child handle's drop sends
         // SIGKILL.
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    // Issue #569: `spawn_tracked` registers the pid with the reaper's
+    // tracked-pid set atomically with the spawn — from this point on the
+    // reaper must never touch this pid; `kill_on_drop` + this module's own
+    // `try_wait()`/`kill()`+`wait()` own its lifecycle exclusively.
+    let child = crate::reaper::spawn_tracked(&mut cmd)
         .map_err(|e| io::Error::new(e.kind(), format!("spawn ttyd ({bin}): {e}")))?;
 
-    *guard = Some(ShellHandle { child, port });
+    // A just-spawned `Child` always has a live pid (tokio only clears it
+    // once something has waited the child to completion). `TrackedChild::new`
+    // re-asserts the (already-set) registration and gives us untrack-on-drop.
+    let tracked =
+        crate::reaper::TrackedChild::new(child.id().expect("freshly spawned child has a pid"));
+    *guard = Some(ShellHandle {
+        child,
+        port,
+        _tracked: tracked,
+    });
 
     // Probe loop. Drop the guard while waiting so other StartShell
     // callers see the new handle as soon as it lands and we don't

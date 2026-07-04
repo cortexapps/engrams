@@ -29,7 +29,7 @@
 //! - **Agentd (1024, host→guest):** we bind a host `UnixListener` and,
 //!   per accept, `connectToPort(1024)` inside the guest and splice —
 //!   preserving the `UnixStream::connect(<base>_1024)` surface the
-//!   backend's `start_agent` / `exec_stream` / `start_shell` / `guest_ip`
+//!   backend's `start_agent` / `exec_stream` / `start_shell` / `guest_endpoints`
 //!   already use. Each UDS accept is its own vsock stream, so concurrent
 //!   control RPCs no longer serialise (unlike the console bridge).
 //! - **Harness (1026) / upload (1029), guest→host:** register a
@@ -464,7 +464,7 @@ async fn lookup_socket_device(
 /// Accept on the host UDS listener and, per accept, dial the guest's
 /// agentd port and splice bytes. Each accepted connection gets its own
 /// vsock stream + task, so concurrent control RPCs (exec, start_shell,
-/// guest_ip) don't serialise.
+/// guest_endpoints) don't serialise.
 async fn agentd_uds_pump(listener: UnixListener, connector: VsockConnector, port: u32) {
     loop {
         let (host_stream, _peer) = match listener.accept().await {

@@ -409,15 +409,23 @@ impl app::session_service_server::SessionService for AppSessionService {
                     .into(),
             ))
         })?;
-        let port = self
+        let start = self
             .state
             .services
             .host
             .start_browser(sandbox_id)
             .await
             .map_err(|e| Status::unavailable(format!("start_browser: {e}")))?;
+        // Issue #569: chromium-CDP liveness warning from agentd (chrome dead /
+        // crash-looping behind a healthy x11vnc). Log-surface only — the
+        // app-level EnsureBrowserResponse deliberately stays port-only, so the
+        // orchestrator/web are untouched; operators find this by session id.
+        if let Some(warning) = &start.warning {
+            tracing::warn!(session_id = %id, sandbox_id = %sandbox_id, %warning,
+                "ensure_browser: chromium liveness warning");
+        }
         Ok(Response::new(app::EnsureBrowserResponse {
-            port: u32::from(port),
+            port: u32::from(start.port),
         }))
     }
 

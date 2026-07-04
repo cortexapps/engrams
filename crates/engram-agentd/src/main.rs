@@ -281,6 +281,16 @@ async fn run(args: Args) -> std::io::Result<()> {
              accepting any host that can reach the listener"
         );
     }
+    // Issue #569: agentd is pid 1 in the guest, and the detached browser
+    // stack (Xvfb/openbox/chromium/x11vnc, ADR 0065) reparents to it on
+    // exit — with nothing reaping those orphans they piled up as zombies
+    // without bound. Spawn once, for the agent's whole lifetime; it never
+    // touches a pid registered in `engram_agentd::reaper`'s tracked-pid set
+    // (the `/exec` child, the harness supervisor's cached child, ttyd), so
+    // it can't steal an exit status a synchronous `try_wait()`/`wait()`
+    // elsewhere is relying on.
+    engram_agentd::reaper::spawn();
+
     // ADR 0015 M1: one supervisor owns the harness child process
     // across the lifetime of the agent. Shared across all
     // serve_connection tasks so a fresh `SpawnHarness` from any
@@ -354,6 +364,13 @@ async fn run_transport(
     // dial-ready. Best-effort + self-contained (it binds its own listener, no
     // ready-port dependency). NOT spawned from `run_unix`: Process dev has no VM
     // boundary, so the host dials the guest's 127.0.0.1 directly.
+    //
+    // Issue #567: a restore's vsock re-kick can surface a transient (or, rarer,
+    // permanent) accept() error on this listener. `run_port_relay` now
+    // supervises its own accept loop — backing off across transient errors,
+    // escalating and re-binding after a persistent run of them, and containing
+    // a panic in the loop — so this one `tokio::spawn` still covers the whole
+    // guest lifetime; it no longer dies for good on the first hiccup.
     tokio::spawn(engram_agentd::port_relay::run_port_relay());
 
     // ADR 0015 M1: dial the host on the readiness port. The host

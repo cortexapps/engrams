@@ -1,15 +1,26 @@
 #!/bin/sh
 # ADR 0065 browser bundle launcher. Self-contained, glibc-linked; runs on any
-# glibc base. ADR 0055: mounts at a dynamic slot (/opt/engram/dyn/<i>) and
-# agentd symlinks this onto PATH, so resolve our real bundle root from $0
+# glibc base — issue #569: NOT via LD_LIBRARY_PATH (the kernel always execs
+# the loader baked into each binary's PT_INTERP, so that only steers a loader
+# that is already running the base image's own), but because build.sh
+# patchelf's every bundled binary to carry its own interpreter + rpath. See
+# the BUNDLE_LINK block a few lines down for the run-time half of that fix.
+# ADR 0055: mounts at a dynamic slot (/opt/engram/dyn/<i>) and agentd
+# symlinks this onto PATH, so resolve our real bundle root from $0
 # (readlink -f follows the PATH symlink) — never a fixed mount path.
 #
 # Brings up, in order: Xvfb (virtual display :99) → openbox (focus/maximize,
-# no panel/menu) → x11vnc (RFB on 127.0.0.1:5900, reached over the ADR-0066
-# proxy_vnc) → chromium (full UI, sized to the framebuffer). No
+# no panel/menu) → a chromium respawn loop (full UI, sized to the framebuffer)
+# → x11vnc (RFB on 127.0.0.1:5900, reached over the ADR-0066 proxy_vnc). No
 # desktop/file-manager/terminal — the framebuffer shows only Chrome. The whole
 # stack shares one process group so agentd can reap it as a unit
-# (StopBrowser → killpg).
+# (StopBrowser → killpg). Issue #569: only chromium used to be supervised —
+# Xvfb/x11vnc dying left the chrome loop spinning against a dead display with
+# nothing to notice or clean up. Xvfb and x11vnc now each run under a
+# supervisor subshell that tears down the whole group the instant its daemon
+# exits (openbox is cosmetic, not watched); agentd's
+# force-stop-on-failed-RFB-probe (#568) makes "kill everything and let the
+# next StartBrowser rebuild" the right recovery.
 #
 # Security (ADR 0065 §7): the human points this browser at arbitrary, untrusted
 # sites, so the stack runs UNPRIVILEGED with chromium's sandbox ON. The script
@@ -21,7 +32,47 @@ set -eu
 here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
 self="$(readlink -f -- "$0")"
 
-export LD_LIBRARY_PATH="$here/lib:${LD_LIBRARY_PATH:-}"
+# --- Stable bundle path for the patchelf'd binaries (issue #569) ------------
+# build.sh patches every bundled ELF's PT_INTERP + DT_RPATH to the fixed
+# absolute path /tmp/engram-browser-bundle/lib, baked in at BUILD time — the
+# kernel always execs the interpreter recorded in the ELF, so this can't be
+# steered via LD_LIBRARY_PATH at run time (see build.sh's header for why the
+# old LD_LIBRARY_PATH-only approach broke on any base image whose glibc
+# differs from the bookworm build stage). But bundles mount at a dynamic
+# reserved slot (/opt/engram/dyn/<i>, ADR 0055) that is not known until this
+# script runs, so the baked-in path can't point there directly. Bridge the
+# two here: keep a stable symlink at that fixed path pointing at $here,
+# created/refreshed before ANY bundled binary can run — including the node
+# probe inside stack_up() below, which the --ensure fast path reaches before
+# anything else in the script.
+#
+# No env override is possible here (an ENGRAM_BROWSER_BUNDLE_LINK knob would
+# be meaningless): the path is compiled into the ELFs themselves at build
+# time, not read from the environment at run time, so both sides must agree
+# on the literal string.
+#
+# /tmp is the right home: the guest is single-tenant (same rationale as
+# BROWSER_PIDFILE below), and it must work for non-root too — the dev
+# ProcessBackend stages this same bundle unpacked and runs the launcher as a
+# regular user with no /opt write access. If the symlink can't be pointed at
+# $here (e.g. sticky-bit /tmp, or an existing entry owned by another uid),
+# fail loudly rather than let every bundled binary silently run against a
+# stale bundle's libs — that would be a subtle heisenbug.
+BUNDLE_LINK=/tmp/engram-browser-bundle
+if [ "$(readlink -- "$BUNDLE_LINK" 2>/dev/null)" != "$here" ]; then
+    ln -sfn "$here" "$BUNDLE_LINK" 2>/dev/null || {
+        echo "engram-browser: cannot point $BUNDLE_LINK at $here (stale symlink owned by another uid, or /tmp not writable?)" >&2
+        exit 1
+    }
+fi
+
+# No LD_LIBRARY_PATH: the patched binaries above find lib/ via their own
+# DT_RPATH through BUNDLE_LINK; system utilities this script also shells out
+# to (sh, sleep, seq, mktemp, grep, date, mount, ...) must keep running
+# against the base image's OWN libc, which a global LD_LIBRARY_PATH used to
+# poison (issue #569 — e.g. /bin/sh re-execs and `timeout` crashed on
+# glibc-mismatched bases even though the browser stack itself never touches
+# them).
 export FONTCONFIG_FILE="$here/fonts.conf"
 export PATH="$here/bin:$PATH"
 
@@ -39,20 +90,41 @@ ENSURE_VNC_PORT="${ENGRAM_BROWSER_VNC_PORT:-5900}"
 # guest is single-tenant (the VM is the isolation boundary), so a fixed path is
 # safe; override via ENGRAM_BROWSER_PIDFILE.
 BROWSER_PIDFILE="${ENGRAM_BROWSER_PIDFILE:-/tmp/engram-browser.pgid}"
+# Bring-up log for the stack itself (Xvfb/openbox/x11vnc stdout+stderr) and a
+# separate log for chrome's respawn loop (below) — issue #569: --ensure-locked
+# used to redirect the whole detached stack to /dev/null, so a startup failure
+# (e.g. chromium's sandbox init) left no trace anywhere. Both are truncated on
+# each bring-up/(re)launch so they stay small and always hold the latest run.
+BROWSER_LOG="${ENGRAM_BROWSER_LOG:-/tmp/engram-browser.log}"
+CHROME_LOG="${ENGRAM_BROWSER_CHROME_LOG:-/tmp/engram-browser.chrome.log}"
 
 # Is the stack up? Probe x11vnc's RFB port (:5900) via the bundled node (shipped
 # for playwright-cli, so the launcher needs no curl/nc). We gate on RFB, NOT
 # chromium's CDP (:9222): x11vnc is the LAST thing the launcher starts, so RFB
 # accepting means the whole stack is up — and chromium's DevTools socket lags,
 # so gating on it made the spawn flaky (the agent's connectOverCDP retries CDP
-# itself). A bare connect suffices here; agentd adds the RFB-banner check.
+# itself). A bare connect is NOT enough (issue #567): a VM snapshot/restore can
+# resurrect a WEDGED x11vnc whose listen socket still accepts but never sends
+# the RFB ProtocolVersion banner — a bare connect passes that wedge, --ensure
+# concludes "already up" and no-ops, and the agent's playwright-cli path (which
+# never goes through agentd's banner probe) stays stuck until the VM is
+# recreated. So require the 12-byte banner ("RFB 003.008\n" — sent immediately
+# on accept, though not necessarily in one segment) within an overall 2s
+# deadline from connect (mirroring agentd's RFB_BANNER_TIMEOUT), so a silent
+# wedge fails in bounded time instead of hanging the ensure.
 stack_up() {
     "$here/node/bin/node" -e '
         const s = require("net").connect(+process.argv[1], "127.0.0.1");
-        s.setTimeout(500);
-        s.on("connect", () => { s.destroy(); process.exit(0); });
-        s.on("error",   () => process.exit(1));
-        s.on("timeout", () => { s.destroy(); process.exit(1); });
+        const done = (code) => { s.destroy(); process.exit(code); };
+        setTimeout(() => done(1), 2000);      // one connect+banner deadline
+        let buf = Buffer.alloc(0);
+        s.on("data", (d) => {
+            buf = Buffer.concat([buf, d]);
+            if (buf.length >= 12)
+                done(buf.slice(0, 4).toString("latin1") === "RFB " ? 0 : 1);
+        });
+        s.on("error", () => done(1));
+        s.on("close", () => done(1));         // hung up before a full banner
     ' "$ENSURE_VNC_PORT" 2>/dev/null
 }
 
@@ -76,7 +148,10 @@ if [ "${1:-}" = "--ensure-locked" ]; then
     # Bring the stack up detached in a fresh session/pgid (setsid) and record
     # the pgid; when this short-lived --ensure process exits, the stack
     # reparents to PID 1 (agentd), which reaps it by the pidfile at teardown.
-    setsid "$self" --run >/dev/null 2>&1 &
+    # Capture stdout+stderr to BROWSER_LOG (truncated here, at bring-up) rather
+    # than /dev/null — issue #569, this used to throw away Xvfb/openbox/x11vnc
+    # startup errors entirely.
+    setsid "$self" --run >"$BROWSER_LOG" 2>&1 &
     pgid=$!
     echo "$pgid" > "$BROWSER_PIDFILE"
     # Return only once x11vnc accepts, so callers can connect immediately; bounded
@@ -91,8 +166,41 @@ if [ "${1:-}" = "--ensure-locked" ]; then
     exit 1
 fi
 
-# Default (`--run`, or no arg for dev): the full bring-up below, ending as
-# x11vnc. Invoked detached by --ensure-locked (or directly on a dev box).
+if [ "${1:-}" = "--wait-cdp" ]; then
+    # Agent path only (the bundled playwright-cli wrapper calls this after
+    # --ensure). --ensure returns on the x11vnc RFB gate (:5900), but chromium
+    # binds its CDP endpoint (:9222) a beat later — and playwright-cli
+    # connectOverCDP fails fast on that gap (one-shot GET /json/version ->
+    # ECONNREFUSED, with no retry of its own), which is the ADR-0065
+    # "RFB readiness is necessary-but-not-sufficient" chromium-liveness gap. So
+    # block until CDP actually answers a /json/version (HTTP 200) before letting
+    # the CLI connect. Bounded (~20s); on timeout exit 0 anyway so the wrapper
+    # still execs the CLI and surfaces the real error instead of us swallowing it.
+    # The human/VNC path never calls this, so --ensure stays RFB-only (gating it
+    # on the laggy CDP socket is what made spawn flaky — ADR 0065).
+    CDP_PORT="${ENGRAM_BROWSER_CDP_PORT:-9222}"
+    "$here/node/bin/node" -e '
+        const http = require("http");
+        const port = +process.argv[1];
+        const deadline = Date.now() + 20000;
+        const retry = () => { if (Date.now() > deadline) process.exit(0); else setTimeout(tick, 200); };
+        const tick = () => {
+            const req = http.get({ host: "127.0.0.1", port, path: "/json/version", timeout: 1000 }, (res) => {
+                res.resume();
+                if (res.statusCode === 200) process.exit(0);
+                retry();
+            });
+            req.on("error", retry);
+            req.on("timeout", () => { req.destroy(); retry(); });
+        };
+        tick();
+    ' "$CDP_PORT" 2>/dev/null || true
+    exit 0
+fi
+
+# Default (`--run`, or no arg for dev): the full bring-up below, ending as the
+# supervising main shell (parked in `wait` on the Xvfb/x11vnc supervisor
+# subshells). Invoked detached by --ensure-locked (or directly on a dev box).
 
 # --- Privilege drop (ADR 0065 §7) -------------------------------------------
 # Drop HERE, in the bundle's own launcher, rather than in agentd: the workspace
@@ -192,15 +300,31 @@ trap cleanup TERM INT EXIT
 # -xkbdir points the server at the bundle's relocated XKB data (build.sh copies
 # /usr/share/X11/xkb -> $here/share/X11/xkb); without it the server can't
 # compile a keymap and aborts before any client can connect.
-"$here/bin/Xvfb" "$DISPLAY" -screen 0 "$GEOMETRY" +extension RANDR -nolisten tcp \
-    -xkbdir "$here/share/X11/xkb" &
-# Wait for the X socket before starting clients.
+# Supervised (issue #569 — see the design note above `wait` at the bottom):
+# the subshell blocks on Xvfb and tears down the whole group the moment it
+# exits. Clear the inherited cleanup trap so a group TERM (a sibling
+# supervisor's teardown, or StopBrowser's killpg) just terminates this
+# subshell instead of re-entering `kill 0`.
+(
+    trap - TERM INT EXIT
+    # The subshell INHERITS `set -e`, so the `|| true` is load-bearing: without
+    # it a crashing daemon's nonzero exit aborts the subshell right here and
+    # the teardown kill below never runs (verified empirically).
+    "$here/bin/Xvfb" "$DISPLAY" -screen 0 "$GEOMETRY" +extension RANDR -nolisten tcp \
+        -xkbdir "$here/share/X11/xkb" || true
+    echo "engram-browser: Xvfb died, tearing down the stack" >&2
+    kill -TERM 0 2>/dev/null || true
+) &
+# Wait for the X socket before starting clients. Stays in the MAIN shell (it
+# only needs the Xvfb supervisor above to have started first).
 for _ in $(seq 1 100); do
     [ -S "/tmp/.X11-unix/X$DISPLAY_NUM" ] && break
     sleep 0.05
 done
 
 # 2) Minimal WM so chromium gets focus + maximizes. No root menu / no panel.
+# Deliberately UNsupervised: openbox is cosmetic (focus/maximize only), so its
+# death shouldn't tear down a working chrome+VNC session.
 "$here/bin/openbox" &
 
 # 3) Chromium under a respawn supervisor. Full UI, sized to the framebuffer, no
@@ -219,7 +343,9 @@ done
 # terminates it cleanly instead of re-entering `kill 0`.
 (
     trap - TERM INT EXIT
+    launch=0
     while true; do
+        launch=$((launch + 1))
         # A crash can leave a stale singleton lock that blocks relaunch with
         # "profile appears to be in use"; the profile is single-tenant and
         # ephemeral, so clear it before each (re)launch.
@@ -229,15 +355,33 @@ done
         # lets chromium use its namespace (zygote) sandbox, so an exploited
         # renderer is confined. (--test-type is gone too — it only existed to
         # silence the bad-flags warning that --no-sandbox raised.)
-        "$here/chrome/chrome" \
+        #
+        # stdout+stderr go to CHROME_LOG, TRUNCATED per launch (`>`, not `>>`)
+        # so the file stays small and always holds the latest attempt — issue
+        # #569, this used to be discarded entirely by the --ensure-locked
+        # redirect, so a sandbox-init failure left no trace anywhere.
+        # --disable-gpu: a microVM has no GPU and Xvfb has no GLX, so the GPU
+        # process can only crash-loop (ANGLE "GLX is not present", one dead
+        # GPU process after another) before chrome settles on the same
+        # software raster path this flag selects directly — measured on a
+        # 2-vCPU FC guest, the loop delayed CDP (:9222) by ~70s (issue #569).
+        if "$here/chrome/chrome" \
             --user-data-dir="$PROFILE_DIR" \
             --no-first-run --no-default-browser-check \
-            --disable-infobars \
+            --disable-infobars --disable-gpu \
             --remote-debugging-port="$CDP_PORT" \
             --remote-allow-origins='*' \
             --window-position=0,0 \
             --window-size="$FB_W,$FB_H" \
-            "${ENGRAM_BROWSER_HOMEPAGE:-about:blank}" || true
+            "${ENGRAM_BROWSER_HOMEPAGE:-about:blank}" >"$CHROME_LOG" 2>&1; then
+            rc=0
+        else
+            rc=$?
+        fi
+        # Appended (not truncated) so the note survives until the NEXT
+        # launch's truncation, i.e. it's still there to explain why the log
+        # ends where it does.
+        echo "engram-browser: chrome exited status=$rc (launch #$launch)" >>"$CHROME_LOG"
         # chrome exited; pause so a hard launch failure can't hot-loop, then
         # bring it back up on the same display.
         sleep 1
@@ -256,11 +400,43 @@ done
 # -forever: survive client disconnects (refresh grace handled host-side).
 # -xrandr: track RANDR resolution changes for noVNC remote resize (x11vnc's flag
 # is -xrandr, NOT -randr — an unrecognized option makes x11vnc abort before
-# binding the RFB port). exec so this process becomes x11vnc; agentd reaps the
-# whole group via killpg, and x11vnc handles its own signals (the shell trap
-# above only covers the pre-exec bring-up).
-exec "$here/bin/x11vnc" \
-    -display "$DISPLAY" \
-    -rfbport "$VNC_PORT" \
-    -localhost \
-    -forever -shared -noxdamage -nopw -quiet -xrandr
+# binding the RFB port). Supervised like Xvfb rather than exec'd (issue #569):
+# the main shell stays alive as the stack's supervisor. This launch must stay
+# AFTER chrome's respawn subshell starts (step 3), so the display already has a
+# client window when RFB comes up. agentd still reaps the whole group via
+# killpg at StopBrowser, and x11vnc still handles its own signals meanwhile.
+(
+    trap - TERM INT EXIT
+    # Same as the Xvfb supervisor: the subshell inherits `set -e`, so without
+    # the `|| true` a crash exit aborts the subshell before the kill runs.
+    "$here/bin/x11vnc" \
+        -display "$DISPLAY" \
+        -rfbport "$VNC_PORT" \
+        -localhost \
+        -forever -shared -noxdamage -nopw -quiet -xrandr || true
+    echo "engram-browser: x11vnc died, tearing down the stack" >&2
+    kill -TERM 0 2>/dev/null || true
+) &
+
+# 5) Park as the supervisor (issue #569): Xvfb and x11vnc are load-bearing —
+# chrome has nowhere to render without the former, and the VNC tab has nothing
+# to connect to without the latter — but before this both ran fire-and-forget,
+# so either dying left the chrome respawn loop spinning forever against a dead
+# display with nothing to notice or clean up. Each now runs under its own
+# supervisor subshell (steps 1 and 4) that blocks on the daemon and signals the
+# whole process group (`kill -TERM 0`) the instant it exits: event-driven and
+# zero-latency, no per-second poll wakeups (the old loop forked a `sleep` every
+# second forever), and immune to pid reuse (the old `kill -0 $PID` re-derived
+# liveness from a pid the shell may have already reaped — reapable within ~1s,
+# after which the pid is recyclable and the watchdog could green-light a
+# stranger forever). The group TERM lands on this shell's trap → cleanup()
+# disarms its traps first, then kills the group (chrome loop, the other
+# supervisor, openbox — no recursion, and the supervisors die with the group).
+# agentd's force-stop-on-failed-RFB-probe (#568) is what makes teardown the
+# correct recovery — the next StartBrowser rebuilds a fresh stack rather than
+# reattaching to a half-dead one.
+wait
+# Belt and suspenders: `wait` only returns here if every child vanished without
+# any supervisor firing the group TERM; tear down explicitly regardless.
+cleanup
+exit 1

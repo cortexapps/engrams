@@ -243,6 +243,11 @@ message ProbeSandboxResponse {
 message BrowserPortResponse {
   // The in-guest RFB port x11vnc is serving on (loopback).
   uint32 port = 1;
+  // Issue #569: set when x11vnc came up but chromium's CDP debug port never
+  // answered agentd's bounded probe — chrome may be dead or crash-looping
+  // behind a healthy VNC. Diagnostic only; the RPC still succeeds. Absent =
+  // chrome answered (or the peer predates the probe).
+  optional string warning = 2;
 }
 
 // 16-byte UUID. Same shape as `engram_core::SandboxId`'s underlying

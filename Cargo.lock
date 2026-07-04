@@ -998,6 +998,7 @@ dependencies = [
 name = "engram-agentd"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bincode",
  "clock-steering",
  "engram-core",

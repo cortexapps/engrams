@@ -435,8 +435,7 @@ async fn build_egress_policy(
     image: &str,
     integration_policy: Option<&engram_core::types::IntegrationPolicy>,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
-    let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
-    let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
+    let guest_ip = state.services.host.guest_ip(sandbox_id).await?;
     Some(engram_core::types::egress::SessionEgressPolicy {
         session_id,
         sandbox_id,
