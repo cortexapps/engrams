@@ -67,9 +67,12 @@ coordinator's capability gate is what actually withholds placement.
 
 NoCapacity visibility: `placement::exclusion_summary` names the first failing reason per
 host (`excluded | not_ready | cordoned | wire_skew | stale | cap:<name> | digest_not_ready |
-no_fit`), logged + counted (`engram_placement_excluded_total{reason}`) on the
-`pick_for_session` `NoCapacity` path — kills the "no capacity with free hosts" mystery mode.
-The fleet view (`HostView.failing_capabilities` / `fc_snapshot_version` /
+no_fit`), logged + counted (`engram_placement_excluded_total{origin,reason}`) via the shared
+`placement::log_empty_candidates` helper — kills the "no capacity with free hosts" mystery
+mode. A core-ops-batch correction pass (see the deferred-items note below) extended this from
+just the `pick_for_session` `NoCapacity` path to all four empty-candidate call sites (`create`
+/ `queue_create` / `queue_resume_precheck` / `resume`), each distinguished by the `origin`
+label. The fleet view (`HostView.failing_capabilities` / `fc_snapshot_version` /
 `capabilities_schema`, proto fields 24–26) surfaces the same thing to operators.
 
 **(b) Probe-before-host_lost.** New `HostService.ProbeSandbox` RPC
@@ -105,11 +108,14 @@ graphable together.
 
 - The issue sketched three PRs (host probes / coordinator gate+surface / probe-before-
   host_lost); shipped as one PR here since one agent owns the whole worktree.
-- `PR 2 step 12`'s NoCapacity exclusion summary is wired at `pick_for_session` (resume/evac
-  — the path the wire-skew incident evidence covers) and not also at the create-path
-  `candidates_for`/`queue_scanner` callers; those callers still resolve `needs_uffd_substrate`
-  correctly for placement decisions, they just don't independently emit the exclusion log.
-  A follow-up can add it if create-path "no capacity" mysteries turn up in practice.
+- `PR 2 step 12`'s NoCapacity exclusion summary originally landed at `pick_for_session`
+  (resume/evac) only — NOT the path the wire-skew incident evidence actually named (that
+  incident's "queued-stuck" symptom traced to the queue-scanner's create-origin break in
+  `place_create`, which had no exclusion visibility at all). A core-ops-batch correction pass
+  fixed the gap: `placement::log_empty_candidates` is now the one shared helper every
+  empty-candidate call site invokes, so coverage spans all four paths — `create`
+  (`api/sessions.rs`), `queue_create` / `queue_resume_precheck` (`queue_scanner.rs`), and
+  `resume` (`pick_for_session`) — each distinguished by the counter's `origin` label.
 - A dedicated unit test for the heartbeat-handler persist-before-reconcile ordering
   (`Testing & CI`'s explicit ask) was not added — it would require extending the widely
   shared `state::tests::MiniMeta` fixture with fault-injection + call-tracking, and the

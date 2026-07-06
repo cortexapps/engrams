@@ -320,15 +320,28 @@ pub const ENABLE_PRESTAGE_SECONDS: &str = "engram_enable_prestage_seconds";
 /// per-host record lives on the `enable_jobs.prestage_hosts` column.
 pub const ENABLE_PRESTAGE_HOST_OUTCOMES_TOTAL: &str = "engram_enable_prestage_host_outcomes_total";
 
-/// Counter (ADR 0068). Per-host exclusion reasons on a `NoCapacity`
-/// pick — kills the "no capacity with free hosts" mystery mode (a
-/// wire-skewed or capability-failing host used to vanish from the
-/// candidate set with the caller seeing only a bare `NoCapacity`).
-/// Labels: `reason` = the bounded `placement::exclusion_summary`
-/// vocabulary (`excluded` / `not_ready` / `cordoned` / `wire_skew` /
-/// `stale` / `cap:<name>` — one of the ~6 named capabilities, so still
-/// bounded / `digest_not_ready` / `no_fit`). No `host_id` label — see
-/// the cardinality convention above; the paired `warn!` names hosts.
+/// Counter (ADR 0068; `origin` label added in the core-ops-batch
+/// correction pass). Per-host exclusion reasons whenever a placement
+/// attempt turns up an empty candidate set — kills the "no capacity
+/// with free hosts" mystery mode (a wire-skewed or capability-failing
+/// host used to vanish from the candidate set with the caller seeing
+/// only a bare `NoCapacity`/empty-`RankedCandidates`). Emitted from
+/// `placement::log_empty_candidates`, the one call site every
+/// empty-candidates path shares. Labels:
+/// - `reason` = the bounded `placement::exclusion_summary` vocabulary
+///   (`excluded` / `not_ready` / `cordoned` / `wire_skew` / `stale` /
+///   `cap:<name>` — one of the ~6 named capabilities, so still bounded
+///   / `digest_not_ready` / `no_fit`).
+/// - `origin` = which call site hit the empty set: `create` (fresh
+///   session, `api/sessions.rs::boot_prepared`) / `queue_create`
+///   (queue-scanner re-placing a create-origin queued session) /
+///   `queue_resume_precheck` (queue-scanner's resume dequeue capacity
+///   check) / `resume` (the resume/evac path, `pick_for_session`).
+///   Bounded to these 4 values — do not add a 5th without updating this
+///   doc.
+///
+/// No `host_id` label — see the cardinality convention above; the
+/// paired `warn!` names hosts.
 pub const PLACEMENT_EXCLUDED_TOTAL: &str = "engram_placement_excluded_total";
 
 /// Counter (ADR 0068). `reconcile::flip_missing` probed the sandbox

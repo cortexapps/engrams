@@ -528,6 +528,13 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
                 return PlaceOutcome::Error;
             }
         };
+    // ADR 0068 (core-ops-batch correction pass): an empty candidate set
+    // here falls into `PlaceOutcome::NoCapacity` below with no visibility
+    // into why — mirror the create/resume paths' exclusion-reason logging.
+    if candidates.hosts.is_empty() {
+        crate::placement::log_empty_candidates(state.services.meta.as_ref(), &ctx, "queue_create")
+            .await;
+    }
     match state
         .services
         .meta
@@ -661,7 +668,22 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<b
         },
     };
     match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
-        Ok(c) => Some(!c.hosts.is_empty()),
+        Ok(c) => {
+            let has_capacity = !c.hosts.is_empty();
+            // ADR 0068 (core-ops-batch correction pass): `Some(false)` is
+            // the one legitimate GLOBAL stop in the sweep loop (see the
+            // caller's comment) — give it the same exclusion-reason
+            // visibility the other empty-candidate paths now have.
+            if !has_capacity {
+                crate::placement::log_empty_candidates(
+                    state.services.meta.as_ref(),
+                    &ctx,
+                    "queue_resume_precheck",
+                )
+                .await;
+            }
+            Some(has_capacity)
+        }
         Err(e) => {
             tracing::warn!(session_id = %q.session.id, error = ?e,
                 "queue-scanner: resume candidates_for failed");

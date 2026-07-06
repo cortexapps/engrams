@@ -522,6 +522,50 @@ pub async fn candidates_for(
     Ok(rank_hosts(&hosts, ctx, Utc::now(), placement_ttl()))
 }
 
+/// ADR 0068 (core-ops-batch correction pass): shared exclusion-visibility
+/// helper for every "empty candidate set" placement failure — not just
+/// `pick_for_session`'s `NoCapacity`. `#564`'s review found three other
+/// call sites (`api/sessions.rs`'s create path, and `queue_scanner.rs`'s
+/// `place_create` + `resume_has_capacity`) that returned an empty
+/// candidate set with zero visibility into why, so a wire-skewed or
+/// capability-failing fleet looked identical to a genuinely full one on
+/// every path except resume. Call this whenever a candidate set turns up
+/// empty; it re-reads `list_active_hosts` (this only runs on the
+/// uncommon failure path, so the extra read doesn't cost the common
+/// case), emits the bounded `exclusion_summary` per host as both the
+/// `PLACEMENT_EXCLUDED_TOTAL` counter (labeled `origin` + `reason`) and a
+/// `tracing::warn!` naming every host.
+///
+/// `origin` is one of the 4 values documented on
+/// `metrics::PLACEMENT_EXCLUDED_TOTAL` — pass a `'static` string literal
+/// from that fixed set so the label cardinality stays bounded.
+pub async fn log_empty_candidates(meta: &dyn MetadataStore, ctx: &ScheduleContext<'_>, origin: &'static str) {
+    let hosts = match meta.list_active_hosts().await {
+        Ok(hosts) => hosts,
+        Err(e) => {
+            tracing::debug!(origin, error = %e,
+                "log_empty_candidates: list_active_hosts failed; skipping exclusion visibility");
+            return;
+        }
+    };
+    let summary = exclusion_summary(&hosts, ctx, Utc::now(), placement_ttl());
+    for (_host_id, reason) in &summary {
+        ::metrics::counter!(
+            crate::metrics::PLACEMENT_EXCLUDED_TOTAL,
+            "origin" => origin,
+            "reason" => reason.clone(),
+        )
+        .increment(1);
+    }
+    tracing::warn!(
+        repo = ctx.repo,
+        image_version = ctx.image_version,
+        origin,
+        exclusions = ?summary,
+        "placement: empty candidate set — per-host exclusion reasons",
+    );
+}
+
 /// Session scheduler for the resume/evac path: pick from the hosts rows
 /// and resolve the backend (dialing through the PG `host_addr` when this
 /// replica hasn't seen the host yet). Emits the ADR 0044 K4
@@ -541,24 +585,9 @@ pub async fn pick_for_session(
     };
     ::metrics::counter!(crate::metrics::SESSION_PLACEMENT_TOTAL, "outcome" => outcome).increment(1);
     // ADR 0068: on NoCapacity ONLY, name why — kills the "no capacity
-    // with free hosts" mystery mode. A fresh `list_active_hosts` read
-    // here (rather than threading the already-fetched list out of
-    // `pick_for_session_inner`) keeps the common (placed) path free of
-    // this cost; it only runs on the failure path.
+    // with free hosts" mystery mode.
     if matches!(result, Err(PickError::NoCapacity)) {
-        if let Ok(hosts) = meta.list_active_hosts().await {
-            let summary = exclusion_summary(&hosts, ctx, Utc::now(), placement_ttl());
-            for (_host_id, reason) in &summary {
-                ::metrics::counter!(crate::metrics::PLACEMENT_EXCLUDED_TOTAL, "reason" => reason.clone())
-                    .increment(1);
-            }
-            tracing::warn!(
-                repo = ctx.repo,
-                image_version = ctx.image_version,
-                exclusions = ?summary,
-                "pick_for_session: NoCapacity — per-host exclusion reasons",
-            );
-        }
+        log_empty_candidates(meta, ctx, "resume").await;
     }
     result
 }
