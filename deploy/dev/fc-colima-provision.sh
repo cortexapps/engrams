@@ -85,7 +85,12 @@ start_profile() {
 profile_status="$(colima list --json 2>/dev/null | jq -rs --arg p "$PROFILE" 'map(select(.name==$p)) | .[0].status // empty')"
 if [ -z "$profile_status" ]; then
     echo "==> profile '$PROFILE' does not exist; creating (vz + nested-virtualization)"
-    start_profile colima start --profile "$PROFILE" --vm-type vz --nested-virtualization --cpu 6 --memory 8 --disk 60
+    # 16 GiB: the host-agent keeps each enabled image's base-snapshot memory
+    # image resident (~4 GiB for the default session budget), so an 8 GiB VM
+    # can't fit that warm cache + a 4 GiB session + OS/host-agent overhead —
+    # sessions queue forever with "no capacity". 16 GiB leaves room for the
+    # cache + a couple of sessions.
+    start_profile colima start --profile "$PROFILE" --vm-type vz --nested-virtualization --cpu 6 --memory 16 --disk 60
 elif [ "$profile_status" != "Running" ]; then
     echo "==> profile '$PROFILE' exists but is stopped ($profile_status); starting"
     start_profile colima start --profile "$PROFILE"
