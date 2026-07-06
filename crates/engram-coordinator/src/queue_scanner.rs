@@ -343,14 +343,14 @@ pub async fn run_once(
                             // Skip this one; don't starve the rest on a transient.
                             continue;
                         }
-                    }
-                    PlaceOutcome::ImageGone => {
-                        // `place_create` already terminally failed the
-                        // session (review finding 3) — just release and
-                        // keep sweeping; an image-gone head must not block
-                        // the rest of the queue.
-                        drop(lease);
-                        continue;
+                        PlaceOutcome::ImageGone => {
+                            // `place_create` already terminally failed the
+                            // session (review finding 3) — just release and
+                            // keep sweeping; an image-gone head must not block
+                            // the rest of the queue.
+                            drop(lease);
+                            continue;
+                        }
                     }
                 }
                 QueueOrigin::Resume => {
