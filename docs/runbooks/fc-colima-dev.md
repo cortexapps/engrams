@@ -97,6 +97,29 @@ under `sudo` with the same env contract as the Linux dev path.
   cache + a session. The VM is provisioned at 16 GiB for this reason; if you
   shrank it, sessions queue forever. Check `allocatable_mib` in the `hosts`
   table vs the session's `mem_budget_mib`.
+- **Claude sessions need egress + a per-session policy.** The egress proxy is
+  mandatory (issue #240) — it's the only path a guest reaches the network — and
+  `dev-fc` runs it on `8443` (the `ENGRAM_EGRESS_PROXY_PORT=0` default is a
+  footgun: a dead `:443→0` redirect while the proxy binds a random port, so the
+  claude CLI's `api.anthropic.com` call hangs and the session sits "working").
+  For a claude session to actually reach the API you also set, per session in
+  the UI: (1) `api.anthropic.com` (and `statsig.anthropic.com`) in the policy's
+  `network.allow_hosts` — ADR 0057, it comes from the session policy, NOT the
+  image manifest, and `network.default="allow"` does not substitute; (2)
+  `ANTHROPIC_API_KEY` (Literal secret → guest env; resolved by the coord's
+  `EnvSecretStore` from its own `$ANTHROPIC_API_KEY`, so export it before
+  `just dev-fc`, or supply it directly as `harness_env`). The anthropic call
+  takes the proxy's Bypass/SNI-splice path, so no guest CA-trust setup is
+  needed. A `--dev-vm` session needs none of this.
+- **`:443` redirects to a stale port after many host-agent restarts.**
+  `host_startup`'s iptables install is additive-idempotent (a `-C` check per
+  exact rule), so if the proxy port ever changed across restarts the old
+  `engram-proxy-redirect … redir ports <old>` PREROUTING rules linger BEFORE
+  the new one and win (first-match). Symptom: proxy listening on the right port
+  but guest HTTPS still dead. Fix: delete the stale rules —
+  `colima ssh --profile fc-dev -- sudo iptables -t nat -L PREROUTING -n --line-numbers | grep dpt:443`
+  then `sudo iptables -t nat -D PREROUTING <n>` the wrong-port ones. A fresh
+  `dev-fc` (single start) doesn't accumulate them.
 - **`tilt down` does not stop the remote host-agent** (or its live microVMs).
   `colima ssh` doesn't propagate signals, so each (re)start pre-kills the
   prior instance instead; between `tilt down` and the next `dev-fc` the old
