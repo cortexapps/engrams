@@ -701,13 +701,19 @@ mod tests {
         ) -> Result<SessionId, MetaError> {
             unreachable!()
         }
-        async fn create_session_created(
+        async fn transition_session_created(
             &self,
             _: SessionId,
-            _: engram_core::types::session::SessionSpec,
-            _: HostId,
             _: SandboxId,
         ) -> Result<(), MetaError> {
+            unreachable!()
+        }
+        async fn reserve_and_persist_create(
+            &self,
+            _: engram_core::traits::SessionCreateWriteSet,
+            _: &[HostId],
+            _: usize,
+        ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
             unreachable!()
         }
         async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
@@ -912,12 +918,6 @@ mod tests {
         async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
             unreachable!()
         }
-        async fn upsert_session_secrets(
-            &self,
-            _: engram_core::types::registry::SessionSecrets,
-        ) -> Result<(), MetaError> {
-            unreachable!()
-        }
         async fn get_session_secrets(
             &self,
             _: SessionId,
@@ -940,6 +940,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         }
     }
 

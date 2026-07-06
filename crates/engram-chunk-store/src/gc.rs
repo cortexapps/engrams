@@ -253,13 +253,19 @@ mod tests {
         async fn create_session(&self, _spec: SessionSpec) -> Result<SessionId, MetaError> {
             Err(MetaError::NotFound)
         }
-        async fn create_session_created(
+        async fn transition_session_created(
             &self,
             _session_id: SessionId,
-            _spec: SessionSpec,
-            _host_id: HostId,
             _sandbox_id: SandboxId,
         ) -> Result<(), MetaError> {
+            Err(MetaError::NotFound)
+        }
+        async fn reserve_and_persist_create(
+            &self,
+            _ws: engram_core::traits::SessionCreateWriteSet,
+            _candidates: &[HostId],
+            _affinity_len: usize,
+        ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
             Err(MetaError::NotFound)
         }
         async fn get_session(&self, _id: SessionId) -> Result<Session, MetaError> {
@@ -435,12 +441,6 @@ mod tests {
             Ok(engram_core::traits::DisableEnabledImageOutcome::Disabled)
         }
         async fn delete_enabled_image(&self, _uri: &str) -> Result<(), MetaError> {
-            Ok(())
-        }
-        async fn upsert_session_secrets(
-            &self,
-            _secrets: engram_core::types::SessionSecrets,
-        ) -> Result<(), MetaError> {
             Ok(())
         }
         async fn get_session_secrets(

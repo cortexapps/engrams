@@ -1157,6 +1157,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
@@ -1209,6 +1210,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
@@ -1357,6 +1359,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta, stashed) = d5_state(session, sandbox_root.path());
@@ -1438,6 +1441,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta, _stashed) = d5_state(session, sandbox_root.path());
@@ -1493,6 +1497,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -1697,6 +1702,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -1917,6 +1923,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -2141,6 +2148,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -2258,6 +2266,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2494,6 +2503,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -2607,6 +2617,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2697,6 +2708,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2727,6 +2739,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2773,6 +2786,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         }
     }
 

@@ -236,15 +236,12 @@ mod adapter {
         let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(1024);
         let reattach = Arc::new(Notify::new());
         let held: HeldEvent = Arc::new(Mutex::new(None));
-        let initial_prompt: Option<String> = std::env::var("ENGRAM_INITIAL_PROMPT").ok();
+        // Issue #535 (d): no more env-seeded initial prompt — every prompt,
+        // first or follow-up, arrives as a `HarnessCommand::Prompt` frame
+        // over the same connection this loop dials. The engine starts with
+        // an empty pending queue and waits.
 
-        let engine = tokio::spawn(run_engine(
-            cli.clone(),
-            cmd_rx,
-            reattach.clone(),
-            evt_tx,
-            initial_prompt,
-        ));
+        let engine = tokio::spawn(run_engine(cli.clone(), cmd_rx, reattach.clone(), evt_tx));
 
         // Connection loop: dial → handshake → splice (forward host
         // commands / pump engine events) until the link drops, then
@@ -887,20 +884,16 @@ mod adapter {
         mut cmd_rx: mpsc::Receiver<HarnessCommand>,
         reattach: Arc<Notify>,
         evt_tx: mpsc::Sender<HarnessEvent>,
-        initial_prompt: Option<String>,
     ) -> ExitCode {
         // The pending queue is owned here so it survives a respawn: a
         // prompt queued mid-turn (type-ahead) or one that hadn't started
         // when claude crashed isn't lost across the process restart.
         // Phase 1b: this IS the user-visible editable queue — each entry
-        // carries its `prompt_id` (the env-seeded initial prompt has none).
+        // carries its `prompt_id`. Issue #535 (d): starts EMPTY — the
+        // create-time initial prompt is no longer env-seeded; it arrives as
+        // an ordinary `HarnessCommand::Prompt` frame once the host attaches,
+        // same as every follow-up.
         let mut pending: VecDeque<QueuedPrompt> = VecDeque::new();
-        if let Some(p) = initial_prompt {
-            pending.push_back(QueuedPrompt {
-                prompt_id: None,
-                text: p,
-            });
-        }
 
         // ADR 0052: prompt_ids we've already accepted (started or queued).
         // The host re-delivers un-confirmed prompts on every reattach
@@ -1298,12 +1291,14 @@ mod adapter {
     /// A prompt waiting in the harness-owned queue (Phase 1b — type-ahead
     /// / steering). The harness is the single-writer owner: it buffers
     /// these in memory and writes one to claude's stdin only at the
-    /// consumption boundary (the running turn's `result`). `prompt_id` is
-    /// `Some` for prompts delivered via `HarnessCommand::Prompt` (carrying
-    /// a client/coord-minted id used to correlate the queue events and the
-    /// eventual `RunStarted{prompt_id}`); `None` only for the env-seeded
-    /// initial prompt, which is consumed immediately and never actually
-    /// waits in the queue.
+    /// consumption boundary (the running turn's `result`). `prompt_id`
+    /// carries the client/coord-minted id used to correlate the queue
+    /// events and the eventual `RunStarted{prompt_id}` — issue #535 (d):
+    /// every prompt, first or follow-up, now arrives via `HarnessCommand::
+    /// Prompt`, so this is always `Some` in practice (the historical `None`
+    /// case was the env-seeded initial prompt, deleted). Kept `Option`
+    /// rather than force-unwrapping at each read site — a defensive `None`
+    /// costs nothing here and this isn't a wire type.
     struct QueuedPrompt {
         prompt_id: Option<String>,
         text: String,
@@ -2052,8 +2047,8 @@ mod adapter {
         *current_run_id.lock().await = Some(run_id.clone());
         // `RunStarted{prompt_id}` is the "queued prompt consumed" signal:
         // a UI that drew a greyed type-ahead item with this id moves it
-        // into the conversation now. `None` for the env-seeded initial
-        // prompt (which never went through the editable queue).
+        // into the conversation now. Issue #535 (d): `Some` in practice for
+        // every turn now, including the session's create-time initial one.
         //
         // `prompt_summary` is deliberately `None`: the coordinator emits the
         // user turn as a `role:user` agent_message (carrying `prompt_id`),
@@ -3168,13 +3163,29 @@ mod adapter {
                 cmd_rx,
                 reattach.clone(),
                 evt_tx,
-                Some("first".into()),
             ));
 
-            // Turn 1 (env-seeded initial prompt → no prompt_id). It is now
-            // in flight (the fake sleeps 300ms before its result).
+            // Issue #535 (d): the pending queue starts empty, so the engine
+            // announces `Idle` before it ever sees a prompt (there's no more
+            // env-seeded entry to kick off with no leading Idle). Deliver
+            // "the initial prompt" the same way every other prompt arrives,
+            // as a `HarnessCommand::Prompt` frame.
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "first".into(),
+                })
+                .await
+                .unwrap();
+
+            // Turn 1 is now in flight (the fake sleeps 300ms before its result).
             let (r1, pid1) = expect_run_started_id(&mut evt_rx).await;
-            assert_eq!(pid1, None, "initial prompt has no prompt_id");
+            assert_eq!(
+                pid1,
+                Some("p1".to_string()),
+                "prompt_id round-trips onto RunStarted"
+            );
 
             // Queue p2, edit it, queue p3, then cancel p3 — all while turn
             // 1 is still sleeping. None of these are written to claude yet.
@@ -3291,8 +3302,18 @@ mod adapter {
                 cmd_rx,
                 reattach.clone(),
                 evt_tx,
-                Some("first".into()), // initial prompt → turn 1 goes in flight
             ));
+
+            // Issue #535 (d): starts Idle (empty pending queue), then the
+            // initial prompt arrives as an ordinary `HarnessCommand::Prompt`.
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "first".into(),
+                })
+                .await
+                .unwrap();
 
             // Turn 1 is now in flight (the fake sleeps 300ms before its result).
             let r1 = expect_run_started(&mut evt_rx).await;
@@ -3397,8 +3418,18 @@ mod adapter {
                 cmd_rx,
                 reattach.clone(),
                 evt_tx,
-                Some("first".into()),
             ));
+
+            // Issue #535 (d): starts Idle (empty pending queue), then the
+            // initial prompt arrives as an ordinary `HarnessCommand::Prompt`.
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "first".into(),
+                })
+                .await
+                .unwrap();
 
             // Turn 1 is in flight: RunStarted + assistant text, no result yet.
             let r1 = expect_run_started(&mut evt_rx).await;
@@ -3450,8 +3481,18 @@ mod adapter {
                 cmd_rx,
                 reattach.clone(),
                 evt_tx,
-                Some("first".into()),
             ));
+
+            // Issue #535 (d): starts Idle (empty pending queue), then the
+            // initial prompt arrives as an ordinary `HarnessCommand::Prompt`.
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "first".into(),
+                })
+                .await
+                .unwrap();
 
             // Turn 1 in flight.
             let r1 = expect_run_started(&mut evt_rx).await;
@@ -3521,7 +3562,6 @@ mod adapter {
                 cmd_rx,
                 reattach.clone(),
                 evt_tx,
-                None, // no initial prompt → starts Idle
             ));
 
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
@@ -3594,8 +3634,18 @@ mod adapter {
                 cmd_rx,
                 reattach.clone(),
                 evt_tx,
-                Some("first".into()),
             ));
+
+            // Issue #535 (d): starts Idle (empty pending queue), then the
+            // initial prompt arrives as an ordinary `HarnessCommand::Prompt`.
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "first".into(),
+                })
+                .await
+                .unwrap();
 
             // Turn 1 (the initial prompt): RunStarted, AgentMessage,
             // RunCompleted, Idle — the run_id shared start-to-end.
@@ -3956,7 +4006,6 @@ mod adapter {
                 cmd_rx,
                 reattach.clone(),
                 evt_tx,
-                None, // no initial prompt → Idle
             ));
 
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
@@ -4046,7 +4095,7 @@ mod adapter {
             let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
             let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
             let reattach = Arc::new(Notify::new());
-            let engine = tokio::spawn(run_engine(cli, cmd_rx, reattach.clone(), evt_tx, None));
+            let engine = tokio::spawn(run_engine(cli, cmd_rx, reattach.clone(), evt_tx));
 
             // Startup idle. The socket is bound before the first run, so once
             // Idle lands a hook fire can connect.

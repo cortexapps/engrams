@@ -213,13 +213,15 @@ pub enum HarnessEvent {
     /// the same `run_id`. `prompt_summary` is the first ~1 KB of
     /// the prompt for Slack/UI rendering.
     ///
-    /// `prompt_id` is the client-minted id of the prompt that started
+    /// `prompt_id` is the client/coord-minted id of the prompt that started
     /// this run (the id carried on `HarnessCommand::Prompt`). It is the
     /// **"queued prompt consumed" signal**: a UI that rendered a greyed
     /// type-ahead composer item with this id moves it into the
-    /// conversation when this event arrives. `None` only for the
-    /// env-seeded initial prompt (cold fresh-exec), which never went
-    /// through the editable queue.
+    /// conversation when this event arrives. Issue #535 (d): every prompt
+    /// — including the session's create-time initial one — arrives via
+    /// `HarnessCommand::Prompt` now, so this is `Some` in practice; kept
+    /// `Option` rather than tightening the wire type (baked-harness compat
+    /// — see the field-order note below).
     RunStarted {
         run_id: String,
         prompt_summary: Option<String>,

@@ -22,6 +22,7 @@ use serde::Deserialize;
 use sqlx::postgres::PgListener;
 use tokio::sync::Notify;
 
+use crate::boot_bundle::BootBundleCache;
 use crate::host_registry::HostRegistry;
 use crate::integrations::IntegrationBroker;
 use crate::state::{IndexedEvent, SessionEvent, SessionEventBus};
@@ -53,6 +54,7 @@ pub fn spawn(
     events: Arc<SessionEventBus>,
     host_registry: Arc<HostRegistry>,
     integrations: IntegrationBroker,
+    boot_bundles: Arc<BootBundleCache>,
     queue_wake: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -62,6 +64,7 @@ pub fn spawn(
             events,
             host_registry,
             integrations,
+            boot_bundles,
             queue_wake,
         )
         .await
@@ -77,6 +80,7 @@ async fn run(
     events: Arc<SessionEventBus>,
     host_registry: Arc<HostRegistry>,
     integrations: IntegrationBroker,
+    boot_bundles: Arc<BootBundleCache>,
     queue_wake: Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listener = PgListener::connect(database_url).await?;
@@ -85,13 +89,21 @@ async fn run(
     listener.listen("host_dead").await?;
     // ADR 0057 C2: org-secret writes/rotations invalidate the mint-engine cache.
     listener.listen("org_secret_changed").await?;
+    // Issue #535 (a): boot-bundle cache invalidation. `enabled_image_changed`
+    // fires on every enable/soft-delete/delete of an `enabled_images` row;
+    // `fleet_catalog_changed` fires on every host INSERT (a new host's first
+    // bundle stamp) and, on UPDATE, only when `current_bundles` actually
+    // changes (the migration's UPDATE-trigger WHEN guard) — not on every
+    // heartbeat.
+    listener.listen("enabled_image_changed").await?;
+    listener.listen("fleet_catalog_changed").await?;
     // ADR 0048 (queue fairness): placement-feasibility events wake the
     // queue scanner (crate::queue_scanner) so a dequeue doesn't wait for
     // its poll fallback.
     listener.listen("placement_changed").await?;
     tracing::info!(
         "pg_listener subscribed to session_events + session_event_deltas + host_dead + \
-         org_secret_changed + placement_changed"
+         org_secret_changed + enabled_image_changed + fleet_catalog_changed + placement_changed"
     );
 
     loop {
@@ -136,6 +148,28 @@ async fn run(
                 tracing::info!(
                     secret = notification.payload(),
                     "org secret changed; invalidated mint-engine cache",
+                );
+                continue;
+            }
+            "enabled_image_changed" => {
+                // Issue #535 (a): the payload is the plain `image_uri` text
+                // (no JSON wrapper), matching `host_dead`'s convention.
+                boot_bundles.invalidate_image(notification.payload());
+                tracing::debug!(
+                    image_uri = notification.payload(),
+                    "enabled image changed; invalidated boot-bundle cache entry",
+                );
+                continue;
+            }
+            "fleet_catalog_changed" => {
+                // Issue #535 (a): any host's `current_bundles` stamp changed
+                // (a host roll) — invalidate the whole cached catalog rather
+                // than tracking which host the cached view came from (see
+                // `BootBundleCache::invalidate_fleet_catalog` docs).
+                boot_bundles.invalidate_fleet_catalog();
+                tracing::debug!(
+                    host_id = notification.payload(),
+                    "fleet bundle stamp changed; invalidated fleet-catalog cache",
                 );
                 continue;
             }

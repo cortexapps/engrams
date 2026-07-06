@@ -1,13 +1,18 @@
-//! Live-Postgres tests for ADR 0046 PG-backed placement reservation:
-//! `reserve_placement`'s `FOR UPDATE` transaction (burst-safe spread + reject),
-//! the `mem_budget_mib` ledger column, and `fleet_free_mib`
-//! (Σ allocatable − reserved) — all against REAL Postgres. The api.rs create
-//! tests use a mock store whose `reserve_placement` is the trivial default, so
-//! this is the only coverage of the actual SQL: the transaction, the
-//! reserved-set aggregate, the pending-row insert, the `LEFT JOIN`/`GREATEST`
-//! free computation, and that migrations 0057/0058 apply. Pins the incident
-//! fix: a create burst SPREADS across hosts and REJECTS the overflow instead of
-//! stacking onto one host (the OOM).
+//! Live-Postgres tests for ADR 0046 PG-backed placement reservation, now
+//! `MetadataStore::reserve_and_persist_create` (issue #535 (b) — formerly
+//! `reserve_placement`)'s `FOR UPDATE` transaction (burst-safe spread +
+//! reject), the `mem_budget_mib` ledger column, `fleet_free_mib` (Σ
+//! allocatable − reserved), and the one-transaction write-set's atomicity —
+//! all against REAL Postgres. The api.rs create tests use a mock store whose
+//! `reserve_and_persist_create` is a trivial in-memory stand-in, so this is
+//! the only coverage of the actual SQL: the transaction, the reserved-set
+//! aggregate, the pending/queued-row insert, the satellite writes (secrets,
+//! capabilities, integration policy, harness, selected skills), the `LEFT
+//! JOIN`/`GREATEST` free computation, and that migrations 0057/0058/0082
+//! apply. Pins the incident fix: a create burst SPREADS across hosts and
+//! REJECTS the overflow instead of stacking onto one host (the OOM) — and
+//! (issue #535) that the write-set commits as ONE transaction, not a chain
+//! of individually-failable writes.
 //!
 //! `#[ignore]`'d by default; requires Postgres at `ENGRAM_TEST_DATABASE_URL`.
 //! Run:
@@ -20,12 +25,12 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use engram_core::traits::MetadataStore;
+use engram_core::traits::{CreateDisposition, MetadataStore, SessionCreateWriteSet};
 use engram_core::types::host::{
     HostCapacity, HostMetadata, HostRecord, HostStatus, HostUtilization,
 };
 use engram_core::types::session::{SessionMode, SessionSpec};
-use engram_core::types::{HostId, SessionId};
+use engram_core::types::{Capability, HostId, SessionId};
 
 async fn connect() -> Option<Arc<dyn MetadataStore>> {
     let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
@@ -107,6 +112,51 @@ fn spec() -> SessionSpec {
     }
 }
 
+fn bare_write_set(
+    session_id: SessionId,
+    mem_budget_mib: i64,
+    cpu_budget_vcpus: i32,
+) -> SessionCreateWriteSet {
+    SessionCreateWriteSet {
+        session_id,
+        spec: spec(),
+        mem_budget_mib,
+        cpu_budget_vcpus,
+        sealed_secrets: None,
+        capabilities: Vec::new(),
+        integration_policy_json: None,
+        selected_harness: None,
+        selected_skills: Vec::new(),
+        queue_prompt: None,
+    }
+}
+
+/// Issue #535 (b): `reserve_placement` retired — `reserve_and_persist_create`
+/// is its structural replacement. Thin wrapper collapsing `CreateDisposition`
+/// back to `Option<HostId>` so the pre-existing burst/reject assertions below
+/// read the same as before the refactor.
+async fn reserve(
+    meta: &Arc<dyn MetadataStore>,
+    session_id: SessionId,
+    mem_budget_mib: i64,
+    cpu_budget_vcpus: i32,
+    candidates: &[HostId],
+    affinity_len: usize,
+) -> Option<HostId> {
+    match meta
+        .reserve_and_persist_create(
+            bare_write_set(session_id, mem_budget_mib, cpu_budget_vcpus),
+            candidates,
+            affinity_len,
+        )
+        .await
+        .expect("reserve_and_persist_create ok")
+    {
+        CreateDisposition::Placed(h) => Some(h),
+        CreateDisposition::Queued => None,
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn burst_packs_one_host_then_overflows_then_rejects() {
@@ -128,10 +178,7 @@ async fn burst_packs_one_host_then_overflows_then_rejects() {
 
     let mut placed = Vec::new();
     for _ in 0..8 {
-        let picked = meta
-            .reserve_placement(SessionId::new(), &spec(), budget, 2, &candidates, 0)
-            .await
-            .expect("reserve_placement ok");
+        let picked = reserve(&meta, SessionId::new(), budget, 2, &candidates, 0).await;
         placed.push(picked);
     }
     assert!(
@@ -155,10 +202,7 @@ async fn burst_packs_one_host_then_overflows_then_rejects() {
     );
 
     // 9th: both hosts at allocatable (4×4096 = 16384) → free 0 → reject.
-    let ninth = meta
-        .reserve_placement(SessionId::new(), &spec(), budget, 2, &candidates, 0)
-        .await
-        .expect("reserve_placement ok");
+    let ninth = reserve(&meta, SessionId::new(), budget, 2, &candidates, 0).await;
     assert_eq!(
         ninth, None,
         "the 9th create must be REJECTED — both hosts are fully reserved (the \
@@ -183,6 +227,126 @@ async fn fleet_free_mib_sql_runs_against_real_pg() {
     assert!(
         free >= 0,
         "free_mib is a non-negative MiB count; got {free}"
+    );
+}
+
+/// Issue #535 (b) acceptance criterion: the session write-set ({row,
+/// session_secrets, session_capabilities, session_integration_policy,
+/// harness, selected_skills}) is committed atomically. Positive half: a
+/// SINGLE `reserve_and_persist_create` call with every satellite populated
+/// leaves ALL of them visible immediately after — proving they land in one
+/// transaction, not a chain of separately-failable writes.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn reserve_and_persist_create_commits_the_full_write_set_together() {
+    let Some(meta) = connect().await else {
+        return;
+    };
+    let host = seed_host(&meta, &format!("plc-atomic-{}", SessionId::new()), 16_384).await;
+    let session_id = SessionId::new();
+    let cap = Capability::parse("github:read@owner/repo").expect("valid capability");
+    let ws = SessionCreateWriteSet {
+        session_id,
+        spec: spec(),
+        mem_budget_mib: 2048,
+        cpu_budget_vcpus: 1,
+        sealed_secrets: Some(engram_core::types::SessionSecrets {
+            session_id,
+            wrapped_dek: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+            ciphertext: vec![7, 8, 9],
+            key_id: "test-key".into(),
+            created_at: Utc::now(),
+        }),
+        capabilities: vec![cap.clone()],
+        integration_policy_json: Some(r#"{"network":{"allow_hosts":[]}}"#.into()),
+        selected_harness: Some("claude".into()),
+        selected_skills: vec!["browser".into()],
+        queue_prompt: Some("hello from the write-set".into()),
+    };
+    let disposition = meta
+        .reserve_and_persist_create(ws, &[host], 0)
+        .await
+        .expect("reserve_and_persist_create ok");
+    assert_eq!(disposition, CreateDisposition::Placed(host));
+
+    let row = meta.get_session(session_id).await.expect("get_session");
+    assert_eq!(row.selected_skills, vec!["browser".to_string()]);
+    let caps = meta
+        .get_session_capabilities(session_id)
+        .await
+        .expect("get_session_capabilities");
+    assert_eq!(caps, vec![cap]);
+    let policy = meta
+        .get_session_integration_policy(session_id)
+        .await
+        .expect("get_session_integration_policy");
+    assert_eq!(policy.as_deref(), Some(r#"{"network":{"allow_hosts":[]}}"#));
+    let harness = meta
+        .get_session_harness(session_id)
+        .await
+        .expect("get_session_harness");
+    assert_eq!(harness.as_deref(), Some("claude"));
+    let secrets = meta
+        .get_session_secrets(session_id)
+        .await
+        .expect("get_session_secrets")
+        .expect("secrets row present");
+    assert_eq!(secrets.key_id, "test-key");
+}
+
+/// Issue #535 (b) acceptance criterion, negative half: when the write-set's
+/// OWN row insert fails (a duplicate `session_id` — the only non-idempotent
+/// statement in the transaction), NOTHING from that attempt lands — not even
+/// satellites a real caller would expect the failed transaction to have
+/// written. Simulates "kill the coordinator mid-create" from the DB's point
+/// of view: a second, DIFFERENT write-set for the same id never partially
+/// applies over the first's.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn reserve_and_persist_create_is_all_or_nothing_on_failure() {
+    let Some(meta) = connect().await else {
+        return;
+    };
+    let host = seed_host(&meta, &format!("plc-rollback-{}", SessionId::new()), 16_384).await;
+    let session_id = SessionId::new();
+    let cap_a = Capability::parse("github:read@owner/repo-a").expect("valid capability");
+    let mut ws_a = bare_write_set(session_id, 2048, 1);
+    ws_a.capabilities = vec![cap_a.clone()];
+    let disposition = meta
+        .reserve_and_persist_create(ws_a, &[host], 0)
+        .await
+        .expect("first reserve_and_persist_create ok");
+    assert_eq!(disposition, CreateDisposition::Placed(host));
+
+    // A second call for the SAME session_id: the `INSERT INTO sessions`
+    // (no `ON CONFLICT`) violates the primary key and the whole transaction
+    // errors — including the satellite writes that would otherwise have
+    // followed it in the SAME attempt.
+    let cap_b = Capability::parse("github:read@owner/repo-b").expect("valid capability");
+    let mut ws_b = bare_write_set(session_id, 4096, 2);
+    ws_b.capabilities = vec![cap_b.clone()];
+    let second = meta.reserve_and_persist_create(ws_b, &[host], 0).await;
+    assert!(
+        second.is_err(),
+        "a duplicate session_id must fail the whole transaction"
+    );
+
+    // The row is exactly what the FIRST call wrote (budgets untouched by the
+    // second attempt) …
+    let row = meta.get_session(session_id).await.expect("get_session");
+    assert_eq!(row.host_id, Some(host));
+    // … and the capabilities table carries ONLY the first attempt's
+    // capability — the second attempt's `cap_b` never landed, proving the
+    // failed transaction didn't leak any of its satellite writes.
+    let caps = meta
+        .get_session_capabilities(session_id)
+        .await
+        .expect("get_session_capabilities");
+    assert_eq!(
+        caps,
+        vec![cap_a],
+        "the second (failed) attempt's capability must not appear"
     );
 }
 

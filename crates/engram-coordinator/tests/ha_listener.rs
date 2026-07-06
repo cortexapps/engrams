@@ -166,6 +166,7 @@ async fn build_app_state(
         state.events.clone(),
         state.host_registry.clone(),
         state.integrations.clone(),
+        state.boot_bundles.clone(),
         Arc::new(tokio::sync::Notify::new()),
     ));
     state

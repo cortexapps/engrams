@@ -475,6 +475,13 @@ pub struct Session {
     /// pre-Phase-B sessions).
     #[serde(default)]
     pub live_disk_manifest: Option<crate::types::manifest::ManifestRef>,
+    /// Issue #535 (b): profile-selected skill names, persisted at create
+    /// (the create-write-set's `selected_skills`) so a queued session's
+    /// boot re-prepare can reconstruct its dynamic mounts (ADR 0055
+    /// TODO(P1-D) fix — the scanner used to boot every queued session with
+    /// base skills only, since the queue row never carried the selection).
+    #[serde(default)]
+    pub selected_skills: Vec<String>,
 }
 
 #[cfg(test)]
@@ -726,6 +733,7 @@ mod tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let blob = serde_json::to_string(&original).unwrap();
         let back: Session = serde_json::from_str(&blob).unwrap();

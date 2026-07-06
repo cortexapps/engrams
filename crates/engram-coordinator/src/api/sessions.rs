@@ -107,6 +107,12 @@ pub(crate) fn cold_boot_spec(
 /// secret's `allow_hosts` (the guest never holds the value). A ref that doesn't
 /// resolve is skipped + warn-logged — the session still boots, that one secret
 /// is just absent (mirrors `resolve_inject_entries`).
+///
+/// Issue #535 (c): the per-secret `SecretStore` round trips are independent
+/// (no secret's resolution depends on another's), so they run concurrently
+/// via `join_all` instead of one-at-a-time — the result folds back into the
+/// SAME order-insensitive (env map + entries vec) shape a serial loop would
+/// have produced.
 pub(crate) async fn resolve_policy_secrets(
     state: &SharedState,
     policy: Option<&engram_core::types::IntegrationPolicy>,
@@ -122,13 +128,16 @@ pub(crate) async fn resolve_policy_secrets(
         return (env, entries);
     };
     let schema = engram_core::types::image::SecretSchema::default();
-    for s in &policy.secrets {
-        let value = match state
-            .services
-            .secrets
-            .get(ctx, &s.secret_ref, &schema)
-            .await
-        {
+    let resolved = futures::future::join_all(policy.secrets.iter().map(|s| {
+        let schema = &schema;
+        async move {
+            let result = state.services.secrets.get(ctx, &s.secret_ref, schema).await;
+            (s, result)
+        }
+    }))
+    .await;
+    for (s, result) in resolved {
+        let value = match result {
             Ok(Some(v)) => v,
             Ok(None) => {
                 tracing::warn!(secret_ref = %s.secret_ref, env_var = %s.env_var,
@@ -188,14 +197,18 @@ fn short_hash(s: &str) -> String {
     format!("{:08x}", h.finish() & 0xffff_ffff)
 }
 
-/// Seal the per-request `secrets` overrides under the deployment KEK
-/// and persist them keyed by `session_id`. Plaintext is JSON-encoded.
-/// Caller is expected to have validated `overrides` is non-empty.
-pub(crate) async fn persist_session_secrets(
+/// Seal the per-request `secrets` overrides under the deployment KEK —
+/// PURE crypto, no PG write. Issue #535 (b): the async KEK seal has no
+/// place inside `reserve_and_persist_create`'s DB transaction, so it
+/// happens here, BEFORE that call, and the sealed row rides
+/// `SessionCreateWriteSet::sealed_secrets` into the transaction instead of
+/// a separate post-insert `upsert_session_secrets` write. Caller is
+/// expected to have validated `overrides` is non-empty.
+pub(crate) async fn seal_session_secrets(
     state: &SharedState,
     session_id: SessionId,
     overrides: &HashMap<String, String>,
-) -> Result<(), ApiError> {
+) -> Result<engram_core::types::registry::SessionSecrets, ApiError> {
     let plaintext = serde_json::to_vec(overrides)
         .map_err(|e| ApiError::Internal(format!("serialize session secrets: {e}")))?;
     let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
@@ -203,16 +216,14 @@ pub(crate) async fn persist_session_secrets(
         .seal(&plaintext)
         .await
         .map_err(|e| ApiError::Internal(format!("seal session secrets: {e}")))?;
-    let row = engram_core::types::registry::SessionSecrets {
+    Ok(engram_core::types::registry::SessionSecrets {
         session_id,
         wrapped_dek: sealed.wrapped_dek,
         nonce: sealed.nonce.to_vec(),
         ciphertext: sealed.ciphertext,
         key_id: sealed.key_id,
         created_at: chrono::Utc::now(),
-    };
-    state.services.meta.upsert_session_secrets(row).await?;
-    Ok(())
+    })
 }
 
 /// Material returned by [`resume_manifest_bundle`] — everything the
@@ -614,7 +625,7 @@ pub(crate) async fn create_session_core(
             return result;
         }
     };
-    let result = boot_prepared(state, prepared).await;
+    let result = boot_prepared(state, prepared, start).await;
     let kind = match &result {
         Ok(body) => body.kind,
         Err(_) => "unknown",
@@ -623,14 +634,28 @@ pub(crate) async fn create_session_core(
     result
 }
 
-/// The shared reserve → queue-or-boot → detached-disposition path. Both
-/// create entry points (axum + gRPC) hand it a fully-resolved
+/// The shared reserve-and-persist → queue-or-boot → detached-disposition
+/// path. Both create entry points (axum + gRPC) hand it a fully-resolved
 /// [`PreparedBoot`]; the hardening (ADR 0046 best-fit reservation, ADR 0048
 /// queue-on-no-capacity, issue #210 boot detachment, panic backstop) lives
 /// here once.
+///
+/// Issue #535 (b): `reserve_and_persist_create` commits the ENTIRE write-set
+/// — the row (placed or queued) plus every satellite (secrets, capabilities,
+/// integration policy, harness, selected skills) — in ONE transaction,
+/// before any host RPC. The FK-ordering bug class (a satellite write that
+/// silently no-ops because the row doesn't exist yet — the ADR 0051
+/// forge-token regression) is dead by construction: nothing downstream of
+/// this call can observe a partially-written session, so `boot_on_reserved_
+/// host` no longer does ANY satellite writes of its own.
 async fn boot_prepared(
     state: &SharedState,
     prepared: crate::session_boot::PreparedBoot,
+    // Issue #535 (observability): `create_session_core`'s entry instant, so
+    // the `coord_prepare` phase covers everything from the RPC landing
+    // through the write-set commit — the coordinator-owned serial prefix
+    // ahead of the (now-concurrent, host-side) restore work.
+    create_start: std::time::Instant,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
         inputs,
@@ -644,7 +669,10 @@ async fn boot_prepared(
     let session_id = inputs.session_id;
     let base_snapshot_id = inputs.base_snapshot_id;
 
-    // -------- Reserve a host (ADR 0046 best-fit, ADR 0048 2D) --------
+    // -------- Candidates (ADR 0046 best-fit, ADR 0048 2D) --------
+    // Issue #535 (a) "conscious divergence": kept as its own scan (unlike the
+    // manifest/fleet-catalog reads folded into the boot bundle) — placement
+    // needs a heartbeat-fresh host view, not a cached one.
     //
     // ADR 0036 amendment (issue #538): gate the candidate pool on the
     // image's manifest digest, the per-host half of the fleet chunk-
@@ -652,9 +680,9 @@ async fn boot_prepared(
     // other half — an `enabled_images` row only exists once the eligible
     // fleet has staged it). `candidates_for` never surfaces
     // `PickError::ImageNotReady` — a digest match that filters every host
-    // out just yields empty `RankedCandidates`, so `reserve_placement`
-    // returns `None` below and this falls into the SAME queue arm a
-    // capacity miss does. A straggler host that hasn't staged yet simply
+    // out just yields empty `RankedCandidates`, so `reserve_and_persist_
+    // create` returns `Queued` below and this falls into the SAME queue arm
+    // a capacity miss does. A straggler host that hasn't staged yet simply
     // isn't in the ranked pool; its next heartbeat un-gates it.
     let ctx = crate::placement::ScheduleContext {
         repo: &image_repo,
@@ -690,27 +718,73 @@ async fn boot_prepared(
     let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
         .await
         .map_err(engram_core::SandboxError::from)?;
-    let host_id = match state
+
+    // -------- Seal secrets + serialize the policy BEFORE the transaction --------
+    // Issue #535 (b): the KEK seal is async crypto with no place inside a DB
+    // transaction — do it here, once, and hand the SEALED row (not the
+    // plaintext) to `reserve_and_persist_create`.
+    let sealed_secrets = match inputs.deferred_session_secrets.as_ref() {
+        Some(overrides) => Some(seal_session_secrets(state, session_id, overrides).await?),
+        None => None,
+    };
+    let integration_policy_json = match inputs.integration_policy.as_ref() {
+        Some(policy) => Some(
+            serde_json::to_string(policy)
+                .map_err(|e| ApiError::Internal(format!("serialize integration policy: {e}")))?,
+        ),
+        None => None,
+    };
+
+    let write_set = engram_core::traits::SessionCreateWriteSet {
+        session_id,
+        spec: inputs.spec.clone(),
+        mem_budget_mib: memory_mib as i64,
+        cpu_budget_vcpus: cpu_budget_vcpus as i32,
+        sealed_secrets,
+        capabilities: inputs.capabilities.clone(),
+        integration_policy_json,
+        selected_harness: inputs.selected_harness.clone(),
+        selected_skills: inputs.selected_skills.clone(),
+        queue_prompt: inputs.prompt.clone(),
+    };
+
+    let disposition = state
         .services
         .meta
-        .reserve_placement(
-            session_id,
-            &inputs.spec,
-            memory_mib as i64,
-            cpu_budget_vcpus as i32,
-            &candidates.hosts,
-            candidates.affinity_len,
-        )
+        .reserve_and_persist_create(write_set, &candidates.hosts, candidates.affinity_len)
         .await
-        .map_err(|e| ApiError::Internal(format!("reserve_placement: {e}")))?
-    {
-        Some(h) => h,
-        // ADR 0048: no host fits → QUEUE (FIFO) instead of 503. The queue
-        // scanner re-attempts placement as capacity frees / the fleet
-        // scales up, and drives the same boot path once a host fits.
-        None => {
-            return enqueue_create(state, inputs, &image_tag).await;
+        .map_err(|e| ApiError::Internal(format!("reserve_and_persist_create: {e}")))?;
+
+    let host_id = match disposition {
+        // ADR 0048: no host fits → QUEUE (FIFO) instead of 503 — the row +
+        // every satellite already committed above, so there is nothing left
+        // to persist here; just tell the caller. The queue scanner
+        // re-attempts placement as capacity frees / the fleet scales up, and
+        // drives the same boot path (`prepare_from_row` → `boot_on_reserved_
+        // host`) once a host fits.
+        engram_core::traits::CreateDisposition::Queued => {
+            if let Err(e) = state
+                .emit(
+                    session_id,
+                    SessionEvent::StatusChanged {
+                        from: SessionState::Pending,
+                        to: SessionState::Queued,
+                        at: chrono::Utc::now(),
+                    },
+                )
+                .await
+            {
+                tracing::warn!(%session_id, error = %e, "emit pending→queued failed; continuing");
+            }
+            tracing::info!(%session_id, "no capacity — session queued for placement (ADR 0048)");
+            return Ok(CreateSessionResponse {
+                session_id,
+                status: SessionState::Queued.as_str(),
+                image_version: image_tag,
+                kind: "queued",
+            });
         }
+        engram_core::traits::CreateDisposition::Placed(host_id) => host_id,
     };
 
     // -------- Boot on the reserved host --------
@@ -718,13 +792,13 @@ async fn boot_prepared(
     // Issue #210: DETACH the boot pipeline from the cancellable request
     // future. `boot_on_reserved_host` makes a LIVE sandbox in
     // `restore_base_on_host` (session_boot.rs) and only later records it via
-    // `create_session_created`; the compensating `host.destroy` runs solely
-    // on the row-insert `Err` arm, never on a dropped future. Awaited INLINE,
-    // a client disconnect between the restore and the insert (a slow restore,
-    // up to a 240s deadline) drops the future: a running sandbox is left with
-    // no recorded binding AND the disposition below — which releases the
-    // `pending` reservation / fails the session — never runs, so the reserved
-    // capacity stays pinned too.
+    // `transition_session_created`; the compensating `host.destroy` runs
+    // solely on that update's `Err` arm, never on a dropped future. Awaited
+    // INLINE, a client disconnect between the restore and the update (a slow
+    // restore, up to a 240s deadline) drops the future: a running sandbox is
+    // left with no recorded binding AND the disposition below — which
+    // releases the `pending` reservation / fails the session — never runs,
+    // so the reserved capacity stays pinned too.
     //
     // Mirror the resume lane (and ADR 0034 / the #208 teleport detachment):
     // run the boot AND its full disposition in a `tokio::spawn`ed task so the
@@ -732,6 +806,11 @@ async fn boot_prepared(
     // released, regardless of the request's fate. The handler awaits the
     // JoinHandle only to shape the connected client's response.
     //
+    // Issue #535 (observability): `coord_prepare` ends HERE — everything
+    // from `create_session_core` entry through the write-set commit, right
+    // before the restore RPC dispatches inside the spawned task.
+    metrics::histogram!(crate::metrics::SESSION_BOOT_SECONDS, "phase" => "coord_prepare")
+        .record(create_start.elapsed().as_secs_f64());
     // ADR 0019 / telemetry restoration (#526): `tokio::spawn` severs the
     // tracing context — a span created inside this future would otherwise
     // become a new orphaned trace root instead of a child of
@@ -746,10 +825,10 @@ async fn boot_prepared(
             match crate::session_boot::boot_on_reserved_host(&st, inputs, host_id).await {
                 Ok(()) => Ok(()),
                 Err(crate::session_boot::BootError::NotStarted(e)) => {
-                    // The sandbox never came up (or was torn down on the insert
-                    // failure); release the reservation row so the host's free
-                    // capacity is restored at once (reconcile would also reap it).
-                    // No Failed transition — nothing usable ever existed.
+                    // The sandbox never came up; release the reservation row so
+                    // the host's free capacity is restored at once (reconcile
+                    // would also reap it). No Failed transition — nothing usable
+                    // ever existed.
                     if let Err(de) = st.services.meta.delete_pending_session(session_id).await {
                         tracing::warn!(%session_id, error = %de,
                             "delete_pending_session after boot failure failed; reconcile will reap");
@@ -788,101 +867,6 @@ async fn boot_prepared(
     })
 }
 
-/// ADR 0048: enqueue a create that found no capacity. INSERTs the row at
-/// `queued` (carrying the budgets + prompt the scanner reconstructs from),
-/// seals any per-request secret overrides now the FK is satisfiable, emits
-/// `Pending → Queued`, and returns 201 `{status:"queued"}`. The handler
-/// NEVER blocks — the `queue_scanner` owns the continuation.
-async fn enqueue_create(
-    state: &SharedState,
-    inputs: crate::session_boot::BootInputs,
-    image_tag: &str,
-) -> Result<CreateSessionResponse, ApiError> {
-    let session_id = inputs.session_id;
-    state
-        .services
-        .meta
-        .enqueue_session_create(
-            session_id,
-            &inputs.spec,
-            // The budgets the scanner will reserve with — same values create
-            // computed, so the queued demand signal is exact.
-            resolved_budget_mib(&inputs),
-            resolved_budget_vcpus(&inputs),
-            inputs.prompt.as_deref(),
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("enqueue_session_create: {e}")))?;
-    // Seal per-request overrides now the row (FK target) exists.
-    if let Some(overrides) = inputs.deferred_session_secrets.as_ref() {
-        if let Err(e) = persist_session_secrets(state, session_id, overrides).await {
-            tracing::warn!(%session_id, error = %e,
-                "queued session secrets persist failed; resume/boot will lose overrides");
-        }
-    }
-    // ADR 0056: bind capabilities now the FK target exists, so they're durable
-    // while queued — the scanner's boot re-prepare carries an empty set and the
-    // boot-path bind is a no-op (it won't clobber these).
-    if let Err(e) = state
-        .services
-        .meta
-        .bind_session_capabilities(session_id, &inputs.capabilities)
-        .await
-    {
-        tracing::warn!(%session_id, error = %e,
-            "queued session capabilities bind failed; the broker will see none on boot");
-    }
-    // ADR 0056 (B′): persist the integration policy now the FK target exists, so
-    // the scanner's boot re-prepare (prepare_from_row) reads it back and injects.
-    crate::session_boot::persist_integration_policy(
-        state,
-        session_id,
-        inputs.integration_policy.as_ref(),
-    )
-    .await;
-    // ADR 0062: persist the selected harness now the FK target exists, so the
-    // scanner's boot re-prepare (prepare_from_row) reconstructs it.
-    if let Err(e) = state
-        .services
-        .meta
-        .set_session_harness(session_id, inputs.selected_harness.as_deref())
-        .await
-    {
-        tracing::warn!(%session_id, error = %e,
-            "queued session harness persist failed; the scanner's boot won't find it");
-    }
-    if let Err(e) = state
-        .emit(
-            session_id,
-            SessionEvent::StatusChanged {
-                from: SessionState::Pending,
-                to: SessionState::Queued,
-                at: chrono::Utc::now(),
-            },
-        )
-        .await
-    {
-        tracing::warn!(%session_id, error = %e, "emit pending→queued failed; continuing");
-    }
-    tracing::info!(%session_id, "no capacity — session queued for placement (ADR 0048)");
-    Ok(CreateSessionResponse {
-        session_id,
-        status: SessionState::Queued.as_str(),
-        image_version: image_tag.to_string(),
-        kind: "queued",
-    })
-}
-
-/// The session's memory budget, recovered from the env baked into
-/// `BootInputs` (it isn't stored separately — `resolved_memory_mib`
-/// is the source of truth, recomputed identically by the scanner).
-fn resolved_budget_mib(inputs: &crate::session_boot::BootInputs) -> i64 {
-    inputs.memory_mib as i64
-}
-fn resolved_budget_vcpus(inputs: &crate::session_boot::BootInputs) -> i32 {
-    inputs.cpu_budget_vcpus as i32
-}
-
 /// ADR 0051: resolve a session's boot inputs for the app-gRPC create. The
 /// orchestrator owns auth/authz, so there is no human `Principal` — it passes
 /// an `identity_env` carrying any harness-secret injection (e.g.
@@ -894,19 +878,21 @@ pub(crate) async fn prepare_from_grpc(
     identity_env: HashMap<String, String>,
     req: &CreateSessionRequest,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
-    let enabled = state
-        .services
-        .meta
-        .get_enabled_image(&req.image)
-        .await
-        .map_err(|e| ApiError::Internal(format!("enabled_images lookup: {e}")))?
-        .ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "image `{}` is not enabled. Operators enable images via \
-                 POST /api/enabled-images before sessions can reference them.",
-                req.image
-            ))
-        })?;
+    // Issue #535 (a): the cache always resolves the soft-delete-TOLERANT
+    // (`_any`) view — this, the strict live-create path, rejects a
+    // soft-deleted row itself instead of forking the cache's fill logic
+    // (the queued path's `prepare_from_row` accepts it below).
+    let bundle = state
+        .boot_bundles
+        .bundle_for(state.services.meta.as_ref(), &req.image)
+        .await?;
+    if bundle.enabled.soft_deleted_at.is_some() {
+        return Err(ApiError::BadRequest(format!(
+            "image `{}` is not enabled. Operators enable images via \
+             POST /api/enabled-images before sessions can reference them.",
+            req.image
+        )));
+    }
     prepare_inner(
         state,
         identity_env,
@@ -915,7 +901,7 @@ pub(crate) async fn prepare_from_grpc(
         req.prompt.clone(),
         req.secrets.clone(),
         SessionId::new(),
-        enabled,
+        bundle,
         req.selected_skills.clone(),
         req.capabilities.clone(),
         req.integration_policy.clone(),
@@ -941,21 +927,18 @@ pub(crate) async fn prepare_from_row(
             "prepare_from_row: secret overrides unavailable; continuing without them");
             None
         });
-    let enabled = state
-        .services
-        .meta
-        .get_enabled_image_any(&session.image)
-        .await
-        .map_err(|e| ApiError::Internal(format!("enabled_images lookup: {e}")))?
-        .ok_or_else(|| {
-            ApiError::Internal(format!(
-                "queued session `{}` image `{}` has no enabled_images row (lineage gone)",
-                session.id, session.image
-            ))
-        })?;
+    // Issue #535 (a): the queued path stays tolerant of a soft-deleted image
+    // (the lineage is still pinned) — the cache's `_any` fill is exactly this.
+    // Propagate the cache's own error verbatim (missing row / bad manifest /
+    // missing snapshot each carry a distinct message already).
+    let bundle = state
+        .boot_bundles
+        .bundle_for(state.services.meta.as_ref(), &session.image)
+        .await?;
     // ADR 0056 (B′): re-read the persisted integration policy so the queued
-    // boot re-injects (build_egress_policy resolves its refs again on the new
-    // host). A malformed/absent blob → None (no injection).
+    // boot re-injects (`resolve_inject_entries` resolves its refs again on the
+    // new host, via `boot_on_reserved_host`'s overlapped env/egress leg).
+    // A malformed/absent blob → None (no injection).
     let integration_policy = match state
         .services
         .meta
@@ -982,14 +965,19 @@ pub(crate) async fn prepare_from_row(
         prompt,
         overrides,
         session.id,
-        enabled,
-        // ADR 0055 TODO(P1-D): queued sessions don't yet carry dynamic mounts
-        // (they'd need persisting in the queue row); the scanner boots them
-        // with base skills only.
-        Vec::new(),
+        bundle,
+        // Issue #535 (b): fixes the ADR 0055 TODO(P1-D) gap — `selected_skills`
+        // is now persisted at create/enqueue time (`reserve_and_persist_
+        // create`), so the re-prepare reconstructs the actual selection
+        // instead of dropping to base skills. Re-resolved against the
+        // (possibly newer) fleet catalog below — the sha may have rolled
+        // while queued, which is the correct semantic.
+        session.selected_skills.clone(),
         // ADR 0056: a queued session's capabilities were already bound to
-        // `session_capabilities` at enqueue (the row existed); the re-prepare
-        // carries an empty set so the boot-path bind is a no-op, preserving them.
+        // `session_capabilities` at create/enqueue (issue #535 (b): now in
+        // the SAME transaction as the row); the re-prepare carries an empty
+        // set purely because `capabilities` is no longer read by the boot
+        // pipeline at all (see `BootInputs::capabilities` docs).
         Vec::new(),
         // ADR 0056 (B′): the integration policy persisted at create/enqueue,
         // re-read above so the queued boot re-injects on the new host.
@@ -1072,22 +1060,14 @@ async fn resolve_selected_skills(
 pub(crate) async fn fleet_bundle_catalog(
     state: &SharedState,
 ) -> Result<std::collections::HashMap<String, String>, ApiError> {
-    let hosts = state
-        .services
-        .meta
-        .list_active_hosts()
-        .await
-        .map_err(|e| ApiError::Internal(format!("list_active_hosts for skill resolve: {e}")))?;
-    Ok(hosts
-        .iter()
-        .find(|h| !h.current_bundles.is_empty())
-        .map(|h| {
-            h.current_bundles
-                .iter()
-                .map(|b| (b.drive_id.clone(), b.sha256.clone()))
-                .collect()
-        })
-        .unwrap_or_default())
+    // Issue #535 (a): read-through the cache instead of a fresh
+    // `list_active_hosts` scan every call — invalidated by `pg_listener` on
+    // an actual `current_bundles` stamp change (host roll), not per create.
+    let catalog = state
+        .boot_bundles
+        .fleet_catalog(state.services.meta.as_ref())
+        .await?;
+    Ok((*catalog).clone())
 }
 
 /// Pure half of skill resolution (no I/O): assign each selected skill name to a
@@ -1136,7 +1116,10 @@ async fn prepare_inner(
     prompt: Option<String>,
     secret_overrides: Option<HashMap<String, String>>,
     session_id: SessionId,
-    enabled: engram_core::types::EnabledImage,
+    // Issue #535 (a): the per-enabled-image boot bundle (manifest already
+    // parsed, base snapshot already fetched) — a read-through cache fill,
+    // not per-create I/O. `Arc` because the cache hands out shared handles.
+    bundle: std::sync::Arc<crate::boot_bundle::BootBundle>,
     // ADR 0055: profile-selected skill names; resolved to reserved-slot mounts.
     selected_skills: Vec<String>,
     // ADR 0056: profile-granted "provider:action[@resource]" capability strings.
@@ -1168,11 +1151,9 @@ async fn prepare_inner(
         let (r, t) = split_image_ref(image_uri);
         (r.to_string(), t.to_string())
     };
-    let manifest: ImageManifest = toml::from_str(&enabled.manifest_toml).map_err(|e| {
-        ApiError::Internal(format!(
-            "stored manifest for {image_uri} failed to parse: {e}"
-        ))
-    })?;
+    // Issue #535 (a): the manifest was parsed ONCE at bundle-fill time (bake
+    // or cache-refresh), not per create — no `toml::from_str` on this path.
+    let manifest = &bundle.manifest;
     // ADR 0062: the harness is no longer baked into the image — it's selected
     // per session and resolved from the catalog below (`resolve_harness`). The
     // image's `[harness]` block, if any legacy one survives, is ignored here.
@@ -1238,13 +1219,17 @@ async fn prepare_inner(
         Some(deferred_map)
     };
 
-    // The forge/upload broker-token injection is NOT done here: it mints a
-    // `session_broker_tokens` row that FKs to `sessions.id`, which doesn't
-    // exist until `create_session_created` runs in `boot_on_reserved_host`.
-    // Doing it now (before the row) fails the FK and is silently swallowed —
-    // the git-credential-injection regression on the gRPC create path. The
-    // git config rides `BootInputs` so the deferred injection can stamp the
-    // forge owner once the row is live.
+    // The forge/upload broker-token injection is NOT done here: minting is a
+    // per-spawn, not a durable, write, so it's deferred to `boot_on_reserved_
+    // host`'s overlapped env/egress leg (issue #535 (c)) — by the time that
+    // runs, the row has existed since `reserve_and_persist_create` committed
+    // the whole write-set transactionally (issue #535 (b)), so the FK it
+    // mints against (`session_broker_tokens` → `sessions.id`) is always
+    // satisfiable. This used to be a hazard here (the pre-#535 shape minted
+    // straight off `prepare_inner`, before any row existed at all — the
+    // git-credential-injection regression on the gRPC create path); it's
+    // dead by construction now, not by convention. The git config rides
+    // `BootInputs` so the deferred injection can stamp the forge owner.
     // ADR 0062: resolve the per-session harness from the catalog → the AgentSpec
     // the backend execs + the `dyn_0` mount carrying the current catalog
     // generation. `None` for a dev VM (no harness, dyn_0 stays sentinel).
@@ -1253,7 +1238,6 @@ async fn prepare_inner(
         selected_harness.as_deref(),
         mode,
         session_id,
-        prompt.as_deref(),
         session_env.clone(),
         manifest.workdir.clone(),
     )
@@ -1271,12 +1255,10 @@ async fn prepare_inner(
         .unwrap_or_default();
 
     // -------- Base snapshot + budgets --------
-    let base_snapshot_id = enabled.base_snapshot_id.ok_or_else(|| {
-        ApiError::Internal(format!(
-            "enabled image `{image_uri}` has no base snapshot — re-enable it \
-             (POST /api/enabled-images) to capture one"
-        ))
-    })?;
+    // Issue #535 (a): the record was fetched ONCE at bundle-fill time
+    // (`bundle_for` already errors if the enabled image has no base
+    // snapshot) — no per-create `get_snapshot` on this path.
+    let base_snapshot_id = bundle.base_snapshot.id;
     // ADR 0055: resolve the profile's selected skill names to reserved-slot
     // mounts against the fleet's staged bundles (name -> sha). Capped at
     // RESERVED_SLOTS; an unknown skill name is a 400.
@@ -1286,30 +1268,32 @@ async fn prepare_inner(
     if let Some(mount) = harness_mount {
         selected_mounts.push(mount);
     }
-    let memory_mib = resolved_memory_mib(&manifest);
-    let cpu_budget_vcpus = resolved_vcpus(&manifest);
+    // Issue #535 (a): already resolved at bundle-fill time; reuse rather
+    // than recompute (identical inputs, so identical outputs).
+    let memory_mib = bundle.memory_mib;
+    let cpu_budget_vcpus = bundle.cpu_budget_vcpus;
     // ADR 0036 amendment (issue #538): carried so `boot_prepared` can gate
     // the reserve-side `ScheduleContext` on `required_image_digest`.
-    let manifest_digest = enabled.manifest_digest.clone();
+    let manifest_digest = bundle.enabled.manifest_digest.clone();
 
     Ok(crate::session_boot::PreparedBoot {
         inputs: crate::session_boot::BootInputs {
             session_id,
             spec,
             base_snapshot_id,
+            base_snapshot: bundle.base_snapshot.clone(),
             spec_env,
             agent,
             session_env,
             egress_secrets,
             network,
             selected_mounts,
+            selected_skills,
             capabilities,
             integration_policy,
             selected_harness,
             deferred_session_secrets,
             prompt: prompt.filter(|s| !s.is_empty()),
-            memory_mib,
-            cpu_budget_vcpus,
         },
         memory_mib,
         cpu_budget_vcpus,
@@ -1320,7 +1304,7 @@ async fn prepare_inner(
         // snapshot — the placement gate needs the UFFD substrate iff
         // that base snapshot carries a memory manifest (an FC image;
         // VZ/Process enabled-image rows never set this).
-        needs_uffd_substrate: enabled.base_snapshot_memory_manifest.is_some(),
+        needs_uffd_substrate: bundle.enabled.base_snapshot_memory_manifest.is_some(),
     })
 }
 /// ADR 0051: fetch a session by id (gRPC `GetSession`). 404 on unknown id.
@@ -1750,7 +1734,6 @@ pub(crate) async fn resolve_harness(
     selected_harness: Option<&str>,
     session_mode: SessionMode,
     session_id: SessionId,
-    initial_prompt: Option<&str>,
     session_env: HashMap<String, String>,
     workdir: Option<String>,
 ) -> Result<
@@ -1820,11 +1803,11 @@ pub(crate) async fn resolve_harness(
     // Harness-only extras, layered on top of `session_env` for the harness
     // child. `session_env` already carries ENGRAM_SESSION_ID + the image env +
     // secrets, so they aren't repeated here; the forge broker token is added by
-    // the caller (per-spawn, kept out of the cached env).
+    // the caller (per-spawn, kept out of the cached env). Issue #535 (d): the
+    // initial prompt no longer rides env — it's delivered as a harness-
+    // protocol `Prompt` frame after boot, identically to a follow-up
+    // `SendPrompt` (see `session_boot::boot_on_reserved_host`).
     let mut env: HashMap<String, String> = HashMap::new();
-    if let Some(prompt) = initial_prompt {
-        env.insert("ENGRAM_INITIAL_PROMPT".into(), prompt.to_string());
-    }
     // The manifest `workdir` reaches agentd as a reserved env entry so the
     // harness child starts there instead of `/`. See `HARNESS_CWD_ENV` for why
     // this isn't a wire-struct field.

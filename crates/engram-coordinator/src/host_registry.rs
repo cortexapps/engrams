@@ -889,13 +889,19 @@ mod tests {
         ) -> Result<engram_core::SessionId, engram_core::MetaError> {
             unreachable!("host_registry tests don't create sessions")
         }
-        async fn create_session_created(
+        async fn transition_session_created(
             &self,
             _: engram_core::SessionId,
-            _: engram_core::types::session::SessionSpec,
-            _: HostId,
             _: SandboxId,
         ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn reserve_and_persist_create(
+            &self,
+            _: engram_core::traits::SessionCreateWriteSet,
+            _: &[HostId],
+            _: usize,
+        ) -> Result<engram_core::traits::CreateDisposition, engram_core::MetaError> {
             unreachable!()
         }
         async fn get_session(
@@ -1098,12 +1104,6 @@ mod tests {
             unreachable!()
         }
         async fn delete_enabled_image(&self, _: &str) -> Result<(), engram_core::MetaError> {
-            unreachable!()
-        }
-        async fn upsert_session_secrets(
-            &self,
-            _: engram_core::types::registry::SessionSecrets,
-        ) -> Result<(), engram_core::MetaError> {
             unreachable!()
         }
         async fn get_session_secrets(

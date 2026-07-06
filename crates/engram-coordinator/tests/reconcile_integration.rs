@@ -67,6 +67,7 @@ impl ReconcileMeta {
                 created_at: now,
                 last_active_at: now,
                 live_disk_manifest: None,
+                selected_skills: Vec::new(),
             },
         );
         id
@@ -122,13 +123,19 @@ impl MetadataStore for ReconcileMeta {
     async fn create_session(&self, _: SessionSpec) -> Result<SessionId, MetaError> {
         unimplemented!("test seeds sessions directly")
     }
-    async fn create_session_created(
+    async fn transition_session_created(
         &self,
         _: SessionId,
-        _: SessionSpec,
-        _: engram_core::HostId,
         _: engram_core::SandboxId,
     ) -> Result<(), MetaError> {
+        unimplemented!("test seeds sessions directly")
+    }
+    async fn reserve_and_persist_create(
+        &self,
+        _: engram_core::traits::SessionCreateWriteSet,
+        _: &[engram_core::HostId],
+        _: usize,
+    ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
         unimplemented!("test seeds sessions directly")
     }
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
@@ -365,12 +372,6 @@ impl MetadataStore for ReconcileMeta {
         Ok(engram_core::traits::DisableEnabledImageOutcome::Disabled)
     }
     async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn upsert_session_secrets(
-        &self,
-        _: engram_core::types::SessionSecrets,
-    ) -> Result<(), MetaError> {
         Ok(())
     }
     async fn get_session_secrets(

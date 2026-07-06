@@ -187,6 +187,82 @@ async fn ensure_active_and_resolve(
     })
 }
 
+/// Issue #535 (d): the echo-then-forward core shared by EVERY prompt
+/// delivery — first-or-follow-up, live-request-or-boot-path. Emits the
+/// user-echo event FIRST (see the ordering comment below — load-bearing for
+/// web rendering), then forwards via `deliver_with_reattach` (self-healing
+/// the harness-unbound desync). Factored out of `send_prompt_core` so the
+/// create path (`session_boot::boot_on_reserved_host`) can deliver the
+/// initial prompt through the EXACT same path a follow-up `SendPrompt`
+/// rides — no more separate env-var/synthetic-event spelling for "the
+/// first" prompt.
+pub(crate) async fn deliver_prompt(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: engram_core::SandboxId,
+    prompt_id: String,
+    text: String,
+) -> Result<(), ApiError> {
+    // Record the user's prompt in the session event log BEFORE forwarding to
+    // the harness. The harness adapter never echoes the prompt back through
+    // Claude's stream-json output — it only translates the *assistant*
+    // response — so without this entry the user's turn is invisible to
+    // subscribers.
+    //
+    // ORDER MATTERS: the forward makes the harness start the run and emit
+    // `run_started`, which is appended to this same log. The web transcript
+    // (buildMessages) HOLDS a `prompt_id` user echo and only renders it when it
+    // reaches the consuming `run_started{prompt_id}` (ADR 0052 type-ahead: a
+    // queued prompt must render at its consumption position, not echo position).
+    // If `run_started` were appended FIRST — as it was when this emit ran AFTER
+    // the forward — the held echo isn't there yet at render time, the run draws
+    // no user turn, and the echo that lands next is held forever → the user's
+    // message vanishes from the transcript on every follow-up `SendPrompt` (prod
+    // session 68c70a65). Emitting here guarantees the echo's `idx` precedes its
+    // `run_started` — including for the CREATE path now (issue #535 (d)): the
+    // initial prompt's `RunStarted.prompt_id` is set from this same consumed
+    // queued prompt (`harness-proto` `QueuedPrompt`), so it renders through the
+    // identical follow-up path.
+    //
+    // Best-effort: an emit failure logs + proceeds (the harness still receives +
+    // runs the prompt below); we never fail the caller over a missing echo. A
+    // forward that ultimately fails leaves the held echo unrendered (no run to
+    // consume it) rather than a dangling bubble.
+    if let Err(e) = state
+        .emit(
+            session_id,
+            SessionEvent::HarnessAgentMessage {
+                run_id: String::new(),
+                message_id: format!("user-{}", uuid::Uuid::new_v4()),
+                role: AgentRole::User,
+                text: text.clone(),
+                // Phase 1b: tag the user-echo with the client prompt_id so
+                // the web dedupes its optimistic bubble against this event
+                // (the double-render fix) instead of rendering both.
+                prompt_id: Some(prompt_id.clone()),
+                at: chrono::Utc::now(),
+            },
+        )
+        .await
+    {
+        tracing::warn!(session_id = %session_id, error = %e, "emit user prompt event failed");
+    }
+
+    deliver_with_reattach(
+        "prompt",
+        REATTACH_FORWARD_BUDGET,
+        REATTACH_FORWARD_POLL,
+        || {
+            let host = state.services.host.clone();
+            let pid = prompt_id.clone();
+            let txt = text.clone();
+            async move { host.send_prompt(sandbox_id, pid, txt).await }
+        },
+        || crate::api::snapshot::reattach_harness_in_place(state, session_id, sandbox_id),
+    )
+    .await
+}
+
 /// ADR 0051: transport-agnostic prompt core (gRPC `SendPrompt`). Holds the
 /// SAME hardened auto-resume + mid-move HOLD logic as the axum `prompt`
 /// handler; only the I/O shape changed (request fields → params,
@@ -252,64 +328,7 @@ pub(crate) async fn send_prompt_core(
     // and resolve the live sandbox. Shared verbatim with `answer_question_core`.
     let sandbox_id = ensure_active_and_resolve(state, id).await?;
 
-    let prompt_text = text;
-
-    // Record the user's prompt in the session event log BEFORE forwarding to
-    // the harness. The harness adapter never echoes the prompt back through
-    // Claude's stream-json output — it only translates the *assistant*
-    // response — so without this entry the user's turn is invisible to
-    // subscribers.
-    //
-    // ORDER MATTERS: the forward makes the harness start the run and emit
-    // `run_started`, which is appended to this same log. The web transcript
-    // (buildMessages) HOLDS a `prompt_id` user echo and only renders it when it
-    // reaches the consuming `run_started{prompt_id}` (ADR 0052 type-ahead: a
-    // queued prompt must render at its consumption position, not echo position).
-    // If `run_started` were appended FIRST — as it was when this emit ran AFTER
-    // the forward — the held echo isn't there yet at render time, the run draws
-    // no user turn, and the echo that lands next is held forever → the user's
-    // message vanishes from the transcript on every follow-up `SendPrompt` (prod
-    // session 68c70a65; the env-seeded initial prompt is unaffected — it carries
-    // no prompt_id and renders inline). Emitting here guarantees the echo's `idx`
-    // precedes its `run_started`.
-    //
-    // Best-effort: an emit failure logs + proceeds (the harness still receives +
-    // runs the prompt below); we never 500 the caller over a missing echo. A
-    // forward that ultimately fails leaves the held echo unrendered (no run to
-    // consume it) rather than a dangling bubble.
-    if let Err(e) = state
-        .emit(
-            id,
-            SessionEvent::HarnessAgentMessage {
-                run_id: String::new(),
-                message_id: format!("user-{}", uuid::Uuid::new_v4()),
-                role: AgentRole::User,
-                text: prompt_text.clone(),
-                // Phase 1b: tag the user-echo with the client prompt_id so
-                // the web dedupes its optimistic bubble against this event
-                // (the double-render fix) instead of rendering both.
-                prompt_id: Some(prompt_id.clone()),
-                at: chrono::Utc::now(),
-            },
-        )
-        .await
-    {
-        tracing::warn!(session_id = %id, error = %e, "emit user prompt event failed");
-    }
-
-    deliver_with_reattach(
-        "prompt",
-        REATTACH_FORWARD_BUDGET,
-        REATTACH_FORWARD_POLL,
-        || {
-            let host = state.services.host.clone();
-            let pid = prompt_id.clone();
-            let txt = prompt_text.clone();
-            async move { host.send_prompt(sandbox_id, pid, txt).await }
-        },
-        || crate::api::snapshot::reattach_harness_in_place(state, id, sandbox_id),
-    )
-    .await?;
+    deliver_prompt(state, id, sandbox_id, prompt_id, text).await?;
 
     Ok("prompt forwarded")
 }
@@ -562,6 +581,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         }
     }
 

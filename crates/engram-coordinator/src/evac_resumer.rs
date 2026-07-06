@@ -529,6 +529,7 @@ mod tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: live_disk,
+            selected_skills: Vec::new(),
         }
     }
 

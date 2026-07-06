@@ -678,6 +678,12 @@ pub struct AppState {
     /// harness connections off a real vsock listener wired through
     /// the same hub.
     pub harness_hub: Arc<HarnessHub>,
+    /// Issue #535 (a): per-enabled-image manifest/snapshot/budget cache +
+    /// the fleet bundle-catalog cache, invalidated by `pg_listener` on
+    /// `enabled_image_changed` / `fleet_catalog_changed` NOTIFYs. Shared
+    /// with the listener task the same way `host_registry`/`integrations`
+    /// are (an `Arc` clone at spawn time).
+    pub boot_bundles: Arc<crate::boot_bundle::BootBundleCache>,
     /// Bound address of the harness TCP listener (set by `lib::run`
     /// once the listener has accepted a port from the OS — `127.0.0.1:0`
     /// becomes e.g. `127.0.0.1:54123`). The session-create handler
@@ -770,6 +776,7 @@ impl AppState {
             events,
             host_registry,
             harness_hub,
+            boot_bundles: Arc::new(crate::boot_bundle::BootBundleCache::new()),
             harness_listen_addr: parking_lot::Mutex::new(None),
             reconciler,
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
@@ -1579,14 +1586,20 @@ pub(crate) mod tests {
         ) -> Result<engram_core::SessionId, MetaError> {
             unreachable!("create_session not used in state tests")
         }
-        async fn create_session_created(
+        async fn transition_session_created(
             &self,
             _: engram_core::SessionId,
-            _: SessionSpec,
-            _: engram_core::HostId,
             _: engram_core::SandboxId,
         ) -> Result<(), MetaError> {
-            unreachable!("create_session_created not used in state tests")
+            unreachable!("transition_session_created not used in state tests")
+        }
+        async fn reserve_and_persist_create(
+            &self,
+            _: engram_core::traits::SessionCreateWriteSet,
+            _: &[engram_core::HostId],
+            _: usize,
+        ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
+            unreachable!("reserve_and_persist_create not used in state tests")
         }
         async fn get_session(&self, id: engram_core::SessionId) -> Result<Session, MetaError> {
             let s = self.session.lock();
@@ -1889,12 +1902,6 @@ pub(crate) mod tests {
         async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
             Ok(())
         }
-        async fn upsert_session_secrets(
-            &self,
-            _: engram_core::types::SessionSecrets,
-        ) -> Result<(), MetaError> {
-            Ok(())
-        }
         async fn get_session_secrets(
             &self,
             _: SessionId,
@@ -2116,6 +2123,7 @@ pub(crate) mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
@@ -2181,6 +2189,7 @@ pub(crate) mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
@@ -2225,6 +2234,7 @@ pub(crate) mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
         };
         (session_id, Arc::new(MiniMeta::new(session)))
     }
