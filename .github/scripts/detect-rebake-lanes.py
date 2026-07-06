@@ -285,7 +285,6 @@ def main():
                  or any_path(changed, BINARY_COMMON)
                  or any_path(changed, ["flake.nix", "flake.lock"]))
     tf_or_helm = any_path(changed, TF_HELM_PATHS)
-    bundles = any_path(changed, BUNDLES_PATHS)
     # The dogfood image builds the whole repo via `just dev`, so it's stale on
     # any source the container/host bakes consume, plus the dev-orchestration
     # inputs. It ALSO bakes in the builtin claude harness, so a harness-only
@@ -293,6 +292,15 @@ def main():
     # without this term, a harness change shipped nothing. NOT tripped by
     # doc/TF/helm-only pushes.
     harness_changed = bool(cc & harness)
+    # A harness-source change must ALSO republish the `bundle-harness-claude`
+    # artifact: publish-bundles builds it from the engram-harness-claude tree
+    # (ADR 0062), and node-assets stages it onto the fleet. Without this term a
+    # harness change rebakes only the host-agent/dev_image and the fleet keeps
+    # staging the STALE harness bundle against a freshly-rolled host-agent — the
+    # exact break that wedged harness attach after the #542 wire-10 roll (the
+    # comment at SESSION_HARNESS_BINS promised this republish but only the
+    # dev_image half was ever wired).
+    bundles = any_path(changed, BUNDLES_PATHS) or harness_changed
     dev_image = (
         images
         or host_binaries
