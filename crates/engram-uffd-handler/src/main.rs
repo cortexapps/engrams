@@ -24,7 +24,7 @@
 //!   [--recorder-window-ms 5000]
 //! ```
 //!
-//! ADR 0067: this handler is a single-evictor-safe cache citizen — it
+//! ADR 0070: this handler is a single-evictor-safe cache citizen — it
 //! *populates* the shared `cache_root` (write-through of faulted chunks,
 //! the locality win) but never *evicts* from it
 //! (`ChunkCacheConfig::eviction_enabled: false`). The host-agent, which

@@ -118,15 +118,15 @@ egress:
 storage:
   # Local NVMe for the chunk cache + per-sandbox work dir.
   workDirHostPath: /var/lib/engram
-  # "" => host-agent's disk-derived default (ADR 0067): min(60% of the
+  # "" => host-agent's disk-derived default (ADR 0070): min(60% of the
   # disk backing workDirHostPath, 80% — the same margin the free-space
   # floor holds below the kubelet eviction line). Set to override the
   # ceiling as an absolute byte count.
   chunkCacheBudgetBytes: ""
-  # ADR 0067: override the 0.60 disk-fraction the default budget derives
+  # ADR 0070: override the 0.60 disk-fraction the default budget derives
   # from (see chunkCacheBudgetBytes). "" => host-agent default (0.60).
   chunkCacheDiskFraction: ""
-  # ADR 0067: the kubelet's ephemeral-storage hard-eviction threshold, as
+  # ADR 0070: the kubelet's ephemeral-storage hard-eviction threshold, as
   # a percent of the filesystem backing workDirHostPath — the line
   # engram_host_disk_headroom_to_kubelet_bytes measures distance to.
   #
@@ -138,7 +138,7 @@ storage:
   # Confirm and adjust here before treating the headroom gauge's alarm
   # threshold as trustworthy.
   kubeletEvictPct: 10
-  # ADR 0067: mount workDirHostPath on its own block device instead of
+  # ADR 0070: mount workDirHostPath on its own block device instead of
   # sharing the node boot disk. "" (default) = today's behavior — a
   # hostPath directory on the root filesystem. When set to a device path
   # (e.g. /dev/nvme1n1, a GKE local-SSD raw-block device), node-prep

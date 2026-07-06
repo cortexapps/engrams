@@ -198,9 +198,13 @@ rehearsal.
   sane.) RAM remains the exact, hard constraint, reserved at the session's
   *configured ceiling* (`mem_budget_mib`) — deliberately conservative; see
   "Future work: memory density" for why and what to revisit.
-- **FIFO head-of-line blocking is deliberate** — fairness + a simple
-  invariant (the operator scales to fit the head). A 32 GiB head blocks
-  smaller queued sessions until capacity fits it.
+- **FIFO head-of-line blocking is deliberate, but scoped per fit class**
+  (issue #537 — see the queue-fairness update above) — fairness + a simple
+  invariant WITHIN a `(mem_budget_mib, cpu_budget_vcpus)` class, not
+  globally across the whole queue. A 32 GiB head blocks smaller queued
+  sessions *of the same fit class* until capacity fits it; a small session
+  behind an unrelated fat head places the same tick instead of inheriting
+  its wait.
 - **Required `resources.suggested_vcpus` opens the standard clean-break window**
   until images are re-baked + re-enabled.
 - **Resume placement still bypasses PG reservation** (pre-existing ADR 0046

@@ -522,7 +522,7 @@ async fn reconcile(
         }
     }
 
-    // ADR 0067: gauge summed on-disk bytes of every currently-tracked
+    // ADR 0070: gauge summed on-disk bytes of every currently-tracked
     // base memfile — unevictable disk (mlock'd, reclaimed only on
     // image-disable), part of the same "floor the budget can't touch"
     // accounting as pinned chunk bytes (see engram-chunk-store's

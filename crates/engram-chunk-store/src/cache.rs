@@ -36,13 +36,13 @@
 //!   (debounced, see `write_local`) AND on an independent timer
 //!   ([`ChunkCache::spawn_sweeper`]) — a host under disk pressure from
 //!   non-cache writers, or one that just came back from a pod restart
-//!   with zero populate traffic, still gets swept (ADR 0067).
+//!   with zero populate traffic, still gets swept (ADR 0070).
 //! - **Single evictor**: [`ChunkCacheConfig::eviction_enabled`] lets a
 //!   process hold a cache that *populates* (writes chunks in, serving
 //!   reads) but never *evicts* (never unlinks). Exactly one process per
 //!   host — the host-agent, which owns the pin set — should evict; every
 //!   other process sharing the same `cache_root` (the UFFD handler) sets
-//!   this `false` (ADR 0067). Without this, two independent LRU policies
+//!   this `false` (ADR 0070). Without this, two independent LRU policies
 //!   raced over the same directory with disjoint in-memory pin state, so
 //!   a pressured non-pinning evictor could unlink exactly the chunks the
 //!   pinning one was protecting.
@@ -55,7 +55,7 @@
 //!   the shared base out from under live File-backend siblings. Pins are
 //!   a **floor, not a bug**: a sweep never auto-unpins under pressure —
 //!   when pinned bytes alone approach or exceed the budget, that's an
-//!   alarm (`engram_chunk_cache_pins_over_budget`, ADR 0067), not a
+//!   alarm (`engram_chunk_cache_pins_over_budget`, ADR 0070), not a
 //!   signal to evict pinned content. Pins are **reference-counted**: two
 //!   enabled images that share a base chunk each hold a pin, and
 //!   disabling one leaves the chunk pinned until the last holder
@@ -144,7 +144,7 @@ pub struct ChunkCacheConfig {
     /// Minimum interval between populate-path eviction sweeps (see
     /// `write_local`). 0 = sweep on every populate (test determinism).
     pub sweep_debounce_ms: i64,
-    /// Single-evictor switch (ADR 0067). `true` (default): this cache's
+    /// Single-evictor switch (ADR 0070). `true` (default): this cache's
     /// `sweep()` (populate-path debounce AND [`ChunkCache::spawn_sweeper`])
     /// evicts as normal. `false`: `sweep()` is a no-op — the cache still
     /// *populates* (writes, reads) but never unlinks a chunk file. Set
@@ -162,7 +162,7 @@ pub struct ChunkCacheConfig {
 /// ceiling, so the dynamic free-space floor governs alone (fill to ~80%
 /// of whatever disk backs the cache, then LRU-evict). The 200 GiB fixed
 /// budget this replaces never tripped on the ~98 GiB FC host — the disk
-/// filled first (the prod incident). NOT the default anymore (ADR 0067)
+/// filled first (the prod incident). NOT the default anymore (ADR 0070)
 /// — [`ChunkCacheConfig::from_env_or_default`] now derives a real
 /// absolute ceiling from the disk backing `root`; this sentinel survives
 /// as the explicit "floor only" opt-out and the fail-soft fallback when
@@ -318,7 +318,7 @@ impl ChunkCacheConfig {
     ///
     /// 1. `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`, if set + parseable, wins
     ///    outright as an absolute operator override.
-    /// 2. Otherwise, derive a disk-sized default (ADR 0067):
+    /// 2. Otherwise, derive a disk-sized default (ADR 0070):
     ///    `create_dir_all(root)` (the budget probe needs the mount
     ///    `root` will live on, which may not exist yet on a fresh host)
     ///    then [`fs_total_bytes`] → [`default_budget_bytes`] with
@@ -1029,7 +1029,7 @@ impl ChunkCache {
         self.evict_to_budget().await
     }
 
-    /// Spawn the periodic sweeper (ADR 0067): calls [`Self::sweep`] every
+    /// Spawn the periodic sweeper (ADR 0070): calls [`Self::sweep`] every
     /// `interval`, independent of populate traffic — closes the gap where
     /// a host under disk pressure with no populate activity (or one that
     /// just restarted with a cold pin set) enforces nothing until the
@@ -1160,7 +1160,7 @@ impl ChunkCache {
     /// the cache itself didn't grow. That's the whole point: the cache
     /// yields disk dynamically rather than holding a fixed slice.
     async fn evict_to_budget(&self) -> Result<()> {
-        // ADR 0067: single-evictor switch. A cache with eviction disabled
+        // ADR 0070: single-evictor switch. A cache with eviction disabled
         // never unlinks (populate — write_local's atomic write — already
         // happened by the time write_local calls this). Skip the walk
         // entirely: this process (the UFFD handler) isn't the owner of
@@ -1191,7 +1191,7 @@ impl ChunkCache {
             c => Some(c),
         };
 
-        // ADR 0067: pins are a floor, not a bug. Compute what's
+        // ADR 0070: pins are a floor, not a bug. Compute what's
         // unevictable BEFORE deciding how much to free, and gauge it
         // regardless of whether a sweep is otherwise a no-op — dashboards
         // and the pins-over-budget alarm must stay live even with zero
@@ -2139,7 +2139,7 @@ mod tests {
 
     #[test]
     fn from_env_or_default_derives_disk_sized_default_when_unset() {
-        // ADR 0067: no env set ⇒ a real, disk-derived ceiling, NOT
+        // ADR 0070: no env set ⇒ a real, disk-derived ceiling, NOT
         // NO_CEILING (the pre-0067 default, retired for prod safety).
         let _g = env_guard();
         std::env::remove_var(BUDGET_ENV_VAR);
@@ -2413,7 +2413,7 @@ mod tests {
         assert_eq!(fs_usage(Path::new("/nonexistent/engram/cache/probe")), None);
     }
 
-    // ---- default_budget_bytes: pure disk-fraction formula (ADR 0067) ----
+    // ---- default_budget_bytes: pure disk-fraction formula (ADR 0070) ----
 
     #[test]
     fn default_budget_bytes_prod_298gb_case() {
@@ -2492,7 +2492,7 @@ mod tests {
         assert_eq!(frac, DEFAULT_DISK_FRACTION);
     }
 
-    // ---- ADR 0067: pins are a floor, never auto-evicted, alarm on overflow ----
+    // ---- ADR 0070: pins are a floor, never auto-evicted, alarm on overflow ----
 
     #[tokio::test]
     async fn pins_over_budget_never_unlinks_pinned_but_still_evicts_unpinned() {
@@ -2541,7 +2541,7 @@ mod tests {
         assert!(cache.contains(h).await, "far under budget: nothing evicts");
     }
 
-    // ---- ADR 0067: eviction_enabled: false never unlinks ----
+    // ---- ADR 0070: eviction_enabled: false never unlinks ----
 
     #[tokio::test]
     async fn eviction_disabled_cache_never_unlinks_under_pressure() {
@@ -2572,11 +2572,11 @@ mod tests {
         );
     }
 
-    // ---- ADR 0067: spawn_sweeper enforces without populate traffic ----
+    // ---- ADR 0070: spawn_sweeper enforces without populate traffic ----
 
     #[tokio::test]
     async fn spawn_sweeper_enforces_with_zero_populate_traffic() {
-        // ADR 0067 acceptance criterion: a cache filled over budget with
+        // ADR 0070 acceptance criterion: a cache filled over budget with
         // NO further populate activity must return under budget within
         // one sweep interval, driven purely by the periodic timer.
         let cache_dir = tempfile::tempdir().unwrap();

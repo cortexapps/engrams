@@ -206,7 +206,7 @@ async fn main() -> Result<(), HostAgentError> {
 
     let cli = Cli::parse();
 
-    // ADR 0067: dedicated-volume mountpoint gate. When the chart pairs
+    // ADR 0070: dedicated-volume mountpoint gate. When the chart pairs
     // `storage.dedicatedDevice` with `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT
     // =true`, `work_dir` MUST resolve to a distinct filesystem from the
     // boot-disk reference path (`ENGRAM_HOST_ROOT_REF_PATH`, default `/`
@@ -451,7 +451,7 @@ async fn main() -> Result<(), HostAgentError> {
     };
     let cloud = Arc::new(StaticCloud::detect().map_err(HostAgentError::Backend)?);
 
-    // ADR 0067: NVMe-backed chunk cache with a disk-derived absolute
+    // ADR 0070: NVMe-backed chunk cache with a disk-derived absolute
     // budget by default (min(60% of the cache disk, 80% — the same
     // margin the free-space floor holds below the kubelet eviction
     // line); ~179 GB on the 298.1 GB prod disk that used to grow
@@ -465,7 +465,7 @@ async fn main() -> Result<(), HostAgentError> {
             cli.work_dir.join("chunk-cache"),
         ),
     );
-    // ADR 0067: periodic enforcement independent of populate traffic —
+    // ADR 0070: periodic enforcement independent of populate traffic —
     // this is the host-agent's ONE cache-eviction policy per host (the
     // UFFD handler shares this directory but builds its own cache with
     // eviction disabled; see engram-uffd-handler). Held for the process
@@ -689,7 +689,7 @@ fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Option<S
     Some(format!("http://127.0.0.1:{grpc_port}"))
 }
 
-/// Env var: ADR 0067's dedicated-volume mountpoint gate. See
+/// Env var: ADR 0070's dedicated-volume mountpoint gate. See
 /// [`require_work_dir_mountpoint_or_exit`].
 const WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR: &str = "ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT";
 
@@ -708,7 +708,7 @@ const WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR: &str = "ENGRAM_WORK_DIR_REQUIRE_MOUNT
 /// the comparison is boot-disk-vs-work_dir, not overlayfs-vs-work_dir.
 const HOST_ROOT_REF_PATH_ENV_VAR: &str = "ENGRAM_HOST_ROOT_REF_PATH";
 
-/// ADR 0067: when `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT` is truthy
+/// ADR 0070: when `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT` is truthy
 /// (`1`/`true`, case-insensitive), hard-fail unless `work_dir` resolves
 /// to a distinct filesystem from the boot-disk reference path
 /// (`ENGRAM_HOST_ROOT_REF_PATH`, default `/`) — i.e. a dedicated volume
@@ -774,7 +774,7 @@ fn require_work_dir_mountpoint_or_exit(work_dir: &std::path::Path) -> Result<(),
              volume isn't mounted there yet (or storage.dedicatedDevice is misconfigured). \
              Refusing to start: coming up on the boot disk here would silently defeat the whole \
              point of the dedicated volume — cache/snapshot/memfile writes would count against \
-             the SAME kubelet nodefs signal ADR 0067's headroom gauge and budget exist to keep \
+             the SAME kubelet nodefs signal ADR 0070's headroom gauge and budget exist to keep \
              clear.",
             work_dir.display(),
             root_path.display(),
@@ -926,7 +926,7 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    // ---- ADR 0067: require_work_dir_mountpoint_or_exit ----
+    // ---- ADR 0070: require_work_dir_mountpoint_or_exit ----
 
     // Tests poke a process-global env var; serialize (mirrors the
     // ENV_LOCK pattern used elsewhere in this repo, e.g.

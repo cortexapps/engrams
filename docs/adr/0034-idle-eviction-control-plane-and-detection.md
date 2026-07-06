@@ -371,8 +371,10 @@ found' while exec works" canaries) with no restore to trigger it.
 
 So the new rung is just: **re-issue the resume `start_agent` against the
 session's existing live sandbox.** `start_agent` is wait-ready (a no-op; agentd
-is up) → InstallHostCa (idempotent) → `SpawnHarness` → the C1 reattach/respawn
-arm. The spec is the **resume shape** — `resolve_harness(prompt = None)`, the
+is up) → `SpawnHarness` (installs the host CA + reattaches/respawns the
+harness — `InstallHostCa` was folded into `SpawnHarness` by #554, no longer a
+separate step) → the C1 reattach/respawn arm. The spec is the **resume
+shape** — `resolve_harness(prompt = None)`, the
 same builder a real resume uses (now shared as `resolve_resume_agent_and_policy`,
 reused by `finish_resume_to_active`). Prompt-less is load-bearing: the initial
 prompt rides `req.env`, so a *boot*-shape respawn of an exited harness would

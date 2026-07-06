@@ -63,7 +63,7 @@ spec:
               ( echo {{ $v | quote }} > /proc/sys/{{ $k | replace "." "/" }} ) 2>&1 || echo "[node-prep] {{ $k }} skipped"
               {{- end }}
               {{- with .Values.storage.dedicatedDevice }}
-              # ADR 0067: format (only if unformatted) + mount the dedicated
+              # ADR 0070: format (only if unformatted) + mount the dedicated
               # volume at workDirHostPath, moving the chunk cache /
               # snapshots / memfiles off the node boot disk (the budget in
               # ChunkCacheConfig is the real disk-headroom mechanism; this

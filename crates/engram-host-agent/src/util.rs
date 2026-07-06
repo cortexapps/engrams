@@ -39,7 +39,7 @@ const MIB: u64 = 1024 * 1024;
 /// default and is consistent with the 611v prod incident's arithmetic
 /// (31,259,425,233 B free at eviction ≈ 10.5% of a 298.1 GB disk).
 ///
-/// TODO(ADR 0067): this is a placeholder pending confirmation against
+/// TODO(ADR 0070): this is a placeholder pending confirmation against
 /// the actual nodepool/kubelet config in the engrams-internal deploy
 /// repo — GKE lets an operator override the default via
 /// `--eviction-hard`/`--system-reserved`, and this default has NOT been
@@ -79,7 +79,7 @@ fn resolve_kubelet_evict_frac() -> f64 {
 /// call [`UtilizationProbe::sample`] each heartbeat.
 pub struct UtilizationProbe {
     prev_cpu: Option<CpuTimes>,
-    /// ADR 0067: resolved once at construction (see
+    /// ADR 0070: resolved once at construction (see
     /// [`resolve_kubelet_evict_frac`]).
     kubelet_evict_frac: f64,
 }
@@ -275,7 +275,7 @@ mod tests {
         );
     }
 
-    // ---- ADR 0067: kubelet-headroom gauge ----
+    // ---- ADR 0070: kubelet-headroom gauge ----
 
     // Tests poke a process-global env var; serialize (mirrors the
     // ENV_LOCK pattern in engram-chunk-store's cache.rs tests).
