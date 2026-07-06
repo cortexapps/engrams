@@ -268,6 +268,17 @@ pub const QUEUE_HEAD_AGE_SECONDS: &str = "engram_queue_head_age_seconds";
 /// per-host labels; the paired `warn!` carries the id for forensics.
 pub const HEARTBEAT_PERSIST_FAILURES_TOTAL: &str = "engram_heartbeat_persist_failures_total";
 
+/// Counter (ADR 0019 / telemetry restoration #526). Same-host vs
+/// cross-host resume split, emitted in `api/snapshot.rs::resume_from_fc_snapshot`
+/// once placement resolves. Labels: `placement` = `same_host` (the
+/// chosen host == the snapshot record's capturing host — the
+/// zero-cost hot-tier hit ADR 0007's local-dir cache exists for) /
+/// `cross_host` (relocated — the host materializes from chunked
+/// manifests) / `unknown_prior_host` (the record carries no `host_id`,
+/// e.g. a pre-ADR-0007 row or one written before the capturing host
+/// was recorded — can't classify).
+pub const SESSION_RESUME_PLACEMENT_TOTAL: &str = "engram_session_resume_total";
+
 /// Histogram (issue #527 Phase 1). Wall-clock from a `prompt_received`
 /// receipt (the first PG write of `send_prompt_core`, before auto-resume)
 /// to the matching `run_started{prompt_id}` landing in `session_events`.

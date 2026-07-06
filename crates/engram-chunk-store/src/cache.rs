@@ -92,6 +92,27 @@ use crate::manifest::ChunkHash;
 /// Default populate-path sweep debounce (see `write_local`).
 pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
 
+/// ADR 0019 / telemetry restoration (#526), review finding 7: the
+/// peer-vs-GCS cache-fill counter, labeled `source="gcs"|"peer"`. This
+/// is the baseline meter for epic-gcs-free-resume's "GCS-free by
+/// policy" claim, so both fill sources must agree on the exact metric
+/// name — a typo in either literal would silently fork the series.
+///
+/// - `source="gcs"`: incremented here, in [`ChunkCache::get`]'s
+///   leader-persist arm, only when `write_local` actually landed the
+///   fetched bytes on disk (a `write_local` failure means the fetch
+///   happened but the cache did NOT fill — see the `write_local`
+///   error-handling comment just above the increment site).
+/// - `source="peer"`: incremented by `engram-host-agent::pooled_backend`
+///   at the two loops that land migration-sourced chunks into this same
+///   cache via [`ChunkCache::put_no_evict`] (the prestage loop and the
+///   `pull_chunks_from_source` divergence pull).
+pub const CHUNK_FILL_TOTAL: &str = "engram_chunk_fill_total";
+
+/// Byte-counted companion to [`CHUNK_FILL_TOTAL`]. Same `source` label,
+/// same two call sites (one here, one in `engram-host-agent`).
+pub const CHUNK_FILL_BYTES_TOTAL: &str = "engram_chunk_fill_bytes_total";
+
 /// Configuration for the on-disk cache.
 ///
 /// Eviction is governed by two independent constraints, whichever bites
@@ -621,7 +642,21 @@ impl ChunkCache {
         // populate; trust on read. (Atomic temp+rename means a present file is
         // never torn; post-write bit-rot is left to PD/local-SSD durability.)
         let path = self.path_for(hash);
-        if let Some(bytes) = read_if_present(&path).await? {
+        // ADR 0019 / telemetry restoration (#526): NVMe-tier hit latency was
+        // previously unmeasured — `engram_chunk_fetch_seconds` only had a
+        // `blobstorage` arm (the miss path below), so there was no signal
+        // for "the fast tier got slow" (a saturated NVMe device, ext4
+        // fragmentation, etc). Time the read regardless of hit/miss; a miss
+        // here is a fast negative stat (no file), not a meaningful latency
+        // sample, so only record on a hit.
+        let nvme_read_start = std::time::Instant::now();
+        let nvme_read = read_if_present(&path).await?;
+        if let Some(bytes) = nvme_read {
+            metrics::histogram!(
+                "engram_chunk_fetch_seconds",
+                "tier" => "nvme",
+            )
+            .record(nvme_read_start.elapsed().as_secs_f64());
             // ADR 0014 M1.15: local NVMe hit. Don't differentiate
             // singleflight-piggyback from true cache hit here —
             // the user-visible win is the same.
@@ -729,20 +764,53 @@ impl ChunkCache {
                     // isn't cached, so every later read re-fetches from GCS —
                     // which presents exactly as "warming ran but reads still
                     // miss". Surface it loudly rather than swallowing (`let _ =`).
-                    if let Err(e) = self.write_local(hash, bytes).await {
-                        tracing::warn!(
-                            hash = %hash,
-                            root = %self.inner.config.root.display(),
-                            bytes = bytes.len(),
-                            error = %e,
-                            "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
-                        );
-                    }
+                    let write_local_ok = match self.write_local(hash, bytes).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                hash = %hash,
+                                root = %self.inner.config.root.display(),
+                                bytes = bytes.len(),
+                                error = %e,
+                                "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
+                            );
+                            false
+                        }
+                    };
+                    // This measures the fetch (bytes pulled from
+                    // BlobStorage), not the fill — it stays unconditional
+                    // even when write_local below fails.
                     metrics::counter!(
                         "engram_chunk_cache_bytes_total",
                         "tier" => "blobstorage",
                     )
                     .increment(bytes.len() as u64);
+                    // ADR 0019 / telemetry restoration (#526), review finding
+                    // 4: the baseline meter for epic-gcs-free-resume's
+                    // "GCS-free by policy" claim — every chunk that fills the
+                    // local cache from BlobStorage (as opposed to a
+                    // peer-fill, recorded at the host-agent's MigrationFetch
+                    // destination pull loops) counts here. `source="gcs"`
+                    // names the fetch backend this closure resolves to in
+                    // practice (BlobStorage is GCS in every deployed
+                    // configuration); a non-GCS BlobStorage impl would still
+                    // be the correct label for "the cold tier", not a peer.
+                    // Gated on `write_local_ok`: a fetch whose local persist
+                    // failed did NOT fill the cache — counting it here would
+                    // mask exactly the "warming ran but reads still miss"
+                    // state the write_local warning above exists to catch.
+                    if write_local_ok {
+                        metrics::counter!(
+                            CHUNK_FILL_TOTAL,
+                            "source" => "gcs",
+                        )
+                        .increment(1);
+                        metrics::counter!(
+                            CHUNK_FILL_BYTES_TOTAL,
+                            "source" => "gcs",
+                        )
+                        .increment(bytes.len() as u64);
+                    }
                 }
                 // Notify waiters. Send-failure (their rx dropped)
                 // is benign.
@@ -1544,6 +1612,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body0_actual.len(), 4 * 1024);
+    }
+
+    /// ADR 0019 / telemetry restoration (#526): `get`'s NVMe-hit arm now
+    /// times `read_if_present` (`engram_chunk_fetch_seconds{tier="nvme"}`)
+    /// before returning — this must be pure instrumentation, not a
+    /// semantic change. Round-trip a chunk through a genuine miss (fetcher
+    /// fires, bytes land via `write_local`) and then a genuine NVMe hit
+    /// (fetcher must NOT fire again), and assert both arms still return the
+    /// exact, hash-verified bytes.
+    #[tokio::test]
+    async fn nvme_hit_latency_timing_does_not_change_returned_bytes() {
+        let (cache, store, _b, _c) = setup(1024 * 1024 * 1024).await;
+        let body = vec![7u8; 8 * 1024];
+        let hash = store.put_chunk(&body).await.unwrap();
+
+        // Miss: fetcher fires, populates the local cache.
+        let via_miss = cache_get_from(&cache, &store, hash).await.unwrap();
+        assert_eq!(via_miss.as_ref(), body.as_slice());
+        assert!(
+            cache.contains(hash).await,
+            "chunk must be cached after the miss fetch"
+        );
+
+        // Hit: must return the SAME verified bytes via the now-timed
+        // read_if_present path, and must NOT re-invoke the fetcher.
+        let via_hit = cache
+            .get(hash, || async {
+                panic!("fetcher must not fire on an NVMe cache hit");
+                #[allow(unreachable_code)]
+                Ok(Bytes::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(via_hit.as_ref(), body.as_slice());
     }
 
     /// Regression: two `ChunkCache`s over the SAME cache_root — modeling

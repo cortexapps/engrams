@@ -651,6 +651,19 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
+    /// ADR 0019 / telemetry restoration (#526): where this sandbox's
+    /// uffd-handler dumps its per-jail prefault-effectiveness snapshot
+    /// (`PrefaultStats` in `engram-uffd-handler`), a sibling of
+    /// [`working_set_trace_path`](Self::working_set_trace_path) in the
+    /// same jail dir. `PooledBackend::restore` reads it after a resume
+    /// completes and emits `engram_resume_prefault_*` — the standing
+    /// detector for "prefault shipped but silently stopped firing" (it
+    /// went inert three separate, undetected ways before this). `None`
+    /// = backend has no per-sandbox prefault detector (VZ, process).
+    fn prefault_stats_path(&self, _id: SandboxId) -> Option<PathBuf> {
+        None
+    }
+
     /// ADR 0045 C2: what the source page server needs to read this
     /// sandbox's guest memory from outside: FC's pid (this process is
     /// its parent, so `process_vm_readv` is YAMA-legal) and the tmpfs

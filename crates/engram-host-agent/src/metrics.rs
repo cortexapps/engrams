@@ -188,6 +188,35 @@ pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lo
 /// after deploy would mean the skip path isn't exercised.
 pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";
 
+/// ADR 0019 / telemetry restoration (#526): the resume-prefault
+/// effectiveness detector. The uffd-handler writes a per-jail
+/// `prefault-stats.json` (sibling of `working-set-trace.json`) at the
+/// end of `prefault_from_trace` (and, for the no-trace case, from
+/// `main.rs` before the fault loop starts); `restore()` here reads it
+/// after a resume completes and increments this by `outcome`:
+/// - `replayed`: a trace was loaded and prefault ran (installed may
+///   still be 0 — see `PREFAULT_CHUNKS_TOTAL`).
+/// - `no_trace`: no working-set trace was requested/loaded for this
+///   resume (base image, migration dest, or publish never landed).
+/// - `stats_missing`: a trace WAS requested but the stats file isn't
+///   there at all — the alarm condition. This is the exact class of
+///   bug that went inert 3x silently (d0e5ecf3, cf6e4d32, 7c2a7226):
+///   the handler died, or the wiring silently didn't fire, and nothing
+///   said so until someone went looking weeks later.
+///
+/// Convergence note: `prefault-admission-control` (same overhaul) reuses
+/// this exact counter name/labels against its own superset gate-file
+/// schema — this crate must not introduce a parallel `engram_prefault_*`
+/// family alongside it.
+pub const RESUME_PREFAULT_TOTAL: &str = "engram_resume_prefault_total";
+
+/// Companion to [`RESUME_PREFAULT_TOTAL`]: per-chunk install outcome
+/// from the same `prefault-stats.json`, labeled `result` =
+/// `installed` | `skipped`. A `replayed` outcome with `installed == 0`
+/// is itself worth alarming on (trace loaded, but the session-manifest
+/// no longer needs any chunk it names — a stale/mismatched trace).
+pub const RESUME_PREFAULT_CHUNKS_TOTAL: &str = "engram_resume_prefault_chunks_total";
+
 /// Issue #539: histogram of how long each named `[warm]`-hook stage ran,
 /// labelled by `stage` (the hook-declared name — cardinality is bounded by
 /// however many distinct stage names the fleet's warm hooks emit) and
