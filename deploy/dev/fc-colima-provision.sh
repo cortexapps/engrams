@@ -175,9 +175,10 @@ udevadm control --reload-rules 2>/dev/null || true
 udevadm trigger --name-match=kvm 2>/dev/null || true
 
 # --- loopback forwarders: preserve the Mac dev stack's loopback literalism
-# (localhost:5001 image refs, STORAGE_EMULATOR_HOST=http://localhost:4443)
-# unmodified inside the VM by forwarding to the Lima host gateway (ADR 0068
-# "Networking" — VM -> Mac direction). ---
+# (localhost:5001 image refs, STORAGE_EMULATOR_HOST=http://localhost:4443,
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317) unmodified inside the VM
+# by forwarding to the Lima host gateway (ADR 0068 "Networking" — VM -> Mac
+# direction). The host-agent env uses these localhost:PORT values as-is. ---
 install_fwd_unit() {
     name="$1"
     listen_port="$2"
@@ -195,10 +196,11 @@ Restart=always
 WantedBy=multi-user.target
 UNIT
 }
-install_fwd_unit registry 5001 5001
-install_fwd_unit gcs 4443 4443
+install_fwd_unit registry 5001 5001   # OCI registry (image pulls)
+install_fwd_unit gcs 4443 4443        # fake-gcs-server (chunk store)
+install_fwd_unit jaeger 4317 4317     # OTLP/gRPC (ADR 0019 tracing)
 systemctl daemon-reload
-systemctl enable --now engram-fwd-registry.service engram-fwd-gcs.service
+systemctl enable --now engram-fwd-registry.service engram-fwd-gcs.service engram-fwd-jaeger.service
 
 # --- working dirs for the host-agent ---
 mkdir -p /opt/engram-dev/bin /opt/engram-dev/shared /opt/engram-dev/var
@@ -249,6 +251,7 @@ Provisioned inside the VM:
   - nbd loaded (nbds_max=16), vm.unprivileged_userfaultfd=1, /dev/kvm mode 0666 (persisted)
   - engram-fwd-registry.service (localhost:5001 -> 192.168.5.2:5001)
   - engram-fwd-gcs.service      (localhost:4443 -> 192.168.5.2:4443)
+  - engram-fwd-jaeger.service   (localhost:4317 -> 192.168.5.2:4317)
   - /opt/engram-dev/{bin,shared,var}
 
 Contract paths:
