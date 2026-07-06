@@ -8418,6 +8418,134 @@ mod tests {
         );
     }
 
+    /// Issue #539/#563 review: a stage's own `deadline_secs` must be
+    /// enforced even when the hook is chatty the whole time — continuous
+    /// heartbeats keep the STALL clock reset forever, so a pass here can
+    /// only be explained by the stage-deadline arm of the watchdog, not
+    /// the stall detector (which this test sets generously precisely to
+    /// rule it out). The resulting `SandboxError::CaptureFailed` must
+    /// carry the `WarmStageDeadline` kind, the open stage's name, and the
+    /// hook's own output in its tail; the same stage must also have
+    /// reached a live `CaptureProgress` event before the terminal
+    /// failure.
+    #[tokio::test]
+    async fn warm_hook_stage_deadline_fails_capture_with_stage_and_tail() {
+        use futures::StreamExt;
+
+        // SAFETY: see the stall test above — nextest gives every test its
+        // own process, so mutating process env here can't race a sibling
+        // test. Generous on purpose: this test proves the STAGE-DEADLINE
+        // path (1s, via the hook's own `deadline_secs=1`), not the stall
+        // backstop.
+        std::env::set_var("ENGRAM_WARM_STALL_SECS", "30");
+
+        struct ChattyStuckStageMock;
+        #[async_trait]
+        impl SandboxBackend for ChattyStuckStageMock {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn exec_stream(
+                &self,
+                id: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                use engram_core::types::sandbox::ExecEvent;
+                let start =
+                    "::engram-warm:: event=start stage=wedged-stage deadline_secs=1 msg=starting\n";
+                let heartbeat =
+                    "::engram-warm:: event=heartbeat stage=wedged-stage msg=still going\n";
+                let events =
+                    futures::stream::once(
+                        async move { ExecEvent::Stdout(bytes::Bytes::from(start)) },
+                    )
+                    .chain(futures::stream::unfold((), move |()| async move {
+                        // Fires far faster than both the 1s stage deadline and
+                        // the 30s stall budget above, so the stall clock never
+                        // comes close to expiring — only the stage deadline can
+                        // explain a failure here.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Some((ExecEvent::Stdout(bytes::Bytes::from(heartbeat)), ()))
+                    }));
+                Ok(ExecStream {
+                    sandbox_id: id,
+                    exec_id: "exec-stage-deadline".into(),
+                    events: Box::pin(events),
+                })
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                unreachable!(
+                    "a stage-deadline-killed [warm] hook must fail the capture before snapshot runs"
+                )
+            }
+            fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+                unreachable!()
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let inner: Arc<dyn SandboxBackend> = Arc::new(ChattyStuckStageMock);
+        let pooled = PooledBackend::new(inner);
+        let warm = WarmConfig {
+            command: vec!["true".into()],
+            // Generous global timeout: the test proves the STAGE DEADLINE
+            // path (1s, via the hook's own `deadline_secs=1`), not this
+            // backstop.
+            timeout_secs: Some(30),
+            workdir: None,
+            network: None,
+        };
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            pooled.build_base_snapshot(
+                live_spec("warm-stage-deadline"),
+                Some(warm),
+                Default::default(),
+                progress_tx,
+            ),
+        )
+        .await
+        .expect("must fail within the stage-deadline budget, not hang past the test timeout");
+
+        let Err(SandboxError::CaptureFailed(failure)) = result else {
+            panic!("expected a structured CaptureFailed error, got {result:?}");
+        };
+        assert_eq!(
+            failure.kind,
+            engram_core::types::CaptureFailureKind::WarmStageDeadline
+        );
+        assert_eq!(failure.stage.as_deref(), Some("wedged-stage"));
+        assert!(
+            failure.tail.contains("wedged-stage"),
+            "tail must carry the hook's own output: {}",
+            failure.tail
+        );
+
+        let mut saw_live_stage = false;
+        while let Ok(ev) = progress_rx.try_recv() {
+            if ev.warm_stage.as_deref() == Some("wedged-stage") {
+                saw_live_stage = true;
+            }
+        }
+        assert!(
+            saw_live_stage,
+            "expected a live CaptureProgress event naming the stage before the terminal failure"
+        );
+    }
+
     /// Review finding 5: a hook that streams newline-free output (gradle
     /// rich-console `\r` redraws, binary noise) must not grow
     /// `pending_stdout` unbounded — and, once the cap drops the
