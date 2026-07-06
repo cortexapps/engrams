@@ -19,7 +19,7 @@ pub(crate) mod forge;
 // registry doesn't exist anymore (the harness is an image property
 // baked at image-bake time).
 mod health;
-mod host_http;
+pub(crate) mod host_http;
 pub(crate) mod hosts;
 pub(crate) mod interrupt;
 pub(crate) mod prompt;

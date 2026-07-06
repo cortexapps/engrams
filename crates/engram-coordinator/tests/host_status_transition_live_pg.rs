@@ -63,6 +63,7 @@ fn host(id: HostId, hostname: &str, addr: &str) -> HostRecord {
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
+        stages_images: false,
         capabilities: engram_core::types::host::HostCapabilities::default(),
     }
 }
@@ -83,6 +84,7 @@ fn heartbeat(status: HostStatus) -> HostHeartbeat {
         current_bundles: Vec::new(),
         total_vcpus: 0,
         wire_version: 0,
+        stages_images: false,
         capabilities: engram_core::types::host::HostCapabilities::default(),
     }
 }

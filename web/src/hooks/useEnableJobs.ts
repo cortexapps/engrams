@@ -11,7 +11,8 @@ import type { EnableJob as ProtoEnableJob } from "../gen/engram/app/v1/image_pb"
 
 // ADR 0036: enabling an image is asynchronous. POST returns 202 with
 // an EnableJob; the coordinator's scanner drives the pipeline
-// (pending → materializing → capturing → ready | failed), updating
+// (pending → materializing → capturing → prestaging → ready | failed,
+// "prestaging" added by the ADR 0036 amendment / issue #538), updating
 // `chunks_done/chunks_total` as chunks materialize. This hook polls
 // the job list while anything is in flight — REAL progress from the
 // server, replacing the old wall-clock-driven stage guesser.
@@ -38,6 +39,7 @@ function protoEnableJobToLegacy(j: ProtoEnableJob): EnableJob {
     warm_stage: j.warmStage ?? null,
     warm_stage_started_at: j.warmStageStartedAt ?? null,
     output_tail: j.outputTail ?? null,
+    prestage_hosts: j.prestageHosts,
   };
 }
 

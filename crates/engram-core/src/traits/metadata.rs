@@ -1306,6 +1306,65 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    // ---- ADR 0036 amendment: fleet chunk prestage (issue #538) ----
+    //
+    // A fourth, non-terminal enable-job stage between `capturing` and
+    // `ready`: the scanner advertises the freshly-captured base snapshot
+    // as a `prestage_images` heartbeat-ack entry and waits for every
+    // eligible (`stages_images`) host to report the digest in
+    // `ready_images` before the `enabled_images` upsert makes it visible
+    // to session-create. See `docs/adr/0036-*.md`'s "prestage stage
+    // (interim)" amendment.
+
+    /// Stamp the wire-shape prestage ref (a JSON-encoded
+    /// `engram_protocol::heartbeat::EnabledImageRef` — this trait can't
+    /// depend on the protocol crate, so the caller serializes it) and flip
+    /// the job to `Prestaging` in ONE fenced write (renews the claim, same
+    /// as `set_enable_job_state`).
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    /// Returns [`MetaError::Conflict`] when the lease has moved on.
+    async fn begin_enable_job_prestage(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        prestage_ref: serde_json::Value,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant, prestage_ref);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Record the per-host prestage outcome map (`{"<host-uuid>":
+    /// {"outcome": "staged"|"timed_out"|"unschedulable", "waited_ms": u64}}`),
+    /// written once at the end of the prestage wait — the audit /
+    /// dashboard record.
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    /// Returns [`MetaError::Conflict`] when the lease has moved on.
+    async fn set_enable_job_prestage_hosts(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        outcomes: serde_json::Value,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant, outcomes);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// The `prestage_ref` of every job currently in `prestaging`, raw JSON
+    /// (the coordinator's heartbeat-ack builder deserializes each into
+    /// `engram_protocol::heartbeat::EnabledImageRef` — this trait doesn't
+    /// depend on the protocol crate, matching the existing dependency
+    /// direction rather than laundering a stringly type). Read on every
+    /// heartbeat ack; best-effort on the caller's side.
+    async fn list_prestaging_refs(&self) -> Result<Vec<serde_json::Value>, MetaError> {
+        Ok(Vec::new())
+    }
+
     // ---- session secrets ----
     //
     // Per-request `secrets` overrides supplied at session-create,

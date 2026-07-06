@@ -1459,6 +1459,13 @@ fn enable_job_to_json(job: &app::EnableJob) -> Value {
         "error": job.error,
         "created_at": job.created_at,
         "updated_at": job.updated_at,
+        // ADR 0036 amendment (issue #538): per-host prestage outcome map.
+        // Wire-encoded as a JSON string; parse it back to a nested object
+        // for `--json` output rather than double-encoding. Malformed
+        // (shouldn't happen — the server always writes valid JSON, "{}"
+        // by default) falls back to an empty object.
+        "prestage_hosts": serde_json::from_str::<Value>(&job.prestage_hosts)
+            .unwrap_or_else(|_| serde_json::json!({})),
     })
 }
 

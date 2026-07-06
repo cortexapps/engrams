@@ -735,6 +735,7 @@ mod tests {
             // placement filter. Tests that exercise the skew gate set this
             // to a concrete version explicitly.
             wire_version: 0,
+            stages_images: false,
             capabilities: engram_core::types::host::HostCapabilities::default(),
         }
     }

@@ -97,7 +97,9 @@ message EnableJob {
   // scanner re-pulls at materialize time). Unset until observed.
   optional string manifest_digest = 3;
   // EnableJobState, snake_case: "pending" | "materializing" |
-  // "capturing" | "ready" | "failed".
+  // "capturing" | "prestaging" | "ready" | "failed". ADR 0036 amendment
+  // (issue #538): "prestaging" is a new non-terminal value between
+  // "capturing" and "ready" — the fleet chunk-prestage wait.
   string state = 4;
   // Total chunks in the image's bootstrap; unset until the scanner has
   // pulled + parsed the artifact metadata.
@@ -124,6 +126,11 @@ message EnableJob {
   // ISO-8601.
   optional string warm_stage_started_at = 13;
   optional string output_tail = 14;
+  // ADR 0036 amendment (issue #538): per-host prestage outcome map,
+  // JSON-encoded (`{"<host-uuid>": {"outcome":
+  // "staged"|"timed_out"|"unschedulable", "waited_ms": <u64>}}`). `"{}"`
+  // until the prestage stage runs.
+  string prestage_hosts = 15;
 }
 
 message DisableImageRequest {

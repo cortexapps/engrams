@@ -548,6 +548,12 @@ pub struct HeartbeatRequest {
     /// gracefully instead of surfacing as 400 decode errors.
     #[serde(default)]
     pub wire_version: u32,
+    /// ADR 0036 amendment (issue #538): true iff this host's image-prefetch
+    /// supervisor is spawned. The coordinator's enable-scanner prestage
+    /// stage waits only on hosts reporting this bit — a fleet with zero
+    /// eligible staging hosts passes the stage vacuously.
+    #[serde(default)]
+    pub stages_images: bool,
     /// ADR 0068: this tick's re-probed capability vector.
     #[serde(default)]
     pub capabilities: engram_core::types::host::HostCapabilities,
@@ -563,6 +569,15 @@ pub struct HeartbeatResponse {
     /// ready.
     #[serde(default)]
     pub enabled_images: Vec<engram_protocol::heartbeat::EnabledImageRef>,
+    /// ADR 0036 amendment (issue #538): base-snapshot refs of images
+    /// currently `prestaging` on the coordinator. The host-agent's
+    /// heartbeat loop pushes the deduped union of this and `enabled_images`
+    /// into the prefetch supervisor's watch channel, so a host warms an
+    /// image BEFORE it's visible to session-create. `#[serde(default)]`:
+    /// an old coord's ack decodes as empty (no prestage work) — exactly
+    /// pre-fix behavior.
+    #[serde(default)]
+    pub prestage_images: Vec<engram_protocol::heartbeat::EnabledImageRef>,
     /// ADR 0035 §5: the coord's bundle pin set (every generation some
     /// snapshot row references). The host's bundle supervisor
     /// prefetches missing pinned generations and sweeps staged files
@@ -742,6 +757,7 @@ mod tests {
             utilization: Default::default(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
+            stages_images: false,
             capabilities: Default::default(),
         };
         let v = serde_json::to_value(&req).unwrap();

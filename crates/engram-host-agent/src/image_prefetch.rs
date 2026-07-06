@@ -192,6 +192,31 @@ impl ImageReadiness {
     }
 }
 
+/// ADR 0036 amendment (issue #538): the deduped union of `enabled_images`
+/// and `prestage_images` from a heartbeat ack — what the supervisor
+/// actually watches (fed into `enabled_images_tx`). The supervisor itself
+/// needs zero changes: from its point of view a prestaging image is just
+/// another enabled image to warm, pin, and report ready; the coordinator's
+/// enable scanner is the one reading `ready_images` back out during the
+/// wait. Pure so it's unit-testable without a live watch channel — dedup by
+/// `manifest_digest`, `enabled` entries winning ties (their manifests are
+/// authoritative once an image is live; identical digests carry identical
+/// manifests anyway, so which copy wins is never observable in practice).
+pub fn union_image_refs(
+    enabled: &[EnabledImageRef],
+    prestaging: &[EnabledImageRef],
+) -> Vec<EnabledImageRef> {
+    let mut seen: HashSet<ManifestDigest> =
+        HashSet::with_capacity(enabled.len() + prestaging.len());
+    let mut out = Vec::with_capacity(enabled.len() + prestaging.len());
+    for r in enabled.iter().chain(prestaging.iter()) {
+        if seen.insert(r.manifest_digest.clone()) {
+            out.push(r.clone());
+        }
+    }
+    out
+}
+
 /// Concurrency cap on in-flight chunk fetches, applied across all
 /// images this host is prefetching. 16 permits ~ 400 MiB in flight
 /// at the default 25 MiB chunk size — leaves 10 Gbps NIC headroom
@@ -928,6 +953,54 @@ mod tests {
         r.mark_unready(&d);
         assert!(!r.contains(&d));
         assert!(r.snapshot().is_empty());
+    }
+
+    fn ref_with_digest(digest: &str) -> EnabledImageRef {
+        EnabledImageRef {
+            image_uri: format!("localhost:5001/demo:{digest}"),
+            manifest_digest: ManifestDigest::new(digest.to_string()),
+            base_snapshot_id: SnapshotId::new(),
+            base_snapshot_disk_manifest: ManifestRef {
+                manifest_id: uuid::Uuid::new_v4(),
+                version: 1,
+            },
+            base_snapshot_memory_manifest: None,
+        }
+    }
+
+    // ADR 0036 amendment (issue #538): `union_image_refs` is what the
+    // host-agent's heartbeat loop feeds the prefetch supervisor's watch
+    // channel — it must dedup by digest (an image that flips
+    // prestaging → enabled between two heartbeats must not appear twice)
+    // and must include every digest from EITHER side.
+    #[test]
+    fn union_image_refs_dedups_by_digest() {
+        let shared = ref_with_digest("sha256:shared");
+        let only_enabled = ref_with_digest("sha256:enabled-only");
+        let only_prestaging = ref_with_digest("sha256:prestage-only");
+
+        let enabled = vec![shared.clone(), only_enabled.clone()];
+        let prestaging = vec![shared.clone(), only_prestaging.clone()];
+
+        let union = union_image_refs(&enabled, &prestaging);
+        let digests: std::collections::HashSet<_> =
+            union.iter().map(|r| r.manifest_digest.clone()).collect();
+        assert_eq!(union.len(), 3, "3 distinct digests, shared one deduped");
+        assert!(digests.contains(&shared.manifest_digest));
+        assert!(digests.contains(&only_enabled.manifest_digest));
+        assert!(digests.contains(&only_prestaging.manifest_digest));
+    }
+
+    #[test]
+    fn union_image_refs_empty_inputs_is_empty() {
+        assert!(union_image_refs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn union_image_refs_prestaging_only() {
+        let r = ref_with_digest("sha256:only-prestaging");
+        let union = union_image_refs(&[], std::slice::from_ref(&r));
+        assert_eq!(union, vec![r]);
     }
 
     #[test]

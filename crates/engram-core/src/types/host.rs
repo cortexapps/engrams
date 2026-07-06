@@ -363,6 +363,15 @@ pub struct HostRecord {
     /// allocatable.
     #[serde(default)]
     pub wire_version: u32,
+    /// ADR 0036 amendment (issue #538): true iff this host-agent runs the
+    /// image-prefetch supervisor (`chunk_store` + `chunk_cache` configured —
+    /// production/VZ hosts; Process-backend dev hosts lack both and never
+    /// spawn it). The enable scanner's prestage stage waits only on hosts
+    /// with this bit; a fleet with zero eligible staging hosts passes the
+    /// stage vacuously. `#[serde(default)]` → `false` for pre-migration rows
+    /// (the exempt, safe posture). Migration 0081.
+    #[serde(default)]
+    pub stages_images: bool,
     /// ADR 0068: the host's self-verified capability vector, from the
     /// most recent register/heartbeat (migration 0080). `schema == 0`
     /// for pre-0068 rows / hosts mid-roll — soft-tolerated by the
@@ -387,6 +396,9 @@ pub struct HostHeartbeat {
     pub total_vcpus: u32,
     /// Issue #229: the host-agent's bincode `WIRE_VERSION` this tick.
     pub wire_version: u32,
+    /// ADR 0036 amendment (issue #538): whether this host's image-prefetch
+    /// supervisor is spawned — see [`HostRecord::stages_images`].
+    pub stages_images: bool,
     /// ADR 0068: this tick's re-probed capability vector.
     pub capabilities: HostCapabilities,
 }
