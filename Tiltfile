@@ -541,6 +541,12 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # exercisable here for the first time (still opt-in via
         # ENGRAM_FC_RESTORE_MODE=uffd; the dev default stays `file`).
         env['ENGRAM_FC_UFFD_HANDLER_BIN'] = '/opt/engram-dev/bin/engram-uffd-handler'
+        # The idle-evict disk-pressure floor defaults to 20 GiB — LARGER than
+        # the fc-dev VM's ~19 GiB rootfs, so free disk can never exceed it and
+        # idle eviction would be permanently paused ("disk pressure (free <
+        # floor)"), never reclaiming space on a small dev VM. Drop it to 3 GiB
+        # so eviction actually runs and keeps the VM from filling.
+        env['ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES'] = '3221225472'
         # No KEK / egress-CA material crosses the VM boundary: the
         # host-agent never reads ENGRAM_KEK_MASTER_KEY (coordinator/
         # orchestrator only — grep confirms no reference in
@@ -606,10 +612,17 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
             colima + ' ssh --profile ' + fc_colima_profile +
             ' -- tar xf - -C /opt/engram-dev/bin'
         )
-        # /opt/engram-dev/shared is created by fc-colima-provision.sh, so the
-        # remote side is a lone `tar xf` (no mkdir &&).
+        # Sync ONLY current.json + the squashfs it references — NOT all of
+        # var/shared. That dir also accumulates stale generations and (from
+        # VZ `just dev` runs) large .erofs bundles the FC guest can't even
+        # mount; `tar -C var/shared .` copied all of it (~9 GiB of erofs) into
+        # the VM and filled its disk. Derive the file list from current.json's
+        # shas at runtime. (/opt/engram-dev/shared is pre-created by
+        # fc-colima-provision.sh, so the remote side is a lone `tar xf`.)
         sync_bundle_cmd = (
-            'COPYFILE_DISABLE=1 tar --no-xattrs -cf - -C ' + _bundle_dir + ' . | ' +
+            'COPYFILE_DISABLE=1 tar --no-xattrs -cf - -C ' + _bundle_dir +
+            " current.json $(grep -oE '[0-9a-f]{64}' " + _bundle_dir +
+            "/current.json | sed 's/$/.squashfs/') | " +
             colima + ' ssh --profile ' + fc_colima_profile +
             ' -- tar xf - -C /opt/engram-dev/shared'
         )

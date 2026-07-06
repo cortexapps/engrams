@@ -242,6 +242,13 @@ fc-colima-provision profile='fc-dev':
 #      `<sandbox>.rootfs.ext4` (+ its vsock sockets) NOT owned by a session
 #      that is still live — the live set is re-read AFTER stage 1, so a
 #      session created concurrently is never swept.
+#   3. Prune stale RO skill bundles in var/shared: any `<sha>.{erofs,squashfs}`
+#      NOT referenced by the live `current.json` stamp. Old generations pile up
+#      on every re-bundle, and a VZ→FC backend switch strands the ENTIRE .erofs
+#      set (VZ stages erofs; FC stages squashfs and can't mount erofs) — that
+#      alone was ~9 GiB. When ENGRAM_FC_COLIMA_PROFILE is set (ADR 0068) the
+#      same prune runs inside the VM's /opt/engram-dev/shared, where the synced
+#      bundles actually consume the small VM disk.
 #
 # Checkpoints (snapshots) are reclaimed by the coordinator's snapshot/chunk
 # GC once their owning sessions are gone; the warm-pool base snapshot an
@@ -303,6 +310,38 @@ reap-sessions:
         swept=$((swept+1))
     done
     echo "swept $swept orphaned sandbox rootfs file(s)."
+    # 3. Prune stale RO skill bundles (var/shared): <sha>.{erofs,squashfs} not
+    #    referenced by current.json. Keeps the download cache (.cache) and the
+    #    hidden .*.build.* / .*.stage temp entries (dotfiles don't match the
+    #    non-dot globs below). No current.json -> nothing is "live", so skip
+    #    rather than nuke the lot.
+    prune_bundles() {  # prune_bundles <dir>   (runs on the Mac; var/shared)
+        local d="$1" keep sha f pruned=0
+        [ -f "$d/current.json" ] || { echo "  ($d: no current.json — skip)"; return 0; }
+        keep="$(grep -oE '[0-9a-f]{64}' "$d/current.json" | sort -u)"
+        shopt -s nullglob
+        for f in "$d"/*.erofs "$d"/*.squashfs; do
+            sha="$(basename "$f")"; sha="${sha%.*}"
+            printf '%s\n' "$keep" | grep -qx "$sha" && continue
+            rm -f "$f"; pruned=$((pruned+1))
+        done
+        echo "  pruned $pruned stale bundle(s) from $d"
+    }
+    echo "==> pruning stale skill bundles (var/shared)"
+    before_shared_kb="$(dir_kb var/shared)"
+    prune_bundles var/shared
+    after_shared_kb="$(dir_kb var/shared)"
+    shared_freed=$(( before_shared_kb > after_shared_kb ? before_shared_kb - after_shared_kb : 0 ))
+    [ "$shared_freed" -gt 0 ] && echo "  reclaimed $(human_kb "$shared_freed") from var/shared."
+    # ADR 0068: the synced bundles live on the small fc-colima VM disk — prune
+    # the VM's /opt/engram-dev/shared the same way. The prune runs from a
+    # helper piped to `sudo bash -s` over stdin (NOT a heredoc: an unindented
+    # heredoc terminator would break `just`'s recipe indentation, and colima
+    # ssh doesn't run remote args through a shell anyway).
+    if [ -n "${ENGRAM_FC_COLIMA_PROFILE:-}" ] && command -v colima >/dev/null 2>&1; then
+        echo "==> pruning stale bundles inside the fc-colima VM ($ENGRAM_FC_COLIMA_PROFILE)"
+        colima ssh --profile "$ENGRAM_FC_COLIMA_PROFILE" -- sudo bash -s < deploy/dev/reap-vm-bundles.sh
+    fi
     after_kb="$(dir_kb "$sandboxes_dir")"; after_kb="${after_kb:-0}"
     reclaimed_kb=$(( before_kb > after_kb ? before_kb - after_kb : 0 ))
     if [ "$reclaimed_kb" -gt 0 ]; then
