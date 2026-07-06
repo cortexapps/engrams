@@ -15,10 +15,20 @@
 //! comes from `statvfs(2)` (Linux + macOS); memory and CPU come from
 //! `/proc` and read as 0 on non-Linux, where the fleet view simply
 //! renders an empty bar.
+//!
+//! Issue #540: the memory figures (`mem_total_mib`, `mem_used_mib`,
+//! `allocatable_mib`, and the RAM-ledger attribution fields) are no
+//! longer read here directly — this module only samples disk + CPU
+//! and PROJECTS the heartbeat tick's [`crate::ram_ledger::RamLedgerSnapshot`]
+//! into `HostUtilization`'s memory fields, so there is exactly one
+//! `/proc/meminfo` read per tick (`ram_ledger.rs`), shared with the
+//! idle-evictor's pressure gate.
 
 use std::path::Path;
 
 use engram_core::types::host::HostUtilization;
+
+use crate::ram_ledger::RamLedgerSnapshot;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -88,29 +98,29 @@ impl UtilizationProbe {
         Self::default()
     }
 
-    /// Sample disk (for `work_dir`), memory, and CPU. The first call
-    /// returns `cpu_pct = 0` because there's no prior sample to diff
-    /// against; subsequent calls report utilization over the interval
-    /// since the previous call.
-    pub fn sample(&mut self, work_dir: &Path, guest_pss_mib: u64) -> HostUtilization {
+    /// Sample disk (for `work_dir`) and CPU, and fold in the RAM
+    /// figures the heartbeat tick already sampled into `ledger` — one
+    /// `RamLedgerSnapshot` per tick, so this probe's numbers and the
+    /// idle-evictor's pressure gate can never disagree (issue #540).
+    /// The first call returns `cpu_pct = 0` because there's no prior
+    /// sample to diff against; subsequent calls report utilization
+    /// over the interval since the previous call.
+    pub fn sample(&mut self, work_dir: &Path, ledger: &RamLedgerSnapshot) -> HostUtilization {
         let (disk_total_mib, disk_used_mib) = self.sample_disk(work_dir);
-        let (mem_total_mib, mem_used_mib) = mem_mib();
         let cpu_pct = self.cpu_pct();
-        // ADR 0046: allocatable = MemAvailable + Σ guest-resident (PSS).
-        // MemAvailable (= mem_total − mem_used) already nets out the daemon, OS,
-        // chunk cache, and the mlock'd base-memfile residency; adding back the
-        // running VMs' resident memory lets placement subtract each session's
-        // FULL budget without double-counting what the VMs already occupy.
-        let allocatable_mib = mem_total_mib
-            .saturating_sub(mem_used_mib)
-            .saturating_add(guest_pss_mib);
         HostUtilization {
             disk_total_mib,
             disk_used_mib,
-            mem_total_mib,
-            mem_used_mib,
-            allocatable_mib,
+            mem_total_mib: ledger.mem_total_mib,
+            mem_used_mib: ledger
+                .mem_total_mib
+                .saturating_sub(ledger.mem_available_mib),
+            allocatable_mib: ledger.allocatable_mib(),
             cpu_pct,
+            base_shm_mib: ledger.base_shm_mib,
+            base_shm_pending_mib: ledger.base_shm_pending_mib,
+            parked_pss_mib: ledger.parked_paused_pss_mib,
+            running_pss_mib: ledger.running_vm_pss_mib,
         }
     }
 
@@ -322,13 +332,41 @@ mod tests {
     #[test]
     fn first_cpu_sample_is_zero_then_subsequent_are_bounded() {
         let mut probe = UtilizationProbe::new();
+        let ledger = RamLedgerSnapshot::default();
         // First sample establishes the baseline → 0 regardless of platform.
-        let first = probe.sample(Path::new("."), 0);
+        let first = probe.sample(Path::new("."), &ledger);
         assert_eq!(first.cpu_pct, 0.0);
         // Second sample must stay within [0, 100] on every platform
         // (0 on non-Linux where there's no /proc).
-        let second = probe.sample(Path::new("."), 0);
+        let second = probe.sample(Path::new("."), &ledger);
         assert!((0.0..=100.0).contains(&second.cpu_pct));
+    }
+
+    #[test]
+    fn sample_derives_utilization_from_the_ledger_snapshot() {
+        // Issue #540: `sample` must be a pure projection of the
+        // `RamLedgerSnapshot` it's handed — no independent meminfo read.
+        let mut probe = UtilizationProbe::new();
+        let ledger = RamLedgerSnapshot {
+            measured: true,
+            mem_total_mib: 64_000,
+            mem_available_mib: 40_000,
+            running_vm_pss_mib: 10_000,
+            parked_paused_pss_mib: 12_000,
+            base_shm_mib: 5_000,
+            base_shm_pending_mib: 1_000,
+            base_shm_tmpfs_used_mib: 5_000,
+            base_shm_tmpfs_total_mib: 32_000,
+            parked_local_memfile_mib: 0,
+        };
+        let u = probe.sample(Path::new("."), &ledger);
+        assert_eq!(u.mem_total_mib, 64_000);
+        assert_eq!(u.mem_used_mib, 24_000);
+        assert_eq!(u.allocatable_mib, ledger.allocatable_mib());
+        assert_eq!(u.base_shm_mib, 5_000);
+        assert_eq!(u.base_shm_pending_mib, 1_000);
+        assert_eq!(u.parked_pss_mib, 12_000);
+        assert_eq!(u.running_pss_mib, 10_000);
     }
 
     #[cfg(target_os = "linux")]

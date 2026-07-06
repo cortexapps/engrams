@@ -579,11 +579,23 @@ function summarizePrestageHosts(raw: string): string | null {
 function EnableJobRow({ job }: { job: EnableJob }) {
   const retry = useRetryEnableJob();
   const failed = job.state === "failed";
+  const capturing = job.state === "capturing";
   const pct =
     job.chunks_total && job.chunks_total > 0
       ? Math.min(100, Math.round((job.chunks_done / job.chunks_total) * 100))
       : null;
   const prestageSummary = summarizePrestageHosts(job.prestage_hosts);
+
+  // Issue #539: while capturing, show the live capture_phase/warm_stage
+  // instead of a frozen progress bar — the operator-facing fix for a
+  // dev-brain enable that used to look identically "capturing" for the
+  // full 10-33 min [warm] hook with zero visibility into what it was
+  // doing. On a failed job, `output_tail` is the [warm] hook's last
+  // 16 KiB of stdout+stderr — no host-log access required to diagnose.
+  const captureDetail =
+    capturing && (job.capture_phase || job.warm_stage)
+      ? [job.capture_phase, job.warm_stage].filter(Boolean).join(" · ")
+      : null;
 
   return (
     <li>
@@ -597,6 +609,11 @@ function EnableJobRow({ job }: { job: EnableJob }) {
                 ? ` · ${job.chunks_done}/${job.chunks_total} chunks`
                 : ""}
             </Badge>
+            {captureDetail && (
+              <Badge variant="outline" className="font-mono font-normal">
+                {captureDetail}
+              </Badge>
+            )}
             {prestageSummary && (
               <Badge variant="outline" className="font-normal">
                 {prestageSummary}
@@ -619,6 +636,16 @@ function EnableJobRow({ job }: { job: EnableJob }) {
           </div>
           {pct !== null && !failed && <Progress value={pct} className="h-1 max-w-md" />}
           {failed && job.error && <p className="text-xs text-destructive">{job.error}</p>}
+          {failed && job.warm_stage && (
+            <p className="text-xs text-muted-foreground">
+              failed at [warm] stage <span className="font-mono">{job.warm_stage}</span>
+            </p>
+          )}
+          {failed && job.output_tail && (
+            <pre className="max-h-40 overflow-y-auto rounded bg-muted p-2 text-xs whitespace-pre-wrap">
+              {job.output_tail}
+            </pre>
+          )}
         </CardContent>
       </Card>
     </li>

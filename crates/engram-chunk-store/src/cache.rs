@@ -92,6 +92,27 @@ use crate::manifest::ChunkHash;
 /// Default populate-path sweep debounce (see `write_local`).
 pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
 
+/// ADR 0019 / telemetry restoration (#526), review finding 7: the
+/// peer-vs-GCS cache-fill counter, labeled `source="gcs"|"peer"`. This
+/// is the baseline meter for epic-gcs-free-resume's "GCS-free by
+/// policy" claim, so both fill sources must agree on the exact metric
+/// name — a typo in either literal would silently fork the series.
+///
+/// - `source="gcs"`: incremented here, in [`ChunkCache::get`]'s
+///   leader-persist arm, only when `write_local` actually landed the
+///   fetched bytes on disk (a `write_local` failure means the fetch
+///   happened but the cache did NOT fill — see the `write_local`
+///   error-handling comment just above the increment site).
+/// - `source="peer"`: incremented by `engram-host-agent::pooled_backend`
+///   at the two loops that land migration-sourced chunks into this same
+///   cache via [`ChunkCache::put_no_evict`] (the prestage loop and the
+///   `pull_chunks_from_source` divergence pull).
+pub const CHUNK_FILL_TOTAL: &str = "engram_chunk_fill_total";
+
+/// Byte-counted companion to [`CHUNK_FILL_TOTAL`]. Same `source` label,
+/// same two call sites (one here, one in `engram-host-agent`).
+pub const CHUNK_FILL_BYTES_TOTAL: &str = "engram_chunk_fill_bytes_total";
+
 /// Configuration for the on-disk cache.
 ///
 /// Eviction is governed by two independent constraints, whichever bites
@@ -621,7 +642,21 @@ impl ChunkCache {
         // populate; trust on read. (Atomic temp+rename means a present file is
         // never torn; post-write bit-rot is left to PD/local-SSD durability.)
         let path = self.path_for(hash);
-        if let Some(bytes) = read_if_present(&path).await? {
+        // ADR 0019 / telemetry restoration (#526): NVMe-tier hit latency was
+        // previously unmeasured — `engram_chunk_fetch_seconds` only had a
+        // `blobstorage` arm (the miss path below), so there was no signal
+        // for "the fast tier got slow" (a saturated NVMe device, ext4
+        // fragmentation, etc). Time the read regardless of hit/miss; a miss
+        // here is a fast negative stat (no file), not a meaningful latency
+        // sample, so only record on a hit.
+        let nvme_read_start = std::time::Instant::now();
+        let nvme_read = read_if_present(&path).await?;
+        if let Some(bytes) = nvme_read {
+            metrics::histogram!(
+                "engram_chunk_fetch_seconds",
+                "tier" => "nvme",
+            )
+            .record(nvme_read_start.elapsed().as_secs_f64());
             // ADR 0014 M1.15: local NVMe hit. Don't differentiate
             // singleflight-piggyback from true cache hit here —
             // the user-visible win is the same.
@@ -729,20 +764,53 @@ impl ChunkCache {
                     // isn't cached, so every later read re-fetches from GCS —
                     // which presents exactly as "warming ran but reads still
                     // miss". Surface it loudly rather than swallowing (`let _ =`).
-                    if let Err(e) = self.write_local(hash, bytes).await {
-                        tracing::warn!(
-                            hash = %hash,
-                            root = %self.inner.config.root.display(),
-                            bytes = bytes.len(),
-                            error = %e,
-                            "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
-                        );
-                    }
+                    let write_local_ok = match self.write_local(hash, bytes).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                hash = %hash,
+                                root = %self.inner.config.root.display(),
+                                bytes = bytes.len(),
+                                error = %e,
+                                "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
+                            );
+                            false
+                        }
+                    };
+                    // This measures the fetch (bytes pulled from
+                    // BlobStorage), not the fill — it stays unconditional
+                    // even when write_local below fails.
                     metrics::counter!(
                         "engram_chunk_cache_bytes_total",
                         "tier" => "blobstorage",
                     )
                     .increment(bytes.len() as u64);
+                    // ADR 0019 / telemetry restoration (#526), review finding
+                    // 4: the baseline meter for epic-gcs-free-resume's
+                    // "GCS-free by policy" claim — every chunk that fills the
+                    // local cache from BlobStorage (as opposed to a
+                    // peer-fill, recorded at the host-agent's MigrationFetch
+                    // destination pull loops) counts here. `source="gcs"`
+                    // names the fetch backend this closure resolves to in
+                    // practice (BlobStorage is GCS in every deployed
+                    // configuration); a non-GCS BlobStorage impl would still
+                    // be the correct label for "the cold tier", not a peer.
+                    // Gated on `write_local_ok`: a fetch whose local persist
+                    // failed did NOT fill the cache — counting it here would
+                    // mask exactly the "warming ran but reads still miss"
+                    // state the write_local warning above exists to catch.
+                    if write_local_ok {
+                        metrics::counter!(
+                            CHUNK_FILL_TOTAL,
+                            "source" => "gcs",
+                        )
+                        .increment(1);
+                        metrics::counter!(
+                            CHUNK_FILL_BYTES_TOTAL,
+                            "source" => "gcs",
+                        )
+                        .increment(bytes.len() as u64);
+                    }
                 }
                 // Notify waiters. Send-failure (their rx dropped)
                 // is benign.
@@ -973,6 +1041,20 @@ impl ChunkCache {
     /// that want to control exactly when a sweep happens call
     /// [`Self::sweep`] directly instead of racing a background timer.
     ///
+    /// Deliberately does NOT sweep at t=0: `tokio::time::interval`'s
+    /// first tick fires immediately, but on a freshly-started host-agent
+    /// pins are in-memory only and haven't been re-established yet (the
+    /// image-prefetch supervisor's reconcile needs a coordinator RPC
+    /// round-trip after registration). A t=0 sweep on a restarted host
+    /// with an over-budget cache would run pin-blind and evict the
+    /// oldest-mtime chunks — exactly the boot-staged base-image chunks
+    /// that were pinned in the prior life — flapping readiness and
+    /// re-fetching from GCS on every rollout of a host that happens to
+    /// sit at or over budget. The first sweep waits one full `interval`
+    /// instead, giving the pin set a chance to repopulate first; the
+    /// populate-path debounced sweep (`sweep_debounce_ms`) still bounds
+    /// growth from writes in the meantime.
+    ///
     /// Mirrors `base_shm_gc::spawn`'s held-handle pattern: the caller
     /// keeps the returned handle alive for the process lifetime (dropping
     /// or aborting it stops the sweeper).
@@ -985,6 +1067,11 @@ impl ChunkCache {
             }
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Consume the immediate t=0 tick without sweeping — see the
+            // doc comment above. Every tick after this one is spaced a
+            // full `interval` apart, so the first real sweep lands at
+            // t=interval, not t=0.
+            tick.tick().await;
             loop {
                 tick.tick().await;
                 if let Err(e) = cache.sweep().await {
@@ -1525,6 +1612,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body0_actual.len(), 4 * 1024);
+    }
+
+    /// ADR 0019 / telemetry restoration (#526): `get`'s NVMe-hit arm now
+    /// times `read_if_present` (`engram_chunk_fetch_seconds{tier="nvme"}`)
+    /// before returning — this must be pure instrumentation, not a
+    /// semantic change. Round-trip a chunk through a genuine miss (fetcher
+    /// fires, bytes land via `write_local`) and then a genuine NVMe hit
+    /// (fetcher must NOT fire again), and assert both arms still return the
+    /// exact, hash-verified bytes.
+    #[tokio::test]
+    async fn nvme_hit_latency_timing_does_not_change_returned_bytes() {
+        let (cache, store, _b, _c) = setup(1024 * 1024 * 1024).await;
+        let body = vec![7u8; 8 * 1024];
+        let hash = store.put_chunk(&body).await.unwrap();
+
+        // Miss: fetcher fires, populates the local cache.
+        let via_miss = cache_get_from(&cache, &store, hash).await.unwrap();
+        assert_eq!(via_miss.as_ref(), body.as_slice());
+        assert!(
+            cache.contains(hash).await,
+            "chunk must be cached after the miss fetch"
+        );
+
+        // Hit: must return the SAME verified bytes via the now-timed
+        // read_if_present path, and must NOT re-invoke the fetcher.
+        let via_hit = cache
+            .get(hash, || async {
+                panic!("fetcher must not fire on an NVMe cache hit");
+                #[allow(unreachable_code)]
+                Ok(Bytes::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(via_hit.as_ref(), body.as_slice());
     }
 
     /// Regression: two `ChunkCache`s over the SAME cache_root — modeling
@@ -2487,6 +2608,48 @@ mod tests {
         assert!(
             !cache.contains(ha).await,
             "the periodic sweeper must evict the over-budget chunk with zero populate traffic",
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_sweeper_does_not_sweep_at_t_zero() {
+        // Regression for the cold-boot pin race: `tokio::time::interval`'s
+        // first tick fires immediately, but at t=0 a freshly-started
+        // host-agent hasn't re-established its pin set yet (that needs a
+        // coordinator RPC round-trip). An immediate sweep would run
+        // pin-blind and evict whatever happens to be oldest — on a real
+        // host, the boot-staged base-image chunks pinned in the prior
+        // life. The sweeper must wait a full interval before its FIRST
+        // sweep, giving the pin set time to repopulate.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: 1, // any populated chunk at all is "over"
+                sweep_debounce_ms: i64::MAX,
+                eviction_enabled: true,
+            },
+            0.0,
+        );
+        let a = b"aaaaaaaaaa";
+        let ha = ChunkHash::of(a);
+        cache.put_no_evict(ha, a).await.unwrap();
+
+        let handle = cache.spawn_sweeper(std::time::Duration::from_millis(200));
+        // Well before the first interval elapses: the chunk must still
+        // be there — a t=0 sweep would have evicted it immediately.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            cache.contains(ha).await,
+            "the sweeper must not evict on its immediate t=0 tick",
+        );
+        // Past the first interval: the (now real) first sweep must have
+        // run and enforced the budget.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.abort();
+        assert!(
+            !cache.contains(ha).await,
+            "the sweeper must still enforce the budget once the first real interval elapses",
         );
     }
 

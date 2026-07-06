@@ -278,12 +278,22 @@ impl From<MetaError> for AdvanceError {
 }
 
 /// Classify a base-snapshot capture failure. `ApiError::Unavailable` is the
-/// capture-host picker's `NoCapacity` — transient, retry. Everything else
-/// from capture (`ApiError::Internal`: a `[warm]` hook non-zero exit, a
-/// snapshot that failed HEAD-verify, …) is deterministic — bail fast.
+/// capture-host picker's `NoCapacity` — transient, retry.
+///
+/// Issue #539: `ApiError::CaptureFailed` carries a `CaptureFailureKind` —
+/// only `WarmExecTransport` (the exec stream died mid-run, e.g. a vsock/
+/// gRPC connection loss) is retryable via the attempts budget; every other
+/// kind (`WarmExitNonZero`/`WarmStall`/`WarmStageDeadline`/
+/// `WarmGlobalTimeout`/`SnapshotFailed`) is a deterministic outcome that
+/// retrying can't fix — bail fast on the first occurrence, same as the old
+/// blanket `ApiError::Internal` treatment (a `[warm]` hook non-zero exit,
+/// a snapshot that failed HEAD-verify, …).
 fn classify_capture_error(e: crate::error::ApiError) -> AdvanceError {
     match e {
         crate::error::ApiError::Unavailable(_) => AdvanceError::Pipeline(Box::new(e)),
+        crate::error::ApiError::CaptureFailed { kind, .. } if kind.is_retryable() => {
+            AdvanceError::Pipeline(Box::new(e))
+        }
         other => AdvanceError::NonRetryable(Box::new(other)),
     }
 }
@@ -392,40 +402,51 @@ async fn advance_one(
         .meta
         .set_enable_job_state(job_id, claimant, EnableJobState::Capturing)
         .await?;
-    // Renew the claim lease throughout the capture. `build_base_snapshot` is a
-    // single long host call; for a `[warm]`-hook image the warm boot + snapshot
-    // upload run tens of minutes — far past `lease_secs`. The materialize ticker
-    // is already aborted, so without renewal here the lease expires mid-capture
-    // and a peer re-claims, spawning a SECOND concurrent capture (host
-    // contention + wasted work). Progress is static now (materialize is done),
-    // so the ticker re-writes the final `done` count purely to renew the lease.
-    let capture_ticker = {
+    // Issue #539: `build_base_snapshot` now streams `CaptureProgress` at
+    // least every 30s (host keepalive) for the whole capture, so THIS
+    // replaces the old blind lease-renewal ticker (deleted — it used to
+    // re-write the static `done` count purely to keep the claim alive):
+    // every progress write doubles as the renewal
+    // (`update_enable_job_capture_progress` bumps `claimed_at`), so a
+    // `[warm]`-hook capture that runs tens of minutes past `lease_secs`
+    // still holds its claim — and renewals stop exactly when the stream
+    // dies (a transport failure), letting a peer legitimately re-claim
+    // instead of racing a still-healthy owner.
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::channel::<engram_core::types::CaptureProgress>(64);
+    let progress_consumer = {
         let meta = state.services.meta.clone();
-        let interval = cfg.progress_interval;
         let claimant = claimant.to_string();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.tick().await;
-            loop {
-                tick.tick().await;
+            while let Some(event) = progress_rx.recv().await {
                 match meta
-                    .update_enable_job_progress(job_id, &claimant, done, None)
+                    .update_enable_job_capture_progress(job_id, &claimant, &event)
                     .await
                 {
                     Ok(()) => {}
                     Err(MetaError::Conflict(msg)) => {
-                        tracing::warn!(%job_id, reason = %msg, "enable capture lease lost; stopping renewal ticker");
+                        tracing::warn!(%job_id, reason = %msg, "enable capture progress write lost the lease; abandoning to peer");
                         break;
                     }
                     Err(e) => {
-                        tracing::debug!(%job_id, error = %e, "enable capture lease renewal failed");
+                        tracing::debug!(%job_id, error = %e, "enable capture progress write failed");
                     }
                 }
             }
         })
     };
-    let capture_result = capture_and_record_base_snapshot(state, &row, &manifest).await;
-    capture_ticker.abort();
+    let capture_result =
+        capture_and_record_base_snapshot(state, &row, &manifest, progress_tx).await;
+    // `capture_and_record_base_snapshot` returning means every `Sender`
+    // clone it (or the host RPC underneath it) held has been dropped —
+    // awaiting the consumer here guarantees every progress event,
+    // INCLUDING the very last one written right before a failure, is
+    // persisted before we act on `capture_result`. This is load-bearing
+    // for the "failing stage + tail survive a WarmExecTransport kill"
+    // acceptance criterion: `record_enable_job_failure` (below) never
+    // touches these columns itself — it relies on this write having
+    // already landed.
+    let _ = progress_consumer.await;
     let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
         capture_result.map_err(classify_capture_error)?;
     row.base_snapshot_id = Some(base_snapshot_id);
@@ -841,6 +862,7 @@ mod tests {
             total_vcpus: 0,
             wire_version: 0,
             stages_images: true,
+            capabilities: Default::default(),
         }
     }
 

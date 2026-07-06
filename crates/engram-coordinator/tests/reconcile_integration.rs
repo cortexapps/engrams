@@ -96,6 +96,7 @@ impl ReconcileMeta {
             recoverable,
             aux_bundles: vec![],
             events_cursor: None,
+            fc_snapshot_version: None,
         };
         self.snapshots.lock().entry(session).or_default().push(snap);
     }
@@ -746,4 +747,163 @@ async fn reconcile_invalidates_host_registry_cache_on_host_lost() {
         Some(host),
         "the alive sandbox's cache row must survive — selective per-sandbox invalidation"
     );
+}
+
+/// ADR 0068 probe-before-host_lost: a mock `HostClient` whose
+/// `probe_sandbox` answers on demand — every other method is
+/// `unreachable!()`, since reconcile only ever calls `probe_sandbox`
+/// on a registered backend.
+struct ProbeBackend {
+    process_alive: Mutex<bool>,
+}
+
+#[async_trait]
+impl engram_core::traits::HostClient for ProbeBackend {
+    async fn create(
+        &self,
+        _: engram_core::types::sandbox::SandboxSpec,
+    ) -> Result<SandboxId, engram_core::SandboxError> {
+        unreachable!()
+    }
+    async fn destroy(&self, _: SandboxId) -> Result<(), engram_core::SandboxError> {
+        unreachable!()
+    }
+    async fn list(&self) -> Result<Vec<SandboxId>, engram_core::SandboxError> {
+        unreachable!()
+    }
+    async fn probe_sandbox(
+        &self,
+        _id: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError> {
+        Ok(engram_core::types::sandbox::SandboxProbe {
+            known_to_backend: false,
+            process_alive: *self.process_alive.lock(),
+        })
+    }
+    async fn exec_stream(
+        &self,
+        _: SandboxId,
+        _: engram_core::types::sandbox::ExecRequest,
+    ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError> {
+        unreachable!()
+    }
+    async fn snapshot(
+        &self,
+        _: SandboxId,
+    ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError> {
+        unreachable!()
+    }
+    async fn restore(
+        &self,
+        _: engram_core::types::snapshot::SnapshotMetadata,
+    ) -> Result<SandboxId, engram_core::SandboxError> {
+        unreachable!()
+    }
+    async fn start_agent(
+        &self,
+        _: SandboxId,
+        _: engram_core::types::sandbox::AgentSpec,
+        _: engram_core::types::egress::SessionEgressPolicy,
+    ) -> Result<(), engram_core::SandboxError> {
+        unreachable!()
+    }
+    async fn apply_egress_policy(
+        &self,
+        _: engram_core::types::egress::SessionEgressPolicy,
+    ) -> Result<(), engram_core::SandboxError> {
+        unreachable!()
+    }
+    async fn guest_ip(&self, _: SandboxId) -> Option<std::net::Ipv4Addr> {
+        unreachable!()
+    }
+    async fn bind_session(&self, _: SessionId, _: SandboxId) {}
+    async fn unbind_session(&self, _: SessionId) {}
+    async fn send_prompt(
+        &self,
+        _: SandboxId,
+        _: String,
+        _: String,
+    ) -> Result<(), engram_core::SandboxError> {
+        unreachable!()
+    }
+    async fn acquire_shell(&self, _: SandboxId) -> Result<(), engram_core::SandboxError> {
+        unreachable!()
+    }
+    async fn release_shell(&self, _: SandboxId) -> Result<(), engram_core::SandboxError> {
+        unreachable!()
+    }
+}
+
+/// ADR 0068 headline scenario — the fbd3794c incident shape: a
+/// sandbox that's genuinely alive (the probe says `process_alive =
+/// true`) but absent from the host's self-reported `running_sandboxes`
+/// for the full grace window must NOT flip to `host_lost`, and its
+/// strike counter must reset (not just hold at the threshold, ready to
+/// flip the instant one more heartbeat is missed).
+#[tokio::test]
+async fn probe_rescues_a_session_whose_process_is_alive_despite_missing_from_running_sandboxes() {
+    let meta = Arc::new(ReconcileMeta::default());
+    let host_registry =
+        HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
+    let events = Arc::new(SessionEventBus::new(64));
+    let reconciler = Reconciler::new(DEFAULT_GRACE_TICKS);
+    let host = HostId::new();
+    let sb = SandboxId::new();
+    let session = meta.seed_active(host, sb);
+
+    let backend = Arc::new(ProbeBackend {
+        process_alive: Mutex::new(true),
+    });
+    host_registry.register(
+        host,
+        backend.clone() as Arc<dyn engram_core::traits::HostClient>,
+    );
+
+    // Missing from every heartbeat's running_sandboxes for MORE than
+    // the grace window — without the probe rescue this would flip.
+    for _ in 0..(DEFAULT_GRACE_TICKS as usize + 2) {
+        let flipped = reconciler
+            .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[])
+            .await;
+        assert!(
+            flipped.is_empty(),
+            "a probe confirming process_alive=true must rescue every tick, not just once"
+        );
+    }
+    assert_eq!(
+        meta.status(session),
+        SessionState::Active,
+        "the session must never leave Active — no host_lost, no transcript rewind"
+    );
+
+    // Now the process actually dies (the probe answers honest) — the
+    // flip must proceed within the SAME grace window as today (the
+    // probe rescue must not delay real failure detection). Reset the
+    // strike counter to a known baseline first: phase 1's tail ticks
+    // (after the last rescue mid-cycle) left a nonzero-but-unspecified
+    // strike count, which would make "exactly DEFAULT_GRACE_TICKS more
+    // ticks" a flaky claim about this test rather than about the code.
+    meta.seed_strikes(session, 0);
+    *backend.process_alive.lock() = false;
+    let mut all_flipped = Vec::new();
+    for i in 0..DEFAULT_GRACE_TICKS {
+        let flipped = reconciler
+            .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[])
+            .await;
+        if i + 1 < DEFAULT_GRACE_TICKS {
+            assert!(
+                flipped.is_empty(),
+                "must not flip before the grace window elapses, tick {}",
+                i + 1
+            );
+        }
+        all_flipped.extend(flipped);
+    }
+    assert_eq!(
+        all_flipped,
+        vec![session],
+        "once the probe agrees the process is gone, the flip proceeds exactly at the grace window \
+         — probe-before-host_lost must not delay real failure detection"
+    );
+    assert_eq!(meta.status(session), SessionState::Dead);
 }

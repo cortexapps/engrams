@@ -172,10 +172,10 @@ async fn exec(backend: &VzBackend, id: SandboxId, sh: &str) -> (String, Option<i
     (out, code)
 }
 
-/// Poll `guest_ip` until the in-VM agentd answers (proves boot + agentd up).
+/// Poll `guest_endpoints` until the in-VM agentd answers (proves boot + agentd up).
 async fn await_agent(backend: &VzBackend, id: SandboxId) {
     let start = std::time::Instant::now();
-    while backend.guest_ip(id).await.is_none() {
+    while backend.guest_endpoints(id).await.is_none() {
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "agentd never came up within 60s",
@@ -291,7 +291,7 @@ async fn e2e_vz_skill_erofs_attaches() {
 }
 
 /// ADR 0066 Phase 2: the port relay reaches a dev server bound to the
-/// guest's `127.0.0.1` (which the old `guest_ip`/eth0 dial can't), and a
+/// guest's `127.0.0.1` (which a direct dial_ip/eth0 dial can't), and a
 /// persistent forwarded connection does NOT head-of-line block a fresh
 /// one — the property real virtio-vsock gives us that the retired
 /// single-stream-per-port console bridge couldn't.
@@ -444,12 +444,12 @@ async fn e2e_vz_browser_bundle_mounts_and_starts() {
     // Lazy-spawn the in-guest browser stack. agentd execs `engram-browser`
     // (Xvfb → openbox → x11vnc → chromium) on first call and blocks until
     // x11vnc accepts on its port, mirroring the ttyd readiness probe.
-    let port = backend
+    let start = backend
         .start_browser(id)
         .await
         .expect("start_browser spawns the browser stack and x11vnc binds");
     assert_eq!(
-        port, 5900,
+        start.port, 5900,
         "x11vnc default VNC port (DEFAULT_VNC_PORT); the host's proxy_vnc \
          dials this guest port",
     );
@@ -457,11 +457,11 @@ async fn e2e_vz_browser_bundle_mounts_and_starts() {
     // Idempotent re-probe: a second call must find the live stack and return
     // the same port without relaunching (the agentd spawn mutex / respawn
     // guard), the same property `start_shell` has for ttyd.
-    let port2 = backend
+    let start2 = backend
         .start_browser(id)
         .await
         .expect("start_browser is idempotent against a live stack");
-    assert_eq!(port2, 5900, "re-probe returns the same bound port");
+    assert_eq!(start2.port, 5900, "re-probe returns the same bound port");
 
     // Teardown is explicit + idempotent (the cancellable VncGrace registry
     // drives the real disconnect path; stop_browser is the belt-and-suspenders

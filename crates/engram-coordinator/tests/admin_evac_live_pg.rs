@@ -127,6 +127,12 @@ impl HostClient for FakeBackend {
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         Ok(vec![])
     }
+    async fn probe_sandbox(
+        &self,
+        _id: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        unimplemented!()
+    }
     async fn exec_stream(
         &self,
         _id: SandboxId,
@@ -182,7 +188,7 @@ impl HostClient for FakeBackend {
     ) -> Result<(), SandboxError> {
         unreachable!()
     }
-    async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
+    async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
         None
     }
     async fn bind_session(&self, _session_id: SessionId, _sandbox_id: SandboxId) {}
@@ -241,6 +247,7 @@ async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: 
         total_vcpus: 0,
         wire_version: 0,
         stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
     })
     .await
     .expect("upsert_host");
@@ -280,6 +287,7 @@ async fn seed_host_with(
         total_vcpus: 0,
         wire_version: 0,
         stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
     })
     .await
     .expect("upsert_host");
@@ -396,6 +404,7 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
         recoverable: true,
         aux_bundles: vec![],
         events_cursor: None,
+        fc_snapshot_version: None,
     })
     .await
     .expect("record snapshot");
@@ -752,6 +761,7 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
         required_image_digest: None,
         exclude_host: None,
         prefer_host: None,
+        caps: Default::default(),
     };
     let (first_pick, _) = placement::pick_for_session(meta.as_ref(), &registry, &ctx)
         .await
@@ -793,6 +803,7 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
             total_vcpus: 8,
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: false,
+            capabilities: engram_core::types::host::HostCapabilities::default(),
         },
     )
     .await
@@ -856,6 +867,7 @@ async fn seed_ready_host(
         total_vcpus: 0,
         wire_version: 0,
         stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
     })
     .await
     .expect("seed host row");
@@ -1079,6 +1091,7 @@ async fn drain_dont_strand_guard_blocks_when_no_survivor_fits() {
                     total_vcpus: vcpus,
                     wire_version: engram_protocol::WIRE_VERSION,
                     stages_images: false,
+                    capabilities: engram_core::types::host::HostCapabilities::default(),
                 },
             )
             .await
@@ -1098,6 +1111,7 @@ async fn drain_dont_strand_guard_blocks_when_no_survivor_fits() {
         required_image_digest: None,
         exclude_host: Some(victim),
         prefer_host: None,
+        caps: Default::default(),
     };
 
     // 8 GiB session, survivor has 4 GiB free → no fit → would strand.

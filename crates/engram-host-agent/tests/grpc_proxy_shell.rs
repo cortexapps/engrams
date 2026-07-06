@@ -56,6 +56,12 @@ impl HostClient for FakeHost {
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         unreachable!()
     }
+    async fn probe_sandbox(
+        &self,
+        _: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        unreachable!()
+    }
     async fn exec_stream(&self, _: SandboxId, _: ExecRequest) -> Result<ExecStream, SandboxError> {
         unreachable!()
     }
@@ -76,7 +82,7 @@ impl HostClient for FakeHost {
     async fn apply_egress_policy(&self, _: SessionEgressPolicy) -> Result<(), SandboxError> {
         unreachable!()
     }
-    async fn guest_ip(&self, _: SandboxId) -> Option<String> {
+    async fn guest_ip(&self, _: SandboxId) -> Option<std::net::Ipv4Addr> {
         None
     }
     async fn bind_session(&self, _: SessionId, _: SandboxId) {}

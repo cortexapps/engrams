@@ -463,6 +463,11 @@ pub struct RegisterRequest {
     pub wire_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud_metadata: Option<engram_core::types::host::HostMetadata>,
+    /// ADR 0068: the probed capability vector, computed once before this
+    /// register POST. `#[serde(default)]` on the coord side gives
+    /// mixed-fleet interop with a pre-0068 host-agent.
+    #[serde(default)]
+    pub capabilities: engram_core::types::host::HostCapabilities,
 }
 
 #[derive(Deserialize)]
@@ -549,6 +554,9 @@ pub struct HeartbeatRequest {
     /// eligible staging hosts passes the stage vacuously.
     #[serde(default)]
     pub stages_images: bool,
+    /// ADR 0068: this tick's re-probed capability vector.
+    #[serde(default)]
+    pub capabilities: engram_core::types::host::HostCapabilities,
 }
 
 #[derive(Deserialize)]
@@ -750,6 +758,7 @@ mod tests {
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: false,
+            capabilities: Default::default(),
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");

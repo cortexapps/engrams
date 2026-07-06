@@ -278,8 +278,9 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         .expect("ext4 bake");
 
     // ADR 0021 P1.5: no substrate to build — the egress CA reaches
-    // the guest via `AgentSpec.host_ca_pem`, which triggers an
-    // `InstallHostCa` vsock RPC right before `SpawnHarness` (see the
+    // the guest via `AgentSpec.host_ca_pem`, which rides the
+    // `SpawnHarness` vsock RPC (2026-07 core-ops fold: the CA install
+    // and the harness spawn are one first-contact call now — see the
     // `start_agent` call below).
 
     // ---- 5. Set up FC backend with networking + proxy redirect ----
@@ -308,20 +309,19 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         aux_ro_drives: Vec::new(),
     };
     let sandbox_id = backend.create(spec).await.expect("create");
-    // Poll for guest_ip — the in-VM agent takes a few seconds to
+    // Poll for guest_endpoints — the in-VM agent takes a few seconds to
     // bind on vsock and answer the GuestIp RPC after kernel boot.
-    let mut guest_ip_str = None;
+    let mut endpoints = None;
     for _ in 0..30 {
-        if let Some(ip) = backend.guest_ip(sandbox_id).await {
-            guest_ip_str = Some(ip);
+        if let Some(ep) = backend.guest_endpoints(sandbox_id).await {
+            endpoints = Some(ep);
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let guest_ip = guest_ip_str
-        .expect("guest_ip should be reachable within 15s")
-        .parse::<std::net::Ipv4Addr>()
-        .expect("ipv4");
+    let guest_ip = endpoints
+        .expect("guest_endpoints should be reachable within 15s")
+        .egress_identity;
 
     // ---- 7. Register the session with the proxy ----
     let secret = engram_egress_proxy::SecretEntry {
@@ -358,11 +358,12 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     // we don't actually want a harness child for this test, just
     // the proof that agentd is bound.
     //
-    // ADR 0021 P1.1+P1.2: `host_ca_pem` triggers `InstallHostCa`
-    // over vsock right after agentd readiness and before the
-    // (no-op) SpawnHarness — the in-VM trust store now carries
-    // the egress proxy's CA, which is what previously rode in on
-    // the (retired) harness substrate.
+    // ADR 0021 P1.1+P1.2: `host_ca_pem` rides this (no-op, empty-argv)
+    // `SpawnHarness` call — agentd installs the CA before the
+    // readiness-probe early return (2026-07 core-ops fold: install
+    // and spawn are one first-contact RPC). The in-VM trust store
+    // now carries the egress proxy's CA, which is what previously
+    // rode in on the (retired) harness substrate.
     backend
         .start_agent(
             sandbox_id,

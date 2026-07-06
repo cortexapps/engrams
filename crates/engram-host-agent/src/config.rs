@@ -42,6 +42,14 @@ pub struct HostAgentConfig {
     /// inert without an in-flight export. `None` disables it (mode=all
     /// dev, non-Linux).
     pub migrate_peer_listen_addr: Option<std::net::SocketAddr>,
+    /// ADR 0068: `"firecracker" | "vz" | "process"` — resolved ONCE in
+    /// `main.rs` from the same `BackendChoice` arm that picks the
+    /// `SandboxBackend` (decision 11: detection stays above the
+    /// cfg-gated leaves, never re-derived deeper in the stack). Feeds
+    /// `capabilities::ProbeInputs::backend`. Defaults to `"process"` —
+    /// the mode=all / in-process test-harness backend, which never
+    /// constructs a `HostAgentConfig` through `main.rs`'s match anyway.
+    pub backend_name: String,
 }
 
 impl Default for HostAgentConfig {
@@ -58,6 +66,7 @@ impl Default for HostAgentConfig {
             grpc_listen_addr: None,
             grpc_advertise_addr: None,
             migrate_peer_listen_addr: None,
+            backend_name: "process".to_string(),
         }
     }
 }

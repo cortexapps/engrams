@@ -73,6 +73,7 @@ async fn ensure_host(meta: &Arc<dyn MetadataStore>, host_id: HostId) {
         total_vcpus: 0,
         wire_version: 0,
         stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
     })
     .await
     .expect("upsert_host");

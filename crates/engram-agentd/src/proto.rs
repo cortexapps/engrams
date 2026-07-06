@@ -149,9 +149,16 @@ pub struct WireHandshakeAck {
 /// variant *index*. agentd is baked into session images / base
 /// snapshots, so the host-agent routinely speaks to agentds built
 /// from older trees. Inserting a variant mid-enum shifts every
-/// later index and desyncs that pair (the host's `SpawnHarness`
-/// decodes as the old agentd's `InstallHostCa`, …). New variants go
-/// at the END of the enum — same rule for [`WireResponse`].
+/// later index and desyncs that pair. New variants go at the END of
+/// the enum — same rule for [`WireResponse`].
+///
+/// 2026-07 core-ops fold: the former standalone CA-install verb was
+/// deleted (its payload now rides the
+/// [`SpawnHarness`](Self::SpawnHarness) frame as
+/// [`SpawnHarnessRequest::host_ca_pem`]); `Sync`/`StartBrowser`/
+/// `StopBrowser` renumbered down one index each. Every agentd baked
+/// into an existing image/base snapshot is incompatible with this
+/// build — a zero-user clean break, not a tombstoned variant.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WireRequest {
     /// Run a command in the sandbox and stream its output. Wraps
@@ -220,36 +227,31 @@ pub enum WireRequest {
     ///
     /// ADR 0021 P1.4: argv points at a path inside the rootfs (the
     /// image's `[harness] exec`, typically `/opt/engram/harness/...`).
-    /// No drive mount; agentd just exec's argv. The CA the harness
-    /// trusts is installed via `InstallHostCa` (called by the host
-    /// post-readiness, pre-SpawnHarness), and agentd points the
-    /// child's `SSL_CERT_FILE` / `NODE_EXTRA_CA_CERTS` / friends at
-    /// the canonical install paths.
+    /// No drive mount; agentd just exec's argv.
+    ///
+    /// 2026-07 core-ops fold: this frame also carries the per-host
+    /// egress-proxy CA (`host_ca_pem`, ADR 0021 P1) — folded in from
+    /// the former standalone CA-install verb. agentd installs it (if
+    /// present) BEFORE spawning, including on the empty-argv
+    /// readiness probe below, so a dev_vm session with no harness
+    /// still trusts the proxy. Install failure replies
+    /// [`WireResponse::Error`] and does not spawn — a harness
+    /// without the proxy CA fails every outbound TLS dial opaquely,
+    /// so this fails loud instead. Idempotent: the agent caches the
+    /// last installed PEM (zero-I/O on a same-cert resume) and
+    /// reports whether it changed via
+    /// [`WireResponse::HarnessSpawned::ca_changed`].
     ///
     /// Empty argv is a **readiness probe**: the agent skips the
-    /// spawn and replies `HarnessSpawned { pid: None }` — useful
-    /// for callers that want to confirm agentd is reachable on
-    /// vsock without launching anything (the no-harness / dev-VM
+    /// spawn (after installing the CA, if any) and replies
+    /// `HarnessSpawned { pid: None, .. }` — useful for callers that
+    /// want to confirm agentd is reachable on vsock, or deliver the
+    /// CA, without launching anything (the no-harness / dev-VM
     /// path).
     ///
     /// Replies [`WireResponse::HarnessSpawned`] on success or
-    /// [`WireResponse::Error`] if the spawn fails.
+    /// [`WireResponse::Error`] if the CA install or the spawn fails.
     SpawnHarness(SpawnHarnessRequest),
-    /// Install the per-host egress-proxy CA into the guest's TLS
-    /// trust store (ADR 0021 P1). Called by the host once per VM
-    /// boot **and** once per resume — the cert is per-host, so a
-    /// session that moves to a different host gets a fresh PEM.
-    ///
-    /// Replaces the pre-0021 delivery path where the CA rode in on
-    /// the harness drive (`<harness_mount>/.engram-host/ca.pem`).
-    /// Once the drive is retired (P1.5), this RPC is the sole path.
-    ///
-    /// Idempotent: the agent caches the last installed PEM and
-    /// replies `InstallHostCaAck { changed: false }` on no-op
-    /// resume. Replies `InstallHostCaAck { changed: true }` on a
-    /// fresh / rotated cert, or [`WireResponse::Error`] if the
-    /// guest filesystem write fails.
-    InstallHostCa(InstallHostCaRequest),
     /// Flush the guest's filesystem buffers to the virtio-blk disk.
     /// Replies [`WireResponse::Synced`] once `sync(2)` returns.
     ///
@@ -313,17 +315,17 @@ pub struct SpawnHarnessRequest {
     /// per-request/harness-only vars ride `env` instead.
     #[serde(default)]
     pub session_env: HashMap<String, String>,
-}
-
-/// Body of [`WireRequest::InstallHostCa`]. ADR 0021 P1 reference:
-/// [`reference_e2b_ca_cert_pattern`] in user memory captures the
-/// E2B `cacerts.go` install model this mirrors.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InstallHostCaRequest {
-    /// PEM-encoded CA bundle to add to the guest's trust store.
-    /// Empty string is treated as a no-op (`changed: false`) to
-    /// keep the host's call-site branchless.
-    pub cert_pem: String,
+    /// Per-host egress-proxy CA (ADR 0021 P1), PEM-encoded.
+    /// `None`/empty = no install (tests, deploys without egress
+    /// proxying). Installed by agentd BEFORE the harness spawn — and
+    /// also on the empty-argv readiness probe, so dev_vm sessions
+    /// (no harness) still trust the proxy. ADR 0021 P1 reference:
+    /// [`reference_e2b_ca_cert_pattern`] in user memory captures the
+    /// E2B `cacerts.go` install model this mirrors. Trailing field —
+    /// the only wire-safe struct evolution — added by the 2026-07
+    /// core-ops fold of the former standalone CA-install verb.
+    #[serde(default)]
+    pub host_ca_pem: Option<String>,
 }
 
 /// Single-shot response for non-streaming [`WireRequest`] verbs.
@@ -355,16 +357,17 @@ pub enum WireResponse {
     /// Reply to [`WireRequest::SpawnHarness`]. `pid` is the spawned
     /// child's PID when argv was non-empty; `None` when the call
     /// was a readiness probe (empty argv) or when the spawn
-    /// otherwise yielded no child (no-op case).
+    /// otherwise yielded no child (no-op case). `ca_changed` mirrors
+    /// the `changed` flag from the former standalone CA-install
+    /// verb's ack: `None` when the request carried no `host_ca_pem`;
+    /// `Some(true)` when the agent wrote new bytes (first install or
+    /// rotation); `Some(false)` when the PEM matched the one already
+    /// installed (zero-I/O resume hot path). Trailing field, added
+    /// by the 2026-07 core-ops fold.
     HarnessSpawned {
         pid: Option<u32>,
-    },
-    /// Reply to [`WireRequest::InstallHostCa`]. `changed` is `true`
-    /// when the agent wrote new bytes (first install or rotation),
-    /// `false` when the PEM matched the one already installed
-    /// (zero-I/O resume hot path).
-    InstallHostCaAck {
-        changed: bool,
+        #[serde(default)]
+        ca_changed: Option<bool>,
     },
     /// Anything the agent couldn't fulfil. `message` is a short
     /// human-readable reason; `kind` mirrors the std `io::ErrorKind`
@@ -384,9 +387,21 @@ pub enum WireResponse {
     /// afterward, it should find a listener. `spawned` is true if this call
     /// started the stack, false if it was already running and only re-probed.
     /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
+    ///
+    /// `cdp_warning` (issue #569) is `Some` when x11vnc came up but
+    /// chromium's CDP debug port never answered within budget
+    /// (dead/crash-looping chrome) — diagnostic only, never fails the RPC.
+    /// DELIBERATE wire break (2026-07, #569): this field was added to the
+    /// existing variant in place. bincode structs are positional, so a host
+    /// built after this change fails to decode a `BrowserReady` from an
+    /// agentd baked before it (the recv surfaces as the typed "version skew"
+    /// error; remedy: re-bake + RefreshImage). Accepted as a clean break:
+    /// the browser path is already broken on pre-#567/#569 bakes, and that
+    /// fix train re-bakes every image anyway.
     BrowserReady {
         port: u16,
         spawned: bool,
+        cdp_warning: Option<String>,
     },
     /// Reply to [`WireRequest::StopBrowser`] — the browser stack has been
     /// torn down (or there was nothing running).

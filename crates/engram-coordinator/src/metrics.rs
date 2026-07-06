@@ -61,6 +61,22 @@ pub fn init(addr: SocketAddr) {
         1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1200.0, 1800.0,
     ];
 
+    // ADR 0048 (queue fairness): queue waits are minutes-scale, not
+    // seconds-scale — a stuck queue can wait the full 30-minute timeout.
+    // Same Full()-beats-Suffix() precedence as the eviction override above.
+    let queue_wait_buckets = &[
+        1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 3600.0,
+    ];
+
+    // Issue #527 Phase 1: prompt→run-start is the same wide-regime problem
+    // as eviction — the prod evidence this metric replaces the proxy for
+    // shows p50 ≈24.5s, p90 ≈140s, max 1,703s (a resume can be a full cold
+    // FC boot). The default `_seconds` buckets top out at 30s, which would
+    // collapse essentially the entire observed distribution into +Inf.
+    let prompt_to_run_started_buckets = &[
+        1.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0,
+    ];
+
     let builder = PrometheusBuilder::new()
         .with_http_listener(addr)
         .set_buckets_for_metric(
@@ -73,6 +89,16 @@ pub fn init(addr: SocketAddr) {
             prestage_buckets,
         )
         .expect("install prestage histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(QUEUE_WAIT_SECONDS.to_string()),
+            queue_wait_buckets,
+        )
+        .expect("install queue-wait histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(PROMPT_TO_RUN_STARTED_SECONDS.to_string()),
+            prompt_to_run_started_buckets,
+        )
+        .expect("install prompt-to-run-started histogram buckets")
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Suffix("_seconds".to_string()),
             buckets,
@@ -223,6 +249,26 @@ pub const SESSIONS_QUEUED_MIB: &str = "engram_sessions_queued_mib";
 /// `outcome` = `placed` / `requeued` / `failed` / `timeout`.
 pub const QUEUE_OUTCOME_TOTAL: &str = "engram_queue_outcome_total";
 
+/// Histogram (ADR 0048, queue-fairness). `queued_at` → placement/terminal,
+/// seconds. This is OUTSIDE `engram_session_boot_seconds`: the create
+/// handler returns 201 `{kind:"queued"}` immediately on enqueue, so the
+/// entire queue wait previously fell outside every latency histogram we
+/// have. Labels:
+/// - `origin`: `create` / `resume`.
+/// - `outcome`: `placed` (create: the durable `queued → pending` flip;
+///   resume: dequeue to `Idle`) / `timeout`.
+///
+/// A requeued-then-placed session emits one `placed` sample per successful
+/// placement, each measuring cumulative wait since the ORIGINAL
+/// `queued_at` (`requeue_session` deliberately doesn't reset it).
+pub const QUEUE_WAIT_SECONDS: &str = "engram_queue_wait_seconds";
+
+/// Gauge (ADR 0048, queue-fairness). Age in seconds of the oldest queued
+/// row (0 when the queue is empty), sampled once per scanner sweep. The
+/// "is the queue stuck" pager signal complementing `engram_sessions_queued`
+/// (which only tells you the queue is nonempty, not for how long).
+pub const QUEUE_HEAD_AGE_SECONDS: &str = "engram_queue_head_age_seconds";
+
 /// Counter (issue #231). The per-tick `touch_host_heartbeat` persist
 /// failed — the host's `last_heartbeat_at` row did NOT advance even
 /// though the agent's heartbeat reached this pod. Sustained nonzero is
@@ -251,3 +297,53 @@ pub const ENABLE_PRESTAGE_SECONDS: &str = "engram_enable_prestage_seconds";
 /// cardinality convention above forbids per-host labels; the durable
 /// per-host record lives on the `enable_jobs.prestage_hosts` column.
 pub const ENABLE_PRESTAGE_HOST_OUTCOMES_TOTAL: &str = "engram_enable_prestage_host_outcomes_total";
+
+/// Counter (ADR 0068). Per-host exclusion reasons on a `NoCapacity`
+/// pick — kills the "no capacity with free hosts" mystery mode (a
+/// wire-skewed or capability-failing host used to vanish from the
+/// candidate set with the caller seeing only a bare `NoCapacity`).
+/// Labels: `reason` = the bounded `placement::exclusion_summary`
+/// vocabulary (`excluded` / `not_ready` / `cordoned` / `wire_skew` /
+/// `stale` / `cap:<name>` — one of the ~6 named capabilities, so still
+/// bounded / `digest_not_ready` / `no_fit`). No `host_id` label — see
+/// the cardinality convention above; the paired `warn!` names hosts.
+pub const PLACEMENT_EXCLUDED_TOTAL: &str = "engram_placement_excluded_total";
+
+/// Counter (ADR 0068). `reconcile::flip_missing` probed the sandbox
+/// directly and found it alive (`process_alive == true`) despite being
+/// absent from the host's self-reported `running_sandboxes` — the flip
+/// to `host_lost` was skipped and the strike counter reset. Sustained
+/// nonzero means the delivery/binding desync class (epic-binding-epoch-
+/// delivery) is still producing false `running_sandboxes` misses; this
+/// metric graphs how often the probe is rescuing sessions from it.
+pub const RECONCILE_PROBE_RESCUES_TOTAL: &str = "engram_reconcile_probe_rescues_total";
+
+/// Counter (ADR 0068). The dead-host detector's own `Ping` probe
+/// (`dead_host.rs`, added in `7fcc4c3c`) found the host alive despite a
+/// stale `last_heartbeat_at` row, and skipped the eviction. No
+/// behavioral change from this issue — added alongside the reconcile
+/// rescue counter above so both rescue paths are graphable together.
+pub const DEAD_HOST_PROBE_RESCUES_TOTAL: &str = "engram_dead_host_probe_rescues_total";
+
+/// Counter (ADR 0019 / telemetry restoration #526). Same-host vs
+/// cross-host resume split, emitted in `api/snapshot.rs::resume_from_fc_snapshot`
+/// once placement resolves. Labels: `placement` = `same_host` (the
+/// chosen host == the snapshot record's capturing host — the
+/// zero-cost hot-tier hit ADR 0007's local-dir cache exists for) /
+/// `cross_host` (relocated — the host materializes from chunked
+/// manifests) / `unknown_prior_host` (the record carries no `host_id`,
+/// e.g. a pre-ADR-0007 row or one written before the capturing host
+/// was recorded — can't classify).
+pub const SESSION_RESUME_PLACEMENT_TOTAL: &str = "engram_session_resume_total";
+
+/// Histogram (issue #527 Phase 1). Wall-clock from a `prompt_received`
+/// receipt (the first PG write of `send_prompt_core`, before auto-resume)
+/// to the matching `run_started{prompt_id}` landing in `session_events`.
+/// The true prompt→first-token *lower bound* — replaces the old
+/// `idle→created` proxy, which post-dates the resume and therefore
+/// undercounts. No labels: this is a single fleet-wide SLO signal, not
+/// per-image (the per-image breakdown is the Phase 2 canary's job).
+/// Recorded once per run-start that carries a `prompt_id`; the env-seeded
+/// initial prompt (no `prompt_id`, no receipt row) never contributes a
+/// sample.
+pub const PROMPT_TO_RUN_STARTED_SECONDS: &str = "engram_prompt_to_run_started_seconds";

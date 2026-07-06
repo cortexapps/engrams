@@ -267,7 +267,6 @@ const COMPOSER_BANNER: Partial<Record<SessionState, string>> = {
 const COMPOSER_HINT: Partial<Record<SessionState, string>> = {
   idle: "Task is idle — sending will resume it.",
   created: "Task is still starting up — the harness will be ready in a moment.",
-  guest_ready: "Task is still starting up — the harness will be ready in a moment.",
 };
 
 // The queued-message rail (ADR 0052): a message sent while a run is in flight

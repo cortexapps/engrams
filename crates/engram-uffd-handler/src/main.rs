@@ -477,6 +477,35 @@ mod linux {
             None
         };
 
+        // ADR 0019 / telemetry restoration (#526): the "no trace" half of
+        // the prefault effectiveness detector. `Runtime::prefault_from_trace`
+        // writes `prefault-stats.json` at the END of a background thread
+        // that only starts once `run_listener` binds — so if no trace was
+        // requested (or the requested one failed to load), NOTHING would
+        // otherwise write the file, and the host-agent's post-restore read
+        // would see the same absence as a crashed handler
+        // (`outcome="stats_missing"`, the alarm condition) even though this
+        // is the ordinary, expected "nothing to replay" case. Write the
+        // `trace_loaded: false` snapshot now, synchronously, before the
+        // listener even binds — the earliest point this process knows the
+        // answer — so `outcome="no_trace"` and `outcome="stats_missing"`
+        // stay distinguishable.
+        if prefault.is_none() {
+            if let Some(stats_path) = args
+                .trace_output
+                .as_ref()
+                .and_then(|p| engram_uffd_handler::runtime::prefault_stats_path(p))
+            {
+                engram_uffd_handler::runtime::write_prefault_stats(
+                    &stats_path,
+                    &engram_uffd_handler::runtime::PrefaultStats {
+                        trace_loaded: false,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
         // ADR 0045 C2: peer mode. Ordering is the soundness story:
         //   1. bind the control sock (host-agent can subscribe NOW);
         //   2. connect the peer session — BLOCKS until the source's

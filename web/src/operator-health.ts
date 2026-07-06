@@ -24,6 +24,11 @@ export interface HealthMetrics {
   /** Average base locality 0–100, or null when nothing is chunk-tracked yet. */
   locality: number | null;
   rpoStale: number;
+  /** ADR 0068: hosts reporting at least one failing capability
+   *  (`Failed`/`Unknown` on a probed vector) — the fleet-view surface
+   *  for what used to be the silent "no capacity with free hosts"
+   *  mystery mode. */
+  capsFailing: number;
 }
 
 export function deriveHealthMetrics(
@@ -41,8 +46,9 @@ export function deriveHealthMetrics(
   const rpoStale = (storage?.rows ?? []).filter(
     (r) => secondsSince(r.last_flush_at) > RPO_WINDOW_S,
   ).length;
+  const capsFailing = hosts.filter((x) => x.failing_capabilities.length > 0).length;
 
-  return { dead, draining, capPct, locality, rpoStale };
+  return { dead, draining, capPct, locality, rpoStale, capsFailing };
 }
 
 // Worst-first: critical issues precede caution ones, and within a tier the push
@@ -77,6 +83,12 @@ export function operatorIssues(m: HealthMetrics): HealthIssue[] {
       sev: 2,
       tone: "caution",
       text: `${m.rpoStale} sandbox${m.rpoStale > 1 ? "es" : ""} past flush window`,
+    });
+  if (m.capsFailing > 0)
+    issues.push({
+      sev: 2,
+      tone: "caution",
+      text: `${m.capsFailing} host${m.capsFailing > 1 ? "s" : ""} failing capability checks`,
     });
 
   issues.sort((a, b) => b.sev - a.sev);

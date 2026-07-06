@@ -5,6 +5,7 @@ use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
 use engram_core::types::{ImageManifest, Session, SessionSpec, SessionState};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
@@ -392,8 +393,7 @@ pub(crate) async fn build_resume_egress_policy(
     sandbox_id: engram_core::SandboxId,
     image: &str,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
-    let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
-    let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
+    let guest_ip = state.services.host.guest_ip(sandbox_id).await?;
     // ADR 0057: re-read the persisted session policy once → network + secrets +
     // injects (resolved host-side) + observes (pure), so a resumed session
     // re-derives its whole egress policy on the new host (same as create).
@@ -639,6 +639,7 @@ async fn boot_prepared(
         image_repo,
         image_tag,
         manifest_digest,
+        needs_uffd_substrate,
     } = prepared;
     let session_id = inputs.session_id;
     let base_snapshot_id = inputs.base_snapshot_id;
@@ -666,6 +667,25 @@ async fn boot_prepared(
         )),
         exclude_host: None,
         prefer_host: None,
+        // ADR 0068: a fresh create with an FC memory-manifest base
+        // snapshot needs a host with a healthy UFFD substrate. No
+        // `fc_snapshot_version` constraint on create — NOT because a
+        // create is somehow exempt from the cross-`SNAPSHOT_VERSION`
+        // corruption class (a create IS an FC restore of the base
+        // snapshot, ADR 0020; there is no warm pool). Base-template rows
+        // now DO carry a real `fc_snapshot_version`
+        // (`enabled_images.rs::capture_and_record_base_snapshot`), but
+        // this `PreparedBoot` assembly only has `enabled.
+        // base_snapshot_memory_manifest`, not the base row's recorded
+        // version — the query that builds `enabled` would need a new
+        // column threaded through before a create could pair against it.
+        // Deferred as a follow-up; not done here to keep this review-fix
+        // pass scoped to the two `record_snapshot` call sites (PR #564
+        // review findings 2/3).
+        caps: crate::placement::CapabilityRequirements {
+            needs_uffd_substrate,
+            fc_snapshot_version: None,
+        },
     };
     let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
         .await
@@ -711,33 +731,45 @@ async fn boot_prepared(
     // sandbox is always recorded or torn down and the reservation is always
     // released, regardless of the request's fate. The handler awaits the
     // JoinHandle only to shape the connected client's response.
+    //
+    // ADR 0019 / telemetry restoration (#526): `tokio::spawn` severs the
+    // tracing context — a span created inside this future would otherwise
+    // become a new orphaned trace root instead of a child of
+    // `session.create.grpc`. `.instrument(Span::current())` re-parents the
+    // detached body onto the request span; it changes span context only,
+    // not task lifetime, so the detach-for-cancellation-safety property
+    // from #210 is unaffected.
     let st = state.clone();
-    let boot_handle = tokio::spawn(async move {
-        match crate::session_boot::boot_on_reserved_host(&st, inputs, host_id).await {
-            Ok(()) => Ok(()),
-            Err(crate::session_boot::BootError::NotStarted(e)) => {
-                // The sandbox never came up (or was torn down on the insert
-                // failure); release the reservation row so the host's free
-                // capacity is restored at once (reconcile would also reap it).
-                // No Failed transition — nothing usable ever existed.
-                if let Err(de) = st.services.meta.delete_pending_session(session_id).await {
-                    tracing::warn!(%session_id, error = %de,
-                        "delete_pending_session after boot failure failed; reconcile will reap");
+    let boot_span = tracing::Span::current();
+    let boot_handle = tokio::spawn(
+        async move {
+            match crate::session_boot::boot_on_reserved_host(&st, inputs, host_id).await {
+                Ok(()) => Ok(()),
+                Err(crate::session_boot::BootError::NotStarted(e)) => {
+                    // The sandbox never came up (or was torn down on the insert
+                    // failure); release the reservation row so the host's free
+                    // capacity is restored at once (reconcile would also reap it).
+                    // No Failed transition — nothing usable ever existed.
+                    if let Err(de) = st.services.meta.delete_pending_session(session_id).await {
+                        tracing::warn!(%session_id, error = %de,
+                            "delete_pending_session after boot failure failed; reconcile will reap");
+                    }
+                    Err(e)
                 }
-                Err(e)
-            }
-            Err(crate::session_boot::BootError::Started(e)) => {
-                // The sandbox booted but a later step failed — fail the
-                // session (the sandbox was already unbound by the boot pipeline).
-                let _ = st
-                    .services
-                    .meta
-                    .transition_session(session_id, SessionState::Failed)
-                    .await;
-                Err(e)
+                Err(crate::session_boot::BootError::Started(e)) => {
+                    // The sandbox booted but a later step failed — fail the
+                    // session (the sandbox was already unbound by the boot pipeline).
+                    let _ = st
+                        .services
+                        .meta
+                        .transition_session(session_id, SessionState::Failed)
+                        .await;
+                    Err(e)
+                }
             }
         }
-    });
+        .instrument(boot_span),
+    );
 
     let boot_result = boot_handle.await.map_err(|join_err| {
         // The boot task panicked: it did NOT run its disposition, so the
@@ -1284,6 +1316,11 @@ async fn prepare_inner(
         image_repo,
         image_tag,
         manifest_digest,
+        // ADR 0068: this create restores the enabled image's base
+        // snapshot — the placement gate needs the UFFD substrate iff
+        // that base snapshot carries a memory manifest (an FC image;
+        // VZ/Process enabled-image rows never set this).
+        needs_uffd_substrate: enabled.base_snapshot_memory_manifest.is_some(),
     })
 }
 /// ADR 0051: fetch a session by id (gRPC `GetSession`). 404 on unknown id.
@@ -1342,8 +1379,8 @@ pub(crate) async fn delete_session_core(
     // Drive the session to its FSM-legal terminal BEFORE destroying the
     // sandbox. `terminate_session` reads the current state and picks the
     // terminal `SessionState::terminal_target` permits — `Completed` for
-    // states that ran, `Failed` for the early states (Pending / Created /
-    // GuestReady) that never became usable (this is what fixes the
+    // states that ran, `Failed` for the early states (Pending / Created)
+    // that never became usable (this is what fixes the
     // `5fadd364` phantom: deleting a `Created` session used to drive an
     // illegal Created→Completed that surfaced as Conflict, destroying the
     // sandbox but leaving the row non-terminal). Terminating first also

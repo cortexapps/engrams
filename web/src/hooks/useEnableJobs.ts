@@ -35,6 +35,10 @@ function protoEnableJobToLegacy(j: ProtoEnableJob): EnableJob {
     error: j.error ?? null,
     created_at: j.createdAt,
     updated_at: j.updatedAt,
+    capture_phase: j.capturePhase ?? null,
+    warm_stage: j.warmStage ?? null,
+    warm_stage_started_at: j.warmStageStartedAt ?? null,
+    output_tail: j.outputTail ?? null,
     prestage_hosts: j.prestageHosts,
   };
 }

@@ -80,7 +80,17 @@ service HostService {
   // snapshot's metadata. The coord calls this during
   // POST /api/enabled-images to produce the per-image base snapshot
   // that CreateSession later restores from.
-  rpc BuildBaseSnapshot(BuildBaseSnapshotRequest) returns (BuildBaseSnapshotResponse);
+  //
+  // Issue #539 (wire v8): server-streaming, not unary. A `[warm]` hook
+  // can run for 10-33 minutes with only ONE opaque global timeout as a
+  // diagnostic; the host now emits `CaptureProgress` at least every 30 s
+  // (phase + current warm stage + output tail) so a live capture is
+  // observable, and a terminal `CaptureFailed` carries the failing
+  // stage + last 16 KiB of hook output instead of "(see host logs for
+  // stderr)". This RPC's streaming shape is a deliberate bridge —
+  // epic-capture-jobs (#546) deletes it once capture moves to a durable
+  // host-owned job row; only the progress *sink* changes.
+  rpc BuildBaseSnapshot(BuildBaseSnapshotRequest) returns (stream BuildBaseSnapshotEvent);
 
   // ADR 0020 P1: restore a per-image base snapshot for a session and
   // late-bind the session's harness via the option-D drive swap (the
@@ -209,13 +219,45 @@ service HostService {
   // these on host register / first heartbeat to keep the warm-path
   // RPC latency budget intact.
   rpc Ping(Empty) returns (Empty);
+
+  // ADR 0068 probe-before-host_lost: ground-truth sandbox liveness,
+  // for `reconcile::flip_missing` to check BEFORE flipping a session to
+  // `host_lost` on nothing but absence from the host's self-reported
+  // `running_sandboxes` list (the fbd3794c incident shape — the host
+  // was reachable and the VM was alive the whole time). A proto
+  // ADDITION is protobuf-compatible: an old host-agent mid-roll answers
+  // `Unimplemented`, which the caller treats as "no probe available ⇒
+  // proceed with the flip" — no WIRE_VERSION bump needed for this RPC
+  // alone.
+  rpc ProbeSandbox(SandboxIdMessage) returns (ProbeSandboxResponse);
 }
 
 message Empty {}
 
+// ADR 0068: answered from GROUND TRUTH, not the in-memory sandbox map —
+// the desync `flip_missing` is rescuing FROM is that map (or its
+// heartbeat-carried mirror, `running_sandboxes`) being wrong. On FC:
+// `process_alive` comes from scanning the jail dir for the sandbox's
+// pidfile and `kill(pid, 0)`-ing it — the same ground the survivor-
+// reattach machinery already walks. On VZ/Process (no orphan-VM mode):
+// the live child-process handle IS the ground truth, so both fields
+// mirror it.
+message ProbeSandboxResponse {
+  // Present in the backend's in-memory sandbox map (`list()` membership).
+  bool known_to_backend = 1;
+  // The VMM process for this sandbox_id is alive on this host, checked
+  // independently of `known_to_backend`.
+  bool process_alive = 2;
+}
+
 message BrowserPortResponse {
   // The in-guest RFB port x11vnc is serving on (loopback).
   uint32 port = 1;
+  // Issue #569: set when x11vnc came up but chromium's CDP debug port never
+  // answered agentd's bounded probe — chrome may be dead or crash-looping
+  // behind a healthy VNC. Diagnostic only; the RPC still succeeds. Absent =
+  // chrome answered (or the peer predates the probe).
+  optional string warning = 2;
 }
 
 // 16-byte UUID. Same shape as `engram_core::SandboxId`'s underlying
@@ -410,6 +452,44 @@ message BuildBaseSnapshotResponse {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.
   bytes metadata_bincode = 1;
 }
+
+// Issue #539: one frame of the `BuildBaseSnapshot` server-streaming
+// response. Zero or more `progress` frames (at least every 30 s, a host
+// keepalive), followed by exactly one terminal frame (`done` or
+// `failed`), then the stream closes.
+message BuildBaseSnapshotEvent {
+  oneof event {
+    CaptureProgress progress = 1;
+    BuildBaseSnapshotResponse done = 2;
+    CaptureFailed failed = 3;
+  }
+}
+
+message CaptureProgress {
+  // "boot" | "warm" | "snapshot" — see
+  // `engram_core::types::capture_progress::CapturePhase`.
+  string phase = 1;
+  // Current `[warm]`-hook stage name while `phase == "warm"`.
+  optional string warm_stage = 2;
+  // Last `msg=`/heartbeat free text, or a synthesized keepalive note.
+  optional string detail = 3;
+  // Rolling last 16 KiB of the hook's combined stdout+stderr
+  // (UTF-8-lossy). Full replacement each event, not a diff.
+  string output_tail = 4;
+  // bincode-encoded `Vec<engram_core::types::capture_progress::WarmStageRecord>`
+  // — the stage history so far, including the still-open current stage.
+  bytes warm_stages_bincode = 5;
+}
+
+message CaptureFailed {
+  string message = 1;
+  // `engram_core::types::capture_progress::CaptureFailureKind`, snake_case
+  // (e.g. "warm_stall", "warm_exec_transport").
+  string kind = 2;
+  optional string warm_stage = 3;
+  string output_tail = 4;
+}
+
 message RestoreBaseForSessionRequest {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`
   // for the per-image base snapshot.

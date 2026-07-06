@@ -96,6 +96,7 @@ pub(crate) fn into_status(err: ApiError) -> Status {
         // 502 it is on the axum side.
         ApiError::BadGateway(_) => Code::Unavailable,
         ApiError::Internal(_) => Code::Internal,
+        ApiError::CaptureFailed { .. } => Code::Internal,
     };
     let slug = err.slug();
     let mut status = Status::new(code, err.message().to_string());

@@ -376,6 +376,17 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_cross == 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Job-level (not step-scoped): any crate in this lane can pull in a
+    # transitive C dependency that needs the kernel UAPI headers against
+    # the musl sysroot (userfaultfd-sys's build-script shim #includes
+    # <linux/types.h>, absent from musl-gcc's own sysroot). ADR 0068 added
+    # `userfaultfd` to engram-host-agent too (ProbeSandbox's UFFD MINOR
+    # self-test) — step-scoping this only onto engram-uffd-handler left
+    # the host-agent musl build with CFLAGS=None and it failed the same
+    # way uffd-handler used to.
+    env:
+      CFLAGS_x86_64_unknown_linux_musl: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+      BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -435,11 +446,9 @@ jobs:
       # uffd-handler also ships into the FC host image (ADR 0020 Route B),
       # so guard its musl build here too. userfaultfd-sys's C shim needs the
       # kernel uapi headers pointed at via CFLAGS/bindgen (libc-agnostic, so
-      # safe to mix with the musl sysroot).
+      # safe to mix with the musl sysroot) — set at the job level above so
+      # every step in this lane gets it, not just this one.
       - name: build engram-uffd-handler (musl)
-        env:
-          CFLAGS_x86_64_unknown_linux_musl: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
-          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
         run: |
           cargo build \
             --target x86_64-unknown-linux-musl \
@@ -958,9 +967,11 @@ jobs:
         run: |
           # ADR 0021 P1.6: `proxy_e2e` came back in the e2e
           # resurrection — baked-in harness path, CA delivered via
-          # `InstallHostCa` vsock RPC instead of the retired
-          # `.engram-host/ca.pem` substrate file. `option_d_warm_lease`
-          # stays deleted (it was specifically about option-D).
+          # the `SpawnHarness` vsock RPC (2026-07 core-ops fold: one
+          # first-contact call installs the CA and spawns) instead of
+          # the retired `.engram-host/ca.pem` substrate file.
+          # `option_d_warm_lease` stays deleted (it was specifically
+          # about option-D).
           # `aux_ro_drive` is NOT in this list: it self-isolates (raw FC
           # spawn, per-process tempdir + auto loop device, its own `sudo
           # mount`) and already runs in the unprivileged `--test-threads=4`
@@ -1017,8 +1028,8 @@ jobs:
       # FC microVM + PooledBackend + real proxy + (for harness)
       # real Claude CLI + real api.anthropic.com 401 round-trip.
       # ADR 0062: the harness is a per-session bundle mounted on dyn_0
-      # (no longer baked into the rootfs); the CA via `InstallHostCa`
-      # vsock RPC.
+      # (no longer baked into the rootfs); the CA rides the
+      # `SpawnHarness` vsock RPC (2026-07 core-ops fold).
       - name: True-e2e tests (root — e2e_shell, e2e_harness, e2e_vnc)
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
