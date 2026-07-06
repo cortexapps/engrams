@@ -269,6 +269,21 @@ pub async fn probe_bundle_stamp(dir: &Path) -> CapStatus {
     }
 }
 
+/// First non-empty line of `--snapshot-version` stdout. Only the first
+/// line: our FC fork's binary appends its exit log ("<timestamp>
+/// [anonymous-instance:main] Firecracker exiting successfully.
+/// exit_code=0") to stdout after the version, and the per-invocation
+/// timestamp makes the raw stdout unique per probe — stamping it whole
+/// fails the placement equality gate on every cross-host restore
+/// (caught by the e2e teleport lane).
+fn parse_snapshot_version(stdout: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
 /// `firecracker --snapshot-version` output (e.g. `"v10.0.0"`),
 /// probed once and cached — a subprocess spawn on every 5s heartbeat
 /// tick would be wasteful for a value that can't change without a
@@ -285,8 +300,7 @@ pub async fn fc_snapshot_version(firecracker_bin: Option<&Path>) -> Option<Strin
         .ok();
     let version = output.and_then(|o| {
         if o.status.success() {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            (!s.is_empty()).then_some(s)
+            parse_snapshot_version(&o.stdout)
         } else {
             None
         }
@@ -492,5 +506,26 @@ mod tests {
     #[tokio::test]
     async fn fc_snapshot_version_none_off_fc_backend() {
         assert_eq!(fc_snapshot_version(None).await, None);
+    }
+
+    #[test]
+    fn snapshot_version_parse_takes_first_nonempty_line_only() {
+        // The fork's binary appends a timestamped exit-log line to
+        // stdout; the timestamp made every raw probe string unique and
+        // deterministically failed the placement equality gate on
+        // cross-host restore. Only the version line may survive.
+        assert_eq!(
+            parse_snapshot_version(
+                b"v10.0.0\n2026-07-06T07:58:54.531383078 [anonymous-instance:main] \
+                  Firecracker exiting successfully. exit_code=0\n"
+            ),
+            Some("v10.0.0".to_string())
+        );
+        assert_eq!(
+            parse_snapshot_version(b"\n  v10.0.0  \n"),
+            Some("v10.0.0".to_string())
+        );
+        assert_eq!(parse_snapshot_version(b""), None);
+        assert_eq!(parse_snapshot_version(b"\n \n"), None);
     }
 }
