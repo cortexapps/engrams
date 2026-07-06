@@ -21,6 +21,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
@@ -972,4 +973,167 @@ async fn prestage_writes_are_fenced_off_from_a_stale_claimant() {
         .expect("b ready");
     let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
     assert_eq!(got.state, EnableJobState::Ready);
+}
+
+// ---- issue #538/PR #565 (T4): prestage against REAL host rows, two polls ----
+
+/// Mirrors `enable_scanner::eval_prestage`'s eligible/staged counting
+/// over a slice of host rows. That function (and `prestage_host_outcomes`,
+/// `advance_one`, `run_once`) is module-private or `pub(crate)` —
+/// unreachable from this external `tests/` binary — so this reimplements
+/// its ~5-line predicate using the actual `pub` `host_is_schedulable` the
+/// production code calls, scoped to just the host ids the caller cares
+/// about (this test's Postgres accumulates hosts from every OTHER test in
+/// this file too, so counting the whole `list_active_hosts()` result
+/// would be cross-test-polluted).
+fn classify_scoped(
+    hosts: &[HostRecord],
+    ids: &[HostId],
+    digest: &str,
+    ttl: Duration,
+) -> (usize, usize) {
+    let now = Utc::now();
+    let eligible: Vec<&HostRecord> = hosts
+        .iter()
+        .filter(|h| ids.contains(&h.id))
+        .filter(|h| {
+            engram_coordinator::placement::host_is_schedulable(h, now, ttl) && h.stages_images
+        })
+        .collect();
+    let staged = eligible
+        .iter()
+        .filter(|h| h.ready_images.iter().any(|d| d == digest))
+        .count();
+    (staged, eligible.len())
+}
+
+/// Issue #538/PR #565 (T4): the prestage stage's actual acceptance
+/// criteria — (a) a host whose staged-ness FLIPS between two polls
+/// eventually shows up `staged`, and (b) a second host that never stages
+/// is recorded `timed_out` while the job still reaches `ready` (the
+/// deadline-with-stragglers policy: proceed once >=1 host is staged
+/// rather than wedge on a straggler forever) — exercised against REAL
+/// host rows read back from live Postgres across two real polls, not a
+/// synthetic `Vec<HostRecord>` (that pure truth table is already
+/// unit-tested that way in `enable_scanner.rs`'s own `#[cfg(test)]`).
+///
+/// Scope note: `enable_scanner::run_once`/`advance_one`/`eval_prestage`
+/// are `pub(crate)` or module-private, so they're unreachable from this
+/// external `tests/` binary; `advance_one` also unconditionally restarts
+/// every job from `fetch_and_seal_manifest` (a real OCI registry fetch)
+/// regardless of the job's current state, which this live-PG-only CI
+/// lane doesn't wire (this file's own header note already scopes the
+/// full pipeline exercise to the FC e2e suite). So this test drives the
+/// REAL fenced `MetadataStore` prestage surface
+/// (`begin_enable_job_prestage` / `set_enable_job_prestage_hosts` /
+/// `list_active_hosts` / `touch_host_heartbeat`) plus the real
+/// `placement::host_is_schedulable` predicate, and sequences
+/// prestaging → ready exactly as `advance_one`'s tail does. No deadline
+/// wait is exercised — this is a synchronous two-poll simulation, not
+/// the scanner's timed loop — so the test runs in well under a second
+/// without needing to shrink `ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS`.
+#[tokio::test]
+#[ignore]
+async fn prestage_flip_and_straggler_reach_ready_via_live_host_rows() {
+    let Some(meta) = connect().await else { return };
+    let digest = format!("sha256:{}", Uuid::new_v4().simple());
+    let ttl = engram_coordinator::placement::placement_ttl();
+
+    // Both hosts start un-staged. `flipping_host`'s prefetch supervisor
+    // will catch up between poll 1 and poll 2 (a real heartbeat write);
+    // `straggler_host` never does.
+    let flipping_host = seed_staging_host(&meta, &digest, false).await;
+    let straggler_host = seed_staging_host(&meta, &digest, false).await;
+    let scope = [flipping_host, straggler_host];
+
+    let uri = unique_uri("prestage-live-flip");
+    let job = meta
+        .create_or_get_enable_job(&uri, Some(&digest), &[])
+        .await
+        .expect("create");
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim");
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Capturing)
+        .await
+        .expect("capturing");
+    meta.begin_enable_job_prestage(job.id, "pod-a", prestage_ref_json(&digest))
+        .await
+        .expect("begin prestage");
+
+    // Poll 1: read REAL rows back from PG — neither host has staged yet.
+    let hosts_poll1 = meta.list_active_hosts().await.expect("list hosts poll 1");
+    assert_eq!(
+        classify_scoped(&hosts_poll1, &scope, &digest, ttl),
+        (0, 2),
+        "poll 1: neither host has staged the digest yet"
+    );
+
+    // The flipping host's prefetch supervisor catches up — a REAL
+    // heartbeat write lands its digest in `ready_images`, exactly like a
+    // live host reporting progress mid-wait.
+    meta.touch_host_heartbeat(
+        flipping_host,
+        HostHeartbeat {
+            status: HostStatus::Ready,
+            capacity: HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 0,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: HostUtilization::default(),
+            ready_images: vec![digest.clone()],
+            local_snapshots: Vec::new(),
+            current_bundles: Vec::new(),
+            total_vcpus: 0,
+            wire_version: engram_protocol::WIRE_VERSION,
+            stages_images: true,
+            capabilities: Default::default(),
+        },
+    )
+    .await
+    .expect("flip flipping_host staged");
+
+    // Poll 2: read REAL rows back again — the flip is visible; the
+    // straggler still isn't staged.
+    let hosts_poll2 = meta.list_active_hosts().await.expect("list hosts poll 2");
+    assert_eq!(
+        classify_scoped(&hosts_poll2, &scope, &digest, ttl),
+        (1, 2),
+        "poll 2: the flipping host's heartbeat landed; the straggler hasn't"
+    );
+
+    // Record the per-host outcome map exactly as `prestage_host_outcomes`
+    // would, then flip to ready — `advance_one`'s tail, applying the
+    // deadline-with-stragglers policy (>=1 staged proceeds rather than
+    // waiting the straggler out).
+    let outcomes = serde_json::json!({
+        flipping_host.to_string(): { "outcome": "staged", "waited_ms": 1500 },
+        straggler_host.to_string(): { "outcome": "timed_out", "waited_ms": 1_200_000 },
+    });
+    meta.set_enable_job_prestage_hosts(job.id, "pod-a", outcomes.clone())
+        .await
+        .expect("record outcomes");
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Ready)
+        .await
+        .expect("ready");
+
+    let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(
+        got.state,
+        EnableJobState::Ready,
+        "job reaches ready despite the straggler"
+    );
+    assert_eq!(
+        got.prestage_hosts[flipping_host.to_string()]["outcome"],
+        serde_json::json!("staged"),
+        "the flipping host must be recorded staged"
+    );
+    assert_eq!(
+        got.prestage_hosts[straggler_host.to_string()]["outcome"],
+        serde_json::json!("timed_out"),
+        "the never-staged host must be recorded timed_out"
+    );
 }
