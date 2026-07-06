@@ -593,6 +593,26 @@ pub(crate) async fn try_cancel_nominated_eviction(
             return Ok(false);
         }
     };
+    // ADR 0074 rung 2 (parked-paused ascent): if this session was parked
+    // by PAUSING the VM in place (park_rung == 2), the sandbox is still
+    // bound and alive — un-pause it BEFORE flipping the row back to
+    // Active so the harness is running the instant the caller resumes.
+    // We do this under the lease we already hold, and only commit the
+    // Active transition if the resume succeeds; a failed un-pause leaves
+    // the session Evicting for the reaper/normal resume path rather than
+    // advertising Active over a paused VM.
+    let row = state.services.meta.get_session(id).await.ok();
+    let parked_paused = row.as_ref().map(|r| r.park_rung).unwrap_or(0) == 2;
+    if parked_paused {
+        if let Some(sandbox_id) = row.as_ref().and_then(|r| r.sandbox_id) {
+            if let Err(e) = state.services.host.resume(sandbox_id).await {
+                tracing::warn!(session_id = %id, %sandbox_id, error = %e,
+                    "rung-2 ascent: un-pause failed; leaving session Evicting for the standard resume path");
+                drop(guard);
+                return Ok(false);
+            }
+        }
+    }
     let result = match state
         .services
         .meta
@@ -602,9 +622,13 @@ pub(crate) async fn try_cancel_nominated_eviction(
         Ok(prev) => {
             let _ = state.services.meta.set_session_park_rung(id, 0, None).await;
             ::metrics::counter!(crate::metrics::EVICTION_CANCELLED_TOTAL).increment(1);
+            if parked_paused {
+                ::metrics::counter!(crate::metrics::EVICTION_UNPARKED_PAUSED_TOTAL).increment(1);
+            }
             tracing::info!(
                 session_id = %id,
-                "eviction cancelled at rung 1 — the user came back before capture began",
+                park_rung = if parked_paused { 2 } else { 1 },
+                "eviction cancelled — the user came back before/at the parking rung",
             );
             let _ = state
                 .emit(
@@ -2457,6 +2481,8 @@ mod evicting_gate_tests {
             last_active_at: Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         }
     }
 
@@ -2786,6 +2812,8 @@ mod evicting_gate_tests {
             last_active_at: Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         }
     }
 

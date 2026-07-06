@@ -52,6 +52,14 @@ pub enum EvictOutcome {
     /// The pipeline ran: the session was (or is being, for the D5
     /// background-finalize fast path) suspended to the target state.
     Evacuated,
+    /// ADR 0074 rung 2: the host had memory headroom, so instead of a
+    /// full snapshot+destroy the VM was PAUSED in place (park_rung=2,
+    /// session stays Evicting, harness alive in RAM). A returning
+    /// user's prompt un-pauses it in <100ms (the rung-2 ascent); a
+    /// later pressure/dwell sweep descends it to a full eviction. The
+    /// scanner treats this like a completed nomination (the session is
+    /// no longer a fresh idle-evict candidate) but does NOT unbind.
+    ParkedPaused,
     /// A re-entry / liveness guard fired; the session was NOT evacuated
     /// by this call. The reason is operator-facing (surfaced in a 409).
     Skipped { reason: &'static str },
@@ -66,12 +74,70 @@ pub enum EvictOutcome {
 /// matching the historical idle-eviction shape. Operator-driven
 /// drains (ADR 0018 commit 12) use [`evict_session_to_state`]
 /// directly with `target_state = Evacuating`.
+/// ADR 0074 rung 2: does `sandbox_id`'s host have memory headroom to
+/// keep a VM PAUSED (rung 2) rather than fully evicting it? Reads the
+/// heartbeat-persisted `hosts.utilization`. Fails CLOSED (no headroom →
+/// full eviction) on a telemetry gap: a paused VM frees no RAM, so
+/// parking under UNKNOWN pressure is the dangerous direction (it could
+/// leave the host overcommitted), the mirror of the idle detector's
+/// fail-open-toward-eviction.
+///
+/// Headroom threshold reuses the detector's mem floor (default 15% free)
+/// plus a margin, so a host that is not "under pressure" for eviction
+/// purposes has room to hold a paused VM.
+async fn host_has_memory_headroom(state: &SharedState, sandbox_id: SandboxId) -> bool {
+    let Some(host_id) = state.host_registry.host_of(sandbox_id) else {
+        return false;
+    };
+    let hosts = match state.services.meta.list_active_hosts().await {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let Some(host) = hosts.into_iter().find(|h| h.id == host_id) else {
+        return false;
+    };
+    let u = &host.utilization;
+    if u.mem_total_mib == 0 {
+        return false; // unmeasured → fail closed (no parking)
+    }
+    // Prefer the RAM ledger's `allocatable_mib` (issue #540): it already
+    // nets out other parked-but-resident VMs' PSS, so parking decisions
+    // don't double-count a host that is already holding parked sandboxes
+    // (which is exactly how a naive `total − used` would over-park a host
+    // into pressure). Fall back to raw physical free on pre-ledger /
+    // non-Linux hosts where `allocatable_mib == 0`.
+    let free_mib = if u.allocatable_mib > 0 {
+        u.allocatable_mib
+    } else {
+        u.mem_total_mib.saturating_sub(u.mem_used_mib)
+    };
+    let free_pct = free_mib.saturating_mul(100) / u.mem_total_mib;
+    // A comfortable margin above the eviction floor: only park when the
+    // host has real slack, so parked residency can't tip it into
+    // pressure.
+    free_pct as u8 >= park_headroom_floor_pct()
+}
+
+/// Free-RAM percent above which a host will PARK (rung 2) instead of
+/// evict. Above the eviction mem floor by design (env-tunable).
+fn park_headroom_floor_pct() -> u8 {
+    std::env::var("ENGRAM_PARK_HEADROOM_FLOOR_PCT")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(30)
+}
+
 pub async fn evict_idle_session(
     state: &SharedState,
     session_id: SessionId,
     sandbox_id: SandboxId,
 ) -> Result<EvictOutcome, EvictError> {
-    evict_session_to_state(state, session_id, sandbox_id, SessionState::Idle).await
+    // The idle-evict entry point allows parking (ADR 0074 rung 2): if
+    // the host has memory headroom the VM is paused in place instead of
+    // fully captured. The rung reaper's DESCENT path calls
+    // `evict_session_to_state(.., allow_park=false)` to force the full
+    // capture even when headroom exists.
+    evict_session_to_state(state, session_id, sandbox_id, SessionState::Idle, true).await
 }
 
 /// ADR 0018 commit 12: parameterized suspend pipeline. Same pause →
@@ -97,6 +163,7 @@ pub async fn evict_session_to_state(
     session_id: SessionId,
     sandbox_id: SandboxId,
     target_state: SessionState,
+    allow_park: bool,
 ) -> Result<EvictOutcome, EvictError> {
     // The pipeline only knows about Idle and Evacuating as legal
     // targets. Both share the "Active → captured-snapshot → suspended"
@@ -222,6 +289,45 @@ pub async fn evict_session_to_state(
     // Hosts that don't support the split (pre-D5, non-FC) surface
     // InvalidSpec and fall through to the composed path too.
     if target_state == SessionState::Idle {
+        // ADR 0074 rung 2 (parked-paused): if the host has memory
+        // headroom, PAUSE the VM in place instead of snapshot+destroy.
+        // Frees CPU (not RAM), keeps the harness alive in RAM, and lets
+        // a returning user un-pause in <100ms rather than pay a full
+        // 12.2s-p50 rebuild. Under real memory pressure this branch is
+        // skipped and the full eviction below runs (rung 4). Only the
+        // idle-evict path parks; drain/evac (Evacuating) always captures.
+        // `allow_park == false` is the reaper's DESCENT path (already
+        // parked, now forcing the full capture) — it must never re-park.
+        if allow_park && host_has_memory_headroom(state, sandbox_id).await {
+            match state.services.host.pause(sandbox_id).await {
+                Ok(()) => {
+                    if let Err(e) = state
+                        .services
+                        .meta
+                        .set_session_park_rung(session_id, 2, Some(Utc::now()))
+                        .await
+                    {
+                        tracing::warn!(session_id = %session_id, error = %e,
+                            "rung-2 park: park_rung stamp failed; un-pausing to avoid a stuck paused VM");
+                        let _ = state.services.host.resume(sandbox_id).await;
+                    } else {
+                        ::metrics::counter!(crate::metrics::EVICTION_PARKED_PAUSED_TOTAL)
+                            .increment(1);
+                        tracing::info!(session_id = %session_id, %sandbox_id,
+                            "rung-2 park: VM paused in place (host has memory headroom)");
+                        return Ok(EvictOutcome::ParkedPaused);
+                    }
+                }
+                Err(engram_core::SandboxError::InvalidSpec(_)) => {
+                    // Backend can't pause (VZ/Process) — fall through to
+                    // the full eviction below.
+                }
+                Err(e) => {
+                    tracing::warn!(session_id = %session_id, error = %e,
+                        "rung-2 park: pause failed; falling through to full eviction");
+                }
+            }
+        }
         // ADR 0065: reap the ephemeral in-guest browser stack before the eviction
         // snapshot so a live Chrome is never frozen into it (re-lazy-started on
         // the next EnsureBrowser after resume). Best-effort; never blocks eviction.
@@ -945,6 +1051,16 @@ pub(crate) async fn scanner_run_once(
         "eviction scanner found Evicting sessions"
     );
     for (session, attempts) in candidates {
+        // ADR 0074 rungs 2-3: a PARKED session (park_rung >= 2) is not a
+        // fresh eviction to drive — the reaper owns its dwell/pressure
+        // descent. Route it there instead of the eviction pipeline (which
+        // `scanner_advance_one` also guards against, defensively).
+        if session.park_rung >= 2 {
+            if let Err(e) = park_reaper_advance_one(state, session).await {
+                tracing::warn!(error = %e, "park reaper per-session advance failed");
+            }
+            continue;
+        }
         if let Err(e) = scanner_advance_one(cfg, state, session, attempts).await {
             // Keep going — one wedged session shouldn't stall the
             // sweep.
@@ -966,6 +1082,18 @@ async fn scanner_advance_one(
     attempts: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_id = session.id;
+
+    // ADR 0074 rungs 2-3: a session left Evicting at a PARKED rung
+    // (park_rung >= 2) has already been through the pipeline — it is
+    // deliberately holding at a resource-cheaper rung (paused in RAM /
+    // data-plane retained on host), NOT a fresh eviction to drive. The
+    // rung reaper (`park_reaper_advance_one`) owns descending it on
+    // dwell/pressure. If this scanner drove the pipeline again it would
+    // re-pause an already-parked VM and bump evict_attempts every tick
+    // until the budget exhausted the session straight to HostLost.
+    if session.park_rung >= 2 {
+        return Ok(());
+    }
 
     // Budget exhausted, or an inconsistent row (Evicting without a
     // bound sandbox — nothing to evict): fall back to HostLost. The
@@ -1043,6 +1171,99 @@ async fn scanner_advance_one(
     // shift).
     ::metrics::histogram!(crate::metrics::EVICTION_PIPELINE_SECONDS)
         .record(started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// ADR 0074 rung reaper: dwell cap (seconds) after which a parked VM is
+/// descended to a full eviction even without memory pressure — its RAM
+/// isn't worth holding if the user hasn't returned in this long, and a
+/// paused guest's TCP connections go stale past this window anyway.
+/// Env-tunable; default 15 minutes (ADR 0074 rung-2 dwell).
+fn park_dwell_cap() -> chrono::Duration {
+    let secs = std::env::var("ENGRAM_PARK_DWELL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(900);
+    chrono::Duration::seconds(secs.max(1))
+}
+
+/// ADR 0074 rungs 2-3: advance one PARKED session (park_rung >= 2). The
+/// pipeline already ran and left it deliberately at a cheaper rung; this
+/// reaper decides whether to keep holding or DESCEND to a full eviction.
+///
+/// Descent triggers (rung 2, parked-paused):
+/// - **dwell**: parked longer than [`park_dwell_cap`] — reclaim the RAM.
+/// - **pressure**: the host lost memory headroom — the whole point of
+///   parking was to use spare RAM; once it's scarce the parked VM must
+///   yield.
+///
+/// Descending un-pauses the VM (so `stop_browser` + the capture see a
+/// live guest) and re-drives the eviction pipeline with `allow_park =
+/// false`, which forces the full snapshot+destroy regardless of
+/// headroom. On success the session lands at `Idle` with a durable
+/// snapshot, exactly like a plain idle eviction — the parking was a
+/// transparent latency optimization that left no trace in the terminal
+/// state.
+#[tracing::instrument(name = "idle_evictor.park_reaper", skip_all, fields(session_id = %session.id, park_rung = session.park_rung))]
+async fn park_reaper_advance_one(
+    state: &SharedState,
+    session: engram_core::types::Session,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let session_id = session.id;
+    let Some(sandbox_id) = session.sandbox_id else {
+        // A parked row with no bound sandbox is inconsistent (park
+        // implies a live VM). Clear the rung and let the normal scanner
+        // path fall it back to HostLost on the next tick.
+        tracing::warn!(%session_id, "park reaper: parked row has no sandbox; clearing rung");
+        let _ = state
+            .services
+            .meta
+            .set_session_park_rung(session_id, 0, None)
+            .await;
+        return Ok(());
+    };
+
+    // Rung 2 (parked-paused) is the only rung this reaper descends today;
+    // rung 3 (parked-local) is handled by the data-plane retention path.
+    if session.park_rung != 2 {
+        return Ok(());
+    }
+
+    let dwell_exceeded = session
+        .parked_at
+        .map(|at| Utc::now().signed_duration_since(at) >= park_dwell_cap())
+        .unwrap_or(true); // no stamp → treat as long-parked (descend)
+    let has_headroom = host_has_memory_headroom(state, sandbox_id).await;
+    let reason = if !has_headroom {
+        "pressure"
+    } else if dwell_exceeded {
+        "dwell"
+    } else {
+        // Still within dwell and the host has room — keep the VM parked.
+        return Ok(());
+    };
+
+    tracing::info!(%session_id, %sandbox_id, reason, "park reaper: descending parked-paused VM to full eviction");
+    // Un-pause first so the capture pipeline (browser reap, flush, guest
+    // agent RPCs) talks to a live guest. A failed un-pause is transient —
+    // leave the session parked and retry next tick.
+    if let Err(e) = state.services.host.resume(sandbox_id).await {
+        tracing::warn!(%session_id, %sandbox_id, error = %e,
+            "park reaper: un-pause before descent failed; will retry next tick");
+        return Ok(());
+    }
+    ::metrics::counter!(crate::metrics::EVICTION_PARK_DESCEND_TOTAL, "reason" => reason)
+        .increment(1);
+
+    // Full capture with parking disabled. The pipeline stamps park_rung
+    // back to 0 as part of landing the session at Idle (see the Idle
+    // transition below), so a completed descent leaves no parked state.
+    evict_session_to_state(state, session_id, sandbox_id, SessionState::Idle, false).await?;
+    let _ = state
+        .services
+        .meta
+        .set_session_park_rung(session_id, 0, None)
+        .await;
     Ok(())
 }
 
@@ -1158,6 +1379,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
@@ -1211,6 +1434,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
@@ -1360,6 +1585,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta, stashed) = d5_state(session, sandbox_root.path());
@@ -1371,7 +1598,7 @@ mod tests {
             .await
             .unwrap();
 
-        evict_session_to_state(&state, session_id, sandbox_id, SessionState::Idle)
+        evict_session_to_state(&state, session_id, sandbox_id, SessionState::Idle, false)
             .await
             .expect("evict");
 
@@ -1442,6 +1669,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta, _stashed) = d5_state(session, sandbox_root.path());
@@ -1453,7 +1682,7 @@ mod tests {
             .await
             .unwrap();
 
-        evict_session_to_state(&state, session_id, sandbox_id, SessionState::Idle)
+        evict_session_to_state(&state, session_id, sandbox_id, SessionState::Idle, false)
             .await
             .expect("evict");
 
@@ -1498,6 +1727,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -1694,6 +1925,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -1906,6 +2139,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -2122,6 +2357,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -2240,6 +2477,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2468,6 +2707,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -2582,6 +2823,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2673,6 +2916,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2704,6 +2949,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2724,10 +2971,15 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome =
-            evict_session_to_state(&state, session_id, sandbox_id, SessionState::Evacuating)
-                .await
-                .expect("a guarded skip is not an error");
+        let outcome = evict_session_to_state(
+            &state,
+            session_id,
+            sandbox_id,
+            SessionState::Evacuating,
+            false,
+        )
+        .await
+        .expect("a guarded skip is not an error");
         assert!(
             matches!(outcome, EvictOutcome::Skipped { .. }),
             "lease-held pipeline must report Skipped, got {outcome:?}",
@@ -2751,6 +3003,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         }
     }
 
@@ -2889,5 +3143,253 @@ mod tests {
             .expect("tick");
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionState::Active, "untouched");
+    }
+
+    /// The session lease releases asynchronously (the RAII guard's Drop
+    /// spawns a best-effort DELETE). Production callers retry on the
+    /// resulting transient 409; tests poll here so the next
+    /// lease-acquiring step doesn't race the release.
+    async fn wait_for_lease_free(meta: &Arc<MiniMeta>, id: engram_core::SessionId) {
+        wait_for("session lease released", || {
+            !meta.session_leases.lock().contains_key(&id)
+        })
+        .await;
+    }
+
+    /// ADR 0074 rung 2: push a `HostRecord` into the mock's
+    /// `list_active_hosts` set whose id matches the registry host that
+    /// owns `sandbox_id`, with a memory utilization that either has or
+    /// lacks parking headroom. `free_mib` feeds `allocatable_mib` (the
+    /// ledger signal `host_has_memory_headroom` prefers).
+    fn seed_host_with_free_ram(meta: &Arc<MiniMeta>, host_id: engram_core::HostId, free_mib: u64) {
+        meta.hosts
+            .lock()
+            .push(engram_core::types::host::HostRecord {
+                id: host_id,
+                hostname: "park-test".into(),
+                cloud_metadata: engram_core::types::host::HostMetadata::default(),
+                capacity: engram_core::types::host::HostCapacity {
+                    total_gb: 100,
+                    used_gb: 10,
+                    total_mib: 65_536,
+                    used_mib: 0,
+                    running_sandboxes: 1,
+                },
+                utilization: engram_core::types::host::HostUtilization {
+                    mem_total_mib: 65_536,
+                    mem_used_mib: 65_536 - free_mib,
+                    allocatable_mib: free_mib,
+                    ..Default::default()
+                },
+                status: engram_core::types::host::HostStatus::Ready,
+                last_heartbeat_at: chrono::Utc::now(),
+                host_addr: Some("http://127.0.0.1:1".into()),
+                ready_images: Vec::new(),
+                local_snapshots: Vec::new(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
+                wire_version: 0,
+                stages_images: true,
+                capabilities: Default::default(),
+            });
+    }
+
+    /// ADR 0074 rung 2 (parked-paused): with host memory headroom, an
+    /// idle eviction PAUSES the VM in place instead of capturing —
+    /// session holds at Evicting, park_rung=2, sandbox alive, nothing
+    /// snapshotted. When the user returns, the cancel path un-pauses and
+    /// flips back to Active with the same live sandbox (no rebuild).
+    #[tokio::test]
+    async fn parked_paused_with_headroom_then_ascends_on_cancel() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let session = evicting_session(session_id); // status = Evicting
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+        let host_id = state
+            .host_registry
+            .host_of(sandbox_id)
+            .expect("sandbox routed");
+        seed_host_with_free_ram(&meta, host_id, 60_000); // ~91% free ≥ 30 floor
+
+        let outcome = evict_idle_session(&state, session_id, sandbox_id)
+            .await
+            .expect("evict");
+        assert!(
+            matches!(outcome, EvictOutcome::ParkedPaused),
+            "headroom → parked, got {outcome:?}"
+        );
+        let s = meta.session.lock().clone();
+        assert_eq!(s.status, SessionState::Evicting, "parked holds at Evicting");
+        assert_eq!(s.park_rung, 2);
+        assert!(s.parked_at.is_some());
+        assert!(
+            state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "parked VM is NOT destroyed"
+        );
+        assert!(
+            meta.snapshots.lock().is_empty(),
+            "parking captures no snapshot"
+        );
+
+        // Ascent: the user comes back → un-pause + flip Active. Wait for
+        // the park pipeline's lease to release first (prod retries this).
+        wait_for_lease_free(&meta, session_id).await;
+        let cancelled = crate::api::snapshot::try_cancel_nominated_eviction(&state, session_id)
+            .await
+            .unwrap();
+        assert!(cancelled, "parked-paused session is cancellable");
+        let s = meta.session.lock().clone();
+        assert_eq!(s.status, SessionState::Active);
+        assert_eq!(s.park_rung, 0, "rung cleared on ascent");
+        assert!(
+            state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "same live sandbox after un-pause — no rebuild"
+        );
+    }
+
+    /// ADR 0074 rung 2 reaper: a parked-paused VM whose dwell cap has
+    /// elapsed is DESCENDED to a full eviction (un-pause → capture →
+    /// destroy → Idle), reclaiming its RAM. The parking left no trace in
+    /// the terminal state.
+    #[tokio::test]
+    async fn parked_paused_descends_to_full_eviction_on_dwell() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let session = evicting_session(session_id);
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+        let host_id = state
+            .host_registry
+            .host_of(sandbox_id)
+            .expect("sandbox routed");
+        seed_host_with_free_ram(&meta, host_id, 60_000);
+
+        // Park first.
+        let outcome = evict_idle_session(&state, session_id, sandbox_id)
+            .await
+            .expect("evict");
+        assert!(matches!(outcome, EvictOutcome::ParkedPaused));
+
+        // Backdate the park entry beyond the dwell cap (default 600s).
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        state
+            .services
+            .meta
+            .set_session_park_rung(session_id, 2, Some(stale))
+            .await
+            .unwrap();
+
+        // A scanner tick routes the parked row to the reaper, which
+        // descends it (host still has headroom, so the trigger is dwell).
+        wait_for_lease_free(&meta, session_id).await;
+        scanner_run_once(&EvictionScannerConfig::default(), &state)
+            .await
+            .expect("tick");
+
+        {
+            let m = meta.clone();
+            wait_for("descended to Idle", move || {
+                m.session.lock().status == SessionState::Idle
+            })
+            .await;
+        }
+        let s = meta.session.lock().clone();
+        assert_eq!(
+            s.status,
+            SessionState::Idle,
+            "dwell-expired park descends to a full eviction"
+        );
+        assert_eq!(s.park_rung, 0, "rung cleared after descent");
+        assert!(
+            !state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "descent destroys the sandbox"
+        );
+        assert!(
+            !meta.snapshots.lock().is_empty(),
+            "descent captures a durable snapshot"
+        );
+    }
+
+    /// ADR 0074: a parked row (park_rung >= 2) must NOT be re-driven
+    /// through the eviction pipeline by the scanner — that would bump
+    /// evict_attempts every tick and eventually fall the session to
+    /// HostLost. The scanner routes it to the reaper instead, which (in
+    /// dwell + headroom) leaves it parked untouched.
+    #[tokio::test]
+    async fn parked_row_is_not_re_evicted_by_scanner() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let session = evicting_session(session_id);
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+        let host_id = state.host_registry.host_of(sandbox_id).expect("routed");
+        seed_host_with_free_ram(&meta, host_id, 60_000);
+        // Freshly parked (within dwell) with headroom → the reaper holds.
+        state
+            .services
+            .meta
+            .set_session_park_rung(session_id, 2, Some(chrono::Utc::now()))
+            .await
+            .unwrap();
+
+        scanner_run_once(&EvictionScannerConfig::default(), &state)
+            .await
+            .expect("tick");
+
+        let s = meta.session.lock().clone();
+        assert_eq!(
+            s.status,
+            SessionState::Evicting,
+            "still parked, not evicted"
+        );
+        assert_eq!(s.park_rung, 2);
+        assert!(
+            state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "parked VM untouched by the scanner"
+        );
     }
 }

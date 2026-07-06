@@ -85,6 +85,8 @@ impl MetadataStore for MockMetadataStore {
             last_active_at: Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         self.sessions.lock().insert(id, session);
         Ok(id)
@@ -129,6 +131,8 @@ impl MetadataStore for MockMetadataStore {
             last_active_at: now,
             live_disk_manifest: None,
             selected_skills: ws.selected_skills,
+            park_rung: 0,
+            parked_at: None,
         };
         self.sessions.lock().insert(ws.session_id, session);
         Ok(match host_id {

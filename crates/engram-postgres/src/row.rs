@@ -59,6 +59,11 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     // project it (e.g. `list_evacuating_sessions`/`list_evicting_sessions`,
     // which don't need it) still decodes.
     let selected_skills: Vec<String> = row.try_get("selected_skills").unwrap_or_default();
+    // ADR 0074 parking ladder: park_rung added in migration 0087.
+    // SELECTs that don't project it (or pre-migration rows) fall back
+    // to 0 = "not parked".
+    let park_rung: i16 = row.try_get("park_rung").unwrap_or(0);
+    let parked_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("parked_at").ok().flatten();
     Ok(Session {
         id: SessionId(id),
         status: parse_session_state(&status)?,
@@ -70,6 +75,8 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         last_active_at,
         live_disk_manifest,
         selected_skills,
+        park_rung,
+        parked_at,
     })
 }
 

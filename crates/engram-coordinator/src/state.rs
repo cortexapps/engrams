@@ -1773,6 +1773,24 @@ pub(crate) mod tests {
             }
             Ok(prev)
         }
+        // ADR 0074 parking ladder: mirror the PG UPDATE into the
+        // in-memory session so the reaper/ascent paths read the stamped
+        // rung back (the default trait impl is a no-op, which would make
+        // any parking assertion vacuous).
+        async fn set_session_park_rung(
+            &self,
+            id: engram_core::SessionId,
+            rung: i16,
+            parked_at: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<(), MetaError> {
+            let mut s = self.session.lock();
+            if id != s.id {
+                return Err(MetaError::NotFound);
+            }
+            s.park_rung = rung;
+            s.parked_at = parked_at;
+            Ok(())
+        }
         async fn assign_session_host(
             &self,
             id: engram_core::SessionId,
@@ -2275,6 +2293,8 @@ pub(crate) mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
@@ -2341,6 +2361,8 @@ pub(crate) mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
@@ -2386,6 +2408,8 @@ pub(crate) mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         (session_id, Arc::new(MiniMeta::new(session)))
     }
@@ -2412,6 +2436,8 @@ pub(crate) mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let sid = session.id;
         let mini = Arc::new(MiniMeta::new(session));

@@ -68,6 +68,8 @@ impl ReconcileMeta {
                 last_active_at: now,
                 live_disk_manifest: None,
                 selected_skills: Vec::new(),
+                park_rung: 0,
+                parked_at: None,
             },
         );
         id

@@ -50,15 +50,65 @@ as candidacy, never as a reclaim trigger; hard TTL remains the
 absolute ceiling. Rung-2/3 residency charges `allocatable_mib` (#540).
 The speculative `ensure_rung` typing hint is dropped from v1.
 
-## This PR: rung 1 only
+## Staging
 
-Ships standalone (the issue's own staging): the `Evicting → Active`
-legality edge, `park_rung`/`parked_at` schema, nomination stamping,
+**Rung 1 (PR #581).** The `Evicting → Active` legality edge,
+`park_rung`/`parked_at` schema (migration 0086), nomination stamping,
 and a lease-guarded cancel folded into `ensure_active` — so ADR 0067's
 outbox delivery driver cancels the nomination inline and the returning
 user's prompt proceeds against the untouched VM. The 8s Evicting hold
-loop survives only as the capture-already-started fallback. Rungs 2–4
-land as follow-ups on this ADR.
+loop survives only as the capture-already-started fallback.
+
+**Rung 2 + reaper (this PR).** Parked-paused, stacked on rung 1:
+
+- **Park decision** (`evict_session_to_state`, Idle target, before the
+  browser reap / capture): if `host_has_memory_headroom` — the RAM
+  ledger's `allocatable_mib` (#540, which already nets out other parked
+  VMs' PSS so we never over-park) is ≥ `ENGRAM_PARK_HEADROOM_FLOOR_PCT`
+  (default 30%) of `mem_total_mib` — PAUSE the VM in place, stamp
+  `park_rung=2 / parked_at`, and return `EvictOutcome::ParkedPaused`
+  with the session held at `Evicting` and the sandbox alive. The
+  headroom check **fails closed** (a telemetry gap → no park → full
+  eviction): a paused VM frees no RAM, so parking under *unknown*
+  pressure is the dangerous direction, the mirror of the idle
+  detector's fail-open-toward-eviction. `allow_park=false` (the drain
+  path and the reaper's own descent) skips this branch entirely.
+- **Ascent** (`try_cancel_nominated_eviction`): if the session is
+  `park_rung=2`, un-pause the sandbox **before** the CAS
+  `Evicting → Active`, under the lease we already hold — and only commit
+  the Active transition if the un-pause succeeded (a failed un-pause
+  leaves the session `Evicting` for the standard resume path rather than
+  advertising Active over a paused VM). The returning user's prompt then
+  proceeds against the same live guest — no rebuild.
+- **Reaper** (`park_reaper_advance_one`, driven by the existing eviction
+  scanner tick): a parked row (`park_rung ≥ 2`) is routed here instead
+  of the eviction pipeline (which would re-pause it and bump
+  `evict_attempts` to `HostLost` every tick — guarded in both
+  `scanner_run_once` and `scanner_advance_one`). The reaper DESCENDS the
+  parked VM to a full eviction when the dwell cap
+  (`ENGRAM_PARK_DWELL_SECS`, default 900s) elapses OR the host loses
+  headroom (`reason=dwell|pressure`): un-pause → `evict_session_to_state
+  (Idle, allow_park=false)` → `Idle` with a durable snapshot, exactly
+  like a plain idle eviction. Parking leaves no trace in the terminal
+  state.
+
+A parked-paused session stays `Evicting`, which `reserves_host_memory`
+already counts — correct, the paused VM still occupies RAM; the RAM
+ledger's `allocatable_mib` nets it back out for placement so it isn't
+double-counted.
+
+**Rung 3 (parked-local) is sequenced into #548, not built here.** Its
+core primitive — destroy the VM but retain the snapshot staging + NBD
+backing on local NVMe so a returning session resumes pinned to the
+parking host without a GCS round-trip — IS the authoritative-affinity +
+peer-first-fill machinery of the GCS-free-resume epic (#548). Building
+host-local retention now, separately from #548's affinity tracking,
+would be the exact "special case layered on shared infrastructure"
+anti-pattern this overhaul is trying to retire (and would duplicate the
+affinity/pin state two ways). Rung 3 lands there, reusing `park_rung=3`
+as the on-host-retention marker. **Rung 4 (evicted-remote) is the
+existing full eviction** — unchanged, now the pressure/dwell floor the
+ladder descends to.
 
 ## Divergence log
 
@@ -73,3 +123,24 @@ land as follow-ups on this ADR.
   a legal post-lease input (the drain path), so an unguarded CAS could
   cancel "under" a pipeline that then proceeds to evict an Active
   session.
+- **Rung 2 is pause-only in v1 — no diff-banking.** The Decision framed
+  parked-paused around "a 38–53ms diff whose upload runs in the
+  background" (ADR 0028's cheap-pause primitive). This PR parks with a
+  plain `pause` and defers the diff/upload to the 2→4 descent (which
+  pays the full capture). The diff-banking optimization — flush a
+  checkpoint *at park time* so the eventual descent is near-free — is a
+  clean follow-up that doesn't change the rung's state shape; it was
+  dropped from v1 to keep the parked path a single backend `pause` call.
+- **Headroom gate reads `allocatable_mib`, fails closed.**
+  `host_has_memory_headroom` prefers the RAM ledger's `allocatable_mib`
+  (falling back to raw `mem_total − mem_used` only on pre-ledger /
+  non-Linux hosts) and returns `false` on any telemetry gap
+  (`mem_total_mib == 0`, host not found, list error). Parking under
+  unknown pressure could overcommit a host, so the safe default is the
+  full eviction.
+- **The park pipeline's lease releases asynchronously**, so an ascent or
+  descent fired *immediately* after a park can race the release and see
+  a held lease (transient false / `Skipped`). Production already retries
+  this (the `ensure_active` hold loop; the next scanner tick); the unit
+  tests poll `wait_for_lease_free` before the follow-on step. No product
+  code change — the retry paths already existed for rung 1.

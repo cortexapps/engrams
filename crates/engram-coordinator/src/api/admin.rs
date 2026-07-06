@@ -202,6 +202,7 @@ pub(crate) async fn evacuate_session_core(
         session_id,
         sandbox_id,
         engram_core::types::SessionState::Evacuating,
+        false,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("evac pipeline: {e}")))?;
@@ -624,6 +625,7 @@ pub(crate) async fn admin_drain_host_core(
                     sid,
                     sb,
                     engram_core::types::SessionState::Evacuating,
+                    false,
                 )
                 .await;
                 // A `Skipped` here (a concurrent eviction won the lease, the

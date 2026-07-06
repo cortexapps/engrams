@@ -201,6 +201,19 @@ pub const IDLE_EVICT_KEPT_RESIDENT_TOTAL: &str = "engram_idle_evict_kept_residen
 /// returning user before capture began — each one is a full
 /// snapshot+destroy+rebuild (p50 12.2s) the user did not pay.
 pub const EVICTION_CANCELLED_TOTAL: &str = "engram_eviction_cancelled_total";
+/// Counter (ADR 0074 rung 2). Idle sessions PARKED PAUSED (VM paused in
+/// place, not evicted) because the host had memory headroom — each is a
+/// full snapshot+destroy+rebuild the returning user avoids.
+pub const EVICTION_PARKED_PAUSED_TOTAL: &str = "engram_eviction_parked_paused_total";
+/// Counter (ADR 0074 rung 2 ascent). Parked-paused sessions un-paused
+/// back to Active because the user returned — the fast-path win the
+/// rung buys (un-pause in <100ms vs a full snapshot rebuild).
+pub const EVICTION_UNPARKED_PAUSED_TOTAL: &str = "engram_eviction_unparked_paused_total";
+/// Counter (ADR 0074 rung reaper). Parked sessions DESCENDED to a full
+/// eviction — the user never returned within the dwell cap, or the host
+/// came under memory pressure and the parked VM's RAM had to be
+/// reclaimed. Labelled by `reason` (`dwell` | `pressure`).
+pub const EVICTION_PARK_DESCEND_TOTAL: &str = "engram_eviction_park_descend_total";
 /// Counter (ADR 0073 phase 4). Heartbeats reporting a RUNNING sandbox
 /// for an Active session with NO attached harness — the demoted
 /// belt-and-braces liveness alarm (was the desync watchdog's job).

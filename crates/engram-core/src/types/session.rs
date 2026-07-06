@@ -490,6 +490,21 @@ pub struct Session {
     /// base skills only, since the queue row never carried the selection).
     #[serde(default)]
     pub selected_skills: Vec<String>,
+    /// ADR 0074 parking ladder: which rung this session's sandbox is
+    /// currently parked at. `0` = not parked (normal). `1` = nominated
+    /// for eviction (still Active, cancellable). `2` = parked-paused
+    /// (VM paused in place, sandbox bound, un-pause to ascend). `3` =
+    /// parked-local (data plane retained on-host after destroy). The
+    /// coordinator reads this on the cancel/ascent path to choose how
+    /// to bring the session back (un-pause vs. resume vs. rebuild).
+    #[serde(default)]
+    pub park_rung: i16,
+    /// ADR 0074: when this session entered its current parking rung.
+    /// Drives the rung-2 dwell cap (reclaim a paused VM's RAM if the
+    /// user hasn't returned within the cap) and rung-3 retention
+    /// accounting. `None` when `park_rung == 0`.
+    #[serde(default)]
+    pub parked_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -746,6 +761,8 @@ mod tests {
             last_active_at: Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let blob = serde_json::to_string(&original).unwrap();
         let back: Session = serde_json::from_str(&blob).unwrap();
