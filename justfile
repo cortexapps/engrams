@@ -533,9 +533,10 @@ integration-session:
     bash deploy/dev/integration-session.sh
 
 # Bake an image from a directory containing Dockerfile + engram.toml,
-# then push it to the local OCI registry. Auto-selects cross-compile
-# target + `--transport` flag based on host arch. Tag defaults to
-# `warm-<rfc3339>`; override with `TAG=...`.
+# then push it to the local OCI registry. Auto-selects the cross-compile
+# target based on host arch; transport is always vsock (ADR 0066 retired
+# console transport — console-baked images no longer boot). Tag defaults
+# to `warm-<rfc3339>`; override with `TAG=...`.
 #
 # Usage:
 #   just bake cortex/api ./examples/api
@@ -550,12 +551,15 @@ bake repo dir='.':
     @set -e; \
     : "${ENGRAM_KEK_MASTER_KEY:?run \`just bootstrap\` first to generate a KEK}"; \
     if [ "$(uname -s -m)" = "Darwin arm64" ]; then \
-        TARGET=aarch64-unknown-linux-musl; PLATFORM=linux/arm64; TRANSPORT=console; \
+        TARGET=aarch64-unknown-linux-musl; PLATFORM=linux/arm64; \
     elif [ "$(uname -s -m)" = "Linux x86_64" ]; then \
-        TARGET=x86_64-unknown-linux-musl; PLATFORM=linux/amd64; TRANSPORT=vsock; \
+        TARGET=x86_64-unknown-linux-musl; PLATFORM=linux/amd64; \
+    elif [ "$(uname -s -m)" = "Linux aarch64" ]; then \
+        TARGET=aarch64-unknown-linux-musl; PLATFORM=linux/arm64; \
     else \
         echo "unsupported host: $(uname -s -m)" >&2; exit 1; \
     fi; \
+    TRANSPORT=vsock; \
     rustup target add $TARGET >/dev/null 2>&1 || true; \
     cargo build -p engram-agentd --target $TARGET --release; \
     TAG="${TAG:-warm-$(date -u +%Y%m%dT%H%M%SZ)}"; \
