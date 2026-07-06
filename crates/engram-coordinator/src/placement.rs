@@ -145,6 +145,15 @@ pub fn host_meets_capabilities(
     }
     if let (Some(want), Some(have)) = (&req.fc_snapshot_version, &caps.fc_snapshot_version) {
         if want != have {
+            // The exclusion reason is a static str; surface the actual pair
+            // here — a mismatch between two hosts running the same binary
+            // is otherwise undiagnosable from the NoCapacity summary alone.
+            tracing::warn!(
+                host_id = %h.id,
+                want = %want,
+                have = %have,
+                "fc_snapshot_version gate mismatch"
+            );
             return Err("fc_snapshot_version");
         }
     }
