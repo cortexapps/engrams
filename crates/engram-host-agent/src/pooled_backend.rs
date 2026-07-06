@@ -2791,7 +2791,11 @@ impl PooledBackend {
                             .map_err(|e| {
                                 SandboxError::Snapshot(format!("catch-up read {hash}: {e}"))
                             })?;
-                        chunk_store.put_chunk(&bytes).await.map_err(|e| {
+                        // ADR 0078 move 5: the teleport catch-up uploads the
+                        // source's un-flushed memory divergence — new by
+                        // construction (memory changed since the last
+                        // publish), so skip the per-chunk `exists()` GCS HEAD.
+                        chunk_store.put_chunk_unchecked(&bytes).await.map_err(|e| {
                             SandboxError::Snapshot(format!("catch-up upload {hash}: {e}"))
                         })?;
                         Ok::<(), SandboxError>(())
