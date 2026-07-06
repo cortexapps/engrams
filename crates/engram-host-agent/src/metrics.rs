@@ -90,7 +90,7 @@ pub const OCI_PULL_BYTES: &str = "engram_oci_pull_bytes";
 /// increments, and ops can page on the cross-over before disk fills.
 pub const HOST_DISK_FREE_BYTES: &str = "engram_host_disk_free_bytes";
 
-/// ADR 0067: gauge of `fs_free - fs_total * ENGRAM_KUBELET_EVICT_PCT/100`
+/// ADR 0070: gauge of `fs_free - fs_total * ENGRAM_KUBELET_EVICT_PCT/100`
 /// on the host's `work_dir` mount — how far free disk sits above the
 /// kubelet's ephemeral-storage hard-eviction line. Sampled every
 /// heartbeat tick (`UtilizationProbe::sample`), independent of the
@@ -103,7 +103,7 @@ pub const HOST_DISK_FREE_BYTES: &str = "engram_host_disk_free_bytes";
 /// the ADR-0028 disk-only cold-recovery path).
 pub const HOST_DISK_HEADROOM_TO_KUBELET_BYTES: &str = "engram_host_disk_headroom_to_kubelet_bytes";
 
-/// ADR 0067: gauge of summed on-disk bytes of every per-template base
+/// ADR 0070: gauge of summed on-disk bytes of every per-template base
 /// memfile the image-prefetch supervisor has materialized (ADR 0022
 /// Option A residency) — these are unevictable disk (mlock'd, reclaimed
 /// only on image-disable), so they're part of the same "floor the

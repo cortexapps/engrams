@@ -1,5 +1,5 @@
-//! In-process integration tests for the app-gRPC surface (ADR 0039 /
-//! ADR 0051). The coordinator's web-facing REST surface is gone; the
+//! In-process integration tests for the app-gRPC surface (ADR 0051).
+//! The coordinator's web-facing REST surface is gone; the
 //! orchestrator drives the coordinator exclusively over the four tonic
 //! services in `grpc_app/` (SessionService, ShellRelayService,
 //! FleetService, ImageService). This file is the gRPC replacement for the
@@ -588,7 +588,7 @@ fn enabled_image(uri: &str) -> engram_core::types::EnabledImage {
 }
 
 // =====================================================================
-// Auth (ADR 0039 §5) — replaces tests/api.rs auth_* REST middleware tests
+// Auth (ADR 0051 §5) — replaces tests/api.rs auth_* REST middleware tests
 // =====================================================================
 
 /// Happy path: a server configured with `TEST_TOKEN`, called with a

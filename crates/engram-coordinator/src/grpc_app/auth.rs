@@ -1,4 +1,4 @@
-//! Machine auth for the app-gRPC surface (ADR 0039 §5): one trusted
+//! Machine auth for the app-gRPC surface (ADR 0051 §5): one trusted
 //! caller (the orchestrator), one static bearer, constant-time compare.
 //! Fail closed: no configured tokens = reject everything.
 //!

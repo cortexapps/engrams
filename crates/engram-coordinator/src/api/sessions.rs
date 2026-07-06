@@ -718,6 +718,14 @@ async fn boot_prepared(
     let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
         .await
         .map_err(engram_core::SandboxError::from)?;
+    // ADR 0068 (core-ops-batch correction pass): this path used to fall
+    // silently into the `Queued` disposition below with zero visibility
+    // into why every host was excluded — the same "no capacity with free
+    // hosts" mystery mode `pick_for_session` already fixed on the
+    // resume/evac path. Mirror it here.
+    if candidates.hosts.is_empty() {
+        crate::placement::log_empty_candidates(state.services.meta.as_ref(), &ctx, "create").await;
+    }
 
     // -------- Seal secrets + serialize the policy BEFORE the transaction --------
     // Issue #535 (b): the KEK seal is async crypto with no place inside a DB

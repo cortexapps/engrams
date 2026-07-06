@@ -698,9 +698,11 @@ pub async fn teardown(setup: &NetSetup, allocator: &parking_lot::Mutex<NetworkAl
 // allocator the cold path uses. The egress proxy registry indexes
 // against that unique IP, just like for cold sessions.
 
-/// Naming for the netns hosting one warm-restored VM. Resolves
-/// under `/var/run/netns/<name>` for both `ip netns exec` and a
-/// future direct `setns(2)` path.
+/// Naming for the netns hosting one warm-restored VM. Resolves under
+/// `/var/run/netns/<name>`, the bind-mount `ip netns add` publishes
+/// (`netns_path_for` below) and that `spawn_firecracker`'s direct exec +
+/// `pre_exec` `setns(2)` closure opens to enter the namespace — the two
+/// consumers of this name.
 pub fn netns_name_for(sandbox_id: SandboxId) -> String {
     let s = sandbox_id.to_string();
     let prefix: String = s

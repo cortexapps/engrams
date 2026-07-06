@@ -172,7 +172,8 @@ landing, regardless of which coordinator (if any) is up when it lands.
 ### 3. `paused_at` cursor + kind-scoped rewind
 
 `SnapshotMetadata` gains `paused_at: Option<DateTime<Utc>>` (bincode —
-`WIRE_VERSION` 7 → 8, lockstep coord+host roll per existing discipline),
+`WIRE_VERSION` 8 → 9, renumbered at merge since main had already taken 8 for
+#563; lockstep coord+host roll per existing discipline),
 stamped unconditionally in `SnapshotFinisher::finish` from the capture's
 exact pause instant. The composed eviction path resolves the
 `session_events` coherence cursor from it instead of coordinator

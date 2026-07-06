@@ -1,4 +1,4 @@
-# ADR 0061: NBD read concurrency — pipeline the serve loop
+# ADR 0071: NBD read concurrency — pipeline the serve loop
 
 **Status:** Accepted (2026-06-29). The in-guest rootfs is served over NBD from the
 chunked content-addressed store (ADR 0007) by a per-sandbox daemon whose serve loop

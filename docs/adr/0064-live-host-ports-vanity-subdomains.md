@@ -3,7 +3,7 @@
 **Status:** Proposed (2026-06-29). engrams can run an agent that builds a web app inside a
 session, but there is no way to *reach* a port that agent opened (a dev server on
 `localhost:3000`). The only inbound path that exists today is the hardcoded ttyd shell
-tunnel (ADR 0014 issue #6 / ADR 0039 §8): the egress proxy (ADR 0006) is strictly
+tunnel (ADR 0014 issue #6 / ADR 0051 §8): the egress proxy (ADR 0006) is strictly
 outbound. This ADR adds a **generic raw-byte guest-port tunnel** — a protocol-agnostic
 generalization of the ttyd `ProxyShell` path — and an orchestrator edge that maps an
 auto-minted **vanity subdomain** (`jumping-fat-kittens.preview.engrams.cortex.io`) to a
@@ -12,7 +12,7 @@ wildcard-localhost domain for local dev / VZ. Implemented across phases on dedic
 worktrees; this ADR is the bookend and is updated between phases.
 
 **Related:** ADR 0014 issue #6 (the `ProxyShell` tunnel this generalizes), ADR 0013
-(coord↔host gRPC transport), ADR 0039 §8 (the `ShellRelayService` app-tier bridge), ADR
+(coord↔host gRPC transport), ADR 0051 §8 (the `ShellRelayService` app-tier bridge), ADR
 0047 (PG is the routing authority — `resolve_sandbox`), ADR 0034 (idle eviction — the pin
 this tunnel takes), ADR 0031 (user auth / owner-scoping / IAP ForwardAuth), ADR 0051 (the
 orchestrator is the only web backend), ADR 0006 (egress proxy — the outbound counterpart),

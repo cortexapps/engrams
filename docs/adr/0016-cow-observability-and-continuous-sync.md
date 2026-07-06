@@ -1076,7 +1076,7 @@ Phase B's migration must take `0034_` (or whichever the next
 free number is when Phase B opens). Renumber + rename in the
 Phase B commit chain — do not leave a duplicate `0033`.
 
-**Later renamed (ADR 0021 follow-up, migration `0044`, 2026-05-29)**:
+**Later renamed (ADR 0016 §A.1.5c follow-up, migration `0044`, 2026-05-29)**:
 the coord-side `eviction_inflight` table → `session_lease`, and its
 `sandbox_id` dropped `NOT NULL`. The lease stopped being
 eviction-only — the resume path now takes the same per-session lease

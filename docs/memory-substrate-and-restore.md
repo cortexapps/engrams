@@ -204,7 +204,7 @@ never touch mtime/atime; atomic temp + rename gives torn-free visibility.
 Singleflight (`LeaderGuard`) dedups concurrent fetches of the same hash, cancel-safe.
 `prefetch` confirms residency with a cheap `contains` stat rather than reading
 (and discarding) the whole chunk. Eviction is **FIFO by populate time** (oldest
-first-write, by mtime) under a free-space floor (ADR 0060: keep ~20% free,
+first-write, by mtime) under a free-space floor (ADR 0070: keep ~20% free,
 re-probed via `statvfs` every sweep; default no absolute ceiling, optional
 `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`) — *not* access-LRU; the hot set is protected
 explicitly by the refcounted pin set, not by recency. Unreferenced BlobStorage

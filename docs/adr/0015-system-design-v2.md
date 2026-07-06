@@ -706,7 +706,7 @@ UX class. Per-host operator drains as a separate concept.
 
 **Open questions.** Eligibility: which sessions can be migrated?
 Ones in `Active` state with a recent snapshot, probably. Idle
-sessions are easier (snapshot already in BlobStorage from ADR 0011).
+sessions are easier (snapshot already in BlobStorage from ADR 0014).
 Cold sessions mid-boot might not be migratable; fail-loud is fine.
 
 ---

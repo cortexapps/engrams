@@ -538,8 +538,17 @@ impl HostService for HostServiceImpl {
             decode_bincode(&inner.capture_env_bincode, "capture_env")?
         };
 
+        // Issue #563 review correction: 64 was tight enough that a slow
+        // consumer (or a burst of keepalive + per-line progress events
+        // around a stage transition) could fill it and silently drop the
+        // one event that mattered — the terminal failure's stage + output
+        // tail (see `pooled_backend::run_warm_hook`'s `violation_failure`).
+        // 256 sits comfortably above the realistic event count for one
+        // capture (a handful of phase transitions + one keepalive tick per
+        // ~30s over a multi-minute hook, drained continuously by the loop
+        // below) without meaningfully growing worst-case memory.
         let (progress_tx, mut progress_rx) =
-            mpsc::channel::<engram_core::types::CaptureProgress>(64);
+            mpsc::channel::<engram_core::types::CaptureProgress>(256);
         let (tx, rx) = mpsc::channel::<Result<BuildBaseSnapshotEvent, Status>>(16);
 
         let backend = self.inner.clone();

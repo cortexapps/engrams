@@ -181,7 +181,7 @@ export type TaskSessionRef = Message<"engram.app.v1.TaskSessionRef"> & {
   session?: Session;
 
   /**
-   * ADR 0052: resolved profile identity for the session's originating profile,
+   * ADR 0053: resolved profile identity for the session's originating profile,
    * for the app-wide chip (§9). Unset for legacy / profile-less sessions.
    *
    * @generated from field: optional engram.app.v1.ProfileSnapshot profile = 4;

@@ -2730,9 +2730,10 @@ impl FirecrackerBackend {
         // per-VM netns BEFORE spawning FC. The netns has the bake's
         // TAP recreated inside it (collision-free vs other warm VMs
         // on the same host) plus SNAT remapping the VM's bake-time
-        // source IP to a unique-per-VM pool slot. FC enters the
-        // netns via `ip netns exec` so `load_snapshot`'s TAP open
-        // resolves inside it.
+        // source IP to a unique-per-VM pool slot. FC enters the netns
+        // via `spawn_firecracker`'s direct exec + `pre_exec` `setns(2)`
+        // closure (no `ip netns exec` wrapper fork) so `load_snapshot`'s
+        // TAP open resolves inside it.
         //
         // Legacy/test snapshots with `manifest.net = None` keep the
         // historical host-root flow: TAP lives directly on host

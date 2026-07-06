@@ -536,13 +536,27 @@ stayed subprocesses by design; veth/addr/route/TAP moved to `rtnetlink` +
 A residual ~20 ms of incidental (not structural) subprocess spawns was closed
 out separately (issue #536): unconditional idempotency pre-clean spawns
 (existence/`link_index`-gated instead), the `ip netns exec` wrapper around the
-Firecracker spawn itself (direct exec + `pre_exec` `setns`), the unconditional
-teardown veth delete (now conditional on the netns delete having failed), and
-the cold-create `provision_with_named_tap` path (unified onto
+Firecracker spawn itself (direct exec + `pre_exec` `setns`), and the
+cold-create `provision_with_named_tap` path (unified onto
 `create_persistent_tap` + `rtnetlink`, for uniformity — it's off the
 session-restore hot path). The netns leg now performs exactly **two**
 deliberate subprocess spawns on the happy path: `ip netns add` and the in-ns
 iptables SNAT rule.
+
+`teardown_netns`'s veth-A delete stayed a synchronous, UNCONDITIONAL netlink
+call issued before `allocator.free(snat_cidr)` (`net.rs::teardown_netns`) —
+it does NOT gate on whether `ip netns delete` failed. `ip netns delete`
+cascades (TAP, veth-B, the netns's iptables tables) but netns destruction
+itself is asynchronous: the kernel defers the actual teardown to the
+`cleanup_net` workqueue after the last reference drops, so veth-A in host
+root (and the /30 it holds) can still be visible for a nondeterministic
+window after `ip netns delete` returns `Ok`. A conditional gate (only delete
+veth-A if the netns delete itself failed) would race `allocator.free` on the
+happy path — the freed slot could be handed to a concurrent provision while
+veth-A still pinned it, reopening the exact double-bound-/30 shape of the
+prod 2026-05-21 incident documented below. The unconditional synchronous
+delete closes that race regardless of `ip netns delete`'s outcome, and it's
+still a syscall (not a subprocess), so the two-spawn invariant survives.
 
 **(b) constant in-namespace identity and (c) the pool remain explicitly NOT
 pursued.** Low absolute remaining yield on a path the warm substrate (~516 ms)

@@ -1,4 +1,4 @@
-//! `ShellRelayService` over gRPC (ADR 0039 §8, Task 12).
+//! `ShellRelayService` over gRPC (ADR 0051 §8, Task 12).
 //!
 //! The orchestrator uses this bidi-streaming RPC to bridge a terminal
 //! session through the coordinator into the session's `ttyd` process.

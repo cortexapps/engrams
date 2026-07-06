@@ -641,7 +641,7 @@ export const DeleteProfileResponseSchema: GenMessage<DeleteProfileResponse> = /*
   messageDesc(file_engram_app_v1_profile, 13);
 
 /**
- * Session profiles (ADR 0052) — admin-curated session starting points.
+ * Session profiles (ADR 0053) — admin-curated session starting points.
  * ORCHESTRATOR-NATIVE: the control plane neither implements nor knows about
  * profiles. This file lives in the app package so web gets one uniform
  * generated API, and it is deliberately ABSENT from crates/engram-protocol/

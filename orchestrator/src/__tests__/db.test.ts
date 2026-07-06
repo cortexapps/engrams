@@ -186,7 +186,7 @@ describe("healthz with live DB (requires ORCHESTRATOR_DATABASE_URL)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Session profiles (ADR 0052)
+// Session profiles (ADR 0053)
 //
 // Round-trips the orchestrator-only `profile` table and the nullable
 // `task_session.profile_id` intra-DB FK that records which profile started a
@@ -194,7 +194,7 @@ describe("healthz with live DB (requires ORCHESTRATOR_DATABASE_URL)", () => {
 // null deleted_at defaults) and the FK column.
 // ---------------------------------------------------------------------------
 
-describe("profile table (ADR 0052)", () => {
+describe("profile table (ADR 0053)", () => {
   test.skipIf(!dbReachable)(
     "insert profile + task_session.profile_id round-trips",
     async () => {

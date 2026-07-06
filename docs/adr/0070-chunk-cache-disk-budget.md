@@ -1,4 +1,4 @@
-# ADR 0067: hard host disk budget for the chunk cache
+# ADR 0070: hard host disk budget for the chunk cache
 
 **Status:** Accepted (2026-07-01) — shipped in four commits on `feat/chunk-cache-disk-budget`
 (issue #528): chunk-store budget derivation + pin accounting + periodic sweeper
@@ -13,6 +13,10 @@ was previously double-assigned to an earlier draft of this exact topic (chunk-ca
 free-floor/kubelet-headroom) and a Slack-bot ADR; the chunk-cache draft was removed in
 commit `97b935b6` (issue #450) and its rationale folded into `cache.rs`'s doc comments.
 This ADR is the actual, current chunk-cache-budget decision record, numbered fresh.
+Renumbered a second time, 0067 → 0070, in the core-ops-batch correction pass: this ADR
+landed as 0067 (issue #557), which collided with the pre-existing
+`0067-browser-stack-reliability-and-portable-bundle.md`; 0068/0069 were already taken
+by the time the collision was caught, so this one moved to the next free number.
 
 ## Context
 

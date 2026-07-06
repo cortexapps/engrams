@@ -70,7 +70,7 @@ export function abilityFor(user: AbilityUser): AppAbility {
   can("read", "EnabledImage");
 
   // Profiles: every member reads the picker menu; mutations are admin-only
-  // (manage("all")). ADR 0052 §6.
+  // (manage("all")). ADR 0053 §6.
   can("read", "Profile");
 
   // Harness catalog (ADR 0063): the harness/model/effort selectors every member

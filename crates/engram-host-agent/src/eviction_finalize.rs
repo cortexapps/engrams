@@ -384,12 +384,28 @@ async fn publish_disk_manifest(
         annotations: serde_json::Value::Null,
     };
 
-    let mut attempt_ref = base_manifest.next_version();
+    // The FIRST attempt always targets this same deterministic version
+    // (derived purely from `base_manifest`, same as `run_memory_leg`'s
+    // `next_ref = prev_ref.next_version()`). That means a conflict on
+    // THIS SPECIFIC attempt can only mean a prior crash-redrive already
+    // published this exact content (a crash between that `put_manifest`
+    // and this leg's stage-bump persist) — idempotent success, not a
+    // race, exactly like `run_memory_leg`'s `attempted == next_ref.version`
+    // arm. Only bump-and-retry on a conflict against a LATER, non-
+    // deterministic `attempt_ref` (this loop's own prior bump), where a
+    // genuine concurrent writer is the more plausible explanation.
+    let deterministic_ref = base_manifest.next_version();
+    let mut attempt_ref = deterministic_ref;
     let mut attempts = 0u32;
     loop {
         attempts += 1;
         match chunk_store.put_manifest(attempt_ref, &new_manifest).await {
             Ok(()) => return Ok(attempt_ref),
+            Err(engram_chunk_store::ChunkStoreError::VersionConflict { attempted, .. })
+                if attempt_ref == deterministic_ref && attempted == deterministic_ref.version =>
+            {
+                return Ok(deterministic_ref);
+            }
             Err(engram_chunk_store::ChunkStoreError::VersionConflict {
                 latest,
                 manifest_id,
@@ -765,3 +781,93 @@ pub(crate) async fn run_eviction_finalize(
 // `chunk_store`, `checkpoint_dir`, `pending_finalizes`, `self_ref`,
 // `capture_locks` — the same reasoning `finisher()` follows for
 // `SnapshotFinisher`).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Correction-pass item C (T7): `publish_disk_manifest`'s
+    /// idempotent-redrive arm (this file, ~line 404) — a `VersionConflict`
+    /// at the FIRST-attempt deterministic ref (`base_manifest.next_version()`)
+    /// can only mean a prior crash-redrive already published this exact
+    /// content, so it must return `Ok(deterministic_ref)` rather than
+    /// erroring or bumping to a new version. No fake store needed: a REAL
+    /// `ChunkStore` genuinely returns `VersionConflict` when a manifest
+    /// already exists at that `(manifest_id, version)` key, so this seeds
+    /// that conflict directly rather than mocking one.
+    #[tokio::test]
+    async fn publish_disk_manifest_conflict_at_deterministic_ref_is_idempotent_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let chunk_store = ChunkStore::new(blob);
+
+        // Base disk manifest, as it stood at capture time.
+        let base_ref = ManifestRef::new();
+        let base = Manifest {
+            schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Disk,
+            chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(4096),
+            total_bytes: 4096,
+            chunks: Vec::new(),
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        chunk_store
+            .put_manifest(base_ref, &base)
+            .await
+            .expect("seed base manifest");
+
+        let bytes = Bytes::from_static(b"one dirty 4KiB-ish chunk's worth of bytes");
+        let hash = chunk_store.put_chunk(&bytes).await.expect("put chunk");
+        let chunks = vec![(0usize, hash, bytes)];
+
+        // Simulate a prior crash-redrive that already published the
+        // deterministic next version with EXACTLY the content this
+        // redrive attempt would independently reconstruct.
+        let deterministic_ref = base_ref.next_version();
+        let prior_publish = Manifest {
+            schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Disk,
+            chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(4096),
+            total_bytes: 4096,
+            chunks: vec![ChunkRef { offset: 0, hash }],
+            parent: Some(base_ref),
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        chunk_store
+            .put_manifest(deterministic_ref, &prior_publish)
+            .await
+            .expect("seed prior-crash publish at the deterministic ref");
+
+        // The redrive: must treat the resulting VersionConflict as
+        // idempotent success, returning the SAME deterministic ref rather
+        // than erroring or bumping to `version + 2`.
+        let result = publish_disk_manifest(&chunk_store, base_ref, 4096, 4096, &chunks)
+            .await
+            .expect("a conflict at the deterministic ref is idempotent success, not an error");
+        assert_eq!(
+            result, deterministic_ref,
+            "must return the already-published deterministic ref, not bump past it"
+        );
+    }
+
+    // T7 (correction-pass item C, PR #566 review): the MEMORY leg's
+    // mirror-image arm (~line 535, inside `run_memory_leg`) is NOT
+    // factored into a standalone helper the way the disk leg's
+    // `publish_disk_manifest` is — exercising it needs a full
+    // `EvictionFinalizeRecord` + `EvictionFinalizer`, a real binary
+    // `memory.diff` file `crate::checkpoint::dirty_ranges` can parse, and
+    // a prev-manifest whose content matches what
+    // `ChunkStore::update_for_dirty_ranges_sparse` deterministically
+    // recomputes — meaningfully more scaffolding than the disk leg's
+    // direct-call test above (which needed no scaffolding beyond a real
+    // `ChunkStore`). Left untested here; the right longer-term fix is
+    // extracting `run_memory_leg`'s publish arm into a standalone
+    // `publish_memory_manifest` helper mirroring `publish_disk_manifest`,
+    // which would make it just as cheaply testable — but that's a
+    // production-code refactor, out of scope for this test-only pass.
+}

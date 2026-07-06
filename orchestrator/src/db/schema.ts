@@ -60,7 +60,7 @@ export const taskSession = pgTable(
       .references(() => task.id, { onDelete: "cascade" }),
     sessionId: text("session_id").notNull(), // control-plane session id
     role: text("role"), // nullable until multi-session types exist
-    // ADR 0052: which profile started this session. Real intra-DB FK (§2).
+    // ADR 0053: which profile started this session. Real intra-DB FK (§2).
     // Nullable for pre-feature / out-of-band sessions. Profiles are only ever
     // soft-deleted, so the target always exists; ON DELETE is moot.
     profileId: text("profile_id").references(() => profile.id),
@@ -73,7 +73,7 @@ export const taskSession = pgTable(
 );
 
 // ---------------------------------------------------------------------------
-// Session profiles (ADR 0052)
+// Session profiles (ADR 0053)
 //
 // Admin-curated session starting points. Orchestrator-only data — the control
 // plane never learns about profiles. `image_id` is a LOGICAL ref to the

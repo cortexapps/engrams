@@ -49,7 +49,7 @@ pub const DEFAULT_DIRTY_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 /// limits (mirrors the memory prefetch + re-chunk bound).
 const DISK_FLUSH_UPLOAD_CONCURRENCY: usize = 32;
 
-/// ADR 0061: bounded concurrency for the per-chunk fetches of a single
+/// ADR 0071: bounded concurrency for the per-chunk fetches of a single
 /// NBD read that spans multiple 16 MiB chunks. The fetches are
 /// order-independent (each `read_chunk` resolves dirty/pending/mem/base
 /// on its own); we fan them out and reassemble in order. Most NBD reads
@@ -2118,7 +2118,7 @@ mod tests {
         assert!(bytes.iter().all(|b| *b == 0xbb));
     }
 
-    /// ADR 0061 (#2): a read that straddles chunk boundaries fans the
+    /// ADR 0071 (#2): a read that straddles chunk boundaries fans the
     /// per-chunk fetches out concurrently (`buffered`) and must reassemble
     /// them IN ORDER — chunk 0's bytes before chunk 1's before chunk 2's, no
     /// transposition from out-of-order fetch completion.

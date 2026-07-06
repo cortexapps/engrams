@@ -1,4 +1,4 @@
-//! `FleetService` over gRPC (ADR 0039 §2.3). Each RPC is a thin
+//! `FleetService` over gRPC (ADR 0051 §2.3). Each RPC is a thin
 //! transport adapter: auth-check, decode, delegate to the same axum
 //! handlers (or their inner logic) that serve the REST surface, encode
 //! the response. No admin gating — the caller (orchestrator) is trusted;

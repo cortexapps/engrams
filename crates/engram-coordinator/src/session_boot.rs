@@ -246,7 +246,16 @@ pub(crate) async fn boot_on_reserved_host(
         }
         resolve_inject_entries(state, session_id, integration_policy.as_ref(), &image_ref).await
     };
+    // Issue #535 correction: neither `coord_prepare` nor `coord_finalize`
+    // covers this join itself — `coord_finalize` only starts once it
+    // returns (below) — so a slow env/egress leg (an external mint-mode
+    // connector round trip) was invisible to both. Time the whole overlap
+    // unconditionally; a restore failure still paid for this wall time
+    // before erroring out below.
+    let overlap_start = std::time::Instant::now();
     let (restore_result, injects) = tokio::join!(restore_leg, env_egress_leg);
+    ::metrics::histogram!(crate::metrics::COORD_BOOT_OVERLAP_SECONDS)
+        .record(overlap_start.elapsed().as_secs_f64());
     // Issue #535 (observability): `coord_finalize` starts HERE — restore
     // returned, whatever its outcome. The phase ends at the Active
     // transition below (a failure returns before recording it — this phase

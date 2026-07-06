@@ -926,6 +926,76 @@ async fn notify_placement_changed_fires_at_every_site() {
     wait_for_reason(&mut listener, "pending_deleted").await;
 }
 
+/// Issue #537/PR #559 (T6): the negative twin of
+/// `notify_placement_changed_fires_at_every_site` above.
+/// `resume_origin_enqueue_requires_idle` already pins the ROW-level
+/// no-op (a session that isn't `idle` — already past it, e.g. `queued` —
+/// leaves `enqueue_session_resume` a no-op); this pins the NOTIFY side:
+/// the guard in `enqueue_session_resume` (`if n > 0`) means the no-op
+/// path must NOT fire `placement_changed`, or every replica's scanner
+/// wakes into a full fleet sweep for a resume that changed nothing.
+///
+/// Same LISTEN harness as the positive test, but a bounded NEGATIVE wait
+/// instead of waiting for an expected payload. Like every other test in
+/// this file that shares the global `placement_changed` channel, this
+/// depends on the suite running with `--test-threads=1` (ci.yml's
+/// "Postgres-gated ignored tests" step, and this file's own module
+/// comment above) for correctness, not just determinism — a concurrently
+/// running sibling test's own legitimate NOTIFY could otherwise land in
+/// the window and produce a false failure.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn enqueue_session_resume_noop_does_not_notify_placement_changed() {
+    let Some(meta) = connect().await else { return };
+    let database_url = std::env::var("ENGRAM_TEST_DATABASE_URL").unwrap();
+
+    let mut listener = sqlx::postgres::PgListener::connect(&database_url)
+        .await
+        .expect("listener connect");
+    listener
+        .listen("placement_changed")
+        .await
+        .expect("listen placement_changed");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Seed a `queued` (not `idle`) session — `enqueue_session_resume` is
+    // gated on `status='idle'`, so calling it on this row is the no-op
+    // path under test.
+    let sid = SessionId::new();
+    enqueue(&meta, sid, spec(), 4096, 2, None).await;
+
+    // The seed itself is a REAL notify site ("enqueued") — drain it
+    // first so it can't be mistaken for a notify fired by the no-op
+    // call below.
+    let seed_notify = tokio::time::timeout(Duration::from_secs(10), listener.recv())
+        .await
+        .expect("timed out waiting for the seed's own enqueued notify")
+        .expect("listener stayed open");
+    assert_eq!(seed_notify.payload(), "enqueued");
+
+    meta.enqueue_session_resume(sid)
+        .await
+        .expect("resume enqueue no-op");
+    let row = meta.get_session(sid).await.unwrap();
+    assert_eq!(
+        row.status,
+        SessionState::Queued,
+        "no-op must not move the row (still the create-origin queued row)"
+    );
+
+    // Bounded negative wait: generous enough that a real notify from the
+    // call under test would have landed by now, short enough to keep
+    // this test fast.
+    match tokio::time::timeout(Duration::from_secs(1), listener.recv()).await {
+        Err(_) => {} // timed out — no notify arrived; the no-op fired nothing.
+        Ok(Ok(n)) => panic!(
+            "enqueue_session_resume's no-op path must not fire placement_changed, got: {:?}",
+            n.payload()
+        ),
+        Ok(Err(e)) => panic!("listener died: {e}"),
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn scanner_wakes_on_notify_and_places_within_the_wake_not_the_fallback() {

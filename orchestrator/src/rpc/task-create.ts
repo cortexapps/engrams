@@ -1,6 +1,6 @@
 /**
  * Task creation — profile→session compilation + the create-a-task primitive
- * (ADR 0052/0055/0056/0057; extracted in ADR 0060 P2.7, unified here).
+ * (ADR 0053/0055/0056/0057; extracted in ADR 0060 P2.7, unified here).
  *
  * `createTaskWithSession` is the ONE path that turns a profile into a running
  * agent: compile the CreateSession request, create the upstream session, then

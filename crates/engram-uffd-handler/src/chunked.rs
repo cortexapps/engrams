@@ -299,7 +299,7 @@ impl ChunkedMemoryBackend {
             }
             None => store.get_manifest(session_ref).await?,
         };
-        // ADR 0067: this handler POPULATES the shared cache_root (a
+        // ADR 0070: this handler POPULATES the shared cache_root (a
         // faulted chunk's write-through is the whole point of the
         // locality win) but never EVICTS from it — the host-agent, which
         // holds the pin set, is the one process per host that evicts.
@@ -453,7 +453,7 @@ mod tests {
         ChunkHash::of(&[byte])
     }
 
-    /// ADR 0067: every cache this handler builds from a blob store must
+    /// ADR 0070: every cache this handler builds from a blob store must
     /// have eviction disabled — the host-agent (holding the pin set) is
     /// the one process per host that evicts. This is the single-evictor
     /// invariant `--cache-budget-bytes` used to violate.

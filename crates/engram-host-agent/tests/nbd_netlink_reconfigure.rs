@@ -138,6 +138,18 @@ fn pread_direct(path: &std::path::Path, offset: u64, len: usize) -> std::io::Res
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Linux + modprobe nbd + writable /dev/nbd0 (root)"]
 async fn survivor_reconfigure_resumes_parked_io() {
+    // Issue #582: this test is CI-flaky; wire up tracing so the next
+    // natural failure captures reattach()/serve_loop diagnostics instead
+    // of a bare assert. Mirrors `two_host_live_teleport.rs`'s init exactly
+    // — `try_init` so a repeat init (another test in the same binary) is
+    // harmless.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            "engram_host_agent=debug,engram_chunk_store=debug,engram_sandbox_firecracker=info",
+        )
+        .with_test_writer()
+        .try_init();
+
     let nbd_path = match preflight() {
         Some(p) => p,
         None => return,

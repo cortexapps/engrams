@@ -1,5 +1,5 @@
 /**
- * DisableImage profile guard (ADR 0052 §3).
+ * DisableImage profile guard (ADR 0053 §3).
  *
  * The coordinator 409s DisableImage when live SESSIONS reference an image, but
  * it knows nothing about orchestrator PROFILES. This pre-flight (run on the
