@@ -501,12 +501,15 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         'ENGRAM_BLOB_BACKEND': 'gcs',
         'ENGRAM_GCS_BUCKET': env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test'),
         'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
-        # Egress proxy off in dev — set ENGRAM_EGRESS_PROXY_PORT to
-        # enable. CI sets it (Blacksmith doesn't NAT FC TAP traffic, so
-        # guests route via the proxy); local dev relies on host masquerade.
-        # Per-host port (each host-agent binds its own 0.0.0.0:<port> +
-        # iptables REDIRECTs its VMs there) so a co-located second host
-        # in the two-host stack doesn't collide on the bind.
+        # Egress proxy port. The proxy is MANDATORY (issue #240) — the only
+        # path a guest reaches the network (SNI allow-list + DNS filter);
+        # there's no "off" (0 is a footgun: a dead :443->0 redirect while the
+        # proxy binds a random port). Per-host fixed port (each host-agent
+        # binds 0.0.0.0:<port> + iptables REDIRECTs its VMs there). The fc path
+        # defaults this to 8443 (see _proxy_base below) so claude sessions can
+        # reach api.anthropic.com; a session still needs api.anthropic.com in
+        # its policy network.allow_hosts + ANTHROPIC_API_KEY for the call to
+        # succeed (ADR 0006/0057).
         'ENGRAM_EGRESS_PROXY_PORT': egress_proxy_port,
         'ENGRAM_HOST_METRICS_ADDR': '0.0.0.0:' + metrics_port,
         # ADR 0019: same OTLP target as the coord, so the host-side
@@ -760,7 +763,16 @@ if dev_split:
         trigger_mode=_bundles_trigger,
         labels=['setup'])
 
-_proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT', '0'))
+# The egress proxy is MANDATORY (issue #240): it's the only path a guest
+# reaches the network, and `0` is NOT an "off" sentinel — host_startup still
+# installs a `:443 -> port 0` REDIRECT (dead) while the proxy binds a random
+# ephemeral port, so guest HTTPS (e.g. a claude session's api.anthropic.com
+# call) silently hangs. On the fc path default it to a real fixed port (8443,
+# the host-agent's own CLI default) so egress actually works; other dev
+# backends keep the historical 0 unless overridden. (The proxy is fail-closed
+# on a bind collision — 8443 is verified free in the fc-dev VM.)
+_proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT',
+                         '8443' if fc_colima_profile else '0'))
 if dev_split:
     host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base))
     if fc_colima_profile:
