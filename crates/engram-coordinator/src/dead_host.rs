@@ -484,7 +484,7 @@ mod tests {
         ) -> Result<(), SandboxError> {
             unimplemented!()
         }
-        async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
+        async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
             unimplemented!()
         }
         async fn bind_session(&self, _session_id: SessionId, _sandbox_id: SandboxId) {

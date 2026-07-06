@@ -23,7 +23,6 @@ export function relativeTime(iso: string): string {
 const ACTIVEISH = new Set<SessionState>([
   "active",
   "created",
-  "guest_ready",
   "pending",
   "queued",
   "host_lost",

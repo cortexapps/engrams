@@ -569,7 +569,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT AS reserved_vcpus
             FROM sessions
             WHERE host_id = ANY($1)
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
               -- A `pending` row older than 10 min is a crash-orphaned
               -- reservation (a boot never takes that long); don't let it leak
@@ -1039,7 +1039,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT AS reserved_vcpus
             FROM sessions
             WHERE host_id = ANY($1)
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
               AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
             GROUP BY host_id
@@ -1163,7 +1163,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT
             FROM sessions
             WHERE host_id IS NOT NULL
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
               -- ADR 0048: gate on last_active_at, not created_at — a session
               -- can sit `queued` for many minutes before `place_queued_session`
@@ -1236,7 +1236,7 @@ impl MetadataStore for PostgresStore {
                 SELECT host_id, SUM(mem_budget_mib) AS reserved
                 FROM sessions
                 WHERE host_id IS NOT NULL
-                  AND status IN ('pending','created','guest_ready','active',
+                  AND status IN ('pending','created','active',
                                  'evacuating','evicting')
                   -- ADR 0048: gate on last_active_at, not created_at — a session
               -- can sit `queued` for many minutes before `place_queued_session`
@@ -1274,7 +1274,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
             FROM sessions
-            WHERE status IN ('pending','created','guest_ready','active',
+            WHERE status IN ('pending','created','active',
                              'idle','evacuating','evicting')
             "#,
         )
@@ -1470,7 +1470,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT COUNT(*)::BIGINT FROM sessions
             WHERE host_id = $1
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
             "#,
         )
@@ -2875,6 +2875,41 @@ impl MetadataStore for PostgresStore {
         rows.iter().map(row::persisted_event_from_row).collect()
     }
 
+    async fn prompt_received_seconds_ago(
+        &self,
+        session_id: SessionId,
+        prompt_id: &str,
+    ) -> Result<Option<f64>, MetaError> {
+        // Issue #527 Phase 1: the receipt row is coordinator-authoritative
+        // and excluded from the rewind tombstone (see
+        // `rewind_session_to_cursor` below), so it is always the live head
+        // for this `prompt_id` — DESC LIMIT 1 is defensive against the
+        // retryable-Conflict duplicate-receipt case (a client retry of a
+        // rejected SendPrompt reusing the same `prompt_id` — see PR #556
+        // review finding #3) rather than a happy-path guarantee.
+        //
+        // PR #556 review finding #1: `NOW() - created_at` is computed here,
+        // PG-side, in the same query as the row read — a single clock, so
+        // there's no coordinator-vs-Postgres (or cross-replica) skew to
+        // bias or drop samples.
+        let row = sqlx::query(
+            r#"
+            SELECT EXTRACT(EPOCH FROM (NOW() - created_at))::float8 AS secs_ago
+              FROM session_events
+             WHERE session_id = $1 AND kind = 'prompt_received' AND payload->>'prompt_id' = $2
+             ORDER BY idx DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(prompt_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| sqlx::Row::try_get::<f64, _>(&r, "secs_ago").map_err(db_err))
+            .transpose()
+    }
+
     async fn rewind_session_to_cursor(
         &self,
         session_id: SessionId,
@@ -2954,11 +2989,25 @@ impl MetadataStore for PostgresStore {
             .collect();
 
         // Tombstone the rolled-back span (audit-preserving) and count it.
+        //
+        // Issue #527 Phase 1: `prompt_received` is excluded — it is a
+        // coordinator-authoritative fact ("the user asked at time T") that
+        // stays true across a guest-state rewind (the resume rewinds the
+        // HARNESS's view of the world, not whether the user sent the
+        // prompt). Without this exclusion, every resume-with-rollback would
+        // tombstone the receipt row and inflate `rolled_back` by one,
+        // masking the real signal this issue exists to measure.
+        //
+        // Merge-coordination note (see issue #527 Guardrails): if a sibling
+        // change extends this same UPDATE with its own lifecycle-kind
+        // exclusion list, merge into one `AND kind NOT IN (...)` predicate
+        // rather than stacking separate `AND kind <>` clauses.
         let tombstoned = sqlx::query(
             r#"
             UPDATE session_events
                SET rewound_at = NOW()
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
+               AND kind <> 'prompt_received'
             "#,
         )
         .bind(session_id.as_uuid())
@@ -2969,8 +3018,12 @@ impl MetadataStore for PostgresStore {
         .rows_affected();
 
         if tombstoned == 0 {
-            // Checkpoint was already the head — no rewind. Don't bump
-            // the epoch (keeps the no-op clean); caller emits nothing.
+            // Checkpoint was already the head — no rewind — OR (PR #556
+            // review finding #5) the only post-cursor rows are excluded
+            // `prompt_received` receipts (see the exclusion above): nothing
+            // user-visible actually rewound either way, so this stays the
+            // correct no-op branch. Don't bump the epoch (keeps the no-op
+            // clean); caller emits nothing.
             tx.rollback().await.map_err(db_err)?;
             return Ok(engram_core::types::event::RewindSummary::default());
         }

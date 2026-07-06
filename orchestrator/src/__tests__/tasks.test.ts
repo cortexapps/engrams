@@ -1284,7 +1284,6 @@ describe("TaskService — session status → task status mapping", () => {
   const cases: Array<[string, string]> = [
     ["pending", "working"],
     ["created", "working"],
-    ["guest_ready", "working"],
     ["active", "working"],
     ["idle", "working"],
     ["evacuating", "working"],

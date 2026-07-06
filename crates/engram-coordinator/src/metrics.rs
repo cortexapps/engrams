@@ -61,6 +61,15 @@ pub fn init(addr: SocketAddr) {
         1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 3600.0,
     ];
 
+    // Issue #527 Phase 1: prompt→run-start is the same wide-regime problem
+    // as eviction — the prod evidence this metric replaces the proxy for
+    // shows p50 ≈24.5s, p90 ≈140s, max 1,703s (a resume can be a full cold
+    // FC boot). The default `_seconds` buckets top out at 30s, which would
+    // collapse essentially the entire observed distribution into +Inf.
+    let prompt_to_run_started_buckets = &[
+        1.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0,
+    ];
+
     let builder = PrometheusBuilder::new()
         .with_http_listener(addr)
         .set_buckets_for_metric(
@@ -73,6 +82,11 @@ pub fn init(addr: SocketAddr) {
             queue_wait_buckets,
         )
         .expect("install queue-wait histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(PROMPT_TO_RUN_STARTED_SECONDS.to_string()),
+            prompt_to_run_started_buckets,
+        )
+        .expect("install prompt-to-run-started histogram buckets")
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Suffix("_seconds".to_string()),
             buckets,
@@ -253,3 +267,15 @@ pub const QUEUE_HEAD_AGE_SECONDS: &str = "engram_queue_head_age_seconds";
 /// No `host_id` label — the cardinality convention above forbids
 /// per-host labels; the paired `warn!` carries the id for forensics.
 pub const HEARTBEAT_PERSIST_FAILURES_TOTAL: &str = "engram_heartbeat_persist_failures_total";
+
+/// Histogram (issue #527 Phase 1). Wall-clock from a `prompt_received`
+/// receipt (the first PG write of `send_prompt_core`, before auto-resume)
+/// to the matching `run_started{prompt_id}` landing in `session_events`.
+/// The true prompt→first-token *lower bound* — replaces the old
+/// `idle→created` proxy, which post-dates the resume and therefore
+/// undercounts. No labels: this is a single fleet-wide SLO signal, not
+/// per-image (the per-image breakdown is the Phase 2 canary's job).
+/// Recorded once per run-start that carries a `prompt_id`; the env-seeded
+/// initial prompt (no `prompt_id`, no receipt row) never contributes a
+/// sample.
+pub const PROMPT_TO_RUN_STARTED_SECONDS: &str = "engram_prompt_to_run_started_seconds";

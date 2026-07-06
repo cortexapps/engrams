@@ -11,8 +11,10 @@
 //! author COPY'd it). There's no drive mount, no NBD page-in on the
 //! spawn hot path; the supervisor just exec's argv. The egress-proxy
 //! CA reaches the child via env vars pointing at the canonical
-//! [`crate::cacerts`] install paths — the host's `InstallHostCa` RPC
-//! ran during `start_agent`, before the SpawnHarness call landed.
+//! [`crate::cacerts`] install paths — 2026-07 core-ops fold: the
+//! handler installs the CA (carried on this same `SpawnHarness`
+//! frame) before calling into [`HarnessSupervisor::spawn`], so those
+//! paths are always populated by the time the child execs.
 //!
 //! Concurrency contract: at most one spawn-in-flight per agent.
 //! Concurrent SpawnHarness calls serialise on the inner mutex;
@@ -207,9 +209,10 @@ impl HarnessSupervisor {
             cmd.current_dir(cwd);
         }
         // Point TLS libraries at the canonical CA paths the
-        // CaCertInstaller writes (ADR 0021 P1.1). The host called
-        // InstallHostCa before SpawnHarness, so these files exist
-        // by the time the harness child starts. NODE_EXTRA_CA_CERTS
+        // CaCertInstaller writes (ADR 0021 P1.1). The handler installs
+        // the CA (2026-07 fold: carried on this SpawnHarness frame)
+        // before calling into `spawn`, so these files exist by the
+        // time the harness child starts. NODE_EXTRA_CA_CERTS
         // wants the single engram cert file (Node doesn't read the
         // system bundle by default); the bundle env vars cover
         // OpenSSL / libcurl / Python requests.
@@ -223,6 +226,11 @@ impl HarnessSupervisor {
 
         let mut guard = self.inner.lock().await;
         if let Some(mut prev) = guard.current_child.take() {
+            // Capture the pid BEFORE `try_wait`/`wait`: once either of those
+            // observes the child has exited, tokio clears `Child::id()` to
+            // `None` (the handle moves to its `Done` state), so `prev.id()`
+            // called after the fact would silently return `None` here.
+            let prev_pid = prev.id();
             // ADR 0045 C1: REATTACH, don't respawn, when the previous
             // harness is still ALIVE. A live-teleported (or mid-run
             // resumed) guest arrives with its harness running inside
@@ -238,7 +246,15 @@ impl HarnessSupervisor {
             // harness spawns — the pre-existing resume semantics.
             match prev.try_wait() {
                 Ok(None) => {
-                    let pid = prev.id();
+                    let pid = prev_pid;
+                    // Issue #569: re-assert tracking on every reattach —
+                    // idempotent (a `HashSet` insert), and self-healing if
+                    // this pid's registration were ever lost (e.g. a future
+                    // bug elsewhere untracks too eagerly). A live harness
+                    // child must NEVER be visible to the zombie reaper.
+                    if let Some(pid) = pid {
+                        crate::reaper::track(pid);
+                    }
                     tracing::info!(
                         pid = ?pid,
                         "harness still running (live move / mid-run resume); reattaching, not respawning",
@@ -275,15 +291,25 @@ impl HarnessSupervisor {
                 }
                 Ok(Some(status)) => {
                     tracing::info!(
-                        pid = ?prev.id(),
+                        pid = ?prev_pid,
                         ?status,
                         "previous harness exited; reaping and spawning fresh",
                     );
+                    // `try_wait` already reaped it (the kernel drops the
+                    // zombie the instant its exit status is retrieved, even
+                    // via WNOHANG) — untrack so the registry doesn't grow
+                    // unbounded across a long-lived agent's many resumes.
+                    if let Some(pid) = prev_pid {
+                        crate::reaper::untrack(pid);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "harness liveness probe failed; respawning");
                     let _ = prev.kill().await;
                     let _ = prev.wait().await;
+                    if let Some(pid) = prev_pid {
+                        crate::reaper::untrack(pid);
+                    }
                 }
             }
         }
@@ -294,11 +320,14 @@ impl HarnessSupervisor {
         // harness log; stdin is closed (the harness takes input over
         // vsock, never the console).
         let (h_out, h_err) = harness_log_stdio();
-        let child = cmd
-            .stdin(Stdio::null())
-            .stdout(h_out)
-            .stderr(h_err)
-            .spawn()
+        cmd.stdin(Stdio::null()).stdout(h_out).stderr(h_err);
+        // Issue #569: `spawn_tracked` registers the pid atomically with the
+        // spawn — this child is held in `guard.current_child` without being
+        // polled between `SpawnHarness` calls, so tokio's own background
+        // reaper does NOT collect it if it exits early; only the
+        // supervisor's own `try_wait()` above may observe (and reap) it, and
+        // the reaper must never race that.
+        let child = crate::reaper::spawn_tracked(&mut cmd)
             .map_err(|e| std::io::Error::new(e.kind(), format!("spawn {:?}: {e}", argv0)))?;
         let pid = child.id();
         tracing::info!(pid = ?pid, argv0 = %argv0, argc = req.argv.len(), "harness child running");
@@ -323,6 +352,7 @@ mod tests {
                 argv: vec![],
                 env: HashMap::new(),
                 session_env: session_env.clone(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -336,6 +366,7 @@ mod tests {
                 argv: vec![],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -354,6 +385,7 @@ mod tests {
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()],
             env: HashMap::new(),
             session_env: HashMap::new(),
+            host_ca_pem: None,
         };
         let pid1 = sup.spawn(long.clone()).await.unwrap().expect("pid");
         // The teleport-handshake shape: SpawnHarness while running.
@@ -374,6 +406,7 @@ mod tests {
             argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
             env: HashMap::new(),
             session_env: HashMap::new(),
+            host_ca_pem: None,
         };
         let sup2 = HarnessSupervisor::new();
         let pid3 = sup2.spawn(short.clone()).await.unwrap().expect("pid");
@@ -390,6 +423,7 @@ mod tests {
                 argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -410,6 +444,7 @@ mod tests {
                 argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -418,6 +453,7 @@ mod tests {
                 argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -449,6 +485,7 @@ mod tests {
                 ],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -491,6 +528,7 @@ mod tests {
                 ],
                 env,
                 session_env,
+                host_ca_pem: None,
             })
             .await
             .unwrap();

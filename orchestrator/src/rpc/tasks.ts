@@ -6,7 +6,7 @@
  * control plane. The web client sees one uniform generated API.
  *
  * Session status mapping (control-plane → task status):
- *   pending | created | guest_ready | active | idle | evacuating | evicting
+ *   pending | created | active | idle | evacuating | evicting
  *     → "working"   (session is alive / in progress)
  *   completed
  *     → "done"      (session ran to completion)
@@ -162,11 +162,11 @@ async function requireUser(
 /**
  * Map a control-plane session status string to a task status string.
  *
- * Session status ∈ { pending, created, guest_ready, active, idle,
+ * Session status ∈ { pending, created, active, idle,
  *                    evacuating, evicting, completed, failed, dead, host_lost }
  *
  * Mapping (documented in module JSDoc above):
- *   pending | created | guest_ready | active | idle | evacuating | evicting → working
+ *   pending | created | active | idle | evacuating | evicting → working
  *   completed → done
  *   failed | dead | host_lost → failed
  *   (anything else) → null (caller keeps persisted task status)
@@ -175,7 +175,6 @@ function sessionStatusToTaskStatus(sessionStatus: string): string | null {
   switch (sessionStatus) {
     case "pending":
     case "created":
-    case "guest_ready":
     case "active":
     case "idle":
     case "evacuating":

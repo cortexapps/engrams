@@ -76,7 +76,7 @@ impl HostClient for FakeHost {
     async fn apply_egress_policy(&self, _: SessionEgressPolicy) -> Result<(), SandboxError> {
         unreachable!()
     }
-    async fn guest_ip(&self, _: SandboxId) -> Option<String> {
+    async fn guest_ip(&self, _: SandboxId) -> Option<std::net::Ipv4Addr> {
         None
     }
     async fn bind_session(&self, _: SessionId, _: SandboxId) {}
