@@ -587,12 +587,15 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # an explicit `bash -c '...'` (see prekill below). The mkdir uses the
         # OUTER Mac shell's `&&` (fine); the remote `tar xf` is a lone command.
         # No remote chmod needed — tar preserves the source's +x bit.
-        # COPYFILE_DISABLE=1: keep macOS's ._* AppleDouble resource-fork
-        # entries out of the tar stream (they'd land as junk in the VM).
+        # Keep macOS tar cruft out of the stream: COPYFILE_DISABLE=1 drops the
+        # ._* AppleDouble companion files, and --no-xattrs drops the
+        # com.apple.* xattrs that macOS bsdtar otherwise embeds as PAX headers
+        # (LIBARCHIVE.xattr.*), which the VM's GNU tar spams "Ignoring unknown
+        # extended header keyword" over on extract. Neither is wanted in-guest.
         sync_bin_cmd = (
             colima + ' ssh --profile ' + fc_colima_profile +
             ' -- mkdir -p /opt/engram-dev/bin /opt/engram-dev/var/sandboxes && ' +
-            'COPYFILE_DISABLE=1 tar cf - -C target/' + target + '/release ' +
+            'COPYFILE_DISABLE=1 tar --no-xattrs -cf - -C target/' + target + '/release ' +
             'engram-host-agent engram-uffd-handler | ' +
             colima + ' ssh --profile ' + fc_colima_profile +
             ' -- tar xf - -C /opt/engram-dev/bin'
@@ -600,7 +603,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # /opt/engram-dev/shared is created by fc-colima-provision.sh, so the
         # remote side is a lone `tar xf` (no mkdir &&).
         sync_bundle_cmd = (
-            'COPYFILE_DISABLE=1 tar cf - -C ' + _bundle_dir + ' . | ' +
+            'COPYFILE_DISABLE=1 tar --no-xattrs -cf - -C ' + _bundle_dir + ' . | ' +
             colima + ' ssh --profile ' + fc_colima_profile +
             ' -- tar xf - -C /opt/engram-dev/shared'
         )
