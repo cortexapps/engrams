@@ -150,6 +150,26 @@ pub struct PendingDiskFlush {
     flush_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
+impl PendingDiskFlush {
+    /// Issue #529: the eviction finalize flavor persists these drained
+    /// chunks to `<dest>/disk-pending/` BEFORE `snapshot_begin` returns
+    /// (durability boundary moves earlier), then re-reads them from disk
+    /// in the (possibly re-driven, possibly cross-process) background
+    /// finalize job — it never calls `flush_upload` on this handle
+    /// directly, so there's no live-backend rebase to preserve and
+    /// nothing left to serialize once these bytes are extracted. Consumes
+    /// `self`, dropping the flush-pipeline guard immediately.
+    ///
+    /// Its only caller is `PooledBackend::snapshot_begin`'s
+    /// `#[cfg(target_os = "linux")]` disk-pending block (NBD is
+    /// Linux-only) — `#[cfg]`'d rather than `#[allow(dead_code)]`'d so a
+    /// non-Linux build doesn't carry an unreachable-by-construction method.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn into_chunks(self) -> Vec<(usize, ChunkHash, Bytes)> {
+        self.new_chunks
+    }
+}
+
 /// ADR 0045 C2 disk post-copy: the frozen source's sealed disk state
 /// — every chunk whose guest-visible content differs from the
 /// published base manifest (dirty buffer + pending-uploads tier),
@@ -3605,6 +3625,14 @@ mod tests {
         let chunk_size = 4096u64;
         let total = 3 * chunk_size;
         let base = synth_manifest(total, chunk_size, vec![]);
+
+        // A near-full dev/CI disk (e.g. the dev VM at >90% used) trips the
+        // cache's default 20%-free-space floor and evicts the just-flushed
+        // chunk before this test can observe it, independent of `budget_bytes`
+        // — see the same fix in two_host_drain_wave.rs / migration_source.rs.
+        // Nextest runs each test in its own process, so this env override
+        // is safe.
+        std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
 
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));

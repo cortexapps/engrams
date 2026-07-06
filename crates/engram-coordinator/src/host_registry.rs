@@ -674,6 +674,17 @@ impl HostClient for HostRegistry {
         backend.start_agent(id, agent, policy).await
     }
 
+    /// ADR 0068: same single-resolve delegation as `start_agent` — this
+    /// mode=all convenience impl has exactly one connected host in
+    /// practice, so no retry logic is warranted for a read-only probe.
+    async fn probe_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.probe_sandbox(id).await
+    }
+
     async fn apply_egress_policy(
         &self,
         policy: engram_core::types::egress::SessionEgressPolicy,
@@ -693,7 +704,7 @@ impl HostClient for HostRegistry {
         Ok(all)
     }
 
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+    async fn guest_ip(&self, id: SandboxId) -> Option<std::net::Ipv4Addr> {
         let (_, backend) = self.resolve_owner(id).await.ok()?;
         backend.guest_ip(id).await
     }
@@ -782,7 +793,10 @@ impl HostClient for HostRegistry {
         backend.acquire_shell(sandbox_id).await
     }
 
-    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+    async fn start_browser(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.start_browser(sandbox_id).await
     }
@@ -975,7 +989,7 @@ mod tests {
         async fn record_snapshot(
             &self,
             _: engram_core::types::snapshot::SnapshotRecord,
-        ) -> Result<(), engram_core::MetaError> {
+        ) -> Result<bool, engram_core::MetaError> {
             unreachable!()
         }
         async fn list_snapshots_for_session(

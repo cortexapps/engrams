@@ -22,6 +22,7 @@ pub mod handler;
 pub mod harness_supervisor;
 pub mod port_relay;
 pub mod proto;
+pub mod reaper;
 pub mod remount;
 pub mod share;
 pub mod shell;
@@ -30,7 +31,7 @@ pub use cacerts::{CaCertInstaller, CaCertPaths};
 pub use handler::serve_connection;
 pub use harness_supervisor::HarnessSupervisor;
 pub use proto::{
-    read_msg, write_msg, AgentReady, InstallHostCaRequest, SpawnHarnessRequest,
-    WireDownloadResponse, WireExecEvent, WireExecRequest, WireHandshake, WireHandshakeAck,
-    WireRequest, WireResponse, WireStatResponse, ENGRAM_AGENTD_READY_PORT, MAX_MSG_BYTES,
+    read_msg, write_msg, AgentReady, SpawnHarnessRequest, WireDownloadResponse, WireExecEvent,
+    WireExecRequest, WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
+    ENGRAM_AGENTD_READY_PORT, MAX_MSG_BYTES,
 };

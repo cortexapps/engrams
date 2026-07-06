@@ -74,6 +74,14 @@ pub struct CheckpointRecord {
     /// after this and still be in the captured state.)
     pub paused_at: DateTime<Utc>,
     pub captured_at: DateTime<Utc>,
+    /// Issue #529: periodic (ADR 0028 Fix A) vs. an eviction's terminal
+    /// snapshot — carried onto the heartbeat advert unchanged so the
+    /// reconcile knows whether a fresh row landing warrants a
+    /// `SnapshotTaken` emit. `#[serde(default)]` so a record persisted
+    /// by a pre-#529 host-agent (mixed roll) reads back as `Periodic`,
+    /// its prior sole meaning.
+    #[serde(default)]
+    pub kind: engram_protocol::heartbeat::CheckpointKind,
 }
 
 impl CheckpointRecord {

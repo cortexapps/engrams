@@ -21,9 +21,17 @@
 //!   [--publish-trace-host <host-uuid>] \
 //!   [--trace-key <session-uuid>] \
 //!   [--cache-root /var/cache/engram/chunks] \
-//!   [--cache-budget-bytes 214748364800] \
 //!   [--recorder-window-ms 5000]
 //! ```
+//!
+//! ADR 0067: this handler is a single-evictor-safe cache citizen — it
+//! *populates* the shared `cache_root` (write-through of faulted chunks,
+//! the locality win) but never *evicts* from it
+//! (`ChunkCacheConfig::eviction_enabled: false`). The host-agent, which
+//! holds the pin set, is the one process per host that evicts; running a
+//! second, pin-blind LRU policy here used to let a pressured handler
+//! sweep reclaim exactly the pinned base-image chunks the host-agent was
+//! protecting.
 //!
 //! `ENGRAM_BLOB_BACKEND` (and `ENGRAM_GCS_BUCKET`) pick the blob
 //! backend — same convention every Engram crate follows so chunked
@@ -109,11 +117,6 @@ mod linux {
     use tokio::runtime::Handle as TokioHandle;
     use uuid::Uuid;
 
-    /// Default LRU budget for the per-host NVMe cache. 200 GiB
-    /// matches the ADR's "L1 host cache" sizing — production hosts
-    /// allocate a dedicated nvme partition for this.
-    const DEFAULT_CACHE_BUDGET_BYTES: u64 = 200 * 1024 * 1024 * 1024;
-
     /// Default trace-recorder window. The literature (FaaSnap, REAP)
     /// converges on ~5 s as the right point: long enough to capture
     /// the steady-state working set, short enough that publishing
@@ -173,7 +176,6 @@ mod linux {
         /// `<images_dir>/store/` layout (not `<root>/blobs/`).
         pub blob_root: Option<PathBuf>,
         pub cache_root: PathBuf,
-        pub cache_budget_bytes: u64,
         pub recorder_window: Duration,
         /// ADR 0045 substrate (v2b): the per-template base shm file this
         /// handler creates, sizes, and lazily populates with canonical
@@ -208,7 +210,6 @@ mod linux {
         let mut trace_output: Option<PathBuf> = None;
         let mut blob_root: Option<PathBuf> = None;
         let mut cache_root: Option<PathBuf> = None;
-        let mut cache_budget_bytes: u64 = DEFAULT_CACHE_BUDGET_BYTES;
         let mut recorder_window_ms: u64 = DEFAULT_RECORDER_WINDOW_MS;
         let mut base_shm: Option<PathBuf> = None;
         let mut peer_addr: Option<String> = None;
@@ -282,14 +283,6 @@ mod linux {
                         Some(PathBuf::from(argv.next().ok_or_else(|| {
                             "--cache-root requires a value".to_string()
                         })?));
-                }
-                "--cache-budget-bytes" => {
-                    let v = argv
-                        .next()
-                        .ok_or_else(|| "--cache-budget-bytes requires a value".to_string())?;
-                    cache_budget_bytes = v
-                        .parse::<u64>()
-                        .map_err(|e| format!("--cache-budget-bytes {v:?}: {e}"))?;
                 }
                 "--base-shm" => {
                     base_shm = Some(PathBuf::from(
@@ -374,7 +367,6 @@ mod linux {
             trace_output,
             blob_root,
             cache_root,
-            cache_budget_bytes,
             recorder_window: Duration::from_millis(recorder_window_ms),
             base_shm,
             peer_addr,
@@ -440,7 +432,6 @@ mod linux {
             args.session_manifest_json.as_deref(),
             blob.clone(),
             &args.cache_root,
-            args.cache_budget_bytes,
         )
         .await
         .map_err(|e| format!("build chunked backend: {e}"))?;
@@ -485,6 +476,35 @@ mod linux {
         } else {
             None
         };
+
+        // ADR 0019 / telemetry restoration (#526): the "no trace" half of
+        // the prefault effectiveness detector. `Runtime::prefault_from_trace`
+        // writes `prefault-stats.json` at the END of a background thread
+        // that only starts once `run_listener` binds — so if no trace was
+        // requested (or the requested one failed to load), NOTHING would
+        // otherwise write the file, and the host-agent's post-restore read
+        // would see the same absence as a crashed handler
+        // (`outcome="stats_missing"`, the alarm condition) even though this
+        // is the ordinary, expected "nothing to replay" case. Write the
+        // `trace_loaded: false` snapshot now, synchronously, before the
+        // listener even binds — the earliest point this process knows the
+        // answer — so `outcome="no_trace"` and `outcome="stats_missing"`
+        // stay distinguishable.
+        if prefault.is_none() {
+            if let Some(stats_path) = args
+                .trace_output
+                .as_ref()
+                .and_then(|p| engram_uffd_handler::runtime::prefault_stats_path(p))
+            {
+                engram_uffd_handler::runtime::write_prefault_stats(
+                    &stats_path,
+                    &engram_uffd_handler::runtime::PrefaultStats {
+                        trace_loaded: false,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
 
         // ADR 0045 C2: peer mode. Ordering is the soundness story:
         //   1. bind the control sock (host-agent can subscribe NOW);
@@ -725,7 +745,6 @@ mod linux {
   [--prefault-trace file:<path>|<host-uuid>] \\
   [--publish-trace-host <host-uuid>] \\
   [--cache-root <path>] \\
-  [--cache-budget-bytes <bytes>] \\
   [--recorder-window-ms <ms>] \\
   [--peer-addr <host:port> --peer-export-id <id> [--peer-token <tok>]] \\
   [--control-sock <sock>]

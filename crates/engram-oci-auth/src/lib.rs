@@ -282,8 +282,8 @@ mod tests {
         ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
             Ok(vec![])
         }
-        async fn record_snapshot(&self, _: SnapshotRecord) -> Result<(), MetaError> {
-            Ok(())
+        async fn record_snapshot(&self, _: SnapshotRecord) -> Result<bool, MetaError> {
+            Ok(true)
         }
         async fn list_snapshots_for_session(
             &self,

@@ -252,17 +252,37 @@ pub async fn evict_session_to_state(
 
     let host_id = state.host_registry.host_of(sandbox_id);
     let now = Utc::now();
-    // ADR 0028 A.log: the event-log leg of the coherence triple. The
-    // guest paused (then gets destroyed) during the capture, so "the
-    // newest event as of now" is the cursor at the pause instant up
-    // to a sub-second skew. Best-effort: a lookup failure degrades to
-    // NULL ("no rewind information"), never fails the eviction.
+    // ADR 0028 A.log / issue #529: the event-log leg of the coherence
+    // triple. Resolve the cursor from the host's EXACT pause instant
+    // (`metadata.paused_at`, stamped in `SnapshotFinisher::finish`) when
+    // present — this closes the skew a coordinator wall-clock `now`
+    // sampled AFTER the (possibly multi-second) capture/upload
+    // introduces, which is what made a clean evict→resume roll back the
+    // coordinator's own lifecycle events (rewind is now also kind-scoped
+    // to guest-derived events; the two fixes are complementary — this
+    // one shrinks the skew window, that one makes the skew harmless).
+    // `unwrap_or(now)` is the pre-#529 behavior, preserved for backends
+    // that don't set it (a mixed wire-version roll; VZ/Process's raw,
+    // unwrapped-by-PooledBackend snapshot() calls).
     let events_cursor = state
         .services
         .meta
-        .latest_event_idx_at_or_before(session_id, now)
+        .latest_event_idx_at_or_before(session_id, metadata.paused_at.unwrap_or(now))
         .await
         .unwrap_or_default();
+    // ADR 0068: stamp the capturing host's FC snapshot-version so a
+    // later restore can be paired against it at placement. Best-effort:
+    // a lookup failure degrades to NULL, same posture as events_cursor
+    // above — never fails the eviction over it.
+    let fc_snapshot_version = match host_id {
+        Some(h) => state
+            .services
+            .meta
+            .fc_snapshot_version_for_host(h)
+            .await
+            .unwrap_or_default(),
+        None => None,
+    };
     let record = SnapshotRecord {
         id: metadata.id,
         session_id: Some(session_id),
@@ -286,6 +306,7 @@ pub async fn evict_session_to_state(
         // ADR 0035: pin the generations this snapshot references.
         aux_bundles: metadata.aux_bundles.clone(),
         events_cursor,
+        fc_snapshot_version,
     };
     if let Err(e) = state.services.meta.record_snapshot(record.clone()).await {
         abort_inflight_snapshot(state, session_id, sandbox_id, "record_snapshot").await;
@@ -432,13 +453,25 @@ pub async fn evict_session_to_state(
     Ok(EvictOutcome::Evacuated)
 }
 
-/// ADR 0045 D5: the fast-path tail of an idle eviction. The capture has
-/// landed (`snapshot_begin` returned), so: mark the session Idle NOW —
-/// user-visible teardown ends here — then spawn the finalize task that
-/// awaits the host's background upload under the touched lease and only
-/// then writes the snapshot row, commits, and destroys. Failure anywhere
-/// in finalize = no row + abort + destroy: resume falls back to the
-/// prior checkpoint.
+/// ADR 0045 D5 (rewritten for issue #529): the fast-path tail of an idle
+/// eviction. The capture has landed (`snapshot_begin` returned) and —
+/// unlike the pre-#529 shape — the finalize is now a HOST-OWNED job: the
+/// host durably persisted its inputs before `snapshot_begin` returned,
+/// and it will eventually land the snapshot row itself via the
+/// heartbeat reconcile (`api/host_http.rs::heartbeat`), survive this
+/// coordinator dying, restarting, or never seeing the upload complete.
+///
+/// So this function's job shrinks to: mark the session Idle NOW
+/// (user-visible teardown ends here — unchanged), then hold the lease
+/// — the thing that serializes a concurrent resume against an in-flight
+/// finalize (a resume during upload still 409s, exactly as before) —
+/// until the row it's waiting for actually lands, or a generous deadline
+/// passes. No host RPCs, no `record_snapshot`, no `commit_snapshot`, no
+/// `abort_snapshot`, no `destroy` — the coordinator never touches the
+/// sandbox or the artifacts again on this path. A coordinator death
+/// mid-watch degrades gracefully: the 180s lease reaper frees resume,
+/// worst case resume briefly sees the prior checkpoint while the row
+/// lands via heartbeat regardless — bounded staleness, never loss.
 async fn finish_eviction_background(
     state: &SharedState,
     session_id: SessionId,
@@ -446,16 +479,7 @@ async fn finish_eviction_background(
     snapshot_id: engram_core::types::SnapshotId,
     lease: SessionLeaseGuard,
 ) -> Result<(), EvictError> {
-    let host_id = state.host_registry.host_of(sandbox_id);
     let now = Utc::now();
-    // The capture paused the guest moments ago; "newest event as of now"
-    // is the coherence cursor, same as the composed path.
-    let events_cursor = state
-        .services
-        .meta
-        .latest_event_idx_at_or_before(session_id, now)
-        .await
-        .unwrap_or_default();
 
     // Idle-before-durable: PG sandbox detach (the authoritative unbind,
     // ADR 0047 — no in-memory registry), then state flip.
@@ -476,8 +500,11 @@ async fn finish_eviction_background(
     {
         Ok(prev) => prev,
         Err(e) => {
-            abort_inflight_snapshot(state, session_id, sandbox_id, "transition_session (D5)").await;
-            let _ = state.services.host.destroy(sandbox_id).await;
+            // Issue #529: the host's finalize artifacts are ALREADY
+            // durable (snapshot_begin returned) — there is nothing to
+            // abort or destroy here. The eviction scanner's retry hits
+            // the idempotent `snapshot_begin` and re-observes the same
+            // pending job rather than re-capturing.
             return Err(EvictError::Meta(e.to_string()));
         }
     };
@@ -498,121 +525,68 @@ async fn finish_eviction_background(
         session_id = %session_id,
         sandbox_id = %sandbox_id,
         snapshot_id = %snapshot_id,
-        "idle eviction: session Idle after capture; upload finalizing in background (ADR 0045 D5)",
+        "idle eviction: session Idle after capture; finalize is now a host-owned \
+         job (issue #529) — the row lands via the heartbeat reconcile",
     );
 
-    // The finalize task. Owns the lease (touched every 60 s so the 180 s
-    // reaper never fires mid-upload — issue #147's secondary bug).
+    // The row-watcher. Owns the lease (heartbeat-touched every 60s, via
+    // the same `spawn_heartbeat` the resume pipeline uses, so the 180s
+    // reaper never fires mid-wait — issue #147's secondary bug, same
+    // fix, reused rather than hand-rolled here) until the row lands or
+    // the deadline passes.
     let state = state.clone();
     tokio::spawn(async move {
-        let lease = lease;
-        let mut touch = tokio::time::interval(std::time::Duration::from_secs(60));
-        touch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        touch.tick().await; // immediate first tick — consume it
-        let wait = state.services.host.snapshot_wait(sandbox_id);
-        tokio::pin!(wait);
-        let metadata = loop {
-            tokio::select! {
-                res = &mut wait => break res,
-                _ = touch.tick() => {
-                    match lease.touch_checked().await {
-                        LeaseTouch::Held => {}
-                        // A transport blip on the touch is NOT loss
-                        // (issue #209): destroying the sandbox + aborting
-                        // the in-flight snapshot on a single PG hiccup is
-                        // destructive. Log and keep waiting; the 180s
-                        // reaper still backstops a genuinely dead holder.
-                        LeaseTouch::TransientError(e) => {
-                            tracing::warn!(
-                                session_id = %session_id,
-                                sandbox_id = %sandbox_id,
-                                error = %e,
-                                "D5 finalize: lease touch transport error — retrying, not abandoning",
-                            );
-                        }
-                        LeaseTouch::Lost => {
-                            tracing::error!(
-                                session_id = %session_id,
-                                sandbox_id = %sandbox_id,
-                                "D5 finalize: session lease lost mid-upload (reaped or \
-                                 released); refusing to record the snapshot row",
-                            );
-                            abort_inflight_snapshot(&state, session_id, sandbox_id, "lease lost (D5)").await;
-                            let _ = state.services.host.destroy(sandbox_id).await;
-                            return;
-                        }
-                    }
+        let _heartbeat = lease.spawn_heartbeat(std::time::Duration::from_secs(60));
+        let deadline_secs = std::env::var("ENGRAM_EVICT_FINALIZE_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(900);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
+        // Overridable so tests don't eat a real 2s per poll tick.
+        let poll_ms = std::env::var("ENGRAM_EVICT_FINALIZE_POLL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2_000);
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(poll_ms));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            poll.tick().await;
+            match state.services.meta.get_snapshot(snapshot_id).await {
+                Ok(Some(_)) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        sandbox_id = %sandbox_id,
+                        snapshot_id = %snapshot_id,
+                        "idle eviction finalize row landed (host-owned, issue #529)",
+                    );
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        snapshot_id = %snapshot_id,
+                        error = %e,
+                        "D5 row-watcher: get_snapshot failed; retrying",
+                    );
                 }
             }
-        };
-        let metadata = match metadata {
-            Ok(m) => m,
-            Err(e) => {
+            if tokio::time::Instant::now() >= deadline {
+                ::metrics::counter!(crate::metrics::EVICTION_FINALIZE_ROW_WAIT_TIMEOUT_TOTAL)
+                    .increment(1);
                 tracing::warn!(
                     session_id = %session_id,
                     sandbox_id = %sandbox_id,
-                    error = %e,
-                    "D5 finalize: snapshot upload failed; no row written — \
-                     resume falls back to the prior checkpoint",
+                    snapshot_id = %snapshot_id,
+                    deadline_secs,
+                    "D5 row-watcher: deadline passed before the finalize row landed; \
+                     releasing the lease — the host-owned job keeps retrying \
+                     independently and the row will land whenever it lands",
                 );
-                abort_inflight_snapshot(&state, session_id, sandbox_id, "snapshot_wait (D5)").await;
-                let _ = state.services.host.destroy(sandbox_id).await;
-                return;
+                break;
             }
-        };
-        // Row-only-at-finalize: the first and only insert, while the
-        // lease is held — a reaped lease can't fork state because the
-        // row never lands without it.
-        let record = SnapshotRecord {
-            id: metadata.id,
-            session_id: Some(session_id),
-            host_id,
-            image_version: metadata.image_version.clone(),
-            size_bytes: metadata.size_bytes,
-            created_at: metadata.created_at,
-            last_accessed_at: now,
-            disk_manifest: metadata.disk_manifest,
-            memory_manifest: metadata.memory_manifest,
-            recoverable: crate::api::snapshot::verify_snapshot_recoverable(
-                state.services.blob.as_ref(),
-                metadata.disk_manifest.as_ref(),
-                metadata.memory_manifest.as_ref(),
-            )
-            .await,
-            aux_bundles: metadata.aux_bundles.clone(),
-            events_cursor,
-        };
-        if let Err(e) = state.services.meta.record_snapshot(record).await {
-            tracing::warn!(session_id = %session_id, error = %e,
-                "D5 finalize: record_snapshot failed; aborting artifacts");
-            abort_inflight_snapshot(&state, session_id, sandbox_id, "record_snapshot (D5)").await;
-            let _ = state.services.host.destroy(sandbox_id).await;
-            return;
         }
-        if let Err(e) = state.services.host.commit_snapshot(sandbox_id).await {
-            tracing::warn!(session_id = %session_id, sandbox_id = %sandbox_id, error = %e,
-                "D5 finalize: commit_snapshot failed; resume-time verification backstops");
-        }
-        if let Err(e) = state.services.host.destroy(sandbox_id).await {
-            tracing::warn!(session_id = %session_id, sandbox_id = %sandbox_id, error = %e,
-                "D5 finalize: destroy failed; orphan_reap will clean up");
-        }
-        let _ = state
-            .emit(
-                session_id,
-                SessionEvent::SnapshotTaken {
-                    snapshot_id: metadata.id,
-                    size_bytes: metadata.size_bytes,
-                    at: Utc::now(),
-                },
-            )
-            .await;
-        tracing::info!(
-            session_id = %session_id,
-            sandbox_id = %sandbox_id,
-            snapshot_id = %metadata.id,
-            "idle eviction finalize completed (ADR 0045 D5)",
-        );
+        // `_heartbeat` and `lease` drop here, releasing both.
     });
     Ok(())
 }
@@ -980,6 +954,11 @@ pub(crate) async fn scanner_run_once(
     Ok(())
 }
 
+// ADR 0019 / telemetry restoration (#526): scanner-driven work has no
+// request span to inherit — give it an explicit root so the pipeline's
+// spans correlate by `session_id` instead of exporting as disconnected
+// roots with no shared attribute.
+#[tracing::instrument(name = "idle_evictor.advance_one", skip_all, fields(session_id = %session.id))]
 async fn scanner_advance_one(
     cfg: &EvictionScannerConfig,
     state: &SharedState,
@@ -1272,16 +1251,16 @@ mod tests {
         }
     }
 
-    /// ADR 0045 D5: a backend exposing the begin/wait split, with the
-    /// upload gated on a Notify so tests can observe the Idle-before-
-    /// durable window. Delegates everything else to ProcessBackend.
+    /// ADR 0045 D5 (issue #529): a backend exposing `snapshot_begin` —
+    /// the coordinator no longer calls `snapshot_wait`/`commit_snapshot`/
+    /// `abort_snapshot`/`destroy` on this flavor at all (the finalize is
+    /// host-owned from here), so the mock only needs to hand back a
+    /// `SnapshotId` and stash it for the test to simulate the host's
+    /// heartbeat reconcile landing the row. Delegates everything else to
+    /// ProcessBackend.
     struct D5SplitBackend {
         inner: Arc<dyn SandboxBackend>,
-        gate: Arc<tokio::sync::Notify>,
         stashed: Arc<PlMutex<Option<engram_core::types::snapshot::SnapshotMetadata>>>,
-        /// when true, snapshot_wait returns an error after the gate fires
-        /// (the finalize-failure path: no row, abort, destroy).
-        fail_wait: bool,
     }
     use engram_core::SandboxError;
     use parking_lot::Mutex as PlMutex;
@@ -1319,16 +1298,6 @@ mod tests {
             *self.stashed.lock() = Some(m);
             Ok(sid)
         }
-        async fn snapshot_wait(
-            &self,
-            _id: SandboxId,
-        ) -> Result<engram_core::types::snapshot::SnapshotMetadata, SandboxError> {
-            self.gate.notified().await;
-            if self.fail_wait {
-                return Err(SandboxError::Snapshot("injected upload failure".into()));
-            }
-            Ok(self.stashed.lock().take().expect("begin ran"))
-        }
         async fn restore(
             &self,
             metadata: engram_core::types::snapshot::SnapshotMetadata,
@@ -1343,17 +1312,18 @@ mod tests {
     fn d5_state(
         session: Session,
         sandbox_root: &Path,
-        fail_wait: bool,
-    ) -> (SharedState, Arc<MiniMeta>, Arc<tokio::sync::Notify>) {
-        let gate = Arc::new(tokio::sync::Notify::new());
+    ) -> (
+        SharedState,
+        Arc<MiniMeta>,
+        Arc<PlMutex<Option<engram_core::types::snapshot::SnapshotMetadata>>>,
+    ) {
+        let stashed = Arc::new(PlMutex::new(None));
         let backend: Arc<dyn SandboxBackend> = Arc::new(D5SplitBackend {
             inner: Arc::new(ProcessBackend::new(sandbox_root.join("sandboxes"))),
-            gate: gate.clone(),
-            stashed: Arc::new(PlMutex::new(None)),
-            fail_wait,
+            stashed: stashed.clone(),
         });
         let (state, meta) = build_state_and_meta_with_backend(session, sandbox_root, backend);
-        (state, meta, gate)
+        (state, meta, stashed)
     }
 
     async fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
@@ -1366,10 +1336,18 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
-    /// The D5 fast path: the session is Idle BEFORE the upload resolves
-    /// and the snapshot row lands ONLY at finalize (row-only-at-finalize).
+    /// Issue #529: the D5 fast path flips Idle before the finalize row
+    /// exists (unchanged — the whole point of D5), but the coordinator
+    /// no longer writes that row itself. It lands only once something
+    /// (in prod: the host's heartbeat reconcile) calls `record_snapshot`
+    /// — simulated here directly, standing in for the host-owned
+    /// finalize job this test harness doesn't run. The row-watcher must
+    /// notice it via `get_snapshot` polling and release its lease
+    /// without the coordinator ever calling `commit_snapshot`/`destroy`
+    /// on this path.
     #[tokio::test]
-    async fn d5_eviction_is_idle_before_durable_and_records_at_finalize() {
+    async fn d5_eviction_is_idle_before_durable_and_row_watcher_observes_the_host_landed_row() {
+        std::env::set_var("ENGRAM_EVICT_FINALIZE_POLL_MS", "20");
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
@@ -1384,7 +1362,7 @@ mod tests {
             selected_skills: Vec::new(),
         };
         let sandbox_root = TempDir::new().unwrap();
-        let (state, meta, gate) = d5_state(session, sandbox_root.path(), false);
+        let (state, meta, stashed) = d5_state(session, sandbox_root.path());
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
         state
             .services
@@ -1397,7 +1375,8 @@ mod tests {
             .await
             .expect("evict");
 
-        // Idle immediately; NO row yet — the upload gate is still closed.
+        // Idle immediately; NO row yet, NO commit/destroy call — the
+        // coordinator's job here is done except for the row-watcher.
         let m = meta.clone();
         wait_for("session Idle", move || {
             m.session.lock().status == SessionState::Idle
@@ -1405,36 +1384,59 @@ mod tests {
         .await;
         assert!(
             meta.snapshots.lock().is_empty(),
-            "row-only-at-finalize: no snapshot row before the upload completes"
+            "row-only-at-host-finalize: no snapshot row before the host lands it"
+        );
+        assert!(
+            futures::executor::block_on(state.services.host.list())
+                .unwrap()
+                .contains(&sandbox_id),
+            "the coordinator must NOT destroy the sandbox on this path — that's the \
+             host-owned finalize job's job now",
         );
 
-        // Open the gate: finalize records the row + destroys the sandbox.
-        gate.notify_one();
+        // Simulate the host's heartbeat reconcile landing the row —
+        // the finalize job this harness doesn't itself run.
+        let metadata = stashed.lock().take().expect("snapshot_begin ran");
+        let record = SnapshotRecord {
+            id: metadata.id,
+            session_id: Some(session_id),
+            host_id: None,
+            image_version: metadata.image_version,
+            size_bytes: metadata.size_bytes,
+            created_at: metadata.created_at,
+            last_accessed_at: Utc::now(),
+            disk_manifest: metadata.disk_manifest,
+            memory_manifest: metadata.memory_manifest,
+            recoverable: true,
+            aux_bundles: metadata.aux_bundles,
+            events_cursor: None,
+            fc_snapshot_version: None,
+        };
+        state.services.meta.record_snapshot(record).await.unwrap();
+
         let m = meta.clone();
-        wait_for("snapshot row recorded", move || {
+        wait_for("row-watcher observes the landed row", move || {
             !m.snapshots.lock().is_empty()
         })
         .await;
-        let st = state.clone();
-        wait_for("sandbox destroyed", move || {
-            futures::executor::block_on(st.services.host.list())
-                .map(|l| !l.contains(&sandbox_id))
-                .unwrap_or(false)
-        })
-        .await;
+        std::env::remove_var("ENGRAM_EVICT_FINALIZE_POLL_MS");
     }
 
-    /// Finalize failure: no row is ever written (resume falls back to the
-    /// prior checkpoint) and the sandbox is still destroyed.
+    /// Issue #529: the row-watcher's deadline is bounded — a finalize
+    /// that never lands a row (e.g. quarantined) doesn't hang the
+    /// watcher task forever; it releases the lease at the deadline
+    /// (verified indirectly: the lease becomes acquirable again).
     #[tokio::test]
-    async fn d5_eviction_upload_failure_writes_no_row_and_destroys() {
+    async fn d5_row_watcher_releases_the_lease_at_its_deadline() {
+        std::env::set_var("ENGRAM_EVICT_FINALIZE_POLL_MS", "10");
+        std::env::set_var("ENGRAM_EVICT_FINALIZE_WAIT_SECS", "0");
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
-            image: "test/repo:d5-fail".into(),
+            image: "test/repo:d5-timeout".into(),
             mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
@@ -1442,7 +1444,7 @@ mod tests {
             selected_skills: Vec::new(),
         };
         let sandbox_root = TempDir::new().unwrap();
-        let (state, meta, gate) = d5_state(session, sandbox_root.path(), true);
+        let (state, meta, _stashed) = d5_state(session, sandbox_root.path());
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
         state
             .services
@@ -1454,18 +1456,27 @@ mod tests {
         evict_session_to_state(&state, session_id, sandbox_id, SessionState::Idle)
             .await
             .expect("evict");
-        gate.notify_one();
-        let st = state.clone();
-        wait_for("sandbox destroyed", move || {
-            futures::executor::block_on(st.services.host.list())
-                .map(|l| !l.contains(&sandbox_id))
-                .unwrap_or(false)
-        })
+
+        // No row ever lands. With WAIT_SECS=0 the watcher's very first
+        // tick is already past its deadline; the lease releases quickly.
+        wait_for(
+            "lease released after the row-watcher's deadline",
+            move || {
+                futures::executor::block_on(SessionLeaseGuard::try_acquire(
+                    &state, session_id, None,
+                ))
+                .ok()
+                .flatten()
+                .is_some()
+            },
+        )
         .await;
         assert!(
             meta.snapshots.lock().is_empty(),
-            "a failed finalize must never write a snapshot row"
+            "the deadline path must never fabricate a row"
         );
+        std::env::remove_var("ENGRAM_EVICT_FINALIZE_POLL_MS");
+        std::env::remove_var("ENGRAM_EVICT_FINALIZE_WAIT_SECS");
         // Session stays Idle (resume falls back to the prior checkpoint).
         assert_eq!(meta.session.lock().status, SessionState::Idle);
     }
@@ -1586,6 +1597,13 @@ mod tests {
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
             }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
             async fn exec_stream(
                 &self,
                 id: engram_core::SandboxId,
@@ -1635,7 +1653,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(
@@ -1803,6 +1821,13 @@ mod tests {
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
             }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
             async fn exec_stream(
                 &self,
                 id: engram_core::SandboxId,
@@ -1852,7 +1877,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(
@@ -2020,6 +2045,13 @@ mod tests {
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
             }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
             async fn exec_stream(
                 &self,
                 id: engram_core::SandboxId,
@@ -2070,7 +2102,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(
@@ -2371,6 +2403,13 @@ mod tests {
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
             }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
             async fn exec_stream(
                 &self,
                 id: engram_core::SandboxId,
@@ -2418,7 +2457,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(

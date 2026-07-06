@@ -59,13 +59,19 @@ echo "==> asserting required symbols"
 require() {
   grep -q "^$1=y" .config || { echo "MISSING required config: $1" >&2; exit 1; }
 }
+# FUSE: stripped by FC's release config -> agentd never boots (dev-vm-verified).
+# NAMESPACES/USER_NS/PID_NS/NET_NS/SECCOMP*: required for chromium's
+# unprivileged namespace (zygote) sandbox (ADR 0065 §7, issue #569) — a future
+# base-config re-sync must not silently drop them.
 for c in \
   CONFIG_NF_TABLES CONFIG_NFT_COMPAT CONFIG_NFT_NAT \
   CONFIG_IP_NF_RAW CONFIG_IP6_NF_NAT CONFIG_IP6_NF_RAW \
   CONFIG_BRIDGE_NETFILTER CONFIG_VXLAN CONFIG_OVERLAY_FS CONFIG_BRIDGE CONFIG_VETH \
   CONFIG_VIRTIO_MMIO CONFIG_VIRTIO_BLK CONFIG_VIRTIO_NET CONFIG_VIRTIO_VSOCKETS \
   CONFIG_IP_PNP CONFIG_EXT4_FS \
-  CONFIG_FUSE_FS ; do  # FUSE: stripped by FC's release config -> agentd never boots (dev-vm-verified)
+  CONFIG_FUSE_FS \
+  CONFIG_NAMESPACES CONFIG_USER_NS CONFIG_PID_NS CONFIG_NET_NS \
+  CONFIG_SECCOMP CONFIG_SECCOMP_FILTER ; do
   require "$c"
 done
 echo "    all required symbols present"

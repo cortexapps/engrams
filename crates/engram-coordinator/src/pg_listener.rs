@@ -20,6 +20,7 @@ use engram_core::traits::MetadataStore;
 use engram_core::{HostId, SessionId};
 use serde::Deserialize;
 use sqlx::postgres::PgListener;
+use tokio::sync::Notify;
 
 use crate::boot_bundle::BootBundleCache;
 use crate::host_registry::HostRegistry;
@@ -54,6 +55,7 @@ pub fn spawn(
     host_registry: Arc<HostRegistry>,
     integrations: IntegrationBroker,
     boot_bundles: Arc<BootBundleCache>,
+    queue_wake: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run(
@@ -63,6 +65,7 @@ pub fn spawn(
             host_registry,
             integrations,
             boot_bundles,
+            queue_wake,
         )
         .await
         {
@@ -78,6 +81,7 @@ async fn run(
     host_registry: Arc<HostRegistry>,
     integrations: IntegrationBroker,
     boot_bundles: Arc<BootBundleCache>,
+    queue_wake: Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listener = PgListener::connect(database_url).await?;
     listener.listen("session_events").await?;
@@ -93,14 +97,27 @@ async fn run(
     // heartbeat.
     listener.listen("enabled_image_changed").await?;
     listener.listen("fleet_catalog_changed").await?;
+    // ADR 0048 (queue fairness): placement-feasibility events wake the
+    // queue scanner (crate::queue_scanner) so a dequeue doesn't wait for
+    // its poll fallback.
+    listener.listen("placement_changed").await?;
     tracing::info!(
         "pg_listener subscribed to session_events + session_event_deltas + host_dead + \
-         org_secret_changed + enabled_image_changed + fleet_catalog_changed"
+         org_secret_changed + enabled_image_changed + fleet_catalog_changed + placement_changed"
     );
 
     loop {
         let notification = listener.recv().await?;
         match notification.channel() {
+            "placement_changed" => {
+                // Informational reason string only (see
+                // `PostgresStore::notify_placement_changed`); we don't
+                // need to parse it, just wake the scanner. `Notify`
+                // coalesces a storm of these into a single permit, so no
+                // debounce machinery is needed here.
+                queue_wake.notify_one();
+                continue;
+            }
             "host_dead" => {
                 // Payload is just `<uuid>` (no JSON wrapper) — the
                 // detector emits it as a plain text NOTIFY.

@@ -82,19 +82,27 @@ pub struct ImageManifest {
 /// is captured into the base snapshot, so every restored session inherits
 /// a warm, cache-hot daemon with no cold-start.
 ///
-/// **Fail-loud:** a non-zero exit or a timeout aborts the capture and
-/// therefore the whole image enable. A declared warm hook that can't run
-/// is a real defect (bad command, cold cache, OOM); we never silently
-/// ship a "cold" base snapshot that claims to be warm.
+/// **Fail-loud:** a non-zero exit, a stall, a blown per-stage deadline, or
+/// the global timeout all abort the capture and therefore the whole image
+/// enable (issue #539 — see [`docs/warm-hooks.md`](../../../../docs/warm-hooks.md)
+/// for the full contract: what the hook may assume, deadline semantics, and
+/// the `::engram-warm::` progress-line protocol a hook can emit for
+/// observability). A declared warm hook that can't run is a real defect
+/// (bad command, cold cache, OOM); we never silently ship a "cold" base
+/// snapshot that claims to be warm.
 ///
-/// **Hermetic requirement:** because capture must be deterministic and
-/// runs without per-session secrets, the warm command must be driven off
-/// baked, offline caches — no network. (The capture VM carries the
-/// manifest `[env]` but not the per-session `[secrets]`.)
+/// **Hermetic by default, egress opt-in:** the warm command runs without
+/// per-session secrets (the capture VM carries the manifest `[env]` +
+/// `capture_env`, not a session's `[secrets]`) and, absent [`Self::network`],
+/// **no network** — driven off baked, offline caches. An image whose warm
+/// boot genuinely needs the network (eager OIDC discovery, an `op inject`)
+/// opts in via `[warm.network]`.
 ///
-/// **Backend note:** only meaningful for memory-snapshot backends
-/// (Firecracker). On disk-only/cold-boot capture (VZ) a live process is
-/// not part of the snapshot, so the hook is a no-op there.
+/// **Backend note:** `build_base_snapshot` (where the hook runs) is
+/// implemented only on `PooledBackend`'s memory-snapshot path
+/// (Firecracker); VZ and Process opt out of base-snapshot capture entirely
+/// via the trait's default (a hard error) — there's no VZ-specific gate on
+/// the `[warm]` hook itself, capture just isn't offered on that backend.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WarmConfig {

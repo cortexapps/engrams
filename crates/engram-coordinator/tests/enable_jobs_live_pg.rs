@@ -1,7 +1,15 @@
 //! Live-Postgres tests for the ADR 0036 `enable_jobs` MetadataStore
 //! surface: create-or-get dedup (one active job per URI), lease-based
 //! claiming (multi-coordinator safety + expiry steal), progress
-//! checkpoints, failure bookkeeping, and the admin retry transition.
+//! checkpoints, failure bookkeeping, the admin retry transition, and
+//! (issue #538) the `prestaging`-stage store surface
+//! (`begin_enable_job_prestage` / `set_enable_job_prestage_hosts` /
+//! `list_prestaging_refs`). The scanner's ORCHESTRATION of that surface
+//! (the poll loop, the deadline policy, the `eval_prestage` truth table) is
+//! pure and unit-tested in `enable_scanner.rs` — driving the full pipeline
+//! here would need a fake OCI registry + capture host, which is the FC e2e
+//! suite's job (see this file's original scope note above); what's new and
+//! testable against REAL Postgres is the fenced store surface itself.
 //!
 //! `#[ignore]`'d by default; requires Postgres reachable at
 //! `ENGRAM_TEST_DATABASE_URL`. Run:
@@ -16,9 +24,12 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
+use engram_core::types::host::{
+    HostCapacity, HostHeartbeat, HostRecord, HostStatus, HostUtilization,
+};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::SnapshotRecord;
-use engram_core::types::{EnableJobState, EnabledImage};
+use engram_core::types::{EnableJobState, EnabledImage, HostId};
 use engram_core::{MetaError, SnapshotId};
 use uuid::Uuid;
 
@@ -441,6 +452,134 @@ async fn stale_claimant_writes_are_fenced_off() {
         .expect("park");
 }
 
+/// Issue #539: `update_enable_job_capture_progress` is claim-fenced
+/// exactly like `update_enable_job_progress` (a peer claimant's write
+/// must `Conflict`, not stomp the row), it renews the lease
+/// (`claimed_at`), and `record_enable_job_failure` — which never
+/// touches `warm_stage`/`output_tail` itself — leaves whatever the last
+/// progress write stamped in place. This is the acceptance-criterion
+/// path: even a `WarmExecTransport` kill (stream dies mid-run, no
+/// further progress write possible) must leave the failing stage + tail
+/// on the row from the last successful write before the kill.
+#[tokio::test]
+#[ignore]
+async fn capture_progress_is_fenced_renews_lease_and_survives_failure() {
+    use engram_core::types::{
+        CaptureFailureKind, CapturePhase, CaptureProgress, WarmStageOutcome, WarmStageRecord,
+    };
+
+    let Some(meta) = connect().await else { return };
+    let uri = unique_uri("capture-progress");
+    let job = meta
+        .create_or_get_enable_job(&uri, None, &[])
+        .await
+        .expect("create");
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim a");
+
+    let stage_started = Utc::now();
+    let progress = CaptureProgress {
+        phase: CapturePhase::Warm,
+        warm_stage: Some("uiresources-wait".into()),
+        detail: Some("waiting on uiresources/brain-backend".into()),
+        output_tail: "error: timed out waiting for the condition on uiresources/brain-backend"
+            .into(),
+        warm_stages: vec![WarmStageRecord {
+            name: "uiresources-wait".into(),
+            started_at: stage_started,
+            ended_at: None,
+            outcome: WarmStageOutcome::Running,
+        }],
+    };
+    meta.update_enable_job_capture_progress(job.id, "pod-a", &progress)
+        .await
+        .expect("pod-a progress write");
+
+    let after_progress = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(after_progress.capture_phase, Some(CapturePhase::Warm));
+    assert_eq!(
+        after_progress.warm_stage.as_deref(),
+        Some("uiresources-wait")
+    );
+    assert_eq!(
+        after_progress.warm_stage_started_at.map(|t| t.timestamp()),
+        Some(stage_started.timestamp())
+    );
+    assert_eq!(after_progress.warm_stages.len(), 1);
+    assert!(after_progress
+        .output_tail
+        .as_deref()
+        .unwrap()
+        .contains("uiresources/brain-backend"));
+
+    // The progress write renewed the lease: an immediate re-claim
+    // attempt at lease_secs=300 must NOT hand the job to a peer (it's
+    // not expired).
+    let stolen = meta.claim_enable_jobs("pod-b", 300, 50).await.unwrap();
+    assert!(
+        !stolen.iter().any(|j| j.id == job.id),
+        "a fresh progress write must have renewed the lease — pod-b must not re-claim"
+    );
+
+    // A peer's write against a claim it doesn't hold is fenced off,
+    // exactly like update_enable_job_progress.
+    let peer_progress = CaptureProgress {
+        phase: CapturePhase::Warm,
+        warm_stage: Some("peer-stage".into()),
+        detail: None,
+        output_tail: "peer output".into(),
+        warm_stages: vec![],
+    };
+    match meta
+        .update_enable_job_capture_progress(job.id, "pod-b", &peer_progress)
+        .await
+    {
+        Err(MetaError::Conflict(msg)) => assert!(msg.contains("pod-a"), "{msg}"),
+        other => panic!("stale-claimant capture progress write must Conflict, got {other:?}"),
+    }
+    let unchanged = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(
+        unchanged.warm_stage.as_deref(),
+        Some("uiresources-wait"),
+        "a fenced-off peer write must not stomp the row"
+    );
+
+    // record_enable_job_failure never touches warm_stage/output_tail —
+    // they must survive the failure exactly as the last progress write
+    // left them (the diagnosis a `status None` / WarmExecTransport kill
+    // used to lose entirely).
+    meta.record_enable_job_failure(
+        job.id,
+        "pod-a",
+        &format!(
+            "base-snapshot capture failed ({}): in-guest wait timed out",
+            CaptureFailureKind::WarmStageDeadline
+        ),
+        5,
+        true,
+    )
+    .await
+    .expect("record failure");
+
+    let failed = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(failed.state, EnableJobState::Failed);
+    assert!(failed.error.unwrap().contains("in-guest wait timed out"));
+    assert_eq!(
+        failed.warm_stage.as_deref(),
+        Some("uiresources-wait"),
+        "failing stage must survive record_enable_job_failure"
+    );
+    assert!(
+        failed
+            .output_tail
+            .as_deref()
+            .unwrap()
+            .contains("uiresources/brain-backend"),
+        "output tail must survive record_enable_job_failure"
+    );
+}
+
 /// ADR 0036 P4: content-keyed base-snapshot reuse lookup. Seeds an
 /// enabled image whose `disk_manifest_*` is a (simulated)
 /// content-derived ref + a base snapshot, then asserts the lookup
@@ -465,6 +604,7 @@ async fn find_enabled_image_by_content_keys_on_disk_manifest_and_toml() {
         recoverable: true,
         aux_bundles: vec![],
         events_cursor: None,
+        fc_snapshot_version: None,
     })
     .await
     .expect("seed base snapshot");
@@ -526,4 +666,267 @@ async fn find_enabled_image_by_content_keys_on_disk_manifest_and_toml() {
         .expect("lookup post-delete")
         .expect("soft-deleted rows must still match");
     assert_eq!(found.image_uri, uri);
+}
+
+// ---- ADR 0036 amendment (issue #538): the `prestaging`-stage store surface ----
+
+/// A schedulable, staging-eligible host reporting `digest` in
+/// `ready_images` iff `staged`.
+async fn seed_staging_host(meta: &Arc<dyn MetadataStore>, digest: &str, staged: bool) -> HostId {
+    let id = HostId::new();
+    meta.upsert_host(HostRecord {
+        id,
+        hostname: format!("prestage-{id}"),
+        cloud_metadata: Default::default(),
+        capacity: HostCapacity {
+            total_gb: 0,
+            used_gb: 0,
+            total_mib: 0,
+            used_mib: 0,
+            running_sandboxes: 0,
+        },
+        utilization: HostUtilization::default(),
+        status: HostStatus::Ready,
+        last_heartbeat_at: Utc::now(),
+        host_addr: None,
+        ready_images: Vec::new(),
+        local_snapshots: Vec::new(),
+        current_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus: 0,
+        wire_version: 0,
+        stages_images: true,
+        capabilities: Default::default(),
+    })
+    .await
+    .expect("upsert staging host");
+    meta.touch_host_heartbeat(
+        id,
+        HostHeartbeat {
+            status: HostStatus::Ready,
+            capacity: HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 0,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: HostUtilization::default(),
+            ready_images: if staged {
+                vec![digest.to_string()]
+            } else {
+                Vec::new()
+            },
+            local_snapshots: Vec::new(),
+            current_bundles: Vec::new(),
+            total_vcpus: 0,
+            wire_version: engram_protocol::WIRE_VERSION,
+            stages_images: true,
+            capabilities: Default::default(),
+        },
+    )
+    .await
+    .expect("heartbeat staging host");
+    id
+}
+
+fn prestage_ref_json(digest: &str) -> serde_json::Value {
+    serde_json::json!({
+        "image_uri": "localhost:5001/prestage-test:warm",
+        "manifest_digest": digest,
+        "base_snapshot_id": SnapshotId::new().to_string(),
+        "base_snapshot_disk_manifest": { "manifest_id": Uuid::new_v4().to_string(), "version": 1 },
+        "base_snapshot_memory_manifest": null,
+    })
+}
+
+/// (a) `begin_enable_job_prestage` flips `capturing → prestaging` and
+/// stamps the ref in ONE fenced write; the job round-trips (state +
+/// `prestage_hosts` default `{}`); `list_prestaging_refs` surfaces exactly
+/// the jobs currently `prestaging` (and none of the others) — the read
+/// the heartbeat-ack handler drives `prestage_images` from.
+#[tokio::test]
+#[ignore]
+async fn begin_prestage_transitions_state_and_ref_is_listed() {
+    let Some(meta) = connect().await else { return };
+    let digest = format!("sha256:{}", Uuid::new_v4().simple());
+    let uri = unique_uri("prestage-transition");
+    let job = meta
+        .create_or_get_enable_job(&uri, Some(&digest), &[])
+        .await
+        .expect("create");
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim");
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Capturing)
+        .await
+        .expect("capturing");
+
+    // A DIFFERENT job stays `pending` — it must never show up in
+    // `list_prestaging_refs`, proving the read filters on state, not just
+    // ref-presence.
+    let other_uri = unique_uri("prestage-transition-control");
+    meta.create_or_get_enable_job(&other_uri, None, &[])
+        .await
+        .expect("create control job");
+
+    let the_ref = prestage_ref_json(&digest);
+    meta.begin_enable_job_prestage(job.id, "pod-a", the_ref.clone())
+        .await
+        .expect("begin prestage");
+
+    let got = meta
+        .get_enable_job(job.id)
+        .await
+        .unwrap()
+        .expect("job exists");
+    assert_eq!(got.state, EnableJobState::Prestaging);
+    assert_eq!(got.prestage_hosts, serde_json::json!({}));
+
+    let refs = meta.list_prestaging_refs().await.expect("list refs");
+    assert_eq!(refs.len(), 1, "only the prestaging job's ref is listed");
+    assert_eq!(refs[0]["manifest_digest"], digest);
+
+    // Advance past prestaging — the ref must drop out of the list (it's
+    // scoped to jobs ACTIVELY prestaging, not a durable advertisement).
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Ready)
+        .await
+        .expect("ready");
+    let refs_after = meta.list_prestaging_refs().await.expect("list refs after");
+    assert!(
+        refs_after.is_empty(),
+        "a ready job's ref must no longer be advertised"
+    );
+
+    // Cleanup: park the control job terminal.
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim control");
+    for j in meta.list_enable_jobs(50).await.unwrap() {
+        if j.image_uri == other_uri {
+            meta.set_enable_job_state(j.id, "pod-a", EnableJobState::Failed)
+                .await
+                .expect("park control");
+        }
+    }
+}
+
+/// (b)/(c) `set_enable_job_prestage_hosts` records the per-host outcome
+/// map the scanner computes from a hosts snapshot — one staged, one
+/// straggler `timed_out`, matching the deadline-with-≥1-staged policy
+/// (proceed to ready with stragglers recorded, never wedge). Also proves
+/// the write is a plain audit record: it doesn't itself flip job state.
+#[tokio::test]
+#[ignore]
+async fn set_prestage_hosts_records_the_outcome_map() {
+    let Some(meta) = connect().await else { return };
+    let digest = format!("sha256:{}", Uuid::new_v4().simple());
+    let staged_host = seed_staging_host(&meta, &digest, true).await;
+    let straggler_host = seed_staging_host(&meta, &digest, false).await;
+
+    let uri = unique_uri("prestage-outcomes");
+    let job = meta
+        .create_or_get_enable_job(&uri, Some(&digest), &[])
+        .await
+        .expect("create");
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim");
+    meta.begin_enable_job_prestage(job.id, "pod-a", prestage_ref_json(&digest))
+        .await
+        .expect("begin prestage");
+
+    let outcomes = serde_json::json!({
+        staged_host.to_string(): { "outcome": "staged", "waited_ms": 4200 },
+        straggler_host.to_string(): { "outcome": "timed_out", "waited_ms": 1_200_000 },
+    });
+    meta.set_enable_job_prestage_hosts(job.id, "pod-a", outcomes.clone())
+        .await
+        .expect("set outcomes");
+
+    let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(got.prestage_hosts, outcomes);
+    // The deadline-with-stragglers policy proceeds to ready — this call
+    // alone must not have flipped state.
+    assert_eq!(got.state, EnableJobState::Prestaging);
+
+    // The scanner's next write in the real pipeline is the Ready flip;
+    // exercise it here to confirm the audit column survives untouched.
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Ready)
+        .await
+        .expect("ready");
+    let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(
+        got.prestage_hosts, outcomes,
+        "the ready flip must not clobber the audit map"
+    );
+}
+
+/// (d) #232 fencing: a peer's re-claim mid-prestage must make the stale
+/// pod's `begin_enable_job_prestage` / `set_enable_job_prestage_hosts`
+/// Conflict — the SAME discipline every other enable-job write already
+/// has (`stale_claimant_writes_are_fenced_off` above), extended to the two
+/// new prestage methods.
+#[tokio::test]
+#[ignore]
+async fn prestage_writes_are_fenced_off_from_a_stale_claimant() {
+    let Some(meta) = connect().await else { return };
+    let digest = format!("sha256:{}", Uuid::new_v4().simple());
+    let uri = unique_uri("prestage-fencing");
+    let job = meta
+        .create_or_get_enable_job(&uri, Some(&digest), &[])
+        .await
+        .expect("create");
+
+    // pod-a claims and drives to capturing.
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim a");
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Capturing)
+        .await
+        .expect("a capturing");
+
+    // pod-a's lease expires; pod-b legitimately re-claims and begins
+    // prestage.
+    meta.claim_enable_jobs("pod-b", 0, 50)
+        .await
+        .expect("claim b");
+    meta.begin_enable_job_prestage(job.id, "pod-b", prestage_ref_json(&digest))
+        .await
+        .expect("b begin prestage");
+    let before = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(before.state, EnableJobState::Prestaging);
+
+    // pod-a is now stale — both new methods must Conflict and mutate
+    // nothing.
+    match meta
+        .begin_enable_job_prestage(job.id, "pod-a", prestage_ref_json("sha256:stale-attempt"))
+        .await
+    {
+        Err(MetaError::Conflict(msg)) => assert!(msg.contains("pod-b"), "got: {msg}"),
+        other => panic!("stale begin_enable_job_prestage must Conflict, got {other:?}"),
+    }
+    match meta
+        .set_enable_job_prestage_hosts(job.id, "pod-a", serde_json::json!({"x": "y"}))
+        .await
+    {
+        Err(MetaError::Conflict(_)) => {}
+        other => panic!("stale set_enable_job_prestage_hosts must Conflict, got {other:?}"),
+    }
+    let after = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(after.state, before.state, "stale pod flipped state");
+    assert_eq!(
+        after.prestage_hosts, before.prestage_hosts,
+        "stale pod stomped the audit map"
+    );
+
+    // pod-b — the rightful holder — can still drive the job.
+    meta.set_enable_job_prestage_hosts(job.id, "pod-b", serde_json::json!({"real": "outcome"}))
+        .await
+        .expect("b set outcomes");
+    meta.set_enable_job_state(job.id, "pod-b", EnableJobState::Ready)
+        .await
+        .expect("b ready");
+    let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(got.state, EnableJobState::Ready);
 }

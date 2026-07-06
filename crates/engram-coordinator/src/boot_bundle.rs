@@ -252,6 +252,7 @@ mod tests {
             recoverable: true,
             aux_bundles: Vec::new(),
             events_cursor: None,
+            fc_snapshot_version: None,
         }
     }
 
@@ -336,7 +337,7 @@ mod tests {
         {
             unimplemented!()
         }
-        async fn record_snapshot(&self, _: SnapshotRecord) -> Result<(), MetaError> {
+        async fn record_snapshot(&self, _: SnapshotRecord) -> Result<bool, MetaError> {
             unimplemented!()
         }
         async fn list_snapshots_for_session(
@@ -478,6 +479,8 @@ mod tests {
                 cordoned: false,
                 total_vcpus: 4,
                 wire_version: 1,
+                stages_images: false,
+                capabilities: engram_core::types::host::HostCapabilities::default(),
             }])
         }
     }

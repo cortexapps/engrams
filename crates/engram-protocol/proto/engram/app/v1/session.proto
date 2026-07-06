@@ -104,8 +104,8 @@ message SessionListItem {
 message Session {
   string id = 1;
   // engram_core SessionState, snake_case: "pending" | "created" |
-  // "guest_ready" | "active" | "idle" | "host_lost" | "evacuating" |
-  // "evicting" | "failed" | "completed" | "dead".
+  // "active" | "idle" | "host_lost" | "evacuating" | "evicting" |
+  // "failed" | "completed" | "dead".
   string status = 2;
   optional string host_id = 3;
   optional string sandbox_id = 4;

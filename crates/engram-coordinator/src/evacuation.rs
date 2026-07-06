@@ -323,6 +323,16 @@ pub async fn evacuate_dead_source(
         required_image_digest: None,
         exclude_host: session.host_id,
         prefer_host,
+        // ADR 0068: same pairing the resume path uses — a memory
+        // manifest needs the FC UFFD substrate, and (when known) the
+        // target must match the snapshot's capture-time
+        // `fc_snapshot_version` exactly.
+        caps: crate::placement::CapabilityRequirements {
+            needs_uffd_substrate: memory_manifest.is_some(),
+            fc_snapshot_version: snapshot
+                .as_ref()
+                .and_then(|s| s.fc_snapshot_version.clone()),
+        },
     };
 
     // Split pick + restore so picker errors and backend errors keep
@@ -415,6 +425,8 @@ pub async fn evacuate_dead_source(
                 // ADR 0035: evac-dest restore is resume-flavored — keep the
                 // pinned generations; the target host materializes them.
                 aux_bundles: s.aux_bundles.clone(),
+                // Issue #529: restore-side reconstruction, not a fresh capture.
+                paused_at: None,
             };
             target_backend
                 .restore(metadata)
@@ -516,6 +528,12 @@ mod tests {
         async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
             Ok(vec![])
         }
+        async fn probe_sandbox(
+            &self,
+            _id: SandboxId,
+        ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+            unimplemented!()
+        }
         async fn exec_stream(
             &self,
             _id: SandboxId,
@@ -544,6 +562,7 @@ mod tests {
                 rootfs_blob_key: None,
                 working_set_blob_key: None,
                 aux_bundles: vec![],
+                paused_at: None,
             })
         }
         async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
@@ -583,7 +602,7 @@ mod tests {
         ) -> Result<(), SandboxError> {
             unreachable!()
         }
-        async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
+        async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
             None
         }
         async fn bind_session(&self, _session_id: SessionId, _sandbox_id: SandboxId) {}
@@ -656,6 +675,8 @@ mod tests {
                     cordoned: false,
                     total_vcpus: 0,
                     wire_version: 0,
+                    stages_images: false,
+                    capabilities: engram_core::types::host::HostCapabilities::default(),
                 });
         }
 
@@ -792,7 +813,7 @@ mod tests {
         async fn record_snapshot(
             &self,
             _: engram_core::types::snapshot::SnapshotRecord,
-        ) -> Result<(), MetaError> {
+        ) -> Result<bool, MetaError> {
             unreachable!()
         }
         async fn list_snapshots_for_session(
@@ -941,6 +962,7 @@ mod tests {
             recoverable: true,
             aux_bundles: vec![],
             events_cursor: None,
+            fc_snapshot_version: None,
         }
     }
 

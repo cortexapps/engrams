@@ -77,6 +77,8 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
+        stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
     })
     .await
     .expect("upsert host");
@@ -94,6 +96,8 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
             current_bundles: Vec::new(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
+            stages_images: false,
+            capabilities: engram_core::types::host::HostCapabilities::default(),
         },
     )
     .await
@@ -343,5 +347,65 @@ async fn reserve_and_persist_create_is_all_or_nothing_on_failure() {
         caps,
         vec![cap_a],
         "the second (failed) attempt's capability must not appear"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn ram_ledger_util_columns_round_trip_through_real_pg() {
+    // Issue #540 / migration 0078: `touch_host_heartbeat` writes the RAM
+    // ledger's attribution columns (util_base_shm_mib, util_parked_pss_mib,
+    // util_running_pss_mib), and `list_active_hosts` (row_from_row) reads
+    // them back into the SAME `HostRecord.utilization` `reserve_placement`
+    // and the fleet view consume. Pins that the migration applied and the
+    // bind/select column lists agree — a drift here would silently zero
+    // out attribution on every real coordinator, not just fail a unit test
+    // (the pure round-trip is only covered against a fake `HostUtilization`
+    // value in engram-protocol's JSON test, never against real SQL).
+    let Some(meta) = connect().await else {
+        return;
+    };
+    let tag = SessionId::new();
+    let hostname = format!("plc-ledger-{tag}");
+    let id = seed_host(&meta, &hostname, 0).await;
+    meta.touch_host_heartbeat(
+        id,
+        engram_core::types::host::HostHeartbeat {
+            status: HostStatus::Ready,
+            capacity: zero_capacity(),
+            utilization: HostUtilization {
+                allocatable_mib: 20_000,
+                base_shm_mib: 19_500,
+                // Not persisted (transient, already folded into
+                // allocatable_mib) — must round-trip to 0, not error.
+                base_shm_pending_mib: 512,
+                parked_pss_mib: 12_288,
+                running_pss_mib: 8_000,
+                ..HostUtilization::default()
+            },
+            ready_images: Vec::new(),
+            local_snapshots: Vec::new(),
+            current_bundles: Vec::new(),
+            total_vcpus: 0,
+            wire_version: engram_protocol::WIRE_VERSION,
+            stages_images: false,
+            capabilities: engram_core::types::host::HostCapabilities::default(),
+        },
+    )
+    .await
+    .expect("heartbeat with ram-ledger columns");
+
+    let hosts = meta.list_active_hosts().await.expect("list_active_hosts");
+    let row = hosts
+        .iter()
+        .find(|h| h.id == id)
+        .expect("seeded host present in list_active_hosts");
+    assert_eq!(row.utilization.allocatable_mib, 20_000);
+    assert_eq!(row.utilization.base_shm_mib, 19_500);
+    assert_eq!(row.utilization.parked_pss_mib, 12_288);
+    assert_eq!(row.utilization.running_pss_mib, 8_000);
+    assert_eq!(
+        row.utilization.base_shm_pending_mib, 0,
+        "base_shm_pending_mib has no PG column and must NOT survive a round-trip"
     );
 }

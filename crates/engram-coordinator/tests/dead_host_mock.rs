@@ -148,8 +148,8 @@ impl MetadataStore for MiniMeta {
         }
         Ok(affected)
     }
-    async fn record_snapshot(&self, _s: SnapshotRecord) -> Result<(), MetaError> {
-        Ok(())
+    async fn record_snapshot(&self, _s: SnapshotRecord) -> Result<bool, MetaError> {
+        Ok(true)
     }
     async fn list_snapshots_for_session(
         &self,
@@ -290,7 +290,6 @@ fn legal_path_from_pending(target: SessionState) -> &'static [SessionState] {
         Pending => &[],
         Queued => &[Queued],
         Created => &[Created],
-        GuestReady => &[Created, GuestReady],
         Active => &[Created, Active],
         Idle => &[Created, Active, Idle],
         HostLost => &[Created, Active, HostLost],

@@ -1,9 +1,9 @@
 //! ADR 0036 — async image-enable scanner.
 //!
 //! Background task that drives `enable_jobs` rows through
-//! `pending → materializing → capturing → ready | failed`. Sibling
-//! to [`crate::evac_resumer`]: same polling shape, same shared-state
-//! surface, distinct table.
+//! `pending → materializing → capturing → prestaging → ready | failed`.
+//! Sibling to [`crate::evac_resumer`]: same polling shape, same
+//! shared-state surface, distinct table.
 //!
 //! ## Flow
 //!
@@ -24,6 +24,16 @@
 //!    - `capturing`: [`crate::api::enabled_images::capture_and_record_base_snapshot`]
 //!      boots the capture VM on a host (idempotent via the
 //!      digest-keyed reuse check).
+//!    - `prestaging` (ADR 0036 amendment, issue #538, INTERIM): advertise
+//!      the freshly-captured base snapshot as a `prestage_images`
+//!      heartbeat-ack entry and wait for every eligible (`stages_images`)
+//!      host to report the digest in `ready_images`, or a deadline
+//!      (`ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS`, default 1200 s) — see
+//!      [`eval_prestage`]. A fleet where NO host has `stages_images`
+//!      (dev/Process backend) passes vacuously; a fleet that has
+//!      staging-capable hosts but none currently schedulable (e.g. a
+//!      MIG roll blip) keeps polling under the deadline instead — see
+//!      review finding 1 on PR #565.
 //!    - upsert the `enabled_images` row → `ready`.
 //! 3. On any pipeline error: record the failure (bumps `attempts`,
 //!    stores `error`, releases the claim) and leave the job in its
@@ -45,6 +55,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use engram_core::types::host::HostRecord;
 use engram_core::types::{EnableJob, EnableJobState};
 use engram_core::MetaError;
 
@@ -76,8 +88,20 @@ pub struct EnableScannerConfig {
     /// How often the materialize progress counter is checkpointed to
     /// PG (progress bar + claim renewal).
     pub progress_interval: Duration,
+    /// ADR 0036 amendment (issue #538): how long the `prestaging` stage
+    /// waits for every eligible host to report the digest before
+    /// proceeding to `ready` with stragglers recorded `timed_out`.
+    /// `ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS`, default 1200 s (minutes-class
+    /// — dev-brain-sized images pull ~33 GB through a 16-permit semaphore;
+    /// see `engram_enable_prestage_seconds` before retuning).
+    pub prestage_timeout: Duration,
 }
 
+/// Every field here is a pure constant — no I/O. Env resolution
+/// (`ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS`) happens at the use-site via
+/// [`EnableScannerConfig::from_env`], cf. `placement::placement_ttl`
+/// (review finding 6, PR #565: a `Default` impl doing env I/O + silently
+/// swallowing a rejected value is surprising and untestable).
 impl Default for EnableScannerConfig {
     fn default() -> Self {
         Self {
@@ -89,7 +113,40 @@ impl Default for EnableScannerConfig {
             claim_limit: 2,
             max_attempts: 5,
             progress_interval: Duration::from_secs(2),
+            prestage_timeout: DEFAULT_PRESTAGE_TIMEOUT,
         }
+    }
+}
+
+const DEFAULT_PRESTAGE_TIMEOUT: Duration = Duration::from_secs(1200);
+
+impl EnableScannerConfig {
+    /// Resolves `ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS` on top of the pure
+    /// [`Default`]. This is the constructor `spawn`'s caller should use in
+    /// production; tests that want the bare constant use `::default()` (or
+    /// `..Default::default()`) directly. Unlike the old `Default` impl, an
+    /// unparseable or non-positive value is NOT silently swallowed — it's
+    /// a config typo (e.g. `=0` plausibly meant "skip the wait"), so it's
+    /// worth a `warn!` on boot rather than a silent 1200s.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(raw) = std::env::var("ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS") {
+            match raw.parse::<u64>() {
+                Ok(secs) if secs > 0 => cfg.prestage_timeout = Duration::from_secs(secs),
+                Ok(_) => tracing::warn!(
+                    raw = %raw,
+                    default_secs = DEFAULT_PRESTAGE_TIMEOUT.as_secs(),
+                    "ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS must be > 0; using the default"
+                ),
+                Err(e) => tracing::warn!(
+                    raw = %raw,
+                    error = %e,
+                    default_secs = DEFAULT_PRESTAGE_TIMEOUT.as_secs(),
+                    "ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS is not a valid u64; using the default"
+                ),
+            }
+        }
+        cfg
     }
 }
 
@@ -221,12 +278,22 @@ impl From<MetaError> for AdvanceError {
 }
 
 /// Classify a base-snapshot capture failure. `ApiError::Unavailable` is the
-/// capture-host picker's `NoCapacity` — transient, retry. Everything else
-/// from capture (`ApiError::Internal`: a `[warm]` hook non-zero exit, a
-/// snapshot that failed HEAD-verify, …) is deterministic — bail fast.
+/// capture-host picker's `NoCapacity` — transient, retry.
+///
+/// Issue #539: `ApiError::CaptureFailed` carries a `CaptureFailureKind` —
+/// only `WarmExecTransport` (the exec stream died mid-run, e.g. a vsock/
+/// gRPC connection loss) is retryable via the attempts budget; every other
+/// kind (`WarmExitNonZero`/`WarmStall`/`WarmStageDeadline`/
+/// `WarmGlobalTimeout`/`SnapshotFailed`) is a deterministic outcome that
+/// retrying can't fix — bail fast on the first occurrence, same as the old
+/// blanket `ApiError::Internal` treatment (a `[warm]` hook non-zero exit,
+/// a snapshot that failed HEAD-verify, …).
 fn classify_capture_error(e: crate::error::ApiError) -> AdvanceError {
     match e {
         crate::error::ApiError::Unavailable(_) => AdvanceError::Pipeline(Box::new(e)),
+        crate::error::ApiError::CaptureFailed { kind, .. } if kind.is_retryable() => {
+            AdvanceError::Pipeline(Box::new(e))
+        }
         other => AdvanceError::NonRetryable(Box::new(other)),
     }
 }
@@ -335,14 +402,88 @@ async fn advance_one(
         .meta
         .set_enable_job_state(job_id, claimant, EnableJobState::Capturing)
         .await?;
-    // Renew the claim lease throughout the capture. `build_base_snapshot` is a
-    // single long host call; for a `[warm]`-hook image the warm boot + snapshot
-    // upload run tens of minutes — far past `lease_secs`. The materialize ticker
-    // is already aborted, so without renewal here the lease expires mid-capture
-    // and a peer re-claims, spawning a SECOND concurrent capture (host
-    // contention + wasted work). Progress is static now (materialize is done),
-    // so the ticker re-writes the final `done` count purely to renew the lease.
-    let capture_ticker = {
+    // Issue #539: `build_base_snapshot` now streams `CaptureProgress` at
+    // least every 30s (host keepalive) for the whole capture, so THIS
+    // replaces the old blind lease-renewal ticker (deleted — it used to
+    // re-write the static `done` count purely to keep the claim alive):
+    // every progress write doubles as the renewal
+    // (`update_enable_job_capture_progress` bumps `claimed_at`), so a
+    // `[warm]`-hook capture that runs tens of minutes past `lease_secs`
+    // still holds its claim — and renewals stop exactly when the stream
+    // dies (a transport failure), letting a peer legitimately re-claim
+    // instead of racing a still-healthy owner.
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::channel::<engram_core::types::CaptureProgress>(64);
+    let progress_consumer = {
+        let meta = state.services.meta.clone();
+        let claimant = claimant.to_string();
+        tokio::spawn(async move {
+            while let Some(event) = progress_rx.recv().await {
+                match meta
+                    .update_enable_job_capture_progress(job_id, &claimant, &event)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(MetaError::Conflict(msg)) => {
+                        tracing::warn!(%job_id, reason = %msg, "enable capture progress write lost the lease; abandoning to peer");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(%job_id, error = %e, "enable capture progress write failed");
+                    }
+                }
+            }
+        })
+    };
+    let capture_result =
+        capture_and_record_base_snapshot(state, &row, &manifest, progress_tx).await;
+    // `capture_and_record_base_snapshot` returning means every `Sender`
+    // clone it (or the host RPC underneath it) held has been dropped —
+    // awaiting the consumer here guarantees every progress event,
+    // INCLUDING the very last one written right before a failure, is
+    // persisted before we act on `capture_result`. This is load-bearing
+    // for the "failing stage + tail survive a WarmExecTransport kill"
+    // acceptance criterion: `record_enable_job_failure` (below) never
+    // touches these columns itself — it relies on this write having
+    // already landed.
+    let _ = progress_consumer.await;
+    let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
+        capture_result.map_err(classify_capture_error)?;
+    row.base_snapshot_id = Some(base_snapshot_id);
+    row.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
+    // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
+    row.base_snapshot_memory_manifest = base_snapshot_memory_manifest;
+
+    // ---- prestaging (ADR 0036 amendment, issue #538, INTERIM) ----
+    //
+    // Advertise the freshly-captured base snapshot to the fleet BEFORE the
+    // `enabled_images` upsert below makes the digest visible to
+    // session-create — closing the window where the first restore after a
+    // refresh pulls ~thousands of chunks from GCS on demand (90-118 s,
+    // observed failing outright 3-for-3 in prod). All pieces already
+    // exist: the per-host prefetch supervisor and the placement digest
+    // gate; this stage just sequences the enable flip to happen AFTER the
+    // fleet has warmed, not at the same instant as the first user create.
+    let image_ref = crate::api::host_http::enabled_image_ref(&row).ok_or_else(|| {
+        // Can't happen in practice — base_snapshot_id/disk_manifest were
+        // just stamped `Some` three lines up — but bail loudly rather than
+        // silently skip prestage and race the create path anyway.
+        AdvanceError::NonRetryable(Box::new(std::io::Error::other(format!(
+            "enable job {job_id}: captured row has no advertisable base-snapshot refs",
+        ))))
+    })?;
+    let prestage_ref_json =
+        serde_json::to_value(&image_ref).map_err(|e| AdvanceError::NonRetryable(Box::new(e)))?;
+    state
+        .services
+        .meta
+        .begin_enable_job_prestage(job_id, claimant, prestage_ref_json)
+        .await?;
+
+    // Renew the claim lease throughout the wait, same trick as the capture
+    // ticker above (progress is static — materialize/capture are done — so
+    // re-writing the same `done` count purely renews `claimed_at`).
+    let prestage_ticker = {
         let meta = state.services.meta.clone();
         let interval = cfg.progress_interval;
         let claimant = claimant.to_string();
@@ -357,24 +498,149 @@ async fn advance_one(
                 {
                     Ok(()) => {}
                     Err(MetaError::Conflict(msg)) => {
-                        tracing::warn!(%job_id, reason = %msg, "enable capture lease lost; stopping renewal ticker");
+                        tracing::warn!(%job_id, reason = %msg, "enable prestage lease lost; stopping renewal ticker");
                         break;
                     }
                     Err(e) => {
-                        tracing::debug!(%job_id, error = %e, "enable capture lease renewal failed");
+                        tracing::debug!(%job_id, error = %e, "enable prestage lease renewal failed");
                     }
                 }
             }
         })
     };
-    let capture_result = capture_and_record_base_snapshot(state, &row, &manifest).await;
-    capture_ticker.abort();
-    let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
-        capture_result.map_err(classify_capture_error)?;
-    row.base_snapshot_id = Some(base_snapshot_id);
-    row.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
-    // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
-    row.base_snapshot_memory_manifest = base_snapshot_memory_manifest;
+
+    let digest = image_ref.manifest_digest.as_str().to_string();
+    let deadline = tokio::time::Instant::now() + cfg.prestage_timeout;
+    let wait_started = std::time::Instant::now();
+    // Last-known counts from a successful poll, surfaced in the TimedOut
+    // outcome if the deadline is hit inside the error arm below (review
+    // finding 2, PR #565) — a persistent `list_active_hosts` failure
+    // shouldn't discard whatever we last observed.
+    let mut last_seen = (0usize, 0usize); // (staged, eligible)
+    let prestage_outcome = loop {
+        let hosts = match state.services.meta.list_active_hosts().await {
+            Ok(hosts) => hosts,
+            Err(e) => {
+                tracing::warn!(%job_id, error = %e, "enable prestage: list_active_hosts failed; retrying");
+                // A persistent PG read failure must still respect the
+                // documented hard deadline (acceptance criterion 3) instead
+                // of spinning forever — `run_once` drives claimed jobs
+                // sequentially, so a wedged wait here stalls every other
+                // claimed enable job too.
+                if tokio::time::Instant::now() >= deadline {
+                    break PrestageOutcome::TimedOut {
+                        staged: last_seen.0,
+                        eligible: last_seen.1,
+                    };
+                }
+                tokio::time::sleep(
+                    cfg.poll_interval
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await;
+                continue;
+            }
+        };
+        match eval_prestage(
+            &hosts,
+            &digest,
+            Utc::now(),
+            crate::placement::placement_ttl(),
+        ) {
+            PrestageEval::Complete => break PrestageOutcome::Complete,
+            PrestageEval::EmptyFleet => break PrestageOutcome::EmptyFleet,
+            PrestageEval::Waiting { staged, eligible } => {
+                last_seen = (staged, eligible);
+                if tokio::time::Instant::now() >= deadline {
+                    break PrestageOutcome::TimedOut { staged, eligible };
+                }
+                tokio::time::sleep(
+                    cfg.poll_interval
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await;
+            }
+        }
+    };
+    prestage_ticker.abort();
+    ::metrics::histogram!(
+        crate::metrics::ENABLE_PRESTAGE_SECONDS,
+        "outcome" => prestage_outcome.metric_label(),
+    )
+    .record(wait_started.elapsed().as_secs_f64());
+
+    // Zero-staged timeout: transient (a fleet mid-roll, or every staging
+    // host briefly unreachable) — retry under the attempts budget rather
+    // than flip ready with nothing warm.
+    if let PrestageOutcome::TimedOut {
+        staged: 0,
+        eligible,
+    } = prestage_outcome
+    {
+        return Err(AdvanceError::Pipeline(Box::new(
+            crate::error::ApiError::Unavailable(format!(
+            "enable job {job_id}: prestage deadline hit with 0/{eligible} eligible hosts staged",
+        )),
+        )));
+    }
+
+    // Record the per-host outcome map (audit / dashboard surface) — one
+    // more hosts read so the map reflects the hosts as of stage-end, not
+    // the last poll (a host that appeared mid-wait should show up here).
+    let waited_ms = wait_started.elapsed().as_millis() as u64;
+    match state.services.meta.list_active_hosts().await {
+        Ok(hosts) => {
+            let entries = prestage_host_outcomes(
+                &hosts,
+                &digest,
+                Utc::now(),
+                crate::placement::placement_ttl(),
+                waited_ms,
+            );
+            for (_, outcome, _) in &entries {
+                ::metrics::counter!(
+                    crate::metrics::ENABLE_PRESTAGE_HOST_OUTCOMES_TOTAL,
+                    "outcome" => *outcome,
+                )
+                .increment(1);
+            }
+            let map: serde_json::Map<String, serde_json::Value> = entries
+                .into_iter()
+                .map(|(host_id, outcome, waited_ms)| {
+                    let entry = match waited_ms {
+                        Some(ms) => serde_json::json!({ "outcome": outcome, "waited_ms": ms }),
+                        None => serde_json::json!({ "outcome": outcome }),
+                    };
+                    (host_id, entry)
+                })
+                .collect();
+            state
+                .services
+                .meta
+                .set_enable_job_prestage_hosts(job_id, claimant, serde_json::Value::Object(map))
+                .await?;
+        }
+        Err(e) => {
+            // Best-effort: the audit map is operator-facing, not correctness-
+            // bearing (the create-path gate reads `ready_images` directly,
+            // not this column) — don't fail the whole enable over it.
+            tracing::warn!(%job_id, error = %e, "enable prestage: list_active_hosts failed while recording outcomes");
+        }
+    }
+
+    // Log the terminal outcome for operator forensics (the audit map above
+    // is the durable record; this is the same-tick log line).
+    match prestage_outcome {
+        PrestageOutcome::Complete => {
+            tracing::info!(%job_id, %digest, "enable prestage: all eligible hosts staged");
+        }
+        PrestageOutcome::EmptyFleet => {
+            tracing::info!(%job_id, %digest, "enable prestage: no eligible staging hosts in the fleet; vacuous pass");
+        }
+        PrestageOutcome::TimedOut { staged, eligible } => {
+            tracing::warn!(%job_id, %digest, staged, eligible, "enable prestage: deadline hit with stragglers; proceeding to ready — stragglers self-heal via the per-host readiness gate");
+        }
+    }
 
     // ---- ready ----
     state
@@ -390,6 +656,111 @@ async fn advance_one(
         .await?;
     tracing::info!(%job_id, %image_uri, "enable job ready; image enabled");
     Ok(())
+}
+
+/// ADR 0036 amendment (issue #538): outcome of one `prestaging`-stage poll —
+/// pure decision over a hosts snapshot, unit-tested without I/O. Eligible =
+/// [`crate::placement::host_is_schedulable`] ∧ `stages_images`; staged =
+/// eligible ∧ `ready_images` contains the digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrestageEval {
+    /// Every eligible host has staged the digest.
+    Complete,
+    /// At least one eligible host hasn't staged yet — including the
+    /// transient "zero eligible right now" case (every staging-capable
+    /// host is momentarily unschedulable, e.g. mid host-agent MIG roll)
+    /// via `staged: 0, eligible: 0`. The deadline / zero-staged-timeout
+    /// retry policy applies exactly as it does to a genuine partial wait.
+    Waiting { staged: usize, eligible: usize },
+    /// No host in the fleet has `stages_images` at all (Process/dev
+    /// fleet) — genuinely nothing will ever report, so the stage passes
+    /// vacuously rather than waiting out the full deadline for nothing.
+    /// Distinct from "staging-capable hosts exist but are transiently
+    /// unschedulable" (review finding 1): that case must NOT take this
+    /// arm, or a MIG-roll blip silently flips the image ready with 0
+    /// hosts actually staged.
+    EmptyFleet,
+}
+
+fn eval_prestage(
+    hosts: &[HostRecord],
+    digest: &str,
+    now: DateTime<Utc>,
+    ttl: Duration,
+) -> PrestageEval {
+    // Genuinely vacuous iff no host in the fleet even claims to stage
+    // images — a Process/dev fleet. This is independent of schedulability:
+    // a fleet that DOES have staging-capable hosts, all of them transiently
+    // unschedulable, is a `Waiting{0,0}` below, not `EmptyFleet`.
+    if !hosts.iter().any(|h| h.stages_images) {
+        return PrestageEval::EmptyFleet;
+    }
+    let eligible: Vec<&HostRecord> = hosts
+        .iter()
+        .filter(|h| crate::placement::host_is_schedulable(h, now, ttl) && h.stages_images)
+        .collect();
+    let staged = eligible
+        .iter()
+        .filter(|h| h.ready_images.iter().any(|d| d == digest))
+        .count();
+    if !eligible.is_empty() && staged == eligible.len() {
+        PrestageEval::Complete
+    } else {
+        PrestageEval::Waiting {
+            staged,
+            eligible: eligible.len(),
+        }
+    }
+}
+
+/// The terminal disposition of a `prestaging` wait loop — what
+/// `advance_one` breaks the poll loop with. Distinct from [`PrestageEval`]
+/// (a per-poll snapshot): this is the loop's final verdict, deadline
+/// applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrestageOutcome {
+    Complete,
+    EmptyFleet,
+    TimedOut { staged: usize, eligible: usize },
+}
+
+impl PrestageOutcome {
+    /// `engram_enable_prestage_seconds`'s `outcome` label.
+    fn metric_label(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::EmptyFleet => "empty_fleet",
+            Self::TimedOut { staged: 0, .. } => "timeout_zero",
+            Self::TimedOut { .. } => "partial",
+        }
+    }
+}
+
+/// ADR 0036 amendment (issue #538): the per-host `prestage_hosts` audit
+/// entries — `(host_id, outcome, waited_ms)`, `waited_ms` set only for
+/// `staged`/`timed_out` (an `unschedulable` host was never part of the
+/// wait). Same eligibility split as [`eval_prestage`], read fresh at
+/// stage-end so a host that (de)registered mid-wait is reflected honestly.
+fn prestage_host_outcomes(
+    hosts: &[HostRecord],
+    digest: &str,
+    now: DateTime<Utc>,
+    ttl: Duration,
+    waited_ms: u64,
+) -> Vec<(String, &'static str, Option<u64>)> {
+    hosts
+        .iter()
+        .map(|h| {
+            let eligible = crate::placement::host_is_schedulable(h, now, ttl) && h.stages_images;
+            if !eligible {
+                (h.id.to_string(), "unschedulable", None)
+            } else if h.ready_images.iter().any(|d| d == digest) {
+                (h.id.to_string(), "staged", Some(waited_ms))
+            } else {
+                (h.id.to_string(), "timed_out", Some(waited_ms))
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -457,5 +828,309 @@ mod tests {
             AdvanceError::NonRetryable(_) => {}
             _ => panic!("a deterministic capture failure must bail fast, not retry"),
         }
+    }
+
+    // ---- ADR 0036 amendment (issue #538): prestage stage ----
+
+    use engram_core::types::host::{HostCapacity, HostMetadata, HostUtilization};
+
+    const DIGEST: &str = "sha256:deadbeef";
+    const TTL: Duration = Duration::from_secs(60);
+
+    /// A schedulable, staging-capable host that has NOT yet reported the
+    /// digest. Tests flip individual fields to build the other shapes.
+    fn eligible_host(n: u128) -> HostRecord {
+        HostRecord {
+            id: engram_core::HostId(uuid::Uuid::from_u128(n)),
+            hostname: format!("h{n}"),
+            cloud_metadata: HostMetadata::default(),
+            capacity: HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 0,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: HostUtilization::default(),
+            status: engram_core::types::host::HostStatus::Ready,
+            last_heartbeat_at: Utc::now(),
+            host_addr: None,
+            ready_images: Vec::new(),
+            local_snapshots: Vec::new(),
+            current_bundles: Vec::new(),
+            cordoned: false,
+            total_vcpus: 0,
+            wire_version: 0,
+            stages_images: true,
+            capabilities: Default::default(),
+        }
+    }
+
+    fn staged(n: u128) -> HostRecord {
+        let mut h = eligible_host(n);
+        h.ready_images.push(DIGEST.to_string());
+        h
+    }
+
+    // Truth-table case 1: every eligible host has staged → Complete.
+    #[test]
+    fn eval_prestage_all_staged_is_complete() {
+        let hosts = [staged(1), staged(2)];
+        assert_eq!(
+            eval_prestage(&hosts, DIGEST, Utc::now(), TTL),
+            PrestageEval::Complete
+        );
+    }
+
+    // Truth-table case 2: some but not all staged → Waiting with counts.
+    #[test]
+    fn eval_prestage_partial_is_waiting_with_counts() {
+        let hosts = [staged(1), eligible_host(2), eligible_host(3)];
+        assert_eq!(
+            eval_prestage(&hosts, DIGEST, Utc::now(), TTL),
+            PrestageEval::Waiting {
+                staged: 1,
+                eligible: 3
+            }
+        );
+    }
+
+    // Truth-table case 3: no host in the fleet has `stages_images` at all
+    // (dev/Process fleet) → EmptyFleet, the vacuous-pass signal. This is
+    // distinct from "staging-capable hosts exist but none are currently
+    // schedulable" — see case 4a below (review finding 1).
+    #[test]
+    fn eval_prestage_no_staging_capable_hosts_is_empty_fleet() {
+        assert_eq!(
+            eval_prestage(&[], DIGEST, Utc::now(), TTL),
+            PrestageEval::EmptyFleet
+        );
+        let mut not_staging = eligible_host(1);
+        not_staging.stages_images = false;
+        assert_eq!(
+            eval_prestage(&[not_staging], DIGEST, Utc::now(), TTL),
+            PrestageEval::EmptyFleet
+        );
+    }
+
+    // Truth-table case 4: a host that goes unschedulable mid-wait (cordoned
+    // / dead / draining) drops out of `eligible` — it must not block
+    // Complete, and must not count toward `staged`.
+    #[test]
+    fn eval_prestage_host_unschedulable_mid_wait_is_excluded() {
+        let mut cordoned = staged(1); // staged, but cordoned mid-wait
+        cordoned.cordoned = true;
+        let ok = staged(2);
+        assert_eq!(
+            eval_prestage(&[cordoned, ok], DIGEST, Utc::now(), TTL),
+            PrestageEval::Complete,
+            "the cordoned host must not block completion",
+        );
+    }
+
+    // Truth-table case 4a (review finding 1, PR #565): every staging-capable
+    // host is transiently unschedulable (e.g. a host-agent MIG roll leaves
+    // heartbeats stale past the placement TTL for a few minutes) — this
+    // must be `Waiting{0,0}`, NOT `EmptyFleet`. `EmptyFleet` vacuously
+    // passes the stage; a fleet that has real staging hosts (just none
+    // reachable this poll) must keep polling under the deadline so the
+    // existing zero-staged-timeout retry policy applies instead of
+    // silently flipping the image ready with 0 hosts actually staged.
+    #[test]
+    fn eval_prestage_all_staging_hosts_transiently_unschedulable_is_waiting_not_empty_fleet() {
+        let mut dead = eligible_host(3);
+        dead.status = engram_core::types::host::HostStatus::Dead;
+        assert_eq!(
+            eval_prestage(&[dead], DIGEST, Utc::now(), TTL),
+            PrestageEval::Waiting {
+                staged: 0,
+                eligible: 0
+            },
+        );
+    }
+
+    // Truth-table case 5: `stages_images = false` hosts are excluded from
+    // `eligible` regardless of schedulability or ready_images content —
+    // Process/dev fleets never wait on them.
+    #[test]
+    fn eval_prestage_stages_images_false_is_excluded() {
+        let mut non_staging_but_ready = staged(1);
+        non_staging_but_ready.stages_images = false;
+        let waiting = eligible_host(2);
+        assert_eq!(
+            eval_prestage(&[non_staging_but_ready, waiting], DIGEST, Utc::now(), TTL),
+            PrestageEval::Waiting {
+                staged: 0,
+                eligible: 1
+            },
+            "a stages_images=false host must not count as eligible even though it reports ready",
+        );
+    }
+
+    // Truth-table case 6: a stale heartbeat (host_is_schedulable's freshness
+    // gate) excludes a host the same way cordoning does. When it's the ONLY
+    // staging-capable host, that's the same transient-unschedulable case as
+    // 4a (review finding 1) — `Waiting{0,0}`, not `EmptyFleet`.
+    #[test]
+    fn eval_prestage_stale_heartbeat_is_excluded() {
+        let mut stale = staged(1);
+        stale.last_heartbeat_at = Utc::now() - chrono::Duration::seconds(300);
+        let ok = staged(2);
+        assert_eq!(
+            eval_prestage(&[stale.clone(), ok], DIGEST, Utc::now(), TTL),
+            PrestageEval::Complete,
+            "a stale host must not block completion",
+        );
+        assert_eq!(
+            eval_prestage(&[stale], DIGEST, Utc::now(), TTL),
+            PrestageEval::Waiting {
+                staged: 0,
+                eligible: 0
+            },
+        );
+    }
+
+    #[test]
+    fn prestage_outcome_metric_labels() {
+        assert_eq!(PrestageOutcome::Complete.metric_label(), "complete");
+        assert_eq!(PrestageOutcome::EmptyFleet.metric_label(), "empty_fleet");
+        assert_eq!(
+            PrestageOutcome::TimedOut {
+                staged: 0,
+                eligible: 2
+            }
+            .metric_label(),
+            "timeout_zero"
+        );
+        assert_eq!(
+            PrestageOutcome::TimedOut {
+                staged: 1,
+                eligible: 2
+            }
+            .metric_label(),
+            "partial"
+        );
+    }
+
+    #[test]
+    fn prestage_host_outcomes_classifies_staged_timed_out_and_unschedulable() {
+        let staged_host = staged(1);
+        let straggler = eligible_host(2); // eligible, hasn't staged
+        let mut not_staging = eligible_host(3);
+        not_staging.stages_images = false; // never eligible
+        let mut cordoned = staged(4);
+        cordoned.cordoned = true; // unschedulable despite reporting ready
+
+        let entries = prestage_host_outcomes(
+            &[
+                staged_host.clone(),
+                straggler.clone(),
+                not_staging.clone(),
+                cordoned.clone(),
+            ],
+            DIGEST,
+            Utc::now(),
+            TTL,
+            4_242,
+        );
+        let find = |id: &engram_core::HostId| {
+            entries
+                .iter()
+                .find(|(hid, _, _)| *hid == id.to_string())
+                .unwrap()
+        };
+        assert_eq!(find(&staged_host.id).1, "staged");
+        assert_eq!(find(&staged_host.id).2, Some(4_242));
+        assert_eq!(find(&straggler.id).1, "timed_out");
+        assert_eq!(find(&straggler.id).2, Some(4_242));
+        assert_eq!(find(&not_staging.id).1, "unschedulable");
+        assert_eq!(find(&not_staging.id).2, None);
+        assert_eq!(find(&cordoned.id).1, "unschedulable");
+        assert_eq!(find(&cordoned.id).2, None);
+    }
+
+    // The scanner's `Prestaging` stage builds its heartbeat-ack ref via
+    // `crate::api::host_http::enabled_image_ref` — the SAME projection
+    // `enabled_image_refs_from_rows` uses for already-live `enabled_images`
+    // rows. This is a compile-time/structural check that the shared fn
+    // exists and produces a ref for a fully-captured row; the two call
+    // sites literally sharing the function is what rules out drift (there
+    // is no second, divergent implementation to test against).
+    #[test]
+    fn enabled_image_ref_projection_matches_a_freshly_captured_row() {
+        let row = engram_core::types::EnabledImage {
+            id: uuid::Uuid::new_v4(),
+            image_uri: "localhost:5001/demo:warm".into(),
+            manifest_toml: String::new(),
+            manifest_digest: DIGEST.to_string(),
+            disk_manifest: None,
+            base_snapshot_id: Some(engram_core::SnapshotId::new()),
+            base_snapshot_disk_manifest: Some(engram_core::types::manifest::ManifestRef {
+                manifest_id: uuid::Uuid::new_v4(),
+                version: 1,
+            }),
+            base_snapshot_memory_manifest: None,
+            last_refreshed_at: Utc::now(),
+            created_at: Utc::now(),
+            updated_at: None,
+            soft_deleted_at: None,
+            capture_env: Vec::new(),
+        };
+        let r = crate::api::host_http::enabled_image_ref(&row)
+            .expect("a fully-stamped row must project to a ref");
+        assert_eq!(r.image_uri, row.image_uri);
+        assert_eq!(r.manifest_digest.as_str(), DIGEST);
+    }
+
+    // ---- review finding 6 (PR #565): `Default` stays pure; env I/O + the
+    // reject-vs-fallback decision live in `from_env` ----
+
+    const PRESTAGE_ENV: &str = "ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS";
+
+    #[test]
+    fn default_is_pure_and_does_not_touch_the_env() {
+        // SAFETY: serial test on a process-global env var (matches the
+        // `chunk_gc::tests` convention for this crate's other `from_env`s).
+        std::env::set_var(PRESTAGE_ENV, "99999");
+        let cfg = EnableScannerConfig::default();
+        std::env::remove_var(PRESTAGE_ENV);
+        assert_eq!(
+            cfg.prestage_timeout, DEFAULT_PRESTAGE_TIMEOUT,
+            "Default must be a pure constant, unaffected by the env"
+        );
+    }
+
+    #[test]
+    fn from_env_unset_uses_the_default() {
+        std::env::remove_var(PRESTAGE_ENV);
+        let cfg = EnableScannerConfig::from_env();
+        assert_eq!(cfg.prestage_timeout, DEFAULT_PRESTAGE_TIMEOUT);
+    }
+
+    #[test]
+    fn from_env_valid_value_overrides_the_default() {
+        std::env::set_var(PRESTAGE_ENV, "45");
+        let cfg = EnableScannerConfig::from_env();
+        std::env::remove_var(PRESTAGE_ENV);
+        assert_eq!(cfg.prestage_timeout, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn from_env_zero_or_garbage_falls_back_to_the_default() {
+        // Zero (plausibly meant "skip the wait") and unparseable garbage
+        // must both fall back rather than producing a zero-wait or
+        // negative-duration timeout — the review flagged the OLD `Default`
+        // impl for swallowing this silently. Falling back is still
+        // correct; the fix is that it's now observable (`warn!`), which
+        // this unit test can't assert on but the reject-path is exercised.
+        for v in ["0", "not-a-number", "-5"] {
+            std::env::set_var(PRESTAGE_ENV, v);
+            let cfg = EnableScannerConfig::from_env();
+            assert_eq!(
+                cfg.prestage_timeout, DEFAULT_PRESTAGE_TIMEOUT,
+                "value {v:?} must fall back to the default, not silently zero/garbage"
+            );
+        }
+        std::env::remove_var(PRESTAGE_ENV);
     }
 }

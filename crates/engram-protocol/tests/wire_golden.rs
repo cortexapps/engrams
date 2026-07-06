@@ -57,6 +57,7 @@ use engram_core::types::sandbox::{
     AgentSpec, AuxBundleRef, AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
+use engram_core::types::{WarmStageOutcome, WarmStageRecord};
 use engram_core::{SandboxId, SessionId, SnapshotId};
 use engram_protocol::wire::{WireExecRequest, WireReapStats, WIRE_VERSION};
 use serde::Serialize;
@@ -199,6 +200,8 @@ fn snapshot_metadata() -> SnapshotMetadata {
             drive_id: "skills".into(),
             sha256: "b".repeat(64),
         }],
+        // v9: trailing field — the host's exact pause instant (issue #529).
+        paused_at: Some(DateTime::from_timestamp(1_770_000_100, 0).unwrap()),
     }
 }
 
@@ -241,6 +244,30 @@ fn cow_state() -> CowState {
     }
 }
 
+/// Issue #539: `Vec<WarmStageRecord>` crosses the coord<->host wire as
+/// the `CaptureProgress.warm_stages_bincode` payload
+/// (`engram-protocol/src/grpc_client.rs`'s `decode_bincode::<Vec<
+/// WarmStageRecord>>`). Two entries: one CLOSED (`ended_at` present,
+/// the `#[serde(skip_serializing_if)]` bincode-irrelevant but exercised
+/// anyway) and one still OPEN (`ended_at: None`) — the shape a failed
+/// or in-flight capture's stage history actually takes.
+fn warm_stages() -> Vec<WarmStageRecord> {
+    vec![
+        WarmStageRecord {
+            name: "deps-up".into(),
+            started_at: DateTime::from_timestamp(1_770_000_000, 0).unwrap(),
+            ended_at: Some(DateTime::from_timestamp(1_770_000_030, 0).unwrap()),
+            outcome: WarmStageOutcome::Done,
+        },
+        WarmStageRecord {
+            name: "migrations".into(),
+            started_at: DateTime::from_timestamp(1_770_000_030, 0).unwrap(),
+            ended_at: None,
+            outcome: WarmStageOutcome::Running,
+        },
+    ]
+}
+
 // ---- tests -------------------------------------------------------------
 
 #[test]
@@ -278,6 +305,9 @@ fn struct_payloads_golden() {
             state: cow_state(),
         },
     );
+    // `Vec<WarmStageRecord>` — the `CaptureProgress.warm_stages_bincode`
+    // payload (issue #539). `WarmStageRecord` derives `PartialEq`.
+    assert_golden("warm_stages", &warm_stages());
 }
 
 #[test]
@@ -293,6 +323,14 @@ fn nested_enum_variant_indices() {
     assert_golden("network_default_deny", &NetworkDefault::Deny);
     assert_variant_index(&NetworkDefault::Allow, 0, "NetworkDefault::Allow");
     assert_variant_index(&NetworkDefault::Deny, 1, "NetworkDefault::Deny");
+
+    // WarmStageOutcome rides WarmStageRecord (issue #539) on the wire.
+    assert_golden("warm_stage_outcome_running", &WarmStageOutcome::Running);
+    assert_golden("warm_stage_outcome_done", &WarmStageOutcome::Done);
+    assert_golden("warm_stage_outcome_failed", &WarmStageOutcome::Failed);
+    assert_variant_index(&WarmStageOutcome::Running, 0, "WarmStageOutcome::Running");
+    assert_variant_index(&WarmStageOutcome::Done, 1, "WarmStageOutcome::Done");
+    assert_variant_index(&WarmStageOutcome::Failed, 2, "WarmStageOutcome::Failed");
 }
 
 #[test]
@@ -327,7 +365,7 @@ fn wire_version_pinned() {
     // signal that a payload shape changed; pin it so a payload change
     // without a bump (or vice-versa) is a conscious decision.
     assert_eq!(
-        WIRE_VERSION, 7,
+        WIRE_VERSION, 9,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -372,9 +410,13 @@ fn regen_golden() {
             state: cow_state(),
         },
     );
+    write("warm_stages", &warm_stages());
 
     write("secret_mode_literal", &SecretMode::Literal);
     write("secret_mode_broker", &SecretMode::Broker);
+    write("warm_stage_outcome_running", &WarmStageOutcome::Running);
+    write("warm_stage_outcome_done", &WarmStageOutcome::Done);
+    write("warm_stage_outcome_failed", &WarmStageOutcome::Failed);
     write("network_default_allow", &NetworkDefault::Allow);
     write("network_default_deny", &NetworkDefault::Deny);
 

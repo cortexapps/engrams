@@ -155,6 +155,11 @@ pub(crate) async fn run_once(
     Ok(())
 }
 
+// ADR 0019 / telemetry restoration (#526): scanner-driven work has no
+// request span to inherit — an explicit root (carrying `session_id`) so
+// the relocation pipeline's spans correlate instead of exporting as
+// disconnected roots.
+#[tracing::instrument(name = "evac_resumer.advance_one", skip_all, fields(session_id = %session.id))]
 async fn advance_one(
     cfg: &EvacResumerConfig,
     state: &SharedState,

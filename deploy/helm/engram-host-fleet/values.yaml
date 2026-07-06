@@ -118,7 +118,46 @@ egress:
 storage:
   # Local NVMe for the chunk cache + per-sandbox work dir.
   workDirHostPath: /var/lib/engram
-  chunkCacheBudgetBytes: ""   # "" => host-agent default (200 GiB)
+  # "" => host-agent's disk-derived default (ADR 0067): min(60% of the
+  # disk backing workDirHostPath, 80% — the same margin the free-space
+  # floor holds below the kubelet eviction line). Set to override the
+  # ceiling as an absolute byte count.
+  chunkCacheBudgetBytes: ""
+  # ADR 0067: override the 0.60 disk-fraction the default budget derives
+  # from (see chunkCacheBudgetBytes). "" => host-agent default (0.60).
+  chunkCacheDiskFraction: ""
+  # ADR 0067: the kubelet's ephemeral-storage hard-eviction threshold, as
+  # a percent of the filesystem backing workDirHostPath — the line
+  # engram_host_disk_headroom_to_kubelet_bytes measures distance to.
+  #
+  # TODO: 10 (GKE's documented nodefs.available < 10% default) is a
+  # PLACEHOLDER pending confirmation against the actual nodepool/kubelet
+  # config in the engrams-internal deploy repo — this OSS chart has not
+  # verified it against a real cluster's kubelet flags
+  # (--eviction-hard/--system-reserved can override the GKE default).
+  # Confirm and adjust here before treating the headroom gauge's alarm
+  # threshold as trustworthy.
+  kubeletEvictPct: 10
+  # ADR 0067: mount workDirHostPath on its own block device instead of
+  # sharing the node boot disk. "" (default) = today's behavior — a
+  # hostPath directory on the root filesystem. When set to a device path
+  # (e.g. /dev/nvme1n1, a GKE local-SSD raw-block device), node-prep
+  # formats it (idempotent — only if unformatted) and mounts it at
+  # workDirHostPath, and the host-agent DaemonSet gets
+  # ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT=true + a read-only hostPath mount
+  # of the NODE's `/` at /mnt/host-root (ENGRAM_HOST_ROOT_REF_PATH) —
+  # refuses to start unless workDirHostPath is actually a distinct
+  # filesystem from the NODE's boot disk (comparing against the
+  # container's OWN `/`, its ephemeral overlayfs, would always differ
+  # from any hostPath mount and never catch a missing mount — hence the
+  # separate host-root reference mount). Guards against a rolled pod
+  # starting before the mount is visible and silently shadow-writing the
+  # boot disk. This moves ACCOUNTING, not
+  # bytes: the dedicated disk still fills, and the budget above (not
+  # this) is the mechanism that keeps the fleet off the kubelet's
+  # eviction line. Nodepool provisioning of the device itself (e.g. a
+  # Terraform local-SSD flag) is out of scope for this chart.
+  dedicatedDevice: ""
 
 nbd:
   # ADR 0049: warm-pool slot allocator. node-prep loads the nbd module
@@ -155,6 +194,64 @@ hostAgent:
       cpu: "16"
       memory: 32Gi
   extraEnv: []        # [{name, value}] escape hatch for any ENGRAM_* knob
+
+# Distributed tracing (ADR 0019 / telemetry restoration #526). The K8s host
+# fleet (ADR 0044) never got a collector or an OTLP endpoint when the GCE/
+# packer fleet (which carried an otelcol systemd unit — see
+# deploy/otel/collector-gcp.yaml) was replaced, so host-side spans
+# (chunk.fetch, host.restore_base_for_session, restore.*, ...) have
+# exported nowhere since the migration. Mirrors the engram chart's `otel`
+# block: an in-pod otelcol NATIVE SIDECAR (no readinessProbe — a crashing
+# collector must never gate the workload; this is the standing guardrail
+# from the coord collector incident). Because the pod is hostNetwork, the
+# sidecar binds node-wide 0.0.0.0:4317/4318, so it also serves the
+# uffd-handler (inherits the host-agent container's env at spawn — no
+# env_clear at the FC spawn site) for free. Cloud-agnostic + inert by
+# default; the engrams-internal overlay flips `enabled: true` + supplies
+# `collector.configMap` (rendered from deploy/otel/collector-gcp.yaml) +
+# grants roles/cloudtrace.agent to the NODE SA (hostNetwork bypasses
+# Workload Identity, same gotcha as the egress CA — see `egress` above).
+otel:
+  enabled: false
+  # OTLP/gRPC endpoint the host-agent container exports to. Default = the
+  # in-pod sidecar.
+  endpoint: "http://localhost:4317"
+  collector:
+    enabled: true
+    # otelcol-contrib (the `googlecloud` exporter is contrib-only). Pinned
+    # to the same VERIFIED-good tag as the coord chart — 0.116.0's image
+    # ships a dynamically-linked binary on a distroless base missing the
+    # glibc loader (`exec: no such file or directory`); 0.111.0 runs.
+    # Re-verify `--version` on bump.
+    image: "otel/opentelemetry-collector-contrib:0.111.0"
+    # Name of an existing ConfigMap with key `config.yaml`, created from
+    # deploy/otel/collector-gcp.yaml. Required when collector.enabled.
+    configMap: ""
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 192Mi
+  # NOTE: no `guestEndpoint` field here (yet). In-guest agentd export
+  # (ENGRAM_GUEST_OTEL_ENDPOINT -> the FC kernel cmdline's `engram_otel=`)
+  # depends on a guest->collector firewall pinhole that doesn't exist yet
+  # — deliberately deferred out of #526's scope (prototype-first). Add
+  # this field in that follow-up, not here.
+
+# Metrics scraping. Mirrors the engram chart's `metrics.podMonitoring`:
+# on GKE, Google Managed Prometheus scrapes via a `PodMonitoring` CRD
+# (samples land in Cloud Monitoring / Monarch on every scrape, so a
+# host-agent pod churning — routine on this fleet, ADR 0044 K2/K3 rolls —
+# doesn't reset the fleet-wide percentile the way an in-cluster
+# Prometheus's per-pod counter would). Operators on self-hosted
+# Prometheus should leave this false and scrape the `metrics` named port
+# (9100) directly.
+metrics:
+  podMonitoring:
+    enabled: false
+    interval: "30s"
 
 # Strategy note: forkd uses `Recreate`-equivalent because the daemon
 # holds VM state. We default the DaemonSet to OnDelete so the K3

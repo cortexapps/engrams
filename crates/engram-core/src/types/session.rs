@@ -38,12 +38,6 @@ pub enum SessionState {
     /// spawned. Calls into `/exec`, `/shell`, `/prompt` against a
     /// `Created` session return 409.
     Created,
-    /// `start_agent`'s ready-dial fired: agentd is reachable on vsock.
-    /// Code-level only in the normal create path — the create handler
-    /// collapses `Created → GuestReady → Active` into a single UPDATE
-    /// because `start_agent` does both halves in one RPC. Persists if
-    /// some future code splits the ready-probe and harness-spawn RPCs.
-    GuestReady,
     /// Harness is running (or `harness=none` and agentd is ready). The
     /// only state in which `/exec`, `/shell`, `/prompt` proceed
     /// without a state-mismatch error.
@@ -73,10 +67,9 @@ pub enum SessionState {
     /// drain (`POST /api/admin/sessions/:id/evacuate` or
     /// `POST /api/admin/hosts/:id/drain`) — ADR 0044 K3. As of ADR
     /// 0045 Phase A the dead-host detector no longer routes here (the
-    /// reactive auto-evac is retired); the `HostLost → Evacuating`
-    /// edge is kept legal but unused (a future post-copy phase may
-    /// reuse it). Sandbox + host bindings are nulled out same as
-    /// `Idle` — the session is recoverable but not running.
+    /// reactive auto-evac is retired), and `HostLost → Evacuating` is
+    /// no longer a legal edge. Sandbox + host bindings are nulled out
+    /// same as `Idle` — the session is recoverable but not running.
     Evacuating,
     /// ADR 0034: durable idle-eviction intent marker. The candidates
     /// handler (or the PG detection backstop) transitions
@@ -121,12 +114,7 @@ impl SessionState {
     pub fn reserves_host_memory(&self) -> bool {
         matches!(
             self,
-            Self::Pending
-                | Self::Created
-                | Self::GuestReady
-                | Self::Active
-                | Self::Evacuating
-                | Self::Evicting
+            Self::Pending | Self::Created | Self::Active | Self::Evacuating | Self::Evicting
         )
     }
 
@@ -134,14 +122,7 @@ impl SessionState {
     /// `status IN (…)` reservation aggregate. Kept in lockstep with the matcher
     /// by `reserving_states_match` (test).
     pub const fn host_memory_reserving_states() -> &'static [&'static str] {
-        &[
-            "pending",
-            "created",
-            "guest_ready",
-            "active",
-            "evacuating",
-            "evicting",
-        ]
+        &["pending", "created", "active", "evacuating", "evicting"]
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -149,7 +130,6 @@ impl SessionState {
             Self::Pending => "pending",
             Self::Queued => "queued",
             Self::Created => "created",
-            Self::GuestReady => "guest_ready",
             Self::Active => "active",
             Self::Idle => "idle",
             Self::HostLost => "host_lost",
@@ -191,13 +171,12 @@ impl SessionState {
     /// Queued      -> Pending (placed create) | Idle (resume dequeue
     ///                / resume-origin timeout) | Failed (create timeout
     ///                / cancel)
-    /// Created     -> GuestReady | Active | Failed | HostLost
-    /// GuestReady  -> Active | Failed | HostLost
+    /// Created     -> Active | Failed | HostLost
     /// Active      -> Idle | HostLost | Evacuating | Evicting | Failed
     ///              | Completed | Dead
     /// Idle        -> Created (resume) | Dead | Completed | Queued (resume
     ///                hit no capacity, ADR 0048)
-    /// HostLost    -> Created | Idle | Evacuating | Dead | Completed
+    /// HostLost    -> Created | Idle | Dead | Completed
     /// Evacuating  -> Created (scanner resumes on peer)
     ///              | Idle (scanner exhausted retries; user /resume)
     ///              | Dead (terminal; chunks gone)
@@ -229,14 +208,13 @@ impl SessionState {
             // timeout goes Queued → Idle; a create-origin timeout / cancel
             // goes Queued → Failed.
             Queued => matches!(target, Pending | Idle | Failed),
-            Created => matches!(target, GuestReady | Active | Failed | HostLost),
-            GuestReady => matches!(target, Active | Failed | HostLost),
+            Created => matches!(target, Active | Failed | HostLost),
             Active => matches!(
                 target,
                 Idle | HostLost | Evacuating | Evicting | Failed | Completed | Dead
             ),
             Idle => matches!(target, Created | Dead | Completed | Queued),
-            HostLost => matches!(target, Created | Idle | Evacuating | Dead | Completed),
+            HostLost => matches!(target, Created | Idle | Dead | Completed),
             Evacuating => matches!(target, Created | Idle | Dead | Completed),
             Evicting => matches!(target, Idle | HostLost | Dead | Completed),
             Failed | Completed | Dead => false,
@@ -256,7 +234,7 @@ impl SessionState {
             Active | Idle | HostLost | Evacuating | Evicting => Completed,
             // Queued never ran → Failed, alongside the other never-usable
             // early states.
-            Pending | Queued | Created | GuestReady => Failed,
+            Pending | Queued | Created => Failed,
             Failed | Completed | Dead => return None,
         };
         debug_assert!(
@@ -525,7 +503,6 @@ mod tests {
         // (UI, integration scripts) must match these strings.
         for (variant, wire) in [
             (SessionState::Created, "created"),
-            (SessionState::GuestReady, "guest_ready"),
             (SessionState::HostLost, "host_lost"),
         ] {
             assert_eq!(
@@ -550,7 +527,6 @@ mod tests {
             SessionState::Pending,
             SessionState::Queued,
             SessionState::Created,
-            SessionState::GuestReady,
             SessionState::Active,
             SessionState::Idle,
             SessionState::HostLost,
@@ -582,13 +558,9 @@ mod tests {
             (Queued, Idle),
             (Queued, Failed),
             (Idle, Queued),
-            (Created, GuestReady),
             (Created, Active),
             (Created, Failed),
             (Created, HostLost),
-            (GuestReady, Active),
-            (GuestReady, Failed),
-            (GuestReady, HostLost),
             (Active, Idle),
             (Active, HostLost),
             (Active, Evacuating),
@@ -601,7 +573,6 @@ mod tests {
             (Idle, Completed),
             (HostLost, Created),
             (HostLost, Idle),
-            (HostLost, Evacuating),
             (HostLost, Dead),
             (HostLost, Completed),
             (Evacuating, Created),
@@ -614,8 +585,8 @@ mod tests {
             (Evicting, Completed),
         ];
         let all_states = [
-            Pending, Queued, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
-            Failed, Completed, Dead,
+            Pending, Queued, Created, Active, Idle, HostLost, Evacuating, Evicting, Failed,
+            Completed, Dead,
         ];
         for &from in &all_states {
             for &to in &all_states {
@@ -641,7 +612,7 @@ mod tests {
         for terminal in [Failed, Completed, Dead] {
             assert!(terminal.is_terminal());
             for target in [
-                Pending, Queued, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
+                Pending, Queued, Created, Active, Idle, HostLost, Evacuating, Evicting,
             ] {
                 assert_eq!(
                     terminal.try_transition_to(target),
@@ -659,7 +630,7 @@ mod tests {
         use SessionState::*;
         // Every non-terminal state maps to a terminal via a LEGAL edge.
         for &s in &[
-            Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
+            Pending, Created, Active, Idle, HostLost, Evacuating, Evicting,
         ] {
             let target = s
                 .terminal_target()

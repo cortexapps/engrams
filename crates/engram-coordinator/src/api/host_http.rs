@@ -57,6 +57,12 @@ pub struct RegisterRequest {
     pub wire_version: u32,
     #[serde(default)]
     pub cloud_metadata: Option<HostMetadata>,
+    /// ADR 0068: the host's self-verified capability vector, probed
+    /// before this register POST. `#[serde(default)]` for interop with
+    /// a pre-0068 host-agent (decodes to `schema: 0`, soft-tolerated by
+    /// `host_meets_capabilities`).
+    #[serde(default)]
+    pub capabilities: engram_core::types::host::HostCapabilities,
 }
 
 #[derive(Serialize)]
@@ -166,6 +172,14 @@ pub async fn register(
         // The first heartbeat persists the version the scheduler filters
         // on; carry it here so the in-memory record is consistent.
         wire_version: req.wire_version,
+        // ADR 0036 amendment (issue #538): scheduling state, same as
+        // `wire_version` above — the first heartbeat persists the real
+        // value; `upsert_host` doesn't write this column at all.
+        stages_images: false,
+        // ADR 0068: persist the register-time vector too — see the
+        // `upsert_host` doc comment on why a first-row host shouldn't
+        // sit at `schema: 0` until its first heartbeat.
+        capabilities: req.capabilities,
     };
     state.services.meta.upsert_host(record).await?;
 
@@ -327,6 +341,19 @@ pub struct HeartbeatRequest {
     /// mid-roll, which the placement filter tolerates.
     #[serde(default)]
     pub wire_version: u32,
+    /// ADR 0036 amendment (issue #538): true iff this host's image-prefetch
+    /// supervisor is spawned (`chunk_store` + `chunk_cache` configured). The
+    /// enable scanner's prestage stage waits only on hosts reporting this —
+    /// a fleet with zero eligible staging hosts passes the stage vacuously.
+    /// `#[serde(default)]` → `false` from a pre-0538 host-agent mid-roll,
+    /// the safe/exempt posture.
+    #[serde(default)]
+    pub stages_images: bool,
+    /// ADR 0068: this tick's re-probed capability vector.
+    /// `#[serde(default)]` → `schema: 0` (soft-tolerated) from a
+    /// pre-0068 host-agent mid-roll.
+    #[serde(default)]
+    pub capabilities: engram_core::types::host::HostCapabilities,
 }
 
 #[derive(Serialize)]
@@ -342,6 +369,15 @@ pub struct HeartbeatResponse {
     /// `ready_images` and pulls missing chunks.
     #[serde(default)]
     pub enabled_images: Vec<EnabledImageRef>,
+    /// ADR 0036 amendment (issue #538): base-snapshot refs of images
+    /// currently in the `prestaging` enable-job stage — advertised so
+    /// eligible hosts warm them via the SAME prefetch supervisor path as
+    /// `enabled_images` (the supervisor consumes the deduped union), before
+    /// the enable scanner's `enabled_images` upsert makes the digest
+    /// visible to session-create. `#[serde(default)]` for interop: a
+    /// pre-0538 host-agent ignores the field.
+    #[serde(default)]
+    pub prestage_images: Vec<EnabledImageRef>,
     /// ADR 0035 §5: the bundle pin set (every generation some
     /// snapshot row references). Drives the host's bundle
     /// prefetch + sweep supervisor. Always present — the host side
@@ -402,45 +438,22 @@ pub async fn heartbeat(
         }
     }
 
-    // ADR 0009 §1-§3: reconcile first, so subsequent state updates
-    // reflect the post-flip view. Same dispatch as the WS
-    // supervisor loop (`api/hosts.rs:266-284`).
+    // ADR 0068: persist BEFORE reconcile (was the reverse — see the
+    // git history on this handler). A heartbeat the coordinator
+    // refuses to ack (5xx on persist failure, issue #231) must not
+    // have ALREADY driven session flips from its `running_sandboxes`
+    // payload — "Postgres is the authority" means reconcile can only
+    // act on a heartbeat that's actually landed. This closes one of
+    // the two candidate producers of the fbd3794c incident shape (the
+    // other, the dead-host detector's own probe, already gates
+    // correctly — see `dead_host.rs`).
     //
-    // Issue #215: skip reconcile when the host couldn't enumerate its
-    // sandboxes this tick (`running_sandboxes_known == false`). The
-    // empty `running_sandboxes` it sends is "no information", not "no
-    // sandboxes running"; reconciling against it would strike every
-    // active session on the host on a single host-side `list()` blip.
-    if !hb.running_sandboxes_known {
-        tracing::warn!(
-            host_id = %host_id,
-            "heartbeat: host reported running_sandboxes_known=false (backend.list() failed); skipping reconcile this tick",
-        );
-    } else {
-        let flipped = state
-            .reconciler
-            .reconcile_host(&state, host_id, &hb.running_sandboxes)
-            .await;
-        if !flipped.is_empty() {
-            tracing::info!(
-                host_id = %host_id,
-                count = flipped.len(),
-                "heartbeat reconcile flipped missing-sandbox sessions",
-            );
-        }
-    }
-
-    // Bump the routing cache's freshness stamp for this host (ADR
-    // 0015 M3). The scheduling payload itself goes to PG below — ADR
-    // 0047 removed the in-memory scheduler mirror.
-    state.host_registry.touch_seen(host_id);
-
     // ADR 0047: the single per-heartbeat persist — capacity +
     // utilization + the scheduling state every coordinator replica
     // places from (ready_images / local_snapshots / current_bundles /
-    // total_vcpus). `status` is the HOST-reported side (`draining` =
-    // the agent's own shutdown flag); the coordinator-owned `cordoned`
-    // bit is deliberately not written here.
+    // total_vcpus / capabilities). `status` is the HOST-reported side
+    // (`draining` = the agent's own shutdown flag); the
+    // coordinator-owned `cordoned` bit is deliberately not written here.
     //
     // Issue #231: this persist is NOT best-effort. It advances the
     // host's `last_heartbeat_at`, which is exactly what the dead-host
@@ -488,6 +501,8 @@ pub async fn heartbeat(
         current_bundles: hb.current_bundles.clone(),
         total_vcpus: hb.total_vcpus,
         wire_version: hb.wire_version,
+        stages_images: hb.stages_images,
+        capabilities: hb.capabilities.clone(),
     };
     if let Err(e) = state
         .services
@@ -502,6 +517,39 @@ pub async fn heartbeat(
         )));
     }
 
+    // ADR 0009 §1-§3: reconcile AFTER the persist above lands — a
+    // heartbeat we 5xx'd never reaches here (early return above).
+    // Same dispatch as the WS supervisor loop (`api/hosts.rs:266-284`).
+    //
+    // Issue #215: skip reconcile when the host couldn't enumerate its
+    // sandboxes this tick (`running_sandboxes_known == false`). The
+    // empty `running_sandboxes` it sends is "no information", not "no
+    // sandboxes running"; reconciling against it would strike every
+    // active session on the host on a single host-side `list()` blip.
+    if !hb.running_sandboxes_known {
+        tracing::warn!(
+            host_id = %host_id,
+            "heartbeat: host reported running_sandboxes_known=false (backend.list() failed); skipping reconcile this tick",
+        );
+    } else {
+        let flipped = state
+            .reconciler
+            .reconcile_host(&state, host_id, &hb.running_sandboxes)
+            .await;
+        if !flipped.is_empty() {
+            tracing::info!(
+                host_id = %host_id,
+                count = flipped.len(),
+                "heartbeat reconcile flipped missing-sandbox sessions",
+            );
+        }
+    }
+
+    // Bump the routing cache's freshness stamp for this host (ADR
+    // 0015 M3). The scheduling payload itself lives in PG above — ADR
+    // 0047 removed the in-memory scheduler mirror.
+    state.host_registry.touch_seen(host_id);
+
     // ADR 0015 M5: ship the coord's authoritative enabled-images
     // set so the host's prefetch loop drives from heartbeat alone.
     // Best-effort: a PG hiccup degrades to no-images for this tick.
@@ -509,6 +557,31 @@ pub async fn heartbeat(
         Ok(rows) => enabled_image_refs_from_rows(rows),
         Err(e) => {
             tracing::debug!(host_id = %host_id, error = %e, "list_enabled_images failed");
+            Vec::new()
+        }
+    };
+
+    // ADR 0036 amendment (issue #538): ship the base-snapshot refs of
+    // every enable job currently `prestaging`, so eligible hosts warm them
+    // BEFORE the scanner's `enabled_images` upsert makes the digest
+    // visible to session-create. Best-effort, same posture as
+    // `enabled_images` above — a PG hiccup degrades to no prestage work
+    // for this tick; the scanner's poll loop just sees one more empty
+    // heartbeat and keeps waiting. A row that fails to deserialize (wire
+    // skew mid-roll) is skipped + logged rather than failing the whole ack.
+    let prestage_images = match state.services.meta.list_prestaging_refs().await {
+        Ok(raw) => raw
+            .into_iter()
+            .filter_map(|v| match serde_json::from_value::<EnabledImageRef>(v) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(host_id = %host_id, error = %e, "prestage_ref failed to deserialize; skipping");
+                    None
+                }
+            })
+            .collect(),
+        Err(e) => {
+            tracing::debug!(host_id = %host_id, error = %e, "list_prestaging_refs failed");
             Vec::new()
         }
     };
@@ -557,9 +630,36 @@ pub async fn heartbeat(
             recoverable,
             aux_bundles: adv.aux_bundles.clone(),
             events_cursor,
+            // ADR 0068: this heartbeat's own capability vector already
+            // carries the recording host's FC snapshot-version — no
+            // separate lookup needed (unlike the eviction pipeline,
+            // which stamps from a different host's perspective and has
+            // to ask PG for it).
+            fc_snapshot_version: hb.capabilities.fc_snapshot_version.clone(),
         };
         match state.services.meta.record_snapshot(record).await {
-            Ok(()) => acked_checkpoints.push(adv.snapshot_id),
+            Ok(inserted) => {
+                acked_checkpoints.push(adv.snapshot_id);
+                // Issue #529: the eviction finalize job is host-owned and
+                // never talks to the coordinator again once
+                // `snapshot_begin` returns — THIS reconcile, on the row's
+                // first landing, is now the only place `SnapshotTaken`
+                // emits for a D5 eviction. A periodic checkpoint's row
+                // (or a re-record of either kind) must NOT re-emit it.
+                if inserted && adv.kind == engram_protocol::heartbeat::CheckpointKind::EvictionFinal
+                {
+                    let _ = state
+                        .emit(
+                            adv.session_id,
+                            SessionEvent::SnapshotTaken {
+                                snapshot_id: adv.snapshot_id,
+                                size_bytes: adv.size_bytes,
+                                at: Utc::now(),
+                            },
+                        )
+                        .await;
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     host_id = %host_id,
@@ -583,6 +683,7 @@ pub async fn heartbeat(
         server_time: Utc::now(),
         revoked_sessions: Vec::new(),
         enabled_images,
+        prestage_images,
         live_bundles,
         acked_checkpoints,
     }))
@@ -595,42 +696,48 @@ pub async fn heartbeat(
 fn enabled_image_refs_from_rows(
     rows: Vec<engram_core::types::EnabledImage>,
 ) -> Vec<EnabledImageRef> {
-    rows.into_iter()
-        .filter_map(|row| {
-            // base_snapshot_disk_manifest is NOT NULL (migration 0042), so a
-            // persisted row always has it — the Option is only the build-then-
-            // stamp shape. Defensively skip (rather than panic) the impossible
-            // None so one malformed row can't break the whole advertisement.
-            let Some(base_snapshot_disk_manifest) = row.base_snapshot_disk_manifest else {
-                tracing::error!(
-                    image_uri = %row.image_uri,
-                    "enabled image has no base_snapshot_disk_manifest (NOT NULL invariant violated); not advertising",
-                );
-                return None;
-            };
-            // ADR 0022 Option A: base_snapshot_id is NOT NULL (migration 0038);
-            // same defensive skip — the host needs it to key the per-template
-            // memfile residency path.
-            let Some(base_snapshot_id) = row.base_snapshot_id else {
-                tracing::error!(
-                    image_uri = %row.image_uri,
-                    "enabled image has no base_snapshot_id (NOT NULL invariant violated); not advertising",
-                );
-                return None;
-            };
-            // ADR 0021 P2 (memory residency): nullable since migration 0049.
-            // `None` for cold-boot backends (VZ) that capture a disk-only base
-            // snapshot — advertise the row anyway; the host's prefetch warms
-            // only the disk tier when memory is absent.
-            Some(EnabledImageRef {
-                image_uri: row.image_uri,
-                manifest_digest: ManifestDigest(row.manifest_digest),
-                base_snapshot_id,
-                base_snapshot_disk_manifest,
-                base_snapshot_memory_manifest: row.base_snapshot_memory_manifest,
-            })
-        })
-        .collect()
+    rows.iter().filter_map(enabled_image_ref).collect()
+}
+
+/// ADR 0036 amendment (issue #538): the single-row half of
+/// [`enabled_image_refs_from_rows`]'s projection, shared with
+/// `enable_scanner`'s `Prestaging`-stage advertisement so the two build
+/// paths can't drift — a row the enable scanner just captured (about to be
+/// upserted) and a row already live in `enabled_images` project to the
+/// SAME wire shape.
+pub(crate) fn enabled_image_ref(row: &engram_core::types::EnabledImage) -> Option<EnabledImageRef> {
+    // base_snapshot_disk_manifest is NOT NULL on a persisted row (migration
+    // 0042); the Option here is only the build-then-stamp shape.
+    // Defensively skip (rather than panic) the impossible None so one
+    // malformed row can't break the whole advertisement.
+    let Some(base_snapshot_disk_manifest) = row.base_snapshot_disk_manifest else {
+        tracing::error!(
+            image_uri = %row.image_uri,
+            "enabled image has no base_snapshot_disk_manifest (NOT NULL invariant violated); not advertising",
+        );
+        return None;
+    };
+    // ADR 0022 Option A: base_snapshot_id is NOT NULL (migration 0038); same
+    // defensive skip — the host needs it to key the per-template memfile
+    // residency path.
+    let Some(base_snapshot_id) = row.base_snapshot_id else {
+        tracing::error!(
+            image_uri = %row.image_uri,
+            "enabled image has no base_snapshot_id (NOT NULL invariant violated); not advertising",
+        );
+        return None;
+    };
+    // ADR 0021 P2 (memory residency): nullable since migration 0049. `None`
+    // for cold-boot backends (VZ) that capture a disk-only base snapshot —
+    // advertise the row anyway; the host's prefetch warms only the disk
+    // tier when memory is absent.
+    Some(EnabledImageRef {
+        image_uri: row.image_uri.clone(),
+        manifest_digest: ManifestDigest(row.manifest_digest.clone()),
+        base_snapshot_id,
+        base_snapshot_disk_manifest,
+        base_snapshot_memory_manifest: row.base_snapshot_memory_manifest,
+    })
 }
 
 // ---- POST /api/hosts/:id/auth/resolve-registry ----

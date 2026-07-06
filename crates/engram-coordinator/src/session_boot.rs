@@ -121,6 +121,17 @@ pub(crate) struct PreparedBoot {
     pub cpu_budget_vcpus: u32,
     pub image_repo: String,
     pub image_tag: String,
+    /// ADR 0036 amendment (issue #538): the enabled image's OCI manifest
+    /// digest, so the reserve-side `ScheduleContext.required_image_digest`
+    /// gates placement onto hosts that have actually prefetched this
+    /// image's base snapshot — the per-host half of the fleet chunk-
+    /// prestage invariant (the enable-scanner's `prestaging` stage is the
+    /// other half).
+    pub manifest_digest: String,
+    /// ADR 0068: the enabled image's base snapshot carries a memory
+    /// manifest — this create needs a host reporting a healthy FC UFFD
+    /// substrate (`placement::CapabilityRequirements::needs_uffd_substrate`).
+    pub needs_uffd_substrate: bool,
 }
 
 /// Why a boot failed, carrying the caller-facing error and — crucially —
@@ -220,6 +231,8 @@ pub(crate) async fn boot_on_reserved_host(
         // always falls back to full-manifest memory-chunk prefetch.
         working_set_blob_key: None,
         aux_bundles: record.aux_bundles,
+        // Issue #529: restore-side reconstruction, not a fresh capture.
+        paused_at: None,
     };
     let restore_leg = state.host_registry.restore_base_on_host(
         host_id,
@@ -445,8 +458,7 @@ async fn assemble_egress_policy(
     injects: Vec<engram_core::types::egress::EgressInjectEntry>,
     observes: Vec<engram_core::types::egress::EgressObserveEntry>,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
-    let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
-    let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
+    let guest_ip = state.services.host.guest_ip(sandbox_id).await?;
     Some(engram_core::types::egress::SessionEgressPolicy {
         session_id,
         sandbox_id,

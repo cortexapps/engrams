@@ -75,6 +75,21 @@ pub struct Heartbeat {
     pub utilization: engram_core::types::host::HostUtilization,
 }
 
+/// Issue #529: distinguishes a periodic (ADR 0028 Fix A) checkpoint
+/// from an eviction's terminal snapshot. The heartbeat reconcile uses
+/// this (+ `record_snapshot`'s `inserted` flag) to emit `SnapshotTaken`
+/// exactly once, only for a freshly-landed eviction row — a periodic
+/// checkpoint reconcile must NOT emit it (the session isn't evicted).
+/// `#[serde(default)]` on the carrying structs' `kind` field keeps a
+/// mixed-version heartbeat additive-safe (JSON, not bincode — no
+/// WIRE_VERSION bump needed for this addition).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckpointKind {
+    #[default]
+    Periodic,
+    EvictionFinal,
+}
+
 /// ADR 0028 Fix A: one un-acked durable checkpoint. Carries
 /// everything `record_snapshot` needs — the advertising host may be
 /// the only survivor of the original capture pipeline.
@@ -95,6 +110,9 @@ pub struct CheckpointAdvert {
     /// when it records the row.
     pub paused_at: DateTime<Utc>,
     pub captured_at: DateTime<Utc>,
+    /// Issue #529: periodic vs. eviction-terminal — see [`CheckpointKind`].
+    #[serde(default)]
+    pub kind: CheckpointKind,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -259,6 +277,11 @@ mod tests {
             mem_used_mib: 9_001,
             allocatable_mib: 23_767,
             cpu_pct: 42.5,
+            // Issue #540: the RAM ledger's attribution fields.
+            base_shm_mib: 19_500,
+            base_shm_pending_mib: 512,
+            parked_pss_mib: 4_096,
+            running_pss_mib: 6_000,
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: Heartbeat = serde_json::from_str(&json).unwrap();
@@ -268,6 +291,33 @@ mod tests {
         assert_eq!(back.utilization.mem_used_mib, 9_001);
         assert_eq!(back.utilization.allocatable_mib, 23_767);
         assert_eq!(back.utilization.cpu_pct, 42.5);
+        assert_eq!(back.utilization.base_shm_mib, 19_500);
+        assert_eq!(back.utilization.base_shm_pending_mib, 512);
+        assert_eq!(back.utilization.parked_pss_mib, 4_096);
+        assert_eq!(back.utilization.running_pss_mib, 6_000);
+    }
+
+    #[test]
+    fn utilization_ram_ledger_fields_default_to_zero_for_old_hosts() {
+        // Rollout interop (same posture as the pre-existing utilization
+        // fields): a host-agent on an older build sends no
+        // base_shm_mib/base_shm_pending_mib/parked_pss_mib/running_pss_mib
+        // keys at all. `#[serde(default)]` must decode that to zeros, not
+        // fail the heartbeat.
+        let mut v: serde_json::Value = serde_json::to_value(sample()).unwrap();
+        v["utilization"] = serde_json::json!({
+            "disk_total_mib": 1,
+            "disk_used_mib": 1,
+            "mem_total_mib": 1,
+            "mem_used_mib": 1,
+            "allocatable_mib": 1,
+            "cpu_pct": 1.0,
+        });
+        let back: Heartbeat = serde_json::from_value(v).unwrap();
+        assert_eq!(back.utilization.base_shm_mib, 0);
+        assert_eq!(back.utilization.base_shm_pending_mib, 0);
+        assert_eq!(back.utilization.parked_pss_mib, 0);
+        assert_eq!(back.utilization.running_pss_mib, 0);
     }
 
     #[test]

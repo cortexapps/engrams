@@ -538,6 +538,14 @@ pub(crate) async fn admin_drain_host_core(
                     }
                     Err(e) => return (sid, Err(format!("get_session: {e}"))),
                 };
+                // ADR 0068: a capacity-fit PREVIEW, not the move itself —
+                // no snapshot/manifest is loaded here, so no substrate
+                // requirement is derivable (or needed: the actual move,
+                // `evacuate_dead_source` or `migrate_session_live` below,
+                // re-derives `caps` from the real snapshot it restores and
+                // is the authoritative gate). The base capability gate
+                // (`host_meets_capabilities` with `Default` requirements)
+                // still applies through `placement_preview`.
                 let fit_ctx = crate::placement::ScheduleContext {
                     repo: &repo,
                     image_version: &tag,
@@ -547,6 +555,7 @@ pub(crate) async fn admin_drain_host_core(
                     required_image_digest: None,
                     exclude_host: Some(host_id),
                     prefer_host: None,
+                    caps: crate::placement::CapabilityRequirements::default(),
                 };
                 match crate::placement::placement_preview(
                     st.services.meta.as_ref(),
@@ -578,6 +587,10 @@ pub(crate) async fn admin_drain_host_core(
                         required_image_digest: None,
                         exclude_host: Some(host_id),
                         prefer_host: None,
+                        // ADR 0068: same preview posture as `fit_ctx` above —
+                        // `migrate_session_live`'s own capture path is the
+                        // authoritative gate for the live-teleport target.
+                        caps: crate::placement::CapabilityRequirements::default(),
                     };
                     let target = crate::placement::pick_for_session(
                         st.services.meta.as_ref(),

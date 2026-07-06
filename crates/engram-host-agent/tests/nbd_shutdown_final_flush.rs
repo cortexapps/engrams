@@ -294,6 +294,7 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
         rootfs_blob_key: None,
         working_set_blob_key: None,
         aux_bundles: vec![],
+        paused_at: None,
     };
 
     // Resume: installs the NBD data plane in `nbd_sandboxes`.

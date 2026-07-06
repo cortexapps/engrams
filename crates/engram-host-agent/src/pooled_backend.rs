@@ -21,6 +21,7 @@ use dashmap::DashMap;
 use engram_chunk_store::{ChunkCache, ChunkStore};
 use engram_core::traits::SandboxBackend;
 use engram_core::types::egress::SessionEgressPolicy;
+use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{AgentSpec, AuxBundleRef, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
@@ -570,8 +571,11 @@ pub struct PooledBackend {
     /// chain advances are not).
     capture_locks: Arc<DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
     /// ADR 0045 D5: per-sandbox background upload tasks spawned by
-    /// `snapshot_begin` / `migration_finish_restore`, awaited by
-    /// `snapshot_wait`.
+    /// `migration_finish_restore`, awaited by `snapshot_wait`. Issue
+    /// #529: `snapshot_begin`'s eviction flavor no longer inserts here —
+    /// it doesn't use the wait/RPC-routing shape at all anymore (see
+    /// `pending_finalizes` below); this map now serves the migration
+    /// restore flavor exclusively.
     ///
     /// Issue #221: the result is stored as a cloneable, retryable
     /// [`SharedSnapshotResult`] (not a raw `JoinHandle`). The
@@ -580,6 +584,25 @@ pub struct PooledBackend {
     /// await and a retry, and two concurrent waiters. The entry is
     /// removed only on successful consumption / supersession / destroy.
     snapshot_waits: Arc<DashMap<SandboxId, SnapshotWait>>,
+    /// Issue #529: `sandbox_id → snapshot_id` for an in-flight (durably
+    /// persisted, not-yet-terminal) eviction finalize job. Seeded from
+    /// disk at startup (`resume_pending_finalizes`) and on every fresh
+    /// `snapshot_begin`; cleared only when the job reaches its terminal
+    /// stage or is quarantined. Makes `snapshot_begin` idempotent under
+    /// an eviction-scanner retry storm: re-observe the pending
+    /// `snapshot_id` instead of re-capturing.
+    pending_finalizes: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
+    /// Issue #529: a weak self-reference, set once via `set_self_ref`
+    /// right after construction (see `lib.rs`, alongside
+    /// `Arc::new(p)`) — so a detached eviction finalize job, which only
+    /// has `EvictionFinalizer` (a bundle of Arc-cloned fields, built from
+    /// `&self`), can still reach the FULL `PooledBackend::destroy` (egress
+    /// unregister, NBD slot release, checkpoint-chain teardown — not just
+    /// the inner backend's VM teardown) at its terminal stage, without
+    /// threading an owned `Arc<PooledBackend>` through `snapshot_begin`'s
+    /// `&self` signature. `Weak` so holding a clone can never keep the
+    /// backend alive past its natural lifetime.
+    self_ref: Arc<std::sync::OnceLock<std::sync::Weak<PooledBackend>>>,
     /// ADR 0045 C1: open live-migration exports (frozen sandboxes
     /// serving a move). See `crate::migration`.
     migrations: Arc<crate::migration::MigrationRegistry>,
@@ -645,6 +668,106 @@ pub struct PooledBackend {
     shutdown_manifest_publish: Option<(crate::coord_client::CoordClient, engram_core::HostId)>,
 }
 
+/// Human-readable message for a [`crate::warm_progress::WarmViolation`] —
+/// shared by `run_warm_hook`'s three watchdog-triggered failure sites.
+fn warm_violation_message(v: crate::warm_progress::WarmViolation) -> String {
+    use crate::warm_progress::WarmViolation;
+    match v {
+        WarmViolation::Stall => format!(
+            "[warm] hook went silent (no output or progress line) for at least the \
+             stall budget (ENGRAM_WARM_STALL_SECS, default {}s)",
+            crate::warm_progress::DEFAULT_STALL_SECS,
+        ),
+        WarmViolation::StageDeadline => {
+            "[warm] hook stage exceeded its declared deadline_secs".into()
+        }
+        WarmViolation::GlobalTimeout => "[warm] hook exceeded its global WarmConfig timeout".into(),
+    }
+}
+
+/// Pull the free-text `msg=`/heartbeat detail (if any) out of a parsed
+/// progress line, for the `CaptureProgress.detail` field.
+fn progress_line_detail(line: &crate::warm_progress::WarmProgressLine) -> Option<String> {
+    use crate::warm_progress::WarmEvent;
+    match &line.event {
+        WarmEvent::Start { msg, .. } | WarmEvent::Heartbeat { msg, .. } => msg.clone(),
+        WarmEvent::Done { .. } => None,
+    }
+}
+
+/// Record `engram_warm_hook_stage_seconds` for every CLOSED stage in a
+/// `[warm]`-hook stage history (the still-open stage, if any — `outcome:
+/// Running` — has no duration to record).
+fn record_warm_stage_metrics(stages: &[engram_core::types::WarmStageRecord]) {
+    use engram_core::types::WarmStageOutcome;
+    for stage in stages {
+        let Some(ended_at) = stage.ended_at else {
+            continue;
+        };
+        let outcome = match stage.outcome {
+            WarmStageOutcome::Done => "done",
+            WarmStageOutcome::Failed => "failed",
+            WarmStageOutcome::Running => continue,
+        };
+        let secs = (ended_at - stage.started_at).num_milliseconds().max(0) as f64 / 1000.0;
+        metrics::histogram!(
+            crate::metrics::WARM_HOOK_STAGE_SECONDS,
+            "stage" => stage.name.clone(),
+            "outcome" => outcome,
+        )
+        .record(secs);
+    }
+}
+
+/// Record `engram_warm_hook_failures_total{kind}` for a capture failure.
+fn record_warm_hook_failure_metric(kind: engram_core::types::CaptureFailureKind) {
+    metrics::counter!(crate::metrics::WARM_HOOK_FAILURES_TOTAL, "kind" => kind.as_str())
+        .increment(1);
+}
+
+/// RAII: aborts the wrapped keepalive task on drop. A leg wrapped by
+/// [`spawn_leg_keepalive`] stops resending stale progress the moment
+/// the guard goes out of scope — on every path, including an early
+/// `?`-return, since `Drop` runs during unwind too.
+struct KeepaliveGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for KeepaliveGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Issue #539 finding 1: `run_warm_hook`'s own >=30s keepalive only
+/// covers the WARM phase. The BOOT leg (cold boot + chunk materialize to
+/// agentd-ready) and the SNAPSHOT leg (pause/flush/chunk memory + upload
+/// a multi-GB state blob to BlobStorage) can each run many minutes with
+/// no `[warm]`-hook progress traffic to drive a keepalive — and the
+/// coordinator's fenced `enable_jobs` write IS the capture-claim lease
+/// renewal (`enable_scanner.rs` deleted the separate blind ticker on
+/// exactly this premise). Silence past `lease_secs` during either leg
+/// lets a peer coordinator re-claim and spawn a SECOND concurrent
+/// capture — the regression the deleted ticker existed to prevent.
+///
+/// Wrap a leg that has no progress source of its own in this: it
+/// resends `event` unchanged every
+/// [`capture_keepalive_secs_from_env`][crate::warm_progress::capture_keepalive_secs_from_env]
+/// (30s in production; test-shrinkable) until the returned guard is
+/// dropped.
+fn spawn_leg_keepalive(
+    progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
+    event: engram_core::types::CaptureProgress,
+) -> KeepaliveGuard {
+    KeepaliveGuard(tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(crate::warm_progress::capture_keepalive_secs_from_env());
+        interval.tick().await; // consume the immediate first tick
+        loop {
+            interval.tick().await;
+            let _ = progress.try_send(event.clone());
+        }
+    }))
+}
+
 impl PooledBackend {
     /// Build the capture-egress policy for a `[warm]` hook from its
     /// `[warm.network]`, or `None` when the image grants no egress (→ the
@@ -706,9 +829,9 @@ impl PooledBackend {
         let egress = self.egress.as_ref()?;
         let Some(guest_ip) = self
             .inner
-            .guest_ip(id)
+            .guest_endpoints(id)
             .await
-            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+            .map(|ep| ep.egress_identity)
         else {
             tracing::warn!(
                 sandbox_id = %id,
@@ -762,16 +885,35 @@ impl PooledBackend {
     /// --daemon`) and exits; that process is then captured into the base
     /// snapshot so every restored session inherits it warm.
     ///
-    /// Fail-loud: an exec error, a non-zero exit, or a missing exit status
-    /// returns `Err` — `build_base_snapshot` propagates it, aborting the
-    /// capture and the enable. We never ship a base snapshot that a
-    /// `[warm]` hook claimed to warm but didn't.
+    /// Issue #539: replaces the old buffered `self.exec` + single opaque
+    /// `WarmConfig::timeout()` with a streaming watchdog. A hook that
+    /// emits the `::engram-warm::` progress protocol (see
+    /// `warm_progress`) is killed within `ENGRAM_WARM_STALL_SECS` of
+    /// going silent, or at a declared stage's `deadline_secs`, whichever
+    /// is sooner; a hook that never emits a progress line keeps today's
+    /// behavior verbatim (only the global timeout applies — no
+    /// regression). Every failure path returns a structured
+    /// `SandboxError::CaptureFailed` carrying the failing stage and the
+    /// hook's last 16 KiB of combined stdout+stderr — no more "(see host
+    /// logs for stderr)". On success the [`crate::warm_progress::OutputTail`]
+    /// is returned too, so a LATER snapshot-phase failure can still report
+    /// the warm hook's last output (the diagnosis a `status None` / a
+    /// vsock-lost failure used to lose entirely).
     async fn run_warm_hook(
         &self,
         id: SandboxId,
         warm: &WarmConfig,
         env: &std::collections::HashMap<String, String>,
-    ) -> Result<(), SandboxError> {
+        progress: &tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
+    ) -> Result<crate::warm_progress::OutputTail, SandboxError> {
+        use crate::warm_progress::{
+            parse_progress_line, warm_stall_secs_from_env, OutputTail, WarmWatchdog,
+            WarmWatchdogConfig, WatchdogInput,
+        };
+        use engram_core::types::sandbox::ExecEvent;
+        use engram_core::types::{CaptureFailure, CaptureFailureKind, CapturePhase};
+        use futures::StreamExt;
+
         // The capture VM's agentd holds NO durable session env: a capture VM
         // never gets a session bind, and `merge_session_env` is a no-op on FC
         // (the guest is already running from the snapshot, so its env can't be
@@ -785,6 +927,8 @@ impl PooledBackend {
             stdin: None,
             env: env.clone(),
             workdir: warm.workdir.clone(),
+            // In-guest backstop unchanged: agentd SIGKILLs the child at this
+            // deadline regardless of what the host-side watchdog decides.
             timeout: Some(warm.timeout()),
         };
         tracing::info!(
@@ -793,27 +937,189 @@ impl PooledBackend {
             timeout_secs = warm.timeout().as_secs(),
             "running capture-time [warm] hook before base-snapshot capture",
         );
-        let out = self.exec(id, req).await.map_err(|e| {
-            SandboxError::Snapshot(format!(
-                "[warm] hook exec failed before base-snapshot capture: {e}"
-            ))
+
+        let mut stream = self.exec_stream(id, req).await.map_err(|e| {
+            SandboxError::CaptureFailed(CaptureFailure {
+                kind: CaptureFailureKind::WarmExecTransport,
+                stage: None,
+                tail: String::new(),
+                message: format!(
+                    "[warm] hook exec_stream failed before base-snapshot capture: {e}"
+                ),
+            })
         })?;
-        match out.exit_status {
+
+        let watchdog_cfg = WarmWatchdogConfig {
+            stall: warm_stall_secs_from_env(),
+            global_timeout: warm.timeout(),
+        };
+        let started = std::time::Instant::now();
+        let mut watchdog = WarmWatchdog::new(watchdog_cfg, started);
+        let mut tail = OutputTail::default();
+        let mut pending_stdout: Vec<u8> = Vec::new();
+        let mut last_detail: Option<String> = None;
+
+        let mut keepalive =
+            tokio::time::interval(crate::warm_progress::capture_keepalive_secs_from_env());
+        keepalive.tick().await; // consume the immediate first tick
+
+        let send_progress =
+            |watchdog: &WarmWatchdog, tail: &OutputTail, detail: &Option<String>| {
+                let event = engram_core::types::CaptureProgress {
+                    phase: CapturePhase::Warm,
+                    warm_stage: watchdog.current_stage_name().map(str::to_string),
+                    detail: detail.clone(),
+                    output_tail: tail.render(),
+                    warm_stages: watchdog.stage_history(),
+                };
+                let _ = progress.try_send(event);
+            };
+
+        let violation_failure = |kind: CaptureFailureKind,
+                                 watchdog: WarmWatchdog,
+                                 tail: &OutputTail,
+                                 detail: &Option<String>,
+                                 message: String| {
+            let stage = watchdog.current_stage_name().map(str::to_string);
+            let stages = watchdog.clone().finish_failed(chrono::Utc::now());
+            record_warm_stage_metrics(&stages);
+            record_warm_hook_failure_metric(kind);
+            let output_tail = tail.render();
+            let _ = progress.try_send(engram_core::types::CaptureProgress {
+                phase: CapturePhase::Warm,
+                warm_stage: stage.clone(),
+                detail: detail.clone(),
+                output_tail: output_tail.clone(),
+                warm_stages: stages,
+            });
+            SandboxError::CaptureFailed(CaptureFailure {
+                kind,
+                stage,
+                tail: output_tail,
+                message,
+            })
+        };
+
+        let exit_status = loop {
+            let deadline = tokio::time::Instant::from_std(watchdog.next_deadline());
+            tokio::select! {
+                ev = stream.events.next() => {
+                    match ev {
+                        Some(ExecEvent::Stdout(bytes)) => {
+                            tail.push(&bytes);
+                            let now = std::time::Instant::now();
+                            let wall_now = chrono::Utc::now();
+                            if let Some(v) = watchdog.on_event(WatchdogInput::OutputBytes, now, wall_now) {
+                                return Err(violation_failure(v.kind(), watchdog, &tail, &last_detail, warm_violation_message(v)));
+                            }
+                            pending_stdout.extend_from_slice(&bytes);
+                            while let Some(pos) = pending_stdout.iter().position(|&b| b == b'\n') {
+                                let line_bytes: Vec<u8> = pending_stdout.drain(..=pos).collect();
+                                let line = String::from_utf8_lossy(&line_bytes);
+                                let line = line.trim_end_matches(['\r', '\n']);
+                                let Some(parsed) = parse_progress_line(line) else {
+                                    continue;
+                                };
+                                last_detail = progress_line_detail(&parsed);
+                                let now = std::time::Instant::now();
+                                let wall_now = chrono::Utc::now();
+                                if let Some(v) = watchdog.on_event(WatchdogInput::Progress(parsed), now, wall_now) {
+                                    return Err(violation_failure(v.kind(), watchdog, &tail, &last_detail, warm_violation_message(v)));
+                                }
+                                send_progress(&watchdog, &tail, &last_detail);
+                            }
+                            // A conforming `::engram-warm::` line is always
+                            // short. Newline-free output (gradle rich-console
+                            // `\r` redraws, binary noise) would otherwise grow
+                            // this buffer unbounded for the hook's whole
+                            // 10-33 min runtime, and the `position(b'\n')`
+                            // scan above re-walks it on every chunk
+                            // (quadratic). Cap it at the same bound as the
+                            // `OutputTail` ring buffer: past that with no
+                            // newline in sight, it can't be a valid protocol
+                            // line, so drop it — nothing valid is lost, and
+                            // parsing resumes cleanly at the next `\n`.
+                            if pending_stdout.len() > OutputTail::DEFAULT_CAP_BYTES {
+                                pending_stdout.clear();
+                            }
+                        }
+                        Some(ExecEvent::Stderr(bytes)) => {
+                            tail.push(&bytes);
+                            let now = std::time::Instant::now();
+                            let wall_now = chrono::Utc::now();
+                            if let Some(v) = watchdog.on_event(WatchdogInput::OutputBytes, now, wall_now) {
+                                return Err(violation_failure(v.kind(), watchdog, &tail, &last_detail, warm_violation_message(v)));
+                            }
+                        }
+                        Some(ExecEvent::Exit(status)) => break status,
+                        None => {
+                            return Err(violation_failure(
+                                CaptureFailureKind::WarmExecTransport,
+                                watchdog,
+                                &tail,
+                                &last_detail,
+                                "[warm] hook exec stream ended before an Exit event (vsock/gRPC transport lost)".into(),
+                            ));
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let now = std::time::Instant::now();
+                    let wall_now = chrono::Utc::now();
+                    if let Some(v) = watchdog.on_event(WatchdogInput::Tick, now, wall_now) {
+                        return Err(violation_failure(v.kind(), watchdog, &tail, &last_detail, warm_violation_message(v)));
+                    }
+                }
+                _ = keepalive.tick() => {
+                    send_progress(&watchdog, &tail, &last_detail);
+                }
+            }
+        };
+
+        match exit_status {
             Some(0) => {
                 tracing::info!(sandbox_id = %id, "[warm] hook completed cleanly");
-                Ok(())
+                record_warm_stage_metrics(&watchdog.stage_history());
+                send_progress(&watchdog, &tail, &last_detail);
+                Ok(tail)
             }
             other => {
                 tracing::error!(
                     sandbox_id = %id,
                     exit_status = ?other,
-                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    tail = %tail.render(),
                     "[warm] hook failed; aborting base-snapshot capture",
                 );
-                Err(SandboxError::Snapshot(format!(
-                    "[warm] hook exited with status {other:?} (expected 0); \
-                     aborting base-snapshot capture (see host logs for stderr)"
-                )))
+                // A `None` status means the child died to a signal — but
+                // agentd's `timeout_ms` in-guest backstop (`handler.rs`)
+                // is only ONE producer of that. A guest-OOM kill (one of
+                // the failure causes `WarmConfig`'s own docs name) at
+                // minute 2 of a 55-minute budget also reports
+                // `Exit(None)`; labeling it `WarmGlobalTimeout` steers an
+                // operator to raise `timeout_secs` instead of fixing
+                // memory. Gate the timeout label on actually having
+                // reached (near) the declared budget — some slack for
+                // scheduling jitter between agentd's kill and this
+                // observing it — else classify as an unattributed signal
+                // kill. A stream that dies WITHOUT ever producing an Exit
+                // event (handled above, `None` from
+                // `stream.events.next()`) is the distinct, retryable
+                // `WarmExecTransport` case.
+                const TIMEOUT_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+                let kind = match other {
+                    Some(_) => CaptureFailureKind::WarmExitNonZero,
+                    None if started.elapsed() + TIMEOUT_SLACK >= warm.timeout() => {
+                        CaptureFailureKind::WarmGlobalTimeout
+                    }
+                    None => CaptureFailureKind::WarmKilled,
+                };
+                Err(violation_failure(
+                    kind,
+                    watchdog,
+                    &tail,
+                    &last_detail,
+                    format!("[warm] hook exited with status {other:?} (expected 0)"),
+                ))
             }
         }
     }
@@ -1240,6 +1546,8 @@ impl PooledBackend {
             checkpoint_chains: Arc::new(DashMap::new()),
             capture_locks: Arc::new(DashMap::new()),
             snapshot_waits: Arc::new(DashMap::new()),
+            pending_finalizes: Arc::new(DashMap::new()),
+            self_ref: Arc::new(std::sync::OnceLock::new()),
             migrations: Arc::new(crate::migration::MigrationRegistry::default()),
             inline_disk_manifests: Arc::new(DashMap::new()),
             migrate_peer: Arc::new(std::sync::OnceLock::new()),
@@ -1385,6 +1693,72 @@ impl PooledBackend {
             checkpoint_chains: self.checkpoint_chains.clone(),
             checkpoint_dir: self.checkpoint_dir.clone(),
             session_bindings: self.session_bindings.clone(),
+        }
+    }
+
+    /// Issue #529: install the weak self-reference `snapshot_begin`'s
+    /// spawned finalize job upgrades to reach the full `destroy()` at its
+    /// terminal stage. MUST be called exactly once, immediately after
+    /// `Arc::new(p)` — before that, `eviction_finalizer()` builds a bundle
+    /// whose `self_ref` can never upgrade, and any finalize job it drives
+    /// silently skips its own destroy call (logged, not fatal — the
+    /// teardown reconcile / orphan_reap backstop it, but it's a real gap).
+    /// A second call is a startup-order bug; logged and ignored rather
+    /// than panicking (mirrors `set_migrate_peer_server`).
+    pub fn set_self_ref(&self, arc: &Arc<PooledBackend>) {
+        if self.self_ref.set(Arc::downgrade(arc)).is_err() {
+            tracing::warn!("PooledBackend self_ref already set; ignoring duplicate");
+        }
+    }
+
+    /// Issue #529: the eviction finalize bundle, or `None` when
+    /// checkpointing is disabled (`checkpoint_dir` unset) — the same gate
+    /// `snapshot_begin` checks before ever constructing one.
+    pub(crate) fn eviction_finalizer(&self) -> Option<crate::eviction_finalize::EvictionFinalizer> {
+        let checkpoint_dir = self.checkpoint_dir.clone()?;
+        Some(crate::eviction_finalize::EvictionFinalizer {
+            chunk_store: self.chunk_store.clone(),
+            chunk_cache: self.chunk_cache.clone(),
+            bundle_dir: self.bundle_dir.clone(),
+            bundle_file_ext: self.bundle_file_ext(),
+            checkpoint_dir,
+            pending_finalizes: self.pending_finalizes.clone(),
+            self_ref: self.self_ref.clone(),
+            max_attempts: crate::eviction_finalize::max_attempts(),
+        })
+    }
+
+    /// Issue #529: re-drive every un-acked eviction finalize record at
+    /// host-agent startup — the whole crash story. A host-agent pod roll
+    /// mid-upload now DELAYS the commit by one restart; it cannot lose
+    /// it. Called from `lib.rs` alongside the checkpoint driver spawn,
+    /// with the SAME `Arc<PooledBackend>` used there (so `set_self_ref`
+    /// must have run first).
+    pub async fn resume_pending_finalizes(self: &Arc<Self>) {
+        let Some(finalizer) = self.eviction_finalizer() else {
+            return;
+        };
+        let records =
+            crate::eviction_finalize::EvictionFinalizeRecord::load_all(&finalizer.finalize_dir())
+                .await;
+        if records.is_empty() {
+            return;
+        }
+        tracing::info!(
+            count = records.len(),
+            "re-driving eviction finalize records from disk (host-agent startup, issue #529)",
+        );
+        for record in records {
+            finalizer
+                .pending_finalizes
+                .insert(record.sandbox_id, record.snapshot_id);
+            metrics::counter!(crate::metrics::EVICTION_FINALIZE_REDRIVEN_TOTAL).increment(1);
+            let capture_lock = self.capture_lock(record.sandbox_id);
+            let f = finalizer.clone();
+            tokio::spawn(async move {
+                let guard = capture_lock.lock_owned().await;
+                crate::eviction_finalize::run_eviction_finalize(f, record, guard).await;
+            });
         }
     }
 
@@ -1786,6 +2160,13 @@ impl PooledBackend {
                         cache.put_no_evict(*hash, &current).await.map_err(|e| {
                             SandboxError::Snapshot(format!("land chunk {hash}: {e}"))
                         })?;
+                        // Review finding 3: this loop (the synchronous
+                        // pre-resume divergence pull, ADR 0045 C1) landed
+                        // chunks into the same local cache as
+                        // `migration_prestage`'s loop but left them
+                        // uncounted — undercounting peer-fill volume on
+                        // every warm migration resume.
+                        count_peer_chunk_fill(current.len());
                         landed += 1;
                         current = Vec::new();
                         current_idx = None;
@@ -2273,6 +2654,14 @@ impl PooledBackend {
                         cache.put_no_evict(hash, &current).await.map_err(|e| {
                             SandboxError::Snapshot(format!("stage chunk {hash}: {e}"))
                         })?;
+                        // ADR 0019 / telemetry restoration (#526): the
+                        // peer half of the peer-vs-GCS fill split — this
+                        // chunk filled the local cache from the migration
+                        // SOURCE host, not BlobStorage. Baseline meter for
+                        // epic-gcs-free-resume's "GCS-free by policy"
+                        // claim (the `source="gcs"` half lives at
+                        // `engram-chunk-store::cache`'s leader-persist arm).
+                        count_peer_chunk_fill(current.len());
                     }
                     // C1 prestage never requests the post-copy disk
                     // items (those ride the C2 fetch poller).
@@ -3965,6 +4354,13 @@ impl SnapshotFinisher {
         unwind.defuse();
         drop(unwind);
         let mut metadata = metadata;
+        // Issue #529: stamp the exact pause instant unconditionally — the
+        // coord's composed eviction path resolves the session_events
+        // coherence cursor from this instead of its own wall-clock `now`
+        // sampled after the (possibly multi-second) post phase below,
+        // closing the skew that made a clean evict→resume rewind the
+        // coordinator's own lifecycle events (median 4, prod evidence).
+        metadata.paused_at = Some(paused_at);
         let post = async {
             // ADR 0038 B3: the guest has resumed (inner.snapshot above
             // brought it back). Upload the drained disk chunks to GCS +
@@ -4260,6 +4656,12 @@ impl SnapshotFinisher {
             aux_bundles: metadata.aux_bundles.clone(),
             paused_at,
             captured_at: metadata.created_at,
+            // This is `advance_checkpoint_state` — the composed
+            // `snapshot()`/periodic-checkpoint path. The eviction flavor's
+            // OWN terminal record write (`run_eviction_finalize`) stamps
+            // `EvictionFinal` explicitly; this call site never runs for it
+            // (it uses `snapshot_begin`, not `snapshot()`).
+            kind: engram_protocol::heartbeat::CheckpointKind::Periodic,
         };
         if let Err(e) = record.persist(&records_dir).await {
             tracing::warn!(
@@ -4387,7 +4789,7 @@ impl SnapshotFinisher {
 }
 
 /// zero chunks + zero bytes of object storage.
-async fn chunk_memory_to_store(
+pub(crate) async fn chunk_memory_to_store(
     chunk_store: &ChunkStore,
     memory_bin: &std::path::Path,
     cache: Option<&ChunkCache>,
@@ -4425,7 +4827,7 @@ async fn chunk_memory_to_store(
 /// shape is the wire contract between the two crates, and FC
 /// deserializes via `#[serde(default)]` so JSON-level patches stay
 /// compatible without a circular dependency.
-async fn patch_fc_manifest_memory_ref(
+pub(crate) async fn patch_fc_manifest_memory_ref(
     manifest_json: &std::path::Path,
     memory_manifest: engram_core::types::manifest::ManifestRef,
     // Tier 2 (resume-prefault fix): the session id, stamped as the
@@ -4481,12 +4883,213 @@ async fn patch_fc_manifest_memory_ref(
     Ok(())
 }
 
-/// Pick a stable name for the harness substrate's mount-root
-/// subdirectory. Tries: (1) the env-injected
-/// `ENGRAM_SESSION_HARNESS_NAME` hint set by `resolve_harness` —
 // ADR 0021 P1.5: `harness_name_for_substrate` / `harness_name_from_uri`
-// retired with the substrate. The in-VM harness path comes from the
-// image manifest's `[harness] exec` now, not a URI suffix.
+// retired with the substrate (the in-VM harness path comes from the
+// image manifest's `[harness] exec` now, not a URI suffix) — this used
+// to be their doc comment; dead code, cleaned up incidentally while
+// touching this section for #526 (a dangling doc comment here newly
+// tripped `clippy::empty_line_after_doc_comments` against the struct
+// below once one was inserted after it).
+
+/// ADR 0019 / telemetry restoration (#526): the on-disk shape of the
+/// uffd-handler's `prefault-stats.json` (`PrefaultStats` in
+/// `engram-uffd-handler::runtime`), duck-typed here rather than shared
+/// via a cross-crate dependency — the file format is the contract
+/// between the two binaries, not a Rust type (the writer is Linux-only
+/// internally; this reader must build on every host-agent target).
+/// `#[serde(default)]` on the count fields means a stats file that only
+/// carries `trace_loaded` (shouldn't happen from this repo's writer,
+/// but keeps a future schema-superset — e.g. `prefault-admission-
+/// control`'s convergent gate file — from breaking this reader) still
+/// parses.
+#[derive(Debug, serde::Deserialize)]
+struct PrefaultStatsFile {
+    trace_loaded: bool,
+    #[serde(default)]
+    installed: usize,
+    #[serde(default)]
+    skipped: usize,
+}
+
+/// Review finding 6: the peer-fill fields `PrefaultStats` carries for
+/// post-copy migration destinations (issue step (d)3 — "uffd-handler
+/// live peer page-serves are recorded in the same per-jail stats file").
+/// Parsed independently of `PrefaultStatsFile`/`classify_prefault_outcome`
+/// (which stay focused on the `engram_resume_prefault_*` counter
+/// contract) — these are **span attributes only for now**, not a new
+/// counter family; `epic-gcs-free-resume` owns promoting them. Every
+/// field defaults to `0` — both for a genuinely non-peer resume (the
+/// fields are simply absent from the JSON) and for a peer resume whose
+/// drain happened to move nothing, so this is only recorded on the span
+/// when at least one field is nonzero (see `restore()`).
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+struct PeerFillSnapshot {
+    #[serde(default)]
+    peer_pulled: u64,
+    #[serde(default)]
+    peer_alt_sourced: u64,
+    #[serde(default)]
+    peer_zero_chunks: u64,
+    #[serde(default)]
+    peer_live_faults: u64,
+}
+
+impl PeerFillSnapshot {
+    fn is_nonzero(&self) -> bool {
+        self.peer_pulled != 0
+            || self.peer_alt_sourced != 0
+            || self.peer_zero_chunks != 0
+            || self.peer_live_faults != 0
+    }
+}
+
+fn parse_peer_fill_snapshot(stats_bytes: Option<&[u8]>) -> Option<PeerFillSnapshot> {
+    serde_json::from_slice(stats_bytes?).ok()
+}
+
+/// The three effectiveness outcomes `engram_resume_prefault_total` is
+/// labeled with. See the module doc on [`crate::metrics::RESUME_PREFAULT_TOTAL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefaultOutcome {
+    /// A trace was requested + loaded, and the prefault ran.
+    /// `installed == 0` is itself worth alarming on downstream (a
+    /// stale/mismatched trace) but is still a "replayed" outcome, not
+    /// an error — the counter split lives in `RESUME_PREFAULT_CHUNKS_TOTAL`.
+    Replayed { installed: usize, skipped: usize },
+    /// No trace was requested/loaded for this resume (base image,
+    /// migration dest with no prior life, or the prior life's publish
+    /// never landed) — expected, not an error.
+    NoTrace,
+    /// A stats file was expected (this backend has a
+    /// `prefault_stats_path`) but wasn't there — the alarm condition.
+    /// This is the exact class of bug that went inert 3x silently
+    /// (d0e5ecf3, cf6e4d32, 7c2a7226): the handler died, or the wiring
+    /// silently didn't fire, and nothing said so.
+    StatsMissing,
+}
+
+impl PrefaultOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Replayed { .. } => "replayed",
+            Self::NoTrace => "no_trace",
+            Self::StatsMissing => "stats_missing",
+        }
+    }
+}
+
+/// Review finding 1: how long / how often to retry the prefault-stats
+/// read before conceding `stats_missing`. The write races a background
+/// thread whose fetch duration is unbounded in principle (chunk count x
+/// NVMe/GCS latency) but "seconds" in the evidence pass's worst observed
+/// case (migration-dest: drain-then-trace-prefault). 20s at a 250ms
+/// cadence is generous relative to that without holding the poll open
+/// indefinitely on a genuinely dead handler; this loop is spawned
+/// off `restore()`'s return path, so it never adds latency to the
+/// resume itself.
+const PREFAULT_STATS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const PREFAULT_STATS_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Poll for the uffd-handler's `prefault-stats.json` until it appears or
+/// [`PREFAULT_STATS_POLL_TIMEOUT`] elapses. `prefault_from_trace` writes
+/// the file exactly once, atomically (temp+rename), at the END of its
+/// background fetch — so there is no "partial write" state to worry
+/// about: the file is either not there yet (keep polling) or fully
+/// there (done). Returns `None` if the timeout is reached without ever
+/// seeing the file — the same `stats_missing` alarm as before, but now
+/// only after a generous wait instead of on the first instant.
+async fn read_prefault_stats_with_retry(stats_path: &std::path::Path) -> Option<Vec<u8>> {
+    read_prefault_stats_with_retry_bounded(
+        stats_path,
+        PREFAULT_STATS_POLL_INTERVAL,
+        PREFAULT_STATS_POLL_TIMEOUT,
+    )
+    .await
+}
+
+/// Parameterized half of [`read_prefault_stats_with_retry`], split out so
+/// tests can exercise the "appears mid-poll" and "never appears" cases
+/// with millisecond bounds instead of the real 20s production timeout.
+async fn read_prefault_stats_with_retry_bounded(
+    stats_path: &std::path::Path,
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(bytes) = fs::read(stats_path).await {
+            return Some(bytes);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Pure stats-file-bytes → outcome mapping (the testable half of the
+/// read). `None` input means the file didn't exist / couldn't be read
+/// (both collapse to `StatsMissing` — a read error other than "not
+/// found" is just as much an alarm as absence). A corrupt/unparseable
+/// file (the atomic temp+rename write should prevent partial reads, but
+/// defend anyway) is treated the same way.
+fn classify_prefault_outcome(stats_bytes: Option<&[u8]>) -> PrefaultOutcome {
+    let Some(bytes) = stats_bytes else {
+        return PrefaultOutcome::StatsMissing;
+    };
+    match serde_json::from_slice::<PrefaultStatsFile>(bytes) {
+        Ok(s) if s.trace_loaded => PrefaultOutcome::Replayed {
+            installed: s.installed,
+            skipped: s.skipped,
+        },
+        Ok(_) => PrefaultOutcome::NoTrace,
+        Err(_) => PrefaultOutcome::StatsMissing,
+    }
+}
+
+/// Emit `engram_resume_prefault_total` + `engram_resume_prefault_chunks_total`
+/// for one resume's prefault outcome.
+fn emit_prefault_metrics(outcome: PrefaultOutcome) {
+    metrics::counter!(
+        crate::metrics::RESUME_PREFAULT_TOTAL,
+        "outcome" => outcome.label(),
+    )
+    .increment(1);
+    if let PrefaultOutcome::Replayed { installed, skipped } = outcome {
+        metrics::counter!(
+            crate::metrics::RESUME_PREFAULT_CHUNKS_TOTAL,
+            "result" => "installed",
+        )
+        .increment(installed as u64);
+        metrics::counter!(
+            crate::metrics::RESUME_PREFAULT_CHUNKS_TOTAL,
+            "result" => "skipped",
+        )
+        .increment(skipped as u64);
+    }
+}
+
+/// ADR 0019 / telemetry restoration (#526), review findings 3 + 7: the
+/// `source="peer"` half of the peer-vs-GCS cache-fill split
+/// ([`engram_chunk_store::cache::CHUNK_FILL_TOTAL`] — the `source="gcs"`
+/// half lives in `engram-chunk-store::cache`'s leader-persist arm).
+/// Shared by both loops that land migration-sourced chunks into the
+/// local cache via `ChunkCache::put_no_evict`: `migration_prestage`'s
+/// per-item loop and `pull_chunks_from_source`'s divergence pull —
+/// finding 3 was that the latter wrote chunks uncounted, systematically
+/// undercounting peer volume.
+fn count_peer_chunk_fill(bytes: usize) {
+    metrics::counter!(
+        engram_chunk_store::cache::CHUNK_FILL_TOTAL,
+        "source" => "peer",
+    )
+    .increment(1);
+    metrics::counter!(
+        engram_chunk_store::cache::CHUNK_FILL_BYTES_TOTAL,
+        "source" => "peer",
+    )
+    .increment(bytes as u64);
+}
 
 #[async_trait]
 impl SandboxBackend for PooledBackend {
@@ -4731,16 +5334,51 @@ impl SandboxBackend for PooledBackend {
         self.finisher().finish(id, cap).await
     }
 
-    /// ADR 0045 D5: the eviction flavor. Runs the capture, re-pauses the
-    /// guest (it's being torn down — today's pipeline already discards
-    /// post-capture execution; this just stops it burning CPU during the
-    /// background upload), and spawns the post phase (chunk + upload +
-    /// chain bookkeeping) as a detached task that `snapshot_wait` awaits.
-    /// The coordinator may mark the session Idle as soon as this returns.
+    /// ADR 0045 D5 (rewritten for issue #529): the eviction flavor. Runs
+    /// the capture, re-pauses the guest (it's being torn down), then
+    /// makes the finalize inputs DURABLE — the drained NBD disk chunks
+    /// (if any) to `<dest>/disk-pending/`, then an
+    /// [`crate::eviction_finalize::EvictionFinalizeRecord`] to
+    /// `<checkpoint_dir>/finalize/<snapshot_id>.json` — and only THEN
+    /// returns. From here the finalize is a host-owned job
+    /// (`eviction_finalize::run_eviction_finalize`, spawned below) that
+    /// never touches the sandbox, the coordinator, or this call's
+    /// stack again: it is a pure function of what was just persisted,
+    /// re-drivable by a fresh host-agent process
+    /// (`resume_pending_finalizes`) if this one dies mid-upload. The
+    /// coordinator may mark the session Idle as soon as this returns —
+    /// unlike the pre-#529 shape, that's now safe: the row will land via
+    /// the heartbeat reconcile regardless of what happens to the
+    /// coordinator or this process next.
+    ///
+    /// Gate: VZ/Process (`!supports_diff_checkpoints()`) and hosts with
+    /// checkpointing disabled (`checkpoint_dir` unset) surface
+    /// `InvalidSpec` — the coordinator's caller falls through to the
+    /// composed `snapshot()` pipeline (`idle_evictor.rs`).
     async fn snapshot_begin(
         &self,
         id: SandboxId,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        if !self.inner.supports_diff_checkpoints() || self.checkpoint_dir.is_none() {
+            return Err(SandboxError::InvalidSpec(
+                "host-durable eviction finalize requires diff-checkpoint support and a wired \
+                 checkpoint_dir"
+                    .into(),
+            ));
+        }
+        // Idempotency: a scanner-retried eviction (coord-side timeout /
+        // 409 / restart before the coordinator's own row-watcher noticed
+        // completion) re-observes the still-in-flight finalize's
+        // snapshot_id instead of re-capturing and racing itself.
+        if let Some(existing) = self.pending_finalizes.get(&id) {
+            return Ok(*existing);
+        }
+        let Some(session_id) = self.session_bindings.get(&id).map(|e| *e) else {
+            return Err(SandboxError::InvalidSpec(
+                "host-durable eviction finalize requires a session-bound sandbox".into(),
+            ));
+        };
+
         let (capture_guard, cap) = self.capture_phase(id).await?;
         // Publish the working-set trace for the next resume's prefault (see
         // `spawn_trace_publish`); detached, never blocks the eviction.
@@ -4750,26 +5388,118 @@ impl SandboxBackend for PooledBackend {
         if let Err(e) = self.inner.pause(id).await {
             tracing::debug!(sandbox_id = %id, error = %e, "post-capture re-pause failed (benign)");
         }
-        let snapshot_id = cap.metadata.id;
-        let finisher = self.finisher();
-        let handle = tokio::spawn(async move {
-            // The capture lock rides into the task: checkpoints stay
-            // locked out until the upload completes (chain bookkeeping
-            // is not concurrent-safe per sandbox).
-            let _capture_guard = capture_guard;
-            finisher.finish(id, cap).await
-        });
-        if let Some(prior) = self
-            .snapshot_waits
-            .insert(id, SnapshotWait::from_handle(handle))
-        {
-            // A prior begin whose wait never came (coordinator died).
-            // Don't await it (it may still be uploading) — just abort the
-            // backing task; its artifacts are covered by the inflight
-            // tracking + abort-prior path on the next snapshot.
-            prior.abort.abort();
-            tracing::warn!(sandbox_id = %id, "snapshot_begin superseded an unconsumed prior wait");
+
+        let SnapshotCapture {
+            metadata,
+            dest,
+            chain_prev,
+            paused_at,
+            mut unwind,
+        } = cap;
+        let snapshot_id = metadata.id;
+
+        // Extract + durably persist the drained disk-flush chunks (if
+        // any) BEFORE returning. See `PendingDiskFlush::into_chunks` and
+        // the module-level deviation note in `eviction_finalize.rs`: we
+        // never call `flush_upload` on this handle — the sandbox is
+        // about to be destroyed, so there is no live reader left for its
+        // rebase side effect to matter to.
+        #[cfg(target_os = "linux")]
+        let disk_pending_record = match (unwind.disk_backend.take(), unwind.disk_pending.take()) {
+            (Some(backend), Some(pending)) => {
+                let base_manifest = backend.manifest_ref().await;
+                let chunk_size = backend.chunk_size();
+                let total_bytes = backend.total_bytes();
+                let chunks = pending.into_chunks();
+                if let Err(e) =
+                    crate::eviction_finalize::persist_disk_pending_chunks(&dest, &chunks).await
+                {
+                    // The guest was already resumed by `capture_phase`
+                    // (its `inner.snapshot`/`snapshot_diff` brought it
+                    // back) — defusing is correct, not a stuck-paused
+                    // guest. Clean up `dest` so this failure doesn't leak
+                    // the multi-GiB local staging dir on every retry.
+                    unwind.defuse();
+                    drop(unwind);
+                    match tokio::fs::remove_dir_all(&dest).await {
+                        Ok(_) => {}
+                        Err(rm_err) => tracing::warn!(
+                            sandbox_id = %id, dest = %dest.display(), error = %rm_err,
+                            "snapshot_begin: disk-pending persist failed AND orphan dir cleanup failed",
+                        ),
+                    }
+                    return Err(SandboxError::Snapshot(format!(
+                        "persist disk-pending chunks: {e}"
+                    )));
+                }
+                Some(crate::eviction_finalize::DiskPendingRecord {
+                    base_manifest,
+                    chunk_size,
+                    total_bytes,
+                    chunks: chunks.iter().map(|(idx, hash, _)| (*idx, *hash)).collect(),
+                })
+            }
+            _ => None,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let disk_pending_record: Option<crate::eviction_finalize::DiskPendingRecord> = None;
+
+        // Ownership of the capture's recovery state transfers to the
+        // finalize record + the spawned job from here — the same
+        // "defuse the instant something durable/owned takes over" rule
+        // `finish()` follows.
+        unwind.defuse();
+        drop(unwind);
+
+        let record = crate::eviction_finalize::EvictionFinalizeRecord {
+            snapshot_id,
+            session_id,
+            sandbox_id: id,
+            image_version: metadata.image_version.clone(),
+            size_bytes: metadata.size_bytes,
+            paused_at,
+            captured_at: metadata.created_at,
+            dest: dest.clone(),
+            chain_prev_ref: chain_prev.map(|(r, _)| r),
+            disk_pending: disk_pending_record,
+            aux_bundles: metadata.aux_bundles.clone(),
+            stage: crate::eviction_finalize::FinalizeStage::default(),
+            attempts: 0,
+            disk_manifest: None,
+            memory_manifest: None,
+        };
+        let Some(finalizer) = self.eviction_finalizer() else {
+            // Gated above; unreachable in practice (checkpoint_dir just
+            // got checked), but never destroy a fresh capture on a
+            // defensive None — clean up and fail loudly instead.
+            let _ = tokio::fs::remove_dir_all(&dest).await;
+            return Err(SandboxError::InvalidSpec(
+                "checkpoint_dir disappeared between the gate check and record construction".into(),
+            ));
+        };
+        if let Err(e) = record.persist(&finalizer.finalize_dir()).await {
+            // Finding 4: mirror the disk-pending failure arm above and the
+            // `None` arm just before it — a persist failure here must not
+            // leak the multi-GiB local staging dir. The eviction scanner
+            // retries ~30s apart, each attempt minting a fresh snapshot_id
+            // + `dest`; without this cleanup that's an unbounded disk-fill
+            // class on a host whose finalize_dir write path is unhealthy.
+            let _ = tokio::fs::remove_dir_all(&dest).await;
+            return Err(SandboxError::Snapshot(format!(
+                "persist eviction finalize record: {e}"
+            )));
         }
+        metrics::counter!(crate::metrics::EVICTION_FINALIZE_PERSISTED_TOTAL).increment(1);
+        self.pending_finalizes.insert(id, snapshot_id);
+
+        tokio::spawn(async move {
+            // The capture lock rides into the task: periodic checkpoints
+            // stay locked out until the finalize completes (chain
+            // bookkeeping is not concurrent-safe per sandbox) — same
+            // guarantee the pre-#529 shape gave, now held for the whole
+            // (re-drivable) job instead of just one process's attempt.
+            crate::eviction_finalize::run_eviction_finalize(finalizer, record, capture_guard).await;
+        });
         Ok(snapshot_id)
     }
 
@@ -5852,6 +6582,10 @@ impl SandboxBackend for PooledBackend {
         self.inner.working_set_trace_path(id)
     }
 
+    fn prefault_stats_path(&self, id: SandboxId) -> Option<std::path::PathBuf> {
+        self.inner.prefault_stats_path(id)
+    }
+
     fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> std::path::PathBuf {
         self.inner.snapshot_path_for(snapshot_id)
     }
@@ -5988,6 +6722,73 @@ impl SandboxBackend for PooledBackend {
                 }
             }
         }
+        // ADR 0019 / telemetry restoration (#526): read the uffd-handler's
+        // per-jail prefault-effectiveness snapshot and emit the
+        // `engram_resume_prefault_*` counters.
+        //
+        // Review finding 1: this used to read `stats_path` synchronously
+        // the instant `restore_with` returned — i.e. the instant FC resumes
+        // vCPUs. But `prefault_from_trace` runs on the handler's dedicated
+        // background thread (ADR 0043 P1, deliberately off the resume
+        // critical path) and only writes the file at the END of that fetch
+        // (seconds; longer on the migration-dest path). Reading immediately
+        // raced the write and chronically misclassified healthy replayed
+        // resumes as `stats_missing`.
+        //
+        // Fix: detach the read into a bounded, backgrounded poll (spawned,
+        // non-blocking — `restore()` must never wait on it, the same
+        // guardrail that put the fetch on a background thread in the first
+        // place) that retries until the file shows up or a generous timeout
+        // elapses. A file that still isn't there after
+        // `PREFAULT_STATS_POLL_TIMEOUT` really does mean the handler died
+        // or the wiring didn't fire — the alarm the counter exists for.
+        //
+        // Finding 5: record the outcome as attributes on a dedicated
+        // `resume.prefault_stats` span (not the RPC's `host.restore` span)
+        // carrying `sandbox_id` for correlation — same "detached work gets
+        // its own span, correlated by attribute, not a fake/held-open
+        // parent" shape this PR already uses for scanner-driven pipelines
+        // and for `restore.prefetch_memory_bg` just above.
+        if let Some(stats_path) = self.prefault_stats_path(id) {
+            tokio::spawn(tracing::Instrument::instrument(
+                async move {
+                    let stats_bytes = read_prefault_stats_with_retry(&stats_path).await;
+                    let outcome = classify_prefault_outcome(stats_bytes.as_deref());
+                    let span = tracing::Span::current();
+                    span.record("outcome", outcome.label());
+                    if let PrefaultOutcome::Replayed { installed, skipped } = outcome {
+                        span.record("installed", installed as u64);
+                        span.record("skipped", skipped as u64);
+                    }
+                    // Finding 6: the peer-fill snapshot (post-copy
+                    // migration destinations only) — span attributes
+                    // only, not a counter; only recorded when nonzero so
+                    // the common non-peer resume doesn't carry four
+                    // always-0 fields.
+                    if let Some(peer) = parse_peer_fill_snapshot(stats_bytes.as_deref())
+                        .filter(PeerFillSnapshot::is_nonzero)
+                    {
+                        span.record("peer_pulled", peer.peer_pulled);
+                        span.record("peer_alt_sourced", peer.peer_alt_sourced);
+                        span.record("peer_zero_chunks", peer.peer_zero_chunks);
+                        span.record("peer_live_faults", peer.peer_live_faults);
+                    }
+                    tracing::info!(outcome = outcome.label(), "resume prefault effectiveness");
+                    emit_prefault_metrics(outcome);
+                },
+                tracing::info_span!(
+                    "resume.prefault_stats",
+                    sandbox_id = %id,
+                    outcome = tracing::field::Empty,
+                    installed = tracing::field::Empty,
+                    skipped = tracing::field::Empty,
+                    peer_pulled = tracing::field::Empty,
+                    peer_alt_sourced = tracing::field::Empty,
+                    peer_zero_chunks = tracing::field::Empty,
+                    peer_live_faults = tracing::field::Empty,
+                ),
+            ));
+        }
         Ok(id)
     }
 
@@ -6058,6 +6859,20 @@ impl SandboxBackend for PooledBackend {
         // whole reconciliation point). GCS chunks are the durable truth;
         // ADR 0039: the chain is manifest-only now (no local rolling
         // image), so there's nothing on disk to remove here.
+        //
+        // Issue #529: the same invariant covers `eviction_finalize.rs`'s
+        // `EvictionFinalizeRecord`/`CheckpointRecord{kind:EvictionFinal}`
+        // (`<checkpoint_dir>/finalize/`, `.../records/`) and the
+        // `pending_finalizes` idempotency map — none of the three are
+        // touched here. In the normal flow that's moot: `run_terminal`
+        // deletes the `EvictionFinalizeRecord` and clears
+        // `pending_finalizes` itself, strictly BEFORE calling this
+        // `destroy()` (see the ordering in `run_terminal`). Were `destroy`
+        // ever invoked directly on a sandbox with a still-in-flight
+        // finalize (outside that job's own terminal step — not a path any
+        // caller in this repo takes today), the finalize job would keep
+        // running unaffected: it is a pure function of `dest` + the chunk
+        // store, never the live sandbox, and this method deletes neither.
         let _ = self.checkpoint_chains.remove(&id);
         let _ = self.capture_locks.remove(&id);
         // Issue #221: reclaim any unconsumed `snapshot_wait` slot. The
@@ -6076,12 +6891,12 @@ impl SandboxBackend for PooledBackend {
     async fn start_agent(&self, id: SandboxId, mut agent: AgentSpec) -> Result<(), SandboxError> {
         // ADR 0021 P1.2: only the host-agent knows the per-host egress-
         // proxy CA, so it stamps the PEM onto the AgentSpec right
-        // before the backend sees it. The FC backend uses this in its
-        // `InstallHostCa` round-trip to agentd (post-readiness,
-        // pre-SpawnHarness). Coord-supplied specs always arrive with
-        // `host_ca_pem = None`; the host-agent fills it in here. The
-        // legacy drive-based delivery still runs in parallel until
-        // P1.5 retires the harness drive.
+        // before the backend sees it. Each backend rides it into the
+        // guest on the same `SpawnHarness` frame that spawns the
+        // harness (2026-07 core-ops fold — one first-contact RPC
+        // installs the CA and spawns, instead of a separate round
+        // trip). Coord-supplied specs always arrive with
+        // `host_ca_pem = None`; the host-agent fills it in here.
         if agent.host_ca_pem.is_none() {
             agent.host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.clone());
         }
@@ -6102,6 +6917,7 @@ impl SandboxBackend for PooledBackend {
         spec: SandboxSpec,
         warm: Option<WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         // ADR 0021 P1.5: no stub-harness attach — the harness lives
         // in the rootfs of the image being captured, so the snapshot
@@ -6134,9 +6950,27 @@ impl SandboxBackend for PooledBackend {
         // on every path.
         let capture_egress = self.register_capture_egress(id, warm.as_ref()).await;
 
+        // Issue #539: `phase=boot` — the capture VM exists and is booting to
+        // agentd-ready. Best-effort; a slow/dropped consumer must not stall
+        // the capture.
+        let boot_event = engram_core::types::CaptureProgress {
+            phase: engram_core::types::CapturePhase::Boot,
+            warm_stage: None,
+            detail: None,
+            output_tail: String::new(),
+            warm_stages: Vec::new(),
+        };
+        let _ = progress.try_send(boot_event.clone());
+
         // Drive the capture to a snapshot, then ALWAYS tear the VM down —
         // a capture VM has no session and must not linger.
         let captured = async {
+            // Finding 1: a slow cold boot / chunk materialize has no
+            // progress source of its own to renew the capture-claim lease
+            // — resend the boot frame every 30s until agentd-ready (or we
+            // bail). Dropped (stopping the ticker) the instant this leg
+            // ends, on every path, including the early `?`-returns below.
+            let boot_keepalive = spawn_leg_keepalive(progress.clone(), boot_event);
             // Wait for the guest to reach agentd-ready (bootstrap on
             // accept(), harness unmounted — the option-D capture point).
             // VZ backend doesn't support this (FC-only), so ignore InvalidSpec.
@@ -6145,6 +6979,7 @@ impl SandboxBackend for PooledBackend {
                 Err(SandboxError::InvalidSpec(_)) => {}
                 Err(e) => return Err(e),
             }
+            drop(boot_keepalive);
             // Capture-time prewarm hook (image `[warm]`): run the warm
             // command in the live VM BEFORE the snapshot, so a process it
             // leaves running (e.g. a `gradle --daemon`) is frozen into the
@@ -6161,8 +6996,16 @@ impl SandboxBackend for PooledBackend {
             // needs (e.g. an `op` token, resolved coordinator-side); still
             // NO per-session secrets — those are session policy, injected
             // post-restore, not at capture.
+            //
+            // `warm_tail` survives a successful hook so a LATER
+            // snapshot-phase failure can still report the hook's last
+            // output — the diagnosis a `status None` / vsock-lost failure
+            // used to lose entirely.
+            let mut warm_tail = crate::warm_progress::OutputTail::default();
             if let Some(warm) = &warm {
-                self.run_warm_hook(id, warm, &session_env).await?;
+                warm_tail = self
+                    .run_warm_hook(id, warm, &session_env, &progress)
+                    .await?;
             }
             // Close the cold-boot window (mirrors `start_agent`) before the
             // snapshot flush opens its own `snapshot` operation scope.
@@ -6170,10 +7013,36 @@ impl SandboxBackend for PooledBackend {
             if let Some(state) = self.nbd_sandboxes.get(&id) {
                 state.backend.operation_scope().end();
             }
+            // `phase=snapshot` — the warm hook (if any) is done; pause/flush/
+            // chunk is next. Carries the warm tail forward so a live watcher
+            // still sees it during the (usually short) snapshot phase.
+            let snapshot_event = engram_core::types::CaptureProgress {
+                phase: engram_core::types::CapturePhase::Snapshot,
+                warm_stage: None,
+                detail: None,
+                output_tail: warm_tail.render(),
+                warm_stages: Vec::new(),
+            };
+            let _ = progress.try_send(snapshot_event.clone());
+            // Finding 1: pause/flush/chunk memory + upload a multi-GB
+            // state blob to BlobStorage has historically run many minutes
+            // on dev-brain with zero progress traffic once the warm hook
+            // (if any) is done — same lease-staleness risk as the boot
+            // leg above.
+            let snapshot_keepalive = spawn_leg_keepalive(progress.clone(), snapshot_event);
             // Capture: pause → flush disk → chunk memory + upload
             // state.bin/sidecar to BlobStorage. This is the portable
             // artifact `create_session` restores from.
-            self.snapshot(id).await
+            let result = self.snapshot(id).await.map_err(|e| {
+                SandboxError::CaptureFailed(engram_core::types::CaptureFailure {
+                    kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
+                    stage: None,
+                    tail: warm_tail.render(),
+                    message: e.to_string(),
+                })
+            });
+            drop(snapshot_keepalive);
+            result
         }
         .await;
 
@@ -6298,8 +7167,20 @@ impl SandboxBackend for PooledBackend {
         self.inner.list().await
     }
 
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
-        self.inner.guest_ip(id).await
+    /// ADR 0068: proxy to the wrapped backend, same as every other
+    /// capability method here — `FirecrackerBackend` overrides the
+    /// trait default with the ground-truth manifest check; VZ/Process
+    /// inherit the default (list-membership mirror). The pool itself
+    /// tracks no independent liveness signal worth adding here.
+    async fn probe_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        self.inner.probe_sandbox(id).await
+    }
+
+    async fn guest_endpoints(&self, id: SandboxId) -> Option<GuestEndpoints> {
+        self.inner.guest_endpoints(id).await
     }
 
     /// ADR 0014 follow-up: forward to inner. Without this, the
@@ -6320,21 +7201,16 @@ impl SandboxBackend for PooledBackend {
     /// this the trait default (`Ok(5900)`) would run and the FC/VZ backend's
     /// actual vsock StartBrowser RPC to in-VM agentd would never fire, so
     /// the host's `proxy_vnc` would dial a port nothing started.
-    async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+    async fn start_browser(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         self.inner.start_browser(id).await
     }
 
     /// ADR 0065: forward to inner (the trait default is a no-op).
     async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
         self.inner.stop_browser(id).await
-    }
-
-    async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
-        self.inner.netns_name_for(id).await
-    }
-
-    async fn vm_internal_ip(&self, id: SandboxId) -> Option<String> {
-        self.inner.vm_internal_ip(id).await
     }
 
     /// ADR 0016 Phase A: COW diagnostic. Reads from the NBD-backed
@@ -6811,6 +7687,112 @@ mod tests {
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
 
+    /// ADR 0019 / telemetry restoration (#526): the stats-file → outcome
+    /// mapping `restore()` drives `engram_resume_prefault_total` off.
+    /// Covers the three labeled outcomes, the alarm shape (absent file),
+    /// and defensive handling of an unparseable file.
+    #[test]
+    fn classify_prefault_outcome_covers_all_three_labels() {
+        // Absent file (read failed / never written) => the alarm.
+        assert_eq!(
+            classify_prefault_outcome(None),
+            PrefaultOutcome::StatsMissing
+        );
+
+        // trace_loaded: false => expected "nothing to replay" case.
+        let no_trace = br#"{"trace_loaded":false,"chunks_in_trace":0,"installed":0,"skipped":0,"duration_ms":3}"#;
+        assert_eq!(
+            classify_prefault_outcome(Some(no_trace)),
+            PrefaultOutcome::NoTrace
+        );
+
+        // trace_loaded: true => replayed, carrying installed/skipped.
+        let replayed = br#"{"trace_loaded":true,"chunks_in_trace":10,"installed":8,"skipped":2,"duration_ms":42}"#;
+        assert_eq!(
+            classify_prefault_outcome(Some(replayed)),
+            PrefaultOutcome::Replayed {
+                installed: 8,
+                skipped: 2
+            }
+        );
+
+        // Corrupt/unparseable bytes => treated the same as absent (a
+        // handler that died mid-write is just as much an alarm as one
+        // that never wrote at all).
+        assert_eq!(
+            classify_prefault_outcome(Some(b"not json")),
+            PrefaultOutcome::StatsMissing
+        );
+
+        // Extra/superset fields (the prefault-admission-control
+        // convergence schema, e.g. a `trace_source` field) must not
+        // break parsing — #[serde(default)] + no `deny_unknown_fields`.
+        let superset = br#"{"trace_loaded":true,"chunks_in_trace":1,"installed":1,"skipped":0,"duration_ms":1,"trace_source":"canonical"}"#;
+        assert_eq!(
+            classify_prefault_outcome(Some(superset)),
+            PrefaultOutcome::Replayed {
+                installed: 1,
+                skipped: 0
+            }
+        );
+    }
+
+    /// Review finding 1 regression test: a file that lands mid-poll
+    /// (mirroring the uffd-handler's background prefault write racing
+    /// resume-return) must be picked up, not misclassified as
+    /// `stats_missing` on the first miss.
+    #[tokio::test]
+    async fn prefault_stats_retry_picks_up_a_late_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefault-stats.json");
+        let write_path = path.clone();
+        // Simulate the handler's background thread: the file doesn't
+        // exist yet when the poll starts, and lands ~30ms later (well
+        // inside the poll's bound but after several immediate misses).
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            tokio::fs::write(
+                &write_path,
+                b"{\"trace_loaded\":true,\"installed\":3,\"skipped\":0}",
+            )
+            .await
+            .unwrap();
+        });
+        let bytes = read_prefault_stats_with_retry_bounded(
+            &path,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            classify_prefault_outcome(bytes.as_deref()),
+            PrefaultOutcome::Replayed {
+                installed: 3,
+                skipped: 0
+            }
+        );
+    }
+
+    /// A file that never appears within the bound still classifies as
+    /// `stats_missing` — the real alarm case (handler died / never
+    /// fired) must survive the race-tolerance fix, just no longer fire
+    /// on the first instant.
+    #[tokio::test]
+    async fn prefault_stats_retry_times_out_to_stats_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefault-stats.json");
+        let bytes = read_prefault_stats_with_retry_bounded(
+            &path,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(30),
+        )
+        .await;
+        assert_eq!(
+            classify_prefault_outcome(bytes.as_deref()),
+            PrefaultOutcome::StatsMissing
+        );
+    }
+
     fn warm_with(network: Option<engram_core::types::image::NetworkPolicy>) -> WarmConfig {
         WarmConfig {
             command: vec!["true".into()],
@@ -6818,6 +7800,51 @@ mod tests {
             workdir: None,
             network,
         }
+    }
+
+    /// Review finding 1: a leg wrapped by `spawn_leg_keepalive` must keep
+    /// resending the SAME event on the keepalive interval until the
+    /// guard is dropped, and must stop immediately once it is. This is
+    /// the mechanism that keeps the coordinator's fenced `enable_jobs`
+    /// write (== the capture-claim lease renewal, since the blind ticker
+    /// was deleted) alive during the boot/snapshot legs, which have no
+    /// `[warm]`-hook progress traffic of their own to drive it.
+    #[tokio::test]
+    async fn leg_keepalive_resends_until_dropped() {
+        // SAFETY: `cargo nextest run` (the repo's enforced test runner —
+        // see `just check`) gives every test its own process, so mutating
+        // process env here can't race a sibling test.
+        std::env::set_var("ENGRAM_CAPTURE_KEEPALIVE_SECS", "1");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let event = engram_core::types::CaptureProgress {
+            phase: engram_core::types::CapturePhase::Boot,
+            warm_stage: None,
+            detail: None,
+            output_tail: "boot-in-progress".into(),
+            warm_stages: Vec::new(),
+        };
+        let guard = spawn_leg_keepalive(tx, event.clone());
+
+        // Two resends within the (test-shrunk) 1s interval.
+        for _ in 0..2 {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("keepalive must resend within the timeout")
+                .expect("channel must stay open while the guard is alive");
+            assert_eq!(got.phase, engram_core::types::CapturePhase::Boot);
+            assert_eq!(got.output_tail, "boot-in-progress");
+        }
+
+        drop(guard);
+        while rx.try_recv().is_ok() {
+            // drain anything already in flight before the drop landed
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no further resend once the guard is dropped"
+        );
     }
 
     /// An image with no `[warm.network]` — and a deny-default policy that lists
@@ -6994,6 +8021,7 @@ mod tests {
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
                     aux_bundles: vec![],
+                    paused_at: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -7032,8 +8060,14 @@ mod tests {
 
         // No warm hook: the exemption must cover the whole capture lifetime —
         // even a big image's snapshot alone can outlast the reconcile debounce.
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
         pooled
-            .build_base_snapshot(live_spec("base-capture-exempt"), None, Default::default())
+            .build_base_snapshot(
+                live_spec("base-capture-exempt"),
+                None,
+                Default::default(),
+                progress_tx,
+            )
             .await
             .expect("capture");
 
@@ -7046,6 +8080,610 @@ mod tests {
         assert!(
             !pooled.is_base_capture(id),
             "the exemption must be cleared after the capture VM is torn down",
+        );
+    }
+
+    /// Review finding 1: a slow cold boot (agentd-ready takes a while)
+    /// must keep emitting `phase=boot` `CaptureProgress` on the keepalive
+    /// interval — not just the one frame at the very start — or the
+    /// coordinator's fenced write (== the capture-claim lease renewal)
+    /// goes stale and a peer re-claims mid-boot. No `[warm]` hook here:
+    /// this specifically isolates the BOOT leg's own keepalive from
+    /// `run_warm_hook`'s (already covered by other tests).
+    #[tokio::test]
+    async fn slow_boot_keeps_emitting_boot_phase_progress() {
+        // SAFETY: see the ENGRAM_WARM_STALL_SECS precedent elsewhere in
+        // this module — nextest gives every test its own process.
+        std::env::set_var("ENGRAM_CAPTURE_KEEPALIVE_SECS", "1");
+
+        struct Probe {
+            staging: PathBuf,
+        }
+        struct SlowBootMock(Arc<Probe>);
+        #[async_trait]
+        impl SandboxBackend for SlowBootMock {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn wait_agent_ready(&self, _: SandboxId) -> Result<(), SandboxError> {
+                // Longer than 2 keepalive ticks (1s each): proves the
+                // boot leg's own keepalive fires WHILE we're still
+                // waiting, not just the single frame sent before this
+                // call.
+                tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+                Ok(())
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                unreachable!("no [warm] hook in this test — exec_stream must not be called")
+            }
+            async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                let snapshot_id = engram_core::SnapshotId::new();
+                let dest = self.0.staging.join(snapshot_id.to_string());
+                tokio::fs::create_dir_all(&dest).await.unwrap();
+                tokio::fs::write(dest.join("memory.bin"), vec![7u8; 4096])
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("state.bin"), b"x")
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("manifest.json"), b"{}")
+                    .await
+                    .unwrap();
+                let _ = id;
+                Ok(SnapshotMetadata {
+                    id: snapshot_id,
+                    size_bytes: 4096,
+                    created_at: chrono::Utc::now(),
+                    image_version: "t:1".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                    working_set_blob_key: None,
+                    aux_bundles: vec![],
+                    paused_at: None,
+                })
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.0.staging.join(id.to_string())
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = Arc::new(Probe {
+            staging: tmp.path().join("snaps"),
+        });
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = engram_chunk_store::ChunkStore::new(blob);
+        let inner: Arc<dyn SandboxBackend> = Arc::new(SlowBootMock(probe));
+        let pooled =
+            PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized"));
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
+
+        pooled
+            .build_base_snapshot(
+                live_spec("slow-boot"),
+                None, // no [warm] hook: isolates the boot leg
+                Default::default(),
+                progress_tx,
+            )
+            .await
+            .expect("capture with no warm hook must succeed");
+
+        let boot_events = {
+            let mut n = 0;
+            while let Ok(ev) = progress_rx.try_recv() {
+                if ev.phase == engram_core::types::CapturePhase::Boot {
+                    n += 1;
+                }
+            }
+            n
+        };
+        assert!(
+            boot_events >= 2,
+            "expected the boot leg's keepalive to resend at least once \
+             during a 2.5s wait_agent_ready with a 1s interval, got {boot_events} boot events"
+        );
+    }
+
+    /// Review finding 3: `Exit(None)` (the child died to a signal) MUST
+    /// NOT be unconditionally labeled `WarmGlobalTimeout` — that's only
+    /// correct when agentd's `timeout_ms` in-guest backstop actually
+    /// fired. A hook killed by something else (guest OOM, a manual
+    /// `kill -9`) well before its declared `timeout_secs` budget must
+    /// classify as the distinct, unattributed `WarmKilled` kind, or an
+    /// operator gets steered to raise `timeout_secs` for a failure that
+    /// timeout had nothing to do with.
+    #[tokio::test]
+    async fn warm_hook_early_signal_kill_is_not_misclassified_as_global_timeout() {
+        struct EarlySignalKillMock;
+        #[async_trait]
+        impl SandboxBackend for EarlySignalKillMock {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn exec_stream(
+                &self,
+                id: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                // Exit(None) arrives almost immediately — nowhere near
+                // the 30s `timeout_secs` budget below.
+                let events =
+                    futures::stream::iter(vec![engram_core::types::sandbox::ExecEvent::Exit(None)]);
+                Ok(ExecStream {
+                    sandbox_id: id,
+                    exec_id: "exec-early-kill".into(),
+                    events: Box::pin(events),
+                })
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                unreachable!("a killed [warm] hook must fail the capture before snapshot runs")
+            }
+            fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+                unreachable!()
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let inner: Arc<dyn SandboxBackend> = Arc::new(EarlySignalKillMock);
+        let pooled = PooledBackend::new(inner);
+        let warm = WarmConfig {
+            command: vec!["true".into()],
+            // Generous: proves the classification isn't just "we're near
+            // the deadline", it's "we're nowhere near it".
+            timeout_secs: Some(30),
+            workdir: None,
+            network: None,
+        };
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            pooled.build_base_snapshot(
+                live_spec("warm-early-kill"),
+                Some(warm),
+                Default::default(),
+                progress_tx,
+            ),
+        )
+        .await
+        .expect("must not hang");
+
+        let Err(SandboxError::CaptureFailed(failure)) = result else {
+            panic!("expected a structured CaptureFailed error, got {result:?}");
+        };
+        assert_eq!(
+            failure.kind,
+            engram_core::types::CaptureFailureKind::WarmKilled,
+            "an Exit(None) far from the timeout budget must not be labeled WarmGlobalTimeout"
+        );
+    }
+
+    /// Issue #539: a `[warm]` hook that emits one `start` progress line and
+    /// then goes silent (no more stdout/stderr, no `Exit`) must be killed
+    /// within the (test-shrunk) stall budget — not the old single opaque
+    /// global timeout, which this test sets generously (30s) precisely so
+    /// a pass proves the STALL path fired, not the global-timeout backstop.
+    /// The resulting `SandboxError::CaptureFailed` must name the open
+    /// stage and carry the hook's own output in its tail; the same
+    /// information must also have reached a live `CaptureProgress` event
+    /// on the `progress` channel before the terminal failure.
+    #[tokio::test]
+    async fn warm_hook_stall_fails_capture_with_stage_and_tail() {
+        use futures::StreamExt;
+
+        // SAFETY: `cargo nextest run` (the repo's enforced test runner —
+        // see `just check`) gives every test its own process, so mutating
+        // process env here can't race a sibling test.
+        std::env::set_var("ENGRAM_WARM_STALL_SECS", "1");
+
+        struct SilentAfterStartMock;
+        #[async_trait]
+        impl SandboxBackend for SilentAfterStartMock {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn exec_stream(
+                &self,
+                id: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                let line = "::engram-warm:: event=start stage=deps-up msg=installing deps\n";
+                let events =
+                    futures::stream::iter(vec![engram_core::types::sandbox::ExecEvent::Stdout(
+                        bytes::Bytes::from(line),
+                    )])
+                    .chain(futures::stream::pending());
+                Ok(ExecStream {
+                    sandbox_id: id,
+                    exec_id: "exec-stall".into(),
+                    events: Box::pin(events),
+                })
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                unreachable!("a stalled [warm] hook must fail the capture before snapshot runs")
+            }
+            fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+                unreachable!()
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let inner: Arc<dyn SandboxBackend> = Arc::new(SilentAfterStartMock);
+        let pooled = PooledBackend::new(inner);
+        let warm = WarmConfig {
+            command: vec!["true".into()],
+            // Generous global timeout: the test proves the STALL path (1s,
+            // via ENGRAM_WARM_STALL_SECS above), not this backstop.
+            timeout_secs: Some(30),
+            workdir: None,
+            network: None,
+        };
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            pooled.build_base_snapshot(
+                live_spec("warm-stall"),
+                Some(warm),
+                Default::default(),
+                progress_tx,
+            ),
+        )
+        .await
+        .expect("must fail within the stall budget, not hang past the test timeout");
+
+        let Err(SandboxError::CaptureFailed(failure)) = result else {
+            panic!("expected a structured CaptureFailed error, got {result:?}");
+        };
+        assert_eq!(
+            failure.kind,
+            engram_core::types::CaptureFailureKind::WarmStall
+        );
+        assert_eq!(failure.stage.as_deref(), Some("deps-up"));
+        assert!(
+            failure.tail.contains("deps-up"),
+            "tail must carry the hook's own output: {}",
+            failure.tail
+        );
+
+        let mut saw_live_stage = false;
+        while let Ok(ev) = progress_rx.try_recv() {
+            if ev.warm_stage.as_deref() == Some("deps-up") {
+                saw_live_stage = true;
+            }
+        }
+        assert!(
+            saw_live_stage,
+            "expected a live CaptureProgress event naming the stage before the terminal failure"
+        );
+    }
+
+    /// Review finding 5: a hook that streams newline-free output (gradle
+    /// rich-console `\r` redraws, binary noise) must not grow
+    /// `pending_stdout` unbounded — and, once the cap drops the
+    /// unparseable noise, a real `::engram-warm::` line arriving right
+    /// after must still parse cleanly (the cap doesn't wedge future
+    /// parsing).
+    #[tokio::test]
+    async fn warm_hook_newline_free_noise_does_not_wedge_progress_parsing() {
+        struct Probe {
+            staging: PathBuf,
+        }
+        struct NoiseThenLineMock(Arc<Probe>);
+        #[async_trait]
+        impl SandboxBackend for NoiseThenLineMock {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn exec_stream(
+                &self,
+                id: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                use engram_core::types::sandbox::ExecEvent;
+                // Well past OutputTail::DEFAULT_CAP_BYTES (16 KiB), no
+                // newline anywhere — the exact shape that grew
+                // `pending_stdout` unbounded pre-fix.
+                let noise = vec![b'x'; 64 * 1024];
+                let events = futures::stream::iter(vec![
+                    ExecEvent::Stdout(bytes::Bytes::from(noise)),
+                    ExecEvent::Stdout(bytes::Bytes::from(
+                        "::engram-warm:: event=start stage=after-noise\n",
+                    )),
+                    ExecEvent::Stdout(bytes::Bytes::from(
+                        "::engram-warm:: event=done stage=after-noise\n",
+                    )),
+                    ExecEvent::Exit(Some(0)),
+                ]);
+                Ok(ExecStream {
+                    sandbox_id: id,
+                    exec_id: "exec-noise".into(),
+                    events: Box::pin(events),
+                })
+            }
+            async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                let snapshot_id = engram_core::SnapshotId::new();
+                let dest = self.0.staging.join(snapshot_id.to_string());
+                tokio::fs::create_dir_all(&dest).await.unwrap();
+                tokio::fs::write(dest.join("memory.bin"), vec![7u8; 4096])
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("state.bin"), b"x")
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("manifest.json"), b"{}")
+                    .await
+                    .unwrap();
+                let _ = id;
+                Ok(SnapshotMetadata {
+                    id: snapshot_id,
+                    size_bytes: 4096,
+                    created_at: chrono::Utc::now(),
+                    image_version: "t:1".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                    working_set_blob_key: None,
+                    aux_bundles: vec![],
+                    paused_at: None,
+                })
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.0.staging.join(id.to_string())
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = Arc::new(Probe {
+            staging: tmp.path().join("snaps"),
+        });
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = engram_chunk_store::ChunkStore::new(blob);
+        let inner: Arc<dyn SandboxBackend> = Arc::new(NoiseThenLineMock(probe));
+        let pooled = Arc::new(
+            PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized")),
+        );
+        let warm = WarmConfig {
+            command: vec!["true".into()],
+            timeout_secs: Some(30),
+            workdir: None,
+            network: None,
+        };
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            pooled.build_base_snapshot(
+                live_spec("warm-noise"),
+                Some(warm),
+                Default::default(),
+                progress_tx,
+            ),
+        )
+        .await
+        .expect("must not hang on unbounded newline-free output");
+
+        result.expect("a hook that exits 0 must succeed even after newline-free noise");
+
+        let mut saw_stage = false;
+        while let Ok(ev) = progress_rx.try_recv() {
+            if ev.warm_stage.as_deref() == Some("after-noise") {
+                saw_stage = true;
+            }
+        }
+        assert!(
+            saw_stage,
+            "the real progress line after the noise must still parse"
+        );
+    }
+
+    /// Issue #539: a `[warm]` hook that emits two stages and exits 0 must
+    /// succeed, and the ordered `CaptureProgress` events observed on the
+    /// channel must carry the full (closed) stage history.
+    #[tokio::test]
+    async fn warm_hook_two_stages_then_exit_zero_succeeds_with_ordered_progress() {
+        struct Probe {
+            staging: PathBuf,
+        }
+        struct TwoStageMock(Arc<Probe>);
+        #[async_trait]
+        impl SandboxBackend for TwoStageMock {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn exec_stream(
+                &self,
+                id: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                use engram_core::types::sandbox::ExecEvent;
+                let lines = [
+                    "::engram-warm:: event=start stage=deps-up\n",
+                    "::engram-warm:: event=done stage=deps-up\n",
+                    "::engram-warm:: event=start stage=migrations\n",
+                    "::engram-warm:: event=done stage=migrations\n",
+                ]
+                .concat();
+                let events = futures::stream::iter(vec![
+                    ExecEvent::Stdout(bytes::Bytes::from(lines)),
+                    ExecEvent::Exit(Some(0)),
+                ]);
+                Ok(ExecStream {
+                    sandbox_id: id,
+                    exec_id: "exec-two-stage".into(),
+                    events: Box::pin(events),
+                })
+            }
+            async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                let snapshot_id = engram_core::SnapshotId::new();
+                let dest = self.0.staging.join(snapshot_id.to_string());
+                tokio::fs::create_dir_all(&dest).await.unwrap();
+                tokio::fs::write(dest.join("memory.bin"), vec![7u8; 4096])
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("state.bin"), b"x")
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("manifest.json"), b"{}")
+                    .await
+                    .unwrap();
+                let _ = id;
+                Ok(SnapshotMetadata {
+                    id: snapshot_id,
+                    size_bytes: 4096,
+                    created_at: chrono::Utc::now(),
+                    image_version: "t:1".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                    working_set_blob_key: None,
+                    aux_bundles: vec![],
+                    paused_at: None,
+                })
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.0.staging.join(id.to_string())
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = Arc::new(Probe {
+            staging: tmp.path().join("snaps"),
+        });
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = engram_chunk_store::ChunkStore::new(blob);
+        let inner: Arc<dyn SandboxBackend> = Arc::new(TwoStageMock(probe.clone()));
+        let pooled = Arc::new(
+            PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized")),
+        );
+
+        let warm = WarmConfig {
+            command: vec!["true".into()],
+            timeout_secs: Some(30),
+            workdir: None,
+            network: None,
+        };
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
+
+        pooled
+            .build_base_snapshot(
+                live_spec("warm-two-stage"),
+                Some(warm),
+                Default::default(),
+                progress_tx,
+            )
+            .await
+            .expect("a two-stage hook that exits 0 must succeed");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = progress_rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            !events.is_empty(),
+            "expected at least one CaptureProgress event"
+        );
+        // The last warm-phase event's stage history must show both stages
+        // closed with outcome `Done`, in emission order.
+        let last_warm = events
+            .iter()
+            .rev()
+            .find(|e| e.phase == engram_core::types::CapturePhase::Warm)
+            .expect("at least one phase=warm event");
+        assert_eq!(last_warm.warm_stages.len(), 2);
+        assert_eq!(last_warm.warm_stages[0].name, "deps-up");
+        assert_eq!(
+            last_warm.warm_stages[0].outcome,
+            engram_core::types::WarmStageOutcome::Done
+        );
+        assert_eq!(last_warm.warm_stages[1].name, "migrations");
+        assert_eq!(
+            last_warm.warm_stages[1].outcome,
+            engram_core::types::WarmStageOutcome::Done
         );
     }
 
@@ -7073,6 +8711,12 @@ mod tests {
     async fn migration_fetch_rejects_unlisted_hash_and_bad_export_id() {
         use engram_core::types::snapshot::MigrationItem;
         use futures::StreamExt;
+        // A near-full dev/CI disk trips the cache's default free-space
+        // floor and evicts the chunk this test `cache.put`s below before
+        // `migration_fetch` can serve it. Nextest runs each test in its
+        // own process, so this env override is safe (see
+        // two_host_drain_wave.rs / migration_source.rs).
+        std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
         let tmp = tempfile::tempdir().unwrap();
         let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
             engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
@@ -7752,6 +9396,7 @@ mod tests {
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
                     aux_bundles: vec![],
+                    paused_at: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -7891,6 +9536,7 @@ mod tests {
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
                     aux_bundles: vec![],
+                    paused_at: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -8030,6 +9676,7 @@ mod tests {
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
                     aux_bundles: vec![],
+                    paused_at: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -8265,6 +9912,7 @@ mod tests {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            paused_at: None,
         };
         pooled.restore(metadata.clone()).await.unwrap();
 
@@ -8394,6 +10042,7 @@ mod tests {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            paused_at: None,
         };
         let _ = pooled.restore(metadata).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
@@ -8410,6 +10059,13 @@ mod tests {
         use engram_chunk_store::{
             cache::ChunkCacheConfig, ChunkCache, ChunkStore, ManifestKind, ManifestRef,
         };
+
+        // A near-full dev/CI disk trips the cache's default free-space
+        // floor and evicts the chunks the first `materialize_chunked_rootfs`
+        // warms below before the second (store-deleted) call can read them
+        // back. Nextest runs each test in its own process, so this env
+        // override is safe (see two_host_drain_wave.rs / migration_source.rs).
+        std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
 
         let tmp = tempfile::tempdir().unwrap();
         let blob_root = tmp.path().join("blob");
@@ -8642,16 +10298,16 @@ mod tests {
 
     // ──────────────────────────────────────────────────────────────
     // ADR 0014 follow-up (prod 2026-05-20 session 5c8d0ce5):
-    // PooledBackend MUST forward start_shell / netns_name_for /
-    // guest_ip to its inner backend. The SandboxBackend trait has
-    // default impls for these (Ok(7681) / None / None respectively)
-    // that exist for backends without that capability (process,
-    // VZ-without-netns). When PooledBackend wraps a FirecrackerBackend
-    // that DOES implement them, NOT forwarding silently routes
-    // through the trait defaults and the real FC capability never
-    // fires — observed in prod: zero start_shell logs on the host-
-    // agent despite a completed proxy_shell GRPC call, exactly
-    // because PooledBackend.start_shell was using the trait default.
+    // PooledBackend MUST forward start_shell / guest_endpoints to its
+    // inner backend. The SandboxBackend trait has default impls for
+    // these (Ok(7681) / None respectively) that exist for backends
+    // without that capability (process, VZ-without-netns). When
+    // PooledBackend wraps a FirecrackerBackend that DOES implement
+    // them, NOT forwarding silently routes through the trait defaults
+    // and the real FC capability never fires — observed in prod: zero
+    // start_shell logs on the host-agent despite a completed
+    // proxy_shell GRPC call, exactly because PooledBackend.start_shell
+    // was using the trait default.
     // ──────────────────────────────────────────────────────────────
 
     mod inner_forwarding_tests {
@@ -8666,15 +10322,13 @@ mod tests {
             start_shell_calls: Mutex<Vec<SandboxId>>,
             start_browser_calls: Mutex<Vec<SandboxId>>,
             stop_browser_calls: Mutex<Vec<SandboxId>>,
-            netns_name_for_calls: Mutex<Vec<SandboxId>>,
-            guest_ip_calls: Mutex<Vec<SandboxId>>,
+            guest_endpoints_calls: Mutex<Vec<SandboxId>>,
             /// Non-default response values so we can verify the
             /// forward returned the inner's value, not the trait
             /// default.
             shell_port: u16,
             browser_port: u16,
-            netns_name: Option<String>,
-            guest_ip_value: Option<String>,
+            guest_endpoints_value: Option<GuestEndpoints>,
         }
         impl SpyInner {
             fn new() -> Self {
@@ -8682,8 +10336,7 @@ mod tests {
                     start_shell_calls: Mutex::new(Vec::new()),
                     start_browser_calls: Mutex::new(Vec::new()),
                     stop_browser_calls: Mutex::new(Vec::new()),
-                    netns_name_for_calls: Mutex::new(Vec::new()),
-                    guest_ip_calls: Mutex::new(Vec::new()),
+                    guest_endpoints_calls: Mutex::new(Vec::new()),
                     // Pick non-default values so a "trait default ran
                     // instead of our override" failure shows up as a
                     // value mismatch, not just a counter mismatch.
@@ -8691,8 +10344,12 @@ mod tests {
                     // Non-default browser port (the trait default is 5900);
                     // a fall-through would return 5900 with a zero counter.
                     browser_port: 45900,
-                    netns_name: Some("engr-vm-spytest".into()),
-                    guest_ip_value: Some("10.200.0.42".into()),
+                    guest_endpoints_value: Some(GuestEndpoints {
+                        egress_identity: "10.200.0.42".parse().unwrap(),
+                        dial_ip: "10.200.0.2".parse().unwrap(),
+                        netns: Some("engr-vm-spytest".into()),
+                        vsock_uds: None,
+                    }),
                 }
             }
         }
@@ -8727,21 +10384,23 @@ mod tests {
                 self.start_shell_calls.lock().push(id);
                 Ok(self.shell_port)
             }
-            async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+            async fn start_browser(
+                &self,
+                id: SandboxId,
+            ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
                 self.start_browser_calls.lock().push(id);
-                Ok(self.browser_port)
+                Ok(engram_core::traits::sandbox::BrowserStart {
+                    port: self.browser_port,
+                    warning: None,
+                })
             }
             async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
                 self.stop_browser_calls.lock().push(id);
                 Ok(())
             }
-            async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
-                self.netns_name_for_calls.lock().push(id);
-                self.netns_name.clone()
-            }
-            async fn guest_ip(&self, id: SandboxId) -> Option<String> {
-                self.guest_ip_calls.lock().push(id);
-                self.guest_ip_value.clone()
+            async fn guest_endpoints(&self, id: SandboxId) -> Option<GuestEndpoints> {
+                self.guest_endpoints_calls.lock().push(id);
+                self.guest_endpoints_value.clone()
             }
         }
 
@@ -8790,7 +10449,7 @@ mod tests {
             let inner = Arc::new(SpyInner::new());
             let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
             let id = SandboxId::new();
-            let port = pooled.start_browser(id).await.unwrap();
+            let start = pooled.start_browser(id).await.unwrap();
 
             // Inner.start_browser received the sandbox id.
             let calls = inner.start_browser_calls.lock().clone();
@@ -8804,7 +10463,7 @@ mod tests {
             // default (5900). A fall-through would return 5900 and leave
             // the inner's counter at 0.
             assert_eq!(
-                port, inner.browser_port,
+                start.port, inner.browser_port,
                 "must return inner's port (proves the forward, not the 5900 default)",
             );
         }
@@ -8830,43 +10489,28 @@ mod tests {
             );
         }
 
-        /// Same regression but for netns_name_for. The host-agent's
-        /// proxy_shell uses this to decide cold-path (None → dial
-        /// from root) vs warm-path (Some → dial inside netns).
-        /// Without forwarding, every warm-restored sandbox looks
-        /// like a cold one and the proxy_shell dial misses the
-        /// VM entirely.
+        /// Regression guard, consolidated (issue #541): PooledBackend
+        /// MUST forward guest_endpoints to its inner backend. This one
+        /// method now carries what used to be three separate forwards
+        /// (guest_ip / netns_name_for / vm_internal_ip) — asserting
+        /// full value equality against a GuestEndpoints whose fields
+        /// are all non-default (egress_identity != dial_ip, netns
+        /// Some) means a fall-through to the trait's `None` default,
+        /// or a forward that drops a field, both fail on value, not
+        /// just call count.
         #[tokio::test]
-        async fn pooled_backend_forwards_netns_name_for_to_inner() {
+        async fn pooled_backend_forwards_guest_endpoints_to_inner() {
             let inner = Arc::new(SpyInner::new());
             let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
             let id = SandboxId::new();
-            let ns = pooled.netns_name_for(id).await;
+            let endpoints = pooled.guest_endpoints(id).await;
 
-            let calls = inner.netns_name_for_calls.lock().clone();
+            let calls = inner.guest_endpoints_calls.lock().clone();
             assert_eq!(calls, vec![id], "must forward to inner");
             assert_eq!(
-                ns,
-                inner.netns_name.clone(),
+                endpoints,
+                inner.guest_endpoints_value.clone(),
                 "must return inner's value (proves the forward, not the default-None)",
-            );
-        }
-
-        /// guest_ip forwarding was correct pre-fix, but exists
-        /// here as a regression guard so we never lose it.
-        #[tokio::test]
-        async fn pooled_backend_forwards_guest_ip_to_inner() {
-            let inner = Arc::new(SpyInner::new());
-            let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
-            let id = SandboxId::new();
-            let ip = pooled.guest_ip(id).await;
-
-            let calls = inner.guest_ip_calls.lock().clone();
-            assert_eq!(calls, vec![id], "must forward to inner");
-            assert_eq!(
-                ip,
-                inner.guest_ip_value.clone(),
-                "must return inner's value"
             );
         }
     }
@@ -9129,6 +10773,7 @@ mod tests {
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
                     aux_bundles: vec![],
+                    paused_at: None,
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -9398,6 +11043,7 @@ mod tests {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: Vec::new(),
+            paused_at: None,
         }
     }
 
@@ -9574,6 +11220,579 @@ mod tests {
         assert!(
             matches!(cancelled, Ok(Err(_))),
             "destroy must abort the backing upload task (got {cancelled:?})",
+        );
+    }
+
+    // ---- Issue #529: host-durable eviction finalize ----
+    use crate::checkpoint::CheckpointRecord;
+    use parking_lot::Mutex as PlMutex;
+    use std::path::Path;
+
+    /// A `BlobStorage` whose FIRST `put_streaming` blocks until
+    /// released — used to freeze a spawned eviction finalize job
+    /// mid-leg so a test can observe it still pending, deterministically
+    /// (not racing the job's own completion).
+    struct GateFirstPut {
+        inner: engram_storage_local::LocalBlobStorage,
+        gate: Arc<tokio::sync::Notify>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl engram_core::traits::BlobStorage for GateFirstPut {
+        async fn put_streaming(
+            &self,
+            key: &str,
+            body: engram_core::traits::ByteStream,
+        ) -> Result<u64, engram_core::error::BlobError> {
+            if !self.armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.gate.notified().await;
+            }
+            self.inner.put_streaming(key, body).await
+        }
+        async fn get_streaming(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::ByteStream, engram_core::error::BlobError> {
+            self.inner.get_streaming(key).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::error::BlobError> {
+            self.inner.head(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), engram_core::error::BlobError> {
+            self.inner.delete(key).await
+        }
+        async fn list_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<String>, engram_core::error::BlobError> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    /// A minimal FC-shaped capture backend for the eviction-finalize
+    /// tests: `supports_diff_checkpoints() -> true` (the gate
+    /// `snapshot_begin` checks before ever routing here) and a
+    /// `snapshot` that writes the same three artifacts real FC leaves in
+    /// its staging dir (memory.bin, state.bin, manifest.json) — the
+    /// `SnapshotFinisher`/`eviction_finalize` legs' contract.
+    #[derive(Clone)]
+    struct FakeCaptureBackend {
+        payload: Vec<u8>,
+        staging_root: PathBuf,
+        destroy_calls: Arc<PlMutex<Vec<SandboxId>>>,
+    }
+    impl FakeCaptureBackend {
+        fn dir_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+            self.staging_root.join(id.to_string())
+        }
+        async fn write_capture(&self, dest: &Path) {
+            tokio::fs::create_dir_all(dest).await.unwrap();
+            tokio::fs::write(dest.join("memory.bin"), &self.payload)
+                .await
+                .unwrap();
+            tokio::fs::write(dest.join("state.bin"), b"state-bin-placeholder")
+                .await
+                .unwrap();
+            let manifest = serde_json::json!({
+                "sandbox_id": uuid::Uuid::new_v4(),
+                "created_at": chrono::Utc::now(),
+                "spec": {
+                    "image": "test:1", "rootfs_source": null, "image_uri": null,
+                    "harness_pack_uri": null, "cpu": {"vcpus": 1}, "memory": {"max_mib": 64},
+                    "disk": {"max_gib": 1}, "ttl": null, "env": {}, "workdir": null,
+                    "harness_substrate": null, "network": {}
+                },
+                "format": "fc"
+            });
+            tokio::fs::write(
+                dest.join("manifest.json"),
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    #[async_trait]
+    impl SandboxBackend for FakeCaptureBackend {
+        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn exec_stream(
+            &self,
+            _: SandboxId,
+            _: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        fn supports_diff_checkpoints(&self) -> bool {
+            true
+        }
+        async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+            let snapshot_id = engram_core::SnapshotId::new();
+            let dest = self.dir_for(snapshot_id);
+            self.write_capture(&dest).await;
+            Ok(SnapshotMetadata {
+                id: snapshot_id,
+                size_bytes: self.payload.len() as u64,
+                created_at: chrono::Utc::now(),
+                image_version: "test:1".into(),
+                disk_manifest: None,
+                memory_manifest: None,
+                base_memory_manifest: None,
+                migration_source: None,
+                source_sandbox_id: None,
+                state_blob_key: None,
+                sidecar_blob_key: None,
+                rootfs_blob_key: None,
+                working_set_blob_key: None,
+                aux_bundles: vec![],
+                paused_at: None,
+            })
+        }
+        fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+            self.dir_for(id)
+        }
+        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.destroy_calls.lock().push(id);
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            Ok(Vec::new())
+        }
+        async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+            Ok(())
+        }
+    }
+
+    fn finalize_payload() -> Vec<u8> {
+        let mut bytes = vec![0u8; 64 * 1024];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ((i % 200) + 1) as u8; // skip zero so chunks aren't elided
+        }
+        bytes
+    }
+
+    /// `PooledBackend` wired with a chunk store + checkpoint_dir + the
+    /// `FakeCaptureBackend`, ready to exercise `snapshot_begin`. The
+    /// `gate`'d blob storage lets a test freeze the spawned finalize job
+    /// mid-upload; `None` runs it to completion unobstructed.
+    async fn finalize_test_backend(
+        gate: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        Arc<PooledBackend>,
+        ChunkStore,
+        PathBuf,
+        Arc<PlMutex<Vec<SandboxId>>>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob"));
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = match gate {
+            Some(gate) => Arc::new(GateFirstPut {
+                inner: local,
+                gate,
+                armed: std::sync::atomic::AtomicBool::new(false),
+            }),
+            None => Arc::new(local),
+        };
+        let cs = ChunkStore::new(blob);
+        let destroy_calls = Arc::new(PlMutex::new(Vec::new()));
+        let inner: Arc<dyn SandboxBackend> = Arc::new(FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: tmp.path().join("fc-snaps"),
+            destroy_calls: destroy_calls.clone(),
+        });
+        let checkpoint_dir = tmp.path().join("checkpoints");
+        let materialize_dir = tmp.path().join("materialized");
+        let p = PooledBackend::new(inner)
+            .with_chunk_store(cs.clone(), materialize_dir)
+            .with_checkpoint_dir(checkpoint_dir.clone());
+        let arc = Arc::new(p);
+        arc.set_self_ref(&arc);
+        std::mem::forget(tmp); // keep the staging dirs alive for the test
+        (arc, cs, checkpoint_dir, destroy_calls)
+    }
+
+    /// Acceptance criterion #7: an eviction-scanner retry storm against
+    /// a mid-finalize sandbox must NOT re-capture — `snapshot_begin`
+    /// re-observes the pending `snapshot_id`. Gated so the first call's
+    /// background job can't race to completion before the second call.
+    #[tokio::test]
+    async fn snapshot_begin_is_idempotent_under_a_pending_finalize() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (pooled, _cs, _ckpt_dir, _destroy_calls) =
+            finalize_test_backend(Some(gate.clone())).await;
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        pooled.session_bindings.insert(sandbox_id, session_id);
+
+        let first = pooled
+            .snapshot_begin(sandbox_id)
+            .await
+            .expect("first begin");
+        let second = pooled
+            .snapshot_begin(sandbox_id)
+            .await
+            .expect("second begin (retry storm)");
+        assert_eq!(
+            first, second,
+            "a pending finalize must be re-observed, not re-captured"
+        );
+
+        // Let the frozen job run to completion so it doesn't outlive the
+        // test's temp dirs.
+        gate.notify_one();
+    }
+
+    /// `snapshot_begin` persists the `EvictionFinalizeRecord` (durably,
+    /// to `<checkpoint_dir>/finalize/`) BEFORE it returns — the core
+    /// durability-boundary-moves-earlier claim. Gated so the assertion
+    /// runs while the job is still frozen mid-leg, not racing its own
+    /// (fast, local-disk) completion.
+    #[tokio::test]
+    async fn snapshot_begin_persists_the_finalize_record_before_returning() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (pooled, _cs, ckpt_dir, _destroy_calls) =
+            finalize_test_backend(Some(gate.clone())).await;
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        pooled.session_bindings.insert(sandbox_id, session_id);
+
+        let snapshot_id = pooled.snapshot_begin(sandbox_id).await.expect("begin");
+        assert!(
+            pooled.pending_finalizes.contains_key(&sandbox_id),
+            "pending_finalizes must be set before snapshot_begin returns",
+        );
+        let record_path = ckpt_dir
+            .join("finalize")
+            .join(format!("{snapshot_id}.json"));
+        let bytes = tokio::fs::read(&record_path)
+            .await
+            .expect("finalize record must be on disk before snapshot_begin returns");
+        let record: crate::eviction_finalize::EvictionFinalizeRecord =
+            serde_json::from_slice(&bytes).expect("finalize record must parse");
+        assert_eq!(record.sandbox_id, sandbox_id);
+        assert_eq!(record.session_id, session_id);
+        // The gate freezes the job inside the memory leg (the first
+        // blob PUT), so by construction the disk leg — synchronous,
+        // no blob I/O — is the furthest it can have progressed; not
+        // asserting an exact stage here avoids racing the job's own
+        // (legitimately fast, local-disk) advancement past `Captured`.
+        assert!(
+            matches!(
+                record.stage,
+                crate::eviction_finalize::FinalizeStage::Captured
+                    | crate::eviction_finalize::FinalizeStage::DiskUploaded
+            ),
+            "unexpected stage {:?} while the job is gated in the memory leg",
+            record.stage,
+        );
+
+        gate.notify_one();
+    }
+
+    /// The full happy path: `snapshot_begin` on an FC-shaped capture
+    /// eventually (without the coordinator ever touching it again)
+    /// produces a durable `CheckpointRecord { kind: EvictionFinal }`,
+    /// deletes its `EvictionFinalizeRecord`, clears `pending_finalizes`,
+    /// and best-effort destroys the sandbox.
+    #[tokio::test]
+    async fn snapshot_begin_completes_and_produces_an_eviction_final_checkpoint() {
+        let (pooled, cs, ckpt_dir, destroy_calls) = finalize_test_backend(None).await;
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        pooled.session_bindings.insert(sandbox_id, session_id);
+
+        let snapshot_id = pooled.snapshot_begin(sandbox_id).await.expect("begin");
+
+        let records_dir = ckpt_dir.join("records");
+        let record_path = records_dir.join(format!("{snapshot_id}.json"));
+        wait_for("eviction-final checkpoint record", || record_path.exists()).await;
+
+        let bytes = tokio::fs::read(&record_path).await.unwrap();
+        let record: CheckpointRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record.snapshot_id, snapshot_id);
+        assert_eq!(record.sandbox_id, sandbox_id);
+        assert_eq!(record.session_id, session_id);
+        assert_eq!(
+            record.kind,
+            engram_protocol::heartbeat::CheckpointKind::EvictionFinal
+        );
+        let memory_ref = record
+            .memory_manifest
+            .expect("a captured memory.bin must chunk to a manifest");
+        let manifest = cs.get_manifest(memory_ref).await.unwrap();
+        assert_eq!(manifest.total_bytes, finalize_payload().len() as u64);
+
+        let finalize_record_path = ckpt_dir
+            .join("finalize")
+            .join(format!("{snapshot_id}.json"));
+        assert!(
+            !finalize_record_path.exists(),
+            "the in-flight finalize record must be deleted on completion"
+        );
+        assert!(
+            !pooled.pending_finalizes.contains_key(&sandbox_id),
+            "pending_finalizes must be cleared on completion"
+        );
+        wait_for("best-effort destroy", || {
+            destroy_calls.lock().contains(&sandbox_id)
+        })
+        .await;
+    }
+
+    /// Issue #529 crash recovery: a record persisted by a PRIOR host-agent
+    /// process (the sandbox is gone — never `create()`d in this test)
+    /// is picked up by `resume_pending_finalizes` and driven to the same
+    /// durable `CheckpointRecord { kind: EvictionFinal }` outcome.
+    #[tokio::test]
+    async fn resume_pending_finalizes_redrives_a_record_with_the_sandbox_absent() {
+        let (pooled, cs, ckpt_dir, _destroy_calls) = finalize_test_backend(None).await;
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let snapshot_id = engram_core::SnapshotId::new();
+
+        // Hand-craft the on-disk state a crashed `snapshot_begin` would
+        // have left: the FC staging dir (memory.bin/state.bin/manifest.json)
+        // plus the durable EvictionFinalizeRecord pointing at it —
+        // entirely independent of any live sandbox or RAM state.
+        let dest = tmp_dest_for(&ckpt_dir, snapshot_id);
+        let backend = FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: dest.parent().unwrap().to_path_buf(),
+            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+        };
+        backend.write_capture(&dest).await;
+
+        let record = crate::eviction_finalize::EvictionFinalizeRecord {
+            snapshot_id,
+            session_id,
+            sandbox_id,
+            image_version: "test:1".into(),
+            size_bytes: finalize_payload().len() as u64,
+            paused_at: chrono::Utc::now(),
+            captured_at: chrono::Utc::now(),
+            dest,
+            chain_prev_ref: None,
+            disk_pending: None,
+            aux_bundles: vec![],
+            stage: crate::eviction_finalize::FinalizeStage::Captured,
+            attempts: 0,
+            disk_manifest: None,
+            memory_manifest: None,
+        };
+        record
+            .persist(&ckpt_dir.join("finalize"))
+            .await
+            .expect("persist finalize record");
+
+        pooled.resume_pending_finalizes().await;
+
+        let record_path = ckpt_dir.join("records").join(format!("{snapshot_id}.json"));
+        wait_for("redriven eviction-final checkpoint record", || {
+            record_path.exists()
+        })
+        .await;
+        let bytes = tokio::fs::read(&record_path).await.unwrap();
+        let checkpoint: CheckpointRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(checkpoint.sandbox_id, sandbox_id);
+        assert_eq!(
+            checkpoint.kind,
+            engram_protocol::heartbeat::CheckpointKind::EvictionFinal
+        );
+        let memory_ref = checkpoint.memory_manifest.expect("memory manifest set");
+        let manifest = cs.get_manifest(memory_ref).await.unwrap();
+        assert_eq!(manifest.total_bytes, finalize_payload().len() as u64);
+    }
+
+    fn tmp_dest_for(checkpoint_dir: &Path, id: engram_core::SnapshotId) -> PathBuf {
+        checkpoint_dir
+            .parent()
+            .unwrap()
+            .join("fc-snaps-redrive")
+            .join(id.to_string())
+    }
+
+    async fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// A `BlobStorage` whose PUTs always fail — drives the finalize
+    /// quarantine path.
+    struct AlwaysFailPut;
+    #[async_trait]
+    impl engram_core::traits::BlobStorage for AlwaysFailPut {
+        async fn put_streaming(
+            &self,
+            _key: &str,
+            _body: engram_core::traits::ByteStream,
+        ) -> Result<u64, engram_core::error::BlobError> {
+            Err(engram_core::error::BlobError::Protocol(
+                "injected put failure (test)".into(),
+            ))
+        }
+        async fn get_streaming(
+            &self,
+            _key: &str,
+        ) -> Result<engram_core::traits::ByteStream, engram_core::error::BlobError> {
+            Err(engram_core::error::BlobError::Protocol(
+                "injected get failure (test)".into(),
+            ))
+        }
+        async fn head(
+            &self,
+            _key: &str,
+        ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::error::BlobError> {
+            Err(engram_core::error::BlobError::Protocol(
+                "injected head failure (test)".into(),
+            ))
+        }
+        async fn delete(&self, _key: &str) -> Result<(), engram_core::error::BlobError> {
+            Ok(())
+        }
+        async fn list_prefix(
+            &self,
+            _prefix: &str,
+        ) -> Result<Vec<String>, engram_core::error::BlobError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Acceptance criterion #5: a finalize that fails terminally is
+    /// quarantined with a metric + WARN/ERROR — never silent — after
+    /// `ENGRAM_EVICTION_FINALIZE_MAX_ATTEMPTS` attempts. Set to 1 so the
+    /// test quarantines on the very first failure (no backoff sleep).
+    #[tokio::test]
+    async fn finalize_quarantines_after_max_attempts() {
+        // SAFETY (test-only): cargo-nextest runs each test in its own
+        // process, so this process-global env var doesn't leak across
+        // tests.
+        std::env::set_var("ENGRAM_EVICTION_FINALIZE_MAX_ATTEMPTS", "1");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(AlwaysFailPut);
+        let cs = ChunkStore::new(blob);
+        let destroy_calls = Arc::new(PlMutex::new(Vec::new()));
+        let inner: Arc<dyn SandboxBackend> = Arc::new(FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: tmp.path().join("fc-snaps"),
+            destroy_calls: destroy_calls.clone(),
+        });
+        let checkpoint_dir = tmp.path().join("checkpoints");
+        let p = PooledBackend::new(inner)
+            .with_chunk_store(cs, tmp.path().join("materialized"))
+            .with_checkpoint_dir(checkpoint_dir.clone());
+        let pooled = Arc::new(p);
+        pooled.set_self_ref(&pooled);
+
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        pooled.session_bindings.insert(sandbox_id, session_id);
+
+        let snapshot_id = pooled.snapshot_begin(sandbox_id).await.expect("begin");
+
+        let quarantined_path = checkpoint_dir
+            .join("finalize")
+            .join("failed")
+            .join(format!("{snapshot_id}.json"));
+        wait_for("quarantined finalize record", || quarantined_path.exists()).await;
+
+        let in_flight_path = checkpoint_dir
+            .join("finalize")
+            .join(format!("{snapshot_id}.json"));
+        assert!(
+            !in_flight_path.exists(),
+            "the in-flight record must be gone once quarantined"
+        );
+        assert!(
+            !pooled.pending_finalizes.contains_key(&sandbox_id),
+            "pending_finalizes must be cleared on quarantine"
+        );
+        // No CheckpointRecord — never falsely claim durability on the
+        // path that gave up.
+        let checkpoint_path = checkpoint_dir
+            .join("records")
+            .join(format!("{snapshot_id}.json"));
+        assert!(
+            !checkpoint_path.exists(),
+            "a quarantined finalize must never produce a checkpoint record"
+        );
+
+        std::env::remove_var("ENGRAM_EVICTION_FINALIZE_MAX_ATTEMPTS");
+        std::mem::forget(tmp);
+    }
+
+    /// Finding 6: `snapshot_begin`'s own `supports_diff_checkpoints()` gate
+    /// — the only thing keeping a VZ/Process host on the composed
+    /// `snapshot()` pipeline instead of the host-durable eviction finalize
+    /// path — must surface `InvalidSpec` (the coordinator's `idle_evictor`
+    /// falls through to `snapshot()` on exactly that variant). `ProcessBackend`
+    /// doesn't override the trait default (`false`), the same shape VZ is
+    /// (module doc: "Gate: VZ/Process ... surface `InvalidSpec`").
+    #[tokio::test]
+    async fn snapshot_begin_returns_invalidspec_over_a_non_diff_checkpoint_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = ChunkStore::new(blob);
+        let inner = Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
+        assert!(
+            !inner.supports_diff_checkpoints(),
+            "test premise: ProcessBackend must not opt into diff checkpoints"
+        );
+        let pooled = PooledBackend::new(inner)
+            .with_chunk_store(cs, tmp.path().join("materialize"))
+            .with_checkpoint_dir(tmp.path().join("checkpoints"));
+
+        let err = pooled
+            .snapshot_begin(SandboxId::new())
+            .await
+            .expect_err("a non-diff-checkpoint backend must not enter the host-durable path");
+        assert!(
+            matches!(err, SandboxError::InvalidSpec(_)),
+            "expected InvalidSpec (the idle_evictor's composed-path fallback signal), got {err:?}"
+        );
+    }
+
+    /// Finding 6, second half: the same gate's `checkpoint_dir` half. A
+    /// diff-checkpoint-capable backend (FC-shaped) with no `checkpoint_dir`
+    /// wired (checkpointing disabled on this host) must also surface
+    /// `InvalidSpec`, not attempt to persist a finalize record with nowhere
+    /// durable to put it.
+    #[tokio::test]
+    async fn snapshot_begin_returns_invalidspec_without_a_wired_checkpoint_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = ChunkStore::new(blob);
+        let inner: Arc<dyn SandboxBackend> = Arc::new(FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: tmp.path().join("fc-snaps"),
+            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+        });
+        // Deliberately no `.with_checkpoint_dir(..)`.
+        let pooled = PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialize"));
+
+        let err = pooled
+            .snapshot_begin(SandboxId::new())
+            .await
+            .expect_err("no wired checkpoint_dir must not enter the host-durable path");
+        assert!(
+            matches!(err, SandboxError::InvalidSpec(_)),
+            "expected InvalidSpec (the idle_evictor's composed-path fallback signal), got {err:?}"
         );
     }
 }

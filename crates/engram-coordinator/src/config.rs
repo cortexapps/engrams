@@ -80,7 +80,6 @@ impl Default for CoordinatorConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunMode {
     Coordinator,
-    Host,
     All,
 }
 
@@ -88,7 +87,6 @@ impl RunMode {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "coordinator" => Ok(Self::Coordinator),
-            "host" => Ok(Self::Host),
             "all" => Ok(Self::All),
             other => Err(format!("invalid mode: {other}")),
         }
@@ -153,13 +151,15 @@ mod tests {
 
     #[test]
     fn run_mode_parse_round_trip_and_rejects_unknown() {
-        for (s, expected) in [
-            ("coordinator", RunMode::Coordinator),
-            ("host", RunMode::Host),
-            ("all", RunMode::All),
-        ] {
+        for (s, expected) in [("coordinator", RunMode::Coordinator), ("all", RunMode::All)] {
             assert_eq!(RunMode::parse(s).unwrap(), expected);
         }
+        // `host` served no purpose on this binary — `engram-host-agent` is
+        // the real `--mode=host` — and used to parse successfully only to
+        // be rejected a few lines later in `main`. Now an ordinary unknown
+        // mode, alongside any other typo.
+        let err = RunMode::parse("host").unwrap_err();
+        assert!(err.contains("host"), "error must echo the bad input");
         let err = RunMode::parse("worker").unwrap_err();
         assert!(err.contains("worker"), "error must echo the bad input");
     }

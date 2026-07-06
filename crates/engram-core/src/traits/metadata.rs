@@ -163,9 +163,9 @@ pub trait MetadataStore: Send + Sync {
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
 
     /// Every live (non-terminal, non-`host_lost`) session: `pending`,
-    /// `created`, `guest_ready`, `active`, `idle`, `evacuating`,
-    /// `evicting`. This is the rehydration source for the coord's
-    /// in-memory routing maps (`repopulate_routing`) — every state
+    /// `created`, `active`, `idle`, `evacuating`, `evicting`. This is
+    /// the rehydration source for the coord's in-memory routing maps
+    /// (`repopulate_routing`) — every state
     /// that can carry a live `sandbox_id` binding (`evicting`
     /// included: the sandbox stays bound while the eviction pipeline
     /// runs) MUST be listed here, or a coord restart strands the
@@ -462,8 +462,8 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0048: deregister a drained host immediately — its `hosts` row
     /// is deleted so the operator's scale-down doesn't wait ~30-40s for
     /// the dead-host detector. REFUSES (returns the bound count) if any
-    /// session is still bound (`pending`/`created`/`guest_ready`/`active`/
-    /// `evacuating`/`evicting`); idempotent (a missing row = `Ok(Deleted)`).
+    /// session is still bound (`pending`/`created`/`active`/`evacuating`/
+    /// `evicting`); idempotent (a missing row = `Ok(Deleted)`).
     /// Default impl (mocks): `Deleted`.
     async fn delete_host(&self, _id: HostId) -> Result<DeleteHostOutcome, MetaError> {
         Ok(DeleteHostOutcome::Deleted)
@@ -750,6 +750,26 @@ pub trait MetadataStore: Send + Sync {
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError>;
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
 
+    /// ADR 0068: `hosts.capabilities.fc_snapshot_version` for one host —
+    /// the value the eviction pipeline and the checkpoint-advert
+    /// reconcile stamp onto a freshly-recorded `snapshots` row so
+    /// placement can later pair a restore against the exact FC
+    /// snapshot-data-format version that captured it. Default derives
+    /// from `list_active_hosts()` (an O(active hosts) scan is fine for
+    /// a per-capture call, which already round-trips several times);
+    /// `None` when the host isn't found or hasn't reported a version.
+    async fn fc_snapshot_version_for_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Option<String>, MetaError> {
+        Ok(self
+            .list_active_hosts()
+            .await?
+            .into_iter()
+            .find(|h| h.id == host_id)
+            .and_then(|h| h.capabilities.fc_snapshot_version))
+    }
+
     /// Record a heartbeat from `host_id`: bump `last_heartbeat_at` to
     /// NOW(), set the host-reported `status`, and persist the full
     /// [`HostHeartbeat`] payload — capacity, utilization, and (ADR
@@ -810,7 +830,13 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError>;
 
     // ---- snapshots ----
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError>;
+    /// Idempotent upsert (`ON CONFLICT (id) DO UPDATE`) keyed by
+    /// `snap.id`. Returns `true` iff this call INSERTed a fresh row,
+    /// `false` on a re-record of an existing one — issue #529: the
+    /// heartbeat reconcile uses this to emit `SnapshotTaken` exactly
+    /// once, on the row's first landing, regardless of which coord (if
+    /// any) survived the original capture.
+    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError>;
     async fn list_snapshots_for_session(
         &self,
         sid: SessionId,
@@ -1015,6 +1041,33 @@ pub trait MetadataStore: Send + Sync {
         _events_cursor: i64,
     ) -> Result<crate::types::event::RewindSummary, MetaError> {
         Ok(crate::types::event::RewindSummary::default())
+    }
+
+    /// Issue #527 Phase 1: resolve the prompt→run-start latency for a given
+    /// `prompt_id` — the coordinator-authoritative "the user asked at time
+    /// T" receipt's age, written as the first PG side-effect of
+    /// `send_prompt_core` (before auto-resume). Used by the harness-event
+    /// sink to record `engram_prompt_to_run_started_seconds` when the
+    /// matching `HarnessRunStarted{prompt_id}` lands. Returns `Ok(None)`
+    /// when no receipt exists — the env-seeded initial prompt carries no
+    /// `prompt_id` and never gets one, so this is an expected, non-error
+    /// case the caller skips silently rather than treating as a bug.
+    ///
+    /// PR #556 review finding #1: the elapsed seconds are computed
+    /// PG-side (`NOW() - created_at`, one clock) rather than by handing
+    /// the receipt's `created_at` back for the caller to diff against a
+    /// coordinator-process `Utc::now()` — mixing those two clocks biases
+    /// (or, under skew, silently drops) exactly the samples this metric
+    /// exists to capture.
+    ///
+    /// Default `Ok(None)` so mocks without an event log are a clean no-op
+    /// (they simply never emit the derived histogram).
+    async fn prompt_received_seconds_ago(
+        &self,
+        _session_id: SessionId,
+        _prompt_id: &str,
+    ) -> Result<Option<f64>, MetaError> {
+        Ok(None)
     }
 
     // ---- file artifacts (ADR 0026) ----
@@ -1233,6 +1286,28 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// Issue #539: persist one `CaptureProgress` event from the streaming
+    /// `BuildBaseSnapshot` RPC onto the job row — the live capture-phase
+    /// counterpart to [`Self::update_enable_job_progress`] (which only
+    /// covers the materialize step). ALSO renews the claim
+    /// (`claimed_at = NOW()`), which is what lets `enable_scanner` delete
+    /// its blind capture-lease-renewal ticker: the host's >=30s keepalive
+    /// is well under the 300s lease, and a transport death stops renewals
+    /// exactly when a peer should legitimately re-claim.
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    async fn update_enable_job_capture_progress(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        progress: &crate::types::CaptureProgress,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant, progress);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
     /// Move the job's state forward (also renews the claim, clears
     /// `error` on non-failed targets, and releases the claim on
     /// terminal states).
@@ -1294,6 +1369,65 @@ pub trait MetadataStore: Send + Sync {
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))
+    }
+
+    // ---- ADR 0036 amendment: fleet chunk prestage (issue #538) ----
+    //
+    // A fourth, non-terminal enable-job stage between `capturing` and
+    // `ready`: the scanner advertises the freshly-captured base snapshot
+    // as a `prestage_images` heartbeat-ack entry and waits for every
+    // eligible (`stages_images`) host to report the digest in
+    // `ready_images` before the `enabled_images` upsert makes it visible
+    // to session-create. See `docs/adr/0036-*.md`'s "prestage stage
+    // (interim)" amendment.
+
+    /// Stamp the wire-shape prestage ref (a JSON-encoded
+    /// `engram_protocol::heartbeat::EnabledImageRef` — this trait can't
+    /// depend on the protocol crate, so the caller serializes it) and flip
+    /// the job to `Prestaging` in ONE fenced write (renews the claim, same
+    /// as `set_enable_job_state`).
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    /// Returns [`MetaError::Conflict`] when the lease has moved on.
+    async fn begin_enable_job_prestage(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        prestage_ref: serde_json::Value,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant, prestage_ref);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Record the per-host prestage outcome map (`{"<host-uuid>":
+    /// {"outcome": "staged"|"timed_out"|"unschedulable", "waited_ms": u64}}`),
+    /// written once at the end of the prestage wait — the audit /
+    /// dashboard record.
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    /// Returns [`MetaError::Conflict`] when the lease has moved on.
+    async fn set_enable_job_prestage_hosts(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        outcomes: serde_json::Value,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant, outcomes);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// The `prestage_ref` of every job currently in `prestaging`, raw JSON
+    /// (the coordinator's heartbeat-ack builder deserializes each into
+    /// `engram_protocol::heartbeat::EnabledImageRef` — this trait doesn't
+    /// depend on the protocol crate, matching the existing dependency
+    /// direction rather than laundering a stringly type). Read on every
+    /// heartbeat ack; best-effort on the caller's side.
+    async fn list_prestaging_refs(&self) -> Result<Vec<serde_json::Value>, MetaError> {
+        Ok(Vec::new())
     }
 
     // ---- session secrets ----

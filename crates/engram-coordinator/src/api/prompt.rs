@@ -286,6 +286,44 @@ pub(crate) async fn send_prompt_core(
         prompt_id
     };
 
+    // Issue #527 Phase 1: the durable "the user asked at time T" receipt —
+    // the FIRST PG write of this function, before the auto-resume below.
+    // The auto-resume can take tens to hundreds of seconds (a cold FC
+    // restore); without a receipt written before it starts, the earliest
+    // durable trace of "the user asked for something" post-dates the
+    // resume, and every prompt→first-token latency number becomes a lower
+    // bound reconstructed from the `idle→created` transition. This event
+    // is coordinator-authoritative and stays true across a guest-state
+    // rewind (the user genuinely did send the prompt), so
+    // `rewind_session_to_cursor` excludes `prompt_received` from its
+    // tombstone UPDATE. Best-effort like the user-echo emit below: an emit
+    // failure logs + proceeds — we never 500 the caller over telemetry.
+    //
+    // PR #556 review finding #3: this write lands BEFORE any request
+    // validation below (session state, mid-move HOLD), so a subsequently
+    // rejected `SendPrompt` still leaves a permanent receipt row, and a
+    // client retry of a *retryable* rejection (e.g. the mid-move HOLD's
+    // documented Conflict) that reuses the same `prompt_id` writes a
+    // second one. This is spec-inherited from issue #527's emit-before-
+    // resume + `DESC LIMIT 1` design, not a regression introduced here —
+    // `prompt_received_seconds_ago`'s `ORDER BY idx DESC LIMIT 1` anchors
+    // on the LAST attempt, undercounting latency for the retried case.
+    // Deduplicating retries (or switching to `ASC LIMIT 1` to anchor on
+    // the user-perceived first ask) is left to a follow-up — out of scope
+    // for Phase 1, which only needed *a* durable receipt to exist.
+    if let Err(e) = state
+        .emit(
+            id,
+            SessionEvent::PromptReceived {
+                prompt_id: prompt_id.clone(),
+                at: chrono::Utc::now(),
+            },
+        )
+        .await
+    {
+        tracing::warn!(session_id = %id, error = %e, "emit prompt_received event failed");
+    }
+
     // Auto-resume (Idle → FC snapshot), HOLD through any in-flight move,
     // and resolve the live sandbox. Shared verbatim with `answer_question_core`.
     let sandbox_id = ensure_active_and_resolve(state, id).await?;
@@ -521,5 +559,82 @@ mod tests {
             0,
             "a non-unbound error must not trigger a reattach",
         );
+    }
+
+    // -- Issue #527 Phase 1: prompt_received emit ordering --------------
+
+    /// `AppState` fixture backed by `MiniMeta`, so assertions can inspect
+    /// the exact `session_events` order `send_prompt_core` produced.
+    /// Shared with `api::snapshot`'s `evicting_gate_tests` via
+    /// `state::tests::build_state_for_session` (PR #556 review finding #4 —
+    /// same-crate unit test modules share `pub(crate)` fns fine).
+    use crate::state::tests::build_state_for_session;
+
+    fn dead_session(id: SessionId) -> engram_core::types::Session {
+        engram_core::types::Session {
+            id,
+            status: engram_core::types::SessionState::Dead,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:prompt-receipt".into(),
+            mode: engram_core::types::session::SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+            selected_skills: Vec::new(),
+        }
+    }
+
+    /// The structural invariant this issue exists to create: `prompt_received`
+    /// is written as the FIRST PG side-effect of `send_prompt_core`, before
+    /// `ensure_active_and_resolve` (the auto-resume). A `Dead` session makes
+    /// `ensure_active_and_resolve` fail immediately with no further side
+    /// effects (no resume attempt, no user-echo) — so if the receipt survives
+    /// as the sole recorded event, it proves the emit happens unconditionally
+    /// up front rather than being contingent on a successful delivery.
+    #[tokio::test]
+    async fn prompt_received_is_recorded_even_when_auto_resume_fails_outright() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(dead_session(id));
+
+        let err = send_prompt_core(&state, id, String::new(), "hello".into())
+            .await
+            .expect_err("a Dead session cannot auto-resume");
+        assert!(
+            matches!(err, ApiError::Gone(_)),
+            "expected the Dead-session Gone mapping, got {err:?}",
+        );
+
+        let events = mini.events.lock();
+        assert_eq!(
+            events.len(),
+            1,
+            "prompt_received must be recorded even though auto-resume (and \
+             therefore the user-echo + delivery) never ran",
+        );
+        assert_eq!(events[0].kind, "prompt_received");
+        let recorded_prompt_id = events[0].payload["prompt_id"]
+            .as_str()
+            .expect("prompt_id string field");
+        assert!(
+            !recorded_prompt_id.is_empty(),
+            "an empty caller prompt_id must be minted before the receipt is written",
+        );
+    }
+
+    /// A caller-supplied `prompt_id` (the web's client-minted id) is carried
+    /// verbatim into the receipt — not re-minted — so it joins cleanly
+    /// against the same id's `run_started` event.
+    #[tokio::test]
+    async fn prompt_received_carries_the_caller_supplied_prompt_id() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(dead_session(id));
+
+        let _ = send_prompt_core(&state, id, "client-pid-42".into(), "hello".into()).await;
+
+        let events = mini.events.lock();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "prompt_received");
+        assert_eq!(events[0].payload["prompt_id"], "client-pid-42");
     }
 }
