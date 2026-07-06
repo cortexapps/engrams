@@ -1052,6 +1052,12 @@ impl SandboxBackend for VzBackend {
             .await
             .ok()
             .flatten();
+        // Not cached: today agentd only ever answers via
+        // `read_primary_ipv4()`, which can't produce a non-IPv4
+        // string, so this is unreachable in practice. If that ever
+        // changes, a parse failure re-pays the full 2s vsock
+        // round-trip on every subsequent call instead of failing
+        // fast from a cached negative.
         let ip: std::net::Ipv4Addr = ip_str?.parse().ok()?;
         let ep = GuestEndpoints {
             egress_identity: ip,

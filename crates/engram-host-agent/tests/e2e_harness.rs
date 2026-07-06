@@ -642,17 +642,13 @@ async fn e2e_harness_cold_via_pooled_backend() {
         aux_ro_drives: Vec::new(),
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
-    let _endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
+    let endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
 
     // Register the session in the proxy registry. For COLD path
     // egress_identity and dial_ip are the same (no SNAT indirection)
     // so we use egress_identity.
     let session_id = engram_core::SessionId::new();
-    let guest_ip: std::net::Ipv4Addr = pooled
-        .guest_endpoints(sandbox_id)
-        .await
-        .expect("guest_endpoints")
-        .egress_identity;
+    let guest_ip: std::net::Ipv4Addr = endpoints.egress_identity;
     let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
     let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {
@@ -724,7 +720,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
     pooled.destroy(cold_id).await.expect("destroy cold");
 
     let warm_id = pooled.restore(metadata).await.expect("restore");
-    let _ = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
+    let warm_endpoints = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
     // INTENTIONAL fixed settle (not converted to a poll): this gates on the
     // warm-restore network path — per-VM netns + SNAT + warm-path REDIRECT —
     // being fully wired before the harness's first outbound dials the proxy.
@@ -741,11 +737,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
     // this matching the registry's key, Registry::lookup misses
     // and the proxy drops the harness's outbound.
     let session_id = engram_core::SessionId::new();
-    let guest_ip: std::net::Ipv4Addr = pooled
-        .guest_endpoints(warm_id)
-        .await
-        .expect("guest_endpoints")
-        .egress_identity;
+    let guest_ip: std::net::Ipv4Addr = warm_endpoints.egress_identity;
     let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
     let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {

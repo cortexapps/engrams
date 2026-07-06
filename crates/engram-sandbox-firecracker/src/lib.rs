@@ -4457,13 +4457,11 @@ impl SandboxBackend for FirecrackerBackend {
                 return Some(ep);
             }
         }
-        let (vsock_uds_path, vsock_uds) = {
+        let vsock_uds_path = {
             let live = self.sandboxes.get(&id)?;
-            (
-                live.state.vsock_uds_path.clone(),
-                Some(live.state.vsock_uds_path.clone()),
-            )
+            live.state.vsock_uds_path.clone()
         };
+        let vsock_uds = Some(vsock_uds_path.clone());
         let fut = async {
             let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
                 .await
