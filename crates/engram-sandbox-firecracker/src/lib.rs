@@ -6365,6 +6365,8 @@ mod tests {
                 net: None,
                 netns: None,
                 guest_endpoints: parking_lot::Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                parked: false,
                 agent_ready,
             }
         };
