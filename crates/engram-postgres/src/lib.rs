@@ -3974,7 +3974,8 @@ impl MetadataStore for PostgresStore {
         // `warm_stage_started_at`/`warm_stages`/`output_tail` as if it
         // were live, until the new attempt's first `CaptureProgress`
         // event overwrote them (or forever, if the retry fails before
-        // emitting one).
+        // emitting one). Includes the `chunks_done`/`chunks_total`
+        // counters — same live-progress class, same staleness bug.
         let row = sqlx::query(
             r#"
             UPDATE enable_jobs
@@ -3982,7 +3983,13 @@ impl MetadataStore for PostgresStore {
                    claimed_by = NULL, claimed_at = NULL, updated_at = NOW(),
                    capture_phase = NULL, warm_stage = NULL,
                    warm_stage_started_at = NULL, warm_stages = NULL,
-                   output_tail = NULL
+                   output_tail = NULL,
+                   -- Also reset the chunk-progress counters (same class as
+                   -- the warm/capture columns above): the UI renders these
+                   -- as live progress too, and the progress checkpoint
+                   -- writes chunks_done absolutely, so a stale value would
+                   -- read as live until the retry's first chunk event.
+                   chunks_done = 0, chunks_total = NULL
              WHERE id = $1 AND state = 'failed'
             RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,

@@ -274,6 +274,11 @@ async fn progress_state_failure_and_retry_round_trip() {
     assert_eq!(retried.warm_stage_started_at, None);
     assert!(retried.warm_stages.is_empty());
     assert_eq!(retried.output_tail, None);
+    // Completeness (review finding): the chunk-progress counters are the same
+    // live-progress class — the retry must reset them too. They were 100/625
+    // above; a stale value would render as live progress on the fresh attempt.
+    assert_eq!(retried.chunks_done, 0);
+    assert_eq!(retried.chunks_total, None);
 
     // Unknown id → NotFound.
     match meta.retry_enable_job(Uuid::new_v4()).await {
