@@ -446,8 +446,8 @@ pub(crate) async fn resume_core(
 ///
 /// ADR 0015 M2: every other state returns a typed error rather than
 /// falling through to a downstream handler that would race against
-/// agentd readiness. `Created` / `GuestReady` (session still mid-
-/// create or mid-resume; harness not yet running) return 409;
+/// agentd readiness. `Created` (session still mid-create or
+/// mid-resume; harness not yet running) returns 409;
 /// `HostLost` / `Dead` are unrecoverable from this entry point and
 /// return 410; terminal `Completed` / `Failed` return 409 (no work
 /// is left to dispatch).
@@ -492,7 +492,7 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
         // status gate serialize against the eviction (no double-
         // resume, no orphaned sandbox).
         SessionState::Evicting => ensure_active_after_evicting_hold(state, id).await,
-        SessionState::Created | SessionState::GuestReady => Err(ApiError::Conflict(format!(
+        SessionState::Created => Err(ApiError::Conflict(format!(
             "session is {} — agentd is not yet ready. \
              Wait for the session to reach Active (subscribe to /sessions/:id/events) \
              and retry.",

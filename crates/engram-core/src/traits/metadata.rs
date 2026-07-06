@@ -112,9 +112,9 @@ pub trait MetadataStore: Send + Sync {
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
 
     /// Every live (non-terminal, non-`host_lost`) session: `pending`,
-    /// `created`, `guest_ready`, `active`, `idle`, `evacuating`,
-    /// `evicting`. This is the rehydration source for the coord's
-    /// in-memory routing maps (`repopulate_routing`) — every state
+    /// `created`, `active`, `idle`, `evacuating`, `evicting`. This is
+    /// the rehydration source for the coord's in-memory routing maps
+    /// (`repopulate_routing`) — every state
     /// that can carry a live `sandbox_id` binding (`evicting`
     /// included: the sandbox stays bound while the eviction pipeline
     /// runs) MUST be listed here, or a coord restart strands the
@@ -403,8 +403,8 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0048: deregister a drained host immediately — its `hosts` row
     /// is deleted so the operator's scale-down doesn't wait ~30-40s for
     /// the dead-host detector. REFUSES (returns the bound count) if any
-    /// session is still bound (`pending`/`created`/`guest_ready`/`active`/
-    /// `evacuating`/`evicting`); idempotent (a missing row = `Ok(Deleted)`).
+    /// session is still bound (`pending`/`created`/`active`/`evacuating`/
+    /// `evicting`); idempotent (a missing row = `Ok(Deleted)`).
     /// Default impl (mocks): `Deleted`.
     async fn delete_host(&self, _id: HostId) -> Result<DeleteHostOutcome, MetaError> {
         Ok(DeleteHostOutcome::Deleted)

@@ -1323,8 +1323,8 @@ pub(crate) async fn delete_session_core(
     // Drive the session to its FSM-legal terminal BEFORE destroying the
     // sandbox. `terminate_session` reads the current state and picks the
     // terminal `SessionState::terminal_target` permits — `Completed` for
-    // states that ran, `Failed` for the early states (Pending / Created /
-    // GuestReady) that never became usable (this is what fixes the
+    // states that ran, `Failed` for the early states (Pending / Created)
+    // that never became usable (this is what fixes the
     // `5fadd364` phantom: deleting a `Created` session used to drive an
     // illegal Created→Completed that surfaced as Conflict, destroying the
     // sandbox but leaving the row non-terminal). Terminating first also

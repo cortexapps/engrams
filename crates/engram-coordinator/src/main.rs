@@ -12,7 +12,6 @@ use engram_coordinator::{
 use engram_core::traits::{CloudBackend, HostClient, SandboxBackend, SecretStore};
 use engram_core::HostId;
 use engram_postgres::PostgresStore;
-use engram_sandbox_firecracker::FirecrackerBackend;
 use engram_secrets_dev::EnvSecretStore;
 
 #[derive(Parser, Debug)]
@@ -64,19 +63,6 @@ struct Cli {
     #[arg(long, env = "ENGRAM_DEFAULT_IMAGE", default_value = "warm-bootstrap")]
     default_image_version: String,
 
-    /// Path to a kernel image (vmlinux) Firecracker can boot. Required
-    /// when `--sandbox-backend=firecracker`; ignored otherwise. Every
-    /// microVM on this host boots the same kernel.
-    #[arg(long, env = "ENGRAM_KERNEL_IMAGE_PATH")]
-    kernel_image_path: Option<PathBuf>,
-
-    /// Path to an arm64 Linux kernel image VZ (Virtualization.framework)
-    /// can boot. Required when `--sandbox-backend=vz`; ignored
-    /// otherwise. Default points at `~/.cache/engram-vz-test/vmlinux-arm64`,
-    /// the location `just pull-kernel` populates.
-    #[arg(long, env = "ENGRAM_VZ_KERNEL_PATH")]
-    vz_kernel_path: Option<PathBuf>,
-
     /// Comma-separated list of bearer tokens accepted on protected
     /// endpoints. Empty (the default) disables auth and is intended
     /// for local dev only. Production deployments populate this from
@@ -122,22 +108,6 @@ struct Cli {
     /// bearer-free endpoint without going through nginx + IAP.
     #[arg(long, env = "ENGRAM_METRICS_ADDR", default_value = "0.0.0.0:9090")]
     metrics_addr: std::net::SocketAddr,
-
-    /// Engram CIDR pool — every Firecracker sandbox gets a unique
-    /// /30 carved from this. Defaults to 10.200.0.0/16 (16k slots).
-    /// Override if you're already using 10.200.0.0/16 on this host.
-    #[arg(long, env = "ENGRAM_FC_NET_CIDR", default_value = "10.200.0.0")]
-    fc_net_cidr: std::net::Ipv4Addr,
-
-    /// `--mode=all` only. TCP port the in-process egress proxy
-    /// listens on for the locally-attached FC backend. iptables
-    /// PREROUTING REDIRECT on the same host sends VM→tcp/443 here.
-    /// `0` (default) disables egress filtering for `--mode=all`.
-    /// Ignored in `--mode=coordinator` — host-agents own their own
-    /// proxies (ADR 0006), configured via the host-agent's own
-    /// `--egress-proxy-port` flag.
-    #[arg(long, env = "ENGRAM_EGRESS_PROXY_PORT", default_value_t = 0)]
-    egress_proxy_port: u16,
 
     /// KEK provider for envelope-encrypting registry credentials.
     /// `env-var` (default) reads a 32-byte key from `--kek-env-var`
@@ -404,23 +374,16 @@ async fn main() -> Result<(), CoordinatorError> {
         CloudBackendChoice::Mock => Arc::new(MockCloud::new()),
     };
 
-    if matches!(cli.mode, RunMode::Host) {
-        // Pure host-agent mode is served by the engram-host-agent binary.
-        return Err(CoordinatorError::Config(
-            "use `engram-host-agent` for --mode=host; this binary serves coordinator/all".into(),
-        ));
-    }
-
-    // ADR 0007 orphan-reap admin endpoint needs to know which
-    // local dir the in-process host-agent materializes into. Only
-    // populated for `--mode=all`; in `--mode=coordinator` the
-    // materialized files live on each host and the reap is a
-    // future multi-host RPC.
-    let coord_materialize_dir = if matches!(cli.mode, RunMode::All) {
-        Some(cli.local_path.join("chunked-rootfs"))
-    } else {
-        None
-    };
+    // ADR 0007 orphan-reap admin endpoint needs to know which local
+    // dir an in-process host-agent materializes into. `--mode=all`
+    // is now Process-backend-only (the FC/VZ in-proc arms were
+    // retired, #530 item f) and `ProcessBackend` has no chunk store /
+    // egress / materialize wiring at all — nothing ever writes under
+    // `<local_path>/chunked-rootfs` — so this is unconditionally
+    // `None`. Revisit once a real materialize-dir producer exists in
+    // `--mode=all` (or the admin reaper grows the multi-host fanout
+    // `--mode=coordinator` already needs).
+    let coord_materialize_dir: Option<std::path::PathBuf> = None;
 
     // ADR 0007: blob storage. The Arc backs the chunk store
     // (manifests + content-addressed chunks live here). Hoisting
@@ -486,247 +449,46 @@ async fn main() -> Result<(), CoordinatorError> {
     let mut in_proc_local_backend: Option<Arc<dyn SandboxBackend>> = None;
 
     if matches!(cli.mode, RunMode::All) {
-        let raw_backend: Arc<dyn SandboxBackend> = match cli.sandbox_backend {
-            SandboxBackendChoice::Firecracker => {
-                let kernel = cli.kernel_image_path.clone().ok_or_else(|| {
-                    CoordinatorError::Config(
-                        "ENGRAM_KERNEL_IMAGE_PATH (or --kernel-image-path) is required when \
-                         --sandbox-backend=firecracker"
-                            .into(),
-                    )
-                })?;
-                let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
-                fc_cfg.net_pool = Some(cli.fc_net_cidr);
-                fc_cfg.egress_proxy_port = if cli.egress_proxy_port == 0 {
-                    None
-                } else {
-                    Some(cli.egress_proxy_port)
-                };
-                fc_cfg.host_id = Some(in_proc_host);
-                // ADR 0014 follow-up: pin CPUID to a Cascade Lake
-                // baseline so snapshots stay portable across host CPU
-                // changes (bake-runner vendor, MIG-driven instance
-                // rolls, region expansion). Without this, prod 2026-
-                // 05-21 hit AMD-bake → Intel-restore segfaults in
-                // every guest shell. `ENGRAM_FC_CPU_TEMPLATE` overrides
-                // (`""` / `"none"` disables, anything else passes
-                // through verbatim).
-                fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
-                // ADR 0020 Route B / ADR 0039: idle-resume uses the
-                // chunk-native UFFD handler (lazy memory). Now the DEFAULT
-                // (ENGRAM_FC_RESTORE_MODE unset ⇒ uffd), so the Helm chart
-                // no longer needs to set it; `file` is the explicit opt-out.
-                fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
-                // Point the UFFD handler at the SAME chunk cache the
-                // PooledBackend restore-prefetch warms (`local_path/
-                // chunk-cache`, wired below) so on-fault `cache.get`
-                // hits prefetched chunks. Cross-process dir sharing is
-                // safe (content-addressed, on-disk + hash-verified get).
-                fc_cfg.uffd_cache_root = Some(cli.local_path.join("chunk-cache"));
-                // Prod bakes `engram-uffd-handler` to /usr/local/bin (on
-                // PATH, the default). Dev/test override the path via
-                // ENGRAM_FC_UFFD_HANDLER_BIN (e.g. target/debug/...).
-                if let Ok(p) = std::env::var("ENGRAM_FC_UFFD_HANDLER_BIN") {
-                    fc_cfg.uffd_handler_bin = p.into();
-                }
-                // ADR 0020: base-snapshot capture (build_base_snapshot)
-                // attaches a stub harness so the snapshot carries a
-                // harness drive slot for the per-session option-D swap.
-                // mode=all embeds the host, so wire the same stub the
-                // host-agent binary does.
-                let stub_path = cli.sandbox_work_dir.join(".stub-harness.ext4");
-                fc_cfg.stub_harness_path = Some(
-                    engram_host_agent::ensure_stub_harness(&stub_path)
-                        .await
-                        .map_err(|e| {
-                            CoordinatorError::Config(format!(
-                                "materialize stub harness at {}: {e}",
-                                stub_path.display()
-                            ))
-                        })?,
-                );
-                let fc = Arc::new(FirecrackerBackend::new(
-                    cli.sandbox_work_dir.clone(),
-                    fc_cfg,
-                ));
-                // Apply once-per-host iptables setup: enable IP
-                // forwarding + install the inter-VM DROP rule.
-                // Idempotent — safe across coord restarts.
-                if let Err(e) = fc.host_startup().await {
-                    tracing::warn!(
-                        error = %e,
-                        "FC host_startup failed; per-VM networking will fail at session create. \
-                         Check that the coord runs as root (or with CAP_NET_ADMIN) and \
-                         iptables/ip are on PATH."
-                    );
-                }
-                fc as Arc<dyn SandboxBackend>
-            }
-            SandboxBackendChoice::Vz => {
-                #[cfg(target_os = "macos")]
-                {
-                    let kernel = cli
-                        .vz_kernel_path
-                        .clone()
-                        .or_else(default_vz_kernel_path)
-                        .ok_or_else(|| {
-                            CoordinatorError::Config(
-                                "ENGRAM_VZ_KERNEL_PATH (or --vz-kernel-path) is required when \
-                                 --sandbox-backend=vz; default location \
-                                 ~/.cache/engram-vz-test/vmlinux-arm64 does not exist (run \
-                                 `just pull-kernel`)"
-                                    .into(),
-                            )
-                        })?;
-                    let vz_cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel);
-                    // ADR 0007: attach the chunk store so snapshots
-                    // chunk the rootfs and report the manifest ref.
-                    // Shares the same `blob` Arc as the rest of the
-                    // process so chunks the bake produced are readable
-                    // here (and vice versa).
-                    let cs = engram_chunk_store::ChunkStore::new(blob.clone());
-                    Arc::new(
-                        engram_sandbox_vz::VzBackend::new(cli.sandbox_work_dir.clone(), vz_cfg)
-                            .map_err(|e| CoordinatorError::Config(format!("vz backend: {e}")))?
-                            .with_chunk_store(cs),
-                    )
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    return Err(CoordinatorError::Config(
-                        "--sandbox-backend=vz only runs on macOS Apple Silicon. Use \
-                         --sandbox-backend=firecracker on Linux"
-                            .into(),
-                    ));
-                }
-            }
-            // ADR 0023: dev-only, un-isolated ProcessBackend, gated
-            // behind ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND so it can't
-            // be selected by accident. Lets the product plane run
-            // without KVM (laptop, or inside an engrams session).
-            SandboxBackendChoice::Process => {
-                if std::env::var("ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND").as_deref() != Ok("1") {
-                    return Err(CoordinatorError::Config(
-                        "--sandbox-backend=process is DEV-ONLY and provides NO isolation; set \
-                         ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND=1 to acknowledge and enable it"
-                            .into(),
-                    ));
-                }
-                tracing::warn!(
-                    "⚠️  DEV-ONLY ProcessBackend: sessions run as un-isolated host subprocesses \
-                     (ADR 0023). NEVER use with untrusted input or in production."
-                );
-                Arc::new(engram_sandbox_process::ProcessBackend::new(
-                    cli.sandbox_work_dir.clone(),
-                )) as Arc<dyn SandboxBackend>
-            }
-        };
-        // ProcessBackend has no chunk store / egress / materialize
-        // wiring — register it directly and skip the PooledBackend
-        // wrapper FC/VZ need. (ADR 0023)
-        let local_backend: Arc<dyn SandboxBackend> = if matches!(
-            cli.sandbox_backend,
-            SandboxBackendChoice::Process
-        ) {
-            raw_backend
-        } else {
-            // Wrap in PooledBackend so the chunked-OCI / image-cache /
-            // egress / chunk-store wiring is shared between `--mode=all`
-            // (single-binary dev) and production host-agents (which build
-            // the same wrapper in `engram-host-agent::lib::run`).
-            //
-            // The cache root lives under `<local_path>/oci-cache` so it
-            // doesn't collide with the legacy on-disk image registry tree.
-            // Reuses the OCI client built up-front (also shared with
-            // `/api/enabled-images`).
-            let oci_cache_root = cli.local_path.join("oci-cache");
-            let image_cache = engram_host_agent::image_cache::ImageCache::open(
-                oci_cache_root,
-                (*oci_client).clone(),
-            )
-            .await
-            .map_err(|e| CoordinatorError::Config(format!("oci cache: {e}")))?;
-            // ADR 0006: --mode=all gets a local HostEgress so the
-            // single-binary dev loop and the multi-host production
-            // topology share one egress code path. `egress_proxy_port=0`
-            // (default) skips it.
-            let host_egress = if cli.egress_proxy_port > 0 {
-                let dir = cli.local_path.join("egress-ca");
-                let source: Arc<dyn engram_egress_proxy::CaSource> =
-                    Arc::new(engram_egress_proxy::LocalDiskCaSource::new(dir));
-                let bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_proxy_port)
-                    .parse()
-                    .expect("egress-proxy-port maps to a valid SocketAddr");
-                // ADR 0056 Phase 4: --mode=all (single-binary dev) doesn't wire
-                // the observe sink yet — response-observation is exercised in
-                // split/prod (the host-agent binary builds the sink) + the proxy
-                // unit/e2e tests. Wiring the coord's own loopback ingest here is
-                // a dev-parity follow-up.
-                match engram_host_agent::egress::HostEgress::spawn(source, bind, None).await {
-                    Ok(e) => Some(Arc::new(e)),
-                    Err(e) => {
-                        tracing::error!(error = %e, "--mode=all egress proxy spawn failed; aborting");
-                        return Err(CoordinatorError::Config(format!("egress: {e}")));
-                    }
-                }
-            } else {
-                None
-            };
-            // ADR 0007: chunked-rootfs materialization root. In
-            // `--mode=all`, coordinator + host-agent share one process,
-            // so the chunk store wired into the PooledBackend uses the
-            // same `blob` Arc the coordinator's Services consumes.
-            // Multi-host deployments wire each host-agent's chunk store
-            // independently, pointing at the same backing bucket via env.
-            let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
-            // The materialize dir lives at `<local_path>/chunked-rootfs/`
-            // — defined inside this block but ALSO consumed by the
-            // Services wiring outside it (so the admin orphan-reap
-            // endpoint knows the path). Pulled out below via the
-            // `coord_materialize_dir` binding.
-            let materialize_dir = cli.local_path.join("chunked-rootfs");
-            // ADR 0007 #3a / ADR 0067: NVMe-backed chunk cache. Amortises
-            // repeat reads for chunks shared across manifests (canonical-
-            // base images, fork lineage). `from_env_or_default` derives a
-            // disk-sized default budget (min(60% of the disk backing
-            // `local_path`, 80%) — no more fixed 200 GiB — and, as a side
-            // effect, `create_dir_all`s the cache root to probe the disk
-            // size. Override via `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`
-            // (absolute) or `ENGRAM_CHUNK_CACHE_DISK_FRACTION` (the
-            // fraction the default derives from).
-            let chunk_cache = engram_chunk_store::ChunkCache::new(
-                engram_chunk_store::cache::ChunkCacheConfig::from_env_or_default(
-                    cli.local_path.join("chunk-cache"),
-                ),
-            );
-            // ADR 0007 Phase 4 / ADR 0049: optional NBD daemon for
-            // chunked rootfs, with a warm-pool slot allocator that
-            // sizes itself from the kernel's `nbds_max` (the chart's
-            // `modprobe nbd nbds_max=<N>`), capped by
-            // `ENGRAM_NBD_MAX_SLOTS` and keeping `ENGRAM_NBD_WARM_SLOTS`
-            // slots warm. `None` (materialize-to-file fallback) when the
-            // nbd module isn't loaded or `ENGRAM_NBD_DISABLE` is set —
-            // still correct, just a slower cold start.
-            let nbd_pool = engram_host_agent::disk_daemon::build_nbd_pool_from_kernel();
-
-            Arc::new({
-                let mut p = engram_host_agent::pooled_backend::PooledBackend::new(raw_backend)
-                    // ADR 0008 Phase 5: feed the OciClient to the pooled
-                    // backend so chunked-OCI images can fault chunks from
-                    // the registry on BlobStorage miss.
-                    .with_oci_client((*oci_client).clone())
-                    .with_image_cache(image_cache)
-                    .with_chunk_store(chunk_store, materialize_dir)
-                    .with_chunk_cache(chunk_cache);
-                if let Some(egress) = host_egress.clone() {
-                    p = p.with_egress(egress);
-                }
-                if let Some(pool) = nbd_pool {
-                    p = p.with_nbd_pool(pool);
-                }
-                p
-            })
-        };
+        // `--mode=all` (single-binary, coordinator embeds a local
+        // sandbox backend) only ever ran the split topology's FC/VZ
+        // arms in a diverged near-copy of the host-agent binary's own
+        // backend construction (no `uffd_base_dir`, no `base_shm_gc`) —
+        // a live prod-parity footgun for any KVM dev box that selected
+        // it, and Tilt never actually exercises it (`dev_split =
+        // sandbox_backend != 'process'`: FC/VZ always run split).
+        // `process` is the only backend that legitimately collapses to
+        // one binary (ADR 0023 dev fallback, zero isolation); firecracker
+        // and vz now hard-error here instead of silently drifting from
+        // `engram-host-agent`'s wiring.
+        if !matches!(cli.sandbox_backend, SandboxBackendChoice::Process) {
+            return Err(CoordinatorError::Config(
+                "--mode=all supports --sandbox-backend=process only; run `engram-host-agent` \
+                 for firecracker/vz (split coordinator + host-agent topology, ENGRAM_MODE=coordinator \
+                 on this binary)"
+                    .into(),
+            ));
+        }
+        // ADR 0023: dev-only, un-isolated ProcessBackend, gated behind
+        // ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND so it can't be selected
+        // by accident. Lets the product plane run without KVM (laptop,
+        // or inside an engrams session). ProcessBackend has no chunk
+        // store / egress / materialize wiring, so it's registered
+        // directly — no PooledBackend wrapper (that wrapper existed
+        // only for the now-deleted FC/VZ arms).
+        if std::env::var("ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND").as_deref() != Ok("1") {
+            return Err(CoordinatorError::Config(
+                "--sandbox-backend=process is DEV-ONLY and provides NO isolation; set \
+                 ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND=1 to acknowledge and enable it"
+                    .into(),
+            ));
+        }
+        tracing::warn!(
+            "⚠️  DEV-ONLY ProcessBackend: sessions run as un-isolated host subprocesses \
+             (ADR 0023). NEVER use with untrusted input or in production."
+        );
+        let local_backend: Arc<dyn SandboxBackend> = Arc::new(
+            engram_sandbox_process::ProcessBackend::new(cli.sandbox_work_dir.clone()),
+        );
         // Use a stable HostId for `--mode=all` so a coordinator
         // restart picks up the same `hosts` row (FK-safe — sessions
         // / snapshots inserted in a prior run still reference a valid
@@ -929,22 +691,4 @@ async fn main() -> Result<(), CoordinatorError> {
         integrations,
     )
     .await
-}
-
-/// Default location for the arm64 Linux kernel `engram-sandbox-vz`
-/// boots: `~/.cache/engram-vz-test/vmlinux-arm64`. Returns `None` if
-/// `$HOME` isn't set or the file doesn't exist; the caller surfaces
-/// a config error pointing at `just pull-kernel`.
-#[cfg(target_os = "macos")]
-fn default_vz_kernel_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let candidate = std::path::PathBuf::from(home)
-        .join(".cache")
-        .join("engram-vz-test")
-        .join("vmlinux-arm64");
-    if candidate.exists() {
-        Some(candidate)
-    } else {
-        None
-    }
 }

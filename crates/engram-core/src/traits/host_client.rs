@@ -91,8 +91,12 @@ pub trait HostClient: Send + Sync {
     /// The chunk+upload work runs as a host-side background task; await it via
     /// [`Self::snapshot_wait`]. Returns the new snapshot's id once the
     /// capture itself has succeeded — the point where the coordinator
-    /// may mark the session Idle. Default errs so non-FC hosts and
-    /// pre-D5 host-agents fall back to the composed [`Self::snapshot`].
+    /// may mark the session Idle. Default errs so backends without the
+    /// split path (VZ, Process) fall back to the composed
+    /// [`Self::snapshot`]. The fleet's hard `WIRE_VERSION` lockstep gate
+    /// (skewed hosts are dropped by `host_wire_version_ok`) means this
+    /// default is never reached because a host is running old code —
+    /// only because its backend genuinely has no split-eviction concept.
     async fn snapshot_begin(
         &self,
         _id: SandboxId,
