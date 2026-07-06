@@ -404,6 +404,7 @@ fn capture_sink() -> (
                 };
             let ack = engram_harness_proto::HarnessAttachAck {
                 ok: true,
+                reject: None,
                 message: None,
             };
             if let Err(e) = engram_harness_proto::write_msg(&mut writer, &ack).await {
@@ -492,6 +493,8 @@ async fn drive_harness(
         .start_agent(
             sandbox_id,
             AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv,
                 env,
                 session_env: HashMap::new(),
@@ -885,6 +888,8 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
         .start_agent(
             sandbox_id,
             AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: Vec::new(),
                 env: HashMap::new(),
                 session_env: HashMap::new(),

@@ -123,7 +123,7 @@ pub fn disk_pressure_check(work_dir: &std::path::Path, floor_bytes: u64) -> (boo
 /// env with an instant rollback.
 ///
 /// When ON, a *soft*-idle sandbox is only nominated for eviction while the
-/// host is under real memory pressure (see [`mem_pressure_from`]); *hard*-
+/// host is under real memory pressure (free RAM under the floor); *hard*-
 /// idle sandboxes and the coord's own hard-TTL backstop are unaffected.
 /// The rationale: eviction snapshots + destroys a warm VM to reclaim
 /// **RAM**, and on a host with abundant free memory that just trades an
@@ -151,36 +151,6 @@ pub fn mem_floor_pct_from_env() -> u8 {
         .ok()
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(DEFAULT_MEM_FLOOR_PCT)
-}
-
-/// Is the host under memory pressure? Eviction frees **RAM** (the disk
-/// floor above is an orthogonal *brake*, not this signal), so soft-idle
-/// reclamation should only fire when free RAM has dropped below the floor.
-/// Returns `(under_pressure, free_pct)`.
-///
-/// **Fails OPEN toward eviction**: if `total_mib` reads as 0 (non-Linux, an
-/// unmeasured `RamLedgerSnapshot`, or a `/proc/meminfo` parse failure) we
-/// report `(true, None)` so a read error degrades pressure-aware mode back
-/// to today's TTL-only behavior rather than silently pinning soft-idle
-/// sessions resident forever — mirroring [`disk_pressure_check`]'s
-/// fail-open stance.
-///
-/// Issue #540: the caller feeds this the heartbeat tick's
-/// `RamLedgerSnapshot` (via a `watch` channel) instead of this module
-/// taking its own private `/proc/meminfo` sample — one source of truth for
-/// both the heartbeat's `allocatable_mib` and this gate's `free_pct`. Pure
-/// core, unit-testable without a live `/proc/meminfo`.
-pub(crate) fn mem_pressure_from(
-    total_mib: u64,
-    used_mib: u64,
-    floor_pct: u8,
-) -> (bool, Option<f32>) {
-    if total_mib == 0 {
-        return (true, None);
-    }
-    let free_mib = total_mib.saturating_sub(used_mib);
-    let free_pct = (free_mib as f32 / total_mib as f32) * 100.0;
-    (free_pct < f32::from(floor_pct), Some(free_pct))
 }
 
 #[cfg(test)]
@@ -266,44 +236,6 @@ mod tests {
     }
 
     // ── Tier 1: pressure-aware idle eviction ────────────────────────────
-
-    /// Unreadable memory (`MemTotal == 0`: non-Linux or a parse failure)
-    /// fails OPEN toward eviction — `(under_pressure = true, None)` — so a
-    /// read error degrades to today's TTL-only behavior instead of pinning
-    /// soft-idle sessions resident forever. Mirrors the disk fail-open.
-    #[test]
-    fn mem_pressure_from_fails_open_when_total_unknown() {
-        let (under, pct) = mem_pressure_from(0, 0, 15);
-        assert!(under, "unreadable RAM must fail open toward eviction");
-        assert!(pct.is_none());
-    }
-
-    /// Abundant free RAM (well above the floor) → no pressure, so soft-idle
-    /// sandboxes stay resident. 64 GiB host, 26 GiB used ≈ 59 % free ≫ 15 %.
-    #[test]
-    fn mem_pressure_from_no_pressure_when_free_above_floor() {
-        let (under, pct) = mem_pressure_from(64_304, 26_456, 15);
-        assert!(!under, "59% free is not pressure at a 15% floor");
-        let p = pct.unwrap();
-        assert!((55.0..65.0).contains(&p), "free_pct ~59, got {p}");
-    }
-
-    /// Scarce free RAM (below the floor) → pressure, so soft-idle sandboxes
-    /// become reclaim candidates. 64 GiB host, 60 GiB used ≈ 6 % free < 15 %.
-    #[test]
-    fn mem_pressure_from_pressure_when_free_below_floor() {
-        let (under, pct) = mem_pressure_from(64_304, 60_000, 15);
-        assert!(under, "6% free is pressure at a 15% floor");
-        assert!(pct.unwrap() < 15.0);
-    }
-
-    /// A floor of 0 never reports pressure (free_pct is always ≥ 0) — a
-    /// clean off-switch equivalent to "reclaim only at the hard TTL".
-    #[test]
-    fn mem_pressure_from_floor_zero_never_pressures() {
-        let (under, _) = mem_pressure_from(64_304, 64_000, 0);
-        assert!(!under, "floor 0 must never pressure");
-    }
 
     /// Without an env override, the master switch defaults OFF (historical
     /// TTL-only behavior) and the floor defaults to

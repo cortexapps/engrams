@@ -101,9 +101,13 @@ const SESSION_FAILED_MSG = "The session ended in failure.";
 // continue. See `TerminalOutcome` in session-events.ts.
 const SESSION_CLOSED_MSG = "This session is complete. Start a new session if you'd like to continue.";
 // Non-fatal: the thread stays alive after these so the user can retry.
+// ADR 0067: SendPrompt/AnswerQuestion now durably ENQUEUE on the
+// coordinator (202) — a resuming/idle session is no longer a delivery
+// failure, so there is no "mention me again" apology arm. These fire
+// only for hard enqueue failures (session gone / coord unreachable).
 const DELIVER_FAIL_MSG =
-  "I couldn't deliver that to your session just now — it may have been resuming. Mention me again to retry.";
-const ANSWER_FAIL_MSG = "I couldn't record that answer just now — please try again.";
+  "I couldn't queue that for your session (it may have ended). Start a new session to continue.";
+const ANSWER_FAIL_MSG = "I couldn't record that answer — the session may have ended.";
 
 /** Run an effect as a checkpointed step. The workflow passes `DBOS.runStep`; a
  *  test passes a plain runner so the drain-loop control flow is unit-testable
@@ -222,11 +226,12 @@ type InboundTurn = Exclude<ThreadInbox, { kind: "session_terminal" }>;
  * Handle one non-terminal inbound message; return the (possibly advanced)
  * `lastTs` cursor. **Never throws** — that is the whole point:
  *
- * - A delivery failure (`sendPrompt` / `answerQuestion` — e.g. coord returns
- *   "sandbox not found" on a just-idle session) is caught and surfaced via
- *   `onDeliveryError` (⚠️ + "mention me again"); the cursor does NOT advance, so
- *   the dropped messages are re-gathered on the next mention. The thread stays
- *   alive.
+ * - An ENQUEUE failure (`sendPrompt` / `answerQuestion` — ADR 0067: these
+ *   202-enqueue on the coordinator's durable outbox, so a resuming/idle
+ *   session is never an error; only hard failures like a terminated
+ *   session or an unreachable coord land here) is caught and surfaced via
+ *   `onDeliveryError`; the cursor does NOT advance, so the dropped
+ *   messages are re-gathered on the next mention. The thread stays alive.
  * - A render failure (a session event) drops that single render and logs — it's
  *   an agent OUTPUT, not the user's input, so no user-facing notice.
  *
@@ -270,7 +275,7 @@ export async function handleInbound(
       } catch (err) {
         log.error(
           { sessionId: session.id, channel: msg.mention.channel, thread: msg.mention.threadRoot, err },
-          "slack: failed to deliver follow-up prompt — keeping the thread alive",
+          "slack: failed to enqueue follow-up prompt — keeping the thread alive",
         );
         await step(() => pol.onDeliveryError(msg.mention, DELIVER_FAIL_MSG), "onDeliveryError").catch(() => {});
         return lastTs; // cursor unchanged: those messages were NOT delivered
@@ -283,7 +288,7 @@ export async function handleInbound(
           "answerQuestion",
         );
       } catch (err) {
-        log.error({ sessionId: session.id, err }, "slack: failed to deliver answer — keeping the thread alive");
+        log.error({ sessionId: session.id, err }, "slack: failed to enqueue answer — keeping the thread alive");
         await step(() => pol.onDeliveryError(st.currentMention, ANSWER_FAIL_MSG), "onDeliveryError").catch(() => {});
       }
       return lastTs;

@@ -322,6 +322,8 @@ async fn e2e_vnc_cold_via_pooled_backend() {
         .start_agent(
             sandbox_id,
             AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: Vec::new(),
                 env: HashMap::new(),
                 session_env: HashMap::new(),

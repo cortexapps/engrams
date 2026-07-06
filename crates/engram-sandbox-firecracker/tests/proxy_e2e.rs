@@ -368,6 +368,8 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         .start_agent(
             sandbox_id,
             AgentSpec {
+                // ADR 0067: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: Vec::new(),
                 env: HashMap::new(),
                 session_env: HashMap::new(),

@@ -709,9 +709,11 @@ impl HostClient for HostRegistry {
         backend.guest_ip(id).await
     }
 
-    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
+    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId, binding_epoch: u64) {
         if let Ok((_, backend)) = self.resolve_owner(sandbox_id).await {
-            backend.bind_session(session_id, sandbox_id).await;
+            backend
+                .bind_session(session_id, sandbox_id, binding_epoch)
+                .await;
         }
     }
 
@@ -773,11 +775,6 @@ impl HostClient for HostRegistry {
         backend.interrupt(sandbox_id).await
     }
 
-    async fn rehandshake(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.rehandshake(sandbox_id).await
-    }
-
     async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.pause(sandbox_id).await
@@ -786,11 +783,6 @@ impl HostClient for HostRegistry {
     async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.resume(sandbox_id).await
-    }
-
-    async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.acquire_shell(sandbox_id).await
     }
 
     async fn start_browser(
@@ -804,16 +796,6 @@ impl HostClient for HostRegistry {
     async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.stop_browser(sandbox_id).await
-    }
-
-    async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.release_shell(sandbox_id).await
-    }
-
-    async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.renew_shell(sandbox_id).await
     }
 
     async fn proxy_shell(

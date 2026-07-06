@@ -121,7 +121,6 @@ service HostService {
   // resyncing a session whose event stream desynced from the run state
   // machine. The running agent is untouched. Driven by the coordinator's
   // desync watchdog.
-  rpc RehandshakeHarness(RehandshakeHarnessRequest) returns (Empty);
 
   // StartAgent bundles SessionEgressPolicy inline so the host
   // applies the policy to its egress proxy registry *before*
@@ -133,15 +132,6 @@ service HostService {
   // sessions still need their proxy allowlist populated). The
   // standalone companion to StartAgent's bundled form.
   rpc ApplyEgressPolicy(ApplyEgressPolicyRequest) returns (Empty);
-
-  // ADR 0011 follow-up #3.
-  rpc AcquireShell(SandboxIdMessage) returns (Empty);
-  rpc ReleaseShell(SandboxIdMessage) returns (Empty);
-  // Issue #219: refresh the keep-alive stamp on a live shell pin. The
-  // coord shell bridge calls this on its WS-keepalive interval so the
-  // host can reap pins whose coord-side bridge died without a
-  // ReleaseShell (rolling deploy, crash, dropped WS).
-  rpc RenewShell(SandboxIdMessage) returns (Empty);
 
   // ADR 0065: bring up / tear down the ephemeral in-guest browser stack
   // (Xvfb + x11vnc + headful chromium). StartBrowser is idempotent and returns
@@ -524,6 +514,9 @@ message GuestIpResponse {
 message BindHarnessSessionRequest {
   bytes session_id = 1; // 16-byte UUID
   bytes sandbox_id = 2; // 16-byte UUID
+  // ADR 0073: binding generation for the attach token; the host's
+  // durable record is monotonic in this value.
+  uint64 binding_epoch = 3;
 }
 
 message UnbindHarnessSessionRequest {
@@ -568,9 +561,6 @@ message InterruptHarnessRequest {
   bytes sandbox_id = 1; // 16-byte UUID
 }
 
-message RehandshakeHarnessRequest {
-  bytes sandbox_id = 1; // 16-byte UUID
-}
 
 message StartAgentRequest {
   bytes sandbox_id = 1; // 16-byte UUID

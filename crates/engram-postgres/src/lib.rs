@@ -1764,6 +1764,71 @@ impl MetadataStore for PostgresStore {
     /// full TTL before the backstop will touch it). The per-session
     /// MAX is served by `idx_session_events_session_created`
     /// (migration 0050).
+    async fn list_idle_scan_candidates(
+        &self,
+        _soft_ttl_secs: i64,
+        _hard_ttl_secs: i64,
+    ) -> Result<Vec<engram_core::traits::metadata::IdleScanCandidate>, MetaError> {
+        // One lateral per Active+bound session for its newest event.
+        // The TTL params are unused here on purpose: classification
+        // (soft vs hard vs neither) is the detector's job; this query
+        // returns every Active session's newest-event row and lets the
+        // caller cut — the Active set is small (it is the fleet's live
+        // VM count), so shipping a few non-candidates is cheaper than
+        // splitting the policy across SQL and Rust.
+        let rows = sqlx::query(
+            r#"
+            SELECT s.id, s.sandbox_id, s.host_id, s.shell_pinned_until, s.created_at,
+                   le.kind AS last_kind, le.created_at AS last_event_at
+            FROM sessions s
+            LEFT JOIN LATERAL (
+                SELECT e.kind, e.created_at
+                FROM session_events e
+                WHERE e.session_id = s.id
+                ORDER BY e.idx DESC
+                LIMIT 1
+            ) le ON true
+            WHERE s.status = 'active' AND s.sandbox_id IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let id: uuid::Uuid = r.try_get("id").map_err(db_err)?;
+            let sandbox: Option<uuid::Uuid> = r.try_get("sandbox_id").map_err(db_err)?;
+            let host: Option<uuid::Uuid> = r.try_get("host_id").map_err(db_err)?;
+            let created_at: chrono::DateTime<chrono::Utc> =
+                r.try_get("created_at").map_err(db_err)?;
+            let last_event_at: Option<chrono::DateTime<chrono::Utc>> =
+                r.try_get("last_event_at").map_err(db_err)?;
+            out.push(engram_core::traits::metadata::IdleScanCandidate {
+                session_id: SessionId::from(id),
+                sandbox_id: sandbox.map(SandboxId::from),
+                host_id: host.map(engram_core::HostId::from),
+                last_event_at: last_event_at.unwrap_or(created_at),
+                last_event_kind: r.try_get("last_kind").map_err(db_err)?,
+                shell_pinned_until: r.try_get("shell_pinned_until").map_err(db_err)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn stamp_shell_pin(
+        &self,
+        id: SessionId,
+        pinned_until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), MetaError> {
+        sqlx::query("UPDATE sessions SET shell_pinned_until = $2 WHERE id = $1")
+            .bind(id.as_uuid())
+            .bind(pinned_until)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn list_active_sessions_idle_past(
         &self,
         idle_for_secs: i64,
@@ -1796,95 +1861,6 @@ impl MetadataStore for PostgresStore {
                 .try_get("last_event_at")
                 .map_err(|e| MetaError::Serialization(format!("backstop last_event_at: {e}")))?;
             out.push((SessionId::from(id), SandboxId::from(sandbox), last_event_at));
-        }
-        Ok(out)
-    }
-
-    async fn list_active_sessions_desynced(
-        &self,
-        stuck_for_secs: i64,
-    ) -> Result<Vec<engram_core::traits::metadata::DesyncedSession>, MetaError> {
-        // Track A: two desync signatures the idle backstop (silence-only)
-        // misses. Per Active+bound session, find the latest non-rewound
-        // event overall and the latest run-lifecycle event, then classify:
-        //   - stuck_open_run:    latest event IS a `run_started` (the run
-        //                        opened and emitted nothing since).
-        //   - orphan_after_close: latest event is a run-scoped event but
-        //                        the most recent run-lifecycle event is NOT
-        //                        a `run_started` — i.e. an event landed
-        //                        after the run closed, with no open run
-        //                        (the `bf3dbbcb` shape).
-        // A healthy in-progress run is excluded: its latest run-lifecycle
-        // event is `run_started`, so an `agent_message`/`tool_call_*` tail
-        // pairs to an OPEN run and is not orphaned. The `last_event_at`
-        // floor ensures we only fire once the session has been wedged for
-        // the TTL (a live run keeps bumping last_event_at).
-        let rows = sqlx::query(
-            r#"
-            WITH active AS (
-                SELECT id, sandbox_id, COALESCE(last_event_at, created_at) AS le
-                  FROM sessions
-                 WHERE status = 'active' AND sandbox_id IS NOT NULL
-            ),
-            latest AS (
-                SELECT DISTINCT ON (e.session_id) e.session_id, e.kind
-                  FROM session_events e
-                  JOIN active a ON a.id = e.session_id
-                 WHERE e.rewound_at IS NULL
-                 ORDER BY e.session_id, e.idx DESC
-            ),
-            latest_run AS (
-                SELECT DISTINCT ON (e.session_id) e.session_id, e.kind
-                  FROM session_events e
-                  JOIN active a ON a.id = e.session_id
-                 WHERE e.rewound_at IS NULL
-                   AND e.kind IN ('run_started', 'run_completed', 'run_interrupted')
-                 ORDER BY e.session_id, e.idx DESC
-            )
-            SELECT a.id, a.sandbox_id, a.le AS last_event_at, l.kind AS latest_kind,
-                   CASE WHEN l.kind = 'run_started'
-                        THEN 'stuck_open_run'
-                        ELSE 'orphan_after_close'
-                   END AS signature
-              FROM active a
-              JOIN latest l ON l.session_id = a.id
-              LEFT JOIN latest_run lr ON lr.session_id = a.id
-             WHERE a.le < NOW() - ($1::bigint * INTERVAL '1 second')
-               AND (
-                     l.kind = 'run_started'
-                  OR (l.kind IN ('agent_message', 'tool_call_started', 'tool_call_completed')
-                      AND COALESCE(lr.kind, '') <> 'run_started')
-                   )
-            "#,
-        )
-        .bind(stuck_for_secs)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in &rows {
-            let id: uuid::Uuid = r
-                .try_get("id")
-                .map_err(|e| MetaError::Serialization(format!("desync id: {e}")))?;
-            let sandbox: uuid::Uuid = r
-                .try_get("sandbox_id")
-                .map_err(|e| MetaError::Serialization(format!("desync sandbox_id: {e}")))?;
-            let latest_kind: String = r
-                .try_get("latest_kind")
-                .map_err(|e| MetaError::Serialization(format!("desync latest_kind: {e}")))?;
-            let signature: String = r
-                .try_get("signature")
-                .map_err(|e| MetaError::Serialization(format!("desync signature: {e}")))?;
-            let last_event_at: chrono::DateTime<chrono::Utc> = r
-                .try_get("last_event_at")
-                .map_err(|e| MetaError::Serialization(format!("desync last_event_at: {e}")))?;
-            out.push(engram_core::traits::metadata::DesyncedSession {
-                session_id: SessionId::from(id),
-                sandbox_id: SandboxId::from(sandbox),
-                latest_kind,
-                signature,
-                last_event_at,
-            });
         }
         Ok(out)
     }
@@ -1941,6 +1917,176 @@ impl MetadataStore for PostgresStore {
             return Err(MetaError::NotFound);
         }
         Ok(())
+    }
+
+    async fn outbox_enqueue(
+        &self,
+        row: &engram_core::types::outbox::OutboxRow,
+    ) -> Result<(), MetaError> {
+        // One round trip: idempotent insert + wake every replica's
+        // delivery driver. ON CONFLICT DO NOTHING makes caller retries
+        // (and cross-pod double-enqueues) harmless.
+        sqlx::query(
+            "WITH ins AS (
+                 INSERT INTO session_outbox
+                     (prompt_id, session_id, kind, payload, created_at, not_before)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (prompt_id) DO NOTHING
+             )
+             SELECT pg_notify('session_outbox', $2::text)",
+        )
+        .bind(&row.prompt_id)
+        .bind(row.session_id.as_uuid())
+        .bind(row.kind.as_str())
+        .bind(&row.payload)
+        .bind(row.created_at)
+        .bind(row.not_before)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn outbox_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT session_id FROM session_outbox
+             WHERE acked_at IS NULL AND not_before <= now()",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| {
+                let id: uuid::Uuid = r.try_get(0).map_err(db_err)?;
+                Ok(SessionId::from(id))
+            })
+            .collect()
+    }
+
+    async fn outbox_next_due(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<engram_core::types::outbox::OutboxRow>, MetaError> {
+        let row = sqlx::query(
+            "SELECT prompt_id, session_id, kind, payload, created_at, attempts,
+                    not_before, delivered_at, acked_at
+             FROM session_outbox
+             WHERE session_id = $1 AND acked_at IS NULL AND not_before <= now()
+             ORDER BY created_at ASC
+             LIMIT 1",
+        )
+        .bind(session_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| outbox_row_from_pg(&r)).transpose()
+    }
+
+    async fn outbox_mark_delivered(
+        &self,
+        prompt_id: &str,
+        ack_timeout: std::time::Duration,
+    ) -> Result<(), MetaError> {
+        sqlx::query(
+            "UPDATE session_outbox
+             SET delivered_at = now(),
+                 attempts = attempts + 1,
+                 not_before = now() + make_interval(secs => $2)
+             WHERE prompt_id = $1 AND acked_at IS NULL",
+        )
+        .bind(prompt_id)
+        .bind(ack_timeout.as_secs_f64())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn outbox_defer(
+        &self,
+        prompt_id: &str,
+        delay: std::time::Duration,
+    ) -> Result<(), MetaError> {
+        sqlx::query(
+            "UPDATE session_outbox
+             SET not_before = now() + make_interval(secs => $2)
+             WHERE prompt_id = $1 AND acked_at IS NULL",
+        )
+        .bind(prompt_id)
+        .bind(delay.as_secs_f64())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn outbox_ack(&self, prompt_id: &str) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE session_outbox SET acked_at = now()
+             WHERE prompt_id = $1 AND acked_at IS NULL",
+        )
+        .bind(prompt_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn outbox_update_prompt_text(
+        &self,
+        prompt_id: &str,
+        text: &str,
+    ) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE session_outbox
+             SET payload = jsonb_set(payload, '{text}', to_jsonb($2::text))
+             WHERE prompt_id = $1 AND kind = 'prompt'
+               AND delivered_at IS NULL AND acked_at IS NULL",
+        )
+        .bind(prompt_id)
+        .bind(text)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn outbox_delete_undelivered(&self, prompt_id: &str) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "DELETE FROM session_outbox
+             WHERE prompt_id = $1 AND delivered_at IS NULL AND acked_at IS NULL",
+        )
+        .bind(prompt_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn mint_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
+        // ADR 0067: one atomic bump; the RETURNING value is the epoch
+        // the caller stamps into the AgentSpec + bind RPC. Monotonic
+        // per session by construction (single row, single counter).
+        let row =
+            sqlx::query("UPDATE sessions SET binding_epoch = binding_epoch + 1 WHERE id = $1 RETURNING binding_epoch")
+                .bind(id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        let row = row.ok_or(MetaError::NotFound)?;
+        let epoch: i64 = row.try_get(0).map_err(db_err)?;
+        Ok(epoch as u64)
+    }
+
+    async fn current_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
+        let row = sqlx::query("SELECT binding_epoch FROM sessions WHERE id = $1")
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        let row = row.ok_or(MetaError::NotFound)?;
+        let epoch: i64 = row.try_get(0).map_err(db_err)?;
+        Ok(epoch as u64)
     }
 
     async fn assign_session_sandbox(
@@ -5104,4 +5250,27 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)?;
         Ok(count.max(0) as u64)
     }
+}
+
+/// ADR 0067: map a `session_outbox` row. Free fn (not a `FromRow`) to
+/// keep the runtime-query style the rest of this store uses.
+fn outbox_row_from_pg(
+    r: &sqlx::postgres::PgRow,
+) -> Result<engram_core::types::outbox::OutboxRow, MetaError> {
+    let kind_s: String = r.try_get("kind").map_err(db_err)?;
+    let kind = engram_core::types::outbox::OutboxKind::parse(&kind_s).ok_or_else(|| {
+        MetaError::Serialization(format!("unknown session_outbox.kind {kind_s:?}"))
+    })?;
+    let session_id: uuid::Uuid = r.try_get("session_id").map_err(db_err)?;
+    Ok(engram_core::types::outbox::OutboxRow {
+        prompt_id: r.try_get("prompt_id").map_err(db_err)?,
+        session_id: SessionId::from(session_id),
+        kind,
+        payload: r.try_get("payload").map_err(db_err)?,
+        created_at: r.try_get("created_at").map_err(db_err)?,
+        attempts: r.try_get("attempts").map_err(db_err)?,
+        not_before: r.try_get("not_before").map_err(db_err)?,
+        delivered_at: r.try_get("delivered_at").map_err(db_err)?,
+        acked_at: r.try_get("acked_at").map_err(db_err)?,
+    })
 }

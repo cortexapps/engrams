@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use engram_core::SessionId;
+use engram_core::{SandboxId, SessionId};
 use engram_harness_proto::{
     read_msg, write_msg, HarnessAttach, HarnessAttachAck, HarnessCommand, HarnessEvent,
     HarnessFrame,
@@ -51,6 +51,11 @@ pub struct NoopConfig {
     /// the harness stays at "between runs" when the test wants to
     /// exercise idle eviction.
     pub send_run_completed: bool,
+    /// ADR 0067 attach token (sandbox half). Tests bind the hub with
+    /// the same pair so the handshake validates.
+    pub sandbox_id: SandboxId,
+    /// ADR 0067 attach token (generation half).
+    pub binding_epoch: u64,
 }
 
 impl NoopConfig {
@@ -64,6 +69,8 @@ impl NoopConfig {
             result_summary_template: "ok (noop)".into(),
             agent_message_template: "noop assistant message".into(),
             send_run_completed: false,
+            sandbox_id: SandboxId::new(),
+            binding_epoch: 1,
         }
     }
 }
@@ -96,6 +103,8 @@ where
         &mut writer,
         &HarnessAttach {
             session_id: cfg.session_id,
+            sandbox_id: cfg.sandbox_id,
+            binding_epoch: cfg.binding_epoch,
             harness_version: cfg.harness_version.clone(),
         },
     )
@@ -148,13 +157,6 @@ where
                     // Noop has no in-flight child to SIGINT — nothing
                     // to interrupt. A real adapter stops its current
                     // run and emits RunInterrupted + Idle.
-                }
-                Ok(HarnessFrame::Command(HarnessCommand::Rehandshake)) => {
-                    // Track A: drop this connection so the host's
-                    // reconnect path re-dials. The noop test driver has a
-                    // single connection, so end the reader (the real
-                    // adapter re-dials in-process and re-emits Idle).
-                    return;
                 }
                 Ok(HarnessFrame::Command(HarnessCommand::EditQueued { .. }))
                 | Ok(HarnessFrame::Command(HarnessCommand::DequeueQueued { .. })) => {
@@ -311,6 +313,7 @@ mod tests {
                 &mut hw,
                 &HarnessAttachAck {
                     ok: true,
+                    reject: None,
                     message: None,
                 },
             )
@@ -374,6 +377,7 @@ mod tests {
                 &mut hw,
                 &HarnessAttachAck {
                     ok: false,
+                    reject: Some(engram_harness_proto::AttachReject::UnknownBinding),
                     message: Some("nope".into()),
                 },
             )
@@ -400,6 +404,7 @@ mod tests {
                 &mut hw,
                 &HarnessAttachAck {
                     ok: true,
+                    reject: None,
                     message: None,
                 },
             )

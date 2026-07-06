@@ -21,6 +21,7 @@ use crate::image_cache::ImageCache;
 
 pub mod admin_handler;
 pub mod base_shm_gc;
+pub mod bindings;
 pub mod blob;
 pub mod bundles;
 pub mod capabilities;
@@ -620,7 +621,10 @@ impl HostAgent {
                     }
                 }
             });
-            let harness_hub = std::sync::Arc::new(crate::harness::HarnessHub::new(event_sink));
+            let bindings = crate::bindings::BindingStore::open(self.cfg.work_dir.join("bindings"))
+                .expect("open binding store under work_dir (ADR 0073)");
+            let harness_hub =
+                std::sync::Arc::new(crate::harness::HarnessHub::new(event_sink, bindings));
             // Plumb the hub into the FC/VZ backend's vsock-accept
             // sink so inbound harness connections land on the local
             // hub's adapter loop. Without this the FC backend drops
@@ -829,7 +833,6 @@ impl HostAgent {
                 };
                 let cc = coord_client.clone();
                 let pooled_for_rehydrate = pooled.clone();
-                let harness_hub_for_rebind = harness_hub.clone();
                 registration_task = Some(tokio::spawn(async move {
                     let mut backoff = std::time::Duration::from_millis(500);
                     let cap = std::time::Duration::from_secs(30);
@@ -842,17 +845,13 @@ impl HostAgent {
                                     rehydrate_sandboxes = resp.rehydrate_sandboxes.len(),
                                     "registered with coord via /api/hosts/register",
                                 );
-                                // Restore harness-hub routing for survivors
-                                // BEFORE the disk rehydrate below: the in-guest
-                                // harness is already re-dialing, and its attach
-                                // is rejected ("no sandbox bound to this
-                                // session_id") until this lands. Platform-neutral
-                                // (the hub exists on every backend); FC is where
-                                // survivors actually occur. (Session b9b28452.)
-                                rebind_survivor_sessions(
-                                    &harness_hub_for_rebind,
-                                    &resp.rehydrate_sandboxes,
-                                );
+                                // ADR 0073: no harness-hub rebind pass here.
+                                // Binding records live on disk under work_dir
+                                // and survive the roll, so the survivor
+                                // harness's re-dial validates against the
+                                // durable record with zero rebuild step (the
+                                // b9b28452/#447 gap is closed by construction,
+                                // not by replay).
                                 // Issue #229: the coord echoes the wire
                                 // version it understands. Previously this was
                                 // deserialized and silently dropped. A skew is
@@ -983,11 +982,14 @@ impl HostAgent {
             // registers a charge before each prewarm write and the
             // heartbeat tick's `sample()` reads it back out every tick.
             let ram_ledger = std::sync::Arc::new(ram_ledger::RamLedger::new());
-            // Published once per heartbeat tick so the idle-evictor's
-            // pressure gate reads the SAME snapshot the heartbeat just
-            // built — one source of truth instead of a second, private
-            // `/proc/meminfo` read (issue #540).
-            let (ram_ledger_tx, ram_ledger_rx) =
+            // Published once per heartbeat tick (issue #540). ADR 0073
+            // deleted the channel's only local subscriber (the host
+            // eviction tick's pressure gate — now coordinator-side,
+            // reading the hosts.utilization these snapshots feed); the
+            // tx side stays as the heartbeat's single measurement
+            // source, and the watch shape stays so a future local
+            // consumer (epic #545's rung residency) subscribes cheaply.
+            let (ram_ledger_tx, _ram_ledger_rx) =
                 tokio::sync::watch::channel(ram_ledger::RamLedgerSnapshot::default());
 
             // ADR 0015 M5: image-prefetch supervisor. Watches the
@@ -1104,6 +1106,7 @@ impl HostAgent {
             // against the local ready set.
             let heartbeat_interval = self.cfg.heartbeat_interval;
             let coord_for_heartbeat = coord_client.clone();
+            let harness_hub_for_heartbeat = harness_hub.clone();
             let pooled_for_heartbeat = pooled.clone();
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
@@ -1269,6 +1272,9 @@ impl HostAgent {
                         total_vcpus: std::thread::available_parallelism()
                             .map(|n| n.get() as u32)
                             .unwrap_or(0),
+                        // ADR 0073 phase 4: harness-attach liveness for the
+                        // coordinator's disagreement alarm.
+                        harness_attached: harness_hub_for_heartbeat.attached_sandboxes(),
                         // Issue #229: report our bincode wire version so the
                         // coordinator drains us off scheduling on a skew
                         // (mixed-version fleet mid rolling deploy).
@@ -1346,230 +1352,23 @@ impl HostAgent {
                 }
             });
 
-            // ADR 0011 follow-up #2: host owns idle-eviction
-            // detection (its HarnessHub is authoritative for "last
-            // harness activity"). Push candidates to coord via
-            // HTTP; coord-side pipeline (`evict_idle_session`)
-            // runs the snapshot+destroy+mark-Idle dance on whatever
-            // pod receives the POST. Idempotent across pods.
-            let eviction_hub = harness_hub.clone();
-            let eviction_coord = coord_client.clone();
-            let eviction_pooled = pooled.clone();
-            let idle_soft_ttl = idle_evictor::idle_ttl_from_env();
-            let idle_hard_ttl = idle_evictor::idle_hard_ttl_from_env();
-            // ADR 0014 issue #4: disk-pressure floor. When free disk
-            // on the work_dir falls below this, we pause pushing
-            // idle-evict candidates — coord-side retry storms (every
-            // one of which writes ~4 GiB of FC memory dump pre-fix)
-            // can't fill the disk if we never push them. The
-            // companion fixes from #1/#2 also stop the per-retry
-            // leak; this is the defense-in-depth backstop for any
-            // future leak class we haven't anticipated.
-            let eviction_work_dir = self.cfg.work_dir.clone();
-            let eviction_floor_bytes = idle_evictor::disk_floor_bytes_from_env();
-            // Tier 1 (pressure-aware idle eviction): default-off. When on,
-            // soft-idle sandboxes are only nominated under real memory
-            // pressure (< mem floor % free) — a warm VM stays resident on
-            // a host with RAM to spare instead of paying snapshot+cold-
-            // resume churn. Hard-idle sandboxes always proceed.
-            let eviction_pressure_aware = idle_evictor::pressure_aware_from_env();
-            let eviction_mem_floor_pct = idle_evictor::mem_floor_pct_from_env();
-            // Issue #540: read the heartbeat tick's RAM-ledger snapshot
-            // instead of taking a second, private `/proc/meminfo` sample —
-            // one source of truth for both the heartbeat's `allocatable_mib`
-            // and this pressure gate's `free_pct`.
-            let mut ram_ledger_rx_for_eviction = ram_ledger_rx;
-            let eviction_task = tokio::spawn(async move {
-                let mut tick = tokio::time::interval(idle_evictor::DEFAULT_POLL_INTERVAL);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tick.tick().await;
-                    let (allow, free) =
-                        idle_evictor::disk_pressure_check(&eviction_work_dir, eviction_floor_bytes);
-                    if let Some(b) = free {
-                        ::metrics::gauge!(crate::metrics::HOST_DISK_FREE_BYTES).set(b as f64);
-                    }
-                    if !allow {
-                        ::metrics::counter!(crate::metrics::IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL)
-                            .increment(1);
-                        tracing::warn!(
-                            host_id = %host_id,
-                            free_bytes = ?free,
-                            floor_bytes = eviction_floor_bytes,
-                            "idle-evict paused: disk pressure (free < floor)",
-                        );
-                        continue;
-                    }
-                    // ADR 0016 §A.1.5a: sweep wedged in-flight markers
-                    // before reading candidates. A spawned POST that
-                    // got stuck (reqwest future hung past its own
-                    // 120s timeout for some pathological reason)
-                    // would otherwise permanently block re-eviction of
-                    // its sandbox. 180s is 1.5× the per-request
-                    // timeout — by that point the POST is unambiguously
-                    // dead, even if the spawned task somehow hasn't
-                    // returned.
-                    let stale =
-                        eviction_hub.sweep_stale_evictions(std::time::Duration::from_secs(180));
-                    if !stale.is_empty() {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            count = stale.len(),
-                            "swept stale eviction-inflight markers (>180s); spawned POSTs presumed wedged",
-                        );
-                    }
-                    // Issue #219: same hardening for `shell_attached`.
-                    // A shell pin is acquired/released by two independent
-                    // coord→host RPCs from the coord's WS bridge task. If
-                    // that task dies without sending ReleaseShell (coord
-                    // pod killed mid-session, dropped WS), the pin would
-                    // stay ≥1 forever, exempting the sandbox from idle
-                    // eviction — hard-TTL backstop included. The coord
-                    // bridge renews live pins on its keepalive interval;
-                    // reap any pin we've stopped hearing about so it
-                    // falls back under the normal TTLs.
-                    let stale_shells =
-                        eviction_hub.sweep_stale_shells(crate::harness::SHELL_PIN_STALE_AGE);
-                    if !stale_shells.is_empty() {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            count = stale_shells.len(),
-                            "swept stale shell pins (un-renewed past SHELL_PIN_STALE_AGE); \
-                             coord WS bridge presumed dead",
-                        );
-                    }
-                    // `idle_sandboxes` now skips sandboxes whose prior
-                    // POST is still in flight (ADR 0016 §A.1.5a).
-                    let mut pairs = eviction_hub.idle_sandboxes(idle_soft_ttl, idle_hard_ttl);
-                    // ADR 0045 C2: sandboxes mid-post-copy are never
-                    // idle-evict candidates — the frozen SOURCE is
-                    // maximally "quiet" and would be nominated every
-                    // tick; the DEST's durability isn't caught up yet.
-                    // The session lease blocks the pipeline anyway;
-                    // this keeps the nominations (and the lease-handoff
-                    // race window) out entirely.
-                    pairs.retain(|(_, sb, _)| eviction_pooled.migration_role(*sb).is_none());
-                    // Tier 1 (pressure-aware idle eviction): with the mode
-                    // on and the host NOT under memory pressure, drop the
-                    // `Soft` candidates — keep the warm VMs resident and
-                    // let a live human resume instantly instead of paying a
-                    // cold restore. `Hard` candidates (the never-emits-Idle
-                    // backstop) always survive, and the coord's own hard-TTL
-                    // backstop remains the absolute residency ceiling. When
-                    // the mode is off this whole block is skipped, so the
-                    // nomination set is byte-identical to the historical
-                    // TTL-only behavior.
-                    if eviction_pressure_aware {
-                        // Issue #540: the same snapshot the heartbeat tick
-                        // just published — `borrow()` never blocks and
-                        // always returns the latest value (or the
-                        // all-zeros default before the first heartbeat).
-                        let snapshot = *ram_ledger_rx_for_eviction.borrow_and_update();
-                        let (under_pressure, free_pct) = idle_evictor::mem_pressure_from(
-                            snapshot.mem_total_mib,
-                            snapshot
-                                .mem_total_mib
-                                .saturating_sub(snapshot.mem_available_mib),
-                            eviction_mem_floor_pct,
-                        );
-                        // Issue #540: HOST_MEM_FREE_PCT is now emitted once,
-                        // at the heartbeat tick's single emission site
-                        // (`ram_snapshot.free_pct()`) — not here, so a gauge
-                        // read never depends on pressure-aware mode being on.
-                        if !under_pressure {
-                            let before = pairs.len();
-                            pairs.retain(|(_, _, kind)| *kind == crate::harness::IdleKind::Hard);
-                            let kept = before - pairs.len();
-                            if kept > 0 {
-                                ::metrics::counter!(crate::metrics::IDLE_EVICT_KEPT_RESIDENT_TOTAL)
-                                    .increment(kept as u64);
-                                tracing::debug!(
-                                    host_id = %host_id,
-                                    kept,
-                                    free_pct = ?free_pct,
-                                    floor_pct = eviction_mem_floor_pct,
-                                    "idle-evict: kept soft-idle sandboxes resident (no memory pressure)",
-                                );
-                            }
-                        }
-                    }
-                    if pairs.is_empty() {
-                        continue;
-                    }
-                    let sandbox_ids: Vec<SandboxId> = pairs.iter().map(|(_, sb, _)| *sb).collect();
-                    let candidates: Vec<coord_client::IdleCandidate> = pairs
-                        .into_iter()
-                        .map(|(session_id, sandbox_id, _)| coord_client::IdleCandidate {
-                            session_id,
-                            sandbox_id,
-                            idle_since: None,
-                        })
-                        .collect();
-                    // Mark BEFORE the spawn so the next tick (10s
-                    // away) can't double-post. The clear runs in the
-                    // spawned task's finally block — covers success,
-                    // transport error, and timeout uniformly.
-                    for sb in &sandbox_ids {
-                        eviction_hub.mark_eviction_inflight(*sb);
-                    }
-                    // Fire-and-forget: don't block the tick loop on
-                    // the POST. Since ADR 0034 the POST is a fast
-                    // nomination (coord flips Active→Evicting and
-                    // returns; its eviction scanner runs the
-                    // pipeline), so the marker clears in seconds and
-                    // re-nomination dedup comes from the coord side
-                    // (non-Active candidate → accepted no-op). The
-                    // marker + 180s stale sweep stay as the
-                    // within-tick guard (ADR 0016 §A.1.5a).
-                    //
-                    // Shutdown caveat: `eviction_task.abort()` on
-                    // process exit will not wait for these spawned
-                    // children. Detached POSTs may be torn down mid-
-                    // flight. Acceptable — the coord-side pipeline
-                    // is idempotent (the registry guard at the top
-                    // of `evict_idle_session` short-circuits on
-                    // re-entry per A.1.5b).
-                    let coord = eviction_coord.clone();
-                    let hub = eviction_hub.clone();
-                    let sandbox_ids_for_clear = sandbox_ids.clone();
-                    tokio::spawn(async move {
-                        let outcome = coord
-                            .push_idle_eviction_candidates(host_id, candidates)
-                            .await;
-                        // Finally: clear in-flight markers regardless
-                        // of outcome. A failed POST should NOT keep
-                        // the sandbox blocked from a retry on the
-                        // next tick — but the next tick will only
-                        // happen after this completes, which is the
-                        // whole point of the gate.
-                        for sb in &sandbox_ids_for_clear {
-                            hub.clear_eviction_inflight(*sb);
-                        }
-                        match outcome {
-                            Ok(resp) => {
-                                tracing::debug!(
-                                    %host_id,
-                                    accepted = resp.accepted,
-                                    failed = resp.failed,
-                                    "idle-eviction POST completed",
-                                );
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    %host_id,
-                                    error = %e,
-                                    "idle-eviction POST failed; \
-                                     will retry on next tick after clear",
-                                );
-                            }
-                        }
-                    });
-                }
-            });
+            // ADR 0073 phase 4: no host-side idle detection. The
+            // coordinator's PG-derived idle detector (idle_detector.rs)
+            // is the ONLY detection plane — same soft/hard TTL
+            // semantics, sourced from the durable event log instead of
+            // hub memory (which went amnesiac on every detach/restart;
+            // the reason the L3 backstop existed). The disk-pressure
+            // brake and pressure-aware gating moved with it, reading
+            // the heartbeat-persisted hosts.utilization.
+            // Issue #540 note: the RAM ledger still feeds the heartbeat's
+            // allocatable_mib (its watch channel is consumed by the
+            // heartbeat tick above); the deleted eviction tick was its
+            // OTHER consumer, and that pressure gate now lives in the
+            // coordinator's detector reading hosts.utilization — the
+            // same ledger numbers, one hop later.
 
             shutdown_signal().await;
             heartbeat_task.abort();
-            eviction_task.abort();
             if let Some(t) = grpc_task {
                 t.abort();
             }
@@ -1697,31 +1496,6 @@ fn stages_images_gate(has_chunk_store: bool, has_chunk_cache: bool) -> bool {
     has_chunk_store && has_chunk_cache
 }
 
-/// Restore harness-hub routing for every survivor the coord re-handed us
-/// on (re)registration. SEPARATE from disk rehydration and platform-neutral:
-/// a host-agent roll / restart rebuilds the hub's `session_to_sandbox` map
-/// EMPTY, so the in-guest harness — which survives the roll and keeps
-/// re-dialing — has its attach answered "no sandbox bound to this
-/// session_id" and (pre-fix) exited, wedging the session `active` forever
-/// (session b9b28452). `reattach_pass` + `rehydrate_survivors` restore the
-/// VM and the disk/egress plane but never touch the harness hub; this closes
-/// that gap. Idempotent (a later bind replaces an earlier one).
-fn rebind_survivor_sessions(
-    harness_hub: &harness::HarnessHub,
-    survivors: &[coord_client::RehydrateSandboxRef],
-) {
-    if survivors.is_empty() {
-        return;
-    }
-    for s in survivors {
-        harness_hub.bind_session(s.session_id, s.sandbox_id);
-    }
-    tracing::info!(
-        count = survivors.len(),
-        "rebound harness-hub routing for survivor sessions after (re)registration",
-    );
-}
-
 #[cfg(target_os = "linux")]
 async fn rehydrate_survivors(
     pooled: &Arc<pooled_backend::PooledBackend>,
@@ -1841,46 +1615,46 @@ mod tests {
     use super::*;
     use engram_core::SessionId;
 
-    fn noop_hub() -> harness::HarnessHub {
-        harness::HarnessHub::new(std::sync::Arc::new(|_, _, _| Box::new(Box::pin(async {}))))
+    fn noop_hub_over(dir: &std::path::Path) -> harness::HarnessHub {
+        harness::HarnessHub::new(
+            std::sync::Arc::new(|_, _, _| Box::new(Box::pin(async {}))),
+            bindings::BindingStore::open(dir).expect("open binding store"),
+        )
     }
 
-    /// Regression (session b9b28452): after a host-agent roll the harness
-    /// hub's session→sandbox map is rebuilt EMPTY, so the surviving in-guest
-    /// harness's re-dial is rejected with "no sandbox bound to this
-    /// session_id". `rebind_survivor_sessions` must repopulate routing for
-    /// every survivor the coord re-hands us, so the harness re-attach lands
-    /// instead of the session wedging `active` forever.
+    /// ADR 0073 replacement for the retired `rebind_survivor_sessions`
+    /// coverage (regression b9b28452 / #447): a host-agent restart must
+    /// accept a survivor harness's re-dial with ZERO rebuild pass. The
+    /// binding record on disk IS the routing — a hub constructed fresh
+    /// over a pre-populated bindings dir (what a restarted process
+    /// sees) resolves the survivor immediately.
     #[test]
-    fn rebind_survivor_sessions_restores_harness_routing() {
-        let hub = noop_hub();
+    fn fresh_hub_over_surviving_bindings_dir_routes_survivors() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let session_id = SessionId::new();
         let sandbox_id = SandboxId::new();
 
-        // Fresh post-roll process: nothing bound → an attach would be rejected.
-        assert!(hub.bound_sandbox(session_id).is_none());
+        // "Old" process binds, then dies (dropped hub).
+        {
+            let hub = noop_hub_over(dir.path());
+            hub.bind_session(session_id, sandbox_id, 1).expect("bind@1");
+        }
 
-        let survivors = vec![coord_client::RehydrateSandboxRef {
-            session_id,
-            sandbox_id,
-            // A survivor with no disk manifest is skipped by the disk
-            // rehydrate, but STILL needs its harness routing restored.
-            disk_manifest_id: None,
-            disk_manifest_version: None,
-        }];
-        rebind_survivor_sessions(&hub, &survivors);
-
+        // "New" process: fresh hub, same dir, no coordinator involved.
+        let hub = noop_hub_over(dir.path());
         assert_eq!(
             hub.bound_sandbox(session_id),
             Some(sandbox_id),
-            "survivor's harness routing must be restored so its re-attach succeeds",
+            "survivor binding must be readable by a restarted host-agent",
         );
     }
 
+    /// An empty bindings dir routes nothing — parity with the old
+    /// empty-list no-op behavior.
     #[test]
-    fn rebind_survivor_sessions_is_a_noop_for_empty_list() {
-        let hub = noop_hub();
-        rebind_survivor_sessions(&hub, &[]);
+    fn fresh_hub_over_empty_bindings_dir_routes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hub = noop_hub_over(dir.path());
         assert!(hub.bound_sandbox(SessionId::new()).is_none());
     }
 

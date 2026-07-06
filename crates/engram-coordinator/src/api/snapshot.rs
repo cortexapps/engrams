@@ -132,6 +132,10 @@ pub(crate) async fn resolve_resume_agent_and_policy(
         selected_harness.as_deref(),
         session.mode,
         id,
+        // Resume re-spawns the harness against an existing session — there
+        // is no create-time initial prompt (ADR 0073: follow-ups ride the
+        // durable outbox, replayed on reattach).
+        None,
         session_env,
         b.manifest.workdir.clone(),
     )
@@ -139,6 +143,15 @@ pub(crate) async fn resolve_resume_agent_and_policy(
     .ok()
     .flatten()?;
     crate::api::sessions::inject_harness_env(state, id, &mut agent.env).await;
+    // ADR 0073: stamp the CURRENT epoch (this runs after the flow's
+    // bind — minted for fresh-spawn resumes, unminted for live moves,
+    // where the surviving harness must keep validating).
+    agent.binding_epoch = state
+        .services
+        .meta
+        .current_binding_epoch(id)
+        .await
+        .unwrap_or(0);
     // Rebuild the SessionEgressPolicy for `sandbox_id`. Falls back to the
     // legacy placeholder when the host has no guest IP (process backend, VZ in
     // some configs) or the IP is unparseable — same as the create path.
@@ -977,7 +990,7 @@ async fn resume_disk_only_cold_boot(
         )
         .await;
 
-    bind_session_routing(&state, id, receipt.new_sandbox_id).await;
+    bind_session_routing_minted(&state, id, receipt.new_sandbox_id).await;
     let refreshed = state.services.meta.get_session(id).await?;
     let outcome = finish_resume_to_active(&state, &refreshed, receipt.new_sandbox_id, true).await?;
     let note = match outcome {
@@ -1706,7 +1719,7 @@ async fn bind_resumed_session(
             return Err(ApiError::Internal(format!("rebind_session on resume: {e}")));
         }
     }
-    bind_session_routing(state, id, sandbox_id).await;
+    bind_session_routing_minted(state, id, sandbox_id).await;
     Ok(())
 }
 
@@ -1729,8 +1742,37 @@ pub(crate) async fn bind_session_routing(
     state: &SharedState,
     id: SessionId,
     sandbox_id: SandboxId,
+    binding_epoch: u64,
 ) {
-    state.services.host.bind_session(id, sandbox_id).await;
+    state
+        .services
+        .host
+        .bind_session(id, sandbox_id, binding_epoch)
+        .await;
+}
+
+/// ADR 0073: mint-then-bind for the NEW-sandbox fresh-spawn flows
+/// (idle resume, disk-only cold recovery, evac restore). Live moves
+/// must NOT come through here — a teleported harness survives with
+/// its generation unchanged; they bind at `current_binding_epoch`.
+pub(crate) async fn bind_session_routing_minted(
+    state: &SharedState,
+    id: SessionId,
+    sandbox_id: SandboxId,
+) -> u64 {
+    let epoch = match state.services.meta.mint_binding_epoch(id).await {
+        Ok(e) => e,
+        Err(e) => {
+            // Loud but non-fatal: with no mint, the spawn-path bind
+            // (LocalHostClient::start_agent) still writes a record at
+            // the spec's epoch; a 0 here means that attach will bounce
+            // UnknownBinding until a later reattach mints properly.
+            tracing::error!(session_id = %id, error = %e, "mint binding epoch failed");
+            0
+        }
+    };
+    bind_session_routing(state, id, sandbox_id, epoch).await;
+    epoch
 }
 
 /// ADR 0051: transport-agnostic evict core (gRPC `EvictLocal` + axum

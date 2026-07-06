@@ -70,10 +70,6 @@ pub fn router(state: SharedState) -> Router {
             get(host_http::sandbox_ownership),
         )
         .route(
-            "/hosts/:id/idle-eviction-candidates",
-            post(host_http::idle_eviction_candidates),
-        )
-        .route(
             "/hosts/:id/live-manifest",
             post(host_http::live_manifest_publish),
         )

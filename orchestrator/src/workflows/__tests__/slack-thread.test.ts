@@ -150,7 +150,9 @@ describe("handleInbound() — follow-up @mention", () => {
     expect(calls.onPickup).toHaveLength(1); // 👀 still went out
     expect(calls.onDeliveryError).toHaveLength(1);
     expect(calls.onDeliveryError[0][0]).toBe(m1); // ⚠️ on the new mention
-    expect(String(calls.onDeliveryError[0][1])).toContain("retry");
+    // ADR 0067: the "mention me again to retry" apology is retired —
+    // enqueue failures are hard failures (session ended / coord down).
+    expect(String(calls.onDeliveryError[0][1])).toContain("session");
     expect(next).toBe("100.0"); // cursor UNCHANGED — undelivered messages re-gather next time
   });
 
@@ -202,7 +204,7 @@ describe("handleInbound() — answer", () => {
 
     expect(calls.onDeliveryError).toHaveLength(1);
     expect(calls.onDeliveryError[0][0]).toBe(cur); // reacts on the current turn's mention
-    expect(String(calls.onDeliveryError[0][1])).toContain("try again");
+    expect(String(calls.onDeliveryError[0][1])).toContain("session");
     expect(next).toBe("180.0");
   });
 });

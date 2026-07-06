@@ -192,7 +192,13 @@ impl HostClient for FakeBackend {
     async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
         None
     }
-    async fn bind_session(&self, _session_id: SessionId, _sandbox_id: SandboxId) {}
+    async fn bind_session(
+        &self,
+        _session_id: SessionId,
+        _sandbox_id: SandboxId,
+        _binding_epoch: u64,
+    ) {
+    }
     async fn unbind_session(&self, _session_id: SessionId) {}
     async fn send_prompt(
         &self,
@@ -200,12 +206,6 @@ impl HostClient for FakeBackend {
         _prompt_id: String,
         _text: String,
     ) -> Result<(), SandboxError> {
-        unreachable!()
-    }
-    async fn acquire_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        unreachable!()
-    }
-    async fn release_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
         unreachable!()
     }
     fn harness_dial(&self) -> HarnessDial {

@@ -178,6 +178,9 @@ fn agent_spec() -> AgentSpec {
         env: HashMap::from([("ENGRAM_HARNESS_CWD".into(), "/workspace".into())]),
         session_env: HashMap::new(),
         host_ca_pem: Some("-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".into()),
+        // ADR 0073 (WIRE_VERSION bump, clean break): the attach-token
+        // generation rides the spec.
+        binding_epoch: 7,
     }
 }
 
@@ -364,8 +367,14 @@ fn wire_version_pinned() {
     // The version stamp coord/host exchange. Bumping it is the deliberate
     // signal that a payload shape changed; pin it so a payload change
     // without a bump (or vice-versa) is a conscious decision.
+    //
+    // 9 -> 10: ADR 0073 (epic #542) — bind_session + AgentSpec carry
+    // binding_epoch, the shell-pin/rehandshake RPCs are deleted, heartbeat
+    // gains harness_attached. Goldens regenerated in the same change.
+    // (Rebased onto main past #590, which left main at wire 9; this bumps
+    // to 10. The overhaul train's #548 later bumps 10 -> 11.)
     assert_eq!(
-        WIRE_VERSION, 9,
+        WIRE_VERSION, 10,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

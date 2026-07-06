@@ -76,25 +76,18 @@ pub enum CreateDisposition {
     Queued,
 }
 
-/// Track A: an `Active` session the desync watchdog flagged as wedged —
-/// the harness event stream desynced from the run state machine, leaving
-/// the session stuck without reaching a clean idle resting state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DesyncedSession {
+/// ADR 0073 phase 4: one idle-scan candidate row (Active + bound).
+#[derive(Clone, Debug)]
+pub struct IdleScanCandidate {
     pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
-    /// The kind of the latest (non-rewound) event the session is stuck on.
-    pub latest_kind: String,
-    /// Which signature tripped: `"orphan_after_close"` (a run-scoped event
-    /// with no open run — the `bf3dbbcb` shape) or `"stuck_open_run"` (a
-    /// `run_started` that produced zero events since).
-    pub signature: String,
-    /// The session's `last_event_at` (COALESCEd to `created_at`). The
-    /// watchdog escalates from re-handshake to eviction once this ages past
-    /// the escalate TTL: a successful re-handshake re-emits `Idle`, bumping
-    /// this and dropping the session out of the flagged set, so a still-old
-    /// value means the nudges aren't taking.
+    pub sandbox_id: Option<crate::SandboxId>,
+    pub host_id: Option<crate::HostId>,
+    /// Newest session_event time, falling back to the session's
+    /// created_at when no events exist yet.
     pub last_event_at: chrono::DateTime<chrono::Utc>,
+    /// Kind of the newest event (`None` = no events yet).
+    pub last_event_kind: Option<String>,
+    pub shell_pinned_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Authoritative source of truth. Postgres-backed in v1; trait exists so
@@ -581,6 +574,142 @@ pub trait MetadataStore: Send + Sync {
         id: SessionId,
         sandbox_id: Option<SandboxId>,
     ) -> Result<(), MetaError>;
+
+    /// ADR 0073: mint the next binding epoch for `id` — one atomic
+    /// `UPDATE … SET binding_epoch = binding_epoch + 1 … RETURNING`.
+    /// Called by the coordinator at the moment it commits to binding
+    /// the session to a NEW sandbox for a fresh-spawn flow (create,
+    /// idle resume, cold recovery, evac). Live moves do NOT mint — the
+    /// harness process survives a teleport and its generation is
+    /// unchanged (see `current_binding_epoch`).
+    ///
+    /// Default (mock stores): a constant `1` — mocks get "no fencing",
+    /// which is the pre-0067 behavior; the Postgres store overrides
+    /// with the real per-session counter. Same degradation pattern as
+    /// the guarded-CAS defaults above.
+    async fn mint_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
+        let _ = id;
+        Ok(1)
+    }
+
+    /// ADR 0073: the session's current binding epoch, without minting.
+    /// Read by flows where the harness process may SURVIVE the
+    /// transition (live migration; in-place reattach on the same
+    /// sandbox) so the spec they build matches the standing record.
+    ///
+    /// Default (mock stores): constant `1`, paired with
+    /// [`Self::mint_binding_epoch`]'s default.
+    async fn current_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
+        let _ = id;
+        Ok(1)
+    }
+
+    /// ADR 0073 phase 4: one row per Active+bound session for the idle
+    /// scan — newest event (kind + time), host, and the shell pin. The
+    /// detector classifies soft/hard client-side so the TTL policy
+    /// lives in one place.
+    async fn list_idle_scan_candidates(
+        &self,
+        soft_ttl_secs: i64,
+        hard_ttl_secs: i64,
+    ) -> Result<Vec<IdleScanCandidate>, MetaError> {
+        let _ = (soft_ttl_secs, hard_ttl_secs);
+        Ok(Vec::new())
+    }
+
+    /// ADR 0073 phase 4: stamp/renew the shell keep-alive pin. The WS
+    /// bridge calls this on its keepalive; passing a past instant (or
+    /// letting it lapse) un-pins.
+    async fn stamp_shell_pin(
+        &self,
+        id: SessionId,
+        pinned_until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), MetaError> {
+        let _ = (id, pinned_until);
+        Ok(())
+    }
+
+    /// ADR 0073 phase 2: durably enqueue a command for delivery.
+    /// Idempotent on `prompt_id` (INSERT … ON CONFLICT DO NOTHING) so a
+    /// caller retry never duplicates a row. The Postgres impl also
+    /// fires `pg_notify('session_outbox', session_id)` in the same
+    /// round trip to wake every replica's delivery driver.
+    ///
+    /// Default (mock stores): drops the row — mocks get pre-0067
+    /// fire-and-forget delivery semantics; tests that assert outbox
+    /// behavior use a store that overrides these.
+    async fn outbox_enqueue(&self, row: &crate::types::outbox::OutboxRow) -> Result<(), MetaError> {
+        let _ = row;
+        Ok(())
+    }
+
+    /// Sessions with at least one due, un-acked row (`acked_at IS NULL
+    /// AND not_before <= now()`). The delivery driver fans out from
+    /// this set. Default (mocks): empty.
+    async fn outbox_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// The OLDEST due, un-acked row for a session — per-session
+    /// delivery order is row order (created_at). Default (mocks): none.
+    async fn outbox_next_due(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<crate::types::outbox::OutboxRow>, MetaError> {
+        let _ = session_id;
+        Ok(None)
+    }
+
+    /// Record a relay handoff: stamp `delivered_at`, bump `attempts`,
+    /// and push `not_before` to `now() + ack_timeout` so the row
+    /// re-becomes due by itself if the confirming event never lands.
+    async fn outbox_mark_delivered(
+        &self,
+        prompt_id: &str,
+        ack_timeout: std::time::Duration,
+    ) -> Result<(), MetaError> {
+        let _ = (prompt_id, ack_timeout);
+        Ok(())
+    }
+
+    /// Push a row's `not_before` out (delivery failed; retry later).
+    async fn outbox_defer(
+        &self,
+        prompt_id: &str,
+        delay: std::time::Duration,
+    ) -> Result<(), MetaError> {
+        let _ = (prompt_id, delay);
+        Ok(())
+    }
+
+    /// Terminal ack: the confirming harness event was ingested.
+    /// Returns whether a row was newly acked (false = unknown id or
+    /// already acked — both fine; acks are at-least-once too).
+    async fn outbox_ack(&self, prompt_id: &str) -> Result<bool, MetaError> {
+        let _ = prompt_id;
+        Ok(false)
+    }
+
+    /// Phase-1b type-ahead edit for a row the relay has NOT yet handed
+    /// off (`delivered_at IS NULL AND acked_at IS NULL`): swap the
+    /// prompt text in place. Returns false when no such row exists
+    /// (the prompt already reached the harness queue — edit it there).
+    async fn outbox_update_prompt_text(
+        &self,
+        prompt_id: &str,
+        text: &str,
+    ) -> Result<bool, MetaError> {
+        let _ = (prompt_id, text);
+        Ok(false)
+    }
+
+    /// Phase-1b dequeue for an undelivered row: delete it. Returns
+    /// false when the row was already delivered/acked (dequeue via the
+    /// harness queue instead).
+    async fn outbox_delete_undelivered(&self, prompt_id: &str) -> Result<bool, MetaError> {
+        let _ = prompt_id;
+        Ok(false)
+    }
 
     /// ADR 0045 C2: the `Committing` persist — rebind a session's host
     /// AND sandbox in one step. The ownership oracle
@@ -2007,26 +2136,6 @@ pub trait MetadataStore: Send + Sync {
         &self,
         _idle_for_secs: i64,
     ) -> Result<Vec<(SessionId, SandboxId, chrono::DateTime<chrono::Utc>)>, MetaError> {
-        Ok(Vec::new())
-    }
-
-    /// Track A: `Active` sessions with a bound sandbox that the desync
-    /// watchdog flags as wedged. Two signatures the idle backstop is blind
-    /// to (it keys only off event *silence* — `MAX(created_at)`):
-    /// - `orphan_after_close`: the latest event is a run-scoped event
-    ///   (`agent_message` / `tool_call_*`) but no run is open — an event
-    ///   arrived after the run closed (the `bf3dbbcb` incident shape).
-    /// - `stuck_open_run`: a `run_started` is the latest event — the run
-    ///   opened and produced zero events since.
-    ///
-    /// Both gated on `last_event_at` older than `stuck_for_secs` (so a
-    /// healthy in-progress run, which keeps emitting, is never flagged).
-    /// The watchdog re-handshakes the flagged sessions. Default empty for
-    /// non-PG mocks.
-    async fn list_active_sessions_desynced(
-        &self,
-        _stuck_for_secs: i64,
-    ) -> Result<Vec<DesyncedSession>, MetaError> {
         Ok(Vec::new())
     }
 

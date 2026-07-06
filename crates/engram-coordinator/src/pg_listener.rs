@@ -48,6 +48,7 @@ struct DeltaNotifyPayload {
 /// follow-up wraps this in an exp-backoff supervisor; for 3c the
 /// coordinator restarts on connection loss because there's nothing
 /// else useful to do without Postgres.
+#[allow(clippy::too_many_arguments)] // cohesive listener wiring: state caches + NOTIFY wakes
 pub fn spawn(
     database_url: String,
     meta: Arc<dyn MetadataStore>,
@@ -56,6 +57,7 @@ pub fn spawn(
     integrations: IntegrationBroker,
     boot_bundles: Arc<BootBundleCache>,
     queue_wake: Arc<Notify>,
+    outbox_wake: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run(
@@ -66,6 +68,7 @@ pub fn spawn(
             integrations,
             boot_bundles,
             queue_wake,
+            outbox_wake,
         )
         .await
         {
@@ -74,6 +77,7 @@ pub fn spawn(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // cohesive listener wiring (mirrors spawn)
 async fn run(
     database_url: &str,
     meta: Arc<dyn MetadataStore>,
@@ -82,6 +86,7 @@ async fn run(
     integrations: IntegrationBroker,
     boot_bundles: Arc<BootBundleCache>,
     queue_wake: Arc<Notify>,
+    outbox_wake: Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listener = PgListener::connect(database_url).await?;
     listener.listen("session_events").await?;
@@ -101,6 +106,10 @@ async fn run(
     // queue scanner (crate::queue_scanner) so a dequeue doesn't wait for
     // its poll fallback.
     listener.listen("placement_changed").await?;
+    // ADR 0073: every outbox enqueue (any replica) NOTIFYs this
+    // channel; the delivery driver's poll interval is only the
+    // crash-recovery fallback.
+    listener.listen("session_outbox").await?;
     tracing::info!(
         "pg_listener subscribed to session_events + session_event_deltas + host_dead + \
          org_secret_changed + enabled_image_changed + fleet_catalog_changed + placement_changed"
@@ -109,6 +118,10 @@ async fn run(
     loop {
         let notification = listener.recv().await?;
         match notification.channel() {
+            "session_outbox" => {
+                outbox_wake.notify_one();
+                continue;
+            }
             "placement_changed" => {
                 // Informational reason string only (see
                 // `PostgresStore::notify_placement_changed`); we don't

@@ -60,7 +60,11 @@ use serde::{Deserialize, Serialize};
 // (the eviction/snapshot response) so the composed eviction path can resolve
 // the `session_events` coherence cursor from it instead of coord wall-clock
 // `now` sampled after the capture returns.
-pub const WIRE_VERSION: u32 = 9;
+// v10 (ADR 0073 / epic #542): bind_session carries binding_epoch; AgentSpec
+// carries binding_epoch; the shell-pin RPCs (AcquireShell/ReleaseShell/
+// RenewShell) and RehandshakeHarness are deleted; heartbeat gains
+// harness_attached. Lockstep coord+host roll, no fallback ladder.
+pub const WIRE_VERSION: u32 = 10;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

@@ -1246,6 +1246,7 @@ async fn prepare_inner(
         selected_harness.as_deref(),
         mode,
         session_id,
+        prompt.as_deref(),
         session_env.clone(),
         manifest.workdir.clone(),
     )
@@ -1742,6 +1743,7 @@ pub(crate) async fn resolve_harness(
     selected_harness: Option<&str>,
     session_mode: SessionMode,
     session_id: SessionId,
+    initial_prompt: Option<&str>,
     session_env: HashMap<String, String>,
     workdir: Option<String>,
 ) -> Result<
@@ -1811,11 +1813,21 @@ pub(crate) async fn resolve_harness(
     // Harness-only extras, layered on top of `session_env` for the harness
     // child. `session_env` already carries ENGRAM_SESSION_ID + the image env +
     // secrets, so they aren't repeated here; the forge broker token is added by
-    // the caller (per-spawn, kept out of the cached env). Issue #535 (d): the
-    // initial prompt no longer rides env — it's delivered as a harness-
-    // protocol `Prompt` frame after boot, identically to a follow-up
-    // `SendPrompt` (see `session_boot::boot_on_reserved_host`).
+    // the caller (per-spawn, kept out of the cached env).
+    //
+    // ADR 0073: the create-time initial prompt is delivered to the harness via
+    // `ENGRAM_INITIAL_PROMPT`, which the in-guest harness consumes at startup
+    // (see `session_boot`, which records the user echo). Follow-up prompts go
+    // through the durable outbox. (Issue #535 (d) wanted the initial prompt off
+    // a bespoke create-time path; ADR 0073's binding-epoch + outbox model made
+    // synchronous over-the-wire delivery — the `deliver_prompt` band-aid #535
+    // introduced — unnecessary, so this reverts to the env var for create and
+    // leaves the outbox for every follow-up. Unifying the create-time prompt
+    // ONTO the outbox too is a clean follow-up.)
     let mut env: HashMap<String, String> = HashMap::new();
+    if let Some(text) = initial_prompt.filter(|s| !s.is_empty()) {
+        env.insert("ENGRAM_INITIAL_PROMPT".into(), text.to_string());
+    }
     // The manifest `workdir` reaches agentd as a reserved env entry so the
     // harness child starts there instead of `/`. See `HARNESS_CWD_ENV` for why
     // this isn't a wire-struct field.
@@ -1858,6 +1870,9 @@ pub(crate) async fn resolve_harness(
     argv.extend(descriptor.args.iter().cloned());
 
     let agent = engram_core::types::sandbox::AgentSpec {
+        // ADR 0073: stamped with the real minted epoch in session_boot
+        // (the mint happens once the sessions row exists); 0 = unstamped.
+        binding_epoch: 0,
         argv,
         env,
         session_env,

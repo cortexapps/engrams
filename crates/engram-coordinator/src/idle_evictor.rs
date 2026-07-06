@@ -1660,8 +1660,11 @@ mod tests {
                 &self,
                 session_id: engram_core::SessionId,
                 sandbox_id: engram_core::SandboxId,
+                binding_epoch: u64,
             ) {
-                self.inner.bind_session(session_id, sandbox_id).await
+                self.inner
+                    .bind_session(session_id, sandbox_id, binding_epoch)
+                    .await
             }
             async fn unbind_session(&self, session_id: engram_core::SessionId) {
                 self.inner.unbind_session(session_id).await
@@ -1673,18 +1676,6 @@ mod tests {
                 text: String,
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.send_prompt(sandbox_id, prompt_id, text).await
-            }
-            async fn acquire_shell(
-                &self,
-                sandbox_id: engram_core::SandboxId,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.acquire_shell(sandbox_id).await
-            }
-            async fn release_shell(
-                &self,
-                sandbox_id: engram_core::SandboxId,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.release_shell(sandbox_id).await
             }
         }
 
@@ -1884,8 +1875,11 @@ mod tests {
                 &self,
                 session_id: engram_core::SessionId,
                 sandbox_id: engram_core::SandboxId,
+                binding_epoch: u64,
             ) {
-                self.inner.bind_session(session_id, sandbox_id).await
+                self.inner
+                    .bind_session(session_id, sandbox_id, binding_epoch)
+                    .await
             }
             async fn unbind_session(&self, session_id: engram_core::SessionId) {
                 self.inner.unbind_session(session_id).await
@@ -1897,18 +1891,6 @@ mod tests {
                 text: String,
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.send_prompt(sandbox_id, prompt_id, text).await
-            }
-            async fn acquire_shell(
-                &self,
-                sandbox_id: engram_core::SandboxId,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.acquire_shell(sandbox_id).await
-            }
-            async fn release_shell(
-                &self,
-                sandbox_id: engram_core::SandboxId,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.release_shell(sandbox_id).await
             }
         }
 
@@ -2109,8 +2091,11 @@ mod tests {
                 &self,
                 session_id: engram_core::SessionId,
                 sandbox_id: engram_core::SandboxId,
+                binding_epoch: u64,
             ) {
-                self.inner.bind_session(session_id, sandbox_id).await
+                self.inner
+                    .bind_session(session_id, sandbox_id, binding_epoch)
+                    .await
             }
             async fn unbind_session(&self, session_id: engram_core::SessionId) {
                 self.inner.unbind_session(session_id).await
@@ -2122,18 +2107,6 @@ mod tests {
                 text: String,
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.send_prompt(sandbox_id, prompt_id, text).await
-            }
-            async fn acquire_shell(
-                &self,
-                sandbox_id: engram_core::SandboxId,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.acquire_shell(sandbox_id).await
-            }
-            async fn release_shell(
-                &self,
-                sandbox_id: engram_core::SandboxId,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.release_shell(sandbox_id).await
             }
         }
 
@@ -2464,8 +2437,11 @@ mod tests {
                 &self,
                 session_id: engram_core::SessionId,
                 sandbox_id: engram_core::SandboxId,
+                binding_epoch: u64,
             ) {
-                self.inner.bind_session(session_id, sandbox_id).await
+                self.inner
+                    .bind_session(session_id, sandbox_id, binding_epoch)
+                    .await
             }
             async fn unbind_session(&self, session_id: engram_core::SessionId) {
                 self.inner.unbind_session(session_id).await
@@ -2477,18 +2453,6 @@ mod tests {
                 text: String,
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.send_prompt(sandbox_id, prompt_id, text).await
-            }
-            async fn acquire_shell(
-                &self,
-                sandbox_id: engram_core::SandboxId,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.acquire_shell(sandbox_id).await
-            }
-            async fn release_shell(
-                &self,
-                sandbox_id: engram_core::SandboxId,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.release_shell(sandbox_id).await
             }
         }
 

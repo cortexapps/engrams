@@ -34,9 +34,9 @@ use engram_protocol::grpc::{
     MigrationFrame, MigrationPresetupResponse, PostCopyCaptureResponse, ProbeSandboxResponse,
     ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
     ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
-    ReapMaterializeDirResponse, RehandshakeHarnessRequest, RestoreBaseForSessionRequest,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, SnapshotBeginResponse,
-    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -671,7 +671,9 @@ impl HostService for HostServiceImpl {
         let r = req.into_inner();
         let session_id = decode_session_id(&r.session_id)?;
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
-        self.inner.bind_session(session_id, sandbox_id).await;
+        self.inner
+            .bind_session(session_id, sandbox_id, r.binding_epoch)
+            .await;
         Ok(Response::new(Empty {}))
     }
 
@@ -755,19 +757,6 @@ impl HostService for HostServiceImpl {
         Ok(Response::new(Empty {}))
     }
 
-    async fn rehandshake_harness(
-        &self,
-        req: Request<RehandshakeHarnessRequest>,
-    ) -> Result<Response<Empty>, Status> {
-        let r = req.into_inner();
-        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
-        self.inner
-            .rehandshake(sandbox_id)
-            .await
-            .map_err(sandbox_to_status)?;
-        Ok(Response::new(Empty {}))
-    }
-
     /// ADR 0013: bundled policy + start. One trait call applies the
     /// `SessionEgressPolicy` to the host's egress proxy registry
     /// BEFORE spawning the agent process. Atomic by construction.
@@ -832,18 +821,6 @@ impl HostService for HostServiceImpl {
         Ok(Response::new(Empty {}))
     }
 
-    async fn acquire_shell(
-        &self,
-        req: Request<SandboxIdMessage>,
-    ) -> Result<Response<Empty>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
-        self.inner
-            .acquire_shell(id)
-            .await
-            .map_err(sandbox_to_status)?;
-        Ok(Response::new(Empty {}))
-    }
-
     async fn start_browser(
         &self,
         req: Request<SandboxIdMessage>,
@@ -874,27 +851,6 @@ impl HostService for HostServiceImpl {
         let id = decode_sandbox_id(&req.into_inner().uuid)?;
         self.inner
             .stop_browser(id)
-            .await
-            .map_err(sandbox_to_status)?;
-        Ok(Response::new(Empty {}))
-    }
-
-    async fn release_shell(
-        &self,
-        req: Request<SandboxIdMessage>,
-    ) -> Result<Response<Empty>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
-        self.inner
-            .release_shell(id)
-            .await
-            .map_err(sandbox_to_status)?;
-        Ok(Response::new(Empty {}))
-    }
-
-    async fn renew_shell(&self, req: Request<SandboxIdMessage>) -> Result<Response<Empty>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
-        self.inner
-            .renew_shell(id)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))

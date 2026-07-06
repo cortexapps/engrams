@@ -168,6 +168,7 @@ async fn build_app_state(
         state.integrations.clone(),
         state.boot_bundles.clone(),
         Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
     ));
     state
 }

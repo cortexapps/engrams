@@ -90,6 +90,7 @@ async fn generated_session_has_skills_and_browser_tooling() {
     // A forge-bound session: the broker token rides AgentSpec.env (per-spawn),
     // which is exactly where the activation gate must look for it.
     let agent = AgentSpec {
+        binding_epoch: 1,
         argv: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
         env: HashMap::from_iter([("ENGRAM_FORGE_TOKEN".into(), "tok".into())]),
         session_env: HashMap::new(),

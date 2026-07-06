@@ -29,8 +29,7 @@ use chrono::{DateTime, Utc};
 use engram_core::types::host::{
     HostCapacity, HostHeartbeat, HostLocalSnapshot, HostMetadata, HostRecord, HostStatus,
 };
-use engram_core::types::SessionState;
-use engram_core::{HostId, MetaError, SandboxId, SessionId};
+use engram_core::{HostId, SandboxId, SessionId};
 use engram_harness_proto::HarnessEvent;
 use engram_protocol::heartbeat::{
     EnabledImageRef, HostCapacityReport, LocalSnapshotReport, ManifestDigest,
@@ -354,6 +353,10 @@ pub struct HeartbeatRequest {
     /// pre-0068 host-agent mid-roll.
     #[serde(default)]
     pub capabilities: engram_core::types::host::HostCapabilities,
+    /// ADR 0073 phase 4: hub-attached sandboxes (see the host-side
+    /// twin). Disagreement-alarm input only.
+    #[serde(default)]
+    pub harness_attached: Vec<SandboxId>,
 }
 
 #[derive(Serialize)]
@@ -549,6 +552,37 @@ pub async fn heartbeat(
     // 0015 M3). The scheduling payload itself lives in PG above — ADR
     // 0047 removed the in-memory scheduler mirror.
     state.host_registry.touch_seen(host_id);
+    // ADR 0073 phase 4: the demoted belt-and-braces liveness check.
+    // Compare the host's hub-attached set against OUR view (Active
+    // sessions bound to this host whose sandbox the host also reports
+    // running) and count disagreements — the metric's rate IS the
+    // health signal; nothing is healed from here (delivery redelivers
+    // via the outbox, detection reads the event log). Best-effort and
+    // deliberately coarse: sessions mid-create/resume legitimately
+    // have no attach yet, so only sessions the host itself lists as
+    // RUNNING but not ATTACHED count.
+    if hb.running_sandboxes_known && !hb.running_sandboxes.is_empty() {
+        let attached: std::collections::HashSet<_> = hb.harness_attached.iter().collect();
+        if let Ok(active) = state
+            .services
+            .meta
+            .list_active_sandbox_assignments_on_host(host_id)
+            .await
+        {
+            for (session_id, sandbox_id) in active {
+                if hb.running_sandboxes.contains(&sandbox_id) && !attached.contains(&sandbox_id) {
+                    ::metrics::counter!(crate::metrics::HARNESS_ATTACH_DISAGREEMENT_TOTAL)
+                        .increment(1);
+                    tracing::debug!(
+                        host_id = %host_id,
+                        %session_id,
+                        %sandbox_id,
+                        "heartbeat: running sandbox with no attached harness (disagreement alarm)",
+                    );
+                }
+            }
+        }
+    }
 
     // ADR 0015 M5: ship the coord's authoritative enabled-images
     // set so the host's prefetch loop drives from heartbeat alone.
@@ -856,31 +890,6 @@ pub async fn integration_asset_ingest(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ---- POST /api/hosts/:id/idle-eviction-candidates (ADR 0011 #2) ----
-
-#[derive(Deserialize)]
-pub struct IdleEvictionCandidatesRequest {
-    /// One entry per candidate. `idle_since` is the host's
-    /// last-seen activity timestamp for that sandbox; coord-side
-    /// can use it for telemetry and for deciding which pipeline
-    /// (snapshot+destroy vs immediate dead) to run.
-    pub candidates: Vec<IdleCandidate>,
-}
-
-#[derive(Deserialize)]
-pub struct IdleCandidate {
-    pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
-    #[serde(default)]
-    pub idle_since: Option<DateTime<Utc>>,
-}
-
-#[derive(Serialize, Default)]
-pub struct IdleEvictionCandidatesResponse {
-    pub accepted: usize,
-    pub failed: usize,
-}
-
 // ---- POST /api/hosts/:id/live-manifest (ADR 0016 Phase B) ----
 
 #[derive(Deserialize)]
@@ -997,92 +1006,6 @@ pub struct SandboxOwnershipResponse {
     pub owned: bool,
 }
 
-pub async fn idle_eviction_candidates(
-    State(state): State<SharedState>,
-    Path(host_id): Path<HostId>,
-    Json(req): Json<IdleEvictionCandidatesRequest>,
-) -> Result<Json<IdleEvictionCandidatesResponse>, ApiError> {
-    let mut accepted = 0usize;
-    let mut failed = 0usize;
-    for candidate in req.candidates {
-        let session = match state.services.meta.get_session(candidate.session_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(
-                    host_id = %host_id,
-                    session_id = %candidate.session_id,
-                    sandbox_id = %candidate.sandbox_id,
-                    error = %e,
-                    "idle-eviction candidate: session lookup failed",
-                );
-                continue;
-            }
-        };
-        if session.status != SessionState::Active {
-            // Already Evicting (the common re-nomination case) or
-            // moved on entirely (deleted, host-lost). Either way the
-            // work is queued or moot — accepted no-op.
-            accepted += 1;
-            continue;
-        }
-        match state
-            .services
-            .meta
-            .transition_session(candidate.session_id, SessionState::Evicting)
-            .await
-        {
-            Ok(prev) => {
-                accepted += 1;
-                ::metrics::counter!(crate::metrics::EVICTION_NOMINATED_TOTAL, "source" => "host")
-                    .increment(1);
-                tracing::info!(
-                    host_id = %host_id,
-                    session_id = %candidate.session_id,
-                    sandbox_id = %candidate.sandbox_id,
-                    idle_since = ?candidate.idle_since,
-                    "idle session nominated for eviction (scanner drives the pipeline)",
-                );
-                if let Err(e) = state
-                    .emit(
-                        candidate.session_id,
-                        SessionEvent::StatusChanged {
-                            from: prev,
-                            to: SessionState::Evicting,
-                            at: Utc::now(),
-                        },
-                    )
-                    .await
-                {
-                    // Status is committed; a lost event is timeline
-                    // cosmetics, not lifecycle state. Don't fail the
-                    // candidate over it.
-                    tracing::warn!(
-                        session_id = %candidate.session_id,
-                        error = %e,
-                        "idle-eviction nomination: StatusChanged emit failed",
-                    );
-                }
-            }
-            // Lost the Active-check race (another pod's nomination,
-            // a concurrent delete): the row is wherever the winner
-            // put it — accepted no-op, same as the pre-check path.
-            Err(MetaError::Conflict(_)) => accepted += 1,
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(
-                    host_id = %host_id,
-                    session_id = %candidate.session_id,
-                    sandbox_id = %candidate.sandbox_id,
-                    error = %e,
-                    "idle-eviction candidate: transition to Evicting failed",
-                );
-            }
-        }
-    }
-    Ok(Json(IdleEvictionCandidatesResponse { accepted, failed }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,6 +1018,7 @@ mod tests {
     use engram_core::traits::SandboxBackend;
     use engram_core::types::session::SessionMode;
     use engram_core::types::Session;
+    use engram_core::types::SessionState;
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
     use std::sync::Arc;
@@ -1159,19 +1083,6 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
-        }
-    }
-
-    fn candidates_req(
-        session_id: SessionId,
-        sandbox_id: SandboxId,
-    ) -> IdleEvictionCandidatesRequest {
-        IdleEvictionCandidatesRequest {
-            candidates: vec![IdleCandidate {
-                session_id,
-                sandbox_id,
-                idle_since: None,
-            }],
         }
     }
 
@@ -1259,140 +1170,15 @@ mod tests {
             "a heartbeat with a healthy persist must succeed: {:?}",
             result2.err()
         );
-        assert_eq!(
-            *meta.reconcile_probe_calls.lock(),
-            1,
+        // ADR 0073: the disagreement-alarm liveness check (added by the
+        // binding-epoch work) ALSO probes `list_active_sandbox_assignments_
+        // on_host` after a successful persist, so the exact count is ≥1 (not
+        // exactly 1 as on pre-binding-epoch main). The load-bearing assertion
+        // is the 0-vs-nonzero split: tick 1 (persist failed) probed 0, tick 2
+        // (persist succeeded) probed at least once — proving the early return.
+        assert!(
+            *meta.reconcile_probe_calls.lock() >= 1,
             "reconcile must run once the persist succeeds"
         );
-    }
-
-    /// ADR 0034 happy path: the handler flips Active → Evicting,
-    /// emits StatusChanged, and returns — it does NOT run the
-    /// pipeline (status is Evicting, not Idle; the sandbox binding
-    /// is untouched for the scanner to use).
-    #[tokio::test]
-    async fn handler_nominates_active_session_and_returns() {
-        let session_id = engram_core::SessionId::new();
-        let sandbox_id = SandboxId::new();
-        let (state, _meta, _local) = build_state_for_session(session_with_status(
-            session_id,
-            sandbox_id,
-            SessionState::Active,
-        ));
-
-        let resp = idle_eviction_candidates(
-            State(state.clone()),
-            Path(HostId::new()),
-            Json(candidates_req(session_id, sandbox_id)),
-        )
-        .await
-        .expect("handler");
-        assert_eq!(resp.0.accepted, 1);
-        assert_eq!(resp.0.failed, 0);
-
-        let session = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(session.status, SessionState::Evicting);
-        assert_eq!(
-            session.sandbox_id,
-            Some(sandbox_id),
-            "nomination must not unbind the sandbox — the scanner's pipeline needs it"
-        );
-
-        // StatusChanged(Active → Evicting) landed on the event log.
-        let events = state
-            .services
-            .meta
-            .list_session_events_since(session_id, -1, -1)
-            .await
-            .unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|e| e.kind == "status_changed"
-                    && e.payload["to"] == serde_json::json!("evicting")),
-            "expected a status_changed→evicting event, got {events:?}"
-        );
-    }
-
-    /// Re-nomination of an already-Evicting sandbox (the host's 10s
-    /// tick while the pipeline runs) is an accepted no-op: no second
-    /// transition, no second event.
-    #[tokio::test]
-    async fn handler_renomination_of_evicting_is_accepted_noop() {
-        let session_id = engram_core::SessionId::new();
-        let sandbox_id = SandboxId::new();
-        let (state, _meta, _local) = build_state_for_session(session_with_status(
-            session_id,
-            sandbox_id,
-            SessionState::Evicting,
-        ));
-
-        let resp = idle_eviction_candidates(
-            State(state.clone()),
-            Path(HostId::new()),
-            Json(candidates_req(session_id, sandbox_id)),
-        )
-        .await
-        .expect("handler");
-        assert_eq!(resp.0.accepted, 1, "re-nomination is accepted");
-        assert_eq!(resp.0.failed, 0);
-
-        let session = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(session.status, SessionState::Evicting, "unchanged");
-        let events = state
-            .services
-            .meta
-            .list_session_events_since(session_id, -1, -1)
-            .await
-            .unwrap();
-        assert!(events.is_empty(), "no event for a no-op, got {events:?}");
-    }
-
-    /// A candidate whose session moved on entirely (terminal) is an
-    /// accepted no-op — the host must not see it as a failure and
-    /// retry-storm it.
-    #[tokio::test]
-    async fn handler_nonactive_candidate_is_accepted_noop() {
-        let session_id = engram_core::SessionId::new();
-        let sandbox_id = SandboxId::new();
-        let (state, _meta, _local) = build_state_for_session(session_with_status(
-            session_id,
-            sandbox_id,
-            SessionState::Completed,
-        ));
-
-        let resp = idle_eviction_candidates(
-            State(state.clone()),
-            Path(HostId::new()),
-            Json(candidates_req(session_id, sandbox_id)),
-        )
-        .await
-        .expect("handler");
-        assert_eq!(resp.0.accepted, 1);
-        assert_eq!(resp.0.failed, 0);
-        let session = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(session.status, SessionState::Completed, "untouched");
-    }
-
-    /// An unknown session is the one genuine failure shape.
-    #[tokio::test]
-    async fn handler_unknown_session_counts_failed() {
-        let session_id = engram_core::SessionId::new();
-        let sandbox_id = SandboxId::new();
-        let (state, _meta, _local) = build_state_for_session(session_with_status(
-            engram_core::SessionId::new(), // different id than nominated
-            sandbox_id,
-            SessionState::Active,
-        ));
-
-        let resp = idle_eviction_candidates(
-            State(state),
-            Path(HostId::new()),
-            Json(candidates_req(session_id, sandbox_id)),
-        )
-        .await
-        .expect("handler");
-        assert_eq!(resp.0.accepted, 0);
-        assert_eq!(resp.0.failed, 1);
     }
 }
