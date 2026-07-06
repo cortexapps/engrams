@@ -12,6 +12,14 @@
 # and node-assets pack through this one recipe so the bundle content-addresses to
 # the same sha on every host.
 #
+# COUPLING (detect-rebake-lanes.py): this bundle's CONTENT is the
+# engram-harness-claude source, NOT anything under deploy/bundles/. A change to
+# that crate MUST re-run publish-bundles so `bundle-harness-claude` is rebuilt —
+# else the fleet stages a stale harness against a freshly-rolled host-agent and
+# in-guest attach fails ("attach ack read failed"). The detector wires this via
+# `bundles |= harness_changed`; keep that term whenever the harness↔host wire
+# evolves (the #542 wire-10 roll shipped without it and wedged new sessions).
+#
 # Usage:
 #   build.sh <staged-tree-dir> <out.squashfs>
 #
