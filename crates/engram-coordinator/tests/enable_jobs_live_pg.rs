@@ -156,6 +156,38 @@ async fn progress_state_failure_and_retry_round_trip() {
         .await
         .expect("claim");
 
+    // Issue #539 (migration 0079): stamp a capture-progress event so the
+    // job carries non-NULL `capture_phase`/`warm_stage`/
+    // `warm_stage_started_at`/`warm_stages`/`output_tail` into the
+    // failure below — the retry-reset assertion further down needs a
+    // prior attempt's capture progress actually present to prove it gets
+    // cleared, not just vacuously absent.
+    let stage_started_at = Utc::now();
+    meta.update_enable_job_capture_progress(
+        job.id,
+        "pod-a",
+        &engram_core::types::CaptureProgress {
+            phase: engram_core::types::CapturePhase::Warm,
+            warm_stage: Some("install-deps".to_string()),
+            detail: None,
+            output_tail: "some hook output".to_string(),
+            warm_stages: vec![engram_core::types::WarmStageRecord {
+                name: "install-deps".to_string(),
+                started_at: stage_started_at,
+                ended_at: None,
+                outcome: engram_core::types::WarmStageOutcome::Running,
+            }],
+        },
+    )
+    .await
+    .expect("stamp capture progress");
+    let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(got.capture_phase, Some(engram_core::types::CapturePhase::Warm));
+    assert_eq!(got.warm_stage.as_deref(), Some("install-deps"));
+    assert!(got.warm_stage_started_at.is_some());
+    assert!(!got.warm_stages.is_empty());
+    assert_eq!(got.output_tail.as_deref(), Some("some hook output"));
+
     // Progress: total stamped once, done advances.
     meta.update_enable_job_progress(job.id, "pod-a", 0, Some(625))
         .await
@@ -230,6 +262,14 @@ async fn progress_state_failure_and_retry_round_trip() {
     assert_eq!(retried.state, EnableJobState::Pending);
     assert_eq!(retried.attempts, 0);
     assert_eq!(retried.error, None);
+    // Issue #539 correction: retry must also clear the PREVIOUS attempt's
+    // capture-progress columns, or the UI keeps rendering a dead attempt's
+    // stage/tail as if it were live.
+    assert_eq!(retried.capture_phase, None);
+    assert_eq!(retried.warm_stage, None);
+    assert_eq!(retried.warm_stage_started_at, None);
+    assert!(retried.warm_stages.is_empty());
+    assert_eq!(retried.output_tail, None);
 
     // Unknown id → NotFound.
     match meta.retry_enable_job(Uuid::new_v4()).await {

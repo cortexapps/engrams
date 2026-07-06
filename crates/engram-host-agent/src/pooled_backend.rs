@@ -985,13 +985,27 @@ impl PooledBackend {
             record_warm_stage_metrics(&stages);
             record_warm_hook_failure_metric(kind);
             let output_tail = tail.render();
-            let _ = progress.try_send(engram_core::types::CaptureProgress {
+            // Issue #563 review correction: this is the TERMINAL event — the
+            // one carrying the failing stage + output tail an operator
+            // actually needs. Unlike the routine per-line `send_progress`
+            // sends, a dropped one here is worth surfacing: warn loudly
+            // (rather than the usual silent `let _ =`) so a full channel
+            // doesn't quietly eat the one frame that mattered.
+            if let Err(e) = progress.try_send(engram_core::types::CaptureProgress {
                 phase: CapturePhase::Warm,
                 warm_stage: stage.clone(),
                 detail: detail.clone(),
                 output_tail: output_tail.clone(),
                 warm_stages: stages,
-            });
+            }) {
+                tracing::warn!(
+                    error = %e,
+                    stage = ?stage,
+                    "run_warm_hook: dropped the TERMINAL capture-progress event \
+                     (progress channel full) — operator loses the live stage/tail \
+                     for this failure, falling back to the CaptureFailed message",
+                );
+            }
             SandboxError::CaptureFailed(CaptureFailure {
                 kind,
                 stage,

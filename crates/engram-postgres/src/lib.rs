@@ -3967,11 +3967,22 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn retry_enable_job(&self, id: Uuid) -> Result<EnableJob, MetaError> {
+        // Issue #539 (migration 0079): also reset the capture-progress
+        // columns a prior (failed) capture attempt left behind. Without
+        // this, a retried capture starts fresh but the UI kept rendering
+        // the PREVIOUS attempt's `capture_phase`/`warm_stage`/
+        // `warm_stage_started_at`/`warm_stages`/`output_tail` as if it
+        // were live, until the new attempt's first `CaptureProgress`
+        // event overwrote them (or forever, if the retry fails before
+        // emitting one).
         let row = sqlx::query(
             r#"
             UPDATE enable_jobs
                SET state = 'pending', attempts = 0, error = NULL,
-                   claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
+                   claimed_by = NULL, claimed_at = NULL, updated_at = NOW(),
+                   capture_phase = NULL, warm_stage = NULL,
+                   warm_stage_started_at = NULL, warm_stages = NULL,
+                   output_tail = NULL
              WHERE id = $1 AND state = 'failed'
             RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,

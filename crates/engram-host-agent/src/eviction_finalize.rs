@@ -384,12 +384,28 @@ async fn publish_disk_manifest(
         annotations: serde_json::Value::Null,
     };
 
-    let mut attempt_ref = base_manifest.next_version();
+    // The FIRST attempt always targets this same deterministic version
+    // (derived purely from `base_manifest`, same as `run_memory_leg`'s
+    // `next_ref = prev_ref.next_version()`). That means a conflict on
+    // THIS SPECIFIC attempt can only mean a prior crash-redrive already
+    // published this exact content (a crash between that `put_manifest`
+    // and this leg's stage-bump persist) — idempotent success, not a
+    // race, exactly like `run_memory_leg`'s `attempted == next_ref.version`
+    // arm. Only bump-and-retry on a conflict against a LATER, non-
+    // deterministic `attempt_ref` (this loop's own prior bump), where a
+    // genuine concurrent writer is the more plausible explanation.
+    let deterministic_ref = base_manifest.next_version();
+    let mut attempt_ref = deterministic_ref;
     let mut attempts = 0u32;
     loop {
         attempts += 1;
         match chunk_store.put_manifest(attempt_ref, &new_manifest).await {
             Ok(()) => return Ok(attempt_ref),
+            Err(engram_chunk_store::ChunkStoreError::VersionConflict { attempted, .. })
+                if attempt_ref == deterministic_ref && attempted == deterministic_ref.version =>
+            {
+                return Ok(deterministic_ref);
+            }
             Err(engram_chunk_store::ChunkStoreError::VersionConflict {
                 latest,
                 manifest_id,

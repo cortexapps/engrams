@@ -153,6 +153,20 @@ pub fn init(addr: SocketAddr) {
 ///   Sourced from `CreateSessionResponse.kind` on success.
 pub const SESSION_BOOT_SECONDS: &str = "engram_session_boot_seconds";
 
+/// Histogram (issue #535 correction pass). Wall time of the
+/// `tokio::join!` in `session_boot.rs::restore_base_on_host` that
+/// overlaps the restore leg (`restore_base_on_host` on the host, ~0.4-0.7s)
+/// against the env/egress leg (`inject_harness_env` + `resolve_inject_entries`,
+/// which can round-trip an external mint-mode connector). Neither
+/// `coord_prepare` nor `coord_finalize` (see `SESSION_BOOT_SECONDS`'s
+/// `phase` doc) covers this window — `coord_finalize` starts only once the
+/// join returns — so a slow env/egress leg (a slow external mint call) was
+/// invisible to both. No labels: this is always the two-leg join,
+/// recorded unconditionally once it resolves (restore success or
+/// failure — the failure path still paid for the full join before
+/// erroring out, so it's still the relevant wall time to see).
+pub const COORD_BOOT_OVERLAP_SECONDS: &str = "engram_coord_boot_overlap_seconds";
+
 /// Counter. Sessions that reached `Active`. Labels: `outcome`
 /// (`success` / `scheduling_rejected` / `sandbox_failed` /
 /// `harness_failed`).

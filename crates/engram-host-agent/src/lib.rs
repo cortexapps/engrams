@@ -999,6 +999,12 @@ impl HostAgent {
             // (production hosts; dev-process backend lacks both and
             // simply never reports ready).
             let readiness = image_prefetch::ImageReadiness::new();
+            // The heartbeat's `stages_images` field (below) must exactly
+            // track whether the supervisor spawn below actually happens —
+            // derive both from the same pure gate rather than letting
+            // `enabled_images_tx.is_some()` implicitly stand in for it.
+            let stages_images =
+                stages_images_gate(self.chunk_store.is_some(), self.chunk_cache.is_some());
             let enabled_images_tx = match (
                 self.chunk_store.as_ref().map(|(cs, _)| cs.clone()),
                 self.chunk_cache.clone(),
@@ -1041,6 +1047,11 @@ impl HostAgent {
                     None
                 }
             };
+            debug_assert_eq!(
+                enabled_images_tx.is_some(),
+                stages_images,
+                "stages_images_gate must track the image-prefetch supervisor's actual spawn condition",
+            );
 
             // ADR 0035: bundle store + supervisor. The stamp is read once
             // (hosts are immutable; only a host-agent pod restart changes it). The
@@ -1100,6 +1111,7 @@ impl HostAgent {
             let probe_inputs_for_heartbeat = probe_inputs.clone();
             let ram_ledger_for_heartbeat = ram_ledger.clone();
             let ram_ledger_tx_for_heartbeat = ram_ledger_tx;
+            let stages_images_for_heartbeat = stages_images;
             // ENGRAM_FC_UFFD_BASE_DIR doesn't change at runtime; resolve
             // once outside the loop (same pattern `base_memfile_dir`
             // above uses).
@@ -1263,10 +1275,11 @@ impl HostAgent {
                         wire_version: engram_protocol::WIRE_VERSION,
                         // ADR 0036 amendment (issue #538): true iff the
                         // image-prefetch supervisor actually spawned
-                        // (chunk_store + chunk_cache configured — see the
-                        // gating a few hundred lines up). The scanner's
-                        // prestage stage waits only on hosts reporting this.
-                        stages_images: enabled_images_tx.is_some(),
+                        // (chunk_store + chunk_cache configured — see
+                        // `stages_images_gate` + the gating a few hundred
+                        // lines up). The scanner's prestage stage waits
+                        // only on hosts reporting this.
+                        stages_images: stages_images_for_heartbeat,
                         capabilities,
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
@@ -1673,6 +1686,17 @@ impl HostAgent {
 /// hosts where the publisher never landed a value) are skipped
 /// with a debug log. They run "untracked" until the next eviction
 /// snapshot.
+/// ADR 0036 amendment (issue #538): whether this host's heartbeat should
+/// advertise `stages_images: true` — the queue-scanner's prestage-wait
+/// gates on this flag, so it must exactly track whether the
+/// image-prefetch supervisor actually spawned (`run`'s gate at the
+/// `enabled_images_tx` match, which needs both a `ChunkStore` and a
+/// `ChunkCache` configured). Pure so the boolean derivation is
+/// unit-testable without wiring a real supervisor.
+fn stages_images_gate(has_chunk_store: bool, has_chunk_cache: bool) -> bool {
+    has_chunk_store && has_chunk_cache
+}
+
 /// Restore harness-hub routing for every survivor the coord re-handed us
 /// on (re)registration. SEPARATE from disk rehydration and platform-neutral:
 /// a host-agent roll / restart rebuilds the hub's `session_to_sandbox` map
@@ -1858,5 +1882,18 @@ mod tests {
         let hub = noop_hub();
         rebind_survivor_sessions(&hub, &[]);
         assert!(hub.bound_sandbox(SessionId::new()).is_none());
+    }
+
+    /// The image-prefetch supervisor only spawns (and this host only
+    /// reports `stages_images: true`) when BOTH a chunk_store and a
+    /// chunk_cache are configured — a dev `Process` backend missing
+    /// either must never advertise it stages images, or the coordinator's
+    /// enable-scanner would wait forever on a prestage this host can't do.
+    #[test]
+    fn stages_images_gate_requires_both_chunk_store_and_chunk_cache() {
+        assert!(stages_images_gate(true, true));
+        assert!(!stages_images_gate(true, false));
+        assert!(!stages_images_gate(false, true));
+        assert!(!stages_images_gate(false, false));
     }
 }
