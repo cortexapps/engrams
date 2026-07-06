@@ -207,6 +207,26 @@ dev:
 dev-down:
     tilt down
 
+# ADR 0068: like `just dev`, but the host-agent (+ its Firecracker stack)
+# runs INSIDE a dedicated Colima VM instead of as a Mac-local process —
+# the only way to exercise the FC-only surfaces (NBD, UFFD, netns egress,
+# squashfs patch-drives) on Apple Silicon. Coordinator/orchestrator/web/
+# compose stay on the Mac exactly as in plain `just dev`; only the
+# Tiltfile's host-agent resource moves. The env var is the real switch —
+# the Tiltfile reads ENGRAM_FC_COLIMA_PROFILE directly — this recipe is
+# sugar so you don't have to remember its name. First-time setup:
+# `just fc-colima-provision [profile]`.
+dev-fc profile='fc-dev':
+    ENGRAM_FC_COLIMA_PROFILE={{profile}} tilt up
+
+# ADR 0068: create/update the named Colima VM (aarch64 Ubuntu, nested
+# virt, /dev/kvm, Firecracker + the aarch64 guest kernel, NBD/UFFD host
+# prep, the loopback-forwarding socat units) — everything `dev-fc` needs
+# before its first run. Idempotent; safe to re-run after a Colima
+# upgrade or a provisioning-script change.
+fc-colima-provision profile='fc-dev':
+    bash deploy/dev/fc-colima-provision.sh {{profile}}
+
 # Reclaim all dev sandbox disk — the dev analog of the production lifecycle
 # GC. Two stages:
 #
@@ -322,9 +342,12 @@ bundles:
 # (<sha256>.squashfs + current.json stamp) under var/shared/, the
 # dev mirror of the FC-host image's /var/lib/engram/shared. Run the
 # host-agent with ENGRAM_BUNDLE_DIR=$PWD/var/shared so FC dev sessions
-# resolve/capture against it. Linux-only (mksquashfs; FC is Linux-only
-# anyway). Re-run after editing a skill — the stamp repoints and new
-# sessions pick the fresh generation up via the §3 swap.
+# resolve/capture against it. Needs mksquashfs: on Linux that's
+# `apt install squashfs-tools`; on macOS (ADR 0068's fc-colima dev mode —
+# FC itself still only ever boots inside the Colima VM) run this from
+# `nix develop`, which provides mksquashfs on darwin too. Re-run after
+# editing a skill — the stamp repoints and new sessions pick the fresh
+# generation up via the §3 swap.
 bundles-squashfs:
     #!/usr/bin/env bash
     set -euo pipefail
