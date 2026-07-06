@@ -188,6 +188,26 @@ pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lo
 /// after deploy would mean the skip path isn't exercised.
 pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";
 
+/// Issue #539: histogram of how long each named `[warm]`-hook stage ran,
+/// labelled by `stage` (the hook-declared name — cardinality is bounded by
+/// however many distinct stage names the fleet's warm hooks emit) and
+/// `outcome` (`done` | `failed`). Recorded from `run_warm_hook`'s closed
+/// stage history at every terminal point (success, watchdog violation, or
+/// non-zero exit) — the productized version of the log-reconstructed
+/// "609 s and 1,071 s" / "~33 min" durations the issue's evidence pass had
+/// to hand-grep out of host-agent logs.
+pub const WARM_HOOK_STAGE_SECONDS: &str = "engram_warm_hook_stage_seconds";
+
+/// Issue #539: counter of `[warm]`-hook capture failures, labelled by
+/// `kind` (`engram_core::types::CaptureFailureKind::as_str()` —
+/// `warm_exit_non_zero` | `warm_stall` | `warm_stage_deadline` |
+/// `warm_global_timeout` | `warm_exec_transport` | `snapshot_failed`).
+/// Before this the only signal was the terse `enable_jobs.error` string;
+/// this is what tells an operator (or an alert) whether the dominant
+/// failure mode is still the stall class after the paired
+/// `warm-brain-stack.sh` fix (engrams-internal) lands.
+pub const WARM_HOOK_FAILURES_TOTAL: &str = "engram_warm_hook_failures_total";
+
 /// Issue #540 (host RAM ledger): gauge of host RAM (MiB) attributed to
 /// one named bucket, sampled once per heartbeat tick from
 /// `ram_ledger::RamLedgerSnapshot`. Label `category`:

@@ -532,25 +532,101 @@ impl GrpcHostClient {
         decode_sandbox_id(&resp.uuid)
     }
 
+    /// Issue #539: `BuildBaseSnapshot` is server-streaming (wire v8) —
+    /// zero or more `progress` frames (host keepalive every <=30 s)
+    /// forwarded onto `progress`, then exactly one terminal frame
+    /// (`done` decodes to `Ok`, `failed` decodes to a structured
+    /// `SandboxError::CaptureFailed`). A stream that ends (or errors)
+    /// before a terminal frame arrives is `WarmExecTransport` — the
+    /// only retryable capture-failure kind (`classify_capture_error`,
+    /// `enable_scanner.rs`).
     pub async fn build_base_snapshot(
         &self,
         spec: SandboxSpec,
         warm: Option<engram_core::types::image::WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         let req = BuildBaseSnapshotRequest {
             spec_bincode: encode_bincode(&spec, "SandboxSpec")?,
             warm_bincode: encode_bincode(&warm, "Option<WarmConfig>")?,
             capture_env_bincode: encode_bincode(&capture_env, "capture_env")?,
         };
-        let resp = self
+        let mut stream = self
             .inner
             .clone()
             .build_base_snapshot(req)
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
-        decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
+
+        loop {
+            let frame = match stream.message().await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    return Err(SandboxError::CaptureFailed(
+                        engram_core::types::CaptureFailure {
+                            kind: engram_core::types::CaptureFailureKind::WarmExecTransport,
+                            stage: None,
+                            tail: String::new(),
+                            message: "build_base_snapshot stream closed before a terminal frame"
+                                .into(),
+                        },
+                    ));
+                }
+                Err(status) => {
+                    return Err(SandboxError::CaptureFailed(
+                        engram_core::types::CaptureFailure {
+                            kind: engram_core::types::CaptureFailureKind::WarmExecTransport,
+                            stage: None,
+                            tail: String::new(),
+                            message: format!("build_base_snapshot stream error: {status}"),
+                        },
+                    ));
+                }
+            };
+            match frame.event {
+                Some(crate::grpc::build_base_snapshot_event::Event::Progress(p)) => {
+                    let warm_stages = if p.warm_stages_bincode.is_empty() {
+                        Vec::new()
+                    } else {
+                        decode_bincode(&p.warm_stages_bincode, "Vec<WarmStageRecord>")?
+                    };
+                    let phase = match p.phase.as_str() {
+                        "boot" => engram_core::types::CapturePhase::Boot,
+                        "snapshot" => engram_core::types::CapturePhase::Snapshot,
+                        _ => engram_core::types::CapturePhase::Warm,
+                    };
+                    let event = engram_core::types::CaptureProgress {
+                        phase,
+                        warm_stage: p.warm_stage,
+                        detail: p.detail,
+                        output_tail: p.output_tail,
+                        warm_stages,
+                    };
+                    // A slow/dropped consumer must not stall the capture —
+                    // best-effort forward.
+                    let _ = progress.try_send(event);
+                }
+                Some(crate::grpc::build_base_snapshot_event::Event::Done(done)) => {
+                    return decode_bincode(&done.metadata_bincode, "SnapshotMetadata");
+                }
+                Some(crate::grpc::build_base_snapshot_event::Event::Failed(failed)) => {
+                    let kind = parse_capture_failure_kind(&failed.kind);
+                    return Err(SandboxError::CaptureFailed(
+                        engram_core::types::CaptureFailure {
+                            kind,
+                            stage: failed.warm_stage,
+                            tail: failed.output_tail,
+                            message: failed.message,
+                        },
+                    ));
+                }
+                None => {
+                    tracing::warn!("build_base_snapshot: empty stream frame; ignoring");
+                }
+            }
+        }
     }
 
     pub async fn restore_base_for_session(
@@ -1244,6 +1320,21 @@ fn decode_bincode<T: serde::de::DeserializeOwned>(
         .map_err(|e| SandboxError::InvalidSpec(format!("bincode decode {kind}: {e}")))
 }
 
+/// Decode a `CaptureFailed.kind` wire string back to
+/// [`engram_core::types::CaptureFailureKind`]. An unrecognized value
+/// (future host, older coord) falls back to `WarmExitNonZero` — a
+/// deterministic, non-retryable classification, so an unknown kind never
+/// accidentally gets the retry treatment reserved for `WarmExecTransport`.
+fn parse_capture_failure_kind(kind: &str) -> engram_core::types::CaptureFailureKind {
+    engram_core::types::CaptureFailureKind::parse(kind).unwrap_or_else(|| {
+        tracing::warn!(
+            kind,
+            "unrecognized CaptureFailureKind on the wire; treating as WarmExitNonZero"
+        );
+        engram_core::types::CaptureFailureKind::WarmExitNonZero
+    })
+}
+
 fn decode_sandbox_id(bytes: &[u8]) -> Result<SandboxId, SandboxError> {
     if bytes.len() != 16 {
         return Err(SandboxError::InvalidSpec(format!(
@@ -1377,8 +1468,9 @@ impl HostClient for GrpcHostClient {
         spec: SandboxSpec,
         warm: Option<engram_core::types::image::WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        Self::build_base_snapshot(self, spec, warm, capture_env).await
+        Self::build_base_snapshot(self, spec, warm, capture_env, progress).await
     }
 
     async fn restore_base_for_session(

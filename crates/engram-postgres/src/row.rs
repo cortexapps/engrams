@@ -386,6 +386,42 @@ fn capture_env_from_row(
     }
 }
 
+/// Issue #539: `enable_jobs.warm_stages` is a nullable JSONB column —
+/// `NULL` means "no stage history yet" (outside/before a capture ever
+/// wrote progress). Every current query projects this column (added by
+/// migration 0079 alongside the row's other four new columns, all of
+/// which use `.map_err(col_err)` — see `enable_job_from_row`); a missing
+/// column is a real bug (e.g. a future SELECT/RETURNING that forgets it),
+/// not a legacy-row case to default through silently.
+fn warm_stages_from_row(
+    row: &PgRow,
+) -> Result<Vec<engram_core::types::WarmStageRecord>, MetaError> {
+    match row
+        .try_get::<Option<serde_json::Value>, _>("warm_stages")
+        .map_err(col_err)?
+    {
+        Some(v) => serde_json::from_value(v).map_err(|e| MetaError::Serialization(e.to_string())),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn capture_phase_from_row(
+    row: &PgRow,
+) -> Result<Option<engram_core::types::CapturePhase>, MetaError> {
+    match row
+        .try_get::<Option<String>, _>("capture_phase")
+        .map_err(col_err)?
+    {
+        Some(s) => Ok(match s.as_str() {
+            "boot" => Some(engram_core::types::CapturePhase::Boot),
+            "warm" => Some(engram_core::types::CapturePhase::Warm),
+            "snapshot" => Some(engram_core::types::CapturePhase::Snapshot),
+            _ => None,
+        }),
+        None => Ok(None),
+    }
+}
+
 pub(crate) fn session_secrets_from_row(row: &PgRow) -> Result<SessionSecrets, MetaError> {
     let session_id: Uuid = row.try_get("session_id").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
@@ -466,6 +502,11 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
         attempts: attempts.max(0) as u32,
         error: row.try_get("error").map_err(col_err)?,
         capture_env: capture_env_from_row(row, "capture_env")?,
+        capture_phase: capture_phase_from_row(row)?,
+        warm_stage: row.try_get("warm_stage").map_err(col_err)?,
+        warm_stage_started_at: row.try_get("warm_stage_started_at").map_err(col_err)?,
+        warm_stages: warm_stages_from_row(row)?,
+        output_tail: row.try_get("output_tail").map_err(col_err)?,
         created_at: row.try_get("created_at").map_err(col_err)?,
         updated_at: row.try_get("updated_at").map_err(col_err)?,
     })

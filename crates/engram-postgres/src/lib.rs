@@ -3525,7 +3525,7 @@ impl MetadataStore for PostgresStore {
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
             DO NOTHING
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, created_at, updated_at
             "#,
         )
         .bind(Uuid::new_v4())
@@ -3540,7 +3540,7 @@ impl MetadataStore for PostgresStore {
         }
         let existing = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, created_at, updated_at
               FROM enable_jobs
              WHERE image_uri = $1 AND state NOT IN ('ready', 'failed')
             "#,
@@ -3560,7 +3560,7 @@ impl MetadataStore for PostgresStore {
                     VALUES ($1, $2, $3, $4)
                     ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
                     DO NOTHING
-                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, created_at, updated_at
                     "#,
                 )
                 .bind(Uuid::new_v4())
@@ -3582,7 +3582,7 @@ impl MetadataStore for PostgresStore {
 
     async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
         let row = sqlx::query(
-            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
+            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -3594,7 +3594,7 @@ impl MetadataStore for PostgresStore {
     async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, created_at, updated_at
               FROM enable_jobs
              ORDER BY created_at DESC
              LIMIT $1
@@ -3629,7 +3629,7 @@ impl MetadataStore for PostgresStore {
                     LIMIT $3
                       FOR UPDATE SKIP LOCKED
              )
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, created_at, updated_at
             "#,
         )
         .bind(claimant)
@@ -3668,6 +3668,59 @@ impl MetadataStore for PostgresStore {
         .bind(claimant)
         .bind(chunks_done as i32)
         .bind(chunks_total.map(|v| v as i32))
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(self.enable_job_fence_miss(id, claimant).await);
+        }
+        Ok(())
+    }
+
+    /// Issue #539: persist one `CaptureProgress` event onto the job row.
+    /// `warm_stage_started_at` is derived from `progress.warm_stages`' still-
+    /// open entry (the caller — `PooledBackend::run_warm_hook`/
+    /// `build_base_snapshot` via the coordinator's stream consumer — always
+    /// sends the full stage history, not a diff), not re-derived in SQL, so
+    /// a stage-name-unchanged heartbeat doesn't need a `DISTINCT FROM`
+    /// dance to avoid resetting it.
+    ///
+    /// Fenced by `claimed_by` exactly like [`Self::update_enable_job_progress`]
+    /// — see #232. Also renews the claim (`claimed_at = NOW()`), which is
+    /// what lets the enable-scanner delete its blind capture-lease ticker
+    /// (`enable_scanner.rs`): the host's >=30s keepalive comfortably beats
+    /// the 300s lease.
+    async fn update_enable_job_capture_progress(
+        &self,
+        id: Uuid,
+        claimant: &str,
+        progress: &engram_core::types::CaptureProgress,
+    ) -> Result<(), MetaError> {
+        let warm_stage_started_at = progress
+            .warm_stages
+            .iter()
+            .find(|s| s.ended_at.is_none())
+            .map(|s| s.started_at);
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET capture_phase = $3,
+                   warm_stage = $4,
+                   warm_stage_started_at = $5,
+                   warm_stages = $6,
+                   output_tail = $7,
+                   claimed_at = NOW(),
+                   updated_at = NOW()
+             WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(id)
+        .bind(claimant)
+        .bind(progress.phase.as_str())
+        .bind(progress.warm_stage.as_deref())
+        .bind(warm_stage_started_at)
+        .bind(sqlx::types::Json(&progress.warm_stages))
+        .bind(&progress.output_tail)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -3770,7 +3823,7 @@ impl MetadataStore for PostgresStore {
                SET state = 'pending', attempts = 0, error = NULL,
                    claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
              WHERE id = $1 AND state = 'failed'
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, created_at, updated_at
             "#,
         )
         .bind(id)

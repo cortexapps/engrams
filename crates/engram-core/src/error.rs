@@ -126,6 +126,17 @@ pub enum SandboxError {
         host: u32,
         coord: u32,
     },
+    /// Issue #539: a structured `build_base_snapshot` failure — a
+    /// `[warm]`-hook watchdog violation (stall / stage deadline / global
+    /// timeout), a non-zero hook exit, an exec-stream transport death, or
+    /// the post-warm snapshot step failing. Carries the failing stage and
+    /// the hook's last 16 KiB of combined stdout+stderr so the
+    /// coordinator can persist a diagnosable failure onto the
+    /// `enable_jobs` row without host-log access. Distinct from the
+    /// catch-all `Snapshot(String)` — `classify_capture_error`
+    /// (`enable_scanner.rs`) reads `kind` to decide retryable vs.
+    /// deterministic bail-fast.
+    CaptureFailed(crate::types::CaptureFailure),
 }
 
 impl fmt::Display for SandboxError {
@@ -150,6 +161,7 @@ impl fmt::Display for SandboxError {
                 "wire_version skew: host={host} coord={coord} (mixed-version fleet \
                  during a rolling deploy); retry — the scheduler drains stale hosts"
             ),
+            Self::CaptureFailed(failure) => write!(f, "{failure}"),
         }
     }
 }

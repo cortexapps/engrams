@@ -50,6 +50,18 @@ pub enum ApiError {
     /// (the coord itself is broken).
     BadGateway(String),
     Internal(String),
+    /// Issue #539: a structured base-snapshot capture failure — carries
+    /// the [`engram_core::types::CaptureFailureKind`] so
+    /// `classify_capture_error` (`enable_scanner.rs`) can decide
+    /// retryable (`WarmExecTransport`) vs. deterministic bail-fast
+    /// without string-matching the message. The failing stage + output
+    /// tail aren't duplicated here — the last `CaptureProgress` write
+    /// already persisted them onto the `enable_jobs` row before this
+    /// error surfaced (even on a `WarmExecTransport` mid-stream death).
+    CaptureFailed {
+        kind: engram_core::types::CaptureFailureKind,
+        message: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -73,6 +85,7 @@ impl ApiError {
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::CaptureFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -91,11 +104,13 @@ impl ApiError {
             Self::TooManyRequests(_) => "too_many_requests",
             Self::BadGateway(_) => "bad_gateway",
             Self::Internal(_) => "internal",
+            Self::CaptureFailed { .. } => "capture_failed",
         }
     }
 
     pub(crate) fn message(&self) -> &str {
         match self {
+            Self::CaptureFailed { message, .. } => message,
             Self::BadRequest(m)
             | Self::NotFound(m)
             | Self::Conflict(m)
