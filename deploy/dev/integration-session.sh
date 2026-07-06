@@ -20,6 +20,22 @@
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+
+# Dev bakes cross-compile the rootfs for the host's own arch (mirrors
+# bake-demo.sh).
+case "$(uname -m)" in
+    arm64 | aarch64)
+        TARGET=aarch64-unknown-linux-musl
+        ;;
+    x86_64 | amd64)
+        TARGET=x86_64-unknown-linux-musl
+        ;;
+    *)
+        echo "integration-session: unsupported arch $(uname -m)" >&2
+        exit 1
+        ;;
+esac
+
 COORD="http://127.0.0.1:8090"
 HARNESS="${HARNESS:-none}"
 PROMPT="${PROMPT:-}"
@@ -52,7 +68,7 @@ if [ "$already_enabled" = "True" ]; then
 else
     echo "==> baking demo image @ $SHORT"
     cargo build --release -p engram-cli >/dev/null 2>&1
-    cargo build --release --target x86_64-unknown-linux-musl \
+    cargo build --release --target "$TARGET" \
         -p engram-agentd >/dev/null 2>&1
     "$ENGRAM_CLI" image build \
         --repo integration-test/demo \
@@ -60,7 +76,7 @@ else
         --source deploy/demo \
         --format ext4 \
         --images-dir ./var/integration/images \
-        --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \
+        --inject-agent "target/$TARGET/release/engram-agentd" \
         --push "$IMAGE_URI" \
         2>&1 | tail -3
     # Base snapshot is captured at enable time (ADR 0020), not at bake — the

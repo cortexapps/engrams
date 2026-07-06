@@ -10,7 +10,9 @@
 #     host-agent are all up).
 #   - host-target engram-cli at ./target/release/engram-cli.
 #   - musl-target engram-agentd at
-#     ./target/x86_64-unknown-linux-musl/release/engram-agentd.
+#     ./target/$TARGET/release/engram-agentd, where $TARGET is the
+#     host-arch musl triple (aarch64- or x86_64-unknown-linux-musl;
+#     see the `uname -m` switch below, mirrors bake-demo.sh).
 #   (the script will cargo-build them if missing.)
 #
 # Side effects:
@@ -32,6 +34,22 @@
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
+
+# Dev bakes cross-compile the rootfs for the host's own arch (mirrors
+# bake-demo.sh — no separate detect-backend.sh call needed here since
+# only the musl target triple is arch-dependent).
+case "$(uname -m)" in
+    arm64 | aarch64)
+        TARGET=aarch64-unknown-linux-musl
+        ;;
+    x86_64 | amd64)
+        TARGET=x86_64-unknown-linux-musl
+        ;;
+    *)
+        echo "integration-bake-demo: unsupported arch $(uname -m)" >&2
+        exit 1
+        ;;
+esac
 
 COORD="${COORD:-http://127.0.0.1:8090}"
 READY_DEADLINE_SECS="${READY_DEADLINE_SECS:-240}"
@@ -79,9 +97,9 @@ if [ ! -x ./target/release/engram-cli ]; then
     log "    building engram-cli (host) — not present in target/release"
     cargo build --release -p engram-cli >&2
 fi
-if [ ! -x ./target/x86_64-unknown-linux-musl/release/engram-agentd ]; then
-    log "    building engram-agentd (musl) — not present in target/x86_64-unknown-linux-musl/release"
-    cargo build --release --target x86_64-unknown-linux-musl -p engram-agentd >&2
+if [ ! -x "./target/$TARGET/release/engram-agentd" ]; then
+    log "    building engram-agentd ($TARGET) — not present in target/$TARGET/release"
+    cargo build --release --target "$TARGET" -p engram-agentd >&2
 fi
 
 T0=$(date +%s.%N)
@@ -91,7 +109,7 @@ T0=$(date +%s.%N)
     --source deploy/demo \
     --format ext4 \
     --images-dir ./var/integration/images \
-    --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \
+    --inject-agent "target/$TARGET/release/engram-agentd" \
     --push "$IMAGE_URI" \
     >&2 2>&1
 T1=$(date +%s.%N)
