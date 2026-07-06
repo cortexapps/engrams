@@ -20,18 +20,29 @@
 //!
 //! ## Per-fit-class FIFO (queue-fairness follow-up to ADR 0048)
 //!
-//! The placement predicate is exactly the 2D `(mem_budget_mib,
-//! cpu_budget_vcpus)` fit — image readiness isn't even consulted on the
-//! queue path (`ScheduleContext::required_image_digest` is always `None`
-//! in [`place_create`] / [`resume_has_capacity`]). Two queued sessions
-//! with equal budgets are therefore equi-placeable by construction, so
-//! [`FitClass`] partitions the FIFO-ordered queue by that pair
-//! ([`partition_queue`]) and each class sweeps strict FIFO independently.
-//! Classes are attempted oldest-head-first (the most-starved class gets
-//! first claim on freed capacity this tick); a create that hits
-//! `NoCapacity` stops only its class, not the whole sweep — a session
-//! behind an unplaceable big head from a DIFFERENT class no longer
-//! inherits that head's wait. Within a class, FIFO order is unchanged.
+//! [`FitClass`] partitions the FIFO-ordered queue purely by the 2D
+//! `(mem_budget_mib, cpu_budget_vcpus)` pair ([`partition_queue`]) and each
+//! class sweeps strict FIFO independently. Classes are attempted
+//! oldest-head-first (the most-starved class gets first claim on freed
+//! capacity this tick); a create that hits `NoCapacity` stops only its
+//! class, not the whole sweep — a session behind an unplaceable big head
+//! from a DIFFERENT class no longer inherits that head's wait. Within a
+//! class, FIFO order is unchanged.
+//!
+//! Image readiness is a separate, per-session concern layered on top of the
+//! class partition, NOT part of it: `resume_has_capacity` never sets
+//! `ScheduleContext::required_image_digest` (a resume places by snapshot
+//! affinity, not base-image residency — see its own doc comment), but
+//! `place_create` does (ADR 0036 amendment / issue #538, hardened by PR
+//! #565's live-only gate — see [`place_create`]'s doc comment). Two
+//! create-origin sessions with equal budgets but DIFFERENT images are
+//! therefore still one fit class — a class is a capacity dimension, not a
+//! placeability guarantee — but they aren't equi-placeable: one may have a
+//! candidate host set the other doesn't, and one may be terminally
+//! image-gone while the other isn't. `PlaceOutcome::ImageGone` accounts for
+//! this within a class: it only drops that one session and continues the
+//! sweep (unlike `NoCapacity`, which stops the whole class), so a
+//! digest-mismatched head never blocks a same-class session behind it.
 //!
 //! One stop remains global: a resume-origin `NoCapacity` means
 //! `candidates_for` returned zero schedulable hosts fleet-wide (not a fit

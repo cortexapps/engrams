@@ -24,8 +24,11 @@ use engram_core::traits::MetadataStore;
 use engram_core::types::host::{
     HostCapacity, HostHeartbeat, HostRecord, HostStatus, HostUtilization,
 };
+use engram_core::types::manifest::ManifestRef;
 use engram_core::types::session::{QueueOrigin, SessionMode, SessionSpec, SessionState};
-use engram_core::types::{HostId, SessionId};
+use engram_core::types::snapshot::SnapshotRecord;
+use engram_core::types::{EnabledImage, HostId, SessionId};
+use uuid::Uuid;
 
 async fn connect() -> Option<Arc<dyn MetadataStore>> {
     let url = std::env::var("ENGRAM_TEST_DATABASE_URL").ok()?;
@@ -43,10 +46,18 @@ fn spec() -> SessionSpec {
     }
 }
 
+/// `ready_images` is the set of manifest digests this host's heartbeat
+/// advertises as staged — PR #565's `place_create` digest gate
+/// (`queue_scanner.rs`) only offers a host as a candidate for a queued
+/// create if its `ready_images` contains that create's enabled image's
+/// digest (`placement::host_passes_filters`). Empty for the tests that
+/// don't drive a create through the gate (they call `place_queued_session`
+/// / `reserve_placement` directly against the store, bypassing `place_create`).
 async fn seed_ready_host(
     meta: &Arc<dyn MetadataStore>,
     allocatable_mib: u64,
     total_vcpus: u32,
+    ready_images: &[String],
 ) -> HostId {
     let id = HostId::new();
     let name = format!("q-{id}");
@@ -91,7 +102,7 @@ async fn seed_ready_host(
                 allocatable_mib,
                 ..HostUtilization::default()
             },
-            ready_images: Vec::new(),
+            ready_images: ready_images.to_vec(),
             local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             total_vcpus,
@@ -105,6 +116,67 @@ async fn seed_ready_host(
     .await
     .expect("heartbeat host");
     id
+}
+
+/// Seeds a live `enabled_images` row for `image_uri` with a freshly
+/// generated, unique digest and returns that digest.
+///
+/// PR #565's `place_create` (`queue_scanner.rs`) does a live-only
+/// `get_enabled_image` lookup before placing a queued create; `Ok(None)`
+/// (no row / soft-deleted) now terminally fails the session
+/// (`fail_queued_create_image_gone`) instead of leaving it queued. Every
+/// session this file enqueues through the scanner (`place_create`, i.e.
+/// anything driven via `queue_scanner::run_once`) therefore needs its own
+/// enabled-image row, even sessions engineered to be capacity-unfittable —
+/// otherwise they'd be observed terminally Failed (image-shaped) instead of
+/// legitimately Queued forever (capacity-shaped), breaking this file's
+/// per-fit-class assertions. `base_snapshot_id` is `NOT NULL REFERENCES
+/// snapshots(id)` (migration 0038), so a real (if content-empty) snapshot
+/// row is recorded first to satisfy the FK — its content is never actually
+/// materialized in these tests (the scanner's own boot attempt fails fast
+/// against the local, unpopulated blob store and requeues, same as this
+/// file's pre-existing "no enabled_images row" comments described before
+/// PR #565 added the gate).
+async fn seed_enabled_image(meta: &Arc<dyn MetadataStore>, image_uri: &str) -> String {
+    let snapshot_id = engram_core::SnapshotId::new();
+    meta.record_snapshot(SnapshotRecord {
+        id: snapshot_id,
+        session_id: None,
+        host_id: None,
+        image_version: image_uri.to_string(),
+        size_bytes: 0,
+        created_at: Utc::now(),
+        last_accessed_at: Utc::now(),
+        disk_manifest: None,
+        memory_manifest: None,
+        recoverable: true,
+        aux_bundles: vec![],
+        events_cursor: None,
+        fc_snapshot_version: None,
+    })
+    .await
+    .expect("seed base snapshot for enabled image");
+
+    let digest = format!("sha256:{}", Uuid::new_v4().simple());
+    let now = Utc::now();
+    meta.upsert_enabled_image(EnabledImage {
+        id: Uuid::new_v4(),
+        image_uri: image_uri.to_string(),
+        manifest_toml: format!("name = \"queue-scanner-fixture-{}\"\n", Uuid::new_v4()),
+        manifest_digest: digest.clone(),
+        disk_manifest: None,
+        base_snapshot_id: Some(snapshot_id),
+        base_snapshot_disk_manifest: Some(ManifestRef::new()),
+        base_snapshot_memory_manifest: None,
+        last_refreshed_at: now,
+        created_at: now,
+        updated_at: None,
+        soft_deleted_at: None,
+        capture_env: Vec::new(),
+    })
+    .await
+    .expect("seed enabled image");
+    digest
 }
 
 #[tokio::test]
@@ -152,7 +224,7 @@ async fn enqueue_list_demand_and_fifo_order() {
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn place_queued_flips_to_pending_on_a_fitting_host() {
     let Some(meta) = connect().await else { return };
-    let host = seed_ready_host(&meta, 16_384, 8).await;
+    let host = seed_ready_host(&meta, 16_384, 8, &[]).await;
     let sid = SessionId::new();
     meta.enqueue_session_create(sid, &spec(), 4096, 2, None)
         .await
@@ -181,7 +253,7 @@ async fn place_queued_flips_to_pending_on_a_fitting_host() {
 async fn place_queued_returns_none_when_no_host_fits() {
     let Some(meta) = connect().await else { return };
     // Host with only 2 GiB allocatable; a 4 GiB session can't fit.
-    let host = seed_ready_host(&meta, 2048, 8).await;
+    let host = seed_ready_host(&meta, 2048, 8, &[]).await;
     let sid = SessionId::new();
     meta.enqueue_session_create(sid, &spec(), 4096, 2, None)
         .await
@@ -199,7 +271,7 @@ async fn place_queued_returns_none_when_no_host_fits() {
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn requeue_and_stale_pending_recovery() {
     let Some(meta) = connect().await else { return };
-    let host = seed_ready_host(&meta, 16_384, 8).await;
+    let host = seed_ready_host(&meta, 16_384, 8, &[]).await;
     let sid = SessionId::new();
     meta.enqueue_session_create(sid, &spec(), 4096, 2, None)
         .await
@@ -456,18 +528,30 @@ async fn hol_break_is_per_class_not_global() {
     // use a fixed 4096/2 budget) could fit on a round-sized host too, get
     // placed onto it by this same sweep, and consume the capacity B
     // needs before the sweep reaches B's class.
+    // PR #565's `place_create` digest-gates every queued create on a LIVE
+    // `enabled_images` row for its own image (see `seed_enabled_image`) —
+    // A and B each need their own row (distinct `spec()` images), even
+    // though A is engineered to be capacity-unfittable: without a row,
+    // A would be observed terminally Failed (image-shaped) instead of
+    // legitimately Queued forever (capacity-shaped), which is what this
+    // test actually asserts below. Only B's digest needs to be staged on
+    // the host — A never gets past the capacity check regardless.
     let b = SessionId::new();
     let (b_mem, b_cpu) = unique_fitting_budget_in(b, HOL_BREAK_BUDGET_BASE_MIB);
-    let host = seed_ready_host(&meta, b_mem as u64, 8).await;
+    let b_spec = spec();
+    let b_digest = seed_enabled_image(&meta, &b_spec.image).await;
+    let host = seed_ready_host(&meta, b_mem as u64, 8, &[b_digest]).await;
 
     // A (unfittable, older) then B (fits, newer) — the pre-fix scanner's
     // whole-sweep FIFO break at A would leave B untouched this tick.
     let a = SessionId::new();
-    meta.enqueue_session_create(a, &spec(), UNFITTABLE_MEM_MIB, UNFITTABLE_CPU_VCPUS, None)
+    let a_spec = spec();
+    seed_enabled_image(&meta, &a_spec.image).await;
+    meta.enqueue_session_create(a, &a_spec, UNFITTABLE_MEM_MIB, UNFITTABLE_CPU_VCPUS, None)
         .await
         .expect("enqueue A");
     tokio::time::sleep(Duration::from_millis(20)).await;
-    meta.enqueue_session_create(b, &spec(), b_mem, b_cpu, None)
+    meta.enqueue_session_create(b, &b_spec, b_mem, b_cpu, None)
         .await
         .expect("enqueue B");
 
@@ -520,23 +604,34 @@ async fn per_class_fifo_head_block_is_scoped_to_its_class() {
     // Draws from a disjoint sub-range from `hol_break`'s own `B` (see
     // `unique_fitting_budget_in`) so a leftover `B` row from a previous
     // local run can never collide with this test's class either.
+    // See the digest-gate comment in `hol_break_is_per_class_not_global`:
+    // every queued create needs its own live `enabled_images` row (PR
+    // #565's `place_create` gate), including x1/x2 (which must stay
+    // Queued for the RIGHT reason — capacity, not a missing image row).
+    // Only y1's digest needs to be staged on the host.
     let y1 = SessionId::new();
     let (y1_mem, y1_cpu) = unique_fitting_budget_in(y1, PER_CLASS_FIFO_BUDGET_BASE_MIB);
-    let _host = seed_ready_host(&meta, y1_mem as u64, 8).await;
+    let y1_spec = spec();
+    let y1_digest = seed_enabled_image(&meta, &y1_spec.image).await;
+    let _host = seed_ready_host(&meta, y1_mem as u64, 8, &[y1_digest]).await;
 
     // Class X: two SAME-budget (unfittable) sessions, x1 older than x2.
     let x1 = SessionId::new();
-    meta.enqueue_session_create(x1, &spec(), UNFITTABLE_MEM_MIB, UNFITTABLE_CPU_VCPUS, None)
+    let x1_spec = spec();
+    seed_enabled_image(&meta, &x1_spec.image).await;
+    meta.enqueue_session_create(x1, &x1_spec, UNFITTABLE_MEM_MIB, UNFITTABLE_CPU_VCPUS, None)
         .await
         .expect("enqueue x1");
     tokio::time::sleep(Duration::from_millis(20)).await;
     let x2 = SessionId::new();
-    meta.enqueue_session_create(x2, &spec(), UNFITTABLE_MEM_MIB, UNFITTABLE_CPU_VCPUS, None)
+    let x2_spec = spec();
+    seed_enabled_image(&meta, &x2_spec.image).await;
+    meta.enqueue_session_create(x2, &x2_spec, UNFITTABLE_MEM_MIB, UNFITTABLE_CPU_VCPUS, None)
         .await
         .expect("enqueue x2");
     tokio::time::sleep(Duration::from_millis(20)).await;
     // Class Y: one small, fitting session, queued after both X members.
-    meta.enqueue_session_create(y1, &spec(), y1_mem, y1_cpu, None)
+    meta.enqueue_session_create(y1, &y1_spec, y1_mem, y1_cpu, None)
         .await
         .expect("enqueue y1");
 
@@ -708,7 +803,7 @@ async fn notify_placement_changed_fires_at_every_site() {
     wait_for_reason(&mut listener, "enqueued").await;
 
     // 2. upsert_host → "host_upserted".
-    let host = seed_ready_host(&meta, 16_384, 8).await;
+    let host = seed_ready_host(&meta, 16_384, 8, &[]).await;
     // `seed_ready_host` calls upsert_host then touch_host_heartbeat;
     // only the former fires this NOTIFY.
     wait_for_reason(&mut listener, "host_upserted").await;
@@ -759,11 +854,20 @@ async fn scanner_wakes_on_notify_and_places_within_the_wake_not_the_fallback() {
         return;
     };
 
+    // `queued_id` is placed via the real scanner (`place_create`), so — per
+    // the digest-gate comment in `hol_break_is_per_class_not_global` — it
+    // needs its own live `enabled_images` row, and the host must advertise
+    // that digest in `ready_images`. `filler` reserves directly via
+    // `reserve_placement` (bypassing `place_create`), so its own `spec()`
+    // image needs no row.
+    let queued_spec = spec();
+    let queued_digest = seed_enabled_image(&meta, &queued_spec.image).await;
+
     // A dedicated, distinctively oversized host so no OTHER
     // concurrently-running test's host could accidentally satisfy the
     // queued session below before we free the filler — that would defeat
     // the "genuinely cannot fit yet" premise.
-    let host = seed_ready_host(&meta, SCANNER_WAKE_MEM_MIB as u64, 64).await;
+    let host = seed_ready_host(&meta, SCANNER_WAKE_MEM_MIB as u64, 64, &[queued_digest]).await;
 
     // Fill the ENTIRE host with a direct reservation (Pending reserves
     // host memory) so the queued session below genuinely cannot fit
@@ -779,7 +883,7 @@ async fn scanner_wakes_on_notify_and_places_within_the_wake_not_the_fallback() {
     assert_eq!(filler_host, host);
 
     let queued_id = SessionId::new();
-    meta.enqueue_session_create(queued_id, &spec(), SCANNER_WAKE_MEM_MIB, 1, None)
+    meta.enqueue_session_create(queued_id, &queued_spec, SCANNER_WAKE_MEM_MIB, 1, None)
         .await
         .expect("enqueue queued session");
 
