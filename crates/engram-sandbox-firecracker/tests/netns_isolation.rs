@@ -37,17 +37,46 @@
 //! sudo -E env "PATH=$PATH" cargo test \
 //!     -p engram-sandbox-firecracker --test netns_isolation -- --ignored
 //! ```
+//!
+//! No `--test-threads=1` needed: the two tests below share a
+//! process-wide lock (`TEST_SERIAL`) for their full duration, so
+//! `delete_stale_netns`'s global sweep can never race a sibling
+//! test's live netns/veth.
 
 #![cfg(target_os = "linux")]
 
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
+use tokio::sync::{Mutex, MutexGuard};
+
 use engram_core::types::ids::SandboxId;
 use engram_sandbox_firecracker::net::{
     netns_name_for, netns_path_for, provision_netns, tap_name_for, teardown_netns, veth_names_for,
     NetworkAllocator, VmCidr,
 };
+
+/// Both tests in this file call `delete_stale_netns()` below, which
+/// does a global sweep of every `engr-vm-*` netns and `vh-engr-*`
+/// veth on the host — not scoped to either test's own (randomly
+/// generated) `SandboxId`, because its job is to reap leftovers from
+/// a DIFFERENT, previously crashed run. Cargo's default test runner
+/// executes `#[tokio::test]`s concurrently on separate threads within
+/// one process, so without serialization one test's stale-wipe can
+/// delete a sibling test's freshly provisioned netns/veth mid-flight
+/// (issue #536 review, finding 2). CI's `test-firecracker` job
+/// happens to pass `--test-threads=1` for this binary, which is why
+/// the race never showed up there — but the module doc above
+/// advertises a bare `cargo test -- --ignored` invocation that
+/// wouldn't be safe. Rather than depend on every caller remembering a
+/// flag, serialize the two tests here with a lock that's held (across
+/// the tests' own awaits) for the full test body — `tokio::sync::Mutex`,
+/// not `std::sync::Mutex`, specifically so that's sound.
+static TEST_SERIAL: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
+
+async fn serialize_test() -> MutexGuard<'static, ()> {
+    TEST_SERIAL.lock().await
+}
 
 /// `/proc/self/status`-based root check matching the other ignored
 /// FC integration tests. Returns `false` (after printing SKIP) when
@@ -181,6 +210,7 @@ async fn netns_provision_isolates_two_warm_slots_from_one_snapshot() {
     if !require_root() {
         return;
     }
+    let _guard = serialize_test().await;
     delete_stale_netns();
 
     let allocator = parking_lot::Mutex::new(NetworkAllocator::new(
@@ -326,4 +356,91 @@ async fn netns_provision_isolates_two_warm_slots_from_one_snapshot() {
     // honest if the function ever moves; same module pin pattern as
     // snapshot_net.rs uses for `netns_name_for`.
     let _ = tap_name_for(slot1_id);
+}
+
+/// Issue #536 (S1): the idempotency pre-clean in `provision_netns_inner`
+/// went from unconditional `ip netns delete`/`ip link delete` spawns to
+/// existence/`link_index`-gated ones. Pins that a partial-failure
+/// leftover — a netns bind-mount plus a host-side veth from a prior
+/// crashed provision — is still cleaned up correctly before the retry
+/// proceeds, and that the end-state topology after the retry is
+/// identical to a from-scratch provision.
+#[tokio::test]
+#[ignore = "requires Linux + root (CAP_NET_ADMIN for netns + veth + iptables)"]
+async fn netns_provision_retries_past_a_stale_leftover() {
+    if !require_root() {
+        return;
+    }
+    let _guard = serialize_test().await;
+    delete_stale_netns();
+
+    let allocator = parking_lot::Mutex::new(NetworkAllocator::new(
+        Ipv4Addr::from_str("10.200.0.0").unwrap(),
+    ));
+
+    let bake_cidr = VmCidr::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
+    let bake_tap = "tap-engr-baked1"; // 15 chars, IFNAMSIZ-safe; distinct from the other test's
+
+    let sandbox_id = SandboxId::new();
+    let ns_name = netns_name_for(sandbox_id);
+    let (veth_host, _veth_ns) = veth_names_for(sandbox_id);
+
+    // Pre-seed exactly the leftover state a crashed prior provision
+    // for this sandbox_id would strand: the netns bind-mount and the
+    // host-root veth. Neither `ip netns add` nor the veth add below
+    // would succeed a second time without cleanup — that's the
+    // regression this test guards against.
+    let status = std::process::Command::new("ip")
+        .args(["netns", "add", &ns_name])
+        .status()
+        .expect("spawn ip netns add");
+    assert!(status.success(), "pre-seed netns add must succeed");
+    let status = std::process::Command::new("ip")
+        .args([
+            "link",
+            "add",
+            &veth_host,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "vh-stale-peer0",
+        ])
+        .status()
+        .expect("spawn ip link add");
+    assert!(status.success(), "pre-seed veth add must succeed");
+
+    // Retry: provision_netns must succeed despite the leftover state,
+    // via the existence/link_index-gated pre-clean rather than
+    // tripping over an "already exists" error from `ip netns add` or
+    // the veth add.
+    let setup = provision_netns(sandbox_id, bake_cidr, bake_tap, &allocator)
+        .await
+        .expect("provision must succeed past a stale leftover");
+
+    // End-state topology matches a from-scratch provision: the bake
+    // TAP lives inside the (freshly re-created) netns and nowhere in
+    // host root, and the netns republishes at the expected path.
+    assert!(
+        netns_path_for(sandbox_id).exists(),
+        "netns must be (re-)published after the retry",
+    );
+    assert!(
+        tap_in_netns(&ns_name, bake_tap),
+        "bake TAP must be present inside the netns after the retry",
+    );
+    assert!(
+        !tap_in_host_root(bake_tap),
+        "bake TAP must not leak into host root after the retry",
+    );
+    assert!(
+        tap_in_host_root(&veth_host),
+        "veth host-end must live in host root after the retry",
+    );
+
+    teardown_netns(&setup, &allocator).await;
+    assert!(
+        !netns_path_for(sandbox_id).exists(),
+        "netns must be deleted post-teardown",
+    );
 }

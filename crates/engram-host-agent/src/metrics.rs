@@ -90,6 +90,30 @@ pub const OCI_PULL_BYTES: &str = "engram_oci_pull_bytes";
 /// increments, and ops can page on the cross-over before disk fills.
 pub const HOST_DISK_FREE_BYTES: &str = "engram_host_disk_free_bytes";
 
+/// ADR 0067: gauge of `fs_free - fs_total * ENGRAM_KUBELET_EVICT_PCT/100`
+/// on the host's `work_dir` mount — how far free disk sits above the
+/// kubelet's ephemeral-storage hard-eviction line. Sampled every
+/// heartbeat tick (`UtilizationProbe::sample`), independent of the
+/// chunk-cache budget: this alarms on TOTAL disk pressure (snapshots,
+/// memfiles, the OCI cache, anything sharing the mount), not just the
+/// cache's own slice. Negative or shrinking toward zero means the
+/// kubelet is about to evict this host-agent pod — page BEFORE that
+/// happens, since the eviction itself is the amplifier (pod churn
+/// orphans the local chunk cache, forcing every subsequent resume onto
+/// the ADR-0028 disk-only cold-recovery path).
+pub const HOST_DISK_HEADROOM_TO_KUBELET_BYTES: &str = "engram_host_disk_headroom_to_kubelet_bytes";
+
+/// ADR 0067: gauge of summed on-disk bytes of every per-template base
+/// memfile the image-prefetch supervisor has materialized (ADR 0022
+/// Option A residency) — these are unevictable disk (mlock'd, reclaimed
+/// only on image-disable), so they're part of the same "floor the
+/// budget can't touch" accounting as pinned chunk bytes. Sampled each
+/// image-prefetch reconcile tick. `generation-purge` (a later item in
+/// the 2026-07 overhaul) deletes File-mode memfiles entirely, taking
+/// this term to zero — this gauge exists to measure that, not to grow
+/// more machinery around it.
+pub const HOST_BASE_MEMFILE_BYTES: &str = "engram_host_base_memfile_bytes";
+
 /// ADR 0014 issue #4: counter incremented each time the idle-evict
 /// tick observes free disk below the floor and skips pushing
 /// candidates. Sustained increments mean a snowballing snapshot
@@ -126,6 +150,15 @@ pub const IDLE_EVICT_KEPT_RESIDENT_TOTAL: &str = "engram_host_idle_evict_kept_re
 /// metric a later UI ADR reads). Absent on VZ/non-Linux backends.
 pub const SANDBOX_GUEST_PSS_BYTES: &str = "engram_sandbox_guest_pss_bytes";
 pub const SANDBOX_GUEST_RSS_BYTES: &str = "engram_sandbox_guest_rss_bytes";
+/// Issue #540: the same Σpss/Σrss density signal, but for sandboxes
+/// flagged `parked` (RAM-resident, reservation-free — epic-parking-
+/// ladder rungs 2-3). Always 0 until a backend ever parks a sandbox.
+/// Gauge-only: never folded into `allocatable_mib`. Without these, the
+/// sharing-credit rule (`Σpss/Σrss < 1.0`, ADR 0046) can't be evaluated
+/// for parked residents — exactly the population density math cares
+/// about once the ladder lands.
+pub const SANDBOX_GUEST_PARKED_PSS_BYTES: &str = "engram_sandbox_guest_parked_pss_bytes";
+pub const SANDBOX_GUEST_PARKED_RSS_BYTES: &str = "engram_sandbox_guest_parked_rss_bytes";
 
 /// ADR 0038 B0: histogram of the FC memory-capture (`PUT /snapshot/
 /// create`) wall-clock — the previously-invisible step that hung for
@@ -183,3 +216,69 @@ pub const RESUME_PREFAULT_TOTAL: &str = "engram_resume_prefault_total";
 /// is itself worth alarming on (trace loaded, but the session-manifest
 /// no longer needs any chunk it names — a stale/mismatched trace).
 pub const RESUME_PREFAULT_CHUNKS_TOTAL: &str = "engram_resume_prefault_chunks_total";
+
+/// Issue #539: histogram of how long each named `[warm]`-hook stage ran,
+/// labelled by `stage` (the hook-declared name — cardinality is bounded by
+/// however many distinct stage names the fleet's warm hooks emit) and
+/// `outcome` (`done` | `failed`). Recorded from `run_warm_hook`'s closed
+/// stage history at every terminal point (success, watchdog violation, or
+/// non-zero exit) — the productized version of the log-reconstructed
+/// "609 s and 1,071 s" / "~33 min" durations the issue's evidence pass had
+/// to hand-grep out of host-agent logs.
+pub const WARM_HOOK_STAGE_SECONDS: &str = "engram_warm_hook_stage_seconds";
+
+/// Issue #539: counter of `[warm]`-hook capture failures, labelled by
+/// `kind` (`engram_core::types::CaptureFailureKind::as_str()` —
+/// `warm_exit_non_zero` | `warm_stall` | `warm_stage_deadline` |
+/// `warm_global_timeout` | `warm_exec_transport` | `snapshot_failed`).
+/// Before this the only signal was the terse `enable_jobs.error` string;
+/// this is what tells an operator (or an alert) whether the dominant
+/// failure mode is still the stall class after the paired
+/// `warm-brain-stack.sh` fix (engrams-internal) lands.
+pub const WARM_HOOK_FAILURES_TOTAL: &str = "engram_warm_hook_failures_total";
+
+/// Issue #540 (host RAM ledger): gauge of host RAM (MiB) attributed to
+/// one named bucket, sampled once per heartbeat tick from
+/// `ram_ledger::RamLedgerSnapshot`. Label `category`:
+/// - `running_vms` — Σ PSS of reservation-backed (non-parked) FC
+///   sandboxes (`RamLedgerSnapshot::running_vm_pss_mib`).
+/// - `parked_paused` — Σ PSS of parked-but-resident sandboxes
+///   (epic-parking-ladder rungs 2-3; always 0 until the ladder lands).
+/// - `base_shm` — measured (`st_blocks`) bytes on the per-image base
+///   shm tmpfs.
+/// - `base_shm_pending` — registered-but-not-yet-materialized prewarm
+///   charges; the reason `allocatable_mib` dips during a prewarm
+///   window instead of after it.
+/// - `parked_local_memfiles` — NVMe-resident retained memfiles (rung
+///   3); disk-side, gauge-only here (chunk-cache-disk-budget owns
+///   charging it), always 0 until that ladder rung exists.
+///
+/// Together these buckets are the attribution `allocatable_mib` never
+/// had: every MiB is charged to exactly one category here.
+pub const HOST_RAM_LEDGER_MIB: &str = "engram_host_ram_ledger_mib";
+
+/// Issue #540: gauge mirroring `HostUtilization.allocatable_mib` —
+/// the same number placement reads off the heartbeat, emitted at the
+/// same tick as [`HOST_RAM_LEDGER_MIB`] so the two can never disagree
+/// (one snapshot, one emission site).
+pub const HOST_RAM_ALLOCATABLE_MIB: &str = "engram_host_ram_allocatable_mib";
+
+/// Issue #540: total capacity (MiB) of the `ENGRAM_FC_UFFD_BASE_DIR`
+/// tmpfs — the fixed `uffdBaseTmpfsSize` cap (helm
+/// `firecracker.uffdBaseTmpfsSize`, default 32 GiB) node-prep mounts.
+/// Surfaces the ceiling the 2026-06-28 `pwrite ... No space left on
+/// device` prewarm failure hit, with nothing measuring it beforehand.
+pub const HOST_BASE_SHM_TMPFS_TOTAL_MIB: &str = "engram_host_base_shm_tmpfs_total_mib";
+/// Issue #540: measured (`st_blocks`) bytes actually allocated on the
+/// base-shm tmpfs — companion to
+/// [`HOST_BASE_SHM_TMPFS_TOTAL_MIB`] for a used/total ratio.
+pub const HOST_BASE_SHM_TMPFS_USED_MIB: &str = "engram_host_base_shm_tmpfs_used_mib";
+
+/// Issue #540: counter incremented each time `image_prefetch`'s
+/// base-shm prewarm arm skips the multi-GiB write attempt because the
+/// tmpfs headroom pre-check found insufficient free space
+/// (`reason="tmpfs_headroom"` — the only reason today, kept as a label
+/// for future skip causes). Prewarm's existing warn-and-continue
+/// failure posture is unchanged: a skip here still falls back to the
+/// handler's lazy per-fault path.
+pub const BASE_SHM_PREWARM_SKIPPED_TOTAL: &str = "engram_base_shm_prewarm_skipped_total";

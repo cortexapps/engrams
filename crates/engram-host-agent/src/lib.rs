@@ -45,45 +45,15 @@ pub mod orphan_reap;
 pub mod pooled_backend;
 pub mod proxy_port;
 pub mod proxy_shell;
+pub mod ram_ledger;
 pub mod resource;
 pub mod snapshot;
 pub mod teardown_reconcile;
 pub mod trace_scope;
 pub mod util;
+pub mod warm_progress;
 
 pub use config::HostAgentConfig;
-
-/// ADR 0014 M1.12 / ADR 0020: materialize the host's 16 MiB empty ext4
-/// stub harness (idempotent — rebuilt only if missing or wrong-sized).
-/// Both the warm-pool restore path and ADR 0020's base-snapshot capture
-/// attach it as the harness drive; `swap_harness_drive` re-points it at
-/// the session's real harness at lease/restore time. Returned path is
-/// canonicalized so the FC drive symlink resolves. Lives in the lib so
-/// both the `engram-host-agent` (mode=host) and `engram-coordinator`
-/// (mode=all) binaries wire the same stub.
-pub async fn ensure_stub_harness(path: &std::path::Path) -> Result<PathBuf, String> {
-    const STUB_SIZE_BYTES: u64 = 16 * 1024 * 1024;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("mkdir stub parent {}: {e}", parent.display()))?;
-    }
-    let needs_build = match tokio::fs::metadata(path).await {
-        Ok(meta) => meta.len() != STUB_SIZE_BYTES,
-        Err(_) => true,
-    };
-    if needs_build {
-        let scratch = tempfile::tempdir().map_err(|e| format!("stub tempdir: {e}"))?;
-        use engram_image_builder::{Ext4Packer, Mke2fsPacker};
-        Mke2fsPacker::default()
-            .pack(scratch.path(), path, STUB_SIZE_BYTES)
-            .await
-            .map_err(|e| format!("mke2fs stub harness: {e}"))?;
-    }
-    tokio::fs::canonicalize(path)
-        .await
-        .map_err(|e| format!("canonicalize stub harness {}: {e}", path.display()))
-}
 
 pub struct HostAgent {
     pub cfg: HostAgentConfig,
@@ -961,6 +931,18 @@ impl HostAgent {
                 })
             });
 
+            // Issue #540: the host RAM ledger. One long-lived instance
+            // holds the pending-base-shm-charge registry; `image_prefetch`
+            // registers a charge before each prewarm write and the
+            // heartbeat tick's `sample()` reads it back out every tick.
+            let ram_ledger = std::sync::Arc::new(ram_ledger::RamLedger::new());
+            // Published once per heartbeat tick so the idle-evictor's
+            // pressure gate reads the SAME snapshot the heartbeat just
+            // built — one source of truth instead of a second, private
+            // `/proc/meminfo` read (issue #540).
+            let (ram_ledger_tx, ram_ledger_rx) =
+                tokio::sync::watch::channel(ram_ledger::RamLedgerSnapshot::default());
+
             // ADR 0015 M5: image-prefetch supervisor. Watches the
             // heartbeat-ack's `enabled_images` set and pulls the
             // chunked rootfs for any image not yet local on this
@@ -1000,6 +982,7 @@ impl HostAgent {
                         chunk_cache,
                         readiness.clone(),
                         base_memfile_dir,
+                        ram_ledger.clone(),
                     );
                     Some(tx)
                 }
@@ -1096,6 +1079,12 @@ impl HostAgent {
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
             let util_work_dir = self.cfg.work_dir.clone();
+            let ram_ledger_for_heartbeat = ram_ledger.clone();
+            let ram_ledger_tx_for_heartbeat = ram_ledger_tx;
+            // ENGRAM_FC_UFFD_BASE_DIR doesn't change at runtime; resolve
+            // once outside the loop (same pattern `base_memfile_dir`
+            // above uses).
+            let base_shm_dir_for_heartbeat = engram_sandbox_firecracker::uffd_base_dir_from_env();
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(heartbeat_interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1134,19 +1123,72 @@ impl HostAgent {
                     // never a stale value. Error-tolerant + non-blocking
                     // (telemetry must not gate the workload); absent on
                     // VZ/non-Linux (guest_memory_stats → None).
-                    // ADR 0046: also feed Σ guest-PSS into the heartbeat's
-                    // `allocatable_mib` (UtilizationProbe::sample = MemAvailable
-                    // + Σ guest-resident), so placement nets out the baseline.
-                    let guest_pss_mib = match pooled_for_heartbeat.guest_memory_stats().await {
-                        Some(mem) => {
-                            ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PSS_BYTES)
-                                .set(mem.pss_bytes as f64);
-                            ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_RSS_BYTES)
-                                .set(mem.rss_bytes as f64);
-                            mem.pss_bytes / (1024 * 1024)
-                        }
-                        None => 0,
-                    };
+                    let guest_mem = pooled_for_heartbeat.guest_memory_stats().await;
+                    if let Some(mem) = &guest_mem {
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PSS_BYTES)
+                            .set(mem.pss_bytes as f64);
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_RSS_BYTES)
+                            .set(mem.rss_bytes as f64);
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PARKED_PSS_BYTES)
+                            .set(mem.parked_pss_bytes as f64);
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PARKED_RSS_BYTES)
+                            .set(mem.parked_rss_bytes as f64);
+                    }
+                    // Issue #540: one RAM-ledger snapshot per tick — the
+                    // meminfo read, the guest-PSS running/parked split
+                    // above, and this ledger's own pending base-shm
+                    // charges. Both `UtilizationProbe::sample` (below) and
+                    // the idle-evictor's pressure gate (via the watch
+                    // channel) derive their numbers from THIS snapshot, so
+                    // the two can never disagree.
+                    let ram_snapshot = ram_ledger_for_heartbeat.sample(
+                        base_shm_dir_for_heartbeat.as_deref(),
+                        &guest_mem.unwrap_or_default(),
+                    );
+                    ram_ledger_tx_for_heartbeat.send_replace(ram_snapshot);
+                    // Issue #540 review finding 3: gate every ledger gauge
+                    // on `measured` — VZ/Process/non-Linux backends (and a
+                    // genuine `/proc/meminfo` parse failure) never took a
+                    // real sample, so `ram_snapshot` is the all-zero
+                    // default. Emitting that as a value would look like
+                    // "this host has 0 MiB of everything" on a dashboard
+                    // instead of "unmeasured" — matches the acceptance
+                    // criterion's "gauges not emitted" posture.
+                    if ram_snapshot.measured {
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "running_vms")
+                            .set(ram_snapshot.running_vm_pss_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "parked_paused")
+                            .set(ram_snapshot.parked_paused_pss_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "base_shm")
+                            .set(ram_snapshot.base_shm_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "base_shm_pending")
+                            .set(ram_snapshot.base_shm_pending_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "parked_local_memfiles")
+                            .set(ram_snapshot.parked_local_memfile_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_ALLOCATABLE_MIB)
+                            .set(ram_snapshot.allocatable_mib() as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_BASE_SHM_TMPFS_TOTAL_MIB)
+                            .set(ram_snapshot.base_shm_tmpfs_total_mib as f64);
+                        // Issue #540 review finding 5: this is the tmpfs
+                        // mount's own `statfs` used figure (`f_blocks -
+                        // f_bfree`), NOT `base_shm_mib` (this ledger's
+                        // st_blocks walk over known files) — the two can
+                        // legitimately diverge (an unlinked-but-open file,
+                        // a stray subdir) and this gauge exists specifically
+                        // to catch that divergence during an ENOSPC-class
+                        // incident.
+                        ::metrics::gauge!(crate::metrics::HOST_BASE_SHM_TMPFS_USED_MIB)
+                            .set(ram_snapshot.base_shm_tmpfs_used_mib as f64);
+                    }
+                    // Issue #540: single emission site for this gauge (was
+                    // previously only set inside the idle-evictor's
+                    // pressure-aware branch, so it read stale/unset when
+                    // that mode was off). Every tick now, unconditionally
+                    // (still gated on `measured` via `free_pct()`'s own
+                    // `None` return).
+                    if let Some(pct) = ram_snapshot.free_pct() {
+                        ::metrics::gauge!(crate::metrics::HOST_MEM_FREE_PCT).set(f64::from(pct));
+                    }
                     // ADR 0028 Fix A: re-advertise every un-acked
                     // durable checkpoint record until a coord acks it
                     // into PG. Empty when checkpointing is disabled.
@@ -1169,7 +1211,7 @@ impl HostAgent {
                             captured_at: r.captured_at,
                         })
                         .collect();
-                    let utilization = util_probe.sample(&util_work_dir, guest_pss_mib);
+                    let utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
                     let req = coord_client::HeartbeatRequest {
                         capacity: engram_protocol::heartbeat::HostCapacityReport {
                             total_mib: host_total_mib,
@@ -1273,6 +1315,11 @@ impl HostAgent {
             // resume churn. Hard-idle sandboxes always proceed.
             let eviction_pressure_aware = idle_evictor::pressure_aware_from_env();
             let eviction_mem_floor_pct = idle_evictor::mem_floor_pct_from_env();
+            // Issue #540: read the heartbeat tick's RAM-ledger snapshot
+            // instead of taking a second, private `/proc/meminfo` sample —
+            // one source of truth for both the heartbeat's `allocatable_mib`
+            // and this pressure gate's `free_pct`.
+            let mut ram_ledger_rx_for_eviction = ram_ledger_rx;
             let eviction_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(idle_evictor::DEFAULT_POLL_INTERVAL);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1354,12 +1401,22 @@ impl HostAgent {
                     // nomination set is byte-identical to the historical
                     // TTL-only behavior.
                     if eviction_pressure_aware {
-                        let (under_pressure, free_pct) =
-                            idle_evictor::mem_pressure_check(eviction_mem_floor_pct);
-                        if let Some(pct) = free_pct {
-                            ::metrics::gauge!(crate::metrics::HOST_MEM_FREE_PCT)
-                                .set(f64::from(pct));
-                        }
+                        // Issue #540: the same snapshot the heartbeat tick
+                        // just published — `borrow()` never blocks and
+                        // always returns the latest value (or the
+                        // all-zeros default before the first heartbeat).
+                        let snapshot = *ram_ledger_rx_for_eviction.borrow_and_update();
+                        let (under_pressure, free_pct) = idle_evictor::mem_pressure_from(
+                            snapshot.mem_total_mib,
+                            snapshot
+                                .mem_total_mib
+                                .saturating_sub(snapshot.mem_available_mib),
+                            eviction_mem_floor_pct,
+                        );
+                        // Issue #540: HOST_MEM_FREE_PCT is now emitted once,
+                        // at the heartbeat tick's single emission site
+                        // (`ram_snapshot.free_pct()`) — not here, so a gauge
+                        // read never depends on pressure-aware mode being on.
                         if !under_pressure {
                             let before = pairs.len();
                             pairs.retain(|(_, _, kind)| *kind == crate::harness::IdleKind::Hard);

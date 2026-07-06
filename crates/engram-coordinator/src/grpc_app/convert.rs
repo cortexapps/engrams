@@ -331,6 +331,10 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         cpu_budget_vcpus,
         reserved_vcpus,
         free_vcpus,
+        // Issue #540: the RAM ledger's attribution fields.
+        util_base_shm_mib,
+        util_parked_pss_mib,
+        util_running_pss_mib,
     } = v;
     app::HostView {
         id: id.to_string(),
@@ -356,6 +360,9 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         cpu_budget_vcpus: *cpu_budget_vcpus,
         reserved_vcpus: *reserved_vcpus,
         free_vcpus: *free_vcpus,
+        util_base_shm_mib: *util_base_shm_mib,
+        util_parked_pss_mib: *util_parked_pss_mib,
+        util_running_pss_mib: *util_running_pss_mib,
     }
 }
 
@@ -603,6 +610,15 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         // at capture); it is not surfaced on the job's API response — the
         // operator sees it on EnabledImageSummary.
         capture_env: _,
+        capture_phase,
+        warm_stage,
+        warm_stage_started_at,
+        // The full stage history is an internal/debugging shape (also
+        // rides the `enable_jobs.warm_stages` JSONB column); the app
+        // surface exposes only the CURRENT stage + tail, not the whole
+        // history — issue #539's plan scopes the proto to fields 11-14.
+        warm_stages: _,
+        output_tail,
         created_at,
         updated_at,
     } = j;
@@ -617,6 +633,10 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         error: error.clone(),
         created_at: created_at.to_rfc3339(),
         updated_at: updated_at.to_rfc3339(),
+        capture_phase: capture_phase.map(|p| p.as_str().to_string()),
+        warm_stage: warm_stage.clone(),
+        warm_stage_started_at: warm_stage_started_at.map(|t| t.to_rfc3339()),
+        output_tail: output_tail.clone(),
     }
 }
 

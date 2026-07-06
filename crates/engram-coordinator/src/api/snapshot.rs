@@ -456,8 +456,8 @@ pub(crate) async fn resume_core(
 ///
 /// ADR 0015 M2: every other state returns a typed error rather than
 /// falling through to a downstream handler that would race against
-/// agentd readiness. `Created` / `GuestReady` (session still mid-
-/// create or mid-resume; harness not yet running) return 409;
+/// agentd readiness. `Created` (session still mid-create or
+/// mid-resume; harness not yet running) returns 409;
 /// `HostLost` / `Dead` are unrecoverable from this entry point and
 /// return 410; terminal `Completed` / `Failed` return 409 (no work
 /// is left to dispatch).
@@ -502,7 +502,7 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
         // status gate serialize against the eviction (no double-
         // resume, no orphaned sandbox).
         SessionState::Evicting => ensure_active_after_evicting_hold(state, id).await,
-        SessionState::Created | SessionState::GuestReady => Err(ApiError::Conflict(format!(
+        SessionState::Created => Err(ApiError::Conflict(format!(
             "session is {} — agentd is not yet ready. \
              Wait for the session to reach Active (subscribe to /sessions/:id/events) \
              and retry.",
@@ -2300,46 +2300,12 @@ mod evicting_gate_tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    /// Shared with `api::prompt`'s emit-ordering tests via
+    /// `state::tests::build_state_for_session` (PR #556 review finding #4 —
+    /// same-crate unit test modules share `pub(crate)` fns fine, so the
+    /// per-file `AppState`/`Services` wiring copy was retired).
     fn build_state_for_session(session: Session) -> (SharedState, TempDir) {
-        let local = TempDir::new().unwrap();
-        let backend: Arc<dyn SandboxBackend> =
-            Arc::new(ProcessBackend::new(local.path().join("sandboxes")));
-        let meta = Arc::new(MiniMeta::new(session));
-        let host_registry = Arc::new(HostRegistry::new(
-            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
-        ));
-        let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
-            engram_host_agent::LocalHostClient::with_noop_hub(backend.clone()),
-        );
-        host_registry.register(engram_core::HostId::new(), local_host);
-        let services = Services {
-            meta: meta.clone(),
-            cloud: Arc::new(MockCloud::new()),
-            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
-            secrets: Arc::new(InMemorySecretStore::new()),
-            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
-                [0u8; 32], "test:v1",
-            )),
-            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
-                engram_oci::AnonymousResolver,
-            ))),
-            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
-            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
-                std::env::temp_dir().join("engram-blobs-test"),
-            )),
-            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
-                engram_storage_local::LocalBlobStorage::new(
-                    std::env::temp_dir().join("engram-blobs-test"),
-                ),
-            )),
-            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
-            materialize_dir: None,
-        };
-        let cfg = CoordinatorConfig {
-            local_path: local.path().to_path_buf(),
-            ..CoordinatorConfig::default()
-        };
-        let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
+        let (state, _mini, local) = crate::state::tests::build_state_for_session(session);
         (state, local)
     }
 

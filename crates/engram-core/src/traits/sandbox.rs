@@ -76,11 +76,32 @@ pub type UploadSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
 /// single-template-per-host case.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GuestMemoryStats {
+    /// Σ PSS/RSS over sandboxes NOT flagged `parked` — i.e. sandboxes
+    /// whose session holds a coordinator memory reservation
+    /// (`SessionState::reserves_host_memory`). This is the figure the
+    /// RAM ledger (`ram_ledger.rs`, issue #540) adds back into
+    /// `allocatable_mib`.
     pub pss_bytes: u64,
     pub rss_bytes: u64,
     /// How many sandboxes were successfully sampled (a dead/unreadable
     /// process is skipped, never fatal).
     pub sampled: u32,
+    /// Σ PSS over sandboxes flagged `parked` — RAM-resident but
+    /// reservation-free (epic-parking-ladder rungs 2-3). `0` until a
+    /// backend ever parks a sandbox (today: always 0, no backend sets
+    /// the flag yet). Never added back into `allocatable_mib` — see
+    /// [`GuestMemoryStats::pss_bytes`].
+    pub parked_pss_bytes: u64,
+    /// Σ RSS over sandboxes flagged `parked` — measured alongside
+    /// `parked_pss_bytes` (the same `smaps_rollup` read returns both)
+    /// but previously discarded. Without this, the density signal
+    /// (`Σpss/Σrss < 1.0`) can never be evaluated for parked residents
+    /// once the parking ladder lands — the exact population the density
+    /// math cares about. Never folded into `allocatable_mib`; a
+    /// gauge-only figure, same posture as `parked_pss_bytes`.
+    pub parked_rss_bytes: u64,
+    /// How many parked sandboxes were successfully sampled.
+    pub parked_sampled: u32,
 }
 
 /// ADR 0045 C2: see [`SandboxBackend::post_copy_source_view`].
@@ -90,6 +111,22 @@ pub struct PostCopySourceView {
     /// The substrate base dir (tmpfs) — the page server resolves the
     /// exact base file by scanning the FC process's maps for it.
     pub uffd_base_dir: PathBuf,
+}
+
+/// Result of [`SandboxBackend::start_browser`] /
+/// [`HostClient::start_browser`](crate::traits::HostClient::start_browser).
+///
+/// `port` is the in-guest RFB port x11vnc is serving on (what the caller
+/// dials/relays). `warning` (issue #569) is `Some` when x11vnc came up but
+/// chromium's CDP debug port never answered agentd's bounded probe — chrome
+/// may be dead or crash-looping behind a healthy VNC. Diagnostic only: a
+/// warning never fails the call, and it propagates as log surface up
+/// through the host gRPC layer (deliberately NOT into the app-level
+/// protos / orchestrator / web).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserStart {
+    pub port: u16,
+    pub warning: Option<String>,
 }
 
 #[async_trait]
@@ -452,17 +489,6 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
-    /// ADR 0020 P1: the host-local stub harness ext4 the base-snapshot
-    /// capture attaches as the harness drive (so the captured snapshot
-    /// carries a harness drive slot that `swap_harness_drive` can
-    /// re-point per session at restore time). `None` when no stub is
-    /// configured — `build_base_snapshot` then fails fast. Only the FC
-    /// backend (which holds `FirecrackerConfig.stub_harness_path`)
-    /// returns a path.
-    fn stub_harness_path(&self) -> Option<PathBuf> {
-        None
-    }
-
     /// ADR 0035/0062: the directory this backend reads its RO bundle stamp
     /// (`current.json`) and staged `<sha>.squashfs` generations from — i.e.
     /// where `restore_fresh` resolves a selected skill/harness sha to a file
@@ -553,11 +579,16 @@ pub trait SandboxBackend: Send + Sync {
     /// already resolved any secret refs) merged over the manifest `[env]`
     /// into the warm hook's exec environment. Empty for an image with no
     /// capture_env or no warm hook.
+    ///
+    /// `progress` (issue #539) receives [`crate::types::CaptureProgress`]
+    /// events for the call's lifetime — see the matching doc on
+    /// [`crate::traits::HostClient::build_base_snapshot`].
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
         _warm: Option<WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _progress: tokio::sync::mpsc::Sender<crate::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `build_base_snapshot` (needs the pooled chunk-store wrapper)".into(),
@@ -778,11 +809,16 @@ pub trait SandboxBackend: Send + Sync {
     }
 
     /// ADR 0065: ensure the in-guest browser stack is running and x11vnc is
-    /// bound, returning the port. FC/VZ override to send `StartBrowser` over
-    /// the agentd channel; the dev ProcessBackend has no real guest and
-    /// inherits this default (the feature is gated to FC/VZ profiles).
-    async fn start_browser(&self, _id: SandboxId) -> Result<u16, SandboxError> {
-        Ok(5900)
+    /// bound, returning the port plus an optional chromium-liveness warning
+    /// (issue #569 — see [`BrowserStart`]). FC/VZ override to send
+    /// `StartBrowser` over the agentd channel; the dev ProcessBackend has no
+    /// real guest and inherits this default (the feature is gated to FC/VZ
+    /// profiles).
+    async fn start_browser(&self, _id: SandboxId) -> Result<BrowserStart, SandboxError> {
+        Ok(BrowserStart {
+            port: 5900,
+            warning: None,
+        })
     }
 
     /// ADR 0065: tear down the in-guest browser stack. Default no-op.

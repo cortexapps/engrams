@@ -608,10 +608,19 @@ impl SandboxBackend for VzBackend {
             SandboxError::Vm(format!("connect agentd UDS {}: {e}", agent_uds.display()).into())
         })?;
 
+        // 2026-07 core-ops fold: this frame also carries the per-host
+        // egress-proxy CA (ADR 0021 P1) — agentd installs it before
+        // spawning. Previously VZ built this request from
+        // argv/env/session_env only and never referenced
+        // `agent.host_ca_pem`, so a VZ host running an egress proxy
+        // silently delivered no CA to the guest; passing it through
+        // here fixes that for free (VZ exercises the identical
+        // agentd code path as FC).
         let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
             session_env: agent.session_env.into_iter().collect(),
+            host_ca_pem: agent.host_ca_pem,
         });
         engram_agentd::write_msg(&mut conn, &req)
             .await
@@ -620,8 +629,13 @@ impl SandboxBackend for VzBackend {
             .await
             .map_err(|e| SandboxError::Vm(format!("read SpawnHarness response: {e}").into()))?;
         match resp {
-            engram_agentd::WireResponse::HarnessSpawned { pid } => {
-                tracing::debug!(sandbox_id = %id, pid = ?pid, "vz start_agent: harness spawned");
+            engram_agentd::WireResponse::HarnessSpawned { pid, ca_changed } => {
+                tracing::debug!(
+                    sandbox_id = %id,
+                    pid = ?pid,
+                    ca_changed = ?ca_changed,
+                    "vz start_agent: harness spawned",
+                );
                 Ok(())
             }
             engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
@@ -921,12 +935,14 @@ impl SandboxBackend for VzBackend {
 
     /// ADR 0065: ask agentd to ensure the in-guest browser stack (Xvfb +
     /// openbox + chromium + x11vnc) is running and x11vnc is accepting on its
-    /// port. Returns the bound port. Mirrors [`Self::start_shell`]: the host's
-    /// `proxy_vnc` (P1.4) calls this just before dialing the guest's raw-TCP
-    /// VNC port, so the connect finds a listener. agentd carries the browser
-    /// bundle + the StartBrowser handler in every bake, so this is a
-    /// host-side-only change.
-    async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+    /// port. Returns the bound port plus agentd's optional chromium-CDP
+    /// liveness warning (issue #569). Mirrors [`Self::start_shell`]: the
+    /// host's `proxy_vnc` (P1.4) calls this just before dialing the guest's
+    /// raw-TCP VNC port, so the connect finds a listener.
+    async fn start_browser(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.vsock_uds_path.clone()
@@ -942,9 +958,15 @@ impl SandboxBackend for VzBackend {
             )
         })?;
         let (mut reader, mut writer) = tokio::io::split(conn);
-        // `port: None` → agentd's default (5900). agentd waits up to 20s
-        // (READY_DEADLINE) for x11vnc to accept, and the browser cold start
-        // (Xvfb + chromium) is heavier than ttyd, so allow 45s here.
+        // `port: None` → agentd's default (5900). Worst-case serial path
+        // inside agentd's start_browser post issue #569's mutex-hold/
+        // CDP-probe fixes: up to a 2s RFB-banner-read timeout (issue #567's
+        // wedge detection) + ~0.3s force-stop grace + up to 20s
+        // (READY_DEADLINE) for the launcher's `--ensure` to bring x11vnc up
+        // + up to a 1s fast CDP probe — call it ~24s worst case (the
+        // fresh-spawn CDP watch itself runs off-path in a detached
+        // background task and never blocks this reply). 45s here still
+        // comfortably covers it.
         write_msg(&mut writer, &WireRequest::StartBrowser { port: None })
             .await
             .map_err(|e| SandboxError::Vm(format!("write StartBrowser: {e}").into()))?;
@@ -954,7 +976,12 @@ impl SandboxBackend for VzBackend {
                 .map_err(|_| SandboxError::Vm("StartBrowser timed out after 45s".into()))?
                 .map_err(|e| SandboxError::Vm(format!("read StartBrowser response: {e}").into()))?;
         match resp {
-            WireResponse::BrowserReady { port, .. } => Ok(port),
+            WireResponse::BrowserReady {
+                port, cdp_warning, ..
+            } => Ok(engram_core::traits::sandbox::BrowserStart {
+                port,
+                warning: cdp_warning,
+            }),
             WireResponse::Error { kind, message } => Err(SandboxError::Vm(
                 format!("StartBrowser rejected ({kind}): {message}").into(),
             )),
@@ -1025,6 +1052,12 @@ impl SandboxBackend for VzBackend {
             .await
             .ok()
             .flatten();
+        // Not cached: today agentd only ever answers via
+        // `read_primary_ipv4()`, which can't produce a non-IPv4
+        // string, so this is unreachable in practice. If that ever
+        // changes, a parse failure re-pays the full 2s vsock
+        // round-trip on every subsequent call instead of failing
+        // fast from a cached negative.
         let ip: std::net::Ipv4Addr = ip_str?.parse().ok()?;
         let ep = GuestEndpoints {
             egress_identity: ip,

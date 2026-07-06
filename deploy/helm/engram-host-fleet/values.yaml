@@ -118,7 +118,46 @@ egress:
 storage:
   # Local NVMe for the chunk cache + per-sandbox work dir.
   workDirHostPath: /var/lib/engram
-  chunkCacheBudgetBytes: ""   # "" => host-agent default (200 GiB)
+  # "" => host-agent's disk-derived default (ADR 0067): min(60% of the
+  # disk backing workDirHostPath, 80% — the same margin the free-space
+  # floor holds below the kubelet eviction line). Set to override the
+  # ceiling as an absolute byte count.
+  chunkCacheBudgetBytes: ""
+  # ADR 0067: override the 0.60 disk-fraction the default budget derives
+  # from (see chunkCacheBudgetBytes). "" => host-agent default (0.60).
+  chunkCacheDiskFraction: ""
+  # ADR 0067: the kubelet's ephemeral-storage hard-eviction threshold, as
+  # a percent of the filesystem backing workDirHostPath — the line
+  # engram_host_disk_headroom_to_kubelet_bytes measures distance to.
+  #
+  # TODO: 10 (GKE's documented nodefs.available < 10% default) is a
+  # PLACEHOLDER pending confirmation against the actual nodepool/kubelet
+  # config in the engrams-internal deploy repo — this OSS chart has not
+  # verified it against a real cluster's kubelet flags
+  # (--eviction-hard/--system-reserved can override the GKE default).
+  # Confirm and adjust here before treating the headroom gauge's alarm
+  # threshold as trustworthy.
+  kubeletEvictPct: 10
+  # ADR 0067: mount workDirHostPath on its own block device instead of
+  # sharing the node boot disk. "" (default) = today's behavior — a
+  # hostPath directory on the root filesystem. When set to a device path
+  # (e.g. /dev/nvme1n1, a GKE local-SSD raw-block device), node-prep
+  # formats it (idempotent — only if unformatted) and mounts it at
+  # workDirHostPath, and the host-agent DaemonSet gets
+  # ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT=true + a read-only hostPath mount
+  # of the NODE's `/` at /mnt/host-root (ENGRAM_HOST_ROOT_REF_PATH) —
+  # refuses to start unless workDirHostPath is actually a distinct
+  # filesystem from the NODE's boot disk (comparing against the
+  # container's OWN `/`, its ephemeral overlayfs, would always differ
+  # from any hostPath mount and never catch a missing mount — hence the
+  # separate host-root reference mount). Guards against a rolled pod
+  # starting before the mount is visible and silently shadow-writing the
+  # boot disk. This moves ACCOUNTING, not
+  # bytes: the dedicated disk still fills, and the budget above (not
+  # this) is the mechanism that keeps the fleet off the kubelet's
+  # eviction line. Nodepool provisioning of the device itself (e.g. a
+  # Terraform local-SSD flag) is out of scope for this chart.
+  dedicatedDevice: ""
 
 nbd:
   # ADR 0049: warm-pool slot allocator. node-prep loads the nbd module

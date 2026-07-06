@@ -112,6 +112,18 @@ message EnableJob {
   string created_at = 9;
   // ISO-8601.
   string updated_at = 10;
+  // Issue #539: live/last capture progress. `capture_phase` is "boot" |
+  // "warm" | "snapshot" while `state == "capturing"`, unset otherwise (or
+  // before this migration ever wrote a value). `warm_stage` is the
+  // current (while capturing) or last-known (on a failed job) [warm]-hook
+  // stage name. `output_tail` is the rolling last 16 KiB of the hook's
+  // combined stdout+stderr — populated on success AND failure, so a
+  // WarmExecTransport kill still leaves the diagnosis on the row.
+  optional string capture_phase = 11;
+  optional string warm_stage = 12;
+  // ISO-8601.
+  optional string warm_stage_started_at = 13;
+  optional string output_tail = 14;
 }
 
 message DisableImageRequest {

@@ -210,9 +210,10 @@ impl HostClient for LocalHostClient {
         spec: SandboxSpec,
         warm: Option<WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.sandbox
-            .build_base_snapshot(spec, warm, capture_env)
+            .build_base_snapshot(spec, warm, capture_env, progress)
             .await
     }
 
@@ -429,9 +430,13 @@ impl HostClient for LocalHostClient {
         Ok(tunnel)
     }
 
-    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+    async fn start_browser(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         // ADR 0065: bring up the in-guest browser stack (Xvfb + x11vnc +
-        // headful chromium with the CDP debug port) and return the VNC port.
+        // headful chromium with the CDP debug port) and return the VNC port
+        // (+ agentd's optional chromium-CDP liveness warning, issue #569).
         // The orchestrator reaches x11vnc :5900 (and CDP :9222) over the
         // ADR-0066 vsock port relay — the guest binds loopback, agentd dials it.
         self.sandbox.start_browser(sandbox_id).await

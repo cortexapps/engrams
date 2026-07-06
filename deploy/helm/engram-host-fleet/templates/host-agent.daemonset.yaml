@@ -227,6 +227,14 @@ spec:
             # mount existed); a freshly-booted node loses the race.
             - {name: work, mountPath: /var/lib/engram, mountPropagation: HostToContainer}
             - {name: cgroup, mountPath: /sys/fs/cgroup}
+            {{- if .Values.storage.dedicatedDevice }}
+            # ADR 0067 finding 1: read-only reference for the mountpoint
+            # gate (ENGRAM_HOST_ROOT_REF_PATH, set in the configmap) —
+            # the container's OWN `/` is its ephemeral image overlayfs,
+            # always a distinct device from any hostPath mount, so the
+            # gate needs the NODE's actual `/` to compare against.
+            - {name: host-root, mountPath: /mnt/host-root, readOnly: true}
+            {{- end }}
       volumes:
         - {name: dev, hostPath: {path: /dev, type: Directory}}
         # ADR 0044 K2 / GAP 2: firecracker + the guest kernel land here from
@@ -239,4 +247,7 @@ spec:
         - name: otel-config
           configMap:
             name: {{ required "otel.collector.configMap is required when the otel collector is enabled" .Values.otel.collector.configMap }}
+        {{- end }}
+        {{- if .Values.storage.dedicatedDevice }}
+        - {name: host-root, hostPath: {path: /, type: Directory}}
         {{- end }}

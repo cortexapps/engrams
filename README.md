@@ -109,7 +109,7 @@ Engram's durability primitive is **chunked-immutable content-addressed storage**
 | Tier | What | Where | Cost model |
 |---|---|---|---|
 | **Persistent** | sha256-keyed chunks (16 MiB disk, 512 KiB memory), versioned manifests, per-host working-set traces | `BlobStorage` impl (GCS / S3 / local) | dedup is automatic (content-addressed); the base image's GiBs are stored once regardless of session count |
-| **Cache** | local NVMe chunk cache (LRU + pin-list + singleflight), per-host materialize-dir for assembled `.ext4` files | each host's `<work_dir>` | bounded by `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` (default 200 GiB); operator-tuned via Packer / Terraform |
+| **Cache** | local NVMe chunk cache (LRU + pin-list + singleflight), per-host materialize-dir for assembled `.ext4` files | each host's `<work_dir>` | disk-derived absolute ceiling by default (ADR 0067: `min(60% of the disk, 80%)`, ~179 GiB on a 298 GiB disk) plus a 20% free-space floor; `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` overrides the ceiling outright |
 | **In-memory** | FC's memory.bin canonical mmap (`MAP_PRIVATE`) + per-session UFFD-populated divergent pages | host RAM | hardware-enforced COW; one canonical copy serves N sessions of the same image |
 | **Metadata** | sessions, conversation log, snapshot manifest refs, hosts, secrets | Postgres | managed/backups |
 
@@ -405,7 +405,7 @@ create → Created → Active                                  (sandbox bound; t
        → DELETE /sessions/:id → Completed                  (terminal)
 ```
 
-The state machine is ADR 0015 M2 — `SessionState` in `engram-core::types::session`, with a single validated `transition_session` trait method behind every `UPDATE sessions SET status`. **Active is honest**: the row reaches it only after `start_agent` returns OK, so `/exec` / `/shell` / `/prompt` against an `Active` session no longer race agentd readiness. Earlier states (`Created`, `GuestReady`) return typed 409s with state-specific bodies instead of falling through.
+The state machine is ADR 0015 M2 — `SessionState` in `engram-core::types::session`, with a single validated `transition_session` trait method behind every `UPDATE sessions SET status`. **Active is honest**: the row reaches it only after `start_agent` returns OK, so `/exec` / `/shell` / `/prompt` against an `Active` session no longer race agentd readiness. Earlier states (e.g. `Created`) return typed 409s with state-specific bodies instead of falling through.
 
 `POST /sessions/:id/resume` is a single-tier dispatcher: **Idle** → restore from the snapshot's chunked manifests (snapshot-affinity-scheduled to the host that captured it); **Dead** / **HostLost** without a recoverable snapshot → 410 Gone; anything else → 409. `ensure_active` auto-resumes Idle sessions on the next exec/prompt/SSE-subscribe so callers don't have to know whether the session is live or paused.
 
