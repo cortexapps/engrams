@@ -249,10 +249,15 @@ fc-colima-provision profile='fc-dev':
 #      alone was ~9 GiB. When ENGRAM_FC_COLIMA_PROFILE is set (ADR 0068) the
 #      same prune runs inside the VM's /opt/engram-dev/shared, where the synced
 #      bundles actually consume the small VM disk.
+#   4. (ADR 0068, fc-colima only) Sweep orphaned base-snapshot dirs in the VM:
+#      /opt/engram-dev/var/sandboxes/snapshots/<id> with no live coordinator DB
+#      row. The snapshot GC works off DB rows, so a dir left by a hard DB delete
+#      or a FAILED capture is never reclaimed — and each holds a GiB-sized
+#      memory dump that fills the small VM disk. Live ids come from Postgres.
 #
-# Checkpoints (snapshots) are reclaimed by the coordinator's snapshot/chunk
-# GC once their owning sessions are gone; the warm-pool base snapshot an
-# enabled image clones from is preserved (re-captured on image re-enable).
+# Checkpoints (snapshots) are otherwise reclaimed by the coordinator's
+# snapshot/chunk GC once their owning sessions are gone; the warm-pool base
+# snapshot an enabled image clones from is preserved (re-captured on re-enable).
 #
 # Use it to reclaim disk or get a clean slate before a re-bake. Talks to the
 # coordinator app-gRPC via ENGRAM_APP_GRPC_ADDR / ENGRAM_APP_GRPC_TOKEN (dev
@@ -341,6 +346,18 @@ reap-sessions:
     if [ -n "${ENGRAM_FC_COLIMA_PROFILE:-}" ] && command -v colima >/dev/null 2>&1; then
         echo "==> pruning stale bundles inside the fc-colima VM ($ENGRAM_FC_COLIMA_PROFILE)"
         colima ssh --profile "$ENGRAM_FC_COLIMA_PROFILE" -- sudo bash -s < deploy/dev/reap-vm-bundles.sh
+        # 4. Sweep orphaned base-snapshot dirs in the VM: the coordinator's
+        #    snapshot GC works off DB rows, so a snapshot dir left by a hard DB
+        #    delete or a failed capture is never reclaimed — and each carries a
+        #    GiB-sized memory dump that fills the small VM disk. Gather the live
+        #    snapshot-id set from Postgres (via the always-up dev container) and
+        #    pass it (space-joined) to the VM sweeper; anything else is orphaned.
+        echo "==> sweeping orphaned base-snapshot dirs in the VM"
+        live_snaps="$(docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
+            psql -U engram -d engram -tAc \
+            "select id::text from snapshots union select base_snapshot_id::text from enabled_images where base_snapshot_id is not null" \
+            2>/dev/null | tr '\n' ' ' | tr -s ' ')"
+        colima ssh --profile "$ENGRAM_FC_COLIMA_PROFILE" -- sudo bash -s -- "$live_snaps" < deploy/dev/reap-vm-snapshots.sh
     fi
     after_kb="$(dir_kb "$sandboxes_dir")"; after_kb="${after_kb:-0}"
     reclaimed_kb=$(( before_kb > after_kb ? before_kb - after_kb : 0 ))
