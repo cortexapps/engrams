@@ -369,20 +369,67 @@ bundles-squashfs:
         stamp="$stamp$sep\"$name\": \"$sha\""
         sep=", "
     done
-    # ADR 0062: the built-in `claude` harness rides the stamp like a skill, but
-    # unlike the committed/container-built bundles above its tree (the
-    # engram-harness-claude entry binary + the bundled `claude` CLI) is BUILT, not
-    # assembled here — so it's staged from a pre-built tree dir handed in via
-    # ENGRAM_HARNESS_CLAUDE_TREE (the e2e sets this to the downloaded harness-claude
-    # artifact). Skipped when unset, so a no-harness dev stack still boots; a local
-    # `just dev` that wants the built-in claude points this at a staged tree.
-    if [ -n "${ENGRAM_HARNESS_CLAUDE_TREE:-}" ]; then
+    # ADR 0062: the built-in `claude` harness rides the stamp like a skill (key
+    # `harness-claude`, mounted on dyn_0). Its tree — the engram-harness-claude
+    # entry binary + the pinned `claude` CLI + the committed harness.toml — is
+    # the ONE bundle not assembled by a per-bundle build.sh: CI hands it in
+    # pre-built via ENGRAM_HARNESS_CLAUDE_TREE (bake-harness-claude-artifact). A
+    # local dev stack has no such artifact, so when unset we build the tree HERE
+    # (mirroring bake-demo's cross-compile + the bundles-vz path), then pack it
+    # via harness-claude/build.sh. Without this the fleet stamp never carries
+    # `harness-claude` and `POST /sessions` 400s with "built-in harness `claude`
+    # squashfs (`harness-claude`) is not staged on any host yet". Requires the
+    # nix cross toolchain on PATH (this recipe runs under `nix develop`).
+    harness_tree="${ENGRAM_HARNESS_CLAUDE_TREE:-}"
+    if [ -z "$harness_tree" ]; then
+        # PINNED — keep in lockstep with ci.yml's bake-harness-claude-artifact
+        # and bundles-vz: 2.1.185 is the newest CLI that still offers
+        # AskUserQuestion headlessly (cortexapps/engrams#431); bump deliberately
+        # and re-verify AUQ.
+        CLAUDE_VERSION=2.1.185
+        case "$(uname -m)" in
+            arm64 | aarch64) htarget=aarch64-unknown-linux-musl; carch=linux-arm64 ;;
+            x86_64 | amd64)  htarget=x86_64-unknown-linux-musl;   carch=linux-x64  ;;
+            *) echo "harness-claude: unsupported arch $(uname -m); skipping" >&2; htarget="" ;;
+        esac
+        if [ -n "$htarget" ]; then
+            # Best-effort: a cross-build/download failure warns and skips so the
+            # stack still comes up (without the built-in claude).
+            tree="$PWD/var/shared/.harness-claude.stage"
+            cache="var/shared/.cache/claude-$CLAUDE_VERSION-$carch"
+            ok=1
+            cargo build --release --target "$htarget" -p engram-harness-claude || ok=0
+            if [ "$ok" = 1 ] && [ ! -x "$cache" ]; then
+                mkdir -p "$(dirname "$cache")"
+                curl -fsSL --retry 3 \
+                    "https://downloads.claude.ai/claude-code-releases/$CLAUDE_VERSION/$carch/claude" \
+                    -o "$cache" && chmod +x "$cache" || ok=0
+            fi
+            if [ "$ok" = 1 ]; then
+                rm -rf "$tree"; mkdir -p "$tree"
+                cp -p "target/$htarget/release/engram-harness-claude" "$tree/harness"
+                cp -p "$cache" "$tree/claude"
+                cp -p deploy/harness-claude/harness.toml "$tree/harness.toml"
+                harness_tree="$tree"
+            else
+                echo "harness-claude local build failed; skipping (dev stack boots without the built-in claude)" >&2
+            fi
+        fi
+    fi
+    if [ -n "$harness_tree" ]; then
+        [ -x "$harness_tree/harness" ] || {
+            echo "harness tree $harness_tree is missing an executable 'harness' entry binary" >&2
+            exit 1
+        }
         tmp="var/shared/.harness-claude.build.squashfs"
-        deploy/bundles/harness-claude/build.sh "$ENGRAM_HARNESS_CLAUDE_TREE" "$tmp"
+        deploy/bundles/harness-claude/build.sh "$harness_tree" "$tmp"
         sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
         mv "$tmp" "var/shared/$sha.squashfs"
         stamp="$stamp$sep\"harness-claude\": \"$sha\""
         sep=", "
+        # Drop the locally-built stage tree (keep the download cache); an
+        # externally-provided ENGRAM_HARNESS_CLAUDE_TREE is left untouched.
+        [ "$harness_tree" = "$PWD/var/shared/.harness-claude.stage" ] && rm -rf "$harness_tree"
     fi
     echo "$stamp}" > var/shared/current.json
     cat var/shared/current.json

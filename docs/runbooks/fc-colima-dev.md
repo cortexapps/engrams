@@ -71,6 +71,16 @@ under `sudo` with the same env contract as the Linux dev path.
 
 ## Gotchas
 
+- **`bundles` is manual-trigger on this path.** The `bundles` resource builds
+  once at `tilt up` (including the built-in `claude` harness — cross-compiled +
+  the pinned `claude` CLI, ADR 0062) and then does **not** auto-rebuild: the
+  Docker-built bundles under colima's file-sharing bump the ctime of the whole
+  `deploy/bundles` tree, which would otherwise retrigger Tilt's deps watcher in
+  a loop. After an intentional skill edit, re-trigger `bundles` from the Tilt
+  UI (VZ `just dev` keeps auto-rebuild). If a session 400s with *"built-in
+  harness `claude` … is not staged on any host yet"*, the bundles build was
+  skipped (e.g. no Docker / not in `nix develop`) — re-trigger it and confirm
+  `var/shared/current.json` carries a `harness-claude` key.
 - **`tilt down` does not stop the remote host-agent** (or its live microVMs).
   `colima ssh` doesn't propagate signals, so each (re)start pre-kills the
   prior instance instead; between `tilt down` and the next `dev-fc` the old
