@@ -54,6 +54,13 @@ pub fn init(addr: SocketAddr) {
     // so this Full() rule beats the Suffix("_seconds") default.
     let eviction_buckets = &[1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 180.0, 300.0];
 
+    // ADR 0048 (queue fairness): queue waits are minutes-scale, not
+    // seconds-scale — a stuck queue can wait the full 30-minute timeout.
+    // Same Full()-beats-Suffix() precedence as the eviction override above.
+    let queue_wait_buckets = &[
+        1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 3600.0,
+    ];
+
     // Issue #527 Phase 1: prompt→run-start is the same wide-regime problem
     // as eviction — the prod evidence this metric replaces the proxy for
     // shows p50 ≈24.5s, p90 ≈140s, max 1,703s (a resume can be a full cold
@@ -70,6 +77,11 @@ pub fn init(addr: SocketAddr) {
             eviction_buckets,
         )
         .expect("install eviction histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(QUEUE_WAIT_SECONDS.to_string()),
+            queue_wait_buckets,
+        )
+        .expect("install queue-wait histogram buckets")
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(PROMPT_TO_RUN_STARTED_SECONDS.to_string()),
             prompt_to_run_started_buckets,
@@ -224,6 +236,26 @@ pub const SESSIONS_QUEUED_MIB: &str = "engram_sessions_queued_mib";
 /// Counter (ADR 0048). Queue-scanner per-session outcomes. Labels:
 /// `outcome` = `placed` / `requeued` / `failed` / `timeout`.
 pub const QUEUE_OUTCOME_TOTAL: &str = "engram_queue_outcome_total";
+
+/// Histogram (ADR 0048, queue-fairness). `queued_at` → placement/terminal,
+/// seconds. This is OUTSIDE `engram_session_boot_seconds`: the create
+/// handler returns 201 `{kind:"queued"}` immediately on enqueue, so the
+/// entire queue wait previously fell outside every latency histogram we
+/// have. Labels:
+/// - `origin`: `create` / `resume`.
+/// - `outcome`: `placed` (create: the durable `queued → pending` flip;
+///   resume: dequeue to `Idle`) / `timeout`.
+///
+/// A requeued-then-placed session emits one `placed` sample per successful
+/// placement, each measuring cumulative wait since the ORIGINAL
+/// `queued_at` (`requeue_session` deliberately doesn't reset it).
+pub const QUEUE_WAIT_SECONDS: &str = "engram_queue_wait_seconds";
+
+/// Gauge (ADR 0048, queue-fairness). Age in seconds of the oldest queued
+/// row (0 when the queue is empty), sampled once per scanner sweep. The
+/// "is the queue stuck" pager signal complementing `engram_sessions_queued`
+/// (which only tells you the queue is nonempty, not for how long).
+pub const QUEUE_HEAD_AGE_SECONDS: &str = "engram_queue_head_age_seconds";
 
 /// Counter (issue #231). The per-tick `touch_host_heartbeat` persist
 /// failed — the host's `last_heartbeat_at` row did NOT advance even

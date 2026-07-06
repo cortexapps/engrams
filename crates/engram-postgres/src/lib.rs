@@ -119,6 +119,23 @@ impl PostgresStore {
             Err(e) => db_err(e),
         }
     }
+
+    /// ADR 0048 (queue fairness): best-effort wake for `queue_scanner`,
+    /// fired at every discrete placement-feasibility event (a reservation
+    /// freed, a `pending` reservation released, a host (re)registered or
+    /// uncordoned, a session freshly enqueued). The scanner LISTENs on
+    /// `placement_changed` and retries immediately instead of waiting for
+    /// its fallback poll (`ENGRAM_QUEUE_POLL_SECS`). Mirrors the
+    /// `org_secret_changed` precedent above: best-effort `let _ =`, the
+    /// payload is an informational reason string only, and a NOTIFY
+    /// failure must never fail (or roll back) the caller's write — the
+    /// poll fallback is the durability story, not this.
+    async fn notify_placement_changed(&self, reason: &str) {
+        let _ = sqlx::query("SELECT pg_notify('placement_changed', $1)")
+            .bind(reason)
+            .execute(&self.pool)
+            .await;
+    }
 }
 
 fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
@@ -906,13 +923,18 @@ impl MetadataStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        // Closes the race where capacity frees between the failed
+        // `reserve_placement` and this enqueue's commit — without this,
+        // the newly-queued row would wait for the next poll fallback
+        // even though a host was free the whole time.
+        self.notify_placement_changed("enqueued").await;
         Ok(())
     }
 
     async fn enqueue_session_resume(&self, id: SessionId) -> Result<(), MetaError> {
         // Idle → queued (resume origin). Gated on `status='idle'` so a
         // racing resume that already advanced the row is a clean no-op.
-        sqlx::query(
+        let n = sqlx::query(
             r#"
             UPDATE sessions
                SET status = 'queued', queued_at = NOW(), queue_origin = 'resume',
@@ -923,7 +945,19 @@ impl MetadataStore for PostgresStore {
         .bind(id.as_uuid())
         .execute(&self.pool)
         .await
-        .map_err(db_err)?;
+        .map_err(db_err)?
+        .rows_affected();
+        if n > 0 {
+            // Matches `delete_pending_session`'s guard below: only a
+            // session that actually landed in `queued` needs the
+            // fleet-wide scanner wake — the capacity-freed-between-
+            // reserve-and-enqueue race this NOTIFY exists for. The
+            // `status='idle'` no-op path (a racing resume that already
+            // advanced the row) has nothing new for the scanner to place;
+            // waking every replica's scanner into a full sweep for it is
+            // pure overhead.
+            self.notify_placement_changed("enqueued").await;
+        }
         Ok(())
     }
 
@@ -1155,13 +1189,19 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn delete_pending_session(&self, session_id: SessionId) -> Result<(), MetaError> {
-        sqlx::query(
+        let n = sqlx::query(
             "DELETE FROM sessions WHERE id = $1 AND status = 'pending' AND sandbox_id IS NULL",
         )
         .bind(session_id.as_uuid())
         .execute(&self.pool)
         .await
-        .map_err(db_err)?;
+        .map_err(db_err)?
+        .rows_affected();
+        if n > 0 {
+            // A reservation was released — the freed budget may now fit a
+            // queued session.
+            self.notify_placement_changed("pending_deleted").await;
+        }
         Ok(())
     }
 
@@ -1517,6 +1557,15 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
+        // ADR 0048 (queue fairness): a session leaving a memory-reserving
+        // state (e.g. Active → Idle) frees its budget — wake the queue
+        // scanner so a waiting session doesn't sit for the poll fallback.
+        // Fired after commit (the freed capacity is only real once
+        // committed); the reverse direction (entering a reserving state)
+        // never frees anything, so it's not a wake trigger.
+        if current.reserves_host_memory() && !target.reserves_host_memory() {
+            self.notify_placement_changed("session_freed").await;
+        }
         Ok(current)
     }
 
@@ -2152,6 +2201,10 @@ impl MetadataStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        // New or re-registered host → schedulable. Always fires (both the
+        // insert and the re-register arm land here); harmless if nothing
+        // was waiting.
+        self.notify_placement_changed("host_upserted").await;
         Ok(())
     }
 
@@ -2286,6 +2339,10 @@ impl MetadataStore for PostgresStore {
             .rows_affected();
         if n == 0 {
             return Err(MetaError::NotFound);
+        }
+        if !cordoned {
+            // Uncordoning makes the host schedulable again.
+            self.notify_placement_changed("host_uncordoned").await;
         }
         Ok(())
     }
