@@ -2,13 +2,15 @@
 //!
 //! The dashboard's SHELL tab speaks WebSocket directly to the
 //! coordinator over `/sessions/:id/shell`. Pre-M1.16 the coordinator
-//! forwarded straight to `ws://<guest_ip>:7681/ws` on the FC host VM,
-//! but coord pods in GKE have no route to the per-VM `guest_ip`
+//! forwarded straight to `ws://<dial_ip>:7681/ws` on the FC host VM,
+//! but coord pods in GKE have no route to the per-VM guest network
 //! (10.200.0.x lives behind a TAP on the FC host VM, or behind a
 //! per-VM netns for warm-restored sandboxes). So the proxy now
 //! tunnels WS frames through the existing coord ↔ host-agent gRPC
-//! channel: host-agent dials ttyd in the right network namespace and
-//! shuttles WS frames across the tunnel.
+//! channel: host-agent relays to ttyd over the in-guest vsock port
+//! relay (ADR 0066) when available, falling back to a direct dial of
+//! `GuestEndpoints::dial_ip`, and shuttles WS frames across the
+//! tunnel.
 //!
 //! `ShellFrame` is the in-process representation of one WebSocket
 //! message that flows through the tunnel — kept in `engram-core` so

@@ -277,6 +277,11 @@ mod tests {
             mem_used_mib: 9_001,
             allocatable_mib: 23_767,
             cpu_pct: 42.5,
+            // Issue #540: the RAM ledger's attribution fields.
+            base_shm_mib: 19_500,
+            base_shm_pending_mib: 512,
+            parked_pss_mib: 4_096,
+            running_pss_mib: 6_000,
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: Heartbeat = serde_json::from_str(&json).unwrap();
@@ -286,6 +291,33 @@ mod tests {
         assert_eq!(back.utilization.mem_used_mib, 9_001);
         assert_eq!(back.utilization.allocatable_mib, 23_767);
         assert_eq!(back.utilization.cpu_pct, 42.5);
+        assert_eq!(back.utilization.base_shm_mib, 19_500);
+        assert_eq!(back.utilization.base_shm_pending_mib, 512);
+        assert_eq!(back.utilization.parked_pss_mib, 4_096);
+        assert_eq!(back.utilization.running_pss_mib, 6_000);
+    }
+
+    #[test]
+    fn utilization_ram_ledger_fields_default_to_zero_for_old_hosts() {
+        // Rollout interop (same posture as the pre-existing utilization
+        // fields): a host-agent on an older build sends no
+        // base_shm_mib/base_shm_pending_mib/parked_pss_mib/running_pss_mib
+        // keys at all. `#[serde(default)]` must decode that to zeros, not
+        // fail the heartbeat.
+        let mut v: serde_json::Value = serde_json::to_value(sample()).unwrap();
+        v["utilization"] = serde_json::json!({
+            "disk_total_mib": 1,
+            "disk_used_mib": 1,
+            "mem_total_mib": 1,
+            "mem_used_mib": 1,
+            "allocatable_mib": 1,
+            "cpu_pct": 1.0,
+        });
+        let back: Heartbeat = serde_json::from_value(v).unwrap();
+        assert_eq!(back.utilization.base_shm_mib, 0);
+        assert_eq!(back.utilization.base_shm_pending_mib, 0);
+        assert_eq!(back.utilization.parked_pss_mib, 0);
+        assert_eq!(back.utilization.running_pss_mib, 0);
     }
 
     #[test]

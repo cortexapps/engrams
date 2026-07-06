@@ -82,6 +82,7 @@ async fn seed_snapshot_row(
         recoverable: true,
         aux_bundles: Vec::new(),
         events_cursor: None,
+        fc_snapshot_version: None,
     })
     .await
     .expect("seed snapshot row");
@@ -274,6 +275,7 @@ async fn seed_snapshot_row_with_id(
         recoverable: true,
         aux_bundles: Vec::new(),
         events_cursor: None,
+        fc_snapshot_version: None,
     })
     .await
     .expect("seed snapshot row");

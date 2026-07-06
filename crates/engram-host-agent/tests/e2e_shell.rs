@@ -9,8 +9,9 @@
 //!
 //!   coord-side `proxy_shell` →
 //!     `PooledBackend.start_shell(id)` (vsock → in-VM agentd → ttyd) →
-//!     `PooledBackend.guest_ip(id)` + `PooledBackend.netns_name_for(id)` →
-//!     `open_shell_tunnel_at(...)` (cold = direct dial, warm = netns) →
+//!     `PooledBackend.guest_endpoints(id)` →
+//!     relay over the vsock port relay when available, else
+//!     `open_shell_tunnel_at(...)` (direct `dial_ip` dial) →
 //!     WS-frame round-trip with ttyd.
 //!
 //! That's the path prod session 5c8d0ce5 (2026-05-20) silently
@@ -22,10 +23,10 @@
 //! Coverage matrix:
 //!   - shell_cold: cold-created FC sandbox, dial from host root.
 //!   - shell_warm: cold → snapshot → destroy → restore (per-VM
-//!     netns), dial INSIDE the netns. Catches the
-//!     `PooledBackend.netns_name_for` forwarding bug too — without
-//!     it, the dial happens from host root and never reaches the
-//!     netns'd VM.
+//!     netns), dial `GuestEndpoints::dial_ip`. Catches the
+//!     `PooledBackend.guest_endpoints` forwarding bug too — without
+//!     it, the dial targets the netns's SNAT slot instead and never
+//!     reaches the netns'd VM.
 //!
 //! Run on the dev VM:
 //!
@@ -53,7 +54,7 @@ use tokio::time::{sleep, timeout};
 // guest-IP poll). Extracted to `tests/common/mod.rs` when `e2e_vnc.rs` (ADR
 // 0064) landed needing the identical helpers.
 mod common;
-use common::{cleanup_host_state, fc_preflight, require_root, wait_for_guest_ip};
+use common::{cleanup_host_state, fc_preflight, require_root, wait_for_guest_endpoints};
 
 /// Bake a debian-slim rootfs with ttyd + the latest `engram-agentd`
 /// musl binary injected. Same shape as `proxy_e2e`'s bake, minus
@@ -248,7 +249,7 @@ async fn open_tunnel_via_pooled(pooled: &PooledBackend, id: engram_core::Sandbox
     // ADR 0066: the FC/warm shell path now rides the vsock relay (mirrors
     // host_client::proxy_shell). `open_guest_stream` delegates through the
     // PooledBackend to FC's vsock: `Some` => relay the ttyd WebSocket to the
-    // guest's `127.0.0.1:port`; `None` => direct `guest_ip` dial (Process / VZ
+    // guest's `127.0.0.1:port`; `None` => direct dial_ip dial (Process / VZ
     // pre-Phase-2).
     match pooled
         .open_guest_stream(id, engram_harness_proto::PROXY_PORT_VSOCK_PORT)
@@ -262,12 +263,13 @@ async fn open_tunnel_via_pooled(pooled: &PooledBackend, id: engram_core::Sandbox
                 .expect("relay shell tunnel must succeed");
         }
         None => {
-            let guest_ip = pooled
-                .vm_internal_ip(id)
+            let dial_ip = pooled
+                .guest_endpoints(id)
                 .await
-                .expect("vm_internal_ip must resolve");
-            eprintln!("--- opening shell tunnel (cold dial): guest_ip={guest_ip} port={port} ---");
-            engram_host_agent::proxy_shell::open_shell_tunnel_at(guest_ip, port, ends)
+                .map(|ep| ep.dial_ip)
+                .expect("guest_endpoints must resolve");
+            eprintln!("--- opening shell tunnel (cold dial): dial_ip={dial_ip} port={port} ---");
+            engram_host_agent::proxy_shell::open_shell_tunnel_at(dial_ip.to_string(), port, ends)
                 .await
                 .expect("cold shell tunnel must succeed");
         }
@@ -315,9 +317,9 @@ async fn e2e_shell_cold_via_pooled_backend() {
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
 
-    // ---- 4. Wait for in-VM agentd to come up so guest_ip resolves
+    // ---- 4. Wait for in-VM agentd to come up so guest_endpoints resolves
     //         AND the bake's init has had a chance to spawn ttyd. ----
-    let _guest_ip = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30)).await;
+    let _endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
     // Give ttyd a couple seconds to bind after the bake's init
     // shim launches it in the background.
     sleep(Duration::from_secs(2)).await;
@@ -371,7 +373,7 @@ async fn e2e_shell_warm_via_pooled_backend() {
 
     // ---- Cold create + wait for VM to be ready ----
     let cold_id = pooled.create(spec).await.expect("create");
-    let _ = wait_for_guest_ip(&pooled, cold_id, Duration::from_secs(30)).await;
+    let _ = wait_for_guest_endpoints(&pooled, cold_id, Duration::from_secs(30)).await;
     sleep(Duration::from_secs(2)).await; // ttyd bind window
 
     // ---- Snapshot + destroy the cold instance ----
@@ -379,25 +381,24 @@ async fn e2e_shell_warm_via_pooled_backend() {
     pooled.destroy(cold_id).await.expect("destroy cold");
 
     // ---- Restore → this is the path that puts the VM in a per-VM
-    //      netns. Catches the PooledBackend.netns_name_for forwarding
-    //      bug: without it, netns_name_for returns None and the
+    //      netns. Catches the PooledBackend.guest_endpoints forwarding
+    //      bug: without it, guest_endpoints().netns returns None and the
     //      tunnel dial happens from host root, which has no route
     //      to the netns'd 10.200.0.x. ----
     let warm_id = pooled.restore(metadata).await.expect("restore");
-    let _ = wait_for_guest_ip(&pooled, warm_id, Duration::from_secs(30)).await;
+    let endpoints = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
     // ttyd's TCP listen socket should survive the snapshot/restore
     // (FC restores the kernel state including sockets). But give a
     // small probe window in case ttyd needs a tick to re-arm.
     sleep(Duration::from_secs(2)).await;
 
-    // Sanity: confirm netns_name_for returns Some — if it doesn't,
+    // Sanity: confirm guest_endpoints().netns is Some — if it isn't,
     // PooledBackend isn't forwarding and the tunnel dial would dial
     // from root netns. We fail loud here with a clear message
     // rather than letting the dial time out.
-    let netns = pooled.netns_name_for(warm_id).await;
     assert!(
-        netns.is_some(),
-        "PooledBackend.netns_name_for returned None for a warm-restored sandbox — \
+        endpoints.netns.is_some(),
+        "PooledBackend.guest_endpoints returned no netns for a warm-restored sandbox — \
          the forwarding to inner FC backend isn't wired up (prod 2026-05-20 bug class)",
     );
 

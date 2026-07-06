@@ -23,12 +23,14 @@
 use async_trait::async_trait;
 
 use crate::error::SandboxError;
-use crate::traits::sandbox::{ForgeSink, HarnessDial, HarnessSink, UploadSink};
+use crate::traits::sandbox::{BrowserStart, ForgeSink, HarnessDial, HarnessSink, UploadSink};
 use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::image::WarmConfig;
 use crate::types::port::PortTunnel;
-use crate::types::sandbox::{AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
+use crate::types::sandbox::{
+    AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+};
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
 use crate::types::{SandboxId, SessionId};
@@ -53,6 +55,19 @@ pub trait HostClient: Send + Sync {
     async fn ping(&self) -> Result<(), SandboxError> {
         self.list().await.map(|_| ())
     }
+
+    /// ADR 0068 probe-before-host_lost: ground-truth liveness for ONE
+    /// sandbox, called by `reconcile::flip_missing` before flipping a
+    /// session to `host_lost` on nothing but absence from a
+    /// self-reported list. Deliberately has NO default `Ok`-shaped
+    /// implementation — a defaulted `Ok` would make "can't probe"
+    /// indistinguishable from "alive", exactly the silent-Ok failure
+    /// mode this issue exists to close. Every transport implements it
+    /// honestly: the gRPC client maps `Unimplemented` (an old host-agent
+    /// mid-roll) to `SandboxError::Unsupported` so the caller can treat
+    /// "no probe available" as "proceed with the flip" without confusing
+    /// it with a real answer.
+    async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError>;
 
     async fn exec_stream(
         &self,
@@ -91,8 +106,12 @@ pub trait HostClient: Send + Sync {
     /// The chunk+upload work runs as a host-side background task; await it via
     /// [`Self::snapshot_wait`]. Returns the new snapshot's id once the
     /// capture itself has succeeded — the point where the coordinator
-    /// may mark the session Idle. Default errs so non-FC hosts and
-    /// pre-D5 host-agents fall back to the composed [`Self::snapshot`].
+    /// may mark the session Idle. Default errs so backends without the
+    /// split path (VZ, Process) fall back to the composed
+    /// [`Self::snapshot`]. The fleet's hard `WIRE_VERSION` lockstep gate
+    /// (skewed hosts are dropped by `host_wire_version_ok`) means this
+    /// default is never reached because a host is running old code —
+    /// only because its backend genuinely has no split-eviction concept.
     async fn snapshot_begin(
         &self,
         _id: SandboxId,
@@ -210,11 +229,23 @@ pub trait HostClient: Send + Sync {
     /// ([`WarmConfig`]), threaded down to the backend. `capture_env` is the
     /// resolved capture-time env injected into the warm hook (refs already
     /// resolved coordinator-side).
+    ///
+    /// Issue #539: `progress` receives [`crate::types::CaptureProgress`]
+    /// events for the lifetime of the call — `phase=boot` once the capture
+    /// VM is up, `phase=warm` stage/heartbeat events while the `[warm]`
+    /// hook runs (a host keepalive at least every 30 s even if the hook is
+    /// silent-but-healthy), then `phase=snapshot` before the memory/disk
+    /// capture. A slow consumer must not block the capture — implementors
+    /// send best-effort (`try_send`). On failure the returned
+    /// `SandboxError::CaptureFailed` carries the same stage + tail the last
+    /// progress event reported, so a dropped/backed-up consumer still gets
+    /// the diagnosis on the terminal error even if it missed live updates.
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
         _warm: Option<WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _progress: tokio::sync::mpsc::Sender<crate::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `build_base_snapshot`".into(),
@@ -259,7 +290,7 @@ pub trait HostClient: Send + Sync {
     /// `(session_id, sandbox_id, guest_ip)` and upserts.
     async fn apply_egress_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError>;
 
-    async fn guest_ip(&self, id: SandboxId) -> Option<String>;
+    async fn guest_ip(&self, id: SandboxId) -> Option<std::net::Ipv4Addr>;
 
     // ---- harness routing ----
     /// Tell this host that an upcoming harness connection identifying
@@ -420,9 +451,8 @@ pub trait HostClient: Send + Sync {
     ///
     /// Default impl errors with `NotFound`: only host-agent
     /// implementations actually proxy shells. The Local impl in the
-    /// host-agent opens a WebSocket to `ws://<guest_ip>:7681/ws`
-    /// inside the right network namespace (per
-    /// [`SandboxBackend::netns_name_for`]) and bridges; the gRPC
+    /// host-agent opens a WebSocket to `ws://<dial_ip>:7681/ws` (per
+    /// [`SandboxBackend::guest_endpoints`]) and bridges; the gRPC
     /// client impl opens a gRPC bidi stream and bridges the channels
     /// with the wire frames.
     async fn proxy_shell(&self, sandbox_id: SandboxId) -> Result<ShellTunnel, SandboxError> {
@@ -431,11 +461,13 @@ pub trait HostClient: Send + Sync {
     }
 
     /// ADR 0065: bring up the ephemeral in-guest browser stack (Xvfb + x11vnc +
-    /// headful chromium with the CDP debug port) and return the VNC port. The
-    /// coordinator calls this before opening a relay tunnel to x11vnc :5900
-    /// (ADR 0066); the browser is reached over the vsock port relay, not a
-    /// direct dial. Default `NotFound` — only host-agent impls own a browser.
-    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+    /// headful chromium with the CDP debug port) and return the VNC port plus
+    /// an optional chromium-liveness warning (issue #569 — see
+    /// [`BrowserStart`]). The coordinator calls this before opening a relay
+    /// tunnel to x11vnc :5900 (ADR 0066); the browser is reached over the
+    /// vsock port relay, not a direct dial. Default `NotFound` — only
+    /// host-agent impls own a browser.
+    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<BrowserStart, SandboxError> {
         let _ = sandbox_id;
         Err(SandboxError::NotFound)
     }
@@ -457,14 +489,17 @@ pub trait HostClient: Send + Sync {
     /// channel closing tears the tunnel down.
     ///
     /// Unlike `proxy_shell` there is no host-side `start_shell` step: the
-    /// service on `port` is user/agent-managed, not host-spawned, so the
-    /// host just dials `guest_ip:port` in the right netns (a short
-    /// connection-refused retry covers the just-started race).
+    /// service on `port` is user/agent-managed, not host-spawned. ADR
+    /// 0066: reached via the in-guest agentd vsock relay when the
+    /// backend has one (FC; VZ after Phase 2), else a direct
+    /// `dial_ip:port` dial (a short connection-refused retry covers
+    /// the just-started race).
     ///
     /// Default errors with `NotFound`: only host-agent implementations
-    /// proxy ports. The Local impl dials inside the per-VM netns; the
-    /// gRPC client impl opens a `ProxyPort` bidi stream and bridges the
-    /// channels with the wire `data`/`close` frames.
+    /// proxy ports. The Local impl relays through the guest's vsock
+    /// port relay or falls back to a direct dial; the gRPC client impl
+    /// opens a `ProxyPort` bidi stream and bridges the channels with
+    /// the wire `data`/`close` frames.
     async fn proxy_port(
         &self,
         sandbox_id: SandboxId,

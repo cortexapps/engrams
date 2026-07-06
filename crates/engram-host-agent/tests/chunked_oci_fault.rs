@@ -463,6 +463,7 @@ async fn materialize_to_file_cached_uses_caller_supplied_store() {
         root: cache_dir.path().to_path_buf(),
         budget_bytes: 100 * 1024 * 1024,
         sweep_debounce_ms: 0,
+        eviction_enabled: true,
     });
 
     // materialize_to_file_cached on the tiered store: cache misses

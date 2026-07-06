@@ -523,7 +523,8 @@ function EnableImageDialog({
 // ---------- Enable-job progress (ADR 0036) ---------------------------
 //
 // Real progress from the server: the coordinator's scanner drives the
-// job through pending → materializing → capturing → ready, updating
+// job through pending → materializing → capturing → prestaging → ready
+// (ADR 0036 amendment / issue #538 added "prestaging"), updating
 // chunks_done/chunks_total as it materializes. We render a thin bar +
 // the state label; failed jobs keep their error visible with a retry
 // affordance.
@@ -532,16 +533,68 @@ const JOB_STATE_LABEL: Record<EnableJob["state"], string> = {
   pending: "queued",
   materializing: "materializing chunks",
   capturing: "capturing canonical snapshot",
+  // ADR 0036 amendment (issue #538): the fleet chunk-prestage wait — every
+  // eligible host warms the base snapshot before the image is usable.
+  prestaging: "staging chunks to hosts",
   ready: "ready",
   failed: "failed",
 };
 
+// ADR 0036 amendment (issue #538): `prestage_hosts` is a JSON-encoded
+// `{"<host-uuid>": {"outcome": "staged"|"timed_out"|"unschedulable",
+// "waited_ms"?: number}}` map, written once at prestage-stage end (stays
+// on the row through `ready`/`failed` as the audit record). "{}" before
+// the stage has run. Malformed/absent JSON renders nothing rather than
+// throwing — this is a best-effort operator surface, not load-bearing.
+function summarizePrestageHosts(raw: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  let staged = 0;
+  let timedOut = 0;
+  let unschedulable = 0;
+  for (const entry of Object.values(parsed as Record<string, { outcome?: string }>)) {
+    switch (entry?.outcome) {
+      case "staged":
+        staged++;
+        break;
+      case "timed_out":
+        timedOut++;
+        break;
+      case "unschedulable":
+        unschedulable++;
+        break;
+    }
+  }
+  const eligible = staged + timedOut;
+  if (eligible === 0) return null;
+  const suffix = unschedulable > 0 ? ` (${unschedulable} unschedulable)` : "";
+  return `${staged}/${eligible} hosts staged${suffix}`;
+}
+
 function EnableJobRow({ job }: { job: EnableJob }) {
   const retry = useRetryEnableJob();
   const failed = job.state === "failed";
+  const capturing = job.state === "capturing";
   const pct =
     job.chunks_total && job.chunks_total > 0
       ? Math.min(100, Math.round((job.chunks_done / job.chunks_total) * 100))
+      : null;
+  const prestageSummary = summarizePrestageHosts(job.prestage_hosts);
+
+  // Issue #539: while capturing, show the live capture_phase/warm_stage
+  // instead of a frozen progress bar — the operator-facing fix for a
+  // dev-brain enable that used to look identically "capturing" for the
+  // full 10-33 min [warm] hook with zero visibility into what it was
+  // doing. On a failed job, `output_tail` is the [warm] hook's last
+  // 16 KiB of stdout+stderr — no host-log access required to diagnose.
+  const captureDetail =
+    capturing && (job.capture_phase || job.warm_stage)
+      ? [job.capture_phase, job.warm_stage].filter(Boolean).join(" · ")
       : null;
 
   return (
@@ -556,6 +609,16 @@ function EnableJobRow({ job }: { job: EnableJob }) {
                 ? ` · ${job.chunks_done}/${job.chunks_total} chunks`
                 : ""}
             </Badge>
+            {captureDetail && (
+              <Badge variant="outline" className="font-mono font-normal">
+                {captureDetail}
+              </Badge>
+            )}
+            {prestageSummary && (
+              <Badge variant="outline" className="font-normal">
+                {prestageSummary}
+              </Badge>
+            )}
             {!failed && (
               <span className="text-xs text-muted-foreground italic animate-pulse">working…</span>
             )}
@@ -573,6 +636,16 @@ function EnableJobRow({ job }: { job: EnableJob }) {
           </div>
           {pct !== null && !failed && <Progress value={pct} className="h-1 max-w-md" />}
           {failed && job.error && <p className="text-xs text-destructive">{job.error}</p>}
+          {failed && job.warm_stage && (
+            <p className="text-xs text-muted-foreground">
+              failed at [warm] stage <span className="font-mono">{job.warm_stage}</span>
+            </p>
+          )}
+          {failed && job.output_tail && (
+            <pre className="max-h-40 overflow-y-auto rounded bg-muted p-2 text-xs whitespace-pre-wrap">
+              {job.output_tail}
+            </pre>
+          )}
         </CardContent>
       </Card>
     </li>

@@ -33,7 +33,8 @@ pub use metadata::{
     UpdateOutcome,
 };
 pub use sandbox::{
-    ForgeSink, HarnessByteStream, HarnessDial, HarnessSink, SandboxBackend, UploadSink,
+    BrowserStart, ForgeSink, HarnessByteStream, HarnessDial, HarnessSink, SandboxBackend,
+    UploadSink,
 };
 pub use secrets::{
     LayeredSecretStore, ResolvedSecret, SecretBundle, SecretContext, SecretStore, StaticSecretStore,

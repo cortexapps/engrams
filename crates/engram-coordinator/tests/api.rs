@@ -798,6 +798,8 @@ impl TestFixture {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                stages_images: false,
+                capabilities: engram_core::types::host::HostCapabilities::default(),
             },
         );
         let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
@@ -882,6 +884,7 @@ fn seed_enabled(
             recoverable: true,
             aux_bundles: vec![],
             events_cursor: None,
+            fc_snapshot_version: None,
         },
     );
     store.enabled.lock().insert(

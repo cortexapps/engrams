@@ -119,6 +119,23 @@ impl PostgresStore {
             Err(e) => db_err(e),
         }
     }
+
+    /// ADR 0048 (queue fairness): best-effort wake for `queue_scanner`,
+    /// fired at every discrete placement-feasibility event (a reservation
+    /// freed, a `pending` reservation released, a host (re)registered or
+    /// uncordoned, a session freshly enqueued). The scanner LISTENs on
+    /// `placement_changed` and retries immediately instead of waiting for
+    /// its fallback poll (`ENGRAM_QUEUE_POLL_SECS`). Mirrors the
+    /// `org_secret_changed` precedent above: best-effort `let _ =`, the
+    /// payload is an informational reason string only, and a NOTIFY
+    /// failure must never fail (or roll back) the caller's write — the
+    /// poll fallback is the durability story, not this.
+    async fn notify_placement_changed(&self, reason: &str) {
+        let _ = sqlx::query("SELECT pg_notify('placement_changed', $1)")
+            .bind(reason)
+            .execute(&self.pool)
+            .await;
+    }
 }
 
 fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
@@ -552,7 +569,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT AS reserved_vcpus
             FROM sessions
             WHERE host_id = ANY($1)
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
               -- A `pending` row older than 10 min is a crash-orphaned
               -- reservation (a boot never takes that long); don't let it leak
@@ -906,13 +923,18 @@ impl MetadataStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        // Closes the race where capacity frees between the failed
+        // `reserve_placement` and this enqueue's commit — without this,
+        // the newly-queued row would wait for the next poll fallback
+        // even though a host was free the whole time.
+        self.notify_placement_changed("enqueued").await;
         Ok(())
     }
 
     async fn enqueue_session_resume(&self, id: SessionId) -> Result<(), MetaError> {
         // Idle → queued (resume origin). Gated on `status='idle'` so a
         // racing resume that already advanced the row is a clean no-op.
-        sqlx::query(
+        let n = sqlx::query(
             r#"
             UPDATE sessions
                SET status = 'queued', queued_at = NOW(), queue_origin = 'resume',
@@ -923,7 +945,19 @@ impl MetadataStore for PostgresStore {
         .bind(id.as_uuid())
         .execute(&self.pool)
         .await
-        .map_err(db_err)?;
+        .map_err(db_err)?
+        .rows_affected();
+        if n > 0 {
+            // Matches `delete_pending_session`'s guard below: only a
+            // session that actually landed in `queued` needs the
+            // fleet-wide scanner wake — the capacity-freed-between-
+            // reserve-and-enqueue race this NOTIFY exists for. The
+            // `status='idle'` no-op path (a racing resume that already
+            // advanced the row) has nothing new for the scanner to place;
+            // waking every replica's scanner into a full sweep for it is
+            // pure overhead.
+            self.notify_placement_changed("enqueued").await;
+        }
         Ok(())
     }
 
@@ -1005,7 +1039,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT AS reserved_vcpus
             FROM sessions
             WHERE host_id = ANY($1)
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
               AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
             GROUP BY host_id
@@ -1129,7 +1163,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT
             FROM sessions
             WHERE host_id IS NOT NULL
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
               -- ADR 0048: gate on last_active_at, not created_at — a session
               -- can sit `queued` for many minutes before `place_queued_session`
@@ -1155,13 +1189,19 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn delete_pending_session(&self, session_id: SessionId) -> Result<(), MetaError> {
-        sqlx::query(
+        let n = sqlx::query(
             "DELETE FROM sessions WHERE id = $1 AND status = 'pending' AND sandbox_id IS NULL",
         )
         .bind(session_id.as_uuid())
         .execute(&self.pool)
         .await
-        .map_err(db_err)?;
+        .map_err(db_err)?
+        .rows_affected();
+        if n > 0 {
+            // A reservation was released — the freed budget may now fit a
+            // queued session.
+            self.notify_placement_changed("pending_deleted").await;
+        }
         Ok(())
     }
 
@@ -1196,7 +1236,7 @@ impl MetadataStore for PostgresStore {
                 SELECT host_id, SUM(mem_budget_mib) AS reserved
                 FROM sessions
                 WHERE host_id IS NOT NULL
-                  AND status IN ('pending','created','guest_ready','active',
+                  AND status IN ('pending','created','active',
                                  'evacuating','evicting')
                   -- ADR 0048: gate on last_active_at, not created_at — a session
               -- can sit `queued` for many minutes before `place_queued_session`
@@ -1234,7 +1274,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
             FROM sessions
-            WHERE status IN ('pending','created','guest_ready','active',
+            WHERE status IN ('pending','created','active',
                              'idle','evacuating','evicting')
             "#,
         )
@@ -1430,7 +1470,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT COUNT(*)::BIGINT FROM sessions
             WHERE host_id = $1
-              AND status IN ('pending','created','guest_ready','active',
+              AND status IN ('pending','created','active',
                              'evacuating','evicting')
             "#,
         )
@@ -1517,6 +1557,15 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
+        // ADR 0048 (queue fairness): a session leaving a memory-reserving
+        // state (e.g. Active → Idle) frees its budget — wake the queue
+        // scanner so a waiting session doesn't sit for the poll fallback.
+        // Fired after commit (the freed capacity is only real once
+        // committed); the reverse direction (entering a reserving state)
+        // never frees anything, so it's not a wake trigger.
+        if current.reserves_host_memory() && !target.reserves_host_memory() {
+            self.notify_placement_changed("session_freed").await;
+        }
         Ok(current)
     }
 
@@ -2116,14 +2165,21 @@ impl MetadataStore for PostgresStore {
     async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
         let cloud_meta = serde_json::to_value(&host.cloud_metadata)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        // ADR 0068: persist the register-time capability vector too — a
+        // host's very first row (before its first heartbeat) should
+        // already carry whatever `probe_all` measured at startup, not
+        // sit at `'{}'::jsonb` (schema 0) until 5s later.
+        let capabilities = serde_json::to_value(&host.capabilities)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
         sqlx::query(
             r#"
             INSERT INTO hosts (id, hostname, cloud_metadata,
                                capacity_total_gb, capacity_used_gb,
                                capacity_total_mib, capacity_used_mib,
                                running_sandboxes_count,
-                               last_heartbeat_at, status, host_addr, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+                               last_heartbeat_at, status, host_addr,
+                               capabilities, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
             ON CONFLICT (id) DO UPDATE SET
                 hostname                = EXCLUDED.hostname,
                 cloud_metadata          = EXCLUDED.cloud_metadata,
@@ -2135,6 +2191,7 @@ impl MetadataStore for PostgresStore {
                 last_heartbeat_at       = EXCLUDED.last_heartbeat_at,
                 status                  = EXCLUDED.status,
                 host_addr               = COALESCE(EXCLUDED.host_addr, hosts.host_addr),
+                capabilities            = EXCLUDED.capabilities,
                 updated_at              = NOW()
             "#,
         )
@@ -2149,9 +2206,14 @@ impl MetadataStore for PostgresStore {
         .bind(host.last_heartbeat_at)
         .bind(host.status.as_str())
         .bind(host.host_addr.as_deref())
+        .bind(capabilities)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        // New or re-registered host → schedulable. Always fires (both the
+        // insert and the re-register arm land here); harmless if nothing
+        // was waiting.
+        self.notify_placement_changed("host_upserted").await;
         Ok(())
     }
 
@@ -2170,8 +2232,9 @@ impl MetadataStore for PostgresStore {
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
+                   util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
                    ready_images, local_snapshots, current_bundles,
-                   cordoned, total_vcpus, wire_version,
+                   cordoned, total_vcpus, wire_version, stages_images, capabilities,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
@@ -2213,6 +2276,9 @@ impl MetadataStore for PostgresStore {
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let current_bundles = serde_json::to_value(&hb.current_bundles)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        // ADR 0068: this tick's re-probed capability vector.
+        let capabilities = serde_json::to_value(&hb.capabilities)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let n = sqlx::query(
             // Issue #230: `dead` is terminal w.r.t. heartbeats — see
             // `HostStatus::can_transition_to`. The dead-host sweep
@@ -2244,6 +2310,11 @@ impl MetadataStore for PostgresStore {
                       current_bundles = $14,
                       total_vcpus = $15,
                       wire_version = $16,
+                      util_base_shm_mib = $17,
+                      util_parked_pss_mib = $18,
+                      util_running_pss_mib = $19,
+                      capabilities = $20,
+                      stages_images = $21,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
@@ -2264,6 +2335,13 @@ impl MetadataStore for PostgresStore {
         .bind(current_bundles)
         .bind(hb.total_vcpus as i32)
         .bind(hb.wire_version as i32)
+        // Issue #540: base_shm_pending_mib has no column (transient,
+        // already folded into allocatable_mib above) — not bound here.
+        .bind(hb.utilization.base_shm_mib as i64)
+        .bind(hb.utilization.parked_pss_mib as i64)
+        .bind(hb.utilization.running_pss_mib as i64)
+        .bind(capabilities)
+        .bind(hb.stages_images)
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -2287,6 +2365,10 @@ impl MetadataStore for PostgresStore {
         if n == 0 {
             return Err(MetaError::NotFound);
         }
+        if !cordoned {
+            // Uncordoning makes the host schedulable again.
+            self.notify_placement_changed("host_uncordoned").await;
+        }
         Ok(())
     }
 
@@ -2303,8 +2385,9 @@ impl MetadataStore for PostgresStore {
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
+                   util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
                    ready_images, local_snapshots, current_bundles,
-                   cordoned, total_vcpus, wire_version,
+                   cordoned, total_vcpus, wire_version, stages_images, capabilities,
                    last_heartbeat_at, status, host_addr
               FROM hosts
              -- Only `ready` hosts are strike-out candidates. A `draining`
@@ -2420,8 +2503,8 @@ impl MetadataStore for PostgresStore {
                  image_version, size_bytes, created_at, last_accessed_at,
                  disk_manifest_id, disk_manifest_version,
                  memory_manifest_id, memory_manifest_version,
-                 recoverable, aux_bundles, events_cursor)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 recoverable, aux_bundles, events_cursor, fc_snapshot_version)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT (id) DO UPDATE SET
                 last_accessed_at        = EXCLUDED.last_accessed_at,
                 disk_manifest_id        = EXCLUDED.disk_manifest_id,
@@ -2435,6 +2518,11 @@ impl MetadataStore for PostgresStore {
                 -- re-ingest a checkpoint the eviction pipeline already
                 -- recorded with a cursor, or vice versa).
                 events_cursor           = COALESCE(EXCLUDED.events_cursor, snapshots.events_cursor),
+                -- ADR 0068: same idempotency guard — a re-record (e.g.
+                -- the checkpoint-advert reconcile re-ingesting a row the
+                -- eviction pipeline already stamped) must not blank out
+                -- an already-known capture-time FC snapshot version.
+                fc_snapshot_version     = COALESCE(EXCLUDED.fc_snapshot_version, snapshots.fc_snapshot_version),
                 updated_at              = NOW()
             RETURNING (xmax = 0) AS inserted
             "#,
@@ -2456,6 +2544,7 @@ impl MetadataStore for PostgresStore {
                 .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
         )
         .bind(snap.events_cursor)
+        .bind(&snap.fc_snapshot_version)
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -2600,7 +2689,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles, events_cursor
+                   recoverable, aux_bundles, events_cursor, fc_snapshot_version
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
             "#,
         )
@@ -2622,7 +2711,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles, events_cursor
+                   recoverable, aux_bundles, events_cursor, fc_snapshot_version
             FROM snapshots WHERE session_id = $1
             ORDER BY created_at DESC LIMIT 1
             "#,
@@ -2645,7 +2734,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles, events_cursor
+                   recoverable, aux_bundles, events_cursor, fc_snapshot_version
             FROM snapshots WHERE id = $1
             "#,
         )
@@ -2826,6 +2915,41 @@ impl MetadataStore for PostgresStore {
         rows.iter().map(row::persisted_event_from_row).collect()
     }
 
+    async fn prompt_received_seconds_ago(
+        &self,
+        session_id: SessionId,
+        prompt_id: &str,
+    ) -> Result<Option<f64>, MetaError> {
+        // Issue #527 Phase 1: the receipt row is coordinator-authoritative
+        // and excluded from the rewind tombstone (see
+        // `rewind_session_to_cursor` below), so it is always the live head
+        // for this `prompt_id` — DESC LIMIT 1 is defensive against the
+        // retryable-Conflict duplicate-receipt case (a client retry of a
+        // rejected SendPrompt reusing the same `prompt_id` — see PR #556
+        // review finding #3) rather than a happy-path guarantee.
+        //
+        // PR #556 review finding #1: `NOW() - created_at` is computed here,
+        // PG-side, in the same query as the row read — a single clock, so
+        // there's no coordinator-vs-Postgres (or cross-replica) skew to
+        // bias or drop samples.
+        let row = sqlx::query(
+            r#"
+            SELECT EXTRACT(EPOCH FROM (NOW() - created_at))::float8 AS secs_ago
+              FROM session_events
+             WHERE session_id = $1 AND kind = 'prompt_received' AND payload->>'prompt_id' = $2
+             ORDER BY idx DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(prompt_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| sqlx::Row::try_get::<f64, _>(&r, "secs_ago").map_err(db_err))
+            .transpose()
+    }
+
     async fn rewind_session_to_cursor(
         &self,
         session_id: SessionId,
@@ -2915,6 +3039,18 @@ impl MetadataStore for PostgresStore {
         // (run_*, agent_message*, tool_call_*, exec_*, stdout/stderr,
         // prompt_*, harness_idle, user_question, question_answered,
         // file_changed, file_shared, integration_asset, …) still rewinds.
+        //
+        // Issue #527 Phase 1: `prompt_received` is ALSO excluded here — it
+        // is a coordinator-authoritative fact ("the user asked at time T")
+        // that stays true across a guest-state rewind (the resume rewinds
+        // the HARNESS's view of the world, not whether the user sent the
+        // prompt). Without this exclusion, every resume-with-rollback would
+        // tombstone the receipt row and inflate `rolled_back` by one,
+        // masking the real signal this issue exists to measure.
+        //
+        // Per issue #527's Guardrails merge-coordination note: the two
+        // sibling exclusion lists compose into one `AND kind NOT IN (...)`
+        // predicate rather than stacking separate `AND kind <>` clauses.
         let tombstoned = sqlx::query(
             r#"
             UPDATE session_events
@@ -2922,7 +3058,7 @@ impl MetadataStore for PostgresStore {
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
                AND kind NOT IN (
                    'status_changed', 'snapshot_taken', 'evicted',
-                   'resumed', 'recovered_from_checkpoint'
+                   'resumed', 'recovered_from_checkpoint', 'prompt_received'
                )
             "#,
         )
@@ -2934,8 +3070,12 @@ impl MetadataStore for PostgresStore {
         .rows_affected();
 
         if tombstoned == 0 {
-            // Checkpoint was already the head — no rewind. Don't bump
-            // the epoch (keeps the no-op clean); caller emits nothing.
+            // Checkpoint was already the head — no rewind — OR (PR #556
+            // review finding #5) the only post-cursor rows are excluded
+            // `prompt_received` receipts (see the exclusion above): nothing
+            // user-visible actually rewound either way, so this stays the
+            // correct no-op branch. Don't bump the epoch (keeps the no-op
+            // clean); caller emits nothing.
             tx.rollback().await.map_err(db_err)?;
             return Ok(engram_core::types::event::RewindSummary::default());
         }
@@ -3427,7 +3567,7 @@ impl MetadataStore for PostgresStore {
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
             DO NOTHING
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(Uuid::new_v4())
@@ -3442,7 +3582,7 @@ impl MetadataStore for PostgresStore {
         }
         let existing = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              WHERE image_uri = $1 AND state NOT IN ('ready', 'failed')
             "#,
@@ -3462,7 +3602,7 @@ impl MetadataStore for PostgresStore {
                     VALUES ($1, $2, $3, $4)
                     ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
                     DO NOTHING
-                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
                     "#,
                 )
                 .bind(Uuid::new_v4())
@@ -3484,7 +3624,7 @@ impl MetadataStore for PostgresStore {
 
     async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
         let row = sqlx::query(
-            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
+            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -3496,7 +3636,7 @@ impl MetadataStore for PostgresStore {
     async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              ORDER BY created_at DESC
              LIMIT $1
@@ -3531,7 +3671,7 @@ impl MetadataStore for PostgresStore {
                     LIMIT $3
                       FOR UPDATE SKIP LOCKED
              )
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(claimant)
@@ -3570,6 +3710,59 @@ impl MetadataStore for PostgresStore {
         .bind(claimant)
         .bind(chunks_done as i32)
         .bind(chunks_total.map(|v| v as i32))
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(self.enable_job_fence_miss(id, claimant).await);
+        }
+        Ok(())
+    }
+
+    /// Issue #539: persist one `CaptureProgress` event onto the job row.
+    /// `warm_stage_started_at` is derived from `progress.warm_stages`' still-
+    /// open entry (the caller — `PooledBackend::run_warm_hook`/
+    /// `build_base_snapshot` via the coordinator's stream consumer — always
+    /// sends the full stage history, not a diff), not re-derived in SQL, so
+    /// a stage-name-unchanged heartbeat doesn't need a `DISTINCT FROM`
+    /// dance to avoid resetting it.
+    ///
+    /// Fenced by `claimed_by` exactly like [`Self::update_enable_job_progress`]
+    /// — see #232. Also renews the claim (`claimed_at = NOW()`), which is
+    /// what lets the enable-scanner delete its blind capture-lease ticker
+    /// (`enable_scanner.rs`): the host's >=30s keepalive comfortably beats
+    /// the 300s lease.
+    async fn update_enable_job_capture_progress(
+        &self,
+        id: Uuid,
+        claimant: &str,
+        progress: &engram_core::types::CaptureProgress,
+    ) -> Result<(), MetaError> {
+        let warm_stage_started_at = progress
+            .warm_stages
+            .iter()
+            .find(|s| s.ended_at.is_none())
+            .map(|s| s.started_at);
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET capture_phase = $3,
+                   warm_stage = $4,
+                   warm_stage_started_at = $5,
+                   warm_stages = $6,
+                   output_tail = $7,
+                   claimed_at = NOW(),
+                   updated_at = NOW()
+             WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(id)
+        .bind(claimant)
+        .bind(progress.phase.as_str())
+        .bind(progress.warm_stage.as_deref())
+        .bind(warm_stage_started_at)
+        .bind(sqlx::types::Json(&progress.warm_stages))
+        .bind(&progress.output_tail)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -3672,7 +3865,7 @@ impl MetadataStore for PostgresStore {
                SET state = 'pending', attempts = 0, error = NULL,
                    claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
              WHERE id = $1 AND state = 'failed'
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -3689,6 +3882,90 @@ impl MetadataStore for PostgresStore {
                 None => Err(MetaError::NotFound),
             },
         }
+    }
+
+    // ---- ADR 0036 amendment: fleet chunk prestage (issue #538) ----
+
+    async fn begin_enable_job_prestage(
+        &self,
+        id: Uuid,
+        claimant: &str,
+        prestage_ref: serde_json::Value,
+    ) -> Result<(), MetaError> {
+        // Stamp the wire-shape ref the heartbeat ack advertises to hosts,
+        // and flip to `prestaging` in the SAME fenced write (mirrors
+        // `set_enable_job_state`: renews the claim, fenced by `claimed_by`
+        // — #232 semantics — so a stale pod can't advertise a ref for a
+        // job a peer now owns).
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET state = 'prestaging',
+                   prestage_ref = $3,
+                   claimed_at = NOW(),
+                   updated_at = NOW()
+             WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(id)
+        .bind(claimant)
+        .bind(prestage_ref)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(self.enable_job_fence_miss(id, claimant).await);
+        }
+        Ok(())
+    }
+
+    async fn set_enable_job_prestage_hosts(
+        &self,
+        id: Uuid,
+        claimant: &str,
+        outcomes: serde_json::Value,
+    ) -> Result<(), MetaError> {
+        // Written once at the end of the prestage wait — the audit /
+        // dashboard record of per-host staged|timed_out|unschedulable
+        // outcomes. Fenced by `claimed_by` (#232): a stale pod's stragglers
+        // must not overwrite a peer's in-progress or completed record.
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET prestage_hosts = $3,
+                   claimed_at = NOW(),
+                   updated_at = NOW()
+             WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(id)
+        .bind(claimant)
+        .bind(outcomes)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(self.enable_job_fence_miss(id, claimant).await);
+        }
+        Ok(())
+    }
+
+    async fn list_prestaging_refs(&self) -> Result<Vec<serde_json::Value>, MetaError> {
+        // Raw JSON out — engram-core (and this store) must not depend on
+        // engram-protocol (the wire-type crate depends on core, not the
+        // reverse); the coordinator's heartbeat handler deserializes each
+        // value into `EnabledImageRef`, matching the existing dependency
+        // direction rather than laundering a stringly type here.
+        let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+            r#"
+            SELECT prestage_ref FROM enable_jobs
+             WHERE state = 'prestaging' AND prestage_ref IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|(v,)| v).collect())
     }
 
     async fn upsert_session_secrets(&self, secrets: SessionSecrets) -> Result<(), MetaError> {

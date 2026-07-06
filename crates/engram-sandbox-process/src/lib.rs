@@ -40,6 +40,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use dashmap::DashMap;
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
@@ -551,12 +552,19 @@ impl SandboxBackend for ProcessBackend {
     }
 
     /// Process-backend "guests" share the host's network stack —
-    /// anything ttyd binds is reachable on localhost. Doesn't bother
-    /// confirming the sandbox is alive; the caller deals with the
-    /// connection failure if it isn't.
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+    /// anything ttyd binds is reachable on localhost, and there's no
+    /// netns indirection, so `egress_identity` and `dial_ip` are both
+    /// loopback. Doesn't bother confirming the sandbox is alive; the
+    /// caller deals with the connection failure if it isn't.
+    async fn guest_endpoints(&self, id: SandboxId) -> Option<GuestEndpoints> {
         if self.sandboxes.contains_key(&id) {
-            Some("127.0.0.1".to_string())
+            let loopback = std::net::Ipv4Addr::LOCALHOST;
+            Some(GuestEndpoints {
+                egress_identity: loopback,
+                dial_ip: loopback,
+                netns: None,
+                vsock_uds: None,
+            })
         } else {
             None
         }

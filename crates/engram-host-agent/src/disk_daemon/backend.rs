@@ -3626,6 +3626,14 @@ mod tests {
         let total = 3 * chunk_size;
         let base = synth_manifest(total, chunk_size, vec![]);
 
+        // A near-full dev/CI disk (e.g. the dev VM at >90% used) trips the
+        // cache's default 20%-free-space floor and evicts the just-flushed
+        // chunk before this test can observe it, independent of `budget_bytes`
+        // — see the same fix in two_host_drain_wave.rs / migration_source.rs.
+        // Nextest runs each test in its own process, so this env override
+        // is safe.
+        std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
+
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         let store = Arc::new(ChunkStore::new(blob));

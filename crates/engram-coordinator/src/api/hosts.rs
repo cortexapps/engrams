@@ -78,8 +78,16 @@ pub struct HostView {
     pub util_mem_total_mib: u64,
     pub util_mem_used_mib: u64,
     pub util_cpu_pct: f32,
-    /// ADR 0046/0047: host-measured allocatable RAM — what placement
-    /// budgets against.
+    /// Issue #540 (host RAM ledger attribution): measured base-shm tmpfs
+    /// residency, and the running/parked split of guest PSS. `0` until
+    /// the host's first post-0078 heartbeat. `base_shm_pending_mib` is
+    /// deliberately absent here — it's transient host-local state
+    /// already folded into `allocatable_mib`, not durable PG state.
+    pub util_base_shm_mib: u64,
+    pub util_parked_pss_mib: u64,
+    pub util_running_pss_mib: u64,
+    /// ADR 0046/0047, amended by issue #540: host-measured allocatable
+    /// RAM — what placement budgets against.
     pub allocatable_mib: u64,
     /// ADR 0048: Σ reserved RAM (mem_budget_mib) and the resulting free
     /// (allocatable − reserved) — the operator's wave planner reads these
@@ -93,6 +101,19 @@ pub struct HostView {
     pub reserved_vcpus: u64,
     pub free_vcpus: u64,
     pub last_heartbeat_at: DateTime<Utc>,
+    /// ADR 0068: names of the capability-vector fields that are
+    /// currently `Failed` (or `Unknown` on a `schema >= 1` host) —
+    /// empty on a healthy host. Kills the "no capacity with free
+    /// hosts" mystery mode at the operator's fleet view, not just in
+    /// the placement-exclusion log.
+    pub failing_capabilities: Vec<String>,
+    /// ADR 0068: this host's `firecracker --snapshot-version`
+    /// (`None` off FC / not yet probed).
+    pub fc_snapshot_version: Option<String>,
+    /// ADR 0068: `0` = this host has never reported a capability
+    /// vector (pre-0068 row, or mid-roll) — the soft-pass posture.
+    /// `>= 1` once it has.
+    pub capabilities_schema: u32,
 }
 
 impl HostView {
@@ -106,6 +127,14 @@ impl HostView {
         let reserved_mib = reserved.mem_mib.max(0) as u64;
         let cpu_budget = engram_core::types::host::host_cpu_budget(row.total_vcpus).max(0) as u64;
         let reserved_vcpus = reserved.vcpus.max(0) as u64;
+        let failing_capabilities = row
+            .capabilities
+            .failing_capabilities()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let fc_snapshot_version = row.capabilities.fc_snapshot_version.clone();
+        let capabilities_schema = row.capabilities.schema;
         Self {
             id: row.id,
             hostname: row.hostname,
@@ -122,6 +151,9 @@ impl HostView {
             util_mem_total_mib: row.utilization.mem_total_mib,
             util_mem_used_mib: row.utilization.mem_used_mib,
             util_cpu_pct: row.utilization.cpu_pct,
+            util_base_shm_mib: row.utilization.base_shm_mib,
+            util_parked_pss_mib: row.utilization.parked_pss_mib,
+            util_running_pss_mib: row.utilization.running_pss_mib,
             allocatable_mib,
             reserved_mib,
             free_mib: allocatable_mib.saturating_sub(reserved_mib),
@@ -130,6 +162,9 @@ impl HostView {
             reserved_vcpus,
             free_vcpus: cpu_budget.saturating_sub(reserved_vcpus),
             last_heartbeat_at: row.last_heartbeat_at,
+            failing_capabilities,
+            fc_snapshot_version,
+            capabilities_schema,
         }
     }
 }

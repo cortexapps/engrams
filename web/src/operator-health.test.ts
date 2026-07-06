@@ -2,7 +2,12 @@ import { describe, expect, test } from "vitest";
 import type { DurabilityRow, HostStatus, HostView, StorageSummaryResponse } from "./lib/types";
 import { deriveHealthMetrics, operatorIssues } from "./operator-health";
 
-const host = (status: HostStatus, total = 100, used = 0): HostView => ({
+const host = (
+  status: HostStatus,
+  total = 100,
+  used = 0,
+  failingCapabilities: string[] = [],
+): HostView => ({
   id: "h",
   hostname: "h",
   status,
@@ -15,7 +20,13 @@ const host = (status: HostStatus, total = 100, used = 0): HostView => ({
   util_mem_total_mib: 0,
   util_mem_used_mib: 0,
   util_cpu_pct: 0,
+  util_base_shm_mib: 0,
+  util_parked_pss_mib: 0,
+  util_running_pss_mib: 0,
   last_heartbeat_at: "",
+  failing_capabilities: failingCapabilities,
+  fc_snapshot_version: "",
+  capabilities_schema: 0,
 });
 const row = (last_flush_at: string | null): DurabilityRow => ({
   sandbox_id: "s",
@@ -45,7 +56,22 @@ const fresh = () => new Date().toISOString();
 describe("deriveHealthMetrics", () => {
   test("empty fleet reads zero capacity and no locality", () => {
     const m = deriveHealthMetrics([], undefined);
-    expect(m).toEqual({ dead: 0, draining: 0, capPct: 0, locality: null, rpoStale: 0 });
+    expect(m).toEqual({
+      dead: 0,
+      draining: 0,
+      capPct: 0,
+      locality: null,
+      rpoStale: 0,
+      capsFailing: 0,
+    });
+  });
+
+  test("hosts with a failing capability are tallied", () => {
+    const m = deriveHealthMetrics(
+      [host("ready", 100, 0, ["grpc_self_connect"]), host("ready"), host("ready", 100, 0, ["nbd"])],
+      undefined,
+    );
+    expect(m.capsFailing).toBe(2);
   });
 
   test("capacity is summed across hosts and rounded", () => {
@@ -85,10 +111,23 @@ describe("deriveHealthMetrics", () => {
 });
 
 describe("operatorIssues", () => {
-  const base = { dead: 0, draining: 0, capPct: 10, locality: null, rpoStale: 0 } as const;
+  const base = {
+    dead: 0,
+    draining: 0,
+    capPct: 10,
+    locality: null,
+    rpoStale: 0,
+    capsFailing: 0,
+  } as const;
 
   test("a healthy fleet has no issues", () => {
     expect(operatorIssues({ ...base })).toEqual([]);
+  });
+
+  test("a host failing capability checks is a caution issue", () => {
+    expect(operatorIssues({ ...base, capsFailing: 1 })).toEqual([
+      { tone: "caution", text: "1 host failing capability checks" },
+    ]);
   });
 
   test("a dead host is critical and named with a count", () => {
@@ -112,7 +151,14 @@ describe("operatorIssues", () => {
   });
 
   test("worst issue sorts first regardless of input order", () => {
-    const issues = operatorIssues({ dead: 1, draining: 2, capPct: 95, locality: 30, rpoStale: 4 });
+    const issues = operatorIssues({
+      dead: 1,
+      draining: 2,
+      capPct: 95,
+      locality: 30,
+      rpoStale: 4,
+      capsFailing: 1,
+    });
     expect(issues[0].tone).toBe("critical"); // never a caution item at the head
     expect(
       issues.every((i, x) => x === 0 || i.tone !== "critical" || issues[x - 1].tone === "critical"),

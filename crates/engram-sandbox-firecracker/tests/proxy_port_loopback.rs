@@ -1,6 +1,6 @@
 //! ADR 0066: end-to-end FC test for the vsock port relay — the fix that lets a
 //! preview reach a dev server bound to the guest's **`127.0.0.1`** (Vite, Tilt),
-//! which the old `guest_ip` dial cannot.
+//! which a direct dial_ip dial cannot.
 //!
 //! Boots a real microVM with `engram-agentd` baked in (carrying the port-relay
 //! listener on `PROXY_PORT_VSOCK_PORT`), starts two concurrent loopback servers
@@ -13,7 +13,7 @@
 //! Assertions:
 //!   1. **loopback reach** (the regression): an echo server bound to
 //!      `127.0.0.1` round-trips bytes — proving the relay reaches guest
-//!      loopback, which `guest_ip:port` never could.
+//!      loopback, which `dial_ip:port` never could.
 //!   2. **no head-of-line blocking**: with one connection backed up (its source
 //!      wants to push a lot but its reader parks), the others must each still
 //!      read a small chunk and finish under a tight bound.

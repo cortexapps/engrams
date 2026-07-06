@@ -270,6 +270,19 @@ pub async fn evict_session_to_state(
         .latest_event_idx_at_or_before(session_id, metadata.paused_at.unwrap_or(now))
         .await
         .unwrap_or_default();
+    // ADR 0068: stamp the capturing host's FC snapshot-version so a
+    // later restore can be paired against it at placement. Best-effort:
+    // a lookup failure degrades to NULL, same posture as events_cursor
+    // above — never fails the eviction over it.
+    let fc_snapshot_version = match host_id {
+        Some(h) => state
+            .services
+            .meta
+            .fc_snapshot_version_for_host(h)
+            .await
+            .unwrap_or_default(),
+        None => None,
+    };
     let record = SnapshotRecord {
         id: metadata.id,
         session_id: Some(session_id),
@@ -293,6 +306,7 @@ pub async fn evict_session_to_state(
         // ADR 0035: pin the generations this snapshot references.
         aux_bundles: metadata.aux_bundles.clone(),
         events_cursor,
+        fc_snapshot_version,
     };
     if let Err(e) = state.services.meta.record_snapshot(record.clone()).await {
         abort_inflight_snapshot(state, session_id, sandbox_id, "record_snapshot").await;
@@ -940,6 +954,11 @@ pub(crate) async fn scanner_run_once(
     Ok(())
 }
 
+// ADR 0019 / telemetry restoration (#526): scanner-driven work has no
+// request span to inherit — give it an explicit root so the pipeline's
+// spans correlate by `session_id` instead of exporting as disconnected
+// roots with no shared attribute.
+#[tracing::instrument(name = "idle_evictor.advance_one", skip_all, fields(session_id = %session.id))]
 async fn scanner_advance_one(
     cfg: &EvictionScannerConfig,
     state: &SharedState,
@@ -1388,6 +1407,7 @@ mod tests {
             recoverable: true,
             aux_bundles: metadata.aux_bundles,
             events_cursor: None,
+            fc_snapshot_version: None,
         };
         state.services.meta.record_snapshot(record).await.unwrap();
 
@@ -1572,6 +1592,13 @@ mod tests {
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
             }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
             async fn exec_stream(
                 &self,
                 id: engram_core::SandboxId,
@@ -1621,7 +1648,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(
@@ -1788,6 +1815,13 @@ mod tests {
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
             }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
             async fn exec_stream(
                 &self,
                 id: engram_core::SandboxId,
@@ -1837,7 +1871,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(
@@ -2004,6 +2038,13 @@ mod tests {
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
             }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
             async fn exec_stream(
                 &self,
                 id: engram_core::SandboxId,
@@ -2054,7 +2095,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(
@@ -2353,6 +2394,13 @@ mod tests {
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
             }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
             async fn exec_stream(
                 &self,
                 id: engram_core::SandboxId,
@@ -2400,7 +2448,7 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.apply_egress_policy(policy).await
             }
-            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
             async fn bind_session(

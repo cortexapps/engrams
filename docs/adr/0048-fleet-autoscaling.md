@@ -75,10 +75,23 @@ INSERTs the row at `queued` (host_id NULL, `queued_at`, `queue_origin =
 `queue_scanner` (evac_resumer shape, `session_lease`-guarded, replica-safe by
 construction) owns the continuation:
 
-- FIFO, **place-until-first-failure** per tick: strict fairness, one
-  serialized placement attempt at the head, no thundering herd. Head-of-line
-  blocking is deliberate — the operator scales the fleet to fit the head,
-  because `queued_mib`/`queued_vcpus` include it.
+- FIFO, **place-until-first-failure per fit class** per tick: strict
+  fairness within a class, one serialized placement attempt at each
+  class's head, no thundering herd. *Updated by the queue-fairness
+  follow-up (issue #537):* the shape shipped here stopped the WHOLE sweep
+  at the first unplaceable session (global head-of-line blocking — "the
+  operator scales the fleet to fit the head"); the queue is now
+  partitioned by `(mem_budget_mib, cpu_budget_vcpus)` — the exact 2D fit
+  the placement predicate uses — and only the class an unplaceable head
+  belongs to stops, so a small session behind an unrelated fat head
+  places the same tick instead of inheriting its wait.
+  `queued_mib`/`queued_vcpus` (the autoscaler's scale-up signal) are
+  unaffected — every queued row, including every class head, still
+  counts. See `crates/engram-coordinator/src/queue_scanner.rs`'s module
+  doc for the full per-class design and the deliberately-unaddressed
+  starvation case. Dequeue is also now push-driven — a `placement_changed`
+  PG NOTIFY wakes the scanner on freed capacity — with a 30s poll
+  fallback replacing the original unconditional 5s poll.
 - Placed ⇒ `Queued → Pending` inside the same reservation transaction shape
   (`place_queued_session`), then the boot continuation runs on a bounded
   JoinSet; boot failure re-queues (the timeout clock keeps the original

@@ -1,4 +1,4 @@
-# ADR 0067: Host-durable eviction finalize (+ `paused_at` cursor, kind-scoped rewind)
+# ADR 0069: Host-durable eviction finalize (+ `paused_at` cursor, kind-scoped rewind)
 
 Status: 2026-07-01 — **Accepted.** Deep-research-synthesis-driven (issue
 #529, part of the 2026-07 core-ops overhaul). Authored alongside the

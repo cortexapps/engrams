@@ -121,13 +121,19 @@ pub struct HostUtilization {
     pub mem_total_mib: u64,
     #[serde(default)]
     pub mem_used_mib: u64,
-    /// ADR 0046: memory (MiB) actually available to place NEW sessions on this
-    /// host — `MemAvailable + Σ guest-resident (PSS)`. It nets out the host
-    /// daemon, OS, kube-system pods, the chunk cache, and the mlock'd
-    /// base-memfile residency (ADR 0022) automatically — everything in
-    /// `MemUsed` that isn't a running VM — so placement subtracts only session
-    /// budgets from it. `0` on non-Linux / pre-0058 hosts, where placement
-    /// falls back to the raw `mem_total_mib`.
+    /// ADR 0046, amended by issue #540 (the host RAM ledger): memory (MiB)
+    /// actually available to place NEW sessions on this host —
+    /// `MemAvailable + Σ PSS of reservation-backed (non-parked) VMs −
+    /// pending base-shm charges`. `MemAvailable` nets out the host daemon,
+    /// OS, kube-system pods, the chunk cache, and populated base-shm tmpfs
+    /// (shmem isn't kernel-reclaimable) automatically; adding back only
+    /// non-parked VM PSS — never parked-resident PSS — is what keeps a
+    /// parked-but-RAM-resident sandbox (epic-parking-ladder rungs 2-3) from
+    /// being double-counted as both occupied and free. `0` on non-Linux /
+    /// pre-0058 hosts, where placement falls back to the raw
+    /// `mem_total_mib`. Derived from `RamLedgerSnapshot::allocatable_mib`
+    /// in `engram-host-agent::ram_ledger` (issue #540) — see that module
+    /// for the full ledger.
     #[serde(default)]
     pub allocatable_mib: u64,
     /// Whole-host CPU utilization in percent (0–100), computed from
@@ -136,6 +142,30 @@ pub struct HostUtilization {
     /// sample to diff against).
     #[serde(default)]
     pub cpu_pct: f32,
+    /// Issue #540: measured (`st_blocks`) bytes (MiB) resident on the
+    /// per-image base-shm tmpfs — attribution the pre-ledger formula had
+    /// none of (it netted these bytes out of `MemAvailable` silently).
+    /// `0` on non-Linux or when no image has ever prewarmed.
+    #[serde(default)]
+    pub base_shm_mib: u64,
+    /// Issue #540: registered-but-not-yet-materialized base-shm prewarm
+    /// charges — bytes `image_prefetch` has promised to write but hasn't
+    /// finished writing (or the tmpfs scan hasn't caught up to) yet.
+    /// Already subtracted out of `allocatable_mib`; broken out here so an
+    /// operator can see WHY allocatable dipped during an enable.
+    #[serde(default)]
+    pub base_shm_pending_mib: u64,
+    /// Issue #540: Σ PSS of sandboxes flagged `parked` — RAM-resident but
+    /// reservation-free (epic-parking-ladder rungs 2-3; `0` until the
+    /// ladder lands). Never folded into `allocatable_mib`; this is the
+    /// seam a later reclaim-under-pressure feature reads.
+    #[serde(default)]
+    pub parked_pss_mib: u64,
+    /// Issue #540: Σ PSS of sandboxes NOT flagged `parked` — the same
+    /// figure already added back into `allocatable_mib`, broken out for
+    /// attribution/dashboards.
+    #[serde(default)]
+    pub running_pss_mib: u64,
 }
 
 /// ADR 0047: a snapshot the host holds locally, as persisted in the
@@ -149,6 +179,132 @@ pub struct HostLocalSnapshot {
     pub size_bytes: u64,
     pub replicated: bool,
     pub last_accessed_at: DateTime<Utc>,
+}
+
+/// ADR 0068: the outcome of a single self-verified host capability probe.
+/// `Unknown` is the wire default so an old host-agent's register/heartbeat
+/// body (missing this field entirely) deserializes to the same soft
+/// posture a `schema == 0` [`HostCapabilities`] gets — see
+/// `crate::placement`-side gating (host_meets_capabilities), which lives in
+/// `engram-coordinator` since this crate has no scheduler.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "status", content = "detail")]
+pub enum CapStatus {
+    /// Absent / pre-roll host-agent — never probed. Soft-tolerated, the
+    /// same posture as `wire_version == 0`.
+    #[default]
+    Unknown,
+    /// The probe ran and passed. `detail` carries free-form context
+    /// (e.g. `nbds_max=128`) for operator display; never load-bearing.
+    Ok(Option<String>),
+    /// The probe ran and failed. `detail` is the errno/message.
+    Failed(String),
+    /// This backend never has this capability (e.g. VZ has no
+    /// uffd/nbd/base_shm substrate) — distinct from `Failed` so the fleet
+    /// view doesn't render a VZ host's substrate row as broken.
+    NotApplicable,
+}
+
+impl CapStatus {
+    /// A capability the placement gate can rely on for a *required*
+    /// dimension. `Failed`, `Unknown`, and `NotApplicable` all fail a
+    /// required capability — only a probe that actually ran and passed
+    /// clears the gate.
+    pub fn is_ok(&self) -> bool {
+        matches!(self, CapStatus::Ok(_))
+    }
+}
+
+/// ADR 0068: typed, self-verified host readiness. Probed by the
+/// host-agent at startup (before the first register) and re-asserted on
+/// every heartbeat; persisted as JSONB on the `hosts` row (migration
+/// 0080) and carried as JSON in the register/heartbeat bodies. The
+/// host<->coord control plane is HTTP/JSON, so every field is
+/// `#[serde(default)]` — an old host-agent's payload (missing this
+/// struct, or missing individual fields within it) decodes to
+/// `schema == 0` / `CapStatus::Unknown`, the same soft posture
+/// `wire_version == 0` gets today. That's what gives a rolling deploy
+/// (coord first, then the host MIG) mixed-fleet interop for free.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct HostCapabilities {
+    /// `0` = never reported (pre-roll host-agent, or a payload with no
+    /// `capabilities` field at all); `>= 1` = a probed vector. Gate
+    /// semantics live in `engram-coordinator::placement`.
+    #[serde(default)]
+    pub schema: u32,
+    /// `"firecracker" | "vz" | "process"` — selected from the same arm
+    /// `main.rs` picks the `SandboxBackend` in.
+    #[serde(default)]
+    pub backend: String,
+    /// A single TCP self-connect to the host-agent's own gRPC listen
+    /// port proved it's bound + backlogging.
+    #[serde(default)]
+    pub grpc_self_connect: CapStatus,
+    /// `statfs(TMPFS_MAGIC)` on the UFFD base-shm dir (ADR 0045
+    /// substrate). `NotApplicable` off the FC backend.
+    #[serde(default)]
+    pub base_shm_tmpfs: CapStatus,
+    /// A userfaultfd + `UFFDIO_REGISTER` MINOR self-test (memfd-backed,
+    /// no guest involved). `NotApplicable` off the FC backend.
+    #[serde(default)]
+    pub uffd_minor_shmem: CapStatus,
+    /// The `nbd` kernel module is loaded (`/sys/module/nbd/parameters/nbds_max`
+    /// readable). `detail` carries `nbds_max=<n>`. `NotApplicable` off the
+    /// FC backend. Does NOT change `build_from_kernel`'s materialize-to-file
+    /// dev fallback — this only makes a prod misconfiguration visible.
+    #[serde(default)]
+    pub nbd: CapStatus,
+    /// `bundles::read_stamp(bundle_dir)` returned a non-empty stamp —
+    /// the host has *some* current RO-bundle generation staged.
+    #[serde(default)]
+    pub bundle_stamp: CapStatus,
+    /// `firecracker --snapshot-version` output (e.g. `"v10.0.0"`),
+    /// probed once at startup and cached. `None` off the FC backend.
+    #[serde(default)]
+    pub fc_snapshot_version: Option<String>,
+    /// Mirror of `engram_protocol::WIRE_VERSION`, carried inside the
+    /// vector too so a one-glance fleet-view render doesn't need a
+    /// second lookup. The authoritative skew gate stays
+    /// `host_wire_version_ok` against `HostRecord::wire_version`.
+    #[serde(default)]
+    pub wire_version: u32,
+}
+
+impl HostCapabilities {
+    /// ADR 0068 fleet-view surface: names of the capabilities that are
+    /// NOT `Ok` — `Failed` always counts; `Unknown` counts only once
+    /// the host has reported a real vector (`schema >= 1`), since an
+    /// `Unknown` at `schema == 0` just means "hasn't reported yet,"
+    /// not "probed and something's wrong." `NotApplicable` never
+    /// counts — it's the correct steady state for e.g. `nbd` on a VZ
+    /// host, not a failure. Fixed field order (not alphabetical) for
+    /// deterministic rendering.
+    pub fn failing_capabilities(&self) -> Vec<&'static str> {
+        let is_failing = |c: &CapStatus| -> bool {
+            match c {
+                CapStatus::Failed(_) => true,
+                CapStatus::Unknown => self.schema >= 1,
+                CapStatus::Ok(_) | CapStatus::NotApplicable => false,
+            }
+        };
+        let mut out = Vec::new();
+        if is_failing(&self.grpc_self_connect) {
+            out.push("grpc_self_connect");
+        }
+        if is_failing(&self.base_shm_tmpfs) {
+            out.push("base_shm_tmpfs");
+        }
+        if is_failing(&self.uffd_minor_shmem) {
+            out.push("uffd_minor_shmem");
+        }
+        if is_failing(&self.nbd) {
+            out.push("nbd");
+        }
+        if is_failing(&self.bundle_stamp) {
+            out.push("bundle_stamp");
+        }
+        out
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -207,6 +363,21 @@ pub struct HostRecord {
     /// allocatable.
     #[serde(default)]
     pub wire_version: u32,
+    /// ADR 0036 amendment (issue #538): true iff this host-agent runs the
+    /// image-prefetch supervisor (`chunk_store` + `chunk_cache` configured —
+    /// production/VZ hosts; Process-backend dev hosts lack both and never
+    /// spawn it). The enable scanner's prestage stage waits only on hosts
+    /// with this bit; a fleet with zero eligible staging hosts passes the
+    /// stage vacuously. `#[serde(default)]` → `false` for pre-migration rows
+    /// (the exempt, safe posture). Migration 0081.
+    #[serde(default)]
+    pub stages_images: bool,
+    /// ADR 0068: the host's self-verified capability vector, from the
+    /// most recent register/heartbeat (migration 0080). `schema == 0`
+    /// for pre-0068 rows / hosts mid-roll — soft-tolerated by the
+    /// placement gate, same posture as `wire_version == 0`.
+    #[serde(default)]
+    pub capabilities: HostCapabilities,
 }
 
 /// ADR 0047: everything a heartbeat persists, in one struct — the
@@ -225,6 +396,11 @@ pub struct HostHeartbeat {
     pub total_vcpus: u32,
     /// Issue #229: the host-agent's bincode `WIRE_VERSION` this tick.
     pub wire_version: u32,
+    /// ADR 0036 amendment (issue #538): whether this host's image-prefetch
+    /// supervisor is spawned — see [`HostRecord::stages_images`].
+    pub stages_images: bool,
+    /// ADR 0068: this tick's re-probed capability vector.
+    pub capabilities: HostCapabilities,
 }
 
 /// ADR 0048: per-host reserved budget across BOTH placement dimensions —
@@ -348,5 +524,85 @@ mod tests {
             assert_eq!(back, variant);
             assert_eq!(variant.as_str(), wire);
         }
+    }
+
+    /// ADR 0068: an old host-agent's register/heartbeat body — no
+    /// `capabilities` field at all — must decode to `schema == 0`, the
+    /// same soft posture `wire_version == 0` gets. This is what keeps a
+    /// mixed-fleet rolling deploy placeable.
+    #[test]
+    fn host_capabilities_defaults_to_schema_zero_when_absent() {
+        let caps: HostCapabilities = serde_json::from_str("{}").unwrap();
+        assert_eq!(caps.schema, 0);
+        assert_eq!(caps.grpc_self_connect, CapStatus::Unknown);
+        assert_eq!(caps.fc_snapshot_version, None);
+    }
+
+    #[test]
+    fn cap_status_round_trips_every_variant() {
+        for cap in [
+            CapStatus::Unknown,
+            CapStatus::Ok(None),
+            CapStatus::Ok(Some("nbds_max=128".to_string())),
+            CapStatus::Failed("ENOENT".to_string()),
+            CapStatus::NotApplicable,
+        ] {
+            let wire = serde_json::to_value(&cap).unwrap();
+            let back: CapStatus = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, cap);
+        }
+    }
+
+    #[test]
+    fn cap_status_is_ok_only_for_the_ok_variant() {
+        assert!(CapStatus::Ok(None).is_ok());
+        assert!(CapStatus::Ok(Some("x".into())).is_ok());
+        assert!(!CapStatus::Unknown.is_ok());
+        assert!(!CapStatus::Failed("x".into()).is_ok());
+        assert!(!CapStatus::NotApplicable.is_ok());
+    }
+
+    #[test]
+    fn failing_capabilities_ignores_not_applicable_and_schema_zero_unknown() {
+        // schema 0 (never reported): Unknown everywhere, but nothing
+        // "failing" — this is the mid-roll soft-pass posture, not a
+        // probed failure.
+        let never_reported = HostCapabilities::default();
+        assert!(never_reported.failing_capabilities().is_empty());
+
+        // schema 1, a real vector: NotApplicable (a VZ host's substrate
+        // fields) never counts; Failed always does; Unknown at schema
+        // 1 (a field the host-agent build didn't populate) counts too.
+        let vz_like = HostCapabilities {
+            schema: 1,
+            backend: "vz".to_string(),
+            grpc_self_connect: CapStatus::Ok(None),
+            base_shm_tmpfs: CapStatus::NotApplicable,
+            uffd_minor_shmem: CapStatus::NotApplicable,
+            nbd: CapStatus::NotApplicable,
+            bundle_stamp: CapStatus::Failed("no stamp".to_string()),
+            fc_snapshot_version: None,
+            wire_version: 7,
+        };
+        assert_eq!(vz_like.failing_capabilities(), vec!["bundle_stamp"]);
+    }
+
+    #[test]
+    fn failing_capabilities_sorted_deterministic_order() {
+        let broken = HostCapabilities {
+            schema: 1,
+            backend: "firecracker".to_string(),
+            grpc_self_connect: CapStatus::Failed("x".into()),
+            base_shm_tmpfs: CapStatus::Failed("x".into()),
+            uffd_minor_shmem: CapStatus::Ok(None),
+            nbd: CapStatus::Unknown,
+            bundle_stamp: CapStatus::Ok(None),
+            fc_snapshot_version: None,
+            wire_version: 7,
+        };
+        assert_eq!(
+            broken.failing_capabilities(),
+            vec!["grpc_self_connect", "base_shm_tmpfs", "nbd"]
+        );
     }
 }

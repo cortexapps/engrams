@@ -231,6 +231,12 @@ impl HostClient for FakeCaptureHost {
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         Ok(vec![])
     }
+    async fn probe_sandbox(
+        &self,
+        _id: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        unimplemented!()
+    }
     async fn exec_stream(
         &self,
         _id: SandboxId,
@@ -258,7 +264,7 @@ impl HostClient for FakeCaptureHost {
     ) -> Result<(), SandboxError> {
         unreachable!()
     }
-    async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
+    async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
         None
     }
     async fn bind_session(&self, _session_id: SessionId, _sandbox_id: SandboxId) {}
@@ -282,6 +288,7 @@ impl HostClient for FakeCaptureHost {
         _spec: SandboxSpec,
         _warm: Option<engram_core::types::image::WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.captures.fetch_add(1, Ordering::SeqCst);
         Ok(SnapshotMetadata {
@@ -494,6 +501,8 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
+        stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
     })
     .await
     .expect("hosts row");

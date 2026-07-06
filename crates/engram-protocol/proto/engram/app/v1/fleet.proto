@@ -104,6 +104,28 @@ message HostView {
   uint64 cpu_budget_vcpus = 21;
   uint64 reserved_vcpus = 22;
   uint64 free_vcpus = 23;
+  // Issue #540 (host RAM ledger attribution): measured base-shm tmpfs
+  // residency, and the running/parked split of guest PSS. `0` until the
+  // host's first post-0078 heartbeat. `base_shm_pending_mib` is
+  // deliberately absent — it's transient host-local state already
+  // folded into `allocatable_mib`, not durable PG state this view reads.
+  uint64 util_base_shm_mib = 24;
+  uint64 util_parked_pss_mib = 25;
+  uint64 util_running_pss_mib = 26;
+  // ADR 0068: names of the capability-vector fields currently
+  // `Failed` (or `Unknown` on a `schema >= 1` host) — empty on a
+  // healthy host. Kills the "no capacity with free hosts" mystery
+  // mode at the operator's fleet view.
+  repeated string failing_capabilities = 27;
+  // ADR 0068: this host's `firecracker --snapshot-version`. Empty
+  // string means "off FC / not yet probed" (proto3 has no optional
+  // scalar without the `optional` keyword; empty is unambiguous here
+  // since a real snapshot-version string is never empty).
+  string fc_snapshot_version = 28;
+  // ADR 0068: `0` = this host has never reported a capability vector
+  // (pre-0068 row, or mid-roll) — the soft-pass posture. `>= 1` once
+  // it has.
+  uint32 capabilities_schema = 29;
 }
 
 message GetHostRequest {
