@@ -81,6 +81,14 @@ under `sudo` with the same env contract as the Linux dev path.
   harness `claude` … is not staged on any host yet"*, the bundles build was
   skipped (e.g. no Docker / not in `nix develop`) — re-trigger it and confirm
   `var/shared/current.json` carries a `harness-claude` key.
+- **Session create 400s with "no host could restore … tcp connect error" /
+  the coordinator can't reach the host.** Lima forwards a guest listener to the
+  Mac's `127.0.0.1` on the *edge* when it starts listening; rapid host-agent
+  restarts can make Lima miss/drop the `9101` forward, so the coordinator's
+  dial-in (`127.0.0.1:9101`) fails even though the host is `ready` (register/
+  heartbeat run the other direction and are unaffected). Fix: re-trigger the
+  `host-agent` resource in the Tilt UI — a fresh listen edge and Lima
+  re-forwards within seconds. Verify with `nc -z 127.0.0.1 9101` on the Mac.
 - **`tilt down` does not stop the remote host-agent** (or its live microVMs).
   `colima ssh` doesn't propagate signals, so each (re)start pre-kills the
   prior instance instead; between `tilt down` and the next `dev-fc` the old
