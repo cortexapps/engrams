@@ -112,9 +112,9 @@ pub trait MetadataStore: Send + Sync {
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
 
     /// Every live (non-terminal, non-`host_lost`) session: `pending`,
-    /// `created`, `guest_ready`, `active`, `idle`, `evacuating`,
-    /// `evicting`. This is the rehydration source for the coord's
-    /// in-memory routing maps (`repopulate_routing`) — every state
+    /// `created`, `active`, `idle`, `evacuating`, `evicting`. This is
+    /// the rehydration source for the coord's in-memory routing maps
+    /// (`repopulate_routing`) — every state
     /// that can carry a live `sandbox_id` binding (`evicting`
     /// included: the sandbox stays bound while the eviction pipeline
     /// runs) MUST be listed here, or a coord restart strands the
@@ -403,8 +403,8 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0048: deregister a drained host immediately — its `hosts` row
     /// is deleted so the operator's scale-down doesn't wait ~30-40s for
     /// the dead-host detector. REFUSES (returns the bound count) if any
-    /// session is still bound (`pending`/`created`/`guest_ready`/`active`/
-    /// `evacuating`/`evicting`); idempotent (a missing row = `Ok(Deleted)`).
+    /// session is still bound (`pending`/`created`/`active`/`evacuating`/
+    /// `evicting`); idempotent (a missing row = `Ok(Deleted)`).
     /// Default impl (mocks): `Deleted`.
     async fn delete_host(&self, _id: HostId) -> Result<DeleteHostOutcome, MetaError> {
         Ok(DeleteHostOutcome::Deleted)
@@ -956,6 +956,33 @@ pub trait MetadataStore: Send + Sync {
         _events_cursor: i64,
     ) -> Result<crate::types::event::RewindSummary, MetaError> {
         Ok(crate::types::event::RewindSummary::default())
+    }
+
+    /// Issue #527 Phase 1: resolve the prompt→run-start latency for a given
+    /// `prompt_id` — the coordinator-authoritative "the user asked at time
+    /// T" receipt's age, written as the first PG side-effect of
+    /// `send_prompt_core` (before auto-resume). Used by the harness-event
+    /// sink to record `engram_prompt_to_run_started_seconds` when the
+    /// matching `HarnessRunStarted{prompt_id}` lands. Returns `Ok(None)`
+    /// when no receipt exists — the env-seeded initial prompt carries no
+    /// `prompt_id` and never gets one, so this is an expected, non-error
+    /// case the caller skips silently rather than treating as a bug.
+    ///
+    /// PR #556 review finding #1: the elapsed seconds are computed
+    /// PG-side (`NOW() - created_at`, one clock) rather than by handing
+    /// the receipt's `created_at` back for the caller to diff against a
+    /// coordinator-process `Utc::now()` — mixing those two clocks biases
+    /// (or, under skew, silently drops) exactly the samples this metric
+    /// exists to capture.
+    ///
+    /// Default `Ok(None)` so mocks without an event log are a clean no-op
+    /// (they simply never emit the derived histogram).
+    async fn prompt_received_seconds_ago(
+        &self,
+        _session_id: SessionId,
+        _prompt_id: &str,
+    ) -> Result<Option<f64>, MetaError> {
+        Ok(None)
     }
 
     // ---- file artifacts (ADR 0026) ----

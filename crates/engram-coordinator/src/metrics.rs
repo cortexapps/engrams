@@ -54,6 +54,22 @@ pub fn init(addr: SocketAddr) {
     // so this Full() rule beats the Suffix("_seconds") default.
     let eviction_buckets = &[1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 180.0, 300.0];
 
+    // ADR 0048 (queue fairness): queue waits are minutes-scale, not
+    // seconds-scale — a stuck queue can wait the full 30-minute timeout.
+    // Same Full()-beats-Suffix() precedence as the eviction override above.
+    let queue_wait_buckets = &[
+        1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 3600.0,
+    ];
+
+    // Issue #527 Phase 1: prompt→run-start is the same wide-regime problem
+    // as eviction — the prod evidence this metric replaces the proxy for
+    // shows p50 ≈24.5s, p90 ≈140s, max 1,703s (a resume can be a full cold
+    // FC boot). The default `_seconds` buckets top out at 30s, which would
+    // collapse essentially the entire observed distribution into +Inf.
+    let prompt_to_run_started_buckets = &[
+        1.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0,
+    ];
+
     let builder = PrometheusBuilder::new()
         .with_http_listener(addr)
         .set_buckets_for_metric(
@@ -61,6 +77,16 @@ pub fn init(addr: SocketAddr) {
             eviction_buckets,
         )
         .expect("install eviction histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(QUEUE_WAIT_SECONDS.to_string()),
+            queue_wait_buckets,
+        )
+        .expect("install queue-wait histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(PROMPT_TO_RUN_STARTED_SECONDS.to_string()),
+            prompt_to_run_started_buckets,
+        )
+        .expect("install prompt-to-run-started histogram buckets")
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Suffix("_seconds".to_string()),
             buckets,
@@ -211,6 +237,26 @@ pub const SESSIONS_QUEUED_MIB: &str = "engram_sessions_queued_mib";
 /// `outcome` = `placed` / `requeued` / `failed` / `timeout`.
 pub const QUEUE_OUTCOME_TOTAL: &str = "engram_queue_outcome_total";
 
+/// Histogram (ADR 0048, queue-fairness). `queued_at` → placement/terminal,
+/// seconds. This is OUTSIDE `engram_session_boot_seconds`: the create
+/// handler returns 201 `{kind:"queued"}` immediately on enqueue, so the
+/// entire queue wait previously fell outside every latency histogram we
+/// have. Labels:
+/// - `origin`: `create` / `resume`.
+/// - `outcome`: `placed` (create: the durable `queued → pending` flip;
+///   resume: dequeue to `Idle`) / `timeout`.
+///
+/// A requeued-then-placed session emits one `placed` sample per successful
+/// placement, each measuring cumulative wait since the ORIGINAL
+/// `queued_at` (`requeue_session` deliberately doesn't reset it).
+pub const QUEUE_WAIT_SECONDS: &str = "engram_queue_wait_seconds";
+
+/// Gauge (ADR 0048, queue-fairness). Age in seconds of the oldest queued
+/// row (0 when the queue is empty), sampled once per scanner sweep. The
+/// "is the queue stuck" pager signal complementing `engram_sessions_queued`
+/// (which only tells you the queue is nonempty, not for how long).
+pub const QUEUE_HEAD_AGE_SECONDS: &str = "engram_queue_head_age_seconds";
+
 /// Counter (issue #231). The per-tick `touch_host_heartbeat` persist
 /// failed — the host's `last_heartbeat_at` row did NOT advance even
 /// though the agent's heartbeat reached this pod. Sustained nonzero is
@@ -221,3 +267,15 @@ pub const QUEUE_OUTCOME_TOTAL: &str = "engram_queue_outcome_total";
 /// No `host_id` label — the cardinality convention above forbids
 /// per-host labels; the paired `warn!` carries the id for forensics.
 pub const HEARTBEAT_PERSIST_FAILURES_TOTAL: &str = "engram_heartbeat_persist_failures_total";
+
+/// Histogram (issue #527 Phase 1). Wall-clock from a `prompt_received`
+/// receipt (the first PG write of `send_prompt_core`, before auto-resume)
+/// to the matching `run_started{prompt_id}` landing in `session_events`.
+/// The true prompt→first-token *lower bound* — replaces the old
+/// `idle→created` proxy, which post-dates the resume and therefore
+/// undercounts. No labels: this is a single fleet-wide SLO signal, not
+/// per-image (the per-image breakdown is the Phase 2 canary's job).
+/// Recorded once per run-start that carries a `prompt_id`; the env-seeded
+/// initial prompt (no `prompt_id`, no receipt row) never contributes a
+/// sample.
+pub const PROMPT_TO_RUN_STARTED_SECONDS: &str = "engram_prompt_to_run_started_seconds";

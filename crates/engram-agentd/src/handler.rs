@@ -89,7 +89,49 @@ where
         );
     }
 
-    let req: WireRequest = read_msg(&mut reader).await?;
+    let req: WireRequest = match read_msg(&mut reader).await {
+        Ok(req) => req,
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            // `read_msg` already consumed the full frame (length
+            // prefix + body) before bincode failed to decode it — the
+            // stream is clean, so a reply is safe. This is NOT a
+            // disconnect (that surfaces as `UnexpectedEof` from
+            // `read_exact` and falls to the `Err(e)` arm below,
+            // un-NAK'd): it's a well-framed request this agentd
+            // couldn't parse, which happens when the host and guest
+            // agentd disagree on the `WireRequest` enum — most often
+            // because the guest's agentd is baked into its image and
+            // predates a variant the host just sent (or, less
+            // commonly, speaks a newer protocol than this build
+            // understands).
+            //
+            // Without this, that skew is indistinguishable from
+            // agentd crashing mid-call: prod session 8174b7aa ran a
+            // dev-brain image whose agentd predated
+            // `WireRequest::StartBrowser`; the unknown variant failed
+            // to decode, `serve_connection` returned `Err` having
+            // written zero bytes, and the host only ever logged
+            // `start_browser: recv: early eof` (#567). Best-effort
+            // write — the host may have already torn the connection
+            // down on its end (mirrors the token-mismatch path
+            // above) — then return the original error so logging is
+            // unchanged.
+            let resp = WireResponse::Error {
+                kind: format!("{:?}", e.kind()),
+                message: format!(
+                    "unsupported or malformed request (agentd v{version}): {e} -- \
+                     likely host/guest version skew (this guest's agentd may \
+                     predate a request the host just sent, or speak an older \
+                     protocol than the host expects); remedy: re-bake the \
+                     image and RefreshImage the session",
+                    version = env!("CARGO_PKG_VERSION"),
+                ),
+            };
+            let _ = write_msg(&mut writer, &resp).await;
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
     let exec_req = match req {
         WireRequest::Exec(e) => e,
         WireRequest::Stat { path } => {
@@ -169,6 +211,7 @@ where
                 Ok(outcome) => WireResponse::BrowserReady {
                     port: outcome.port,
                     spawned: outcome.spawned,
+                    cdp_warning: outcome.cdp_warning,
                 },
                 Err(e) => WireResponse::Error {
                     kind: format!("{:?}", e.kind()),
@@ -190,22 +233,33 @@ where
             return Ok(());
         }
         WireRequest::SpawnHarness(req) => {
+            // 2026-07 core-ops fold: install the per-host egress-proxy
+            // CA (if this request carries one) BEFORE spawning, and
+            // before the empty-argv readiness-probe early return inside
+            // `HarnessSupervisor::spawn` — so a dev_vm probe still
+            // delivers the CA. Install failure is loud: a harness
+            // spawned without the proxy CA would fail every outbound
+            // TLS dial opaquely, so we reject the whole request instead
+            // of spawning a harness that can't reach anything.
+            let ca_changed = match req.host_ca_pem.as_deref() {
+                Some(pem) if !pem.is_empty() => match cacerts.install(pem).await {
+                    Ok(changed) => Some(changed),
+                    Err(e) => {
+                        let resp = WireResponse::Error {
+                            kind: format!("{:?}", e.kind()),
+                            message: format!("install_host_ca: {e}"),
+                        };
+                        write_msg(&mut writer, &resp).await?;
+                        return Ok(());
+                    }
+                },
+                _ => None,
+            };
             let resp = match supervisor.spawn(req).await {
-                Ok(pid) => WireResponse::HarnessSpawned { pid },
+                Ok(pid) => WireResponse::HarnessSpawned { pid, ca_changed },
                 Err(e) => WireResponse::Error {
                     kind: format!("{:?}", e.kind()),
                     message: format!("spawn_harness: {e}"),
-                },
-            };
-            write_msg(&mut writer, &resp).await?;
-            return Ok(());
-        }
-        WireRequest::InstallHostCa(req) => {
-            let resp = match cacerts.install(&req.cert_pem).await {
-                Ok(changed) => WireResponse::InstallHostCaAck { changed },
-                Err(e) => WireResponse::Error {
-                    kind: format!("{:?}", e.kind()),
-                    message: format!("install_host_ca: {e}"),
                 },
             };
             write_msg(&mut writer, &resp).await?;
@@ -256,9 +310,15 @@ where
         // reach child.wait — we'd otherwise leak the process.
         .kill_on_drop(true);
 
-    let mut child = cmd
-        .spawn()
+    // Issue #569: `spawn_tracked` registers the pid with the reaper's
+    // tracked-pid set atomically with the spawn itself (see `crate::reaper`),
+    // so agentd's init-style zombie reaper never races this handle's own
+    // `child.wait()` for the exit status. `TrackedChild::new` re-asserts the
+    // (already-set) registration and untracks on drop, covering every return
+    // path below (including the timeout branch).
+    let mut child = crate::reaper::spawn_tracked(&mut cmd)
         .map_err(|e| io::Error::new(e.kind(), format!("spawn {:?}: {e}", req.command[0])))?;
+    let _tracked = child.id().map(crate::reaper::TrackedChild::new);
 
     // stdin is fire-and-forget: drain the buffer, then close.
     if let Some(bytes) = req.stdin {
@@ -1188,5 +1248,352 @@ mod tests {
             }
             other => panic!("expected Error response, got {other:?}"),
         }
+    }
+
+    // ---- SpawnHarness CA fold (2026-07 core-ops) ------------------------
+    //
+    // The former standalone CA-install verb is gone; these tests exercise
+    // the CA install now living inside the `SpawnHarness` handler arm —
+    // `cacerts.rs`'s own unit tests already cover the installer in
+    // isolation, so these focus on the handler wiring: install-before-spawn
+    // ordering, the readiness-probe (empty argv) path, install-failure
+    // blocking the spawn, and the `last_pem` cache surfacing as
+    // `ca_changed` across two round trips.
+
+    /// Like [`round_trip`] but lets the caller supply its own
+    /// `CaCertInstaller` so CA-fold tests can point at inspectable temp
+    /// paths (or paths engineered to fail) instead of the throwaway
+    /// `for_tests()` installer.
+    async fn round_trip_with_cacerts(
+        req: WireRequest,
+        cacerts: Arc<crate::cacerts::CaCertInstaller>,
+    ) -> WireResponse {
+        let (mut client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            serve_connection(server, None, HarnessSupervisor::new(), cacerts).await
+        });
+        write_msg(&mut client, &req).await.unwrap();
+        let resp: WireResponse = read_msg(&mut client).await.unwrap();
+        let _ = server_task.await.unwrap();
+        resp
+    }
+
+    fn temp_cacert_paths(tmp: &tempfile::TempDir) -> crate::cacerts::CaCertPaths {
+        crate::cacerts::CaCertPaths {
+            bundle: tmp.path().join("etc/ssl/certs/ca-certificates.crt"),
+            extra_cert: tmp
+                .path()
+                .join("usr/local/share/ca-certificates/engram.crt"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_harness_installs_ca_before_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = temp_cacert_paths(&tmp);
+        // Pin the ORDERING, not just eventual existence: the spawned
+        // child stats the bundle path itself, at exec time, and records
+        // what it saw into `marker`. Asserting `paths.bundle.exists()`
+        // only after the response comes back would also pass an
+        // install-AFTER-spawn reordering bug, since both complete before
+        // the reply — this makes the child's own exec-time observation
+        // the assertion.
+        let marker = tmp.path().join("bundle-state-at-exec");
+        let cacerts = Arc::new(crate::cacerts::CaCertInstaller::new(paths.clone()));
+        let resp = round_trip_with_cacerts(
+            WireRequest::SpawnHarness(crate::proto::SpawnHarnessRequest {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "test -f {} && echo present > {} || echo absent > {}",
+                        paths.bundle.display(),
+                        marker.display(),
+                        marker.display()
+                    ),
+                ],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: Some(
+                    "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----".into(),
+                ),
+            }),
+            cacerts,
+        )
+        .await;
+        match resp {
+            WireResponse::HarnessSpawned { pid, ca_changed } => {
+                assert!(pid.is_some(), "non-empty argv must spawn a child");
+                assert_eq!(
+                    ca_changed,
+                    Some(true),
+                    "first install on a fresh installer must report changed"
+                );
+            }
+            other => panic!("expected HarnessSpawned, got {other:?}"),
+        }
+        // The response only pins that spawn() returned, not that the
+        // detached child finished execing — poll for its marker.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let state = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(
+            state.trim(),
+            "present",
+            "CA bundle must already exist when the spawned child execs"
+        );
+        let bundle = std::fs::read_to_string(&paths.bundle).unwrap();
+        assert!(bundle.contains("AAAA"));
+        assert!(paths.extra_cert.exists());
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_installs_ca_without_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = temp_cacert_paths(&tmp);
+        let cacerts = Arc::new(crate::cacerts::CaCertInstaller::new(paths.clone()));
+        let resp = round_trip_with_cacerts(
+            WireRequest::SpawnHarness(crate::proto::SpawnHarnessRequest {
+                argv: vec![],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: Some(
+                    "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----".into(),
+                ),
+            }),
+            cacerts,
+        )
+        .await;
+        match resp {
+            WireResponse::HarnessSpawned { pid, ca_changed } => {
+                assert_eq!(pid, None, "empty argv must not spawn");
+                assert_eq!(ca_changed, Some(true));
+            }
+            other => panic!("expected HarnessSpawned, got {other:?}"),
+        }
+        assert!(
+            paths.bundle.exists(),
+            "the dev_vm readiness probe must still deliver the CA (no harness spawn needed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ca_install_failure_blocks_spawn() {
+        // Force the install to fail without permission games: `bundle`'s
+        // parent path component is a plain FILE, so `create_dir_all` can't
+        // create it — portable across CI runners (no root, no chmod 000
+        // on a filesystem that might ignore it).
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"i am a file, not a directory").unwrap();
+        let paths = crate::cacerts::CaCertPaths {
+            bundle: blocker.join("etc/ssl/certs/ca-certificates.crt"),
+            extra_cert: tmp
+                .path()
+                .join("usr/local/share/ca-certificates/engram.crt"),
+        };
+        let cacerts = Arc::new(crate::cacerts::CaCertInstaller::new(paths));
+        // The issue spec required pinning "supervisor never spawned", not
+        // just "the response is an Error" — a regression that spawns the
+        // harness AND still returns Error would pass a message-only
+        // assertion unchanged. Have the argv (which would only ever run
+        // if spawn() were reached) touch a marker, and assert its
+        // absence.
+        let marker = tmp.path().join("spawned.marker");
+        let resp = round_trip_with_cacerts(
+            WireRequest::SpawnHarness(crate::proto::SpawnHarnessRequest {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("touch {}", marker.display()),
+                ],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: Some(
+                    "-----BEGIN CERTIFICATE-----\nCCCC\n-----END CERTIFICATE-----".into(),
+                ),
+            }),
+            cacerts,
+        )
+        .await;
+        match resp {
+            WireResponse::Error { message, .. } => {
+                assert!(
+                    message.contains("install_host_ca"),
+                    "error should name the failing step: {message}"
+                );
+            }
+            other => panic!(
+                "CA install failure must block the spawn with an Error response, got {other:?}"
+            ),
+        }
+        assert!(
+            !marker.exists(),
+            "supervisor must never spawn when CA install fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_pem_resume_is_ca_changed_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = temp_cacert_paths(&tmp);
+        let cacerts = Arc::new(crate::cacerts::CaCertInstaller::new(paths));
+        let pem = "-----BEGIN CERTIFICATE-----\nDDDD\n-----END CERTIFICATE-----".to_string();
+        let req = || {
+            WireRequest::SpawnHarness(crate::proto::SpawnHarnessRequest {
+                argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: Some(pem.clone()),
+            })
+        };
+        let first = round_trip_with_cacerts(req(), cacerts.clone()).await;
+        assert!(
+            matches!(
+                first,
+                WireResponse::HarnessSpawned {
+                    ca_changed: Some(true),
+                    ..
+                }
+            ),
+            "first install must report changed: {first:?}"
+        );
+        let second = round_trip_with_cacerts(req(), cacerts).await;
+        match second {
+            WireResponse::HarnessSpawned { ca_changed, .. } => {
+                assert_eq!(
+                    ca_changed,
+                    Some(false),
+                    "identical PEM on resume must hit the zero-I/O `last_pem` cache"
+                );
+            }
+            other => panic!("expected HarnessSpawned, got {other:?}"),
+        }
+    }
+
+    // ---- #567 version-skew NAK ------------------------------------
+
+    /// A guest's agentd is baked into its image at build time, so a live
+    /// fleet routinely runs older agentd binaries than the host speaks.
+    /// Prod session 8174b7aa hit this: the guest's agentd predated
+    /// `WireRequest::StartBrowser`, so the request's variant index
+    /// decoded as unknown, `read_msg` failed, and `serve_connection`
+    /// returned `Err` having written zero bytes -- indistinguishable
+    /// from agentd crashing mid-call. The host only ever saw
+    /// `start_browser: recv: early eof`. This test pins that an
+    /// undecodable-but-well-framed request instead gets a typed
+    /// `WireResponse::Error` naming the skew, before the connection
+    /// drops.
+    #[tokio::test]
+    async fn unknown_request_gets_typed_error_not_eof() {
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            serve_connection(
+                server,
+                None,
+                HarnessSupervisor::new(),
+                Arc::new(crate::cacerts::CaCertInstaller::for_tests()),
+            )
+            .await
+        });
+
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+
+        // Hand-craft a frame whose body is a well-formed length prefix
+        // over a bincode enum-variant tag that's out of range for
+        // `WireRequest`. `bincode::serialize`/`deserialize` (the free
+        // functions `read_msg`/`write_msg` use) default to *fixint*
+        // encoding for the free-function API (see
+        // `bincode::config` module docs — the `DefaultOptions` struct
+        // and the top-level functions disagree on this), so a variant
+        // tag is a fixed 4-byte little-endian `u32`. `WireRequest` has
+        // well under 9999 variants, so this frame is exactly what an
+        // agentd that predates a new variant (or one running a newer
+        // protocol than we understand) sees on the wire.
+        let bad_variant: u32 = 9999;
+        let body = bad_variant.to_le_bytes();
+        let len_prefix = (body.len() as u32).to_be_bytes();
+        client_writer.write_all(&len_prefix).await.unwrap();
+        client_writer.write_all(&body).await.unwrap();
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_msg::<_, WireResponse>(&mut client_reader),
+        )
+        .await
+        .expect(
+            "agentd must reply with a typed error instead of silently \
+             dropping the connection (#567 version-skew incident)",
+        )
+        .expect("reply must decode as a WireResponse frame");
+
+        match resp {
+            WireResponse::Error { message, .. } => {
+                assert!(
+                    message.contains(env!("CARGO_PKG_VERSION")),
+                    "message should name agentd's version: {message}"
+                );
+                assert!(
+                    message.to_lowercase().contains("skew"),
+                    "message should name host/guest version skew: {message}"
+                );
+                assert!(
+                    message.contains("RefreshImage"),
+                    "message should name the remedy: {message}"
+                );
+            }
+            other => panic!("expected WireResponse::Error, got {other:?}"),
+        }
+
+        let err = server_task.await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Guard rail for the fix above: an ordinary peer disconnect (host
+    /// crash, connection reset, or simply closing without sending a
+    /// request) must NOT get a NAK written back — there's no
+    /// undecodable frame, just an absent one, and the stream may
+    /// already be gone.
+    #[tokio::test]
+    async fn clean_disconnect_gets_no_reply() {
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            serve_connection(
+                server,
+                None,
+                HarnessSupervisor::new(),
+                Arc::new(crate::cacerts::CaCertInstaller::for_tests()),
+            )
+            .await
+        });
+
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        // Shut down the write half without sending anything -- an
+        // ordinary disconnect. (A bare `drop` doesn't work here: the
+        // split halves share the underlying `DuplexStream` by
+        // reference, so the write direction only actually closes via
+        // an explicit `shutdown()`, not by dropping one handle while
+        // the other's still alive.)
+        client_writer.shutdown().await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("serve_connection must return promptly on a clean disconnect")
+            .unwrap();
+        // Either Ok or Err is acceptable here -- the only thing this
+        // test pins is that no reply is written (below).
+        let _ = result;
+
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), client_reader.read(&mut buf))
+            .await
+            .expect("reading the (absent) reply must not hang")
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "agentd must not write any bytes on a clean disconnect"
+        );
     }
 }

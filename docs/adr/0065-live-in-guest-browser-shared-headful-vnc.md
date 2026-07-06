@@ -232,6 +232,30 @@ redirects its own output, so there is no inherited pipe for agentd to drain, and
 agentd" contract is simply the pidfile (no in-guest control verb). A `DEFAULT_VNC_PORT = 5900`
 constant sits beside `DEFAULT_TTYD_PORT`; the pidfile path is `ENGRAM_BROWSER_PIDFILE`-overridable.
 
+**Amendment (issue #567) — the restored-wedge case: readiness must be two-sided, and detection must
+trigger repair.** A VM snapshot/restore can resurrect x11vnc in a state where its listen socket
+still *accepts* but it never sends the RFB ProtocolVersion banner — exactly the "accepts yet serves
+zero bytes" wedge the banner probe exists to catch. As originally built the wedge was *detected* but
+never *repaired*: agentd's banner probe failed, but the launcher `--ensure` it then shelled out to
+guarded on a **bare TCP connect** (`stack_up()`), which the wedged listener passes — so `--ensure`
+concluded "already up", no-op'd, and `start_browser` timed out against the same wedge on every
+retry (the Browser tab stayed dead until the VM was recreated). The fix is two-sided, one side per
+audience:
+
+- **agentd (`start_browser`):** when the initial probe fails, **force-stop the recorded pgid** (the
+  `stop_browser` reap, factored into a lock-held `stop_browser_locked` — `start_browser` already
+  holds the start lock and the mutex is not reentrant) *before* running `--ensure`, so a
+  wedged-but-accepting stack is actually replaced instead of no-op'd. Best-effort: a cold start (no
+  pidfile) is a no-op, and a failed reap still falls through to `--ensure`.
+- **launcher (`stack_up()`):** gate on the **RFB banner** (buffer to ≥ 12 bytes, first four must be
+  `RFB `, one overall 2 s deadline mirroring agentd's `RFB_BANNER_TIMEOUT`) instead of a bare
+  connect, so the agent's `playwright-cli` path — which calls `engram-browser --ensure` directly and
+  never passes through agentd's probe — detects the wedge too.
+
+Deploy split: the launcher half ships by **republishing the bundle** (no rebake); the agentd half
+rides an **agentd/image rebake**. Periodic checkpoints deliberately do *not* stop a live browser;
+recovery-on-wedge is the chosen posture (the checkpoint-path gap is tracked separately).
+
 ### 3. The tunnel — generalize the relay to carry any guest stream (Approach A)
 
 The relay is generalized at **both** seams so the byte-stream it carries is parameterized by a
@@ -470,8 +494,22 @@ the commit chain at the end. Stacked phases (one PR each, worktree per phase):
   `playwright-cli` (`cdpEndpoint`→`:9222`, **no** headless-shell) + `show-your-work`. Add the
   two-audience lazy lifecycle — `engram-browser --ensure` (flock + detached + pidfile) called by both
   the human `StartBrowser` path and the agent's `playwright-cli` wrapper — and **reap-by-pidfile** at
-  teardown. Readiness stays the RFB banner: the earlier `/json/version` CDP gate was dropped (DevTools
-  lags x11vnc on FC and made the spawn flaky; the agent's `connectOverCDP` retries CDP itself). *Dev-vm
+  teardown. Readiness of the shared launcher (`--ensure`) stays the RFB banner: gating it on
+  `/json/version` made the human/VNC spawn flaky (DevTools lags x11vnc on FC and the human path needs
+  no CDP). **Post-P1 pitfall (fixed):** the P1 assumption that "the agent's `connectOverCDP` retries CDP
+  itself" was *wrong* for `@playwright/cli@0.1.13` — its one-shot `GET /json/version` fails fast on
+  `ECONNREFUSED` with no retry. Because chromium binds `:9222` a beat *after* x11vnc binds `:5900` (the
+  launcher starts chrome, then `exec`s x11vnc *\[amended — ADR 0067 / issue #569: the launcher no
+  longer `exec`s x11vnc; Xvfb and x11vnc each run under supervisor subshells and the main shell stays
+  alive to tear the group down when either dies\]*), `--ensure` returns "ready" while CDP is still coming up,
+  and the agent's very first `playwright-cli` invocation dies with `connect ECONNREFUSED 127.0.0.1:9222`
+  (prod session `0f0eed74`; a retry a beat later succeeds — this is the chromium-liveness gap §1 warns
+  of, on the CDP side). Fix: the CDP wait lives **only in the agent path** — the `playwright-cli` wrapper
+  calls a new `engram-browser --wait-cdp` (bounded ~20s poll of `/json/version`) between `--ensure` and
+  the CLI hand-off, so `--ensure`/`StartBrowser` stay RFB-only. *\[Amended — ADR 0067 / issue #569:
+  StartBrowser's readiness still gates on RFB only, but agentd now also probes CDP as a non-fatal
+  liveness check (1s fast-path on an already-up stack, carried as `BrowserReady.cdp_warning`; async
+  20s watch on a fresh spawn) so a dead chrome behind a healthy x11vnc is at least diagnosed.\]* *Dev-vm
   acceptance gate:* a `playwright-cli open` lands in the *same* window the human sees over VNC (Chrome
   default context, not a fresh Playwright context), and the stack reaps at idle. Folds in **P4**
   (capability) — there is no longer a separate `playwright` skill to gate.

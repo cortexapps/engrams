@@ -246,8 +246,11 @@ impl HostClient for LocalHostClient {
         self.sandbox.notify_session_policy(policy).await
     }
 
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
-        self.sandbox.guest_ip(id).await
+    async fn guest_ip(&self, id: SandboxId) -> Option<std::net::Ipv4Addr> {
+        self.sandbox
+            .guest_endpoints(id)
+            .await
+            .map(|ep| ep.egress_identity)
     }
 
     async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
@@ -348,11 +351,10 @@ impl HostClient for LocalHostClient {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<engram_core::types::shell::ShellTunnel, SandboxError> {
-        // ADR 0014 issue #6: dial ttyd in the right netns and bridge
-        // WS frames through a ShellTunnel pair. The host's own
-        // SandboxBackend knows whether this sandbox is warm-restored
-        // (`netns_name_for == Some`) or cold (`None`); the proxy_shell
-        // module handles both cases.
+        // ADR 0014 issue #6 + ADR 0066: bridge WS frames through a
+        // ShellTunnel pair, reaching ttyd via the vsock relay when the
+        // backend has one (FC; VZ after Phase 2) or a direct dial_ip
+        // dial otherwise (Process; VZ pre-Phase-2) — see below.
         //
         // start_shell() asks the in-VM agentd to ensure ttyd is up
         // and accepting on its port before we attempt the dial. The
@@ -367,8 +369,8 @@ impl HostClient for LocalHostClient {
         // Phase 2 real-vsock migration) — the ttyd WebSocket handshake + frames
         // ride the relay stream to the guest's `127.0.0.1:port`. Backends without
         // a vsock relay (Process; VZ pre-Phase-2) return `None` and fall back to
-        // a direct `guest_ip` WebSocket dial. Only FC ever had a per-VM netns,
-        // and FC now always takes the relay, so the direct path is netns-free.
+        // a direct dial_ip WebSocket dial. Only FC ever had a per-VM netns, and
+        // FC now always takes the relay, so the direct path is netns-free.
         match self
             .sandbox
             .open_guest_stream(sandbox_id, engram_harness_proto::PROXY_PORT_VSOCK_PORT)
@@ -378,14 +380,15 @@ impl HostClient for LocalHostClient {
                 crate::proxy_shell::open_shell_tunnel_via_relay(stream, port, ends).await?
             }
             None => {
-                let guest_ip = self
+                let dial_ip = self
                     .sandbox
-                    .vm_internal_ip(sandbox_id)
+                    .guest_endpoints(sandbox_id)
                     .await
+                    .map(|ep| ep.dial_ip)
                     .ok_or_else(|| {
-                        SandboxError::Vm("proxy_shell: vm_internal_ip unavailable".into())
+                        SandboxError::Vm("proxy_shell: guest_endpoints unavailable".into())
                     })?;
-                crate::proxy_shell::open_shell_tunnel_at(guest_ip, port, ends).await?;
+                crate::proxy_shell::open_shell_tunnel_at(dial_ip.to_string(), port, ends).await?;
             }
         }
         Ok(tunnel)
@@ -400,7 +403,7 @@ impl HostClient for LocalHostClient {
         // ADR 0066: FC (and, after its Phase 2 migration, VZ) reach the dev
         // server through the in-guest agentd relay, which dials the guest's own
         // `127.0.0.1` — reaching loopback-bound dev servers (Vite, the Tilt UI,
-        // `next dev`) that the old `guest_ip` dial can't. Backends with no vsock
+        // `next dev`) that a direct dial_ip dial can't. Backends with no vsock
         // relay (Process; VZ until Phase 2) return `None` from
         // `open_guest_stream`, and we dial the guest's reachable IP directly:
         // Process => `127.0.0.1` (agentd is a host subprocess); VZ => the in-VM
@@ -413,22 +416,27 @@ impl HostClient for LocalHostClient {
         {
             Some(stream) => crate::proxy_port::open_vsock_tunnel_at(stream, port, ends).await?,
             None => {
-                let guest_ip = self
+                let dial_ip = self
                     .sandbox
-                    .vm_internal_ip(sandbox_id)
+                    .guest_endpoints(sandbox_id)
                     .await
+                    .map(|ep| ep.dial_ip)
                     .ok_or_else(|| {
-                        SandboxError::Vm("proxy_port: vm_internal_ip unavailable".into())
+                        SandboxError::Vm("proxy_port: guest_endpoints unavailable".into())
                     })?;
-                crate::proxy_port::open_tcp_tunnel_at(guest_ip, port, ends).await?;
+                crate::proxy_port::open_tcp_tunnel_at(dial_ip.to_string(), port, ends).await?;
             }
         }
         Ok(tunnel)
     }
 
-    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+    async fn start_browser(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         // ADR 0065: bring up the in-guest browser stack (Xvfb + x11vnc +
-        // headful chromium with the CDP debug port) and return the VNC port.
+        // headful chromium with the CDP debug port) and return the VNC port
+        // (+ agentd's optional chromium-CDP liveness warning, issue #569).
         // The orchestrator reaches x11vnc :5900 (and CDP :9222) over the
         // ADR-0066 vsock port relay — the guest binds loopback, agentd dials it.
         self.sandbox.start_browser(sandbox_id).await

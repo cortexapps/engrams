@@ -123,7 +123,7 @@ pub fn disk_pressure_check(work_dir: &std::path::Path, floor_bytes: u64) -> (boo
 /// env with an instant rollback.
 ///
 /// When ON, a *soft*-idle sandbox is only nominated for eviction while the
-/// host is under real memory pressure (see [`mem_pressure_check`]); *hard*-
+/// host is under real memory pressure (see [`mem_pressure_from`]); *hard*-
 /// idle sandboxes and the coord's own hard-TTL backstop are unaffected.
 /// The rationale: eviction snapshots + destroys a warm VM to reclaim
 /// **RAM**, and on a host with abundant free memory that just trades an
@@ -156,22 +156,20 @@ pub fn mem_floor_pct_from_env() -> u8 {
 /// Is the host under memory pressure? Eviction frees **RAM** (the disk
 /// floor above is an orthogonal *brake*, not this signal), so soft-idle
 /// reclamation should only fire when free RAM has dropped below the floor.
-/// Reads `MemTotal`/`MemAvailable` via [`crate::util::mem_mib`] (in-proc
-/// `/proc/meminfo`, no PG round-trip). Returns `(under_pressure, free_pct)`.
+/// Returns `(under_pressure, free_pct)`.
 ///
-/// **Fails OPEN toward eviction**: if `MemTotal` reads as 0 (non-Linux, or
-/// a `/proc/meminfo` parse failure) we report `(true, None)` so a read
-/// error degrades pressure-aware mode back to today's TTL-only behavior
-/// rather than silently pinning soft-idle sessions resident forever —
-/// mirroring [`disk_pressure_check`]'s fail-open stance.
-pub fn mem_pressure_check(floor_pct: u8) -> (bool, Option<f32>) {
-    let (total_mib, used_mib) = crate::util::mem_mib();
-    mem_pressure_from(total_mib, used_mib, floor_pct)
-}
-
-/// Pure core of [`mem_pressure_check`], split out so the policy is unit-
-/// testable without a live `/proc/meminfo` (which differs by host and is
-/// `(0, 0)` on non-Linux). `total_mib == 0` (unreadable) fails open.
+/// **Fails OPEN toward eviction**: if `total_mib` reads as 0 (non-Linux, an
+/// unmeasured `RamLedgerSnapshot`, or a `/proc/meminfo` parse failure) we
+/// report `(true, None)` so a read error degrades pressure-aware mode back
+/// to today's TTL-only behavior rather than silently pinning soft-idle
+/// sessions resident forever — mirroring [`disk_pressure_check`]'s
+/// fail-open stance.
+///
+/// Issue #540: the caller feeds this the heartbeat tick's
+/// `RamLedgerSnapshot` (via a `watch` channel) instead of this module
+/// taking its own private `/proc/meminfo` sample — one source of truth for
+/// both the heartbeat's `allocatable_mib` and this gate's `free_pct`. Pure
+/// core, unit-testable without a live `/proc/meminfo`.
 pub(crate) fn mem_pressure_from(
     total_mib: u64,
     used_mib: u64,

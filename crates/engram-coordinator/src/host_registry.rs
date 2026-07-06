@@ -693,7 +693,7 @@ impl HostClient for HostRegistry {
         Ok(all)
     }
 
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+    async fn guest_ip(&self, id: SandboxId) -> Option<std::net::Ipv4Addr> {
         let (_, backend) = self.resolve_owner(id).await.ok()?;
         backend.guest_ip(id).await
     }
@@ -782,7 +782,10 @@ impl HostClient for HostRegistry {
         backend.acquire_shell(sandbox_id).await
     }
 
-    async fn start_browser(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+    async fn start_browser(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.start_browser(sandbox_id).await
     }

@@ -392,8 +392,7 @@ pub(crate) async fn build_resume_egress_policy(
     sandbox_id: engram_core::SandboxId,
     image: &str,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
-    let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
-    let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
+    let guest_ip = state.services.host.guest_ip(sandbox_id).await?;
     // ADR 0057: re-read the persisted session policy once → network + secrets +
     // injects (resolved host-side) + observes (pure), so a resumed session
     // re-derives its whole egress policy on the new host (same as create).
@@ -1324,8 +1323,8 @@ pub(crate) async fn delete_session_core(
     // Drive the session to its FSM-legal terminal BEFORE destroying the
     // sandbox. `terminate_session` reads the current state and picks the
     // terminal `SessionState::terminal_target` permits — `Completed` for
-    // states that ran, `Failed` for the early states (Pending / Created /
-    // GuestReady) that never became usable (this is what fixes the
+    // states that ran, `Failed` for the early states (Pending / Created)
+    // that never became usable (this is what fixes the
     // `5fadd364` phantom: deleting a `Created` session used to drive an
     // illegal Created→Completed that surfaced as Conflict, destroying the
     // sandbox but leaving the row non-terminal). Terminating first also

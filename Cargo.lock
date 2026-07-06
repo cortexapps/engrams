@@ -998,6 +998,7 @@ dependencies = [
 name = "engram-agentd"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bincode",
  "clock-steering",
  "engram-core",
@@ -1133,9 +1134,7 @@ dependencies = [
  "engram-oci-auth",
  "engram-postgres",
  "engram-protocol",
- "engram-sandbox-firecracker",
  "engram-sandbox-process",
- "engram-sandbox-vz",
  "engram-secrets-dev",
  "engram-secrets-gcp",
  "engram-storage-gcs",
@@ -6500,6 +6499,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
+ "hashbrown 0.15.5",
  "hyper",
  "hyper-rustls",
  "hyper-util",

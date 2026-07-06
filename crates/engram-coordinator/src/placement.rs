@@ -638,6 +638,34 @@ mod tests {
     }
 
     #[test]
+    fn parked_resident_on_one_host_never_gets_placed_on() {
+        // Issue #540: both hosts have 32,000 MiB physical RAM and zero
+        // reservations, but h1 "parks" a 12,288 MiB (12 GiB) resident VM
+        // (epic-parking-ladder rungs 2-3) while h2 has nothing resident.
+        // The ledger's `allocatable_mib` NEVER adds parked PSS back in
+        // (`RamLedgerSnapshot::allocatable_mib`, engram-host-agent), so
+        // by the time placement sees these two hosts, h1's allocatable
+        // is already 12,288 MiB lower than h2's — exactly as if that RAM
+        // were simply unavailable. Placement (which only ever sees the
+        // final `allocatable_mib`, never ledger internals) must route a
+        // session that needs more than h1's remaining headroom to h2,
+        // never double-counting the parked VM's bytes as free on h1.
+        let mut h1 = host(1);
+        h1.utilization.allocatable_mib = 32_000 - 12_288; // parked VM already excluded
+        let mut h2 = host(2);
+        h2.utilization.allocatable_mib = 32_000; // nothing resident
+        let mut c = ctx();
+        c.memory_mib = Some(24_000); // fits h2 only; h1 has 19,712 free
+        let pick = pick_from(&[h1, h2], &HashMap::new(), &c, Utc::now(), TTL).unwrap();
+        assert_eq!(
+            pick,
+            hid(2),
+            "a session too big for h1's parked-excluded headroom must land on h2, \
+             not get double-counted onto the parking host",
+        );
+    }
+
+    #[test]
     fn cpu_budget_excludes_a_host_with_no_free_vcpu() {
         // h1 is the tighter RAM fit but its CPU budget is exhausted; a
         // 2-vCPU session must land on h2.
