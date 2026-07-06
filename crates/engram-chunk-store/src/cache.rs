@@ -10,13 +10,13 @@
 //! - **Atomic writes**: bytes land in a *writer-unique* temp file
 //!   alongside the target path, then rename into place. Crashes
 //!   mid-write don't leave the cache pointing at half-written chunks.
-//!   The temp name carries pid + a process-global counter so two
-//!   processes sharing one cache_root — the in-process restore
-//!   prefetch and the out-of-process `engram-uffd-handler`, which
-//!   fault the same memory chunks concurrently — never collide on a
-//!   fixed temp path and lose the rename with `ENOENT` (the chunks
-//!   end up uncached, so every read falls through to GCS — a prod
-//!   cold-recovery resume spent ~92 s page-faulting from GCS this way).
+//!   The temp name carries pid + a process-global counter for
+//!   IN-process concurrency: many tokio tasks (restore prefetch,
+//!   populate-server connections, disk-daemon flushes) populate
+//!   concurrently inside the ONE writer process. (ADR 0075 made this
+//!   single-writer; the pid component is vestigial-but-harmless
+//!   belt-and-braces from the multi-writer era, whose fixed-temp
+//!   collision once cost a prod resume ~92 s of GCS page-faulting.)
 //! - **Eviction (FIFO by populate time)**: when the cache filesystem is
 //!   fuller than the free-space floor (default: keep ~20% free) — or,
 //!   when total cached bytes exceed the absolute ceiling (disk-derived
@@ -591,8 +591,9 @@ impl ChunkCache {
     }
 
     fn path_for(&self, hash: ChunkHash) -> PathBuf {
-        let hex = hash.to_hex();
-        self.inner.config.root.join(&hex[..2]).join(&hex[2..])
+        // ONE layout definition, shared with the read-only view
+        // (ADR 0075) — writer and reader can never disagree.
+        crate::reader::chunk_path(&self.inner.config.root, hash)
     }
 
     /// Does this chunk's content-addressed file exist on local NVMe right now?
@@ -603,11 +604,46 @@ impl ChunkCache {
         self.path_for(hash).try_exists().unwrap_or(false)
     }
 
+    /// ADR 0075: the on-disk path for a resident chunk. Public so the
+    /// substrate populate server can open + fd-pass a chunk it just
+    /// populated; the layout is the shared `reader::chunk_path`, so
+    /// this can never diverge from what a `ChunkCacheReader` sees.
+    pub fn on_disk_path(&self, hash: ChunkHash) -> PathBuf {
+        self.path_for(hash)
+    }
+
+    /// ADR 0075 `HelloAck.cache_writable` probe: create + remove a
+    /// probe file under the root. Live evidence, not a config echo.
+    pub fn root_writable_probe(&self) -> bool {
+        let probe = self
+            .inner
+            .config
+            .root
+            .join(format!(".writable-probe.{}", std::process::id()));
+        match std::fs::write(&probe, b"probe") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Test-only: drop a chunk's on-disk cache file, simulating an LRU
     /// eviction (or a silently-failed `write_local`) so callers can exercise
     /// the "pinned-but-not-resident" recovery paths without driving real
     /// disk pressure. Not part of the runtime surface.
     #[doc(hidden)]
+    /// Test-only: run one budget sweep synchronously. Production
+    /// sweeps ride `spawn_sweeper` + the write-path debounce; tests
+    /// (ADR 0075 pin-integrity-under-pressure) need a deterministic
+    /// trigger.
+    pub async fn sweep_for_test(&self) {
+        if let Err(e) = self.evict_to_budget().await {
+            panic!("test sweep failed: {e}");
+        }
+    }
+
     pub fn evict_on_disk_for_test(&self, hash: ChunkHash) {
         let _ = std::fs::remove_file(self.path_for(hash));
     }

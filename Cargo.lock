@@ -1341,7 +1341,9 @@ dependencies = [
  "engram-secrets-gcp",
  "engram-storage-gcs",
  "engram-storage-local",
+ "engram-substrate-proto",
  "engram-telemetry",
+ "engram-uffd-handler",
  "filetime",
  "futures",
  "futures-util",
@@ -1714,6 +1716,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-substrate-proto"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "engram-core",
+ "nix 0.31.2",
+ "serde",
+ "tempfile",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-telemetry"
 version = "0.1.0"
 dependencies = [
@@ -1747,6 +1761,7 @@ dependencies = [
  "engram-migrate-proto",
  "engram-storage-gcs",
  "engram-storage-local",
+ "engram-substrate-proto",
  "engram-telemetry",
  "libc",
  "sendfd",

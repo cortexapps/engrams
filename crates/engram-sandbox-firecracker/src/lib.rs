@@ -362,6 +362,12 @@ pub struct FirecrackerConfig {
     /// cache so residency prefetch warms what the handler reads —
     /// ADR 0021 P2) when the backend is built via `FirecrackerBackend::new`.
     pub uffd_cache_root: Option<PathBuf>,
+    /// ADR 0075: the substrate populate socket handed to the handler
+    /// as `--substrate-sock` — the single-writer host-agent's UDS.
+    /// `None` (tests, image-builder profile pass) leaves the handler
+    /// on its direct-blob fallback. Constructors derive
+    /// `<work_dir>/substrate.sock` alongside `uffd_cache_root`.
+    pub uffd_substrate_sock: Option<PathBuf>,
     /// ADR 0014 M1.14: bake-side override for the UFFD handler's
     /// blob root. The bake's chunk store lives at
     /// `<images_dir>/store/` rather than the runtime convention
@@ -579,6 +585,7 @@ impl FirecrackerConfig {
             track_dirty_pages: false,
             host_id: None,
             uffd_cache_root: None,
+            uffd_substrate_sock: None,
             uffd_blob_root: None,
             // Host-passthrough by default. Prod (`engram-coordinator`)
             // and the bake (`engram-image-builder`) both opt in to a
@@ -861,6 +868,9 @@ impl FirecrackerBackend {
         let mut config = config;
         if config.uffd_cache_root.is_none() {
             config.uffd_cache_root = Some(work_dir.join("chunk-cache"));
+            // ADR 0075: same-work_dir default as the host-agent's
+            // substrate.sock bind.
+            config.uffd_substrate_sock = Some(work_dir.join("substrate.sock"));
         }
         Self {
             work_dir,
@@ -1782,6 +1792,13 @@ impl FirecrackerBackend {
         // default is `/var/cache/engram/chunks`, root-only).
         if let Some(cache_root) = self.config.uffd_cache_root.as_ref() {
             cmd.arg("--cache-root").arg(cache_root);
+        }
+        // ADR 0075: point the handler at the single writer's populate
+        // socket. Misses populate through the host-agent's cache (one
+        // singleflight / pin set / budget per host); the handler keeps
+        // a direct-blob fallback for writer-unreachable windows.
+        if let Some(sock) = self.config.uffd_substrate_sock.as_ref() {
+            cmd.arg("--substrate-sock").arg(sock);
         }
         // ADR 0045 substrate (v2b): the handler creates + sizes the base
         // shm file (it knows total_bytes from the canonical manifest)
@@ -5725,6 +5742,7 @@ mod tests {
             egress_dns_port: None,
             host_id: None,
             uffd_cache_root: None,
+            uffd_substrate_sock: None,
             uffd_blob_root: None,
             cpu_template: None,
             bundle_dir: dir.path().join("bundles"),

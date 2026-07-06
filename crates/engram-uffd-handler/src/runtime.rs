@@ -1967,7 +1967,7 @@ pub fn run_listener(
 mod tests {
     use super::*;
     use crate::chunked::ChunkedMemoryBackend;
-    use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
+    use engram_chunk_store::cache::ChunkCacheConfig;
     use engram_chunk_store::manifest::{
         ChunkRef, ChunkSize, ManifestKind, MANIFEST_SCHEMA_VERSION,
     };
@@ -2125,7 +2125,14 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
         let backend = Arc::new(
-            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+            ChunkedMemoryBackend::new(
+                &manifest,
+                &manifest,
+                engram_chunk_store::reader::ChunkCacheReader::new(cfg.root.clone()),
+                None,
+                store,
+            )
+            .unwrap(),
         );
 
         // mmap a private region and create + register an (unprivileged,
@@ -2276,7 +2283,14 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
         let backend = Arc::new(
-            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+            ChunkedMemoryBackend::new(
+                &manifest,
+                &manifest,
+                engram_chunk_store::reader::ChunkCacheReader::new(cfg.root.clone()),
+                None,
+                store,
+            )
+            .unwrap(),
         );
 
         // Fake source: seals chunks {1, 3, 5}; chunk 1 = peer bytes,
@@ -2502,7 +2516,14 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
         let backend = Arc::new(
-            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+            ChunkedMemoryBackend::new(
+                &manifest,
+                &manifest,
+                engram_chunk_store::reader::ChunkCacheReader::new(cfg.root.clone()),
+                None,
+                store,
+            )
+            .unwrap(),
         );
 
         // Fake source seals chunk 2 and fails its FIRST NeedAt with a
@@ -2696,7 +2717,14 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
         let backend = Arc::new(
-            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+            ChunkedMemoryBackend::new(
+                &manifest,
+                &manifest,
+                engram_chunk_store::reader::ChunkCacheReader::new(cfg.root.clone()),
+                None,
+                store,
+            )
+            .unwrap(),
         );
 
         // Source: completes the handshake (so `connect` succeeds), then we
@@ -2924,7 +2952,14 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
         let backend = Arc::new(
-            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+            ChunkedMemoryBackend::new(
+                &manifest,
+                &manifest,
+                engram_chunk_store::reader::ChunkCacheReader::new(cfg.root.clone()),
+                None,
+                store,
+            )
+            .unwrap(),
         );
 
         // Two SEPARATE mmaps → naturally non-contiguous VAs (the gap),
@@ -3106,7 +3141,14 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
         let backend = Arc::new(
-            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+            ChunkedMemoryBackend::new(
+                &manifest,
+                &manifest,
+                engram_chunk_store::reader::ChunkCacheReader::new(cfg.root.clone()),
+                None,
+                store,
+            )
+            .unwrap(),
         );
 
         let len = total as usize;
@@ -3324,7 +3366,14 @@ mod tests {
         // faults, simulating the transient store error clearing.
         let store_handle = store.clone();
         let backend = Arc::new(
-            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+            ChunkedMemoryBackend::new(
+                &manifest,
+                &manifest,
+                engram_chunk_store::reader::ChunkCacheReader::new(cfg.root.clone()),
+                None,
+                store,
+            )
+            .unwrap(),
         );
 
         let len = total as usize;

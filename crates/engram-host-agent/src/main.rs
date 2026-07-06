@@ -358,14 +358,18 @@ async fn main() -> Result<(), HostAgentError> {
             // to the chunk-native UFFD handler (lazy memory, no memory.bin
             // materialize). Defaults to File.
             fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
-            // Point the UFFD handler at the SAME chunk cache the
-            // PooledBackend's restore-prefetch warms (`chunk-cache`,
-            // see below) — not the FC backend's separate default — so
-            // the handler's on-fault `cache.get` hits the chunks the
-            // prefetch already pulled local. ChunkCache.get's fast path
-            // is on-disk + hash-verified, so cross-process sharing of
-            // the dir is safe (content-addressed, idempotent writes).
+            // Point the UFFD handler's READ-ONLY view at the SAME
+            // chunk cache the PooledBackend's restore-prefetch warms
+            // (`chunk-cache`, see below). ADR 0075: the handler never
+            // writes here — misses populate through THIS process's
+            // cache via the substrate socket, so one singleflight /
+            // pin set / budget governs the directory. (The old
+            // "cross-process sharing is safe" claim was true for
+            // BYTES, false for POLICY — the multi-writer arrangement
+            // is gone.)
             fc_cfg.uffd_cache_root = Some(cli.work_dir.join("chunk-cache"));
+            // ADR 0075: the substrate populate socket this process binds.
+            fc_cfg.uffd_substrate_sock = Some(cli.work_dir.join("substrate.sock"));
             // Prod bakes `engram-uffd-handler` to /usr/local/bin (on PATH,
             // the default). Dev/test override via ENGRAM_FC_UFFD_HANDLER_BIN.
             if let Ok(p) = std::env::var("ENGRAM_FC_UFFD_HANDLER_BIN") {
@@ -474,6 +478,12 @@ async fn main() -> Result<(), HostAgentError> {
         engram_chunk_store::cache::resolve_sweep_interval_secs(),
     ));
 
+    // ADR 0075: the substrate populate server — the WRITER side of the
+    // single-writer cache discipline. Handlers are read-only clients;
+    // their populate requests run against THIS cache instance, so the
+    // global singleflight / pin set / budget govern handler traffic too.
+    // (Spawned below once the chunk store exists; see substrate_spawn.)
+
     // ADR 0007: chunk store for the PooledBackend wrapper (materialize +
     // base-snapshot residency). `blob` was created above the backend
     // match so the inner VZ backend could share it; reuse it here. Wire the
@@ -483,6 +493,19 @@ async fn main() -> Result<(), HostAgentError> {
     // served locally on the next resume instead of re-fetched from GCS.
     let chunk_store =
         engram_chunk_store::ChunkStore::new(blob).with_chunk_cache(chunk_cache.clone());
+
+    // ADR 0075: spawn the substrate populate server now both halves
+    // exist. The uffd base dir mirrors the FC config default (env
+    // override first) so the tmpfs probe answers for the dir handlers
+    // actually use.
+    let _substrate_server = engram_host_agent::substrate_server::SubstrateServer::new(
+        chunk_cache.clone(),
+        std::sync::Arc::new(chunk_store.clone()),
+        engram_sandbox_firecracker::uffd_base_dir_from_env()
+            .unwrap_or_else(|| std::path::PathBuf::from("/dev/shm/engram")),
+    )
+    .spawn(cli.work_dir.join("substrate.sock"))
+    .map_err(HostAgentError::Io)?;
     let materialize_dir = cli.work_dir.join("chunked-rootfs");
 
     // OCI auth resolver. The standalone host-agent doesn't have

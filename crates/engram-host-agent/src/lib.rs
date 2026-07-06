@@ -37,6 +37,7 @@ pub mod harness;
 pub mod host_client;
 pub mod migrate_peer;
 pub mod migration;
+pub mod substrate_server;
 pub use host_client::LocalHostClient;
 pub mod heartbeat;
 pub mod idle_evictor;

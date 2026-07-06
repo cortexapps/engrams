@@ -42,6 +42,7 @@ pub mod chunked;
 /// one-way `--control-sock` reports). Portable (plain sockets); the
 /// fault-path consumer lives in the Linux-only `runtime`.
 pub mod peer;
+pub mod populate_client;
 pub mod proto;
 pub mod working_set;
 
