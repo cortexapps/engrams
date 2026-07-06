@@ -1443,6 +1443,21 @@ pub(crate) mod tests {
         /// (the SQL signature classification is integration-tested, not
         /// re-derived in the mock).
         pub(crate) desynced: PlMutex<Vec<engram_core::traits::metadata::DesyncedSession>>,
+        /// Issue #531/PR #564 (ADR 0068 persist-before-reconcile
+        /// regression): when true, the NEXT `touch_host_heartbeat` call
+        /// fails instead of persisting — tests use this to prove the
+        /// heartbeat handler's early-return skips `reconcile_host`
+        /// entirely on a persist failure, rather than just happening to
+        /// flip nothing. Reset to false on use.
+        pub(crate) fail_next_heartbeat_persist: PlMutex<bool>,
+        /// Counts `list_active_sandbox_assignments_on_host` calls — the
+        /// entry point `Reconciler::reconcile_with_deps` hits on every
+        /// tick it actually runs. A no-op default `apply_missing_sandbox_strikes`
+        /// (this mock doesn't override it) would make "no flip happened"
+        /// true whether or not reconcile ran at all, so tests assert on
+        /// this call count instead to prove reconcile was actually
+        /// skipped.
+        pub(crate) reconcile_probe_calls: PlMutex<u32>,
     }
 
     /// Alias so `clippy::type_complexity` stays happy on MiniMeta's
@@ -1513,6 +1528,8 @@ pub(crate) mod tests {
                 evict_attempts: PlMutex::new(std::collections::HashMap::new()),
                 teleport_targets: PlMutex::new(std::collections::HashMap::new()),
                 desynced: PlMutex::new(Vec::new()),
+                fail_next_heartbeat_persist: PlMutex::new(false),
+                reconcile_probe_calls: PlMutex::new(0),
             }
         }
     }
@@ -1713,6 +1730,15 @@ pub(crate) mod tests {
             id: HostId,
             hb: engram_core::types::host::HostHeartbeat,
         ) -> Result<(), MetaError> {
+            {
+                let mut fail = self.fail_next_heartbeat_persist.lock();
+                if *fail {
+                    *fail = false;
+                    return Err(MetaError::Conflict(
+                        "MiniMeta fail_next_heartbeat_persist: injected failure".into(),
+                    ));
+                }
+            }
             let mut hosts = self.hosts.lock();
             if let Some(h) = hosts.iter_mut().find(|h| h.id == id) {
                 h.status = hb.status;
@@ -1725,6 +1751,25 @@ pub(crate) mod tests {
                 h.last_heartbeat_at = chrono::Utc::now();
             }
             Ok(())
+        }
+        /// Issue #531: overrides the trait's default (which scans
+        /// `list_active_sessions`) purely to count invocations — this
+        /// is the entry point `Reconciler::reconcile_with_deps` hits on
+        /// every tick it actually runs, so the persist-before-reconcile
+        /// regression test asserts on this counter. Behavior otherwise
+        /// matches the default: this mock only ever tracks one session.
+        async fn list_active_sandbox_assignments_on_host(
+            &self,
+            host_id: HostId,
+        ) -> Result<Vec<(engram_core::SessionId, SandboxId)>, MetaError> {
+            *self.reconcile_probe_calls.lock() += 1;
+            let s = self.session.lock();
+            Ok(match (s.status, s.host_id, s.sandbox_id) {
+                (engram_core::types::SessionState::Active, Some(h), Some(sb)) if h == host_id => {
+                    vec![(s.id, sb)]
+                }
+                _ => Vec::new(),
+            })
         }
         async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
             let mut hosts = self.hosts.lock();

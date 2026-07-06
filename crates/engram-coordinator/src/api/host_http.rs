@@ -1100,7 +1100,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn build_state_for_session(session: Session) -> (SharedState, TempDir) {
+    fn build_state_for_session(session: Session) -> (SharedState, Arc<MiniMeta>, TempDir) {
         let local = TempDir::new().unwrap();
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(local.path().join("sandboxes")));
@@ -1140,7 +1140,7 @@ mod tests {
             ..CoordinatorConfig::default()
         };
         let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
-        (state, local)
+        (state, meta, local)
     }
 
     fn session_with_status(
@@ -1207,6 +1207,65 @@ mod tests {
         );
     }
 
+    /// ADR 0068 / issue #531 regression (PR #564): a heartbeat whose
+    /// `touch_host_heartbeat` persist fails must 5xx AND must never
+    /// reach `reconcile_host` for this tick — "Postgres is the
+    /// authority" means reconcile can only act on a heartbeat that
+    /// actually landed. Proves the EARLY RETURN, not just "no flip
+    /// happened" — this fixture's `apply_missing_sandbox_strikes` never
+    /// flips regardless (the trait's no-op default), so a weaker
+    /// "assert no flip" test would pass even if the persist/reconcile
+    /// order were swapped back. `reconcile_probe_calls` counts entry
+    /// into `list_active_sandbox_assignments_on_host` — the call
+    /// `Reconciler::reconcile_with_deps` makes on every tick it
+    /// actually runs — so it distinguishes "reconcile ran and found
+    /// nothing" from "reconcile never ran".
+    #[tokio::test]
+    async fn heartbeat_persist_failure_skips_reconcile_this_tick() {
+        let host_id = HostId::new();
+        let sandbox_id = SandboxId::new();
+        let session_id = engram_core::SessionId::new();
+        let mut session = session_with_status(session_id, sandbox_id, SessionState::Active);
+        session.host_id = Some(host_id);
+        let (state, meta, _local) = build_state_for_session(session);
+
+        let hb_json = serde_json::json!({
+            "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 1 },
+            "running_sandboxes": [sandbox_id],
+        });
+
+        // Tick 1: force the persist to fail.
+        *meta.fail_next_heartbeat_persist.lock() = true;
+        let hb: HeartbeatRequest =
+            serde_json::from_value(hb_json.clone()).expect("deserialize heartbeat");
+        let result = heartbeat(State(state.clone()), Path(host_id), Json(hb)).await;
+        assert!(
+            result.is_err(),
+            "a heartbeat whose persist fails must 5xx, not silently ack"
+        );
+        assert_eq!(
+            *meta.reconcile_probe_calls.lock(),
+            0,
+            "reconcile must not run this tick — the persist never landed"
+        );
+
+        // Tick 2: persist succeeds, so reconcile DOES run — proves the
+        // zero count above is specifically caused by the persist
+        // failure, not some other reason this fixture never reconciles.
+        let hb2: HeartbeatRequest = serde_json::from_value(hb_json).expect("deserialize heartbeat");
+        let result2 = heartbeat(State(state.clone()), Path(host_id), Json(hb2)).await;
+        assert!(
+            result2.is_ok(),
+            "a heartbeat with a healthy persist must succeed: {:?}",
+            result2.err()
+        );
+        assert_eq!(
+            *meta.reconcile_probe_calls.lock(),
+            1,
+            "reconcile must run once the persist succeeds"
+        );
+    }
+
     /// ADR 0034 happy path: the handler flips Active → Evicting,
     /// emits StatusChanged, and returns — it does NOT run the
     /// pipeline (status is Evicting, not Idle; the sandbox binding
@@ -1215,7 +1274,7 @@ mod tests {
     async fn handler_nominates_active_session_and_returns() {
         let session_id = engram_core::SessionId::new();
         let sandbox_id = SandboxId::new();
-        let (state, _local) = build_state_for_session(session_with_status(
+        let (state, _meta, _local) = build_state_for_session(session_with_status(
             session_id,
             sandbox_id,
             SessionState::Active,
@@ -1262,7 +1321,7 @@ mod tests {
     async fn handler_renomination_of_evicting_is_accepted_noop() {
         let session_id = engram_core::SessionId::new();
         let sandbox_id = SandboxId::new();
-        let (state, _local) = build_state_for_session(session_with_status(
+        let (state, _meta, _local) = build_state_for_session(session_with_status(
             session_id,
             sandbox_id,
             SessionState::Evicting,
@@ -1296,7 +1355,7 @@ mod tests {
     async fn handler_nonactive_candidate_is_accepted_noop() {
         let session_id = engram_core::SessionId::new();
         let sandbox_id = SandboxId::new();
-        let (state, _local) = build_state_for_session(session_with_status(
+        let (state, _meta, _local) = build_state_for_session(session_with_status(
             session_id,
             sandbox_id,
             SessionState::Completed,
@@ -1320,7 +1379,7 @@ mod tests {
     async fn handler_unknown_session_counts_failed() {
         let session_id = engram_core::SessionId::new();
         let sandbox_id = SandboxId::new();
-        let (state, _local) = build_state_for_session(session_with_status(
+        let (state, _meta, _local) = build_state_for_session(session_with_status(
             engram_core::SessionId::new(), // different id than nominated
             sandbox_id,
             SessionState::Active,
