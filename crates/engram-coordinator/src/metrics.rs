@@ -197,6 +197,10 @@ pub const IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL: &str =
 /// candidates kept resident because the host is not under memory
 /// pressure (pressure-aware mode only).
 pub const IDLE_EVICT_KEPT_RESIDENT_TOTAL: &str = "engram_idle_evict_kept_resident_total";
+/// Counter (ADR 0074 rung 1). Nominated evictions cancelled by a
+/// returning user before capture began — each one is a full
+/// snapshot+destroy+rebuild (p50 12.2s) the user did not pay.
+pub const EVICTION_CANCELLED_TOTAL: &str = "engram_eviction_cancelled_total";
 /// Counter (ADR 0073 phase 4). Heartbeats reporting a RUNNING sandbox
 /// for an Active session with NO attached harness — the demoted
 /// belt-and-braces liveness alarm (was the desync watchdog's job).

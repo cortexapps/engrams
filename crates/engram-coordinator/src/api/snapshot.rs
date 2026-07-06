@@ -525,7 +525,17 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
         // then takes the standard resume path, whose session lease +
         // status gate serialize against the eviction (no double-
         // resume, no orphaned sandbox).
-        SessionState::Evicting => ensure_active_after_evicting_hold(state, id).await,
+        SessionState::Evicting => {
+            // ADR 0074 rung 1: try the one-write cancel first — the
+            // nomination window (up to the 10s scanner tick) is exactly
+            // when the VM is untouched and the user most often returns.
+            if try_cancel_nominated_eviction(state, id).await? {
+                return Ok(());
+            }
+            // Capture already owns the session: hold-then-resume,
+            // exactly as before.
+            ensure_active_after_evicting_hold(state, id).await
+        }
         SessionState::Created => Err(ApiError::Conflict(format!(
             "session is {} — agentd is not yet ready. \
              Wait for the session to reach Active (subscribe to /sessions/:id/events) \
@@ -555,6 +565,67 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
             session.status.as_str()
         ))),
     }
+}
+
+/// ADR 0074 rung 1: cancel a NOMINATED eviction — the returning user's
+/// prompt un-nominates instead of waiting for a healthy VM to be
+/// destroyed and rebuilt. Returns `Ok(true)` when the session is Active
+/// again (VM untouched, delivery may proceed immediately).
+///
+/// The session lease is the fence, and it is LOAD-BEARING: the eviction
+/// scanner accepts `Active` as a legal post-lease input (the drain
+/// path), so an unguarded CAS could flip a session Active "under" a
+/// pipeline that then evicts it anyway. `try_acquire` with NO retry —
+/// a held lease means the capture owns the session; the caller falls
+/// back to the hold-then-resume path (`Ok(false)`), which is exactly
+/// the pre-0068 behavior.
+pub(crate) async fn try_cancel_nominated_eviction(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<bool, ApiError> {
+    let guard = match crate::idle_evictor::SessionLeaseGuard::try_acquire(state, id, None).await {
+        Ok(Some(g)) => g,
+        // Lease busy: the eviction pipeline (or a competing resume) owns
+        // the session — not cancellable.
+        Ok(None) => return Ok(false),
+        Err(e) => {
+            tracing::debug!(session_id = %id, error = %e, "cancel-evict lease probe failed");
+            return Ok(false);
+        }
+    };
+    let result = match state
+        .services
+        .meta
+        .transition_session(id, SessionState::Active)
+        .await
+    {
+        Ok(prev) => {
+            let _ = state.services.meta.set_session_park_rung(id, 0, None).await;
+            ::metrics::counter!(crate::metrics::EVICTION_CANCELLED_TOTAL).increment(1);
+            tracing::info!(
+                session_id = %id,
+                "eviction cancelled at rung 1 — the user came back before capture began",
+            );
+            let _ = state
+                .emit(
+                    id,
+                    crate::state::SessionEvent::StatusChanged {
+                        from: prev,
+                        to: SessionState::Active,
+                        at: chrono::Utc::now(),
+                    },
+                )
+                .await;
+            Ok(true)
+        }
+        // Raced out of Evicting between our caller's read and the lease
+        // (e.g. the scanner finished to Idle first) — not an error; the
+        // caller re-dispatches on the fresh status.
+        Err(engram_core::MetaError::Conflict(_)) => Ok(false),
+        Err(e) => Err(ApiError::Internal(format!("cancel evict: {e}"))),
+    };
+    drop(guard);
+    result
 }
 
 /// ADR 0039 follow-up #20: the `Evicting` arm of [`ensure_active`].
@@ -2387,6 +2458,55 @@ mod evicting_gate_tests {
             live_disk_manifest: None,
             selected_skills: Vec::new(),
         }
+    }
+
+    /// ADR 0074 rung 1: a nominated (lease-free) eviction is cancelled
+    /// by one CAS — `ensure_active` returns Ok with the session back at
+    /// Active and NO resume machinery invoked (the VM was untouched).
+    #[tokio::test]
+    async fn ensure_active_cancels_a_nominated_eviction_inline() {
+        let id = SessionId::new();
+        let (state, mini, _local) =
+            crate::state::tests::build_state_for_session(evicting_session(id));
+
+        ensure_active(&state, id).await.expect("cancel path");
+
+        assert_eq!(
+            mini.session.lock().status,
+            SessionState::Active,
+            "rung-1 cancel must land the session back at Active",
+        );
+        let events = mini.events.lock();
+        assert!(
+            events.iter().any(|e| e.kind == "status_changed"),
+            "the cancel must emit StatusChanged(Evicting -> Active)",
+        );
+    }
+
+    /// The lease fence: with the session lease HELD (the capture
+    /// pipeline owns the session), the cancel must NOT fire — the
+    /// Evicting arm falls back to the hold loop, which (with a zero
+    /// hold) surfaces the pre-0068 retryable Conflict.
+    #[tokio::test]
+    async fn cancel_is_fenced_out_while_the_lease_is_held() {
+        let id = SessionId::new();
+        let (state, mini, _local) =
+            crate::state::tests::build_state_for_session(evicting_session(id));
+        // Hold the lease as the eviction pipeline would.
+        let _guard = crate::idle_evictor::SessionLeaseGuard::try_acquire(&state, id, None)
+            .await
+            .expect("lease probe")
+            .expect("lease acquired");
+
+        let cancelled = try_cancel_nominated_eviction(&state, id)
+            .await
+            .expect("cancel probe");
+        assert!(!cancelled, "a held lease must fence the cancel out");
+        assert_eq!(
+            mini.session.lock().status,
+            SessionState::Evicting,
+            "the session must stay Evicting under the pipeline's lease",
+        );
     }
 
     fn evacuating_session(id: SessionId) -> Session {

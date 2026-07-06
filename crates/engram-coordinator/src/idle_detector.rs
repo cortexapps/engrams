@@ -251,6 +251,17 @@ async fn nominate(
         .await
     {
         Ok(prev) => {
+            // ADR 0074 rung 1: the nomination is rung 1 — VM untouched,
+            // cancellable by one lease-guarded CAS until the capture
+            // pipeline claims the session.
+            if let Err(e) = state
+                .services
+                .meta
+                .set_session_park_rung(c.session_id, 1, Some(Utc::now()))
+                .await
+            {
+                tracing::warn!(session_id = %c.session_id, error = %e, "park_rung stamp failed");
+            }
             ::metrics::counter!(
                 crate::metrics::EVICTION_NOMINATED_TOTAL,
                 "source" => "detector"
