@@ -124,9 +124,9 @@ export interface TaskDeps {
   harnessCatalog?: HarnessCatalogClient;
   /** Per-user KEK-sealed session secret store (ADR 0051 Drip A). */
   secrets?: UserSecretStore;
-  /** Admin-curated session profiles (ADR 0052). */
+  /** Admin-curated session profiles (ADR 0053). */
   profiles?: ProfileStore;
-  /** Enabled-image catalog client (ADR 0052) — resolves image_id → image_uri. */
+  /** Enabled-image catalog client (ADR 0053) — resolves image_id → image_uri. */
   images?: ImagesClient;
   /** Connector catalog (ADR 0057) — custom connectors merged with built-in seeds. */
   connectors?: CustomConnectorSource;

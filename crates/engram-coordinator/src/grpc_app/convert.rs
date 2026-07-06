@@ -3,7 +3,7 @@
 //! generated proto types (`engram_protocol::app`). No business logic
 //! lives here — every function is a mechanical field-by-field copy.
 //!
-//! The proto `Session` is the JSON wire shape minus `user_id` (ADR 0039
+//! The proto `Session` is the JSON wire shape minus `user_id` (ADR 0051
 //! §2.1: attribution leaves the contract). Timestamps cross as ISO-8601
 //! strings, exactly as the JSON wire serializes them; the string-literal
 //! status/mode unions stay strings via the core types' `as_str()`.
@@ -23,7 +23,7 @@ use crate::error::ApiError;
 use engram_core::types::session::SessionMode;
 
 /// `engram_core::types::Session` → proto `Session`. Drops `user_id`
-/// (off-contract per ADR 0039 §2.1: attribution leaves the contract) and
+/// (off-contract per ADR 0051 §2.1: attribution leaves the contract) and
 /// `live_disk_manifest` (internal coord state, not on the wire shape).
 ///
 /// The exhaustive destructure below is the totality guard — if a field is

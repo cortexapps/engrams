@@ -19,7 +19,7 @@
 //!    fresh socket via `NBD_CMD_RECONFIGURE` after a restart — the
 //!    survivor-rehydrate primitive.
 //! 3. Spawns a tokio task that reads NBD requests over the
-//!    server-side `UnixStream` and PIPELINES them (ADR 0061): a
+//!    server-side `UnixStream` and PIPELINES them (ADR 0071): a
 //!    reader dispatches each request to a bounded pool of handler
 //!    tasks and a single writer serializes the replies back. The
 //!    kernel issues many in-flight requests per socket (correlated
@@ -104,7 +104,7 @@ fn nbd_dead_conn_timeout_secs() -> u64 {
         .unwrap_or(300)
 }
 
-/// Max NBD requests serviced concurrently per sandbox (ADR 0061). The
+/// Max NBD requests serviced concurrently per sandbox (ADR 0071). The
 /// kernel issues many in-flight requests on one socket (each carries a
 /// `handle` for correlation); this bounds how many the daemon services
 /// at once, overlapping the per-request chunk fetches instead of
@@ -874,7 +874,7 @@ fn unix_socketpair() -> io::Result<(OwnedFd, std::os::unix::net::UnixStream)> {
 
 /// Serve NBD requests on `stream` until the kernel disconnects or the
 /// stream errors. The kernel issues many in-flight requests on one
-/// socket (correlated by `handle`), so we PIPELINE (ADR 0061): a reader
+/// socket (correlated by `handle`), so we PIPELINE (ADR 0071): a reader
 /// parses headers and dispatches each request to a bounded pool of
 /// handler tasks; a single writer task serializes the replies back onto
 /// the wire. Out-of-order completion is legal on the wire (the handle
@@ -973,7 +973,7 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
 
 /// A computed NBD reply awaiting serialization onto the wire. The
 /// per-request `InFlightGuard` and concurrency `_permit` ride along and
-/// drop only after the writer flushes the reply (ADR 0061 / 0018).
+/// drop only after the writer flushes the reply (ADR 0071 / 0018).
 struct ReplyMsg {
     header: [u8; REPLY_HEADER_LEN],
     /// `Some` for READ responses (the data follows the header); `None`
@@ -1165,7 +1165,7 @@ mod tests {
         (backend, dir)
     }
 
-    /// ADR 0061 (#1): the pipelined serve loop services several in-flight
+    /// ADR 0071 (#1): the pipelined serve loop services several in-flight
     /// reads concurrently, returns well-formed replies correlated by handle,
     /// and — once every reply is drained — releases all in-flight guards so
     /// the snapshot drain (`wait_idle`) settles. A leaked guard would hang it.
@@ -1206,7 +1206,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), serve).await;
     }
 
-    /// ADR 0061 (#1): a WRITE round-trips through the pipeline — its payload is
+    /// ADR 0071 (#1): a WRITE round-trips through the pipeline — its payload is
     /// consumed in order by the reader, applied by the backend, and a later
     /// READ of the same range reads it back.
     #[tokio::test]

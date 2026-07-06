@@ -85,7 +85,7 @@ export interface Session {
   last_active_at: string;
 }
 
-/** ADR 0052: profile identity snapshot, as surfaced on a session list row.
+/** ADR 0053: profile identity snapshot, as surfaced on a session list row.
  * Maps the ProfileSnapshot proto to a plain view object. */
 export interface ProfileSnapshotView {
   id: string;
@@ -107,7 +107,7 @@ export interface SessionListItem extends Session {
   /** `'system'` for warm-pool / automated sessions; `'user'` or absent for
    * human-launched sessions. Drives the OwnerCell badge choice. */
   owner_kind?: "user" | "system" | null;
-  /** ADR 0052: resolved profile snapshot for the row's primary session; null
+  /** ADR 0053: resolved profile snapshot for the row's primary session; null
    * for legacy / profile-less sessions. */
   profile?: ProfileSnapshotView | null;
 }

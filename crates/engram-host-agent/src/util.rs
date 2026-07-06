@@ -173,7 +173,7 @@ impl UtilizationProbe {
 /// (`f_bavail`), matching what `df` reports. `None` if the probe fails.
 /// The one `statvfs` call site — [`UtilizationProbe::sample_disk`]
 /// derives both the fleet-view `(total_mib, used_mib)` pair and the
-/// ADR-0067 kubelet-headroom gauge from it.
+/// ADR-0070 kubelet-headroom gauge from it.
 fn disk_stat_bytes(path: &Path) -> Option<(u64, u64)> {
     let stat = nix::sys::statvfs::statvfs(path).ok()?;
     let frag = stat.fragment_size() as u64;

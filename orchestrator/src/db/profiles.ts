@@ -1,5 +1,5 @@
 /**
- * Profile data-access seam (ADR 0052).
+ * Profile data-access seam (ADR 0053).
  *
  * The injectable seam that ProfileService (rpc/profiles.ts) and
  * TaskService.createTask (rpc/tasks.ts) depend on, and that the seam tests

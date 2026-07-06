@@ -36,7 +36,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 /// `PodMonitoring` CRD have a stable target.
 pub fn init(addr: SocketAddr) {
     // Histogram buckets sized for sub-second boot latencies that
-    // ADR 0007 targets (warm path: ~100ms; cold path: seconds).
+    // ADR 0020 targets (warm path: ~100ms; cold path: seconds).
     // The bucket boundaries skew toward the fast end because that's
     // where we want resolution; the upper bound catches outliers
     // without distorting the percentile estimates.

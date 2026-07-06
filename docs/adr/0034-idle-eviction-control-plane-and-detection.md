@@ -288,7 +288,8 @@ landing here; this ADR's fix is the durability changes only.
 ## Addendum (Track A, 2026-06-16): harness-desync watchdog + re-handshake
 
 Incident `bf3dbbcb` exposed a wedge class the two detectors above miss. A
-warm-reattached session (ADR 0037) desynced: after a periodic checkpoint it
+warm-reattached session (the unmerged ADR 0037 draft's File-restore wedge
+finding, recorded in ADR 0052) desynced: after a periodic checkpoint it
 emitted a bare `agent_message` with **no enclosing `run_started` and no
 `run_completed`**, then went silent. The VM was healthy (still
 checkpointing, ttyd spawned) — only the coordinator-visible run state was

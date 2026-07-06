@@ -84,7 +84,7 @@ export function SessionDetail() {
   const profileSnap =
     tasksData?.tasks.flatMap((t) => t.sessions).find((r) => r.sessionId === id)?.profile ?? null;
   // Normalize the embedded snapshot to the UI view once. Point-in-time by
-  // design (ADR 0052) — what this session launched from, not the profile's
+  // design (ADR 0053) — what this session launched from, not the profile's
   // current state.
   const profile: ProfileSnapshotView | null = profileSnap
     ? {
@@ -366,7 +366,7 @@ export function SessionDetail() {
 
 // The masthead vitals strip — the only session metadata a developer needs at a
 // glance: lifecycle status (glyph + word), the profile this launched from
-// (ADR 0052, the dense inline chip with its image on hover), and the calm
+// (ADR 0053, the dense inline chip with its image on hover), and the calm
 // durability telltale. Items render only when present and are divided by a
 // hairline Separator, so the strip never trails a dangling divider.
 function SessionVitals({

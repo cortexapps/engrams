@@ -116,7 +116,7 @@ const server = buildServer(
     // Registered BEFORE the passthrough so it wins the /rpc/engram.app.v1.TaskService/* prefix.
     registerTasks(router);
 
-    // Native ProfileService: orchestrator-owned session profiles (ADR 0052).
+    // Native ProfileService: orchestrator-owned session profiles (ADR 0053).
     registerProfiles(router);
 
     // Native MountCatalogService (ADR 0055 P2): admin-gated + owner-stamped
@@ -140,7 +140,7 @@ const server = buildServer(
 
     // Generic passthrough: forwards SessionService, FleetService, ImageService
     // to the control plane with per-method CASL authz gate (ADR 0051 Task 18).
-    // ADR 0052 Task 8: a DisableImage pre-flight blocks disabling an image that
+    // ADR 0053 §3: a DisableImage pre-flight blocks disabling an image that
     // any active profile still references (the coordinator only knows sessions).
     registerPassthrough(router, SURFACE, controlPlaneTransport, undefined, undefined, {
       "ImageService.DisableImage": makeDisableImageGuard(),

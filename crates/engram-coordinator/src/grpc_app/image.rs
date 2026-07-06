@@ -1,4 +1,4 @@
-//! `ImageService` over gRPC (ADR 0039 §2.3). Delegates to the same api
+//! `ImageService` over gRPC (ADR 0051 §2.3). Delegates to the same api
 //! cores as the axum handlers; no admin gating — caller is trusted (ADR §6).
 
 use std::sync::Arc;

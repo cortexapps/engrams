@@ -1,4 +1,4 @@
-//! Live smoke tests for the app-gRPC surface (ADR 0039 / ADR 0051).
+//! Live smoke tests for the app-gRPC surface (ADR 0051).
 //!
 //! Gate: `ENGRAM_SMOKE_GRPC` must be set to `<host>:<port>` (the
 //! coordinator's `--app-grpc-addr`). When unset the test prints a skip
