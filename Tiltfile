@@ -763,6 +763,28 @@ if dev_split:
 _proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT', '0'))
 if dev_split:
     host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base))
+    if fc_colima_profile:
+        # ADR 0068: the coordinator dials the host-agent's advertised
+        # 127.0.0.1:9101 (and scrapes metrics on :9100) — reachable only via a
+        # guest->Mac forward. Lima's auto-forward is edge-triggered and proved
+        # unreliable across host-agent/VM restarts (the port silently stops
+        # forwarding -> "no host could restore … tcp connect error"). Hold the
+        # forward DETERMINISTICALLY ourselves with `ssh -L` over colima's own
+        # ssh (regenerate ssh-config each start — the VM's ssh port changes on
+        # restart; ServerAliveInterval drops the tunnel when the VM dies so
+        # Tilt restarts + reconnects). This is what makes coord->host stable.
+        local_resource('fc-grpc-forward',
+            serve_cmd=(
+                'export PATH="/opt/homebrew/bin:$PATH" && ' +
+                'cfg="$(mktemp)" && colima ssh-config ' + fc_colima_profile +
+                ' > "$cfg" && exec ssh -F "$cfg" -N ' +
+                '-o ExitOnForwardFailure=yes -o ServerAliveInterval=5 ' +
+                '-o ServerAliveCountMax=3 ' +
+                '-L 127.0.0.1:9101:127.0.0.1:9101 ' +
+                '-L 127.0.0.1:9100:127.0.0.1:9100 ' +
+                'colima-' + fc_colima_profile),
+            resource_deps=['host-agent'],
+            labels=['setup'])
     if two_hosts:
         # Distinct proxy port for the second host-agent; 0 (disabled)
         # stays 0 so the dev default is unchanged.
