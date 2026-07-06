@@ -1,7 +1,7 @@
 //! ADR 0014 issue #6 + ADR 0066: host-agent half of the ProxyShell tunnel.
 //!
-//! Coord pods in GKE have no route to the per-VM `guest_ip`, so the pre-M1.16
-//! `ws://<guest_ip>:7681/ws` direct-WebSocket from coord/api/shell.rs always
+//! Coord pods in GKE have no route to the per-VM guest IP, so the pre-M1.16
+//! `ws://<dial_ip>:7681/ws` direct-WebSocket from coord/api/shell.rs always
 //! timed out from prod. This module is the host-agent half of the fix: reach
 //! ttyd in the guest and shuttle WebSocket frames across a bidi gRPC stream the
 //! coord opens.
@@ -19,7 +19,7 @@
 //! warm, with no per-VM-netns dial (retired — only FC ever had one, and FC now
 //! always takes the relay). Backends without a vsock relay (Process; VZ until
 //! its Phase 2 real-vsock migration) fall back to [`open_shell_tunnel_at`],
-//! which dials `guest_ip:port` directly with `tokio_tungstenite::connect_async`.
+//! which dials `dial_ip:port` directly with `tokio_tungstenite::connect_async`.
 
 use std::time::Duration;
 
@@ -81,17 +81,17 @@ pub async fn open_shell_tunnel_via_relay(
     Ok(())
 }
 
-/// Cold-path shell tunnel: dial ttyd at `guest_ip:port` directly over a
+/// Cold-path shell tunnel: dial ttyd at `dial_ip:port` directly over a
 /// WebSocket, with a connection-refused retry. Used only by backends WITHOUT a
-/// vsock relay: the Process backend (`guest_ip` is `127.0.0.1`) and VZ until its
+/// vsock relay: the Process backend (`dial_ip` is `127.0.0.1`) and VZ until its
 /// Phase 2 real-vsock migration. FC goes through [`open_shell_tunnel_via_relay`],
 /// so the old per-VM-netns dial (only FC ever had one) is retired.
 pub async fn open_shell_tunnel_at(
-    guest_ip: String,
+    dial_ip: String,
     port: u16,
     ends: ShellTunnelEnds,
 ) -> Result<(), SandboxError> {
-    let target = format!("ws://{guest_ip}:{port}/ws");
+    let target = format!("ws://{dial_ip}:{port}/ws");
     let upstream = connect_ttyd_cold(|| ttyd_request_from(&target)).await?;
     pump_websocket_through_tunnel(upstream, ends);
     Ok(())
@@ -358,7 +358,7 @@ mod tests {
     };
 
     /// End-to-end via `open_shell_tunnel_at` — covers the full
-    /// guest_ip → ws://{guest_ip}:{port}/ws connect + handshake +
+    /// dial_ip → ws://{dial_ip}:{port}/ws connect + handshake +
     /// pump path. Doubles as the cold-path regression for the
     /// connection-refused retry.
     #[tokio::test]

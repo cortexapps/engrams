@@ -109,7 +109,7 @@ Engram's durability primitive is **chunked-immutable content-addressed storage**
 | Tier | What | Where | Cost model |
 |---|---|---|---|
 | **Persistent** | sha256-keyed chunks (16 MiB disk, 512 KiB memory), versioned manifests, per-host working-set traces | `BlobStorage` impl (GCS / S3 / local) | dedup is automatic (content-addressed); the base image's GiBs are stored once regardless of session count |
-| **Cache** | local NVMe chunk cache (LRU + pin-list + singleflight), per-host materialize-dir for assembled `.ext4` files | each host's `<work_dir>` | bounded by `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` (default 200 GiB); operator-tuned via Packer / Terraform |
+| **Cache** | local NVMe chunk cache (LRU + pin-list + singleflight), per-host materialize-dir for assembled `.ext4` files | each host's `<work_dir>` | disk-derived absolute ceiling by default (ADR 0067: `min(60% of the disk, 80%)`, ~179 GiB on a 298 GiB disk) plus a 20% free-space floor; `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` overrides the ceiling outright |
 | **In-memory** | FC's memory.bin canonical mmap (`MAP_PRIVATE`) + per-session UFFD-populated divergent pages | host RAM | hardware-enforced COW; one canonical copy serves N sessions of the same image |
 | **Metadata** | sessions, conversation log, snapshot manifest refs, hosts, secrets | Postgres | managed/backups |
 

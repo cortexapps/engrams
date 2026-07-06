@@ -80,6 +80,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest};
 use engram_core::traits::sandbox::{HarnessByteStream, SandboxBackend};
+use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
@@ -634,11 +635,12 @@ struct LiveSandbox {
     /// `net::teardown_netns` on this. Mutually exclusive with
     /// `net`: at most one is `Some` per `LiveSandbox`.
     netns: Option<net::NetnsSetup>,
-    /// Cached IPv4 address discovered by querying agentd on first
-    /// `guest_ip` call (mirrors VZ's pattern). Populated lazily
-    /// because the agent's eth0 needs IP_PNP DHCP+kernel boot before
-    /// it can answer.
-    guest_ip: parking_lot::Mutex<Option<String>>,
+    /// Cached guest-network identity, discovered from `net`/`netns`
+    /// state or (lazily) by querying agentd on first
+    /// `guest_endpoints` call (mirrors VZ's pattern). Populated
+    /// lazily in the vsock-fallback case because the agent's eth0
+    /// needs IP_PNP DHCP+kernel boot before it can answer.
+    guest_endpoints: parking_lot::Mutex<Option<GuestEndpoints>>,
     /// ADR 0015 M1: receiver for the agentd-readiness signal.
     /// Switches to `true` when the in-VM agentd successfully dials
     /// `<vsock_uds>_<ENGRAM_AGENTD_READY_PORT>` and writes its
@@ -1199,8 +1201,8 @@ impl FirecrackerBackend {
         // host-agent restart. Verify the netns survived, re-reserve the
         // SNAT `/30` from the host pool (existence-check FIRST so a missing
         // netns doesn't leak a reservation), and rebuild the in-memory
-        // `NetnsSetup` so `destroy()` can later tear it down + `guest_ip()`
-        // resolves to the SNAT IP. Mutually exclusive with `net_setup`.
+        // `NetnsSetup` so `destroy()` can later tear it down + `guest_endpoints()`
+        // resolves `egress_identity` to the SNAT IP. Mutually exclusive with `net_setup`.
         let netns_setup = if let Some(ns_rec) = manifest.netns.as_ref() {
             let netns_path =
                 std::path::PathBuf::from(format!("/var/run/netns/{}", ns_rec.netns_name));
@@ -1326,7 +1328,7 @@ impl FirecrackerBackend {
                 // ADR 0044 K2: warm-restored VMs reattach with their per-VM
                 // netns rehydrated above; cold/host-root VMs leave this None.
                 netns: netns_setup,
-                guest_ip: parking_lot::Mutex::new(None),
+                guest_endpoints: parking_lot::Mutex::new(None),
                 agent_ready: ready_rx,
             },
         );
@@ -1457,15 +1459,16 @@ impl FirecrackerBackend {
         // Post-`load_snapshot`, FC's vsock muxer has a brief window where it
         // accepts a host CONNECT and returns OK, then closes the connection
         // before the guest's accept-loop wakes — surfacing as `early eof` on
-        // the CONNECT-response read 3-5 ms in (the same window InstallHostCa
-        // documents and retries). It widens with the device count a restore
-        // has to kick (ADR 0027 added the RO bundle drive), which tipped the
-        // previously-lucky post-resume `/exec` dial into it. The CONNECT
-        // handshake is PRE-APPLICATION — no bytes have reached the guest
-        // service yet — so re-dialing is safe for every caller (exec, forge,
-        // upload, shell tunnel, CA). Retry EOF/RST-shaped handshake failures
-        // with a short backoff; a genuinely-dead agentd EOFs every attempt
-        // and the final error propagates.
+        // the CONNECT-response read 3-5 ms in (the same window `start_agent`'s
+        // `SpawnHarness` first-contact retry documents, one layer up). It
+        // widens with the device count a restore has to kick (ADR 0027 added
+        // the RO bundle drive), which tipped the previously-lucky post-resume
+        // `/exec` dial into it. The CONNECT handshake is PRE-APPLICATION — no
+        // bytes have reached the guest service yet — so re-dialing is safe
+        // for every caller (exec, forge, upload, shell tunnel, harness spawn
+        // + CA). Retry EOF/RST-shaped handshake failures with a short
+        // backoff; a genuinely-dead agentd EOFs every attempt and the final
+        // error propagates.
         // The muxer-settle window is usually a few ms, but on a cold boot,
         // under CI load, or with more restore-time devices (ADR 0027 added a
         // RO bundle drive) it can stretch well past the old flat 5×50 ms
@@ -1528,9 +1531,12 @@ impl FirecrackerBackend {
         let mut line = Vec::with_capacity(32);
         let mut byte = [0u8; 1];
         loop {
-            conn.read_exact(&mut byte)
-                .await
-                .map_err(|e| vm_err(format!("read FC vsock CONNECT response: {e}")))?;
+            conn.read_exact(&mut byte).await.map_err(|e| {
+                vm_err(format!(
+                    "read FC vsock CONNECT response: {}",
+                    describe_relay_connect_failure(port, &e)
+                ))
+            })?;
             line.push(byte[0]);
             if byte[0] == b'\n' {
                 break;
@@ -1558,12 +1564,12 @@ impl FirecrackerBackend {
     /// On any error after this call, the caller drops the Child —
     /// `kill_on_drop=true` cleans up.
     ///
-    /// `netns_name`: when `Some`, FC is spawned via
-    /// `ip netns exec <name> firecracker …` so the process (and
-    /// any TAP it opens via `host_dev_name`) lives inside that
-    /// netns. ADR 0014 M1.16 warm-restore path passes the
-    /// per-VM netns here; cold path passes `None` and FC stays
-    /// in host root, as today.
+    /// `netns_name`: when `Some`, FC is exec'd directly and `setns`'d
+    /// into that netns from a `pre_exec` closure (no `ip netns exec`
+    /// wrapper fork) so the process (and any TAP it opens via
+    /// `host_dev_name`) lives inside it. ADR 0014 M1.16 warm-restore
+    /// path passes the per-VM netns here; cold path passes `None`
+    /// and FC stays in host root, as today.
     async fn spawn_firecracker(
         &self,
         jail_dir: &Path,
@@ -1586,24 +1592,51 @@ impl FirecrackerBackend {
             .try_clone()
             .map_err(|e| vm_err(format!("dup log fd: {e}")))?;
 
-        let fc_bin = self.config.firecracker_bin.to_string_lossy().into_owned();
         let socket_arg = socket.to_string_lossy().into_owned();
-        let mut cmd = match netns_name {
+        let mut cmd = Command::new(&self.config.firecracker_bin);
+        cmd.args(["--api-sock", &socket_arg]);
+
+        // `_ns_file` must stay alive (open, in this parent process)
+        // across the `cmd.spawn()` call below — `spawn()` forks
+        // synchronously, and the child's duplicated fd table is only
+        // valid for fds still open in the parent at that instant. It
+        // can be (and is, implicitly) dropped once `spawn()` returns.
+        #[cfg(target_os = "linux")]
+        let _ns_file = match netns_name {
             Some(ns) => {
-                // `ip netns exec` forks + setns(CLONE_NEWNET) + exec
-                // the given command — the FC child (and its eventual
-                // PUT /network-interfaces host_dev_name lookup) all
-                // resolve TAP names inside this netns.
-                let mut c = Command::new("ip");
-                c.args(["netns", "exec", ns, &fc_bin, "--api-sock", &socket_arg]);
-                c
+                let ns_path = format!("/var/run/netns/{ns}");
+                let ns_file = std::fs::File::open(&ns_path)
+                    .map_err(|e| vm_err(format!("open netns {ns} ({ns_path}): {e}")))?;
+                use std::os::unix::io::AsRawFd;
+                let ns_fd = ns_file.as_raw_fd();
+                // SAFETY: this closure runs in the forked child between
+                // `fork()` and `exec()`, when the child is guaranteed
+                // single-threaded — the constraint `pre_exec` documents.
+                // `setns(2)` only touches this process's own namespace
+                // membership and, like `close(2)`, is async-signal-safe,
+                // so calling it here (instead of e.g. allocating) is
+                // sound. `ns_fd` is valid for the duration of the fork
+                // because `ns_file` is held alive in the caller's scope
+                // (`_ns_file`, bound below) past the `spawn()` call.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if libc::setns(ns_fd, libc::CLONE_NEWNET) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                Some(ns_file)
             }
-            None => {
-                let mut c = Command::new(&self.config.firecracker_bin);
-                c.args(["--api-sock", &socket_arg]);
-                c
-            }
+            None => None,
         };
+        #[cfg(not(target_os = "linux"))]
+        if netns_name.is_some() {
+            return Err(vm_err(
+                "netns-scoped Firecracker spawn requires Linux".to_string(),
+            ));
+        }
+
         // ADR 0044 K2: NO `kill_on_drop` — a live FC must survive the
         // host-agent process exiting (detach + reattach). The
         // create-window backstop is the explicit `SpawnKillGuard` armed
@@ -2225,7 +2258,7 @@ impl FirecrackerBackend {
                 net: net_setup.cloned(),
                 // Cold create path: VM is in host root netns.
                 netns: None,
-                guest_ip: parking_lot::Mutex::new(None),
+                guest_endpoints: parking_lot::Mutex::new(None),
                 agent_ready: agent_ready_rx,
             },
         );
@@ -3180,7 +3213,7 @@ impl FirecrackerBackend {
                 uffd_pid,
                 net: net_setup,
                 netns: netns_setup,
-                guest_ip: parking_lot::Mutex::new(None),
+                guest_endpoints: parking_lot::Mutex::new(None),
                 agent_ready: ready_rx,
             },
         );
@@ -3272,6 +3305,53 @@ impl FirecrackerBackend {
 
 fn vm_err(msg: impl Into<String>) -> SandboxError {
     SandboxError::Vm(msg.into().into())
+}
+
+/// #567 / prod session 8174b7aa: an agentd RPC recv that hits a bare
+/// early EOF (zero bytes back) is indistinguishable, on the wire,
+/// from agentd crashing mid-call -- but it's *exactly* what an older
+/// guest agentd produces when the host sends a `WireRequest` variant
+/// the guest predates: the frame fails to bincode-decode, `serve_
+/// connection` returns before writing anything, and the connection
+/// just drops (engram-agentd's typed-NAK fix only helps once the
+/// guest image is re-baked). Appends both plausible causes to an
+/// EOF-shaped recv error so an operator doesn't have to already know
+/// this incident's history to triage it; every other error passes
+/// through untouched -- this is purely additive context, not a new
+/// error path.
+fn describe_agentd_rpc_recv_failure(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        format!(
+            "{e} -- agentd closed the stream without a response: guest \
+             agentd may predate this request (host/guest version skew: \
+             re-bake + RefreshImage) or crashed mid-call"
+        )
+    } else {
+        e.to_string()
+    }
+}
+
+/// #567: the FC vsock CONNECT handshake for the ADR-0066 port relay
+/// (guest port [`engram_harness_proto::PROXY_PORT_VSOCK_PORT`])
+/// failing with an early EOF means nothing accepted the CONNECT
+/// inside the guest -- either this agentd predates the relay
+/// listener entirely (host/guest version skew), or a once-live relay
+/// died (the dead-relay bug #567's other fixes target). Gated on the
+/// relay port specifically: `connect_fc_vsock_once` is shared by
+/// every guest port (exec included), and the same read failing on
+/// agentd's exec port (1024) means something else entirely.
+fn describe_relay_connect_failure(port: u32, e: &std::io::Error) -> String {
+    if port == engram_harness_proto::PROXY_PORT_VSOCK_PORT
+        && e.kind() == std::io::ErrorKind::UnexpectedEof
+    {
+        format!(
+            "{e} -- no listener on the guest relay port: guest agentd may \
+             predate the ADR-0066 relay (version skew: re-bake + \
+             RefreshImage), or the relay died (#567)"
+        )
+    } else {
+        e.to_string()
+    }
 }
 
 /// Timeout for `PUT /snapshot/create`. The call flushes the full guest
@@ -4294,45 +4374,66 @@ impl SandboxBackend for FirecrackerBackend {
         Ok(self.sandboxes.iter().map(|r| *r.key()).collect())
     }
 
-    /// IPv4 the host can use to reach a TCP service inside this
-    /// guest (used by the dashboard SHELL tab to dial `ttyd` on
-    /// :7681). Mirrors the VZ pattern: dial agentd via vsock, send
-    /// `WireRequest::GuestIp`, cache the answer. None until the
-    /// guest's eth0 has an address — kernel `ip=` cmdline brings it
-    /// up before init, but the agent has to start before answering.
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
+    /// The sandbox's guest-network identity. Mirrors the VZ pattern:
+    /// derive from `net`/`netns` state when we have it (no I/O),
+    /// falling back to an agentd vsock query + cache when we don't.
+    ///
+    /// - Warm-restored (`netns` is `Some`): `egress_identity` is the
+    ///   netns SNAT pool slot (`ns.host_reachable_ip()`) — the value
+    ///   the egress-proxy registry indexes against. `dial_ip` is the
+    ///   bake-time in-VM eth0 address (`ns.vm_cidr.guest()`,
+    ///   `10.200.0.2` by default) — every warm VM shares it because
+    ///   each lives in its own netns; the SHELL tab (pre-ADR-0066)
+    ///   entered the netns before dialing, so it resolved through the
+    ///   TAP to the VM, not the netns's own veth IP. Returning the
+    ///   SNAT slot as the dial target would miss the VM entirely
+    ///   (prod-shape failure mode caught by e2e_shell_warm: `connect
+    ///   10.200.0.6:7681: Connection refused`).
+    /// - Cold-created (`net` is `Some`, no netns indirection):
+    ///   `egress_identity` and `dial_ip` collapse to the same
+    ///   per-sandbox `net.vm_cidr.guest()` — the TAP is in host root,
+    ///   reachable directly. This is also the deterministic fast path
+    ///   (no agentd dial): the /30 allocator already assigned this
+    ///   value, so we skip a ~2s vsock RTT on every fresh-session
+    ///   `notify_session_policy` call — critical because the
+    ///   coord-side policy registration races the agent's boot.
+    /// - Neither `net` nor `netns` (host networking disabled in
+    ///   tests, or a restored legacy pre-M1.16-bake manifest with no
+    ///   net record): fall back to an agentd `WireRequest::GuestIp`
+    ///   vsock query, both IP fields set to the answer.
+    async fn guest_endpoints(&self, id: SandboxId) -> Option<GuestEndpoints> {
         if let Some(live) = self.sandboxes.get(&id) {
-            if let Some(ip) = live.guest_ip.lock().clone() {
-                return Some(ip);
+            if let Some(ep) = live.guest_endpoints.lock().clone() {
+                return Some(ep);
             }
-            // ADR 0014 M1.16: warm-restored VMs all share the
-            // bake-time eth0 IP `10.200.0.2` inside the guest, but
-            // each netns SNATs to a unique-per-VM pool slot on the
-            // host-visible side. Egress proxy registry indexes
-            // against that SNAT'd IP and the dashboard SHELL tab
-            // dials it for ttyd — so this is the value
-            // host-side callers want.
+            let vsock_uds = Some(live.state.vsock_uds_path.clone());
             if let Some(ns) = live.netns.as_ref() {
-                let ip = ns.host_reachable_ip().to_string();
-                *live.guest_ip.lock() = Some(ip.clone());
-                return Some(ip);
+                let ep = GuestEndpoints {
+                    egress_identity: ns.host_reachable_ip(),
+                    dial_ip: ns.vm_cidr.guest(),
+                    netns: Some(ns.netns_name.clone()),
+                    vsock_uds,
+                };
+                *live.guest_endpoints.lock() = Some(ep.clone());
+                return Some(ep);
             }
-            // Fast path: the /30 allocator assigned the guest a
-            // deterministic .2 from the network address. We don't
-            // need to dial agentd to learn what we already know.
-            // Skips a ~2s vsock RTT on every fresh-session
-            // `notify_session_policy` call — critical because the
-            // coord-side policy registration races the agent's boot.
             if let Some(net) = live.net.as_ref() {
-                let ip = net.vm_cidr.guest().to_string();
-                *live.guest_ip.lock() = Some(ip.clone());
-                return Some(ip);
+                let ip = net.vm_cidr.guest();
+                let ep = GuestEndpoints {
+                    egress_identity: ip,
+                    dial_ip: ip,
+                    netns: None,
+                    vsock_uds,
+                };
+                *live.guest_endpoints.lock() = Some(ep.clone());
+                return Some(ep);
             }
         }
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id)?;
             live.state.vsock_uds_path.clone()
         };
+        let vsock_uds = Some(vsock_uds_path.clone());
         let fut = async {
             let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
                 .await
@@ -4347,56 +4448,21 @@ impl SandboxBackend for FirecrackerBackend {
                 _ => None,
             }
         };
-        let ip = tokio::time::timeout(Duration::from_secs(2), fut)
+        let ip_str: Option<String> = tokio::time::timeout(Duration::from_secs(2), fut)
             .await
             .ok()
             .flatten();
-        if let Some(ref s) = ip {
-            if let Some(live) = self.sandboxes.get(&id) {
-                *live.guest_ip.lock() = Some(s.clone());
-            }
+        let ip: std::net::Ipv4Addr = ip_str?.parse().ok()?;
+        let ep = GuestEndpoints {
+            egress_identity: ip,
+            dial_ip: ip,
+            netns: None,
+            vsock_uds,
+        };
+        if let Some(live) = self.sandboxes.get(&id) {
+            *live.guest_endpoints.lock() = Some(ep.clone());
         }
-        ip
-    }
-
-    /// ADR 0014 issue #6: the per-VM netns this sandbox runs inside,
-    /// when warm-restored under the M1.16 netns model. Cold sandboxes
-    /// run with TAPs on host root (`Some(net)`, `None`-netns); warm
-    /// sandboxes run inside `engr-vm-<id>` (`None`-net, `Some(netns)`).
-    /// Returned for ProxyShell so the host-agent can dial ttyd from
-    /// inside the right namespace.
-    async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
-        let live = self.sandboxes.get(&id)?;
-        live.netns.as_ref().map(|ns| ns.netns_name.clone())
-    }
-
-    /// In-VM dial target for the SHELL tab. Returns the IP ttyd is
-    /// bound to inside the guest — distinct from `guest_ip` which
-    /// returns the SNAT slot for warm sandboxes (used by the egress
-    /// proxy registry, NOT for direct ttyd dials).
-    ///
-    /// - Warm-restored sandboxes: every VM inherits the bake's
-    ///   eth0 IP `bake_cidr.guest()` (10.200.0.2 by default). The
-    ///   host's proxy_shell flow enters the per-VM netns before
-    ///   dialing, so 10.200.0.2 resolves through the TAP to the
-    ///   VM.
-    /// - Cold-created sandboxes: no netns indirection; the VM's
-    ///   eth0 is at `vm_cidr.guest()` and reachable from host root
-    ///   via the TAP.
-    async fn vm_internal_ip(&self, id: SandboxId) -> Option<String> {
-        let live = self.sandboxes.get(&id)?;
-        // Warm: TAP is inside the netns, VM eth0 is at the bake
-        // CIDR's guest octet. Every warm VM gets the same value
-        // because they live in separate netnses.
-        if let Some(ns) = live.netns.as_ref() {
-            return Some(ns.vm_cidr.guest().to_string());
-        }
-        // Cold: per-sandbox unique IP from the same pool, in root
-        // netns.
-        if let Some(net) = live.net.as_ref() {
-            return Some(net.vm_cidr.guest().to_string());
-        }
-        None
+        Some(ep)
     }
 
     /// Ask agentd to ensure `ttyd` is running and accepting on its
@@ -4426,9 +4492,16 @@ impl SandboxBackend for FirecrackerBackend {
             engram_agentd::write_msg(&mut conn, &WireRequest::StartShell { port: None })
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_shell: send: {e}").into()))?;
-            let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("start_shell: recv: {e}").into()))?;
+            let resp: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(
+                        format!(
+                            "start_shell: recv: {}",
+                            describe_agentd_rpc_recv_failure(&e)
+                        )
+                        .into(),
+                    )
+                })?;
             match resp {
                 engram_agentd::WireResponse::ShellReady { port, spawned } => {
                     tracing::info!(
@@ -4454,10 +4527,14 @@ impl SandboxBackend for FirecrackerBackend {
 
     /// ADR 0065: ask agentd to ensure the in-guest browser stack (Xvfb +
     /// openbox + chromium + x11vnc) is running and x11vnc is accepting on its
-    /// port. Returns the bound port. Mirrors [`Self::start_shell`] — the
+    /// port. Returns the bound port plus agentd's optional chromium-CDP
+    /// liveness warning (issue #569). Mirrors [`Self::start_shell`] — the
     /// host's `proxy_vnc` (P1.4) calls this just before dialing the guest's
     /// raw-TCP VNC port, so the connect finds a listener.
-    async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+    async fn start_browser(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or_else(|| {
                 SandboxError::Vm(format!("start_browser: no live sandbox {id}").into())
@@ -4473,18 +4550,33 @@ impl SandboxBackend for FirecrackerBackend {
             engram_agentd::write_msg(&mut conn, &WireRequest::StartBrowser { port: None })
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_browser: send: {e}").into()))?;
-            let resp: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("start_browser: recv: {e}").into()))?;
+            let resp: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(
+                        format!(
+                            "start_browser: recv: {}",
+                            describe_agentd_rpc_recv_failure(&e)
+                        )
+                        .into(),
+                    )
+                })?;
             match resp {
-                engram_agentd::WireResponse::BrowserReady { port, spawned } => {
+                engram_agentd::WireResponse::BrowserReady {
+                    port,
+                    spawned,
+                    cdp_warning,
+                } => {
                     tracing::info!(
                         sandbox_id = %id,
                         port,
                         spawned,
+                        cdp_warning = ?cdp_warning,
                         "agentd reports browser ready",
                     );
-                    Ok(port)
+                    Ok(engram_core::traits::sandbox::BrowserStart {
+                        port,
+                        warning: cdp_warning,
+                    })
                 }
                 engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
                     format!("start_browser: agentd error ({kind}): {message}").into(),
@@ -4494,9 +4586,14 @@ impl SandboxBackend for FirecrackerBackend {
                 )),
             }
         };
-        // The browser spawn (Xvfb + chromium cold start) is heavier than
-        // ttyd, and agentd waits up to 20s (READY_DEADLINE) for x11vnc to
-        // accept, so allow 30s of headroom here.
+        // Worst-case serial path inside agentd's start_browser post issue
+        // #569's mutex-hold/CDP-probe fixes: up to a 2s RFB-banner-read
+        // timeout (issue #567's wedge detection) + ~0.3s force-stop grace +
+        // up to 20s (READY_DEADLINE) for the launcher's `--ensure` to bring
+        // x11vnc up + up to a 1s fast CDP probe — call it ~24s worst case.
+        // The fresh-spawn CDP watch itself runs off-path in a detached
+        // background task and never blocks this reply. 30s of headroom here
+        // still comfortably covers it.
         tokio::time::timeout(Duration::from_secs(30), fut)
             .await
             .map_err(|_| SandboxError::Vm("start_browser: timed out waiting for agentd".into()))?
@@ -4521,9 +4618,16 @@ impl SandboxBackend for FirecrackerBackend {
             engram_agentd::write_msg(&mut conn, &WireRequest::StopBrowser)
                 .await
                 .map_err(|e| SandboxError::Vm(format!("stop_browser: send: {e}").into()))?;
-            let _: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("stop_browser: recv: {e}").into()))?;
+            let _: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(
+                        format!(
+                            "stop_browser: recv: {}",
+                            describe_agentd_rpc_recv_failure(&e)
+                        )
+                        .into(),
+                    )
+                })?;
             Ok(())
         };
         // A wedged guest must never hang teardown — bound the round-trip at
@@ -4653,143 +4757,81 @@ impl SandboxBackend for FirecrackerBackend {
             live.state.vsock_uds_path.clone()
         };
 
-        // ADR 0021 P1.2: deliver the per-host egress-proxy CA via
-        // `InstallHostCa` over vsock as soon as agentd is reachable,
-        // before any harness spawn. Replaces the pre-0021 path where
-        // the CA rode in on the harness drive. Idempotent — agentd's
-        // `last_pem` cache makes a resume-with-same-cert a zero-I/O
-        // hot path, and an empty PEM is a server-side no-op. The
-        // legacy drive-based install in
-        // `engram_agentd::harness_supervisor::inject_egress_proxy_ca`
-        // remains in place until P1.5 retires the drive.
-        if let Some(pem) = agent.host_ca_pem.as_deref() {
-            if !pem.is_empty() {
-                let req = engram_agentd::WireRequest::InstallHostCa(
-                    engram_agentd::InstallHostCaRequest {
-                        cert_pem: pem.to_string(),
-                    },
-                );
-                // Restore-side settle: a warm-restored sandbox's
-                // `agent_ready` watch is pre-set to true (see
-                // `restore_in_jail`), so `wait_agent_ready` above
-                // returned instantly. But FC's vsock muxer has a
-                // brief window post-`load_snapshot` where it accepts
-                // a host `CONNECT`/returns `OK`, then closes the
-                // connection before agentd's accept-loop task wakes
-                // and drains the request bytes. Host then sees
-                // `read InstallHostCa response: early eof` 3-5 ms
-                // after the `CONNECT/OK` round-trip (vs the 140-180 ms
-                // a successful install takes). Surfaced by PR #40 e2e_
-                // stack on cold-snapshot-during-startup-fix landings.
-                // Cold paths don't hit this — the agentd dial of
-                // AgentReady gates `wait_agent_ready`, and by the
-                // time AgentReady fires the muxer has settled.
-                //
-                // Retry the full connect → write → read sequence on
-                // an EOF-shaped error, up to ~5 attempts with 50ms
-                // backoff. Each attempt is independent (fresh
-                // connect, fresh CONNECT verb, fresh write/read) so
-                // double-send is structurally impossible —
-                // agentd's `InstallHostCa` handler is idempotent
-                // (writes the same PEM to the same path; the
-                // `last_pem` cache short-circuits on identical
-                // input). A genuinely broken agentd surfaces as
-                // EOF every attempt; the final attempt's error
-                // propagates with the attempt count for
-                // diagnosis.
-                let max_attempts: u32 = 5;
-                let mut attempt: u32 = 0;
-                let resp = loop {
-                    attempt += 1;
-                    let span = tracing::info_span!("fc.install_host_ca", attempt);
-                    let inner = async {
-                        let mut conn =
-                            Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
-                        engram_agentd::write_msg(&mut conn, &req)
-                            .await
-                            .map_err(|e| {
-                                SandboxError::Vm(format!("write InstallHostCa: {e}").into())
-                            })?;
-                        let resp = engram_agentd::read_msg(&mut conn).await.map_err(|e| {
-                            SandboxError::Vm(format!("read InstallHostCa response: {e}").into())
-                        })?;
-                        Ok::<_, SandboxError>(resp)
-                    };
-                    match tracing::Instrument::instrument(inner, span).await {
-                        Ok(r) => break r,
-                        Err(e) => {
-                            // Only retry EOF/RST-shaped errors. Other
-                            // failures (write failures, bincode decode
-                            // errors, protocol mismatches) are
-                            // structural — retrying won't help.
-                            let msg = format!("{e}");
-                            let retryable = msg.contains("early eof")
-                                || msg.contains("unexpected end of file")
-                                || msg.contains("connection reset")
-                                || msg.contains("broken pipe");
-                            if !retryable || attempt >= max_attempts {
-                                return Err(SandboxError::Vm(
-                                    format!("InstallHostCa failed after {attempt} attempt(s): {e}")
-                                        .into(),
-                                ));
-                            }
-                            tracing::debug!(
-                                sandbox_id = %id,
-                                attempt,
-                                error = %e,
-                                "InstallHostCa transient failure; retrying after 50 ms (vsock muxer settle)",
-                            );
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                    }
-                };
-                match resp {
-                    engram_agentd::WireResponse::InstallHostCaAck { changed } => {
-                        // ADR 0045 C1 instrumentation: the cross-host CA
-                        // install is the prime suspect for the in-guest
-                        // handshake tail on a teleport (the dest's CA
-                        // differs, so the guest-side hot path misses and
-                        // the full bundle regeneration runs). INFO so the
-                        // breakdown is greppable per sandbox.
-                        tracing::info!(
-                            sandbox_id = %id,
-                            attempt,
-                            changed,
-                            elapsed_ms = phase_start.elapsed().as_millis() as u64,
-                            wait_ready_ms = t_ready,
-                            "host CA install ack",
-                        );
-                    }
-                    engram_agentd::WireResponse::Error { kind, message } => {
-                        return Err(SandboxError::Vm(
-                            format!("InstallHostCa rejected ({kind}): {message}").into(),
-                        ));
-                    }
-                    other => {
-                        return Err(SandboxError::Vm(
-                            format!("InstallHostCa: unexpected response: {other:?}").into(),
-                        ));
-                    }
-                }
-            }
-        }
-
         // ADR 0021 P1.4: no harness drive — argv points at a path
         // inside the rootfs (the image manifest's `[harness] exec`).
         // The `harness_substrate` / `harness_pack_uri` plumbing on
         // SandboxSpec stays (always-None on the new coord path)
         // until P1.5 retires it together with option-D.
+        //
+        // 2026-07 core-ops fold: this single frame also carries the
+        // per-host egress-proxy CA (ADR 0021 P1). agentd installs it
+        // (if present) before spawning, so there is exactly ONE
+        // host→guest first-contact RPC per `start_agent` instead of
+        // two — the CA-specific retry ladder that used to precede
+        // this call is gone; its bounded first-contact retry moves
+        // to wrap this round trip instead (below). Idempotent —
+        // agentd's `last_pem` cache makes a resume-with-same-cert a
+        // zero-I/O hot path, and an empty/`None` PEM is a no-op.
         let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
             session_env: agent.session_env.into_iter().collect(),
+            host_ca_pem: agent.host_ca_pem,
         });
 
         // Harness spawn: connect to agentd-1024 and round-trip SpawnHarness.
-        // Separate span so the (usually fast) spawn is distinct from the wait.
-        let t_spawn = std::time::Instant::now();
-        let resp: engram_agentd::WireResponse = tracing::Instrument::instrument(
-            async {
+        //
+        // This is now the ONLY host→guest first-contact RPC `start_agent`
+        // makes, so it inherits the bounded EOF-retry the CA-install verb
+        // used to have — not as a CA-specific bandage, but as a first-
+        // contact guard against the FC vsock-muxer settle race. Restored
+        // sandboxes pre-set `agent_ready` to `true` (`restore_in_jail`),
+        // so `wait_agent_ready` above returns instantly, but FC's vsock
+        // muxer has a brief window post-`load_snapshot` where it accepts a
+        // host `CONNECT`/returns `OK`, then closes the connection before
+        // agentd's accept-loop task wakes and drains the request bytes —
+        // surfacing as `read SpawnHarness response: early eof` 3-5 ms
+        // after the `CONNECT/OK` round trip. Cold paths don't hit this:
+        // the agentd dial of `AgentReady` gates `wait_agent_ready`, and by
+        // the time `AgentReady` fires the muxer has settled.
+        //
+        // SpawnHarness is safe to retry: `HarnessSupervisor::spawn`
+        // serialises on a mutex and reattaches a still-live previous
+        // child (SIGUSR1 reconnect nudge) rather than killing it, so a
+        // lost-but-actually-delivered attempt just gets reattached by the
+        // retry, not double-spawned. Each attempt is a fresh connect,
+        // fresh write, fresh read, so double-send is structurally
+        // impossible to distinguish from — and structurally harmless
+        // either way.
+        //
+        // Deliberately NO deadline on the round trip: prod has observed a
+        // 299 s handshake that eventually succeeded under guest CPU/IO
+        // starvation during UFFD/NBD page-in — a deadline would convert
+        // that slow-but-successful case into a hard failure. Starvation
+        // itself is a separate concern (prefault-admission-control, not
+        // this fold) to fix at the source.
+        //
+        // The true fix for the underlying muxer race lives in the
+        // vendored FC fork (`third_party/firecracker`), not here — this
+        // retry only bounds the blast radius of a race we can't close
+        // from the host side (see `connect_fc_vsock`'s doc comment and
+        // `harness_supervisor.rs`'s SIGUSR1 comment for why agentd can't
+        // signal its own resume over an already-held vsock connection).
+        let max_attempts: u32 = 5;
+        let mut attempt: u32 = 0;
+        let resp: engram_agentd::WireResponse = loop {
+            attempt += 1;
+            let span = tracing::info_span!("fc.spawn_harness", attempt);
+            // Per-attempt, not per-round-trip: reset at the top of each
+            // iteration so `connect_ms` below measures THIS attempt's
+            // CONNECT leg only. A single Instant hoisted above the loop
+            // would accumulate prior attempts' full connect+write+read
+            // plus their 50 ms backoff sleeps into later attempts'
+            // `connect_ms`, corrupting the sub-leg split the ADR 0045 C1
+            // diagnosis below relies on (a slow CONNECT reading as a
+            // starved guest that was actually just a late retry).
+            let t_attempt = std::time::Instant::now();
+            let inner = async {
                 let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
                 // ADR 0045 C1 tail diagnosis: split the handshake into
                 // host-visible sub-legs — a slow CONNECT means the guest
@@ -4798,7 +4840,8 @@ impl SandboxBackend for FirecrackerBackend {
                 // itself is stuck past accept.
                 tracing::info!(
                     sandbox_id = %id,
-                    connect_ms = t_spawn.elapsed().as_millis() as u64,
+                    attempt,
+                    connect_ms = t_attempt.elapsed().as_millis() as u64,
                     "spawn-harness vsock connected",
                 );
                 engram_agentd::write_msg(&mut conn, &req)
@@ -4814,17 +4857,58 @@ impl SandboxBackend for FirecrackerBackend {
                 // is why single-crate check + workspace clippy passed but the
                 // integration `-p` build failed.
                 Ok::<_, SandboxError>(resp)
-            },
-            tracing::info_span!("fc.spawn_harness"),
-        )
-        .await?;
+            };
+            match tracing::Instrument::instrument(inner, span).await {
+                Ok(r) => break r,
+                Err(e) => {
+                    // Only retry EOF/RST-shaped errors — the muxer-settle
+                    // signature. Other failures (write failures, bincode
+                    // decode errors, protocol mismatches, connection
+                    // refused) are structural — retrying won't help, and
+                    // `Connection refused` in particular stays a
+                    // non-retryable, terminal class (the FC process
+                    // itself isn't accepting; out of scope for this fold).
+                    let msg = format!("{e}");
+                    let retryable = msg.contains("early eof")
+                        || msg.contains("unexpected end of file")
+                        || msg.contains("connection reset")
+                        || msg.contains("broken pipe");
+                    if !retryable || attempt >= max_attempts {
+                        return Err(SandboxError::Vm(
+                            format!("SpawnHarness failed after {attempt} attempt(s): {e}").into(),
+                        ));
+                    }
+                    tracing::debug!(
+                        sandbox_id = %id,
+                        attempt,
+                        error = %e,
+                        "SpawnHarness transient failure; retrying after 50 ms (vsock muxer settle)",
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
         match resp {
-            engram_agentd::WireResponse::HarnessSpawned { pid } => {
+            engram_agentd::WireResponse::HarnessSpawned { pid, ca_changed } => {
                 let elapsed = phase_start.elapsed().as_secs_f64();
+                // `ca_changed` is only authoritative at `attempt == 1`.
+                // agentd's `last_pem` cache is keyed on the PEM content,
+                // not on this round trip: if attempt 1's request landed
+                // and installed a genuinely new CA (changed=true) but the
+                // *response* was lost to a retryable error (connection
+                // reset / broken pipe — not just the early-eof muxer-
+                // settle race), attempt 2 resends the identical PEM, hits
+                // the now-warm cache, and reports changed=false — masking
+                // the ADR 0045 C1 cross-host-resume signal on exactly the
+                // retried-restore path. Treat `ca_changed=false` with
+                // `attempt > 1` as "unknown", not "no rotation happened".
                 tracing::info!(
                     sandbox_id = %id,
                     elapsed_ms = (elapsed * 1000.0) as u64,
+                    wait_ready_ms = t_ready,
                     pid = ?pid,
+                    ca_changed = ?ca_changed,
+                    attempt,
                     "fc agent handshake complete",
                 );
                 // Slow-handshake forensics without a jail shell: surface
@@ -5401,6 +5485,74 @@ mod tests {
         );
         // Monotonic in memory.
         assert!(snapshot_create_timeout(16 * 1024) < big);
+    }
+
+    // ---- #567 version-skew message enrichment ----------------------
+
+    #[test]
+    fn agentd_rpc_recv_failure_names_version_skew_on_eof() {
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof");
+        let msg = describe_agentd_rpc_recv_failure(&e);
+        assert!(
+            msg.starts_with("early eof"),
+            "must preserve the existing leading text so log-grep muscle \
+             memory keeps working: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("skew"),
+            "must name host/guest version skew: {msg}"
+        );
+        assert!(msg.contains("RefreshImage"), "must name the remedy: {msg}");
+    }
+
+    #[test]
+    fn agentd_rpc_recv_failure_passes_through_non_eof_errors() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let msg = describe_agentd_rpc_recv_failure(&e);
+        assert_eq!(
+            msg,
+            e.to_string(),
+            "non-EOF errors must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn relay_connect_failure_names_version_skew_for_relay_port_eof() {
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof");
+        let msg = describe_relay_connect_failure(engram_harness_proto::PROXY_PORT_VSOCK_PORT, &e);
+        assert!(
+            msg.starts_with("early eof"),
+            "must preserve the existing leading text: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("skew"),
+            "must name host/guest version skew: {msg}"
+        );
+        assert!(
+            msg.contains("#567"),
+            "must name the dead-relay alternative: {msg}"
+        );
+    }
+
+    #[test]
+    fn relay_connect_failure_passes_through_for_non_relay_ports() {
+        // The same read fails for unrelated reasons on agentd's exec
+        // port (1024) -- relay-specific wording there would misname
+        // the cause.
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof");
+        let msg = describe_relay_connect_failure(ENGRAM_AGENTD_PORT, &e);
+        assert_eq!(
+            msg,
+            e.to_string(),
+            "non-relay ports must not get relay-specific wording"
+        );
+    }
+
+    #[test]
+    fn relay_connect_failure_passes_through_for_non_eof_errors() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let msg = describe_relay_connect_failure(engram_harness_proto::PROXY_PORT_VSOCK_PORT, &e);
+        assert_eq!(msg, e.to_string());
     }
 
     // ADR 0044 K2: node-cgroup escape helpers. A tempdir stands in for the
@@ -6235,7 +6387,7 @@ mod tests {
                 uffd_pid: None,
                 net: None,
                 netns: None,
-                guest_ip: parking_lot::Mutex::new(None),
+                guest_endpoints: parking_lot::Mutex::new(None),
                 agent_ready,
             },
         );

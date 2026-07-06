@@ -21,6 +21,7 @@ use dashmap::DashMap;
 use engram_chunk_store::{ChunkCache, ChunkStore};
 use engram_core::traits::SandboxBackend;
 use engram_core::types::egress::SessionEgressPolicy;
+use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{AgentSpec, AuxBundleRef, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
@@ -706,9 +707,9 @@ impl PooledBackend {
         let egress = self.egress.as_ref()?;
         let Some(guest_ip) = self
             .inner
-            .guest_ip(id)
+            .guest_endpoints(id)
             .await
-            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+            .map(|ep| ep.egress_identity)
         else {
             tracing::warn!(
                 sandbox_id = %id,
@@ -6076,12 +6077,12 @@ impl SandboxBackend for PooledBackend {
     async fn start_agent(&self, id: SandboxId, mut agent: AgentSpec) -> Result<(), SandboxError> {
         // ADR 0021 P1.2: only the host-agent knows the per-host egress-
         // proxy CA, so it stamps the PEM onto the AgentSpec right
-        // before the backend sees it. The FC backend uses this in its
-        // `InstallHostCa` round-trip to agentd (post-readiness,
-        // pre-SpawnHarness). Coord-supplied specs always arrive with
-        // `host_ca_pem = None`; the host-agent fills it in here. The
-        // legacy drive-based delivery still runs in parallel until
-        // P1.5 retires the harness drive.
+        // before the backend sees it. Each backend rides it into the
+        // guest on the same `SpawnHarness` frame that spawns the
+        // harness (2026-07 core-ops fold — one first-contact RPC
+        // installs the CA and spawns, instead of a separate round
+        // trip). Coord-supplied specs always arrive with
+        // `host_ca_pem = None`; the host-agent fills it in here.
         if agent.host_ca_pem.is_none() {
             agent.host_ca_pem = self.egress.as_ref().map(|e| e.ca_cert_pem.clone());
         }
@@ -6298,8 +6299,8 @@ impl SandboxBackend for PooledBackend {
         self.inner.list().await
     }
 
-    async fn guest_ip(&self, id: SandboxId) -> Option<String> {
-        self.inner.guest_ip(id).await
+    async fn guest_endpoints(&self, id: SandboxId) -> Option<GuestEndpoints> {
+        self.inner.guest_endpoints(id).await
     }
 
     /// ADR 0014 follow-up: forward to inner. Without this, the
@@ -6320,21 +6321,16 @@ impl SandboxBackend for PooledBackend {
     /// this the trait default (`Ok(5900)`) would run and the FC/VZ backend's
     /// actual vsock StartBrowser RPC to in-VM agentd would never fire, so
     /// the host's `proxy_vnc` would dial a port nothing started.
-    async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+    async fn start_browser(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
         self.inner.start_browser(id).await
     }
 
     /// ADR 0065: forward to inner (the trait default is a no-op).
     async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
         self.inner.stop_browser(id).await
-    }
-
-    async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
-        self.inner.netns_name_for(id).await
-    }
-
-    async fn vm_internal_ip(&self, id: SandboxId) -> Option<String> {
-        self.inner.vm_internal_ip(id).await
     }
 
     /// ADR 0016 Phase A: COW diagnostic. Reads from the NBD-backed
@@ -8642,16 +8638,16 @@ mod tests {
 
     // ──────────────────────────────────────────────────────────────
     // ADR 0014 follow-up (prod 2026-05-20 session 5c8d0ce5):
-    // PooledBackend MUST forward start_shell / netns_name_for /
-    // guest_ip to its inner backend. The SandboxBackend trait has
-    // default impls for these (Ok(7681) / None / None respectively)
-    // that exist for backends without that capability (process,
-    // VZ-without-netns). When PooledBackend wraps a FirecrackerBackend
-    // that DOES implement them, NOT forwarding silently routes
-    // through the trait defaults and the real FC capability never
-    // fires — observed in prod: zero start_shell logs on the host-
-    // agent despite a completed proxy_shell GRPC call, exactly
-    // because PooledBackend.start_shell was using the trait default.
+    // PooledBackend MUST forward start_shell / guest_endpoints to its
+    // inner backend. The SandboxBackend trait has default impls for
+    // these (Ok(7681) / None respectively) that exist for backends
+    // without that capability (process, VZ-without-netns). When
+    // PooledBackend wraps a FirecrackerBackend that DOES implement
+    // them, NOT forwarding silently routes through the trait defaults
+    // and the real FC capability never fires — observed in prod: zero
+    // start_shell logs on the host-agent despite a completed
+    // proxy_shell GRPC call, exactly because PooledBackend.start_shell
+    // was using the trait default.
     // ──────────────────────────────────────────────────────────────
 
     mod inner_forwarding_tests {
@@ -8666,15 +8662,13 @@ mod tests {
             start_shell_calls: Mutex<Vec<SandboxId>>,
             start_browser_calls: Mutex<Vec<SandboxId>>,
             stop_browser_calls: Mutex<Vec<SandboxId>>,
-            netns_name_for_calls: Mutex<Vec<SandboxId>>,
-            guest_ip_calls: Mutex<Vec<SandboxId>>,
+            guest_endpoints_calls: Mutex<Vec<SandboxId>>,
             /// Non-default response values so we can verify the
             /// forward returned the inner's value, not the trait
             /// default.
             shell_port: u16,
             browser_port: u16,
-            netns_name: Option<String>,
-            guest_ip_value: Option<String>,
+            guest_endpoints_value: Option<GuestEndpoints>,
         }
         impl SpyInner {
             fn new() -> Self {
@@ -8682,8 +8676,7 @@ mod tests {
                     start_shell_calls: Mutex::new(Vec::new()),
                     start_browser_calls: Mutex::new(Vec::new()),
                     stop_browser_calls: Mutex::new(Vec::new()),
-                    netns_name_for_calls: Mutex::new(Vec::new()),
-                    guest_ip_calls: Mutex::new(Vec::new()),
+                    guest_endpoints_calls: Mutex::new(Vec::new()),
                     // Pick non-default values so a "trait default ran
                     // instead of our override" failure shows up as a
                     // value mismatch, not just a counter mismatch.
@@ -8691,8 +8684,12 @@ mod tests {
                     // Non-default browser port (the trait default is 5900);
                     // a fall-through would return 5900 with a zero counter.
                     browser_port: 45900,
-                    netns_name: Some("engr-vm-spytest".into()),
-                    guest_ip_value: Some("10.200.0.42".into()),
+                    guest_endpoints_value: Some(GuestEndpoints {
+                        egress_identity: "10.200.0.42".parse().unwrap(),
+                        dial_ip: "10.200.0.2".parse().unwrap(),
+                        netns: Some("engr-vm-spytest".into()),
+                        vsock_uds: None,
+                    }),
                 }
             }
         }
@@ -8727,21 +8724,23 @@ mod tests {
                 self.start_shell_calls.lock().push(id);
                 Ok(self.shell_port)
             }
-            async fn start_browser(&self, id: SandboxId) -> Result<u16, SandboxError> {
+            async fn start_browser(
+                &self,
+                id: SandboxId,
+            ) -> Result<engram_core::traits::sandbox::BrowserStart, SandboxError> {
                 self.start_browser_calls.lock().push(id);
-                Ok(self.browser_port)
+                Ok(engram_core::traits::sandbox::BrowserStart {
+                    port: self.browser_port,
+                    warning: None,
+                })
             }
             async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
                 self.stop_browser_calls.lock().push(id);
                 Ok(())
             }
-            async fn netns_name_for(&self, id: SandboxId) -> Option<String> {
-                self.netns_name_for_calls.lock().push(id);
-                self.netns_name.clone()
-            }
-            async fn guest_ip(&self, id: SandboxId) -> Option<String> {
-                self.guest_ip_calls.lock().push(id);
-                self.guest_ip_value.clone()
+            async fn guest_endpoints(&self, id: SandboxId) -> Option<GuestEndpoints> {
+                self.guest_endpoints_calls.lock().push(id);
+                self.guest_endpoints_value.clone()
             }
         }
 
@@ -8790,7 +8789,7 @@ mod tests {
             let inner = Arc::new(SpyInner::new());
             let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
             let id = SandboxId::new();
-            let port = pooled.start_browser(id).await.unwrap();
+            let start = pooled.start_browser(id).await.unwrap();
 
             // Inner.start_browser received the sandbox id.
             let calls = inner.start_browser_calls.lock().clone();
@@ -8804,7 +8803,7 @@ mod tests {
             // default (5900). A fall-through would return 5900 and leave
             // the inner's counter at 0.
             assert_eq!(
-                port, inner.browser_port,
+                start.port, inner.browser_port,
                 "must return inner's port (proves the forward, not the 5900 default)",
             );
         }
@@ -8830,43 +8829,28 @@ mod tests {
             );
         }
 
-        /// Same regression but for netns_name_for. The host-agent's
-        /// proxy_shell uses this to decide cold-path (None → dial
-        /// from root) vs warm-path (Some → dial inside netns).
-        /// Without forwarding, every warm-restored sandbox looks
-        /// like a cold one and the proxy_shell dial misses the
-        /// VM entirely.
+        /// Regression guard, consolidated (issue #541): PooledBackend
+        /// MUST forward guest_endpoints to its inner backend. This one
+        /// method now carries what used to be three separate forwards
+        /// (guest_ip / netns_name_for / vm_internal_ip) — asserting
+        /// full value equality against a GuestEndpoints whose fields
+        /// are all non-default (egress_identity != dial_ip, netns
+        /// Some) means a fall-through to the trait's `None` default,
+        /// or a forward that drops a field, both fail on value, not
+        /// just call count.
         #[tokio::test]
-        async fn pooled_backend_forwards_netns_name_for_to_inner() {
+        async fn pooled_backend_forwards_guest_endpoints_to_inner() {
             let inner = Arc::new(SpyInner::new());
             let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
             let id = SandboxId::new();
-            let ns = pooled.netns_name_for(id).await;
+            let endpoints = pooled.guest_endpoints(id).await;
 
-            let calls = inner.netns_name_for_calls.lock().clone();
+            let calls = inner.guest_endpoints_calls.lock().clone();
             assert_eq!(calls, vec![id], "must forward to inner");
             assert_eq!(
-                ns,
-                inner.netns_name.clone(),
+                endpoints,
+                inner.guest_endpoints_value.clone(),
                 "must return inner's value (proves the forward, not the default-None)",
-            );
-        }
-
-        /// guest_ip forwarding was correct pre-fix, but exists
-        /// here as a regression guard so we never lose it.
-        #[tokio::test]
-        async fn pooled_backend_forwards_guest_ip_to_inner() {
-            let inner = Arc::new(SpyInner::new());
-            let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
-            let id = SandboxId::new();
-            let ip = pooled.guest_ip(id).await;
-
-            let calls = inner.guest_ip_calls.lock().clone();
-            assert_eq!(calls, vec![id], "must forward to inner");
-            assert_eq!(
-                ip,
-                inner.guest_ip_value.clone(),
-                "must return inner's value"
             );
         }
     }
