@@ -880,11 +880,14 @@ impl AppState {
             .meta
             .append_session_event(session, kind, payload)
             .await?;
-        // ADR 0073: single ack choke point. Every ingest path (local
-        // mode=all sink, host HTTP forward, WS replay) funnels through
-        // this emit, so acking here covers them all. A confirming
-        // event terminally retires the matching outbox row; unknown /
-        // already-acked ids are no-ops (acks are at-least-once too).
+        // ADR 0073: ack any outbox row a DIRECTLY-EMITTED confirming event
+        // retires. NOTE: the confirming events (`run_started`/`prompt_queued`/
+        // `question_answered`) are HARNESS events, and those ingest via
+        // `harness_event_sink` → `append_session_event`, NOT this `emit` — so
+        // they ack THERE (see the ack in `harness_event_sink`). This arm is the
+        // defensive catch for any confirming event authored/replayed straight
+        // through `emit`; a confirming event terminally retires the matching
+        // outbox row, and unknown / already-acked ids are no-ops (at-least-once).
         if let Some(ack_id) = outbox_ack_id(&event) {
             match self.services.meta.outbox_ack(&ack_id).await {
                 Ok(true) => {
@@ -1022,6 +1025,19 @@ fn harness_event_sink(
                 None
             };
 
+            // ADR 0073 fix: harness events are the CONFIRMING events that retire
+            // the durable outbox row (`run_started{prompt_id}` /
+            // `prompt_queued{prompt_id}` / `question_answered{tool_call_id}`),
+            // but they ingest through THIS sink — NOT `AppState::emit`, where the
+            // ack lived — so the ack never fired. An un-acked row is redelivered
+            // forever: the delivery driver re-resumes the session and re-runs the
+            // prompt on every idle cycle (acked_at NULL, attempts climbing;
+            // phantom re-runs + resume/evict churn + a duplicate-turn transcript
+            // the web can't render). Capture the ack id here (before
+            // `session_event` moves into the published frame) and retire the row
+            // after the append. Unknown / already-acked ids are no-ops.
+            let ack_id = outbox_ack_id(&session_event);
+
             // Drop a back-to-back duplicate `harness_idle`. The
             // upstream TTL bookkeeping in HarnessHub::reader_loop
             // already saw the event, so suppressing it here only
@@ -1084,6 +1100,27 @@ fn harness_event_sink(
                             ephemeral: false,
                         },
                     );
+
+                    // ADR 0073 fix: retire the durable outbox row this harness
+                    // event confirms. Placed AFTER `publish` so the ack's PG
+                    // write never sits in front of the live SSE frame (same
+                    // rationale as the metric join below). Without this, the
+                    // delivery driver never learns the prompt was consumed and
+                    // redelivers it on every resume forever.
+                    if let Some(ack_id) = &ack_id {
+                        match meta.outbox_ack(ack_id).await {
+                            Ok(true) => {
+                                metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
+                            }
+                            Ok(false) => {}
+                            Err(e) => tracing::warn!(
+                                session_id = %session_id,
+                                ack_id = %ack_id,
+                                error = %e,
+                                "outbox ack from harness event failed",
+                            ),
+                        }
+                    }
 
                     // Issue #527 Phase 1: join this run-start against its
                     // `prompt_received` receipt (one PG lookup per run-start —
@@ -1505,6 +1542,13 @@ pub(crate) mod tests {
         /// this call count instead to prove reconcile was actually
         /// skipped.
         pub(crate) reconcile_probe_calls: PlMutex<u32>,
+        /// ADR 0073 ack-path regression: records every `outbox_ack` id so a
+        /// test can prove a harness `run_started{prompt_id}` retires the
+        /// durable outbox row (the bug: harness events bypassed the ack, so
+        /// the row redelivered forever). The default trait `outbox_ack` is a
+        /// no-op returning `Ok(false)`, which would make such an assertion
+        /// vacuous — so the mock records for real.
+        pub(crate) acked_outbox: PlMutex<Vec<String>>,
     }
 
     /// Alias so `clippy::type_complexity` stays happy on MiniMeta's
@@ -1576,6 +1620,7 @@ pub(crate) mod tests {
                 teleport_targets: PlMutex::new(std::collections::HashMap::new()),
                 fail_next_heartbeat_persist: PlMutex::new(false),
                 reconcile_probe_calls: PlMutex::new(0),
+                acked_outbox: PlMutex::new(Vec::new()),
             }
         }
     }
@@ -1927,6 +1972,10 @@ pub(crate) mod tests {
                 rewound_at: None,
             });
             Ok(idx)
+        }
+        async fn outbox_ack(&self, prompt_id: &str) -> Result<bool, MetaError> {
+            self.acked_outbox.lock().push(prompt_id.to_string());
+            Ok(true)
         }
         async fn list_session_events_since(
             &self,
@@ -2339,6 +2388,72 @@ pub(crate) mod tests {
             selected_skills: Vec::new(),
         };
         (session_id, Arc::new(MiniMeta::new(session)))
+    }
+
+    /// ADR 0073 ack-path regression: a harness `run_started{prompt_id}` MUST
+    /// retire the durable outbox row it confirms. These events ingest through
+    /// `harness_event_sink` (NOT `AppState::emit`, where the ack originally
+    /// lived), so the sink has to ack itself. The bug: it didn't — the row
+    /// stayed un-acked and the delivery driver re-resumed the session and
+    /// re-ran the prompt on every idle cycle (acked_at NULL, attempts
+    /// climbing), producing phantom re-runs and a duplicate-turn transcript
+    /// that crashed the web. This pins the ack so a future refactor that moves
+    /// the harness path off `emit` can't silently drop it again.
+    #[tokio::test]
+    async fn harness_run_started_with_prompt_id_acks_the_outbox_row() {
+        let session = Session {
+            id: SessionId::new(),
+            status: engram_core::types::SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:ack".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+            selected_skills: Vec::new(),
+        };
+        let sid = session.id;
+        let mini = Arc::new(MiniMeta::new(session));
+        let meta: Arc<dyn MetadataStore> = mini.clone();
+        let events = Arc::new(SessionEventBus::new(8));
+        let sink = harness_event_sink(events, meta);
+        let sandbox_id = engram_core::SandboxId::new();
+
+        // A run_started carrying the outbox row's prompt_id retires that row.
+        sink(
+            sid,
+            sandbox_id,
+            HarnessEvent::RunStarted {
+                run_id: "run-1".into(),
+                prompt_summary: None,
+                prompt_id: Some("prompt-abc".into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            mini.acked_outbox.lock().as_slice(),
+            ["prompt-abc".to_string()],
+            "run_started{{prompt_id}} must ack the matching outbox row",
+        );
+
+        // A prompt_id-less run_started (there is no outbox row to confirm)
+        // acks nothing — it must not spuriously retire some other row.
+        sink(
+            sid,
+            sandbox_id,
+            HarnessEvent::RunStarted {
+                run_id: "run-2".into(),
+                prompt_summary: None,
+                prompt_id: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            mini.acked_outbox.lock().len(),
+            1,
+            "a run_started with no prompt_id must ack nothing",
+        );
     }
 
     #[tokio::test]
