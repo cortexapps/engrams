@@ -278,8 +278,9 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         .expect("ext4 bake");
 
     // ADR 0021 P1.5: no substrate to build — the egress CA reaches
-    // the guest via `AgentSpec.host_ca_pem`, which triggers an
-    // `InstallHostCa` vsock RPC right before `SpawnHarness` (see the
+    // the guest via `AgentSpec.host_ca_pem`, which rides the
+    // `SpawnHarness` vsock RPC (2026-07 core-ops fold: the CA install
+    // and the harness spawn are one first-contact call now — see the
     // `start_agent` call below).
 
     // ---- 5. Set up FC backend with networking + proxy redirect ----
@@ -357,11 +358,12 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     // we don't actually want a harness child for this test, just
     // the proof that agentd is bound.
     //
-    // ADR 0021 P1.1+P1.2: `host_ca_pem` triggers `InstallHostCa`
-    // over vsock right after agentd readiness and before the
-    // (no-op) SpawnHarness — the in-VM trust store now carries
-    // the egress proxy's CA, which is what previously rode in on
-    // the (retired) harness substrate.
+    // ADR 0021 P1.1+P1.2: `host_ca_pem` rides this (no-op, empty-argv)
+    // `SpawnHarness` call — agentd installs the CA before the
+    // readiness-probe early return (2026-07 core-ops fold: install
+    // and spawn are one first-contact RPC). The in-VM trust store
+    // now carries the egress proxy's CA, which is what previously
+    // rode in on the (retired) harness substrate.
     backend
         .start_agent(
             sandbox_id,

@@ -224,8 +224,9 @@ async fn ensure_harness_artifacts() -> (PathBuf, PathBuf) {
 /// Dockerfile COPYs the prebuilt harness wrapper + claude CLI from
 /// the build context; engram.toml declares the custom-harness
 /// launch contract. The egress CA reaches the guest at runtime via
-/// `AgentSpec.host_ca_pem`, which triggers an `InstallHostCa` vsock
-/// RPC before SpawnHarness.
+/// `AgentSpec.host_ca_pem`, which rides the `SpawnHarness` vsock RPC
+/// (2026-07 core-ops fold: agentd installs the CA before spawning,
+/// one first-contact call instead of two).
 async fn bake_harness_rootfs(repo: &str, harness_bin: &Path, claude_bin: &Path) -> PathBuf {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let target_root = Path::new(&manifest).join("..").join("..").join("target");
@@ -245,9 +246,10 @@ async fn bake_harness_rootfs(repo: &str, harness_bin: &Path, claude_bin: &Path) 
     std::fs::copy(claude_bin, src.path().join("claude")).unwrap();
     // No in-container network — the dev-vm's Docker daemon has DNS
     // issues during apt-get. debian-slim already has /bin/sh + the
-    // base TLS libraries; ca-certificates is wired by agentd's
-    // `InstallHostCa` install + `SSL_CERT_FILE` env-var family it
-    // exports onto every harness child.
+    // base TLS libraries; ca-certificates is wired by agentd's CA
+    // install (now part of the `SpawnHarness` handler) + the
+    // `SSL_CERT_FILE` env-var family it exports onto every harness
+    // child.
     std::fs::write(
         src.path().join("Dockerfile"),
         "FROM debian:bookworm-slim\n\
@@ -466,8 +468,9 @@ async fn drive_harness(
                 argv,
                 env,
                 session_env: HashMap::new(),
-                // ADR 0021 P1.1+P1.2: triggers `InstallHostCa` over
-                // vsock right before SpawnHarness, so the in-VM
+                // ADR 0021 P1.1+P1.2: rides the `SpawnHarness` vsock
+                // RPC (2026-07 core-ops fold: CA install and harness
+                // spawn are one first-contact call), so the in-VM
                 // trust store carries the engram proxy CA before
                 // the harness's first outbound TLS dial.
                 host_ca_pem: Some(ca_pem.to_string()),
@@ -775,7 +778,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
 /// `engram-coordinator/tests/api.rs::create_session_dev_vm_mode_skips_harness_on_harnessed_image`
 /// against a mock backend. This is the real-FC counterpart — it
 /// proves the whole chain (cold create → `wait_agent_ready` →
-/// `InstallHostCa` → empty-argv `SpawnHarness` → Active) survives a
+/// empty-argv `SpawnHarness` with a CA payload → Active) survives a
 /// real microVM with no harness child running.
 ///
 /// Assertions:
@@ -871,9 +874,9 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
 
     // Prove agentd is reachable on the *same* vsock path that
     // start_agent used. `exec` is a `WireRequest::Exec` over
-    // ENGRAM_AGENTD_PORT — same connect path as InstallHostCa /
-    // SpawnHarness. Success here means the dev VM is fully usable
-    // for shell-tab / ad-hoc commands without a harness driving it.
+    // ENGRAM_AGENTD_PORT — same connect path as SpawnHarness.
+    // Success here means the dev VM is fully usable for shell-tab /
+    // ad-hoc commands without a harness driving it.
     let exec_handle = pooled
         .exec(
             sandbox_id,

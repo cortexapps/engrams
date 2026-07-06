@@ -608,10 +608,19 @@ impl SandboxBackend for VzBackend {
             SandboxError::Vm(format!("connect agentd UDS {}: {e}", agent_uds.display()).into())
         })?;
 
+        // 2026-07 core-ops fold: this frame also carries the per-host
+        // egress-proxy CA (ADR 0021 P1) — agentd installs it before
+        // spawning. Previously VZ built this request from
+        // argv/env/session_env only and never referenced
+        // `agent.host_ca_pem`, so a VZ host running an egress proxy
+        // silently delivered no CA to the guest; passing it through
+        // here fixes that for free (VZ exercises the identical
+        // agentd code path as FC).
         let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
             session_env: agent.session_env.into_iter().collect(),
+            host_ca_pem: agent.host_ca_pem,
         });
         engram_agentd::write_msg(&mut conn, &req)
             .await
@@ -620,8 +629,13 @@ impl SandboxBackend for VzBackend {
             .await
             .map_err(|e| SandboxError::Vm(format!("read SpawnHarness response: {e}").into()))?;
         match resp {
-            engram_agentd::WireResponse::HarnessSpawned { pid } => {
-                tracing::debug!(sandbox_id = %id, pid = ?pid, "vz start_agent: harness spawned");
+            engram_agentd::WireResponse::HarnessSpawned { pid, ca_changed } => {
+                tracing::debug!(
+                    sandbox_id = %id,
+                    pid = ?pid,
+                    ca_changed = ?ca_changed,
+                    "vz start_agent: harness spawned",
+                );
                 Ok(())
             }
             engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
