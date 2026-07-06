@@ -46,6 +46,15 @@ const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// after a cold resume; the cost of redelivering early is nil (dedup).
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// ADR 0074 rung-2: on a `NotFound` (VM alive, no harness bound), how many
+/// plain-retry attempts to wait for the in-guest harness to SELF-reattach
+/// before falling back to `start_agent`. A parked-paused un-pause leaves the
+/// harness alive in RAM; it re-dials the hub on its own within a beat, and a
+/// premature `start_agent` would kill it and pay a full ~40s handshake. Over
+/// `failure_backoff`'s 2s/4s/6s schedule this is a ~12s self-reattach window —
+/// ample for an in-guest redial, a small delay for the rare genuine desync.
+const HARNESS_SELF_REATTACH_ATTEMPTS: i32 = 3;
+
 /// Backoff for rows whose delivery attempt FAILED (resume error, host
 /// error). Grows linearly with attempts, capped — an unresumable
 /// session shouldn't spin the driver, and there is deliberately no
@@ -211,15 +220,40 @@ async fn deliver_one(state: &SharedState, row: &OutboxRow) -> Result<(), Deliver
     match forward().await {
         Ok(()) => Ok(()),
         Err(SandboxError::NotFound) => {
-            // Harness-unbound desync: the VM is alive but no harness is
-            // attached for delivery. Issue the in-place reattach (the
-            // respawn arm of the old self-heal — kept, minus its
-            // polling) and let the NEXT pass forward; the redial lands
-            // within a beat and the row is still oldest-due.
+            // The VM is alive but no harness is attached for delivery. There are
+            // TWO causes, and they want OPPOSITE responses:
+            //
+            //  1. ADR 0074 rung-2 parked-paused un-pause: the VM was PAUSED with
+            //     the harness alive in RAM, then un-paused by the ascent. The
+            //     harness's ADR 0073 self-auth loop re-dials the hub on its own
+            //     (its vsock dropped across the pause) and re-binds with its
+            //     still-valid epoch within a beat. `start_agent` here is not just
+            //     wasteful — it KILLS that self-reattaching harness and pays a
+            //     full ~40s agent_handshake (respawn + resume prefault), turning
+            //     a returning-user un-pause (should be sub-second) into WORSE
+            //     than a plain evict+resume. This was the rung-2 regression.
+            //
+            //  2. Genuine harness-unbound desync (harness process gone, VM alive):
+            //     the harness will NOT come back on its own — `start_agent` (the
+            //     e35ed1fa self-heal) is required.
+            //
+            // We can't synchronously distinguish them (no per-sandbox harness-
+            // attach RPC), so give the self-reattach a bounded window of plain
+            // retries FIRST; only fall back to `start_agent` once the harness
+            // clearly isn't self-reattaching. The window (`failure_backoff`
+            // cumulative over `HARNESS_SELF_REATTACH_ATTEMPTS`) is a few seconds
+            // — ample for an in-guest redial, a small delay for the rare desync.
+            if row.attempts < HARNESS_SELF_REATTACH_ATTEMPTS {
+                return Err(DeliverError::Retry(
+                    "harness not attached — awaiting in-guest self-reattach".into(),
+                ));
+            }
             match crate::api::snapshot::reattach_harness_in_place(state, row.session_id, sandbox_id)
                 .await
             {
-                Ok(true) => Err(DeliverError::Retry("harness reattach issued".into())),
+                Ok(true) => Err(DeliverError::Retry(
+                    "harness reattach issued (start_agent fallback)".into(),
+                )),
                 Ok(false) => Err(DeliverError::Retry(
                     "session moved off the sandbox mid-delivery".into(),
                 )),

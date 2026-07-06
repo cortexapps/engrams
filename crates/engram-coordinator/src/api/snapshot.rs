@@ -488,7 +488,21 @@ pub(crate) async fn resume_core(
 pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
     let session = state.services.meta.get_session(id).await?;
     match session.status {
-        SessionState::Active => Ok(()),
+        SessionState::Active => {
+            // ADR 0074 rung-2: a session can be Active AND parked-paused
+            // (`park_rung == 2`, VM frozen) — the admin `EvictIdle` path parks
+            // from Active, and `evict_session_to_state`'s park branch returns
+            // WITHOUT a status transition, so it inherits `Active`. Returning Ok
+            // would advertise a live session over a PAUSED VM and stall the next
+            // prompt on a frozen harness. Un-pause it first (the natural
+            // nomination path parks from `Evicting`, routing through the
+            // `try_cancel` ascent; this covers the Active/paused shape). No-op
+            // for the common not-parked Active session.
+            if session.park_rung == 2 {
+                let _ = try_cancel_nominated_eviction(state, id).await?;
+            }
+            Ok(())
+        }
         SessionState::Idle => {
             // Snapshotted, sandbox destroyed, ready to resume. Take the
             // standard lease-serialized resume path inline.
