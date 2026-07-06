@@ -184,6 +184,7 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         rootfs_blob_key: metadata.rootfs_blob_key.clone(),
         working_set_blob_key: metadata.working_set_blob_key.clone(),
         aux_bundles: metadata.aux_bundles.clone(),
+        paused_at: metadata.paused_at,
     };
 
     let dump_logs_and_panic = |what: &str, e: String, work_path: &Path| -> ! {

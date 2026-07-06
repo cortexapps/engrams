@@ -425,6 +425,8 @@ pub async fn evacuate_dead_source(
                 // ADR 0035: evac-dest restore is resume-flavored — keep the
                 // pinned generations; the target host materializes them.
                 aux_bundles: s.aux_bundles.clone(),
+                // Issue #529: restore-side reconstruction, not a fresh capture.
+                paused_at: None,
             };
             target_backend
                 .restore(metadata)
@@ -560,6 +562,7 @@ mod tests {
                 rootfs_blob_key: None,
                 working_set_blob_key: None,
                 aux_bundles: vec![],
+                paused_at: None,
             })
         }
         async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
@@ -804,7 +807,7 @@ mod tests {
         async fn record_snapshot(
             &self,
             _: engram_core::types::snapshot::SnapshotRecord,
-        ) -> Result<(), MetaError> {
+        ) -> Result<bool, MetaError> {
             unreachable!()
         }
         async fn list_snapshots_for_session(

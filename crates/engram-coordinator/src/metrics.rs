@@ -181,6 +181,16 @@ pub const EVICTION_PIPELINE_SECONDS: &str = "engram_eviction_pipeline_seconds";
 /// means hosts are going blind to running sandboxes).
 pub const EVICTION_NOMINATED_TOTAL: &str = "engram_eviction_nominated_total";
 
+/// Counter (issue #529). The D5 row-watcher's wait for the eviction's
+/// snapshot row (landed host-side via the heartbeat reconcile) hit its
+/// `ENGRAM_EVICT_FINALIZE_WAIT_SECS` deadline before the row appeared.
+/// Not itself data loss (the host-owned finalize keeps retrying and the
+/// row lands eventually; the lease reaper frees resume in the
+/// meantime) — but a sustained nonzero rate means finalize jobs are
+/// taking pathologically long and warrants investigation.
+pub const EVICTION_FINALIZE_ROW_WAIT_TIMEOUT_TOTAL: &str =
+    "engram_eviction_finalize_row_wait_timeout_total";
+
 /// Counter (Track A). Active sessions the desync watchdog flagged as
 /// wedged — the harness event stream desynced from the run state machine.
 /// Label: `signature` = `orphan_after_close` (a run-scoped event with no

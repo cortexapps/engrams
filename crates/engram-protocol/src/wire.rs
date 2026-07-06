@@ -55,7 +55,12 @@ use serde::{Deserialize, Serialize};
 // carrying the `[warm]`-hook progress protocol's `CaptureProgress` events
 // and a structured `CaptureFailed` terminal frame. Clean break — coord+host
 // roll together, no dual-decode ladder.
-pub const WIRE_VERSION: u32 = 8;
+// v9 (issue #529): `SnapshotMetadata` gains `paused_at: Option<DateTime<Utc>>` —
+// the host's exact pause instant, carried over the coord↔host RPC boundary
+// (the eviction/snapshot response) so the composed eviction path can resolve
+// the `session_events` coherence cursor from it instead of coord wall-clock
+// `now` sampled after the capture returns.
+pub const WIRE_VERSION: u32 = 9;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

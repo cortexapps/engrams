@@ -638,7 +638,28 @@ pub async fn heartbeat(
             fc_snapshot_version: hb.capabilities.fc_snapshot_version.clone(),
         };
         match state.services.meta.record_snapshot(record).await {
-            Ok(()) => acked_checkpoints.push(adv.snapshot_id),
+            Ok(inserted) => {
+                acked_checkpoints.push(adv.snapshot_id);
+                // Issue #529: the eviction finalize job is host-owned and
+                // never talks to the coordinator again once
+                // `snapshot_begin` returns — THIS reconcile, on the row's
+                // first landing, is now the only place `SnapshotTaken`
+                // emits for a D5 eviction. A periodic checkpoint's row
+                // (or a re-record of either kind) must NOT re-emit it.
+                if inserted && adv.kind == engram_protocol::heartbeat::CheckpointKind::EvictionFinal
+                {
+                    let _ = state
+                        .emit(
+                            adv.session_id,
+                            SessionEvent::SnapshotTaken {
+                                snapshot_id: adv.snapshot_id,
+                                size_bytes: adv.size_bytes,
+                                at: Utc::now(),
+                            },
+                        )
+                        .await;
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     host_id = %host_id,

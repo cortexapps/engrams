@@ -30,6 +30,7 @@ pub mod coord_client;
 pub mod dirty_map;
 pub mod disk_daemon;
 pub mod egress;
+pub mod eviction_finalize;
 pub mod grpc_server;
 pub mod harness;
 pub mod host_client;
@@ -288,7 +289,13 @@ impl HostAgent {
                 if self.chunk_store.is_some() && checkpoints_supported {
                     p = p.with_checkpoint_dir(self.cfg.work_dir.join("checkpoints"));
                 }
-                Arc::new(p)
+                let arc = Arc::new(p);
+                // Issue #529: must run before anything spawns a finalize
+                // job against this backend (the checkpoint driver, an
+                // incoming snapshot_begin, or resume_pending_finalizes
+                // below all rely on it for the terminal destroy call).
+                arc.set_self_ref(&arc);
+                arc
             };
             // ADR 0045 C1: the migration export TTL sweep — the
             // dumb-host rule. An export past EXPORT_TTL means the
@@ -571,6 +578,18 @@ impl HostAgent {
             } else {
                 None
             };
+
+            // Issue #529: re-drive every un-acked eviction finalize
+            // record left on disk by a prior host-agent process (crash /
+            // OOM / rolling update mid-upload) — the crash-recovery half
+            // of the host-durable finalize redesign. No-ops when there
+            // are none (the common case).
+            {
+                let pooled_for_finalize_redrive = pooled.clone();
+                tokio::spawn(async move {
+                    pooled_for_finalize_redrive.resume_pending_finalizes().await;
+                });
+            }
             // ADR 0013: every harness event POSTs to the coord via
             // HTTP. Any coord pod can serve the POST (the
             // `state.emit` path on the receiving pod handles
@@ -1209,6 +1228,7 @@ impl HostAgent {
                             aux_bundles: r.aux_bundles.clone(),
                             paused_at: r.paused_at,
                             captured_at: r.captured_at,
+                            kind: r.kind,
                         })
                         .collect();
                     let utilization = util_probe.sample(&util_work_dir, &ram_snapshot);

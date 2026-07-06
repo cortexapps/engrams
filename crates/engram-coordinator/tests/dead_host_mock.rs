@@ -150,8 +150,8 @@ impl MetadataStore for MiniMeta {
         }
         Ok(affected)
     }
-    async fn record_snapshot(&self, _s: SnapshotRecord) -> Result<(), MetaError> {
-        Ok(())
+    async fn record_snapshot(&self, _s: SnapshotRecord) -> Result<bool, MetaError> {
+        Ok(true)
     }
     async fn list_snapshots_for_session(
         &self,

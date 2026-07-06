@@ -75,6 +75,21 @@ pub struct Heartbeat {
     pub utilization: engram_core::types::host::HostUtilization,
 }
 
+/// Issue #529: distinguishes a periodic (ADR 0028 Fix A) checkpoint
+/// from an eviction's terminal snapshot. The heartbeat reconcile uses
+/// this (+ `record_snapshot`'s `inserted` flag) to emit `SnapshotTaken`
+/// exactly once, only for a freshly-landed eviction row — a periodic
+/// checkpoint reconcile must NOT emit it (the session isn't evicted).
+/// `#[serde(default)]` on the carrying structs' `kind` field keeps a
+/// mixed-version heartbeat additive-safe (JSON, not bincode — no
+/// WIRE_VERSION bump needed for this addition).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckpointKind {
+    #[default]
+    Periodic,
+    EvictionFinal,
+}
+
 /// ADR 0028 Fix A: one un-acked durable checkpoint. Carries
 /// everything `record_snapshot` needs — the advertising host may be
 /// the only survivor of the original capture pipeline.
@@ -95,6 +110,9 @@ pub struct CheckpointAdvert {
     /// when it records the row.
     pub paused_at: DateTime<Utc>,
     pub captured_at: DateTime<Utc>,
+    /// Issue #529: periodic vs. eviction-terminal — see [`CheckpointKind`].
+    #[serde(default)]
+    pub kind: CheckpointKind,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

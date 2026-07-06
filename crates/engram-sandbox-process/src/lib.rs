@@ -419,6 +419,10 @@ impl SandboxBackend for ProcessBackend {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            // Issue #529: no real pause instant when run unwrapped by
+            // `PooledBackend` (which stamps it from its own capture_phase);
+            // dev-only backend, so the composed path's `now` fallback is fine.
+            paused_at: None,
         })
     }
 
@@ -1125,6 +1129,7 @@ mod tests {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            paused_at: None,
         };
         let res = b.restore(meta).await;
         assert!(matches!(res, Err(SandboxError::Snapshot(_))));

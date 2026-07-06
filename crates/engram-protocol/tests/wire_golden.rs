@@ -200,6 +200,8 @@ fn snapshot_metadata() -> SnapshotMetadata {
             drive_id: "skills".into(),
             sha256: "b".repeat(64),
         }],
+        // v9: trailing field — the host's exact pause instant (issue #529).
+        paused_at: Some(DateTime::from_timestamp(1_770_000_100, 0).unwrap()),
     }
 }
 
@@ -363,7 +365,7 @@ fn wire_version_pinned() {
     // signal that a payload shape changed; pin it so a payload change
     // without a bump (or vice-versa) is a conscious decision.
     assert_eq!(
-        WIRE_VERSION, 8,
+        WIRE_VERSION, 9,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

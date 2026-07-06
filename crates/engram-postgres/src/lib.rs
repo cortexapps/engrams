@@ -2475,7 +2475,7 @@ impl MetadataStore for PostgresStore {
             .collect::<Result<Vec<_>, MetaError>>()
     }
 
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
+    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
         // ADR 0007: single-tier durability. Every snapshot row
         // references chunked manifests in `BlobStorage` via the
         // `disk_manifest_*` / `memory_manifest_*` quartet. The
@@ -2490,7 +2490,13 @@ impl MetadataStore for PostgresStore {
         // chunks; with the bump, the sweep's post-collection
         // generation read catches the divergence and restarts.
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        sqlx::query(
+        // Issue #529: `RETURNING (xmax = 0)` tells the caller whether this
+        // call INSERTed a fresh row or UPDATEd an existing one — Postgres's
+        // standard idiom for "was this an insert". The heartbeat reconcile
+        // uses it to emit `SnapshotTaken` exactly once, on the row's first
+        // landing, regardless of which coord (if any) survived the
+        // original capture.
+        let row = sqlx::query(
             r#"
             INSERT INTO snapshots
                 (id, session_id, host_id,
@@ -2518,6 +2524,7 @@ impl MetadataStore for PostgresStore {
                 -- an already-known capture-time FC snapshot version.
                 fc_snapshot_version     = COALESCE(EXCLUDED.fc_snapshot_version, snapshots.fc_snapshot_version),
                 updated_at              = NOW()
+            RETURNING (xmax = 0) AS inserted
             "#,
         )
         .bind(snap.id.as_uuid())
@@ -2538,15 +2545,16 @@ impl MetadataStore for PostgresStore {
         )
         .bind(snap.events_cursor)
         .bind(&snap.fc_snapshot_version)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
+        let inserted: bool = sqlx::Row::try_get(&row, "inserted").map_err(db_err)?;
         sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        Ok(())
+        Ok(inserted)
     }
 
     async fn prune_session_snapshots(
@@ -3021,25 +3029,37 @@ impl MetadataStore for PostgresStore {
             .collect();
 
         // Tombstone the rolled-back span (audit-preserving) and count it.
+        // Issue #529: exclude coordinator-fact kinds — `status_changed`,
+        // `snapshot_taken`, `evicted`, `resumed`, `recovered_from_checkpoint`.
+        // Those are control-plane bookkeeping the coordinator itself
+        // appended around the eviction/resume boundary; they stay true
+        // regardless of what the guest remembers, so rewinding them was
+        // what made every clean evict→resume "roll back" (median 4
+        // events) even with nothing lost. Everything guest-derived
+        // (run_*, agent_message*, tool_call_*, exec_*, stdout/stderr,
+        // prompt_*, harness_idle, user_question, question_answered,
+        // file_changed, file_shared, integration_asset, …) still rewinds.
         //
-        // Issue #527 Phase 1: `prompt_received` is excluded — it is a
-        // coordinator-authoritative fact ("the user asked at time T") that
-        // stays true across a guest-state rewind (the resume rewinds the
-        // HARNESS's view of the world, not whether the user sent the
+        // Issue #527 Phase 1: `prompt_received` is ALSO excluded here — it
+        // is a coordinator-authoritative fact ("the user asked at time T")
+        // that stays true across a guest-state rewind (the resume rewinds
+        // the HARNESS's view of the world, not whether the user sent the
         // prompt). Without this exclusion, every resume-with-rollback would
         // tombstone the receipt row and inflate `rolled_back` by one,
         // masking the real signal this issue exists to measure.
         //
-        // Merge-coordination note (see issue #527 Guardrails): if a sibling
-        // change extends this same UPDATE with its own lifecycle-kind
-        // exclusion list, merge into one `AND kind NOT IN (...)` predicate
-        // rather than stacking separate `AND kind <>` clauses.
+        // Per issue #527's Guardrails merge-coordination note: the two
+        // sibling exclusion lists compose into one `AND kind NOT IN (...)`
+        // predicate rather than stacking separate `AND kind <>` clauses.
         let tombstoned = sqlx::query(
             r#"
             UPDATE session_events
                SET rewound_at = NOW()
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
-               AND kind <> 'prompt_received'
+               AND kind NOT IN (
+                   'status_changed', 'snapshot_taken', 'evicted',
+                   'resumed', 'recovered_from_checkpoint', 'prompt_received'
+               )
             "#,
         )
         .bind(session_id.as_uuid())

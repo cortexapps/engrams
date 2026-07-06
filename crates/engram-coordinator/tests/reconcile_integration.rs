@@ -238,14 +238,14 @@ impl MetadataStore for ReconcileMeta {
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
         Ok(Vec::new())
     }
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
+    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
         // Template snapshots (session_id=None) don't appear in the
         // per-session lookup mock; ignore them. The real PG store
         // indexes by snapshot_id so it doesn't have this issue.
         if let Some(sid) = snap.session_id {
             self.snapshots.lock().entry(sid).or_default().push(snap);
         }
-        Ok(())
+        Ok(true)
     }
     async fn list_snapshots_for_session(
         &self,

@@ -325,6 +325,9 @@ pub async fn migrate_session_live(
             .map(|r| r.aux_bundles.clone())
             .or_else(|| base_row.as_ref().map(|r| r.aux_bundles.clone()))
             .unwrap_or_default(),
+        // Issue #529: restore-side reconstruction, not a fresh capture —
+        // no pause instant to carry.
+        paused_at: None,
     };
     // ADR 0019 / telemetry restoration (#526): `dest.restore` makes a
     // gRPC call to the target host-agent; the `TraceparentInjector`

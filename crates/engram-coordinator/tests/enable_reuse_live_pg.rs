@@ -306,6 +306,7 @@ impl HostClient for FakeCaptureHost {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            paused_at: None,
         })
     }
 }

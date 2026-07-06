@@ -188,6 +188,27 @@ pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lo
 /// after deploy would mean the skip path isn't exercised.
 pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";
 
+/// Issue #529: an `EvictionFinalizeRecord` (+ its `disk-pending/` chunk
+/// files, when the capture had a dirty disk tier) was durably persisted
+/// before `snapshot_begin` returned — the durability boundary moved
+/// from "upload complete" to "this instant". Should track 1:1 with
+/// D5 eviction attempts on FC hosts.
+pub const EVICTION_FINALIZE_PERSISTED_TOTAL: &str = "engram_eviction_finalize_persisted_total";
+/// Issue #529: an eviction finalize job reached its terminal stage —
+/// the durable `CheckpointRecord { kind: EvictionFinal }` was written
+/// (to be reconciled into PG on the next heartbeat) and the finalize
+/// record was deleted.
+pub const EVICTION_FINALIZE_COMPLETED_TOTAL: &str = "engram_eviction_finalize_completed_total";
+/// Issue #529: `resume_pending_finalizes` re-drove a persisted record
+/// at host-agent startup — the crash-recovery path actually firing.
+pub const EVICTION_FINALIZE_REDRIVEN_TOTAL: &str = "engram_eviction_finalize_redriven_total";
+/// Issue #529: a finalize job exhausted `ENGRAM_EVICTION_FINALIZE_MAX_ATTEMPTS`
+/// and was quarantined (`finalize/failed/`) — never silent; resume falls
+/// back to the prior periodic checkpoint. Should stay at/near zero.
+pub const EVICTION_FINALIZE_QUARANTINED_TOTAL: &str = "engram_eviction_finalize_quarantined_total";
+/// Issue #529: wall-clock per finalize leg. Label `stage` =
+/// `disk`|`memory`|`blobs`|`terminal`.
+pub const EVICTION_FINALIZE_STAGE_SECONDS: &str = "engram_eviction_finalize_stage_seconds";
 /// ADR 0019 / telemetry restoration (#526): the resume-prefault
 /// effectiveness detector. The uffd-handler writes a per-jail
 /// `prefault-stats.json` (sibling of `working-set-trace.json`) at the

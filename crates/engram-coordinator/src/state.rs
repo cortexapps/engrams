@@ -1733,7 +1733,7 @@ pub(crate) mod tests {
         {
             Ok(Vec::new())
         }
-        async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
+        async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
             let mut should_fail = self.fail_next_record_snapshot.lock();
             if *should_fail {
                 *should_fail = false;
@@ -1742,8 +1742,20 @@ pub(crate) mod tests {
                 ));
             }
             drop(should_fail);
-            self.snapshots.lock().push(snap);
-            Ok(())
+            let mut snapshots = self.snapshots.lock();
+            let inserted = !snapshots.iter().any(|s| s.id == snap.id);
+            snapshots.push(snap);
+            Ok(inserted)
+        }
+        async fn get_snapshot(
+            &self,
+            id: engram_core::types::SnapshotId,
+        ) -> Result<Option<SnapshotRecord>, MetaError> {
+            // Issue #529: the coordinator's row-watcher polls this to
+            // detect a snapshot row landing via the host's heartbeat
+            // reconcile (which, in this mock harness, is simulated by a
+            // test calling `record_snapshot` directly).
+            Ok(self.snapshots.lock().iter().find(|s| s.id == id).cloned())
         }
         async fn list_snapshots_for_session(
             &self,

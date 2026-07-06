@@ -882,6 +882,7 @@ jobs:
             --test two_host_live_teleport \
             --test two_host_drain_wave \
             --test pagemap_scanner \
+            --test eviction_finalize_redrive \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
