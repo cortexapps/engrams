@@ -299,11 +299,16 @@ pub struct AgentSpec {
     /// Per-host egress-proxy CA cert in PEM form (ADR 0021 P1).
     /// Populated by the host-agent *after* receiving the spec from
     /// coord, immediately before handing it to the sandbox backend —
-    /// only the host knows its own CA. The Firecracker backend pushes
-    /// this via `InstallHostCa` over vsock right after `wait_agent_ready`
-    /// and before `SpawnHarness`, replacing the pre-0021 path where the
-    /// CA rode in on the harness drive. `None` skips the install — used
+    /// only the host knows its own CA. `None` skips the install — used
     /// by tests, dev backends, and any deploy without egress proxying.
+    ///
+    /// 2026-07 core-ops fold: this rides the guest-bound `SpawnHarness`
+    /// wire frame (`engram_agentd::proto::SpawnHarnessRequest`) as a
+    /// single first-contact RPC that both installs the CA and spawns
+    /// the harness — there is no separate CA-install round trip
+    /// anymore. Firecracker and VZ both wire it through (VZ used to
+    /// silently drop this field); the Process backend is N/A — no
+    /// agentd wire, no guest boundary, so it always sends `None`.
     ///
     /// **Wire format note**: this field intentionally does NOT carry
     /// `#[serde(skip_serializing_if = "Option::is_none")]`. AgentSpec

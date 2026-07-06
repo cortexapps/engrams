@@ -5,6 +5,7 @@ use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
 use engram_core::types::{ImageManifest, Session, SessionSpec, SessionState};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
@@ -716,33 +717,45 @@ async fn boot_prepared(
     // sandbox is always recorded or torn down and the reservation is always
     // released, regardless of the request's fate. The handler awaits the
     // JoinHandle only to shape the connected client's response.
+    //
+    // ADR 0019 / telemetry restoration (#526): `tokio::spawn` severs the
+    // tracing context — a span created inside this future would otherwise
+    // become a new orphaned trace root instead of a child of
+    // `session.create.grpc`. `.instrument(Span::current())` re-parents the
+    // detached body onto the request span; it changes span context only,
+    // not task lifetime, so the detach-for-cancellation-safety property
+    // from #210 is unaffected.
     let st = state.clone();
-    let boot_handle = tokio::spawn(async move {
-        match crate::session_boot::boot_on_reserved_host(&st, inputs, host_id).await {
-            Ok(()) => Ok(()),
-            Err(crate::session_boot::BootError::NotStarted(e)) => {
-                // The sandbox never came up (or was torn down on the insert
-                // failure); release the reservation row so the host's free
-                // capacity is restored at once (reconcile would also reap it).
-                // No Failed transition — nothing usable ever existed.
-                if let Err(de) = st.services.meta.delete_pending_session(session_id).await {
-                    tracing::warn!(%session_id, error = %de,
-                        "delete_pending_session after boot failure failed; reconcile will reap");
+    let boot_span = tracing::Span::current();
+    let boot_handle = tokio::spawn(
+        async move {
+            match crate::session_boot::boot_on_reserved_host(&st, inputs, host_id).await {
+                Ok(()) => Ok(()),
+                Err(crate::session_boot::BootError::NotStarted(e)) => {
+                    // The sandbox never came up (or was torn down on the insert
+                    // failure); release the reservation row so the host's free
+                    // capacity is restored at once (reconcile would also reap it).
+                    // No Failed transition — nothing usable ever existed.
+                    if let Err(de) = st.services.meta.delete_pending_session(session_id).await {
+                        tracing::warn!(%session_id, error = %de,
+                            "delete_pending_session after boot failure failed; reconcile will reap");
+                    }
+                    Err(e)
                 }
-                Err(e)
-            }
-            Err(crate::session_boot::BootError::Started(e)) => {
-                // The sandbox booted but a later step failed — fail the
-                // session (the sandbox was already unbound by the boot pipeline).
-                let _ = st
-                    .services
-                    .meta
-                    .transition_session(session_id, SessionState::Failed)
-                    .await;
-                Err(e)
+                Err(crate::session_boot::BootError::Started(e)) => {
+                    // The sandbox booted but a later step failed — fail the
+                    // session (the sandbox was already unbound by the boot pipeline).
+                    let _ = st
+                        .services
+                        .meta
+                        .transition_session(session_id, SessionState::Failed)
+                        .await;
+                    Err(e)
+                }
             }
         }
-    });
+        .instrument(boot_span),
+    );
 
     let boot_result = boot_handle.await.map_err(|join_err| {
         // The boot task panicked: it did NOT run its disposition, so the
@@ -1348,8 +1361,8 @@ pub(crate) async fn delete_session_core(
     // Drive the session to its FSM-legal terminal BEFORE destroying the
     // sandbox. `terminate_session` reads the current state and picks the
     // terminal `SessionState::terminal_target` permits — `Completed` for
-    // states that ran, `Failed` for the early states (Pending / Created /
-    // GuestReady) that never became usable (this is what fixes the
+    // states that ran, `Failed` for the early states (Pending / Created)
+    // that never became usable (this is what fixes the
     // `5fadd364` phantom: deleting a `Created` session used to drive an
     // illegal Created→Completed that surfaced as Conflict, destroying the
     // sandbox but leaving the row non-terminal). Terminating first also

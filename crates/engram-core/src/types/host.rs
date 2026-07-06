@@ -121,13 +121,19 @@ pub struct HostUtilization {
     pub mem_total_mib: u64,
     #[serde(default)]
     pub mem_used_mib: u64,
-    /// ADR 0046: memory (MiB) actually available to place NEW sessions on this
-    /// host — `MemAvailable + Σ guest-resident (PSS)`. It nets out the host
-    /// daemon, OS, kube-system pods, the chunk cache, and the mlock'd
-    /// base-memfile residency (ADR 0022) automatically — everything in
-    /// `MemUsed` that isn't a running VM — so placement subtracts only session
-    /// budgets from it. `0` on non-Linux / pre-0058 hosts, where placement
-    /// falls back to the raw `mem_total_mib`.
+    /// ADR 0046, amended by issue #540 (the host RAM ledger): memory (MiB)
+    /// actually available to place NEW sessions on this host —
+    /// `MemAvailable + Σ PSS of reservation-backed (non-parked) VMs −
+    /// pending base-shm charges`. `MemAvailable` nets out the host daemon,
+    /// OS, kube-system pods, the chunk cache, and populated base-shm tmpfs
+    /// (shmem isn't kernel-reclaimable) automatically; adding back only
+    /// non-parked VM PSS — never parked-resident PSS — is what keeps a
+    /// parked-but-RAM-resident sandbox (epic-parking-ladder rungs 2-3) from
+    /// being double-counted as both occupied and free. `0` on non-Linux /
+    /// pre-0058 hosts, where placement falls back to the raw
+    /// `mem_total_mib`. Derived from `RamLedgerSnapshot::allocatable_mib`
+    /// in `engram-host-agent::ram_ledger` (issue #540) — see that module
+    /// for the full ledger.
     #[serde(default)]
     pub allocatable_mib: u64,
     /// Whole-host CPU utilization in percent (0–100), computed from
@@ -136,6 +142,30 @@ pub struct HostUtilization {
     /// sample to diff against).
     #[serde(default)]
     pub cpu_pct: f32,
+    /// Issue #540: measured (`st_blocks`) bytes (MiB) resident on the
+    /// per-image base-shm tmpfs — attribution the pre-ledger formula had
+    /// none of (it netted these bytes out of `MemAvailable` silently).
+    /// `0` on non-Linux or when no image has ever prewarmed.
+    #[serde(default)]
+    pub base_shm_mib: u64,
+    /// Issue #540: registered-but-not-yet-materialized base-shm prewarm
+    /// charges — bytes `image_prefetch` has promised to write but hasn't
+    /// finished writing (or the tmpfs scan hasn't caught up to) yet.
+    /// Already subtracted out of `allocatable_mib`; broken out here so an
+    /// operator can see WHY allocatable dipped during an enable.
+    #[serde(default)]
+    pub base_shm_pending_mib: u64,
+    /// Issue #540: Σ PSS of sandboxes flagged `parked` — RAM-resident but
+    /// reservation-free (epic-parking-ladder rungs 2-3; `0` until the
+    /// ladder lands). Never folded into `allocatable_mib`; this is the
+    /// seam a later reclaim-under-pressure feature reads.
+    #[serde(default)]
+    pub parked_pss_mib: u64,
+    /// Issue #540: Σ PSS of sandboxes NOT flagged `parked` — the same
+    /// figure already added back into `allocatable_mib`, broken out for
+    /// attribution/dashboards.
+    #[serde(default)]
+    pub running_pss_mib: u64,
 }
 
 /// ADR 0047: a snapshot the host holds locally, as persisted in the

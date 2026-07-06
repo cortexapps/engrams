@@ -225,6 +225,22 @@ function HostCard({
               string means off-FC or not-yet-probed, so render nothing. */}
           {host.fc_snapshot_version && <> · fc {host.fc_snapshot_version}</>}
         </div>
+        {/* Issue #540: the RAM ledger's attribution — where the host's
+            RAM actually went, broken out of the single mem bar above.
+            Hidden until the host's first post-0078 heartbeat. */}
+        {(host.util_base_shm_mib > 0 ||
+          host.util_running_pss_mib > 0 ||
+          host.util_parked_pss_mib > 0) && (
+          <div className="font-mono text-xs text-muted-foreground">
+            ram: {(host.util_running_pss_mib / 1024).toFixed(1)} GiB running
+            {host.util_parked_pss_mib > 0 && (
+              <> · {(host.util_parked_pss_mib / 1024).toFixed(1)} GiB parked</>
+            )}
+            {host.util_base_shm_mib > 0 && (
+              <> · {(host.util_base_shm_mib / 1024).toFixed(1)} GiB base-shm</>
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
   );

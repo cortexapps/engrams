@@ -50,7 +50,12 @@ use serde::{Deserialize, Serialize};
 // `BuildBaseSnapshotRequest`) and `SessionEgressPolicy` gains `allow_all`. The
 // host registers a matching egress policy (allow-all or allowlist) for the
 // capture VM's guest IP so the warm boot can reach the network.
-pub const WIRE_VERSION: u32 = 7;
+// v8 (issue #539): `BuildBaseSnapshot` becomes server-streaming
+// (`BuildBaseSnapshotEvent` — `progress`/`done`/`failed`) instead of unary,
+// carrying the `[warm]`-hook progress protocol's `CaptureProgress` events
+// and a structured `CaptureFailed` terminal frame. Clean break — coord+host
+// roll together, no dual-decode ladder.
+pub const WIRE_VERSION: u32 = 8;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

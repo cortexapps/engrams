@@ -50,6 +50,28 @@ data:
   {{- with .Values.storage.chunkCacheBudgetBytes }}
   ENGRAM_CHUNK_CACHE_BUDGET_BYTES: {{ . | quote }}
   {{- end }}
+  {{- with .Values.storage.chunkCacheDiskFraction }}
+  ENGRAM_CHUNK_CACHE_DISK_FRACTION: {{ . | quote }}
+  {{- end }}
+  # ADR 0067: distance-to-kubelet-eviction headroom gauge. Always set
+  # (has a sane default) so the gauge is meaningful even when the
+  # operator hasn't tuned it — see the TODO on storage.kubeletEvictPct.
+  ENGRAM_KUBELET_EVICT_PCT: {{ .Values.storage.kubeletEvictPct | quote }}
+  {{- if .Values.storage.dedicatedDevice }}
+  # ADR 0067: paired with storage.dedicatedDevice — node-prep formats +
+  # mounts the device at workDirHostPath; the host-agent refuses to
+  # start unless that mount actually landed (guards the
+  # base-shm-startup-race failure class: a rolled pod starting before
+  # the mount is visible would otherwise silently write to the boot disk).
+  ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT: "true"
+  # ADR 0067 finding 1: the gate must compare workDirHostPath against
+  # the NODE's boot disk, not the host-agent container's own `/` (its
+  # ephemeral image overlayfs, which is on a distinct device from EVERY
+  # hostPath mount by construction — that comparison would always
+  # report "distinct filesystem" and never fire). The DaemonSet mounts
+  # the node's `/` read-only at /mnt/host-root for exactly this check.
+  ENGRAM_HOST_ROOT_REF_PATH: /mnt/host-root
+  {{- end }}
   # ADR 0006 + issue #240: the egress proxy is MANDATORY. host-agent
   # always binds it and FAILS TO START if it can't (CA unloadable /
   # port unbindable). The K8s migration (ADR 0044 K5) dropped these

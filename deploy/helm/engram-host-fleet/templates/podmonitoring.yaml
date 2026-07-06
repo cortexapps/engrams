@@ -1,0 +1,39 @@
+{{- if .Values.metrics.podMonitoring.enabled -}}
+# Google Managed Prometheus PodMonitoring — GKE-native scrape config.
+# Mirrors the engram (coordinator) chart's podmonitoring.yaml. GMP picks
+# up this CRD and scrapes the host-agent's named `metrics` port (9100) on
+# every selector-matching pod without any standalone Prometheus infra.
+# Available on GKE clusters with `managed-prometheus` enabled.
+#
+# ADR 0019 / telemetry restoration (#526): the host-fleet had no
+# PodMonitoring at all — Prometheus counters died with every pod churn
+# (9 host-agent pod identities in 48h observed in prod), so no
+# metric-based percentile was computable. GMP's remote-write into Cloud
+# Monitoring (Monarch) is the fix: counter resets on pod churn become
+# ordinary rate()/increase() resets, and histograms aggregate across pod
+# incarnations and hosts — no in-cluster Prometheus to operate.
+#
+# Even though host-agent pods are hostNetwork (the scrape target is
+# podIP=nodeIP:9100), the PodMonitoring selector still matches on pod
+# labels the normal way — GMP resolves the port via the pod spec, not
+# the network mode. (Unverified against the internal cluster per the
+# issue's "Unverified claims" — confirm during the internal rollout
+# before relying on it for the acceptance PromQL.)
+#
+# Operators on self-hosted Prometheus should leave this false and scrape
+# the host-agent pods directly via the `metrics` named port.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ include "hostfleet.hostAgent.fullname" . }}
+  labels:
+    {{- include "hostfleet.hostAgent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hostfleet.hostAgent.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.metrics.podMonitoring.interval | quote }}
+      path: /metrics
+{{- end -}}

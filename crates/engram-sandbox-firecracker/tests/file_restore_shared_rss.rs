@@ -302,6 +302,7 @@ async fn file_backend_base_create_shares_residency_memfile() {
         root: store_root.path().join("cache"),
         budget_bytes: 4 * 1024 * 1024 * 1024,
         sweep_debounce_ms: 0,
+        eviction_enabled: true,
     });
     let memory_manifest = chunk_store
         .chunk_file(&mem_path, ManifestKind::Memory, None)

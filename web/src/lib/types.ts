@@ -13,17 +13,16 @@
 
 /**
  * ADR 0015 M2 lifecycle. Matches the Rust `SessionState` enum
- * exactly. Persistence: `pending` and `guest_ready` are code-level
- * only and won't appear on a row read from `GET /sessions/:id`; the
- * server may still emit them as the `from`/`to` of an early
- * `status_changed` event during create.
+ * exactly. Persistence: `pending` is code-level only and won't
+ * appear on a row read from `GET /sessions/:id`; the server may
+ * still emit it as the `from`/`to` of an early `status_changed`
+ * event during create.
  *
  *   pending     — request accepted, scheduler not yet returned
  *   queued      — accepted but no host had capacity; waiting FIFO for
  *                 scale-up (ADR 0048). Resolves to created/active once
  *                 placed, or failed on a long timeout.
  *   created     — sandbox bound; agentd not yet started
- *   guest_ready — agentd reachable; harness not yet running
  *   active      — agentd reachable AND harness running (or
  *                 harness=none and agentd is ready). Only state in
  *                 which /exec, /shell, /prompt proceed.
@@ -45,7 +44,6 @@ export type SessionState =
   | "pending"
   | "queued"
   | "created"
-  | "guest_ready"
   | "active"
   | "idle"
   | "host_lost"
@@ -161,6 +159,12 @@ export interface HostView {
   util_mem_total_mib: number;
   util_mem_used_mib: number;
   util_cpu_pct: number;
+  /** Issue #540 (host RAM ledger attribution): measured base-shm tmpfs
+   *  residency, and the running/parked split of guest PSS. 0 until the
+   *  host's first post-0078 heartbeat. */
+  util_base_shm_mib: number;
+  util_parked_pss_mib: number;
+  util_running_pss_mib: number;
   last_heartbeat_at: string;
   /** ADR 0068: names of the capability-vector fields currently
    *  `Failed` (or `Unknown` once the host has reported a real
@@ -401,6 +405,17 @@ export interface EnableJob {
   error: string | null;
   created_at: string;
   updated_at: string;
+  /** Issue #539: live/last capture progress. `capture_phase` is
+   * "boot" | "warm" | "snapshot" while `state === "capturing"`; unset
+   * outside a capture. `warm_stage` is the current (or, on a failed
+   * job, last-known) [warm]-hook stage name. `output_tail` is the
+   * rolling last 16 KiB of the hook's combined stdout+stderr —
+   * populated on success AND failure, so a failed job's diagnosis
+   * needs no host-log access. */
+  capture_phase: string | null;
+  warm_stage: string | null;
+  warm_stage_started_at: string | null;
+  output_tail: string | null;
 }
 
 export interface ListEnableJobsResponse {

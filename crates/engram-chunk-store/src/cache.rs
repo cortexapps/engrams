@@ -18,33 +18,49 @@
 //!   end up uncached, so every read falls through to GCS — a prod
 //!   cold-recovery resume spent ~92 s page-faulting from GCS this way).
 //! - **Eviction (FIFO by populate time)**: when the cache filesystem is
-//!   fuller than the free-space floor (default: keep ~20% free) — or, if
-//!   an absolute ceiling is configured, when total cached bytes exceed it
-//!   — the oldest chunks get unlinked. "Oldest" is by file modification
-//!   time, i.e. *populate* time: reads do NOT touch mtime (and atime is
-//!   not consulted), so this is FIFO by first-write, not true
-//!   LRU-by-access. Hot chunks are protected explicitly instead — by the
-//!   refcounted pin set (an enabled image's base manifest is pinned
-//!   resident), not by recency. Cheap; doesn't require a separate
+//!   fuller than the free-space floor (default: keep ~20% free) — or,
+//!   when total cached bytes exceed the absolute ceiling (disk-derived
+//!   by default; see [`ChunkCacheConfig::from_env_or_default`], ADR
+//!   0067) — the oldest chunks get unlinked. "Oldest" is by file
+//!   modification time, i.e. *populate* time: reads do NOT touch mtime
+//!   (and atime is not consulted), so this is FIFO by first-write, not
+//!   true LRU-by-access. Hot chunks are protected explicitly instead —
+//!   by the refcounted pin set (an enabled image's base manifest is
+//!   pinned resident), not by recency. Cheap; doesn't require a separate
 //!   in-memory metadata store. The free-space floor is re-checked via
 //!   `statvfs(2)` on every sweep, so the cache yields disk to the
 //!   snapshots and checkpoints that share the work_dir mount rather than
 //!   racing them to ENOSPC (the prod incident where a 200 GiB byte-budget
 //!   never tripped on a ~98 GiB FC host).
+//! - **Periodic enforcement**: eviction runs both on the populate path
+//!   (debounced, see `write_local`) AND on an independent timer
+//!   ([`ChunkCache::spawn_sweeper`]) — a host under disk pressure from
+//!   non-cache writers, or one that just came back from a pod restart
+//!   with zero populate traffic, still gets swept (ADR 0067).
+//! - **Single evictor**: [`ChunkCacheConfig::eviction_enabled`] lets a
+//!   process hold a cache that *populates* (writes chunks in, serving
+//!   reads) but never *evicts* (never unlinks). Exactly one process per
+//!   host — the host-agent, which owns the pin set — should evict; every
+//!   other process sharing the same `cache_root` (the UFFD handler) sets
+//!   this `false` (ADR 0067). Without this, two independent LRU policies
+//!   raced over the same directory with disjoint in-memory pin state, so
+//!   a pressured non-pinning evictor could unlink exactly the chunks the
+//!   pinning one was protecting.
 //! - **Singleflight on miss**: if N threads simultaneously ask for
 //!   a chunk that's not cached, exactly one BlobStorage fetch
 //!   runs; the others await its completion.
-//! - **Pin set**: working-set chunks can be marked never-evict.
-//!   The UFFD handler populates this from the replay trace so the
-//!   prefaulted set survives between restores; the image-prefetch
-//!   supervisor (ADR 0039) pins each enabled image's canonical base
-//!   manifest (disk + memory) so the LRU can never evict the shared
-//!   base out from under live File-backend siblings. Pins are
-//!   **reference-counted**: two enabled images that share a base
-//!   chunk each hold a pin, and disabling one leaves the chunk
-//!   pinned until the last holder unpins. `pin`/`unpin` are the
-//!   single-hash primitives; `pin_all`/`unpin_all` batch over a
-//!   manifest's chunk set.
+//! - **Pin set**: working-set chunks can be marked never-evict. The
+//!   image-prefetch supervisor (ADR 0039) pins each enabled image's
+//!   canonical base manifest (disk + memory) so the LRU can never evict
+//!   the shared base out from under live File-backend siblings. Pins are
+//!   a **floor, not a bug**: a sweep never auto-unpins under pressure —
+//!   when pinned bytes alone approach or exceed the budget, that's an
+//!   alarm (`engram_chunk_cache_pins_over_budget`, ADR 0067), not a
+//!   signal to evict pinned content. Pins are **reference-counted**: two
+//!   enabled images that share a base chunk each hold a pin, and
+//!   disabling one leaves the chunk pinned until the last holder
+//!   unpins. `pin`/`unpin` are the single-hash primitives;
+//!   `pin_all`/`unpin_all` batch over a manifest's chunk set.
 //!
 //! What this module does NOT do:
 //!
@@ -63,6 +79,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -74,6 +91,27 @@ use crate::manifest::ChunkHash;
 
 /// Default populate-path sweep debounce (see `write_local`).
 pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
+
+/// ADR 0019 / telemetry restoration (#526), review finding 7: the
+/// peer-vs-GCS cache-fill counter, labeled `source="gcs"|"peer"`. This
+/// is the baseline meter for epic-gcs-free-resume's "GCS-free by
+/// policy" claim, so both fill sources must agree on the exact metric
+/// name — a typo in either literal would silently fork the series.
+///
+/// - `source="gcs"`: incremented here, in [`ChunkCache::get`]'s
+///   leader-persist arm, only when `write_local` actually landed the
+///   fetched bytes on disk (a `write_local` failure means the fetch
+///   happened but the cache did NOT fill — see the `write_local`
+///   error-handling comment just above the increment site).
+/// - `source="peer"`: incremented by `engram-host-agent::pooled_backend`
+///   at the two loops that land migration-sourced chunks into this same
+///   cache via [`ChunkCache::put_no_evict`] (the prestage loop and the
+///   `pull_chunks_from_source` divergence pull).
+pub const CHUNK_FILL_TOTAL: &str = "engram_chunk_fill_total";
+
+/// Byte-counted companion to [`CHUNK_FILL_TOTAL`]. Same `source` label,
+/// same two call sites (one here, one in `engram-host-agent`).
+pub const CHUNK_FILL_BYTES_TOTAL: &str = "engram_chunk_fill_bytes_total";
 
 /// Configuration for the on-disk cache.
 ///
@@ -106,14 +144,90 @@ pub struct ChunkCacheConfig {
     /// Minimum interval between populate-path eviction sweeps (see
     /// `write_local`). 0 = sweep on every populate (test determinism).
     pub sweep_debounce_ms: i64,
+    /// Single-evictor switch (ADR 0067). `true` (default): this cache's
+    /// `sweep()` (populate-path debounce AND [`ChunkCache::spawn_sweeper`])
+    /// evicts as normal. `false`: `sweep()` is a no-op — the cache still
+    /// *populates* (writes, reads) but never unlinks a chunk file. Set
+    /// `false` on every process sharing a `cache_root` with the process
+    /// that owns eviction — in this codebase, `engram-uffd-handler`,
+    /// since the host-agent (which holds the pin set) is the one evictor
+    /// per host. Without this, two independent LRU sweeps over the same
+    /// directory can race: a pin-blind evictor preferentially reclaims
+    /// exactly the pinned base-image chunks the pinning evictor is
+    /// protecting (oldest-populate-first = host-boot-staged chunks).
+    pub eviction_enabled: bool,
 }
 
-/// Default value for [`ChunkCacheConfig::budget_bytes`]: no absolute
-/// byte ceiling, so the dynamic free-space floor governs (fill to ~80%
+/// Sentinel for [`ChunkCacheConfig::budget_bytes`]: no absolute byte
+/// ceiling, so the dynamic free-space floor governs alone (fill to ~80%
 /// of whatever disk backs the cache, then LRU-evict). The 200 GiB fixed
 /// budget this replaces never tripped on the ~98 GiB FC host — the disk
-/// filled first (the prod incident).
+/// filled first (the prod incident). NOT the default anymore (ADR 0067)
+/// — [`ChunkCacheConfig::from_env_or_default`] now derives a real
+/// absolute ceiling from the disk backing `root`; this sentinel survives
+/// as the explicit "floor only" opt-out and the fail-soft fallback when
+/// the filesystem probe fails.
 pub const NO_CEILING: u64 = u64::MAX;
+
+/// Default fraction of the cache disk the cache may claim as its
+/// absolute ceiling (see [`default_budget_bytes`]). 0.60: the cache's
+/// fair share, leaving headroom for snapshots, checkpoints, memfiles,
+/// the OCI cache, jails, and OS/image storage sharing the same mount.
+pub const DEFAULT_DISK_FRACTION: f64 = 0.60;
+
+/// Env var: override [`DEFAULT_DISK_FRACTION`] (0.0-1.0). Only consulted
+/// when [`BUDGET_ENV_VAR`] is unset/unparseable — an explicit
+/// `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` always wins outright.
+pub const DISK_FRACTION_ENV_VAR: &str = "ENGRAM_CHUNK_CACHE_DISK_FRACTION";
+
+/// Resolve [`DEFAULT_DISK_FRACTION`] from env, fail-soft (out-of-range or
+/// unparseable ⇒ default, with a warn). Mirrors [`resolve_free_floor_pct`].
+fn resolve_disk_fraction() -> f64 {
+    match std::env::var(DISK_FRACTION_ENV_VAR) {
+        Ok(raw) => match raw.parse::<f64>() {
+            Ok(frac) if (0.0..=1.0).contains(&frac) => {
+                tracing::info!(
+                    disk_fraction = frac,
+                    env = DISK_FRACTION_ENV_VAR,
+                    "chunk cache disk-fraction budget set via env",
+                );
+                frac
+            }
+            other => {
+                tracing::warn!(
+                    env = DISK_FRACTION_ENV_VAR,
+                    value = raw,
+                    parsed = ?other,
+                    "disk-fraction env var out of range [0,1] / unparseable; using default",
+                );
+                DEFAULT_DISK_FRACTION
+            }
+        },
+        Err(_) => DEFAULT_DISK_FRACTION,
+    }
+}
+
+/// Default absolute cache budget for a disk of `fs_total` bytes:
+/// `min(fs_total × fraction, fs_total × (1 − headroom_frac))`.
+///
+/// - `fraction` (typically [`DEFAULT_DISK_FRACTION`] = 0.60): the
+///   cache's fair share of the disk.
+/// - `headroom_frac` (typically the resolved free-space floor fraction,
+///   default [`DEFAULT_FREE_FLOOR_PCT`] = 0.20): the same kubelet
+///   hard-eviction-line rationale as the floor (see its doc comment) —
+///   the budget must never itself authorize filling past the line the
+///   floor is trying to hold the disk under.
+///
+/// On a 298.1 GB disk with the defaults: `min(0.60 × 298.1 GB, 0.80 ×
+/// 298.1 GB)` ≈ 179 GB. Pure + no I/O so the formula is exhaustively
+/// unit-testable; callers resolve `fs_total` via [`fs_total_bytes`].
+fn default_budget_bytes(fs_total: u64, fraction: f64, headroom_frac: f64) -> u64 {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let headroom_frac = headroom_frac.clamp(0.0, 1.0);
+    let by_fraction = (fs_total as f64 * fraction) as u64;
+    let by_headroom = (fs_total as f64 * (1.0 - headroom_frac)) as u64;
+    by_fraction.min(by_headroom)
+}
 
 /// Default free-space floor: keep 20% of the cache filesystem free
 /// (i.e. evict to hold the mount at/under ~80% full). Re-checked via
@@ -147,52 +261,144 @@ pub const FREE_FLOOR_PCT_ENV_VAR: &str = "ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT";
 /// [`FREE_FLOOR_PCT_ENV_VAR`] is unset.
 pub const FREE_FLOOR_BYTES_ENV_VAR: &str = "ENGRAM_CHUNK_CACHE_FREE_FLOOR_BYTES";
 
+/// Default interval between [`ChunkCache::spawn_sweeper`] ticks (ADR
+/// 0067). Independent of populate traffic — this is what closes the "a
+/// host under disk pressure with no populate traffic enforces nothing"
+/// gap. 60s: frequent enough that a host climbing toward the kubelet
+/// line gets caught within a minute, infrequent enough that the
+/// directory walk (see `list_entries`) is a rounding error against any
+/// real cache size.
+pub const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 60;
+
+/// Env var: override [`DEFAULT_SWEEP_INTERVAL_SECS`]. `0` disables the
+/// periodic sweeper entirely (tests; the populate-path debounced sweep
+/// still runs).
+pub const SWEEP_INTERVAL_ENV_VAR: &str = "ENGRAM_CHUNK_CACHE_SWEEP_INTERVAL_SECS";
+
+/// Resolve the periodic sweep interval from env, fail-soft (unparseable
+/// ⇒ default, with a warn). `0` (explicit disable) is a valid parsed
+/// result, distinct from "unset" — see [`ChunkCache::spawn_sweeper`].
+/// `pub` so host-agent's `main.rs` can resolve the same env var when
+/// deciding the `Duration` to hand `spawn_sweeper`.
+pub fn resolve_sweep_interval_secs() -> u64 {
+    match std::env::var(SWEEP_INTERVAL_ENV_VAR) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(secs) => secs,
+            Err(e) => {
+                tracing::warn!(
+                    env = SWEEP_INTERVAL_ENV_VAR,
+                    value = raw,
+                    error = %e,
+                    "could not parse chunk cache sweep interval env var; using default",
+                );
+                DEFAULT_SWEEP_INTERVAL_SECS
+            }
+        },
+        Err(_) => DEFAULT_SWEEP_INTERVAL_SECS,
+    }
+}
+
 impl ChunkCacheConfig {
-    /// Sensible default: no absolute byte ceiling ([`NO_CEILING`]); the
-    /// [`DEFAULT_FREE_FLOOR_PCT`] free-space floor (resolved in
-    /// [`ChunkCache::new`]) governs. On a typical host this means "fill
-    /// to ~80% of whatever disk backs the cache, then LRU-evict."
+    /// Bare constructor: [`NO_CEILING`] (no absolute byte ceiling) — used
+    /// by callers that set `budget_bytes` themselves (tests, the UFFD
+    /// handler) and by [`Self::from_env_or_default`] as its starting
+    /// point before resolving the real default. Production callers
+    /// should use [`Self::from_env_or_default`], which derives a real
+    /// ceiling from the disk.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             budget_bytes: NO_CEILING,
             sweep_debounce_ms: DEFAULT_SWEEP_DEBOUNCE_MS,
+            eviction_enabled: true,
         }
     }
 
-    /// Construct with `budget_bytes` (the absolute ceiling) from
-    /// `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` if set + parseable, otherwise
-    /// [`NO_CEILING`]. Logs at info on override so operators can confirm
-    /// the value picked up. Unparseable values fall back to no-ceiling
-    /// with a warn log — fail-soft mirrors the other env-knob parsers in
-    /// the codebase. The free-space floor knobs are read separately, in
-    /// [`ChunkCache::new`].
+    /// Resolve `budget_bytes` for a production cache:
+    ///
+    /// 1. `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`, if set + parseable, wins
+    ///    outright as an absolute operator override.
+    /// 2. Otherwise, derive a disk-sized default (ADR 0067):
+    ///    `create_dir_all(root)` (the budget probe needs the mount
+    ///    `root` will live on, which may not exist yet on a fresh host)
+    ///    then [`fs_total_bytes`] → [`default_budget_bytes`] with
+    ///    [`resolve_disk_fraction`] and the free-space-floor fraction
+    ///    ([`resolve_free_floor_pct`]) as `headroom_frac`.
+    /// 3. If the directory can't be created or the filesystem can't be
+    ///    probed, fall back to [`NO_CEILING`] with a warn — fail-soft
+    ///    mirrors the other env-knob parsers in the codebase; the
+    ///    free-space floor alone still governs.
+    ///
+    /// Logs at info on every path so operators can confirm the value
+    /// picked up.
     pub fn from_env_or_default(root: impl Into<PathBuf>) -> Self {
-        let mut cfg = Self::new(root);
-        match std::env::var(BUDGET_ENV_VAR) {
+        let root: PathBuf = root.into();
+        let mut cfg = Self::new(root.clone());
+        let explicit = match std::env::var(BUDGET_ENV_VAR) {
             Ok(raw) => match raw.parse::<u64>() {
                 Ok(bytes) => {
                     tracing::info!(
                         budget_bytes = bytes,
                         env = BUDGET_ENV_VAR,
-                        "chunk cache absolute ceiling set via env (wins over free-space floor)",
+                        "chunk cache absolute ceiling set via env (wins over the disk-derived default)",
                     );
-                    cfg.budget_bytes = bytes;
+                    Some(bytes)
                 }
                 Err(e) => {
                     tracing::warn!(
                         env = BUDGET_ENV_VAR,
                         value = raw,
                         error = %e,
-                        "could not parse chunk cache ceiling env var; no absolute ceiling",
+                        "could not parse chunk cache ceiling env var; falling back to the disk-derived default",
                     );
+                    None
                 }
             },
-            Err(_) => {
-                // Unset is the common case — the floor governs.
+            Err(_) => None,
+        };
+        cfg.budget_bytes = match explicit {
+            Some(bytes) => bytes,
+            None => Self::disk_derived_budget(&root),
+        };
+        cfg
+    }
+
+    /// The disk-sized default from [`default_budget_bytes`], probed
+    /// against the filesystem backing `root`. `root` is created first
+    /// (best-effort) since a fresh host may not have it yet — the
+    /// budget probe needs a real mount to `statvfs(2)`, not the parent
+    /// of a not-yet-existing dir.
+    fn disk_derived_budget(root: &Path) -> u64 {
+        if let Err(e) = std::fs::create_dir_all(root) {
+            tracing::warn!(
+                root = %root.display(),
+                error = %e,
+                "could not create chunk cache root to probe disk size; no absolute ceiling",
+            );
+            return NO_CEILING;
+        }
+        match fs_total_bytes(root) {
+            Some(total) if total > 0 => {
+                let fraction = resolve_disk_fraction();
+                let headroom_frac = resolve_free_floor_pct(root);
+                let budget = default_budget_bytes(total, fraction, headroom_frac);
+                tracing::info!(
+                    fs_total_bytes = total,
+                    disk_fraction = fraction,
+                    headroom_frac,
+                    budget_bytes = budget,
+                    "chunk cache absolute ceiling derived from disk size",
+                );
+                budget
+            }
+            _ => {
+                tracing::warn!(
+                    root = %root.display(),
+                    "could not probe cache filesystem size; no absolute ceiling",
+                );
+                NO_CEILING
             }
         }
-        cfg
     }
 }
 
@@ -436,7 +642,21 @@ impl ChunkCache {
         // populate; trust on read. (Atomic temp+rename means a present file is
         // never torn; post-write bit-rot is left to PD/local-SSD durability.)
         let path = self.path_for(hash);
-        if let Some(bytes) = read_if_present(&path).await? {
+        // ADR 0019 / telemetry restoration (#526): NVMe-tier hit latency was
+        // previously unmeasured — `engram_chunk_fetch_seconds` only had a
+        // `blobstorage` arm (the miss path below), so there was no signal
+        // for "the fast tier got slow" (a saturated NVMe device, ext4
+        // fragmentation, etc). Time the read regardless of hit/miss; a miss
+        // here is a fast negative stat (no file), not a meaningful latency
+        // sample, so only record on a hit.
+        let nvme_read_start = std::time::Instant::now();
+        let nvme_read = read_if_present(&path).await?;
+        if let Some(bytes) = nvme_read {
+            metrics::histogram!(
+                "engram_chunk_fetch_seconds",
+                "tier" => "nvme",
+            )
+            .record(nvme_read_start.elapsed().as_secs_f64());
             // ADR 0014 M1.15: local NVMe hit. Don't differentiate
             // singleflight-piggyback from true cache hit here —
             // the user-visible win is the same.
@@ -544,20 +764,53 @@ impl ChunkCache {
                     // isn't cached, so every later read re-fetches from GCS —
                     // which presents exactly as "warming ran but reads still
                     // miss". Surface it loudly rather than swallowing (`let _ =`).
-                    if let Err(e) = self.write_local(hash, bytes).await {
-                        tracing::warn!(
-                            hash = %hash,
-                            root = %self.inner.config.root.display(),
-                            bytes = bytes.len(),
-                            error = %e,
-                            "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
-                        );
-                    }
+                    let write_local_ok = match self.write_local(hash, bytes).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                hash = %hash,
+                                root = %self.inner.config.root.display(),
+                                bytes = bytes.len(),
+                                error = %e,
+                                "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
+                            );
+                            false
+                        }
+                    };
+                    // This measures the fetch (bytes pulled from
+                    // BlobStorage), not the fill — it stays unconditional
+                    // even when write_local below fails.
                     metrics::counter!(
                         "engram_chunk_cache_bytes_total",
                         "tier" => "blobstorage",
                     )
                     .increment(bytes.len() as u64);
+                    // ADR 0019 / telemetry restoration (#526), review finding
+                    // 4: the baseline meter for epic-gcs-free-resume's
+                    // "GCS-free by policy" claim — every chunk that fills the
+                    // local cache from BlobStorage (as opposed to a
+                    // peer-fill, recorded at the host-agent's MigrationFetch
+                    // destination pull loops) counts here. `source="gcs"`
+                    // names the fetch backend this closure resolves to in
+                    // practice (BlobStorage is GCS in every deployed
+                    // configuration); a non-GCS BlobStorage impl would still
+                    // be the correct label for "the cold tier", not a peer.
+                    // Gated on `write_local_ok`: a fetch whose local persist
+                    // failed did NOT fill the cache — counting it here would
+                    // mask exactly the "warming ran but reads still miss"
+                    // state the write_local warning above exists to catch.
+                    if write_local_ok {
+                        metrics::counter!(
+                            CHUNK_FILL_TOTAL,
+                            "source" => "gcs",
+                        )
+                        .increment(1);
+                        metrics::counter!(
+                            CHUNK_FILL_BYTES_TOTAL,
+                            "source" => "gcs",
+                        )
+                        .increment(bytes.len() as u64);
+                    }
                 }
                 // Notify waiters. Send-failure (their rx dropped)
                 // is benign.
@@ -732,6 +985,14 @@ impl ChunkCache {
         self.inner.pinned.lock().contains_key(&hash)
     }
 
+    /// Whether this cache instance will ever unlink a chunk file (ADR
+    /// 0067's single-evictor switch). Diagnostic / test accessor — used
+    /// by `engram-uffd-handler`'s constructor test to assert the handler
+    /// always builds an eviction-disabled cache.
+    pub fn eviction_enabled(&self) -> bool {
+        self.inner.config.eviction_enabled
+    }
+
     /// True if local NVMe currently has this chunk. Cheap stat;
     /// doesn't load bytes.
     pub async fn contains(&self, hash: ChunkHash) -> bool {
@@ -766,6 +1027,58 @@ impl ChunkCache {
     /// [`Self::put_no_evict`].
     pub async fn sweep(&self) -> Result<()> {
         self.evict_to_budget().await
+    }
+
+    /// Spawn the periodic sweeper (ADR 0067): calls [`Self::sweep`] every
+    /// `interval`, independent of populate traffic — closes the gap where
+    /// a host under disk pressure with no populate activity (or one that
+    /// just restarted with a cold pin set) enforces nothing until the
+    /// next write. Errors are logged and looping continues; a single
+    /// failed sweep must never take enforcement offline.
+    ///
+    /// `interval` of [`Duration::ZERO`] disables the sweeper (the spawned
+    /// task returns immediately without ticking) — deterministic tests
+    /// that want to control exactly when a sweep happens call
+    /// [`Self::sweep`] directly instead of racing a background timer.
+    ///
+    /// Deliberately does NOT sweep at t=0: `tokio::time::interval`'s
+    /// first tick fires immediately, but on a freshly-started host-agent
+    /// pins are in-memory only and haven't been re-established yet (the
+    /// image-prefetch supervisor's reconcile needs a coordinator RPC
+    /// round-trip after registration). A t=0 sweep on a restarted host
+    /// with an over-budget cache would run pin-blind and evict the
+    /// oldest-mtime chunks — exactly the boot-staged base-image chunks
+    /// that were pinned in the prior life — flapping readiness and
+    /// re-fetching from GCS on every rollout of a host that happens to
+    /// sit at or over budget. The first sweep waits one full `interval`
+    /// instead, giving the pin set a chance to repopulate first; the
+    /// populate-path debounced sweep (`sweep_debounce_ms`) still bounds
+    /// growth from writes in the meantime.
+    ///
+    /// Mirrors `base_shm_gc::spawn`'s held-handle pattern: the caller
+    /// keeps the returned handle alive for the process lifetime (dropping
+    /// or aborting it stops the sweeper).
+    pub fn spawn_sweeper(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let cache = self.clone();
+        tokio::spawn(async move {
+            if interval.is_zero() {
+                tracing::debug!("chunk cache periodic sweeper disabled (interval=0)");
+                return;
+            }
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Consume the immediate t=0 tick without sweeping — see the
+            // doc comment above. Every tick after this one is spaced a
+            // full `interval` apart, so the first real sweep lands at
+            // t=interval, not t=0.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if let Err(e) = cache.sweep().await {
+                    tracing::warn!(error = %e, "periodic chunk cache sweep failed");
+                }
+            }
+        })
     }
 
     /// Write bytes to the cache atomically. Used internally on
@@ -847,6 +1160,16 @@ impl ChunkCache {
     /// the cache itself didn't grow. That's the whole point: the cache
     /// yields disk dynamically rather than holding a fixed slice.
     async fn evict_to_budget(&self) -> Result<()> {
+        // ADR 0067: single-evictor switch. A cache with eviction disabled
+        // never unlinks (populate — write_local's atomic write — already
+        // happened by the time write_local calls this). Skip the walk
+        // entirely: this process (the UFFD handler) isn't the owner of
+        // the cache's size/pin gauges either — the host-agent's own
+        // sweeper, over the same directory, is the source of truth.
+        if !self.inner.config.eviction_enabled {
+            tracing::debug!("chunk cache sweep skipped: eviction_enabled=false on this cache");
+            return Ok(());
+        }
         let mut entries = self.list_entries().await?;
         let cache_total: u64 = entries.iter().map(|e| e.size).sum();
         // ADR 0014 M1.15: snapshot of current cache size at every
@@ -867,6 +1190,45 @@ impl ChunkCache {
             NO_CEILING => None,
             c => Some(c),
         };
+
+        // ADR 0067: pins are a floor, not a bug. Compute what's
+        // unevictable BEFORE deciding how much to free, and gauge it
+        // regardless of whether a sweep is otherwise a no-op — dashboards
+        // and the pins-over-budget alarm must stay live even with zero
+        // eviction pressure this tick.
+        let pinned = self.inner.pinned.lock().clone();
+        let pinned_bytes: u64 = entries
+            .iter()
+            .filter(|e| pinned.contains_key(&e.hash))
+            .map(|e| e.size)
+            .sum();
+        metrics::gauge!("engram_chunk_cache_pinned_bytes").set(pinned_bytes as f64);
+        // 0 is the "no ceiling configured" sentinel here (u64::MAX would
+        // render as a meaningless huge gauge value) — mirrors the "0 =
+        // disabled" convention other env knobs in this codebase use.
+        metrics::gauge!("engram_chunk_cache_budget_bytes").set(ceiling.unwrap_or(0) as f64);
+        let pins_over_budget = matches!(ceiling, Some(c) if pinned_bytes > c);
+        metrics::gauge!("engram_chunk_cache_pins_over_budget").set(if pins_over_budget {
+            1.0
+        } else {
+            0.0
+        });
+        if pins_over_budget {
+            // No separate rate-limiter: the sweep interval (default 60 s,
+            // `ENGRAM_CHUNK_CACHE_SWEEP_INTERVAL_SECS`) already bounds how
+            // often this fires — same pattern as the idle-evict
+            // disk-pressure warn, which also logs once per tick under
+            // sustained pressure rather than adding its own throttle.
+            tracing::error!(
+                pinned_bytes,
+                budget_bytes = ceiling.unwrap_or(0),
+                "chunk cache: pinned (unevictable) bytes exceed the configured budget — the \
+                 enabled-image set does not fit this host's disk. Pins are never auto-released; \
+                 fix is more disk, fewer/graded enabled images, or a smaller working set — never \
+                 raising the budget above the kubelet eviction line",
+            );
+        }
+
         let mut over = bytes_to_free(cache_total, ceiling, self.inner.free_floor_pct, fs);
         if over == 0 {
             return Ok(());
@@ -874,7 +1236,6 @@ impl ChunkCache {
 
         // Oldest mtime first; skip pinned (any refcount > 0).
         entries.sort_by_key(|e| e.mtime);
-        let pinned = self.inner.pinned.lock().clone();
         for entry in entries {
             if over == 0 {
                 break;
@@ -1191,6 +1552,7 @@ mod tests {
                 root: cache_dir.path().to_path_buf(),
                 budget_bytes: budget,
                 sweep_debounce_ms: 0,
+                eviction_enabled: true,
             },
             0.0,
         );
@@ -1252,6 +1614,40 @@ mod tests {
         assert_eq!(body0_actual.len(), 4 * 1024);
     }
 
+    /// ADR 0019 / telemetry restoration (#526): `get`'s NVMe-hit arm now
+    /// times `read_if_present` (`engram_chunk_fetch_seconds{tier="nvme"}`)
+    /// before returning — this must be pure instrumentation, not a
+    /// semantic change. Round-trip a chunk through a genuine miss (fetcher
+    /// fires, bytes land via `write_local`) and then a genuine NVMe hit
+    /// (fetcher must NOT fire again), and assert both arms still return the
+    /// exact, hash-verified bytes.
+    #[tokio::test]
+    async fn nvme_hit_latency_timing_does_not_change_returned_bytes() {
+        let (cache, store, _b, _c) = setup(1024 * 1024 * 1024).await;
+        let body = vec![7u8; 8 * 1024];
+        let hash = store.put_chunk(&body).await.unwrap();
+
+        // Miss: fetcher fires, populates the local cache.
+        let via_miss = cache_get_from(&cache, &store, hash).await.unwrap();
+        assert_eq!(via_miss.as_ref(), body.as_slice());
+        assert!(
+            cache.contains(hash).await,
+            "chunk must be cached after the miss fetch"
+        );
+
+        // Hit: must return the SAME verified bytes via the now-timed
+        // read_if_present path, and must NOT re-invoke the fetcher.
+        let via_hit = cache
+            .get(hash, || async {
+                panic!("fetcher must not fire on an NVMe cache hit");
+                #[allow(unreachable_code)]
+                Ok(Bytes::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(via_hit.as_ref(), body.as_slice());
+    }
+
     /// Regression: two `ChunkCache`s over the SAME cache_root — modeling
     /// the in-process restore prefetch and the out-of-process
     /// `engram-uffd-handler`, which share the dir and each keep their own
@@ -1274,6 +1670,7 @@ mod tests {
                     root: cache_dir.path().to_path_buf(),
                     budget_bytes: NO_CEILING,
                     sweep_debounce_ms: 0,
+                    eviction_enabled: true,
                 },
                 0.0,
             )
@@ -1470,6 +1867,7 @@ mod tests {
             root: std::path::PathBuf::from("/tmp/engram-pin-batch-test"),
             budget_bytes: 1024,
             sweep_debounce_ms: 0,
+            eviction_enabled: true,
         };
         let cache = ChunkCache::new(cfg);
         let shared = ChunkHash::of(b"shared-base-chunk");
@@ -1496,6 +1894,7 @@ mod tests {
             root: std::path::PathBuf::from("/tmp/engram-unpin-noop-test"),
             budget_bytes: 1024,
             sweep_debounce_ms: 0,
+            eviction_enabled: true,
         };
         let cache = ChunkCache::new(cfg);
         let h = ChunkHash::of(b"never-pinned");
@@ -1739,14 +2138,23 @@ mod tests {
     }
 
     #[test]
-    fn from_env_or_default_uses_default_when_unset() {
+    fn from_env_or_default_derives_disk_sized_default_when_unset() {
+        // ADR 0067: no env set ⇒ a real, disk-derived ceiling, NOT
+        // NO_CEILING (the pre-0067 default, retired for prod safety).
         let _g = env_guard();
         std::env::remove_var(BUDGET_ENV_VAR);
-        let cfg = ChunkCacheConfig::from_env_or_default("/tmp/cache-test");
+        std::env::remove_var(DISK_FRACTION_ENV_VAR);
+        clear_floor_env();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("chunk-cache");
+        let cfg = ChunkCacheConfig::from_env_or_default(root.clone());
+        let total = fs_total_bytes(&root).expect("probe should succeed for a real tempdir");
+        let expected = default_budget_bytes(total, DEFAULT_DISK_FRACTION, DEFAULT_FREE_FLOOR_PCT);
         assert_eq!(
-            cfg.budget_bytes, NO_CEILING,
-            "no ceiling by default — the free-space floor governs",
+            cfg.budget_bytes, expected,
+            "unset ⇒ min(fs_total × disk_fraction, fs_total × (1 − floor))",
         );
+        assert_ne!(cfg.budget_bytes, NO_CEILING);
     }
 
     #[test]
@@ -1755,18 +2163,44 @@ mod tests {
         std::env::set_var(BUDGET_ENV_VAR, "12345");
         let cfg = ChunkCacheConfig::from_env_or_default("/tmp/cache-test");
         std::env::remove_var(BUDGET_ENV_VAR);
-        assert_eq!(cfg.budget_bytes, 12345);
+        assert_eq!(
+            cfg.budget_bytes, 12345,
+            "an explicit override always wins outright",
+        );
     }
 
     #[test]
-    fn from_env_or_default_falls_back_on_unparseable_ceiling() {
+    fn from_env_or_default_falls_back_to_disk_derived_on_unparseable_ceiling() {
         let _g = env_guard();
         std::env::set_var(BUDGET_ENV_VAR, "not-a-number");
-        let cfg = ChunkCacheConfig::from_env_or_default("/tmp/cache-test");
+        std::env::remove_var(DISK_FRACTION_ENV_VAR);
+        clear_floor_env();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("chunk-cache");
+        let cfg = ChunkCacheConfig::from_env_or_default(root.clone());
         std::env::remove_var(BUDGET_ENV_VAR);
+        let total = fs_total_bytes(&root).expect("probe should succeed for a real tempdir");
+        let expected = default_budget_bytes(total, DEFAULT_DISK_FRACTION, DEFAULT_FREE_FLOOR_PCT);
+        assert_eq!(
+            cfg.budget_bytes, expected,
+            "an unparseable ceiling must fail-soft to the disk-derived default \
+             (never silently unbounded)",
+        );
+    }
+
+    #[test]
+    fn from_env_or_default_falls_back_to_no_ceiling_when_probe_fails() {
+        let _g = env_guard();
+        std::env::remove_var(BUDGET_ENV_VAR);
+        // A path whose PARENT is a regular file can never be created —
+        // `create_dir_all` fails deterministically (ENOTDIR), independent
+        // of the host disk's real layout.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let unusable_root = file.path().join("chunk-cache");
+        let cfg = ChunkCacheConfig::from_env_or_default(unusable_root);
         assert_eq!(
             cfg.budget_bytes, NO_CEILING,
-            "unparseable ceiling must fail-soft to no-ceiling",
+            "a probe failure must fail-soft to no ceiling, never panic or hang",
         );
     }
 
@@ -1979,6 +2413,303 @@ mod tests {
         assert_eq!(fs_usage(Path::new("/nonexistent/engram/cache/probe")), None);
     }
 
+    // ---- default_budget_bytes: pure disk-fraction formula (ADR 0067) ----
+
+    #[test]
+    fn default_budget_bytes_prod_298gb_case() {
+        // The 2026-07-01 evidence pass's headline number: on a 298.1 GB
+        // disk with the defaults, the derived ceiling is ~179 GB (vs the
+        // unbounded 182.2 GB the cache had actually grown to).
+        let fs_total = 298_100_000_000u64;
+        let budget = default_budget_bytes(fs_total, DEFAULT_DISK_FRACTION, DEFAULT_FREE_FLOOR_PCT);
+        assert_eq!(budget, (fs_total as f64 * 0.60) as u64);
+        let budget_gb = budget as f64 / 1e9;
+        assert!(
+            (178.0..180.0).contains(&budget_gb),
+            "expected ~179 GB, got {budget_gb} GB",
+        );
+    }
+
+    #[test]
+    fn default_budget_bytes_fraction_governs_under_defaults() {
+        // min(0.60, 0.80) always picks the 0.60 fraction term while
+        // fraction <= 1 - headroom_frac (true for the shipped defaults).
+        let fs_total = 100_000_000_000u64;
+        let budget = default_budget_bytes(fs_total, 0.60, 0.20);
+        assert_eq!(budget, 60_000_000_000);
+    }
+
+    #[test]
+    fn default_budget_bytes_headroom_caps_an_aggressive_fraction() {
+        // An operator setting the fraction knob above (1 - headroom) must
+        // still be capped by the headroom term — the budget can never
+        // itself authorize filling past the kubelet-eviction margin.
+        let fs_total = 100_000_000_000u64;
+        let budget = default_budget_bytes(fs_total, 0.95, 0.20);
+        assert_eq!(budget, 80_000_000_000, "headroom term (0.80) must cap");
+    }
+
+    #[test]
+    fn default_budget_bytes_clamps_out_of_range_fractions() {
+        let fs_total = 100_000_000_000u64;
+        // fraction > 1 clamps to 1; headroom_frac < 0 clamps to 0 (1 - 0 = 1).
+        let budget = default_budget_bytes(fs_total, 1.5, -0.5);
+        assert_eq!(budget, fs_total);
+    }
+
+    #[test]
+    fn default_budget_bytes_zero_disk_is_zero_budget() {
+        assert_eq!(
+            default_budget_bytes(0, DEFAULT_DISK_FRACTION, DEFAULT_FREE_FLOOR_PCT),
+            0
+        );
+    }
+
+    // ---- resolve_disk_fraction: env precedence ----
+
+    #[test]
+    fn disk_fraction_defaults_when_unset() {
+        let _g = env_guard();
+        std::env::remove_var(DISK_FRACTION_ENV_VAR);
+        assert_eq!(resolve_disk_fraction(), DEFAULT_DISK_FRACTION);
+    }
+
+    #[test]
+    fn disk_fraction_env_overrides_default() {
+        let _g = env_guard();
+        std::env::set_var(DISK_FRACTION_ENV_VAR, "0.75");
+        let frac = resolve_disk_fraction();
+        std::env::remove_var(DISK_FRACTION_ENV_VAR);
+        assert!((frac - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn disk_fraction_env_out_of_range_keeps_default() {
+        let _g = env_guard();
+        std::env::set_var(DISK_FRACTION_ENV_VAR, "1.5");
+        let frac = resolve_disk_fraction();
+        std::env::remove_var(DISK_FRACTION_ENV_VAR);
+        assert_eq!(frac, DEFAULT_DISK_FRACTION);
+    }
+
+    // ---- ADR 0067: pins are a floor, never auto-evicted, alarm on overflow ----
+
+    #[tokio::test]
+    async fn pins_over_budget_never_unlinks_pinned_but_still_evicts_unpinned() {
+        // Budget of 5 bytes; a single 10-byte PINNED chunk alone already
+        // exceeds it — the infeasible case the pins-over-budget alarm
+        // exists for (verifying the `engram_chunk_cache_pins_over_budget`
+        // gauge value itself needs a real Prometheus scrape / recorder,
+        // which is an integration-level concern outside this pure-logic
+        // test — this test asserts the behavior the gauge reports on).
+        // The pinned chunk must never be unlinked (pins are a floor, not
+        // a bug) and an unpinned chunk sharing the sweep still evicts
+        // normally (eviction isn't disabled, it's just insufficient to
+        // reach the budget on its own).
+        let (cache, _store, _b, _c) = setup(5).await;
+        let pinned_body = b"aaaaaaaaaa"; // 10 bytes
+        let evictable_body = b"bbbbbbbbbb"; // 10 bytes
+        let hp = ChunkHash::of(pinned_body);
+        let he = ChunkHash::of(evictable_body);
+        // Pin BEFORE the populating put — a hash can be pinned before it's
+        // ever written (pin() only touches the refcount map), which
+        // matters here: pin AFTER put would let the put's own debounced
+        // sweep see the not-yet-pinned 10-byte chunk alone exceed the
+        // 5-byte budget and evict it before `pin()` ever runs.
+        cache.pin(hp);
+        cache.put(hp, pinned_body).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cache.put(he, evictable_body).await.unwrap();
+
+        assert!(cache.contains(hp).await, "pinned chunk must survive");
+        assert!(
+            !cache.contains(he).await,
+            "unpinned chunk must still evict even though it can't close the deficit alone",
+        );
+    }
+
+    #[tokio::test]
+    async fn pins_under_budget_do_not_trigger_extra_eviction() {
+        // Pins well under budget: nothing about the pin accounting should
+        // cause eviction pressure that wouldn't otherwise exist.
+        let (cache, _store, _b, _c) = setup(1024 * 1024).await;
+        let body = b"aaaaaaaaaa";
+        let h = ChunkHash::of(body);
+        cache.put(h, body).await.unwrap();
+        cache.pin(h);
+        cache.sweep().await.unwrap();
+        assert!(cache.contains(h).await, "far under budget: nothing evicts");
+    }
+
+    // ---- ADR 0067: eviction_enabled: false never unlinks ----
+
+    #[tokio::test]
+    async fn eviction_disabled_cache_never_unlinks_under_pressure() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: 5, // impossibly tight — every put is "over"
+                sweep_debounce_ms: 0,
+                eviction_enabled: false,
+            },
+            0.0,
+        );
+        let a = b"aaaaaaaaaa";
+        let b = b"bbbbbbbbbb";
+        let ha = ChunkHash::of(a);
+        let hb = ChunkHash::of(b);
+        cache.put(ha, a).await.unwrap();
+        cache.put(hb, b).await.unwrap();
+        cache.sweep().await.unwrap();
+        assert!(
+            cache.contains(ha).await,
+            "eviction disabled: a must survive"
+        );
+        assert!(
+            cache.contains(hb).await,
+            "eviction disabled: b must survive"
+        );
+    }
+
+    // ---- ADR 0067: spawn_sweeper enforces without populate traffic ----
+
+    #[tokio::test]
+    async fn spawn_sweeper_enforces_with_zero_populate_traffic() {
+        // ADR 0067 acceptance criterion: a cache filled over budget with
+        // NO further populate activity must return under budget within
+        // one sweep interval, driven purely by the periodic timer.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: 1,             // any populated chunk at all is "over"
+                sweep_debounce_ms: i64::MAX, // populate-path sweep never fires
+                eviction_enabled: true,
+            },
+            0.0, // floor disabled; only the ceiling governs
+        );
+        let a = b"aaaaaaaaaa";
+        let ha = ChunkHash::of(a);
+        // `put_no_evict` skips the sweep entirely, modeling "populated,
+        // then zero traffic since" (e.g. a host that just restarted).
+        cache.put_no_evict(ha, a).await.unwrap();
+        assert!(
+            cache.contains(ha).await,
+            "chunk lands before any sweep runs"
+        );
+
+        // No further writes and no explicit sweep() — only the periodic
+        // sweeper can enforce the budget from here.
+        let handle = cache.spawn_sweeper(std::time::Duration::from_millis(20));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        handle.abort();
+
+        assert!(
+            !cache.contains(ha).await,
+            "the periodic sweeper must evict the over-budget chunk with zero populate traffic",
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_sweeper_does_not_sweep_at_t_zero() {
+        // Regression for the cold-boot pin race: `tokio::time::interval`'s
+        // first tick fires immediately, but at t=0 a freshly-started
+        // host-agent hasn't re-established its pin set yet (that needs a
+        // coordinator RPC round-trip). An immediate sweep would run
+        // pin-blind and evict whatever happens to be oldest — on a real
+        // host, the boot-staged base-image chunks pinned in the prior
+        // life. The sweeper must wait a full interval before its FIRST
+        // sweep, giving the pin set time to repopulate.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: 1, // any populated chunk at all is "over"
+                sweep_debounce_ms: i64::MAX,
+                eviction_enabled: true,
+            },
+            0.0,
+        );
+        let a = b"aaaaaaaaaa";
+        let ha = ChunkHash::of(a);
+        cache.put_no_evict(ha, a).await.unwrap();
+
+        let handle = cache.spawn_sweeper(std::time::Duration::from_millis(200));
+        // Well before the first interval elapses: the chunk must still
+        // be there — a t=0 sweep would have evicted it immediately.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            cache.contains(ha).await,
+            "the sweeper must not evict on its immediate t=0 tick",
+        );
+        // Past the first interval: the (now real) first sweep must have
+        // run and enforced the budget.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.abort();
+        assert!(
+            !cache.contains(ha).await,
+            "the sweeper must still enforce the budget once the first real interval elapses",
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_sweeper_zero_interval_disables_the_loop() {
+        // interval=0 must not panic (tokio::time::interval(ZERO) panics)
+        // and must not tick — the task returns immediately.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: NO_CEILING,
+                sweep_debounce_ms: 0,
+                eviction_enabled: true,
+            },
+            0.0,
+        );
+        let handle = cache.spawn_sweeper(std::time::Duration::ZERO);
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("interval=0 must return promptly, not hang")
+            .expect("sweeper task must not panic");
+    }
+
+    // ---- ChunkCacheConfig::SWEEP_INTERVAL_ENV_VAR precedence ----
+
+    #[test]
+    fn sweep_interval_defaults_when_unset() {
+        let _g = env_guard();
+        std::env::remove_var(SWEEP_INTERVAL_ENV_VAR);
+        assert_eq!(resolve_sweep_interval_secs(), DEFAULT_SWEEP_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn sweep_interval_env_overrides_default() {
+        let _g = env_guard();
+        std::env::set_var(SWEEP_INTERVAL_ENV_VAR, "5");
+        let secs = resolve_sweep_interval_secs();
+        std::env::remove_var(SWEEP_INTERVAL_ENV_VAR);
+        assert_eq!(secs, 5);
+    }
+
+    #[test]
+    fn sweep_interval_env_zero_is_explicit_disable() {
+        let _g = env_guard();
+        std::env::set_var(SWEEP_INTERVAL_ENV_VAR, "0");
+        let secs = resolve_sweep_interval_secs();
+        std::env::remove_var(SWEEP_INTERVAL_ENV_VAR);
+        assert_eq!(secs, 0);
+    }
+
+    #[test]
+    fn sweep_interval_env_unparseable_keeps_default() {
+        let _g = env_guard();
+        std::env::set_var(SWEEP_INTERVAL_ENV_VAR, "not-a-number");
+        let secs = resolve_sweep_interval_secs();
+        std::env::remove_var(SWEEP_INTERVAL_ENV_VAR);
+        assert_eq!(secs, DEFAULT_SWEEP_INTERVAL_SECS);
+    }
+
     // ---- end-to-end: thrash counter increments on refetch-after-evict ----
 
     #[tokio::test]
@@ -2033,6 +2764,7 @@ mod tests {
                 root: cache_dir.path().to_path_buf(),
                 budget_bytes: NO_CEILING, // floor governs, not a byte ceiling,
                 sweep_debounce_ms: 0,
+                eviction_enabled: true,
             },
             1.0,
         );
@@ -2061,6 +2793,7 @@ mod tests {
                 root: cache_dir.path().to_path_buf(),
                 budget_bytes: NO_CEILING,
                 sweep_debounce_ms: 0,
+                eviction_enabled: true,
             },
             1.0,
         );

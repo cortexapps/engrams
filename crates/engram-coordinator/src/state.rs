@@ -34,6 +34,23 @@ pub enum SessionEvent {
         to: SessionState,
         at: DateTime<Utc>,
     },
+    /// Issue #527 Phase 1: the durable "the user asked at time T" fact.
+    /// Emitted as the FIRST PG write of `send_prompt_core`, before
+    /// `ensure_active_and_resolve` (the auto-resume) — unlike the
+    /// user-echo `HarnessAgentMessage`, which is deliberately ordered
+    /// AFTER the resume to satisfy ADR 0052 type-ahead rendering. This
+    /// event exists purely for measurement: it is the receipt anchor
+    /// `engram_prompt_to_run_started_seconds` joins against
+    /// `run_started{prompt_id}` to compute true prompt→first-token
+    /// latency, replacing the `idle→created` proxy (which is a lower
+    /// bound because it post-dates the resume). Coordinator-authoritative
+    /// — stays true across a guest-state rewind, so
+    /// `rewind_session_to_cursor` excludes this kind from its tombstone
+    /// UPDATE (the user genuinely did send the prompt).
+    PromptReceived {
+        prompt_id: String,
+        at: DateTime<Utc>,
+    },
     /// `POST /sessions/:id/exec*` started a new command. `exec_id` is
     /// the sandbox-side identifier; downstream Stdout/Stderr/Exit
     /// events for this run carry the same value so multiplexed clients
@@ -333,6 +350,7 @@ impl SessionEvent {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::StatusChanged { .. } => "status_changed",
+            Self::PromptReceived { .. } => "prompt_received",
             Self::ExecStarted { .. } => "exec_started",
             Self::ExecCompleted { .. } => "exec_completed",
             Self::Stdout { .. } => "stdout",
@@ -928,6 +946,23 @@ fn harness_event_sink(
             let session_event = SessionEvent::from_harness(ev, Utc::now());
             let kind = session_event.kind();
 
+            // Issue #527 Phase 1: a run-started with a client prompt_id is
+            // the consuming end of the `prompt_received` receipt — captured
+            // here (before `session_event` moves into the published
+            // `IndexedEvent` below) so the post-append lookup below can join
+            // it against the receipt row and record prompt→run-start
+            // latency. `None` for the env-seeded initial prompt, which
+            // never gets a receipt.
+            let run_started_prompt_id = if let SessionEvent::HarnessRunStarted {
+                prompt_id: Some(pid),
+                ..
+            } = &session_event
+            {
+                Some(pid.clone())
+            } else {
+                None
+            };
+
             // Drop a back-to-back duplicate `harness_idle`. The
             // upstream TTL bookkeeping in HarnessHub::reader_loop
             // already saw the event, so suppressing it here only
@@ -974,6 +1009,14 @@ fn harness_event_sink(
             match meta.append_session_event(session_id, kind, payload).await {
                 Ok(idx) => {
                     last_kind.insert(session_id, kind);
+
+                    // PR #556 review finding #2: publish FIRST. This is the
+                    // live SSE frame the ADR-0052 held user-echo waits on to
+                    // un-hold and render — the metric join below is a
+                    // synchronous PG round-trip that must never sit in front
+                    // of it (worst case: the query's full timeout delays
+                    // every run_started delivery, precisely when a
+                    // contended Postgres makes that delay most costly).
                     events.publish(
                         session_id,
                         IndexedEvent {
@@ -982,6 +1025,48 @@ fn harness_event_sink(
                             ephemeral: false,
                         },
                     );
+
+                    // Issue #527 Phase 1: join this run-start against its
+                    // `prompt_received` receipt (one PG lookup per run-start —
+                    // runs are low-rate, acceptable per-event cost) and
+                    // record the true prompt→run-start latency. Skip
+                    // silently when there's no receipt (env-seeded initial
+                    // prompt) rather than treating it as an error.
+                    //
+                    // PR #556 review finding #1: the elapsed seconds come
+                    // back already computed PG-side (`NOW() - created_at`,
+                    // one clock) — no coordinator-process `Utc::now()` is
+                    // mixed in, so there's no coordinator/Postgres (or
+                    // cross-replica) clock skew to bias or drop samples.
+                    if let Some(pid) = &run_started_prompt_id {
+                        match meta.prompt_received_seconds_ago(session_id, pid).await {
+                            Ok(Some(secs)) if secs >= 0.0 => {
+                                metrics::histogram!(crate::metrics::PROMPT_TO_RUN_STARTED_SECONDS)
+                                    .record(secs);
+                            }
+                            Ok(Some(secs)) => {
+                                // PG-side computation makes this all but
+                                // unreachable in practice (would require
+                                // Postgres's own clock to step backward
+                                // between the two reads in one query) — kept
+                                // as a defensive guard, not a routine branch.
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    prompt_id = %pid,
+                                    secs,
+                                    "prompt_received_seconds_ago went negative; \
+                                     skipping implausible sample",
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!(
+                                session_id = %session_id,
+                                prompt_id = %pid,
+                                error = %e,
+                                "prompt_received_seconds_ago lookup failed",
+                            ),
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1051,6 +1136,30 @@ pub(crate) mod tests {
             other => panic!("expected HarnessRunInterrupted, got {other:?}"),
         }
         assert_eq!(ev.kind(), "run_interrupted");
+    }
+
+    /// Issue #527 Phase 1: `PromptReceived` is coordinator-native (never
+    /// constructed via `from_harness`), serialises under the stable
+    /// `prompt_received` kind the tombstone-exclusion query in
+    /// `engram-postgres` and the `MetadataStore::prompt_received_seconds_ago`
+    /// lookup key on, and round-trips through serde untouched.
+    #[test]
+    fn prompt_received_has_stable_kind_and_round_trips() {
+        let ev = SessionEvent::PromptReceived {
+            prompt_id: "p-1".into(),
+            at: chrono::Utc::now(),
+        };
+        assert_eq!(ev.kind(), "prompt_received");
+
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(json["type"], "prompt_received");
+        assert_eq!(json["prompt_id"], "p-1");
+
+        let back: SessionEvent = serde_json::from_value(json).expect("deserialize");
+        match back {
+            SessionEvent::PromptReceived { prompt_id, .. } => assert_eq!(prompt_id, "p-1"),
+            other => panic!("expected PromptReceived, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1398,6 +1507,67 @@ pub(crate) mod tests {
                 desynced: PlMutex::new(Vec::new()),
             }
         }
+    }
+
+    /// Shared `AppState` fixture for tests that need a full `Services`
+    /// wiring backed by [`MiniMeta`] — same-crate unit test modules
+    /// (`api::snapshot`, `api::prompt`, …) share `pub(crate)` fns fine, so
+    /// this retires what used to be a per-file ~60-line copy of the same
+    /// wiring (finding #4, PR #556 review).
+    pub(crate) fn build_state_for_session(
+        session: Session,
+    ) -> (
+        crate::state::SharedState,
+        std::sync::Arc<MiniMeta>,
+        tempfile::TempDir,
+    ) {
+        use crate::config::CoordinatorConfig;
+        use crate::host_registry::HostRegistry;
+        use crate::state::AppState;
+        use crate::Services;
+        use engram_cloud_mock::MockCloud;
+        use engram_core::traits::SandboxBackend;
+        use engram_secrets_dev::InMemorySecretStore;
+
+        let local = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SandboxBackend> = Arc::new(
+            engram_sandbox_process::ProcessBackend::new(local.path().join("sandboxes")),
+        );
+        let meta = Arc::new(MiniMeta::new(session));
+        let host_registry = Arc::new(HostRegistry::new(meta.clone() as Arc<dyn MetadataStore>));
+        let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
+            engram_host_agent::LocalHostClient::with_noop_hub(backend.clone()),
+        );
+        host_registry.register(engram_core::HostId::new(), local_host);
+        let blobs_dir =
+            std::env::temp_dir().join(format!("engram-blobs-test-{}", uuid::Uuid::new_v4()));
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                blobs_dir.clone(),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(blobs_dir),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = CoordinatorConfig {
+            local_path: local.path().to_path_buf(),
+            ..CoordinatorConfig::default()
+        };
+        let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
+        (state, meta, local)
     }
 
     #[async_trait]
@@ -1976,6 +2146,54 @@ pub(crate) mod tests {
                 "harness_idle".to_string(),
             ],
         );
+    }
+
+    /// Issue #527 Phase 1: a `run_started{prompt_id}` whose matching
+    /// `prompt_received` receipt row doesn't exist (`MiniMeta`'s default
+    /// `prompt_received_seconds_ago` — see `MetadataStore`'s default impl —
+    /// returns `Ok(None)`, mirroring the env-seeded initial prompt, which
+    /// never gets a receipt) must not panic and must still append the
+    /// `run_started` event normally. The `engram_prompt_to_run_started_seconds`
+    /// join is best-effort telemetry, never load-bearing for delivery.
+    #[tokio::test]
+    async fn harness_event_sink_skips_metric_when_no_receipt_row_exists() {
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            status: engram_core::types::SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:no-receipt".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        };
+        let mini = Arc::new(MiniMeta::new(session));
+        let meta: Arc<dyn MetadataStore> = mini.clone();
+        let sandbox_id = engram_core::SandboxId::new();
+
+        let bus = Arc::new(SessionEventBus::default());
+        let sink = super::harness_event_sink(bus, meta);
+
+        sink(
+            session_id,
+            sandbox_id,
+            HarnessEvent::RunStarted {
+                run_id: "run-1".into(),
+                prompt_summary: None,
+                prompt_id: Some("p-missing".into()),
+            },
+        )
+        .await;
+
+        let events = mini.events.lock();
+        assert_eq!(
+            events.len(),
+            1,
+            "run_started must append even though its receipt lookup misses",
+        );
+        assert_eq!(events[0].kind, "run_started");
     }
 
     // -- ADR 0016 Phase B: live_disk_manifest + chunk_generation -------

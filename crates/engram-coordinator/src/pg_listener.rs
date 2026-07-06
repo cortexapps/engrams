@@ -20,6 +20,7 @@ use engram_core::traits::MetadataStore;
 use engram_core::{HostId, SessionId};
 use serde::Deserialize;
 use sqlx::postgres::PgListener;
+use tokio::sync::Notify;
 
 use crate::host_registry::HostRegistry;
 use crate::integrations::IntegrationBroker;
@@ -52,9 +53,19 @@ pub fn spawn(
     events: Arc<SessionEventBus>,
     host_registry: Arc<HostRegistry>,
     integrations: IntegrationBroker,
+    queue_wake: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run(&database_url, meta, events, host_registry, integrations).await {
+        if let Err(e) = run(
+            &database_url,
+            meta,
+            events,
+            host_registry,
+            integrations,
+            queue_wake,
+        )
+        .await
+        {
             tracing::error!(error = %e, "pg listener task exited");
         }
     })
@@ -66,6 +77,7 @@ async fn run(
     events: Arc<SessionEventBus>,
     host_registry: Arc<HostRegistry>,
     integrations: IntegrationBroker,
+    queue_wake: Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listener = PgListener::connect(database_url).await?;
     listener.listen("session_events").await?;
@@ -73,13 +85,27 @@ async fn run(
     listener.listen("host_dead").await?;
     // ADR 0057 C2: org-secret writes/rotations invalidate the mint-engine cache.
     listener.listen("org_secret_changed").await?;
+    // ADR 0048 (queue fairness): placement-feasibility events wake the
+    // queue scanner (crate::queue_scanner) so a dequeue doesn't wait for
+    // its poll fallback.
+    listener.listen("placement_changed").await?;
     tracing::info!(
-        "pg_listener subscribed to session_events + session_event_deltas + host_dead + org_secret_changed"
+        "pg_listener subscribed to session_events + session_event_deltas + host_dead + \
+         org_secret_changed + placement_changed"
     );
 
     loop {
         let notification = listener.recv().await?;
         match notification.channel() {
+            "placement_changed" => {
+                // Informational reason string only (see
+                // `PostgresStore::notify_placement_changed`); we don't
+                // need to parse it, just wake the scanner. `Notify`
+                // coalesces a storm of these into a single permit, so no
+                // debounce machinery is needed here.
+                queue_wake.notify_one();
+                continue;
+            }
             "host_dead" => {
                 // Payload is just `<uuid>` (no JSON wrapper) — the
                 // detector emits it as a plain text NOTIFY.

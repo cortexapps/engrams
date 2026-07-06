@@ -299,8 +299,9 @@ async fn run(args: Args) -> std::io::Result<()> {
     let supervisor = engram_agentd::HarnessSupervisor::new();
     // ADR 0021 P1.1: one CA-cert installer for the agent's lifetime.
     // The `last_pem` cache that makes resume-with-same-cert a
-    // zero-I/O hot path only works if every InstallHostCa RPC hits
-    // the same installer, regardless of which connection it lands on.
+    // zero-I/O hot path only works if every CA install (2026-07
+    // fold: riding the `SpawnHarness` frame) hits the same
+    // installer, regardless of which connection it lands on.
     let cacerts = std::sync::Arc::new(engram_agentd::CaCertInstaller::new(
         engram_agentd::CaCertPaths::default_linux(),
     ));

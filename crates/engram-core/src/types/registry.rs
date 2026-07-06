@@ -402,6 +402,24 @@ pub struct EnableJob {
     /// [`CaptureEnvEntry`].
     #[serde(default)]
     pub capture_env: Vec<CaptureEnvEntry>,
+    /// Issue #539: live/last capture progress, persisted from the
+    /// streaming `BuildBaseSnapshot` RPC's `CaptureProgress` events (and,
+    /// on a `[warm]`-hook failure, left in place by `record_enable_job_failure`
+    /// so the failing stage + tail survive even a `WarmExecTransport` kill).
+    /// `None` outside the `capturing` state (or before this migration ever
+    /// wrote a value for the row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_phase: Option<crate::types::CapturePhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_stage_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub warm_stages: Vec<crate::types::WarmStageRecord>,
+    /// Rolling last 16 KiB of the `[warm]` hook's combined stdout+stderr —
+    /// the diagnostic that used to require host-log access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tail: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

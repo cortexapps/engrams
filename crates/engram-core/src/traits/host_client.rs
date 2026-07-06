@@ -106,8 +106,12 @@ pub trait HostClient: Send + Sync {
     /// The chunk+upload work runs as a host-side background task; await it via
     /// [`Self::snapshot_wait`]. Returns the new snapshot's id once the
     /// capture itself has succeeded — the point where the coordinator
-    /// may mark the session Idle. Default errs so non-FC hosts and
-    /// pre-D5 host-agents fall back to the composed [`Self::snapshot`].
+    /// may mark the session Idle. Default errs so backends without the
+    /// split path (VZ, Process) fall back to the composed
+    /// [`Self::snapshot`]. The fleet's hard `WIRE_VERSION` lockstep gate
+    /// (skewed hosts are dropped by `host_wire_version_ok`) means this
+    /// default is never reached because a host is running old code —
+    /// only because its backend genuinely has no split-eviction concept.
     async fn snapshot_begin(
         &self,
         _id: SandboxId,
@@ -225,11 +229,23 @@ pub trait HostClient: Send + Sync {
     /// ([`WarmConfig`]), threaded down to the backend. `capture_env` is the
     /// resolved capture-time env injected into the warm hook (refs already
     /// resolved coordinator-side).
+    ///
+    /// Issue #539: `progress` receives [`crate::types::CaptureProgress`]
+    /// events for the lifetime of the call — `phase=boot` once the capture
+    /// VM is up, `phase=warm` stage/heartbeat events while the `[warm]`
+    /// hook runs (a host keepalive at least every 30 s even if the hook is
+    /// silent-but-healthy), then `phase=snapshot` before the memory/disk
+    /// capture. A slow consumer must not block the capture — implementors
+    /// send best-effort (`try_send`). On failure the returned
+    /// `SandboxError::CaptureFailed` carries the same stage + tail the last
+    /// progress event reported, so a dropped/backed-up consumer still gets
+    /// the diagnosis on the terminal error even if it missed live updates.
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
         _warm: Option<WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _progress: tokio::sync::mpsc::Sender<crate::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `build_base_snapshot`".into(),

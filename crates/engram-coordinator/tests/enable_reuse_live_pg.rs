@@ -288,6 +288,7 @@ impl HostClient for FakeCaptureHost {
         _spec: SandboxSpec,
         _warm: Option<engram_core::types::image::WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.captures.fetch_add(1, Ordering::SeqCst);
         Ok(SnapshotMetadata {

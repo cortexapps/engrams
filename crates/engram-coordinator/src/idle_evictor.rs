@@ -29,6 +29,7 @@ use engram_core::traits::SandboxBackend;
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::SessionState;
 use engram_core::{SandboxId, SessionId};
+use tracing::Instrument;
 
 use crate::state::{SessionEvent, SharedState};
 
@@ -517,8 +518,16 @@ async fn finish_eviction_background(
 
     // The finalize task. Owns the lease (touched every 60 s so the 180 s
     // reaper never fires mid-upload — issue #147's secondary bug).
+    //
+    // ADR 0019 / telemetry restoration (#526): re-parent onto the caller's
+    // span (which, via `scanner_advance_one`'s `#[instrument]`, carries
+    // `session_id`) so this finalize task's spans correlate instead of
+    // exporting as an orphaned root — span context only, task lifetime
+    // unchanged.
     let state = state.clone();
-    tokio::spawn(async move {
+    let finalize_span = tracing::Span::current();
+    tokio::spawn(
+        async move {
         let lease = lease;
         let mut touch = tokio::time::interval(std::time::Duration::from_secs(60));
         touch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -638,7 +647,9 @@ async fn finish_eviction_background(
             snapshot_id = %metadata.id,
             "idle eviction finalize completed (ADR 0045 D5)",
         );
-    });
+    }
+    .instrument(finalize_span),
+    );
     Ok(())
 }
 
@@ -1005,6 +1016,11 @@ pub(crate) async fn scanner_run_once(
     Ok(())
 }
 
+// ADR 0019 / telemetry restoration (#526): scanner-driven work has no
+// request span to inherit — give it an explicit root so the pipeline's
+// spans correlate by `session_id` instead of exporting as disconnected
+// roots with no shared attribute.
+#[tracing::instrument(name = "idle_evictor.advance_one", skip_all, fields(session_id = %session.id))]
 async fn scanner_advance_one(
     cfg: &EvictionScannerConfig,
     state: &SharedState,
