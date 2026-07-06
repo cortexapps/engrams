@@ -649,6 +649,17 @@ struct LiveSandbox {
     /// running when the snapshot was captured. Replaces the
     /// pre-M1 boot-race CONNECT-then-retry on port 1024.
     agent_ready: tokio::sync::watch::Receiver<bool>,
+    /// RAM ledger (issue #540): true iff this sandbox is RAM-resident
+    /// but its session no longer holds a coordinator memory reservation
+    /// (epic-parking-ladder rungs 2-3). Always `false` today — no
+    /// backend transition sets it yet; this field is the seam the
+    /// ladder's park/unpark ops will flip. `guest_memory_stats` buckets
+    /// the PSS/RSS sum by this flag so a parked sandbox's memory is
+    /// never added back into `allocatable_mib`. Linux-only, like the
+    /// `smaps_rollup` read that consumes it (`guest_memory_stats` is
+    /// `None` on non-Linux, so the flag has no reader there).
+    #[cfg(target_os = "linux")]
+    parked: bool,
 }
 
 /// Sidecar JSON file written next to `state.bin` and `memory.bin` to
@@ -1329,6 +1340,8 @@ impl FirecrackerBackend {
                 // netns rehydrated above; cold/host-root VMs leave this None.
                 netns: netns_setup,
                 guest_endpoints: parking_lot::Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                parked: false,
                 agent_ready: ready_rx,
             },
         );
@@ -2259,6 +2272,8 @@ impl FirecrackerBackend {
                 // Cold create path: VM is in host root netns.
                 netns: None,
                 guest_endpoints: parking_lot::Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                parked: false,
                 agent_ready: agent_ready_rx,
             },
         );
@@ -3214,6 +3229,8 @@ impl FirecrackerBackend {
                 net: net_setup,
                 netns: netns_setup,
                 guest_endpoints: parking_lot::Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                parked: false,
                 agent_ready: ready_rx,
             },
         );
@@ -4662,19 +4679,31 @@ impl SandboxBackend for FirecrackerBackend {
         // their mapcount, so Σpss/Σrss across same-template File-backend
         // siblings is the density ratio. Error-tolerant: a vanished or
         // unreadable pid is skipped, never fatal.
+        //
+        // Issue #540: bucket the sum by the per-sandbox `parked` flag so
+        // the RAM ledger can add back only reservation-backed (non-parked)
+        // residents into `allocatable_mib`. `parked` is always `false`
+        // today (no backend transition sets it yet), so this is a
+        // behavior-preserving split until epic-parking-ladder lands.
         #[cfg(target_os = "linux")]
         {
-            let pids: Vec<u32> = self
+            let pids: Vec<(u32, bool)> = self
                 .sandboxes
                 .iter()
-                .filter_map(|e| e.value().fc_pid)
+                .filter_map(|e| e.value().fc_pid.map(|pid| (pid, e.value().parked)))
                 .collect();
             let mut stats = engram_core::traits::sandbox::GuestMemoryStats::default();
-            for pid in pids {
+            for (pid, parked) in pids {
                 if let Some((pss, rss)) = read_smaps_rollup_pss_rss(pid).await {
-                    stats.pss_bytes += pss;
-                    stats.rss_bytes += rss;
-                    stats.sampled += 1;
+                    if parked {
+                        stats.parked_pss_bytes += pss;
+                        stats.parked_rss_bytes += rss;
+                        stats.parked_sampled += 1;
+                    } else {
+                        stats.pss_bytes += pss;
+                        stats.rss_bytes += rss;
+                        stats.sampled += 1;
+                    }
                 }
             }
             Some(stats)
@@ -5166,6 +5195,19 @@ async fn destroy_teardown(
 /// (Nothing in the sidecar changes across the freeze, so the two are
 /// byte-identical by construction.)
 impl FirecrackerBackend {
+    /// Issue #540 / epic-parking-ladder seam: flip the RAM-ledger `parked`
+    /// bit for `id`. **No `SandboxBackend` trait method wraps this** —
+    /// the ladder's park/unpark ops own the transition that calls it;
+    /// this issue only lands the flag and the accounting split. Test-
+    /// visible (`pub(crate)`) so ledger unit tests can exercise the
+    /// parked-exclusion behavior without a live ladder.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn set_parked_for_test(&self, id: SandboxId, parked: bool) {
+        if let Some(mut live) = self.sandboxes.get_mut(&id) {
+            live.parked = parked;
+        }
+    }
+
     /// Compose the restore sidecar (`manifest.json` content) from the
     /// LIVE sandbox state — the same composition `snapshot_with_type`
     /// writes at capture (spec env redacted, net echo, canonical-path
@@ -6278,6 +6320,86 @@ mod tests {
         assert!(super::read_smaps_rollup_pss_rss(u32::MAX).await.is_none());
     }
 
+    /// Issue #540: `guest_memory_stats` must bucket PSS/RSS by the
+    /// per-sandbox `parked` flag so the RAM ledger never adds a parked
+    /// resident's memory back into `allocatable_mib`. Both entries
+    /// sample the test process's own pid (no real FC process needed) —
+    /// the property under test is the split, not the smaps parse
+    /// (covered by `read_smaps_rollup_parses_own_process`).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn guest_memory_stats_buckets_parked_pss_separately() {
+        let (be, _dir) = backend();
+        let own_pid = std::process::id();
+        let (_tx, agent_ready) = tokio::sync::watch::channel(true);
+        let dummy_state = || SandboxState {
+            spec: spec(),
+            firecracker_socket: PathBuf::new(),
+            rootfs_path: PathBuf::new(),
+            vsock_cid: 3,
+            vsock_uds_path: PathBuf::new(),
+            rootfs_canonical: PathBuf::new(),
+        };
+
+        let running_id = SandboxId::new();
+        be.sandboxes.insert(
+            running_id,
+            LiveSandbox {
+                state: dummy_state(),
+                child: None,
+                fc_pid: Some(own_pid),
+                uffd_handler: None,
+                uffd_pid: None,
+                net: None,
+                netns: None,
+                guest_endpoints: parking_lot::Mutex::new(None),
+                parked: false,
+                agent_ready: agent_ready.clone(),
+            },
+        );
+        let parked_id = SandboxId::new();
+        be.sandboxes.insert(
+            parked_id,
+            LiveSandbox {
+                state: dummy_state(),
+                child: None,
+                fc_pid: Some(own_pid),
+                uffd_handler: None,
+                uffd_pid: None,
+                net: None,
+                netns: None,
+                guest_endpoints: parking_lot::Mutex::new(None),
+                parked: false,
+                agent_ready: agent_ready.clone(),
+            },
+        );
+        be.set_parked_for_test(parked_id, true);
+
+        let stats = be
+            .guest_memory_stats()
+            .await
+            .expect("linux backend samples memory");
+        assert_eq!(stats.sampled, 1, "only the non-parked sandbox counts here");
+        assert_eq!(stats.parked_sampled, 1, "the parked sandbox counts here");
+        assert!(stats.pss_bytes > 0, "non-parked PSS must be charged");
+        assert!(stats.rss_bytes > 0);
+        assert!(
+            stats.parked_pss_bytes > 0,
+            "parked PSS must be measured (never assumed 0)"
+        );
+        assert!(
+            stats.parked_rss_bytes > 0,
+            "parked RSS must be measured too, not discarded alongside PSS"
+        );
+        // The two entries sample the SAME real pid, so the two buckets
+        // should be roughly equal — the point is they land in DIFFERENT
+        // buckets, not summed into one.
+        assert_ne!(
+            stats.pss_bytes, 0,
+            "parked residency must not silently zero out the running bucket"
+        );
+    }
+
     /// True iff `pid` is alive (`kill(pid, 0)` succeeds). A dead/reaped
     /// pid yields `ESRCH`.
     #[cfg(unix)]
@@ -6388,6 +6510,8 @@ mod tests {
                 net: None,
                 netns: None,
                 guest_endpoints: parking_lot::Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                parked: false,
                 agent_ready,
             },
         );

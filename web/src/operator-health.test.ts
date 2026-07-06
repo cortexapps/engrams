@@ -15,6 +15,9 @@ const host = (status: HostStatus, total = 100, used = 0): HostView => ({
   util_mem_total_mib: 0,
   util_mem_used_mib: 0,
   util_cpu_pct: 0,
+  util_base_shm_mib: 0,
+  util_parked_pss_mib: 0,
+  util_running_pss_mib: 0,
   last_heartbeat_at: "",
 });
 const row = (last_flush_at: string | null): DurabilityRow => ({

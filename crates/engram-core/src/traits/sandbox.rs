@@ -76,11 +76,32 @@ pub type UploadSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
 /// single-template-per-host case.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GuestMemoryStats {
+    /// Σ PSS/RSS over sandboxes NOT flagged `parked` — i.e. sandboxes
+    /// whose session holds a coordinator memory reservation
+    /// (`SessionState::reserves_host_memory`). This is the figure the
+    /// RAM ledger (`ram_ledger.rs`, issue #540) adds back into
+    /// `allocatable_mib`.
     pub pss_bytes: u64,
     pub rss_bytes: u64,
     /// How many sandboxes were successfully sampled (a dead/unreadable
     /// process is skipped, never fatal).
     pub sampled: u32,
+    /// Σ PSS over sandboxes flagged `parked` — RAM-resident but
+    /// reservation-free (epic-parking-ladder rungs 2-3). `0` until a
+    /// backend ever parks a sandbox (today: always 0, no backend sets
+    /// the flag yet). Never added back into `allocatable_mib` — see
+    /// [`GuestMemoryStats::pss_bytes`].
+    pub parked_pss_bytes: u64,
+    /// Σ RSS over sandboxes flagged `parked` — measured alongside
+    /// `parked_pss_bytes` (the same `smaps_rollup` read returns both)
+    /// but previously discarded. Without this, the density signal
+    /// (`Σpss/Σrss < 1.0`) can never be evaluated for parked residents
+    /// once the parking ladder lands — the exact population the density
+    /// math cares about. Never folded into `allocatable_mib`; a
+    /// gauge-only figure, same posture as `parked_pss_bytes`.
+    pub parked_rss_bytes: u64,
+    /// How many parked sandboxes were successfully sampled.
+    pub parked_sampled: u32,
 }
 
 /// ADR 0045 C2: see [`SandboxBackend::post_copy_source_view`].

@@ -230,6 +230,11 @@ pub fn spawn_supervisor(
     // readiness on it). `None` ⇒ density off; the prefetch warms only
     // chunks, exactly as before.
     base_memfile_dir: Option<SnapshotDirResolver>,
+    // Issue #540: register the base-shm prewarm's expected byte charge
+    // against the host RAM ledger BEFORE writing, so the very next
+    // heartbeat tick's `allocatable_mib` reflects it — instead of minutes
+    // later when the multi-GiB write finishes.
+    ram_ledger: Arc<crate::ram_ledger::RamLedger>,
 ) -> (
     watch::Sender<Vec<EnabledImageRef>>,
     tokio::task::JoinHandle<()>,
@@ -264,6 +269,7 @@ pub fn spawn_supervisor(
                 base_memfile_dir.as_ref(),
                 &mut memfiles,
                 pinned_manifests.clone(),
+                ram_ledger.clone(),
             )
             .await;
 
@@ -298,6 +304,7 @@ async fn reconcile(
     base_memfile_dir: Option<&SnapshotDirResolver>,
     memfiles: &mut HashMap<ManifestDigest, MemfileState>,
     pinned_manifests: PinnedManifests,
+    ram_ledger: Arc<crate::ram_ledger::RamLedger>,
 ) {
     let current = readiness.snapshot();
     let current: HashSet<ManifestDigest> = current.into_iter().collect();
@@ -414,8 +421,18 @@ async fn reconcile(
         let chunk_cache = chunk_cache.clone();
         let semaphore = semaphore.clone();
         let pinned_manifests = pinned_manifests.clone();
+        let ram_ledger = ram_ledger.clone();
         tokio::spawn(async move {
-            match prefetch_one(&image, &chunk_store, &chunk_cache, &semaphore, base_memfile).await {
+            match prefetch_one(
+                &image,
+                &chunk_store,
+                &chunk_cache,
+                &semaphore,
+                base_memfile,
+                &ram_ledger,
+            )
+            .await
+            {
                 Ok(warmed) => {
                     // ADR 0039: pin the canonical base manifest (disk +
                     // memory) so the LRU never evicts the shared base while
@@ -541,6 +558,10 @@ async fn prefetch_one(
     // readiness on this means an image isn't "ready" until the shared
     // memfile exists, so the first session restores against a warm file.
     base_memfile: Option<PathBuf>,
+    // Issue #540: the host RAM ledger's pending-charge registry — the
+    // prewarm arm below registers the expected write BEFORE it starts and
+    // settles it in both the success and failure arms.
+    ram_ledger: &crate::ram_ledger::RamLedger,
 ) -> Result<WarmedManifest, PrefetchError> {
     // ADR 0045 substrate readiness gate. A memory-bearing (FC) image restores
     // Uffd-against-the-shared-base-shm, which REQUIRES the uffd base dir to be
@@ -634,24 +655,64 @@ async fn prefetch_one(
         if let Some(base_dir) = engram_sandbox_firecracker::uffd_base_dir_from_env() {
             let base_path = engram_sandbox_firecracker::uffd_base_path_in(&base_dir, &memory_ref);
             if tokio::fs::metadata(&base_path).await.is_err() {
-                match prewarm_base_shm(&base_path, &memory_manifest, chunk_store, chunk_cache).await
-                {
-                    Ok(written) => {
-                        tracing::info!(
-                            image_uri = %image.image_uri,
-                            path = %base_path.display(),
-                            chunks = written,
-                            "per-image base shm pre-warmed at prefetch (ADR 0045 C1)",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            image_uri = %image.image_uri,
-                            path = %base_path.display(),
-                            error = %e,
-                            "base shm pre-warm failed; the handler's lazy path backstops",
-                        );
-                        let _ = tokio::fs::remove_file(&base_path).await;
+                // Issue #540: the non-hole byte total this write is about
+                // to land — the same figure `prewarm_base_shm` will
+                // actually pwrite (elided ranges stay holes, never
+                // written). Registered BEFORE the write so the very next
+                // heartbeat tick charges it against `allocatable_mib`.
+                let pending_bytes = manifest_non_hole_bytes(&memory_manifest);
+                // Headroom pre-check (the 2026-06-28 `pwrite ... No space
+                // left on device` incident class): skip the multi-GiB
+                // write attempt outright if the tmpfs plainly doesn't have
+                // room, instead of discovering it mid-pwrite. `None`
+                // (statfs failed, or non-Linux) is treated as "don't
+                // skip" — fail-soft, same posture as every other read
+                // here; the existing warn-and-continue-then-lazy-backstop
+                // still catches it if this check is wrong.
+                let headroom_mib = crate::ram_ledger::tmpfs_free_mib(&base_dir);
+                let needed_mib = pending_bytes.div_ceil(1024 * 1024);
+                if headroom_mib.is_some_and(|free| free < needed_mib) {
+                    ::metrics::counter!(
+                        crate::metrics::BASE_SHM_PREWARM_SKIPPED_TOTAL,
+                        "reason" => "tmpfs_headroom"
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        image_uri = %image.image_uri,
+                        path = %base_path.display(),
+                        needed_mib,
+                        free_mib = ?headroom_mib,
+                        "base shm pre-warm skipped: insufficient tmpfs headroom; \
+                         the handler's lazy path backstops",
+                    );
+                } else {
+                    ram_ledger.register_pending_base_shm(
+                        memory_ref,
+                        base_path.clone(),
+                        pending_bytes,
+                    );
+                    let prewarm_result =
+                        prewarm_base_shm(&base_path, &memory_manifest, chunk_store, chunk_cache)
+                            .await;
+                    ram_ledger.settle_pending(&memory_ref);
+                    match prewarm_result {
+                        Ok(written) => {
+                            tracing::info!(
+                                image_uri = %image.image_uri,
+                                path = %base_path.display(),
+                                chunks = written,
+                                "per-image base shm pre-warmed at prefetch (ADR 0045 C1)",
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                image_uri = %image.image_uri,
+                                path = %base_path.display(),
+                                error = %e,
+                                "base shm pre-warm failed; the handler's lazy path backstops",
+                            );
+                            let _ = tokio::fs::remove_file(&base_path).await;
+                        }
                     }
                 }
             }
@@ -688,6 +749,24 @@ async fn prefetch_one(
         chunk_count: total,
         hashes: pin_hashes,
     })
+}
+
+/// Issue #540: the total bytes a `prewarm_base_shm` call against this
+/// manifest will actually `pwrite` — Σ chunk lengths, NOT
+/// `manifest.total_bytes` (the virtual/logical size, which includes
+/// manifest-elided HOLE ranges the prewarm never writes). Every chunk is
+/// `chunk_size` bytes except possibly the last, which is clipped to
+/// whatever remains before `total_bytes`.
+fn manifest_non_hole_bytes(manifest: &Manifest) -> u64 {
+    let chunk_size = manifest.chunk_size.as_u64();
+    manifest
+        .chunks
+        .iter()
+        .map(|c| {
+            let remaining = manifest.total_bytes.saturating_sub(c.offset);
+            remaining.min(chunk_size)
+        })
+        .sum()
 }
 
 /// ADR 0045 C1: populate a per-image base shm file from a memory
@@ -980,6 +1059,7 @@ mod tests {
     async fn prefetch_materializes_base_memfile_and_is_idempotent() {
         let (store, cache, dir, disk_ref, mem_ref, mem_bytes) = seed().await;
         let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let base_id = SnapshotId::new();
         let dest = dir
             .path()
@@ -988,7 +1068,7 @@ mod tests {
             .join("memory.bin");
 
         let img = image_ref(base_id, disk_ref, Some(mem_ref));
-        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()))
+        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()), &ledger)
             .await
             .unwrap();
 
@@ -1003,7 +1083,7 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
-        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()))
+        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()), &ledger)
             .await
             .unwrap();
         let after = tokio::fs::metadata(&dest)
@@ -1023,6 +1103,7 @@ mod tests {
         // dest path supplied, no memfile is built — density is FC-only.
         let (store, cache, dir, disk_ref, _mem_ref, _mem_bytes) = seed().await;
         let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let base_id = SnapshotId::new();
         let dest = dir
             .path()
@@ -1031,7 +1112,7 @@ mod tests {
             .join("memory.bin");
 
         let img = image_ref(base_id, disk_ref, None);
-        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()))
+        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()), &ledger)
             .await
             .unwrap();
         assert!(
@@ -1050,6 +1131,7 @@ mod tests {
         // union (a mix-up between disk/memory chunks would surface here).
         let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
         let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let base_id = SnapshotId::new();
         let _ = dir; // tempdir kept alive
 
@@ -1063,7 +1145,7 @@ mod tests {
             .collect();
 
         let img = image_ref(base_id, disk_ref, Some(mem_ref));
-        let warmed = prefetch_one(&img, &store, &cache, &sem, None)
+        let warmed = prefetch_one(&img, &store, &cache, &sem, None, &ledger)
             .await
             .unwrap();
 
@@ -1081,6 +1163,7 @@ mod tests {
         let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
         let _ = dir;
         let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
         let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
@@ -1110,6 +1193,7 @@ mod tests {
             None,
             &mut memfiles,
             pinned.clone(),
+            ledger.clone(),
         )
         .await;
         for _ in 0..200 {
@@ -1139,6 +1223,7 @@ mod tests {
             None,
             &mut memfiles,
             pinned.clone(),
+            ledger.clone(),
         )
         .await;
         assert!(!readiness.contains(&img.manifest_digest), "now unready");
@@ -1154,6 +1239,7 @@ mod tests {
         // not-ready so a restore never lands on a ready-but-cold host.
         let (store, cache, _dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
         let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
         let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
@@ -1170,6 +1256,7 @@ mod tests {
             None,
             &mut memfiles,
             pinned.clone(),
+            ledger.clone(),
         )
         .await;
         for _ in 0..200 {
@@ -1207,6 +1294,7 @@ mod tests {
             None,
             &mut memfiles,
             pinned.clone(),
+            ledger.clone(),
         )
         .await;
         assert!(
