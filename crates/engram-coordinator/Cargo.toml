@@ -24,8 +24,6 @@ engram-postgres.workspace = true
 engram-mount-manifest.workspace = true
 engram-chunk-store.workspace = true
 engram-host-agent.workspace = true
-engram-sandbox-firecracker.workspace = true
-engram-sandbox-vz.workspace = true
 # ADR 0023: ProcessBackend is now an operator-selectable (guarded) backend,
 # not just a test fixture — promoted from dev-dependencies.
 engram-sandbox-process.workspace = true

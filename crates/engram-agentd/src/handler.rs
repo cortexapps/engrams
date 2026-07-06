@@ -233,22 +233,33 @@ where
             return Ok(());
         }
         WireRequest::SpawnHarness(req) => {
+            // 2026-07 core-ops fold: install the per-host egress-proxy
+            // CA (if this request carries one) BEFORE spawning, and
+            // before the empty-argv readiness-probe early return inside
+            // `HarnessSupervisor::spawn` — so a dev_vm probe still
+            // delivers the CA. Install failure is loud: a harness
+            // spawned without the proxy CA would fail every outbound
+            // TLS dial opaquely, so we reject the whole request instead
+            // of spawning a harness that can't reach anything.
+            let ca_changed = match req.host_ca_pem.as_deref() {
+                Some(pem) if !pem.is_empty() => match cacerts.install(pem).await {
+                    Ok(changed) => Some(changed),
+                    Err(e) => {
+                        let resp = WireResponse::Error {
+                            kind: format!("{:?}", e.kind()),
+                            message: format!("install_host_ca: {e}"),
+                        };
+                        write_msg(&mut writer, &resp).await?;
+                        return Ok(());
+                    }
+                },
+                _ => None,
+            };
             let resp = match supervisor.spawn(req).await {
-                Ok(pid) => WireResponse::HarnessSpawned { pid },
+                Ok(pid) => WireResponse::HarnessSpawned { pid, ca_changed },
                 Err(e) => WireResponse::Error {
                     kind: format!("{:?}", e.kind()),
                     message: format!("spawn_harness: {e}"),
-                },
-            };
-            write_msg(&mut writer, &resp).await?;
-            return Ok(());
-        }
-        WireRequest::InstallHostCa(req) => {
-            let resp = match cacerts.install(&req.cert_pem).await {
-                Ok(changed) => WireResponse::InstallHostCaAck { changed },
-                Err(e) => WireResponse::Error {
-                    kind: format!("{:?}", e.kind()),
-                    message: format!("install_host_ca: {e}"),
                 },
             };
             write_msg(&mut writer, &resp).await?;
@@ -1236,6 +1247,229 @@ mod tests {
                 assert!(message.contains("read"), "message should name the op");
             }
             other => panic!("expected Error response, got {other:?}"),
+        }
+    }
+
+    // ---- SpawnHarness CA fold (2026-07 core-ops) ------------------------
+    //
+    // The former standalone CA-install verb is gone; these tests exercise
+    // the CA install now living inside the `SpawnHarness` handler arm —
+    // `cacerts.rs`'s own unit tests already cover the installer in
+    // isolation, so these focus on the handler wiring: install-before-spawn
+    // ordering, the readiness-probe (empty argv) path, install-failure
+    // blocking the spawn, and the `last_pem` cache surfacing as
+    // `ca_changed` across two round trips.
+
+    /// Like [`round_trip`] but lets the caller supply its own
+    /// `CaCertInstaller` so CA-fold tests can point at inspectable temp
+    /// paths (or paths engineered to fail) instead of the throwaway
+    /// `for_tests()` installer.
+    async fn round_trip_with_cacerts(
+        req: WireRequest,
+        cacerts: Arc<crate::cacerts::CaCertInstaller>,
+    ) -> WireResponse {
+        let (mut client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            serve_connection(server, None, HarnessSupervisor::new(), cacerts).await
+        });
+        write_msg(&mut client, &req).await.unwrap();
+        let resp: WireResponse = read_msg(&mut client).await.unwrap();
+        let _ = server_task.await.unwrap();
+        resp
+    }
+
+    fn temp_cacert_paths(tmp: &tempfile::TempDir) -> crate::cacerts::CaCertPaths {
+        crate::cacerts::CaCertPaths {
+            bundle: tmp.path().join("etc/ssl/certs/ca-certificates.crt"),
+            extra_cert: tmp
+                .path()
+                .join("usr/local/share/ca-certificates/engram.crt"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_harness_installs_ca_before_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = temp_cacert_paths(&tmp);
+        // Pin the ORDERING, not just eventual existence: the spawned
+        // child stats the bundle path itself, at exec time, and records
+        // what it saw into `marker`. Asserting `paths.bundle.exists()`
+        // only after the response comes back would also pass an
+        // install-AFTER-spawn reordering bug, since both complete before
+        // the reply — this makes the child's own exec-time observation
+        // the assertion.
+        let marker = tmp.path().join("bundle-state-at-exec");
+        let cacerts = Arc::new(crate::cacerts::CaCertInstaller::new(paths.clone()));
+        let resp = round_trip_with_cacerts(
+            WireRequest::SpawnHarness(crate::proto::SpawnHarnessRequest {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "test -f {} && echo present > {} || echo absent > {}",
+                        paths.bundle.display(),
+                        marker.display(),
+                        marker.display()
+                    ),
+                ],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: Some(
+                    "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----".into(),
+                ),
+            }),
+            cacerts,
+        )
+        .await;
+        match resp {
+            WireResponse::HarnessSpawned { pid, ca_changed } => {
+                assert!(pid.is_some(), "non-empty argv must spawn a child");
+                assert_eq!(
+                    ca_changed,
+                    Some(true),
+                    "first install on a fresh installer must report changed"
+                );
+            }
+            other => panic!("expected HarnessSpawned, got {other:?}"),
+        }
+        // The response only pins that spawn() returned, not that the
+        // detached child finished execing — poll for its marker.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let state = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(
+            state.trim(),
+            "present",
+            "CA bundle must already exist when the spawned child execs"
+        );
+        let bundle = std::fs::read_to_string(&paths.bundle).unwrap();
+        assert!(bundle.contains("AAAA"));
+        assert!(paths.extra_cert.exists());
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_installs_ca_without_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = temp_cacert_paths(&tmp);
+        let cacerts = Arc::new(crate::cacerts::CaCertInstaller::new(paths.clone()));
+        let resp = round_trip_with_cacerts(
+            WireRequest::SpawnHarness(crate::proto::SpawnHarnessRequest {
+                argv: vec![],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: Some(
+                    "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----".into(),
+                ),
+            }),
+            cacerts,
+        )
+        .await;
+        match resp {
+            WireResponse::HarnessSpawned { pid, ca_changed } => {
+                assert_eq!(pid, None, "empty argv must not spawn");
+                assert_eq!(ca_changed, Some(true));
+            }
+            other => panic!("expected HarnessSpawned, got {other:?}"),
+        }
+        assert!(
+            paths.bundle.exists(),
+            "the dev_vm readiness probe must still deliver the CA (no harness spawn needed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ca_install_failure_blocks_spawn() {
+        // Force the install to fail without permission games: `bundle`'s
+        // parent path component is a plain FILE, so `create_dir_all` can't
+        // create it — portable across CI runners (no root, no chmod 000
+        // on a filesystem that might ignore it).
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"i am a file, not a directory").unwrap();
+        let paths = crate::cacerts::CaCertPaths {
+            bundle: blocker.join("etc/ssl/certs/ca-certificates.crt"),
+            extra_cert: tmp
+                .path()
+                .join("usr/local/share/ca-certificates/engram.crt"),
+        };
+        let cacerts = Arc::new(crate::cacerts::CaCertInstaller::new(paths));
+        // The issue spec required pinning "supervisor never spawned", not
+        // just "the response is an Error" — a regression that spawns the
+        // harness AND still returns Error would pass a message-only
+        // assertion unchanged. Have the argv (which would only ever run
+        // if spawn() were reached) touch a marker, and assert its
+        // absence.
+        let marker = tmp.path().join("spawned.marker");
+        let resp = round_trip_with_cacerts(
+            WireRequest::SpawnHarness(crate::proto::SpawnHarnessRequest {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("touch {}", marker.display()),
+                ],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: Some(
+                    "-----BEGIN CERTIFICATE-----\nCCCC\n-----END CERTIFICATE-----".into(),
+                ),
+            }),
+            cacerts,
+        )
+        .await;
+        match resp {
+            WireResponse::Error { message, .. } => {
+                assert!(
+                    message.contains("install_host_ca"),
+                    "error should name the failing step: {message}"
+                );
+            }
+            other => panic!(
+                "CA install failure must block the spawn with an Error response, got {other:?}"
+            ),
+        }
+        assert!(
+            !marker.exists(),
+            "supervisor must never spawn when CA install fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_pem_resume_is_ca_changed_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = temp_cacert_paths(&tmp);
+        let cacerts = Arc::new(crate::cacerts::CaCertInstaller::new(paths));
+        let pem = "-----BEGIN CERTIFICATE-----\nDDDD\n-----END CERTIFICATE-----".to_string();
+        let req = || {
+            WireRequest::SpawnHarness(crate::proto::SpawnHarnessRequest {
+                argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: Some(pem.clone()),
+            })
+        };
+        let first = round_trip_with_cacerts(req(), cacerts.clone()).await;
+        assert!(
+            matches!(
+                first,
+                WireResponse::HarnessSpawned {
+                    ca_changed: Some(true),
+                    ..
+                }
+            ),
+            "first install must report changed: {first:?}"
+        );
+        let second = round_trip_with_cacerts(req(), cacerts).await;
+        match second {
+            WireResponse::HarnessSpawned { ca_changed, .. } => {
+                assert_eq!(
+                    ca_changed,
+                    Some(false),
+                    "identical PEM on resume must hit the zero-I/O `last_pem` cache"
+                );
+            }
+            other => panic!("expected HarnessSpawned, got {other:?}"),
         }
     }
 

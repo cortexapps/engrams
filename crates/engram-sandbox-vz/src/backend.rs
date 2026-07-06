@@ -608,10 +608,19 @@ impl SandboxBackend for VzBackend {
             SandboxError::Vm(format!("connect agentd UDS {}: {e}", agent_uds.display()).into())
         })?;
 
+        // 2026-07 core-ops fold: this frame also carries the per-host
+        // egress-proxy CA (ADR 0021 P1) — agentd installs it before
+        // spawning. Previously VZ built this request from
+        // argv/env/session_env only and never referenced
+        // `agent.host_ca_pem`, so a VZ host running an egress proxy
+        // silently delivered no CA to the guest; passing it through
+        // here fixes that for free (VZ exercises the identical
+        // agentd code path as FC).
         let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),
             session_env: agent.session_env.into_iter().collect(),
+            host_ca_pem: agent.host_ca_pem,
         });
         engram_agentd::write_msg(&mut conn, &req)
             .await
@@ -620,8 +629,13 @@ impl SandboxBackend for VzBackend {
             .await
             .map_err(|e| SandboxError::Vm(format!("read SpawnHarness response: {e}").into()))?;
         match resp {
-            engram_agentd::WireResponse::HarnessSpawned { pid } => {
-                tracing::debug!(sandbox_id = %id, pid = ?pid, "vz start_agent: harness spawned");
+            engram_agentd::WireResponse::HarnessSpawned { pid, ca_changed } => {
+                tracing::debug!(
+                    sandbox_id = %id,
+                    pid = ?pid,
+                    ca_changed = ?ca_changed,
+                    "vz start_agent: harness spawned",
+                );
                 Ok(())
             }
             engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
@@ -1038,6 +1052,12 @@ impl SandboxBackend for VzBackend {
             .await
             .ok()
             .flatten();
+        // Not cached: today agentd only ever answers via
+        // `read_primary_ipv4()`, which can't produce a non-IPv4
+        // string, so this is unreachable in practice. If that ever
+        // changes, a parse failure re-pays the full 2s vsock
+        // round-trip on every subsequent call instead of failing
+        // fast from a cached negative.
         let ip: std::net::Ipv4Addr = ip_str?.parse().ok()?;
         let ep = GuestEndpoints {
             egress_identity: ip,

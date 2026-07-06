@@ -92,11 +92,15 @@ pub struct Services {
     /// `PooledBackend` (materialize-on-create) and the coord's
     /// admin GC endpoint (sweep unreferenced chunks).
     pub chunk_store: engram_chunk_store::ChunkStore,
-    /// ADR 0007: where the in-process host-agent (active in
-    /// `--mode=all`) materializes chunked manifests. `Some` when
-    /// running `--mode=all`; `None` in `--mode=coordinator` (the
-    /// admin reaper endpoint then becomes a multi-host fanout —
-    /// out of scope for this slice).
+    /// ADR 0007: where an in-process host-agent would materialize
+    /// chunked manifests, for the admin orphan-reap endpoint.
+    /// Currently always `None`: `--mode=all`'s only backend is
+    /// `ProcessBackend` (the FC/VZ in-proc arms were retired, #530
+    /// item f), which has no chunk store / materialize wiring, and
+    /// `--mode=coordinator`'s reap would need a multi-host fanout
+    /// that doesn't exist yet. Kept as a field (not deleted) since a
+    /// real `--mode=all` materialize-dir producer would plug back in
+    /// here without a wire change.
     pub materialize_dir: Option<std::path::PathBuf>,
 }
 
@@ -176,6 +180,12 @@ pub async fn run_with_registry_and_local(
         tracing::warn!(error = %e, "startup host-registry prewarm failed");
     }
 
+    // ADR 0048 (queue fairness): shared wake handle between the pg
+    // listener (fires it on `placement_changed` NOTIFYs) and the queue
+    // scanner (parks on it instead of a pure poll). One per coord
+    // replica — see the `queue_scanner` module doc.
+    let queue_wake = Arc::new(tokio::sync::Notify::new());
+
     // Phase 3c HA: every replica subscribes to the shared
     // `session_events` channel so SSE clients connected to any one
     // replica see events emitted via any other. The same listener
@@ -190,6 +200,7 @@ pub async fn run_with_registry_and_local(
         state.events.clone(),
         state.host_registry.clone(),
         state.integrations.clone(),
+        queue_wake.clone(),
     );
 
     // Phase 3d follow-up: dead-host auto-detector. Opens its own
@@ -222,11 +233,15 @@ pub async fn run_with_registry_and_local(
         evac_resumer::spawn(evac_resumer::EvacResumerConfig::default(), state.clone());
 
     // ADR 0048: the session queue scanner. Drives `queued` sessions to
-    // placement (best-fit, FIFO) as capacity frees / the fleet scales up,
-    // or times them out. Lease-guarded → replica-safe. Without it, a
-    // session enqueued on no-capacity sits forever.
-    let _queue_scanner =
-        queue_scanner::spawn(queue_scanner::QueueScannerConfig::default(), state.clone());
+    // placement (best-fit, per-fit-class FIFO) as capacity frees / the
+    // fleet scales up, or times them out. Lease-guarded → replica-safe.
+    // Without it, a session enqueued on no-capacity sits forever.
+    // Push-driven via `queue_wake` (see above); polling is the fallback.
+    let _queue_scanner = queue_scanner::spawn(
+        queue_scanner::QueueScannerConfig::default(),
+        state.clone(),
+        queue_wake,
+    );
 
     // ADR 0028 Fix A: prune aged-out per-session checkpoint rows
     // (latest-per-session always kept; the window doubles as the

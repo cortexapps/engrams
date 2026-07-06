@@ -489,17 +489,6 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
-    /// ADR 0020 P1: the host-local stub harness ext4 the base-snapshot
-    /// capture attaches as the harness drive (so the captured snapshot
-    /// carries a harness drive slot that `swap_harness_drive` can
-    /// re-point per session at restore time). `None` when no stub is
-    /// configured — `build_base_snapshot` then fails fast. Only the FC
-    /// backend (which holds `FirecrackerConfig.stub_harness_path`)
-    /// returns a path.
-    fn stub_harness_path(&self) -> Option<PathBuf> {
-        None
-    }
-
     /// ADR 0035/0062: the directory this backend reads its RO bundle stamp
     /// (`current.json`) and staged `<sha>.squashfs` generations from — i.e.
     /// where `restore_fresh` resolves a selected skill/harness sha to a file

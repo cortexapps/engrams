@@ -106,7 +106,7 @@ export function durabilitySummary(
     return null;
   }
 
-  // Active-ish (active / created / guest_ready / pending / queued). Without live
+  // Active-ish (active / created / pending / queued). Without live
   // COW telemetry there's nothing honest to claim, and "unavailable" is operator
   // noise — stay quiet; the drawer explains the why.
   if (!state) return null;

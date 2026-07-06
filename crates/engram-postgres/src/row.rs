@@ -416,7 +416,6 @@ fn parse_session_state(s: &str) -> Result<SessionState, MetaError> {
         "pending" => SessionState::Pending,
         "queued" => SessionState::Queued,
         "created" => SessionState::Created,
-        "guest_ready" => SessionState::GuestReady,
         "active" => SessionState::Active,
         "idle" => SessionState::Idle,
         "host_lost" => SessionState::HostLost,
@@ -491,17 +490,15 @@ mod tests {
 
     /// Each enum variant must round-trip through the wire format the
     /// migration uses. ADR 0015 M2 expanded the set: `created`,
-    /// `guest_ready`, `host_lost` join the original six. If you add
-    /// a new variant, extend this test and `parse_session_state`
-    /// together — the column is `TEXT` with no CHECK constraint, so
-    /// the parser is the only enforcement.
+    /// `host_lost` join the original six. If you add a new variant,
+    /// extend this test, `parse_session_state`, and the `sessions`
+    /// status CHECK constraint together.
     #[test]
     fn session_state_parses_every_variant() {
         let variants = [
             ("pending", SessionState::Pending),
             ("queued", SessionState::Queued),
             ("created", SessionState::Created),
-            ("guest_ready", SessionState::GuestReady),
             ("active", SessionState::Active),
             ("idle", SessionState::Idle),
             ("host_lost", SessionState::HostLost),
