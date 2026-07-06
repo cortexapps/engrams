@@ -71,6 +71,7 @@ async fn seed_ready_host(
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
     })
     .await
     .expect("upsert host");
@@ -96,6 +97,7 @@ async fn seed_ready_host(
             // Issue #229: report the coordinator's wire version so the
             // placement filter keeps this seeded host schedulable.
             wire_version: engram_protocol::WIRE_VERSION,
+            capabilities: engram_core::types::host::HostCapabilities::default(),
         },
     )
     .await

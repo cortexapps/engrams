@@ -2165,14 +2165,21 @@ impl MetadataStore for PostgresStore {
     async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
         let cloud_meta = serde_json::to_value(&host.cloud_metadata)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        // ADR 0068: persist the register-time capability vector too — a
+        // host's very first row (before its first heartbeat) should
+        // already carry whatever `probe_all` measured at startup, not
+        // sit at `'{}'::jsonb` (schema 0) until 5s later.
+        let capabilities = serde_json::to_value(&host.capabilities)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
         sqlx::query(
             r#"
             INSERT INTO hosts (id, hostname, cloud_metadata,
                                capacity_total_gb, capacity_used_gb,
                                capacity_total_mib, capacity_used_mib,
                                running_sandboxes_count,
-                               last_heartbeat_at, status, host_addr, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+                               last_heartbeat_at, status, host_addr,
+                               capabilities, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
             ON CONFLICT (id) DO UPDATE SET
                 hostname                = EXCLUDED.hostname,
                 cloud_metadata          = EXCLUDED.cloud_metadata,
@@ -2184,6 +2191,7 @@ impl MetadataStore for PostgresStore {
                 last_heartbeat_at       = EXCLUDED.last_heartbeat_at,
                 status                  = EXCLUDED.status,
                 host_addr               = COALESCE(EXCLUDED.host_addr, hosts.host_addr),
+                capabilities            = EXCLUDED.capabilities,
                 updated_at              = NOW()
             "#,
         )
@@ -2198,6 +2206,7 @@ impl MetadataStore for PostgresStore {
         .bind(host.last_heartbeat_at)
         .bind(host.status.as_str())
         .bind(host.host_addr.as_deref())
+        .bind(capabilities)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -2225,7 +2234,7 @@ impl MetadataStore for PostgresStore {
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
                    ready_images, local_snapshots, current_bundles,
-                   cordoned, total_vcpus, wire_version,
+                   cordoned, total_vcpus, wire_version, capabilities,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
@@ -2267,6 +2276,9 @@ impl MetadataStore for PostgresStore {
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let current_bundles = serde_json::to_value(&hb.current_bundles)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        // ADR 0068: this tick's re-probed capability vector.
+        let capabilities = serde_json::to_value(&hb.capabilities)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let n = sqlx::query(
             // Issue #230: `dead` is terminal w.r.t. heartbeats — see
             // `HostStatus::can_transition_to`. The dead-host sweep
@@ -2301,6 +2313,7 @@ impl MetadataStore for PostgresStore {
                       util_base_shm_mib = $17,
                       util_parked_pss_mib = $18,
                       util_running_pss_mib = $19,
+                      capabilities = $20,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
@@ -2326,6 +2339,7 @@ impl MetadataStore for PostgresStore {
         .bind(hb.utilization.base_shm_mib as i64)
         .bind(hb.utilization.parked_pss_mib as i64)
         .bind(hb.utilization.running_pss_mib as i64)
+        .bind(capabilities)
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -2371,7 +2385,7 @@ impl MetadataStore for PostgresStore {
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
                    ready_images, local_snapshots, current_bundles,
-                   cordoned, total_vcpus, wire_version,
+                   cordoned, total_vcpus, wire_version, capabilities,
                    last_heartbeat_at, status, host_addr
               FROM hosts
              -- Only `ready` hosts are strike-out candidates. A `draining`
@@ -2481,8 +2495,8 @@ impl MetadataStore for PostgresStore {
                  image_version, size_bytes, created_at, last_accessed_at,
                  disk_manifest_id, disk_manifest_version,
                  memory_manifest_id, memory_manifest_version,
-                 recoverable, aux_bundles, events_cursor)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 recoverable, aux_bundles, events_cursor, fc_snapshot_version)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT (id) DO UPDATE SET
                 last_accessed_at        = EXCLUDED.last_accessed_at,
                 disk_manifest_id        = EXCLUDED.disk_manifest_id,
@@ -2496,6 +2510,11 @@ impl MetadataStore for PostgresStore {
                 -- re-ingest a checkpoint the eviction pipeline already
                 -- recorded with a cursor, or vice versa).
                 events_cursor           = COALESCE(EXCLUDED.events_cursor, snapshots.events_cursor),
+                -- ADR 0068: same idempotency guard — a re-record (e.g.
+                -- the checkpoint-advert reconcile re-ingesting a row the
+                -- eviction pipeline already stamped) must not blank out
+                -- an already-known capture-time FC snapshot version.
+                fc_snapshot_version     = COALESCE(EXCLUDED.fc_snapshot_version, snapshots.fc_snapshot_version),
                 updated_at              = NOW()
             "#,
         )
@@ -2516,6 +2535,7 @@ impl MetadataStore for PostgresStore {
                 .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
         )
         .bind(snap.events_cursor)
+        .bind(&snap.fc_snapshot_version)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -2659,7 +2679,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles, events_cursor
+                   recoverable, aux_bundles, events_cursor, fc_snapshot_version
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
             "#,
         )
@@ -2681,7 +2701,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles, events_cursor
+                   recoverable, aux_bundles, events_cursor, fc_snapshot_version
             FROM snapshots WHERE session_id = $1
             ORDER BY created_at DESC LIMIT 1
             "#,
@@ -2704,7 +2724,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles, events_cursor
+                   recoverable, aux_bundles, events_cursor, fc_snapshot_version
             FROM snapshots WHERE id = $1
             "#,
         )

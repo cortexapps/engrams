@@ -674,6 +674,17 @@ impl HostClient for HostRegistry {
         backend.start_agent(id, agent, policy).await
     }
 
+    /// ADR 0068: same single-resolve delegation as `start_agent` — this
+    /// mode=all convenience impl has exactly one connected host in
+    /// practice, so no retry logic is warranted for a read-only probe.
+    async fn probe_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.probe_sandbox(id).await
+    }
+
     async fn apply_egress_policy(
         &self,
         policy: engram_core::types::egress::SessionEgressPolicy,

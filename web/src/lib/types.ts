@@ -166,6 +166,19 @@ export interface HostView {
   util_parked_pss_mib: number;
   util_running_pss_mib: number;
   last_heartbeat_at: string;
+  /** ADR 0068: names of the capability-vector fields currently
+   *  `Failed` (or `Unknown` once the host has reported a real
+   *  vector) — empty on a healthy host. Kills the "no capacity with
+   *  free hosts" mystery mode at the fleet view. */
+  failing_capabilities: string[];
+  /** ADR 0068: this host's `firecracker --snapshot-version`. Empty
+   *  string means "off FC / not yet probed" — a real snapshot-version
+   *  string is never empty, so this is unambiguous. */
+  fc_snapshot_version: string;
+  /** ADR 0068: `0` = this host has never reported a capability vector
+   *  (pre-0068 row, or mid-roll) — the soft-pass posture. `>= 1` once
+   *  it has reported a real vector. */
+  capabilities_schema: number;
 }
 
 export interface ListHostsResponse {

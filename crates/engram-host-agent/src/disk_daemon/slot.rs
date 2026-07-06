@@ -560,7 +560,11 @@ impl NbdSlotAllocator {
 /// Read the kernel's `nbds_max` — the count of `/dev/nbdN` devices the
 /// `nbd` module created at load. `None` if the module isn't loaded
 /// (macOS dev, or a host that never ran `modprobe nbd`).
-fn kernel_nbds_max() -> Option<u32> {
+///
+/// `pub(crate)` (ADR 0068): also the basis of `capabilities::probe_nbd`,
+/// which reports the same value as the `CapStatus::Ok` detail so the
+/// fleet view surfaces the kernel's slot ceiling without a second probe.
+pub(crate) fn kernel_nbds_max() -> Option<u32> {
     std::fs::read_to_string("/sys/module/nbd/parameters/nbds_max")
         .ok()?
         .trim()

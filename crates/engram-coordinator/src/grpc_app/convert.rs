@@ -331,6 +331,10 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         cpu_budget_vcpus,
         reserved_vcpus,
         free_vcpus,
+        // ADR 0068: the capability-vector fleet-view surface.
+        failing_capabilities,
+        fc_snapshot_version,
+        capabilities_schema,
         // Issue #540: the RAM ledger's attribution fields.
         util_base_shm_mib,
         util_parked_pss_mib,
@@ -360,6 +364,9 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         cpu_budget_vcpus: *cpu_budget_vcpus,
         reserved_vcpus: *reserved_vcpus,
         free_vcpus: *free_vcpus,
+        failing_capabilities: failing_capabilities.clone(),
+        fc_snapshot_version: fc_snapshot_version.clone().unwrap_or_default(),
+        capabilities_schema: *capabilities_schema,
         util_base_shm_mib: *util_base_shm_mib,
         util_parked_pss_mib: *util_parked_pss_mib,
         util_running_pss_mib: *util_running_pss_mib,

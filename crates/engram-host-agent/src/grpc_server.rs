@@ -31,12 +31,12 @@ use engram_protocol::grpc::{
     DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
     ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse, InterruptHarnessRequest,
     ListSandboxesResponse, MigrationCaptureResponse, MigrationExportRef, MigrationFetchRequest,
-    MigrationFrame, MigrationPresetupResponse, PostCopyCaptureResponse, ProxyPortData,
-    ProxyPortMessage, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
-    RehandshakeHarnessRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    MigrationFrame, MigrationPresetupResponse, PostCopyCaptureResponse, ProbeSandboxResponse,
+    ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
+    ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    ReapMaterializeDirResponse, RehandshakeHarnessRequest, RestoreBaseForSessionRequest,
+    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, SnapshotBeginResponse,
+    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -156,6 +156,22 @@ impl HostService for HostServiceImpl {
                 .into_iter()
                 .map(|id| id.as_uuid().as_bytes().to_vec())
                 .collect(),
+        }))
+    }
+
+    async fn probe_sandbox(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<ProbeSandboxResponse>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        let probe = self
+            .inner
+            .probe_sandbox(id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(ProbeSandboxResponse {
+            known_to_backend: probe.known_to_backend,
+            process_alive: probe.process_alive,
         }))
     }
 
@@ -1446,6 +1462,13 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         SandboxError::WireSkew { host, coord } => {
             Status::failed_precondition(engram_protocol::wire::wire_skew_message(host, coord))
         }
+        // ADR 0068: the host-agent never ORIGINATES `Unsupported` from
+        // its local backend (`SandboxBackend::probe_sandbox`'s default
+        // impl always answers; `Unimplemented` is what the CLIENT sees
+        // against an old host-agent that doesn't have this handler at
+        // all, not something this handler itself would ever return).
+        // Map defensively in case a future refactor surfaces it here.
+        SandboxError::Unsupported(_) => Status::unimplemented(err.to_string()),
         // Issue #539: the streaming `build_base_snapshot` handler pattern-
         // matches this variant itself and emits a structured `CaptureFailed`
         // stream frame instead of a gRPC error status (so the kind/stage/

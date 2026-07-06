@@ -18,7 +18,7 @@ use engram_core::traits::HostClient;
 use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
-    AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
+    AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
@@ -187,6 +187,34 @@ impl GrpcHostClient {
             .iter()
             .map(|b| decode_sandbox_id(b))
             .collect()
+    }
+
+    /// ADR 0068 probe-before-host_lost: ground-truth liveness for ONE
+    /// sandbox. `Unimplemented` (an old host-agent mid-roll — a proto
+    /// RPC ADDITION is protobuf-compatible, so this needs no
+    /// `WIRE_VERSION` bump) maps to the dedicated `Unsupported` variant
+    /// rather than `grpc_to_sandbox_err`'s generic `Unimplemented →
+    /// InvalidSpec` mapping (that shared mapping serves a DIFFERENT
+    /// purpose — the `snapshot_begin`/`snapshot_wait` "fall back to the
+    /// composed call" fallback — and conflating the two would make
+    /// `reconcile::flip_missing` unable to tell "can't probe, proceed
+    /// with the flip" apart from "the spec was rejected").
+    pub async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self.inner.clone().probe_sandbox(req).await.map_err(|s| {
+            if s.code() == tonic::Code::Unimplemented {
+                SandboxError::Unsupported(s.message().to_string())
+            } else {
+                grpc_to_sandbox_err(s)
+            }
+        })?;
+        let resp = resp.into_inner();
+        Ok(SandboxProbe {
+            known_to_backend: resp.known_to_backend,
+            process_alive: resp.process_alive,
+        })
     }
 
     pub async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
@@ -1364,6 +1392,10 @@ impl HostClient for GrpcHostClient {
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         self.list_sandboxes().await
+    }
+
+    async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+        GrpcHostClient::probe_sandbox(self, id).await
     }
 
     async fn ping(&self) -> Result<(), SandboxError> {

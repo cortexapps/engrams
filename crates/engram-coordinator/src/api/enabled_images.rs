@@ -531,6 +531,17 @@ pub(crate) async fn capture_and_record_base_snapshot(
     }
 
     let now = Utc::now();
+    // ADR 0068: stamp the capturing host's FC snapshot-version so a
+    // later restore (a fresh `create`, ADR 0020 — there is no warm pool,
+    // every create restores this base row) can eventually be paired
+    // against it at placement. Best-effort: a lookup failure degrades to
+    // NULL (today's unconstrained behavior), never fails the enable.
+    let fc_snapshot_version = state
+        .services
+        .meta
+        .fc_snapshot_version_for_host(host_id)
+        .await
+        .unwrap_or_default();
     // Record the snapshot row (session_id = NULL — a template artifact,
     // not a session capture). The caller stamps the returned id onto the
     // enabled_images row's NOT NULL base_snapshot_id and upserts it only
@@ -553,6 +564,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
             recoverable,
             // Template artifact — no session, no event log.
             events_cursor: None,
+            fc_snapshot_version,
         })
         .await?;
 

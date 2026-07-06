@@ -219,9 +219,36 @@ service HostService {
   // these on host register / first heartbeat to keep the warm-path
   // RPC latency budget intact.
   rpc Ping(Empty) returns (Empty);
+
+  // ADR 0068 probe-before-host_lost: ground-truth sandbox liveness,
+  // for `reconcile::flip_missing` to check BEFORE flipping a session to
+  // `host_lost` on nothing but absence from the host's self-reported
+  // `running_sandboxes` list (the fbd3794c incident shape — the host
+  // was reachable and the VM was alive the whole time). A proto
+  // ADDITION is protobuf-compatible: an old host-agent mid-roll answers
+  // `Unimplemented`, which the caller treats as "no probe available ⇒
+  // proceed with the flip" — no WIRE_VERSION bump needed for this RPC
+  // alone.
+  rpc ProbeSandbox(SandboxIdMessage) returns (ProbeSandboxResponse);
 }
 
 message Empty {}
+
+// ADR 0068: answered from GROUND TRUTH, not the in-memory sandbox map —
+// the desync `flip_missing` is rescuing FROM is that map (or its
+// heartbeat-carried mirror, `running_sandboxes`) being wrong. On FC:
+// `process_alive` comes from scanning the jail dir for the sandbox's
+// pidfile and `kill(pid, 0)`-ing it — the same ground the survivor-
+// reattach machinery already walks. On VZ/Process (no orphan-VM mode):
+// the live child-process handle IS the ground truth, so both fields
+// mirror it.
+message ProbeSandboxResponse {
+  // Present in the backend's in-memory sandbox map (`list()` membership).
+  bool known_to_backend = 1;
+  // The VMM process for this sandbox_id is alive on this host, checked
+  // independently of `known_to_backend`.
+  bool process_alive = 2;
+}
 
 message BrowserPortResponse {
   // The in-guest RFB port x11vnc is serving on (loopback).

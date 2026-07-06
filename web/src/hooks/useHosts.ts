@@ -21,6 +21,9 @@ function protoHostToLegacy(h: ProtoHostView): HostView {
     util_parked_pss_mib: Number(h.utilParkedPssMib),
     util_running_pss_mib: Number(h.utilRunningPssMib),
     last_heartbeat_at: h.lastHeartbeatAt,
+    failing_capabilities: h.failingCapabilities,
+    fc_snapshot_version: h.fcSnapshotVersion,
+    capabilities_schema: h.capabilitiesSchema,
   };
 }
 

@@ -534,6 +534,7 @@ async fn main() -> Result<(), CoordinatorError> {
             // Issue #229: the in-process host runs this very binary, so it
             // is trivially on the coordinator's wire version.
             wire_version: engram_protocol::WIRE_VERSION,
+            capabilities: engram_core::types::host::HostCapabilities::default(),
         };
         if let Err(e) = engram_core::traits::MetadataStore::upsert_host(&pg, host_record).await {
             return Err(CoordinatorError::Config(format!(
@@ -571,6 +572,7 @@ async fn main() -> Result<(), CoordinatorError> {
                     cordoned: false,
                     total_vcpus: 0,
                     wire_version: engram_protocol::WIRE_VERSION,
+                    capabilities: engram_core::types::host::HostCapabilities::default(),
                 };
                 if let Err(e) = engram_core::traits::MetadataStore::upsert_host(&pg_for_hb, r).await
                 {

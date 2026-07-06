@@ -57,6 +57,12 @@ pub struct RegisterRequest {
     pub wire_version: u32,
     #[serde(default)]
     pub cloud_metadata: Option<HostMetadata>,
+    /// ADR 0068: the host's self-verified capability vector, probed
+    /// before this register POST. `#[serde(default)]` for interop with
+    /// a pre-0068 host-agent (decodes to `schema: 0`, soft-tolerated by
+    /// `host_meets_capabilities`).
+    #[serde(default)]
+    pub capabilities: engram_core::types::host::HostCapabilities,
 }
 
 #[derive(Serialize)]
@@ -166,6 +172,10 @@ pub async fn register(
         // The first heartbeat persists the version the scheduler filters
         // on; carry it here so the in-memory record is consistent.
         wire_version: req.wire_version,
+        // ADR 0068: persist the register-time vector too — see the
+        // `upsert_host` doc comment on why a first-row host shouldn't
+        // sit at `schema: 0` until its first heartbeat.
+        capabilities: req.capabilities,
     };
     state.services.meta.upsert_host(record).await?;
 
@@ -327,6 +337,11 @@ pub struct HeartbeatRequest {
     /// mid-roll, which the placement filter tolerates.
     #[serde(default)]
     pub wire_version: u32,
+    /// ADR 0068: this tick's re-probed capability vector.
+    /// `#[serde(default)]` → `schema: 0` (soft-tolerated) from a
+    /// pre-0068 host-agent mid-roll.
+    #[serde(default)]
+    pub capabilities: engram_core::types::host::HostCapabilities,
 }
 
 #[derive(Serialize)]
@@ -402,45 +417,22 @@ pub async fn heartbeat(
         }
     }
 
-    // ADR 0009 §1-§3: reconcile first, so subsequent state updates
-    // reflect the post-flip view. Same dispatch as the WS
-    // supervisor loop (`api/hosts.rs:266-284`).
+    // ADR 0068: persist BEFORE reconcile (was the reverse — see the
+    // git history on this handler). A heartbeat the coordinator
+    // refuses to ack (5xx on persist failure, issue #231) must not
+    // have ALREADY driven session flips from its `running_sandboxes`
+    // payload — "Postgres is the authority" means reconcile can only
+    // act on a heartbeat that's actually landed. This closes one of
+    // the two candidate producers of the fbd3794c incident shape (the
+    // other, the dead-host detector's own probe, already gates
+    // correctly — see `dead_host.rs`).
     //
-    // Issue #215: skip reconcile when the host couldn't enumerate its
-    // sandboxes this tick (`running_sandboxes_known == false`). The
-    // empty `running_sandboxes` it sends is "no information", not "no
-    // sandboxes running"; reconciling against it would strike every
-    // active session on the host on a single host-side `list()` blip.
-    if !hb.running_sandboxes_known {
-        tracing::warn!(
-            host_id = %host_id,
-            "heartbeat: host reported running_sandboxes_known=false (backend.list() failed); skipping reconcile this tick",
-        );
-    } else {
-        let flipped = state
-            .reconciler
-            .reconcile_host(&state, host_id, &hb.running_sandboxes)
-            .await;
-        if !flipped.is_empty() {
-            tracing::info!(
-                host_id = %host_id,
-                count = flipped.len(),
-                "heartbeat reconcile flipped missing-sandbox sessions",
-            );
-        }
-    }
-
-    // Bump the routing cache's freshness stamp for this host (ADR
-    // 0015 M3). The scheduling payload itself goes to PG below — ADR
-    // 0047 removed the in-memory scheduler mirror.
-    state.host_registry.touch_seen(host_id);
-
     // ADR 0047: the single per-heartbeat persist — capacity +
     // utilization + the scheduling state every coordinator replica
     // places from (ready_images / local_snapshots / current_bundles /
-    // total_vcpus). `status` is the HOST-reported side (`draining` =
-    // the agent's own shutdown flag); the coordinator-owned `cordoned`
-    // bit is deliberately not written here.
+    // total_vcpus / capabilities). `status` is the HOST-reported side
+    // (`draining` = the agent's own shutdown flag); the
+    // coordinator-owned `cordoned` bit is deliberately not written here.
     //
     // Issue #231: this persist is NOT best-effort. It advances the
     // host's `last_heartbeat_at`, which is exactly what the dead-host
@@ -488,6 +480,7 @@ pub async fn heartbeat(
         current_bundles: hb.current_bundles.clone(),
         total_vcpus: hb.total_vcpus,
         wire_version: hb.wire_version,
+        capabilities: hb.capabilities.clone(),
     };
     if let Err(e) = state
         .services
@@ -501,6 +494,39 @@ pub async fn heartbeat(
             "heartbeat persistence failed; ack withheld so the host retries: {e}"
         )));
     }
+
+    // ADR 0009 §1-§3: reconcile AFTER the persist above lands — a
+    // heartbeat we 5xx'd never reaches here (early return above).
+    // Same dispatch as the WS supervisor loop (`api/hosts.rs:266-284`).
+    //
+    // Issue #215: skip reconcile when the host couldn't enumerate its
+    // sandboxes this tick (`running_sandboxes_known == false`). The
+    // empty `running_sandboxes` it sends is "no information", not "no
+    // sandboxes running"; reconciling against it would strike every
+    // active session on the host on a single host-side `list()` blip.
+    if !hb.running_sandboxes_known {
+        tracing::warn!(
+            host_id = %host_id,
+            "heartbeat: host reported running_sandboxes_known=false (backend.list() failed); skipping reconcile this tick",
+        );
+    } else {
+        let flipped = state
+            .reconciler
+            .reconcile_host(&state, host_id, &hb.running_sandboxes)
+            .await;
+        if !flipped.is_empty() {
+            tracing::info!(
+                host_id = %host_id,
+                count = flipped.len(),
+                "heartbeat reconcile flipped missing-sandbox sessions",
+            );
+        }
+    }
+
+    // Bump the routing cache's freshness stamp for this host (ADR
+    // 0015 M3). The scheduling payload itself lives in PG above — ADR
+    // 0047 removed the in-memory scheduler mirror.
+    state.host_registry.touch_seen(host_id);
 
     // ADR 0015 M5: ship the coord's authoritative enabled-images
     // set so the host's prefetch loop drives from heartbeat alone.
@@ -557,6 +583,12 @@ pub async fn heartbeat(
             recoverable,
             aux_bundles: adv.aux_bundles.clone(),
             events_cursor,
+            // ADR 0068: this heartbeat's own capability vector already
+            // carries the recording host's FC snapshot-version — no
+            // separate lookup needed (unlike the eviction pipeline,
+            // which stamps from a different host's perspective and has
+            // to ask PG for it).
+            fc_snapshot_version: hb.capabilities.fc_snapshot_version.clone(),
         };
         match state.services.meta.record_snapshot(record).await {
             Ok(()) => acked_checkpoints.push(adv.snapshot_id),

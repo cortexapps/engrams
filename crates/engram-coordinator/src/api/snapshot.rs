@@ -324,6 +324,21 @@ pub(crate) async fn snapshot_core(
                 .latest_event_idx_at_or_before(id, now)
                 .await
                 .unwrap_or_default();
+            // ADR 0068: stamp the capturing host's FC snapshot-version so a
+            // later restore can be paired against it at placement — same
+            // best-effort lookup the idle-evictor's periodic-checkpoint path
+            // uses (`idle_evictor.rs`). A lookup failure degrades to NULL
+            // (unconstrained restore, today's behavior), never fails the
+            // snapshot over it.
+            let fc_snapshot_version = match host_id {
+                Some(h) => st
+                    .services
+                    .meta
+                    .fc_snapshot_version_for_host(h)
+                    .await
+                    .unwrap_or_default(),
+                None => None,
+            };
             // Issue #213: write the row `recoverable = false` FIRST, then flip
             // to true only after `commit_snapshot` succeeds. This makes the
             // phantom state ("PG says recoverable but the blobs were never
@@ -355,6 +370,7 @@ pub(crate) async fn snapshot_core(
                 // (the guest pauses inside the snapshot RPC; sub-second skew
                 // accepted, documented on `latest_event_idx_at_or_before`).
                 events_cursor,
+                fc_snapshot_version,
             };
             st.services.meta.record_snapshot(record.clone()).await?;
 
@@ -1369,6 +1385,15 @@ async fn resume_from_fc_snapshot(
         // chunk cache + per-image base shm are warm — the capturing
         // host first, else wherever the session last ran.
         prefer_host: record.host_id.or(session.host_id),
+        // ADR 0068: a memory-manifest snapshot restores via the FC UFFD
+        // substrate; a candidate host must also match the snapshot's
+        // capture-time `fc_snapshot_version` when both are known — the
+        // cross-`SNAPSHOT_VERSION` restore-corruption class this issue
+        // closes at placement instead of at guest-boot failure.
+        caps: crate::placement::CapabilityRequirements {
+            needs_uffd_substrate: record.memory_manifest.is_some(),
+            fc_snapshot_version: record.fc_snapshot_version.clone(),
+        },
     };
 
     // ADR 0048 C7: if NO host can take this resume (the fleet is fully
@@ -2046,6 +2071,7 @@ mod recoverable_tests {
             recoverable: true,
             aux_bundles: Vec::new(),
             events_cursor: None,
+            fc_snapshot_version: None,
         }
     }
 

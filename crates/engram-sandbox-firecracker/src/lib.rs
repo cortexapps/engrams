@@ -83,7 +83,7 @@ use engram_core::traits::sandbox::{HarnessByteStream, SandboxBackend};
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
-    AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
+    AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
@@ -4418,6 +4418,42 @@ impl SandboxBackend for FirecrackerBackend {
     }
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         Ok(self.sandboxes.iter().map(|r| *r.key()).collect())
+    }
+
+    /// ADR 0068 probe-before-host_lost: overrides the trait default
+    /// with an INDEPENDENT ground-truth check — the in-memory
+    /// `self.sandboxes` map, or its heartbeat-carried mirror
+    /// `running_sandboxes`, being wrong is exactly the desync
+    /// `reconcile::flip_missing` uses this probe to catch, so
+    /// `process_alive` must not be derived from that same map.
+    /// Instead: read the persisted per-sandbox manifest
+    /// (`sandbox_manifest::manifest_path`) and verify the same
+    /// three-axis pid identity (pid + start-time-jiffies + comm) the
+    /// survivor-reattach pass (`reattach_sandbox`) already trusts. A
+    /// missing/malformed manifest (never written, or already deleted
+    /// at the start of `destroy()`) reads as "unverifiable" — falls
+    /// back to the in-memory signal, since there's nothing else to
+    /// check against.
+    async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+        let known_to_backend = self.sandboxes.contains_key(&id);
+        let manifest_path = sandbox_manifest::manifest_path(&self.work_dir, id);
+        let process_alive = match sandbox_manifest::read_manifest(&manifest_path) {
+            Ok(manifest) => {
+                let rec = &manifest.firecracker.process;
+                sandbox_manifest::read_proc_start_time_jiffies(rec.pid)
+                    == Some(rec.start_time_jiffies)
+                    && sandbox_manifest::read_proc_comm(rec.pid).as_deref()
+                        == Some(rec.comm.as_str())
+            }
+            // No manifest on disk (never written, or already deleted at
+            // the start of `destroy()`) — nothing to independently
+            // verify against; fall back to the in-memory signal.
+            Err(_) => known_to_backend,
+        };
+        Ok(SandboxProbe {
+            known_to_backend,
+            process_alive,
+        })
     }
 
     /// The sandbox's guest-network identity. Mirrors the VZ pattern:

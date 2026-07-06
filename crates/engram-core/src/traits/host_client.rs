@@ -28,7 +28,9 @@ use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::image::WarmConfig;
 use crate::types::port::PortTunnel;
-use crate::types::sandbox::{AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
+use crate::types::sandbox::{
+    AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+};
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
 use crate::types::{SandboxId, SessionId};
@@ -53,6 +55,19 @@ pub trait HostClient: Send + Sync {
     async fn ping(&self) -> Result<(), SandboxError> {
         self.list().await.map(|_| ())
     }
+
+    /// ADR 0068 probe-before-host_lost: ground-truth liveness for ONE
+    /// sandbox, called by `reconcile::flip_missing` before flipping a
+    /// session to `host_lost` on nothing but absence from a
+    /// self-reported list. Deliberately has NO default `Ok`-shaped
+    /// implementation — a defaulted `Ok` would make "can't probe"
+    /// indistinguishable from "alive", exactly the silent-Ok failure
+    /// mode this issue exists to close. Every transport implements it
+    /// honestly: the gRPC client maps `Unimplemented` (an old host-agent
+    /// mid-roll) to `SandboxError::Unsupported` so the caller can treat
+    /// "no probe available" as "proceed with the flip" without confusing
+    /// it with a real answer.
+    async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError>;
 
     async fn exec_stream(
         &self,

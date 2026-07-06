@@ -155,14 +155,28 @@ impl Reconciler {
             }
         };
 
+        // ADR 0068: `flip_missing` may RESCUE a session (probe says the
+        // process is alive) instead of flipping it — filter the return
+        // value down to sessions actually flipped, so callers (the
+        // heartbeat handler's "reconcile flipped N sessions" log,
+        // `/api/admin/reconcile-now`) don't report a flip that didn't
+        // happen. `to_flip` itself (crossed the strike threshold this
+        // tick) is exactly what feeds the strike-reset-on-rescue path
+        // inside `flip_missing`.
+        let mut actually_flipped = Vec::new();
         for session_id in &to_flip {
             let sb = sandbox_by_session.get(session_id).copied();
-            flip_missing(meta, events, host_registry, *session_id, host_id, sb).await;
+            if flip_missing(meta, events, host_registry, *session_id, host_id, sb).await {
+                actually_flipped.push(*session_id);
+            }
         }
-        to_flip
+        actually_flipped
     }
 }
 
+/// Returns `true` if the session was actually flipped to `host_lost`,
+/// `false` if it was rescued (ADR 0068 probe-before-host_lost) or
+/// short-circuited (already terminal / get_session failed).
 async fn flip_missing(
     meta: &dyn MetadataStore,
     events: &SessionEventBus,
@@ -170,7 +184,7 @@ async fn flip_missing(
     session_id: SessionId,
     host_id: HostId,
     sandbox_id: Option<SandboxId>,
-) {
+) -> bool {
     // Cheap idempotency: if the session is already in target state
     // (or terminal beyond it), skip. Avoids racing with an operator
     // who manually killed the session between the strike-out and now.
@@ -178,7 +192,7 @@ async fn flip_missing(
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(session_id = %session_id, error = %e, "reconcile: get_session failed; skipping flip");
-            return;
+            return false;
         }
     };
     let prev = session.status;
@@ -188,7 +202,70 @@ async fn flip_missing(
             ?prev,
             "reconcile: session already in non-active state; skipping flip"
         );
-        return;
+        return false;
+    }
+
+    // ADR 0068 probe-before-host_lost: before flipping on nothing but
+    // absence from the host's self-reported `running_sandboxes`, ask
+    // the host directly whether the VMM process for THIS sandbox is
+    // actually alive. Rescues the fbd3794c incident shape (a provably-
+    // alive VM — in-guest uptime + a surviving marker file — declared
+    // `host_lost` and "resumed" 8 times in 12 minutes while the host
+    // was reachable the entire time): the desync producing a stale
+    // `running_sandboxes` list belongs to epic-binding-epoch-delivery;
+    // this is the belt that stops the coordinator killing sessions
+    // over it. A probe error (RPC unreachable, or `Unsupported` from
+    // an old host-agent mid-roll with no `ProbeSandbox` handler yet)
+    // falls through to the flip unchanged — only an explicit
+    // `process_alive == true` answer rescues.
+    if let Some(sb) = sandbox_id {
+        if let Some(backend) = host_registry.backend_of(host_id) {
+            match backend.probe_sandbox(sb).await {
+                Ok(probe) if probe.process_alive => {
+                    ::metrics::counter!(crate::metrics::RECONCILE_PROBE_RESCUES_TOTAL).increment(1);
+                    tracing::warn!(
+                        session_id = %session_id,
+                        host_id = %host_id,
+                        sandbox_id = %sb,
+                        known_to_backend = probe.known_to_backend,
+                        "reconcile: probe found the sandbox process ALIVE despite being \
+                         missing from running_sandboxes — skipping the host_lost flip and \
+                         resetting the strike counter (probe-before-host_lost, ADR 0068)",
+                    );
+                    // The present-arm of `apply_missing_sandbox_strikes`
+                    // already zeroes the counter for sessions it's
+                    // told are present — reuse it rather than adding a
+                    // second strike-reset code path.
+                    if let Err(e) = meta
+                        .apply_missing_sandbox_strikes(&[session_id], &[], 1)
+                        .await
+                    {
+                        tracing::warn!(session_id = %session_id, error = %e,
+                            "reconcile: strike reset after probe rescue failed (non-fatal; \
+                             the next present tick will reset it anyway)");
+                    }
+                    return false;
+                }
+                Ok(probe) => {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        host_id = %host_id,
+                        sandbox_id = %sb,
+                        known_to_backend = probe.known_to_backend,
+                        "reconcile: probe confirms the sandbox is gone; proceeding with the flip",
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        host_id = %host_id,
+                        sandbox_id = %sb,
+                        error = %e,
+                        "reconcile: probe unavailable; proceeding with the flip unchanged",
+                    );
+                }
+            }
+        }
     }
 
     // ADR 0015 M3: drop the HostRegistry cache row *before* we
@@ -241,7 +318,7 @@ async fn flip_missing(
                 "reconcile: sandbox binding changed since strike-out (likely a fresh \
                  rebind) — aborting flip so we don't null a healthy binding"
             );
-            return;
+            return false;
         }
         tracing::warn!(
             session_id = %session_id,
@@ -262,7 +339,7 @@ async fn flip_missing(
                 error = %e,
                 "reconcile: transition to HostLost failed; will retry next tick"
             );
-            return;
+            return false;
         }
     };
     emit_status_changed(meta, events, session_id, prev, SessionState::HostLost).await;
@@ -309,6 +386,10 @@ async fn flip_missing(
             );
         }
     }
+    // The Active -> HostLost transition above landed regardless of
+    // whether stage 2 (HostLost -> {Idle,Dead}) also succeeded — the
+    // session left Active, which is what `to_flip` promises callers.
+    true
 }
 
 async fn emit_status_changed(

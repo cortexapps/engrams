@@ -1148,6 +1148,7 @@ mod tests {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                capabilities: engram_core::types::host::HostCapabilities::default(),
             });
         meta.snapshots
             .lock()
@@ -1164,6 +1165,7 @@ mod tests {
                 recoverable: true,
                 aux_bundles: Vec::new(),
                 events_cursor: None,
+                fc_snapshot_version: None,
             });
 
         let err = migrate_session_live(&state, session_id, target)
@@ -1338,6 +1340,7 @@ mod tests {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                capabilities: engram_core::types::host::HostCapabilities::default(),
             });
         meta.snapshots
             .lock()
@@ -1354,6 +1357,7 @@ mod tests {
                 recoverable: true,
                 aux_bundles: Vec::new(),
                 events_cursor: None,
+                fc_snapshot_version: None,
             });
 
         migrate_session_live(&state, session_id, target)
@@ -1625,6 +1629,7 @@ mod tests {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                capabilities: engram_core::types::host::HostCapabilities::default(),
             });
         meta.snapshots
             .lock()
@@ -1641,6 +1646,7 @@ mod tests {
                 recoverable: true,
                 aux_bundles: Vec::new(),
                 events_cursor: None,
+                fc_snapshot_version: None,
             });
 
         // The verb returns Ok — the move LANDED; the finalize runs async.

@@ -1364,6 +1364,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "userfaultfd",
  "uuid",
  "workspace-hack",
 ]
@@ -6499,7 +6500,6 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
- "hashbrown 0.15.5",
  "hyper",
  "hyper-rustls",
  "hyper-util",

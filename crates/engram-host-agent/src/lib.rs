@@ -23,6 +23,7 @@ pub mod admin_handler;
 pub mod base_shm_gc;
 pub mod blob;
 pub mod bundles;
+pub mod capabilities;
 pub mod checkpoint;
 pub mod config;
 pub mod coord_client;
@@ -737,6 +738,26 @@ impl HostAgent {
                     as std::sync::Arc<dyn engram_protocol::admin::HostAdminHandler>
             });
 
+            // ADR 0068: resolve once, up front — the SAME `ProbeInputs`
+            // feeds both the register POST below and every heartbeat
+            // tick's re-probe. `bundle_dir` is hoisted here (out of the
+            // later ADR 0035 bundle-supervisor block) so the register
+            // POST carries an honest `bundle_stamp` from the first
+            // attempt, not `Unknown` until the first heartbeat.
+            let bundle_dir = self.sandbox.bundle_dir().to_path_buf();
+            let probe_inputs = capabilities::ProbeInputs {
+                backend: self.cfg.backend_name.clone(),
+                grpc_probe_addr: self.cfg.grpc_listen_addr,
+                bundle_dir: bundle_dir.clone(),
+                fc: self.fc_for_reattach.as_ref().map(|fc| {
+                    let cfg = fc.config();
+                    capabilities::FcProbeInputs {
+                        firecracker_bin: cfg.firecracker_bin.clone(),
+                        uffd_base_dir: cfg.uffd_base_dir.clone(),
+                    }
+                }),
+            };
+
             // ADR 0013: per-process CoordClient for HTTP traffic
             // (register, heartbeat, registry-auth, harness-events,
             // idle-eviction).
@@ -772,6 +793,12 @@ impl HostAgent {
                     .ok()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| format!("host-{host_id}"));
+                // ADR 0068: probe BEFORE the first register, not after —
+                // a host that can't yet prove `grpc_self_connect` /
+                // `bundle_stamp` should say so on its very first row,
+                // not claim `schema: 0` (soft-tolerated) until its
+                // first heartbeat 5s later.
+                let capabilities = capabilities::probe_all(&probe_inputs).await;
                 let register_req = coord_client::RegisterRequest {
                     host_id,
                     hostname,
@@ -779,6 +806,7 @@ impl HostAgent {
                     agent_version: env!("CARGO_PKG_VERSION").to_string(),
                     wire_version: engram_protocol::WIRE_VERSION,
                     cloud_metadata: None,
+                    capabilities,
                 };
                 let cc = coord_client.clone();
                 let pooled_for_rehydrate = pooled.clone();
@@ -1007,7 +1035,6 @@ impl HostAgent {
             // config, which silently defaulted elsewhere — a host could then
             // advertise a sha it couldn't attach.) The supervisor materializes
             // pinned generations into the same dir.
-            let bundle_dir = self.sandbox.bundle_dir().to_path_buf();
             let bundle_ext = self.sandbox.bundle_file_ext();
             let current_bundles = bundles::read_stamp(&bundle_dir).await;
             let live_bundles_tx = self.chunk_store.as_ref().map(|(cs, _)| {
@@ -1021,49 +1048,21 @@ impl HostAgent {
                 )
             });
 
-            // ADR 0050 D: gRPC readiness gate. Heartbeating is what makes
-            // this host schedulable + routable, so don't start until our
-            // own gRPC server is actually accepting connections — else the
-            // coord can register us and dispatch a restore/exec before the
-            // server is up, which the lazy-dialing pool surfaces as a
-            // transient `Unavailable` (the load test's fresh-host 500s and
-            // truncated streams). A successful TCP connect to the listen
-            // port proves the listener is bound + backlogging.
-            if let Some(addr) = self.cfg.grpc_listen_addr {
-                let probe_addr = if addr.ip().is_unspecified() {
-                    match addr.ip() {
-                        std::net::IpAddr::V4(_) => std::net::SocketAddr::new(
-                            std::net::Ipv4Addr::LOCALHOST.into(),
-                            addr.port(),
-                        ),
-                        std::net::IpAddr::V6(_) => std::net::SocketAddr::new(
-                            std::net::Ipv6Addr::LOCALHOST.into(),
-                            addr.port(),
-                        ),
-                    }
-                } else {
-                    addr
-                };
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-                loop {
-                    match tokio::net::TcpStream::connect(probe_addr).await {
-                        Ok(_) => {
-                            tracing::info!(%addr,
-                                "gRPC server accepting; host ready to heartbeat");
-                            break;
-                        }
-                        Err(_) if tokio::time::Instant::now() < deadline => {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        Err(e) => {
-                            tracing::error!(%addr, error = %e,
-                                "gRPC server still not accepting after 30s; \
-                                 heartbeating anyway to avoid stranding the host");
-                            break;
-                        }
-                    }
-                }
-            }
+            // ADR 0068: the blocking "gRPC readiness gate" (ADR 0050 D)
+            // that used to live here — a synchronous up-to-30s TCP-connect
+            // retry loop with a "heartbeat anyway" optimism escape hatch
+            // once it gave up — is RETIRED, not hardened. The heartbeat
+            // loop below now starts immediately and its every-tick
+            // `capabilities::probe_all` re-runs this exact TCP self-connect
+            // as the `grpc_self_connect` capability; a still-binding
+            // listener just reports `Failed` on this tick (and `Ok` on a
+            // later one) instead of the host racing to heartbeat before it
+            // can actually serve anything. The coordinator's placement
+            // filter (`host_meets_capabilities`, PR 2) requires
+            // `grpc_self_connect: Ok` for ANY placement, so the same
+            // "coord can't dispatch before the listener is up" failure
+            // mode this gate closed is now closed at the scheduler instead
+            // of at host-agent startup.
 
             // ADR 0013: HTTP heartbeat loop. Posts
             // {capacity, local_snapshots, running_sandboxes,
@@ -1079,6 +1078,7 @@ impl HostAgent {
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
             let util_work_dir = self.cfg.work_dir.clone();
+            let probe_inputs_for_heartbeat = probe_inputs.clone();
             let ram_ledger_for_heartbeat = ram_ledger.clone();
             let ram_ledger_tx_for_heartbeat = ram_ledger_tx;
             // ENGRAM_FC_UFFD_BASE_DIR doesn't change at runtime; resolve
@@ -1212,6 +1212,12 @@ impl HostAgent {
                         })
                         .collect();
                     let utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
+                    // ADR 0068: re-run every probe this tick. Cheap
+                    // (statfs/stat/one TCP connect/a memfd-backed uffd
+                    // self-test; the FC binary version is cached after
+                    // its first call) — this IS the retry for whatever
+                    // the old blocking gRPC gate used to loop on.
+                    let capabilities = capabilities::probe_all(&probe_inputs_for_heartbeat).await;
                     let req = coord_client::HeartbeatRequest {
                         capacity: engram_protocol::heartbeat::HostCapacityReport {
                             total_mib: host_total_mib,
@@ -1235,6 +1241,7 @@ impl HostAgent {
                         // coordinator drains us off scheduling on a skew
                         // (mixed-version fleet mid rolling deploy).
                         wire_version: engram_protocol::WIRE_VERSION,
+                        capabilities,
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {

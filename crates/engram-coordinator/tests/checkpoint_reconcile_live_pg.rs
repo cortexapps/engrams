@@ -77,6 +77,7 @@ fn checkpoint_row(
         recoverable: true,
         aux_bundles: vec![],
         events_cursor,
+        fc_snapshot_version: None,
     }
 }
 
@@ -97,6 +98,7 @@ fn base_row(created_at: chrono::DateTime<Utc>) -> SnapshotRecord {
         recoverable: true,
         aux_bundles: vec![],
         events_cursor: None,
+        fc_snapshot_version: None,
     }
 }
 

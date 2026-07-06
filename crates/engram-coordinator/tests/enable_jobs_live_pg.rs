@@ -593,6 +593,7 @@ async fn find_enabled_image_by_content_keys_on_disk_manifest_and_toml() {
         recoverable: true,
         aux_bundles: vec![],
         events_cursor: None,
+        fc_snapshot_version: None,
     })
     .await
     .expect("seed base snapshot");

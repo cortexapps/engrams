@@ -126,6 +126,17 @@ pub enum SandboxError {
         host: u32,
         coord: u32,
     },
+    /// ADR 0068: the host answered but doesn't implement this RPC — an
+    /// old host-agent mid-roll against a coord that just added a new
+    /// `HostClient` method (e.g. `probe_sandbox`; a proto RPC ADDITION
+    /// is protobuf-compatible, so this is the honest "old peer, no
+    /// `WIRE_VERSION` bump needed" case), distinct from `Unavailable`
+    /// (transient / unreachable) and `Vm` (the host answered with a
+    /// real VM error). Callers that have a safe fallback for "can't
+    /// probe" (e.g. `reconcile::flip_missing`: proceed with the flip,
+    /// same as today) match on this explicitly rather than swallowing
+    /// it into a generic error arm.
+    Unsupported(String),
     /// Issue #539: a structured `build_base_snapshot` failure — a
     /// `[warm]`-hook watchdog violation (stall / stage deadline / global
     /// timeout), a non-zero hook exit, an exec-stream transport death, or
@@ -161,6 +172,7 @@ impl fmt::Display for SandboxError {
                 "wire_version skew: host={host} coord={coord} (mixed-version fleet \
                  during a rolling deploy); retry — the scheduler drains stale hosts"
             ),
+            Self::Unsupported(msg) => write!(f, "host does not implement this RPC: {msg}"),
             Self::CaptureFailed(failure) => write!(f, "{failure}"),
         }
     }

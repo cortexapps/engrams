@@ -421,6 +421,22 @@ fn record_boot_outcome(
 /// candidates, then atomically flip `queued → pending` on a fitting host.
 async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
     let (repo, tag) = engram_core::types::session::split_image_ref(&q.session.image);
+    // ADR 0068: same derivation `prepare_inner` uses for a live create —
+    // the enabled image's base snapshot carrying a memory manifest means
+    // this create needs the FC UFFD substrate. Tolerant lookup (mirrors
+    // `prepare_from_row`): a transient PG hiccup or a since-disabled
+    // image degrades to "no substrate requirement" rather than blocking
+    // the whole re-place attempt — `boot_on_reserved_host` re-resolves
+    // the enabled image properly and fails there if it's truly gone.
+    let needs_uffd_substrate = state
+        .services
+        .meta
+        .get_enabled_image_any(&q.session.image)
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.base_snapshot_memory_manifest.is_some())
+        .unwrap_or(false);
     let ctx = crate::placement::ScheduleContext {
         repo,
         image_version: tag,
@@ -430,6 +446,10 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
         required_image_digest: None,
         exclude_host: None,
         prefer_host: None,
+        caps: crate::placement::CapabilityRequirements {
+            needs_uffd_substrate,
+            fc_snapshot_version: None,
+        },
     };
     let candidates =
         match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
@@ -533,6 +553,19 @@ async fn boot_placed_create(
 /// `Some(false)` = none (stay queued), `None` = transient read error.
 async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<bool> {
     let (repo, tag) = engram_core::types::session::split_image_ref(&q.session.image);
+    // ADR 0068: same pairing `resume_from_fc_snapshot` uses. This is a
+    // soft pre-check (does ANY host look schedulable before we bother
+    // dequeueing) — the authoritative gate is the real resume path's own
+    // `ScheduleContext`, which re-derives this from the snapshot it
+    // actually restores. A stale/missing lookup here just means one
+    // extra requeue cycle, not a correctness gap.
+    let latest = state
+        .services
+        .meta
+        .latest_snapshot_for_session(q.session.id)
+        .await
+        .ok()
+        .flatten();
     let ctx = crate::placement::ScheduleContext {
         repo,
         image_version: tag,
@@ -542,6 +575,10 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<b
         required_image_digest: None,
         exclude_host: None,
         prefer_host: None,
+        caps: crate::placement::CapabilityRequirements {
+            needs_uffd_substrate: latest.as_ref().is_some_and(|s| s.memory_manifest.is_some()),
+            fc_snapshot_version: latest.and_then(|s| s.fc_snapshot_version),
+        },
     };
     match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
         Ok(c) => Some(!c.hosts.is_empty()),

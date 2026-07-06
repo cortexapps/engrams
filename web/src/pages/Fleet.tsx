@@ -140,6 +140,30 @@ function HostCard({
         <CardTitle className="font-mono text-base">{host.id}</CardTitle>
         <div className="flex items-center gap-3">
           <Badge variant={statusVariant(host.status)}>{host.status}</Badge>
+          {host.failing_capabilities.length > 0 && (
+            <Badge
+              variant="destructive"
+              title={`Failing capabilities: ${host.failing_capabilities.join(", ")}`}
+            >
+              {host.failing_capabilities.length === 1
+                ? host.failing_capabilities[0]
+                : `${host.failing_capabilities.length} caps failing`}
+            </Badge>
+          )}
+          {/* ADR 0068: schema 0 means this host has never reported a
+              capability vector (pre-0068 row, or mid-roll) — the soft-pass
+              posture. Without this badge it's visually indistinguishable
+              from a probed-healthy host, which is exactly the "no capacity
+              with free hosts" mystery mode the capability vector exists to
+              kill. */}
+          {host.capabilities_schema === 0 && (
+            <Badge
+              variant="outline"
+              title="This host has never reported an ADR 0068 capability vector (pre-rollout row, or mid-roll) — placement soft-passes it like a schema-0/wire-version-0 host."
+            >
+              caps unreported
+            </Badge>
+          )}
           {host.status === "ready" && (
             <AlertDialog>
               <AlertDialogTrigger asChild>
@@ -195,6 +219,11 @@ function HostCard({
             </>
           )}{" "}
           · {host.local_snapshots} snapshots
+          {/* ADR 0068: the operator's one-glance skew display — a host
+              excluded on `cap:fc_snapshot_version` shows its own reported
+              version right here instead of forcing a coord-log dig. Empty
+              string means off-FC or not-yet-probed, so render nothing. */}
+          {host.fc_snapshot_version && <> · fc {host.fc_snapshot_version}</>}
         </div>
         {/* Issue #540: the RAM ledger's attribution — where the host's
             RAM actually went, broken out of the single mem bar above.

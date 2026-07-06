@@ -268,6 +268,33 @@ pub const QUEUE_HEAD_AGE_SECONDS: &str = "engram_queue_head_age_seconds";
 /// per-host labels; the paired `warn!` carries the id for forensics.
 pub const HEARTBEAT_PERSIST_FAILURES_TOTAL: &str = "engram_heartbeat_persist_failures_total";
 
+/// Counter (ADR 0068). Per-host exclusion reasons on a `NoCapacity`
+/// pick — kills the "no capacity with free hosts" mystery mode (a
+/// wire-skewed or capability-failing host used to vanish from the
+/// candidate set with the caller seeing only a bare `NoCapacity`).
+/// Labels: `reason` = the bounded `placement::exclusion_summary`
+/// vocabulary (`excluded` / `not_ready` / `cordoned` / `wire_skew` /
+/// `stale` / `cap:<name>` — one of the ~6 named capabilities, so still
+/// bounded / `digest_not_ready` / `no_fit`). No `host_id` label — see
+/// the cardinality convention above; the paired `warn!` names hosts.
+pub const PLACEMENT_EXCLUDED_TOTAL: &str = "engram_placement_excluded_total";
+
+/// Counter (ADR 0068). `reconcile::flip_missing` probed the sandbox
+/// directly and found it alive (`process_alive == true`) despite being
+/// absent from the host's self-reported `running_sandboxes` — the flip
+/// to `host_lost` was skipped and the strike counter reset. Sustained
+/// nonzero means the delivery/binding desync class (epic-binding-epoch-
+/// delivery) is still producing false `running_sandboxes` misses; this
+/// metric graphs how often the probe is rescuing sessions from it.
+pub const RECONCILE_PROBE_RESCUES_TOTAL: &str = "engram_reconcile_probe_rescues_total";
+
+/// Counter (ADR 0068). The dead-host detector's own `Ping` probe
+/// (`dead_host.rs`, added in `7fcc4c3c`) found the host alive despite a
+/// stale `last_heartbeat_at` row, and skipped the eviction. No
+/// behavioral change from this issue — added alongside the reconcile
+/// rescue counter above so both rescue paths are graphable together.
+pub const DEAD_HOST_PROBE_RESCUES_TOTAL: &str = "engram_dead_host_probe_rescues_total";
+
 /// Counter (ADR 0019 / telemetry restoration #526). Same-host vs
 /// cross-host resume split, emitted in `api/snapshot.rs::resume_from_fc_snapshot`
 /// once placement resolves. Labels: `placement` = `same_host` (the
