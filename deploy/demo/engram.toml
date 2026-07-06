@@ -31,4 +31,4 @@ allow_hosts = [
 # ADR 0048: an enabled image must declare its vCPU count — placement
 # reserves it against the host's CPU budget so packing has a CPU bound.
 [resources]
-suggested_vcpus = 2
+suggested_vcpus = 4
