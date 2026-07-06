@@ -899,13 +899,13 @@ async fn host_list(c: &mut Clients, json: bool) -> Result<(), CliError> {
         return Ok(());
     }
     println!(
-        "{:<36}  {:<10}  {:<10}  {:<10}  SNAPSHOTS",
+        "{:<36}  {:<10}  {:<10}  {:<10}",
         "ID", "STATUS", "USED_MIB", "TOTAL_MIB"
     );
     for h in &resp.hosts {
         println!(
-            "{:<36}  {:<10}  {:<10}  {:<10}  {}",
-            h.id, h.status, h.capacity_used_mib, h.capacity_total_mib, h.local_snapshots,
+            "{:<36}  {:<10}  {:<10}  {:<10}",
+            h.id, h.status, h.capacity_used_mib, h.capacity_total_mib,
         );
     }
     Ok(())
@@ -919,7 +919,6 @@ fn host_to_json(h: &app::HostView) -> Value {
         "capacity_total_mib": h.capacity_total_mib,
         "capacity_used_mib": h.capacity_used_mib,
         "running_sandboxes": h.running_sandboxes,
-        "local_snapshots": h.local_snapshots,
         "ready_images": h.ready_images,
         "ready_image_digests": h.ready_image_digests,
         "last_heartbeat_at": h.last_heartbeat_at,
@@ -947,7 +946,6 @@ async fn host_get(c: &mut Clients, id: &str, json: bool) -> Result<(), CliError>
     println!("capacity_used   : {} MiB", h.capacity_used_mib);
     println!("capacity_total  : {} MiB", h.capacity_total_mib);
     println!("running_sandboxes: {}", h.running_sandboxes);
-    println!("local_snapshots : {}", h.local_snapshots);
     Ok(())
 }
 

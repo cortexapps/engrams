@@ -61,7 +61,6 @@ pub struct HostView {
     pub capacity_total_mib: u64,
     pub capacity_used_mib: u64,
     pub running_sandboxes: u32,
-    pub local_snapshots: usize,
     /// ADR 0015 M5: count of images this host has fully prefetched
     /// and is ready to serve (heartbeat-persisted; ADR 0047).
     pub ready_images: usize,
@@ -143,7 +142,6 @@ impl HostView {
             capacity_total_mib: row.capacity.total_mib,
             capacity_used_mib: row.capacity.used_mib,
             running_sandboxes: row.capacity.running_sandboxes,
-            local_snapshots: row.local_snapshots.len(),
             ready_images: ready_image_digests.len(),
             ready_image_digests,
             util_disk_total_mib: row.utilization.disk_total_mib,

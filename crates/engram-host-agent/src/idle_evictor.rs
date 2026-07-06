@@ -70,7 +70,7 @@ pub fn idle_hard_ttl_from_env() -> Duration {
 /// the 99 GB disk filled in ~13 min at ~25 attempted evictions
 /// × 4 GiB; 20 GiB free is the safety margin under which idle-evict
 /// stops pushing new candidates.
-pub const DEFAULT_DISK_FLOOR_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+pub const DEFAULT_DISK_FLOOR_BYTES: u64 = engram_core::types::host::HOST_DISK_CACHE_FLOOR_BYTES;
 
 /// Read `ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES` — falls through to
 /// [`DEFAULT_DISK_FLOOR_BYTES`].

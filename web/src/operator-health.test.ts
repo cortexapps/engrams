@@ -14,7 +14,6 @@ const host = (
   capacity_total_mib: total,
   capacity_used_mib: used,
   running_sandboxes: 0,
-  local_snapshots: 0,
   util_disk_total_mib: 0,
   util_disk_used_mib: 0,
   util_mem_total_mib: 0,

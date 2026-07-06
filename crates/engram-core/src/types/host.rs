@@ -95,6 +95,21 @@ pub struct HostCapacity {
     pub running_sandboxes: u32,
 }
 
+/// The host chunk-cache disk floor (bytes): free work_dir space below
+/// which the host is treated as disk-pressured. Issue #528 / the
+/// `engrams-fc-xngk` post-mortem: 20 GiB is the margin under which the
+/// host-agent's idle-evict stops pushing candidates. The SINGLE owner of
+/// this value — the host-agent's `DEFAULT_DISK_FLOOR_BYTES` aliases it,
+/// and ADR 0078's placement affinity vetoes a snapshot-host whose free
+/// disk is below it (placing a resume on a host about to disk-evict its
+/// cache is pointless). Do not mint a second threshold.
+pub const HOST_DISK_CACHE_FLOOR_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// [`HOST_DISK_CACHE_FLOOR_BYTES`] in MiB, for comparison against
+/// [`HostUtilization`]'s MiB disk fields on the coordinator placement
+/// path.
+pub const HOST_DISK_CACHE_FLOOR_MIB: u64 = HOST_DISK_CACHE_FLOOR_BYTES / (1024 * 1024);
+
 /// Observed host resource utilization, sampled fresh on every
 /// heartbeat. Distinct from [`HostCapacity`], which is the
 /// *reservation* model the scheduler reasons about (committed guest
@@ -166,19 +181,6 @@ pub struct HostUtilization {
     /// attribution/dashboards.
     #[serde(default)]
     pub running_pss_mib: u64,
-}
-
-/// ADR 0047: a snapshot the host holds locally, as persisted in the
-/// `hosts.local_snapshots` JSONB column. Field-compatible with the
-/// heartbeat wire type (`engram_protocol::heartbeat::LocalSnapshotReport`)
-/// so the handler serializes the wire payload straight into the row.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HostLocalSnapshot {
-    pub snapshot_id: super::ids::SnapshotId,
-    pub session_id: super::ids::SessionId,
-    pub size_bytes: u64,
-    pub replicated: bool,
-    pub last_accessed_at: DateTime<Utc>,
 }
 
 /// ADR 0068: the outcome of a single self-verified host capability probe.
@@ -333,11 +335,6 @@ pub struct HostRecord {
     /// replica schedules from the same authority.
     #[serde(default)]
     pub ready_images: Vec<String>,
-    /// ADR 0047: snapshots the host holds locally (heartbeat-persisted).
-    /// Snapshot-affinity ranking reads the ids; the fleet view renders
-    /// the count.
-    #[serde(default)]
-    pub local_snapshots: Vec<HostLocalSnapshot>,
     /// ADR 0035/0047: the host's current bundle bake stamp
     /// (heartbeat-persisted). Operator visibility into fleet skew.
     #[serde(default)]
@@ -391,7 +388,6 @@ pub struct HostHeartbeat {
     pub capacity: HostCapacity,
     pub utilization: HostUtilization,
     pub ready_images: Vec<String>,
-    pub local_snapshots: Vec<HostLocalSnapshot>,
     pub current_bundles: Vec<super::sandbox::AuxBundleRef>,
     pub total_vcpus: u32,
     /// Issue #229: the host-agent's bincode `WIRE_VERSION` this tick.

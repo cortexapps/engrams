@@ -183,6 +183,44 @@ teleport contracts.
   §Evidence baselines on a post-#528 fleet and record the deltas with the
   fleet-stability precondition. No unconditional "collapses to X" claim.
 
+## Divergence log
+
+- **Phase 1 (write-through floor) — landed** (`be8f4161`, PR #586): moves
+  4+5. `divergence_source{tier}` deferred to phase 3 (where local|peer|gcs
+  are all real at the resume miss-chain, not redundant on the cache path).
+- **Phase 2 (authoritative affinity + `local_snapshots` retirement) —
+  landed.** Move 1. Divergences from the plan:
+  - **Tier 0 lives in `pick_from`, not `rank_hosts`.** The plan put the
+    affinity prefix in `rank_hosts`, but the authoritative check needs the
+    reserved-budget map (for the RAM/CPU + disk-headroom veto), which only
+    `pick_from` has. `rank_hosts` now just yields the schedulable set;
+    `pick_from` runs the tier-0 `snapshot_host_veto` before the soft
+    tiers. `RankedCandidates::affinity_len` is retained (always 0) — it is
+    the *create*-path `reserve_placement` capacity-blind-prefix input, an
+    orthogonal mechanism that was already 0 in prod (it also keyed on the
+    dead mirror); fully removing it is a `reserve_placement` refactor left
+    out of this move's scope (documented, not inert-by-accident).
+  - **`disk_full` const owner moved to `engram-core`.** The plan said
+    "import #528's constant." #528's `DEFAULT_DISK_FLOOR_BYTES` lived in
+    `engram-host-agent` (not coordinator-reachable), so the canonical
+    `HOST_DISK_CACHE_FLOOR_BYTES`/`_MIB` now lives in
+    `engram_core::types::host` and the host-agent floor *aliases* it —
+    one owner, no second threshold.
+  - **`cpu_full` reason added** alongside the plan's
+    `missing|dead|cordoned|wire_skew|disk_full|ram_full` (a snapshot-host
+    that fails the CPU budget is a distinct, honest veto).
+  - **Resume budget is best-effort.** The plan said "pass the session's
+    mem/cpu budgets." The resume path resolves them via
+    `resolve_cold_boot_spec` (best-effort — `None` on an un-enabled image,
+    preserving the pre-0072 soft posture); the tier-0 *disk* veto (the
+    primary locality signal) fires regardless.
+  - **`local_snapshots` retired end-to-end**: `HostRecord`/`HostHeartbeat`
+    fields, `HostLocalSnapshot`/`LocalSnapshotReport` types, the
+    `Heartbeat` wire field, the coord HTTP DTO + PG upsert/select + row
+    decode, the fleet-view proto count (`reserved 7`, satisfies buf
+    `FIELD_NO_DELETE`) + api DTO + CLI display, and the
+    `hosts.local_snapshots` column (migration 0082). WIRE 9→10.
+
 ## Degradation & reliability floor
 
 Every new mechanism (export open, bulk pull, on-demand peer tier,
@@ -199,3 +237,16 @@ Every baseline quoted from the issue is 2026-07-01, 7–14 d-window
 evidence; "LAN beats GCS ~20×" is a code comment, not an independent
 measurement. Re-measure at the Phase-5 flip; never present the peer-fill
 wins without the fleet-stability precondition.
+
+### Phase-2 review note: affinity asserts locality it cannot verify
+
+`snapshots.host_id` is a capture-time fact with no possession freshness —
+the tier-0 pin has no way to know the host's NVMe LRU has since evicted
+this snapshot's chunks (the retired advert carried `last_accessed_at`
+from the host itself, though it was never populated). A pinned resume on
+such a host passes every veto, pages from GCS anyway, and
+`engram_resume_affinity_fallback_total` reports no fallback — a locality
+"hit" with cold-path latency. Acceptable for phase 2 (the miss is
+correctness-free and phase 3's peer/local fill shrinks the window);
+possession-freshness belongs to the substrated readiness registry
+(ADR 0076) if it proves to matter in prod.

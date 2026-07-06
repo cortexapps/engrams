@@ -667,7 +667,6 @@ async fn boot_prepared(
         needs_uffd_substrate,
     } = prepared;
     let session_id = inputs.session_id;
-    let base_snapshot_id = inputs.base_snapshot_id;
 
     // -------- Candidates (ADR 0046 best-fit, ADR 0048 2D) --------
     // Issue #535 (a) "conscious divergence": kept as its own scan (unlike the
@@ -687,7 +686,12 @@ async fn boot_prepared(
     let ctx = crate::placement::ScheduleContext {
         repo: &image_repo,
         image_version: &image_tag,
-        prefer_snapshot_id: Some(base_snapshot_id),
+        // ADR 0078: a base snapshot is fleet-wide (prewarmed on many
+        // hosts, #538), not a single-host fact — no authoritative
+        // affinity on create. (The old `prefer_snapshot_id` tier keyed
+        // on the never-populated `local_snapshots`, so this was already
+        // a no-op in prod.)
+        snapshot_host: None,
         memory_mib: Some(memory_mib),
         cpu_budget_vcpus: Some(cpu_budget_vcpus),
         required_image_digest: Some(engram_protocol::heartbeat::ManifestDigest::new(

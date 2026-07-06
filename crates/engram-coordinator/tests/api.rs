@@ -815,7 +815,6 @@ impl TestFixture {
                 last_heartbeat_at: chrono::Utc::now(),
                 host_addr: None,
                 ready_images: Vec::new(),
-                local_snapshots: Vec::new(),
                 current_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,

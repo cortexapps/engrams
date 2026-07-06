@@ -1594,7 +1594,6 @@ pub(crate) mod tests {
                 last_heartbeat_at: chrono::Utc::now(),
                 host_addr: None,
                 ready_images: Vec::new(),
-                local_snapshots: Vec::new(),
                 current_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,
@@ -1879,7 +1878,6 @@ pub(crate) mod tests {
                 h.capacity = hb.capacity;
                 h.utilization = hb.utilization;
                 h.ready_images = hb.ready_images;
-                h.local_snapshots = hb.local_snapshots;
                 h.current_bundles = hb.current_bundles;
                 h.total_vcpus = hb.total_vcpus;
                 h.last_heartbeat_at = chrono::Utc::now();

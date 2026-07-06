@@ -739,7 +739,6 @@ async fn seed_staging_host(meta: &Arc<dyn MetadataStore>, digest: &str, staged: 
         last_heartbeat_at: Utc::now(),
         host_addr: None,
         ready_images: Vec::new(),
-        local_snapshots: Vec::new(),
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
@@ -766,7 +765,6 @@ async fn seed_staging_host(meta: &Arc<dyn MetadataStore>, digest: &str, staged: 
             } else {
                 Vec::new()
             },
-            local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
@@ -1090,7 +1088,6 @@ async fn prestage_flip_and_straggler_reach_ready_via_live_host_rows() {
             },
             utilization: HostUtilization::default(),
             ready_images: vec![digest.clone()],
-            local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,

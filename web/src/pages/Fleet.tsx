@@ -217,8 +217,7 @@ function HostCard({
               {" "}
               · {diskUsedGiB}/{diskTotalGiB} GiB disk
             </>
-          )}{" "}
-          · {host.local_snapshots} snapshots
+          )}
           {/* ADR 0068: the operator's one-glance skew display — a host
               excluded on `cap:fc_snapshot_version` shows its own reported
               version right here instead of forcing a coord-log dig. Empty

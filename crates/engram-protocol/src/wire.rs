@@ -64,7 +64,13 @@ use serde::{Deserialize, Serialize};
 // carries binding_epoch; the shell-pin RPCs (AcquireShell/ReleaseShell/
 // RenewShell) and RehandshakeHarness are deleted; heartbeat gains
 // harness_attached. Lockstep coord+host roll, no fallback ladder.
-pub const WIRE_VERSION: u32 = 10;
+// v11 (issue #548 / ADR 0078): the never-populated `local_snapshots`
+// heartbeat mirror is retired end-to-end — the `Heartbeat.local_snapshots`
+// wire field, `HostRecord`/`HostHeartbeat` fields, the `hosts.local_snapshots`
+// PG column (migration 0090), and the fleet-view proto count (reserved 7).
+// Clean break — coord+host roll together; skewed hosts drain off scheduling
+// via `host_wire_version_ok` until the host MIG rolls.
+pub const WIRE_VERSION: u32 = 11;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

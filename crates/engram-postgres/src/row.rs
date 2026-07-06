@@ -130,8 +130,6 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let ready_images: Vec<String> =
         serde_json::from_value(row.try_get("ready_images").map_err(col_err)?)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
-    let local_snapshots = serde_json::from_value(row.try_get("local_snapshots").map_err(col_err)?)
-        .map_err(|e| MetaError::Serialization(e.to_string()))?;
     let current_bundles = serde_json::from_value(row.try_get("current_bundles").map_err(col_err)?)
         .map_err(|e| MetaError::Serialization(e.to_string()))?;
     let cordoned: bool = row.try_get("cordoned").map_err(col_err)?;
@@ -175,7 +173,6 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         last_heartbeat_at,
         host_addr,
         ready_images,
-        local_snapshots,
         current_bundles,
         cordoned,
         total_vcpus: total_vcpus.max(0) as u32,

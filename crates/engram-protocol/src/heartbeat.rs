@@ -27,7 +27,6 @@ pub struct Heartbeat {
     pub host_id: HostId,
     pub sent_at: DateTime<Utc>,
     pub capacity: HostCapacityReport,
-    pub local_snapshots: Vec<LocalSnapshotReport>,
     /// Sandbox IDs currently live on this host (per `backend.list()`).
     /// Empty on hosts that haven't enabled reconciliation yet (Phase 1
     /// observation window). ~12 B per id × ~50 sandboxes ≈ 600 B per
@@ -120,15 +119,6 @@ pub struct HostCapacityReport {
     pub total_mib: u64,
     pub used_mib: u64,
     pub running_sandboxes: u32,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LocalSnapshotReport {
-    pub snapshot_id: SnapshotId,
-    pub session_id: SessionId,
-    pub size_bytes: u64,
-    pub replicated: bool,
-    pub last_accessed_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -229,13 +219,6 @@ mod tests {
                 used_mib: 64_000,
                 running_sandboxes: 7,
             },
-            local_snapshots: vec![LocalSnapshotReport {
-                snapshot_id: SnapshotId::new(),
-                session_id: SessionId::new(),
-                size_bytes: 12_345_678,
-                replicated: true,
-                last_accessed_at: Utc::now(),
-            }],
             running_sandboxes: vec![SandboxId::new(), SandboxId::new()],
             running_sandboxes_known: true,
             draining: false,
@@ -257,12 +240,6 @@ mod tests {
             back.capacity.running_sandboxes,
             original.capacity.running_sandboxes
         );
-        assert_eq!(back.local_snapshots.len(), 1);
-        assert_eq!(
-            back.local_snapshots[0].snapshot_id,
-            original.local_snapshots[0].snapshot_id
-        );
-        assert!(back.local_snapshots[0].replicated);
         assert_eq!(back.running_sandboxes, original.running_sandboxes);
         assert_eq!(back.draining, original.draining);
     }
@@ -330,7 +307,6 @@ mod tests {
             "host_id": "00000000-0000-0000-0000-000000000000",
             "sent_at": "2026-06-05T00:00:00Z",
             "capacity": {"total_mib": 1024, "used_mib": 0, "running_sandboxes": 0},
-            "local_snapshots": [],
             "running_sandboxes": [],
             "draining": false
         }"#;
@@ -377,17 +353,6 @@ mod tests {
         let back: HeartbeatAck = serde_json::from_str(&json).unwrap();
         assert_eq!(back.revoked_sessions, original.revoked_sessions);
         assert_eq!(back.enabled_images, original.enabled_images);
-    }
-
-    #[test]
-    fn empty_local_snapshots_serializes_as_array() {
-        // Defending against an accidental switch to Option<Vec<_>> or
-        // skip_serializing_if which would change the wire shape and
-        // break the host-side parser.
-        let mut h = sample();
-        h.local_snapshots.clear();
-        let v: serde_json::Value = serde_json::to_value(&h).unwrap();
-        assert_eq!(v["local_snapshots"], serde_json::json!([]));
     }
 
     #[test]
