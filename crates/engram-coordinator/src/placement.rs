@@ -539,7 +539,11 @@ pub async fn candidates_for(
 /// `origin` is one of the 4 values documented on
 /// `metrics::PLACEMENT_EXCLUDED_TOTAL` — pass a `'static` string literal
 /// from that fixed set so the label cardinality stays bounded.
-pub async fn log_empty_candidates(meta: &dyn MetadataStore, ctx: &ScheduleContext<'_>, origin: &'static str) {
+pub async fn log_empty_candidates(
+    meta: &dyn MetadataStore,
+    ctx: &ScheduleContext<'_>,
+    origin: &'static str,
+) {
     let hosts = match meta.list_active_hosts().await {
         Ok(hosts) => hosts,
         Err(e) => {

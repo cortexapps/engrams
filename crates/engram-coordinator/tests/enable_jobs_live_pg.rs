@@ -182,7 +182,10 @@ async fn progress_state_failure_and_retry_round_trip() {
     .await
     .expect("stamp capture progress");
     let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
-    assert_eq!(got.capture_phase, Some(engram_core::types::CapturePhase::Warm));
+    assert_eq!(
+        got.capture_phase,
+        Some(engram_core::types::CapturePhase::Warm)
+    );
     assert_eq!(got.warm_stage.as_deref(), Some("install-deps"));
     assert!(got.warm_stage_started_at.is_some());
     assert!(!got.warm_stages.is_empty());
