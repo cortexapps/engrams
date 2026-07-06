@@ -76,12 +76,13 @@ pub(crate) struct BootInputs {
     /// ADR 0055: per-session skills resolved from the profile + assigned to
     /// reserved slots (dyn_0..). Patched into the restored VM load-paused.
     pub selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    /// ADR 0055 / issue #535 (b): the RAW selected skill names (before slot
-    /// resolution) — persisted into `sessions.selected_skills` by
-    /// `reserve_and_persist_create` so a queued create's boot re-prepare
-    /// (`prepare_from_row`) can reconstruct the selection (the
-    /// `selected_mounts` above are already-resolved-to-slots and re-derived
-    /// fresh on every prepare instead — the sha may have rolled while queued).
+    /// ADR 0077 phase 3: the RAW selected skill names (before slot
+    /// resolution). `boot_prepared` folds these into the RuntimeSpec written
+    /// by `reserve_and_persist_create` in the create transaction, so a queued
+    /// create's boot re-prepare (`prepare_from_row`) reconstructs the
+    /// selection from the persisted RuntimeSpec (the `selected_mounts` above
+    /// are already-resolved-to-slots and re-derived fresh on every prepare —
+    /// the sha may have rolled while queued).
     pub selected_skills: Vec<String>,
     /// ADR 0056: the profile-granted capabilities (parsed + validated).
     /// Issue #535 (b): bound to `session_capabilities` by `reserve_and_

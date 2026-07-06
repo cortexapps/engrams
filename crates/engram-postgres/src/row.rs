@@ -58,7 +58,6 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     // Missing-column-tolerant (defaults empty) so a SELECT that doesn't
     // project it (e.g. `list_evacuating_sessions`/`list_evicting_sessions`,
     // which don't need it) still decodes.
-    let selected_skills: Vec<String> = row.try_get("selected_skills").unwrap_or_default();
     // ADR 0074 parking ladder: park_rung added in migration 0087.
     // SELECTs that don't project it (or pre-migration rows) fall back
     // to 0 = "not parked".
@@ -74,7 +73,6 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         created_at,
         last_active_at,
         live_disk_manifest,
-        selected_skills,
         park_rung,
         parked_at,
     })

@@ -623,9 +623,9 @@ impl MetadataStore for PostgresStore {
                     INSERT INTO sessions
                         (id, status, host_id, sandbox_id,
                          image_uri, mode, mem_budget_mib, cpu_budget_vcpus,
-                         harness, selected_skills,
+                         harness,
                          created_at, last_active_at)
-                    VALUES ($1, 'pending', $2, NULL, $3, $4, $5, $6, $7, $8, $9, $9)
+                    VALUES ($1, 'pending', $2, NULL, $3, $4, $5, $6, $7, $8, $8)
                     "#,
                 )
                 .bind(ws.session_id.as_uuid())
@@ -634,8 +634,11 @@ impl MetadataStore for PostgresStore {
                 .bind(ws.spec.mode.as_str())
                 .bind(ws.mem_budget_mib)
                 .bind(ws.cpu_budget_vcpus)
-                .bind(ws.selected_harness.as_deref())
-                .bind(&ws.selected_skills)
+                // ADR 0077: `harness` mirrors the RuntimeSpec's selection into
+                // the pre-existing `sessions.harness` column; `selected_skills`
+                // is no longer a column — it lives in the RuntimeSpec written
+                // below (migration 0090 dropped the column).
+                .bind(ws.runtime_spec.selected_harness.as_deref())
                 .bind(now)
                 .execute(&mut *tx)
                 .await
@@ -651,10 +654,10 @@ impl MetadataStore for PostgresStore {
                     INSERT INTO sessions
                         (id, status, host_id, sandbox_id, image_uri, mode,
                          mem_budget_mib, cpu_budget_vcpus,
-                         harness, selected_skills,
+                         harness,
                          queued_at, queue_origin,
                          created_at, last_active_at)
-                    VALUES ($1, 'queued', NULL, NULL, $2, $3, $4, $5, $6, $7, $8, 'create', $8, $8)
+                    VALUES ($1, 'queued', NULL, NULL, $2, $3, $4, $5, $6, $7, 'create', $7, $7)
                     "#,
                 )
                 .bind(ws.session_id.as_uuid())
@@ -662,8 +665,9 @@ impl MetadataStore for PostgresStore {
                 .bind(ws.spec.mode.as_str())
                 .bind(ws.mem_budget_mib)
                 .bind(ws.cpu_budget_vcpus)
-                .bind(ws.selected_harness.as_deref())
-                .bind(&ws.selected_skills)
+                // ADR 0077: harness column mirrors the RuntimeSpec; no
+                // selected_skills column (lives in the RuntimeSpec below).
+                .bind(ws.runtime_spec.selected_harness.as_deref())
                 .bind(now)
                 .execute(&mut *tx)
                 .await
@@ -673,9 +677,31 @@ impl MetadataStore for PostgresStore {
         };
 
         // -------- satellites, in the SAME transaction (issue #535 (b)) --------
-        // `harness` and `selected_skills` already rode the row INSERT above;
-        // the remaining satellites keep their own tables (FK'd to
-        // `sessions.id`, now guaranteed to exist by the time this commits).
+        // `harness` already rode the row INSERT above (mirrored from the
+        // RuntimeSpec); the remaining satellites keep their own tables (FK'd
+        // to `sessions.id`, now guaranteed to exist by the time this commits).
+        //
+        // ADR 0077 phase 3: the RuntimeSpec (selected skills/harness/workdir)
+        // is written in THIS transaction too — the single durable source the
+        // queue re-prepare / resume / evac reads instead of re-deriving. It
+        // subsumes the retired `sessions.selected_skills` column.
+        {
+            let spec_json = serde_json::to_value(&ws.runtime_spec)
+                .map_err(|e| MetaError::Serialization(format!("runtime_spec encode: {e}")))?;
+            sqlx::query(
+                r#"
+                INSERT INTO session_runtime_specs (session_id, spec, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (session_id) DO UPDATE
+                  SET spec = EXCLUDED.spec, updated_at = NOW()
+                "#,
+            )
+            .bind(ws.session_id.as_uuid())
+            .bind(spec_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
         if let Some(secrets) = ws.sealed_secrets {
             sqlx::query(
                 r#"
@@ -1047,7 +1073,6 @@ impl MetadataStore for PostgresStore {
             SELECT id, status, host_id, sandbox_id, image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
-                   selected_skills,
                    COALESCE(mem_budget_mib, 0)::BIGINT AS mem_budget_mib,
                    COALESCE(cpu_budget_vcpus, 0) AS cpu_budget_vcpus,
                    queue_origin, queued_at
@@ -1291,7 +1316,6 @@ impl MetadataStore for PostgresStore {
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
-                   selected_skills,
                    park_rung, parked_at
             FROM sessions WHERE id = $1
             "#,
@@ -1353,8 +1377,7 @@ impl MetadataStore for PostgresStore {
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
-                   live_disk_manifest_id, live_disk_manifest_version,
-                   selected_skills
+                   live_disk_manifest_id, live_disk_manifest_version
             FROM sessions
             WHERE status IN ('pending','created','active',
                              'idle','evacuating','evicting')
@@ -2726,6 +2749,47 @@ impl MetadataStore for PostgresStore {
             .collect::<Result<Vec<_>, MetaError>>()
     }
 
+    async fn put_session_runtime_spec(
+        &self,
+        session_id: SessionId,
+        spec: &engram_core::types::runtime_spec::RuntimeSpec,
+    ) -> Result<(), MetaError> {
+        let json = serde_json::to_value(spec)
+            .map_err(|e| MetaError::Serialization(format!("runtime_spec encode: {e}")))?;
+        sqlx::query(
+            "INSERT INTO session_runtime_specs (session_id, spec, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (session_id) DO UPDATE
+               SET spec = EXCLUDED.spec, updated_at = NOW()",
+        )
+        .bind(session_id.as_uuid())
+        .bind(json)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_session_runtime_spec(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<engram_core::types::runtime_spec::RuntimeSpec>, MetaError> {
+        let row = sqlx::query("SELECT spec FROM session_runtime_specs WHERE session_id = $1")
+            .bind(session_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        match row {
+            Some(r) => {
+                let json: serde_json::Value = r.try_get(0).map_err(db_err)?;
+                let spec = serde_json::from_value(json)
+                    .map_err(|e| MetaError::Serialization(format!("runtime_spec decode: {e}")))?;
+                Ok(Some(spec))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
         // ADR 0007: single-tier durability. Every snapshot row
         // references chunked manifests in `BlobStorage` via the
@@ -2804,8 +2868,80 @@ impl MetadataStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        // ADR 0077 phase 1: advance the per-session durable head in the
+        // SAME transaction as the row write — row existence ==
+        // durability. Monotonic by created_at: a re-record or an
+        // out-of-order reconcile (the host re-advertises an older
+        // checkpoint) never regresses the head. Base captures
+        // (session_id IS NULL) skip this — their head is
+        // enabled_images.base_snapshot_id.
+        //
+        // GATED ON `recoverable`: the issue-#213 two-phase capture and the
+        // resume demote path both record rows with recoverable=false, and
+        // the head's contract is "newest snapshot whose blobs AND row are
+        // committed" — an unrecoverable row must never hold it (the next
+        // abort-inflight tick deletes its blobs while the monotonic guard
+        // would block an older good snapshot from ever reclaiming the
+        // pointer). A demote that hits the CURRENT head re-points it to
+        // the newest still-recoverable snapshot instead.
+        if let Some(session_id) = snap.session_id {
+            if snap.recoverable {
+                sqlx::query(
+                    r#"
+                    UPDATE sessions
+                    SET durable_head_snapshot_id = $2
+                    WHERE id = $1
+                      AND (
+                        durable_head_snapshot_id IS NULL
+                        OR $3 >= COALESCE(
+                            (SELECT created_at FROM snapshots WHERE id = sessions.durable_head_snapshot_id),
+                            'epoch'::timestamptz
+                        )
+                      )
+                    "#,
+                )
+                .bind(session_id.as_uuid())
+                .bind(snap.id.as_uuid())
+                .bind(snap.created_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            } else {
+                sqlx::query(
+                    r#"
+                    UPDATE sessions
+                    SET durable_head_snapshot_id = (
+                        SELECT id FROM snapshots
+                        WHERE session_id = $1 AND recoverable AND id <> $2
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    )
+                    WHERE id = $1 AND durable_head_snapshot_id = $2
+                    "#,
+                )
+                .bind(session_id.as_uuid())
+                .bind(snap.id.as_uuid())
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            }
+        }
         tx.commit().await.map_err(db_err)?;
         Ok(inserted)
+    }
+
+    async fn durable_head_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<engram_core::types::SnapshotId>, MetaError> {
+        let row = sqlx::query("SELECT durable_head_snapshot_id FROM sessions WHERE id = $1")
+            .bind(session_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        let row = row.ok_or(MetaError::NotFound)?;
+        let id: Option<uuid::Uuid> = row.try_get(0).map_err(db_err)?;
+        Ok(id.map(engram_core::types::SnapshotId::from))
     }
 
     async fn prune_session_snapshots(

@@ -878,7 +878,6 @@ mod tests {
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
-                selected_skills: Vec::new(),
                 park_rung: 0,
                 parked_at: None,
             },

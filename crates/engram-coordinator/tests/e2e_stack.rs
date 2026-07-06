@@ -194,9 +194,9 @@ impl Driver {
     /// execs the harness binary even if it's sitting in the rootfs.
     async fn create_session_none_harness(&mut self, image: &str) -> SessionId {
         let req = app::CreateSessionRequest {
-            selected_skills: Vec::new(),
             capabilities: Vec::new(),
             integration_policy_json: E2E_ALLOW_ALL_POLICY.to_string(),
+            selected_skills: Vec::new(),
             image_uri: image.to_string(),
             mode: "dev_vm".to_string(),
             prompt: None,
@@ -214,9 +214,9 @@ impl Driver {
     /// into a reserved dyn-* slot in the paused restore window.
     async fn create_session_skills(&mut self, image: &str, skills: &[&str]) -> SessionId {
         let req = app::CreateSessionRequest {
-            selected_skills: skills.iter().map(|s| s.to_string()).collect(),
             capabilities: Vec::new(),
             integration_policy_json: E2E_ALLOW_ALL_POLICY.to_string(),
+            selected_skills: skills.iter().map(|s| s.to_string()).collect(),
             image_uri: image.to_string(),
             mode: "dev_vm".to_string(),
             prompt: None,
@@ -251,9 +251,9 @@ impl Driver {
         let mut harness_env = HashMap::new();
         harness_env.insert("ANTHROPIC_API_KEY".to_string(), api_key.to_string());
         let req = app::CreateSessionRequest {
-            selected_skills: Vec::new(),
             capabilities: Vec::new(),
             integration_policy_json: E2E_ALLOW_ALL_POLICY.to_string(),
+            selected_skills: Vec::new(),
             image_uri: image.to_string(),
             mode: "agent".to_string(),
             prompt: prompt.map(str::to_string),

@@ -40,7 +40,6 @@ impl MetadataStore for MiniMeta {
                 mode: spec.mode,
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
-                selected_skills: Vec::new(),
                 park_rung: 0,
                 parked_at: None,
             },

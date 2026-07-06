@@ -97,7 +97,6 @@ impl MetadataStore for MockMetadataStore {
             mode: spec.mode,
             last_active_at: Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -143,7 +142,6 @@ impl MetadataStore for MockMetadataStore {
             mode: ws.spec.mode,
             last_active_at: now,
             live_disk_manifest: None,
-            selected_skills: ws.selected_skills,
             park_rung: 0,
             parked_at: None,
         };
@@ -1169,7 +1167,6 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
-                selected_skills: Vec::new(),
                 park_rung: 0,
                 parked_at: None,
             },
@@ -1264,7 +1261,6 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
-                selected_skills: Vec::new(),
                 park_rung: 0,
                 parked_at: None,
             },

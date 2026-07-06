@@ -84,7 +84,6 @@ impl MetadataStore for MockMetadataStore {
             mode: spec.mode,
             last_active_at: Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -130,7 +129,6 @@ impl MetadataStore for MockMetadataStore {
             mode: ws.spec.mode,
             last_active_at: now,
             live_disk_manifest: None,
-            selected_skills: ws.selected_skills,
             park_rung: 0,
             parked_at: None,
         };
@@ -877,9 +875,9 @@ async fn create_session_unknown_image_is_invalid_argument() {
 
     let err = client
         .create_session(app::CreateSessionRequest {
-            selected_skills: Vec::new(),
             capabilities: Vec::new(),
             integration_policy_json: String::new(),
+            selected_skills: Vec::new(),
             image_uri: "localhost:5001/never-enabled:warm".into(),
             mode: "agent".into(),
             prompt: None,

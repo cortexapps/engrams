@@ -751,8 +751,18 @@ async fn boot_prepared(
         sealed_secrets,
         capabilities: inputs.capabilities.clone(),
         integration_policy_json,
-        selected_harness: inputs.selected_harness.clone(),
-        selected_skills: inputs.selected_skills.clone(),
+        // ADR 0077 phase 3: the session's boot inputs as ONE persisted
+        // document, written into `session_runtime_specs` inside the create
+        // transaction (subsumes the retired `sessions.selected_skills`
+        // column). `reserve_and_persist_create` also mirrors the harness key
+        // into the pre-existing `sessions.harness` column.
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            inputs.selected_skills.clone(),
+            inputs.selected_harness.clone(),
+            // workdir re-derives from the stable image manifest at boot; it is
+            // not a re-derivation-drift source, so it is not persisted here.
+            None,
+        ),
     };
 
     let disposition = state
@@ -992,6 +1002,29 @@ pub(crate) async fn prepare_from_row(
             None
         }
     };
+    // ADR 0077 phase 3: read the persisted RuntimeSpec so the queued /
+    // resumed boot re-resolves the session's dynamic skill NAMES against
+    // the current fleet stamp — fixing the ADR 0055 TODO(P1-D) where the
+    // scanner booted queued sessions with base skills only. A pre-0077
+    // session (no spec row) yields an empty list, i.e. the old behavior —
+    // but a READ ERROR (PG blip, spec decode failure) must PROPAGATE, not
+    // degrade to "no skills": FC needs skills pre-staged at boot, so a
+    // swallowed error here boots the session's whole life without its
+    // mounts, silently. The caller's retry (queue scanner tick / resume
+    // re-dispatch) is the correct recovery.
+    let persisted_skills = state
+        .services
+        .meta
+        .get_session_runtime_spec(session.id)
+        .await
+        .map_err(|e| {
+            ApiError::Internal(format!(
+                "runtime spec read for {} failed (retryable — refusing to boot skill-less): {e}",
+                session.id
+            ))
+        })?
+        .map(|rs| rs.selected_skills)
+        .unwrap_or_default();
     prepare_inner(
         state,
         HashMap::new(),
@@ -1004,13 +1037,10 @@ pub(crate) async fn prepare_from_row(
         overrides,
         session.id,
         bundle,
-        // Issue #535 (b): fixes the ADR 0055 TODO(P1-D) gap — `selected_skills`
-        // is now persisted at create/enqueue time (`reserve_and_persist_
-        // create`), so the re-prepare reconstructs the actual selection
-        // instead of dropping to base skills. Re-resolved against the
-        // (possibly newer) fleet catalog below — the sha may have rolled
-        // while queued, which is the correct semantic.
-        session.selected_skills.clone(),
+        // ADR 0077 phase 3: the persisted skill NAMES from the RuntimeSpec
+        // (the TODO(P1-D) fix) — re-resolved against the current fleet catalog
+        // below, since the sha may have rolled while queued.
+        persisted_skills,
         // ADR 0056: a queued session's capabilities were already bound to
         // `session_capabilities` at create/enqueue (issue #535 (b): now in
         // the SAME transaction as the row); the re-prepare carries an empty
@@ -1326,6 +1356,8 @@ async fn prepare_inner(
             egress_secrets,
             network,
             selected_mounts,
+            // ADR 0077 phase 3: the raw skill names, persisted in the
+            // RuntimeSpec so a queued re-prepare / resume re-resolves them.
             selected_skills,
             capabilities,
             integration_policy,

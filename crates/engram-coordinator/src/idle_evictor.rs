@@ -1426,7 +1426,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -1481,7 +1480,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -1632,7 +1630,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -1716,7 +1713,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -1774,7 +1770,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -1972,7 +1967,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -2186,7 +2180,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -2404,7 +2397,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -2524,7 +2516,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -2754,7 +2745,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -2870,7 +2860,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -2963,7 +2952,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -2996,7 +2984,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -3050,7 +3037,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         }

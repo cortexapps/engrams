@@ -67,8 +67,7 @@ async fn enqueue(
         sealed_secrets: None,
         capabilities: Vec::new(),
         integration_policy_json: None,
-        selected_harness: None,
-        selected_skills: Vec::new(),
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
     };
     let disposition = meta
         .reserve_and_persist_create(ws, &[], 0)
@@ -103,8 +102,7 @@ async fn reserve(
         sealed_secrets: None,
         capabilities: Vec::new(),
         integration_policy_json: None,
-        selected_harness: None,
-        selected_skills: Vec::new(),
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
     };
     match meta
         .reserve_and_persist_create(ws, candidates, affinity_len)

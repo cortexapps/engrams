@@ -337,3 +337,42 @@ async fn release_session_lease_is_holder_scoped_no_blind_delete() {
         .await
         .unwrap());
 }
+
+/// #584 review regression (the recurring missing-comma projection class):
+/// `get_session` must round-trip park_rung, parked_at, AND the live disk
+/// manifest under their OWN column names. A dropped comma in its SELECT
+/// silently aliases a neighbor (`x AS park_rung`), and row.rs's tolerant
+/// decode masks it (`unwrap_or(0)` / `.ok().flatten()`): a rung-2
+/// parked-paused session then reads rung 0 — the un-pause ascent flips a
+/// FROZEN VM to Active without resuming it — and the disk-only cold-boot
+/// gate never fires. Only a live-PG round-trip catches this shape.
+#[tokio::test]
+#[ignore = "requires live Postgres (ENGRAM_TEST_DATABASE_URL)"]
+async fn get_session_round_trips_park_and_live_disk_manifest() {
+    let Some(meta) = pg().await else { return };
+    let (id, sandbox) = seed_active(&meta).await;
+
+    let parked_at = chrono::Utc::now();
+    meta.set_session_park_rung(id, 2, Some(parked_at))
+        .await
+        .expect("set park_rung");
+    let mref = engram_core::types::manifest::ManifestRef {
+        manifest_id: uuid::Uuid::new_v4(),
+        version: 7,
+    };
+    meta.update_live_disk_manifest(id, sandbox, mref)
+        .await
+        .expect("publish live disk manifest");
+
+    let s = meta.get_session(id).await.expect("get_session");
+    assert_eq!(s.park_rung, 2, "park_rung must project under its own name");
+    assert!(
+        s.parked_at.is_some(),
+        "parked_at must project under its own name"
+    );
+    assert_eq!(
+        s.live_disk_manifest,
+        Some(mref),
+        "live_disk_manifest_{{id,version}} must project under their own names"
+    );
+}
