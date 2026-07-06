@@ -1508,13 +1508,26 @@ jobs:
   # `just bundles-squashfs`), and resolved from there per session.
   # Runs the three flows in `e2e_stack.rs`.
   #
-  # DAG dep on the cheap gates only (lint, test-linux, web,
-  # cross-musl-linux) plus the artifacts producer. `test-firecracker`
-  # is intentionally NOT in `needs:` — it tests the host-agent's
-  # PooledBackend in isolation; this lane tests the coord HTTP →
-  # gRPC → host-agent path. Orthogonal coverage; running them in
-  # parallel saves ~6min on the critical path on push-to-main and a
-  # flaky `proxy_e2e` doesn't suppress e2e-stack signal.
+  # `needs:` only lists jobs whose *artifacts* this lane downloads
+  # (artifacts-e2e-stack's release binaries, bake-harness-claude-artifact's
+  # harness tree, detect's `e2e` flag). It used to also list the cheap
+  # gates (lint, test-linux, web, cross-musl-linux) as a cost-saving
+  # DAG dep, but GitHub Actions force-skips a job whenever ANY of its
+  # `needs:` was skipped — overriding this job's own `if:`. `web` (gated
+  # on web-path changes) and `cross-musl-linux`/`lint`/`test-linux`
+  # (gated on their own path flags) routinely skip on a Rust-only PR
+  # that doesn't touch their paths, which silently skipped this entire
+  # lane on every Rust-only push/PR (never actually exercising the
+  # coord HTTP → gRPC → host-agent path CI claims to cover). Those
+  # lanes are still independently required via `ci-gate`'s `needs:`, so
+  # dropping them here doesn't weaken the overall gate — it just means
+  # this lane no longer skips itself as a side effect of an unrelated
+  # lane skipping. `test-firecracker` is intentionally NOT in `needs:`
+  # — it tests the host-agent's PooledBackend in isolation; this lane
+  # tests the coord HTTP → gRPC → host-agent path. Orthogonal coverage;
+  # running them in parallel saves ~6min on the critical path on
+  # push-to-main and a flaky `proxy_e2e` doesn't suppress e2e-stack
+  # signal.
   # ------------------------------------------------------------------
   test-e2e-stack:
     name: e2e stack ${{ matrix.variant }} (coord app-gRPC → FC)
@@ -1556,16 +1569,29 @@ jobs:
     # Path-gate: run on any e2e-relevant change, and always on merge_group +
     # push-to-main. On changes that can't affect e2e it skips, which the CI Gate
     # treats as OK (so gating it doesn't wedge non-coord PRs).
+    #
+    # `!cancelled()` is required because this job's `needs:` includes jobs
+    # (artifacts-e2e-stack, bake-harness-claude-artifact) that share this same
+    # path-gate — without it, GitHub Actions' default "skip if any needed job
+    # skipped" behavior would force-skip this job whenever those upstream jobs
+    # skip, regardless of this `if:`. That default skip-propagation is exactly
+    # what silently dropped this lane on Rust-only changes before `web` /
+    # `cross-musl-linux` were removed from `needs:` below. Since `!cancelled()`
+    # also stops GitHub from implicitly requiring those `needs:` entries to have
+    # *succeeded*, each one this job actually depends on for artifacts is
+    # checked explicitly below instead.
     if: >-
-      needs.detect.outputs.e2e == 'true'
-      || github.event_name == 'merge_group'
-      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      !cancelled()
+      && needs.detect.result == 'success'
+      && needs.artifacts-e2e-stack.result == 'success'
+      && needs.bake-harness-claude-artifact.result == 'success'
+      && (
+        needs.detect.outputs.e2e == 'true'
+        || github.event_name == 'merge_group'
+        || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      )
     needs:
       - detect
-      - lint
-      - test-linux
-      - web
-      - cross-musl-linux
       - artifacts-e2e-stack
       # ADR 0062: the demo image is harness-free. The built-in `claude`
       # harness rides the host `current_bundles` stamp instead — the job
