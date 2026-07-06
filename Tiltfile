@@ -105,6 +105,13 @@ fc_colima_profile = env_or('ENGRAM_FC_COLIMA_PROFILE', '')
 # ----------------------------------------------------------------
 
 uname_str = str(local('uname -s -m', echo_off=True, quiet=True)).strip()
+
+# ADR 0068: the fc-colima bundles + host-agent build steps run under a real
+# `nix develop` (for mksquashfs + the aarch64 musl cross-toolchain). The loop
+# that a per-build `nix develop` used to feed is handled by the bundles
+# resource's TRIGGER_MODE_MANUAL (see below), not by avoiding nix.
+_nix = '$(command -v nix || echo /nix/var/nix/profiles/default/bin/nix)'
+
 if fc_colima_profile:
     # The VM's /dev/kvm is invisible to a probe run on the Mac — force the
     # backend instead of asking detect-backend.sh, and fail fast (at parse
@@ -556,27 +563,46 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # `bundles` resource below already stages var/shared on the Mac
         # side first).
         target = 'aarch64-unknown-linux-musl'
-        nix_bin = ('$(command -v nix || echo ' +
-                   '/nix/var/nix/profiles/default/bin/nix)')
+        # Tilt's serve process runs with a reduced PATH that (unlike the
+        # parse-time local() context and an interactive shell) does NOT
+        # include Homebrew's bin dir, so a bare `colima` fails with
+        # "command not found". Resolve it to an absolute path once at the
+        # front of the serve_cmd and reference "$_colima" everywhere — the
+        # var propagates across the &&/| stages since they share one shell.
+        colima = '"$_colima"'
+        # Cross-compile under a real `nix develop` shell: cc-rs building ring's
+        # C code needs the exact per-target CC/CFLAGS `nix develop` sets up (a
+        # sourced env snapshot got the wrong musl-gcc and leaked Apple clang
+        # flags like `-arch arm64` into the aarch64 build). host-agent rebuilds
+        # rarely (only on a .rs change or a current.json repoint), so the
+        # per-build flake eval is a non-issue.
         build_cmd = (
-            nix_bin + ' develop -c cargo build --release --target ' + target +
+            _nix + ' develop -c cargo build --release --target ' + target +
             ' -p engram-host-agent -p engram-uffd-handler'
         )
+        # NOTE on remote-command quoting: `colima ssh -- <args>` does NOT run
+        # the joined args through a remote shell, so `&&`/`||`/`|` in a single
+        # remote arg are taken literally ("command not found"). Keep each
+        # remote command a single program (no shell operators), or wrap it in
+        # an explicit `bash -c '...'` (see prekill below). The mkdir uses the
+        # OUTER Mac shell's `&&` (fine); the remote `tar xf` is a lone command.
+        # No remote chmod needed — tar preserves the source's +x bit.
+        # COPYFILE_DISABLE=1: keep macOS's ._* AppleDouble resource-fork
+        # entries out of the tar stream (they'd land as junk in the VM).
         sync_bin_cmd = (
-            'colima ssh --profile ' + fc_colima_profile +
+            colima + ' ssh --profile ' + fc_colima_profile +
             ' -- mkdir -p /opt/engram-dev/bin /opt/engram-dev/var/sandboxes && ' +
-            'tar cf - -C target/' + target + '/release ' +
+            'COPYFILE_DISABLE=1 tar cf - -C target/' + target + '/release ' +
             'engram-host-agent engram-uffd-handler | ' +
-            'colima ssh --profile ' + fc_colima_profile +
-            " -- 'tar xf - -C /opt/engram-dev/bin && chmod +x " +
-            "/opt/engram-dev/bin/engram-host-agent " +
-            "/opt/engram-dev/bin/engram-uffd-handler'"
+            colima + ' ssh --profile ' + fc_colima_profile +
+            ' -- tar xf - -C /opt/engram-dev/bin'
         )
+        # /opt/engram-dev/shared is created by fc-colima-provision.sh, so the
+        # remote side is a lone `tar xf` (no mkdir &&).
         sync_bundle_cmd = (
-            'tar cf - -C ' + _bundle_dir + ' . | colima ssh --profile ' +
-            fc_colima_profile +
-            " -- 'mkdir -p /opt/engram-dev/shared && " +
-            "tar xf - -C /opt/engram-dev/shared'"
+            'COPYFILE_DISABLE=1 tar cf - -C ' + _bundle_dir + ' . | ' +
+            colima + ' ssh --profile ' + fc_colima_profile +
+            ' -- tar xf - -C /opt/engram-dev/shared'
         )
         # Restart semantics: verified live that `colima ssh`'s multiplexed
         # ControlMaster transport does NOT propagate SIGTERM/SIGHUP to the
@@ -590,15 +616,27 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # host-agent or its live microVMs — they keep running in the VM
         # until the next `tilt up` / `dev-fc`, or a manual
         # `colima ssh --profile <p> -- sudo pkill -f engram-host-agent`.
+        # Keep the REMOTE side a lone command (`sudo -n pkill -f <bin>`, no
+        # operators/quotes — `bash -c '...'` quoting doesn't survive colima ssh
+        # reliably) and put the `|| true` on the Mac side, in a subshell so it
+        # only swallows pkill's "no match" exit (not the &&-chained syncs).
         prekill_cmd = (
-            'colima ssh --profile ' + fc_colima_profile +
-            " -- 'sudo -n pkill -f /opt/engram-dev/bin/engram-host-agent || true'"
+            '( ' + colima + ' ssh --profile ' + fc_colima_profile +
+            ' -- sudo -n pkill -f /opt/engram-dev/bin/engram-host-agent || true )'
         )
         env_kv = ' '.join([k + '=' + v for k, v in env.items()])
         serve_cmd = (
+            # Tilt's serve process has a reduced PATH without Homebrew's bin
+            # dir. `colima` itself shells out to `limactl` (both in
+            # /opt/homebrew/bin), so an absolute `colima` path isn't enough —
+            # put Homebrew on PATH so colima finds lima. Safe for the
+            # `nix develop -c` cross-build below: nix prepends its own toolchain
+            # ahead of this (matches the spike env that built the binaries).
+            'export PATH="/opt/homebrew/bin:$PATH" && ' +
+            '_colima="$(command -v colima || echo /opt/homebrew/bin/colima)" && ' +
             build_cmd + ' && ' + sync_bin_cmd + ' && ' + sync_bundle_cmd +
             ' && ' + prekill_cmd + ' && ' +
-            'exec colima ssh --profile ' + fc_colima_profile +
+            'exec ' + colima + ' ssh --profile ' + fc_colima_profile +
             ' -- sudo -n env ' + env_kv +
             ' /opt/engram-dev/bin/engram-host-agent'
         )
@@ -666,21 +704,38 @@ _bundle_dir = os.path.abspath('var/shared')
 if dev_split:
     _bundles_recipe = 'bundles-vz' if sandbox_backend == 'vz' else 'bundles-squashfs'
     _bundles_cmd = 'just ' + _bundles_recipe
+    # On the fc-colima path this resource auto-retriggered forever. The build
+    # is content-deterministic and never modifies deploy/bundles (verified:
+    # content + mtime unchanged across builds), but the Docker-built bundles
+    # under colima's file-sharing bump the *ctime* of the whole deploy/bundles
+    # tree as a side effect, and Tilt's deps watcher fires on ctime -> rebuild
+    # -> ctime sweep -> loop. (VZ dev never hit it — no fc-dev colima VM /
+    # docker-bundle churn in that path.) The build's output is deterministic,
+    # so losing auto-rebuild costs nothing: build once at startup, and after an
+    # intentional skill edit re-trigger `bundles` from the Tilt UI. Keep AUTO
+    # off the fc path so plain `just dev` (VZ) still auto-rebuilds on edits.
+    _bundles_trigger = TRIGGER_MODE_AUTO
     if fc_colima_profile and 'Darwin' in uname_str:
-        # bundles-squashfs (forced by the firecracker backend, above)
-        # needs mksquashfs, which isn't on a bare macOS PATH. Verified
-        # live: `nix develop -c mksquashfs -version` succeeds on Apple
-        # Silicon (squashfsTools is an unconditional flake.nix devShell
-        # package, already relied on for the coordinator's skill_pack
-        # pack test) — so route through the nix devShell rather than
-        # require Docker or a Homebrew squashfs-tools install.
-        _bundles_cmd = (
-            '$(command -v nix || echo /nix/var/nix/profiles/default/bin/nix) ' +
-            'develop -c ' + _bundles_cmd
-        )
+        # Run under a real `nix develop`: bundles-squashfs needs mksquashfs AND
+        # (to build the harness-claude bundle locally, ADR 0062) the aarch64
+        # musl cross-toolchain with the exact per-target CC/CFLAGS — the sourced
+        # print-dev-env snapshot got the cc-rs cross-build wrong. `nix develop`
+        # keeps the inherited PATH, so prepend Homebrew's bin so the Docker-built
+        # bundles find docker/colima. TRIGGER_MODE_MANUAL (below) is what stops
+        # the rebuild loop, so paying the per-build flake eval once is fine.
+        _bundles_cmd = ('export PATH="/opt/homebrew/bin:$PATH" && ' + _nix +
+                        ' develop -c ' + _bundles_cmd)
+        # The loop: the Docker-built bundles under colima's file-sharing bump
+        # the *ctime* of the whole deploy/bundles tree, and Tilt's deps watcher
+        # fires on ctime -> rebuild -> ctime sweep -> forever. (VZ never hit it —
+        # no fc-dev colima VM / docker-bundle churn.) The build output is
+        # deterministic, so MANUAL costs nothing: build once at startup, and
+        # re-trigger `bundles` from the Tilt UI after an intentional skill edit.
+        _bundles_trigger = TRIGGER_MODE_MANUAL
     local_resource('bundles',
         cmd=_bundles_cmd,
         deps=['deploy/bundles'],
+        trigger_mode=_bundles_trigger,
         labels=['setup'])
 
 _proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT', '0'))
