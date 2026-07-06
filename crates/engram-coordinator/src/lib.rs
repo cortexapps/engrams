@@ -20,7 +20,6 @@ pub mod chunk_gc;
 pub mod config;
 pub mod cow_state;
 pub mod dead_host;
-pub mod desync_watchdog;
 pub mod enable_scanner;
 pub mod error;
 pub mod evac_resumer;
@@ -29,13 +28,14 @@ pub mod grpc_app;
 pub mod harness_catalog;
 pub mod harness_paths;
 pub mod host_registry;
-pub mod idle_detect_backstop;
+pub mod idle_detector;
 pub mod idle_evictor;
 pub mod integration_ops;
 pub mod integrations;
 pub mod live_migration;
 pub mod metrics;
 pub mod org_secrets;
+pub mod outbox_delivery;
 pub mod pg_listener;
 pub mod placement;
 pub mod preemption_drain;
@@ -43,6 +43,7 @@ pub mod queue_scanner;
 pub mod reconcile;
 pub mod scheduler;
 pub mod session_boot;
+pub mod session_shell_pin;
 pub mod skill_pack;
 pub mod snapshot_blob_gc;
 #[cfg(test)]
@@ -205,6 +206,7 @@ pub async fn run_with_registry_and_local(
         state.integrations.clone(),
         state.boot_bundles.clone(),
         queue_wake.clone(),
+        state.outbox_wake.clone(),
     );
 
     // Phase 3d follow-up: dead-host auto-detector. Opens its own
@@ -241,6 +243,9 @@ pub async fn run_with_registry_and_local(
     // fleet scales up, or times them out. Lease-guarded → replica-safe.
     // Without it, a session enqueued on no-capacity sits forever.
     // Push-driven via `queue_wake` (see above); polling is the fallback.
+    // ADR 0073 phase 2: the outbox delivery driver — resume-behind-
+    // enqueue + at-least-once forward + redelivery-until-acked.
+    let _outbox_delivery = outbox_delivery::spawn(state.clone(), state.outbox_wake.clone());
     let _queue_scanner = queue_scanner::spawn(
         queue_scanner::QueueScannerConfig::default(),
         state.clone(),
@@ -312,18 +317,16 @@ pub async fn run_with_registry_and_local(
     // nominates attached harnesses) by reading the durable activity
     // record — session_events — instead. Hard-TTL only; nominates
     // into the same Evicting lane the host path uses.
-    let _idle_backstop = idle_detect_backstop::spawn(
-        idle_detect_backstop::BackstopConfig::from_env(),
-        state.clone(),
-    );
+    // ADR 0073 phase 4: THE idle detector (the host detection plane +
+    // the L3 backstop are unified here — see idle_detector.rs).
+    let _idle_detector =
+        idle_detector::spawn(idle_detector::IdleDetectorConfig::from_env(), state.clone());
 
     // Track A: harness-desync watchdog. Catches the wedge class the
     // silence-only backstop misses — a harness whose event stream desynced
     // from the run state machine (a run-scoped event with no open run, or a
     // stuck-open run) — and recovers it with a non-destructive harness
     // re-handshake, escalating to the eviction lane if the nudges don't take.
-    let _desync_watchdog =
-        desync_watchdog::spawn(desync_watchdog::WatchdogConfig::from_env(), state.clone());
 
     // Phase 4 Track D: preemption best-effort drain. Subscribes to
     // `cloud.preemption_signal()` (engram-cloud-gcp polls the GCE

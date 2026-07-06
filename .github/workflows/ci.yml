@@ -366,6 +366,7 @@ jobs:
             --test host_status_transition_live_pg \
             --test queue_scanner_live_pg \
             --test binding_cas_live_pg \
+            --test outbox_live_pg \
             --test mount_catalog_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \

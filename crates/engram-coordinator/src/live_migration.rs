@@ -517,7 +517,16 @@ pub async fn migrate_session_live(
             .await;
         return Err(parachute_or_kill(state, session_id, durable_row.is_some(), e).await);
     }
-    crate::api::snapshot::bind_session_routing(state, session_id, new_sandbox_id).await;
+    // ADR 0073: live move — the harness process SURVIVES the teleport
+    // (agentd C1 reattach), so its generation is unchanged: bind the
+    // target host's record at the CURRENT epoch (re-point, no mint).
+    let epoch = state
+        .services
+        .meta
+        .current_binding_epoch(session_id)
+        .await
+        .unwrap_or(0);
+    crate::api::snapshot::bind_session_routing(state, session_id, new_sandbox_id, epoch).await;
     // CASE 1 (issue #209): the teleport_target pin's ONLY job is to aim
     // the parachute at the dest while the move is in flight. The rebind
     // above committed the ownership flip — the dest is now the durable

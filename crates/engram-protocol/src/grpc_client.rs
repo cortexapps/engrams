@@ -40,9 +40,8 @@ use crate::grpc::{
     InterruptHarnessRequest, MigrationExportRef, MigrationFetchRequest, MigrationItem,
     ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
     ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
-    ReapMaterializeDirRequest, RehandshakeHarnessRequest, RestoreBaseForSessionRequest,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest, StringList,
-    UnbindHarnessSessionRequest,
+    ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, StartAgentRequest, StringList, UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -692,10 +691,12 @@ impl GrpcHostClient {
         &self,
         session_id: SessionId,
         sandbox_id: SandboxId,
+        binding_epoch: u64,
     ) -> Result<(), SandboxError> {
         let req = BindHarnessSessionRequest {
             session_id: session_id.as_uuid().as_bytes().to_vec(),
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+            binding_epoch,
         };
         self.inner
             .clone()
@@ -807,18 +808,6 @@ impl GrpcHostClient {
         Ok(())
     }
 
-    pub async fn rehandshake_harness(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let req = RehandshakeHarnessRequest {
-            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
-        };
-        self.inner
-            .clone()
-            .rehandshake_harness(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?;
-        Ok(())
-    }
-
     /// ADR 0045 Phase F: freeze the microVM in place.
     pub async fn pause_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let req = SandboxIdMessage {
@@ -887,18 +876,6 @@ impl GrpcHostClient {
         Ok(())
     }
 
-    pub async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
-        };
-        self.inner
-            .clone()
-            .acquire_shell(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?;
-        Ok(())
-    }
-
     pub async fn start_browser(
         &self,
         sandbox_id: SandboxId,
@@ -926,31 +903,6 @@ impl GrpcHostClient {
         self.inner
             .clone()
             .stop_browser(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?;
-        Ok(())
-    }
-
-    pub async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
-        };
-        self.inner
-            .clone()
-            .release_shell(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?;
-        Ok(())
-    }
-
-    /// Issue #219: refresh a live shell pin's keep-alive stamp.
-    pub async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
-        };
-        self.inner
-            .clone()
-            .renew_shell(req)
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -1531,9 +1483,12 @@ impl HostClient for GrpcHostClient {
         Self::guest_ip(self, id).await
     }
 
-    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
-        if let Err(e) = self.bind_harness_session(session_id, sandbox_id).await {
-            tracing::warn!(%session_id, %sandbox_id, error = %e, "gRPC bind_harness_session failed");
+    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId, binding_epoch: u64) {
+        if let Err(e) = self
+            .bind_harness_session(session_id, sandbox_id, binding_epoch)
+            .await
+        {
+            tracing::warn!(%session_id, %sandbox_id, binding_epoch, error = %e, "gRPC bind_harness_session failed");
         }
     }
 
@@ -1585,20 +1540,12 @@ impl HostClient for GrpcHostClient {
         self.interrupt_harness(sandbox_id).await
     }
 
-    async fn rehandshake(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        self.rehandshake_harness(sandbox_id).await
-    }
-
     async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.pause_sandbox(sandbox_id).await
     }
 
     async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.resume_sandbox(sandbox_id).await
-    }
-
-    async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        Self::acquire_shell(self, sandbox_id).await
     }
 
     async fn start_browser(
@@ -1610,14 +1557,6 @@ impl HostClient for GrpcHostClient {
 
     async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         Self::stop_browser(self, sandbox_id).await
-    }
-
-    async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        Self::release_shell(self, sandbox_id).await
-    }
-
-    async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        Self::renew_shell(self, sandbox_id).await
     }
 
     async fn proxy_shell(

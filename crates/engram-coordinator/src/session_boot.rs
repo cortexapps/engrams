@@ -307,19 +307,33 @@ pub(crate) async fn boot_on_reserved_host(
     )
     .await;
 
+    // ADR 0073: mint the binding generation for this fresh-spawn bind.
+    // The epoch fences out any surviving older-generation harness for
+    // this session (Superseded at attach) and rides both the durable
+    // host record (bind below) and the harness spawn env (spec stamp).
+    let binding_epoch = match state.services.meta.mint_binding_epoch(session_id).await {
+        Ok(e) => e,
+        Err(e) => {
+            return Err(BootError::Started(ApiError::Internal(format!(
+                "mint binding epoch: {e}"
+            ))));
+        }
+    };
     state
         .services
         .host
-        .bind_session(session_id, sandbox_id)
+        .bind_session(session_id, sandbox_id, binding_epoch)
         .await;
 
     // ---- start the agent ----
-    let agent = agent.unwrap_or_else(|| AgentSpec {
+    let mut agent = agent.unwrap_or_else(|| AgentSpec {
         argv: Vec::new(),
         env: HashMap::new(),
         session_env,
         host_ca_pem: None,
+        binding_epoch: 0,
     });
+    agent.binding_epoch = binding_epoch;
     let policy = egress_policy.unwrap_or_else(|| engram_core::types::egress::SessionEgressPolicy {
         session_id,
         sandbox_id,
@@ -399,36 +413,37 @@ pub(crate) async fn boot_on_reserved_host(
     ::metrics::histogram!(crate::metrics::SESSION_BOOT_SECONDS, "phase" => "coord_finalize")
         .record(finalize_start.elapsed().as_secs_f64());
 
-    // Issue #535 (d): the initial prompt rides the harness-protocol `Prompt`
-    // frame — the SAME `deliver_prompt` path (echo-then-forward,
-    // self-healing reattach) every follow-up `SendPrompt` uses. No more
-    // separate create-time-only env-var spelling (deleted) or synthetic
-    // no-`prompt_id` event: the harness consumes it off its queue exactly
-    // like a wire-delivered follow-up and stamps `RunStarted.prompt_id`
-    // from it (client-id threading stays deferred — the web loads the
-    // session view from server events, so there's no optimistic
-    // first-bubble to dedupe against; see `create_request_from_proto`).
+    // ADR 0073: the initial prompt is delivered to the harness via the
+    // `ENGRAM_INITIAL_PROMPT` env var the create path stamps into the
+    // spawn env (see `sessions.rs`), which the in-guest harness consumes
+    // at startup — NOT via a synchronous `deliver_prompt`/reattach round
+    // trip. (Issue #535 (d) wanted the initial prompt off a bespoke path
+    // and onto the same one follow-ups use; ADR 0073's durable model is
+    // that path — the env var for the create-time prompt, the outbox for
+    // every follow-up — so the fragile synchronous `deliver_prompt` band-
+    // aid it introduced is dropped.) Here we only RECORD the user echo in
+    // the session event log so the web renders it immediately; a PG hiccup
+    // is non-fatal (the harness still runs the prompt from its env).
     if let Some(text) = prompt.as_deref().filter(|s| !s.is_empty()) {
-        let prompt_id = uuid::Uuid::new_v4().to_string();
-        if let Err(e) = crate::api::prompt::deliver_prompt(
-            state,
-            session_id,
-            sandbox_id,
-            prompt_id,
-            text.to_string(),
-        )
-        .await
+        if let Err(e) = state
+            .emit(
+                session_id,
+                crate::state::SessionEvent::HarnessAgentMessage {
+                    run_id: String::new(),
+                    message_id: format!("user-{}", uuid::Uuid::new_v4()),
+                    role: engram_harness_proto::AgentRole::User,
+                    text: text.to_string(),
+                    // Initial-prompt client id threading is deferred (see
+                    // create_request_from_proto); the web loads the session
+                    // view from server events, so there's no optimistic
+                    // first-bubble to dedupe against.
+                    prompt_id: None,
+                    at: chrono::Utc::now(),
+                },
+            )
+            .await
         {
-            // Rarity: the hub already waits up to
-            // `SEND_PROMPT_ATTACH_WAIT_SECS` for the harness to attach and
-            // holds the prompt in `undelivered_prompts` for at-least-once
-            // replay on reattach — this only fires past that budget. A
-            // session that reached Active but can't receive the prompt
-            // that created it is broken; terminal, like a `start_agent`
-            // failure.
-            tracing::error!(%session_id, error = %e,
-                "initial prompt delivery failed past the reattach budget; session is broken");
-            return Err(BootError::Started(e));
+            tracing::warn!(%session_id, error = %e, "emit initial prompt event failed");
         }
     }
 

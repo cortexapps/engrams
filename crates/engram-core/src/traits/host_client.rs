@@ -294,12 +294,15 @@ pub trait HostClient: Send + Sync {
 
     // ---- harness routing ----
     /// Tell this host that an upcoming harness connection identifying
-    /// itself with `session_id` should be routed to `sandbox_id`.
-    /// Errors are infallible locally (the local hub just inserts into
-    /// a HashMap); remote impls swallow transport failures into a
-    /// warning log because the harness can still attach via the
-    /// session-id lookup path on its end.
-    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId);
+    /// itself with `session_id` should be routed to `sandbox_id`,
+    /// fenced by `binding_epoch` (ADR 0073): the host persists the
+    /// token as a durable binding record and validates every attach
+    /// against it. The write is monotonic in the epoch — a stale
+    /// caller's bind is refused host-side, so races converge to the
+    /// newest generation. Remote impls swallow transport failures into
+    /// a warning log (the record also rides the spawn path; the next
+    /// delivery attempt re-binds).
+    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId, binding_epoch: u64);
 
     /// Drop the session→sandbox binding.
     async fn unbind_session(&self, session_id: SessionId);
@@ -373,17 +376,6 @@ pub trait HostClient: Send + Sync {
         Ok(())
     }
 
-    /// Track A: non-destructive harness re-handshake — tell the attached
-    /// harness for `sandbox_id` to drop + re-dial its host connection so
-    /// the re-attach re-emits `Idle`, resyncing a session whose event
-    /// stream desynced from the run state machine. The running agent is
-    /// untouched. Used by the coordinator's desync watchdog. `NotFound`
-    /// if no harness is bound. Default no-op for harness-less fakes; the
-    /// `HostRegistry`, gRPC client, and `LocalHostClient` override it.
-    async fn rehandshake(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        Ok(())
-    }
-
     /// ADR 0045 Phase F: freeze the running microVM for `sandbox_id`
     /// *in place* — pause its vCPUs without snapshotting, destroying, or
     /// changing session state. An admin affordance to drive + observe
@@ -398,38 +390,6 @@ pub trait HostClient: Send + Sync {
     /// ADR 0045 Phase F: unfreeze a [`Self::pause`]d microVM — resume
     /// its vCPUs in place. Symmetric with `pause`; same overrides.
     async fn resume(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        Ok(())
-    }
-
-    /// ADR 0013 + ADR 0011 follow-up #3: pin a sandbox against idle
-    /// eviction while a shell WebSocket is open. The local hub is the
-    /// only source of truth for "is a shell attached to this sandbox?"
-    /// — the in-proc `LocalHostClient` reaches its hub directly;
-    /// remote impls route to the host that owns the harness session.
-    /// Reference-counted in the hub so a future second client doesn't
-    /// decrement to zero prematurely.
-    async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError>;
-
-    /// Release a `acquire_shell` reference. Called on shell bridge
-    /// exit (success or error). Symmetric with `acquire_shell`; the
-    /// hub silently swallows underflow rather than erroring so a buggy
-    /// caller can't poison the count.
-    async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError>;
-
-    /// Issue #219: refresh the keep-alive stamp on an existing shell
-    /// pin. The coord shell bridge calls this periodically (piggybacking
-    /// its WS keepalive) so the host can distinguish a live shell from
-    /// one whose coord-side bridge task died without sending
-    /// `release_shell` (rolling deploy, crash, dropped WS). The host's
-    /// eviction tick reaps pins not renewed within its stale window,
-    /// closing the "pinned forever" leak. A no-op if no pin exists for
-    /// the sandbox — renewal must never resurrect a released pin.
-    ///
-    /// Default impl is a no-op so backends that don't own a hub (mocks,
-    /// remote impls in tests) need no change; the in-proc
-    /// `LocalHostClient` and the gRPC client override it.
-    async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let _ = sandbox_id;
         Ok(())
     }
 

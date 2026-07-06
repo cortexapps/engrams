@@ -498,7 +498,12 @@ mod tests {
         async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
             unimplemented!()
         }
-        async fn bind_session(&self, _session_id: SessionId, _sandbox_id: SandboxId) {
+        async fn bind_session(
+            &self,
+            _session_id: SessionId,
+            _sandbox_id: SandboxId,
+            _binding_epoch: u64,
+        ) {
             unimplemented!()
         }
         async fn unbind_session(&self, _session_id: SessionId) {
@@ -510,12 +515,6 @@ mod tests {
             _prompt_id: String,
             _text: String,
         ) -> Result<(), SandboxError> {
-            unimplemented!()
-        }
-        async fn acquire_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
-            unimplemented!()
-        }
-        async fn release_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
             unimplemented!()
         }
     }

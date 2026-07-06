@@ -183,6 +183,32 @@ pub const SESSIONS_ACTIVE: &str = "engram_sessions_active";
 /// Postgres for the slice of time both views are consistent.
 pub const HOSTS_READY: &str = "engram_hosts_ready";
 
+/// Counter (ADR 0073). Outbox rows handed to the host relay. The gap
+/// between this and OUTBOX_ACKED going nonzero-and-growing is the
+/// alarmed "delivered but never acked" signal.
+pub const OUTBOX_DELIVERED_TOTAL: &str = "engram_outbox_delivered_total";
+
+/// Counter (ADR 0073 phase 4, moved from the host detector). A host
+/// whose reported free disk is under the floor had its idle
+/// nominations held this tick (ADR 0014 issue #4 brake).
+pub const IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL: &str =
+    "engram_idle_evict_disk_pressure_holds_total";
+/// Counter (ADR 0073 phase 4, moved from the host detector). Soft-idle
+/// candidates kept resident because the host is not under memory
+/// pressure (pressure-aware mode only).
+pub const IDLE_EVICT_KEPT_RESIDENT_TOTAL: &str = "engram_idle_evict_kept_resident_total";
+/// Counter (ADR 0073 phase 4). Heartbeats reporting a RUNNING sandbox
+/// for an Active session with NO attached harness — the demoted
+/// belt-and-braces liveness alarm (was the desync watchdog's job).
+/// Alert on a sustained nonzero rate.
+pub const HARNESS_ATTACH_DISAGREEMENT_TOTAL: &str = "engram_harness_attach_disagreement_total";
+/// Counter (ADR 0073). Rows terminally acked by a confirming event.
+pub const OUTBOX_ACKED_TOTAL: &str = "engram_outbox_acked_total";
+/// Counter (ADR 0073). Delivery attempts deferred to backoff.
+pub const OUTBOX_DEFERRED_TOTAL: &str = "engram_outbox_deferred_total";
+/// Counter (ADR 0073). Rows dropped because the session went terminal.
+pub const OUTBOX_DROPPED_TERMINAL_TOTAL: &str = "engram_outbox_dropped_terminal_total";
+
 /// ADR 0045 C1: live-teleport leg timings. Labels: leg =
 /// capture|restore|total, outcome = success|error|fallback.
 pub const MIGRATION_LEG_SECONDS: &str = "engram_migration_leg_seconds";
@@ -216,23 +242,6 @@ pub const EVICTION_NOMINATED_TOTAL: &str = "engram_eviction_nominated_total";
 /// taking pathologically long and warrants investigation.
 pub const EVICTION_FINALIZE_ROW_WAIT_TIMEOUT_TOTAL: &str =
     "engram_eviction_finalize_row_wait_timeout_total";
-
-/// Counter (Track A). Active sessions the desync watchdog flagged as
-/// wedged — the harness event stream desynced from the run state machine.
-/// Label: `signature` = `orphan_after_close` (a run-scoped event with no
-/// open run, the `bf3dbbcb` shape) or `stuck_open_run` (a `run_started`
-/// with zero progress). Should be ~0; a sustained nonzero rate means
-/// harnesses are desyncing — alarm-worthy until the streaming rewrite
-/// (ADR 0052) removes the inference that causes it.
-pub const HARNESS_DESYNC_DETECTED_TOTAL: &str = "engram_harness_desync_detected_total";
-
-/// Counter (Track A). Non-destructive harness re-handshakes the desync
-/// watchdog issued to resync a wedged session. A successful one re-emits
-/// `Idle` and the session drops out of the flagged set; a session that
-/// keeps getting re-handshaked (its `last_event_at` never advances) is
-/// escalated to the eviction lane (counted under
-/// `engram_eviction_nominated_total{source="desync_watchdog"}`).
-pub const HARNESS_REHANDSHAKE_TOTAL: &str = "engram_harness_rehandshake_total";
 
 /// Counter (ADR 0034 Track A). In-place harness reattaches the desync
 /// watchdog issued when `rehandshake` returned `NotFound` (the harness vsock

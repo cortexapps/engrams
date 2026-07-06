@@ -684,6 +684,8 @@ pub struct AppState {
     /// with the listener task the same way `host_registry`/`integrations`
     /// are (an `Arc` clone at spawn time).
     pub boot_bundles: Arc<crate::boot_bundle::BootBundleCache>,
+    /// ADR 0073: wakes the outbox delivery driver on local enqueues.
+    pub outbox_wake: Arc<tokio::sync::Notify>,
     /// Bound address of the harness TCP listener (set by `lib::run`
     /// once the listener has accepted a port from the OS — `127.0.0.1:0`
     /// becomes e.g. `127.0.0.1:54123`). The session-create handler
@@ -764,10 +766,20 @@ impl AppState {
         host_registry: Arc<HostRegistry>,
     ) -> Self {
         let events = Arc::new(SessionEventBus::default());
-        let harness_hub = Arc::new(HarnessHub::new(harness_event_sink(
-            events.clone(),
-            services.meta.clone(),
-        )));
+        // ADR 0073: the coordinator's own hub replays remote-host events
+        // (emit_external) and serves mode=all in-process attaches. Its
+        // binding records live under the coordinator's local state dir —
+        // ephemeral per process is correct here: mode=all sandboxes
+        // (Process backend) do not survive a coordinator restart, so
+        // there are no survivor re-dials for a fresh store to validate.
+        let bindings_dir =
+            std::env::temp_dir().join(format!("engram-coord-bindings-{}", std::process::id()));
+        let bindings = engram_host_agent::bindings::BindingStore::open(bindings_dir)
+            .expect("open coordinator binding store");
+        let harness_hub = Arc::new(HarnessHub::new(
+            harness_event_sink(events.clone(), services.meta.clone()),
+            bindings,
+        ));
         let reconciler =
             crate::reconcile::Reconciler::new(crate::reconcile::grace_ticks_from_env());
         Self {
@@ -777,6 +789,9 @@ impl AppState {
             host_registry,
             harness_hub,
             boot_bundles: Arc::new(crate::boot_bundle::BootBundleCache::new()),
+            // ADR 0073: local fast-path wake for the outbox delivery
+            // driver (the PG NOTIFY covers cross-pod).
+            outbox_wake: Arc::new(tokio::sync::Notify::new()),
             harness_listen_addr: parking_lot::Mutex::new(None),
             reconciler,
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
@@ -865,6 +880,22 @@ impl AppState {
             .meta
             .append_session_event(session, kind, payload)
             .await?;
+        // ADR 0073: single ack choke point. Every ingest path (local
+        // mode=all sink, host HTTP forward, WS replay) funnels through
+        // this emit, so acking here covers them all. A confirming
+        // event terminally retires the matching outbox row; unknown /
+        // already-acked ids are no-ops (acks are at-least-once too).
+        if let Some(ack_id) = outbox_ack_id(&event) {
+            match self.services.meta.outbox_ack(&ack_id).await {
+                Ok(true) => {
+                    ::metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(session_id = %session, ack_id, error = %e, "outbox ack failed");
+                }
+            }
+        }
         self.events.publish(
             session,
             IndexedEvent {
@@ -874,6 +905,27 @@ impl AppState {
             },
         );
         Ok(idx)
+    }
+}
+
+/// ADR 0073: which outbox row (if any) does this event confirm?
+/// - `run_started{prompt_id}` / `prompt_queued{prompt_id}` — the
+///   harness took ownership of the prompt (running it or holding it in
+///   its type-ahead queue; the queue survives via the replay the
+///   harness itself does, and an edit/dequeue of a queued prompt keeps
+///   its own confirmations).
+/// - `question_answered{tool_call_id}` — the answer landed.
+fn outbox_ack_id(event: &SessionEvent) -> Option<String> {
+    match event {
+        SessionEvent::HarnessRunStarted {
+            prompt_id: Some(pid),
+            ..
+        } => Some(pid.clone()),
+        SessionEvent::HarnessPromptQueued { prompt_id, .. } => Some(prompt_id.clone()),
+        SessionEvent::HarnessQuestionAnswered { tool_call_id, .. } => {
+            Some(format!("answer:{tool_call_id}"))
+        }
+        _ => None,
     }
 }
 
@@ -1438,11 +1490,6 @@ pub(crate) mod tests {
         /// Issue #214: tracks the set-at timestamp alongside the pin so
         /// the aged-pin scanner test can backdate one deterministically.
         pub(crate) teleport_targets: PlMutex<TeleportPinMap>,
-        /// Track A: desync-watchdog tests set this directly; the
-        /// `list_active_sessions_desynced` override returns it verbatim
-        /// (the SQL signature classification is integration-tested, not
-        /// re-derived in the mock).
-        pub(crate) desynced: PlMutex<Vec<engram_core::traits::metadata::DesyncedSession>>,
         /// Issue #531/PR #564 (ADR 0068 persist-before-reconcile
         /// regression): when true, the NEXT `touch_host_heartbeat` call
         /// fails instead of persisting — tests use this to prove the
@@ -1527,7 +1574,6 @@ pub(crate) mod tests {
                 evac_attempts: PlMutex::new(std::collections::HashMap::new()),
                 evict_attempts: PlMutex::new(std::collections::HashMap::new()),
                 teleport_targets: PlMutex::new(std::collections::HashMap::new()),
-                desynced: PlMutex::new(Vec::new()),
                 fail_next_heartbeat_persist: PlMutex::new(false),
                 reconcile_probe_calls: PlMutex::new(0),
             }
@@ -1597,6 +1643,31 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl MetadataStore for MiniMeta {
+        /// ADR 0073: derive the idle-scan candidate from the mock's own
+        /// session + event rows — the same "newest event" semantics the
+        /// PG lateral implements, so idle_detector tests exercise real
+        /// classification against realistic state.
+        async fn list_idle_scan_candidates(
+            &self,
+            _soft_ttl_secs: i64,
+            _hard_ttl_secs: i64,
+        ) -> Result<Vec<engram_core::traits::metadata::IdleScanCandidate>, MetaError> {
+            let session = self.session.lock().clone();
+            if session.status != SessionState::Active || session.sandbox_id.is_none() {
+                return Ok(Vec::new());
+            }
+            let events = self.events.lock();
+            let last = events.last();
+            Ok(vec![engram_core::traits::metadata::IdleScanCandidate {
+                session_id: session.id,
+                sandbox_id: session.sandbox_id,
+                host_id: session.host_id,
+                last_event_at: last.map(|e| e.created_at).unwrap_or(session.created_at),
+                last_event_kind: last.map(|e| e.kind.clone()),
+                shell_pinned_until: None,
+            }])
+        }
+
         async fn create_session(
             &self,
             _: SessionSpec,
@@ -2134,20 +2205,6 @@ pub(crate) mod tests {
             } else {
                 Ok(Vec::new())
             }
-        }
-
-        async fn list_active_sessions_desynced(
-            &self,
-            _stuck_for_secs: i64,
-        ) -> Result<Vec<engram_core::traits::metadata::DesyncedSession>, MetaError> {
-            // Only Active sessions are candidates (mirrors the PG WHERE).
-            if !matches!(
-                self.session.lock().status,
-                engram_core::types::SessionState::Active
-            ) {
-                return Ok(Vec::new());
-            }
-            Ok(self.desynced.lock().clone())
         }
     }
 

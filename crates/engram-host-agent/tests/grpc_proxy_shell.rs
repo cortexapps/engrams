@@ -85,16 +85,10 @@ impl HostClient for FakeHost {
     async fn guest_ip(&self, _: SandboxId) -> Option<std::net::Ipv4Addr> {
         None
     }
-    async fn bind_session(&self, _: SessionId, _: SandboxId) {}
+    async fn bind_session(&self, _: SessionId, _: SandboxId, _: u64) {}
     async fn unbind_session(&self, _: SessionId) {}
     async fn send_prompt(&self, _: SandboxId, _: String, _: String) -> Result<(), SandboxError> {
         unreachable!()
-    }
-    async fn acquire_shell(&self, _: SandboxId) -> Result<(), SandboxError> {
-        Ok(())
-    }
-    async fn release_shell(&self, _: SandboxId) -> Result<(), SandboxError> {
-        Ok(())
     }
     async fn proxy_shell(&self, sandbox_id: SandboxId) -> Result<ShellTunnel, SandboxError> {
         *self.captured_open.lock() = Some(sandbox_id);

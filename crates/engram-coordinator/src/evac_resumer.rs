@@ -59,7 +59,7 @@ use std::time::Duration;
 use chrono::Utc;
 use engram_core::types::{Session, SessionState};
 
-use crate::api::snapshot::{bind_session_routing, finish_resume_to_active, FinishResumeOutcome};
+use crate::api::snapshot::{finish_resume_to_active, FinishResumeOutcome};
 use crate::evacuation::{evacuate_dead_source, resolve_cold_boot_spec, EvacError};
 use crate::state::{SessionEvent, SharedState};
 
@@ -440,7 +440,9 @@ async fn run_resume_pipeline(
         )
         .await;
 
-    bind_session_routing(state, session_id, receipt.new_sandbox_id).await;
+    // ADR 0073: evac restore is a fresh-spawn generation — mint.
+    crate::api::snapshot::bind_session_routing_minted(state, session_id, receipt.new_sandbox_id)
+        .await;
 
     // ADR 0028 A.log: warm rung-1 recovery — rewind the transcript to
     // the checkpoint's cursor + emit the recovery boundary. Gated on

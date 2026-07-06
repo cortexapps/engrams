@@ -121,6 +121,19 @@ mod adapter {
         #[arg(long, env = "ENGRAM_SESSION_ID")]
         pub session_id: SessionId,
 
+        /// ADR 0073: the sandbox half of the attach token (from
+        /// `ENGRAM_SANDBOX_ID`, stamped by the backend at spawn).
+        /// Required — a harness with no token cannot attach, and
+        /// failing at arg-parse is louder and earlier than bouncing
+        /// `UnknownBinding` forever.
+        #[arg(long, env = "ENGRAM_SANDBOX_ID")]
+        pub sandbox_id: engram_core::SandboxId,
+
+        /// ADR 0073: the binding-generation half of the attach token
+        /// (from `ENGRAM_BINDING_EPOCH`, minted coordinator-side).
+        #[arg(long, env = "ENGRAM_BINDING_EPOCH")]
+        pub binding_epoch: u64,
+
         /// Cap on tool calls per run. Adapter logs and stops on
         /// excess; hard cost backstop. Default is intentionally
         /// permissive — the VM is the safety boundary, and a long
@@ -418,6 +431,10 @@ mod adapter {
         /// deploy roll; the VM survived but the harness died and the session
         /// wedged `active` forever.)
         Rejected { reason: String },
+        /// ADR 0073: host rejected the attach `Superseded` — a newer
+        /// binding generation owns this session. FATAL by design:
+        /// exit 0; retrying can never succeed.
+        Superseded,
         /// Handshake didn't complete (transport flake at/ before attach).
         HandshakeFailed { reason: &'static str },
         /// An established connection later dropped — re-dial.
@@ -446,6 +463,14 @@ mod adapter {
         fn reconnect(&self) -> Reconnect {
             match self {
                 ConnOutcome::EngineDone => Reconnect::Stop,
+                // ADR 0073: superseded = a newer generation owns the
+                // session. The ONLY-EngineDone-stops invariant gains its
+                // one deliberate exception: this rejection is typed and
+                // deterministic (never a transient roll window, which
+                // rejects UnknownBinding instead), so exiting cannot
+                // strand a session the way the b9b28452 string-matched
+                // exit did.
+                ConnOutcome::Superseded => Reconnect::Stop,
                 ConnOutcome::Dropped { .. } => Reconnect::Settle,
                 ConnOutcome::HandshakeFailed { .. } | ConnOutcome::Rejected { .. } => {
                     Reconnect::Backoff
@@ -457,6 +482,7 @@ mod adapter {
         fn reason(&self) -> &str {
             match self {
                 ConnOutcome::EngineDone => "engine_done",
+                ConnOutcome::Superseded => "superseded",
                 ConnOutcome::Rejected { reason } => reason,
                 ConnOutcome::HandshakeFailed { reason } | ConnOutcome::Dropped { reason } => reason,
             }
@@ -1102,6 +1128,8 @@ mod adapter {
             &mut writer,
             &HarnessAttach {
                 session_id: cli.session_id,
+                sandbox_id: cli.sandbox_id,
+                binding_epoch: cli.binding_epoch,
                 harness_version: format!("engram-harness-claude/{}", env!("CARGO_PKG_VERSION")),
             },
         )
@@ -1115,9 +1143,18 @@ mod adapter {
         match read_msg::<_, HarnessAttachAck>(&mut reader).await {
             Ok(ack) if ack.ok => {}
             Ok(ack) => {
-                // Not fatal — the outer loop retries with backoff (the host
-                // is usually mid-reattach after a roll). Carry the host's
-                // message so the reconnect log names the cause.
+                // ADR 0073: typed rejection. `Superseded` is FATAL — a
+                // newer generation owns the session; retrying can never
+                // succeed, and exiting promptly is what makes the
+                // competing-bind loop (fbd3794c) unrepresentable.
+                // Everything else is transient (create/restore bind
+                // still in flight): the outer loop retries with backoff.
+                if ack.reject == Some(engram_harness_proto::AttachReject::Superseded) {
+                    tracing::warn!(
+                        "attach superseded: a newer binding generation owns this                          session; exiting cleanly",
+                    );
+                    return ConnOutcome::Superseded;
+                }
                 return ConnOutcome::Rejected {
                     reason: ack.message.unwrap_or_else(|| "host rejected attach".into()),
                 };
@@ -1159,10 +1196,6 @@ mod adapter {
                 // re-dials and the re-attach re-emits `Idle`. It is never
                 // forwarded to the engine (the running agent is untouched).
                 // This is the in-band twin of the SIGUSR1 reconnect nudge.
-                Ok(HarnessFrame::Command(HarnessCommand::Rehandshake)) => {
-                    tracing::info!("rehandshake command; dropping the connection and re-dialing");
-                    return "rehandshake";
-                }
                 Ok(HarnessFrame::Command(c)) => {
                     if cmd_tx.send(c).await.is_err() {
                         return "engine_gone";
@@ -1904,7 +1937,6 @@ mod adapter {
                         // the link to force a re-dial) and never forwarded
                         // to the engine. This arm exists only for
                         // exhaustiveness over `HarnessCommand`.
-                        Some(HarnessCommand::Rehandshake) => {}
                         // All command senders gone = the connection loop
                         // exited = process teardown.
                         None => return SessionOutcome::ChannelClosed,
@@ -3095,6 +3127,9 @@ mod adapter {
                 connect: None,
                 vsock_host: Some(1),
                 session_id: SessionId::new(),
+                // ADR 0073: the test's sole binding generation.
+                sandbox_id: engram_core::SandboxId::new(),
+                binding_epoch: 1,
                 max_tool_calls: 100_000,
                 max_tool_call_secs: 600,
                 max_run_secs: 86_400,

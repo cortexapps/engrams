@@ -52,66 +52,6 @@ pub struct AppShellRelayService {
 
 /// RAII guard that ensures `release_shell` is always called even when
 /// tonic cancels the future mid-bridge.  `Drop` spawns a fire-and-forget
-/// task rather than blocking (async `Drop` is not supported in Rust).
-struct ShellLeaseGuard {
-    host: Arc<dyn engram_core::traits::HostClient>,
-    sandbox_id: engram_core::SandboxId,
-    released: bool,
-}
-
-impl ShellLeaseGuard {
-    fn new(
-        host: Arc<dyn engram_core::traits::HostClient>,
-        sandbox_id: engram_core::SandboxId,
-    ) -> Self {
-        Self {
-            host,
-            sandbox_id,
-            released: false,
-        }
-    }
-
-    /// Explicit release on the normal exit path.  Marks the guard as
-    /// released and spawns the async `release_shell` call (so this method
-    /// can be called from non-async contexts and from `Drop`-alike paths).
-    /// `Drop` is then a no-op because `released == true`.
-    fn release(mut self) {
-        self.released = true;
-        let host = self.host.clone();
-        let sandbox_id = self.sandbox_id;
-        tokio::spawn(async move {
-            if let Err(e) = host.release_shell(sandbox_id).await {
-                tracing::warn!(
-                    %sandbox_id,
-                    error = %e,
-                    "ShellRelay: release_shell failed on explicit release",
-                );
-            }
-        });
-    }
-}
-
-impl Drop for ShellLeaseGuard {
-    fn drop(&mut self) {
-        if self.released {
-            return;
-        }
-        // Tonic cancelled mid-bridge — spawn a detached task so the
-        // async release can still run (Drop cannot .await).
-        let host = self.host.clone();
-        let sandbox_id = self.sandbox_id;
-        tokio::spawn(async move {
-            if let Err(e) = host.release_shell(sandbox_id).await {
-                tracing::warn!(
-                    %sandbox_id,
-                    error = %e,
-                    "ShellRelay: release_shell failed in Drop guard (post-cancel cleanup)",
-                );
-            }
-        });
-    }
-}
-
 // EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
 #[tonic::async_trait]
 impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService {
@@ -164,25 +104,18 @@ impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService
                 ))
             })?;
 
-        // ---- 3. acquire_shell (warn-and-continue, non-fatal) ---------
+        // ---- 3. Pin against idle eviction (ADR 0073: a PG column the
+        // idle detector reads; no host RPC, no refcount) ---------------
         let host = self.state.services.host.clone();
-        if let Err(e) = host.acquire_shell(sandbox_id).await {
-            tracing::warn!(
-                %session_id,
-                %sandbox_id,
-                error = %e,
-                "ShellRelay: acquire_shell failed; relay still opens but idle eviction may race",
-            );
-        }
+        let pin =
+            crate::session_shell_pin::SessionShellPin::new(self.state.clone(), session_id).await;
 
         // ---- 4. proxy_shell → open host tunnel -----------------------
         let open = host.proxy_shell(sandbox_id).await;
         let tunnel = match open {
             Ok(t) => t,
             Err(e) => {
-                // Release the pin we just acquired before returning.
-                let guard = ShellLeaseGuard::new(host.clone(), sandbox_id);
-                guard.release();
+                pin.release();
                 return Err(Status::unavailable(format!(
                     "proxy tunnel open failed: {e}"
                 )));
@@ -190,8 +123,9 @@ impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService
         };
 
         // ---- 5. Bridge: inbound gRPC ↔ ShellTunnel ------------------
-        // The lease guard ensures release_shell runs even if tonic cancels.
-        let lease = ShellLeaseGuard::new(host.clone(), sandbox_id);
+        // The pin un-stamps (or lapses) on every exit path, tonic
+        // cancellation included.
+        let lease = pin;
 
         let relay_stream = build_relay_stream(session_id, sandbox_id, inbound, tunnel, lease);
 
@@ -266,7 +200,7 @@ fn build_relay_stream(
     sandbox_id: engram_core::SandboxId,
     mut grpc_inbound: tonic::Streaming<app::RelayShellRequest>,
     tunnel: ShellTunnel,
-    lease: ShellLeaseGuard,
+    lease: crate::session_shell_pin::SessionShellPin,
 ) -> impl futures::stream::Stream<Item = Result<app::RelayShellResponse, Status>> + Send {
     // Channel capacity: 64 frames, matching ShellTunnel's own capacity.
     let (resp_tx, resp_rx) =

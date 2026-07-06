@@ -230,6 +230,8 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .start_agent(
             vm,
             engram_core::types::sandbox::AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: vec![
                     "/bin/sh".into(),
                     "-c".into(),
@@ -332,6 +334,8 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .start_agent(
             moved,
             engram_core::types::sandbox::AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: vec![
                     "/bin/sh".into(),
                     "-c".into(),
@@ -622,6 +626,8 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         .start_agent(
             vm,
             engram_core::types::sandbox::AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: reader_argv.clone(),
                 env: HashMap::new(),
                 session_env: HashMap::new(),
@@ -707,6 +713,8 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         .start_agent(
             moved,
             engram_core::types::sandbox::AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: reader_argv.clone(),
                 env: HashMap::new(),
                 session_env: HashMap::new(),

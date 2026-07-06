@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use engram_core::SessionId;
+use engram_core::{SandboxId, SessionId};
 
 /// Vsock port the in-guest harness dials to reach the host. Distinct
 /// from the agentd exec port (1024) so the host can demux at `accept`
@@ -63,23 +63,55 @@ pub const MAX_MSG_BYTES: usize = 16 * 1024 * 1024;
 /// env) by `engram-agentd`'s harness supervisor.
 pub const HARNESS_CWD_ENV: &str = "ENGRAM_HARNESS_CWD";
 
-/// First frame the harness sends after dialing the host. Identifies
-/// which session this connection belongs to. The host validates the
-/// session exists and is in a state that accepts harness traffic; on
-/// rejection it replies with `HarnessAttachAck { ok: false }` and
-/// closes.
+/// First frame the harness sends after dialing the host. Carries the
+/// full attach token (ADR 0073): the hub validates it against the
+/// host-durable binding record — never an in-memory map — and rejects
+/// with a typed [`AttachReject`] on mismatch.
+///
+/// Wire note: this is a clean bincode break from the pre-0067 two-field
+/// frame (zero users; a stale harness bundle cannot attach, which is
+/// the correct failure — the bundle re-publish rides the same PR).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HarnessAttach {
     pub session_id: SessionId,
+    /// The sandbox this harness believes it lives in. From
+    /// `ENGRAM_SANDBOX_ID`, stamped into the harness env at spawn by
+    /// the host-agent (the only party that knows it pre-boot).
+    pub sandbox_id: SandboxId,
+    /// Binding generation. From `ENGRAM_BINDING_EPOCH`, minted by the
+    /// coordinator when it committed to this (re)bind. A presented
+    /// epoch older than the on-disk record is `Superseded` — fatal.
+    pub binding_epoch: u64,
     /// Free-form identifier for the harness build (e.g.
     /// `"engram-harness-claude/0.1.0"`). Logged at debug; no semantics.
     pub harness_version: String,
+}
+
+/// Typed attach rejection (ADR 0073). The harness's reconnect policy
+/// is derived from the variant, never from string matching.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AttachReject {
+    /// No binding record for this session on this host (create/restore
+    /// bind still in flight, or the sandbox was torn down). TRANSIENT:
+    /// back off and retry.
+    UnknownBinding,
+    /// The presented epoch is older than the host's durable record —
+    /// a newer generation owns this session. FATAL: exit; retrying
+    /// can never succeed (ADR 0073 makes the fbd3794c competing-bind
+    /// loop unrepresentable via exactly this arm).
+    Superseded,
+    /// Token internally inconsistent (session/sandbox pair does not
+    /// match the record). TRANSIENT: treated like `UnknownBinding`.
+    SessionMismatch,
 }
 
 /// Host's reply to [`HarnessAttach`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HarnessAttachAck {
     pub ok: bool,
+    /// Typed rejection when `ok = false` (ADR 0073). Drives the
+    /// harness's reconnect-vs-exit decision deterministically.
+    pub reject: Option<AttachReject>,
     /// Short human-readable reason on `ok = false`. Plaintext on the
     /// vsock — never include sensitive context.
     pub message: Option<String>,
@@ -460,18 +492,12 @@ pub enum HarnessCommand {
     /// if no run is in flight. NOT a process kill — unlike `Shutdown`,
     /// the adapter does not exit.
     Interrupt,
-    /// Track A: non-destructive re-handshake. The adapter drops its
-    /// current host connection and immediately re-dials, re-running the
-    /// attach handshake (which re-emits `Idle` when idle) — the same
-    /// effect as the SIGUSR1 reconnect nudge, but in-band over the live
-    /// command channel. Used by the coordinator's desync watchdog to
-    /// resync a session whose event stream desynced from the run state
-    /// machine, WITHOUT touching the running agent: it never reaches the
-    /// engine, only the connection layer.
-    Rehandshake,
-    // ── Phase 1b: queue mutation (ADR 0052). APPENDED after `Rehandshake`
-    //    so existing variant indices (Checkpoint=0 … Rehandshake=4) never
-    //    shift — see tests/wire_golden.rs.
+    // ── Phase 1b: queue mutation (ADR 0052). ADR 0073 phase 4 removed
+    //    `Rehandshake` (the desync watchdog's in-band nudge — the outbox
+    //    redelivery loop subsumed the heal), shifting these indices
+    //    (EditQueued 5→4, DequeueQueued 6→5, AnswerQuestion 7→6): a
+    //    deliberate clean wire break, re-pinned in tests/wire_golden.rs
+    //    and shipped with the same-PR harness bundle re-publish.
     /// Edit the text of a still-queued prompt (by its `prompt_id`),
     /// before it is consumed. No-op if already consumed: the harness is
     /// the single writer, so the `RunStarted{prompt_id}` that consumed
@@ -762,6 +788,8 @@ mod tests {
     fn attach_round_trip() {
         round_trip(HarnessAttach {
             session_id: SessionId::new(),
+            sandbox_id: SandboxId::new(),
+            binding_epoch: 5,
             harness_version: "engram-harness-noop/0.1.0".into(),
         });
     }
@@ -770,10 +798,12 @@ mod tests {
     fn attach_ack_round_trip() {
         round_trip(HarnessAttachAck {
             ok: true,
+            reject: None,
             message: None,
         });
         round_trip(HarnessAttachAck {
             ok: false,
+            reject: Some(AttachReject::Superseded),
             message: Some("unknown session".into()),
         });
     }
@@ -903,7 +933,6 @@ mod tests {
             prompt_id: "p1".into(),
         }));
         round_trip(HarnessFrame::Command(HarnessCommand::Interrupt));
-        round_trip(HarnessFrame::Command(HarnessCommand::Rehandshake));
         round_trip(HarnessFrame::Command(HarnessCommand::AnswerQuestion {
             tool_call_id: "toolu_1".into(),
             answers: sample_answers(),

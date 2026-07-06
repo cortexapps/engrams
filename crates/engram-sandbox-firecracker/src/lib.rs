@@ -4867,6 +4867,13 @@ impl SandboxBackend for FirecrackerBackend {
         // to wrap this round trip instead (below). Idempotent —
         // agentd's `last_pem` cache makes a resume-with-same-cert a
         // zero-I/O hot path, and an empty/`None` PEM is a no-op.
+        // ADR 0067: stamp the attach token into the harness child env —
+        // the backend is the only party that knows the sandbox id
+        // pre-boot; the epoch was minted coordinator-side into the spec.
+        let token_env = agent.attach_token_env(id);
+        let mut agent = agent;
+        agent.env.extend(token_env);
+
         let req = engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
             argv: agent.argv,
             env: agent.env.into_iter().collect(),

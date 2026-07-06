@@ -57,6 +57,13 @@ fn fixed_session_id() -> SessionId {
     ]))
 }
 
+fn fixed_sandbox_id() -> engram_core::SandboxId {
+    engram_core::SandboxId::from(Uuid::from_bytes([
+        0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ]))
+}
+
 fn assert_golden<T>(name: &str, value: &T)
 where
     T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
@@ -374,7 +381,6 @@ fn harness_command_golden_and_variant_indices() {
     assert_golden("command_shutdown", &cmd_shutdown());
     assert_golden("command_prompt", &cmd_prompt());
     assert_golden("command_interrupt", &HarnessCommand::Interrupt);
-    assert_golden("command_rehandshake", &HarnessCommand::Rehandshake);
     assert_golden("command_edit_queued", &cmd_edit_queued());
     assert_golden("command_dequeue_queued", &cmd_dequeue_queued());
     assert_golden("command_answer_question", &cmd_answer_question());
@@ -384,16 +390,13 @@ fn harness_command_golden_and_variant_indices() {
     assert_variant_index(&cmd_prompt(), 2, "HarnessCommand::Prompt");
     assert_variant_index(&HarnessCommand::Interrupt, 3, "HarnessCommand::Interrupt");
     // Track A appended Rehandshake (4); Phase 1b appends the queue
-    // mutations (5,6) — existing indices never shift.
-    assert_variant_index(
-        &HarnessCommand::Rehandshake,
-        4,
-        "HarnessCommand::Rehandshake",
-    );
-    assert_variant_index(&cmd_edit_queued(), 5, "HarnessCommand::EditQueued");
-    assert_variant_index(&cmd_dequeue_queued(), 6, "HarnessCommand::DequeueQueued");
-    // ADR 0054 interactive answer — APPENDED after DequeueQueued (7).
-    assert_variant_index(&cmd_answer_question(), 7, "HarnessCommand::AnswerQuestion");
+    // ADR 0073 phase 4: `Rehandshake` (was index 4) is REMOVED — a
+    // deliberate clean wire break shipped with the same-PR harness
+    // bundle re-publish, shifting everything after it down by one.
+    // These pins are the post-0067 contract.
+    assert_variant_index(&cmd_edit_queued(), 4, "HarnessCommand::EditQueued");
+    assert_variant_index(&cmd_dequeue_queued(), 5, "HarnessCommand::DequeueQueued");
+    assert_variant_index(&cmd_answer_question(), 6, "HarnessCommand::AnswerQuestion");
 }
 
 #[test]
@@ -478,6 +481,8 @@ fn handshake_and_bridge_payload_structs_golden() {
         "harness_attach",
         &HarnessAttach {
             session_id: fixed_session_id(),
+            sandbox_id: fixed_sandbox_id(),
+            binding_epoch: 3,
             harness_version: "engram-harness-noop/0.1.0".into(),
         },
     );
@@ -485,6 +490,7 @@ fn handshake_and_bridge_payload_structs_golden() {
         "harness_attach_ack",
         &HarnessAttachAck {
             ok: false,
+            reject: Some(engram_harness_proto::AttachReject::UnknownBinding),
             message: Some("unknown session".into()),
         },
     );
@@ -555,7 +561,6 @@ fn regen_golden() {
     write("command_shutdown", &cmd_shutdown());
     write("command_prompt", &cmd_prompt());
     write("command_interrupt", &HarnessCommand::Interrupt);
-    write("command_rehandshake", &HarnessCommand::Rehandshake);
     write("command_edit_queued", &cmd_edit_queued());
     write("command_dequeue_queued", &cmd_dequeue_queued());
     write("command_answer_question", &cmd_answer_question());
@@ -618,6 +623,8 @@ fn regen_golden() {
         "harness_attach",
         &HarnessAttach {
             session_id: fixed_session_id(),
+            sandbox_id: fixed_sandbox_id(),
+            binding_epoch: 3,
             harness_version: "engram-harness-noop/0.1.0".into(),
         },
     );
@@ -625,6 +632,7 @@ fn regen_golden() {
         "harness_attach_ack",
         &HarnessAttachAck {
             ok: false,
+            reject: Some(engram_harness_proto::AttachReject::UnknownBinding),
             message: Some("unknown session".into()),
         },
     );

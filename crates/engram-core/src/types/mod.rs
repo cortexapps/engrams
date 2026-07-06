@@ -16,6 +16,7 @@ pub mod image;
 pub mod integration;
 pub mod manifest;
 pub mod org_secret;
+pub mod outbox;
 pub mod port;
 pub mod registry;
 pub mod sandbox;

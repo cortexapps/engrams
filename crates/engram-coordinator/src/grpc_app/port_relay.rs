@@ -17,10 +17,8 @@
 //! `shell_relay` does it).
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
-use engram_core::traits::HostClient;
 use engram_core::types::port::PortTunnel;
 use engram_protocol::app;
 use futures::StreamExt as _;
@@ -29,82 +27,24 @@ use tonic::{Request, Response, Status};
 use super::{auth, into_status, parse_session_id, BoxStream};
 use crate::state::SharedState;
 
-/// Renew the interactive-attachment pin this often while a preview
-/// connection is live, so a long-lived but low-traffic preview isn't
-/// reaped by the host's stale-pin sweep (host-agent
-/// `harness::SHELL_PIN_STALE_AGE` = 300s) and idle-evicted out from
-/// under the viewer. Matches the shell pin's intended renew cadence
-/// (`harness::SHELL_PIN_RENEW_INTERVAL` = 60s); kept well below the
-/// stale age so a few dropped renewals don't trip the sweep. (Not
-/// importing the host-agent const to avoid a coordinator→host-agent
-/// build coupling for one number.)
-const PIN_RENEW_INTERVAL: Duration = Duration::from_secs(60);
-
 pub struct AppPortRelayService {
     pub state: SharedState,
     pub auth: Arc<auth::BearerAuth>,
 }
 
-/// RAII guard mirroring `shell_relay::ShellLeaseGuard`: releases the
-/// interactive-attachment pin even when tonic cancels the future
-/// mid-bridge (async `Drop` isn't supported, so `Drop` spawns a
-/// fire-and-forget release).
-struct PortLeaseGuard {
-    host: Arc<dyn engram_core::traits::HostClient>,
-    sandbox_id: engram_core::SandboxId,
-    released: bool,
-    /// ADR 0066: the per-session preview slot, released when this guard drops
-    /// (i.e. on every connection-exit path, exactly with the pin).
-    _preview: Option<crate::state::PreviewPermit>,
+/// The connection's lifetime bundle: the PG shell pin (ADR 0073 —
+/// stamps `sessions.shell_pinned_until`; renew tick inside) plus the
+/// ADR 0066 preview-connection permit. Dropping either half on any
+/// exit path is what un-pins / frees the slot.
+struct PortLease {
+    pin: crate::session_shell_pin::SessionShellPin,
+    _permit: Option<crate::state::PreviewPermit>,
 }
 
-impl PortLeaseGuard {
-    fn new(
-        host: Arc<dyn engram_core::traits::HostClient>,
-        sandbox_id: engram_core::SandboxId,
-        preview: Option<crate::state::PreviewPermit>,
-    ) -> Self {
-        Self {
-            host,
-            sandbox_id,
-            released: false,
-            _preview: preview,
-        }
-    }
-
-    /// Explicit release on the normal exit path; `Drop` then no-ops.
-    fn release(mut self) {
-        self.released = true;
-        let host = self.host.clone();
-        let sandbox_id = self.sandbox_id;
-        tokio::spawn(async move {
-            if let Err(e) = host.release_shell(sandbox_id).await {
-                tracing::warn!(
-                    %sandbox_id,
-                    error = %e,
-                    "PortRelay: release pin failed on explicit release",
-                );
-            }
-        });
-    }
-}
-
-impl Drop for PortLeaseGuard {
-    fn drop(&mut self) {
-        if self.released {
-            return;
-        }
-        let host = self.host.clone();
-        let sandbox_id = self.sandbox_id;
-        tokio::spawn(async move {
-            if let Err(e) = host.release_shell(sandbox_id).await {
-                tracing::warn!(
-                    %sandbox_id,
-                    error = %e,
-                    "PortRelay: release pin failed in Drop guard (post-cancel cleanup)",
-                );
-            }
-        });
+impl PortLease {
+    fn release(self) {
+        self.pin.release();
+        // permit drops here
     }
 }
 
@@ -180,25 +120,19 @@ impl app::port_relay_service_server::PortRelayService for AppPortRelayService {
                 ))
             })?;
 
-        // ---- 3. Pin against idle eviction (warn-and-continue) --------
+        // ---- 3. Pin against idle eviction (ADR 0073: a PG column the
+        // idle detector reads; no host RPC, no refcount) --------------
         let host = self.state.services.host.clone();
-        if let Err(e) = host.acquire_shell(sandbox_id).await {
-            tracing::warn!(
-                %session_id,
-                %sandbox_id,
-                error = %e,
-                "PortRelay: acquire pin failed; relay still opens but idle eviction may race",
-            );
-        }
+        let pin =
+            crate::session_shell_pin::SessionShellPin::new(self.state.clone(), session_id).await;
 
         // ---- 4. proxy_port → open host tunnel -----------------------
         let tunnel = match host.proxy_port(sandbox_id, port).await {
             Ok(t) => t,
             Err(e) => {
-                // Release the pin we just acquired before returning. The preview
-                // permit drops with `preview_permit` at the return below.
-                let guard = PortLeaseGuard::new(host.clone(), sandbox_id, None);
-                guard.release();
+                // Un-pin before returning; the preview permit drops with
+                // `preview_permit` at the return below.
+                pin.release();
                 return Err(Status::unavailable(format!(
                     "proxy_port tunnel open failed: {e}"
                 )));
@@ -208,8 +142,11 @@ impl app::port_relay_service_server::PortRelayService for AppPortRelayService {
         // ---- 5. Bridge: inbound gRPC ↔ PortTunnel -------------------
         // The lease guard now also owns the preview slot for the connection's
         // lifetime (released on every exit path, exactly with the pin).
-        let lease = PortLeaseGuard::new(host.clone(), sandbox_id, Some(preview_permit));
-        let relay_stream = build_relay_stream(session_id, sandbox_id, host, inbound, tunnel, lease);
+        let lease = PortLease {
+            pin,
+            _permit: Some(preview_permit),
+        };
+        let relay_stream = build_relay_stream(session_id, sandbox_id, inbound, tunnel, lease);
 
         Ok(Response::new(Box::pin(relay_stream)))
     }
@@ -231,10 +168,9 @@ fn relay_frame_name(f: &app::relay_port_request::Frame) -> &'static str {
 fn build_relay_stream(
     session_id: engram_core::SessionId,
     sandbox_id: engram_core::SandboxId,
-    host: Arc<dyn HostClient>,
     mut grpc_inbound: tonic::Streaming<app::RelayPortRequest>,
     tunnel: PortTunnel,
-    lease: PortLeaseGuard,
+    lease: PortLease,
 ) -> impl futures::stream::Stream<Item = Result<app::RelayPortResponse, Status>> + Send {
     let (resp_tx, resp_rx) =
         tokio::sync::mpsc::channel::<Result<app::RelayPortResponse, Status>>(64);
@@ -295,29 +231,10 @@ fn build_relay_stream(
             }
         };
 
-        // Keep the interactive-attachment pin fresh for the life of the
-        // connection so the host's stale-pin sweep doesn't reap it (and
-        // make the sandbox idle-evictable) under a long-lived preview.
-        // Never completes on its own; cancelled when g2t/t2g finishes.
-        let renew = async move {
-            let mut tick = tokio::time::interval(PIN_RENEW_INTERVAL);
-            tick.tick().await; // consume the immediate first tick
-            loop {
-                tick.tick().await;
-                if let Err(e) = host.renew_shell(sandbox_id).await {
-                    tracing::debug!(
-                        %sandbox_id,
-                        error = %e,
-                        "PortRelay: renew pin failed (will retry next tick)",
-                    );
-                }
-            }
-        };
-
+        // ADR 0073: pin renewal lives inside SessionShellPin.
         tokio::select! {
             _ = g2t => {}
             _ = t2g => {}
-            _ = renew => {}
         }
 
         // Normal exit — explicit release (spawns async release internally).
