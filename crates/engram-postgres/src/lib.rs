@@ -1813,6 +1813,22 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
+    async fn set_session_park_rung(
+        &self,
+        id: SessionId,
+        rung: i16,
+        parked_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), MetaError> {
+        sqlx::query("UPDATE sessions SET park_rung = $2, parked_at = $3 WHERE id = $1")
+            .bind(id.as_uuid())
+            .bind(rung)
+            .bind(parked_at)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn stamp_shell_pin(
         &self,
         id: SessionId,

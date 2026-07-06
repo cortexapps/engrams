@@ -613,6 +613,19 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// ADR 0074: stamp the parking-ladder rung (and its entry time;
+    /// `None` clears both). Bookkeeping only — the FSM `status` stays
+    /// authoritative for lifecycle legality.
+    async fn set_session_park_rung(
+        &self,
+        id: SessionId,
+        rung: i16,
+        parked_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), MetaError> {
+        let _ = (id, rung, parked_at);
+        Ok(())
+    }
+
     /// ADR 0073 phase 4: stamp/renew the shell keep-alive pin. The WS
     /// bridge calls this on its keepalive; passing a past instant (or
     /// letting it lapse) un-pins.
@@ -875,7 +888,7 @@ pub trait MetadataStore: Send + Sync {
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError>;
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
 
-    /// ADR 0068: `hosts.capabilities.fc_snapshot_version` for one host —
+    /// ADR 0071: `hosts.capabilities.fc_snapshot_version` for one host —
     /// the value the eviction pipeline and the checkpoint-advert
     /// reconcile stamp onto a freshly-recorded `snapshots` row so
     /// placement can later pair a restore against the exact FC

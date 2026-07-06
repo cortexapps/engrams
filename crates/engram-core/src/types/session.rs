@@ -181,6 +181,8 @@ impl SessionState {
     ///              | Idle (scanner exhausted retries; user /resume)
     ///              | Dead (terminal; chunks gone)
     ///              | Completed (user delete mid-evac)
+    /// Evicting    -> Active (ADR 0074 rung-1 cancel: the user came back
+    ///                 before capture began; lease-guarded)
     /// Evicting    -> Idle (eviction pipeline success)
     ///              | HostLost (scanner exhausted retries; host died
     ///                mid-eviction via the dead-host sweep)
@@ -216,7 +218,12 @@ impl SessionState {
             Idle => matches!(target, Created | Dead | Completed | Queued),
             HostLost => matches!(target, Created | Idle | Dead | Completed),
             Evacuating => matches!(target, Created | Idle | Dead | Completed),
-            Evicting => matches!(target, Idle | HostLost | Dead | Completed),
+            // ADR 0074 rung 1: `Active` is the cancel edge — a returning
+            // user's prompt un-nominates an eviction whose capture has
+            // not begun (lease-guarded CAS; see
+            // api::snapshot::try_cancel_nominated_eviction). The ONLY
+            // new FSM edge in the 2026-07 overhaul.
+            Evicting => matches!(target, Active | Idle | HostLost | Dead | Completed),
             Failed | Completed | Dead => false,
         }
     }
@@ -580,6 +587,10 @@ mod tests {
             (Evacuating, Idle),
             (Evacuating, Dead),
             (Evacuating, Completed),
+            // ADR 0074 rung 1: the cancel edge — the ONLY new FSM edge
+            // in the 2026-07 overhaul (lease-guarded; see
+            // try_cancel_nominated_eviction).
+            (Evicting, Active),
             (Evicting, Idle),
             (Evicting, HostLost),
             (Evicting, Dead),
