@@ -419,7 +419,7 @@ if two_hosts and fc_colima_profile:
          'ENGRAM_FC_COLIMA_PROFILE yet.')
 
 def _discover_nbd():
-    # FC serves the chunked rootfs over /dev/nbdN. The host-agent only
+    # (ADR 0024) FC serves the chunked rootfs over /dev/nbdN. The host-agent only
     # takes the chunked-NBD path (which produces the chunked disk +
     # memory manifests that `POST /api/enabled-images` REQUIRES — it
     # 500s on a base snapshot built via the materialize-to-file
@@ -429,14 +429,20 @@ def _discover_nbd():
     if sandbox_backend != 'firecracker':
         return []
     if fc_colima_profile:
-        # The devices are inside the VM, not on the Mac.
+        # Devices are in the VM. `colima ssh -- ls /dev/nbd*` does NOT work:
+        # colima ssh runs no remote shell, so the glob passes literally,
+        # matches nothing, and ENGRAM_NBD_DEVICES ends up unset — which
+        # silently drops the host-agent onto the materialize-to-file path,
+        # producing base snapshots with no chunked manifest that then fail to
+        # restore ("read fc manifest.json … No such file"). List /dev (a lone
+        # command) and filter for nbdN on the Mac side.
         listing = str(local(
-            "colima ssh --profile " + fc_colima_profile +
-            " -- ls -1 /dev/nbd* 2>/dev/null || true",
+            "colima ssh --profile " + fc_colima_profile + " -- ls -1 /dev",
             echo_off=True, quiet=True)).strip()
-    else:
-        listing = str(local("ls -1 /dev/nbd* 2>/dev/null || true",
-                            echo_off=True, quiet=True)).strip()
+        return ['/dev/' + d.strip() for d in listing.split('\n')
+                if d.strip().startswith('nbd') and d.strip()[3:].isdigit()]
+    listing = str(local("ls -1 /dev/nbd* 2>/dev/null || true",
+                        echo_off=True, quiet=True)).strip()
     return [d for d in listing.split('\n') if d]
 
 _nbd = _discover_nbd()
