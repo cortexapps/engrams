@@ -753,7 +753,6 @@ async fn boot_prepared(
         integration_policy_json,
         selected_harness: inputs.selected_harness.clone(),
         selected_skills: inputs.selected_skills.clone(),
-        queue_prompt: inputs.prompt.clone(),
     };
 
     let disposition = state
@@ -762,6 +761,32 @@ async fn boot_prepared(
         .reserve_and_persist_create(write_set, &candidates.hosts, candidates.affinity_len)
         .await
         .map_err(|e| ApiError::Internal(format!("reserve_and_persist_create: {e}")))?;
+
+    // ADR 0073 (completion): the create-time initial prompt rides the SAME
+    // durable outbox path as every follow-up — enqueue it now that the session
+    // row is committed. `send_prompt_core` writes the `prompt_received` receipt
+    // + the user echo and INSERTs the outbox row; the delivery driver forwards
+    // it once the harness attaches, deferring (retryable) while the session is
+    // still Pending/Queued. This covers BOTH dispositions below (a Queued
+    // session's prompt is delivered by the driver once the queue scanner boots
+    // it) and retires the never-consumed `ENGRAM_INITIAL_PROMPT` env var — #542
+    // stamped it but no in-guest consumer was ever written, so create-time
+    // prompts were silently dropped. Deterministic `prompt_id` so a create
+    // retry dedups against the same outbox row. Best-effort: a failure here
+    // logs + proceeds (the session is still usable via a follow-up prompt); we
+    // never fail the create over the initial-prompt enqueue.
+    if let Some(text) = inputs.prompt.clone().filter(|s| !s.is_empty()) {
+        if let Err(e) = crate::api::prompt::send_prompt_core(
+            state,
+            session_id,
+            format!("create:{session_id}"),
+            text,
+        )
+        .await
+        {
+            tracing::warn!(%session_id, error = %e, "enqueue create-time prompt failed");
+        }
+    }
 
     let host_id = match disposition {
         // ADR 0048: no host fits → QUEUE (FIFO) instead of 503 — the row +
@@ -920,13 +945,15 @@ pub(crate) async fn prepare_from_grpc(
 
 /// ADR 0048 C6: resolve the same boot inputs from a durable `queued` row,
 /// so the queue scanner can boot a session no live request is holding.
-/// Secret overrides come from the sealed `session_secrets` row; the prompt
-/// from `queue_prompt`. Tolerant image lookup (the image may have been
-/// soft-deleted while the session waited — the lineage is still pinned).
+/// Secret overrides come from the sealed `session_secrets` row. The
+/// create-time prompt is NOT re-delivered here — it was enqueued to the
+/// durable outbox when the session was first created (ADR 0073), so the
+/// delivery driver forwards it once this boot brings the harness up.
+/// Tolerant image lookup (the image may have been soft-deleted while the
+/// session waited — the lineage is still pinned).
 pub(crate) async fn prepare_from_row(
     state: &SharedState,
     session: &Session,
-    prompt: Option<String>,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
     let overrides = load_session_secrets(state, session.id)
         .await
@@ -970,7 +997,10 @@ pub(crate) async fn prepare_from_row(
         HashMap::new(),
         &session.image,
         session.mode,
-        prompt,
+        // The initial prompt already lives in the outbox (enqueued at create);
+        // the queued reboot only needs to bring the harness up so the delivery
+        // driver can forward it.
+        None,
         overrides,
         session.id,
         bundle,
@@ -1246,7 +1276,6 @@ async fn prepare_inner(
         selected_harness.as_deref(),
         mode,
         session_id,
-        prompt.as_deref(),
         session_env.clone(),
         manifest.workdir.clone(),
     )
@@ -1743,7 +1772,6 @@ pub(crate) async fn resolve_harness(
     selected_harness: Option<&str>,
     session_mode: SessionMode,
     session_id: SessionId,
-    initial_prompt: Option<&str>,
     session_env: HashMap<String, String>,
     workdir: Option<String>,
 ) -> Result<
@@ -1815,19 +1843,13 @@ pub(crate) async fn resolve_harness(
     // secrets, so they aren't repeated here; the forge broker token is added by
     // the caller (per-spawn, kept out of the cached env).
     //
-    // ADR 0073: the create-time initial prompt is delivered to the harness via
-    // `ENGRAM_INITIAL_PROMPT`, which the in-guest harness consumes at startup
-    // (see `session_boot`, which records the user echo). Follow-up prompts go
-    // through the durable outbox. (Issue #535 (d) wanted the initial prompt off
-    // a bespoke create-time path; ADR 0073's binding-epoch + outbox model made
-    // synchronous over-the-wire delivery — the `deliver_prompt` band-aid #535
-    // introduced — unnecessary, so this reverts to the env var for create and
-    // leaves the outbox for every follow-up. Unifying the create-time prompt
-    // ONTO the outbox too is a clean follow-up.)
+    // ADR 0073 (completion): the create-time initial prompt is NOT stamped into
+    // the spawn env — it rides the durable outbox exactly like every follow-up
+    // (enqueued in `create_session_core` right after the session row commits;
+    // the delivery driver forwards it once the harness attaches). #542 stamped
+    // an `ENGRAM_INITIAL_PROMPT` here that no in-guest consumer ever read, so
+    // create-time prompts were silently dropped — that env var is retired.
     let mut env: HashMap<String, String> = HashMap::new();
-    if let Some(text) = initial_prompt.filter(|s| !s.is_empty()) {
-        env.insert("ENGRAM_INITIAL_PROMPT".into(), text.to_string());
-    }
     // The manifest `workdir` reaches agentd as a reserved env entry so the
     // harness child starts there instead of `/`. See `HARNESS_CWD_ENV` for why
     // this isn't a wire-struct field.

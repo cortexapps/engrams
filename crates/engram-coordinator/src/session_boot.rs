@@ -106,7 +106,10 @@ pub(crate) struct BootInputs {
     /// inner`'s shared shape; nothing downstream of `boot_prepared` reads it
     /// any more.
     pub deferred_session_secrets: Option<HashMap<String, String>>,
-    /// An initial prompt to record as a user-role message once Active.
+    /// The create-time initial prompt. Read ONCE by `create_session_core`
+    /// (right after the session row commits) to enqueue it onto the durable
+    /// outbox via `send_prompt_core` — the same path every follow-up uses
+    /// (ADR 0073). The boot pipeline itself no longer reads it.
     pub prompt: Option<String>,
 }
 
@@ -184,7 +187,9 @@ pub(crate) async fn boot_on_reserved_host(
         integration_policy,
         selected_harness: _,
         deferred_session_secrets: _,
-        prompt,
+        // The create-time prompt was enqueued to the outbox by
+        // `create_session_core`; the boot pipeline no longer delivers it.
+        prompt: _,
     } = inputs;
 
     // ADR 0056: the image ref doubles as the SecretContext for resolving the
@@ -413,39 +418,11 @@ pub(crate) async fn boot_on_reserved_host(
     ::metrics::histogram!(crate::metrics::SESSION_BOOT_SECONDS, "phase" => "coord_finalize")
         .record(finalize_start.elapsed().as_secs_f64());
 
-    // ADR 0073: the initial prompt is delivered to the harness via the
-    // `ENGRAM_INITIAL_PROMPT` env var the create path stamps into the
-    // spawn env (see `sessions.rs`), which the in-guest harness consumes
-    // at startup — NOT via a synchronous `deliver_prompt`/reattach round
-    // trip. (Issue #535 (d) wanted the initial prompt off a bespoke path
-    // and onto the same one follow-ups use; ADR 0073's durable model is
-    // that path — the env var for the create-time prompt, the outbox for
-    // every follow-up — so the fragile synchronous `deliver_prompt` band-
-    // aid it introduced is dropped.) Here we only RECORD the user echo in
-    // the session event log so the web renders it immediately; a PG hiccup
-    // is non-fatal (the harness still runs the prompt from its env).
-    if let Some(text) = prompt.as_deref().filter(|s| !s.is_empty()) {
-        if let Err(e) = state
-            .emit(
-                session_id,
-                crate::state::SessionEvent::HarnessAgentMessage {
-                    run_id: String::new(),
-                    message_id: format!("user-{}", uuid::Uuid::new_v4()),
-                    role: engram_harness_proto::AgentRole::User,
-                    text: text.to_string(),
-                    // Initial-prompt client id threading is deferred (see
-                    // create_request_from_proto); the web loads the session
-                    // view from server events, so there's no optimistic
-                    // first-bubble to dedupe against.
-                    prompt_id: None,
-                    at: chrono::Utc::now(),
-                },
-            )
-            .await
-        {
-            tracing::warn!(%session_id, error = %e, "emit initial prompt event failed");
-        }
-    }
+    // ADR 0073 (completion): the create-time prompt's user echo + outbox row
+    // are written by `send_prompt_core` in `create_session_core` when the
+    // session is first created (the same path every follow-up uses), so the
+    // boot finalize records nothing prompt-related here. The delivery driver
+    // forwards the enqueued prompt once this boot brings the harness up.
 
     Ok(())
 }

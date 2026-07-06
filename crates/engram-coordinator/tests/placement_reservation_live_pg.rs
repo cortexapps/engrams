@@ -127,7 +127,6 @@ fn bare_write_set(
         integration_policy_json: None,
         selected_harness: None,
         selected_skills: Vec::new(),
-        queue_prompt: None,
     }
 }
 
@@ -262,7 +261,6 @@ async fn reserve_and_persist_create_commits_the_full_write_set_together() {
         integration_policy_json: Some(r#"{"network":{"allow_hosts":[]}}"#.into()),
         selected_harness: Some("claude".into()),
         selected_skills: vec!["browser".into()],
-        queue_prompt: Some("hello from the write-set".into()),
     };
     let disposition = meta
         .reserve_and_persist_create(ws, &[host], 0)
