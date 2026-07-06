@@ -662,6 +662,7 @@ mod tests {
                 root: cache_dir.path().to_path_buf(),
                 budget_bytes: 1024 * 1024 * 1024,
                 sweep_debounce_ms: 0,
+                eviction_enabled: true,
             },
             0.0,
         );
@@ -739,6 +740,7 @@ mod tests {
             root: cache_dir.path().to_path_buf(),
             budget_bytes: 1024 * 1024,
             sweep_debounce_ms: 0,
+            eviction_enabled: true,
         });
         let work = tempfile::tempdir().unwrap();
 

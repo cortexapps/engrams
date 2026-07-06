@@ -479,6 +479,32 @@ async fn reconcile(
             }
         }
     }
+
+    // ADR 0067: gauge summed on-disk bytes of every currently-tracked
+    // base memfile — unevictable disk (mlock'd, reclaimed only on
+    // image-disable), part of the same "floor the budget can't touch"
+    // accounting as pinned chunk bytes (see engram-chunk-store's
+    // engram_chunk_cache_pinned_bytes). Runs every tick, including the
+    // LRU-recheck; reads 0 when density is off (`memfiles` stays empty).
+    // A metadata() failure (not yet materialized, or racing the disable
+    // reclaim above) just skips that entry — best-effort, same tolerance
+    // as the pin loop above.
+    //
+    // Collect owned paths FIRST, then await: `MemfileState::pin` holds a
+    // raw `*mut libc::c_void` (only `unsafe impl Send`, never `Sync`), so
+    // holding `memfiles.values()`'s borrow across an `.await` makes this
+    // whole async fn's future non-Send — invisible on macOS (no UFFD, no
+    // MemfilePin materializes there) but a hard compile error on the
+    // Linux target `spawn_supervisor` actually runs on.
+    let memfile_paths: Vec<std::path::PathBuf> =
+        memfiles.values().map(|state| state.path.clone()).collect();
+    let mut memfile_bytes: u64 = 0;
+    for path in memfile_paths {
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            memfile_bytes += meta.len();
+        }
+    }
+    ::metrics::gauge!(crate::metrics::HOST_BASE_MEMFILE_BYTES).set(memfile_bytes as f64);
 }
 
 /// The outcome of [`prefetch_one`]: the total chunk count warmed (for
@@ -906,6 +932,7 @@ mod tests {
             root: dir.path().join("cache"),
             budget_bytes: 256 * 1024 * 1024,
             sweep_debounce_ms: 0,
+            eviction_enabled: true,
         });
         // Distinct disk + memory payloads so a mix-up would be caught.
         let disk_bytes = (0..37u8).cycle().take(2 * 1024 * 1024).collect::<Vec<_>>();
