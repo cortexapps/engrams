@@ -41,6 +41,8 @@ pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session 
         last_active_at,
         live_disk_manifest: _, // Internal coord state (ADR 0016 Phase B); not on the wire shape.
         selected_skills: _,    // Internal coord state (issue #535); not on the wire shape.
+        park_rung: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
+        parked_at: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
     } = s;
     app::Session {
         id: id.to_string(),
@@ -782,6 +784,8 @@ mod tests {
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         }
     }
 

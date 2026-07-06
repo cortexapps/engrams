@@ -323,6 +323,8 @@ mod tests {
             last_active_at: Utc::now() - chrono::Duration::seconds(7200),
             live_disk_manifest: None,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         let (state, mini, _local) = build_state_for_session(session);
         // No events at all → last_event_at falls back to created_at

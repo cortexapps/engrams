@@ -532,6 +532,8 @@ mod tests {
             last_active_at: Utc::now(),
             live_disk_manifest: live_disk,
             selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         }
     }
 

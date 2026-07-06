@@ -1291,7 +1291,8 @@ impl MetadataStore for PostgresStore {
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
-                   selected_skills
+                   selected_skills,
+                   park_rung, parked_at
             FROM sessions WHERE id = $1
             "#,
         )
@@ -1713,6 +1714,7 @@ impl MetadataStore for PostgresStore {
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
+                   park_rung, parked_at,
                    evict_attempts
             FROM sessions
             WHERE status = 'evicting'
