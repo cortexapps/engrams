@@ -623,9 +623,9 @@ impl MetadataStore for PostgresStore {
                     INSERT INTO sessions
                         (id, status, host_id, sandbox_id,
                          image_uri, mode, mem_budget_mib, cpu_budget_vcpus,
-                         harness, selected_skills, queue_prompt,
+                         harness, selected_skills,
                          created_at, last_active_at)
-                    VALUES ($1, 'pending', $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+                    VALUES ($1, 'pending', $2, NULL, $3, $4, $5, $6, $7, $8, $9, $9)
                     "#,
                 )
                 .bind(ws.session_id.as_uuid())
@@ -636,7 +636,6 @@ impl MetadataStore for PostgresStore {
                 .bind(ws.cpu_budget_vcpus)
                 .bind(ws.selected_harness.as_deref())
                 .bind(&ws.selected_skills)
-                .bind(ws.queue_prompt.as_deref())
                 .bind(now)
                 .execute(&mut *tx)
                 .await
@@ -653,9 +652,9 @@ impl MetadataStore for PostgresStore {
                         (id, status, host_id, sandbox_id, image_uri, mode,
                          mem_budget_mib, cpu_budget_vcpus,
                          harness, selected_skills,
-                         queued_at, queue_origin, queue_prompt,
+                         queued_at, queue_origin,
                          created_at, last_active_at)
-                    VALUES ($1, 'queued', NULL, NULL, $2, $3, $4, $5, $6, $7, $8, 'create', $9, $8, $8)
+                    VALUES ($1, 'queued', NULL, NULL, $2, $3, $4, $5, $6, $7, $8, 'create', $8, $8)
                     "#,
                 )
                 .bind(ws.session_id.as_uuid())
@@ -666,7 +665,6 @@ impl MetadataStore for PostgresStore {
                 .bind(ws.selected_harness.as_deref())
                 .bind(&ws.selected_skills)
                 .bind(now)
-                .bind(ws.queue_prompt.as_deref())
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -1052,7 +1050,7 @@ impl MetadataStore for PostgresStore {
                    selected_skills,
                    COALESCE(mem_budget_mib, 0)::BIGINT AS mem_budget_mib,
                    COALESCE(cpu_budget_vcpus, 0) AS cpu_budget_vcpus,
-                   queue_origin, queue_prompt, queued_at
+                   queue_origin, queued_at
             FROM sessions
             WHERE status = 'queued'
             ORDER BY queued_at ASC

@@ -59,10 +59,6 @@ pub struct SessionCreateWriteSet {
     /// so a queued create's boot re-prepare (`prepare_from_row`) can
     /// reconstruct the selection instead of silently dropping it.
     pub selected_skills: Vec<String>,
-    /// The durable prompt for the queued/wire delivery path
-    /// (`sessions.queue_prompt`) — populated for BOTH dispositions now, so
-    /// a `Queued` outcome needs no second write to carry it.
-    pub queue_prompt: Option<String>,
 }
 
 /// Outcome of [`MetadataStore::reserve_and_persist_create`].

@@ -573,6 +573,18 @@ impl Driver {
         let mut captured: Vec<(String, String)> = Vec::new();
         let started = std::time::Instant::now();
 
+        // ADR 0073 (create-prompt regression guard): the auth error is only a
+        // valid signal if it came from a RUN the CREATE-TIME PROMPT triggered —
+        // `run_started` proves the prompt was actually delivered to the harness
+        // and accepted as a turn. Without this gate the test passes even when
+        // the create-time prompt is silently DROPPED (the #542 env-var-with-no-
+        // consumer bug): the Claude CLI surfaces "Invalid API key" during its
+        // own startup warmup, independent of any prompt, so a bare
+        // agent_message match masks a broken delivery path. Requiring a
+        // preceding `run_started` makes the dropped-prompt case time out (fail)
+        // instead of falsely passing.
+        let mut saw_run_started = false;
+
         loop {
             let Some(remaining) = deadline.checked_sub(started.elapsed()) else {
                 return AuthFailureSignal::TimedOut(captured);
@@ -588,8 +600,15 @@ impl Driver {
                 Ok(Ok(Some(ev))) => ev,
             };
 
-            // Signal 1: an agent_message carrying the expected text.
-            if ev.kind == "agent_message" {
+            // The create-time prompt reached the harness and started a turn —
+            // this is what the env-var-with-no-consumer bug broke.
+            if ev.kind == "run_started" {
+                saw_run_started = true;
+            }
+
+            // Signal 1: an agent_message carrying the expected text — but only
+            // once the prompt-triggered run is under way (see `saw_run_started`).
+            if saw_run_started && ev.kind == "agent_message" {
                 if let Some(text) = payload_str(&ev.payload_json, "text") {
                     if text.contains(expected_substr) {
                         return AuthFailureSignal::ErrorMessage(text);
@@ -600,7 +619,8 @@ impl Driver {
             // Signal 2: run_completed with ok == false. Give the stream a
             // short grace so a trailing agent_message with the error text
             // (if any) can land first — the harness emits run_completed
-            // AFTER forwarding agent_messages.
+            // AFTER forwarding agent_messages. (A run_completed implies its
+            // run_started already landed, so no extra gate is needed here.)
             if ev.kind == "run_completed" && payload_bool(&ev.payload_json, "ok") == Some(false) {
                 captured.push((ev.kind.clone(), ev.payload_json.clone()));
                 let grace = std::time::Instant::now() + Duration::from_millis(500);

@@ -58,7 +58,6 @@ async fn enqueue(
     spec: SessionSpec,
     mem_budget_mib: i64,
     cpu_budget_vcpus: i32,
-    prompt: Option<&str>,
 ) {
     let ws = engram_core::traits::SessionCreateWriteSet {
         session_id,
@@ -70,7 +69,6 @@ async fn enqueue(
         integration_policy_json: None,
         selected_harness: None,
         selected_skills: Vec::new(),
-        queue_prompt: prompt.map(str::to_string),
     };
     let disposition = meta
         .reserve_and_persist_create(ws, &[], 0)
@@ -107,7 +105,6 @@ async fn reserve(
         integration_policy_json: None,
         selected_harness: None,
         selected_skills: Vec::new(),
-        queue_prompt: None,
     };
     match meta
         .reserve_and_persist_create(ws, candidates, affinity_len)
@@ -261,9 +258,9 @@ async fn enqueue_list_demand_and_fifo_order() {
     let s1 = SessionId::new();
     let s2 = SessionId::new();
     // s1 enqueued first → must sort first (FIFO by queued_at).
-    enqueue(&meta, s1, spec(), 4096, 2, Some("hello")).await;
+    enqueue(&meta, s1, spec(), 4096, 2).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
-    enqueue(&meta, s2, spec(), 8192, 4, None).await;
+    enqueue(&meta, s2, spec(), 8192, 4).await;
 
     // demand reflects both (Σ over ALL queued in the shared DB ≥ ours).
     let demand = meta.queued_demand().await.expect("demand");
@@ -284,7 +281,6 @@ async fn enqueue_list_demand_and_fifo_order() {
     // Metadata round-trips.
     let q1 = ours.iter().find(|q| q.session.id == s1).unwrap();
     assert_eq!(q1.origin, QueueOrigin::Create);
-    assert_eq!(q1.prompt.as_deref(), Some("hello"));
     assert_eq!(q1.mem_budget_mib, 4096);
     assert_eq!(q1.cpu_budget_vcpus, 2);
     assert_eq!(q1.session.status, SessionState::Queued);
@@ -296,7 +292,7 @@ async fn place_queued_flips_to_pending_on_a_fitting_host() {
     let Some(meta) = connect().await else { return };
     let host = seed_ready_host(&meta, 16_384, 8, &[]).await;
     let sid = SessionId::new();
-    enqueue(&meta, sid, spec(), 4096, 2, None).await;
+    enqueue(&meta, sid, spec(), 4096, 2).await;
 
     // Fits → flips queued → pending, binds the host, returns it.
     let placed = meta
@@ -323,7 +319,7 @@ async fn place_queued_returns_none_when_no_host_fits() {
     // Host with only 2 GiB allocatable; a 4 GiB session can't fit.
     let host = seed_ready_host(&meta, 2048, 8, &[]).await;
     let sid = SessionId::new();
-    enqueue(&meta, sid, spec(), 4096, 2, None).await;
+    enqueue(&meta, sid, spec(), 4096, 2).await;
     let placed = meta
         .place_queued_session(sid, 4096, 2, &[host], 0)
         .await
@@ -339,7 +335,7 @@ async fn requeue_and_stale_pending_recovery() {
     let Some(meta) = connect().await else { return };
     let host = seed_ready_host(&meta, 16_384, 8, &[]).await;
     let sid = SessionId::new();
-    enqueue(&meta, sid, spec(), 4096, 2, None).await;
+    enqueue(&meta, sid, spec(), 4096, 2).await;
     meta.place_queued_session(sid, 4096, 2, &[host], 0)
         .await
         .expect("place");
@@ -377,7 +373,7 @@ async fn resume_origin_enqueue_requires_idle() {
     // A non-idle session is a no-op for the resume enqueue (gated on
     // status='idle'); we just assert it doesn't error and doesn't queue.
     let sid = SessionId::new();
-    enqueue(&meta, sid, spec(), 4096, 2, None).await;
+    enqueue(&meta, sid, spec(), 4096, 2).await;
     // It's `queued`, not `idle`, so enqueue_session_resume is a no-op.
     meta.enqueue_session_resume(sid)
         .await
@@ -609,17 +605,9 @@ async fn hol_break_is_per_class_not_global() {
     let a = SessionId::new();
     let a_spec = spec();
     seed_enabled_image(&meta, &a_spec.image).await;
-    enqueue(
-        &meta,
-        a,
-        a_spec,
-        UNFITTABLE_MEM_MIB,
-        UNFITTABLE_CPU_VCPUS,
-        None,
-    )
-    .await;
+    enqueue(&meta, a, a_spec, UNFITTABLE_MEM_MIB, UNFITTABLE_CPU_VCPUS).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
-    enqueue(&meta, b, b_spec, b_mem, b_cpu, None).await;
+    enqueue(&meta, b, b_spec, b_mem, b_cpu).await;
 
     let summary = queue_scanner::run_once(&QueueScannerConfig::default(), &state)
         .await
@@ -685,31 +673,15 @@ async fn per_class_fifo_head_block_is_scoped_to_its_class() {
     let x1 = SessionId::new();
     let x1_spec = spec();
     seed_enabled_image(&meta, &x1_spec.image).await;
-    enqueue(
-        &meta,
-        x1,
-        x1_spec,
-        UNFITTABLE_MEM_MIB,
-        UNFITTABLE_CPU_VCPUS,
-        None,
-    )
-    .await;
+    enqueue(&meta, x1, x1_spec, UNFITTABLE_MEM_MIB, UNFITTABLE_CPU_VCPUS).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     let x2 = SessionId::new();
     let x2_spec = spec();
     seed_enabled_image(&meta, &x2_spec.image).await;
-    enqueue(
-        &meta,
-        x2,
-        x2_spec,
-        UNFITTABLE_MEM_MIB,
-        UNFITTABLE_CPU_VCPUS,
-        None,
-    )
-    .await;
+    enqueue(&meta, x2, x2_spec, UNFITTABLE_MEM_MIB, UNFITTABLE_CPU_VCPUS).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     // Class Y: one small, fitting session, queued after both X members.
-    enqueue(&meta, y1, y1_spec, y1_mem, y1_cpu, None).await;
+    enqueue(&meta, y1, y1_spec, y1_mem, y1_cpu).await;
 
     queue_scanner::run_once(&QueueScannerConfig::default(), &state)
         .await
@@ -745,15 +717,7 @@ async fn create_origin_timeout_fails_session_and_records_wait() {
     };
 
     let sid = SessionId::new();
-    enqueue(
-        &meta,
-        sid,
-        spec(),
-        UNFITTABLE_MEM_MIB,
-        UNFITTABLE_CPU_VCPUS,
-        None,
-    )
-    .await;
+    enqueue(&meta, sid, spec(), UNFITTABLE_MEM_MIB, UNFITTABLE_CPU_VCPUS).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let cfg = QueueScannerConfig {
@@ -880,7 +844,7 @@ async fn notify_placement_changed_fires_at_every_site() {
     // 1. reserve_and_persist_create's Queued disposition (issue #535 (b);
     //    formerly `enqueue_session_create`) → "enqueued".
     let sid = SessionId::new();
-    enqueue(&meta, sid, spec(), 4096, 2, None).await;
+    enqueue(&meta, sid, spec(), 4096, 2).await;
     wait_for_reason(&mut listener, "enqueued").await;
 
     // 2. upsert_host → "host_upserted".
@@ -911,7 +875,7 @@ async fn notify_placement_changed_fires_at_every_site() {
 
     // 5. delete_pending_session → "pending_deleted".
     let sid2 = SessionId::new();
-    enqueue(&meta, sid2, spec(), 4096, 2, None).await;
+    enqueue(&meta, sid2, spec(), 4096, 2).await;
     wait_for_reason(&mut listener, "enqueued").await;
     // `place_queued_session` is NOT a notify site (only the 5 sites in
     // `notify_placement_changed`'s doc comment are), so no drain needed here.
@@ -962,7 +926,7 @@ async fn enqueue_session_resume_noop_does_not_notify_placement_changed() {
     // gated on `status='idle'`, so calling it on this row is the no-op
     // path under test.
     let sid = SessionId::new();
-    enqueue(&meta, sid, spec(), 4096, 2, None).await;
+    enqueue(&meta, sid, spec(), 4096, 2).await;
 
     // The seed itself is a REAL notify site ("enqueued") — drain it
     // first so it can't be mistaken for a notify fired by the no-op
@@ -1036,7 +1000,7 @@ async fn scanner_wakes_on_notify_and_places_within_the_wake_not_the_fallback() {
     assert_eq!(filler_host, host);
 
     let queued_id = SessionId::new();
-    enqueue(&meta, queued_id, queued_spec, SCANNER_WAKE_MEM_MIB, 1, None).await;
+    enqueue(&meta, queued_id, queued_spec, SCANNER_WAKE_MEM_MIB, 1).await;
 
     // Spawn the REAL scanner + pg_listener with a deliberately long
     // fallback poll (well beyond this test's deadline below) so a

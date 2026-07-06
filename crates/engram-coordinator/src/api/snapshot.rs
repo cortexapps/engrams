@@ -132,10 +132,6 @@ pub(crate) async fn resolve_resume_agent_and_policy(
         selected_harness.as_deref(),
         session.mode,
         id,
-        // Resume re-spawns the harness against an existing session — there
-        // is no create-time initial prompt (ADR 0073: follow-ups ride the
-        // durable outbox, replayed on reattach).
-        None,
         session_env,
         b.manifest.workdir.clone(),
     )

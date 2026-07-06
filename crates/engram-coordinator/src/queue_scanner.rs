@@ -582,16 +582,15 @@ async fn boot_placed_create(
     )
     .await;
 
-    let prepared =
-        match crate::api::sessions::prepare_from_row(state, &q.session, q.prompt.clone()).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(%session_id, error = %e,
+    let prepared = match crate::api::sessions::prepare_from_row(state, &q.session).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e,
                 "queue-scanner: prepare_from_row failed; requeueing");
-                let _ = state.services.meta.requeue_session(session_id).await;
-                return BootOutcomeKind::Requeued;
-            }
-        };
+            let _ = state.services.meta.requeue_session(session_id).await;
+            return BootOutcomeKind::Requeued;
+        }
+    };
     match crate::session_boot::boot_on_reserved_host(state, prepared.inputs, host_id).await {
         Ok(()) => {
             ::metrics::counter!(crate::metrics::QUEUE_OUTCOME_TOTAL, "outcome" => "placed")
@@ -882,7 +881,6 @@ mod tests {
                 selected_skills: Vec::new(),
             },
             origin: QueueOrigin::Create,
-            prompt: None,
             mem_budget_mib: mem,
             cpu_budget_vcpus: cpu,
             queued_at: Utc::now() - chrono::Duration::seconds(secs_ago),

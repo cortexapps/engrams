@@ -124,6 +124,37 @@ implementer must not merge them.
 Single PR per the 2026-07 execution plan; one commit per phase; divergences
 recorded here between commits; flips to Accepted with the commit chain.
 
+## Follow-up (2026-07-06): create-time prompt unified onto the outbox
+
+The as-merged phase-2 decision left the **create-time** initial prompt on a
+separate rail from follow-ups: the coordinator stamped it into an
+`ENGRAM_INITIAL_PROMPT` spawn-env var (and stashed a copy in
+`sessions.queue_prompt` for the queued disposition), on the premise that "the
+in-guest harness consumes it at startup." **No in-guest consumer was ever
+written.** The harness reads prompts only as `HarnessCommand::Prompt` frames off
+its command channel; nothing read the env var. Every fresh create-with-prompt
+therefore booted, spawned `claude`, echoed the user turn — and then hung on an
+empty stdin forever (the demo Slack/UI "👀 then silence" shape, but at create).
+The slow-release verification (a Demo-profile `CreateTask` → no `run_started`,
+no assistant reply) caught it; the outbox path (`SendPrompt`) was proven working
+in the same session, isolating the break to the create rail.
+
+**Fix (this PR): delete the second rail.** The create-time prompt now rides the
+SAME durable outbox as every follow-up — `create_session_core` calls
+`send_prompt_core` the moment the session row commits (`prompt_received` receipt
++ user echo + `outbox_enqueue` + driver wake), for BOTH dispositions. The
+delivery driver forwards it once the harness attaches, deferring (retryable
+`Conflict`) while the session is still `Pending`/`Queued` — so a queued create's
+prompt is delivered when the queue scanner boots it, with no second delivery
+path. Retired outright: the `ENGRAM_INITIAL_PROMPT` env var, the
+`sessions.queue_prompt` column (migration 0086), `QueuedSession.prompt`,
+`SessionCreateWriteSet.queue_prompt`, and the boot-finalize echo emit. One
+delivery mechanism, durable + idempotent (`prompt_id` dedup) + ordered, for
+create / follow-up / queued alike — the "clean follow-up" phase 2's own comment
+named. (A separate CI-detector fix, PR #591, was also required: a harness-source
+change did not re-publish `bundle-harness-claude`, so the wire-10 roll first hit
+a stale-harness attach break before this create-rail bug was even reachable.)
+
 ## Divergence log
 
 - **Phase 1 — epoch mint point moved coordinator-side, pre-spawn.** The issue

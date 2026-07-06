@@ -331,13 +331,14 @@ impl QueueOrigin {
 }
 
 /// ADR 0048: a row the queue scanner sees — the session plus its queue
-/// metadata (origin, the stashed create prompt, the budgets to reserve
-/// with, and when it was queued for FIFO + timeout).
+/// metadata (origin, the budgets to reserve with, and when it was queued
+/// for FIFO + timeout). The create-time prompt is NOT here: it was enqueued
+/// to the durable outbox at create (ADR 0073), so the scanner only needs to
+/// boot the session for the delivery driver to forward it.
 #[derive(Clone, Debug)]
 pub struct QueuedSession {
     pub session: Session,
     pub origin: QueueOrigin,
-    pub prompt: Option<String>,
     pub mem_budget_mib: i64,
     pub cpu_budget_vcpus: i32,
     pub queued_at: DateTime<Utc>,

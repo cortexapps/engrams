@@ -81,14 +81,12 @@ pub(crate) fn queued_session_from_row(
     let origin = engram_core::types::session::QueueOrigin::parse(&origin_str).ok_or_else(|| {
         MetaError::Serialization(format!("queue_origin: unknown value {origin_str:?}"))
     })?;
-    let prompt: Option<String> = row.try_get("queue_prompt").map_err(col_err)?;
     let mem_budget_mib: i64 = row.try_get("mem_budget_mib").map_err(col_err)?;
     let cpu_budget_vcpus: i32 = row.try_get("cpu_budget_vcpus").map_err(col_err)?;
     let queued_at: DateTime<Utc> = row.try_get("queued_at").map_err(col_err)?;
     Ok(engram_core::types::session::QueuedSession {
         session,
         origin,
-        prompt,
         mem_budget_mib,
         cpu_budget_vcpus,
         queued_at,
