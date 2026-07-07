@@ -293,6 +293,18 @@ as workspace requirements). `engram-image-builder`,
 - Phase 2's migration 0094 wipes `enabled_images`/`enable_jobs`:
   quiesce sessions, re-enable each image via the new UI/CLI (dev-brain
   pays one warm capture).
+- **Profiles dangle across the wipe**: `profile.image_id` (orchestrator
+  DB) is a logical ref to `enabled_images.id`, and a post-wipe
+  re-enable mints a NEW row id — so every existing profile's ref goes
+  stale. Failure is graceful and diagnosable (task-create throws
+  `FailedPrecondition` "the profile's image is no longer enabled";
+  list views degrade the image chip to empty), but every
+  profile-driven create fails until remediated. Rollout step: before
+  applying, snapshot `SELECT id, image_uri FROM enabled_images`; after
+  re-enabling, re-point each profile at the new id — via the profile
+  editor's image picker (a handful of profiles today), or
+  `UPDATE profile SET image_id = '<new>' WHERE image_id = '<old>'`
+  against the orchestrator DB using the snapshot as the join.
 - Phase 3 requires images be pushed as standard docker images
   (dev-brain already is); enable/rebase re-materializes on a host.
 
