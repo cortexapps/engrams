@@ -13,8 +13,9 @@
 //! 2. Per job, run the enable pipeline from the top — every step
 //!    fast-forwards, so a job resumed after a coordinator crash
 //!    re-runs cheaply:
-//!    - [`crate::api::enabled_images::fetch_and_seal_manifest`] —
-//!      KB-sized metadata pull, parses the manifest.
+//!    - [`crate::api::enabled_images::fetch_and_seal_artifact`] —
+//!      KB-sized metadata pull; builds the row from the job's
+//!      ImageConfig + the artifact's runtime_defaults (ADR 0080).
 //!    - `materializing`: [`crate::api::enabled_images::materialize_disk_chunks`]
 //!      with a shared progress counter; already-present chunks
 //!      content-address-skip (the resume high-water mark is free). A
@@ -61,7 +62,7 @@ use engram_core::types::{EnableJob, EnableJobState};
 use engram_core::MetaError;
 
 use crate::api::enabled_images::{
-    capture_and_record_base_snapshot, fetch_and_seal_manifest, materialize_disk_chunks,
+    capture_and_record_base_snapshot, fetch_and_seal_artifact, materialize_disk_chunks,
 };
 use crate::state::SharedState;
 
@@ -322,15 +323,15 @@ async fn advance_one(
     // store writes (`?` on `MetaError`) become `LeaseLost` on Conflict
     // via `From<MetaError>` and bubble all the way out, abandoning the
     // job without further writes.
-    let (mut row, manifest, artifacts) = fetch_and_seal_manifest(state, &image_uri)
+    // ADR 0080: the full image config rides the job (set on enable/update,
+    // inherited on refresh) — `fetch_and_seal_artifact` stamps it onto the
+    // row it builds, so capture resolves warm env/egress from it and the
+    // ready-time upsert persists it for the dashboard's edit form. Config
+    // edits therefore stay invisible to session-create until the new base
+    // snapshot actually exists.
+    let (mut row, artifacts) = fetch_and_seal_artifact(state, &image_uri, &job.image_config)
         .await
         .map_err(|e| AdvanceError::Pipeline(Box::new(e)))?;
-    // `fetch_and_seal_manifest` builds the row from the registry manifest,
-    // which carries no secrets (ADR 0057). The capture-time env rides the
-    // job (set on enable, inherited on refresh); stamp it onto the row so
-    // `capture_and_record_base_snapshot` can resolve + inject it into the
-    // `[warm]` hook, and the upsert persists it for the dashboard's edit form.
-    row.capture_env = job.capture_env.clone();
 
     // ---- materializing ----
     state
@@ -435,8 +436,7 @@ async fn advance_one(
             }
         })
     };
-    let capture_result =
-        capture_and_record_base_snapshot(state, &row, &manifest, progress_tx).await;
+    let capture_result = capture_and_record_base_snapshot(state, &row, progress_tx).await;
     // `capture_and_record_base_snapshot` returning means every `Sender`
     // clone it (or the host RPC underneath it) held has been dropped —
     // awaiting the consumer here guarantees every progress event,
@@ -856,7 +856,6 @@ mod tests {
             last_heartbeat_at: Utc::now(),
             host_addr: None,
             ready_images: Vec::new(),
-            local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             cordoned: false,
             total_vcpus: 0,
@@ -1061,7 +1060,8 @@ mod tests {
         let row = engram_core::types::EnabledImage {
             id: uuid::Uuid::new_v4(),
             image_uri: "localhost:5001/demo:warm".into(),
-            manifest_toml: String::new(),
+            image_config: Default::default(),
+            oci_defaults: Default::default(),
             manifest_digest: DIGEST.to_string(),
             disk_manifest: None,
             base_snapshot_id: Some(engram_core::SnapshotId::new()),
@@ -1074,7 +1074,6 @@ mod tests {
             created_at: Utc::now(),
             updated_at: None,
             soft_deleted_at: None,
-            capture_env: Vec::new(),
         };
         let r = crate::api::host_http::enabled_image_ref(&row)
             .expect("a fully-stamped row must project to a ref");

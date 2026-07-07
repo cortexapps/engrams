@@ -20,10 +20,12 @@ use engram_harness_proto::AgentRole;
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
 
-/// ADR 0051: transport-agnostic prompt core (gRPC `SendPrompt`). Holds the
-/// SAME hardened auto-resume + mid-move HOLD logic as the axum `prompt`
-/// handler; only the I/O shape changed (request fields → params,
-/// `Json<PromptResponse>` → the `&'static str` note).
+/// ADR 0051: transport-agnostic prompt core (gRPC `SendPrompt`).
+/// ADR 0079: enqueue-only — the durable receipts + one outbox row + a
+/// Deliver op, then return. Delivery ordering (behind an in-flight
+/// resume/evict), the auto-resume, and the mid-move wait all ride the
+/// deliver op's position in the session op log; the 60s mid-move HOLD
+/// this handler used to poll is gone.
 pub(crate) async fn send_prompt_core(
     state: &SharedState,
     id: SessionId,
@@ -152,15 +154,18 @@ pub(crate) async fn send_prompt_core(
         .outbox_enqueue(&row)
         .await
         .map_err(|e| ApiError::Internal(format!("enqueue prompt: {e}")))?;
+    // ADR 0079: enqueue the Deliver op directly (no wake hop for first
+    // delivery); the shim's NOTIFY/poll loop owns redelivery.
+    crate::outbox_delivery::enqueue_deliver_op(state, id).await;
     state.outbox_wake.notify_one();
 
     Ok("prompt queued")
 }
 
 /// ADR 0054: transport-agnostic answer core (gRPC `AnswerQuestion`).
-/// Answering a deferred `UserQuestion` resumes the session exactly as a
-/// prompt does — so it reuses the identical auto-resume + HOLD + resolve
-/// preamble — then forwards `HarnessCommand::AnswerQuestion`. Unlike a
+/// Answering a deferred `UserQuestion` delivers exactly as a prompt does
+/// — one outbox row + a Deliver op (the deliver verb auto-resumes behind
+/// the enqueue) — forwarding `HarnessCommand::AnswerQuestion`. Unlike a
 /// prompt it emits **no user-echo**: the harness's own `QuestionAnswered`
 /// event is the durable "answered" record, and a synthetic user turn would
 /// pollute the transcript. Idempotent end to end (the deferred tool yields
@@ -199,6 +204,7 @@ pub(crate) async fn answer_question_core(
         .outbox_enqueue(&row)
         .await
         .map_err(|e| ApiError::Internal(format!("enqueue answer: {e}")))?;
+    crate::outbox_delivery::enqueue_deliver_op(state, id).await;
     state.outbox_wake.notify_one();
     Ok("answer queued")
 }
@@ -310,7 +316,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         }
@@ -318,11 +323,12 @@ mod tests {
 
     /// The structural invariant this issue exists to create: `prompt_received`
     /// is written as the FIRST PG side-effect of `send_prompt_core`, before
-    /// `ensure_active_and_resolve` (the auto-resume). A `Dead` session makes
-    /// `ensure_active_and_resolve` fail immediately with no further side
-    /// effects (no resume attempt, no user-echo) — so if the receipt survives
-    /// as the sole recorded event, it proves the emit happens unconditionally
-    /// up front rather than being contingent on a successful delivery.
+    /// the terminal-state gate (and, post-ADR-0079, before the outbox row +
+    /// Deliver op). A `Dead` session fails the gate immediately with no
+    /// further side effects (no enqueue, no user-echo) — so if the receipt
+    /// survives as the sole recorded event, it proves the emit happens
+    /// unconditionally up front rather than being contingent on a successful
+    /// delivery.
     #[tokio::test]
     async fn prompt_received_is_recorded_even_when_auto_resume_fails_outright() {
         let id = SessionId::new();

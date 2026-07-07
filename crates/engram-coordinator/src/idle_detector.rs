@@ -252,8 +252,8 @@ async fn nominate(
     {
         Ok(prev) => {
             // ADR 0074 rung 1: the nomination is rung 1 — VM untouched,
-            // cancellable by one lease-guarded CAS until the capture
-            // pipeline claims the session.
+            // cancellable (queued-op cancel + one CAS) until the evict
+            // op's pipeline claims the session.
             if let Err(e) = state
                 .services
                 .meta
@@ -261,6 +261,23 @@ async fn nominate(
                 .await
             {
                 tracing::warn!(session_id = %c.session_id, error = %e, "park_rung stamp failed");
+            }
+            // ADR 0079: the nomination ENQUEUES the evict op; the op
+            // executor drives the pipeline. Plain enqueue (no
+            // idempotency key) — the eviction scanner's keyed backstop
+            // dedups any later re-enqueue for this nomination. Failure
+            // is benign: the scanner re-enqueues on its next sweep.
+            if let Err(e) = crate::session_ops::enqueue(
+                state,
+                c.session_id,
+                engram_core::types::session_op::OpKind::Evict,
+                serde_json::json!({ "target": "idle", "allow_park": true, "nominated": true }),
+                None,
+            )
+            .await
+            {
+                tracing::warn!(session_id = %c.session_id, error = %e,
+                    "idle detector: evict op enqueue failed; the eviction scanner will re-enqueue");
             }
             ::metrics::counter!(
                 crate::metrics::EVICTION_NOMINATED_TOTAL,
@@ -322,7 +339,6 @@ mod tests {
             created_at: Utc::now() - chrono::Duration::seconds(7200),
             last_active_at: Utc::now() - chrono::Duration::seconds(7200),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };

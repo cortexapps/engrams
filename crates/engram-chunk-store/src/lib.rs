@@ -45,6 +45,7 @@ pub mod error;
 pub mod file;
 pub mod gc;
 pub mod manifest;
+pub mod reader;
 pub mod resolver;
 pub mod snapshot_blob;
 pub mod store;

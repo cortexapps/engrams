@@ -230,8 +230,8 @@ async fn per_chunk_artifact_push_pull_roundtrip() {
     assert_eq!(reg.blob_uploads.load(Ordering::Relaxed), 3);
 
     let layers = ChunkedImageLayers {
-        manifest_toml: b"name = \"roundtrip\"\n".to_vec(),
-        config_json: br#"{"kind":"engram-image-v1"}"#.to_vec(),
+        config_json: br#"{"kind":"engram-image-v1","runtime_defaults":{"env":{},"workdir":null}}"#
+            .to_vec(),
         bundle_json: br#"{"schema_version":2,"bootstrap_disk_available":true}"#.to_vec(),
         disk_bootstrap_json: br#"{"fake":"bootstrap"}"#.to_vec(),
     };
@@ -269,7 +269,7 @@ async fn per_chunk_artifact_push_pull_roundtrip() {
         .pull_template_metadata(&uri)
         .await
         .expect("pull metadata");
-    assert_eq!(meta.manifest_toml, layers.manifest_toml);
+    assert_eq!(meta.config_json, layers.config_json);
     assert_eq!(meta.bundle_json.as_deref(), Some(&layers.bundle_json[..]));
     assert_eq!(
         meta.disk_bootstrap_json.as_deref(),
@@ -278,7 +278,7 @@ async fn per_chunk_artifact_push_pull_roundtrip() {
     let metadata_gets = reg.chunk_blob_gets.load(Ordering::Relaxed) - gets_before;
     assert_eq!(
         metadata_gets, 3,
-        "metadata pull fetches exactly the 3 small layers, no chunks"
+        "metadata pull fetches exactly the 3 small blobs (bundle, bootstrap, config), no chunks"
     );
 
     // ---- 4. Per-chunk pull, digest-verified by oci-client. ----
@@ -297,16 +297,14 @@ async fn per_chunk_artifact_push_pull_roundtrip() {
         .pull_image(&uri, dest.path())
         .await
         .expect("pull image");
-    assert_eq!(
-        std::fs::read(&pulled.manifest_path).unwrap(),
-        layers.manifest_toml
-    );
+    let bundle_path = pulled.bundle_path.as_ref().expect("bundle on disk");
+    assert_eq!(std::fs::read(bundle_path).unwrap(), layers.bundle_json);
     let bs_path = pulled.disk_bootstrap_path.expect("bootstrap on disk");
     assert_eq!(std::fs::read(bs_path).unwrap(), layers.disk_bootstrap_json);
     assert!(pulled.rootfs_path.is_none(), "no rootfs layer pushed");
     let image_gets = reg.chunk_blob_gets.load(Ordering::Relaxed) - gets_before;
     assert_eq!(
-        image_gets, 3,
-        "pull_image fetches the 3 small layers only — chunk layers skipped"
+        image_gets, 2,
+        "pull_image fetches the 2 small layers (bundle, bootstrap) only — chunk layers skipped"
     );
 }

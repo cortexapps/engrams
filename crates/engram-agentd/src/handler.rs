@@ -232,6 +232,67 @@ where
             write_msg(&mut writer, &resp).await?;
             return Ok(());
         }
+        WireRequest::RefreshAgent => {
+            // ADR 0080: fresh-create restore, pre-bind. The host may have
+            // patch_drive'd the agentd slot (and others) in the paused
+            // window — re-parse every bundle device first, then compare
+            // the slot's stamp against the copy we're executing from.
+            let remount = tokio::task::spawn_blocking(crate::remount::remount_and_log).await;
+            if let Err(e) = remount {
+                tracing::warn!(error = %e, "RefreshAgent: remount task panicked");
+            }
+            let staged = tokio::task::spawn_blocking(crate::refresh::check_and_stage)
+                .await
+                .unwrap_or_else(|e| Err(io::Error::other(format!("stage task panicked: {e}"))));
+            match staged {
+                Ok(crate::refresh::Refresh::UpToDate { sha256 }) => {
+                    write_msg(
+                        &mut writer,
+                        &WireResponse::AgentRefreshed {
+                            restarting: false,
+                            sha256,
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Ok(crate::refresh::Refresh::Staged { sha256 }) => {
+                    tracing::info!(%sha256, "RefreshAgent: new agentd staged; re-exec after reply");
+                    // The reply must reach the host before the process
+                    // image is replaced: write, then shut the half down
+                    // (drives the flush), then exec. Post-exec the
+                    // CLOEXEC'd listener + this connection close and the
+                    // host's readiness re-poll finds the new agentd.
+                    write_msg(
+                        &mut writer,
+                        &WireResponse::AgentRefreshed {
+                            restarting: true,
+                            sha256: Some(sha256),
+                        },
+                    )
+                    .await?;
+                    use tokio::io::AsyncWriteExt;
+                    let _ = writer.shutdown().await;
+                    let e = crate::refresh::exec_staged();
+                    // Only reachable when execv itself failed. The staged
+                    // binary is corrupt/unloadable but the RUNNING agentd
+                    // is intact — keep serving (the host was told we'd
+                    // restart; its readiness re-poll will find us, one
+                    // generation stale, which the next create retries).
+                    tracing::error!(error = %e, "RefreshAgent: execv failed; still on the prior agentd");
+                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "RefreshAgent: stage failed");
+                    let resp = WireResponse::Error {
+                        kind: format!("{:?}", e.kind()),
+                        message: format!("refresh_agent: {e}"),
+                    };
+                    write_msg(&mut writer, &resp).await?;
+                    return Ok(());
+                }
+            }
+        }
         WireRequest::SpawnHarness(req) => {
             // 2026-07 core-ops fold: install the per-host egress-proxy
             // CA (if this request carries one) BEFORE spawning, and

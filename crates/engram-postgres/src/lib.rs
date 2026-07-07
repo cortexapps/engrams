@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use engram_core::traits::{
     CreateDisposition, DisableEnabledImageOutcome, MetadataStore, SessionCreateWriteSet,
 };
+use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp};
 use engram_core::types::{
     ArtifactRow, Capability, EnableJob, EnableJobState, EnabledImage, HostRecord, HostStatus,
     PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState,
@@ -138,11 +139,144 @@ impl PostgresStore {
             .execute(&self.pool)
             .await;
     }
+
+    /// ADR 0079: one enqueue transaction — INSERT the op row, and (when
+    /// `claimed_by` is `Some` and the fresh row is immediately runnable:
+    /// nothing running, nothing queued ahead) claim it inline by
+    /// CAS-bumping `sessions.current_epoch` and stamping the row
+    /// `running`. `pg_notify('session_ops', session_id)` fires in the
+    /// same transaction for both Inserted outcomes so every replica's
+    /// executor wakes on commit.
+    ///
+    /// A racing claim from another pod trips the `session_ops_one_running`
+    /// partial unique index and fails THIS transaction (insert included)
+    /// with 23505 — [`MetadataStore::op_enqueue_and_claim`] detects that
+    /// and retries once with `claimed_by = None` (enqueue-only).
+    async fn op_enqueue_tx(
+        &self,
+        session_id: SessionId,
+        kind: OpKind,
+        payload: &serde_json::Value,
+        idempotency_key: Option<&str>,
+        claimed_by: Option<&str>,
+    ) -> Result<EnqueueOutcome, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // ON CONFLICT must name the partial-unique's predicate to arbitrate
+        // on `session_ops_idem`; a NULL key row is never indexed, so it
+        // can never be a duplicate. The predicate is scoped to the ACTIVE
+        // states (ADR 0079 review finding #4): the fresh row is inserted
+        // `queued` (in the index), so it conflicts with an existing
+        // queued|running keyed row (→ Duplicate) but NOT with a terminal
+        // one — a terminal keyed row no longer burns the key, so the
+        // scanner/reaper can re-enqueue after a terminal failure.
+        let insert = format!(
+            "INSERT INTO session_ops (session_id, kind, payload, idempotency_key)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (session_id, kind, idempotency_key)
+                 WHERE idempotency_key IS NOT NULL AND state IN ('queued', 'running')
+                 DO NOTHING
+             RETURNING {OP_COLUMNS}"
+        );
+        let row = sqlx::query(&insert)
+            .bind(session_id.as_uuid())
+            .bind(kind.as_str())
+            .bind(payload)
+            .bind(idempotency_key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let Some(row) = row else {
+            // Idempotency hit: the identical (session, kind, key) row
+            // already exists — the enqueue is a no-op, and the existing
+            // row's own enqueue already notified.
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(EnqueueOutcome::Duplicate);
+        };
+        let op = row::session_op_from_row(&row)?;
+
+        // Inline claim IFF nothing is running for the session AND the
+        // just-inserted row is the queue head (it is always due: a fresh
+        // row has `not_before` NULL). This SELECT is advisory — the
+        // one_running partial unique is what makes a racing claim fail.
+        let claimable = match claimed_by {
+            None => false,
+            Some(_) => sqlx::query_scalar::<_, bool>(
+                "SELECT NOT EXISTS (SELECT 1 FROM session_ops
+                                     WHERE session_id = $1 AND state = 'running')
+                    AND NOT EXISTS (SELECT 1 FROM session_ops
+                                     WHERE session_id = $1 AND state = 'queued' AND id < $2)",
+            )
+            .bind(session_id.as_uuid())
+            .bind(op.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?,
+        };
+
+        let outcome = if let (true, Some(claimant)) = (claimable, claimed_by) {
+            let epoch: i64 = sqlx::query_scalar(
+                "UPDATE sessions SET current_epoch = current_epoch + 1
+                 WHERE id = $1 RETURNING current_epoch",
+            )
+            .bind(session_id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let stamp = format!(
+                "UPDATE session_ops
+                    SET state = 'running', epoch = $2, claimed_by = $3,
+                        claimed_at = now(), heartbeat_at = now(),
+                        attempts = attempts + 1
+                  WHERE id = $1 AND state = 'queued'
+                 RETURNING {OP_COLUMNS}"
+            );
+            let row = sqlx::query(&stamp)
+                .bind(op.id)
+                .bind(epoch)
+                .bind(claimant)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            EnqueueOutcome::Claimed(row::session_op_from_row(&row)?)
+        } else {
+            EnqueueOutcome::Queued(op)
+        };
+
+        sqlx::query("SELECT pg_notify('session_ops', $1)")
+            .bind(session_id.as_uuid().to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(outcome)
+    }
 }
 
 fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
     MetaError::Db(Box::new(e))
 }
+
+/// ADR 0079: PG unique-violation (SQLSTATE 23505). The op-claim paths
+/// lean on the `session_ops_one_running` partial unique index for
+/// correctness — a racing second claimer fails its transaction here, and
+/// the caller maps that to "not claimed" instead of an error.
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23505")
+}
+
+/// The [`is_unique_violation`] probe lifted over [`MetaError`], for call
+/// sites that only see the already-wrapped error.
+fn meta_is_unique_violation(e: &MetaError) -> bool {
+    matches!(e, MetaError::Db(b)
+        if b.downcast_ref::<sqlx::Error>().is_some_and(is_unique_violation))
+}
+
+/// ADR 0079: the full `session_ops` projection, kept in ONE place so the
+/// six queries that materialize a [`SessionOp`] can't drift from
+/// `row::session_op_from_row`'s strict decode. (`claimed_at` is a
+/// DB-side bookkeeping column the domain type doesn't carry.)
+const OP_COLUMNS: &str = "id, session_id, kind, payload, state, step, epoch, attempts, \
+     not_before, idempotency_key, claimed_by, error, created_at, finished_at";
 
 /// ADR 0055 P2: a `mount_catalog` row → the shared `CatalogSkill`. The tuple is
 /// `(id, owner, name, description, sha256, mount_json, size_bytes, created_at)`.
@@ -430,6 +564,182 @@ mod placement_tests {
     }
 }
 
+impl PostgresStore {
+    /// The shared INSERT-or-idempotent-UPDATE body behind `record_snapshot`
+    /// / `fenced_record_snapshot` (ADR 0079 re-review #3/#4). `fence = None`
+    /// writes unconditionally; `Some(epoch)` gates the write on the
+    /// session's `current_epoch` atomically. Returns `None` when fenced
+    /// (nothing written), else `Some(inserted)`.
+    async fn record_snapshot_guarded(
+        &self,
+        snap: SnapshotRecord,
+        fence: Option<i64>,
+    ) -> Result<Option<bool>, MetaError> {
+        // ADR 0007: single-tier durability. Every snapshot row
+        // references chunked manifests in `BlobStorage` via the
+        // `disk_manifest_*` / `memory_manifest_*` quartet. The
+        // previous hot-tier (`local_path`) + cold-tier (envelope-
+        // encrypted blob ref) columns retired with Phase 7
+        // (migration 0020).
+        //
+        // ADR 0016 Phase C: bump `chunk_generation` in the same TX
+        // so the GC barrier sees the new pin-set entry atomically
+        // with the row write. Without this, a sweep that read the
+        // pin set before the row committed would miss the snapshot's
+        // chunks; with the bump, the sweep's post-collection
+        // generation read catches the divergence and restarts.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // ADR 0079 (re-review findings #3/#4): the optional fence. When
+        // `Some(epoch)`, gate the write on the session's `current_epoch`
+        // in the SAME transaction (the fence read + the write serialize
+        // against a concurrent claim/reclaim CAS via `FOR UPDATE`). A
+        // mismatch means the op executor was fenced by a successor's
+        // re-claim: write NOTHING (a reclaimed-out predecessor must never
+        // land a phantom `recoverable` row a resume would pick — the
+        // 89f7984d durability-lie class) and return `Ok(None)`.
+        if let Some(epoch) = fence {
+            let session_id = snap.session_id.ok_or_else(|| {
+                MetaError::Serialization(
+                    "fenced_record_snapshot requires a session-scoped snapshot".into(),
+                )
+            })?;
+            let stored: Option<i64> =
+                sqlx::query_scalar("SELECT current_epoch FROM sessions WHERE id = $1 FOR UPDATE")
+                    .bind(session_id.as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            if stored != Some(epoch) {
+                let _ = tx.rollback().await;
+                return Ok(None);
+            }
+        }
+        // Issue #529: `RETURNING (xmax = 0)` tells the caller whether this
+        // call INSERTed a fresh row or UPDATEd an existing one — Postgres's
+        // standard idiom for "was this an insert". The heartbeat reconcile
+        // uses it to emit `SnapshotTaken` exactly once, on the row's first
+        // landing, regardless of which coord (if any) survived the
+        // original capture.
+        let row = sqlx::query(
+            r#"
+            INSERT INTO snapshots
+                (id, session_id, host_id,
+                 image_version, size_bytes, created_at, last_accessed_at,
+                 disk_manifest_id, disk_manifest_version,
+                 memory_manifest_id, memory_manifest_version,
+                 recoverable, aux_bundles, events_cursor, fc_snapshot_version)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            ON CONFLICT (id) DO UPDATE SET
+                last_accessed_at        = EXCLUDED.last_accessed_at,
+                disk_manifest_id        = EXCLUDED.disk_manifest_id,
+                disk_manifest_version   = EXCLUDED.disk_manifest_version,
+                memory_manifest_id      = EXCLUDED.memory_manifest_id,
+                memory_manifest_version = EXCLUDED.memory_manifest_version,
+                recoverable             = EXCLUDED.recoverable,
+                aux_bundles             = EXCLUDED.aux_bundles,
+                -- ADR 0028 A.log: never clobber a resolved cursor with
+                -- NULL on an idempotent re-record (the reconciler may
+                -- re-ingest a checkpoint the eviction pipeline already
+                -- recorded with a cursor, or vice versa).
+                events_cursor           = COALESCE(EXCLUDED.events_cursor, snapshots.events_cursor),
+                -- ADR 0068: same idempotency guard — a re-record (e.g.
+                -- the checkpoint-advert reconcile re-ingesting a row the
+                -- eviction pipeline already stamped) must not blank out
+                -- an already-known capture-time FC snapshot version.
+                fc_snapshot_version     = COALESCE(EXCLUDED.fc_snapshot_version, snapshots.fc_snapshot_version),
+                updated_at              = NOW()
+            RETURNING (xmax = 0) AS inserted
+            "#,
+        )
+        .bind(snap.id.as_uuid())
+        .bind(snap.session_id.map(|s| s.as_uuid()))
+        .bind(snap.host_id.map(|h| h.as_uuid()))
+        .bind(&snap.image_version)
+        .bind(snap.size_bytes as i64)
+        .bind(snap.created_at)
+        .bind(snap.last_accessed_at)
+        .bind(snap.disk_manifest.map(|m| m.manifest_id))
+        .bind(snap.disk_manifest.map(|m| m.version as i64))
+        .bind(snap.memory_manifest.map(|m| m.manifest_id))
+        .bind(snap.memory_manifest.map(|m| m.version as i64))
+        .bind(snap.recoverable)
+        .bind(
+            serde_json::to_value(&snap.aux_bundles)
+                .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
+        )
+        .bind(snap.events_cursor)
+        .bind(&snap.fc_snapshot_version)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let inserted: bool = sqlx::Row::try_get(&row, "inserted").map_err(db_err)?;
+        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        // ADR 0077 phase 1: advance the per-session durable head in the
+        // SAME transaction as the row write — row existence ==
+        // durability. Monotonic by created_at: a re-record or an
+        // out-of-order reconcile (the host re-advertises an older
+        // checkpoint) never regresses the head. Base captures
+        // (session_id IS NULL) skip this — their head is
+        // enabled_images.base_snapshot_id.
+        //
+        // GATED ON `recoverable`: the issue-#213 two-phase capture and the
+        // resume demote path both record rows with recoverable=false, and
+        // the head's contract is "newest snapshot whose blobs AND row are
+        // committed" — an unrecoverable row must never hold it (the next
+        // abort-inflight tick deletes its blobs while the monotonic guard
+        // would block an older good snapshot from ever reclaiming the
+        // pointer). A demote that hits the CURRENT head re-points it to
+        // the newest still-recoverable snapshot instead.
+        if let Some(session_id) = snap.session_id {
+            if snap.recoverable {
+                sqlx::query(
+                    r#"
+                    UPDATE sessions
+                    SET durable_head_snapshot_id = $2
+                    WHERE id = $1
+                      AND (
+                        durable_head_snapshot_id IS NULL
+                        OR $3 >= COALESCE(
+                            (SELECT created_at FROM snapshots WHERE id = sessions.durable_head_snapshot_id),
+                            'epoch'::timestamptz
+                        )
+                      )
+                    "#,
+                )
+                .bind(session_id.as_uuid())
+                .bind(snap.id.as_uuid())
+                .bind(snap.created_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            } else {
+                sqlx::query(
+                    r#"
+                    UPDATE sessions
+                    SET durable_head_snapshot_id = (
+                        SELECT id FROM snapshots
+                        WHERE session_id = $1 AND recoverable AND id <> $2
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    )
+                    WHERE id = $1 AND durable_head_snapshot_id = $2
+                    "#,
+                )
+                .bind(session_id.as_uuid())
+                .bind(snap.id.as_uuid())
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(Some(inserted))
+    }
+}
+
 #[async_trait]
 impl MetadataStore for PostgresStore {
     async fn ping(&self) -> Result<(), MetaError> {
@@ -474,9 +784,9 @@ impl MetadataStore for PostgresStore {
         // Issue #535 (c): the row is GUARANTEED to already exist (`pending`,
         // committed by `reserve_and_persist_create` before any host RPC ran)
         // — a slim UPDATE replaces the old `create_session_created` upsert.
-        // But existing != still-`pending`: DeleteSession can remove the row,
-        // or `requeue_stale_pending` can flip it back to `queued`, while the
-        // restore RPC that preceded this call is in flight. Guard on the
+        // But existing != still-`pending`: a DeleteSession (the destroy op,
+        // ADR 0079) can flip the row terminal while the restore RPC that
+        // preceded this call is in flight. Guard on the
         // expected state and check `rows_affected` so a lost race surfaces
         // as `NotFound` instead of silently binding `sandbox_id` onto
         // whatever status the row now has — the caller's `Err` arm tears the
@@ -623,9 +933,9 @@ impl MetadataStore for PostgresStore {
                     INSERT INTO sessions
                         (id, status, host_id, sandbox_id,
                          image_uri, mode, mem_budget_mib, cpu_budget_vcpus,
-                         harness, selected_skills,
+                         harness,
                          created_at, last_active_at)
-                    VALUES ($1, 'pending', $2, NULL, $3, $4, $5, $6, $7, $8, $9, $9)
+                    VALUES ($1, 'pending', $2, NULL, $3, $4, $5, $6, $7, $8, $8)
                     "#,
                 )
                 .bind(ws.session_id.as_uuid())
@@ -634,8 +944,11 @@ impl MetadataStore for PostgresStore {
                 .bind(ws.spec.mode.as_str())
                 .bind(ws.mem_budget_mib)
                 .bind(ws.cpu_budget_vcpus)
-                .bind(ws.selected_harness.as_deref())
-                .bind(&ws.selected_skills)
+                // ADR 0077: `harness` mirrors the RuntimeSpec's selection into
+                // the pre-existing `sessions.harness` column; `selected_skills`
+                // is no longer a column — it lives in the RuntimeSpec written
+                // below (migration 0090 dropped the column).
+                .bind(ws.runtime_spec.selected_harness.as_deref())
                 .bind(now)
                 .execute(&mut *tx)
                 .await
@@ -651,10 +964,10 @@ impl MetadataStore for PostgresStore {
                     INSERT INTO sessions
                         (id, status, host_id, sandbox_id, image_uri, mode,
                          mem_budget_mib, cpu_budget_vcpus,
-                         harness, selected_skills,
+                         harness,
                          queued_at, queue_origin,
                          created_at, last_active_at)
-                    VALUES ($1, 'queued', NULL, NULL, $2, $3, $4, $5, $6, $7, $8, 'create', $8, $8)
+                    VALUES ($1, 'queued', NULL, NULL, $2, $3, $4, $5, $6, $7, 'create', $7, $7)
                     "#,
                 )
                 .bind(ws.session_id.as_uuid())
@@ -662,8 +975,9 @@ impl MetadataStore for PostgresStore {
                 .bind(ws.spec.mode.as_str())
                 .bind(ws.mem_budget_mib)
                 .bind(ws.cpu_budget_vcpus)
-                .bind(ws.selected_harness.as_deref())
-                .bind(&ws.selected_skills)
+                // ADR 0077: harness column mirrors the RuntimeSpec; no
+                // selected_skills column (lives in the RuntimeSpec below).
+                .bind(ws.runtime_spec.selected_harness.as_deref())
                 .bind(now)
                 .execute(&mut *tx)
                 .await
@@ -673,9 +987,31 @@ impl MetadataStore for PostgresStore {
         };
 
         // -------- satellites, in the SAME transaction (issue #535 (b)) --------
-        // `harness` and `selected_skills` already rode the row INSERT above;
-        // the remaining satellites keep their own tables (FK'd to
-        // `sessions.id`, now guaranteed to exist by the time this commits).
+        // `harness` already rode the row INSERT above (mirrored from the
+        // RuntimeSpec); the remaining satellites keep their own tables (FK'd
+        // to `sessions.id`, now guaranteed to exist by the time this commits).
+        //
+        // ADR 0077 phase 3: the RuntimeSpec (selected skills/harness/workdir)
+        // is written in THIS transaction too — the single durable source the
+        // queue re-prepare / resume / evac reads instead of re-deriving. It
+        // subsumes the retired `sessions.selected_skills` column.
+        {
+            let spec_json = serde_json::to_value(&ws.runtime_spec)
+                .map_err(|e| MetaError::Serialization(format!("runtime_spec encode: {e}")))?;
+            sqlx::query(
+                r#"
+                INSERT INTO session_runtime_specs (session_id, spec, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (session_id) DO UPDATE
+                  SET spec = EXCLUDED.spec, updated_at = NOW()
+                "#,
+            )
+            .bind(ws.session_id.as_uuid())
+            .bind(spec_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
         if let Some(secrets) = ws.sealed_secrets {
             sqlx::query(
                 r#"
@@ -1009,18 +1345,22 @@ impl MetadataStore for PostgresStore {
         Ok(flipped)
     }
 
-    async fn enqueue_session_resume(&self, id: SessionId) -> Result<(), MetaError> {
+    async fn enqueue_session_resume(&self, id: SessionId, epoch: i64) -> Result<bool, MetaError> {
         // Idle → queued (resume origin). Gated on `status='idle'` so a
-        // racing resume that already advanced the row is a clean no-op.
+        // racing resume that already advanced the row is a clean no-op,
+        // AND on the resume op's fencing epoch (ADR 0079) so a
+        // reclaimed-away zombie executor can't fork the state machine —
+        // same predicate shape as `fenced_transition_session`.
         let n = sqlx::query(
             r#"
             UPDATE sessions
                SET status = 'queued', queued_at = NOW(), queue_origin = 'resume',
                    last_active_at = NOW()
-             WHERE id = $1 AND status = 'idle'
+             WHERE id = $1 AND status = 'idle' AND current_epoch = $2
             "#,
         )
         .bind(id.as_uuid())
+        .bind(epoch)
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -1036,7 +1376,7 @@ impl MetadataStore for PostgresStore {
             // pure overhead.
             self.notify_placement_changed("enqueued").await;
         }
-        Ok(())
+        Ok(n > 0)
     }
 
     async fn list_queued_sessions_fifo(
@@ -1047,7 +1387,6 @@ impl MetadataStore for PostgresStore {
             SELECT id, status, host_id, sandbox_id, image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
-                   selected_skills,
                    COALESCE(mem_budget_mib, 0)::BIGINT AS mem_budget_mib,
                    COALESCE(cpu_budget_vcpus, 0) AS cpu_budget_vcpus,
                    queue_origin, queued_at
@@ -1170,42 +1509,9 @@ impl MetadataStore for PostgresStore {
         Ok(Some(HostId(picked)))
     }
 
-    async fn requeue_session(&self, id: SessionId) -> Result<bool, MetaError> {
-        let n = sqlx::query(
-            r#"
-            UPDATE sessions
-               SET status = 'queued', host_id = NULL, last_active_at = NOW()
-             WHERE id = $1 AND status = 'pending'
-            "#,
-        )
-        .bind(id.as_uuid())
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        Ok(n > 0)
-    }
-
-    async fn requeue_stale_pending(
-        &self,
-        older_than: std::time::Duration,
-    ) -> Result<u64, MetaError> {
-        let n = sqlx::query(
-            r#"
-            UPDATE sessions
-               SET status = 'queued', host_id = NULL, last_active_at = NOW()
-             WHERE status = 'pending'
-               AND queue_origin IS NOT NULL
-               AND last_active_at < NOW() - make_interval(secs => $1::bigint)
-            "#,
-        )
-        .bind(older_than.as_secs() as i64)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        Ok(n)
-    }
+    // ADR 0079 (issue #543): `requeue_session` / `requeue_stale_pending`
+    // retired — the create_boot op's `not_before`/`attempts` own boot
+    // retry, and the op reclaim sweep owns coord-died-mid-boot recovery.
 
     async fn queued_demand(&self) -> Result<engram_core::types::session::QueuedDemand, MetaError> {
         let row: (i64, i64, i64) = sqlx::query_as(
@@ -1291,7 +1597,6 @@ impl MetadataStore for PostgresStore {
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
-                   selected_skills,
                    park_rung, parked_at
             FROM sessions WHERE id = $1
             "#,
@@ -1353,8 +1658,7 @@ impl MetadataStore for PostgresStore {
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
-                   live_disk_manifest_id, live_disk_manifest_version,
-                   selected_skills
+                   live_disk_manifest_id, live_disk_manifest_version
             FROM sessions
             WHERE status IN ('pending','created','active',
                              'idle','evacuating','evicting')
@@ -1831,6 +2135,27 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn fenced_set_session_park_rung(
+        &self,
+        id: SessionId,
+        epoch: i64,
+        rung: i16,
+        parked_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE sessions SET park_rung = $2, parked_at = $3
+              WHERE id = $1 AND current_epoch = $4",
+        )
+        .bind(id.as_uuid())
+        .bind(rung)
+        .bind(parked_at)
+        .bind(epoch)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn stamp_shell_pin(
         &self,
         id: SessionId,
@@ -2023,9 +2348,15 @@ impl MetadataStore for PostgresStore {
         prompt_id: &str,
         delay: std::time::Duration,
     ) -> Result<(), MetaError> {
+        // `attempts` counts every delivery *try*, deferred or delivered —
+        // `failure_backoff(attempts)` only grows if defers bump it too. (It
+        // used to bump only on mark_delivered, so a row failing before the
+        // forward — e.g. ensure_active erroring — retried at the floor
+        // backoff forever and read as attempts=0 in every investigation.)
         sqlx::query(
             "UPDATE session_outbox
-             SET not_before = now() + make_interval(secs => $2)
+             SET not_before = now() + make_interval(secs => $2),
+                 attempts = attempts + 1
              WHERE prompt_id = $1 AND acked_at IS NULL",
         )
         .bind(prompt_id)
@@ -2478,7 +2809,7 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
-                   ready_images, local_snapshots, current_bundles,
+                   ready_images, current_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
@@ -2512,12 +2843,11 @@ impl MetadataStore for PostgresStore {
     ) -> Result<(), MetaError> {
         // ADR 0047: the single per-heartbeat UPDATE — capacity +
         // utilization + the scheduling state every replica reads
-        // (ready_images / local_snapshots / current_bundles /
-        // total_vcpus). `cordoned` is deliberately absent: it is
-        // coordinator-owned and only `set_host_cordoned` writes it.
+        // (ready_images / current_bundles / total_vcpus). `cordoned` is
+        // deliberately absent: it is coordinator-owned and only
+        // `set_host_cordoned` writes it. (ADR 0078 retired the dead
+        // `local_snapshots` mirror.)
         let ready_images = serde_json::to_value(&hb.ready_images)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
-        let local_snapshots = serde_json::to_value(&hb.local_snapshots)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let current_bundles = serde_json::to_value(&hb.current_bundles)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
@@ -2551,15 +2881,14 @@ impl MetadataStore for PostgresStore {
                       util_cpu_pct = $10,
                       allocatable_mib = $11,
                       ready_images = $12,
-                      local_snapshots = $13,
-                      current_bundles = $14,
-                      total_vcpus = $15,
-                      wire_version = $16,
-                      util_base_shm_mib = $17,
-                      util_parked_pss_mib = $18,
-                      util_running_pss_mib = $19,
-                      capabilities = $20,
-                      stages_images = $21,
+                      current_bundles = $13,
+                      total_vcpus = $14,
+                      wire_version = $15,
+                      util_base_shm_mib = $16,
+                      util_parked_pss_mib = $17,
+                      util_running_pss_mib = $18,
+                      capabilities = $19,
+                      stages_images = $20,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
@@ -2576,7 +2905,6 @@ impl MetadataStore for PostgresStore {
         .bind(hb.utilization.cpu_pct)
         .bind(hb.utilization.allocatable_mib as i64)
         .bind(ready_images)
-        .bind(local_snapshots)
         .bind(current_bundles)
         .bind(hb.total_vcpus as i32)
         .bind(hb.wire_version as i32)
@@ -2631,7 +2959,7 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
-                   ready_images, local_snapshots, current_bundles,
+                   ready_images, current_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
                    last_heartbeat_at, status, host_addr
               FROM hosts
@@ -2720,86 +3048,86 @@ impl MetadataStore for PostgresStore {
             .collect::<Result<Vec<_>, MetaError>>()
     }
 
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
-        // ADR 0007: single-tier durability. Every snapshot row
-        // references chunked manifests in `BlobStorage` via the
-        // `disk_manifest_*` / `memory_manifest_*` quartet. The
-        // previous hot-tier (`local_path`) + cold-tier (envelope-
-        // encrypted blob ref) columns retired with Phase 7
-        // (migration 0020).
-        //
-        // ADR 0016 Phase C: bump `chunk_generation` in the same TX
-        // so the GC barrier sees the new pin-set entry atomically
-        // with the row write. Without this, a sweep that read the
-        // pin set before the row committed would miss the snapshot's
-        // chunks; with the bump, the sweep's post-collection
-        // generation read catches the divergence and restarts.
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
-        // Issue #529: `RETURNING (xmax = 0)` tells the caller whether this
-        // call INSERTed a fresh row or UPDATEd an existing one — Postgres's
-        // standard idiom for "was this an insert". The heartbeat reconcile
-        // uses it to emit `SnapshotTaken` exactly once, on the row's first
-        // landing, regardless of which coord (if any) survived the
-        // original capture.
-        let row = sqlx::query(
-            r#"
-            INSERT INTO snapshots
-                (id, session_id, host_id,
-                 image_version, size_bytes, created_at, last_accessed_at,
-                 disk_manifest_id, disk_manifest_version,
-                 memory_manifest_id, memory_manifest_version,
-                 recoverable, aux_bundles, events_cursor, fc_snapshot_version)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            ON CONFLICT (id) DO UPDATE SET
-                last_accessed_at        = EXCLUDED.last_accessed_at,
-                disk_manifest_id        = EXCLUDED.disk_manifest_id,
-                disk_manifest_version   = EXCLUDED.disk_manifest_version,
-                memory_manifest_id      = EXCLUDED.memory_manifest_id,
-                memory_manifest_version = EXCLUDED.memory_manifest_version,
-                recoverable             = EXCLUDED.recoverable,
-                aux_bundles             = EXCLUDED.aux_bundles,
-                -- ADR 0028 A.log: never clobber a resolved cursor with
-                -- NULL on an idempotent re-record (the reconciler may
-                -- re-ingest a checkpoint the eviction pipeline already
-                -- recorded with a cursor, or vice versa).
-                events_cursor           = COALESCE(EXCLUDED.events_cursor, snapshots.events_cursor),
-                -- ADR 0068: same idempotency guard — a re-record (e.g.
-                -- the checkpoint-advert reconcile re-ingesting a row the
-                -- eviction pipeline already stamped) must not blank out
-                -- an already-known capture-time FC snapshot version.
-                fc_snapshot_version     = COALESCE(EXCLUDED.fc_snapshot_version, snapshots.fc_snapshot_version),
-                updated_at              = NOW()
-            RETURNING (xmax = 0) AS inserted
-            "#,
+    async fn put_session_runtime_spec(
+        &self,
+        session_id: SessionId,
+        spec: &engram_core::types::runtime_spec::RuntimeSpec,
+    ) -> Result<(), MetaError> {
+        let json = serde_json::to_value(spec)
+            .map_err(|e| MetaError::Serialization(format!("runtime_spec encode: {e}")))?;
+        sqlx::query(
+            "INSERT INTO session_runtime_specs (session_id, spec, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (session_id) DO UPDATE
+               SET spec = EXCLUDED.spec, updated_at = NOW()",
         )
-        .bind(snap.id.as_uuid())
-        .bind(snap.session_id.map(|s| s.as_uuid()))
-        .bind(snap.host_id.map(|h| h.as_uuid()))
-        .bind(&snap.image_version)
-        .bind(snap.size_bytes as i64)
-        .bind(snap.created_at)
-        .bind(snap.last_accessed_at)
-        .bind(snap.disk_manifest.map(|m| m.manifest_id))
-        .bind(snap.disk_manifest.map(|m| m.version as i64))
-        .bind(snap.memory_manifest.map(|m| m.manifest_id))
-        .bind(snap.memory_manifest.map(|m| m.version as i64))
-        .bind(snap.recoverable)
-        .bind(
-            serde_json::to_value(&snap.aux_bundles)
-                .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
-        )
-        .bind(snap.events_cursor)
-        .bind(&snap.fc_snapshot_version)
-        .fetch_one(&mut *tx)
+        .bind(session_id.as_uuid())
+        .bind(json)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
-        let inserted: bool = sqlx::Row::try_get(&row, "inserted").map_err(db_err)?;
-        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
-            .execute(&mut *tx)
+        Ok(())
+    }
+
+    async fn get_session_runtime_spec(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<engram_core::types::runtime_spec::RuntimeSpec>, MetaError> {
+        let row = sqlx::query("SELECT spec FROM session_runtime_specs WHERE session_id = $1")
+            .bind(session_id.as_uuid())
+            .fetch_optional(&self.pool)
             .await
             .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        Ok(inserted)
+        match row {
+            Some(r) => {
+                let json: serde_json::Value = r.try_get(0).map_err(db_err)?;
+                let spec = serde_json::from_value(json)
+                    .map_err(|e| MetaError::Serialization(format!("runtime_spec decode: {e}")))?;
+                Ok(Some(spec))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
+        Ok(self
+            .record_snapshot_guarded(snap, None)
+            .await?
+            .expect("unfenced record_snapshot always writes a row"))
+    }
+
+    /// ADR 0079 (re-review findings #3/#4): record a snapshot row ONLY
+    /// while the session's `current_epoch` still equals `epoch`. `Ok(false)`
+    /// means a successor op re-claimed the session (the epoch moved) and the
+    /// row was NOT written — the fenced-out op executor must stop, never
+    /// commit the capture. PG is the authority; this closes the window the
+    /// host-side per-session epoch high-water leaves open between a PG
+    /// reclaim and the successor's first fenced host RPC (so the proactive
+    /// host-epoch-advance-at-reclaim, ADR 0079 deferral #1c, stays a pure
+    /// optimization rather than a correctness requirement).
+    async fn fenced_record_snapshot(
+        &self,
+        snap: SnapshotRecord,
+        epoch: i64,
+    ) -> Result<bool, MetaError> {
+        Ok(self
+            .record_snapshot_guarded(snap, Some(epoch))
+            .await?
+            .is_some())
+    }
+
+    async fn durable_head_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<engram_core::types::SnapshotId>, MetaError> {
+        let row = sqlx::query("SELECT durable_head_snapshot_id FROM sessions WHERE id = $1")
+            .bind(session_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        let row = row.ok_or(MetaError::NotFound)?;
+        let id: Option<uuid::Uuid> = row.try_get(0).map_err(db_err)?;
+        Ok(id.map(engram_core::types::SnapshotId::from))
     }
 
     async fn prune_session_snapshots(
@@ -3096,6 +3424,53 @@ impl MetadataStore for PostgresStore {
         .ok_or(MetaError::NotFound)?;
         let idx: i64 = sqlx::Row::try_get(&row, "idx").map_err(db_err)?;
         Ok(idx)
+    }
+
+    async fn append_session_event_fenced(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<i64>, MetaError> {
+        // Identical to `append_session_event` but the idx-allocation
+        // UPDATE carries `AND current_epoch = $4`. 0 rows (fenced) ⇒ the
+        // whole statement returns nothing → `Ok(None)`; the fenced-out
+        // predecessor's event never lands after the successor's.
+        let row = sqlx::query(
+            r#"
+            WITH next AS (
+                UPDATE sessions
+                   SET next_event_idx = next_event_idx + 1,
+                       updated_at = NOW(),
+                       last_event_at = NOW()
+                 WHERE id = $1 AND current_epoch = $4
+             RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
+            ),
+            inserted AS (
+                INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch)
+                SELECT $1, allocated_idx, $2, $3, recovery_epoch FROM next
+                RETURNING idx
+            )
+            SELECT i.idx,
+                   pg_notify(
+                       'session_events',
+                       json_build_object('session_id', $1::text, 'idx', i.idx)::text
+                   )
+              FROM inserted i
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(kind)
+        .bind(payload)
+        .bind(epoch)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match row {
+            Some(row) => Ok(Some(sqlx::Row::try_get(&row, "idx").map_err(db_err)?)),
+            None => Ok(None),
+        }
     }
 
     async fn notify_session_delta(
@@ -3523,14 +3898,15 @@ impl MetadataStore for PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO enabled_images
-                (id, image_uri, manifest_toml, manifest_digest,
+                (id, image_uri, image_config, oci_defaults, manifest_digest,
                  disk_manifest_id, disk_manifest_version, base_snapshot_id,
                  base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                  base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
-                 last_refreshed_at, created_at, updated_at, soft_deleted_at, capture_env)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULL, NULL, $14)
+                 last_refreshed_at, created_at, updated_at, soft_deleted_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL, NULL)
             ON CONFLICT (image_uri) DO UPDATE SET
-                manifest_toml         = EXCLUDED.manifest_toml,
+                image_config          = EXCLUDED.image_config,
+                oci_defaults          = EXCLUDED.oci_defaults,
                 manifest_digest       = EXCLUDED.manifest_digest,
                 disk_manifest_id      = EXCLUDED.disk_manifest_id,
                 disk_manifest_version = EXCLUDED.disk_manifest_version,
@@ -3540,7 +3916,6 @@ impl MetadataStore for PostgresStore {
                 base_snapshot_memory_manifest_id      = EXCLUDED.base_snapshot_memory_manifest_id,
                 base_snapshot_memory_manifest_version = EXCLUDED.base_snapshot_memory_manifest_version,
                 last_refreshed_at     = EXCLUDED.last_refreshed_at,
-                capture_env           = EXCLUDED.capture_env,
                 updated_at            = NOW(),
                 -- ADR 0021 P1.8: enabling an image always "undeletes" any
                 -- prior soft-delete on the same image_uri. Operator who
@@ -3554,7 +3929,8 @@ impl MetadataStore for PostgresStore {
         )
         .bind(image.id)
         .bind(&image.image_uri)
-        .bind(&image.manifest_toml)
+        .bind(sqlx::types::Json(&image.image_config))
+        .bind(sqlx::types::Json(&image.oci_defaults))
         .bind(&image.manifest_digest)
         .bind(image.disk_manifest.map(|m| m.manifest_id))
         .bind(image.disk_manifest.map(|m| m.version as i64))
@@ -3565,7 +3941,6 @@ impl MetadataStore for PostgresStore {
         .bind(image.base_snapshot_memory_manifest.map(|m| m.version as i64))
         .bind(image.last_refreshed_at)
         .bind(image.created_at)
-        .bind(sqlx::types::Json(&image.capture_env))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -3588,18 +3963,49 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn update_enabled_image_config(
+        &self,
+        image_uri: &str,
+        config: &engram_core::types::image::ImageConfig,
+    ) -> Result<(), MetaError> {
+        // ADR 0080 cheap-edit path: replace image_config in place on a
+        // live row — no snapshot work, so callers must have gated out
+        // capture-affecting diffs (resources/warm) before landing here.
+        // Same transactional NOTIFY as upsert_enabled_image so every
+        // replica's boot-bundle cache drops its copy immediately.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let res = sqlx::query(
+            "UPDATE enabled_images SET image_config = $2, updated_at = NOW() \
+             WHERE image_uri = $1 AND soft_deleted_at IS NULL",
+        )
+        .bind(image_uri)
+        .bind(sqlx::types::Json(config))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(MetaError::NotFound);
+        }
+        sqlx::query("SELECT pg_notify('enabled_image_changed', $1)")
+            .bind(image_uri)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
     async fn list_enabled_images(&self) -> Result<Vec<EnabledImage>, MetaError> {
         // ADR 0021 P1.8: live-only filter. Hosts advertise + the
         // dashboard surfaces only `soft_deleted_at IS NULL`. The
         // resume path's lookup uses `get_enabled_image_any` instead.
         let rows = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_toml, manifest_digest,
+            SELECT id, image_uri, image_config, oci_defaults, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
                    base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                    base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
-                   last_refreshed_at, created_at, updated_at, soft_deleted_at,
-                   capture_env
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE soft_deleted_at IS NULL
              ORDER BY image_uri
@@ -3618,12 +4024,11 @@ impl MetadataStore for PostgresStore {
         // `get_enabled_image_any` to look past the flag.
         let row = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_toml, manifest_digest,
+            SELECT id, image_uri, image_config, oci_defaults, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
                    base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                    base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
-                   last_refreshed_at, created_at, updated_at, soft_deleted_at,
-                   capture_env
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE image_uri = $1 AND soft_deleted_at IS NULL
             "#,
@@ -3646,12 +4051,11 @@ impl MetadataStore for PostgresStore {
         // `get_enabled_image` (live-filtered).
         let row = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_toml, manifest_digest,
+            SELECT id, image_uri, image_config, oci_defaults, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
                    base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                    base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
-                   last_refreshed_at, created_at, updated_at, soft_deleted_at,
-                   capture_env
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE image_uri = $1
             "#,
@@ -3786,24 +4190,32 @@ impl MetadataStore for PostgresStore {
     async fn find_enabled_image_by_content(
         &self,
         disk_manifest: engram_core::types::manifest::ManifestRef,
-        manifest_toml: &str,
+        resources: &engram_core::types::image::ResourceHints,
     ) -> Result<Option<EnabledImage>, MetaError> {
         // Soft-deleted rows are deliberately INCLUDED: their base
         // snapshots remain GC-pinned and restorable, and content
         // equality is what makes the reuse sound — liveness of the
         // *row* is irrelevant to the snapshot's validity.
+        //
+        // ADR 0080: the config half of the reuse key is ONLY the
+        // capture-affecting `resources` slice (JSONB containment on
+        // `image_config->'resources'`, order-insensitive) — name/
+        // description/env/workdir are applied per-session and don't
+        // invalidate a snapshot. Warm images never reach this query
+        // (caller-gated).
+        let resources_json =
+            serde_json::to_value(resources).map_err(|e| MetaError::Serialization(e.to_string()))?;
         let row = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_toml, manifest_digest,
+            SELECT id, image_uri, image_config, oci_defaults, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
                    base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                    base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
-                   last_refreshed_at, created_at, updated_at, soft_deleted_at,
-                   capture_env
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE disk_manifest_id = $1
                AND disk_manifest_version = $2
-               AND manifest_toml = $3
+               AND image_config->'resources' = $3::jsonb
                AND base_snapshot_id IS NOT NULL
              ORDER BY COALESCE(updated_at, created_at) DESC
              LIMIT 1
@@ -3811,7 +4223,7 @@ impl MetadataStore for PostgresStore {
         )
         .bind(disk_manifest.manifest_id)
         .bind(disk_manifest.version as i64)
-        .bind(manifest_toml)
+        .bind(resources_json)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -3824,26 +4236,27 @@ impl MetadataStore for PostgresStore {
         &self,
         image_uri: &str,
         manifest_digest: Option<&str>,
-        capture_env: &[engram_core::types::CaptureEnvEntry],
+        image_config: &engram_core::types::image::ImageConfig,
     ) -> Result<EnableJob, MetaError> {
         // INSERT guarded by the partial unique index (one non-terminal
         // job per image_uri); on conflict fall through to SELECTing
         // the in-flight job. Re-POST = resume, never duplicate work.
-        // `capture_env` rides the job so the scanner injects it into the
-        // [warm] hook at capture (refs resolved there, values never stored).
+        // The full `image_config` rides the job (ADR 0080): the scanner
+        // captures under it (warm env refs resolved there, values never
+        // stored) and stamps it onto the enabled_images row at ready.
         let inserted = sqlx::query(
             r#"
-            INSERT INTO enable_jobs (id, image_uri, manifest_digest, capture_env)
+            INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config)
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
             DO NOTHING
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(Uuid::new_v4())
         .bind(image_uri)
         .bind(manifest_digest)
-        .bind(sqlx::types::Json(capture_env))
+        .bind(sqlx::types::Json(image_config))
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -3852,7 +4265,7 @@ impl MetadataStore for PostgresStore {
         }
         let existing = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              WHERE image_uri = $1 AND state NOT IN ('ready', 'failed')
             "#,
@@ -3868,17 +4281,17 @@ impl MetadataStore for PostgresStore {
             None => {
                 let row = sqlx::query(
                     r#"
-                    INSERT INTO enable_jobs (id, image_uri, manifest_digest, capture_env)
+                    INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config)
                     VALUES ($1, $2, $3, $4)
                     ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
                     DO NOTHING
-                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
                     "#,
                 )
                 .bind(Uuid::new_v4())
                 .bind(image_uri)
                 .bind(manifest_digest)
-                .bind(sqlx::types::Json(capture_env))
+                .bind(sqlx::types::Json(image_config))
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(db_err)?
@@ -3894,7 +4307,7 @@ impl MetadataStore for PostgresStore {
 
     async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
         let row = sqlx::query(
-            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
+            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -3906,7 +4319,7 @@ impl MetadataStore for PostgresStore {
     async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              ORDER BY created_at DESC
              LIMIT $1
@@ -3941,7 +4354,7 @@ impl MetadataStore for PostgresStore {
                     LIMIT $3
                       FOR UPDATE SKIP LOCKED
              )
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(claimant)
@@ -4153,7 +4566,7 @@ impl MetadataStore for PostgresStore {
                    -- read as live until the retry's first chunk event.
                    chunks_done = 0, chunks_total = NULL
              WHERE id = $1 AND state = 'failed'
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -4404,116 +4817,619 @@ impl MetadataStore for PostgresStore {
     }
 
     // ----------------------------------------------------------------
-    // ADR 0016 §A.1.5c — session_lease leasing row.
+    // ADR 0079 (issue #543) — the durable per-session op log (the
+    // successor of the retired session-lease ecosystem; migration 0093
+    // dropped the table). `sessions.current_epoch` is the fencing epoch:
+    // CAS-bumped in the SAME transaction that claims an op, appended
+    // (`AND current_epoch = $e`) to every session-row write an op makes.
+    // The `session_ops_one_running` partial unique index is the
+    // correctness authority for "one running op per session"; the
+    // pre-checks in these methods only keep the race cheap.
     // ----------------------------------------------------------------
 
-    async fn try_acquire_session_lease(
+    async fn op_enqueue_and_claim(
         &self,
         session_id: SessionId,
-        sandbox_id: Option<engram_core::SandboxId>,
-        locked_by: &str,
-    ) -> Result<bool, MetaError> {
-        // ON CONFLICT (session_id) DO NOTHING returns 0 rows
-        // affected when the row already exists. Atomic vs. a
-        // racing INSERT from another coord pod.
-        let res = sqlx::query(
-            "INSERT INTO session_lease (session_id, locked_by, sandbox_id) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (session_id) DO NOTHING",
-        )
-        .bind(session_id.as_uuid())
-        .bind(locked_by)
-        .bind(sandbox_id.map(|s| s.as_uuid()))
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(res.rows_affected() == 1)
+        kind: OpKind,
+        payload: serde_json::Value,
+        idempotency_key: Option<&str>,
+        claimed_by: &str,
+    ) -> Result<EnqueueOutcome, MetaError> {
+        // Attempt insert + inline claim; a racing claimer from another
+        // pod trips the one_running unique and aborts the WHOLE
+        // transaction (insert included), so retry once enqueue-only —
+        // the now-committed peer's completion re-drive (or the NOTIFY
+        // this retry fires) picks the row up in order.
+        match self
+            .op_enqueue_tx(
+                session_id,
+                kind,
+                &payload,
+                idempotency_key,
+                Some(claimed_by),
+            )
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(e) if meta_is_unique_violation(&e) => {
+                self.op_enqueue_tx(session_id, kind, &payload, idempotency_key, None)
+                    .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    async fn release_session_lease(
+    async fn op_enqueue_and_claim_exclusive(
         &self,
         session_id: SessionId,
-        locked_by: &str,
-    ) -> Result<bool, MetaError> {
-        // Scoped to the holder: `AND locked_by = $2`. Without it, a holder
-        // whose row was reaped (held >180s without a touch) and then
-        // re-acquired by another holder would blind-delete the new
-        // holder's lease on its own late Drop — the serializer fails open
-        // and two pipelines drive one session. Mirrors the touch's filter.
-        let res = sqlx::query("DELETE FROM session_lease WHERE session_id = $1 AND locked_by = $2")
+        kind: OpKind,
+        payload: serde_json::Value,
+        claimed_by: &str,
+    ) -> Result<Option<SessionOp>, MetaError> {
+        // ADR 0079 (review finding #8): insert + claim in ONE transaction,
+        // rolling the WHOLE thing back (row included) if the lane is not
+        // free. Inline claims are never idempotency-keyed. A racing peer
+        // claim trips the `session_ops_one_running` unique on the stamp
+        // and aborts here → mapped to `None` (busy), still no orphan row.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let insert = format!(
+            "INSERT INTO session_ops (session_id, kind, payload)
+             VALUES ($1, $2, $3)
+             RETURNING {OP_COLUMNS}"
+        );
+        let row = sqlx::query(&insert)
             .bind(session_id.as_uuid())
-            .bind(locked_by)
-            .execute(&self.pool)
+            .bind(kind.as_str())
+            .bind(&payload)
+            .fetch_one(&mut *tx)
             .await
             .map_err(db_err)?;
-        // Idempotent: missing row = already released / reaped / stolen.
-        Ok(res.rows_affected() == 1)
-    }
-
-    async fn session_lease_held(&self, session_id: SessionId) -> Result<bool, MetaError> {
-        let row: Option<(uuid::Uuid,)> =
-            sqlx::query_as("SELECT session_id FROM session_lease WHERE session_id = $1")
-                .bind(session_id.as_uuid())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?;
-        Ok(row.is_some())
-    }
-
-    async fn touch_session_lease(
-        &self,
-        session_id: SessionId,
-        locked_by: &str,
-    ) -> Result<bool, MetaError> {
-        let res = sqlx::query(
-            "UPDATE session_lease SET locked_at = now() \
-             WHERE session_id = $1 AND locked_by = $2",
+        let op = row::session_op_from_row(&row)?;
+        // The lane is free only if nothing is running AND no OTHER op is
+        // queued for the session (ours was just inserted `queued`).
+        let free: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS (SELECT 1 FROM session_ops
+                                 WHERE session_id = $1 AND state = 'running')
+                AND NOT EXISTS (SELECT 1 FROM session_ops
+                                 WHERE session_id = $1 AND state = 'queued' AND id <> $2)",
         )
         .bind(session_id.as_uuid())
-        .bind(locked_by)
-        .execute(&self.pool)
+        .bind(op.id)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
-        Ok(res.rows_affected() == 1)
+        if !free {
+            // Busy: roll back so the just-inserted row disappears — the
+            // executor can never grab a row we withdrew.
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(None);
+        }
+        let epoch: i64 = sqlx::query_scalar(
+            "UPDATE sessions SET current_epoch = current_epoch + 1
+             WHERE id = $1 RETURNING current_epoch",
+        )
+        .bind(session_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let stamp = format!(
+            "UPDATE session_ops
+                SET state = 'running', epoch = $2, claimed_by = $3,
+                    claimed_at = now(), heartbeat_at = now(),
+                    attempts = attempts + 1
+              WHERE id = $1 AND state = 'queued'
+             RETURNING {OP_COLUMNS}"
+        );
+        let stamped = match sqlx::query(&stamp)
+            .bind(op.id)
+            .bind(epoch)
+            .bind(claimed_by)
+            .fetch_one(&mut *tx)
+            .await
+        {
+            Ok(row) => row::session_op_from_row(&row)?,
+            Err(e) if is_unique_violation(&e) => return Ok(None),
+            Err(e) => return Err(db_err(e)),
+        };
+        sqlx::query("SELECT pg_notify('session_ops', $1)")
+            .bind(session_id.as_uuid().to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        match tx.commit().await {
+            Ok(()) => Ok(Some(stamped)),
+            Err(e) if is_unique_violation(&e) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
     }
 
-    async fn sweep_stale_session_leases(
+    async fn op_claim_head(
         &self,
-        max_age: std::time::Duration,
-    ) -> Result<Vec<engram_core::traits::StaleSessionLease>, MetaError> {
-        // DELETE ... RETURNING is one statement; rows lifted to
-        // app-side for warn-logging. Interval is passed as seconds
-        // (BIGINT-castable) because the sqlx postgres driver doesn't
-        // bind `std::time::Duration` natively.
-        let max_age_secs = max_age.as_secs() as i64;
-        let rows = sqlx::query_as::<
-            _,
-            (
-                uuid::Uuid,
-                Option<uuid::Uuid>,
-                String,
-                chrono::DateTime<chrono::Utc>,
-            ),
-        >(
-            "DELETE FROM session_lease \
-             WHERE locked_at < now() - make_interval(secs => $1::double precision) \
-             RETURNING session_id, sandbox_id, locked_by, locked_at",
+        session_id: SessionId,
+        claimed_by: &str,
+    ) -> Result<Option<SessionOp>, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Head = smallest queued id, due. SKIP LOCKED keeps a race with
+        // a peer's claim (or a concurrent enqueue_and_claim) cheap: if
+        // the head is mid-claim elsewhere we either see nothing or fall
+        // onto the one_running unique below and map it to None.
+        let head = format!(
+            "SELECT {OP_COLUMNS} FROM session_ops
+              WHERE session_id = $1 AND state = 'queued'
+                AND (not_before IS NULL OR not_before <= now())
+              ORDER BY id ASC LIMIT 1
+              FOR UPDATE SKIP LOCKED"
+        );
+        let Some(row) = sqlx::query(&head)
+            .bind(session_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+        else {
+            return Ok(None);
+        };
+        let op = row::session_op_from_row(&row)?;
+        // Advisory pre-check (the partial unique enforces on the stamp):
+        // don't burn an epoch bump when something is visibly running.
+        let running: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM session_ops
+                             WHERE session_id = $1 AND state = 'running')",
         )
-        .bind(max_age_secs as f64)
+        .bind(session_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if running {
+            return Ok(None);
+        }
+        let epoch: i64 = sqlx::query_scalar(
+            "UPDATE sessions SET current_epoch = current_epoch + 1
+             WHERE id = $1 RETURNING current_epoch",
+        )
+        .bind(session_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let stamp = format!(
+            "UPDATE session_ops
+                SET state = 'running', epoch = $2, claimed_by = $3,
+                    claimed_at = now(), heartbeat_at = now(),
+                    attempts = attempts + 1
+              WHERE id = $1 AND state = 'queued'
+             RETURNING {OP_COLUMNS}"
+        );
+        let stamped = match sqlx::query(&stamp)
+            .bind(op.id)
+            .bind(epoch)
+            .bind(claimed_by)
+            .fetch_one(&mut *tx)
+            .await
+        {
+            Ok(row) => row::session_op_from_row(&row)?,
+            // A peer won the one_running race between our pre-check and
+            // the stamp — not claimable, not an error.
+            Err(e) if is_unique_violation(&e) => return Ok(None),
+            Err(e) => return Err(db_err(e)),
+        };
+        match tx.commit().await {
+            Ok(()) => Ok(Some(stamped)),
+            Err(e) if is_unique_violation(&e) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    async fn op_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT session_id FROM session_ops
+              WHERE state = 'queued'
+                AND (not_before IS NULL OR not_before <= now())
+                AND NOT EXISTS (SELECT 1 FROM session_ops r
+                                 WHERE r.session_id = session_ops.session_id
+                                   AND r.state = 'running')",
+        )
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|(session_id, sandbox_id, locked_by, locked_at)| {
-                engram_core::traits::StaleSessionLease {
-                    session_id: SessionId::from(session_id),
-                    sandbox_id: sandbox_id.map(engram_core::SandboxId::from),
-                    locked_by,
-                    locked_at,
-                }
+        rows.into_iter()
+            .map(|r| {
+                let id: uuid::Uuid = r.try_get(0).map_err(db_err)?;
+                Ok(SessionId::from(id))
             })
-            .collect())
+            .collect()
+    }
+
+    async fn op_record_step(&self, op_id: i64, epoch: i64, step: &str) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE session_ops SET step = $3, heartbeat_at = now()
+              WHERE id = $1 AND epoch = $2 AND state = 'running'",
+        )
+        .bind(op_id)
+        .bind(epoch)
+        .bind(step)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn op_heartbeat(&self, op_id: i64, epoch: i64) -> Result<bool, MetaError> {
+        // Bump ONLY heartbeat_at — NOT step (the within-step liveness beat
+        // must not clobber the crash-resume marker). Fenced.
+        let res = sqlx::query(
+            "UPDATE session_ops SET heartbeat_at = now()
+              WHERE id = $1 AND epoch = $2 AND state = 'running'",
+        )
+        .bind(op_id)
+        .bind(epoch)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn op_finish(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        state: OpState,
+        error: Option<&str>,
+    ) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE session_ops SET state = $3, error = $4, finished_at = now()
+              WHERE id = $1 AND epoch = $2 AND state = 'running'",
+        )
+        .bind(op_id)
+        .bind(epoch)
+        .bind(state.as_str())
+        .bind(error)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn op_requeue_with_backoff(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        backoff: std::time::Duration,
+        error: &str,
+    ) -> Result<bool, MetaError> {
+        // Back to `queued` with the claim stamps cleared; `attempts`
+        // stays (it was counted at claim) and `step` stays (the next
+        // claimer resumes idempotent-from-step).
+        let res = sqlx::query(
+            "UPDATE session_ops
+                SET state = 'queued',
+                    not_before = now() + make_interval(secs => $3),
+                    error = $4,
+                    epoch = NULL, claimed_by = NULL, heartbeat_at = NULL
+              WHERE id = $1 AND epoch = $2 AND state = 'running'",
+        )
+        .bind(op_id)
+        .bind(epoch)
+        .bind(backoff.as_secs_f64())
+        .bind(error)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn op_cancel_queued(
+        &self,
+        session_id: SessionId,
+        kind: OpKind,
+    ) -> Result<bool, MetaError> {
+        // Every queued op of the kind — a cancelled verb has no business
+        // running later from a duplicate row further down the queue.
+        let res = sqlx::query(
+            "UPDATE session_ops SET state = 'cancelled', finished_at = now()
+              WHERE session_id = $1 AND kind = $2 AND state = 'queued'",
+        )
+        .bind(session_id.as_uuid())
+        .bind(kind.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn op_wake_queued_kind(
+        &self,
+        session_id: SessionId,
+        kind: OpKind,
+    ) -> Result<u64, MetaError> {
+        // ADR 0079 latency fix: pull a backed-off queued op's not_before
+        // to now so the completion re-drive claims it immediately, then
+        // NOTIFY so any replica's executor wakes even if the completion
+        // re-drive already passed.
+        let res = sqlx::query(
+            "UPDATE session_ops SET not_before = now()
+              WHERE session_id = $1 AND kind = $2 AND state = 'queued'
+                AND not_before > now()",
+        )
+        .bind(session_id.as_uuid())
+        .bind(kind.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let woken = res.rows_affected();
+        if woken > 0 {
+            sqlx::query("SELECT pg_notify('session_ops', $1)")
+                .bind(session_id.as_uuid().to_string())
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?;
+        }
+        Ok(woken)
+    }
+
+    async fn op_request_cancel_running(
+        &self,
+        session_id: SessionId,
+        kind: OpKind,
+    ) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE session_ops SET payload = jsonb_set(payload, '{_cancel}', 'true')
+              WHERE session_id = $1 AND kind = $2 AND state = 'running'",
+        )
+        .bind(session_id.as_uuid())
+        .bind(kind.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn op_cancel_requested(&self, op_id: i64) -> Result<bool, MetaError> {
+        let flag: Option<Option<bool>> = sqlx::query_scalar(
+            "SELECT payload->>'_cancel' = 'true' FROM session_ops WHERE id = $1",
+        )
+        .bind(op_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        // Missing row or absent key (SQL NULL) both read as "no cancel".
+        Ok(flag.flatten().unwrap_or(false))
+    }
+
+    async fn op_running_for(&self, session_id: SessionId) -> Result<Option<SessionOp>, MetaError> {
+        let q = format!(
+            "SELECT {OP_COLUMNS} FROM session_ops
+              WHERE session_id = $1 AND state = 'running'"
+        );
+        let row = sqlx::query(&q)
+            .bind(session_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| row::session_op_from_row(&r)).transpose()
+    }
+
+    async fn op_get(&self, op_id: i64) -> Result<Option<SessionOp>, MetaError> {
+        let q = format!("SELECT {OP_COLUMNS} FROM session_ops WHERE id = $1");
+        let row = sqlx::query(&q)
+            .bind(op_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| row::session_op_from_row(&r)).transpose()
+    }
+
+    async fn op_cancel_by_id(&self, op_id: i64) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE session_ops SET state = 'cancelled', finished_at = now()
+              WHERE id = $1 AND state = 'queued'",
+        )
+        .bind(op_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn op_pending_exists(
+        &self,
+        session_id: SessionId,
+        kind: OpKind,
+    ) -> Result<bool, MetaError> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM session_ops
+                             WHERE session_id = $1 AND kind = $2
+                               AND state IN ('queued', 'running'))",
+        )
+        .bind(session_id.as_uuid())
+        .bind(kind.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(exists)
+    }
+
+    async fn orphaned_pending_sessions(
+        &self,
+        older_than: std::time::Duration,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        let rows = sqlx::query(
+            "SELECT s.id FROM sessions s
+              WHERE s.status = 'pending'
+                AND s.last_active_at < now() - make_interval(secs => $1)
+                AND NOT EXISTS (
+                    SELECT 1 FROM session_ops o
+                     WHERE o.session_id = s.id
+                       AND o.kind = 'create_boot'
+                       AND o.state IN ('queued', 'running')
+                )",
+        )
+        .bind(older_than.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| {
+                let id: uuid::Uuid = r.try_get(0).map_err(db_err)?;
+                Ok(SessionId::from(id))
+            })
+            .collect()
+    }
+
+    async fn op_reclaim_stale(
+        &self,
+        stale: std::time::Duration,
+        claimed_by: &str,
+    ) -> Result<Vec<SessionOp>, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // SKIP LOCKED: a row a peer sweep is mid-reclaiming is theirs.
+        // State stays 'running' through the re-stamp, so the one_running
+        // index is never perturbed — the fence is the epoch bump.
+        let select = format!(
+            "SELECT {OP_COLUMNS} FROM session_ops
+              WHERE state = 'running'
+                AND heartbeat_at < now() - make_interval(secs => $1)
+              ORDER BY id ASC
+              FOR UPDATE SKIP LOCKED"
+        );
+        let rows = sqlx::query(&select)
+            .bind(stale.as_secs_f64())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let mut reclaimed = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let op = row::session_op_from_row(row)?;
+            // Fence the stalled writer everywhere: bump the session's
+            // epoch, then hand the row (and its recorded `step`) to us.
+            let epoch: i64 = sqlx::query_scalar(
+                "UPDATE sessions SET current_epoch = current_epoch + 1
+                 WHERE id = $1 RETURNING current_epoch",
+            )
+            .bind(op.session_id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let stamp = format!(
+                "UPDATE session_ops
+                    SET epoch = $2, claimed_by = $3, claimed_at = now(),
+                        heartbeat_at = now(), attempts = attempts + 1
+                  WHERE id = $1
+                 RETURNING {OP_COLUMNS}"
+            );
+            let row = sqlx::query(&stamp)
+                .bind(op.id)
+                .bind(epoch)
+                .bind(claimed_by)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            reclaimed.push(row::session_op_from_row(&row)?);
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(reclaimed)
+    }
+
+    async fn fenced_transition_session(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        to: SessionState,
+    ) -> Result<Option<SessionState>, MetaError> {
+        // Same legality semantics as `transition_session` (SELECT-then-
+        // UPDATE under the row lock, `try_transition_to` gating the
+        // write), plus the epoch fence on the UPDATE. An illegal
+        // transition is a `Conflict` (a real bug in the caller); a fenced
+        // write (0 rows because `current_epoch` moved) is `Ok(None)` —
+        // the op executor was superseded and must stop silently.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let row =
+            sqlx::query("SELECT status, current_epoch FROM sessions WHERE id = $1 FOR UPDATE")
+                .bind(session_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .ok_or(MetaError::NotFound)?;
+        // ADR 0079 (review finding #3): the FENCE CHECK MUST PRECEDE the
+        // legality check. A fenced executor whose successor already
+        // transitioned would otherwise see the successor's *resulting*
+        // state and fail `try_transition_to` with a bare `Conflict` (no
+        // `fenced:` prefix) — callers matching `starts_with("fenced:")`
+        // would drop to the generic Err arm and fire the compensation
+        // (`abort_inflight_snapshot`) that a fenced executor MUST NOT run
+        // (the 89f7984d brick class). Reading `current_epoch` in this same
+        // FOR UPDATE row and returning `Ok(None)` on a mismatch makes
+        // epoch-staleness the silent-stop path regardless of the
+        // successor's resulting state.
+        let stored_epoch: i64 = row.try_get("current_epoch").map_err(|e| {
+            MetaError::Serialization(format!("fenced_transition_session: read epoch: {e}"))
+        })?;
+        if stored_epoch != epoch {
+            return Ok(None);
+        }
+        let current_raw: String = row.try_get("status").map_err(|e| {
+            MetaError::Serialization(format!("fenced_transition_session: read current: {e}"))
+        })?;
+        let current = row::parse_session_state_for_lib(&current_raw)?;
+        current.try_transition_to(to).map_err(|e| {
+            tracing::warn!(
+                session_id = %session_id,
+                from = %current.as_str(),
+                to = %to.as_str(),
+                "rejected illegal session state transition (fenced path)"
+            );
+            MetaError::Conflict(e.to_string())
+        })?;
+        // The same UPDATE `transition_session` commits (counter resets
+        // included), fenced by the epoch predicate.
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET status = $2,
+                   last_active_at = NOW(),
+                   updated_at = NOW(),
+                   evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
+                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END
+             WHERE id = $1 AND current_epoch = $3
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(to.as_str())
+        .bind(epoch)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        tx.commit().await.map_err(db_err)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        // Mirror `transition_session`'s post-commit queue-scanner wake:
+        // a session leaving a memory-reserving state frees its budget.
+        if current.reserves_host_memory() && !to.reserves_host_memory() {
+            self.notify_placement_changed("session_freed").await;
+        }
+        Ok(Some(current))
+    }
+
+    async fn fenced_assign_sandbox(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        sandbox_id: Option<SandboxId>,
+        host_id: Option<HostId>,
+    ) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE sessions
+                SET sandbox_id = $2, host_id = $3, last_active_at = now(), updated_at = now()
+              WHERE id = $1 AND current_epoch = $4",
+        )
+        .bind(session_id.as_uuid())
+        .bind(sandbox_id.map(|s| s.as_uuid()))
+        .bind(host_id.map(|h| h.as_uuid()))
+        .bind(epoch)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// ADR 0016 Phase B: publish the host's freshly-flushed disk

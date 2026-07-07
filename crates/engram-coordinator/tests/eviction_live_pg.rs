@@ -234,106 +234,41 @@ async fn backstop_query_uses_newest_event() {
     );
 }
 
-/// ADR 0045 D5 / issue #147: `touch_session_lease` refreshes only the
-/// holder's own row — a touch can't resurrect a reaped/foreign lease,
-/// and a touched lease survives the stale-reap window.
+/// #584 review regression (the recurring missing-comma projection class):
+/// `get_session` must round-trip park_rung, parked_at, AND the live disk
+/// manifest under their OWN column names. A dropped comma in its SELECT
+/// silently aliases a neighbor (`x AS park_rung`), and row.rs's tolerant
+/// decode masks it (`unwrap_or(0)` / `.ok().flatten()`): a rung-2
+/// parked-paused session then reads rung 0 — the un-pause ascent flips a
+/// FROZEN VM to Active without resuming it — and the disk-only cold-boot
+/// gate never fires. Only a live-PG round-trip catches this shape.
 #[tokio::test]
 #[ignore = "requires live Postgres (ENGRAM_TEST_DATABASE_URL)"]
-async fn touch_session_lease_is_holder_scoped_and_defeats_the_reaper() {
+async fn get_session_round_trips_park_and_live_disk_manifest() {
     let Some(meta) = pg().await else { return };
-    let session_id = SessionId::new();
+    let (id, sandbox) = seed_active(&meta).await;
 
-    assert!(meta
-        .try_acquire_session_lease(session_id, None, "pod-a")
+    let parked_at = chrono::Utc::now();
+    meta.set_session_park_rung(id, 2, Some(parked_at))
         .await
-        .unwrap());
-
-    // Holder touch succeeds; a foreign pod's touch does not.
-    assert!(meta.touch_session_lease(session_id, "pod-a").await.unwrap());
-    assert!(!meta.touch_session_lease(session_id, "pod-b").await.unwrap());
-
-    // A touched lease is NOT reaped at a max_age its refresh stays inside.
-    assert!(meta.touch_session_lease(session_id, "pod-a").await.unwrap());
-    let reaped = meta
-        .sweep_stale_session_leases(std::time::Duration::from_secs(60))
+        .expect("set park_rung");
+    let mref = engram_core::types::manifest::ManifestRef {
+        manifest_id: uuid::Uuid::new_v4(),
+        version: 7,
+    };
+    meta.update_live_disk_manifest(id, sandbox, mref)
         .await
-        .unwrap();
+        .expect("publish live disk manifest");
+
+    let s = meta.get_session(id).await.expect("get_session");
+    assert_eq!(s.park_rung, 2, "park_rung must project under its own name");
     assert!(
-        !reaped.iter().any(|l| l.session_id == session_id),
-        "freshly-touched lease must survive the reaper"
+        s.parked_at.is_some(),
+        "parked_at must project under its own name"
     );
-
-    // After release, touch reports the loss.
-    assert!(
-        meta.release_session_lease(session_id, "pod-a")
-            .await
-            .unwrap(),
-        "holder release deletes its own row"
+    assert_eq!(
+        s.live_disk_manifest,
+        Some(mref),
+        "live_disk_manifest_{{id,version}} must project under their own names"
     );
-    assert!(!meta.touch_session_lease(session_id, "pod-a").await.unwrap());
-}
-
-/// Issue #212: `release_session_lease` is holder-scoped — a reaped holder
-/// whose row was re-acquired by a new holder must NOT blind-delete the new
-/// holder's lease on its (late) Drop. Without the `AND locked_by = $2`
-/// filter the fleet's primary serializer fails open after any >180s hold.
-#[tokio::test]
-#[ignore = "requires live Postgres (ENGRAM_TEST_DATABASE_URL)"]
-async fn release_session_lease_is_holder_scoped_no_blind_delete() {
-    let Some(meta) = pg().await else { return };
-    let session_id = SessionId::new();
-
-    // Holder A acquires.
-    assert!(meta
-        .try_acquire_session_lease(session_id, None, "pod-a")
-        .await
-        .unwrap());
-
-    // A is reaped (it held >180s without touching). Simulate with a
-    // zero-age sweep that deletes everything currently held.
-    let reaped = meta
-        .sweep_stale_session_leases(std::time::Duration::from_secs(0))
-        .await
-        .unwrap();
-    assert!(
-        reaped.iter().any(|l| l.session_id == session_id),
-        "the reaper must have removed A's aged lease"
-    );
-
-    // Holder B legitimately acquires the now-free lease and starts its
-    // own pipeline.
-    assert!(meta
-        .try_acquire_session_lease(session_id, None, "pod-b")
-        .await
-        .unwrap());
-
-    // A's RPC finally resolves and its guard drops, firing the release.
-    // The scoped DELETE must NOT touch B's row: it affects 0 rows.
-    assert!(
-        !meta
-            .release_session_lease(session_id, "pod-a")
-            .await
-            .unwrap(),
-        "A's late release must affect 0 rows — it no longer owns the lease",
-    );
-
-    // B's lease is still present, so a third holder C cannot acquire it.
-    assert!(
-        meta.session_lease_held(session_id).await.unwrap(),
-        "B's lease must survive A's blind release",
-    );
-    assert!(
-        !meta
-            .try_acquire_session_lease(session_id, None, "pod-c")
-            .await
-            .unwrap(),
-        "C must NOT acquire while B holds the lease",
-    );
-
-    // B can still touch and release its own lease.
-    assert!(meta.touch_session_lease(session_id, "pod-b").await.unwrap());
-    assert!(meta
-        .release_session_lease(session_id, "pod-b")
-        .await
-        .unwrap());
 }

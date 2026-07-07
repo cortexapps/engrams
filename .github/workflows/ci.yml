@@ -367,6 +367,7 @@ jobs:
             --test queue_scanner_live_pg \
             --test binding_cas_live_pg \
             --test outbox_live_pg \
+            --test session_ops_live_pg \
             --test mount_catalog_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
@@ -856,6 +857,7 @@ jobs:
             --test snapshot \
             --test snapshot_uffd \
             --test exec_real_vm \
+            --test agentd_bundle_reexec \
             --test baked_harness_loopback \
             --test forge_loopback \
             --test upload_loopback \
@@ -867,6 +869,7 @@ jobs:
             --test diff_snapshot \
             --test file_restore_shared_rss \
             --test stock_fork_snapshot_compat \
+            --test pause_resume_vsock \
             --test vmstate_only_snapshot \
             --test substrate_kernel_capabilities \
             --test substrate_uffd_base \
@@ -1015,6 +1018,10 @@ jobs:
       # which Blacksmith runners provide; the other bundles in the recipe
       # degrade gracefully if their build skips (e2e_vnc only needs `browser`).
       - name: Stage browser bundle for e2e_vnc (ADR 0064)
+        env:
+          # ADR 0080: `bundles-squashfs` also packs `bundle-agentd`; reuse the
+          # musl agentd this lane already built instead of a second compile.
+          ENGRAM_AGENTD_BIN: target/x86_64-unknown-linux-musl/release/engram-agentd
         run: |
           just bundles-squashfs
           ls -l var/shared/
@@ -1302,14 +1309,14 @@ jobs:
           # stable across commits — the shared cache saves ~1-2min
           # on whichever job runs second. Shares the key with
           # artifacts-e2e-stack because their cargo build inputs are
-          # identical (engram-cli reads the image's engram.toml at bake
-          # time — not a compile input).
+          # identical (the image source is not a compile input).
           shared-key: release-musl-bake
 
       - name: Build engram-cli + static-musl agentd
         run: |
-          # Static-musl agentd goes inside the guest rootfs via
-          # --inject-agent. (ADR 0015 M1 collapsed engram-bootstrap
+          # Static-musl agentd is packed into `bundle-agentd` by
+          # `just bundles-squashfs` (ADR 0080 — nothing injects it into a
+          # rootfs anymore). (ADR 0015 M1 collapsed engram-bootstrap
           # into engram-agentd, `75ba2df`.)
           cargo build --release --target x86_64-unknown-linux-musl \
               -p engram-agentd
@@ -1318,9 +1325,10 @@ jobs:
 
       - name: Stage ${{ matrix.variant }} source
         run: |
+          # ADR 0080: the image source is just the Dockerfile — runtime
+          # config is applied at enable time (image-config.toml), never baked.
           mkdir -p var/${{ matrix.variant }}
           cp deploy/${{ matrix.variant }}/Dockerfile  var/${{ matrix.variant }}/
-          cp deploy/${{ matrix.variant }}/engram.toml var/${{ matrix.variant }}/
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -1775,6 +1783,10 @@ jobs:
           # Point `just bundles-squashfs` (tilt runs it next) at this downloaded
           # tree so it packs `harness-claude` into var/shared's stamp.
           echo "ENGRAM_HARNESS_CLAUDE_TREE=$PWD/var/harness-claude-stage" >> "$GITHUB_ENV"
+          # ADR 0080: likewise hand it the pre-built musl agentd (downloaded
+          # with the e2e binaries above) so packing `bundle-agentd` doesn't
+          # recompile anything in this no-cargo lane.
+          echo "ENGRAM_AGENTD_BIN=$PWD/target/x86_64-unknown-linux-musl/release/engram-agentd" >> "$GITHUB_ENV"
 
       # `just bundles-squashfs` (the tilt `bundles` resource) packs the RO bundles
       # with mksquashfs, so squashfs-tools must be on PATH before the stack comes up.

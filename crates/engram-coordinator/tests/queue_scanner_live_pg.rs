@@ -1,11 +1,14 @@
 //! Live-Postgres tests for the ADR 0048 session-queue store layer:
 //! `reserve_and_persist_create`'s Queued disposition (issue #535 (b);
 //! formerly `enqueue_session_create`), `list_queued_sessions_fifo`,
-//! `place_queued_session` (the queued-row reservation transaction),
-//! `requeue_session`, `requeue_stale_pending`, and `queued_demand` — all
-//! against REAL Postgres (the migration 0064 schema + the FIFO index +
-//! the queued→pending flip). The scanner's boot half is covered by the
-//! api.rs create tests + e2e_stack; this pins the SQL the scanner stands on.
+//! `place_queued_session` (the queued-row reservation transaction), and
+//! `queued_demand` — all against REAL Postgres (the migration 0064
+//! schema + the FIFO index + the queued→pending flip). ADR 0079: the
+//! scanner's boot half is the create_boot OP now — placement enqueues a
+//! `session_ops` row (asserted below) and the op executor owns boot
+//! retry + crash recovery (`requeue_session`/`requeue_stale_pending`
+//! are retired); the boot pipeline itself is covered by the api.rs
+//! create tests + e2e_stack.
 //!
 //! Also covers the queue-fairness follow-up (per-fit-class scanner
 //! sweeps + the `placement_changed` NOTIFY wake): `queue_scanner::run_once`
@@ -67,8 +70,7 @@ async fn enqueue(
         sealed_secrets: None,
         capabilities: Vec::new(),
         integration_policy_json: None,
-        selected_harness: None,
-        selected_skills: Vec::new(),
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
     };
     let disposition = meta
         .reserve_and_persist_create(ws, &[], 0)
@@ -103,8 +105,7 @@ async fn reserve(
         sealed_secrets: None,
         capabilities: Vec::new(),
         integration_policy_json: None,
-        selected_harness: None,
-        selected_skills: Vec::new(),
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
     };
     match meta
         .reserve_and_persist_create(ws, candidates, affinity_len)
@@ -148,7 +149,6 @@ async fn seed_ready_host(
         last_heartbeat_at: Utc::now(),
         host_addr: None,
         ready_images: Vec::new(),
-        local_snapshots: Vec::new(),
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
@@ -174,7 +174,6 @@ async fn seed_ready_host(
                 ..HostUtilization::default()
             },
             ready_images: ready_images.to_vec(),
-            local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             total_vcpus,
             // Issue #229: report the coordinator's wire version so the
@@ -233,7 +232,11 @@ async fn seed_enabled_image(meta: &Arc<dyn MetadataStore>, image_uri: &str) -> S
     meta.upsert_enabled_image(EnabledImage {
         id: Uuid::new_v4(),
         image_uri: image_uri.to_string(),
-        manifest_toml: format!("name = \"queue-scanner-fixture-{}\"\n", Uuid::new_v4()),
+        image_config: engram_core::types::image::ImageConfig {
+            name: "test".into(),
+            ..Default::default()
+        },
+        oci_defaults: Default::default(),
         manifest_digest: digest.clone(),
         disk_manifest: None,
         base_snapshot_id: Some(snapshot_id),
@@ -243,7 +246,6 @@ async fn seed_enabled_image(meta: &Arc<dyn MetadataStore>, image_uri: &str) -> S
         created_at: now,
         updated_at: None,
         soft_deleted_at: None,
-        capture_env: Vec::new(),
     })
     .await
     .expect("seed enabled image");
@@ -329,40 +331,72 @@ async fn place_queued_returns_none_when_no_host_fits() {
     assert_eq!(row.status, SessionState::Queued, "row stays queued");
 }
 
+/// ADR 0079: the successor to the retired `requeue_and_stale_pending_
+/// recovery` test. Placement no longer bounces a failed boot back to the
+/// queue by poll — the sweep's `queued → pending` flip enqueues a
+/// `create_boot` op (keyed `boot:{session}:{queued_at millis}`) whose
+/// row-level retry/reclaim own everything the requeue paths used to.
+/// Asserts: the sweep placed the session (durable Queued→Pending event),
+/// a create_boot op is pending for it, and a sibling replica's re-derived
+/// key dedups instead of double-enqueueing.
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn requeue_and_stale_pending_recovery() {
-    let Some(meta) = connect().await else { return };
-    let host = seed_ready_host(&meta, 16_384, 8, &[]).await;
+async fn placement_enqueues_create_boot_op_with_stable_key() {
+    use engram_core::types::session_op::{EnqueueOutcome, OpKind};
+    let Some((meta, state, _database_url)) = setup(true).await else {
+        return;
+    };
+
+    // Same fixture shape as `hol_break_is_per_class_not_global`: a host
+    // sized EXACTLY to this session's own randomized budget (see that
+    // test's comment for why), the enabled-image row PR #565's digest
+    // gate requires, and the digest staged on the host.
     let sid = SessionId::new();
-    enqueue(&meta, sid, spec(), 4096, 2).await;
-    meta.place_queued_session(sid, 4096, 2, &[host], 0)
+    let (mem, cpu) = unique_fitting_budget_in(sid, BOOT_OP_BUDGET_BASE_MIB);
+    let s_spec = spec();
+    let digest = seed_enabled_image(&meta, &s_spec.image).await;
+    let _host = seed_ready_host(&meta, mem as u64, 8, &[digest]).await;
+    enqueue(&meta, sid, s_spec, mem, cpu).await;
+    let queued_at = meta
+        .list_queued_sessions_fifo()
         .await
-        .expect("place");
+        .expect("list queued")
+        .into_iter()
+        .find(|q| q.session.id == sid)
+        .expect("our queued row")
+        .queued_at;
 
-    // requeue_session: pending → queued.
-    assert!(meta.requeue_session(sid).await.expect("requeue"));
-    assert_eq!(
-        meta.get_session(sid).await.unwrap().status,
-        SessionState::Queued
+    queue_scanner::run_once(&QueueScannerConfig::default(), &state)
+        .await
+        .expect("run_once");
+
+    assert!(
+        has_status_change_to(&meta, sid, "pending").await,
+        "the sweep must have placed the session (durable Queued→Pending event)"
     );
-    // A second requeue is a no-op (no longer pending).
-    assert!(!meta.requeue_session(sid).await.expect("requeue2"));
-
-    // requeue_stale_pending: place again, then reclaim with a zero
-    // staleness window (everything older than "now" qualifies).
-    meta.place_queued_session(sid, 4096, 2, &[host], 0)
+    assert!(
+        meta.op_pending_exists(sid, OpKind::CreateBoot)
+            .await
+            .expect("op_pending_exists"),
+        "placement must enqueue a create_boot op (the boot's durable owner)"
+    );
+    // The key is derived from durable row state (`queued_at`), so a
+    // sibling replica racing the same placement re-derives the SAME key
+    // and dedups instead of appending a second boot op.
+    let key = format!("boot:{sid}:{}", queued_at.timestamp_millis());
+    let dup = meta
+        .op_enqueue_and_claim(
+            sid,
+            OpKind::CreateBoot,
+            serde_json::json!({}),
+            Some(&key),
+            "rival-pod",
+        )
         .await
-        .expect("place2");
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let n = meta
-        .requeue_stale_pending(Duration::from_millis(1))
-        .await
-        .expect("stale");
-    assert!(n >= 1, "stale placed-pending row should be reclaimed");
-    assert_eq!(
-        meta.get_session(sid).await.unwrap().status,
-        SessionState::Queued
+        .expect("duplicate enqueue");
+    assert!(
+        matches!(dup, EnqueueOutcome::Duplicate),
+        "the stable idempotency key must dedup a sibling's re-enqueue, got {dup:?}"
     );
 }
 
@@ -375,9 +409,13 @@ async fn resume_origin_enqueue_requires_idle() {
     let sid = SessionId::new();
     enqueue(&meta, sid, spec(), 4096, 2).await;
     // It's `queued`, not `idle`, so enqueue_session_resume is a no-op.
-    meta.enqueue_session_resume(sid)
+    // (Epoch 0 = the row's fresh `current_epoch` default — no op has
+    // ever claimed this session.)
+    let landed = meta
+        .enqueue_session_resume(sid, 0)
         .await
         .expect("resume enqueue no-op");
+    assert!(!landed, "a non-idle row must not be re-queued");
     let row = meta.get_session(sid).await.unwrap();
     // Still a create-origin queued row.
     assert_eq!(row.status, SessionState::Queued);
@@ -504,6 +542,11 @@ const HOL_BREAK_BUDGET_BASE_MIB: i64 = 1024; // 1024..=1535 MiB
 /// [`HOL_BREAK_BUDGET_BASE_MIB`] by more than the 512-wide span either
 /// draws from.
 const PER_CLASS_FIFO_BUDGET_BASE_MIB: i64 = 2048; // 2048..=2559 MiB
+
+/// [`unique_fitting_budget_in`]'s range for
+/// `placement_enqueues_create_boot_op_with_stable_key` — disjoint from
+/// both ranges above (ADR 0079).
+const BOOT_OP_BUDGET_BASE_MIB: i64 = 3072; // 3072..=3583 MiB
 
 /// Does `session_id`'s durable event log contain a `status_changed` event
 /// whose `to` field is `to`? Durable proof that the scanner attempted (and
@@ -768,9 +811,14 @@ async fn resume_origin_timeout_returns_to_idle() {
     meta.transition_session(sid, SessionState::Idle)
         .await
         .expect("Active->Idle");
-    meta.enqueue_session_resume(sid)
+    let landed = meta
+        .enqueue_session_resume(sid, 0)
         .await
         .expect("enqueue resume");
+    assert!(
+        landed,
+        "the Idle row (epoch 0, never op-claimed) must queue"
+    );
     // Nothing in the fleet can satisfy a resume-origin session with this
     // large a budget — but `enqueue_session_resume` doesn't carry budgets
     // (resume re-derives them at dequeue time via the session's live disk
@@ -937,9 +985,11 @@ async fn enqueue_session_resume_noop_does_not_notify_placement_changed() {
         .expect("listener stayed open");
     assert_eq!(seed_notify.payload(), "enqueued");
 
-    meta.enqueue_session_resume(sid)
+    let landed = meta
+        .enqueue_session_resume(sid, 0)
         .await
         .expect("resume enqueue no-op");
+    assert!(!landed, "a non-idle row must not be re-queued");
     let row = meta.get_session(sid).await.unwrap();
     assert_eq!(
         row.status,
@@ -1020,6 +1070,7 @@ async fn scanner_wakes_on_notify_and_places_within_the_wake_not_the_fallback() {
         state.integrations.clone(),
         state.boot_bundles.clone(),
         wake,
+        std::sync::Arc::new(tokio::sync::Notify::new()),
         std::sync::Arc::new(tokio::sync::Notify::new()),
     );
     // Let both tasks reach their first `select!` / `LISTEN` before we

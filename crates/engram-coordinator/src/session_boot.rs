@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 
+use engram_core::traits::SessionFence;
 use engram_core::types::sandbox::AgentSpec;
 use engram_core::types::session::{SessionSpec, SessionState};
 use engram_core::types::SnapshotId;
@@ -76,12 +77,13 @@ pub(crate) struct BootInputs {
     /// ADR 0055: per-session skills resolved from the profile + assigned to
     /// reserved slots (dyn_0..). Patched into the restored VM load-paused.
     pub selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    /// ADR 0055 / issue #535 (b): the RAW selected skill names (before slot
-    /// resolution) — persisted into `sessions.selected_skills` by
-    /// `reserve_and_persist_create` so a queued create's boot re-prepare
-    /// (`prepare_from_row`) can reconstruct the selection (the
-    /// `selected_mounts` above are already-resolved-to-slots and re-derived
-    /// fresh on every prepare instead — the sha may have rolled while queued).
+    /// ADR 0077 phase 3: the RAW selected skill names (before slot
+    /// resolution). `boot_prepared` folds these into the RuntimeSpec written
+    /// by `reserve_and_persist_create` in the create transaction, so a queued
+    /// create's boot re-prepare (`prepare_from_row`) reconstructs the
+    /// selection from the persisted RuntimeSpec (the `selected_mounts` above
+    /// are already-resolved-to-slots and re-derived fresh on every prepare —
+    /// the sha may have rolled while queued).
     pub selected_skills: Vec<String>,
     /// ADR 0056: the profile-granted capabilities (parsed + validated).
     /// Issue #535 (b): bound to `session_capabilities` by `reserve_and_
@@ -170,6 +172,11 @@ pub(crate) async fn boot_on_reserved_host(
     state: &SharedState,
     inputs: BootInputs,
     host_id: HostId,
+    // ADR 0079: the caller's fencing epoch, stamped into every session-
+    // scoped host RPC below. The create_boot verb threads its op fence;
+    // the direct (capacity-available) create pipeline is out-of-op and
+    // passes `SessionFence::unfenced()`.
+    fence: SessionFence,
 ) -> Result<(), BootError> {
     let BootInputs {
         session_id,
@@ -244,6 +251,7 @@ pub(crate) async fn boot_on_reserved_host(
         metadata,
         spec_env.clone(),
         selected_mounts,
+        fence,
     );
     let env_egress_leg = async {
         if let Some(a) = agent.as_mut() {
@@ -289,7 +297,7 @@ pub(crate) async fn boot_on_reserved_host(
             %session_id, %sandbox_id, %host_id, error = %e,
             "session row transition-to-created failed after sandbox create; tearing sandbox down",
         );
-        if let Err(de) = state.services.host.destroy(sandbox_id).await {
+        if let Err(de) = state.services.host.destroy(sandbox_id, fence).await {
             tracing::error!(
                 %session_id, %sandbox_id, error = %de,
                 "sandbox teardown after transition failure also failed — host reconcile will GC",
@@ -373,7 +381,7 @@ pub(crate) async fn boot_on_reserved_host(
     if let Err(e) = state
         .services
         .host
-        .start_agent(sandbox_id, agent, policy)
+        .start_agent(sandbox_id, agent, policy, fence)
         .await
     {
         tracing::error!(
@@ -476,6 +484,53 @@ async fn assemble_egress_policy(
         // substitutes per `EgressSecretEntry`. Kept Broker for the (vestigial)
         // wire field — substitution is driven by the entries, not this flag.
         secret_mode: engram_core::types::image::SecretMode::Broker,
+    })
+}
+
+/// ADR 0080 (wire v13): the capture flavor of egress assembly — build the
+/// `SessionEgressPolicy` a `[warm]` hook runs under from the image
+/// config's `warm.network`, or `None` when the image grants no egress (→
+/// the capture stays egress-less; the default for every non-opted-in
+/// image). One builder for sessions and captures alike: the host's own
+/// `capture_egress_policy` (which duplicated this posture mapping from
+/// `WarmConfig.network`) is retired.
+///
+/// `default = "allow"` → allow-all (dev posture: no agent runs at
+/// capture, so the in-session threat model doesn't apply); `default =
+/// "deny"` + non-empty lists → a scoped allowlist; `deny` with no hosts →
+/// `None`. `SecretMode::Literal` = SNI-filter only (no MITM): the warm
+/// hook talks to the real upstreams over unbroken TLS; no secrets /
+/// injects / observes — those are session policy, never capture policy.
+///
+/// The sandbox-dependent identity half is left as placeholders: the
+/// capture VM is created INSIDE the host's `build_base_snapshot`, so the
+/// host stamps `sandbox_id` + `guest_ip` at registration. The synthetic
+/// `session_id` minted here keys the host's registry entry for teardown.
+pub(crate) fn assemble_capture_egress_policy(
+    network: &engram_core::types::image::NetworkPolicy,
+) -> Option<engram_core::types::egress::SessionEgressPolicy> {
+    let allow_all = matches!(
+        network.default,
+        engram_core::types::image::NetworkDefault::Allow
+    );
+    // A deny-default policy that lists no hosts grants nothing — there's
+    // no egress to register, so leave the capture egress-less.
+    if !allow_all && network.allow_hosts.is_empty() && network.allow_host_patterns.is_empty() {
+        return None;
+    }
+    Some(engram_core::types::egress::SessionEgressPolicy {
+        session_id: SessionId::new(),
+        // Stamped by the host at registration (the capture VM doesn't
+        // exist yet when this is assembled).
+        sandbox_id: SandboxId(uuid::Uuid::nil()),
+        guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+        network_allow_hosts: network.allow_hosts.clone(),
+        network_allow_host_patterns: network.allow_host_patterns.clone(),
+        allow_all,
+        secrets: Vec::new(),
+        injects: Vec::new(),
+        observes: Vec::new(),
+        secret_mode: engram_core::types::image::SecretMode::Literal,
     })
 }
 
@@ -673,3 +728,67 @@ async fn mint_inject_header(
 // ADR 0057: `egress_secret_entries` (manifest-secret → egress pairing) is
 // retired — the per-secret broker entries are built in
 // `crate::api::sessions::resolve_policy_secrets` from the session policy.
+
+#[cfg(test)]
+mod capture_egress_tests {
+    use engram_core::types::image::{NetworkDefault, NetworkPolicy, SecretMode};
+
+    use super::assemble_capture_egress_policy;
+
+    /// Ported from the host's retired `capture_egress_policy` (ADR 0080
+    /// moved the posture decision coordinator-side): a deny-default
+    /// policy that lists no hosts grants nothing, so the capture stays
+    /// egress-less (the default for every non-opted-in image — "no
+    /// [warm.network]" never reaches this builder at all).
+    #[test]
+    fn capture_egress_none_when_no_egress_granted() {
+        assert!(
+            assemble_capture_egress_policy(&NetworkPolicy {
+                default: NetworkDefault::Deny,
+                allow_hosts: vec![],
+                allow_host_patterns: vec![],
+            })
+            .is_none(),
+            "deny-default with no hosts grants nothing → no policy",
+        );
+    }
+
+    /// A `deny` default + declared hosts becomes a scoped allowlist policy
+    /// (`allow_all = false`, SNI-filter only, no secrets/injects/observes),
+    /// with placeholder identity for the host to stamp.
+    #[test]
+    fn capture_egress_scopes_declared_allowlist() {
+        let policy = assemble_capture_egress_policy(&NetworkPolicy {
+            default: NetworkDefault::Deny,
+            allow_hosts: vec!["accounts.google.com".into()],
+            allow_host_patterns: vec!["*.auth0.com".into()],
+        })
+        .expect("allowlist must produce a policy");
+
+        assert!(!policy.allow_all);
+        assert_eq!(policy.network_allow_hosts, vec!["accounts.google.com"]);
+        assert_eq!(policy.network_allow_host_patterns, vec!["*.auth0.com"]);
+        assert!(matches!(policy.secret_mode, SecretMode::Literal));
+        assert!(policy.secrets.is_empty());
+        assert!(policy.injects.is_empty());
+        assert!(policy.observes.is_empty());
+        // Identity half is a placeholder — the host stamps sandbox_id +
+        // guest_ip at registration (the capture VM doesn't exist yet).
+        assert!(policy.sandbox_id.0.is_nil());
+        assert!(policy.guest_ip.is_unspecified());
+    }
+
+    /// An `allow` default becomes an allow-all policy (`allow_all = true`);
+    /// the dev posture for an image whose warm boot needs unrestricted
+    /// network.
+    #[test]
+    fn capture_egress_allow_all_for_allow_default() {
+        let policy = assemble_capture_egress_policy(&NetworkPolicy {
+            default: NetworkDefault::Allow,
+            allow_hosts: vec![],
+            allow_host_patterns: vec![],
+        })
+        .expect("allow-default must produce a policy");
+        assert!(policy.allow_all, "default=allow → allow_all");
+    }
+}

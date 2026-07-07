@@ -138,6 +138,9 @@ export const POLICY: Record<string, PolicyEntry> = {
   "ImageService.ListEnableJobs": { action: "read", subject: "EnabledImage" },
   "ImageService.GetEnableJob": { action: "read", subject: "EnabledImage" },
   "ImageService.EnableImage": { action: "manage", subject: "all" },
+  // ADR 0080: full-replace config edit (cheap fields immediate;
+  // resources/warm behind allow_recapture) — admin, like every mutation.
+  "ImageService.UpdateImage": { action: "manage", subject: "all" },
   "ImageService.DisableImage": { action: "manage", subject: "all" },
   "ImageService.RefreshImage": { action: "manage", subject: "all" },
   "ImageService.RetryEnableJob": { action: "manage", subject: "all" },

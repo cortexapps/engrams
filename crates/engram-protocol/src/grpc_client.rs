@@ -14,7 +14,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use engram_core::traits::HostClient;
+use engram_core::traits::{HostClient, SessionFence};
 use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
@@ -36,7 +36,7 @@ use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     AnswerHarnessQuestionRequest, ApplyEgressPolicyRequest, BindHarnessSessionRequest,
     BuildBaseSnapshotRequest, CreateSandboxRequest, DequeueHarnessQueuedPromptRequest,
-    EditHarnessQueuedPromptRequest, Empty, ExecStartRequest, GuestIpResponse,
+    EditHarnessQueuedPromptRequest, Empty, ExecStartRequest, FencedSandboxRequest, GuestIpResponse,
     InterruptHarnessRequest, MigrationExportRef, MigrationFetchRequest, MigrationItem,
     ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
     ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
@@ -93,6 +93,18 @@ impl Interceptor for TraceparentInjector {
 /// rides the gRPC deadline header, the *host* side observes it too and
 /// can abort its own work. Override via
 /// `ENGRAM_RESTORE_RPC_TIMEOUT_SECS`.
+/// ADR 0079: build the shared fenced request for the
+/// `SandboxIdMessage`-shaped lifecycle RPCs. `SessionFence::unfenced()`
+/// encodes epoch 0 (interim "verb not yet migrated" — the host allows
+/// without advancing).
+fn fenced_request(id: SandboxId, fence: SessionFence) -> FencedSandboxRequest {
+    FencedSandboxRequest {
+        uuid: id.as_uuid().as_bytes().to_vec(),
+        fencing_epoch: fence.epoch,
+        session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
+    }
+}
+
 fn restore_rpc_timeout() -> Duration {
     let secs = std::env::var("ENGRAM_RESTORE_RPC_TIMEOUT_SECS")
         .ok()
@@ -162,13 +174,14 @@ impl GrpcHostClient {
         decode_sandbox_id(&resp.sandbox_id)
     }
 
-    pub async fn destroy_sandbox(&self, id: SandboxId) -> Result<(), SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
+    pub async fn destroy_sandbox(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         self.inner
             .clone()
-            .destroy_sandbox(req)
+            .destroy_sandbox(fenced_request(id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -216,14 +229,15 @@ impl GrpcHostClient {
         })
     }
 
-    pub async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
+    pub async fn snapshot(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         let resp = self
             .inner
             .clone()
-            .snapshot(req)
+            .snapshot(fenced_request(id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -236,14 +250,12 @@ impl GrpcHostClient {
     pub async fn snapshot_begin(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
         let resp = self
             .inner
             .clone()
-            .snapshot_begin(req)
+            .snapshot_begin(fenced_request(id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -253,14 +265,15 @@ impl GrpcHostClient {
     }
 
     /// ADR 0045 D5: await the host-side background upload.
-    pub async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
+    pub async fn snapshot_wait(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         let resp = self
             .inner
             .clone()
-            .snapshot_wait(req)
+            .snapshot_wait(fenced_request(id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -271,14 +284,12 @@ impl GrpcHostClient {
     pub async fn migration_capture(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
         let resp = self
             .inner
             .clone()
-            .migration_capture(req)
+            .migration_capture(fenced_request(id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -320,14 +331,12 @@ impl GrpcHostClient {
     pub async fn migration_presetup(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
         let resp = self
             .inner
             .clone()
-            .migration_presetup(req)
+            .migration_presetup(fenced_request(id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -358,10 +367,13 @@ impl GrpcHostClient {
         &self,
         id: SandboxId,
         export_id: &str,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
         let req = MigrationExportRef {
             sandbox_id: id.as_uuid().as_bytes().to_vec(),
             export_id: export_id.to_string(),
+            fencing_epoch: fence.epoch,
+            session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
         };
         let resp = self
             .inner
@@ -491,12 +503,15 @@ impl GrpcHostClient {
         &self,
         id: SandboxId,
         export_id: &str,
+        fence: SessionFence,
     ) -> Result<(), SandboxError> {
         self.inner
             .clone()
             .migration_commit(MigrationExportRef {
                 sandbox_id: id.as_uuid().as_bytes().to_vec(),
                 export_id: export_id.to_string(),
+                fencing_epoch: fence.epoch,
+                session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
             })
             .await
             .map_err(grpc_to_sandbox_err)?;
@@ -508,45 +523,56 @@ impl GrpcHostClient {
         &self,
         id: SandboxId,
         export_id: &str,
+        fence: SessionFence,
     ) -> Result<(), SandboxError> {
         self.inner
             .clone()
             .migration_abort(MigrationExportRef {
                 sandbox_id: id.as_uuid().as_bytes().to_vec(),
                 export_id: export_id.to_string(),
+                fencing_epoch: fence.epoch,
+                session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
             })
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
     }
 
-    pub async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
+    pub async fn commit_snapshot(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         self.inner
             .clone()
-            .commit_snapshot(req)
+            .commit_snapshot(fenced_request(id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
     }
 
-    pub async fn abort_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
+    pub async fn abort_snapshot(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         self.inner
             .clone()
-            .abort_snapshot(req)
+            .abort_snapshot(fenced_request(id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
     }
 
-    pub async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    pub async fn restore(
+        &self,
+        metadata: SnapshotMetadata,
+        fence: SessionFence,
+    ) -> Result<SandboxId, SandboxError> {
         let mut req = tonic::Request::new(RestoreRequest {
             metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
+            session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
+            fencing_epoch: fence.epoch,
         });
         req.set_timeout(restore_rpc_timeout());
         let resp = self
@@ -572,12 +598,14 @@ impl GrpcHostClient {
         spec: SandboxSpec,
         warm: Option<engram_core::types::image::WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        capture_egress: Option<engram_core::types::egress::SessionEgressPolicy>,
         progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         let req = BuildBaseSnapshotRequest {
             spec_bincode: encode_bincode(&spec, "SandboxSpec")?,
             warm_bincode: encode_bincode(&warm, "Option<WarmConfig>")?,
             capture_env_bincode: encode_bincode(&capture_env, "capture_env")?,
+            capture_egress_bincode: encode_bincode(&capture_egress, "Option<SessionEgressPolicy>")?,
         };
         let mut stream = self
             .inner
@@ -661,12 +689,15 @@ impl GrpcHostClient {
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
         selected_mounts: Vec<AuxRoDrive>,
+        fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
         let mut req = tonic::Request::new(RestoreBaseForSessionRequest {
             metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
             session_env,
             // ADR 0055: per-session selected skills, assigned to reserved slots.
             selected_mounts_bincode: encode_bincode(&selected_mounts, "selected_mounts")?,
+            session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
+            fencing_epoch: fence.epoch,
         });
         req.set_timeout(restore_rpc_timeout());
         let resp = self
@@ -809,26 +840,28 @@ impl GrpcHostClient {
     }
 
     /// ADR 0045 Phase F: freeze the microVM in place.
-    pub async fn pause_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
-        };
+    pub async fn pause_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         self.inner
             .clone()
-            .pause_sandbox(req)
+            .pause_sandbox(fenced_request(sandbox_id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
     }
 
     /// ADR 0045 Phase F: unfreeze a paused microVM.
-    pub async fn resume_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
-        };
+    pub async fn resume_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         self.inner
             .clone()
-            .resume_sandbox(req)
+            .resume_sandbox(fenced_request(sandbox_id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -844,11 +877,14 @@ impl GrpcHostClient {
         sandbox_id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
+        fence: SessionFence,
     ) -> Result<(), SandboxError> {
         let req = StartAgentRequest {
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
             agent_bincode: encode_bincode(&agent, "AgentSpec")?,
             policy_bincode: encode_bincode(&policy, "SessionEgressPolicy")?,
+            session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
+            fencing_epoch: fence.epoch,
         };
         self.inner
             .clone()
@@ -1338,8 +1374,8 @@ impl HostClient for GrpcHostClient {
         self.create_sandbox(spec).await
     }
 
-    async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
-        self.destroy_sandbox(id).await
+    async fn destroy(&self, id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
+        self.destroy_sandbox(id, fence).await
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
@@ -1368,42 +1404,54 @@ impl HostClient for GrpcHostClient {
         self.exec_start(id, cmd).await
     }
 
-    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         // Disambiguates from the trait's `snapshot` method.
-        Self::snapshot(self, id).await
+        Self::snapshot(self, id, fence).await
     }
 
     async fn snapshot_begin(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
-        Self::snapshot_begin(self, id).await
+        Self::snapshot_begin(self, id, fence).await
     }
 
-    async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        Self::snapshot_wait(self, id).await
+    async fn snapshot_wait(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        Self::snapshot_wait(self, id, fence).await
     }
 
     async fn migration_capture(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
-        Self::migration_capture(self, id).await
+        Self::migration_capture(self, id, fence).await
     }
 
     async fn migration_presetup(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
-        Self::migration_presetup(self, id).await
+        Self::migration_presetup(self, id, fence).await
     }
 
     async fn migration_capture_postcopy(
         &self,
         id: SandboxId,
         export_id: &str,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
-        Self::migration_capture_postcopy(self, id, export_id).await
+        Self::migration_capture_postcopy(self, id, export_id, fence).await
     }
 
     async fn migration_drain_wait(
@@ -1427,24 +1475,42 @@ impl HostClient for GrpcHostClient {
         Self::migration_fetch(self, export_id, items).await
     }
 
-    async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
-        Self::migration_commit(self, id, export_id).await
+    async fn migration_commit(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
+        Self::migration_commit(self, id, export_id, fence).await
     }
 
-    async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
-        Self::migration_abort(self, id, export_id).await
+    async fn migration_abort(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
+        Self::migration_abort(self, id, export_id, fence).await
     }
 
-    async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
-        Self::commit_snapshot(self, id).await
+    async fn commit_snapshot(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
+        Self::commit_snapshot(self, id, fence).await
     }
 
-    async fn abort_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
-        Self::abort_snapshot(self, id).await
+    async fn abort_snapshot(&self, id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
+        Self::abort_snapshot(self, id, fence).await
     }
 
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        Self::restore(self, metadata).await
+    async fn restore(
+        &self,
+        metadata: SnapshotMetadata,
+        fence: SessionFence,
+    ) -> Result<SandboxId, SandboxError> {
+        Self::restore(self, metadata, fence).await
     }
 
     async fn build_base_snapshot(
@@ -1452,9 +1518,10 @@ impl HostClient for GrpcHostClient {
         spec: SandboxSpec,
         warm: Option<engram_core::types::image::WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        capture_egress: Option<engram_core::types::egress::SessionEgressPolicy>,
         progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        Self::build_base_snapshot(self, spec, warm, capture_env, progress).await
+        Self::build_base_snapshot(self, spec, warm, capture_env, capture_egress, progress).await
     }
 
     async fn restore_base_for_session(
@@ -1462,8 +1529,9 @@ impl HostClient for GrpcHostClient {
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
         selected_mounts: Vec<AuxRoDrive>,
+        fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
-        Self::restore_base_for_session(self, metadata, session_env, selected_mounts).await
+        Self::restore_base_for_session(self, metadata, session_env, selected_mounts, fence).await
     }
 
     async fn start_agent(
@@ -1471,8 +1539,9 @@ impl HostClient for GrpcHostClient {
         id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
+        fence: SessionFence,
     ) -> Result<(), SandboxError> {
-        Self::start_agent(self, id, agent, policy).await
+        Self::start_agent(self, id, agent, policy, fence).await
     }
 
     async fn apply_egress_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
@@ -1540,12 +1609,12 @@ impl HostClient for GrpcHostClient {
         self.interrupt_harness(sandbox_id).await
     }
 
-    async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        self.pause_sandbox(sandbox_id).await
+    async fn pause(&self, sandbox_id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
+        self.pause_sandbox(sandbox_id, fence).await
     }
 
-    async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        self.resume_sandbox(sandbox_id).await
+    async fn resume(&self, sandbox_id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
+        self.resume_sandbox(sandbox_id, fence).await
     }
 
     async fn start_browser(

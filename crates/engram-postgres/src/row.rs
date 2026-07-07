@@ -3,6 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use engram_core::types::session::SessionMode;
+use engram_core::types::session_op::{OpKind, OpState, SessionOp};
 use engram_core::types::{
     EnableJob, EnableJobState, EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus,
     HostUtilization, PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionState,
@@ -58,7 +59,6 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     // Missing-column-tolerant (defaults empty) so a SELECT that doesn't
     // project it (e.g. `list_evacuating_sessions`/`list_evicting_sessions`,
     // which don't need it) still decodes.
-    let selected_skills: Vec<String> = row.try_get("selected_skills").unwrap_or_default();
     // ADR 0074 parking ladder: park_rung added in migration 0087.
     // SELECTs that don't project it (or pre-migration rows) fall back
     // to 0 = "not parked".
@@ -74,7 +74,6 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         created_at,
         last_active_at,
         live_disk_manifest,
-        selected_skills,
         park_rung,
         parked_at,
     })
@@ -132,8 +131,6 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let ready_images: Vec<String> =
         serde_json::from_value(row.try_get("ready_images").map_err(col_err)?)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
-    let local_snapshots = serde_json::from_value(row.try_get("local_snapshots").map_err(col_err)?)
-        .map_err(|e| MetaError::Serialization(e.to_string()))?;
     let current_bundles = serde_json::from_value(row.try_get("current_bundles").map_err(col_err)?)
         .map_err(|e| MetaError::Serialization(e.to_string()))?;
     let cordoned: bool = row.try_get("cordoned").map_err(col_err)?;
@@ -177,7 +174,6 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         last_heartbeat_at,
         host_addr,
         ready_images,
-        local_snapshots,
         current_bundles,
         cordoned,
         total_vcpus: total_vcpus.max(0) as u32,
@@ -249,6 +245,39 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         aux_bundles,
         events_cursor,
         fc_snapshot_version,
+    })
+}
+
+/// ADR 0079: a `session_ops` row → [`SessionOp`]. Every query that
+/// projects an op row uses `lib.rs`'s `OP_COLUMNS` list, so all fourteen
+/// columns are always present — strict decode, no missing-column
+/// tolerance. `kind`/`state` are exhaustive parses: an unknown wire
+/// string is a hard `Serialization` error, never a silent default (a
+/// defaulted state could resurrect a terminal op into the executor).
+pub(crate) fn session_op_from_row(row: &PgRow) -> Result<SessionOp, MetaError> {
+    let session_id: Uuid = row.try_get("session_id").map_err(col_err)?;
+    let kind_s: String = row.try_get("kind").map_err(col_err)?;
+    let kind = OpKind::parse(&kind_s)
+        .ok_or_else(|| MetaError::Serialization(format!("unknown session_ops.kind {kind_s:?}")))?;
+    let state_s: String = row.try_get("state").map_err(col_err)?;
+    let state = OpState::parse(&state_s).ok_or_else(|| {
+        MetaError::Serialization(format!("unknown session_ops.state {state_s:?}"))
+    })?;
+    Ok(SessionOp {
+        id: row.try_get("id").map_err(col_err)?,
+        session_id: SessionId(session_id),
+        kind,
+        payload: row.try_get("payload").map_err(col_err)?,
+        state,
+        step: row.try_get("step").map_err(col_err)?,
+        epoch: row.try_get("epoch").map_err(col_err)?,
+        attempts: row.try_get("attempts").map_err(col_err)?,
+        not_before: row.try_get("not_before").map_err(col_err)?,
+        idempotency_key: row.try_get("idempotency_key").map_err(col_err)?,
+        claimed_by: row.try_get("claimed_by").map_err(col_err)?,
+        error: row.try_get("error").map_err(col_err)?,
+        created_at: row.try_get("created_at").map_err(col_err)?,
+        finished_at: row.try_get("finished_at").map_err(col_err)?,
     })
 }
 
@@ -380,14 +409,14 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
     // generic decode path so a row pulled before the migration runs
     // still decodes; live SELECTs always project the column.
     let soft_deleted_at: Option<DateTime<Utc>> = row.try_get("soft_deleted_at").unwrap_or(None);
-    // Capture-time env (migration 0073). Missing-column-tolerant (default
-    // empty) for a row pulled before the migration; live SELECTs project
-    // the column (NOT NULL DEFAULT '[]').
-    let capture_env = capture_env_from_row(row, "capture_env")?;
     Ok(EnabledImage {
         id,
         image_uri: row.try_get("image_uri").map_err(col_err)?,
-        manifest_toml: row.try_get("manifest_toml").map_err(col_err)?,
+        // ADR 0080 (migration 0094): both JSONB columns are NOT NULL
+        // with no default and the migration wiped pre-0080 rows, so
+        // strict decode — a missing/malformed value is a real bug.
+        image_config: jsonb_from_row(row, "image_config")?,
+        oci_defaults: jsonb_from_row(row, "oci_defaults")?,
         manifest_digest: row.try_get("manifest_digest").map_err(col_err)?,
         disk_manifest,
         base_snapshot_id: base_snapshot_id.map(engram_core::types::SnapshotId),
@@ -397,22 +426,15 @@ pub(crate) fn enabled_image_from_row(row: &PgRow) -> Result<EnabledImage, MetaEr
         created_at,
         updated_at,
         soft_deleted_at,
-        capture_env,
     })
 }
 
-/// Decode a `capture_env` JSONB column into `Vec<CaptureEnvEntry>`.
-/// Missing-column-tolerant (returns empty) so a row pulled before
-/// migration 0073 still decodes; a present-but-malformed value is a hard
-/// `Serialization` error.
-fn capture_env_from_row(
-    row: &PgRow,
-    col: &str,
-) -> Result<Vec<engram_core::types::CaptureEnvEntry>, MetaError> {
-    match row.try_get::<serde_json::Value, _>(col) {
-        Ok(v) => serde_json::from_value(v).map_err(|e| MetaError::Serialization(e.to_string())),
-        Err(_) => Ok(Vec::new()),
-    }
+/// Strictly decode a JSONB column into a serde type. Missing column or
+/// malformed value are both hard errors — post-0094 the callers'
+/// columns are NOT NULL with no legacy rows to tolerate.
+fn jsonb_from_row<T: serde::de::DeserializeOwned>(row: &PgRow, col: &str) -> Result<T, MetaError> {
+    let v: serde_json::Value = row.try_get(col).map_err(col_err)?;
+    serde_json::from_value(v).map_err(|e| MetaError::Serialization(format!("{col}: {e}")))
 }
 
 /// Issue #539: `enable_jobs.warm_stages` is a nullable JSONB column —
@@ -533,7 +555,7 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
         chunks_done: chunks_done.max(0) as u32,
         attempts: attempts.max(0) as u32,
         error: row.try_get("error").map_err(col_err)?,
-        capture_env: capture_env_from_row(row, "capture_env")?,
+        image_config: jsonb_from_row(row, "image_config")?,
         prestage_hosts,
         capture_phase: capture_phase_from_row(row)?,
         warm_stage: row.try_get("warm_stage").map_err(col_err)?,

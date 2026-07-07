@@ -39,7 +39,9 @@ function makeCaptureEnv(
   };
 }
 
-// Minimal proto-shaped enabled-image row for tests that need a row in the list.
+// Minimal proto-shaped enabled-image row for tests that need a row in the
+// list. ADR 0080: the row carries the RPC-supplied ImageConfig; capture env
+// rides config.warm.env, so passing entries also implies a warm command.
 function makeProtoImage(
   imageUri: string,
   captureEnv: ProtoCaptureEnvEntry[] = [],
@@ -49,11 +51,26 @@ function makeProtoImage(
     id: "row-1",
     imageUri,
     manifestDigest: "sha256:abc",
-    manifestName: "cortex-api",
-    manifestDescription: "",
     lastRefreshedAt: new Date().toISOString(),
     createdAt: new Date().toISOString(),
-    captureEnv,
+    config: {
+      $typeName: "engram.app.v1.ImageConfig",
+      name: "cortex-api",
+      description: "",
+      env: {},
+      resources: {
+        $typeName: "engram.app.v1.ImageResources",
+        suggestedVcpus: 2,
+      },
+      warm:
+        captureEnv.length > 0
+          ? {
+              $typeName: "engram.app.v1.ImageWarmConfig",
+              command: ["/opt/engram/warm.sh"],
+              env: captureEnv,
+            }
+          : undefined,
+    },
   };
 }
 
@@ -125,7 +142,7 @@ afterEach(() => {
 });
 
 describe("ImagesPanel RPC contract", () => {
-  test("enable form sends {imageUri} to ImageService.EnableImage", async () => {
+  test("enable form sends {imageUri, config} to ImageService.EnableImage", async () => {
     const { transport, captures } = installCapturingTransport([]);
     renderWithProviders(<ImagesPanel />, { transport });
 
@@ -139,18 +156,23 @@ describe("ImagesPanel RPC contract", () => {
       screen.getByPlaceholderText("ghcr.io/cortex/api:warm-1"),
       "ghcr.io/cortex/api:warm-1",
     );
+    await user.type(screen.getByLabelText("Name"), "cortex-api");
     await user.click(screen.getByRole("button", { name: /^enable$/i }));
 
     await waitFor(() => {
       expect(captures.enableCalls.length).toBeGreaterThan(0);
     });
-    expect(captures.enableCalls.at(-1)!.imageUri).toBe("ghcr.io/cortex/api:warm-1");
-    // No rows added → an empty capture_env (server-side this inherits the
-    // existing set rather than wiping it).
-    expect(captures.enableCalls.at(-1)!.captureEnv).toEqual([]);
+    const req = captures.enableCalls.at(-1)!;
+    expect(req.imageUri).toBe("ghcr.io/cortex/api:warm-1");
+    // ADR 0080: the form is the full config and is ALWAYS sent (a first
+    // enable is rejected server-side without one). vCPUs default to 2.
+    expect(req.config?.name).toBe("cortex-api");
+    expect(req.config?.resources?.suggestedVcpus).toBe(2);
+    // Empty warm command → no [warm] hook in the config.
+    expect(req.config?.warm).toBeUndefined();
   });
 
-  test("enable form builds capture_env entries from the editor rows", async () => {
+  test("enable form builds config.warm from the command + env editor rows", async () => {
     const { transport, captures } = installCapturingTransport([]);
     renderWithProviders(<ImagesPanel />, { transport });
 
@@ -161,6 +183,10 @@ describe("ImagesPanel RPC contract", () => {
       screen.getByPlaceholderText("ghcr.io/cortex/api:warm-1"),
       "ghcr.io/cortex/api:warm-1",
     );
+    await user.type(screen.getByLabelText("Name"), "cortex-api");
+    // ADR 0080: capture env rides the [warm] block, so it needs a command
+    // (space-separated argv).
+    await user.type(screen.getByLabelText(/warm command/i), "/opt/warm.sh --all");
 
     // Add a literal capture var (the default type). A row with an empty name
     // is skipped, so only the named row should reach the request.
@@ -175,14 +201,17 @@ describe("ImagesPanel RPC contract", () => {
     });
     const req = captures.enableCalls.at(-1)!;
     expect(req.imageUri).toBe("ghcr.io/cortex/api:warm-1");
-    expect(req.captureEnv).toHaveLength(1);
-    expect(req.captureEnv[0].name).toBe("FEATURE_FLAGS");
-    expect(req.captureEnv[0].value).toEqual({ case: "literal", value: "beta,fast" });
+    expect(req.config?.warm?.command).toEqual(["/opt/warm.sh", "--all"]);
+    expect(req.config?.warm?.env).toHaveLength(1);
+    expect(req.config?.warm?.env[0].name).toBe("FEATURE_FLAGS");
+    expect(req.config?.warm?.env[0].value).toEqual({ case: "literal", value: "beta,fast" });
   });
 
-  test("edit capture env pre-fills the form and re-submits the full list", async () => {
-    // An enabled image already carrying a secret-ref capture var. The edit
-    // affordance opens the same form, pinned to the URI + pre-filled.
+  test("edit config pre-fills the form and re-submits the full config", async () => {
+    // An enabled image already carrying a warm hook with a secret-ref env
+    // var. The edit affordance opens the same form, pinned to the URI +
+    // pre-filled from the row's config; a plain re-submit round-trips it
+    // (ADR 0080: the form always sends the full config, which replaces).
     const { transport, captures } = installCapturingTransport([
       makeProtoImage("ghcr.io/cortex/api:warm-1", [
         makeCaptureEnv(
@@ -197,9 +226,14 @@ describe("ImagesPanel RPC contract", () => {
     const user = userEvent.setup();
     await screen.findByText("ghcr.io/cortex/api:warm-1");
 
-    await user.click(screen.getByRole("button", { name: /edit capture env/i }));
+    await user.click(screen.getByRole("button", { name: /edit config/i }));
 
-    // Pre-filled from the row's current capture_env.
+    // Pre-filled from the row's current config.
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("cortex-api");
+    expect((screen.getByLabelText("vCPUs") as HTMLInputElement).value).toBe("2");
+    expect((screen.getByLabelText(/warm command/i) as HTMLInputElement).value).toBe(
+      "/opt/engram/warm.sh",
+    );
     expect((screen.getByLabelText("Variable name") as HTMLInputElement).value).toBe(
       "OPENAI_API_KEY",
     );
@@ -207,7 +241,7 @@ describe("ImagesPanel RPC contract", () => {
       "gcp-sm://projects/p/secrets/k/versions/latest",
     );
 
-    // Re-submit (edit path is a re-enable with the full list).
+    // Re-submit (edit path is a re-enable with the full config).
     await user.click(screen.getByRole("button", { name: /^save$/i }));
 
     await waitFor(() => {
@@ -215,9 +249,12 @@ describe("ImagesPanel RPC contract", () => {
     });
     const req = captures.enableCalls[0];
     expect(req.imageUri).toBe("ghcr.io/cortex/api:warm-1");
-    expect(req.captureEnv).toHaveLength(1);
-    expect(req.captureEnv[0].name).toBe("OPENAI_API_KEY");
-    expect(req.captureEnv[0].value).toEqual({
+    expect(req.config?.name).toBe("cortex-api");
+    expect(req.config?.resources?.suggestedVcpus).toBe(2);
+    expect(req.config?.warm?.command).toEqual(["/opt/engram/warm.sh"]);
+    expect(req.config?.warm?.env).toHaveLength(1);
+    expect(req.config?.warm?.env[0].name).toBe("OPENAI_API_KEY");
+    expect(req.config?.warm?.env[0].value).toEqual({
       case: "secretRef",
       value: "gcp-sm://projects/p/secrets/k/versions/latest",
     });

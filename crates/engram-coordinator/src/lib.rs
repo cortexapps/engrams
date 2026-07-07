@@ -43,7 +43,9 @@ pub mod queue_scanner;
 pub mod reconcile;
 pub mod scheduler;
 pub mod session_boot;
+pub mod session_ops;
 pub mod session_shell_pin;
+pub mod session_verbs;
 pub mod skill_pack;
 pub mod snapshot_blob_gc;
 #[cfg(test)]
@@ -207,6 +209,7 @@ pub async fn run_with_registry_and_local(
         state.boot_bundles.clone(),
         queue_wake.clone(),
         state.outbox_wake.clone(),
+        state.session_ops_wake.clone(),
     );
 
     // Phase 3d follow-up: dead-host auto-detector. Opens its own
@@ -246,6 +249,8 @@ pub async fn run_with_registry_and_local(
     // ADR 0073 phase 2: the outbox delivery driver — resume-behind-
     // enqueue + at-least-once forward + redelivery-until-acked.
     let _outbox_delivery = outbox_delivery::spawn(state.clone(), state.outbox_wake.clone());
+    // ADR 0079: the session-op executor — the lifecycle kernel.
+    let _session_ops = session_ops::spawn(state.clone(), state.session_ops_wake.clone());
     let _queue_scanner = queue_scanner::spawn(
         queue_scanner::QueueScannerConfig::default(),
         state.clone(),
@@ -282,18 +287,9 @@ pub async fn run_with_registry_and_local(
         state.clone(),
     );
 
-    // ADR 0016 §A.1.5c: stale-lease reaper for the
-    // `session_lease` PG table. Any lease whose RAII Drop was
-    // skipped (panic, OOM, pod terminated mid-pipeline) becomes
-    // a permanent block on re-evicting that session until reaped.
-    // 180s max-age matches the host-side §A.1.5a sweep; 30s poll
-    // interval is cheap (one DELETE every 30s, rows are short-
-    // lived under normal operation).
-    let _eviction_lease_reaper = idle_evictor::spawn_session_lease_reaper(
-        state.services.meta.clone(),
-        std::time::Duration::from_secs(180),
-        std::time::Duration::from_secs(30),
-    );
+    // ADR 0079: the session-lease reaper is GONE — the op executor's
+    // reclaim sweep (session_ops.rs) is the fence-then-resume successor
+    // for any lifecycle holder that dies mid-pipeline.
 
     // ADR 0013 + ADR 0011 #2: the idle-eviction *detection driver*
     // runs on each host-agent (its local HarnessHub is authoritative

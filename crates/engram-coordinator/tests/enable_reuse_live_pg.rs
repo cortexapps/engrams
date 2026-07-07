@@ -2,7 +2,7 @@
 //! under two different tags captures exactly ONE base snapshot.
 //!
 //! Drives the real enable pipeline — `create_or_get_enable_job` →
-//! `enable_scanner` → `fetch_and_seal_manifest` → per-chunk
+//! `enable_scanner` → `fetch_and_seal_artifact` → per-chunk
 //! materialize → content-keyed capture reuse → `enabled_images`
 //! upsert — against a fake in-process OCI registry and a fake capture
 //! host that counts `build_base_snapshot` calls. This is the
@@ -180,6 +180,12 @@ async fn get_manifest(
         .unwrap()
 }
 
+/// Minimal valid ImageConfig for enable jobs (ADR 0080: the full config
+/// rides the job; ADR 0048: suggested_vcpus required).
+fn test_config() -> engram_core::types::image::ImageConfig {
+    toml::from_str("name = \"reuse-fixture\"\n[resources]\nsuggested_vcpus = 2\n").unwrap()
+}
+
 async fn spawn_registry() -> (SocketAddr, oneshot::Sender<()>) {
     let reg = Registry::default();
     let app = Router::new()
@@ -225,7 +231,11 @@ impl HostClient for FakeCaptureHost {
     async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         unreachable!()
     }
-    async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
+    async fn destroy(
+        &self,
+        _id: SandboxId,
+        _fence: engram_core::traits::SessionFence,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
@@ -244,10 +254,18 @@ impl HostClient for FakeCaptureHost {
     ) -> Result<ExecStream, SandboxError> {
         unreachable!()
     }
-    async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(
+        &self,
+        _id: SandboxId,
+        _fence: engram_core::traits::SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         unreachable!()
     }
-    async fn restore(&self, _md: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(
+        &self,
+        _md: SnapshotMetadata,
+        _fence: engram_core::traits::SessionFence,
+    ) -> Result<SandboxId, SandboxError> {
         unreachable!()
     }
     async fn start_agent(
@@ -255,6 +273,7 @@ impl HostClient for FakeCaptureHost {
         _id: SandboxId,
         _agent: engram_core::types::sandbox::AgentSpec,
         _policy: engram_core::types::egress::SessionEgressPolicy,
+        _fence: engram_core::traits::SessionFence,
     ) -> Result<(), SandboxError> {
         unreachable!()
     }
@@ -288,6 +307,7 @@ impl HostClient for FakeCaptureHost {
         _spec: SandboxSpec,
         _warm: Option<engram_core::types::image::WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _capture_egress: Option<engram_core::types::egress::SessionEgressPolicy>,
         _progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.captures.fetch_add(1, Ordering::SeqCst);
@@ -378,13 +398,6 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
     let bootstrap = Bootstrap::build_per_chunk(&image_manifest);
     assert!(bootstrap.is_per_chunk());
 
-    // Unique manifest.toml per run so reuse can't match residue from
-    // prior runs against the shared dev/CI database. ADR 0048: an
-    // enabled image must declare `[resources] suggested_vcpus`.
-    let manifest_toml = format!(
-        "name = \"reuse-fixture-{}\"\n[resources]\nsuggested_vcpus = 2\n",
-        Uuid::new_v4()
-    );
     let bundle_json = serde_json::json!({
         "schema_version": 2,
         "disk_manifest": content_ref,
@@ -418,8 +431,11 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         oci.push_chunked_image_manifest(
             uri,
             ChunkedImageLayers {
-                manifest_toml: manifest_toml.clone().into_bytes(),
-                config_json: br#"{"kind":"engram-image-v1"}"#.to_vec(),
+                // ADR 0080: the config blob must carry runtime_defaults —
+                // the pipeline fail-louds on a pre-0080 artifact.
+                config_json:
+                    br#"{"kind":"engram-image-v1","runtime_defaults":{"env":{},"workdir":null}}"#
+                        .to_vec(),
                 bundle_json: serde_json::to_vec(&bundle_json).unwrap(),
                 disk_bootstrap_json: serde_json::to_vec(&bootstrap).unwrap(),
             },
@@ -496,7 +512,6 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         last_heartbeat_at: Utc::now(),
         host_addr: None,
         ready_images: Vec::new(),
-        local_snapshots: Vec::new(),
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
@@ -548,7 +563,7 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
     };
 
     let job_a = meta
-        .create_or_get_enable_job(&uri_a, None, &[])
+        .create_or_get_enable_job(&uri_a, None, &test_config())
         .await
         .expect("job a");
     wait_ready(job_a.id).await;
@@ -559,7 +574,7 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
     );
 
     let job_b = meta
-        .create_or_get_enable_job(&uri_b, None, &[])
+        .create_or_get_enable_job(&uri_b, None, &test_config())
         .await
         .expect("job b");
     let job_b = wait_ready(job_b.id).await;

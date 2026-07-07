@@ -362,6 +362,19 @@ mod adapter {
             }
         }
 
+        // The loop exits on EngineDone (engine already finished) or on a
+        // Superseded rejection (engine still RUNNING). Drop our command
+        // sender either way: the engine terminates when all senders are
+        // gone, and holding this one across the await turned the
+        // Superseded "exiting cleanly" into a LIE — the process lingered
+        // alive with its connection loop (and SIGUSR1 handler) dead, so
+        // agentd's SpawnHarness reattach arm saw a live pid, nudged a
+        // corpse-in-spirit forever, and never respawned a fresh harness:
+        // every resume from a live-harness checkpoint (evict_local, the
+        // ADR 0028 host-loss recovery) wedged prompt delivery permanently
+        // (prod session 7ed23d9f, 2026-07-06).
+        drop(cmd_tx);
+
         // Engine finished — reap its exit code.
         engine.await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "engine task panicked");
@@ -1938,8 +1951,17 @@ mod adapter {
                         // to the engine. This arm exists only for
                         // exhaustiveness over `HarnessCommand`.
                         // All command senders gone = the connection loop
-                        // exited = process teardown.
-                        None => return SessionOutcome::ChannelClosed,
+                        // exited = process teardown (the Superseded exit
+                        // path). SIGINT claude first: this arm skips the
+                        // reap block, and an orphaned twin left running
+                        // would contend with the successor harness's
+                        // `--resume` on the same transcript (claude
+                        // flushes per-message, so SIGINT is
+                        // resume-safe).
+                        None => {
+                            sigint_child(&child);
+                            return SessionOutcome::ChannelClosed;
+                        }
                     }
                 }
                 // A fresh connection attached: re-announce `Idle` iff idle

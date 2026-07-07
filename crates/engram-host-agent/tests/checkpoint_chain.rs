@@ -30,6 +30,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -39,7 +41,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::checkpoint::CheckpointRecord;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -60,7 +62,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
         eprintln!("SKIP: /dev/kvm not present");
         return;
     }
-    for bin in ["firecracker", "docker", "mke2fs"] {
+    for bin in ["firecracker", "docker", "mke2fs", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)
@@ -84,11 +86,6 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // ---- 1. Bake an agentd-injected rootfs ----
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-ckpt-chain-test\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let work = tempfile::tempdir().expect("work dir");
     let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
@@ -103,8 +100,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -115,6 +111,10 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
 
     // ---- 2. PooledBackend with chunk store + checkpoint dir, FC inner ----
     let mut cfg = FirecrackerConfig::with_kernel(kernel);
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = None;
     cfg.restore_mode = RestoreMode::File;
     // ADR 0028: dirty tracking armed — required for Diff captures.
@@ -144,7 +144,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
     let sandbox = pooled.create(spec).await.expect("create");

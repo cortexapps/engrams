@@ -26,7 +26,7 @@ use engram_harness_proto::{
     ForgeRequest, ForgeResponse, HarnessEvent, UploadRequest, UploadResponse,
 };
 use engram_oci::{BasicCreds, OciError, RegistryAuthResolver};
-use engram_protocol::heartbeat::{HostCapacityReport, LocalSnapshotReport};
+use engram_protocol::heartbeat::HostCapacityReport;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -455,8 +455,6 @@ pub struct RehydrateSandboxRef {
 pub struct HeartbeatRequest {
     pub capacity: HostCapacityReport,
     #[serde(default)]
-    pub local_snapshots: Vec<LocalSnapshotReport>,
-    #[serde(default)]
     pub running_sandboxes: Vec<SandboxId>,
     /// Issue #215: `false` iff `backend.list()` failed this tick, so
     /// `running_sandboxes` carries no usable signal and the coord must
@@ -697,7 +695,6 @@ mod tests {
     fn heartbeat_request_current_bundles_serializes() {
         let req = HeartbeatRequest {
             capacity: HostCapacityReport::default(),
-            local_snapshots: vec![],
             running_sandboxes: vec![],
             running_sandboxes_known: true,
             draining: false,

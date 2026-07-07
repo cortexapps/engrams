@@ -137,7 +137,7 @@ Snapshot store has **two tiers** (ADR 0005). **Hot tier** lives on each host's l
   - `engram-sandbox-firecracker` — Linux + KVM. Production. Firecracker's HTTP-over-Unix-socket API + UFFD-backed memory restore.
   - `engram-sandbox-vz` — macOS Apple Silicon. Apple Virtualization.framework via `objc2-virtualization` bindings. APFS clone-based snapshots. Mac dev with real microVM isolation. (ADR 0003.)
   - `engram-sandbox-process` — anywhere. Subprocesses, no isolation. Fastest iteration loop for orchestration-layer work.
-- Maintains the chunked-OCI image cache + tiered chunk resolver (host-side `PooledBackend` wrapper, agnostic of which `SandboxBackend` is wrapped), `HarnessHub` TCP listener for in-VM harness adapters dialing back, preemption signal handler. Heartbeats `(capacity, local_snapshots, draining)` to the coordinator.
+- Maintains the chunked-OCI image cache + tiered chunk resolver (host-side `PooledBackend` wrapper, agnostic of which `SandboxBackend` is wrapped), `HarnessHub` TCP listener for in-VM harness adapters dialing back, preemption signal handler. Heartbeats `(capacity, utilization, draining)` to the coordinator.
 - **`engram-agentd`**: in-VM exec daemon + harness supervisor (PID 1 after the init shim). Length-prefixed bincode over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `StartShell`, `Ping`, `Shutdown`, `SpawnHarness`. First-frame token handshake (server side) gates non-trivial verbs. Owns the harness child process; each `SpawnHarness` kills the previous child and exec's a fresh one — clean re-spawn point on resume. On startup, dials the host's per-sandbox ready UDS so the host can block on `accept()` rather than poll for "is the in-VM listener bound."
 - **`engram-transport`**: backend-agnostic transport trait. `VsockTransport` (FC) and `ConsoleTransport` (VZ); chosen at runtime via `ENGRAM_TRANSPORT` set by the bake's init shim.
 - **`engram-image-builder`**: warm-image baker. `Dockerfile` + `engram.toml` → `docker build` → `docker create + export | tar -x` → optional `mke2fs -t ext4 -F -d`. Injects static-musl `engram-agentd` + harness binaries + `/sbin/engram-init` shim into the rootfs.
@@ -370,7 +370,7 @@ pub trait SandboxBackend: Send + Sync {
 
 #### In-guest agent (`engram-agentd`)
 
-Firecracker has no "exec a command in a running guest" primitive. Production rootfs images include `engram-agentd` (`crates/engram-agentd`) — a small Rust binary baked into `/sbin/engram-agentd` that listens on AF_VSOCK port 1024 and proxies exec / stdin / stdout for the host agent. `SandboxBackend::exec_stream` on the Firecracker backend connects to Firecracker's vsock proxy at `<vsock_uds>`, performs the `CONNECT 1024\n` → `OK <peer_port>\n` handshake, sends a `WireExecRequest`, and streams `WireExecEvent`s back. Full design in the [In-guest agent](#in-guest-agent-engram-agentd) section below.
+Firecracker has no "exec a command in a running guest" primitive. Every guest runs `engram-agentd` (`crates/engram-agentd`) — a small Rust binary the stage-1 init copies out of its reserved bundle slot to `/run/engram/engram-agentd` and execs (ADR 0080; nothing engrams-owned is baked into the rootfs beyond the shim). It listens on AF_VSOCK port 1024 and proxies exec / stdin / stdout for the host agent. `SandboxBackend::exec_stream` on the Firecracker backend connects to Firecracker's vsock proxy at `<vsock_uds>`, performs the `CONNECT 1024\n` → `OK <peer_port>\n` handshake, sends a `WireExecRequest`, and streams `WireExecEvent`s back. Full design in the [In-guest agent](#in-guest-agent-engram-agentd) section below.
 
 ---
 
@@ -391,7 +391,6 @@ This section documents the design for **coordinator ↔ host-agent** and **host 
    │              │                             │              │
    │              │ ──── Heartbeat (5s) ──────► │              │
    │              │ ──── CapacityReport ──────► │              │
-   │              │ ──── LocalSnapshots ──────► │              │
    │              │                             │              │
    │              │ ◄─── AssignSession ──────── │              │
    │              │ ◄─── RevokeSession ──────── │              │
@@ -483,7 +482,7 @@ Phase 4 adds (1) and the trait surface for the others.
 
 ## In-guest agent (`engram-agentd`)
 
-A small Rust binary baked into every Firecracker rootfs at `/sbin/engram-agentd`, started at guest boot by a tiny init shim (`/sbin/engram-init`). Bridges the gap between Firecracker (which has no exec primitive) and the host agent. Lives at `crates/engram-agentd`.
+A small Rust binary every guest boots by exec'ing it out of the `agentd` bundle slot (ADR 0080) via the tiny baked init shim (`/sbin/engram-init`). Bridges the gap between Firecracker (which has no exec primitive) and the host agent. Lives at `crates/engram-agentd`.
 
 ```text
             host-agent                            ┌── guest VM ──────────┐
@@ -559,7 +558,7 @@ Production hardening will add a first-frame token handshake. Token injection opt
 
 ### Distribution
 
-`engram-agentd` is baked into every Firecracker rootfs at `/sbin/engram-agentd`, plus `/sbin/engram-init` (the init shim that brings up just enough kernel plumbing for the agent to talk vsock). Both injected by `engram-image-builder` when `BuildRequest.agent_injection` is set; the binary is built statically against musl (`x86_64-unknown-linux-musl`, release mode) so it runs in any base image regardless of the rootfs's libc / dynamic-linker layout.
+`engram-agentd` ships as the fleet `bundle-agentd` (reserved slot `dyn_1`, ADR 0080); the only baked file is `/sbin/engram-init` (the stage-1 init shim that brings up kernel plumbing, mounts the bundle slots, copies agentd to tmpfs, and execs it), injected by `engram-image-builder` when `BuildRequest.init_injection` is set. agentd is built statically against musl so it runs in any base image regardless of the rootfs's libc / dynamic-linker layout — and an agentd change ships by republishing the bundle, with zero image re-bakes and zero base-snapshot recaptures (fresh restores re-exec onto the swapped generation).
 
 Initial scope is exec-only — `Stat`/`Upload`/`Download`/`Ping`/`Shutdown` verbs from the original design are deferred. They'll land when the surface is needed (file upload for snapshot transfer, ping for liveness, etc.).
 

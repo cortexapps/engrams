@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use engram_core::traits::SessionFence;
 use engram_core::types::host::PreemptionNotice;
 use engram_core::types::SessionState;
 use engram_core::{SandboxId, SessionId};
@@ -173,7 +174,13 @@ pub async fn drain_session(
             "preemption drain: invalidated HostRegistry cache before destroy",
         );
     }
-    if let Err(e) = state.services.host.destroy(sandbox_id).await {
+    // ADR 0079: epoch threaded by the op executor; 0 until the verb migrates.
+    if let Err(e) = state
+        .services
+        .host
+        .destroy(sandbox_id, SessionFence::unfenced())
+        .await
+    {
         tracing::debug!(
             session_id = %session_id,
             sandbox_id = %sandbox_id,
@@ -365,7 +372,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         }

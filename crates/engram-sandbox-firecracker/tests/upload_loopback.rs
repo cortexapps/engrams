@@ -35,7 +35,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::SessionId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_harness_proto::{read_msg, write_msg, UploadOp, UploadRequest, UploadResponse};
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use parking_lot::Mutex;
 use tokio::io::AsyncReadExt;
@@ -49,7 +49,7 @@ async fn share_file_round_trips_over_vsock() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") {
+    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
 
@@ -76,11 +76,6 @@ async fn share_file_round_trips_over_vsock() {
         "FROM debian:bookworm-slim\nRUN mkdir -p /workspace\n",
     )
     .unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"upload-loopback-test\"\n",
-    )
-    .unwrap();
 
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
@@ -96,8 +91,7 @@ async fn share_file_round_trips_over_vsock() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agentd_bin,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -109,6 +103,10 @@ async fn share_file_round_trips_over_vsock() {
     // ---- 2. FC backend + an UploadSink that drains the body. ----
     let work = tempfile::tempdir().expect("work dir");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle (agentd + stamp + sentinel) and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agentd_bin);
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
     let backend = FirecrackerBackend::new(work.path(), cfg);
@@ -170,7 +168,7 @@ async fn share_file_round_trips_over_vsock() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let sandbox_id = backend.create(spec).await.expect("create sandbox");
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
@@ -187,7 +185,7 @@ async fn share_file_round_trips_over_vsock() {
     let make_and_share = "set -e; \
          printf '\\211PNG\\r\\n\\032\\n' > /tmp/shot.png; \
          head -c 20971512 /dev/zero >> /tmp/shot.png; \
-         /sbin/engram-agentd share-file --file /tmp/shot.png --caption 'boot test'";
+         /run/engram/engram-agentd share-file --file /tmp/shot.png --caption 'boot test'";
     let req = ExecRequest {
         command: vec!["/bin/sh".into(), "-c".into(), make_and_share.into()],
         stdin: None,

@@ -5,11 +5,14 @@
 //! in 2022. We use the `application/vnd.engram.*` namespace so an
 //! external observer can recognize Engram artifacts without ambiguity.
 
-/// Bake image config (small JSON: format, agent_version, transport).
+/// Bake image config (small JSON: format, repo/tag, and — ADR 0080 —
+/// `runtime_defaults`, the Dockerfile ENV/WORKDIR the enable pipeline
+/// persists onto the enabled_images row).
 pub const ENGRAM_IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.engram.image.v1+json";
 
-/// Bake image manifest layer — the existing `manifest.toml` content.
-pub const ENGRAM_MANIFEST_MEDIA_TYPE: &str = "application/vnd.engram.manifest.v1+toml";
+// ADR 0080 retired `ENGRAM_MANIFEST_MEDIA_TYPE` (the manifest.toml
+// layer): the bake carries no runtime config anymore — it arrives
+// out-of-band via the ImageService (`image enable --config`).
 
 /// Bake image rootfs layer — raw `rootfs.ext4` bytes (large blob).
 pub const ENGRAM_ROOTFS_EXT4_MEDIA_TYPE: &str = "application/vnd.engram.rootfs.ext4.v1";

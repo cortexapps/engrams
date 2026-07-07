@@ -31,18 +31,11 @@ fi
 
 REGISTRY="localhost:5001"
 
-# Dev bakes cross-compile the rootfs for the host's own arch. Every
-# backend uses the vsock transport (ADR 0066 Phase 2 migrated VZ off
-# virtio-console onto real vsock).
+# Dev bakes target the host's own arch (the base image is pinned via
+# --platform on arm64 below).
 case "$(uname -m)" in
-    arm64 | aarch64)
-        TARGET=aarch64-unknown-linux-musl
-        ARM=1
-        ;;
-    x86_64 | amd64)
-        TARGET=x86_64-unknown-linux-musl
-        ARM=0
-        ;;
+    arm64 | aarch64) ARM=1 ;;
+    x86_64 | amd64)  ARM=0 ;;
     *)
         echo "bake-demo: unsupported arch $(uname -m)" >&2
         exit 1
@@ -56,10 +49,10 @@ esac
 # relay is head-of-line-free).
 TRANSPORT=vsock
 
-rustup target add "$TARGET" >/dev/null 2>&1 || true
-
-echo "==> build agentd ($TARGET) + cli"
-cargo build --release --target "$TARGET" -p engram-agentd
+# ADR 0080: agentd is NOT baked into the image — it rides the `agentd`
+# bundle (staged by `just bundles-squashfs` / `just bundles-vz`); the bake
+# injects only the stage-1 init shim.
+echo "==> build cli"
 cargo build --release -p engram-cli
 
 # Stage the image source; pin the debian base to the guest arch on
@@ -68,7 +61,6 @@ STAGING="./var/bake/demo"
 rm -rf "$STAGING"
 mkdir -p "$STAGING"
 cp deploy/demo/Dockerfile "$STAGING/Dockerfile"
-cp deploy/demo/engram.toml "$STAGING/engram.toml"
 if [ "$ARM" = "1" ]; then
     sed -i.bak 's|^FROM debian:|FROM --platform=linux/arm64 debian:|' "$STAGING/Dockerfile"
     rm -f "$STAGING/Dockerfile.bak"
@@ -82,10 +74,10 @@ echo "==> bake demo -> $REGISTRY/demo:warm-1"
     --format ext4 \
     --images-dir ./var/bake/_staging \
     --transport "$TRANSPORT" \
-    --inject-agent "target/$TARGET/release/engram-agentd" \
+    --inject-init \
     --push "$REGISTRY/demo"
 
 echo ""
 echo "✓ pushed $REGISTRY/demo:warm-1"
-echo "  enable it: engram image enable $REGISTRY/demo:warm-1"
+echo "  enable it: engram image enable --uri $REGISTRY/demo:warm-1 --config deploy/demo/image-config.toml"
 echo "  or create a session against --image $REGISTRY/demo:warm-1"

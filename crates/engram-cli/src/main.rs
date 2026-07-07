@@ -263,15 +263,42 @@ enum ImageCmd {
     /// coordinator. Sessions may only reference URIs in this set.
     List,
     /// Enable an image: tell the coordinator to fetch and cache the
-    /// engram manifest from the given OCI URI so sessions can
+    /// engram artifact metadata from the given OCI URI so sessions can
     /// reference it. The bytes must already exist at the URI (push
     /// via `engram image build --push <uri>`).
     Enable {
         /// Full OCI URI: `<host>[:port]/<repo>:<tag>`.
         #[arg(long)]
         uri: String,
+        /// ADR 0080: path to the image-config TOML (name, description,
+        /// [env], workdir, [resources], [warm] incl. [[warm.env]] +
+        /// [warm.network]). REQUIRED on the first enable; omit on a
+        /// re-enable to inherit the already-enabled row's config.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Don't poll the enable job to completion — print the job id
         /// and return immediately (ADR 0036: enabling is async).
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// ADR 0080: edit an enabled image's config (full replace). Cheap
+    /// fields (name/description/env/workdir) apply immediately; a diff
+    /// touching resources or [warm] needs --allow-recapture and enqueues
+    /// a recapture job.
+    Update {
+        /// Full OCI URI of an already-enabled image.
+        #[arg(long)]
+        uri: String,
+        /// Path to the complete new image-config TOML (full replace,
+        /// not a patch).
+        #[arg(long)]
+        config: PathBuf,
+        /// Consent to a base-snapshot recapture when the diff touches
+        /// resources or [warm] (takes minutes; the enable pipeline
+        /// re-runs).
+        #[arg(long)]
+        allow_recapture: bool,
+        /// Don't poll a recapture job to completion.
         #[arg(long)]
         no_wait: bool,
     },
@@ -321,14 +348,14 @@ enum ImageCmd {
         #[arg(long, value_parser = parse_image_format, default_value = "directory")]
         format: Format,
 
-        /// Inject a static-musl `engram-agentd` binary into the
-        /// rootfs at `/sbin/engram-agentd` and write a `/sbin/engram-init`
-        /// shim that exec's it on the reserved vsock port (1024).
-        /// Required for Firecracker images; without it the host
-        /// can't `exec()` against the VM. Pre-build the binary with
-        /// `cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release`.
+        /// Write the ADR 0080 stage-1 `/sbin/engram-init` shim into the
+        /// rootfs: it mounts the aux bundle slots, copies `engram-agentd`
+        /// out of its reserved bundle slot to tmpfs, and exec's it on the
+        /// reserved vsock port (1024). Required for Firecracker/VZ
+        /// images; agentd itself is NEVER baked — it ships as
+        /// `bundle-agentd`, staged host-side.
         #[arg(long)]
-        inject_agent: Option<PathBuf>,
+        inject_init: bool,
 
         /// Which `engram-transport` impl the in-VM binaries should
         /// select at runtime. The init shim writes
@@ -526,7 +553,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 images_dir,
                 docker_bin,
                 format,
-                inject_agent,
+                inject_init,
                 transport,
                 push,
             },
@@ -539,7 +566,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             images_dir,
             docker_bin.as_deref(),
             *format,
-            inject_agent.as_deref(),
+            *inject_init,
             *transport,
             push.as_deref(),
         )
@@ -582,9 +609,17 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             // Build handled above before dialing the coordinator.
             ImageCmd::Build { .. } => unreachable!("image build handled before client setup"),
             ImageCmd::List => image_list(&mut c, cli.json).await,
-            ImageCmd::Enable { uri, no_wait } => {
-                image_enable(&mut c, uri, cli.json, *no_wait).await
-            }
+            ImageCmd::Enable {
+                uri,
+                config,
+                no_wait,
+            } => image_enable(&mut c, uri, config.as_deref(), cli.json, *no_wait).await,
+            ImageCmd::Update {
+                uri,
+                config,
+                allow_recapture,
+                no_wait,
+            } => image_update(&mut c, uri, config, *allow_recapture, cli.json, *no_wait).await,
             ImageCmd::Disable { uri } => image_disable(&mut c, uri).await,
             ImageCmd::Refresh { uri } => image_refresh(&mut c, uri, cli.json).await,
         },
@@ -899,13 +934,13 @@ async fn host_list(c: &mut Clients, json: bool) -> Result<(), CliError> {
         return Ok(());
     }
     println!(
-        "{:<36}  {:<10}  {:<10}  {:<10}  SNAPSHOTS",
+        "{:<36}  {:<10}  {:<10}  {:<10}",
         "ID", "STATUS", "USED_MIB", "TOTAL_MIB"
     );
     for h in &resp.hosts {
         println!(
-            "{:<36}  {:<10}  {:<10}  {:<10}  {}",
-            h.id, h.status, h.capacity_used_mib, h.capacity_total_mib, h.local_snapshots,
+            "{:<36}  {:<10}  {:<10}  {:<10}",
+            h.id, h.status, h.capacity_used_mib, h.capacity_total_mib,
         );
     }
     Ok(())
@@ -919,7 +954,6 @@ fn host_to_json(h: &app::HostView) -> Value {
         "capacity_total_mib": h.capacity_total_mib,
         "capacity_used_mib": h.capacity_used_mib,
         "running_sandboxes": h.running_sandboxes,
-        "local_snapshots": h.local_snapshots,
         "ready_images": h.ready_images,
         "ready_image_digests": h.ready_image_digests,
         "last_heartbeat_at": h.last_heartbeat_at,
@@ -947,7 +981,6 @@ async fn host_get(c: &mut Clients, id: &str, json: bool) -> Result<(), CliError>
     println!("capacity_used   : {} MiB", h.capacity_used_mib);
     println!("capacity_total  : {} MiB", h.capacity_total_mib);
     println!("running_sandboxes: {}", h.running_sandboxes);
-    println!("local_snapshots : {}", h.local_snapshots);
     Ok(())
 }
 
@@ -1127,15 +1160,14 @@ async fn image_build(
     images_dir: &Path,
     docker_bin: Option<&str>,
     format: Format,
-    inject_agent: Option<&Path>,
+    inject_init: bool,
     transport: engram_image_builder::Transport,
     push: Option<&str>,
 ) -> Result<(), CliError> {
     let resolved_tag = tag
         .map(str::to_string)
         .unwrap_or_else(|| format!("warm-{}", Utc::now().format("%Y%m%dT%H%M%SZ")));
-    let agent_injection = inject_agent.map(|p| engram_image_builder::AgentInjection {
-        agent_binary: p.to_path_buf(),
+    let init_injection = inject_init.then_some(engram_image_builder::InitInjection {
         // Reserved port engram-agentd listens on inside the guest.
         // Hard-coded here (and in engram-sandbox-firecracker as
         // ENGRAM_AGENTD_PORT) so the bake and the host's connect
@@ -1150,7 +1182,7 @@ async fn image_build(
         tag: resolved_tag.clone(),
         images_dir: images_dir.to_path_buf(),
         format,
-        agent_injection,
+        init_injection,
     };
     let docker = match docker_bin {
         Some(bin) => DockerCli::with_binary(bin.to_string()),
@@ -1378,8 +1410,8 @@ async fn image_list(c: &mut Clients, json: bool) -> Result<(), CliError> {
                     "id": img.id,
                     "image_uri": img.image_uri,
                     "manifest_digest": img.manifest_digest,
-                    "manifest_name": img.manifest_name,
-                    "manifest_description": img.manifest_description,
+                    "name": img.config.as_ref().map(|c| c.name.clone()),
+                    "description": img.config.as_ref().and_then(|c| c.description.clone()),
                     "last_refreshed_at": img.last_refreshed_at,
                     "created_at": img.created_at,
                 })
@@ -1400,30 +1432,99 @@ async fn image_list(c: &mut Clients, json: bool) -> Result<(), CliError> {
         println!(
             "{:<48}  {:<22}  {}",
             img.image_uri,
-            img.manifest_name.as_deref().unwrap_or("(unparsed)"),
+            img.config.as_ref().map(|c| c.name.as_str()).unwrap_or("?"),
             img.manifest_digest,
         );
     }
     Ok(())
 }
 
+/// ADR 0080: read + strictly parse an image-config TOML and convert it
+/// to the proto shape. Parse errors (typos, retired manifest sections)
+/// fail here with the serde message — same strictness as the server.
+// `clippy::result_large_err`: `CliError` embeds `tonic::Status` (~176
+// bytes); it's the CLI's one error type and this is a cold path.
+#[allow(clippy::result_large_err)]
+fn load_image_config(path: &Path) -> Result<app::ImageConfig, CliError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Other(format!("read {}: {e}", path.display())))?;
+    let c: engram_core::types::image::ImageConfig = toml::from_str(&text).map_err(|e| {
+        CliError::Other(format!(
+            "{} is not a valid image config: {e}",
+            path.display()
+        ))
+    })?;
+    c.validate()
+        .map_err(|e| CliError::Other(format!("{}: {e}", path.display())))?;
+    Ok(image_config_to_proto(&c))
+}
+
+/// Core ImageConfig → the app-proto shape (the CLI-side mirror of the
+/// coordinator's convert layer).
+fn image_config_to_proto(c: &engram_core::types::image::ImageConfig) -> app::ImageConfig {
+    use engram_core::types::image::NetworkDefault;
+    use engram_core::types::CaptureEnvValue;
+    app::ImageConfig {
+        name: c.name.clone(),
+        description: c.description.clone(),
+        env: c.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        workdir: c.workdir.clone(),
+        resources: Some(app::ImageResources {
+            suggested_memory_mib: c.resources.suggested_memory_mib,
+            suggested_vcpus: c.resources.suggested_vcpus,
+            suggested_disk_gib: c.resources.suggested_disk_gib,
+        }),
+        warm: c.warm.as_ref().map(|w| app::ImageWarmConfig {
+            command: w.command.clone(),
+            timeout_secs: w.timeout_secs,
+            workdir: w.workdir.clone(),
+            env: w
+                .env
+                .iter()
+                .map(|e| app::CaptureEnvEntry {
+                    name: e.name.clone(),
+                    value: Some(match &e.value {
+                        CaptureEnvValue::Literal { value } => {
+                            app::capture_env_entry::Value::Literal(value.clone())
+                        }
+                        CaptureEnvValue::SecretRef { secret_ref } => {
+                            app::capture_env_entry::Value::SecretRef(secret_ref.clone())
+                        }
+                    }),
+                })
+                .collect(),
+            network: w.network.as_ref().map(|n| app::ProfileNetwork {
+                default: match n.default {
+                    NetworkDefault::Allow => "allow".to_string(),
+                    NetworkDefault::Deny => "deny".to_string(),
+                },
+                allow_hosts: n.allow_hosts.clone(),
+                allow_host_patterns: n.allow_host_patterns.clone(),
+            }),
+        }),
+    }
+}
+
 async fn image_enable(
     c: &mut Clients,
     uri: &str,
+    config: Option<&Path>,
     json: bool,
     no_wait: bool,
 ) -> Result<(), CliError> {
     // ADR 0036: EnableImage records an enable job; the coordinator's
     // scanner drives the pipeline. Default UX polls the job to a
     // terminal state with a live chunk progress line.
+    //
+    // ADR 0080: `--config` supplies the image's full runtime config
+    // (unset inherits the already-enabled row's; the server rejects a
+    // first enable without one).
+    let config = config.map(load_image_config).transpose()?;
     let resp = c
         .image
         .enable_image(app::EnableImageRequest {
             image_uri: uri.to_string(),
-            // Capture-env is set via the dashboard's enable/edit form; the
-            // admin CLI enables with an empty list (inherits any existing
-            // capture_env on a re-enable).
-            capture_env: Vec::new(),
+            config,
         })
         .await?
         .into_inner();
@@ -1445,6 +1546,53 @@ async fn image_enable(
         return Ok(());
     }
     poll_enable_job(c, &job.id, json).await
+}
+
+/// ADR 0080: full-replace config edit. Cheap edits apply immediately (no
+/// job in the response); capture-affecting edits (resources/[warm]) come
+/// back as an enable job to poll.
+async fn image_update(
+    c: &mut Clients,
+    uri: &str,
+    config: &Path,
+    allow_recapture: bool,
+    json: bool,
+    no_wait: bool,
+) -> Result<(), CliError> {
+    let config = load_image_config(config)?;
+    let resp = c
+        .image
+        .update_image(app::UpdateImageRequest {
+            image_uri: uri.to_string(),
+            config: Some(config),
+            allow_recapture,
+        })
+        .await?
+        .into_inner();
+    match resp.job {
+        None => {
+            if json {
+                println!("{}", serde_json::json!({ "applied": "immediate" }));
+            } else {
+                println!("config updated (no recapture needed; live immediately)");
+            }
+            Ok(())
+        }
+        Some(job) => {
+            if no_wait {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&enable_job_to_json(&job))?
+                    );
+                } else {
+                    println!("recapture job {} accepted", job.id);
+                }
+                return Ok(());
+            }
+            poll_enable_job(c, &job.id, json).await
+        }
+    }
 }
 
 fn enable_job_to_json(job: &app::EnableJob) -> Value {

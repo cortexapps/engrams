@@ -129,6 +129,20 @@ pub struct BrowserStart {
     pub warning: Option<String>,
 }
 
+/// ADR 0080: outcome of [`SandboxBackend::refresh_agent`] — did the
+/// restored guest's agentd already match the attached bundle
+/// generation, or did it re-exec onto a newer one?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentRefresh {
+    /// The running agentd already matches the slot's content stamp
+    /// (the steady state: one stat inside the guest, nothing spawned).
+    UpToDate,
+    /// The slot carried a different generation; agentd re-exec'd onto
+    /// it and answered ready again. New sessions on this host run the
+    /// fleet's current agentd without any image recapture.
+    Restarted,
+}
+
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
@@ -576,9 +590,16 @@ pub trait SandboxBackend: Send + Sync {
     /// fail-loud — it aborts the capture (and the enable).
     ///
     /// `capture_env` is the resolved capture-time env (the coordinator
-    /// already resolved any secret refs) merged over the manifest `[env]`
+    /// already resolved any secret refs) merged over the config `[env]`
     /// into the warm hook's exec environment. Empty for an image with no
-    /// capture_env or no warm hook.
+    /// warm env or no warm hook.
+    ///
+    /// `capture_egress` (ADR 0080, wire v13) is the egress policy to
+    /// register for the capture VM's guest IP while the warm hook runs —
+    /// assembled coordinator-side from the config's `warm.network` (one
+    /// egress builder for sessions and captures alike). `None` ⇒ register
+    /// nothing: the capture stays egress-less (the proxy denies unknown
+    /// guests). The backend must NOT derive egress from `warm` itself.
     ///
     /// `progress` (issue #539) receives [`crate::types::CaptureProgress`]
     /// events for the call's lifetime — see the matching doc on
@@ -588,6 +609,7 @@ pub trait SandboxBackend: Send + Sync {
         _spec: SandboxSpec,
         _warm: Option<WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _capture_egress: Option<crate::types::egress::SessionEgressPolicy>,
         _progress: tokio::sync::mpsc::Sender<crate::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
@@ -613,6 +635,22 @@ pub trait SandboxBackend: Send + Sync {
         _env: std::collections::HashMap<String, String>,
     ) -> Result<(), SandboxError> {
         Ok(())
+    }
+
+    /// ADR 0080: ask the restored guest's agentd to adopt the agentd
+    /// bundle generation now attached at its reserved slot
+    /// (`AuxRoDrive::AGENTD_SLOT_INDEX`). The captured agentd re-mounts
+    /// the bundle slots, compares the slot's content stamp against the
+    /// one it booted from, and — if they differ — re-execs itself onto
+    /// the new binary before any session state binds. Called by the
+    /// fresh-create restore path only (resumes keep their pinned
+    /// agentd; the version is per-session).
+    ///
+    /// Default: `UpToDate` no-op. VZ cold-boots every restore, so its
+    /// stage-1 init always picks the attached generation; Process runs
+    /// no guest agentd at all.
+    async fn refresh_agent(&self, _id: SandboxId) -> Result<AgentRefresh, SandboxError> {
+        Ok(AgentRefresh::UpToDate)
     }
 
     /// ADR 0020 P1: restore a per-image base snapshot for a session and

@@ -53,12 +53,16 @@ pub struct SessionCreateWriteSet {
     /// ADR 0056 (B′): the compiled integration policy, pre-serialized to
     /// JSON (mirrors `bind_session_integration_policy`'s wire shape).
     pub integration_policy_json: Option<String>,
-    /// ADR 0062: the selected harness catalog key.
-    pub selected_harness: Option<String>,
-    /// ADR 0055 TODO(P1-D) fix: the profile-selected skill names, persisted
-    /// so a queued create's boot re-prepare (`prepare_from_row`) can
-    /// reconstruct the selection instead of silently dropping it.
-    pub selected_skills: Vec<String>,
+    /// ADR 0077 phase 3: the session's boot inputs as ONE persisted
+    /// document — `selected_skills` (the TODO(P1-D) fix), `selected_harness`
+    /// (ADR 0062 catalog key), and `workdir`. Written into the
+    /// `session_runtime_specs` row in the SAME create transaction, and
+    /// consumed by queue re-prepare instead of re-derived. This is the
+    /// single source that subsumes #566's interim
+    /// `sessions.selected_skills` column (retired, migration 0090).
+    /// `reserve_and_persist_create` also mirrors `runtime_spec
+    /// .selected_harness` into the pre-existing `sessions.harness` column.
+    pub runtime_spec: crate::types::runtime_spec::RuntimeSpec,
 }
 
 /// Outcome of [`MetadataStore::reserve_and_persist_create`].
@@ -227,9 +231,16 @@ pub trait MetadataStore: Send + Sync {
     // ---- ADR 0048: session queue ----
 
     /// Park an `Idle` session that hit no capacity on resume back in the
-    /// queue (`Idle → queued`, `queue_origin = 'resume'`). Default no-op.
-    async fn enqueue_session_resume(&self, _id: SessionId) -> Result<(), MetaError> {
-        Ok(())
+    /// queue (`Idle → queued`, `queue_origin = 'resume'`), fenced by the
+    /// resume op's epoch (ADR 0079: `sessions.current_epoch = epoch` —
+    /// every sibling write in the op pipeline is fenced, and this one
+    /// must be too or a reclaimed-away zombie executor forks the state
+    /// machine). Returns whether the flip landed: `false` means the row
+    /// was no longer `Idle` (a racing writer advanced it) OR the epoch
+    /// moved (a successor re-claimed) — either way the caller must stop
+    /// without emitting the Queued event. Default no-op: `false`.
+    async fn enqueue_session_resume(&self, _id: SessionId, _epoch: i64) -> Result<bool, MetaError> {
+        Ok(false)
     }
 
     /// Every `queued` session, oldest-first (FIFO). The scanner walks
@@ -256,24 +267,10 @@ pub trait MetadataStore: Send + Sync {
         Ok(candidates.first().copied())
     }
 
-    /// Boot failed on a placed (`pending`) queued session — return it to
-    /// the queue (`pending → queued`), but ONLY while still `pending`
-    /// (a row that advanced to `created` is past requeue; the caller
-    /// fails it). Returns whether a row was requeued. Default: no-op false.
-    async fn requeue_session(&self, _id: SessionId) -> Result<bool, MetaError> {
-        Ok(false)
-    }
-
-    /// Crash recovery: `pending` rows with a `queue_origin` (i.e. placed
-    /// queued sessions) whose `last_active_at` is older than `older_than`
-    /// — a coord died mid-boot — flip back to `queued` for the scanner to
-    /// retry. Returns the count requeued. Default: 0.
-    async fn requeue_stale_pending(
-        &self,
-        _older_than: std::time::Duration,
-    ) -> Result<u64, MetaError> {
-        Ok(0)
-    }
+    // ADR 0079 (issue #543): `requeue_session` + `requeue_stale_pending`
+    // are retired — a placed queued session's boot rides the create_boot
+    // op (`session_ops`), whose row-level `not_before`/`attempts` own the
+    // retry and whose reclaim sweep owns the coord-died-mid-boot recovery.
 
     /// The queue's demand (count, Σ mem_budget_mib, Σ cpu_budget_vcpus) —
     /// the scale-up signal the operator reads via `/admin/fleet/demand`.
@@ -626,6 +623,27 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0079 (review finding #6): the FENCED park-rung write for
+    /// op-path callers (rung-2 park bookkeeping + its compensations, the
+    /// idle-evict park clear). Appends `AND current_epoch = $e`; `Ok(false)`
+    /// ⇒ a successor re-claimed — the stamp is a no-op so a fenced-out
+    /// predecessor's `set_session_park_rung(0)` compensation can never wipe
+    /// the successor's fresh `park_rung = 2` (the #585 stall reborn). The
+    /// out-of-op nomination (idle_detector rung 1) keeps the unfenced
+    /// variant above.
+    async fn fenced_set_session_park_rung(
+        &self,
+        id: SessionId,
+        epoch: i64,
+        rung: i16,
+        parked_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, MetaError> {
+        let _ = (id, epoch, rung, parked_at);
+        Err(MetaError::Serialization(
+            "fenced writes not supported by this store".into(),
+        ))
+    }
+
     /// ADR 0073 phase 4: stamp/renew the shell keep-alive pin. The WS
     /// bridge calls this on its keepalive; passing a past instant (or
     /// letting it lapse) un-pins.
@@ -636,6 +654,279 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), MetaError> {
         let _ = (id, pinned_until);
         Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // ADR 0079 (issue #543) — the durable per-session op log. Every
+    // lifecycle verb is a `session_ops` row; `sessions.current_epoch`
+    // is the fencing epoch, CAS-bumped in the SAME transaction that
+    // claims an op and appended (`AND current_epoch = $e`) to every
+    // session-row write an op makes. Defaults are mock-benign (no-op /
+    // empty); PostgresStore overrides with the real SQL. Tests that
+    // assert op semantics use the live-PG harness.
+    // ----------------------------------------------------------------
+
+    /// Enqueue a lifecycle op and, when NOTHING is running or queued
+    /// ahead of it for this session, claim it in the same transaction
+    /// (CAS-bumping `current_epoch`). The idle-session happy path is one
+    /// PG round trip. Fires `pg_notify('session_ops', session_id)`.
+    async fn op_enqueue_and_claim(
+        &self,
+        session_id: SessionId,
+        kind: crate::types::session_op::OpKind,
+        payload: serde_json::Value,
+        idempotency_key: Option<&str>,
+        claimed_by: &str,
+    ) -> Result<crate::types::session_op::EnqueueOutcome, MetaError> {
+        let _ = (session_id, kind, payload, idempotency_key, claimed_by);
+        Err(MetaError::Serialization(
+            "op log not supported by this store".into(),
+        ))
+    }
+
+    /// ADR 0079 (review finding #8): an ATOMIC claim-or-fail for inline
+    /// claims (`OpClaim` — admin evacuate/drain, evac-resumer, teleport).
+    /// Inserts AND claims the op in one transaction IFF the session's op
+    /// lane is free (nothing running, nothing else queued); otherwise
+    /// ROLLS BACK so no grabbable `queued` row is ever left behind (the
+    /// enqueue-then-`op_cancel_by_id` shape had a window where the
+    /// executor could claim the row between INSERT-commit and the cancel,
+    /// running a full verb the caller was told it couldn't). `Ok(None)` =
+    /// the lane is busy — the caller reports "busy" and the row does not
+    /// exist.
+    async fn op_enqueue_and_claim_exclusive(
+        &self,
+        session_id: SessionId,
+        kind: crate::types::session_op::OpKind,
+        payload: serde_json::Value,
+        claimed_by: &str,
+    ) -> Result<Option<crate::types::session_op::SessionOp>, MetaError> {
+        let _ = (session_id, kind, payload, claimed_by);
+        Err(MetaError::Serialization(
+            "op log not supported by this store".into(),
+        ))
+    }
+
+    /// Claim the head queued op for `session_id` (if due and nothing is
+    /// running): CAS-bump `current_epoch`, stamp the row `running` with
+    /// the new epoch. `Ok(None)` = nothing claimable.
+    async fn op_claim_head(
+        &self,
+        session_id: SessionId,
+        claimed_by: &str,
+    ) -> Result<Option<crate::types::session_op::SessionOp>, MetaError> {
+        let _ = (session_id, claimed_by);
+        Ok(None)
+    }
+
+    /// Sessions with at least one due queued op — the executor's scan
+    /// input (NOTIFY is the hot path; this backs the fallback poll and
+    /// startup recovery).
+    async fn op_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Record the op's durable step marker + progress heartbeat. Fenced:
+    /// the UPDATE carries `AND epoch = $e AND state = 'running'`; 0 rows
+    /// ⇒ a successor re-claimed (the caller must STOP silently).
+    async fn op_record_step(&self, op_id: i64, epoch: i64, step: &str) -> Result<bool, MetaError> {
+        let _ = (op_id, epoch, step);
+        Ok(true)
+    }
+
+    /// ADR 0079 (review finding #1): bump ONLY `heartbeat_at` (not
+    /// `step`), so a within-step background heartbeat can prove liveness
+    /// while a step's body is in flight across a multi-second-to-minute
+    /// host RPC (restore's ~92s GCS page-in, composed capture/upload)
+    /// WITHOUT clobbering the crash-resume step marker. Fenced like
+    /// `op_record_step`; `Ok(false)` ⇒ a successor re-claimed (stop the
+    /// heartbeat loop).
+    async fn op_heartbeat(&self, op_id: i64, epoch: i64) -> Result<bool, MetaError> {
+        let _ = (op_id, epoch);
+        Ok(true)
+    }
+
+    /// Finish an op: `done` (success), or terminal `failed` with error
+    /// text. Fenced like `op_record_step`. Returns whether the row was
+    /// ours to finish.
+    async fn op_finish(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        state: crate::types::session_op::OpState,
+        error: Option<&str>,
+    ) -> Result<bool, MetaError> {
+        let _ = (op_id, epoch, state, error);
+        Ok(true)
+    }
+
+    /// Retryable failure: back to `queued` with `not_before = now() +
+    /// backoff` (attempts already counted at claim). Fenced.
+    async fn op_requeue_with_backoff(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        backoff: std::time::Duration,
+        error: &str,
+    ) -> Result<bool, MetaError> {
+        let _ = (op_id, epoch, backoff, error);
+        Ok(true)
+    }
+
+    /// Wake every QUEUED op of `kind` for this session by resetting its
+    /// `not_before` to now (and NOTIFY). ADR 0079 latency fix: the deliver
+    /// verb, on an Idle session, enqueues a Resume op and requeues itself
+    /// with a FAILURE backoff — but the resume completing is not a
+    /// failure, and the backed-off deliver would otherwise wait out the
+    /// 5 s fallback poll after the resume finishes (prod: prompt-after-
+    /// idle regressed ~10 s → ~21 s). When a `for_delivery` resume reaches
+    /// terminal, we wake its sibling deliver so the executor's completion
+    /// re-drive claims it in <100 ms. A no-spin wake (only fired on the
+    /// resume's terminal, never while it runs — the one-running slot
+    /// already blocks the deliver during the resume). Returns rows woken.
+    async fn op_wake_queued_kind(
+        &self,
+        session_id: SessionId,
+        kind: crate::types::session_op::OpKind,
+    ) -> Result<u64, MetaError> {
+        let _ = (session_id, kind);
+        Ok(0)
+    }
+
+    /// Cancel a still-queued op (`queued → cancelled`). Running ops are
+    /// cancelled cooperatively via [`Self::op_cancel_requested`].
+    async fn op_cancel_queued(
+        &self,
+        session_id: SessionId,
+        kind: crate::types::session_op::OpKind,
+    ) -> Result<bool, MetaError> {
+        let _ = (session_id, kind);
+        Ok(false)
+    }
+
+    /// Set the cancel flag on the RUNNING op of `kind` (payload-embedded
+    /// `_cancel: true`); the executor checks it between steps.
+    async fn op_request_cancel_running(
+        &self,
+        session_id: SessionId,
+        kind: crate::types::session_op::OpKind,
+    ) -> Result<bool, MetaError> {
+        let _ = (session_id, kind);
+        Ok(false)
+    }
+
+    /// The RUNNING op's cancel flag (executor-side check between steps).
+    async fn op_cancel_requested(&self, op_id: i64) -> Result<bool, MetaError> {
+        let _ = op_id;
+        Ok(false)
+    }
+
+    /// The session's currently-running op, if any — the "is a resume in
+    /// flight" visibility read (no `Resuming` FSM state; the op row IS
+    /// the visibility).
+    async fn op_running_for(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<crate::types::session_op::SessionOp>, MetaError> {
+        let _ = session_id;
+        Ok(None)
+    }
+
+    /// One op row by id — the bounded-observe read (wire handlers poll a
+    /// just-enqueued op to relay its terminal outcome to the caller).
+    async fn op_get(
+        &self,
+        op_id: i64,
+    ) -> Result<Option<crate::types::session_op::SessionOp>, MetaError> {
+        let _ = op_id;
+        Ok(None)
+    }
+
+    /// Cancel ONE still-queued op by id. The inline-claim helper uses
+    /// this to withdraw its own row when the enqueue landed behind an
+    /// in-flight op (claim-or-give-up semantics) without collaterally
+    /// cancelling other queued ops of the same kind.
+    async fn op_cancel_by_id(&self, op_id: i64) -> Result<bool, MetaError> {
+        let _ = op_id;
+        Ok(false)
+    }
+
+    /// Is a queued-or-running op of `kind` already pending for this
+    /// session? The cheap duplicate guard for wake-driven enqueuers (the
+    /// outbox delivery shim fires per due session per wake; without this
+    /// every wake would append another identical Deliver row). Advisory —
+    /// a racing enqueue may still slip a duplicate through, which is
+    /// harmless (the duplicate finds no due work and completes).
+    async fn op_pending_exists(
+        &self,
+        session_id: SessionId,
+        kind: crate::types::session_op::OpKind,
+    ) -> Result<bool, MetaError> {
+        let _ = (session_id, kind);
+        Ok(false)
+    }
+
+    /// ADR 0079 (review finding #5): PENDING sessions that lost their
+    /// create_boot op — placed (`queued → pending`, host reserved) but no
+    /// active (`queued|running`) create_boot op exists, older than
+    /// `older_than` (so a just-placed session whose op enqueue is still in
+    /// flight isn't swept). Covers BOTH the crash-between-the-flip-and-the-
+    /// enqueue window AND a terminal-Failed create_boot whose fenced flip
+    /// to Failed also errored — either way the session is stuck Pending
+    /// holding a reservation with nothing to drive it (the deleted
+    /// `requeue_stale_pending` was the old backstop). The reclaim sweep
+    /// re-enqueues a fresh create_boot (the verb re-reads host_id from the
+    /// row). Default: empty (mock stores).
+    async fn orphaned_pending_sessions(
+        &self,
+        older_than: std::time::Duration,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        let _ = older_than;
+        Ok(Vec::new())
+    }
+
+    /// Fence-then-resume crash recovery: for every `running` op whose
+    /// `heartbeat_at` is older than `stale`, CAS-bump the session's
+    /// `current_epoch` again (the old writer is fenced everywhere) and
+    /// re-stamp the row with the new epoch + `claimed_by`. Returns the
+    /// re-claimed ops (each resumes at its recorded `step`).
+    async fn op_reclaim_stale(
+        &self,
+        stale: std::time::Duration,
+        claimed_by: &str,
+    ) -> Result<Vec<crate::types::session_op::SessionOp>, MetaError> {
+        let _ = (stale, claimed_by);
+        Ok(Vec::new())
+    }
+
+    /// Uniform fenced session-row transition: `transition_session` with
+    /// `AND current_epoch = $e`. `Ok(false)` = fenced (0 rows) — the
+    /// caller stops silently, never retries, never compensates.
+    async fn fenced_transition_session(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        to: crate::types::SessionState,
+    ) -> Result<Option<crate::types::SessionState>, MetaError> {
+        let _ = (session_id, epoch, to);
+        Err(MetaError::Serialization(
+            "fenced writes not supported by this store".into(),
+        ))
+    }
+
+    /// Fenced sandbox (re)bind — subsumes `rebind_session_guarded`'s
+    /// bespoke expected-state list with the one epoch predicate.
+    async fn fenced_assign_sandbox(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        sandbox_id: Option<SandboxId>,
+        host_id: Option<crate::types::HostId>,
+    ) -> Result<bool, MetaError> {
+        let _ = (session_id, epoch, sandbox_id, host_id);
+        Err(MetaError::Serialization(
+            "fenced writes not supported by this store".into(),
+        ))
     }
 
     /// ADR 0073 phase 2: durably enqueue a command for delivery.
@@ -888,7 +1179,7 @@ pub trait MetadataStore: Send + Sync {
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError>;
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
 
-    /// ADR 0071: `hosts.capabilities.fc_snapshot_version` for one host —
+    /// ADR 0068: `hosts.capabilities.fc_snapshot_version` for one host —
     /// the value the eviction pipeline and the checkpoint-advert
     /// reconcile stamp onto a freshly-recorded `snapshots` row so
     /// placement can later pair a restore against the exact FC
@@ -968,13 +1259,77 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError>;
 
     // ---- snapshots ----
+    /// ADR 0077 phase 3: persist a session's RuntimeSpec (upsert). Written
+    /// in the create transaction (`reserve_and_persist_create`) and
+    /// refreshed at eviction finalize; the boot inputs a queue re-prepare /
+    /// resume / evac consumes instead of re-deriving. The SINGLE source of
+    /// a session's selected skills/harness/workdir — it SUBSUMES #566's
+    /// interim `sessions.selected_skills` column (retired, migration 0090).
+    /// Default (mock): no-op.
+    async fn put_session_runtime_spec(
+        &self,
+        session_id: SessionId,
+        spec: &crate::types::runtime_spec::RuntimeSpec,
+    ) -> Result<(), MetaError> {
+        let _ = (session_id, spec);
+        Ok(())
+    }
+
+    /// ADR 0077 phase 3: read a session's persisted RuntimeSpec. `None` =
+    /// none written yet (pre-0074 sessions). Default (mock): `None`.
+    async fn get_session_runtime_spec(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<crate::types::runtime_spec::RuntimeSpec>, MetaError> {
+        let _ = session_id;
+        Ok(None)
+    }
+
     /// Idempotent upsert (`ON CONFLICT (id) DO UPDATE`) keyed by
     /// `snap.id`. Returns `true` iff this call INSERTed a fresh row,
     /// `false` on a re-record of an existing one — issue #529: the
     /// heartbeat reconcile uses this to emit `SnapshotTaken` exactly
-    /// once, on the row's first landing, regardless of which coord (if
-    /// any) survived the original capture.
+    /// once, on the row's first landing. ADR 0077 phase 1: the SAME
+    /// transaction advances the session's `durable_head`.
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError>;
+
+    /// ADR 0079 (re-review findings #3/#4): the fenced counterpart to
+    /// [`record_snapshot`]. Writes the row ONLY while the session's
+    /// `current_epoch` still equals `epoch`, atomically in one transaction.
+    /// Returns `Ok(false)` when the op executor has been fenced by a
+    /// successor's re-claim (the epoch moved) — NOTHING is written, so a
+    /// reclaimed-out predecessor can never land a phantom `recoverable` row
+    /// a resume would later pick (the 89f7984d durability-lie class). The
+    /// op-driven capture sites (idle eviction, manual snapshot) use this
+    /// instead of the plain insert; the host-heartbeat reconcile and
+    /// image-enable base captures keep [`record_snapshot`] (not op-fenced).
+    ///
+    /// The default delegates to [`record_snapshot`] (fence-less) — fine for
+    /// in-memory test mocks that never exercise a reclaim; the Postgres
+    /// impl overrides it with the real, atomic epoch gate.
+    async fn fenced_record_snapshot(
+        &self,
+        snap: SnapshotRecord,
+        epoch: i64,
+    ) -> Result<bool, MetaError> {
+        let _ = epoch;
+        self.record_snapshot(snap).await
+    }
+
+    /// ADR 0077 phase 1: the session's durable head — the newest
+    /// snapshot whose blobs AND row are both committed (advanced in
+    /// `record_snapshot`'s transaction). `None` = no committed
+    /// snapshot yet. Phase 5 makes this the resume selector; phase 1
+    /// exposes it read-side for the SLO canary and tests.
+    ///
+    /// Default (mock stores): `None` — mocks get pre-0074 behavior.
+    async fn durable_head_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<crate::types::SnapshotId>, MetaError> {
+        let _ = session_id;
+        Ok(None)
+    }
     async fn list_snapshots_for_session(
         &self,
         sid: SessionId,
@@ -1131,6 +1486,28 @@ pub trait MetadataStore: Send + Sync {
         payload: serde_json::Value,
     ) -> Result<i64, MetaError>;
 
+    /// ADR 0079 (review finding #6): append a lifecycle event ONLY when
+    /// `sessions.current_epoch == epoch`, atomically (the epoch predicate
+    /// rides the same idx-allocation UPDATE). `Ok(None)` ⇒ a successor op
+    /// re-claimed the session — the caller is a fenced-out predecessor and
+    /// its stale StatusChanged/Evicted must NOT land after the successor's
+    /// newer events (an event-log tail corruption that misleads
+    /// SSE/idle-detect/transcript). The default appends unconditionally
+    /// (benign for non-fencing mock stores); `PostgresStore` and the
+    /// coordinator's `MiniMeta` enforce the fence.
+    async fn append_session_event_fenced(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<i64>, MetaError> {
+        let _ = epoch;
+        self.append_session_event(session_id, kind, payload)
+            .await
+            .map(Some)
+    }
+
     /// Phase 1c (ADR 0052): fan out one EPHEMERAL session event (a live
     /// token chunk) to all coordinator replicas via
     /// `NOTIFY session_event_deltas`. Unlike [`append_session_event`],
@@ -1275,6 +1652,23 @@ pub trait MetadataStore: Send + Sync {
     // but that's lazy + cached separately by digest.
 
     async fn upsert_enabled_image(&self, image: EnabledImage) -> Result<(), MetaError>;
+    /// ADR 0080 cheap-edit path: replace `image_config` on a live row
+    /// WITHOUT touching the base snapshot. Only correct for edits
+    /// that don't affect capture (name/description/env/workdir —
+    /// callers gate resources/warm changes behind a recapture job).
+    /// Implementations must notify boot-bundle-cache listeners so
+    /// coordinator replicas drop their cached copy. `NotFound` when
+    /// no live row exists for `image_uri`.
+    async fn update_enabled_image_config(
+        &self,
+        image_uri: &str,
+        config: &crate::types::image::ImageConfig,
+    ) -> Result<(), MetaError> {
+        let _ = (image_uri, config);
+        Err(MetaError::Migration(
+            "enabled-image config updates unsupported by this store".into(),
+        ))
+    }
     /// Live-only — filters `soft_deleted_at IS NULL`. Used by host
     /// advertisement, the dashboard's enabled-images list, and the
     /// session-create handler (where a disabled image must fail with
@@ -1315,26 +1709,31 @@ pub trait MetadataStore: Send + Sync {
     /// from BlobStorage.
     async fn delete_enabled_image(&self, image_uri: &str) -> Result<(), MetaError>;
 
-    /// ADR 0036 P4: content-keyed base-snapshot reuse. Find an
-    /// enabled image (INCLUDING soft-deleted rows — their snapshots
-    /// stay GC-pinned and restorable) whose bake produced the same
-    /// disk content (`disk_manifest_*`, content-derived since ADR
-    /// 0036) AND the same `manifest_toml`, and which carries a base
-    /// snapshot. The enable pipeline reuses that snapshot instead of
-    /// booting a capture VM: with both inputs equal, a fresh capture
-    /// is equivalent for every session created from it (bundle
-    /// generations are swapped to the host's current staging at
-    /// session create — ADR 0035 Invariant 2 — so reuse does not
-    /// freeze bundle freshness).
+    /// ADR 0036 P4 / ADR 0080: content-keyed base-snapshot reuse.
+    /// Find an enabled image (INCLUDING soft-deleted rows — their
+    /// snapshots stay GC-pinned and restorable) whose bake produced
+    /// the same disk content (`disk_manifest_*`, content-derived
+    /// since ADR 0036) AND the same capture-affecting `resources`
+    /// (the only non-warm config that's frozen into the memory
+    /// snapshot — ADR 0080 keys reuse on `image_config->'resources'`
+    /// alone; name/description/env/workdir are applied per-session),
+    /// and which carries a base snapshot. The enable pipeline reuses
+    /// that snapshot instead of booting a capture VM: with both
+    /// inputs equal, a fresh capture is equivalent for every session
+    /// created from it (bundle generations are swapped to the host's
+    /// current staging at session create — ADR 0035 Invariant 2 — so
+    /// reuse does not freeze bundle freshness). Warm images never
+    /// reuse (gated by the caller — a warm hook makes captures
+    /// non-equivalent by definition).
     ///
     /// Default `None`: stores without the query surface (test mocks)
     /// simply never reuse.
     async fn find_enabled_image_by_content(
         &self,
         disk_manifest: ManifestRef,
-        manifest_toml: &str,
+        resources: &crate::types::image::ResourceHints,
     ) -> Result<Option<EnabledImage>, MetaError> {
-        let _ = (disk_manifest, manifest_toml);
+        let _ = (disk_manifest, resources);
         Ok(None)
     }
 
@@ -1356,12 +1755,16 @@ pub trait MetadataStore: Send + Sync {
         &self,
         image_uri: &str,
         manifest_digest: Option<&str>,
-        // Capture-time env for this enable's `[warm]` hook (resolved at
-        // capture, never stored as values). Carried from the triggering
-        // request (enable) or inherited from the existing row (refresh).
-        capture_env: &[crate::types::CaptureEnvEntry],
+        // The full image config this enable will capture under (ADR
+        // 0080). Rides the job and is stamped onto the enabled_images
+        // row only when the job reaches `ready` — capture-affecting
+        // edits stay invisible to session-create until the new base
+        // snapshot actually exists. Carried from the triggering
+        // request (enable/update) or inherited from the existing row
+        // (refresh).
+        image_config: &crate::types::image::ImageConfig,
     ) -> Result<EnableJob, MetaError> {
-        let _ = (image_uri, manifest_digest, capture_env);
+        let _ = (image_uri, manifest_digest, image_config);
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))
@@ -1642,101 +2045,6 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Option<String>, MetaError> {
         let _ = session_id;
         Ok(None)
-    }
-
-    // ----------------------------------------------------------------
-    // ADR 0016 §A.1.5c — cross-replica per-session op lease.
-    // Serializes mutually-exclusive session-lifecycle ops (idle
-    // eviction, resume) so two coord pods can't drive the same
-    // session at once. Backed by the `session_lease` table. The
-    // contract:
-    //   - `try_acquire_session_lease` is atomic INSERT ... ON
-    //     CONFLICT DO NOTHING. Returns Ok(true) if the row was
-    //     inserted (caller owns the pipeline), Ok(false) if a
-    //     row already exists (another caller is mid-pipeline).
-    //   - `release_session_lease` is idempotent — extra calls
-    //     against an already-deleted row are Ok(()). Used by the
-    //     RAII guard's drop path. Scoped to the holder (`locked_by`):
-    //     it deletes ONLY the row this holder owns, so a holder that
-    //     was reaped (its row aged past the sweep threshold) and
-    //     re-acquired by someone else can't blind-delete the new
-    //     holder's lease on its own (late) Drop. Mirrors
-    //     `touch_session_lease`'s `AND locked_by = $2` scoping.
-    //   - `sweep_stale_session_leases` deletes rows older than
-    //     `max_age` and returns them for warn-logging. Backs the
-    //     coord-side stale-lease reaper.
-    // ----------------------------------------------------------------
-
-    /// Returns `Ok(true)` if the lease was acquired (row inserted),
-    /// `Ok(false)` if a concurrent caller already holds it.
-    ///
-    /// Default impl unconditionally returns `Ok(true)` — the
-    /// benign behaviour for test mocks / in-memory backends where
-    /// concurrent coord-pod racing isn't a concern. `PostgresStore`
-    /// overrides with the real INSERT ... ON CONFLICT DO NOTHING.
-    ///
-    /// `sandbox_id` is diagnostic-only (records which sandbox the op
-    /// concerns): `Some` for an eviction, `None` for a resume — no
-    /// sandbox exists yet at resume-lease time, it's about to be
-    /// created.
-    async fn try_acquire_session_lease(
-        &self,
-        _session_id: SessionId,
-        _sandbox_id: Option<SandboxId>,
-        _locked_by: &str,
-    ) -> Result<bool, MetaError> {
-        Ok(true)
-    }
-
-    /// Idempotent. Drop-safe. Scoped to the holder: deletes only the row
-    /// owned by `locked_by`, so a reaped-then-re-acquired lease can't be
-    /// blind-deleted out from under the new holder by the old holder's
-    /// late Drop (the fleet's primary serializer must not fail open after
-    /// a >180s hold). Returns whether a row was deleted — `false` means
-    /// the lease was already gone (reaped or stolen); the caller should
-    /// `warn!` for forensics.
-    async fn release_session_lease(
-        &self,
-        _session_id: SessionId,
-        _locked_by: &str,
-    ) -> Result<bool, MetaError> {
-        Ok(true)
-    }
-
-    /// Peek: is the per-session lease currently held (an eviction /
-    /// resume / live migration in flight)? Read-only — never acquires.
-    /// Used by user-facing forwards (prompt) to HOLD delivery instead
-    /// of writing into a frozen sandbox's vsock buffer, which a live
-    /// move then destroys with the source (prod session 284d72e3: a
-    /// prompt sent mid-teleport vanished and the UI hung "working…").
-    async fn session_lease_held(&self, _session_id: SessionId) -> Result<bool, MetaError> {
-        Ok(false)
-    }
-
-    /// ADR 0045 D5 / issue #147: refresh a held lease's `locked_at` so a
-    /// long-running owner (the eviction finalize task awaiting a slow
-    /// upload) is never reaped mid-work by `sweep_stale_session_leases`.
-    /// Scoped to the holder: refreshes only the row this `locked_by`
-    /// owns, so a touch can't resurrect a lease that was reaped and
-    /// re-acquired by someone else. Returns whether a row was touched —
-    /// `false` means the lease is gone (reaped or released) and the
-    /// caller should treat its ownership as lost.
-    async fn touch_session_lease(
-        &self,
-        _session_id: SessionId,
-        _locked_by: &str,
-    ) -> Result<bool, MetaError> {
-        Ok(true)
-    }
-
-    /// Stale-lease reaper. Deletes rows where `locked_at < now() -
-    /// max_age` and returns them so the caller can warn-log
-    /// `(session_id, locked_by, locked_at)` per reaped row.
-    async fn sweep_stale_session_leases(
-        &self,
-        _max_age: std::time::Duration,
-    ) -> Result<Vec<StaleSessionLease>, MetaError> {
-        Ok(Vec::new())
     }
 
     /// ADR 0016 Phase B: write the host's freshly-flushed disk
@@ -2193,15 +2501,4 @@ pub enum UpdateOutcome {
     /// gone. Coord handler logs `warn!` with the mismatch fields;
     /// host shouldn't retry.
     DroppedStale,
-}
-
-/// One row from [`MetadataStore::sweep_stale_session_leases`].
-/// Carried so the coord-side sweeper can warn-log who held the
-/// lease for how long before it was reaped.
-#[derive(Clone, Debug)]
-pub struct StaleSessionLease {
-    pub session_id: SessionId,
-    pub sandbox_id: Option<SandboxId>,
-    pub locked_by: String,
-    pub locked_at: chrono::DateTime<chrono::Utc>,
 }

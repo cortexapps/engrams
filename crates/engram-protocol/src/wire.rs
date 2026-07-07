@@ -64,7 +64,25 @@ use serde::{Deserialize, Serialize};
 // carries binding_epoch; the shell-pin RPCs (AcquireShell/ReleaseShell/
 // RenewShell) and RehandshakeHarness are deleted; heartbeat gains
 // harness_attached. Lockstep coord+host roll, no fallback ladder.
-pub const WIRE_VERSION: u32 = 10;
+// v11 (issue #548 / ADR 0078): the never-populated `local_snapshots`
+// heartbeat mirror is retired end-to-end — the `Heartbeat.local_snapshots`
+// wire field, `HostRecord`/`HostHeartbeat` fields, the `hosts.local_snapshots`
+// PG column (migration 0091), and the fleet-view proto count (reserved 7).
+// Clean break — coord+host roll together; skewed hosts drain off scheduling
+// via `host_wire_version_ok` until the host MIG rolls.
+// v12 (ADR 0079 / #543): fencing_epoch on session-scoped host RPCs — the
+// SandboxIdMessage-shaped lifecycle RPCs (destroy / snapshot family /
+// pause / resume) migrate to `FencedSandboxRequest{uuid, fencing_epoch,
+// session_id}`; StartAgent / Restore / RestoreBaseForSession gain the
+// same (session_id, fencing_epoch) pair. Lockstep coord+host roll.
+// v13 (ADR 0080 Phase 2a): `BuildBaseSnapshotRequest` gains
+// `capture_egress_bincode` — the capture VM's `[warm]`-hook egress policy
+// is assembled COORDINATOR-side (one `SessionEgressPolicy` builder for
+// sessions and captures alike) and shipped ready-to-register; the host's
+// own `capture_egress_policy` builder (from `WarmConfig.network`) is
+// retired, and the host no longer interprets `warm.env`/`warm.network`
+// out of `warm_bincode`. Lockstep coord+host roll.
+pub const WIRE_VERSION: u32 = 13;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

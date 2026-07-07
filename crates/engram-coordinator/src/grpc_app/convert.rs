@@ -40,7 +40,6 @@ pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session 
         created_at,
         last_active_at,
         live_disk_manifest: _, // Internal coord state (ADR 0016 Phase B); not on the wire shape.
-        selected_skills: _,    // Internal coord state (issue #535); not on the wire shape.
         park_rung: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
         parked_at: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
     } = s;
@@ -314,7 +313,6 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         capacity_total_mib,
         capacity_used_mib,
         running_sandboxes,
-        local_snapshots,
         ready_images,
         ready_image_digests,
         util_disk_total_mib,
@@ -350,7 +348,6 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         capacity_total_mib: *capacity_total_mib,
         capacity_used_mib: *capacity_used_mib,
         running_sandboxes: *running_sandboxes,
-        local_snapshots: *local_snapshots as u64,
         ready_images: *ready_images as u64,
         ready_image_digests: ready_image_digests.clone(),
         util_disk_total_mib: *util_disk_total_mib,
@@ -539,22 +536,116 @@ pub(crate) fn enabled_image_summary_to_proto(
         id,
         image_uri,
         manifest_digest,
-        manifest_name,
-        manifest_description,
+        config,
         last_refreshed_at,
         created_at,
-        capture_env,
     } = s;
     app::EnabledImageSummary {
         id: id.to_string(),
         image_uri: image_uri.clone(),
         manifest_digest: manifest_digest.clone(),
-        manifest_name: manifest_name.clone(),
-        manifest_description: manifest_description.clone(),
+        config: Some(image_config_to_proto(config)),
         last_refreshed_at: last_refreshed_at.to_rfc3339(),
         created_at: created_at.to_rfc3339(),
-        capture_env: capture_env.iter().map(capture_env_to_proto).collect(),
     }
+}
+
+/// Core [`engram_core::types::image::ImageConfig`] → proto (ADR 0080).
+/// Secret refs are shown by name only — `CaptureEnvEntry` never carries a
+/// resolved value in either direction, so nothing to redact.
+pub(crate) fn image_config_to_proto(
+    c: &engram_core::types::image::ImageConfig,
+) -> app::ImageConfig {
+    app::ImageConfig {
+        name: c.name.clone(),
+        description: c.description.clone(),
+        env: c.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        workdir: c.workdir.clone(),
+        resources: Some(app::ImageResources {
+            suggested_memory_mib: c.resources.suggested_memory_mib,
+            suggested_vcpus: c.resources.suggested_vcpus,
+            suggested_disk_gib: c.resources.suggested_disk_gib,
+        }),
+        warm: c.warm.as_ref().map(|w| app::ImageWarmConfig {
+            command: w.command.clone(),
+            timeout_secs: w.timeout_secs,
+            workdir: w.workdir.clone(),
+            env: w.env.iter().map(capture_env_to_proto).collect(),
+            network: w.network.as_ref().map(network_policy_to_proto),
+        }),
+    }
+}
+
+/// Proto `ImageConfig` → core, validating shape (name/vcpus/warm argv are
+/// validated by `ImageConfig::validate` at the call site — this only
+/// rejects structurally malformed entries). `Err` is `invalid_argument`.
+pub(crate) fn image_config_from_proto(
+    c: &app::ImageConfig,
+) -> Result<engram_core::types::image::ImageConfig, String> {
+    let resources = c
+        .resources
+        .as_ref()
+        .map(|r| engram_core::types::image::ResourceHints {
+            suggested_memory_mib: r.suggested_memory_mib,
+            suggested_vcpus: r.suggested_vcpus,
+            suggested_disk_gib: r.suggested_disk_gib,
+        });
+    let warm = match &c.warm {
+        Some(w) => Some(engram_core::types::image::WarmConfig {
+            command: w.command.clone(),
+            timeout_secs: w.timeout_secs,
+            workdir: w.workdir.clone(),
+            env: capture_env_from_proto(&w.env)?,
+            network: w
+                .network
+                .as_ref()
+                .map(network_policy_from_proto)
+                .transpose()?,
+        }),
+        None => None,
+    };
+    Ok(engram_core::types::image::ImageConfig {
+        name: c.name.clone(),
+        description: c.description.clone(),
+        env: c.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        workdir: c.workdir.clone(),
+        resources: resources.unwrap_or_default(),
+        warm,
+    })
+}
+
+/// Core [`engram_core::types::image::NetworkPolicy`] → the shared
+/// `ProfileNetwork` proto shape (the warm-egress editor reuses the
+/// profile network editor's wire type).
+fn network_policy_to_proto(n: &engram_core::types::image::NetworkPolicy) -> app::ProfileNetwork {
+    app::ProfileNetwork {
+        default: match n.default {
+            engram_core::types::image::NetworkDefault::Allow => "allow".to_string(),
+            engram_core::types::image::NetworkDefault::Deny => "deny".to_string(),
+        },
+        allow_hosts: n.allow_hosts.clone(),
+        allow_host_patterns: n.allow_host_patterns.clone(),
+    }
+}
+
+fn network_policy_from_proto(
+    n: &app::ProfileNetwork,
+) -> Result<engram_core::types::image::NetworkPolicy, String> {
+    let default = match n.default.as_str() {
+        "allow" => engram_core::types::image::NetworkDefault::Allow,
+        // Empty = proto default = the safe posture.
+        "deny" | "" => engram_core::types::image::NetworkDefault::Deny,
+        other => {
+            return Err(format!(
+                "network default must be \"allow\" or \"deny\", got {other:?}"
+            ))
+        }
+    };
+    Ok(engram_core::types::image::NetworkPolicy {
+        default,
+        allow_hosts: n.allow_hosts.clone(),
+        allow_host_patterns: n.allow_host_patterns.clone(),
+    })
 }
 
 /// One core [`engram_core::types::CaptureEnvEntry`] → proto.
@@ -616,10 +707,11 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         chunks_done,
         attempts,
         error,
-        // capture_env rides the job internally (carried to the warm hook
-        // at capture); it is not surfaced on the job's API response — the
-        // operator sees it on EnabledImageSummary.
-        capture_env: _,
+        // The full image config rides the job internally (ADR 0080:
+        // captured under, stamped onto the row at ready); it is not
+        // surfaced on the job's API response — the operator sees it on
+        // EnabledImageSummary.config.
+        image_config: _,
         prestage_hosts,
         capture_phase,
         warm_stage,
@@ -783,7 +875,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         }

@@ -131,10 +131,11 @@ export type Profile = Message<"engram.app.v1.Profile"> & {
   isDefault: boolean;
 
   /**
-   * ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
-   * + default model/effort (catalog option ids) for this profile's sessions.
-   * Empty = inherit (deployment-default harness; the harness descriptor's
-   * default model/effort). Overridable per session at create.
+   * ADR 0062/0063: the default harness (a HarnessCatalogService catalog
+   * name) plus default model/effort (catalog option ids) for this
+   * profile's sessions. Empty = inherit (deployment-default harness; the
+   * harness descriptor's default model/effort). Overridable per session
+   * at create.
    *
    * @generated from field: optional string harness = 16;
    */

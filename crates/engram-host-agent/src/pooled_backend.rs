@@ -769,63 +769,26 @@ fn spawn_leg_keepalive(
 }
 
 impl PooledBackend {
-    /// Build the capture-egress policy for a `[warm]` hook from its
-    /// `[warm.network]`, or `None` when the image grants no egress (→ the
-    /// capture stays egress-less). Pure (no proxy / no I/O) so the posture
-    /// decision is unit-testable; [`Self::register_capture_egress`] adds the
-    /// guest-IP lookup + proxy registration. `default = "allow"` → allow-all
-    /// (dev posture); `default = "deny"` + non-empty lists → a scoped
-    /// allowlist; `deny` with no hosts (or no `[warm.network]`) → `None`.
-    /// `SecretMode::Literal` = SNI-filter only (no MITM): the warm hook talks
-    /// to the real upstreams over unbroken TLS.
-    fn capture_egress_policy(
-        warm: &WarmConfig,
-        sandbox_id: SandboxId,
-        guest_ip: std::net::Ipv4Addr,
-        session_id: SessionId,
-    ) -> Option<SessionEgressPolicy> {
-        let network = warm.network.as_ref()?;
-        let allow_all = matches!(
-            network.default,
-            engram_core::types::image::NetworkDefault::Allow
-        );
-        // A deny-default policy that lists no hosts grants nothing — there's no
-        // egress to register, so leave the capture egress-less.
-        if !allow_all && network.allow_hosts.is_empty() && network.allow_host_patterns.is_empty() {
-            return None;
-        }
-        Some(SessionEgressPolicy {
-            session_id,
-            sandbox_id,
-            guest_ip,
-            network_allow_hosts: network.allow_hosts.clone(),
-            network_allow_host_patterns: network.allow_host_patterns.clone(),
-            allow_all,
-            secrets: Vec::new(),
-            injects: Vec::new(),
-            observes: Vec::new(),
-            secret_mode: engram_core::types::image::SecretMode::Literal,
-        })
-    }
-
-    /// Capture-time egress: the capture VM gets a tap + guest IP like any
-    /// sandbox, but no egress policy is registered for it, so the proxy denies
-    /// its traffic as `UnknownGuest`. If the image's `[warm.network]` grants
-    /// egress (allow-all or an allowlist), register a matching policy for the
-    /// capture VM's guest IP so the hook can reach the network (e.g. eager OIDC
-    /// discovery, an `op inject`) for the duration of the capture. Returns the
-    /// synthetic [`SessionId`] the caller MUST pass to
-    /// [`Self::unregister_capture_egress`] after teardown. No-op (returns
-    /// `None`) when the image grants no egress, no local proxy is wired, or the
-    /// guest has no IP — the capture then stays egress-less.
+    /// Capture-time egress (ADR 0080, wire v13): the capture VM gets a tap +
+    /// guest IP like any sandbox, but no egress policy is registered for it,
+    /// so the proxy denies its traffic as `UnknownGuest`. When the coordinator
+    /// shipped a capture policy (assembled from the config's `warm.network` —
+    /// the posture decision is coordinator-side now; this host never derives
+    /// egress from `WarmConfig` itself), stamp the sandbox-dependent identity
+    /// (this `sandbox_id` + the VM's guest IP) onto it and register it for the
+    /// duration of the capture. Returns the policy's synthetic [`SessionId`],
+    /// which the caller MUST pass to [`Self::unregister_capture_egress`] after
+    /// teardown. No-op (returns `None`) when no policy was shipped, no local
+    /// proxy is wired, or the guest has no IP — the capture then stays
+    /// egress-less.
     async fn register_capture_egress(
         &self,
         id: SandboxId,
-        warm: Option<&WarmConfig>,
+        policy: Option<SessionEgressPolicy>,
     ) -> Option<SessionId> {
-        // No `[warm.network]` → egress-less (the common case); skip the lookup.
-        let warm = warm?;
-        let network = warm.network.as_ref()?;
+        // No coordinator-granted egress → egress-less (the common case);
+        // skip the guest-IP lookup entirely.
+        let mut policy = policy?;
         let egress = self.egress.as_ref()?;
         let Some(guest_ip) = self
             .inner
@@ -839,18 +802,23 @@ impl PooledBackend {
             );
             return None;
         };
-        let session_id = SessionId::new();
-        let policy = Self::capture_egress_policy(warm, id, guest_ip, session_id)?;
+        // The coordinator assembled the posture half; the sandbox-dependent
+        // identity half only exists here (the VM was created inside this
+        // call), so stamp it now.
+        policy.sandbox_id = id;
+        policy.guest_ip = guest_ip;
+        let session_id = policy.session_id;
         let allow_all = policy.allow_all;
+        let allow_hosts = policy.network_allow_hosts.clone();
+        let allow_host_patterns = policy.network_allow_host_patterns.clone();
         match crate::egress::register_policy(&egress.registry, policy) {
             Ok(()) => {
                 tracing::info!(
                     sandbox_id = %id,
                     %guest_ip,
                     allow_all,
-                    default = ?network.default,
-                    allow_hosts = ?network.allow_hosts,
-                    allow_host_patterns = ?network.allow_host_patterns,
+                    ?allow_hosts,
+                    ?allow_host_patterns,
                     "capture egress: registered policy for the [warm] hook",
                 );
                 Some(session_id)
@@ -2791,7 +2759,11 @@ impl PooledBackend {
                             .map_err(|e| {
                                 SandboxError::Snapshot(format!("catch-up read {hash}: {e}"))
                             })?;
-                        chunk_store.put_chunk(&bytes).await.map_err(|e| {
+                        // ADR 0078 move 5: the teleport catch-up uploads the
+                        // source's un-flushed memory divergence — new by
+                        // construction (memory changed since the last
+                        // publish), so skip the per-chunk `exists()` GCS HEAD.
+                        chunk_store.put_chunk_unchecked(&bytes).await.map_err(|e| {
                             SandboxError::Snapshot(format!("catch-up upload {hash}: {e}"))
                         })?;
                         Ok::<(), SandboxError>(())
@@ -3480,7 +3452,7 @@ impl PooledBackend {
                 self.flush_config.dirty_threshold_bytes,
                 // Disk-only cold recovery resumes the session's OWN evolved
                 // manifest — already a private id, so tick, don't fork.
-                /*fork_on_first_flush=*/
+                /*fork_at_attach=*/
                 false,
             )
             .await
@@ -3611,7 +3583,7 @@ impl PooledBackend {
             self.flush_config.dirty_threshold_bytes,
             // ADR 0049 follow-up: FRESH create from the shared base image —
             // fork the disk manifest to a private per-session id on first write.
-            /*fork_on_first_flush=*/
+            /*fork_at_attach=*/
             true,
         )
         .await
@@ -6931,13 +6903,14 @@ impl SandboxBackend for PooledBackend {
         spec: SandboxSpec,
         warm: Option<WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        capture_egress: Option<engram_core::types::egress::SessionEgressPolicy>,
         progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         // ADR 0021 P1.5: no stub-harness attach — the harness lives
         // in the rootfs of the image being captured, so the snapshot
         // is already complete without any second virtio-blk drive.
 
-        // The manifest `[env]` (JAVA_HOME, PATH, …) the `[warm]` hook needs,
+        // The config `[env]` (JAVA_HOME, PATH, …) the `[warm]` hook needs,
         // MERGED with the resolved capture-time env (`capture_env` — literals
         // plus the coordinator's SecretStore-resolved refs). capture_env wins
         // on a key collision: it's the operator's explicit capture override.
@@ -6956,13 +6929,12 @@ impl SandboxBackend for PooledBackend {
         // 2-strike debounce). Cleared after the destroy below, on every path.
         self.base_captures.insert(id, ());
 
-        // Capture-time egress: register an egress policy for the capture VM's
-        // guest IP when the image's `[warm.network]` grants it (allow-all or an
-        // allowlist), so the hook can reach the network (e.g. OIDC discovery) —
-        // without it the proxy denies the capture VM as an unknown guest. No-op
-        // for images that grant no egress. Torn down after the destroy below,
-        // on every path.
-        let capture_egress = self.register_capture_egress(id, warm.as_ref()).await;
+        // Capture-time egress (ADR 0080): register the coordinator-assembled
+        // policy for the capture VM's guest IP so the `[warm]` hook can reach
+        // the network (e.g. OIDC discovery) — without it the proxy denies the
+        // capture VM as an unknown guest. No-op when the coordinator granted
+        // no egress. Torn down after the destroy below, on every path.
+        let capture_egress = self.register_capture_egress(id, capture_egress).await;
 
         // Issue #539: `phase=boot` — the capture VM exists and is booting to
         // agentd-ready. Best-effort; a slow/dropped consumer must not stall
@@ -7105,6 +7077,31 @@ impl SandboxBackend for PooledBackend {
             self.seed_checkpoint_chain_forked(id, memory_ref).await;
         }
 
+        // ADR 0080: let the captured agentd adopt the agentd bundle
+        // generation the fresh flavor just patched into its slot —
+        // BEFORE any session state (env, harness, policy) binds, so a
+        // re-exec loses nothing. Non-fatal by design: a pre-ADR-0080
+        // snapshot (agentd baked into the rootfs, no bundle slot), a
+        // bundle staging hiccup, or a typed skew error all degrade to
+        // the captured agentd — one generation stale beats a failed
+        // create.
+        match self.inner.refresh_agent(id).await {
+            Ok(engram_core::traits::AgentRefresh::UpToDate) => {}
+            Ok(engram_core::traits::AgentRefresh::Restarted) => {
+                tracing::info!(
+                    sandbox_id = %id,
+                    "agentd refreshed onto the host's current bundle generation",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    error = %e,
+                    "agentd refresh degraded; session keeps the captured agentd",
+                );
+            }
+        }
+
         // Inject the per-session env (manifest env + secrets + session
         // id). The base snapshot is shared, so per-session values can't
         // be baked into it — in cold-create they rode vm_spec.env.
@@ -7209,6 +7206,17 @@ impl SandboxBackend for PooledBackend {
     /// forward was missing.
     async fn start_shell(&self, id: SandboxId) -> Result<u16, SandboxError> {
         self.inner.start_shell(id).await
+    }
+
+    /// ADR 0080: forward to inner, exactly as `start_shell` does — without
+    /// this the trait default (`Ok(UpToDate)`) would run and the FC
+    /// backend's actual vsock RefreshAgent RPC to in-VM agentd would never
+    /// fire, silently pinning every session to its capture-time agentd.
+    async fn refresh_agent(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::traits::AgentRefresh, SandboxError> {
+        self.inner.refresh_agent(id).await
     }
 
     /// ADR 0065: forward to inner, exactly as `start_shell` does — without
@@ -7595,7 +7603,7 @@ impl PooledBackend {
             self.flush_config.dirty_threshold_bytes,
             // Resume attaches the session's OWN already-forked manifest id
             // (from its prior snapshot) — tick, don't fork.
-            /*fork_on_first_flush=*/
+            /*fork_at_attach=*/
             false,
         )
         .await
@@ -7807,15 +7815,6 @@ mod tests {
         );
     }
 
-    fn warm_with(network: Option<engram_core::types::image::NetworkPolicy>) -> WarmConfig {
-        WarmConfig {
-            command: vec!["true".into()],
-            timeout_secs: None,
-            workdir: None,
-            network,
-        }
-    }
-
     /// Review finding 1: a leg wrapped by `spawn_leg_keepalive` must keep
     /// resending the SAME event on the keepalive interval until the
     /// guard is dropped, and must stop immediately once it is. This is
@@ -7861,87 +7860,46 @@ mod tests {
         );
     }
 
-    /// An image with no `[warm.network]` — and a deny-default policy that lists
-    /// no hosts — grants no egress, so it gets NO capture-egress policy (the
-    /// capture VM stays egress-less; the default for every non-opted-in image).
+    /// A capture-shaped policy (ADR 0080: assembled coordinator-side —
+    /// see `session_boot::assemble_capture_egress_policy`, where the
+    /// posture-mapping tests now live) with a scoped allowlist must
+    /// translate + register cleanly on the proxy.
     #[test]
-    fn capture_egress_policy_none_when_no_egress_granted() {
-        let mk = |w: &WarmConfig| {
-            PooledBackend::capture_egress_policy(
-                w,
-                SandboxId::new(),
-                "169.254.0.2".parse().unwrap(),
-                SessionId::new(),
-            )
+    fn capture_shaped_allowlist_policy_registers_on_the_proxy() {
+        let policy = SessionEgressPolicy {
+            session_id: SessionId::new(),
+            sandbox_id: SandboxId::new(),
+            guest_ip: "169.254.0.2".parse().unwrap(),
+            network_allow_hosts: vec!["accounts.google.com".into()],
+            network_allow_host_patterns: vec!["*.auth0.com".into()],
+            allow_all: false,
+            secrets: Vec::new(),
+            injects: Vec::new(),
+            observes: Vec::new(),
+            secret_mode: engram_core::types::image::SecretMode::Literal,
         };
-        assert!(
-            mk(&warm_with(None)).is_none(),
-            "no [warm.network] → no policy"
-        );
-        assert!(
-            mk(&warm_with(Some(engram_core::types::image::NetworkPolicy {
-                default: engram_core::types::image::NetworkDefault::Deny,
-                allow_hosts: vec![],
-                allow_host_patterns: vec![],
-            })))
-            .is_none(),
-            "deny-default with no hosts grants nothing → no policy",
-        );
-    }
-
-    /// A `deny` default + declared hosts becomes a scoped allowlist policy
-    /// (`allow_all = false`, SNI-filter only, no secrets/injects/observes).
-    #[test]
-    fn capture_egress_policy_scopes_declared_allowlist() {
-        let warm = warm_with(Some(engram_core::types::image::NetworkPolicy {
-            default: engram_core::types::image::NetworkDefault::Deny,
-            allow_hosts: vec!["accounts.google.com".into()],
-            allow_host_patterns: vec!["*.auth0.com".into()],
-        }));
-        let sid = SessionId::new();
-        let sbx = SandboxId::new();
-        let policy =
-            PooledBackend::capture_egress_policy(&warm, sbx, "169.254.0.2".parse().unwrap(), sid)
-                .expect("allowlist must produce a policy");
-
-        assert_eq!(policy.session_id, sid);
-        assert_eq!(policy.sandbox_id, sbx);
-        assert!(!policy.allow_all);
-        assert_eq!(policy.network_allow_hosts, vec!["accounts.google.com"]);
-        assert_eq!(policy.network_allow_host_patterns, vec!["*.auth0.com"]);
-        assert!(matches!(
-            policy.secret_mode,
-            engram_core::types::image::SecretMode::Literal
-        ));
-        assert!(policy.secrets.is_empty());
-        assert!(policy.injects.is_empty());
-        assert!(policy.observes.is_empty());
-
-        // The proxy accepts the translated allowlist.
         let registry = engram_egress_proxy::Registry::new();
         crate::egress::register_policy(&registry, policy)
             .expect("proxy must accept the capture-egress allowlist");
     }
 
-    /// An `allow` default becomes an allow-all policy (`allow_all = true`); the
-    /// dev posture for an image whose warm boot needs unrestricted network.
+    /// A capture-shaped allow-all policy must register, and the proxy must
+    /// bypass an arbitrary host under it (the dev posture for an image whose
+    /// warm boot needs unrestricted network).
     #[test]
-    fn capture_egress_policy_allow_all_for_allow_default() {
-        let warm = warm_with(Some(engram_core::types::image::NetworkPolicy {
-            default: engram_core::types::image::NetworkDefault::Allow,
-            allow_hosts: vec![],
-            allow_host_patterns: vec![],
-        }));
-        let policy = PooledBackend::capture_egress_policy(
-            &warm,
-            SandboxId::new(),
-            "169.254.0.2".parse().unwrap(),
-            SessionId::new(),
-        )
-        .expect("allow-default must produce a policy");
-        assert!(policy.allow_all, "default=allow → allow_all");
-
-        // The proxy resolves + bypasses an arbitrary host under allow-all.
+    fn capture_shaped_allow_all_policy_bypasses_on_the_proxy() {
+        let policy = SessionEgressPolicy {
+            session_id: SessionId::new(),
+            sandbox_id: SandboxId::new(),
+            guest_ip: "169.254.0.3".parse().unwrap(),
+            network_allow_hosts: Vec::new(),
+            network_allow_host_patterns: Vec::new(),
+            allow_all: true,
+            secrets: Vec::new(),
+            injects: Vec::new(),
+            observes: Vec::new(),
+            secret_mode: engram_core::types::image::SecretMode::Literal,
+        };
         let registry = engram_egress_proxy::Registry::new();
         let guest_ip = policy.guest_ip;
         crate::egress::register_policy(&registry, policy).expect("register allow-all");
@@ -8080,6 +8038,7 @@ mod tests {
                 live_spec("base-capture-exempt"),
                 None,
                 Default::default(),
+                None,
                 progress_tx,
             )
             .await
@@ -8201,6 +8160,7 @@ mod tests {
                 live_spec("slow-boot"),
                 None, // no [warm] hook: isolates the boot leg
                 Default::default(),
+                None,
                 progress_tx,
             )
             .await
@@ -8281,6 +8241,7 @@ mod tests {
             // the deadline", it's "we're nowhere near it".
             timeout_secs: Some(30),
             workdir: None,
+            env: Vec::new(),
             network: None,
         };
         let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
@@ -8291,6 +8252,7 @@ mod tests {
                 live_spec("warm-early-kill"),
                 Some(warm),
                 Default::default(),
+                None,
                 progress_tx,
             ),
         )
@@ -8376,6 +8338,7 @@ mod tests {
             // via ENGRAM_WARM_STALL_SECS above), not this backstop.
             timeout_secs: Some(30),
             workdir: None,
+            env: Vec::new(),
             network: None,
         };
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
@@ -8386,6 +8349,7 @@ mod tests {
                 live_spec("warm-stall"),
                 Some(warm),
                 Default::default(),
+                None,
                 progress_tx,
             ),
         )
@@ -8504,6 +8468,7 @@ mod tests {
             // backstop.
             timeout_secs: Some(30),
             workdir: None,
+            env: Vec::new(),
             network: None,
         };
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
@@ -8514,6 +8479,7 @@ mod tests {
                 live_spec("warm-stage-deadline"),
                 Some(warm),
                 Default::default(),
+                None,
                 progress_tx,
             ),
         )
@@ -8654,6 +8620,7 @@ mod tests {
             command: vec!["true".into()],
             timeout_secs: Some(30),
             workdir: None,
+            env: Vec::new(),
             network: None,
         };
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
@@ -8664,6 +8631,7 @@ mod tests {
                 live_spec("warm-noise"),
                 Some(warm),
                 Default::default(),
+                None,
                 progress_tx,
             ),
         )
@@ -8787,6 +8755,7 @@ mod tests {
             command: vec!["true".into()],
             timeout_secs: Some(30),
             workdir: None,
+            env: Vec::new(),
             network: None,
         };
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
@@ -8796,6 +8765,7 @@ mod tests {
                 live_spec("warm-two-stage"),
                 Some(warm),
                 Default::default(),
+                None,
                 progress_tx,
             )
             .await

@@ -28,6 +28,7 @@ path = "src/main.rs"
 engram-core.workspace = true
 engram-protocol.workspace = true
 engram-chunk-store.workspace = true
+engram-substrate-proto.workspace = true
 engram-migrate-proto.workspace = true
 engram-storage-local.workspace = true
 engram-storage-gcs.workspace = true
@@ -94,6 +95,7 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 userfaultfd = { version = "0.9", features = ["linux5_13"] }
 
 [dev-dependencies]
+engram-uffd-handler.workspace = true
 # base_shm_gc tests backdate mtimes
 filetime = "0.2"
 engram-harness-noop.workspace = true

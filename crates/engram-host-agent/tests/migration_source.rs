@@ -27,7 +27,7 @@ use std::sync::Arc;
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -50,7 +50,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         eprintln!("SKIP: /dev/kvm not present");
         return;
     }
-    for bin in ["firecracker", "docker", "mke2fs"] {
+    for bin in ["firecracker", "docker", "mke2fs", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)
@@ -84,11 +84,6 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     // ---- 1. Bake an agentd-injected rootfs ----
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-migration-src-test\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let work = tempfile::tempdir().expect("work dir");
     let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
@@ -103,8 +98,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -116,6 +110,10 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     // ---- 2. PooledBackend (FC inner, chunked, dirty tracking) ----
     let mut cfg = FirecrackerConfig::with_kernel(kernel);
     cfg.net_pool = None;
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
+    cfg.bundle_dir = staged.bundle_dir.clone();
     // File for ordinary creates/restores — the migration restore must
     // OVERRIDE to Uffd on its own (the product fix this test pins).
     cfg.restore_mode = RestoreMode::File;
@@ -151,7 +149,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let vm = pooled.create(spec.clone()).await.expect("create vm");
 
@@ -234,6 +232,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         addr,
         serve_inner,
         None,
+        engram_host_agent::session_epochs::ephemeral(),
     ));
     assert!(
         common::wait_tcp_bound(addr, std::time::Duration::from_secs(5)).await,

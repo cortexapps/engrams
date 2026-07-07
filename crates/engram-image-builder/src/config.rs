@@ -1,32 +1,25 @@
-//! `engram.toml` — the source-side per-repo config the baker reads.
+//! `engram.toml` — the source-side per-repo BUILD config the baker reads.
 //!
-//! Carries everything the rendered `manifest.toml` carries (env,
-//! secrets schema, network policy, resources, secret_mode), plus a
-//! `[build]` section the runtime doesn't need (Dockerfile path,
-//! context, build args, build-time secrets).
-//!
-//! ImageManifest in `engram-core` has `deny_unknown_fields` for tight
-//! validation. We can't `#[serde(flatten)]` it here because that
-//! breaks unknown-field detection. Instead we read the raw TOML once,
-//! pop the `[build]` table out, and parse the remainder as
-//! ImageManifest separately. Both halves get strict validation; no
-//! field duplication; ImageManifest stays the single source of truth
-//! for runtime fields.
+//! ADR 0080: this file now carries ONLY the `[build]` section (Dockerfile
+//! path, context, build args, build-time secrets) and is OPTIONAL — a repo
+//! whose Dockerfile sits at the default path needs no engram.toml at all.
+//! Everything the runtime used to read from here (name/description/env/
+//! workdir/resources/warm) is supplied out-of-band at enable time via
+//! `engram image enable --config <image-config.toml>` (the ImageService
+//! RPC) and never rides the baked artifact. A leftover manifest-era key at
+//! the top level fails the bake loudly with a pointer to the new home.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use engram_core::types::ImageManifest;
 use serde::{Deserialize, Serialize};
 
 use crate::BuildError;
 
-/// What `engram.toml` looks like to the baker after parsing. The
-/// `manifest` portion is what gets written to `<image_dir>/manifest.toml`;
-/// `build` is consumed by the baker and discarded.
-#[derive(Clone, Debug)]
+/// What `engram.toml` looks like to the baker after parsing: just the
+/// `[build]` directives (defaults when the file or section is absent).
+#[derive(Clone, Debug, Default)]
 pub struct EngramRepoConfig {
-    pub manifest: ImageManifest,
     pub build: BuildConfig,
 }
 
@@ -51,9 +44,9 @@ pub struct BuildConfig {
     /// `--secret id=...` mechanism. Looked up via the configured
     /// SecretStore at bake time. Note: these are *build-time* secrets
     /// (e.g. private NPM tokens needed during `pnpm install`); they
-    /// are NOT the same as runtime `[secrets]` (which the agent uses
-    /// at runtime). Build-time secrets stay in the build cache, never
-    /// in the produced image.
+    /// are NOT the same as runtime secrets (which are session policy).
+    /// Build-time secrets stay in the build cache, never in the
+    /// produced image.
     #[serde(default)]
     pub build_secrets: Vec<String>,
 }
@@ -64,7 +57,7 @@ impl Default for BuildConfig {
         // field-level `default = "..."` callbacks only fire on
         // deserialization, not when std `::default()` is called.
         // This is the case where the source `engram.toml` omits the
-        // entire `[build]` section.
+        // entire `[build]` section (or doesn't exist at all).
         Self {
             dockerfile: default_dockerfile(),
             context: default_context(),
@@ -83,16 +76,22 @@ fn default_context() -> String {
 }
 
 impl EngramRepoConfig {
+    /// Read `engram.toml` if present; a missing file is the all-defaults
+    /// config (ADR 0080: a plain-Dockerfile repo needs no engram.toml).
     pub fn read_from(path: &Path) -> Result<Self, BuildError> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| BuildError::Config(format!("read {}: {e}", path.display())))?;
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(BuildError::Config(format!("read {}: {e}", path.display()))),
+        };
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| BuildError::Config(format!("{} is not UTF-8: {e}", path.display())))?;
         Self::parse(text)
     }
 
-    /// Parse the raw TOML. Splits `[build]` from the manifest fields
-    /// without duplicating ImageManifest's schema.
+    /// Parse the raw TOML. ADR 0080: only `[build]` is legal — any other
+    /// top-level key is a retired manifest-era field and fails loudly,
+    /// pointing the author at the enable-time config that replaced it.
     pub fn parse(toml_str: &str) -> Result<Self, BuildError> {
         let mut value: toml::Value =
             toml::from_str(toml_str).map_err(|e| BuildError::Config(format!("parse: {e}")))?;
@@ -102,23 +101,18 @@ impl EngramRepoConfig {
                 .map_err(|e| BuildError::Config(format!("[build]: {e}")))?,
             None => BuildConfig::default(),
         };
-        let manifest = value
-            .try_into::<ImageManifest>()
-            .map_err(|e| BuildError::Config(format!("manifest fields: {e}")))?;
-        // A `[warm]` hook with an empty argv has nothing to run — fail the
-        // bake here rather than shipping an image whose enable aborts at
-        // base-snapshot capture (warm hooks are fail-loud).
-        if let Some(warm) = &manifest.warm {
-            warm.validate()
-                .map_err(|e| BuildError::Config(format!("[warm]: {e}")))?;
+        if let Some(table) = value.as_table() {
+            if let Some(key) = table.keys().next() {
+                return Err(BuildError::Config(format!(
+                    "engram.toml key `{key}` is retired (ADR 0080): the bake carries no \
+                     runtime config anymore. Move name/description/env/workdir/resources/warm \
+                     into an image-config TOML and apply it at enable time with \
+                     `engram image enable --uri <uri> --config <image-config.toml>`. \
+                     engram.toml now holds only the [build] section (and is optional)."
+                )));
+            }
         }
-        Ok(Self { manifest, build })
-    }
-
-    /// Return the rendered manifest (everything but `[build]`). This
-    /// is what `<image_dir>/manifest.toml` contains.
-    pub fn to_manifest(&self) -> ImageManifest {
-        self.manifest.clone()
+        Ok(Self { build })
     }
 }
 
@@ -127,20 +121,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_minimal_engram_toml() {
-        let cfg = EngramRepoConfig::parse(r#"name = "x""#).unwrap();
-        assert_eq!(cfg.manifest.name, "x");
+    fn parse_empty_engram_toml_uses_defaults() {
+        let cfg = EngramRepoConfig::parse("").unwrap();
         assert_eq!(cfg.build.dockerfile, "Dockerfile");
         assert_eq!(cfg.build.context, ".");
         assert!(cfg.build.args.is_empty());
+        assert!(cfg.build.build_secrets.is_empty());
     }
 
     #[test]
     fn parse_with_build_section() {
         let cfg = EngramRepoConfig::parse(
             r#"
-            name = "cortex-api"
-
             [build]
             dockerfile = "deploy/Dockerfile.runtime"
             context = "."
@@ -158,54 +150,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_with_full_manifest_fields_and_build_section() {
-        // Combined config: every manifest field + a [build] section.
-        // Locks down that the split logic doesn't drop any manifest
-        // field on the way through.
-        let cfg = EngramRepoConfig::parse(
-            r#"
-            name = "cortex-api"
-            description = "API service"
-            secret_mode = "broker"
-            workdir = "/workspace"
-
-            [env]
-            NODE_ENV = "production"
-
-            [secrets.GITHUB_TOKEN]
-            allow_hosts = ["api.github.com"]
-            required = true
-
-            [network]
-            default = "deny"
-            allow_hosts = ["api.github.com"]
-
-            [resources]
-            suggested_memory_mib = 4096
-
-            [build]
-            dockerfile = "Dockerfile"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.manifest.description.as_deref(), Some("API service"));
-        assert_eq!(
-            cfg.manifest.env.get("NODE_ENV").map(String::as_str),
-            Some("production")
-        );
-        // Top-level `workdir` routes into the manifest.
-        assert_eq!(cfg.manifest.workdir.as_deref(), Some("/workspace"));
-        assert_eq!(cfg.manifest.resources.suggested_memory_mib, Some(4096));
-        // ADR 0057: the `secret_mode` / `[secrets]` / `[network]` sections in the
-        // TOML above are accepted-and-ignored (no longer manifest fields).
-    }
-
-    #[test]
     fn parse_rejects_unknown_field_in_build_section() {
         // deny_unknown_fields on BuildConfig catches typos.
         let res = EngramRepoConfig::parse(
             r#"
-            name = "x"
             [build]
             dockerfile_typo = "Dockerfile"
             "#,
@@ -213,85 +161,29 @@ mod tests {
         assert!(res.is_err(), "unknown build field must be rejected");
     }
 
+    /// ADR 0080: a manifest-era key (name/env/warm/…) at the top level is
+    /// a stale config that would silently do nothing — fail the bake with
+    /// a pointer to `image enable --config` instead.
     #[test]
-    fn parse_tolerates_legacy_manifest_sections() {
-        // ADR 0057: ImageManifest dropped `deny_unknown_fields` so the
-        // coordinator can still parse manifests baked BEFORE the strip (which
-        // carry `[secrets]`/`[network]`/`secret_mode`) during the rollout window.
-        // The baker shares that type, so legacy sections (and, as a tradeoff,
-        // unknown top-level fields) are accepted-and-ignored rather than rejected.
-        let cfg = EngramRepoConfig::parse(
-            r#"
-            name = "x"
-            secret_mode = "broker"
-            [secrets.GITHUB_TOKEN]
-            allow_hosts = ["api.github.com"]
-            [network]
-            allow_hosts = ["api.github.com"]
-            "#,
-        )
-        .expect("legacy manifest sections are ignored, not rejected");
-        assert_eq!(cfg.manifest.name, "x");
+    fn parse_rejects_retired_manifest_keys_with_migration_pointer() {
+        for src in [
+            "name = \"x\"\n",
+            "[env]\nNODE_ENV = \"production\"\n",
+            "[resources]\nsuggested_vcpus = 4\n",
+            "[warm]\ncommand = [\"true\"]\n",
+        ] {
+            let err = format!("{:?}", EngramRepoConfig::parse(src).unwrap_err());
+            assert!(
+                err.contains("image enable") && err.contains("ADR 0080"),
+                "must point at the enable-time config: {src} → {err}"
+            );
+        }
     }
 
     #[test]
-    fn missing_build_section_uses_defaults() {
-        let cfg = EngramRepoConfig::parse(r#"name = "x""#).unwrap();
+    fn missing_file_is_all_defaults() {
+        let cfg =
+            EngramRepoConfig::read_from(Path::new("/nonexistent/engram.toml")).expect("optional");
         assert_eq!(cfg.build.dockerfile, "Dockerfile");
-        assert_eq!(cfg.build.context, ".");
-        assert!(cfg.build.build_secrets.is_empty());
-    }
-
-    #[test]
-    fn parse_accepts_warm_block() {
-        let cfg = EngramRepoConfig::parse(
-            r#"
-            name = "dev-brain"
-            [warm]
-            command = ["bash", "-lc", "gradle --daemon help"]
-            timeout_secs = 900
-            "#,
-        )
-        .unwrap();
-        let w = cfg.manifest.warm.expect("warm parsed");
-        assert_eq!(w.command.len(), 3);
-        assert_eq!(w.timeout_secs, Some(900));
-    }
-
-    #[test]
-    fn parse_rejects_empty_warm_command() {
-        // An empty [warm] argv has nothing to run — fail the bake up
-        // front rather than shipping an image whose enable aborts at
-        // capture (warm hooks are fail-loud).
-        let res = EngramRepoConfig::parse(
-            r#"
-            name = "x"
-            [warm]
-            command = []
-            "#,
-        );
-        let err = format!("{:?}", res.unwrap_err());
-        assert!(err.contains("[warm]"), "error must point at [warm]: {err}");
-    }
-
-    #[test]
-    fn rendered_manifest_does_not_include_build_section() {
-        let cfg = EngramRepoConfig::parse(
-            r#"
-            name = "x"
-            [build]
-            dockerfile = "Dockerfile.alt"
-            "#,
-        )
-        .unwrap();
-        let rendered = toml::to_string(&cfg.to_manifest()).unwrap();
-        assert!(
-            !rendered.contains("[build]"),
-            "rendered manifest must not carry the source-only [build] section",
-        );
-        assert!(
-            !rendered.contains("Dockerfile.alt"),
-            "rendered manifest must not carry build directives",
-        );
     }
 }

@@ -303,3 +303,7 @@ pub const HOST_BASE_SHM_TMPFS_USED_MIB: &str = "engram_host_base_shm_tmpfs_used_
 /// failure posture is unchanged: a skip here still falls back to the
 /// handler's lazy per-fault path.
 pub const BASE_SHM_PREWARM_SKIPPED_TOTAL: &str = "engram_base_shm_prewarm_skipped_total";
+
+/// Counter (ADR 0075). Populate requests served by the substrate
+/// writer. Labels: outcome = already_local | populated | error.
+pub const SUBSTRATE_POPULATE_REQUESTS_TOTAL: &str = "engram_substrate_populate_requests_total";

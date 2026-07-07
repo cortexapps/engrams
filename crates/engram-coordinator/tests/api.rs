@@ -57,13 +57,6 @@ struct MockMetadataStore {
     /// test host here and `mark_host_ready_for` mutates its
     /// `ready_images`.
     hosts: Mutex<HashMap<HostId, HostRecord>>,
-    /// Issue #213: simulate the per-session lease being held by another
-    /// holder (a concurrent eviction / resume / live migration). When
-    /// set, `try_acquire_session_lease` returns `false`, so the
-    /// lease-acquiring handlers (snapshot, evict_local) must back off and
-    /// refuse rather than mutate. Default `false` = the lease is free
-    /// (preserves the existing tests' behaviour).
-    lease_held: std::sync::atomic::AtomicBool,
     /// Issue #231: simulate `touch_host_heartbeat` failing (a saturated
     /// coord PG pool). When set, the per-heartbeat persist returns an
     /// error so the test can assert the handler now returns 5xx (and
@@ -97,7 +90,6 @@ impl MetadataStore for MockMetadataStore {
             mode: spec.mode,
             last_active_at: Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };
@@ -143,7 +135,6 @@ impl MetadataStore for MockMetadataStore {
             mode: ws.spec.mode,
             last_active_at: now,
             live_disk_manifest: None,
-            selected_skills: ws.selected_skills,
             park_rung: 0,
             parked_at: None,
         };
@@ -344,20 +335,6 @@ impl MetadataStore for MockMetadataStore {
         id: engram_core::types::SnapshotId,
     ) -> Result<Option<SnapshotRecord>, MetaError> {
         Ok(self.snapshots_by_id.lock().get(&id).cloned())
-    }
-
-    // Issue #213: the lease is the serializer the snapshot / evict_local
-    // handlers now acquire. `lease_held` lets a test pin it "held by
-    // another holder" so those handlers must back off (Conflict) instead
-    // of mutating. Default (false) returns `true` like the trait default,
-    // so every other test acquires freely.
-    async fn try_acquire_session_lease(
-        &self,
-        _session_id: SessionId,
-        _sandbox_id: Option<engram_core::SandboxId>,
-        _locked_by: &str,
-    ) -> Result<bool, MetaError> {
-        Ok(!self.lease_held.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     async fn list_snapshots_for_session(
@@ -817,7 +794,6 @@ impl TestFixture {
                 last_heartbeat_at: chrono::Utc::now(),
                 host_addr: None,
                 ready_images: Vec::new(),
-                local_snapshots: Vec::new(),
                 current_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,
@@ -854,9 +830,9 @@ impl TestFixture {
     /// lets the next session create through. Production hosts
     /// populate this set via the prefetch supervisor; tests have
     /// no chunks to fault so we just declare the host ready.
-    fn write_image(&self, repo: &str, tag: &str, manifest_toml: &str) {
+    fn write_image(&self, repo: &str, tag: &str, config_toml: &str) {
         let uri = format!("{repo}:{tag}");
-        let digest = seed_enabled(&self.meta, &uri, manifest_toml);
+        let digest = seed_enabled(&self.meta, &uri, config_toml);
         self.mark_host_ready_for(digest);
     }
 
@@ -880,7 +856,7 @@ impl TestFixture {
 fn seed_enabled(
     store: &MockMetadataStore,
     uri: &str,
-    manifest_toml: &str,
+    config_toml: &str,
 ) -> engram_protocol::heartbeat::ManifestDigest {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -916,7 +892,8 @@ fn seed_enabled(
         engram_core::types::EnabledImage {
             id: uuid::Uuid::new_v4(),
             image_uri: uri.to_string(),
-            manifest_toml: manifest_toml.to_string(),
+            image_config: toml::from_str(config_toml).expect("fixture config TOML parses"),
+            oci_defaults: Default::default(),
             manifest_digest: digest.clone(),
             disk_manifest: None,
             base_snapshot_id: Some(base_snapshot_id),
@@ -932,7 +909,6 @@ fn seed_enabled(
             created_at: now,
             updated_at: None,
             soft_deleted_at: None,
-            capture_env: Vec::new(),
         },
     );
     engram_protocol::heartbeat::ManifestDigest::new(&digest)
@@ -1169,7 +1145,6 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
-                selected_skills: Vec::new(),
                 park_rung: 0,
                 parked_at: None,
             },
@@ -1264,7 +1239,6 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
-                selected_skills: Vec::new(),
                 park_rung: 0,
                 parked_at: None,
             },

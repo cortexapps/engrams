@@ -23,18 +23,18 @@ pub mod secrets;
 pub mod storage;
 
 pub use cloud::{CloudBackend, PreemptionStream};
-pub use host_client::HostClient;
+pub use host_client::{HostClient, SessionFence};
 pub use integration::{
     default_inject_header, CredentialHint, InjectHeader, Integration, MintFieldKind,
     MintFieldSchema, MintKindDescriptor, ResolvedFields, ScopedCredential,
 };
 pub use metadata::{
     CreateDisposition, DisableEnabledImageOutcome, GcCandidateRow, MetadataStore,
-    SessionCreateWriteSet, SnapshotTotals, StaleSessionLease, UpdateOutcome,
+    SessionCreateWriteSet, SnapshotTotals, UpdateOutcome,
 };
 pub use sandbox::{
-    BrowserStart, ForgeSink, HarnessByteStream, HarnessDial, HarnessSink, SandboxBackend,
-    UploadSink,
+    AgentRefresh, BrowserStart, ForgeSink, HarnessByteStream, HarnessDial, HarnessSink,
+    SandboxBackend, UploadSink,
 };
 pub use secrets::{
     LayeredSecretStore, ResolvedSecret, SecretBundle, SecretContext, SecretStore, StaticSecretStore,

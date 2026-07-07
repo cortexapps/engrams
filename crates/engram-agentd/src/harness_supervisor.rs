@@ -130,22 +130,7 @@ impl HarnessSupervisor {
         // superblock predates the swap, so reads (including activate()'s
         // probes below) would EIO until a umount/mount re-parses the device.
         // EBUSY = resume path (drive unswapped, mount still correct) — kept.
-        for (target, outcome) in crate::remount::remount_bundle_mounts() {
-            match outcome {
-                crate::remount::RemountOutcome::Remounted => {
-                    tracing::info!(%target, "ADR 0035: bundle mount re-parsed");
-                }
-                crate::remount::RemountOutcome::KeptBusy => {
-                    tracing::debug!(%target, "ADR 0035: bundle mount in use (resume); kept");
-                }
-                crate::remount::RemountOutcome::Failed(e) => {
-                    // Loud: a swapped device under a stale mount is the
-                    // 2026-06-03 incident class — the session will come up
-                    // with broken skills if this fires after a swap.
-                    tracing::error!(%target, error = %e, "ADR 0035: bundle remount FAILED");
-                }
-            }
-        }
+        crate::remount::remount_and_log();
 
         // ADR 0027: wire whatever RO bundles the init shim mounted (the
         // skills / playwright squashfs) into the harness's skill

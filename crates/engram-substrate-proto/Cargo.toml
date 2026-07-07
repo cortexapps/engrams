@@ -1,0 +1,23 @@
+[package]
+name = "engram-substrate-proto"
+version = "0.1.0"
+edition = "2021"
+
+# ADR 0075: the populate protocol between the chunk-cache WRITER (the
+# host-agent — later engram-substrated, ADR 0076) and its read-only
+# clients (the per-VM uffd handlers). Deliberately synchronous and
+# dependency-minimal: the client sits adjacent to the page-fault path,
+# which is a blocking thread that must never grow tokio/tonic (the
+# engram-migrate-proto / peer.rs discipline).
+
+[dependencies]
+engram-core.workspace = true
+bincode.workspace = true
+serde.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["socket", "uio"] }
+
+[dev-dependencies]
+tempfile = "3"

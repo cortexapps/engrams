@@ -15,13 +15,16 @@ function protoImageToLegacy(img: ProtoEnabledImageSummary): EnabledImageSummary 
     id: img.id,
     image_uri: img.imageUri,
     manifest_digest: img.manifestDigest,
-    manifest_name: img.manifestName ?? null,
-    manifest_description: img.manifestDescription ?? null,
+    name: img.config?.name ?? null,
+    description: img.config?.description ?? null,
+    suggested_vcpus: img.config?.resources?.suggestedVcpus ?? null,
+    suggested_memory_mib: img.config?.resources?.suggestedMemoryMib ?? null,
+    warm_command: img.config?.warm?.command ?? [],
     last_refreshed_at: img.lastRefreshedAt,
     created_at: img.createdAt,
     // Flatten the proto `value` oneof: secretRef → "secret_ref", everything
     // else (literal, or an unset case) → "literal" with its string value.
-    capture_env: img.captureEnv.map((e) => ({
+    capture_env: (img.config?.warm?.env ?? []).map((e) => ({
       name: e.name,
       kind: e.value.case === "secretRef" ? ("secret_ref" as const) : ("literal" as const),
       value: e.value.value ?? "",
@@ -29,8 +32,8 @@ function protoImageToLegacy(img: ProtoEnabledImageSummary): EnabledImageSummary 
   };
 }
 
-/** List of operator-enabled OCI image URIs. The coordinator stores a
- * snapshot of each URI's manifest.toml on enable, so this list is the
+/** List of operator-enabled OCI image URIs. The coordinator stores the
+ * RPC-supplied ImageConfig for each URI (ADR 0080), so this list is the
  * authoritative source of "what sessions can reference." */
 export function useEnabledImages(enabled = true) {
   return useQuery(

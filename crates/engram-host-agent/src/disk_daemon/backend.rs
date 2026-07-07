@@ -488,21 +488,24 @@ impl Drop for InFlightGuard {
 }
 
 struct BackendState {
+    /// The RESOLVABLE manifest ref: always names a manifest that exists
+    /// in the chunk store (the shared base at attach; this session's
+    /// private vN after its first publish). Every out-of-process reader
+    /// of `manifest_ref()` — snapshot capture, eviction finalize,
+    /// cow-state — treats it as store-fetchable, so an unpublished
+    /// placeholder must NEVER live here (review of #584: a session
+    /// evicted before its first flush recorded a dangling ref, making
+    /// it unevictable; the zero-dirty variant made snapshots
+    /// permanently unresumable).
     manifest_ref: ManifestRef,
+    /// ADR 0077 phase 2: the per-session manifest identity, minted at
+    /// FRESH-CREATE ATTACH (not lazily on first flush — `fork_pending`
+    /// is gone). The FIRST publish adopts it at v1, so concurrent
+    /// same-base sessions never version the shared chain; until then
+    /// `manifest_ref` stays the resolvable shared base. Cleared once
+    /// adopted (and by a migration-destination rebase).
+    fork_identity: Option<uuid::Uuid>,
     base: PositionalDiskManifest,
-    /// ADR 0049 follow-up: when `true`, the FIRST flush mints a fresh
-    /// per-session `manifest_id` (forking the shared base) instead of
-    /// `next_version()`-ing the base's. Set only on the fresh-create
-    /// attach path (`attach_manifest(.., fork_on_first_flush=true)`);
-    /// cleared after the fork. A resumed session attaches its OWN
-    /// already-forked id, so this stays `false` and it just ticks.
-    ///
-    /// Without this, every same-base session writes under ONE shared
-    /// `manifest_id` — concurrent restores race that version chain and
-    /// `(manifest_id, version)` becomes ambiguous across sessions →
-    /// cross-session rootfs corruption (the ADR 0048 load-test
-    /// `reread ''` + stale-drop reaps).
-    fork_pending: bool,
 }
 
 /// ADR 0021 P2: byte budget for the per-backend in-memory chunk cache.
@@ -644,8 +647,8 @@ impl ChunkedDiskBackend {
         Ok(Self {
             state: Arc::new(Mutex::new(BackendState {
                 manifest_ref,
+                fork_identity: None,
                 base,
-                fork_pending: false,
             })),
             chunk_size,
             total_bytes,
@@ -684,8 +687,8 @@ impl ChunkedDiskBackend {
         Ok(Self {
             state: Arc::new(Mutex::new(BackendState {
                 manifest_ref,
+                fork_identity: None,
                 base,
-                fork_pending: false,
             })),
             chunk_size,
             total_bytes,
@@ -1055,15 +1058,27 @@ impl ChunkedDiskBackend {
     /// ref can lose the shared-lineage version race). Future flushes
     /// chain from here.
     pub async fn rebase_manifest_ref(&self, manifest_ref: ManifestRef) {
-        self.state.lock().await.manifest_ref = manifest_ref;
+        let mut state = self.state.lock().await;
+        state.manifest_ref = manifest_ref;
+        state.fork_identity = None;
     }
 
     /// ADR 0049 follow-up: arm the lazy per-session manifest fork. Called
     /// on the fresh-create attach path (where the backend is born on the
     /// SHARED base `manifest_id`) so the first flush mints a private id
     /// instead of versioning the shared base. See [`BackendState::fork_pending`].
-    pub async fn mark_fork_pending(&self) {
-        self.state.lock().await.fork_pending = true;
+    /// ADR 0077 phase 2: fork the manifest identity NOW (fresh-create
+    /// attach) — mint the private `manifest_id` the FIRST publish adopts
+    /// at v1, whose base chunks stay the deduped+pinned enabled-image
+    /// set. `manifest_ref` deliberately stays the SHARED BASE ref until
+    /// that publish: it is the resolvable pointer every out-of-process
+    /// consumer (snapshot capture, eviction finalize, cow-state) fetches
+    /// from the store, and a pre-publish placeholder here left sessions
+    /// evicted before their first flush unevictable / unresumable.
+    /// Idempotent-safe: only the fresh-create call site invokes it,
+    /// exactly once, before any flush.
+    pub async fn fork_manifest_identity(&self) {
+        self.state.lock().await.fork_identity = Some(uuid::Uuid::new_v4());
     }
 
     /// ADR 0045 C1: see `migration_fence`.
@@ -1547,7 +1562,10 @@ impl ChunkedDiskBackend {
                         // ADR 0019: span each dirty-chunk upload under an
                         // active operation so this (now post-resume)
                         // flush still shows in the op's trace.
-                        let put = store.put_chunk(&bytes);
+                        // ADR 0078 move 5: dirty flush chunks are freshly
+                        // re-chunked and new by construction — skip the
+                        // per-chunk `exists()` GCS HEAD that always missed.
+                        let put = store.put_chunk_unchecked(&bytes);
                         match op {
                             Some(op) => {
                                 let span = op.span.in_scope(|| {
@@ -1564,13 +1582,20 @@ impl ChunkedDiskBackend {
                                 put.await?;
                             }
                         }
-                        // ADR 0039 (sticky-everywhere): write-through to the
-                        // local cache so the flushing host keeps its OWN
-                        // just-uploaded chunks and never re-fetches its writes
-                        // from GCS (`put_chunk` is upload-only). Best-effort:
-                        // the chunk is durable in GCS, so a local-cache write
-                        // failure (ENOSPC/perms) is logged, not fatal — reads
-                        // fall back to GCS.
+                        // ADR 0039 (sticky-everywhere): write-through to
+                        // the local cache so the flushing host keeps its
+                        // OWN just-uploaded chunks. Rides the backend's
+                        // explicit cache handle: the store's internal
+                        // write-through (ADR 0078 move 5) only fires when
+                        // the store was built with a cache wired — prod
+                        // wiring, but not a structural guarantee (cache
+                        // and store travel separately into this backend).
+                        // Prod double-writes 16 MiB per chunk as a result;
+                        // collapsing to one cache identity is substrated
+                        // (ADR 0076) territory, not this PR's. Best-effort:
+                        // the chunk is durable in GCS, so a cache-write
+                        // failure is a missed optimization, never
+                        // incorrect (reads fall back).
                         if let Err(e) = cache.put(hash, &bytes).await {
                             tracing::warn!(
                                 chunk = chunk_idx,
@@ -1716,10 +1741,20 @@ impl ChunkedDiskBackend {
         // retry loop below only ever fires for the resume/own-id path. The
         // base chunks the fork's manifest lists stay deduped + pinned (the
         // enabled-image GC source); only the manifest identity forks.
-        let mut attempt_ref = if state.fork_pending {
-            ManifestRef::new()
-        } else {
-            state.manifest_ref.next_version()
+        // ADR 0077 phase 2: always tick our OWN private id. The fork
+        // happened at attach, so there is no fresh-base branch here —
+        // a fresh id can't conflict, and the retry loop below only ever
+        // fires for the own-chain store-ahead race (issue #14).
+        // ADR 0077 phase 2: the first publish of a forked fresh-create
+        // adopts the private identity at v1 (never versioning the shared
+        // base chain); afterwards — and for every non-forked backend —
+        // it is a plain next_version() of the resolvable ref.
+        let mut attempt_ref = match state.fork_identity {
+            Some(id) => ManifestRef {
+                manifest_id: id,
+                version: 1,
+            },
+            None => state.manifest_ref.next_version(),
         };
         let new_ref = loop {
             attempts += 1;
@@ -1770,8 +1805,7 @@ impl ChunkedDiskBackend {
             }
         }
         state.manifest_ref = new_ref;
-        // The fork (if any) is done — future flushes tick this private id.
-        state.fork_pending = false;
+        state.fork_identity = None;
         drop(state);
 
         // ADR 0038 B3: chunks are now durable in GCS AND `base` is
@@ -2183,13 +2217,14 @@ mod tests {
             ChunkCache::new(cfg)
         };
 
-        // Two fresh-create backends on the SAME base, both fork-armed.
+        // Two fresh-create backends on the SAME base, forked AT ATTACH
+        // (ADR 0077 phase 2) — before any write touches them.
         let a = ChunkedDiskBackend::new(base_ref, &manifest, mk_cache(), store.clone(), u64::MAX)
             .unwrap();
         let b = ChunkedDiskBackend::new(base_ref, &manifest, mk_cache(), store.clone(), u64::MAX)
             .unwrap();
-        a.mark_fork_pending().await;
-        b.mark_fork_pending().await;
+        a.fork_manifest_identity().await;
+        b.fork_manifest_identity().await;
 
         a.write(0, &[0x11u8; 4096]).await.unwrap();
         b.write(0, &[0x22u8; 4096]).await.unwrap();
@@ -2226,6 +2261,69 @@ mod tests {
         assert_eq!(oa2.manifest_ref.version, 2);
     }
 
+    /// #584 review regression: `manifest_ref()` must stay STORE-RESOLVABLE
+    /// between the fresh-create fork and the first publish. The eviction
+    /// capture, finalize, and cow-state paths all `get_manifest` whatever
+    /// this returns — an unpublished placeholder here made a session
+    /// evicted before its first flush unevictable (finalize NotFound on
+    /// every redrive), and the zero-dirty capture variant recorded the
+    /// dangling ref into the snapshot row, permanently unresumable.
+    #[tokio::test]
+    async fn forked_backend_stays_resolvable_until_first_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![(0, h0)]);
+        let base_ref = ManifestRef::new();
+        store.put_manifest(base_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let backend = ChunkedDiskBackend::new(
+            base_ref,
+            &manifest,
+            ChunkCache::new(cfg),
+            store.clone(),
+            u64::MAX,
+        )
+        .unwrap();
+        backend.fork_manifest_identity().await;
+
+        // Pre-publish: the advertised ref is the shared base — resolvable.
+        let pre = backend.manifest_ref().await;
+        assert_eq!(pre, base_ref, "pre-publish ref must be the shared base");
+        store
+            .get_manifest(pre)
+            .await
+            .expect("pre-publish manifest_ref must resolve in the store");
+
+        // Zero-dirty flush (the evict-with-no-writes shape): still the
+        // resolvable base, no phantom publish.
+        let out = backend.flush().await.unwrap();
+        assert_eq!(out.chunks_flushed, 0);
+        assert_eq!(
+            out.manifest_ref, base_ref,
+            "zero-dirty flush must not mint a ref"
+        );
+        store
+            .get_manifest(out.manifest_ref)
+            .await
+            .expect("zero-dirty flush outcome must resolve in the store");
+
+        // First real write adopts the private identity at v1 — and THAT
+        // resolves too.
+        backend.write(0, &[0x55u8; 4096]).await.unwrap();
+        let out = backend.flush().await.unwrap();
+        assert_ne!(out.manifest_ref.manifest_id, base_ref.manifest_id);
+        assert_eq!(out.manifest_ref.version, 1);
+        store
+            .get_manifest(out.manifest_ref)
+            .await
+            .expect("first publish must resolve in the store");
+        assert_eq!(backend.manifest_ref().await, out.manifest_ref);
+    }
+
     /// The resume/recovery path (fork NOT armed) keeps ticking the id it
     /// attached — it already owns a private manifest from its prior snapshot.
     #[tokio::test]
@@ -2243,7 +2341,7 @@ mod tests {
         let backend =
             ChunkedDiskBackend::new(own_ref, &manifest, ChunkCache::new(cfg), store, u64::MAX)
                 .unwrap();
-        // No mark_fork_pending — resume semantics.
+        // No fork_manifest_identity — resume semantics (own id).
         backend.write(0, &[0x44u8; 4096]).await.unwrap();
         let out = backend.flush().await.unwrap();
         assert_eq!(

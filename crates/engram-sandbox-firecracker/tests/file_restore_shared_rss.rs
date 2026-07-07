@@ -713,11 +713,6 @@ async fn bake_spike_rootfs() -> Baked {
          RUN chmod 0755 /spike-init.sh\n",
     )
     .expect("write Dockerfile");
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"fc-shared-rss-test\"\n",
-    )
-    .expect("write engram.toml");
 
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
@@ -732,7 +727,7 @@ async fn bake_spike_rootfs() -> Baked {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: None,
+            init_injection: None,
         })
         .await
         .expect("ext4 bake");

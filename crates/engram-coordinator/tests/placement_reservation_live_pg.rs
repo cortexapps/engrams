@@ -72,7 +72,6 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
         last_heartbeat_at: Utc::now(),
         host_addr: Some(format!("http://{hostname}:9101")),
         ready_images: Vec::new(),
-        local_snapshots: Vec::new(),
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
@@ -92,7 +91,6 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
                 ..HostUtilization::default()
             },
             ready_images: Vec::new(),
-            local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
@@ -125,8 +123,7 @@ fn bare_write_set(
         sealed_secrets: None,
         capabilities: Vec::new(),
         integration_policy_json: None,
-        selected_harness: None,
-        selected_skills: Vec::new(),
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
     }
 }
 
@@ -259,8 +256,11 @@ async fn reserve_and_persist_create_commits_the_full_write_set_together() {
         }),
         capabilities: vec![cap.clone()],
         integration_policy_json: Some(r#"{"network":{"allow_hosts":[]}}"#.into()),
-        selected_harness: Some("claude".into()),
-        selected_skills: vec!["browser".into()],
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            vec!["browser".into()],
+            Some("claude".into()),
+            None,
+        ),
     };
     let disposition = meta
         .reserve_and_persist_create(ws, &[host], 0)
@@ -268,8 +268,15 @@ async fn reserve_and_persist_create_commits_the_full_write_set_together() {
         .expect("reserve_and_persist_create ok");
     assert_eq!(disposition, CreateDisposition::Placed(host));
 
-    let row = meta.get_session(session_id).await.expect("get_session");
-    assert_eq!(row.selected_skills, vec!["browser".to_string()]);
+    // ADR 0077 phase 3: skills are persisted in the RuntimeSpec (written in
+    // the create transaction), NOT the retired `sessions.selected_skills`
+    // column — assert the RuntimeSpec landed with them.
+    let rspec = meta
+        .get_session_runtime_spec(session_id)
+        .await
+        .expect("get_session_runtime_spec")
+        .expect("runtime spec written in the create transaction");
+    assert_eq!(rspec.selected_skills, vec!["browser".to_string()]);
     let caps = meta
         .get_session_capabilities(session_id)
         .await
@@ -382,7 +389,6 @@ async fn ram_ledger_util_columns_round_trip_through_real_pg() {
                 ..HostUtilization::default()
             },
             ready_images: Vec::new(),
-            local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,

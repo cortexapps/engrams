@@ -1,0 +1,14 @@
+-- ADR 0078 (GCS-free resume): retire the dead `local_snapshots` mirror.
+--
+-- The `hosts.local_snapshots` JSONB column (added by migration 0060) was
+-- the intended backing for snapshot-affinity placement, but the
+-- host-agent NEVER populated it — `local_snapshots: Vec::new()` was
+-- hardcoded in the heartbeat loop for the column's entire life. Placement
+-- now reads the authoritative owner of "which host holds a snapshot's
+-- chunks", `snapshots.host_id`, so the mirror is deleted end-to-end (wire
+-- field, HostRecord/HostHeartbeat, the fleet-view proto count, and this
+-- column). WIRE_VERSION 10 -> 11.
+--
+-- Numbered 0091: main high-water at land = 0090. Applied migrations are
+-- checksum-immutable — 0060 is never edited.
+ALTER TABLE hosts DROP COLUMN IF EXISTS local_snapshots;

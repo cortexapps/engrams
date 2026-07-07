@@ -22,7 +22,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engram_core::traits::MetadataStore;
-use engram_core::types::{EnabledImage, ImageManifest, SnapshotRecord};
+use engram_core::types::image::ImageConfig;
+use engram_core::types::{EnabledImage, SnapshotRecord};
 
 use crate::error::ApiError;
 
@@ -41,8 +42,10 @@ pub(crate) struct BootBundle {
     /// `enabled.soft_deleted_at` themselves (mirrors `get_enabled_image` vs
     /// `get_enabled_image_any`'s split without forking the cache).
     pub enabled: EnabledImage,
-    /// Parsed ONCE per bake, not per create.
-    pub manifest: ImageManifest,
+    /// The image's effective config (ADR 0080: the RPC-supplied
+    /// ImageConfig merged over the Dockerfile-derived defaults), computed
+    /// ONCE per fill, not per create.
+    pub config: ImageConfig,
     pub base_snapshot: SnapshotRecord,
     pub memory_mib: u32,
     pub cpu_budget_vcpus: u32,
@@ -94,11 +97,8 @@ impl BootBundleCache {
                      POST /api/enabled-images before sessions can reference them.",
                 ))
             })?;
-        let manifest: ImageManifest = toml::from_str(&enabled.manifest_toml).map_err(|e| {
-            ApiError::Internal(format!(
-                "stored manifest for {image_uri} failed to parse: {e}"
-            ))
-        })?;
+        // ADR 0080: the row carries the config as typed JSONB — no TOML parse.
+        let config = enabled.effective_config();
         let base_snapshot_id = enabled.base_snapshot_id.ok_or_else(|| {
             ApiError::Internal(format!(
                 "enabled image `{image_uri}` has no base snapshot — re-enable it \
@@ -115,11 +115,11 @@ impl BootBundleCache {
                      {base_snapshot_id} but its row is gone"
                 ))
             })?;
-        let memory_mib = crate::api::sessions::resolved_memory_mib(&manifest);
-        let cpu_budget_vcpus = crate::api::sessions::resolved_vcpus(&manifest);
+        let memory_mib = crate::api::sessions::resolved_memory_mib(&config);
+        let cpu_budget_vcpus = crate::api::sessions::resolved_vcpus(&config);
         let bundle = Arc::new(BootBundle {
             enabled,
-            manifest,
+            config,
             base_snapshot,
             memory_mib,
             cpu_budget_vcpus,
@@ -215,16 +215,19 @@ mod tests {
         list_hosts_calls: AtomicU32,
     }
 
-    fn test_manifest_toml() -> String {
-        "name = \"demo\"\n[resources]\nsuggested_memory_mib = 2048\nsuggested_vcpus = 2\n"
-            .to_string()
+    fn test_image_config() -> ImageConfig {
+        toml::from_str(
+            "name = \"demo\"\n[resources]\nsuggested_memory_mib = 2048\nsuggested_vcpus = 2\n",
+        )
+        .unwrap()
     }
 
     fn test_enabled_image(snapshot_id: engram_core::types::SnapshotId) -> EnabledImage {
         EnabledImage {
             id: uuid::Uuid::new_v4(),
             image_uri: "localhost:5001/demo:test".into(),
-            manifest_toml: test_manifest_toml(),
+            image_config: test_image_config(),
+            oci_defaults: Default::default(),
             manifest_digest: "sha256:deadbeef".into(),
             disk_manifest: None,
             base_snapshot_id: Some(snapshot_id),
@@ -234,7 +237,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: None,
             soft_deleted_at: None,
-            capture_env: Vec::new(),
         }
     }
 
@@ -471,7 +473,6 @@ mod tests {
                 last_heartbeat_at: chrono::Utc::now(),
                 host_addr: None,
                 ready_images: Vec::new(),
-                local_snapshots: Vec::new(),
                 current_bundles: vec![engram_core::types::sandbox::AuxBundleRef {
                     drive_id: "claude".into(),
                     sha256: "sha256:cafe".into(),

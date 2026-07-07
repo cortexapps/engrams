@@ -13,7 +13,12 @@ import {
 } from "../../hooks/useEnabledImages";
 import { isJobActive, useEnableJobs, useRetryEnableJob } from "../../hooks/useEnableJobs";
 import type { EnableJob, EnabledImageSummary } from "../../lib/types";
-import { CaptureEnvEntrySchema } from "../../gen/engram/app/v1/image_pb";
+import {
+  CaptureEnvEntrySchema,
+  ImageConfigSchema,
+  ImageResourcesSchema,
+  ImageWarmConfigSchema,
+} from "../../gen/engram/app/v1/image_pb";
 import { errorMessage } from "../../lib/errors";
 import { PageHeading } from "../page-heading";
 import { Badge } from "@/components/ui/badge";
@@ -119,7 +124,7 @@ export function ImagesPanel() {
           <TableHeader>
             <TableRow>
               <TableHead>Image</TableHead>
-              <TableHead>Manifest</TableHead>
+              <TableHead>Name</TableHead>
               <TableHead>Digest</TableHead>
               <TableHead>Capture env</TableHead>
               <TableHead>Refreshed</TableHead>
@@ -162,10 +167,10 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
       <TableCell className="font-mono text-sm whitespace-nowrap">{row.image_uri}</TableCell>
       <TableCell className="text-sm text-muted-foreground whitespace-normal">
         <div className="max-w-md">
-          {row.manifest_name || "—"}
-          {row.manifest_description && (
-            <span className="mt-0.5 block text-xs line-clamp-2" title={row.manifest_description}>
-              {row.manifest_description}
+          {row.name || "—"}
+          {row.description && (
+            <span className="mt-0.5 block text-xs line-clamp-2" title={row.description}>
+              {row.description}
             </span>
           )}
         </div>
@@ -190,7 +195,7 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
             editImage={row}
             trigger={
               <Button variant="ghost" size="sm">
-                Edit capture env
+                Edit config
               </Button>
             }
           />
@@ -269,18 +274,46 @@ const captureEnvRowSchema = z.object({
   kind: z.enum(["literal", "secret_ref"]),
   value: z.string(),
 });
-const enableImageSchema = z.object({
-  imageUri: z.string().trim().min(1, "image URI is required"),
-  captureEnv: z.array(captureEnvRowSchema),
-});
+// ADR 0080: the form collects the full ImageConfig. Numeric fields stay
+// strings in form state (native inputs yield strings); onSubmit converts.
+const enableImageSchema = z
+  .object({
+    imageUri: z.string().trim().min(1, "image URI is required"),
+    name: z.string().trim().min(1, "name is required"),
+    description: z.string(),
+    vcpus: z
+      .string()
+      .trim()
+      .regex(/^[1-9]\d*$/, "vCPUs must be a positive integer"),
+    memoryMib: z
+      .string()
+      .trim()
+      .regex(/^(?:[1-9]\d*)?$/, "memory must be a positive integer (MiB)"),
+    warmCommand: z.string(),
+    captureEnv: z.array(captureEnvRowSchema),
+  })
+  .refine((v) => v.warmCommand.trim() !== "" || v.captureEnv.every((r) => r.name.trim() === ""), {
+    message: "warm env needs a warm command — everything warm rides the [warm] block",
+    path: ["warmCommand"],
+  });
 type EnableImageValues = z.infer<typeof enableImageSchema>;
 
-function captureEnvDefaults(image?: EnabledImageSummary): EnableImageValues["captureEnv"] {
-  return (image?.capture_env ?? []).map((v) => ({
-    name: v.name,
-    kind: v.kind,
-    value: v.value,
-  }));
+// Pre-fill the full-config form from the enabled row (edit mode) or with
+// blank/default values (first enable).
+function formDefaults(image?: EnabledImageSummary): EnableImageValues {
+  return {
+    imageUri: image?.image_uri ?? "",
+    name: image?.name ?? "",
+    description: image?.description ?? "",
+    vcpus: image?.suggested_vcpus != null ? String(image.suggested_vcpus) : "2",
+    memoryMib: image?.suggested_memory_mib != null ? String(image.suggested_memory_mib) : "",
+    warmCommand: (image?.warm_command ?? []).join(" "),
+    captureEnv: (image?.capture_env ?? []).map((v) => ({
+      name: v.name,
+      kind: v.kind,
+      value: v.value,
+    })),
+  };
 }
 
 // One editable capture-env row: name · type toggle · value · remove. The
@@ -356,10 +389,12 @@ function CaptureEnvRow({
   );
 }
 
-// Enable a new image, or edit an already-enabled image's capture_env. In
-// edit mode the URI is pinned (read-only) and the form pre-fills with the
-// row's current capture_env — re-submitting re-enables with the full list,
-// which REPLACES the set (ADR 0057). There is no separate update RPC.
+// Enable a new image, or edit an already-enabled image's config. In edit
+// mode the URI is pinned (read-only) and the form pre-fills with the row's
+// current config — the form is the FULL ImageConfig and always sends it,
+// which REPLACES the config wholesale (ADR 0080) and recaptures the base
+// snapshot. (UpdateImage exists on the wire but isn't surfaced here yet —
+// phase 2b.)
 function EnableImageDialog({
   editImage,
   trigger,
@@ -373,10 +408,7 @@ function EnableImageDialog({
 
   const form = useForm<EnableImageValues>({
     resolver: zodResolver(enableImageSchema),
-    defaultValues: {
-      imageUri: editImage?.image_uri ?? "",
-      captureEnv: captureEnvDefaults(editImage),
-    },
+    defaultValues: formDefaults(editImage),
   });
   const { fields, append, remove } = useFieldArray({
     control: form.control,
@@ -384,22 +416,20 @@ function EnableImageDialog({
   });
 
   // Re-seed on every open so an edit always reflects the row's current
-  // capture_env and a cancelled edit doesn't linger in the form.
+  // config and a cancelled edit doesn't linger in the form.
   const onOpenChange = (next: boolean) => {
     setOpen(next);
     if (next) {
-      form.reset({
-        imageUri: editImage?.image_uri ?? "",
-        captureEnv: captureEnvDefaults(editImage),
-      });
+      form.reset(formDefaults(editImage));
     }
   };
 
   const onSubmit = async (data: EnableImageValues) => {
-    // Skip rows with an empty name; map each surviving row's type toggle to
-    // the proto oneof. A non-empty list REPLACES the image's capture_env;
-    // an empty list on a plain re-enable inherits the existing set.
-    const captureEnv = data.captureEnv
+    // Skip env rows with an empty name; map each surviving row's type toggle
+    // to the proto oneof. The config is ALWAYS sent (ADR 0080): the form is
+    // the full ImageConfig, so a submit replaces the row's config wholesale
+    // (an edit pre-fills from the row, so a plain re-submit round-trips).
+    const warmEnv = data.captureEnv
       .filter((r) => r.name.trim() !== "")
       .map((r) =>
         create(CaptureEnvEntrySchema, {
@@ -410,8 +440,26 @@ function EnableImageDialog({
           },
         }),
       );
+    const warmCommand = data.warmCommand.trim();
+    const config = create(ImageConfigSchema, {
+      name: data.name,
+      description: data.description.trim() || undefined,
+      env: {},
+      resources: create(ImageResourcesSchema, {
+        suggestedVcpus: Number(data.vcpus),
+        suggestedMemoryMib: data.memoryMib ? Number(data.memoryMib) : undefined,
+      }),
+      // Empty command = no [warm] hook (the schema already rejects warm env
+      // without a command).
+      warm: warmCommand
+        ? create(ImageWarmConfigSchema, {
+            command: warmCommand.split(/\s+/),
+            env: warmEnv,
+          })
+        : undefined,
+    });
     try {
-      await enable.mutateAsync({ imageUri: data.imageUri, captureEnv });
+      await enable.mutateAsync({ imageUri: data.imageUri, config });
       setOpen(false);
     } catch (err) {
       // Surface the coordinator's real message (e.g. a registry-auth
@@ -425,18 +473,20 @@ function EnableImageDialog({
       <DialogTrigger asChild>{trigger ?? <Button>Enable a new image</Button>}</DialogTrigger>
       <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{isEdit ? "Edit capture env" : "Enable a new image"}</DialogTitle>
+          <DialogTitle>{isEdit ? "Edit config" : "Enable a new image"}</DialogTitle>
           <DialogDescription>
             {isEdit ? (
               <>
-                Re-enabling replaces this image's capture-time env with the full list below.
+                The config is applied at enable time (ADR 0080) — saving re-enables with the full
+                config below, replacing the current one and recapturing the base snapshot.
                 Materialization progress shows in the list above.
               </>
             ) : (
               <>
                 Full OCI reference:{" "}
                 <code className="font-mono">&lt;host&gt;[:port]/&lt;repo&gt;:&lt;tag&gt;</code>. The
-                coordinator queues an enable job — materialization progress shows in the list above.
+                config below is applied at enable time (ADR 0080). The coordinator queues an enable
+                job — materialization progress shows in the list above.
               </>
             )}
           </DialogDescription>
@@ -465,9 +515,108 @@ function EnableImageDialog({
               )}
             />
 
+            <Controller
+              name="name"
+              control={form.control}
+              render={({ field, fieldState }) => (
+                <Field data-invalid={fieldState.invalid}>
+                  <FieldLabel htmlFor={field.name}>Name</FieldLabel>
+                  <Input
+                    {...field}
+                    id={field.name}
+                    placeholder="cortex-api"
+                    aria-invalid={fieldState.invalid}
+                  />
+                  <FieldDescription>Display name shown in pickers.</FieldDescription>
+                  {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                </Field>
+              )}
+            />
+
+            <Controller
+              name="description"
+              control={form.control}
+              render={({ field, fieldState }) => (
+                <Field data-invalid={fieldState.invalid}>
+                  <FieldLabel htmlFor={field.name}>Description (optional)</FieldLabel>
+                  <Input
+                    {...field}
+                    id={field.name}
+                    placeholder="What this image is for"
+                    aria-invalid={fieldState.invalid}
+                  />
+                  {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                </Field>
+              )}
+            />
+
+            <div className="grid grid-cols-2 gap-4">
+              <Controller
+                name="vcpus"
+                control={form.control}
+                render={({ field, fieldState }) => (
+                  <Field data-invalid={fieldState.invalid}>
+                    <FieldLabel htmlFor={field.name}>vCPUs</FieldLabel>
+                    <Input
+                      {...field}
+                      id={field.name}
+                      type="number"
+                      min={1}
+                      step={1}
+                      aria-invalid={fieldState.invalid}
+                    />
+                    {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                  </Field>
+                )}
+              />
+              <Controller
+                name="memoryMib"
+                control={form.control}
+                render={({ field, fieldState }) => (
+                  <Field data-invalid={fieldState.invalid}>
+                    <FieldLabel htmlFor={field.name}>Memory MiB (optional)</FieldLabel>
+                    <Input
+                      {...field}
+                      id={field.name}
+                      type="number"
+                      min={1}
+                      step={1}
+                      placeholder="2048"
+                      aria-invalid={fieldState.invalid}
+                    />
+                    {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                  </Field>
+                )}
+              />
+            </div>
+
+            <Controller
+              name="warmCommand"
+              control={form.control}
+              render={({ field, fieldState }) => (
+                <Field data-invalid={fieldState.invalid}>
+                  <FieldLabel htmlFor={field.name}>Warm command (optional)</FieldLabel>
+                  <Input
+                    {...field}
+                    id={field.name}
+                    className="font-mono"
+                    placeholder="/opt/engram/warm.sh --all"
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    aria-invalid={fieldState.invalid}
+                  />
+                  <FieldDescription>
+                    Space-separated argv run inside the capture VM at base-snapshot capture. Leave
+                    empty for no <code className="font-mono">[warm]</code> hook.
+                  </FieldDescription>
+                  {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                </Field>
+              )}
+            />
+
             <Field>
               <div className="flex items-center justify-between">
-                <FieldLabel>Capture-time env</FieldLabel>
+                <FieldLabel>Warm capture env</FieldLabel>
                 <Button
                   type="button"
                   variant="ghost"
@@ -478,13 +627,13 @@ function EnableImageDialog({
                 </Button>
               </div>
               <FieldDescription>
-                Injected into the image's <code className="font-mono">[warm]</code> hook at
-                base-snapshot capture (not a session secret). Each is a literal value or a secret
-                ref (e.g. <code className="font-mono">gcp-sm://…</code>) resolved server-side.
-                Leaving this empty on a re-enable keeps the current set.
+                Injected into the warm command's environment at base-snapshot capture (not a session
+                secret) — ADR 0080: rides the <code className="font-mono">[warm]</code> block, so it
+                needs a warm command. Each is a literal value or a secret ref (e.g.{" "}
+                <code className="font-mono">gcp-sm://…</code>) resolved server-side.
               </FieldDescription>
               {fields.length === 0 ? (
-                <p className="text-xs text-muted-foreground">No capture vars.</p>
+                <p className="text-xs text-muted-foreground">No warm env vars.</p>
               ) : (
                 <div className="space-y-2">
                   {fields.map((f, i) => (

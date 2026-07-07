@@ -32,7 +32,6 @@ pub fn build_heartbeat(
             used_mib: cap.used_mib,
             running_sandboxes: cap.running_sandboxes,
         },
-        local_snapshots: Vec::new(),
         running_sandboxes,
         // In-process path: the caller already resolved the list
         // successfully, so the set is authoritative.
@@ -73,7 +72,6 @@ mod tests {
         assert!(!hb.draining);
         // Phase 1: the local snapshot field isn't populated by the
         // helper. It gets filled by the host agent before send.
-        assert!(hb.local_snapshots.is_empty());
         assert!(hb.running_sandboxes.is_empty());
     }
 

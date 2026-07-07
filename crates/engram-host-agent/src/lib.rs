@@ -37,6 +37,8 @@ pub mod harness;
 pub mod host_client;
 pub mod migrate_peer;
 pub mod migration;
+pub mod session_epochs;
+pub mod substrate_server;
 pub use host_client::LocalHostClient;
 pub mod heartbeat;
 pub mod idle_evictor;
@@ -952,8 +954,16 @@ impl HostAgent {
             let grpc_task = self.cfg.grpc_listen_addr.map(|addr| {
                 let local_for_grpc = local_host.clone();
                 let admin_for_grpc = admin_handler.clone();
+                // ADR 0079: the per-session fencing-epoch high-water,
+                // durable under work_dir like the binding records.
+                let epochs = session_epochs::SessionEpochStore::open(
+                    self.cfg.work_dir.join("epochs"),
+                )
+                .expect("open session epoch store under work_dir (ADR 0079)");
                 tokio::spawn(async move {
-                    if let Err(e) = grpc_server::boot(addr, local_for_grpc, admin_for_grpc).await {
+                    if let Err(e) =
+                        grpc_server::boot(addr, local_for_grpc, admin_for_grpc, epochs).await
+                    {
                         tracing::error!(addr = %addr, error = %e, "gRPC server terminated with error");
                     }
                 })
@@ -1259,7 +1269,6 @@ impl HostAgent {
                             used_mib: 0,
                             running_sandboxes: running_count,
                         },
-                        local_snapshots: Vec::new(),
                         running_sandboxes,
                         running_sandboxes_known,
                         draining: false,

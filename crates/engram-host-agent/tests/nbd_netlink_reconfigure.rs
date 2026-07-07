@@ -150,6 +150,21 @@ async fn survivor_reconfigure_resumes_parked_io() {
         .with_test_writer()
         .try_init();
 
+    // Issue #582 root cause: the "parked" probe below is indistinguishable
+    // (from userspace) from a read whose request went IN-FLIGHT on the
+    // dying gen-1 socket during the abort transition. A queued-parked
+    // request dispatches the moment RECONFIGURE lands; an in-flight-doomed
+    // one requeues only after the kernel's PER-REQUEST timeout — which
+    // attach sets to 90s (`nbd_kernel_timeout_secs`), triple the 30s
+    // completion budget, so the test's outcome was decided by which side
+    // of the dead-mark the probe's request landed on (load-dependent: 2
+    // CI failures in 3 runs on 2026-07-06). Pin the request timeout small
+    // for THIS test so both interleavings complete within the budget —
+    // the asserted property (parked I/O survives RECONFIGURE with the
+    // right bytes) is unchanged. Nextest runs each test in its own
+    // process, so the env override cannot leak.
+    std::env::set_var("ENGRAM_NBD_KERNEL_TIMEOUT_SECS", "5");
+
     let nbd_path = match preflight() {
         Some(p) => p,
         None => return,

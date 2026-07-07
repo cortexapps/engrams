@@ -4,9 +4,11 @@
 //! handler enqueues the session (`status='queued'`) instead of 503-ing,
 //! and a resume that hits the same wall parks the idle session back in
 //! the queue. This background task is the continuation: each sweep it
-//! walks the queue — per fit class, oldest-first — and either places +
-//! boots a session (capacity arrived / the fleet scaled up) or fails it
-//! on a generous timeout.
+//! walks the queue — per fit class, oldest-first — and either places a
+//! session (capacity arrived / the fleet scaled up) and enqueues its
+//! `create_boot` op (ADR 0079 — the op executor owns the boot, its
+//! retry backoff, and the coord-died-mid-boot reclaim), or fails it on
+//! a generous timeout.
 //!
 //! ## Why a scanner (not an inline retry)
 //!
@@ -14,9 +16,11 @@
 //! minutes while a node provisions (the idle-evict inline-handler
 //! cancellation incident is the cautionary tale). The handler writes
 //! "this session wants capacity" durably and returns; the scanner — on
-//! any coord replica — owns the placement retry. Each per-session advance
-//! is `SessionLeaseGuard`-guarded, so two replicas can't double-place the
-//! same session.
+//! any coord replica — owns the placement retry. Cross-replica
+//! exclusion is the durable `queued → pending` flip inside
+//! `place_queued_session` (single-winner UPDATE) for creates, and the
+//! `Queued → Idle` legality CAS + the resume op's claim for resumes
+//! (ADR 0079) — the per-session session-lease guard is retired.
 //!
 //! ## Per-fit-class FIFO (queue-fairness follow-up to ADR 0048)
 //!
@@ -47,9 +51,10 @@
 //! One stop remains global: a resume-origin `NoCapacity` means
 //! `candidates_for` returned zero schedulable hosts fleet-wide (not a fit
 //! failure for one class — the fleet itself has no room), so it
-//! legitimately breaks the whole sweep. Everything else (the boot
-//! `JoinSet`, `boot_concurrency`, the stale-pending crash recovery, and
-//! the timeout check) is unchanged and still applies fleet-/sweep-wide.
+//! legitimately breaks the whole sweep. The timeout check is unchanged
+//! and still applies sweep-wide. (ADR 0079: the boot `JoinSet`, its
+//! concurrency bound, and the stale-pending crash recovery are gone —
+//! the create_boot op owns all three.)
 //!
 //! **Starvation, deliberately unaddressed:** oldest-head-first class
 //! ordering gives a starved big class the FIRST placement attempt every
@@ -71,9 +76,10 @@
 //! dropped NOTIFY, a `draining → ready` flip (arrives via heartbeat, which
 //! deliberately gets no NOTIFY of its own — a per-heartbeat NOTIFY would be
 //! a busy-loop), or allocatable drift. `ENGRAM_QUEUE_RETRY_SECS` (default
-//! 5) is a one-shot re-arm: a sweep that requeued or errored a session
-//! schedules a short retry so transient boot/prepare failures keep the
-//! old ≤5s retry latency instead of waiting for the 30s fallback.
+//! 5) is a one-shot re-arm: a sweep that errored a placement attempt
+//! schedules a short retry so transient PG/candidates failures keep the
+//! old ≤5s retry latency instead of waiting for the 30s fallback (boot
+//! failures retry on the create_boot op row, not here — ADR 0079).
 //! `spawn` also parks on the same `wake`-or-`poll_interval` race before
 //! its very first sweep (not just between sweeps) — a beat for hosts to
 //! heartbeat back in on a cold coordinator start, same rationale as
@@ -88,7 +94,6 @@ use engram_core::types::session::{QueueOrigin, QueuedSession, SessionState};
 use engram_core::SessionId;
 use tokio::sync::Notify;
 
-use crate::idle_evictor::SessionLeaseGuard;
 use crate::state::{SessionEvent, SharedState};
 
 #[derive(Clone, Debug)]
@@ -99,10 +104,11 @@ pub struct QueueScannerConfig {
     /// latency is push-driven (see the module doc); this is no longer
     /// the primary drive mechanism.
     pub poll_interval: Duration,
-    /// One-shot re-arm after a sweep that requeued or errored a session
-    /// (transient boot/prepare failure). `ENGRAM_QUEUE_RETRY_SECS`,
+    /// One-shot re-arm after a sweep that errored a placement attempt
+    /// (transient PG/candidates failure). `ENGRAM_QUEUE_RETRY_SECS`,
     /// default 5s — keeps the pre-NOTIFY retry latency for that case
-    /// instead of waiting for `poll_interval`.
+    /// instead of waiting for `poll_interval`. (Boot failures no longer
+    /// re-arm the scanner: the create_boot op row owns boot retry.)
     pub retry_interval: Duration,
     /// How long a session may wait before it's failed (create) / returned
     /// to Idle (resume). `ENGRAM_QUEUE_TIMEOUT_SECS`, default 1800 (30
@@ -111,11 +117,6 @@ pub struct QueueScannerConfig {
     /// scale-up (node provision + image prefetch is minutes). We prefer a
     /// long queue to dropping a request.
     pub timeout: Duration,
-    /// Crash-recovery horizon: a `pending` placed-queued row whose boot
-    /// stalled past this (a coord died mid-boot) is requeued.
-    pub stale_pending: Duration,
-    /// Max concurrent boots per tick, shared across every fit class.
-    pub boot_concurrency: usize,
 }
 
 impl Default for QueueScannerConfig {
@@ -124,8 +125,6 @@ impl Default for QueueScannerConfig {
             poll_interval: Duration::from_secs(env_secs("ENGRAM_QUEUE_POLL_SECS", 30)),
             retry_interval: Duration::from_secs(env_secs("ENGRAM_QUEUE_RETRY_SECS", 5)),
             timeout: Duration::from_secs(env_secs("ENGRAM_QUEUE_TIMEOUT_SECS", 1800)),
-            stale_pending: Duration::from_secs(env_secs("ENGRAM_QUEUE_STALE_PENDING_SECS", 600)),
-            boot_concurrency: env_secs("ENGRAM_QUEUE_BOOT_CONCURRENCY", 4) as usize,
         }
     }
 }
@@ -239,13 +238,12 @@ async fn retry_sleep(armed: bool, dur: Duration) {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RunSummary {
     pub placed: u32,
-    pub requeued: u32,
     pub errored: u32,
 }
 
 impl RunSummary {
     fn needs_retry(&self) -> bool {
-        self.requeued > 0 || self.errored > 0
+        self.errored > 0
     }
 }
 
@@ -257,22 +255,9 @@ pub async fn run_once(
     cfg: &QueueScannerConfig,
     state: &SharedState,
 ) -> Result<RunSummary, Box<dyn std::error::Error + Send + Sync>> {
-    // Crash recovery first: reclaim placed-queued rows whose boot stalled.
-    match state
-        .services
-        .meta
-        .requeue_stale_pending(cfg.stale_pending)
-        .await
-    {
-        Ok(n) if n > 0 => {
-            tracing::warn!(
-                count = n,
-                "queue-scanner: requeued stale pending (coord died mid-boot)"
-            )
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "queue-scanner: requeue_stale_pending failed"),
-    }
+    // ADR 0079: no stale-pending crash recovery here — a coord that died
+    // mid-boot left a `create_boot` op row whose stale heartbeat the op
+    // executor's reclaim sweep re-claims and re-drives at its step.
 
     let queued = state.services.meta.list_queued_sessions_fifo().await?;
     sample_queue_metrics(state, &queued).await;
@@ -281,7 +266,6 @@ pub async fn run_once(
     }
 
     let mut summary = RunSummary::default();
-    let mut boots: tokio::task::JoinSet<BootOutcomeKind> = tokio::task::JoinSet::new();
     'classes: for class in partition_queue(queued) {
         for q in class {
             // Timeouts are checked first so a stuck head is failed out
@@ -297,59 +281,37 @@ pub async fn run_once(
                 continue;
             }
 
-            // One serialized placement attempt at the head of this class,
-            // under the lease.
-            let lease = match SessionLeaseGuard::try_acquire(state, q.session.id, None).await {
-                Ok(Some(g)) => g,
-                Ok(None) => continue, // a sibling replica owns it this tick
-                Err(e) => {
-                    tracing::warn!(session_id = %q.session.id, error = %e,
-                        "queue-scanner: lease acquire failed; skipping");
-                    continue;
-                }
-            };
-
+            // One placement attempt at the head of this class. ADR 0079
+            // note: no lease — for creates, `place_queued_session`'s
+            // durable `queued → pending` flip is the single-winner CAS
+            // (a sibling replica's attempt returns NoCapacity/None); for
+            // resumes, the `Queued → Idle` transition CAS + the enqueued
+            // resume op serialize.
             match q.origin {
                 QueueOrigin::Create => {
                     match place_create(state, &q).await {
                         PlaceOutcome::Placed(host_id) => {
                             // The durable `queued → pending` flip IS the
                             // placement moment — record here, not after
-                            // boot, so a later boot failure/requeue
-                            // doesn't lose the sample (the requeued
-                            // session's NEXT placement records its own,
-                            // cumulative-since-original-queued_at, sample).
+                            // boot, so a later boot failure (which now
+                            // retries on the create_boot op row, ADR
+                            // 0079) doesn't lose the sample.
                             ::metrics::histogram!(
                                 crate::metrics::QUEUE_WAIT_SECONDS,
                                 "origin" => "create",
                                 "outcome" => "placed",
                             )
                             .record(wait_duration(&q).as_secs_f64());
-                            // Hand the boot to the bounded pool; the lease
-                            // rides into the task so it's held for the
-                            // whole boot.
-                            if boots.len() >= cfg.boot_concurrency {
-                                // Drain one before queuing more — bounds
-                                // concurrency (global across classes).
-                                if let Some(res) = boots.join_next().await {
-                                    record_boot_outcome(res, &mut summary);
-                                }
-                            }
-                            let st = state.clone();
-                            let q2 = q.clone();
-                            boots.spawn(async move {
-                                boot_placed_create(&st, q2, host_id, lease).await
-                            });
+                            summary.placed += 1;
+                            enqueue_boot_op(state, &q, host_id).await;
                         }
                         PlaceOutcome::NoCapacity => {
                             // This class's head doesn't fit → stop THIS
                             // class only (strict FIFO within the class);
                             // the outer loop moves on to the next class.
-                            drop(lease);
                             break;
                         }
                         PlaceOutcome::Error => {
-                            drop(lease);
                             summary.errored += 1;
                             // Skip this one; don't starve the rest on a transient.
                             continue;
@@ -359,7 +321,6 @@ pub async fn run_once(
                             // session (review finding 3) — just release and
                             // keep sweeping; an image-gone head must not block
                             // the rest of the queue.
-                            drop(lease);
                             continue;
                         }
                     }
@@ -376,14 +337,11 @@ pub async fn run_once(
                     match resume_has_capacity(state, &q).await {
                         Some(true) => {
                             dequeue_resume(state, &q).await;
-                            drop(lease);
                         }
                         Some(false) => {
-                            drop(lease);
                             break 'classes;
                         }
                         None => {
-                            drop(lease);
                             summary.errored += 1;
                             continue; // transient read error; don't starve the rest
                         }
@@ -392,11 +350,43 @@ pub async fn run_once(
             }
         }
     }
-    // Let in-flight boots finish (bounded; the next tick re-sweeps anyway).
-    while let Some(res) = boots.join_next().await {
-        record_boot_outcome(res, &mut summary);
-    }
     Ok(summary)
+}
+
+/// ADR 0079: hand a just-placed (`queued → pending`, host bound) create
+/// to the op executor. Emits the placement's `Queued → Pending` status
+/// event, then enqueues the `create_boot` op keyed
+/// `boot:{session}:{queued_at millis}` — stable across scanner replicas
+/// and sweeps for THIS stay in the queue (the durable `queued → pending`
+/// flip is single-winner, so duplicates only arise from a racing sibling
+/// sweep, which the idempotency key collapses). Boot retry/backoff and
+/// crash recovery live on the op row from here.
+async fn enqueue_boot_op(state: &SharedState, q: &QueuedSession, host_id: engram_core::HostId) {
+    let session_id = q.session.id;
+    emit_from(
+        state,
+        session_id,
+        SessionState::Queued,
+        SessionState::Pending,
+    )
+    .await;
+    let key = format!("boot:{session_id}:{}", q.queued_at.timestamp_millis());
+    if let Err(e) = crate::session_ops::enqueue(
+        state,
+        session_id,
+        engram_core::types::session_op::OpKind::CreateBoot,
+        serde_json::json!({ "host_id": host_id.to_string() }),
+        Some(&key),
+    )
+    .await
+    {
+        // The pending row + the op executor's fallback poll are the
+        // safety net only for rows that DID enqueue; an enqueue failure
+        // here means no op row exists — log loudly. The next placement
+        // NOTIFY re-sweeps, and the enqueue retries via the same key.
+        tracing::warn!(%session_id, %host_id, error = %e,
+            "queue-scanner: create_boot op enqueue failed; re-sweep retries");
+    }
 }
 
 /// Wall-clock elapsed since `q` was queued (never negative).
@@ -416,29 +406,6 @@ enum PlaceOutcome {
     /// terminally failed the session (image-shaped, not a queue timeout);
     /// the caller just drops the lease and moves on.
     ImageGone,
-}
-
-/// Outcome of a spawned [`boot_placed_create`] task, folded into the
-/// sweep's [`RunSummary`] by [`record_boot_outcome`].
-enum BootOutcomeKind {
-    Placed,
-    Requeued,
-    Failed,
-}
-
-fn record_boot_outcome(
-    res: Result<BootOutcomeKind, tokio::task::JoinError>,
-    summary: &mut RunSummary,
-) {
-    match res {
-        Ok(BootOutcomeKind::Placed) => summary.placed += 1,
-        Ok(BootOutcomeKind::Requeued) => summary.requeued += 1,
-        Ok(BootOutcomeKind::Failed) => summary.errored += 1,
-        Err(e) => {
-            tracing::warn!(error = %e, "queue-scanner: boot task panicked");
-            summary.errored += 1;
-        }
-    }
 }
 
 /// Re-attempt placement for a create-origin queued session: rank
@@ -481,7 +448,7 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
         Err(e) => {
             // Transient PG error: keep the old degrade-to-no-gate behavior
             // rather than failing a session over a blip — `place_queued_session`
-            // still enforces capacity, and `boot_placed_create`'s
+            // still enforces capacity, and the create_boot op's
             // `prepare_from_row` (tolerant, correctly) will 404 on a
             // genuinely-gone image right after if this guess was wrong.
             tracing::debug!(session_id = %q.session.id, error = %e,
@@ -508,7 +475,7 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
     let ctx = crate::placement::ScheduleContext {
         repo,
         image_version: tag,
-        prefer_snapshot_id: None,
+        snapshot_host: None,
         memory_mib: Some(q.mem_budget_mib.max(0) as u32),
         cpu_budget_vcpus: Some(q.cpu_budget_vcpus.max(0) as u32),
         required_image_digest,
@@ -557,71 +524,6 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
     }
 }
 
-/// Boot a placed (now `pending`) create-origin session. Emits
-/// `Queued → Pending`, runs the shared boot pipeline, and on failure
-/// requeues (NotStarted, still `pending`) or fails (Started, reached
-/// `created`). `lease` is held for the whole boot.
-///
-/// ADR 0019 / telemetry restoration (#526): this runs on a scanner
-/// `JoinSet` task with no request span to inherit — an explicit root
-/// (carrying `session_id`) so its spans correlate instead of exporting
-/// as disconnected roots.
-#[tracing::instrument(name = "queue_scanner.boot_placed_create", skip_all, fields(session_id = %q.session.id, %host_id))]
-async fn boot_placed_create(
-    state: &SharedState,
-    q: QueuedSession,
-    host_id: engram_core::HostId,
-    _lease: SessionLeaseGuard,
-) -> BootOutcomeKind {
-    let session_id = q.session.id;
-    emit(
-        state,
-        session_id,
-        SessionState::Queued,
-        SessionState::Pending,
-    )
-    .await;
-
-    let prepared = match crate::api::sessions::prepare_from_row(state, &q.session).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(%session_id, error = %e,
-                "queue-scanner: prepare_from_row failed; requeueing");
-            let _ = state.services.meta.requeue_session(session_id).await;
-            return BootOutcomeKind::Requeued;
-        }
-    };
-    match crate::session_boot::boot_on_reserved_host(state, prepared.inputs, host_id).await {
-        Ok(()) => {
-            ::metrics::counter!(crate::metrics::QUEUE_OUTCOME_TOTAL, "outcome" => "placed")
-                .increment(1);
-            tracing::info!(%session_id, %host_id, "queue-scanner: placed + booted");
-            BootOutcomeKind::Placed
-        }
-        Err(crate::session_boot::BootError::NotStarted(e)) => {
-            // Row still `pending` — return it to the queue (timeout clock
-            // keeps the original queued_at, since requeue doesn't reset it).
-            tracing::warn!(%session_id, error = %e, "queue-scanner: boot not-started; requeueing");
-            let _ = state.services.meta.requeue_session(session_id).await;
-            ::metrics::counter!(crate::metrics::QUEUE_OUTCOME_TOTAL, "outcome" => "requeued")
-                .increment(1);
-            BootOutcomeKind::Requeued
-        }
-        Err(crate::session_boot::BootError::Started(e)) => {
-            // Reached `created` then failed — terminal (requeue illegal).
-            tracing::warn!(%session_id, error = %e, "queue-scanner: boot failed past created; failing");
-            let _ = state
-                .services
-                .meta
-                .transition_session(session_id, SessionState::Failed)
-                .await;
-            ::metrics::counter!(crate::metrics::QUEUE_OUTCOME_TOTAL, "outcome" => "failed")
-                .increment(1);
-            BootOutcomeKind::Failed
-        }
-    }
-}
-
 /// Is there a schedulable host for a resume-origin session? `Some(true)`
 /// = a candidate exists (resume's own soft placement will pick one),
 /// `Some(false)` = none (stay queued), `None` = transient read error.
@@ -655,7 +557,7 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<b
     let ctx = crate::placement::ScheduleContext {
         repo,
         image_version: tag,
-        prefer_snapshot_id: None,
+        snapshot_host: None,
         memory_mib: Some(q.mem_budget_mib.max(0) as u32),
         cpu_budget_vcpus: Some(q.cpu_budget_vcpus.max(0) as u32),
         required_image_digest: None,
@@ -691,9 +593,10 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<b
     }
 }
 
-/// Dequeue a resume-origin session: `Queued → Idle`, then drive a resume
-/// inline. The resume path owns its own placement + re-enqueues if it
-/// hits no capacity (ADR 0048 C7), so this is self-correcting.
+/// Dequeue a resume-origin session: `Queued → Idle`, then enqueue the
+/// resume op (ADR 0079 — the op executor owns the pipeline). The resume
+/// verb owns its own placement + re-queues the session if it hits no
+/// capacity (ADR 0048 C7), so this is self-correcting.
 async fn dequeue_resume(state: &SharedState, q: &QueuedSession) {
     let session_id = q.session.id;
     match state
@@ -717,10 +620,18 @@ async fn dequeue_resume(state: &SharedState, q: &QueuedSession) {
             return;
         }
     }
-    // Best-effort inline resume; a no-capacity result re-enqueues itself.
-    if let Err(e) = crate::api::snapshot::resume_session(state.clone(), session_id).await {
+    // Best-effort resume op; a no-capacity result re-queues the session.
+    if let Err(e) = crate::session_ops::enqueue(
+        state,
+        session_id,
+        engram_core::types::session_op::OpKind::Resume,
+        serde_json::json!({}),
+        None,
+    )
+    .await
+    {
         tracing::info!(%session_id, error = %e,
-            "queue-scanner: resume after dequeue did not complete (may re-queue)");
+            "queue-scanner: resume enqueue after dequeue failed (next sweep retries)");
     }
 }
 
@@ -839,10 +750,6 @@ async fn sample_queue_metrics(state: &SharedState, queued: &[QueuedSession]) {
     ::metrics::gauge!(crate::metrics::QUEUE_HEAD_AGE_SECONDS).set(head_age);
 }
 
-async fn emit(state: &SharedState, id: SessionId, from: SessionState, to: SessionState) {
-    emit_from(state, id, from, to).await;
-}
-
 async fn emit_from(state: &SharedState, id: SessionId, from: SessionState, to: SessionState) {
     if let Err(e) = state
         .emit(
@@ -878,7 +785,6 @@ mod tests {
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
-                selected_skills: Vec::new(),
                 park_rung: 0,
                 parked_at: None,
             },

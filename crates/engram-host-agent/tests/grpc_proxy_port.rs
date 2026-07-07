@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use engram_core::error::SandboxError;
 use engram_core::traits::sandbox::{HarnessDial, HarnessSink};
-use engram_core::traits::HostClient;
+use engram_core::traits::{HostClient, SessionFence};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::port::{PortTunnel, PortTunnelEnds};
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
@@ -38,7 +38,7 @@ impl HostClient for FakeHost {
     async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
         unreachable!("proxy_port test path doesn't call create")
     }
-    async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+    async fn destroy(&self, _: SandboxId, _: SessionFence) -> Result<(), SandboxError> {
         unreachable!()
     }
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
@@ -53,10 +53,18 @@ impl HostClient for FakeHost {
     async fn exec_stream(&self, _: SandboxId, _: ExecRequest) -> Result<ExecStream, SandboxError> {
         unreachable!()
     }
-    async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(
+        &self,
+        _: SandboxId,
+        _: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         unreachable!()
     }
-    async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(
+        &self,
+        _: SnapshotMetadata,
+        _: SessionFence,
+    ) -> Result<SandboxId, SandboxError> {
         unreachable!()
     }
     async fn start_agent(
@@ -64,6 +72,7 @@ impl HostClient for FakeHost {
         _: SandboxId,
         _: AgentSpec,
         _: SessionEgressPolicy,
+        _: SessionFence,
     ) -> Result<(), SandboxError> {
         unreachable!()
     }
@@ -107,7 +116,13 @@ async fn boot_grpc_server(host: Arc<FakeHost>) -> std::net::SocketAddr {
     let addr = pick_local_addr();
     let host_dyn: Arc<dyn HostClient> = host;
     tokio::spawn(async move {
-        let _ = engram_host_agent::grpc_server::boot(addr, host_dyn, None).await;
+        let _ = engram_host_agent::grpc_server::boot(
+            addr,
+            host_dyn,
+            None,
+            engram_host_agent::session_epochs::ephemeral(),
+        )
+        .await;
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {

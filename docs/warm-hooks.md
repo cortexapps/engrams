@@ -1,6 +1,8 @@
 # Authoring an image's `[warm]` hook
 
-An image's `engram.toml` can declare a `[warm]` block (see
+An image's config (ADR 0080: the image-config TOML applied at enable
+time via `engram image enable --config` / the ImageService — never
+baked) can declare a `[warm]` block (see
 [`WarmConfig`](../crates/engram-core/src/types/image.rs)): a command run
 inside the capture VM, once `agentd` is ready, just before the base
 snapshot is frozen. The command must **start its long-lived process
@@ -17,23 +19,26 @@ and how to report progress" reference.
 ## What a `[warm]` hook may assume
 
 - **A ready guest.** `agentd` has already reached its readiness dial;
-  the image's rootfs/manifest `[env]` (`JAVA_HOME`, `PATH`, …) is merged
-  with the resolved `capture_env` and injected into the hook's exec
-  environment.
+  the image's effective `[env]` (config `[env]` over the Dockerfile
+  `ENV` — `JAVA_HOME`, `PATH`, …) is merged with the resolved
+  `[[warm.env]]` entries and injected into the hook's exec environment.
 - **Egress per `[warm.network]`.** Absent (the default) → the capture VM
   is **egress-less**: no policy is registered, so the proxy denies all
   traffic. An image whose warm boot needs the network (eager OIDC
   discovery, an `op inject`) opts in via `[warm.network] default =
   "allow"` (dev posture — no agent runs at capture) or a scoped `"deny"`
-  + `allow_hosts`/`allow_host_patterns` allowlist.
+  + `allow_hosts`/`allow_host_patterns` allowlist. ADR 0080: the policy
+  is assembled coordinator-side (the same builder sessions use) and
+  edited via `UpdateImage` — like everything under `[warm]`, changing it
+  requires a recapture (`--allow-recapture`).
 - **No per-session secrets.** The capture VM's `agentd` holds no durable
-  session env and never gets a session bind. `capture_env` (an
-  admin-attached, capture-time-only env — literals or secret refs
-  resolved against the same `SecretStore` a session uses) is the only
-  secret-bearing input a `[warm]` hook gets; it is distinct from a
-  session's profile-injected runtime secrets and is captured (frozen)
-  into the base snapshot along with everything else the hook does, so
-  treat it as secret-bearing storage (ADR 0007).
+  session env and never gets a session bind. `[[warm.env]]` (ADR 0080:
+  the capture-time-only env on the warm config — literals or secret refs
+  resolved against the same `SecretStore` a session uses, FAIL-LOUD on
+  an unresolvable ref) is the only secret-bearing input a `[warm]` hook
+  gets; it is distinct from a session's profile-injected runtime secrets
+  and is captured (frozen) into the base snapshot along with everything
+  else the hook does, so treat it as secret-bearing storage (ADR 0007).
 - **No TTY.** The hook runs as a plain exec, not an interactive shell.
 - **A fresh VM per attempt.** Every capture attempt (including a scanner
   retry) boots a brand-new capture VM from a fresh image pull — the hook
@@ -68,7 +73,7 @@ Three independent budgets apply, tightest-wins:
   (a `kubectl wait`-style condition, a poll loop) must emit heartbeats,
   or the platform can't tell "slow but alive" from "wedged".**
 - **Global timeout** (`WarmConfig.timeout_secs`, default 600s, set in
-  `engram.toml`): the same backstop this always had — `agentd` SIGKILLs
+  the image config's `[warm]` block): the same backstop this always had — `agentd` SIGKILLs
   the child in-guest at this deadline regardless of the other two. Has
   supremacy: it fires even if a stage/stall budget would otherwise allow
   more time.

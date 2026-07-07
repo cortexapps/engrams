@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
-use engram_core::traits::SecretContext;
+use engram_core::traits::{SecretContext, SessionFence};
+use engram_core::types::image::ImageConfig;
 use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
-use engram_core::types::{ImageManifest, Session, SessionSpec, SessionState};
+use engram_core::types::{Session, SessionSpec, SessionState};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
@@ -24,8 +25,8 @@ pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
 /// skill-agnostic (skills bind via `patch_drive`, never resize memory), so
 /// memory-heavy tooling (e.g. browser) is an image-sizing concern —
 /// declare `suggested_memory_mib` on the image, not a per-session skill.
-pub(crate) fn resolved_memory_mib(manifest: &engram_core::types::ImageManifest) -> u32 {
-    manifest
+pub(crate) fn resolved_memory_mib(config: &ImageConfig) -> u32 {
+    config
         .resources
         .suggested_memory_mib
         .unwrap_or(DEFAULT_MEMORY_MIB)
@@ -36,8 +37,8 @@ pub(crate) fn resolved_memory_mib(manifest: &engram_core::types::ImageManifest) 
 /// declaration is present for enabled images; `DEFAULT_VCPUS` is the
 /// defensive fallback for the test / non-enabled paths, mirroring
 /// `resolved_memory_mib`. This is the budget placement reserves.
-pub(crate) fn resolved_vcpus(manifest: &engram_core::types::ImageManifest) -> u32 {
-    manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS)
+pub(crate) fn resolved_vcpus(config: &ImageConfig) -> u32 {
+    config.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS)
 }
 
 /// The system's cold-boot `SandboxSpec` shape — a fresh kernel boot
@@ -53,7 +54,7 @@ pub(crate) fn resolved_vcpus(manifest: &engram_core::types::ImageManifest) -> u3
 ///   mounting the session's evolved rootfs lineage.
 pub(crate) fn cold_boot_spec(
     image_uri: &str,
-    manifest: &engram_core::types::ImageManifest,
+    config: &ImageConfig,
     rootfs_manifest: Option<engram_core::types::manifest::ManifestRef>,
     // ADR 0057: network is no longer on the manifest. The caller supplies it —
     // base-snapshot capture uses allow-all (a trusted, ephemeral build step;
@@ -63,9 +64,9 @@ pub(crate) fn cold_boot_spec(
 ) -> engram_core::types::sandbox::SandboxSpec {
     use engram_core::types::sandbox::{AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 
-    let vcpus = resolved_vcpus(manifest);
-    let memory_mib = resolved_memory_mib(manifest);
-    let disk_gib = manifest
+    let vcpus = resolved_vcpus(config);
+    let memory_mib = resolved_memory_mib(config);
+    let disk_gib = config
         .resources
         .suggested_disk_gib
         .unwrap_or(DEFAULT_DISK_GIB);
@@ -89,7 +90,7 @@ pub(crate) fn cold_boot_spec(
         },
         disk: DiskLimit { max_gib: disk_gib },
         ttl: None,
-        env: manifest.env.clone(),
+        env: config.env.clone(),
         workdir: None,
         network,
         aux_ro_drives,
@@ -227,13 +228,14 @@ pub(crate) async fn seal_session_secrets(
 }
 
 /// Material returned by [`resume_manifest_bundle`] — everything the
-/// resume path needs from the image manifest and its secret schema
-/// to (1) build the post-resume launch env and (2) rebuild the
-/// per-session egress policy (§A.1.7) without a second SecretStore
+/// resume path needs from the image's effective config (ADR 0080: the
+/// RPC-supplied ImageConfig merged over the Dockerfile-derived
+/// defaults) to (1) build the post-resume launch env and (2) rebuild
+/// the per-session egress policy (§A.1.7) without a second SecretStore
 /// round-trip.
 pub(crate) struct ResumeManifestBundle {
-    pub manifest: ImageManifest,
-    /// `manifest.env` with the session policy's secrets applied (ADR 0057:
+    pub config: ImageConfig,
+    /// `config.env` with the session policy's secrets applied (ADR 0057:
     /// literal values / broker placeholders). Per-request overrides from
     /// `load_session_secrets` are NOT folded in here — the caller layers them on.
     pub env: HashMap<String, String>,
@@ -279,12 +281,8 @@ pub(crate) async fn resume_manifest_bundle(
                 session.image,
             ))
         })?;
-    let manifest: ImageManifest = toml::from_str(&enabled.manifest_toml).map_err(|e| {
-        ApiError::Internal(format!(
-            "stored manifest for `{}` failed to parse: {e}",
-            session.image,
-        ))
-    })?;
+    // ADR 0080: the row carries the config as typed JSONB — no TOML parse.
+    let config = enabled.effective_config();
     let (repo, tag) = split_image_ref(&session.image);
     let secret_ctx = SecretContext {
         repo,
@@ -297,9 +295,9 @@ pub(crate) async fn resume_manifest_bundle(
     let policy = load_session_policy(state, session.id).await;
     let (policy_secret_env, _egress) =
         resolve_policy_secrets(state, policy.as_ref(), &secret_ctx, session.id).await;
-    let mut env: HashMap<String, String> = manifest.env.clone();
+    let mut env: HashMap<String, String> = config.env.clone();
     env.extend(policy_secret_env);
-    Ok(ResumeManifestBundle { manifest, env })
+    Ok(ResumeManifestBundle { config, env })
 }
 
 /// ADR 0057: re-read + parse the persisted per-session integration policy.
@@ -667,7 +665,6 @@ async fn boot_prepared(
         needs_uffd_substrate,
     } = prepared;
     let session_id = inputs.session_id;
-    let base_snapshot_id = inputs.base_snapshot_id;
 
     // -------- Candidates (ADR 0046 best-fit, ADR 0048 2D) --------
     // Issue #535 (a) "conscious divergence": kept as its own scan (unlike the
@@ -687,7 +684,12 @@ async fn boot_prepared(
     let ctx = crate::placement::ScheduleContext {
         repo: &image_repo,
         image_version: &image_tag,
-        prefer_snapshot_id: Some(base_snapshot_id),
+        // ADR 0078: a base snapshot is fleet-wide (prewarmed on many
+        // hosts, #538), not a single-host fact — no authoritative
+        // affinity on create. (The old `prefer_snapshot_id` tier keyed
+        // on the never-populated `local_snapshots`, so this was already
+        // a no-op in prod.)
+        snapshot_host: None,
         memory_mib: Some(memory_mib),
         cpu_budget_vcpus: Some(cpu_budget_vcpus),
         required_image_digest: Some(engram_protocol::heartbeat::ManifestDigest::new(
@@ -751,8 +753,18 @@ async fn boot_prepared(
         sealed_secrets,
         capabilities: inputs.capabilities.clone(),
         integration_policy_json,
-        selected_harness: inputs.selected_harness.clone(),
-        selected_skills: inputs.selected_skills.clone(),
+        // ADR 0077 phase 3: the session's boot inputs as ONE persisted
+        // document, written into `session_runtime_specs` inside the create
+        // transaction (subsumes the retired `sessions.selected_skills`
+        // column). `reserve_and_persist_create` also mirrors the harness key
+        // into the pre-existing `sessions.harness` column.
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            inputs.selected_skills.clone(),
+            inputs.selected_harness.clone(),
+            // workdir re-derives from the stable image manifest at boot; it is
+            // not a re-derivation-drift source, so it is not persisted here.
+            None,
+        ),
     };
 
     let disposition = state
@@ -855,7 +867,19 @@ async fn boot_prepared(
     let boot_span = tracing::Span::current();
     let boot_handle = tokio::spawn(
         async move {
-            match crate::session_boot::boot_on_reserved_host(&st, inputs, host_id).await {
+            // ADR 0079: the direct (capacity-available) create pipeline is
+            // deliberately out-of-op — see the epoch-0 disposition note in
+            // the host's `check_session_epoch` — so the boot RPCs are
+            // unfenced here. The queued-create path fences via the
+            // create_boot verb.
+            match crate::session_boot::boot_on_reserved_host(
+                &st,
+                inputs,
+                host_id,
+                SessionFence::unfenced(),
+            )
+            .await
+            {
                 Ok(()) => Ok(()),
                 Err(crate::session_boot::BootError::NotStarted(e)) => {
                     // The sandbox never came up; release the reservation row so
@@ -992,6 +1016,29 @@ pub(crate) async fn prepare_from_row(
             None
         }
     };
+    // ADR 0077 phase 3: read the persisted RuntimeSpec so the queued /
+    // resumed boot re-resolves the session's dynamic skill NAMES against
+    // the current fleet stamp — fixing the ADR 0055 TODO(P1-D) where the
+    // scanner booted queued sessions with base skills only. A pre-0077
+    // session (no spec row) yields an empty list, i.e. the old behavior —
+    // but a READ ERROR (PG blip, spec decode failure) must PROPAGATE, not
+    // degrade to "no skills": FC needs skills pre-staged at boot, so a
+    // swallowed error here boots the session's whole life without its
+    // mounts, silently. The caller's retry (queue scanner tick / resume
+    // re-dispatch) is the correct recovery.
+    let persisted_skills = state
+        .services
+        .meta
+        .get_session_runtime_spec(session.id)
+        .await
+        .map_err(|e| {
+            ApiError::Internal(format!(
+                "runtime spec read for {} failed (retryable — refusing to boot skill-less): {e}",
+                session.id
+            ))
+        })?
+        .map(|rs| rs.selected_skills)
+        .unwrap_or_default();
     prepare_inner(
         state,
         HashMap::new(),
@@ -1004,13 +1051,10 @@ pub(crate) async fn prepare_from_row(
         overrides,
         session.id,
         bundle,
-        // Issue #535 (b): fixes the ADR 0055 TODO(P1-D) gap — `selected_skills`
-        // is now persisted at create/enqueue time (`reserve_and_persist_
-        // create`), so the re-prepare reconstructs the actual selection
-        // instead of dropping to base skills. Re-resolved against the
-        // (possibly newer) fleet catalog below — the sha may have rolled
-        // while queued, which is the correct semantic.
-        session.selected_skills.clone(),
+        // ADR 0077 phase 3: the persisted skill NAMES from the RuntimeSpec
+        // (the TODO(P1-D) fix) — re-resolved against the current fleet catalog
+        // below, since the sha may have rolled while queued.
+        persisted_skills,
         // ADR 0056: a queued session's capabilities were already bound to
         // `session_capabilities` at create/enqueue (issue #535 (b): now in
         // the SAME transaction as the row); the re-prepare carries an empty
@@ -1090,6 +1134,37 @@ async fn resolve_selected_skills(
     assign_skill_slots(&view, names)
 }
 
+/// ADR 0080: the agentd bundle's reserved-slot mount for a fresh create,
+/// pinned to the fleet's current `agentd` generation. `None` (with a LOUD
+/// warn) when no host reports one: the restore then keeps the snapshot's
+/// pinned agentd — which the host's restore staging hard-checks — so the
+/// session runs a stale-but-working agentd instead of failing the create.
+/// Deliberately soft, unlike skills: the Process backend runs no guest
+/// agentd at all, and on FC the *capture* path already hard-fails a fleet
+/// that stages no agentd bundle, so mis-staging can't compound silently.
+async fn resolve_agentd_mount(
+    state: &SharedState,
+) -> Result<Option<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
+    use engram_core::types::sandbox::AuxRoDrive;
+    let catalog = fleet_bundle_catalog(state).await?;
+    let Some(sha) = catalog.get(AuxRoDrive::AGENTD_STAMP_KEY) else {
+        tracing::warn!(
+            "ADR 0080: no host reports a staged `{}` bundle — new sessions keep \
+             their base snapshot's pinned agentd generation (agentd rolls are \
+             NOT reaching this fleet; stage bundle-agentd via node-assets / \
+             `just bundles-squashfs`)",
+            AuxRoDrive::AGENTD_STAMP_KEY,
+        );
+        return Ok(None);
+    };
+    Ok(Some(AuxRoDrive {
+        drive_id: AuxRoDrive::slot_drive_id(AuxRoDrive::AGENTD_SLOT_INDEX),
+        guest_mount: AuxRoDrive::slot_guest_mount(AuxRoDrive::AGENTD_SLOT_INDEX),
+        fs_type: "squashfs".into(),
+        sha256: Some(sha.clone()),
+    }))
+}
+
 /// The fleet's baked bundle catalog: any active host's `current_bundles`
 /// (name -> staged sha256). All hosts bake the same generations, so the first
 /// non-empty report is authoritative; empty if no host has reported yet. Shared
@@ -1127,8 +1202,9 @@ fn assign_skill_slots(
     }
     let mut mounts = Vec::with_capacity(names.len());
     for (i, name) in names.iter().enumerate() {
-        // Skills occupy dyn_1.. — slot 0 is reserved for the harness (ADR 0062).
-        let slot = AuxRoDrive::HARNESS_SLOT_INDEX + 1 + i;
+        // Skills occupy dyn_2.. — slot 0 is the harness (ADR 0062), slot 1
+        // is agentd (ADR 0080).
+        let slot = AuxRoDrive::FIRST_SKILL_SLOT_INDEX + i;
         let sha = catalog.get(name.as_str()).ok_or_else(|| {
             ApiError::BadRequest(format!(
                 "skill `{name}` is unknown (not a staged fleet bundle and not in the \
@@ -1189,9 +1265,9 @@ async fn prepare_inner(
         let (r, t) = split_image_ref(image_uri);
         (r.to_string(), t.to_string())
     };
-    // Issue #535 (a): the manifest was parsed ONCE at bundle-fill time (bake
-    // or cache-refresh), not per create — no `toml::from_str` on this path.
-    let manifest = &bundle.manifest;
+    // Issue #535 (a): the effective config was computed ONCE at
+    // bundle-fill time (enable or cache-refresh), not per create.
+    let config = &bundle.config;
     // ADR 0062: the harness is no longer baked into the image — it's selected
     // per session and resolved from the catalog below (`resolve_harness`). The
     // image's `[harness]` block, if any legacy one survives, is ignored here.
@@ -1215,7 +1291,7 @@ async fn prepare_inner(
     // -------- Build the sandbox env --------
     // Base = image manifest `[env]`; then the policy's secrets (literal values /
     // broker placeholders) layered on.
-    let mut spec_env: HashMap<String, String> = manifest.env.clone();
+    let mut spec_env: HashMap<String, String> = config.env.clone();
     spec_env.extend(policy_secret_env);
 
     // The map that gets sealed into `session_secrets` and replayed on resume.
@@ -1277,7 +1353,7 @@ async fn prepare_inner(
         mode,
         session_id,
         session_env.clone(),
-        manifest.workdir.clone(),
+        config.workdir.clone(),
     )
     .await?
     {
@@ -1301,7 +1377,17 @@ async fn prepare_inner(
     // mounts against the fleet's staged bundles (name -> sha). Capped at
     // RESERVED_SLOTS; an unknown skill name is a 400.
     let mut selected_mounts = resolve_selected_skills(state, &selected_skills).await?;
-    // ADR 0062: the harness catalog rides `dyn_0` alongside the skills (dyn_1..),
+    // ADR 0080: pin the fleet's current agentd generation to its reserved
+    // slot (`dyn_1`) — the identical paused-window patch_drive path. The
+    // host compares this pin against the snapshot's and only when they
+    // differ does the captured agentd re-exec (RefreshAgent), so an agentd
+    // roll reaches new sessions with zero recapture and zero steady-state
+    // latency. `None` (bundle-less fleet: Process dev, mid-bring-up) keeps
+    // the snapshot's pinned generation.
+    if let Some(mount) = resolve_agentd_mount(state).await? {
+        selected_mounts.push(mount);
+    }
+    // ADR 0062: the harness catalog rides `dyn_0` alongside the skills (dyn_2..),
     // bound through the identical paused-window patch_drive path.
     if let Some(mount) = harness_mount {
         selected_mounts.push(mount);
@@ -1326,6 +1412,8 @@ async fn prepare_inner(
             egress_secrets,
             network,
             selected_mounts,
+            // ADR 0077 phase 3: the raw skill names, persisted in the
+            // RuntimeSpec so a queued re-prepare / resume re-resolves them.
             selected_skills,
             capabilities,
             integration_policy,
@@ -1389,130 +1477,89 @@ pub struct ListSessionsResponse {
     pub sessions: Vec<SessionListItem>,
 }
 
+/// ADR 0079: how long `delete_session_core` observes its just-enqueued
+/// destroy op before returning the retryable "teardown in flight" 409.
+/// Short: the destroy verb's user-visible work (terminal flip + destroy
+/// RPC dispatch) lands in seconds; only an op queued behind a slow
+/// in-flight resume/evict outlasts this, and the retry is idempotent.
+const DESTROY_OBSERVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// ADR 0051: terminate a session + tear down its sandbox (gRPC
 /// `DeleteSession`). Idempotent: an already-terminal or unknown-then-raced
-/// session returns `Ok(())`. Holds the SAME hardened terminate-first /
-/// CAS-guarded teardown logic as the axum `delete_session` handler — only
-/// the return shape changed (`StatusCode` → `()`).
+/// session returns `Ok(())`.
+///
+/// ADR 0079: the teardown body (the terminate-first / fenced-teardown
+/// pipeline) is the DESTROY VERB (`session_verbs::destroy`); this handler
+/// only enqueues (idempotency key `"destroy"` — one destroy per session,
+/// ever) and bounded-observes the op. An in-flight resume/evict op ahead
+/// in the queue runs first — the terminate-races-resume #211 interleaving
+/// is closed by ordering, and the destroy claim's epoch bump fences any
+/// stale predecessor's writes.
 pub(crate) async fn delete_session_core(
     state: &SharedState,
     id: SessionId,
 ) -> Result<(), ApiError> {
-    // Drive the session to its FSM-legal terminal BEFORE destroying the
-    // sandbox. `terminate_session` reads the current state and picks the
-    // terminal `SessionState::terminal_target` permits — `Completed` for
-    // states that ran, `Failed` for the early states (Pending / Created)
-    // that never became usable (this is what fixes the
-    // `5fadd364` phantom: deleting a `Created` session used to drive an
-    // illegal Created→Completed that surfaced as Conflict, destroying the
-    // sandbox but leaving the row non-terminal). Terminating first also
-    // removes this row from the heartbeat reconcile's "active session whose
-    // sandbox is missing" view, so reconcile can't race us into HostLost
-    // during the (best-effort, can-take-seconds) destroy RPC below.
-    //
-    // - `Ok(None)`: already terminal — idempotent 204, nothing to tear down.
-    // - `Ok(Some((prev, target)))`: transitioned; emit + drop the broker
-    //   token, then destroy.
-    // - `Conflict`: a sibling (drain, dead-host detector, eviction scanner)
-    //   raced us to terminal — best-effort tear down, then 204. (ADR 0034:
-    //   deleting mid-eviction works this way — the scanner's racing
-    //   transition_session(Idle) then fails against the terminal row, fires
-    //   abort_inflight_snapshot, and releases the lease.)
-    //
-    // An unknown id surfaces as 404 from `terminate_session`'s own
-    // `get_session` — matching the get/exec contract — before any teardown.
-    //
-    // Capture the live sandbox binding (PG authority, read through the
-    // per-replica cache) BEFORE the terminal transition clears it, so the
-    // teardown below works on any replica (ADR 0047) — not just the pod
-    // that cached the bind. Without this, a delete fielded by a non-owning
-    // replica would `unbind` nothing and leak the sandbox (host reconcile
-    // GC is the backstop, but we tear down promptly here).
-    let bound_sandbox = state.resolve_sandbox(id).await;
-    match state.services.meta.terminate_session(id).await {
-        Ok(None) => return Ok(()),
-        Ok(Some((prev, target))) => {
-            state
-                .emit(
-                    id,
-                    SessionEvent::StatusChanged {
-                        from: prev,
-                        to: target,
-                        at: chrono::Utc::now(),
-                    },
-                )
-                .await?;
-            // ADR 0023: drop the session's credential-broker token so a
-            // terminated session can no longer mint git credentials.
-            // ADR 0047: the PG row is the authority; the map is a cache.
-            state.git_broker_tokens.remove(&id);
-            if let Err(e) = state.services.meta.delete_broker_token(id).await {
-                tracing::warn!(session_id = %id, error = %e,
-                    "delete_broker_token failed; ON DELETE CASCADE is the backstop");
+    use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState};
+    // An unknown id surfaces as 404 before any enqueue — matching the
+    // get/exec contract (and the retired inline body's `terminate_session`
+    // lookup).
+    state.services.meta.get_session(id).await?;
+
+    let outcome = crate::session_ops::enqueue(
+        state,
+        id,
+        OpKind::Destroy,
+        serde_json::json!({}),
+        Some("destroy"),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("destroy enqueue failed: {e}")))?;
+    // `Duplicate` = a prior DELETE already enqueued/ran the destroy (the
+    // burned idempotency key) — observe the session row alone.
+    let op_id = match outcome {
+        EnqueueOutcome::Claimed(op) | EnqueueOutcome::Queued(op) => Some(op.id),
+        EnqueueOutcome::Duplicate => None,
+    };
+
+    let deadline = std::time::Instant::now() + DESTROY_OBSERVE_TIMEOUT;
+    loop {
+        // The terminal flip is the user-visible outcome; it lands before
+        // the (best-effort, can-take-seconds) sandbox destroy finishes.
+        match state.services.meta.get_session(id).await {
+            Ok(s) if s.status.is_terminal() => return Ok(()),
+            Ok(_) => {}
+            // Row hard-deleted (FK cascade) — idempotent 204.
+            Err(engram_core::MetaError::NotFound) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        if let Some(op_id) = op_id {
+            if let Ok(Some(op)) = state.services.meta.op_get(op_id).await {
+                match op.state {
+                    OpState::Done => return Ok(()),
+                    OpState::Failed => {
+                        return Err(ApiError::Internal(format!(
+                            "session teardown failed: {}",
+                            op.error.as_deref().unwrap_or("destroy op failed")
+                        )));
+                    }
+                    OpState::Cancelled => {
+                        return Err(ApiError::Conflict(
+                            "session teardown was cancelled; retry the delete".into(),
+                        ));
+                    }
+                    OpState::Queued | OpState::Running => {}
+                }
             }
         }
-        Err(engram_core::MetaError::Conflict(msg)) => {
-            tracing::info!(
-                session_id = %id,
-                error = %msg,
-                "delete_session: state machine raced us (likely reconciler flipped to terminal first); returning 204 idempotently"
-            );
-            // Still tear down whatever's left for tidiness, then 204.
-            if let Some(sandbox_id) = bound_sandbox {
-                let _ = state.services.host.destroy(sandbox_id).await;
-            }
-            state.services.host.unbind_session(id).await;
-            return Ok(());
+        if std::time::Instant::now() >= deadline {
+            return Err(ApiError::Conflict(
+                "session teardown in flight (destroy op enqueued behind an in-flight \
+                 op); retry shortly"
+                    .into(),
+            ));
         }
-        Err(e) => return Err(e.into()),
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-
-    // Status is now terminal; reconcile won't touch this row anymore.
-    // Now tear down the sandbox and clear the routing columns.
-    if let Some(sandbox_id) = bound_sandbox {
-        if let Err(e) = state.services.host.destroy(sandbox_id).await {
-            tracing::warn!(
-                session_id = %id,
-                sandbox_id = %sandbox_id,
-                error = %e,
-                "sandbox destroy failed during session delete; host-agent reconcile will GC",
-            );
-        }
-        // ADR 0006: the host-agent unregisters its local proxy
-        // entry as part of `destroy`. No coordinator-side cleanup.
-    }
-
-    // Clear sandbox_id since the sandbox is destroyed; the session
-    // row is now terminal and won't be repopulated by startup
-    // routing rebuild even if it kept the column set, but tidy
-    // anyway so an audit query "what sandboxes does the coordinator
-    // think exist" matches reality.
-    //
-    // Issue #211: guard the clear on the EXACT sandbox we read +
-    // destroyed (`bound_sandbox`). The row is terminal, so a competing
-    // rebind onto it can't happen anymore — but a stale read elsewhere
-    // shouldn't be able to null a column that something else legitimately
-    // re-populated either. `Some(bound_sandbox)` means "only clear if the
-    // row still points at the sandbox I destroyed"; a `Conflict` (the
-    // binding already moved on) is benign here, so it's logged not failed.
-    if let Some(sandbox_id) = bound_sandbox {
-        if let Err(e) = state
-            .services
-            .meta
-            .assign_session_sandbox_guarded(id, None, Some(Some(sandbox_id)), &[])
-            .await
-        {
-            tracing::debug!(
-                session_id = %id,
-                sandbox_id = %sandbox_id,
-                error = %e,
-                "delete_session: guarded sandbox clear was a no-op (binding already \
-                 changed) — leaving it for the new owner",
-            );
-        }
-    }
-    state.services.host.unbind_session(id).await;
-    Ok(())
 }
 
 /// ADR 0023: when a forge is configured and the image declares `[git]`,
@@ -1912,7 +1959,6 @@ pub(crate) async fn resolve_harness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engram_core::types::ImageManifest;
     use engram_core::SandboxId;
 
     /// ADR 0055: memory is purely the image's `suggested_memory_mib` (or the
@@ -1922,7 +1968,7 @@ mod tests {
     #[test]
     fn resolved_memory_mib_is_suggested_or_default() {
         let mk = |mem: Option<u32>| {
-            let mut m = ImageManifest {
+            let mut m = ImageConfig {
                 name: "x".into(),
                 ..Default::default()
             };
@@ -2018,23 +2064,33 @@ mod tests {
         // Empty selection → empty mounts.
         assert!(assign_skill_slots(&catalog, &[]).unwrap().is_empty());
 
-        // ADR 0062: slot 0 is the harness, so skills start at dyn_1. Two skills
-        // → two drives at dyn_1 / dyn_2 with the catalog shas, in request order.
+        // ADR 0062/0080: slot 0 is the harness, slot 1 is agentd, so skills
+        // start at dyn_2. Two skills → two drives at dyn_2 / dyn_3 with the
+        // catalog shas, in request order.
         let mounts = assign_skill_slots(&catalog, &["skills".into(), "browser".into()]).unwrap();
         assert_eq!(mounts.len(), 2);
-        assert_eq!(mounts[0].drive_id, AuxRoDrive::slot_drive_id(1));
-        assert_eq!(mounts[0].guest_mount, AuxRoDrive::slot_guest_mount(1));
+        assert_eq!(
+            mounts[0].drive_id,
+            AuxRoDrive::slot_drive_id(AuxRoDrive::FIRST_SKILL_SLOT_INDEX)
+        );
+        assert_eq!(
+            mounts[0].guest_mount,
+            AuxRoDrive::slot_guest_mount(AuxRoDrive::FIRST_SKILL_SLOT_INDEX)
+        );
         assert_eq!(mounts[0].fs_type, "squashfs");
         assert_eq!(mounts[0].sha256.as_deref(), Some("sha_a"));
-        assert_eq!(mounts[1].drive_id, AuxRoDrive::slot_drive_id(2));
+        assert_eq!(
+            mounts[1].drive_id,
+            AuxRoDrive::slot_drive_id(AuxRoDrive::FIRST_SKILL_SLOT_INDEX + 1)
+        );
         assert_eq!(mounts[1].sha256.as_deref(), Some("sha_b"));
 
         // Unknown skill → 400.
         let err = assign_skill_slots(&catalog, &["nope".into()]).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
 
-        // Over the skill-slot cap (RESERVED_SLOTS - 1, since the harness takes
-        // slot 0) → 400, even if every name is known.
+        // Over the skill-slot cap (RESERVED_SLOTS - 2: harness slot 0,
+        // agentd slot 1) → 400, even if every name is known.
         let too_many: Vec<String> = (0..AuxRoDrive::MAX_SKILL_SLOTS + 1)
             .map(|_| "skills".to_string())
             .collect();

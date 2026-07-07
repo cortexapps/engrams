@@ -39,7 +39,7 @@ use engram_core::types::sandbox::{
 };
 use engram_core::types::snapshot::MigrationSourceInfo;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -63,6 +63,7 @@ fn build_host(
     kernel: &Path,
     handler: &Path,
     blob_root: &Path,
+    bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
     let work = tempfile::Builder::new()
@@ -71,6 +72,8 @@ fn build_host(
         .expect("host workdir");
     let mut cfg = FirecrackerConfig::with_kernel(kernel.to_path_buf());
     cfg.net_pool = None;
+    // ADR 0080: both hosts stage the same agentd bundle dir (the fleet mirror).
+    cfg.bundle_dir = bundle_dir.to_path_buf();
     cfg.restore_mode = RestoreMode::File;
     cfg.uffd_handler_bin = handler.to_path_buf();
     cfg.uffd_blob_root = Some(blob_root.to_path_buf());
@@ -98,7 +101,13 @@ async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
         ),
     );
     let server = tokio::spawn(async move {
-        let _ = engram_host_agent::grpc_server::boot(addr, inner, None).await;
+        let _ = engram_host_agent::grpc_server::boot(
+            addr,
+            inner,
+            None,
+            engram_host_agent::session_epochs::ephemeral(),
+        )
+        .await;
     });
     assert!(
         common::wait_tcp_bound(addr, std::time::Duration::from_secs(5)).await,
@@ -165,11 +174,6 @@ async fn drain_wave_teleports_every_session_off_host_a() {
     // the shared store, so B can restore without A's local cache).
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-drain-wave\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let baker = Builder::new(DockerCli::new(), chunk_store.clone());
     let outcome = baker
@@ -179,8 +183,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -189,8 +192,25 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         .await
         .expect("bake");
 
-    let (pooled_a, _work_a) = build_host("a", &kernel, &handler, &blob_root, &chunk_store);
-    let (pooled_b, _work_b) = build_host("b", &kernel, &handler, &blob_root, &chunk_store);
+    // ADR 0080: one staged agentd bundle dir shared by both hosts (the
+    // fleet stages identical generations).
+    let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
+    let (pooled_a, _work_a) = build_host(
+        "a",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
+    let (pooled_b, _work_b) = build_host(
+        "b",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
@@ -220,7 +240,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
             env: HashMap::new(),
             workdir: None,
             network: Default::default(),
-            aux_ro_drives: Vec::new(),
+            aux_ro_drives: vec![staged.agentd_slot()],
         };
         let vm = host_a.pooled.create(spec).await.expect("create on A");
         let _ = exec(&host_a.pooled, vm, "true").await;
@@ -295,7 +315,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
     let mut moved_vms = Vec::with_capacity(SESSIONS);
     for (i, s) in live.iter().enumerate() {
         let cap = client_a
-            .migration_capture(s.vm)
+            .migration_capture(s.vm, engram_core::traits::SessionFence::unfenced())
             .await
             .expect("capture on A");
         let mut metadata = s.ckpt.clone();
@@ -321,7 +341,10 @@ async fn drain_wave_teleports_every_session_off_host_a() {
             sidecar_json: Vec::new(),
         });
 
-        let moved = client_b.restore(metadata).await.expect("restore on B");
+        let moved = client_b
+            .restore(metadata, engram_core::traits::SessionFence::unfenced())
+            .await
+            .expect("restore on B");
 
         // The post-checkpoint sentinel survived the move (a genuine live
         // teleport, not a cold rehome from the checkpoint).
@@ -393,7 +416,11 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         // Commit on A: the frozen source is destroyed. This is what
         // empties the victim host one session at a time.
         client_a
-            .migration_commit(s.vm, &cap.export_id)
+            .migration_commit(
+                s.vm,
+                &cap.export_id,
+                engram_core::traits::SessionFence::unfenced(),
+            )
             .await
             .expect("commit on A");
         moved_vms.push(moved);
@@ -439,7 +466,7 @@ fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
         eprintln!("SKIP: /dev/kvm not present");
         return None;
     }
-    for bin in ["firecracker", "docker", "mke2fs"] {
+    for bin in ["firecracker", "docker", "mke2fs", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)

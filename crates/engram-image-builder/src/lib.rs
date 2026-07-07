@@ -1,28 +1,28 @@
 //! Image baker.
 //!
-//! Source of truth for an image is a repo containing two files:
+//! ADR 0080: the source of truth for an image is its **Dockerfile** —
+//! the bake carries no runtime config. An optional `engram.toml` holds
+//! only the `[build]` section (Dockerfile path, context, args, build
+//! secrets). Everything the runtime needs (name/description/env/workdir/
+//! resources/warm) is supplied out-of-band at enable time via
+//! `engram image enable --config`; the artifact's config blob carries the
+//! Dockerfile-derived `runtime_defaults` (ENV/WORKDIR) so the platform
+//! never re-reads the OCI image config after enable.
 //!
-//! ```text
-//!   <repo>/
-//!     Dockerfile          # WHAT'S in the image — universal Docker syntax
-//!     engram.toml         # HOW the image is USED — secrets, network, resources
-//! ```
-//!
-//! `engram-image-builder build` reads both, runs `docker build`, exports
-//! the resulting OCI image's filesystem to the registry layout the
+//! `engram-image-builder build` runs `docker build`, exports the
+//! resulting OCI image's filesystem to the registry layout the
 //! coordinator reads:
 //!
 //! ```text
 //!   <images_dir>/<repo>/<tag>/
-//!     manifest.toml       # rendered ImageManifest (engram.toml minus [build])
 //!     rootfs/             # ProcessBackend dev path
-//!     rootfs.ext4         # FirecrackerBackend prod path (Phase 2)
+//!     rootfs.ext4         # FirecrackerBackend prod path
+//!     bundle.json         # chunk-manifest pointer (Ext4 bakes)
 //! ```
 //!
 //! For ProcessBackend dev, we extract via `docker create + docker
-//! export | tar -x`. For Firecracker prod (Phase 2), the same pipe
-//! continues into `mkfs.ext4` and bakes in `engram-agentd` + an init
-//! unit. Out of scope this round.
+//! export | tar -x`. For Firecracker prod, the same pipe continues into
+//! `mkfs.ext4` (the only injected file is the stage-1 init shim).
 
 pub mod blob;
 pub mod config;
@@ -31,7 +31,7 @@ pub mod ext4;
 
 use std::path::{Path, PathBuf};
 
-use engram_core::types::ImageManifest;
+use engram_core::types::image::OciRuntimeDefaults;
 
 pub use config::{BuildConfig, EngramRepoConfig};
 pub use docker::{DockerCli, DockerRunner};
@@ -65,24 +65,24 @@ pub struct BuildRequest {
     /// Firecracker. Defaults to `Directory` so existing callers keep
     /// working.
     pub format: Format,
-    /// Optional: bake `engram-agentd` into the rootfs at
-    /// `/sbin/engram-agentd` plus a small init shim at
-    /// `/sbin/engram-init` that mounts the essentials and exec's
-    /// the agent on a vsock port. When `Some`, the resulting image
-    /// boots straight into the agent — pair with FC's
-    /// `default_boot_args = "... init=/sbin/engram-init"` and the
-    /// host's `exec_stream` reaches the in-guest agent over vsock.
-    pub agent_injection: Option<AgentInjection>,
+    /// Optional: write the ADR 0080 stage-1 init shim to
+    /// `/sbin/engram-init`. The shim mounts the essentials, mounts the
+    /// aux bundle slots, copies `engram-agentd` out of its reserved
+    /// bundle slot to tmpfs, and exec's the copy on a vsock port —
+    /// agentd itself is NEVER baked into the rootfs. Pair with FC's
+    /// `default_boot_args = "... init=/sbin/engram-init"` and a host
+    /// that stages `bundle-agentd`.
+    pub init_injection: Option<InitInjection>,
 }
 
-/// How to put `engram-agentd` inside the rootfs at bake time. Optional
-/// because the dev backend doesn't need it — only Firecracker images
-/// do.
+/// How to put the stage-1 init shim inside the rootfs at bake time.
+/// Optional because the dev backend doesn't need it — only Firecracker
+/// (and VZ) images do. ADR 0080: this used to also bake the agentd
+/// binary; agentd now rides its reserved bundle slot so it iterates
+/// with zero re-bakes, and the shim is the only engrams file in the
+/// rootfs.
 #[derive(Clone, Debug)]
-pub struct AgentInjection {
-    /// Linux-built `engram-agentd` binary on the host. Copied verbatim
-    /// to `/sbin/engram-agentd` inside the rootfs and chmod'd 0755.
-    pub agent_binary: PathBuf,
+pub struct InitInjection {
     /// Vsock port the agent should listen on inside the guest. Pair
     /// this with the host-side `ENGRAM_AGENTD_PORT` constant
     /// (`engram_sandbox_firecracker::ENGRAM_AGENTD_PORT`, currently
@@ -102,7 +102,7 @@ pub struct AgentInjection {
 }
 
 /// Which `engram-transport` implementation the in-VM binaries should
-/// select at runtime. Set on [`AgentInjection`] at bake time; the
+/// select at runtime. Set on [`InitInjection`] at bake time; the
 /// default init shim writes `ENGRAM_TRANSPORT=<value>` into the rootfs
 /// so `engram-transport::from_env` picks the right impl.
 ///
@@ -135,9 +135,6 @@ impl Transport {
     }
 }
 
-/// Where the agent binary lands inside the rootfs (relative to root).
-const AGENT_PATH: &str = "sbin/engram-agentd";
-
 /// Where the init shim lands inside the rootfs (relative to root).
 /// Pair with kernel boot arg `init=/sbin/engram-init`.
 const INIT_PATH: &str = "sbin/engram-init";
@@ -153,7 +150,7 @@ const VSOCK_PORT_PLACEHOLDER: &str = "__VSOCK_PORT__";
 const TRANSPORT_PLACEHOLDER: &str = "__TRANSPORT__";
 
 /// Default init shim. Written to `/sbin/engram-init` when an
-/// [`AgentInjection`] is requested without an explicit override.
+/// [`InitInjection`] is requested without an explicit override.
 /// Requires `/bin/sh` in the rootfs (alpine, debian-slim, ubuntu —
 /// all standard bases ship it).
 ///
@@ -193,6 +190,14 @@ mount -t devpts devpts /dev/pts 2>/dev/null || true
 # /tmp in our guest, so that path fails too. A real /dev/shm is the fix.
 mkdir -p /dev/shm 2>/dev/null || true
 mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /dev/shm 2>/dev/null || true
+# /run as tmpfs — standard Linux init behavior, and load-bearing for
+# ADR 0080: agentd executes from a tmpfs COPY (/run/engram/) so its
+# text pages are guest memory and the host's paused-window
+# patch_drive swap of the agentd bundle device can never fault a
+# running binary's pages from swapped bytes (the same asymmetry that
+# makes the harness-slot swap safe). Everything staged below
+# (.ca-stage, engram/harnesses, engram/) lands on this tmpfs.
+mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run 2>/dev/null || true
 # /tmp must be the standard world-writable, sticky 1777 dir. Our rootfs
 # ships it as 0755 owned by the session user, which blocks writes from any
 # other uid — e.g. a root `engram exec`, or chromium's renderer running with
@@ -252,6 +257,19 @@ fi
 # dev server). Seed the loopback names if /etc/hosts is empty.
 if [ ! -s /etc/hosts ]; then
     printf '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n' > /etc/hosts
+fi
+# ADR 0080: seed the SHELL-tab ergonomics (colors + a two-tone prompt)
+# if the image doesn't ship its own — engrams-owned polish that no
+# longer belongs in the user's Dockerfile. Quoted heredoc: zero
+# interpolation, the PS1 escapes land verbatim.
+if [ ! -s /root/.bashrc ]; then
+    cat > /root/.bashrc <<'ENGRAM_BASHRC'
+export TERM=xterm-256color
+alias ls="ls --color=auto"
+alias ll="ls -lah --color=auto"
+alias grep="grep --color=auto"
+PS1='\[\e[36m\]\u@\h\[\e[0m\]:\[\e[34m\]\w\[\e[0m\]\$ '
+ENGRAM_BASHRC
 fi
 # ADR 0014 M1.12 (option D) + ADR 0015 M1: engram-init no longer
 # leaves a persistent mount of the harness substrate at
@@ -365,13 +383,45 @@ fi
 # on every session create, and only a tiny fraction of sessions
 # actually use the SHELL tab.
 mark exec_agentd
-exec /sbin/engram-agentd --port __VSOCK_PORT__
+# ADR 0080: agentd is NOT baked into this rootfs — it rides its
+# reserved bundle slot (engram-agentd + agentd.sha256). Probe the
+# mounted slots for it (position-independent: FC keeps dyn/<i> ==
+# slot i, VZ compacts resolved drives), copy binary + content stamp
+# to tmpfs, and exec the COPY. The stamp is what a later
+# RefreshAgent compares against the (possibly patch_drive-swapped)
+# slot to decide a re-exec. PID 1 exiting panics the kernel
+# (panic=1) — a boot without the agentd bundle fails loud, with the
+# reason on the guest console.
+AGENTD_DIR=""
+for d in /opt/engram/dyn/*; do
+    if [ -x "$d/engram-agentd" ]; then
+        AGENTD_DIR="$d"
+        break
+    fi
+done
+if [ -z "$AGENTD_DIR" ]; then
+    echo "engram-init: FATAL: no agentd bundle mounted under /opt/engram/dyn — stage bundle-agentd on the host (ADR 0080)" >&2
+    exit 1
+fi
+mkdir -p /run/engram
+cp "$AGENTD_DIR/engram-agentd" /run/engram/engram-agentd
+chmod 0755 /run/engram/engram-agentd
+if [ -f "$AGENTD_DIR/agentd.sha256" ]; then
+    cp "$AGENTD_DIR/agentd.sha256" /run/engram/agentd.sha256
+fi
+mark agentd_staged
+exec /run/engram/engram-agentd --port __VSOCK_PORT__
 "#;
 
 #[derive(Clone, Debug)]
 pub struct BuildOutcome {
     pub image_dir: PathBuf,
-    pub manifest_path: PathBuf,
+    /// ADR 0080: the built image's Dockerfile `ENV` + `WORKDIR`, read via
+    /// `docker inspect` at bake time. `push_to_registry` embeds this in
+    /// the artifact's config blob (`runtime_defaults`); the coordinator
+    /// persists it at enable so session-create merges it under the
+    /// RPC-supplied `ImageConfig` with no OCI re-read.
+    pub runtime_defaults: OciRuntimeDefaults,
     /// Path on disk where the rootfs lives (directory for
     /// `Format::Directory`; `.ext4` file for `Format::Ext4`).
     /// Kept for ProcessBackend dev path; production consumers
@@ -508,12 +558,12 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
     /// Run a single bake. Steps:
     ///
     /// 1. Validate paths in `req`.
-    /// 2. Read `<source>/engram.toml`, split into manifest + build.
+    /// 2. Read `<source>/engram.toml` (optional; `[build]` only — ADR 0080).
     /// 3. `docker build` against the source.
     /// 4. `docker create` a throwaway container; `docker export` its
     ///    filesystem to the staging tarball.
     /// 5. Extract the tarball into `<images_dir>/<repo>/<tag>/rootfs/`.
-    /// 6. Write `manifest.toml`.
+    /// 6. Extract the Dockerfile ENV/WORKDIR as `runtime_defaults`.
     /// 7. Best-effort `docker rm <container>` + remove the temporary tag.
     ///
     /// Idempotent on the registry side — overwrites any existing
@@ -577,7 +627,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         //    or fails. We don't surface cleanup errors; the bake's
         //    outcome is what matters.
         let outcome = self
-            .build_after_container(req, &cfg, &image_dir, &container_id, &docker_tag)
+            .build_after_container(req, &image_dir, &container_id, &docker_tag)
             .await;
         // Cleanup: `build_after_container` already frees the image+container
         // on its success path (after export, before the ext4 pack — see
@@ -596,14 +646,13 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         })
     }
 
-    /// Steps 5–6 of `build`: export, write manifest, optionally pack
-    /// to ext4, compute size. Factored out so the unconditional
-    /// cleanup at the bottom of `build` is symmetrical regardless of
-    /// where this fails.
+    /// Steps 5–6 of `build`: export, extract the runtime defaults,
+    /// optionally pack to ext4, compute size. Factored out so the
+    /// unconditional cleanup at the bottom of `build` is symmetrical
+    /// regardless of where this fails.
     async fn build_after_container(
         &self,
         req: &BuildRequest,
-        cfg: &EngramRepoConfig,
         image_dir: &Path,
         container_id: &str,
         docker_tag: &str,
@@ -620,18 +669,17 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             .await
             .map_err(|e| BuildError::Docker(format!("export: {e}")))?;
 
-        // Optional: inject engram-agentd + bootstrap + an init shim
-        // before we pack to ext4. Done after docker export so the
-        // rootfs the user described in their Dockerfile is the base;
-        // we just overlay our agent / bootstrap on top.
+        // Optional: inject the stage-1 init shim before we pack to ext4.
+        // Done after docker export so the rootfs the user described in
+        // their Dockerfile is the base; we just overlay the shim on top.
         //
-        // ADR 0062: the image bakes NO harness. Harnesses are a per-session
-        // selection mounted on `dyn_0` from their own squashfs bundle (the
-        // harness catalog), so there is nothing harness-specific to inject
-        // here — only the agent / bootstrap overlay below.
-        let mut effective_manifest = cfg.to_manifest();
-        if let Some(injection) = &req.agent_injection {
-            inject_agent(&rootfs_dir, injection).await?;
+        // ADR 0062: the image bakes NO harness. ADR 0080: it bakes NO
+        // agentd either — both ride reserved bundle slots so they iterate
+        // with zero re-bakes. The one engrams file in the rootfs is the
+        // stage-1 init shim below (mounts the slots, copies agentd to
+        // tmpfs, execs it).
+        if let Some(injection) = &req.init_injection {
+            inject_init(&rootfs_dir, injection).await?;
         }
 
         // ADR 0027: the share-file skill + the git forge glue is no
@@ -643,31 +691,25 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // skill edit ships fleet-wide by rolling the bundle, no re-bake.
         // The wrapper scripts + SKILL.md now live in `deploy/bundles/skills/`.
 
-        // Fold the built image's Docker config (its `ENV` + `WORKDIR`)
-        // into the manifest as defaults — the author's `engram.toml`
-        // [env]/workdir wins. The platform doesn't otherwise read the
-        // OCI image config, so this is what lets a Dockerfile's ENV /
-        // WORKDIR reach the guest (the agent at start_agent + `engram
-        // exec`). Inspect the created-but-unstarted container, whose
-        // `Config` mirrors the image's Env/WorkingDir.
-        match self.docker.inspect_config(container_id).await {
-            Ok(cfg) => {
-                effective_manifest.apply_image_config_defaults(&cfg.env, cfg.working_dir.as_deref())
+        // ADR 0080: extract the built image's Docker config (its `ENV` +
+        // `WORKDIR`) as the artifact's `runtime_defaults`. This is the ONLY
+        // place the platform reads the OCI image config — the coordinator
+        // persists it at enable and merges it UNDER the RPC-supplied
+        // ImageConfig at session create. Inspect the created-but-unstarted
+        // container, whose `Config` mirrors the image's Env/WorkingDir.
+        // HARD error: with no manifest.toml carrying a fold-in anymore, a
+        // failed inspect would silently strip the Dockerfile ENV/WORKDIR
+        // from every session of this image — fail the bake instead.
+        let runtime_defaults = match self.docker.inspect_config(container_id).await {
+            Ok(cfg) => OciRuntimeDefaults::from_docker_config(&cfg.env, cfg.working_dir.as_deref()),
+            Err(e) => {
+                return Err(BuildError::Docker(format!(
+                    "docker inspect for the image config failed: {e}. The artifact's \
+                     runtime_defaults (Dockerfile ENV/WORKDIR) can't be extracted, so the \
+                     bake is aborted rather than shipping an image that silently drops them."
+                )));
             }
-            // Non-fatal: an inspect hiccup shouldn't fail an otherwise
-            // good bake. The image still works; it just doesn't inherit
-            // the Dockerfile env/workdir (same as pre-this-feature), and
-            // the author can always set them in engram.toml.
-            Err(e) => tracing::warn!(
-                error = %e,
-                "docker inspect for image config failed; \
-                 manifest will not inherit the Dockerfile ENV/WORKDIR",
-            ),
-        }
-
-        let manifest_path = image_dir.join("manifest.toml");
-        let manifest_str = render_manifest_value(&effective_manifest)?;
-        tokio::fs::write(&manifest_path, manifest_str).await?;
+        };
 
         // Free the docker image + container NOW. The rootfs is fully
         // exported to `rootfs_dir` and the last image read (inspect_config
@@ -832,7 +874,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
 
         Ok(BuildOutcome {
             image_dir: image_dir.to_path_buf(),
-            manifest_path,
+            runtime_defaults,
             rootfs_path,
             disk_manifest,
             size_bytes: total_size,
@@ -886,16 +928,17 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             format!("{registry_uri}:{}", req.tag)
         };
 
-        let manifest_bytes = tokio::fs::read(&outcome.manifest_path)
-            .await
-            .map_err(BuildError::Io)?;
-        // Tiny config blob for introspection — registries display this
-        // and it makes Engram artifacts easy to recognize in a UI.
+        // The artifact's config blob: introspection metadata (registries
+        // display it) plus — ADR 0080 — the Dockerfile-derived
+        // `runtime_defaults` the enable pipeline persists. The bake
+        // carries NO other runtime config (engram.toml's manifest half is
+        // retired; config arrives via `image enable --config`).
         let config = serde_json::json!({
             "kind": "engram-image-v1",
             "format": match req.format { Format::Ext4 => "ext4", Format::Directory => "directory" },
             "repo":   req.repo,
             "tag":    req.tag,
+            "runtime_defaults": outcome.runtime_defaults,
         });
         let config_bytes = serde_json::to_vec(&config)
             .map_err(|e| BuildError::Config(format!("config json: {e}")))?;
@@ -958,7 +1001,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 .collect::<Result<_, BuildError>>()?;
 
             let layers = engram_oci::ChunkedImageLayers {
-                manifest_toml: manifest_bytes,
                 config_json: config_bytes,
                 bundle_json: bundle.clone(),
                 disk_bootstrap_json,
@@ -990,7 +1032,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         let digest = oci
             .push_image(
                 &full_uri,
-                &manifest_bytes,
                 rootfs_arg,
                 &config_bytes,
                 bundle_bytes.as_deref(),
@@ -1160,15 +1201,7 @@ pub struct RegistryPush {
     pub manifest_digest: engram_oci::Digest256,
 }
 
-/// Render the manifest as TOML. Strips the `[build]` section since
-/// runtime doesn't need it (already filtered out by
-/// `EngramRepoConfig::to_manifest`).
-fn render_manifest_value(manifest: &ImageManifest) -> Result<String, BuildError> {
-    toml::to_string_pretty(manifest)
-        .map_err(|e| BuildError::Config(format!("render manifest: {e}")))
-}
-
-/// Copy the agent binary into `<rootfs>/sbin/engram-agentd`, write the
+/// Write the stage-1 init shim into `<rootfs>/sbin/engram-init` — the
 /// init shim to `<rootfs>/sbin/engram-init`, and chmod 0755 on both.
 /// Mirrors the layout the kernel boot args expect:
 /// `init=/sbin/engram-init`.
@@ -1177,21 +1210,11 @@ fn render_manifest_value(manifest: &ImageManifest) -> Result<String, BuildError>
 /// host-side: `cfg.harnesses_dir` is mounted into every sandbox at
 /// `/run/engram/harnesses` via virtio-fs, so the rootfs no longer
 /// carries them.
-async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(), BuildError> {
-    if !injection.agent_binary.exists() {
-        return Err(BuildError::Config(format!(
-            "agent_binary {} does not exist",
-            injection.agent_binary.display()
-        )));
-    }
-
-    let agent_dst = rootfs_dir.join(AGENT_PATH);
+async fn inject_init(rootfs_dir: &Path, injection: &InitInjection) -> Result<(), BuildError> {
     let init_dst = rootfs_dir.join(INIT_PATH);
-    if let Some(parent) = agent_dst.parent() {
+    if let Some(parent) = init_dst.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-
-    install_file(&injection.agent_binary, &agent_dst, "agent").await?;
 
     match &injection.init_script {
         Some(src) => install_file(src, &init_dst, "init").await?,

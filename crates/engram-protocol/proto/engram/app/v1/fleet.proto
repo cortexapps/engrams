@@ -68,12 +68,14 @@ message HostView {
   uint64 capacity_total_mib = 4;
   uint64 capacity_used_mib = 5;
   uint32 running_sandboxes = 6;
-  // Live-only (not persisted) — reads 0 on a coord replica that hasn't
-  // received this host's heartbeat.
-  uint64 local_snapshots = 7;
+  // ADR 0078: `local_snapshots` (field 7) retired — the heartbeat mirror
+  // it counted was never populated (dead wire). Reserved so the number is
+  // never reused.
+  reserved 7;
+  reserved "local_snapshots";
   // ADR 0015 M5: count of images this host has fully prefetched.
-  // Live-only, like local_snapshots. RUST-WIRE-ONLY: absent from the TS
-  // mirror (web/src/types.ts HostView) — Rust is the wire truth.
+  // Live-only. RUST-WIRE-ONLY: absent from the TS mirror
+  // (web/src/types.ts HostView) — Rust is the wire truth.
   uint64 ready_images = 8;
   // Manifest digests of the prefetched images, sorted for deterministic
   // output. RUST-WIRE-ONLY, same note as ready_images.

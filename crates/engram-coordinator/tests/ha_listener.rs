@@ -169,6 +169,7 @@ async fn build_app_state(
         state.boot_bundles.clone(),
         Arc::new(tokio::sync::Notify::new()),
         Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
     ));
     state
 }
@@ -294,7 +295,6 @@ async fn cross_replica_scheduling_pins_and_tokens() {
                 last_heartbeat_at: chrono::Utc::now(),
                 host_addr: None,
                 ready_images: Vec::new(),
-                local_snapshots: Vec::new(),
                 current_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,
@@ -318,7 +318,6 @@ async fn cross_replica_scheduling_pins_and_tokens() {
                     },
                     utilization: Default::default(),
                     ready_images: vec![digest.clone()],
-                    local_snapshots: Vec::new(),
                     current_bundles: Vec::new(),
                     total_vcpus: 8,
                     wire_version: engram_protocol::WIRE_VERSION,
@@ -343,7 +342,7 @@ async fn cross_replica_scheduling_pins_and_tokens() {
     let ctx = ScheduleContext {
         repo: "r",
         image_version: "v",
-        prefer_snapshot_id: None,
+        snapshot_host: None,
         memory_mib: None,
         cpu_budget_vcpus: None,
         required_image_digest: Some(engram_protocol::heartbeat::ManifestDigest::new(

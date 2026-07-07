@@ -167,25 +167,61 @@ async fn advance_one(
     attempts: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_id = session.id;
-    // ADR 0045 C1 (the named follow-up in the module docs): take the
-    // session lease before driving a resume — a live migration's
-    // synchronous verb (or a peer pod's pipeline) may be mid-flight on
-    // this session; without the lease two actors can double-restore.
-    // Skip-if-held: the holder owns the session; we re-scan next tick.
-    let Some(_lease) = crate::idle_evictor::SessionLeaseGuard::try_acquire(state, session_id, None)
-        .await
-        .map_err(|e| format!("evac-resumer lease acquire: {e}"))?
+    // ADR 0045 C1 / ADR 0079: claim the session's op lane before driving
+    // a resume — a live migration's inline claim (or a peer pod's op) may
+    // be mid-flight on this session; without the claim two actors can
+    // double-restore. Claim-or-give-up: a busy lane means the holder owns
+    // the session; we re-scan next tick. The claim rides the op log
+    // (kind = resume, evac flavor); if this pod dies mid-pipeline the
+    // reclaim sweep re-claims the row and the resume verb terminally
+    // fails it (status Evacuating is not verb-resumable), freeing the
+    // lane for the next tick's fresh claim.
+    let Some(claim) = crate::session_ops::OpClaim::try_acquire(
+        state,
+        session_id,
+        engram_core::types::session_op::OpKind::Resume,
+        serde_json::json!({ "flavor": "evac" }),
+    )
+    .await
+    .map_err(|e| format!("evac-resumer op claim acquire: {e}"))?
     else {
-        tracing::debug!(%session_id, "evac-resumer: session lease held; skipping this tick");
+        tracing::debug!(%session_id, "evac-resumer: an op owns the session; skipping this tick");
         return Ok(());
     };
+    let result = advance_one_claimed(cfg, state, session, attempts, &claim).await;
+    match &result {
+        Ok(()) => {
+            claim
+                .finish(engram_core::types::session_op::OpState::Done, None)
+                .await
+        }
+        Err(e) => {
+            claim
+                .finish(
+                    engram_core::types::session_op::OpState::Failed,
+                    Some(&e.to_string()),
+                )
+                .await
+        }
+    }
+    result
+}
 
+/// The claimed body of [`advance_one`] — runs with the op lane held.
+async fn advance_one_claimed(
+    cfg: &EvacResumerConfig,
+    state: &SharedState,
+    session: Session,
+    attempts: u32,
+    claim: &crate::session_ops::OpClaim,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let session_id = session.id;
     // Issue #211 (ADR 0044 K5 shape, copied from idle_evictor): the
     // `candidates` list is a sweep snapshot up to ~10s stale. Without a
-    // post-lease re-read we could drive a resume — restoring a live VM
+    // post-claim re-read we could drive a resume — restoring a live VM
     // on a peer host and binding it — onto a row that has since gone
     // terminal (a `DELETE /sessions/:id` flips Evacuating→Failed) or was
-    // already relocated by a competitor. The lease is held until the
+    // already relocated by a competitor. The op claim is held until the
     // pipeline finishes, so once we hold it any concurrent actor has
     // fully completed; re-read the authoritative PG state and skip
     // unless the row is still `Evacuating` (the only legal input to the
@@ -198,14 +234,14 @@ async fn advance_one(
             tracing::info!(
                 %session_id,
                 state = s.status.as_str(),
-                "evac-resumer: session no longer Evacuating after lease (terminated or \
+                "evac-resumer: session no longer Evacuating after claim (terminated or \
                  relocated by a peer) — skipping",
             );
             return Ok(());
         }
         Ok(_) => {}
         Err(e) => {
-            return Err(format!("evac-resumer: re-read session state after lease: {e}").into());
+            return Err(format!("evac-resumer: re-read session state after claim: {e}").into());
         }
     }
 
@@ -213,7 +249,7 @@ async fn advance_one(
     // `/resume` manually. Idle is a legal target from Evacuating per
     // the legality table; the row's snapshot lineage is already
     // durable (it was captured before the pipeline marked the
-    // session Evacuating in `evict_session_to_state`), so /resume
+    // session Evacuating in the evict pipeline), so /resume
     // from Idle restores cleanly.
     if attempts >= cfg.max_attempts {
         match state
@@ -271,13 +307,14 @@ async fn advance_one(
         "evac-resumer: starting resume attempt",
     );
 
-    run_resume_pipeline(state, session).await?;
+    run_resume_pipeline(state, session, claim.fence()).await?;
     Ok(())
 }
 
 async fn run_resume_pipeline(
     state: &SharedState,
     session: Session,
+    fence: engram_core::traits::SessionFence,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_id = session.id;
     let snapshot = state
@@ -352,6 +389,7 @@ async fn run_resume_pipeline(
         // No origin preference: every scanner producer (drain, dead
         // host, migration parachute) is moving AWAY from the source.
         None,
+        fence,
     )
     .await
     {
@@ -465,7 +503,15 @@ async fn run_resume_pipeline(
     // Refresh the session row so finish_resume_to_active sees the
     // freshly-bound host_id + sandbox_id.
     let session_refreshed = state.services.meta.get_session(session_id).await?;
-    match finish_resume_to_active(state, &session_refreshed, receipt.new_sandbox_id, true).await {
+    match finish_resume_to_active(
+        state,
+        &session_refreshed,
+        receipt.new_sandbox_id,
+        true,
+        fence,
+    )
+    .await
+    {
         Ok(FinishResumeOutcome::Active) => {
             tracing::info!(
                 %session_id,
@@ -531,7 +577,6 @@ mod tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: live_disk,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         }
@@ -575,19 +620,17 @@ mod tests {
         )
     }
 
-    /// ADR 0045 C1: a held session lease (a live migration's
-    /// synchronous verb, a peer pod's pipeline) makes the scanner SKIP
-    /// the session this tick — no transition, no restore attempt, no
-    /// double-driving.
+    /// ADR 0045 C1 / ADR 0079: a RUNNING op on the session (a live
+    /// migration's inline claim, a peer pod's pipeline) makes the
+    /// scanner SKIP the session this tick — no transition, no restore
+    /// attempt, no double-driving.
     #[tokio::test]
-    async fn advance_one_skips_when_session_lease_held() {
+    async fn advance_one_skips_when_an_op_owns_the_session() {
         let session = evacuating_session(None);
         let session_id = session.id;
         let (state, meta) = build_state(session.clone());
-        assert!(meta
-            .try_acquire_session_lease(session_id, None, "rival-pod")
-            .await
-            .unwrap());
+        meta.ops
+            .seed_running(session_id, engram_core::types::session_op::OpKind::Teleport);
 
         advance_one(&EvacResumerConfig::default(), &state, session, 0)
             .await
@@ -597,7 +640,7 @@ mod tests {
         assert_eq!(
             after.status,
             SessionState::Evacuating,
-            "lease-held session must be left untouched for the holder",
+            "an op-owned session must be left untouched for the holder",
         );
     }
 

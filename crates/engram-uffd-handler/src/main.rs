@@ -197,6 +197,14 @@ mod linux {
         /// `HandlerControl` reports (Sealed/DrainProgress/DrainDone/
         /// PeerLost) to whichever host-agent dials in.
         pub control_sock: Option<PathBuf>,
+        /// ADR 0075: the substrate populate socket (the single-writer
+        /// host-agent). When set, chunk misses are populated by the
+        /// writer (its singleflight / pins / budget govern) and this
+        /// handler performs the readiness Hello BEFORE creating the
+        /// base-shm file or binding the FC-facing UDS. When unset
+        /// (tests, image-builder profile pass), misses take the
+        /// direct-blob fallback.
+        pub substrate_sock: Option<PathBuf>,
     }
 
     pub fn parse_args() -> Result<Args, String> {
@@ -216,6 +224,7 @@ mod linux {
         let mut peer_export_id: Option<String> = None;
         let mut peer_token: Option<String> = None;
         let mut control_sock: Option<PathBuf> = None;
+        let mut substrate_sock: Option<PathBuf> = None;
 
         let mut argv = std::env::args().skip(1);
         while let Some(arg) = argv.next() {
@@ -322,6 +331,12 @@ mod linux {
                             "--control-sock requires a value".to_string()
                         })?));
                 }
+                "--substrate-sock" => {
+                    substrate_sock =
+                        Some(PathBuf::from(argv.next().ok_or_else(|| {
+                            "--substrate-sock requires a value".to_string()
+                        })?));
+                }
                 "-h" | "--help" => {
                     eprintln!("{HELP}");
                     std::process::exit(0);
@@ -373,6 +388,7 @@ mod linux {
             peer_export_id,
             peer_token,
             control_sock,
+            substrate_sock,
         })
     }
 
@@ -426,12 +442,60 @@ mod linux {
             .await
             .map_err(|e| format!("create cache root {}: {e}", args.cache_root.display()))?;
 
+        // ADR 0075: dial the single writer and run the readiness Hello
+        // BEFORE any FC-facing surface exists (base-shm creation + the
+        // UDS bind happen downstream of here). A HelloAck with
+        // tmpfs_ok=false exits nonzero with a distinct string the
+        // host-agent surfaces in the spawn failure — the VM fails at
+        // spawn time instead of booting and later dying with
+        // `register memory … userfaultfd … System error`.
+        let populate = match &args.substrate_sock {
+            Some(sock) => {
+                let client = std::sync::Arc::new(
+                    engram_uffd_handler::populate_client::PopulateClient::new(sock.clone()),
+                );
+                match client.hello(Some(args.canonical_manifest), Some(args.session_manifest)) {
+                    Ok((tmpfs_ok, cache_writable)) => {
+                        if !tmpfs_ok {
+                            return Err(
+                                "substrate readiness: uffd base dir is NOT tmpfs — refusing to                                  serve (the guest would die later with `register memory …                                  userfaultfd … System error`)"
+                                    .to_string(),
+                            );
+                        }
+                        if !cache_writable {
+                            tracing::warn!(
+                                "substrate readiness: cache root not writable at the writer;                                  populates will fail to the direct-blob fallback",
+                            );
+                        }
+                        Some(client)
+                    }
+                    Err(e) => {
+                        // Hello failing at STARTUP means no writer is
+                        // serving this socket — and handler spawns are
+                        // host-agent-driven, so the writer is alive at
+                        // spawn in production. Run fallback-only rather
+                        // than paying the per-miss retry budget against
+                        // a socket that will not appear (FC test suites
+                        // and the image-builder profile pass hit this
+                        // arm by design).
+                        tracing::warn!(
+                            error = %e,
+                            "substrate Hello failed at startup; running fallback-only",
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         let backend = ChunkedMemoryBackend::from_blob_with_session_json(
             args.canonical_manifest,
             args.session_manifest,
             args.session_manifest_json.as_deref(),
             blob.clone(),
             &args.cache_root,
+            populate,
         )
         .await
         .map_err(|e| format!("build chunked backend: {e}"))?;

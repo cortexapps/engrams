@@ -76,7 +76,7 @@ else
         --source deploy/demo \
         --format ext4 \
         --images-dir ./var/integration/images \
-        --inject-agent "target/$TARGET/release/engram-agentd" \
+        --inject-init \
         --push "$IMAGE_URI" \
         2>&1 | tail -3
     # Base snapshot is captured at enable time (ADR 0020), not at bake — the
@@ -85,7 +85,7 @@ else
     echo "==> enable image over app-gRPC (blocks until the enable job is ready)"
     # ADR 0051 + ADR 0036: `image enable` enables AND polls the async
     # enable job internally, returning non-zero on job failure.
-    if ! "$ENGRAM_CLI" image enable --uri "$IMAGE_URI"; then
+    if ! "$ENGRAM_CLI" image enable --uri "$IMAGE_URI" --config deploy/demo/image-config.toml; then
         echo "ERROR: enabling $IMAGE_URI failed (enable job did not reach ready)" >&2
         exit 1
     fi

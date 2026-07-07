@@ -46,7 +46,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_core::types::shell::{ShellFrame, ShellTunnel};
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format, Transport};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::time::{sleep, timeout};
 
@@ -55,6 +55,13 @@ use tokio::time::{sleep, timeout};
 // 0064) landed needing the identical helpers.
 mod common;
 use common::{cleanup_host_state, fc_preflight, require_root, wait_for_guest_endpoints};
+
+/// ADR 0080: the musl agentd the staged bundle fixture packs (the same
+/// binary the old bake used to inject into the rootfs).
+fn agentd_musl_bin() -> PathBuf {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    Path::new(&manifest).join("../../target/x86_64-unknown-linux-musl/release/engram-agentd")
+}
 
 /// Bake a debian-slim rootfs with ttyd + the latest `engram-agentd`
 /// musl binary injected. Same shape as `proxy_e2e`'s bake, minus
@@ -122,11 +129,6 @@ async fn bake_shell_rootfs(repo: &str) -> PathBuf {
          RUN chmod +x /usr/local/bin/ttyd && mkdir -p /workspace\n",
     )
     .unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        format!("name = \"{repo}\"\n"),
-    )
-    .unwrap();
 
     let images_dir = tempfile::tempdir().expect("images");
     let images_dir_path = images_dir.path().to_path_buf();
@@ -148,8 +150,7 @@ async fn bake_shell_rootfs(repo: &str) -> PathBuf {
             tag: "warm-1".into(),
             images_dir: images_dir_path.clone(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent_bin,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: Transport::Vsock,
                 init_script: None,
@@ -295,6 +296,10 @@ async fn e2e_shell_cold_via_pooled_backend() {
     // ---- 2. Wrap FC in PooledBackend (exactly as host-agent does) ----
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agentd_musl_bin());
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
     let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
     fc.host_startup().await.expect("host_startup");
@@ -313,7 +318,7 @@ async fn e2e_shell_cold_via_pooled_backend() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
 
@@ -351,6 +356,10 @@ async fn e2e_shell_warm_via_pooled_backend() {
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agentd_musl_bin());
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
     let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
     fc.host_startup().await.expect("host_startup");
@@ -368,7 +377,7 @@ async fn e2e_shell_warm_via_pooled_backend() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
 
     // ---- Cold create + wait for VM to be ready ----
