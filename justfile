@@ -270,8 +270,29 @@ dev-down:
 # the Tiltfile reads ENGRAM_FC_COLIMA_PROFILE directly — this recipe is
 # sugar so you don't have to remember its name. First-time setup:
 # `just fc-colima-provision [profile]`.
-dev-fc profile='fc-dev':
-    ENGRAM_FC_COLIMA_PROFILE={{profile}} tilt up
+dev-fc profile='fc-dev' mac_docker_context='colima':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # ADR 0068: only the host-agent + FC stack run in the Colima VM (as a raw
+    # `colima ssh` process, NOT a container); the docker-compose deps stay on the
+    # Mac. `colima start` persistently repoints the docker CLI at the VM daemon
+    # (writes currentContext=colima-<profile> to ~/.docker/config.json), so a
+    # plain `tilt up` makes Tilt's docker_compose() deploy the deps INTO the VM —
+    # where they collide with the in-VM socat forwarders on :5001/:4443. Pin
+    # DOCKER_HOST to the Mac docker for the tilt process ONLY (no global-context
+    # mutation — other shells keep whatever colima set). Mac context defaults to
+    # `colima` (the default-profile daemon, per ADR 0068 "default Colima docker
+    # daemon untouched"); for Docker Desktop: `just dev-fc {{profile}} desktop-linux`.
+    mac_host="$(docker context inspect '{{mac_docker_context}}' 2>/dev/null \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["Endpoints"]["docker"]["Host"])' 2>/dev/null || true)"
+    if [ -z "$mac_host" ]; then
+        echo "dev-fc: docker context '{{mac_docker_context}}' not found or has no docker endpoint. Available:" >&2
+        docker context ls >&2
+        echo "Pass one explicitly, e.g.: just dev-fc {{profile}} desktop-linux" >&2
+        exit 1
+    fi
+    echo "dev-fc: compose deps -> Mac docker '{{mac_docker_context}}' ($mac_host); host-agent -> colima VM '{{profile}}'"
+    ENGRAM_FC_COLIMA_PROFILE={{profile}} DOCKER_HOST="$mac_host" tilt up
 
 # ADR 0068: create/update the named Colima VM (aarch64 Ubuntu, nested
 # virt, /dev/kvm, Firecracker + the aarch64 guest kernel, NBD/UFFD host

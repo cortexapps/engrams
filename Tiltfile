@@ -129,6 +129,29 @@ if fc_colima_profile:
              'running). Run `just fc-colima-provision {p}` first.')
                 .format(p=fc_colima_profile)
         )
+    # ADR 0068: the docker-compose deps (postgres/registry/fake-gcs/jaeger) MUST
+    # run on the Mac's docker, never inside the fc-dev VM — only the host-agent (a
+    # `colima ssh` PROCESS, not a container) + its FC stack belong there. But
+    # `colima start` persistently repoints the docker CLI at the VM daemon (writes
+    # currentContext=colima-<profile> to ~/.docker/config.json), so a bare
+    # `tilt up` would make docker_compose() deploy the deps INTO the VM — where
+    # they collide with the in-VM socat forwarders on :5001/:4443 and strand the
+    # coordinator's DB. `just dev-fc` pins DOCKER_HOST to the Mac docker; this
+    # guard fails fast if that DIDN'T happen (e.g. a direct `tilt up` under the
+    # stolen context) rather than silently misplacing the deps.
+    _docker_host = os.environ.get('DOCKER_HOST', '')
+    if not _docker_host:
+        _docker_host = str(local(
+            'docker context inspect --format "{{.Endpoints.docker.Host}}" 2>/dev/null || true',
+            echo_off=True, quiet=True)).strip()
+    if ('/' + fc_colima_profile + '/docker.sock') in _docker_host:
+        fail(
+            ("docker is pointed at the fc-dev VM daemon ({h}), so the compose " +
+             "deps would deploy INTO the VM instead of the Mac (ADR 0068). Start " +
+             "with `just dev-fc {p}` — it pins DOCKER_HOST to your Mac docker — or " +
+             "run `docker context use colima` before `tilt up`.")
+                .format(h=_docker_host, p=fc_colima_profile)
+        )
     sandbox_backend = 'firecracker'
 else:
     sandbox_backend = str(

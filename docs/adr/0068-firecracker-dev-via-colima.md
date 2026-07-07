@@ -157,3 +157,21 @@ When `ENGRAM_FC_COLIMA_PROFILE` is set, the Tiltfile:
     message printed raw `{path}` placeholders.
   - `ENGRAM_INTEG_TWO_HOSTS` + this mode is rejected at parse time (a second
     agent would need its own forwarded ports and NBD split inside the VM).
+- P2: **docker-context steal reaches `dev-fc`, not just provisioning.**
+  `colima start` doesn't just transiently steal the docker CLI context — it
+  writes `currentContext=colima-<profile>` into `~/.docker/config.json`, which
+  is sticky for every later shell. `fc-colima-provision.sh` captures/restores it
+  (P1), but `just dev-fc` was a bare `ENGRAM_FC_COLIMA_PROFILE=… tilt up` with no
+  restore, so whenever the profile had been (re)started outside the provision
+  wrapper (reboot/auto-start/manual `colima start`), Tilt inherited the VM
+  context and `docker_compose()` deployed postgres/registry/fake-gcs **into the
+  VM**. There the registry can't even bind — the in-VM socat forwarder already
+  owns `127.0.0.1:5001` (`0.0.0.0:5001` overlaps it) — and postgres only "works"
+  by colima re-forwarding its published port back to the Mac, which made
+  `just db-reset` wipe a DB the still-running coordinator couldn't see. Fix:
+  `dev-fc` now pins `DOCKER_HOST` to the Mac docker for the tilt process only
+  (resolved from a `mac_docker_context` param, default `colima`; no global
+  mutation), and the Tiltfile `fail()`s fast if the effective docker host is the
+  `colima-<profile>` VM socket — so the deps can never silently land in the VM
+  again (a direct `tilt up` under the stolen context is now a clear error, not a
+  half-broken stack).
