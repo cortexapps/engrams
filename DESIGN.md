@@ -370,7 +370,7 @@ pub trait SandboxBackend: Send + Sync {
 
 #### In-guest agent (`engram-agentd`)
 
-Firecracker has no "exec a command in a running guest" primitive. Production rootfs images include `engram-agentd` (`crates/engram-agentd`) — a small Rust binary baked into `/sbin/engram-agentd` that listens on AF_VSOCK port 1024 and proxies exec / stdin / stdout for the host agent. `SandboxBackend::exec_stream` on the Firecracker backend connects to Firecracker's vsock proxy at `<vsock_uds>`, performs the `CONNECT 1024\n` → `OK <peer_port>\n` handshake, sends a `WireExecRequest`, and streams `WireExecEvent`s back. Full design in the [In-guest agent](#in-guest-agent-engram-agentd) section below.
+Firecracker has no "exec a command in a running guest" primitive. Every guest runs `engram-agentd` (`crates/engram-agentd`) — a small Rust binary the stage-1 init copies out of its reserved bundle slot to `/run/engram/engram-agentd` and execs (ADR 0080; nothing engrams-owned is baked into the rootfs beyond the shim). It listens on AF_VSOCK port 1024 and proxies exec / stdin / stdout for the host agent. `SandboxBackend::exec_stream` on the Firecracker backend connects to Firecracker's vsock proxy at `<vsock_uds>`, performs the `CONNECT 1024\n` → `OK <peer_port>\n` handshake, sends a `WireExecRequest`, and streams `WireExecEvent`s back. Full design in the [In-guest agent](#in-guest-agent-engram-agentd) section below.
 
 ---
 
@@ -482,7 +482,7 @@ Phase 4 adds (1) and the trait surface for the others.
 
 ## In-guest agent (`engram-agentd`)
 
-A small Rust binary baked into every Firecracker rootfs at `/sbin/engram-agentd`, started at guest boot by a tiny init shim (`/sbin/engram-init`). Bridges the gap between Firecracker (which has no exec primitive) and the host agent. Lives at `crates/engram-agentd`.
+A small Rust binary every guest boots by exec'ing it out of the `agentd` bundle slot (ADR 0080) via the tiny baked init shim (`/sbin/engram-init`). Bridges the gap between Firecracker (which has no exec primitive) and the host agent. Lives at `crates/engram-agentd`.
 
 ```text
             host-agent                            ┌── guest VM ──────────┐
@@ -558,7 +558,7 @@ Production hardening will add a first-frame token handshake. Token injection opt
 
 ### Distribution
 
-`engram-agentd` is baked into every Firecracker rootfs at `/sbin/engram-agentd`, plus `/sbin/engram-init` (the init shim that brings up just enough kernel plumbing for the agent to talk vsock). Both injected by `engram-image-builder` when `BuildRequest.agent_injection` is set; the binary is built statically against musl (`x86_64-unknown-linux-musl`, release mode) so it runs in any base image regardless of the rootfs's libc / dynamic-linker layout.
+`engram-agentd` ships as the fleet `bundle-agentd` (reserved slot `dyn_1`, ADR 0080); the only baked file is `/sbin/engram-init` (the stage-1 init shim that brings up kernel plumbing, mounts the bundle slots, copies agentd to tmpfs, and execs it), injected by `engram-image-builder` when `BuildRequest.init_injection` is set. agentd is built statically against musl so it runs in any base image regardless of the rootfs's libc / dynamic-linker layout — and an agentd change ships by republishing the bundle, with zero image re-bakes and zero base-snapshot recaptures (fresh restores re-exec onto the swapped generation).
 
 Initial scope is exec-only — `Stat`/`Upload`/`Download`/`Ping`/`Shutdown` verbs from the original design are deferred. They'll land when the surface is needed (file upload for snapshot transfer, ping for liveness, etc.).
 

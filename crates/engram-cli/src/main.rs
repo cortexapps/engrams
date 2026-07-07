@@ -1132,7 +1132,7 @@ async fn image_build(
     let resolved_tag = tag
         .map(str::to_string)
         .unwrap_or_else(|| format!("warm-{}", Utc::now().format("%Y%m%dT%H%M%SZ")));
-    let init_injection = inject_init.then(|| engram_image_builder::InitInjection {
+    let init_injection = inject_init.then_some(engram_image_builder::InitInjection {
         // Reserved port engram-agentd listens on inside the guest.
         // Hard-coded here (and in engram-sandbox-firecracker as
         // ENGRAM_AGENTD_PORT) so the bake and the host's connect

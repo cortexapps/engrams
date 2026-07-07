@@ -39,7 +39,7 @@ use engram_core::types::sandbox::{
 };
 use engram_core::types::snapshot::MigrationSourceInfo;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{InitInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -200,10 +200,22 @@ async fn drain_wave_teleports_every_session_off_host_a() {
     // ADR 0080: one staged agentd bundle dir shared by both hosts (the
     // fleet stages identical generations).
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
-    let (pooled_a, _work_a) =
-        build_host("a", &kernel, &handler, &blob_root, &staged.bundle_dir, &chunk_store);
-    let (pooled_b, _work_b) =
-        build_host("b", &kernel, &handler, &blob_root, &staged.bundle_dir, &chunk_store);
+    let (pooled_a, _work_a) = build_host(
+        "a",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
+    let (pooled_b, _work_b) = build_host(
+        "b",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;

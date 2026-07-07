@@ -101,7 +101,13 @@ thing the restore path already swaps: the aux RO bundle drives
   cannot cold-boot — loud.
 - **Session create (fresh restore)**: the coordinator appends an
   agentd `AuxRoDrive` (slot 1, sha resolved from the fleet catalog) to
-  `selected_mounts`, exactly like the harness. The host `patch_drive`s
+  `selected_mounts`, exactly like the harness. Resolution is **soft
+  with a loud warn** when no host reports an `agentd` bundle: the
+  restore keeps the snapshot's pinned generation (hard-checked staged
+  at restore), so a bundle-less fleet (Process dev, mid-bring-up)
+  still binds sessions — it just can't roll agentd. Capture stays
+  hard: an FC/VZ host that stages no agentd bundle cannot cold-boot,
+  so mis-staging can't compound into new images. The host `patch_drive`s
   it in the paused window. **Latency guard (boot time is paramount):**
   the restore records whether the agentd slot's content actually
   changed vs. the snapshot's pin (`LiveSandbox.agentd_slot_swapped`);

@@ -23,9 +23,9 @@ Lanes:
   host_image    host_binaries OR host_base. The union gates the OSS
                 publish-host-binaries job — the GHCR artifact must exist at
                 this SHA for either downstream bake to consume.
-  cli_tools     engram-cli + engram-agentd changed — release closure of
-                {engram-cli, engram-agentd}. Gates the OSS publish-cli-tools
-                job, which republishes the "golden" cli+agentd GHCR artifact
+  cli_tools     engram-cli changed — release closure of {engram-cli}.
+                Gates the OSS publish-cli-tools job, which republishes the
+                "golden" cli GHCR artifact
                 (cli-tools) that the reusable bake-dev-image workflow pulls
                 instead of recompiling. Same role publish-host-binaries plays
                 for the FC-host bakes.
@@ -75,16 +75,23 @@ CONTAINER_BINS = {
 # NEITHER the container nor the host closure, so without this lane a
 # harness-only change shipped nothing (the bug this gate fixes).
 SESSION_HARNESS_BINS = {"engram-harness-claude"}
-# The ops CLI + the in-guest agent injected into session images at bake time.
-# OSS publishes them once as the `cli-tools` GHCR artifact (publish-cli-tools);
-# the reusable bake-dev-image workflow pulls that instead of compiling from a
-# source checkout — exactly how the FC-host bakes consume publish-host-binaries.
-# agentd must match the deployed coordinator, so a change to either binary (or
-# anything in its release closure) must republish cli-tools.
-CLI_TOOLS_BINS = {"engram-cli", "engram-agentd"}
+# The ops CLI. OSS publishes it once as the `cli-tools` GHCR artifact
+# (publish-cli-tools); the reusable bake-dev-image workflow pulls that instead
+# of compiling from a source checkout — exactly how the FC-host bakes consume
+# publish-host-binaries. ADR 0080: engram-agentd LEFT this set — agentd is no
+# longer injected into any image; it ships as `bundle-agentd` (see AGENTD_BINS
+# below), so an agentd change republishes a bundle instead of re-baking every
+# session image (the dev-brain wedge this ADR kills).
+CLI_TOOLS_BINS = {"engram-cli"}
+# ADR 0080: the in-guest agent, exec'd out of its reserved bundle slot by the
+# stage-1 init. A change to it (or its release closure) must republish
+# `bundle-agentd` via publish-bundles — the identical coupling (and failure
+# mode) as the harness: roll the fleet against a stale agentd bundle and every
+# fresh create runs yesterday's agentd.
+AGENTD_BINS = {"engram-agentd"}
 # The binaries the `test-e2e-stack` lane builds + boots: coord + host-agent
-# (the stack), cli (drives enable/registry), agentd (injected into the demo
-# image), and harness-claude (staged into the host bundle stamp; ADR 0062). A
+# (the stack), cli (drives enable/registry), agentd (staged into the host
+# bundle stamp; ADR 0080), and harness-claude (likewise; ADR 0062). A
 # change anywhere in their release closure means the e2e lane could behave
 # differently, so run it. Gates the (expensive, non-required) e2e lane.
 E2E_BINS = {
@@ -260,6 +267,7 @@ def main():
     fc = release_closure(meta, FC_BINS)
     cont = release_closure(meta, CONTAINER_BINS)
     harness = release_closure(meta, SESSION_HARNESS_BINS)
+    agentd_closure = release_closure(meta, AGENTD_BINS)
     cli_tools_closure = release_closure(meta, CLI_TOOLS_BINS)
     e2e_closure = release_closure(meta, E2E_BINS)
 
@@ -300,7 +308,11 @@ def main():
     # exact break that wedged harness attach after the #542 wire-10 roll (the
     # comment at SESSION_HARNESS_BINS promised this republish but only the
     # dev_image half was ever wired).
-    bundles = any_path(changed, BUNDLES_PATHS) or harness_changed
+    # ADR 0080: an agentd-source change republishes `bundle-agentd` — the
+    # bundle IS the delivery vehicle (no image carries agentd), so without
+    # this term an agentd change ships nothing.
+    agentd_changed = bool(cc & agentd_closure)
+    bundles = any_path(changed, BUNDLES_PATHS) or harness_changed or agentd_changed
     dev_image = (
         images
         or host_binaries

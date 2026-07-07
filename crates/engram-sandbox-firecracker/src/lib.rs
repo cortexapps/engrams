@@ -24,7 +24,7 @@
 //! are verified by `tests/snapshot.rs` and `tests/snapshot_uffd.rs`.
 //!
 //! End-to-end `tests/exec_real_vm.rs` bakes a debian-slim rootfs with
-//! a static-musl `engram-agentd` injected at `/sbin/engram-agentd`,
+//! a static-musl `engram-agentd` exec'd out of its bundle slot (ADR 0080),
 //! boots it under FC with `init=/sbin/engram-init`, and round-trips
 //! an exec through the agent over vsock — the whole `SandboxBackend`
 //! contract works against a real microVM.
@@ -2051,16 +2051,18 @@ impl FirecrackerBackend {
                     ))
                 })
             };
-            let sentinel_sha = stamp_for(AuxRoDrive::SENTINEL_STAMP_KEY)?;
-            let agentd_sha = stamp_for(AuxRoDrive::AGENTD_STAMP_KEY)?;
             for drive in &mut spec.aux_ro_drives {
                 if drive.sha256.is_none() {
-                    drive.sha256 =
-                        Some(if drive.slot_index() == Some(AuxRoDrive::AGENTD_SLOT_INDEX) {
-                            agentd_sha.clone()
-                        } else {
-                            sentinel_sha.clone()
-                        });
+                    // Lazy per-slot: only demand the stamp keys the spec's
+                    // symbolic slots actually reference (a sentinel-only
+                    // spec must not require an agentd entry, and vice
+                    // versa).
+                    let key = if drive.slot_index() == Some(AuxRoDrive::AGENTD_SLOT_INDEX) {
+                        AuxRoDrive::AGENTD_STAMP_KEY
+                    } else {
+                        AuxRoDrive::SENTINEL_STAMP_KEY
+                    };
+                    drive.sha256 = Some(stamp_for(key)?);
                 }
             }
         }
@@ -4652,11 +4654,9 @@ impl SandboxBackend for FirecrackerBackend {
                     tracing::debug!(sandbox_id = %id, restarting, ?sha256, "RefreshAgent reply");
                     Ok(restarting)
                 }
-                Ok(engram_agentd::WireResponse::Error { kind, message }) => {
-                    Err(SandboxError::Vm(
-                        format!("refresh_agent: agentd error ({kind}): {message}").into(),
-                    ))
-                }
+                Ok(engram_agentd::WireResponse::Error { kind, message }) => Err(SandboxError::Vm(
+                    format!("refresh_agent: agentd error ({kind}): {message}").into(),
+                )),
                 Ok(other) => Err(SandboxError::Vm(
                     format!("refresh_agent: unexpected response: {other:?}").into(),
                 )),
@@ -4688,8 +4688,9 @@ impl SandboxBackend for FirecrackerBackend {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let probe = async {
-                let mut conn =
-                    Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await.ok()?;
+                let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+                    .await
+                    .ok()?;
                 engram_agentd::write_msg(&mut conn, &WireRequest::Ping)
                     .await
                     .ok()?;
@@ -5997,6 +5998,36 @@ mod tests {
             }
             Err(_) => {} // FC spawn failure — past the resolve step.
             Ok(_) => panic!("create can't succeed without a real firecracker"),
+        }
+    }
+
+    /// ADR 0080: the agentd slot resolves against the `agentd` stamp key —
+    /// and a stamp without it is loud (a host that can't boot the agentd
+    /// slot can't cold-boot at all). The lookup is lazy per-slot: the
+    /// sentinel-only specs above never demand an `agentd` entry.
+    #[tokio::test]
+    async fn create_with_agentd_slot_demands_agentd_stamp_key() {
+        let (b, d) = backend();
+        std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
+        let rootfs = d.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"not-really-ext4").unwrap();
+        let bundle_dir = d.path().join("bundles");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        let sha = "a".repeat(64);
+        // Stamp carries only the sentinel — the agentd slot must fail loud.
+        std::fs::write(
+            bundle_dir.join(AuxRoDrive::CURRENT_STAMP),
+            format!("{{\"{}\": \"{sha}\"}}", AuxRoDrive::SENTINEL_STAMP_KEY),
+        )
+        .unwrap();
+        let mut sp = spec();
+        sp.rootfs_source = Some(rootfs.clone());
+        sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(AuxRoDrive::AGENTD_SLOT_INDEX)];
+        match b.create(sp).await {
+            Err(SandboxError::InvalidSpec(msg)) => {
+                assert!(msg.contains(AuxRoDrive::AGENTD_STAMP_KEY), "{msg}");
+            }
+            other => panic!("expected InvalidSpec(missing agentd), got {other:?}"),
         }
     }
 

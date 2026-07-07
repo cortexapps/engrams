@@ -426,17 +426,17 @@ jobs:
             firecracker:application/octet-stream
           echo "Published forked firecracker -> $REPO:$FC_SHA"
 
-  # Compile the ops CLI + the in-guest agentd ONCE — the exact, CI-tested
-  # binaries — and publish them to GHCR as an OCI artifact keyed by SHA. The
-  # reusable bake-dev-image.yml workflow (and any consuming repo's dev-image
-  # bake) pulls these instead of compiling from a private source checkout —
-  # exactly how the FC-host bakes consume publish-host-binaries, and for the
-  # same reason: the bake that ships is the bake CI tested, and the consuming
-  # workflow needs no Rust toolchain. agentd matches the deployed coordinator at
-  # the moving `main` tag (the same contract host-binaries:main relies on).
-  # engram-agentd is static-musl (injected into the guest rootfs at bake);
-  # engram-cli is the runner-native gnu build — it only ever runs on the ubuntu
-  # bake runner, so gnu is correct and dodges a musl reqwest/TLS rebuild.
+  # Compile the ops CLI ONCE — the exact, CI-tested binary — and publish it to
+  # GHCR as an OCI artifact keyed by SHA. The reusable bake-dev-image.yml
+  # workflow (and any consuming repo's dev-image bake) pulls this instead of
+  # compiling from a private source checkout — exactly how the FC-host bakes
+  # consume publish-host-binaries, and for the same reason: the bake that
+  # ships is the bake CI tested, and the consuming workflow needs no Rust
+  # toolchain. ADR 0080: engram-agentd LEFT this artifact — no bake injects
+  # agentd anymore; it ships as `bundle-agentd` via publish-bundles and every
+  # guest execs it out of the staged bundle slot. engram-cli is the
+  # runner-native gnu build — it only ever runs on the ubuntu bake runner, so
+  # gnu is correct and dodges a musl reqwest/TLS rebuild.
   publish-cli-tools:
     needs: detect
     if: needs.detect.outputs.cli_tools == 'true' || github.event_name == 'workflow_dispatch'
@@ -450,12 +450,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Set up Rust (stable + musl target)
+      - name: Set up Rust (stable)
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
 
-      # engram-protocol/build.rs (transitively, via engram-agentd) invokes
+      # engram-protocol/build.rs (transitively, via engram-cli) invokes
       # protoc. Pin an exact tag — the action's default semver range hits the
       # GitHub releases API, which flakes on the shared Blacksmith IP pool.
       - uses: arduino/setup-protoc@v3
@@ -466,21 +464,14 @@ jobs:
       - name: Cache cargo build state
         uses: Swatinem/rust-cache@v2
 
-      - name: Install musl-tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
-
-      - name: Build engram-cli (gnu) + engram-agentd (musl-static)
+      - name: Build engram-cli (gnu)
         run: |
-          # agentd is injected into the guest rootfs, so it must be static-musl
-          # (no glibc loader inside the minimal guest).
-          cargo build --release --target x86_64-unknown-linux-musl -p engram-agentd
           # engram-cli drives the bake on the host runner; the runner-native gnu
           # build is correct and avoids the musl reqwest/TLS rebuild.
           cargo build --release -p engram-cli
           mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/engram-agentd dist/
           cp target/release/engram-cli dist/
-          file dist/engram-cli dist/engram-agentd
+          file dist/engram-cli
 
       # ADR 0036: bundle the pinned STATIC mke2fs (e2fsprogs >= 1.47.1, honors
       # SOURCE_DATE_EPOCH) INTO cli-tools, alongside engram-cli. Then every
@@ -520,13 +511,12 @@ jobs:
           set -euo pipefail
           REPO="ghcr.io/${{ github.repository }}/cli-tools"
           SHORT="${SHA:0:7}"
-          # All three as one artifact tagged by full SHA. `oras pull
-          # <repo>/cli-tools:<ref>` drops engram-cli + engram-agentd + the pinned
-          # mke2fs into cwd (consumers chmod +x — oras doesn't preserve the bit).
+          # Both as one artifact tagged by full SHA. `oras pull
+          # <repo>/cli-tools:<ref>` drops engram-cli + the pinned mke2fs into
+          # cwd (consumers chmod +x — oras doesn't preserve the bit).
           oras push "$REPO:$SHA" \
             --artifact-type application/vnd.engrams.cli-tools.v1 \
             engram-cli:application/octet-stream \
-            engram-agentd:application/octet-stream \
             mke2fs:application/octet-stream
           oras tag "$REPO:$SHA" "$SHORT"
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
@@ -676,7 +666,9 @@ jobs:
           set -euo pipefail
           # Keep CLAUDE_VERSION in lockstep with ci.yml's bake-harness-claude-artifact.
           CLAUDE_VERSION=2.1.185
-          cargo build --release --target x86_64-unknown-linux-musl -p engram-harness-claude
+          # ADR 0080: agentd ships as bundle-agentd off this same musl build
+          # (no image bake carries it anymore).
+          cargo build --release --target x86_64-unknown-linux-musl -p engram-harness-claude -p engram-agentd
           curl -fsSL --retry 3 \
             "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
             -o /tmp/claude
@@ -707,6 +699,10 @@ jobs:
           deploy/bundles/browser/build.sh dist/browser.squashfs
           # ADR 0062: the built-in claude harness (tree staged above).
           deploy/bundles/harness-claude/build.sh var/harness-claude-stage dist/harness-claude.squashfs
+          # ADR 0080: agentd — the guest control surface, exec'd out of this
+          # bundle by the stage-1 init; an agentd change ships fleet-wide by
+          # republishing this (zero image re-bakes / recaptures).
+          deploy/bundles/agentd/build.sh target/x86_64-unknown-linux-musl/release/engram-agentd dist/agentd.squashfs
           ls -l dist/
 
       - name: Log in to GHCR
@@ -725,7 +721,7 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${SHA:0:7}"
-          for name in sentinel skills integrations-cli browser harness-claude; do
+          for name in sentinel skills integrations-cli browser harness-claude agentd; do
             REPO="ghcr.io/${{ github.repository }}/bundle-$name"
             # `oras pull <repo>:<sha>` drops <name>.squashfs into cwd verbatim.
             oras push "$REPO:$SHA" \

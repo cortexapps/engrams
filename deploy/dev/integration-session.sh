@@ -60,7 +60,7 @@ else
         --source deploy/demo \
         --format ext4 \
         --images-dir ./var/integration/images \
-        --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \
+        --inject-init \
         --push "$IMAGE_URI" \
         2>&1 | tail -3
     # Base snapshot is captured at enable time (ADR 0020), not at bake — the

@@ -857,6 +857,7 @@ jobs:
             --test snapshot \
             --test snapshot_uffd \
             --test exec_real_vm \
+            --test agentd_bundle_reexec \
             --test baked_harness_loopback \
             --test forge_loopback \
             --test upload_loopback \
@@ -1017,6 +1018,10 @@ jobs:
       # which Blacksmith runners provide; the other bundles in the recipe
       # degrade gracefully if their build skips (e2e_vnc only needs `browser`).
       - name: Stage browser bundle for e2e_vnc (ADR 0064)
+        env:
+          # ADR 0080: `bundles-squashfs` also packs `bundle-agentd`; reuse the
+          # musl agentd this lane already built instead of a second compile.
+          ENGRAM_AGENTD_BIN: target/x86_64-unknown-linux-musl/release/engram-agentd
         run: |
           just bundles-squashfs
           ls -l var/shared/
@@ -1310,8 +1315,9 @@ jobs:
 
       - name: Build engram-cli + static-musl agentd
         run: |
-          # Static-musl agentd goes inside the guest rootfs via
-          # --inject-agent. (ADR 0015 M1 collapsed engram-bootstrap
+          # Static-musl agentd is packed into `bundle-agentd` by
+          # `just bundles-squashfs` (ADR 0080 — nothing injects it into a
+          # rootfs anymore). (ADR 0015 M1 collapsed engram-bootstrap
           # into engram-agentd, `75ba2df`.)
           cargo build --release --target x86_64-unknown-linux-musl \
               -p engram-agentd
@@ -1777,6 +1783,10 @@ jobs:
           # Point `just bundles-squashfs` (tilt runs it next) at this downloaded
           # tree so it packs `harness-claude` into var/shared's stamp.
           echo "ENGRAM_HARNESS_CLAUDE_TREE=$PWD/var/harness-claude-stage" >> "$GITHUB_ENV"
+          # ADR 0080: likewise hand it the pre-built musl agentd (downloaded
+          # with the e2e binaries above) so packing `bundle-agentd` doesn't
+          # recompile anything in this no-cargo lane.
+          echo "ENGRAM_AGENTD_BIN=$PWD/target/x86_64-unknown-linux-musl/release/engram-agentd" >> "$GITHUB_ENV"
 
       # `just bundles-squashfs` (the tilt `bundles` resource) packs the RO bundles
       # with mksquashfs, so squashfs-tools must be on PATH before the stack comes up.

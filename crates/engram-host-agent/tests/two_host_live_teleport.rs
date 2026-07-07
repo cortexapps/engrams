@@ -33,7 +33,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_core::types::snapshot::MigrationSourceInfo;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{InitInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -55,7 +55,15 @@ fn build_host(
     bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
-    build_host_with_nbd(label, kernel, handler, blob_root, bundle_dir, chunk_store, None)
+    build_host_with_nbd(
+        label,
+        kernel,
+        handler,
+        blob_root,
+        bundle_dir,
+        chunk_store,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // cohesive host-fixture inputs
@@ -191,10 +199,22 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
-    let (pooled_a, _work_a) =
-        build_host("a", &kernel, &handler, &blob_root, &staged.bundle_dir, &chunk_store);
-    let (pooled_b, _work_b) =
-        build_host("b", &kernel, &handler, &blob_root, &staged.bundle_dir, &chunk_store);
+    let (pooled_a, _work_a) = build_host(
+        "a",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
+    let (pooled_b, _work_b) = build_host(
+        "b",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
@@ -603,10 +623,22 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
-    let (pooled_a, _work_a) =
-        build_host("pipe-a", &kernel, &handler, &blob_root, &staged.bundle_dir, &chunk_store);
-    let (pooled_b, _work_b) =
-        build_host("pipe-b", &kernel, &handler, &blob_root, &staged.bundle_dir, &chunk_store);
+    let (pooled_a, _work_a) = build_host(
+        "pipe-a",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
+    let (pooled_b, _work_b) = build_host(
+        "pipe-b",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
@@ -1115,10 +1147,22 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
-    let (pooled_a, _work_a) =
-        build_host("ka", &kernel, &handler, &blob_root, &staged.bundle_dir, &chunk_store);
-    let (pooled_b, _work_b) =
-        build_host("kb", &kernel, &handler, &blob_root, &staged.bundle_dir, &chunk_store);
+    let (pooled_a, _work_a) = build_host(
+        "ka",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
+    let (pooled_b, _work_b) = build_host(
+        "kb",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;

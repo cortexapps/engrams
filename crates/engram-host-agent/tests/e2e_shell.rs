@@ -46,7 +46,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_core::types::shell::{ShellFrame, ShellTunnel};
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{InitInjection, BuildRequest, Builder, DockerCli, Format, Transport};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::time::{sleep, timeout};
 

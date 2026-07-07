@@ -39,7 +39,7 @@ use engram_harness_proto::{
     read_msg, write_msg, HarnessAttach, HarnessAttachAck, HarnessEvent, HarnessFrame,
     HARNESS_VSOCK_PORT,
 };
-use engram_image_builder::{InitInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::time::timeout;
 

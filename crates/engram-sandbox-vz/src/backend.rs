@@ -242,7 +242,10 @@ impl VzBackend {
         })?;
         let stamp: std::collections::HashMap<String, String> = serde_json::from_slice(&bytes)
             .map_err(|e| {
-                SandboxError::InvalidSpec(format!("parse bundle stamp {}: {e}", stamp_path.display()))
+                SandboxError::InvalidSpec(format!(
+                    "parse bundle stamp {}: {e}",
+                    stamp_path.display()
+                ))
             })?;
         let sha = stamp.get(AuxRoDrive::AGENTD_STAMP_KEY).ok_or_else(|| {
             SandboxError::InvalidSpec(format!(

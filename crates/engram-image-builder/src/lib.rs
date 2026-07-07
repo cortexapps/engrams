@@ -1214,7 +1214,7 @@ fn render_manifest_value(manifest: &ImageManifest) -> Result<String, BuildError>
         .map_err(|e| BuildError::Config(format!("render manifest: {e}")))
 }
 
-/// Copy the agent binary into `<rootfs>/sbin/engram-agentd`, write the
+/// Write the stage-1 init shim into `<rootfs>/sbin/engram-init` — the
 /// init shim to `<rootfs>/sbin/engram-init`, and chmod 0755 on both.
 /// Mirrors the layout the kernel boot args expect:
 /// `init=/sbin/engram-init`.

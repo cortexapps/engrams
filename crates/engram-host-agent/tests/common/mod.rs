@@ -258,11 +258,8 @@ pub fn stage_agentd_bundle(bundle_dir: &Path, agentd_binary: &Path) -> StagedAge
         )
         .expect("chmod agentd");
     }
-    std::fs::write(
-        tree.path().join("agentd.sha256"),
-        format!("{binary_sha}\n"),
-    )
-    .expect("write agentd stamp");
+    std::fs::write(tree.path().join("agentd.sha256"), format!("{binary_sha}\n"))
+        .expect("write agentd stamp");
     let agentd_sha = stage(&pack(tree.path()));
 
     // Sentinel: the minimal placeholder every other reserved slot
