@@ -406,9 +406,13 @@ async fn resume_origin_enqueue_requires_idle() {
     let sid = SessionId::new();
     enqueue(&meta, sid, spec(), 4096, 2).await;
     // It's `queued`, not `idle`, so enqueue_session_resume is a no-op.
-    meta.enqueue_session_resume(sid)
+    // (Epoch 0 = the row's fresh `current_epoch` default — no op has
+    // ever claimed this session.)
+    let landed = meta
+        .enqueue_session_resume(sid, 0)
         .await
         .expect("resume enqueue no-op");
+    assert!(!landed, "a non-idle row must not be re-queued");
     let row = meta.get_session(sid).await.unwrap();
     // Still a create-origin queued row.
     assert_eq!(row.status, SessionState::Queued);
@@ -804,9 +808,14 @@ async fn resume_origin_timeout_returns_to_idle() {
     meta.transition_session(sid, SessionState::Idle)
         .await
         .expect("Active->Idle");
-    meta.enqueue_session_resume(sid)
+    let landed = meta
+        .enqueue_session_resume(sid, 0)
         .await
         .expect("enqueue resume");
+    assert!(
+        landed,
+        "the Idle row (epoch 0, never op-claimed) must queue"
+    );
     // Nothing in the fleet can satisfy a resume-origin session with this
     // large a budget — but `enqueue_session_resume` doesn't carry budgets
     // (resume re-derives them at dequeue time via the session's live disk
@@ -973,9 +982,11 @@ async fn enqueue_session_resume_noop_does_not_notify_placement_changed() {
         .expect("listener stayed open");
     assert_eq!(seed_notify.payload(), "enqueued");
 
-    meta.enqueue_session_resume(sid)
+    let landed = meta
+        .enqueue_session_resume(sid, 0)
         .await
         .expect("resume enqueue no-op");
+    assert!(!landed, "a non-idle row must not be re-queued");
     let row = meta.get_session(sid).await.unwrap();
     assert_eq!(
         row.status,

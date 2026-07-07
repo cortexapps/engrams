@@ -231,9 +231,16 @@ pub trait MetadataStore: Send + Sync {
     // ---- ADR 0048: session queue ----
 
     /// Park an `Idle` session that hit no capacity on resume back in the
-    /// queue (`Idle → queued`, `queue_origin = 'resume'`). Default no-op.
-    async fn enqueue_session_resume(&self, _id: SessionId) -> Result<(), MetaError> {
-        Ok(())
+    /// queue (`Idle → queued`, `queue_origin = 'resume'`), fenced by the
+    /// resume op's epoch (ADR 0079: `sessions.current_epoch = epoch` —
+    /// every sibling write in the op pipeline is fenced, and this one
+    /// must be too or a reclaimed-away zombie executor forks the state
+    /// machine). Returns whether the flip landed: `false` means the row
+    /// was no longer `Idle` (a racing writer advanced it) OR the epoch
+    /// moved (a successor re-claimed) — either way the caller must stop
+    /// without emitting the Queued event. Default no-op: `false`.
+    async fn enqueue_session_resume(&self, _id: SessionId, _epoch: i64) -> Result<bool, MetaError> {
+        Ok(false)
     }
 
     /// Every `queued` session, oldest-first (FIFO). The scanner walks

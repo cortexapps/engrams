@@ -897,6 +897,31 @@ mod tests {
     use engram_core::types::session_op::{EnqueueOutcome, OpState};
     use engram_core::SessionId;
 
+    /// ADR 0078 re-review (finding #2): a transient placement failure —
+    /// `PickError::HostUnreachable` (the picked host couldn't be dialed)
+    /// or `PickError::Internal` (the hosts read hiccuped) — must surface
+    /// through the `SandboxError → ApiError` chain as a RETRYABLE verb
+    /// outcome, not terminal `Failed`. Pre-0079 the wire caller retried
+    /// around the resume; the verb now owns the only attempt (bounded by
+    /// `RESUME_MAX_ATTEMPTS`).
+    #[test]
+    fn transient_pick_errors_map_to_retry_not_failed() {
+        for pick_err in [
+            crate::placement::PickError::HostUnreachable(
+                engram_core::HostId::new(),
+                "dial refused".into(),
+            ),
+            crate::placement::PickError::Internal("list_active_hosts: pg timeout".into()),
+        ] {
+            let sandbox_err: engram_core::SandboxError = pick_err.clone().into();
+            let outcome = outcome_from_api_error(ApiError::from(sandbox_err));
+            assert!(
+                matches!(outcome, OpOutcome::Retry(_)),
+                "{pick_err:?} must map to OpOutcome::Retry, the transient contract",
+            );
+        }
+    }
+
     /// Moved with `failure_backoff` from the retired `outbox_delivery`
     /// driver (ADR 0079 pass 2).
     #[test]
