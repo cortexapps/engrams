@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { PlusIcon, XIcon } from "lucide-react";
 import { create } from "@bufbuild/protobuf";
+import { ConnectError, Code } from "@connectrpc/connect";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useFieldArray, useForm, useWatch, type Control } from "react-hook-form";
 import * as z from "zod";
@@ -10,17 +11,22 @@ import {
   useEnableImage,
   useEnabledImages,
   useRefreshEnabledImage,
+  useUpdateImage,
 } from "../../hooks/useEnabledImages";
 import { isJobActive, useEnableJobs, useRetryEnableJob } from "../../hooks/useEnableJobs";
+import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
 import type { EnableJob, EnabledImageSummary } from "../../lib/types";
 import {
   CaptureEnvEntrySchema,
   ImageConfigSchema,
   ImageResourcesSchema,
   ImageWarmConfigSchema,
+  type ImageConfig,
 } from "../../gen/engram/app/v1/image_pb";
+import { ProfileNetworkSchema } from "../../gen/engram/app/v1/profile_pb";
 import { errorMessage } from "../../lib/errors";
 import { PageHeading } from "../page-heading";
+import { OrgSecretCombobox } from "../integrations/OrgSecretCombobox";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -36,6 +42,7 @@ import {
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
   SelectContent,
@@ -281,6 +288,8 @@ const enableImageSchema = z
     imageUri: z.string().trim().min(1, "image URI is required"),
     name: z.string().trim().min(1, "name is required"),
     description: z.string(),
+    envRows: z.array(z.object({ key: z.string(), value: z.string() })),
+    workdir: z.string(),
     vcpus: z
       .string()
       .trim()
@@ -289,8 +298,22 @@ const enableImageSchema = z
       .string()
       .trim()
       .regex(/^(?:[1-9]\d*)?$/, "memory must be a positive integer (MiB)"),
+    diskGib: z
+      .string()
+      .trim()
+      .regex(/^(?:[1-9]\d*)?$/, "disk must be a positive integer (GiB)"),
     warmCommand: z.string(),
+    warmTimeoutSecs: z
+      .string()
+      .trim()
+      .regex(/^(?:[1-9]\d*)?$/, "timeout must be a positive integer (seconds)"),
+    warmWorkdir: z.string(),
     captureEnv: z.array(captureEnvRowSchema),
+    // "none" = no warm.network at all (egress-less capture); "deny"/"allow"
+    // map to ProfileNetwork.default. Sent only when a warm command is set.
+    netDefault: z.enum(["none", "deny", "allow"]),
+    allowHostsText: z.string(),
+    allowPatternsText: z.string(),
   })
   .refine((v) => v.warmCommand.trim() !== "" || v.captureEnv.every((r) => r.name.trim() === ""), {
     message: "warm env needs a warm command — everything warm rides the [warm] block",
@@ -299,32 +322,108 @@ const enableImageSchema = z
 type EnableImageValues = z.infer<typeof enableImageSchema>;
 
 // Pre-fill the full-config form from the enabled row (edit mode) or with
-// blank/default values (first enable).
+// blank/default values (first enable). Every ImageConfig field must seed
+// from the row so an untouched re-submit reproduces the row's config
+// exactly (the server then treats it as a cheap no-op edit, not a
+// recapture) — see buildConfig for the inverse.
 function formDefaults(image?: EnabledImageSummary): EnableImageValues {
   return {
     imageUri: image?.image_uri ?? "",
     name: image?.name ?? "",
     description: image?.description ?? "",
+    envRows: Object.entries(image?.env ?? {}).map(([key, value]) => ({ key, value })),
+    workdir: image?.workdir ?? "",
     vcpus: image?.suggested_vcpus != null ? String(image.suggested_vcpus) : "2",
     memoryMib: image?.suggested_memory_mib != null ? String(image.suggested_memory_mib) : "",
+    diskGib: image?.suggested_disk_gib != null ? String(image.suggested_disk_gib) : "",
     warmCommand: (image?.warm_command ?? []).join(" "),
+    warmTimeoutSecs: image?.warm_timeout_secs != null ? String(image.warm_timeout_secs) : "",
+    warmWorkdir: image?.warm_workdir ?? "",
     captureEnv: (image?.capture_env ?? []).map((v) => ({
       name: v.name,
       kind: v.kind,
       value: v.value,
     })),
+    netDefault: image?.warm_network ? image.warm_network.default : "none",
+    allowHostsText: (image?.warm_network?.allow_hosts ?? []).join("\n"),
+    allowPatternsText: (image?.warm_network?.allow_host_patterns ?? []).join("\n"),
   };
 }
 
-// One editable capture-env row: name · type toggle · value · remove. The
-// value placeholder follows the selected type (literal vs secret ref).
+const linesOf = (text: string) =>
+  text
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+// Form values → the full proto ImageConfig (ADR 0080: always the whole
+// config; the server replaces wholesale). The inverse of formDefaults:
+// empty-string optionals stay ABSENT (undefined), never become "" — the
+// round-trip invariant the cheap-edit path depends on.
+function buildConfig(data: EnableImageValues): ImageConfig {
+  const env: Record<string, string> = {};
+  // Last write wins on a duplicate key, matching the profile env editor.
+  for (const r of data.envRows) if (r.key.trim()) env[r.key.trim()] = r.value;
+  // Skip env rows with an empty name; map each surviving row's type toggle
+  // to the proto oneof.
+  const warmEnv = data.captureEnv
+    .filter((r) => r.name.trim() !== "")
+    .map((r) =>
+      create(CaptureEnvEntrySchema, {
+        name: r.name.trim(),
+        value: {
+          case: r.kind === "secret_ref" ? "secretRef" : "literal",
+          value: r.value,
+        },
+      }),
+    );
+  const warmCommand = data.warmCommand.trim();
+  return create(ImageConfigSchema, {
+    name: data.name,
+    description: data.description.trim() || undefined,
+    env,
+    workdir: data.workdir.trim() || undefined,
+    resources: create(ImageResourcesSchema, {
+      suggestedVcpus: Number(data.vcpus),
+      suggestedMemoryMib: data.memoryMib ? Number(data.memoryMib) : undefined,
+      suggestedDiskGib: data.diskGib ? Number(data.diskGib) : undefined,
+    }),
+    // Empty command = no [warm] hook (the schema already rejects warm env
+    // without a command; timeout/workdir/network ride the block too).
+    warm: warmCommand
+      ? create(ImageWarmConfigSchema, {
+          command: warmCommand.split(/\s+/),
+          timeoutSecs: data.warmTimeoutSecs ? BigInt(data.warmTimeoutSecs) : undefined,
+          workdir: data.warmWorkdir.trim() || undefined,
+          env: warmEnv,
+          // "none" = unset = egress-less capture (ADR 0080).
+          network:
+            data.netDefault !== "none"
+              ? create(ProfileNetworkSchema, {
+                  default: data.netDefault,
+                  allowHosts: linesOf(data.allowHostsText),
+                  allowHostPatterns: linesOf(data.allowPatternsText),
+                })
+              : undefined,
+        })
+      : undefined,
+  });
+}
+
+// One editable capture-env row: name · type toggle · value · remove. A
+// secret_ref row picks an org-secret name via the same typeahead the
+// profile secrets editor uses (only names cross the wire, never values);
+// a literal row keeps the plain input.
 function CaptureEnvRow({
   control,
   index,
+  secretNames,
   onRemove,
 }: {
   control: Control<EnableImageValues>;
   index: number;
+  /** Existing org-secret names for the secret-ref typeahead. */
+  secretNames: string[];
   onRemove: () => void;
 }) {
   const kind = useWatch({ control, name: `captureEnv.${index}.kind` });
@@ -362,18 +461,26 @@ function CaptureEnvRow({
       <Controller
         control={control}
         name={`captureEnv.${index}.value`}
-        render={({ field }) => (
-          <Input
-            {...field}
-            className="font-mono"
-            placeholder={
-              kind === "secret_ref" ? "gcp-sm://…/secrets/foo/versions/latest" : "literal value"
-            }
-            aria-label="Variable value"
-            spellCheck={false}
-            autoCapitalize="off"
-          />
-        )}
+        render={({ field }) =>
+          kind === "secret_ref" ? (
+            <OrgSecretCombobox
+              value={field.value}
+              onChange={field.onChange}
+              secretNames={secretNames}
+              placeholder="org-secret name (ref)"
+              className="min-w-0 flex-1"
+            />
+          ) : (
+            <Input
+              {...field}
+              className="font-mono"
+              placeholder="literal value"
+              aria-label="Variable value"
+              spellCheck={false}
+              autoCapitalize="off"
+            />
+          )
+        }
       />
       <Button
         type="button"
@@ -389,12 +496,71 @@ function CaptureEnvRow({
   );
 }
 
+// One editable image-env row (config.env): key · value · remove. Mirrors
+// the CaptureEnvRow visual style minus the type toggle — image env is
+// always a plain non-secret literal (merged over Dockerfile ENV, under
+// session env).
+function ImageEnvRow({
+  control,
+  index,
+  onRemove,
+}: {
+  control: Control<EnableImageValues>;
+  index: number;
+  onRemove: () => void;
+}) {
+  return (
+    <div className="flex items-start gap-2">
+      <Controller
+        control={control}
+        name={`envRows.${index}.key`}
+        render={({ field }) => (
+          <Input
+            {...field}
+            className="font-mono"
+            placeholder="KEY"
+            aria-label="Env key"
+            spellCheck={false}
+            autoCapitalize="off"
+          />
+        )}
+      />
+      <Controller
+        control={control}
+        name={`envRows.${index}.value`}
+        render={({ field }) => (
+          <Input
+            {...field}
+            className="font-mono"
+            placeholder="value"
+            aria-label="Env value"
+            spellCheck={false}
+            autoCapitalize="off"
+          />
+        )}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-sm"
+        className="shrink-0"
+        onClick={onRemove}
+        aria-label="Remove env var"
+      >
+        <XIcon />
+      </Button>
+    </div>
+  );
+}
+
 // Enable a new image, or edit an already-enabled image's config. In edit
-// mode the URI is pinned (read-only) and the form pre-fills with the row's
-// current config — the form is the FULL ImageConfig and always sends it,
-// which REPLACES the config wholesale (ADR 0080) and recaptures the base
-// snapshot. (UpdateImage exists on the wire but isn't surfaced here yet —
-// phase 2b.)
+// mode the URI is pinned (read-only), the form pre-fills with the row's
+// current config, and saving goes through UpdateImage (ADR 0080 phase 2b):
+// the full config is sent with allow_recapture=false first — cheap fields
+// (name/description/env/workdir) apply immediately; a diff touching
+// resources or warm comes back FailedPrecondition, and an inline confirm
+// block re-sends with allow_recapture=true (spawning a recapture job).
+// Create mode keeps EnableImage, which queues the initial enable job.
 function EnableImageDialog({
   editImage,
   trigger,
@@ -403,8 +569,18 @@ function EnableImageDialog({
   trigger?: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  // A capture-affecting edit awaiting operator confirmation: the config
+  // built at submit time + the server's FailedPrecondition text (it names
+  // the offending fields).
+  const [pendingRecapture, setPendingRecapture] = useState<{
+    config: ImageConfig;
+    reason: string;
+  } | null>(null);
   const enable = useEnableImage();
+  const update = useUpdateImage();
+  const { data: orgSecretNames } = useOrgSecretNames();
   const isEdit = !!editImage;
+  const busy = enable.isPending || update.isPending;
 
   const form = useForm<EnableImageValues>({
     resolver: zodResolver(enableImageSchema),
@@ -414,56 +590,75 @@ function EnableImageDialog({
     control: form.control,
     name: "captureEnv",
   });
+  const envArray = useFieldArray({ control: form.control, name: "envRows" });
+  // The warm network editor is only meaningful with a warm command (the
+  // policy applies to the capture VM while the hook runs) — hide it (and
+  // disable the other warm extras) otherwise.
+  const warmCommandLive = useWatch({ control: form.control, name: "warmCommand" });
+  const hasWarmCommand = warmCommandLive.trim() !== "";
+  const netDefaultLive = useWatch({ control: form.control, name: "netDefault" });
 
   // Re-seed on every open so an edit always reflects the row's current
   // config and a cancelled edit doesn't linger in the form.
   const onOpenChange = (next: boolean) => {
     setOpen(next);
+    setPendingRecapture(null);
     if (next) {
       form.reset(formDefaults(editImage));
     }
   };
 
   const onSubmit = async (data: EnableImageValues) => {
-    // Skip env rows with an empty name; map each surviving row's type toggle
-    // to the proto oneof. The config is ALWAYS sent (ADR 0080): the form is
-    // the full ImageConfig, so a submit replaces the row's config wholesale
-    // (an edit pre-fills from the row, so a plain re-submit round-trips).
-    const warmEnv = data.captureEnv
-      .filter((r) => r.name.trim() !== "")
-      .map((r) =>
-        create(CaptureEnvEntrySchema, {
-          name: r.name.trim(),
-          value: {
-            case: r.kind === "secret_ref" ? "secretRef" : "literal",
-            value: r.value,
-          },
-        }),
-      );
-    const warmCommand = data.warmCommand.trim();
-    const config = create(ImageConfigSchema, {
-      name: data.name,
-      description: data.description.trim() || undefined,
-      env: {},
-      resources: create(ImageResourcesSchema, {
-        suggestedVcpus: Number(data.vcpus),
-        suggestedMemoryMib: data.memoryMib ? Number(data.memoryMib) : undefined,
-      }),
-      // Empty command = no [warm] hook (the schema already rejects warm env
-      // without a command).
-      warm: warmCommand
-        ? create(ImageWarmConfigSchema, {
-            command: warmCommand.split(/\s+/),
-            env: warmEnv,
-          })
-        : undefined,
-    });
+    // The config is ALWAYS sent whole (ADR 0080): the form is the full
+    // ImageConfig, so a submit replaces the row's config wholesale (an edit
+    // pre-fills from the row, so an untouched re-submit round-trips as a
+    // no-op).
+    const config = buildConfig(data);
+    if (!isEdit) {
+      try {
+        await enable.mutateAsync({ imageUri: data.imageUri, config });
+        setOpen(false);
+      } catch (err) {
+        // Surface the coordinator's real message (e.g. a registry-auth
+        // failure) instead of an opaque `[internal] HTTP 400`.
+        form.setError("root", { message: errorMessage(err) });
+      }
+      return;
+    }
+    // Edit: optimistically try the cheap path. The server accepts a diff
+    // confined to name/description/env/workdir outright; a capture-affecting
+    // diff (resources, anything under warm) fails FailedPrecondition naming
+    // the fields — surface that as an explicit recapture confirmation
+    // instead of silently kicking off a minutes-long job (ADR 0080).
     try {
-      await enable.mutateAsync({ imageUri: data.imageUri, config });
+      await update.mutateAsync({ imageUri: data.imageUri, config, allowRecapture: false });
+      toast.success("Config updated — changes applied immediately");
       setOpen(false);
     } catch (err) {
-      // Surface the coordinator's real message (e.g. a registry-auth
-      // failure) instead of an opaque `[internal] HTTP 400`.
+      const ce = ConnectError.from(err);
+      if (ce.code === Code.FailedPrecondition) {
+        setPendingRecapture({ config, reason: ce.rawMessage });
+      } else {
+        form.setError("root", { message: errorMessage(err) });
+      }
+    }
+  };
+
+  const onConfirmRecapture = async () => {
+    if (!pendingRecapture || !editImage) return;
+    try {
+      await update.mutateAsync({
+        imageUri: editImage.image_uri,
+        config: pendingRecapture.config,
+        allowRecapture: true,
+      });
+      // The returned job lands in the enable-jobs table via the hook's
+      // invalidation — no extra wiring here.
+      toast.success("Recapture started — sessions keep the old snapshot until it's ready");
+      setPendingRecapture(null);
+      setOpen(false);
+    } catch (err) {
+      setPendingRecapture(null);
       form.setError("root", { message: errorMessage(err) });
     }
   };
@@ -471,15 +666,15 @@ function EnableImageDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogTrigger asChild>{trigger ?? <Button>Enable a new image</Button>}</DialogTrigger>
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{isEdit ? "Edit config" : "Enable a new image"}</DialogTitle>
           <DialogDescription>
             {isEdit ? (
               <>
-                The config is applied at enable time (ADR 0080) — saving re-enables with the full
-                config below, replacing the current one and recapturing the base snapshot.
-                Materialization progress shows in the list above.
+                Full-replace edit (ADR 0080): name, description, image env and workdir apply
+                immediately; a change to resources or the warm hook asks for confirmation, then
+                recaptures the base snapshot.
               </>
             ) : (
               <>
@@ -550,7 +745,64 @@ function EnableImageDialog({
               )}
             />
 
-            <div className="grid grid-cols-2 gap-4">
+            <Field>
+              <div className="flex items-center justify-between">
+                <FieldLabel>Image env</FieldLabel>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => envArray.append({ key: "", value: "" })}
+                >
+                  <PlusIcon /> Add env var
+                </Button>
+              </div>
+              <FieldDescription>
+                Non-secret env applied to every sandbox of this image — merged over the
+                Dockerfile's <code className="font-mono">ENV</code>, under session env (ADR 0080).
+                Applies immediately on save, no recapture.
+              </FieldDescription>
+              {envArray.fields.length === 0 ? (
+                <p className="text-xs text-muted-foreground">No image env vars.</p>
+              ) : (
+                <div className="space-y-2">
+                  {envArray.fields.map((f, i) => (
+                    <ImageEnvRow
+                      key={f.id}
+                      control={form.control}
+                      index={i}
+                      onRemove={() => envArray.remove(i)}
+                    />
+                  ))}
+                </div>
+              )}
+            </Field>
+
+            <Controller
+              name="workdir"
+              control={form.control}
+              render={({ field, fieldState }) => (
+                <Field data-invalid={fieldState.invalid}>
+                  <FieldLabel htmlFor={field.name}>Workdir (optional)</FieldLabel>
+                  <Input
+                    {...field}
+                    id={field.name}
+                    className="font-mono"
+                    placeholder="/workspace"
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    aria-invalid={fieldState.invalid}
+                  />
+                  <FieldDescription>
+                    Default working directory; falls back to the Dockerfile{" "}
+                    <code className="font-mono">WORKDIR</code>.
+                  </FieldDescription>
+                  {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                </Field>
+              )}
+            />
+
+            <div className="grid grid-cols-3 gap-4">
               <Controller
                 name="vcpus"
                 control={form.control}
@@ -574,7 +826,7 @@ function EnableImageDialog({
                 control={form.control}
                 render={({ field, fieldState }) => (
                   <Field data-invalid={fieldState.invalid}>
-                    <FieldLabel htmlFor={field.name}>Memory MiB (optional)</FieldLabel>
+                    <FieldLabel htmlFor={field.name}>Memory MiB</FieldLabel>
                     <Input
                       {...field}
                       id={field.name}
@@ -588,81 +840,265 @@ function EnableImageDialog({
                   </Field>
                 )}
               />
+              <Controller
+                name="diskGib"
+                control={form.control}
+                render={({ field, fieldState }) => (
+                  <Field data-invalid={fieldState.invalid}>
+                    <FieldLabel htmlFor={field.name}>Disk GiB</FieldLabel>
+                    <Input
+                      {...field}
+                      id={field.name}
+                      type="number"
+                      min={1}
+                      step={1}
+                      placeholder="16"
+                      aria-invalid={fieldState.invalid}
+                    />
+                    {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                  </Field>
+                )}
+              />
             </div>
 
-            <Controller
-              name="warmCommand"
-              control={form.control}
-              render={({ field, fieldState }) => (
-                <Field data-invalid={fieldState.invalid}>
-                  <FieldLabel htmlFor={field.name}>Warm command (optional)</FieldLabel>
-                  <Input
-                    {...field}
-                    id={field.name}
-                    className="font-mono"
-                    placeholder="/opt/engram/warm.sh --all"
-                    spellCheck={false}
-                    autoCapitalize="off"
-                    aria-invalid={fieldState.invalid}
+            {/* Warm capture hook — grouped because EVERYTHING in here is
+                capture-affecting (ADR 0080: the hook runs inside the capture
+                VM, so its config is baked into the base snapshot). */}
+            <div className="space-y-4 rounded-md border p-4">
+              <div>
+                <FieldLabel>Warm capture hook</FieldLabel>
+                <FieldDescription>
+                  Runs inside the capture VM at base-snapshot capture. Everything in this section
+                  is capture-affecting — editing it recaptures the base snapshot (minutes; sessions
+                  keep working against the old snapshot until the new one is ready).
+                </FieldDescription>
+              </div>
+
+              <Controller
+                name="warmCommand"
+                control={form.control}
+                render={({ field, fieldState }) => (
+                  <Field data-invalid={fieldState.invalid}>
+                    <FieldLabel htmlFor={field.name}>Warm command (optional)</FieldLabel>
+                    <Input
+                      {...field}
+                      id={field.name}
+                      className="font-mono"
+                      placeholder="/opt/engram/warm.sh --all"
+                      spellCheck={false}
+                      autoCapitalize="off"
+                      aria-invalid={fieldState.invalid}
+                    />
+                    <FieldDescription>
+                      Space-separated argv. Leave empty for no{" "}
+                      <code className="font-mono">[warm]</code> hook.
+                    </FieldDescription>
+                    {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                  </Field>
+                )}
+              />
+
+              <div className="grid grid-cols-2 gap-4">
+                <Controller
+                  name="warmTimeoutSecs"
+                  control={form.control}
+                  render={({ field, fieldState }) => (
+                    <Field data-invalid={fieldState.invalid}>
+                      <FieldLabel htmlFor={field.name}>Timeout secs</FieldLabel>
+                      <Input
+                        {...field}
+                        id={field.name}
+                        type="number"
+                        min={1}
+                        step={1}
+                        placeholder="900"
+                        disabled={!hasWarmCommand}
+                        aria-invalid={fieldState.invalid}
+                      />
+                      {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                    </Field>
+                  )}
+                />
+                <Controller
+                  name="warmWorkdir"
+                  control={form.control}
+                  render={({ field, fieldState }) => (
+                    <Field data-invalid={fieldState.invalid}>
+                      <FieldLabel htmlFor={field.name}>Warm workdir</FieldLabel>
+                      <Input
+                        {...field}
+                        id={field.name}
+                        className="font-mono"
+                        placeholder="/workspace"
+                        spellCheck={false}
+                        autoCapitalize="off"
+                        disabled={!hasWarmCommand}
+                        aria-invalid={fieldState.invalid}
+                      />
+                      {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                    </Field>
+                  )}
+                />
+              </div>
+
+              <Field>
+                <div className="flex items-center justify-between">
+                  <FieldLabel>Warm capture env</FieldLabel>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => append({ name: "", kind: "literal", value: "" })}
+                  >
+                    <PlusIcon /> Add variable
+                  </Button>
+                </div>
+                <FieldDescription>
+                  Injected into the warm command's environment at base-snapshot capture (not a
+                  session secret) — ADR 0080: rides the <code className="font-mono">[warm]</code>{" "}
+                  block, so it needs a warm command. Each is a literal value or an org-secret ref
+                  resolved server-side at capture (names only — never values).
+                </FieldDescription>
+                {fields.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">No warm env vars.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {fields.map((f, i) => (
+                      <CaptureEnvRow
+                        key={f.id}
+                        control={form.control}
+                        index={i}
+                        secretNames={orgSecretNames ?? []}
+                        onRemove={() => remove(i)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </Field>
+
+              {hasWarmCommand && (
+                <Field>
+                  <FieldLabel htmlFor="warm-net-default">Warm network</FieldLabel>
+                  <Controller
+                    name="netDefault"
+                    control={form.control}
+                    render={({ field }) => (
+                      <Select value={field.value} onValueChange={field.onChange}>
+                        <SelectTrigger
+                          id="warm-net-default"
+                          className="w-full"
+                          aria-label="Warm network"
+                        >
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="none">No network (egress-less)</SelectItem>
+                          <SelectItem value="deny">Deny by default, allow-list below</SelectItem>
+                          <SelectItem value="allow">Allow all egress</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    )}
                   />
                   <FieldDescription>
-                    Space-separated argv run inside the capture VM at base-snapshot capture. Leave
-                    empty for no <code className="font-mono">[warm]</code> hook.
+                    Egress policy for the capture VM while the warm hook runs (ADR 0080; same
+                    shape as a profile's allow-list). No network — or deny with an empty
+                    allow-list — is an egress-less capture.
                   </FieldDescription>
-                  {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                  {netDefaultLive === "deny" && (
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <Controller
+                        name="allowHostsText"
+                        control={form.control}
+                        render={({ field }) => (
+                          <Field>
+                            <FieldLabel htmlFor="warm-allow-hosts">Allowed hosts</FieldLabel>
+                            <Textarea
+                              {...field}
+                              id="warm-allow-hosts"
+                              rows={3}
+                              placeholder={"registry.npmjs.org\nproxy.golang.org"}
+                              className="font-mono text-sm"
+                            />
+                          </Field>
+                        )}
+                      />
+                      <Controller
+                        name="allowPatternsText"
+                        control={form.control}
+                        render={({ field }) => (
+                          <Field>
+                            <FieldLabel htmlFor="warm-allow-patterns">Host patterns</FieldLabel>
+                            <Textarea
+                              {...field}
+                              id="warm-allow-patterns"
+                              rows={3}
+                              placeholder={"*.githubusercontent.com\n*.pypi.org"}
+                              className="font-mono text-sm"
+                            />
+                          </Field>
+                        )}
+                      />
+                    </div>
+                  )}
                 </Field>
               )}
-            />
+            </div>
 
-            <Field>
-              <div className="flex items-center justify-between">
-                <FieldLabel>Warm capture env</FieldLabel>
+            {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
+          </FieldGroup>
+
+          {/* ADR 0080: a capture-affecting edit was refused with
+              FailedPrecondition — confirm before re-sending with
+              allow_recapture=true. */}
+          {pendingRecapture && (
+            <div className="mt-4 space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
+              <p className="text-sm font-medium text-destructive">
+                This edit changes capture-affecting fields
+              </p>
+              <p className="font-mono text-xs text-muted-foreground">{pendingRecapture.reason}</p>
+              <p className="text-xs text-muted-foreground">
+                Applying it will recapture the base snapshot — that takes minutes, and sessions
+                keep working against the old snapshot until the new one is ready. Progress shows
+                in the jobs list above.
+              </p>
+              <div className="flex justify-end gap-2">
                 <Button
                   type="button"
                   variant="ghost"
                   size="sm"
-                  onClick={() => append({ name: "", kind: "literal", value: "" })}
+                  onClick={() => setPendingRecapture(null)}
+                  disabled={update.isPending}
                 >
-                  <PlusIcon /> Add variable
+                  Keep editing
+                </Button>
+                <Button
+                  type="button"
+                  variant="destructive"
+                  size="sm"
+                  onClick={onConfirmRecapture}
+                  disabled={update.isPending}
+                >
+                  {update.isPending ? "Recapturing…" : "Recapture and apply"}
                 </Button>
               </div>
-              <FieldDescription>
-                Injected into the warm command's environment at base-snapshot capture (not a session
-                secret) — ADR 0080: rides the <code className="font-mono">[warm]</code> block, so it
-                needs a warm command. Each is a literal value or a secret ref (e.g.{" "}
-                <code className="font-mono">gcp-sm://…</code>) resolved server-side.
-              </FieldDescription>
-              {fields.length === 0 ? (
-                <p className="text-xs text-muted-foreground">No warm env vars.</p>
-              ) : (
-                <div className="space-y-2">
-                  {fields.map((f, i) => (
-                    <CaptureEnvRow
-                      key={f.id}
-                      control={form.control}
-                      index={i}
-                      onRemove={() => remove(i)}
-                    />
-                  ))}
-                </div>
-              )}
-            </Field>
+            </div>
+          )}
 
-            {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
-          </FieldGroup>
-          <DialogFooter className="mt-4 sm:items-center">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => onOpenChange(false)}
-              disabled={enable.isPending}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" disabled={enable.isPending}>
-              {enable.isPending ? (isEdit ? "Saving…" : "Enabling…") : isEdit ? "Save" : "Enable"}
-            </Button>
-          </DialogFooter>
+          {!pendingRecapture && (
+            <DialogFooter className="mt-4 sm:items-center">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => onOpenChange(false)}
+                disabled={busy}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={busy}>
+                {busy ? (isEdit ? "Saving…" : "Enabling…") : isEdit ? "Save" : "Enable"}
+              </Button>
+            </DialogFooter>
+          )}
         </form>
       </DialogContent>
     </Dialog>

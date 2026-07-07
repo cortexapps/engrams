@@ -41,7 +41,8 @@ layer: how to build, test, and the conventions we hold.
 `engram-image-builder`. Notable libraries: `engram-core` (shared traits:
 `SandboxBackend`, `HarnessHub`, `BlobStorage`, `MetadataStore`, `GitForge`, …),
 `engram-protocol` (control-plane wire types), `engram-sandbox-{firecracker,vz,process}`,
-`engram-chunk-store` (content-addressed storage, ADR 0007), `engram-postgres`,
+`engram-chunk-store` (content-addressed storage, ADR 0007), `engram-rootfs-materializer`
+(standard OCI image → flattened ext4 rootfs + chunks, ADR 0080), `engram-postgres`,
 `engram-crypto`, `engram-egress-proxy`, `engram-transport`, `engram-telemetry`.
 
 **Other top-level:** `orchestrator/` (Bun), `web/` (pnpm), `deploy/` (helm,

@@ -36,10 +36,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod chunk_resolver;
 pub mod docker_config;
+pub mod docker_image;
 pub mod media_types;
 
 pub use chunk_resolver::{OciBlobLocator, OciChunkIndex, OciChunkResolver};
 pub use docker_config::DockerConfigResolver;
+pub use docker_image::{DockerBlobRef, DockerImageManifest};
 pub use media_types::*;
 
 /// Resolves auth credentials for a given registry host.

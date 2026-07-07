@@ -7,9 +7,13 @@
 //! mount, no root needed. This is the same flow Firecracker's CI uses
 //! to bake their published `ubuntu-*.ext4` artifacts.
 //!
-//! [`Ext4Packer`] is a trait so the unit tests can mock it; the
-//! integration test in `tests/builder.rs` exercises the real binary
-//! against a real source dir.
+//! ADR 0080: this module moved here from `engram-image-builder`
+//! (which now re-exports it) — the materializer is the one home for
+//! tree → ext4 packing, whether the tree came from `docker export`
+//! (the retiring bake) or an OCI-layer flatten (this crate).
+//!
+//! [`Ext4Packer`] is a trait so unit tests can mock it; the real
+//! binary is exercised by the packer/determinism integration tests.
 
 use std::path::{Path, PathBuf};
 
@@ -90,16 +94,16 @@ impl Mke2fsPacker {
 /// `SOURCE_DATE_EPOCH` (>= 1.47.1); most distros' system e2fsprogs is older and
 /// silently stamps wall-clock times, breaking cross-bake chunk dedup. So we
 /// don't rely on whatever `mke2fs` happens to be on `$PATH` — we ship a pinned
-/// static `mke2fs` *inside the `cli-tools` artifact* (next to this binary) and
-/// resolve it here, so the bake is deterministic by construction wherever it
-/// runs. Order:
+/// static `mke2fs` *next to the current executable* (the `cli-tools` artifact
+/// for bakes; ADR 0080 moves the same pin into the host-agent image for
+/// enable-time materialization) and resolve it here, so the pack is
+/// deterministic by construction wherever it runs. Order:
 ///
 /// 1. `$ENGRAM_MKE2FS` — explicit override (CI's packer test, debugging).
-/// 2. an `mke2fs` sibling of the current executable — the one bundled in
-///    `cli-tools` beside `engram-cli`.
-/// 3. `mke2fs` from `$PATH` — `nix develop` dev shells, and the host-agent's
-///    distro e2fsprogs (which packs only the empty stub, where determinism is
-///    immaterial).
+/// 2. an `mke2fs` sibling of the current executable — the bundled pin.
+/// 3. `mke2fs` from `$PATH` — `nix develop` dev shells, and hosts whose
+///    distro e2fsprogs packs only content where determinism is immaterial
+///    (e.g. the empty stub harness).
 fn resolve_mke2fs() -> PathBuf {
     if let Some(p) = std::env::var_os("ENGRAM_MKE2FS") {
         return PathBuf::from(p);
@@ -175,10 +179,13 @@ const DETERMINISTIC_HASH_SEED: &str = "00000000-5eed-4a11-8036-000000000036";
 /// 2024-01-01T00:00:00Z. e2fsprogs (≥1.45) reads `SOURCE_DATE_EPOCH`
 /// and (a) stamps superblock mkfs/write times from it instead of the
 /// wall clock, and (b) clamps inode timestamps newer than it — which
-/// covers the bake-time-injected files (agentd, init shim) without a
-/// separate mtime-normalization pass over the exported tree.
+/// covers files injected at materialize time (the init shim, whiteout
+/// side effects). [`clamp_mtimes`] performs the same clamp in the tree
+/// itself as belt-and-braces (the reproducible-bundle lesson: one path
+/// skipping the clamp produced sha mismatches).
 /// Verified empirically: same tree packed twice (and two
 /// separately-created identical trees) → byte-identical images.
+pub const DETERMINISTIC_EPOCH_SECS: u64 = 1_704_067_200;
 const DETERMINISTIC_EPOCH: &str = "1704067200";
 
 impl Mke2fsPacker {
@@ -350,6 +357,88 @@ pub fn inode_count_for(entry_count: u64, fs_size_bytes: u64) -> u64 {
     recommended.min(cap)
 }
 
+/// Sum the *actual disk usage* (allocated 512-byte blocks, à la `du`) of every
+/// entry under `dir`, without following symlinks.
+///
+/// We size from `st_blocks`, NOT apparent file length (`meta.len()`): the
+/// brain/gradle/pnpm caches baked into warm dev images are hundreds of
+/// thousands of tiny files, and ext4 rounds every file up to a 4 KiB block
+/// (plus a block per directory). Summing apparent lengths undercounts real
+/// block consumption by 2-4× for such trees, so `recommended_size`'s 2×
+/// headroom still undershot and `mke2fs -d` hit ENOSPC mid-populate (the
+/// dev-brain bake). Block usage captures the rounding, directory blocks, and
+/// xattr/inline overhead directly.
+///
+/// Counting is per-entry, so a hardlink (pnpm's content-addressed store links
+/// into `node_modules`) is counted once per link — an overcount, but in the
+/// safe direction (a slightly larger fs is fine; a too-small one is fatal).
+/// Not following symlinks matches `count_entries` and `mke2fs -d`, which
+/// replicates a symlink as a symlink: we count the link inode's own blocks and
+/// reach a target only if it lives in the real tree. `symlink_metadata`
+/// (lstat) also can't error on broken symlinks, unlike `metadata`.
+pub async fn recursive_size(dir: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&d).await {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            // `file_type()` is readdir's d_type — it reflects the entry
+            // itself, not a symlink target, so we descend only real dirs.
+            let ft = entry.file_type().await?;
+            // lstat: count the entry's own allocated blocks (st_blocks is in
+            // 512-byte units), never the symlink target.
+            let meta = tokio::fs::symlink_metadata(entry.path()).await?;
+            total = total.saturating_add(meta.blocks().saturating_mul(512));
+            if ft.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Clamp every mtime under `root` (files, dirs, symlinks) to
+/// [`DETERMINISTIC_EPOCH_SECS`] — anything newer is set to the epoch;
+/// older (tar-carried, already deterministic) timestamps are left
+/// alone. Belt-and-braces for the pack's `SOURCE_DATE_EPOCH` clamp:
+/// e2fsprogs < 1.47.1 silently ignores the env var, and the
+/// reproducible-bundle incident taught us that any single path
+/// skipping the clamp shows up later as a sha-mismatch head-scratcher.
+/// Run right before [`Ext4Packer::pack`]. Blocking — call from
+/// `spawn_blocking`.
+pub fn clamp_mtimes(root: &Path) -> std::io::Result<()> {
+    let clamp = filetime::FileTime::from_unix_time(DETERMINISTIC_EPOCH_SECS as i64, 0);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        // Clamp the directory itself AFTER queueing (children writes
+        // won't touch it again — we only read below this point).
+        for entry in std::fs::read_dir(&d)? {
+            let entry = entry?;
+            let p = entry.path();
+            let meta = std::fs::symlink_metadata(&p)?;
+            if meta.is_dir() {
+                stack.push(p.clone());
+            }
+            let mtime = filetime::FileTime::from_last_modification_time(&meta);
+            if mtime > clamp {
+                // lutimes: never follow symlinks (the target may not
+                // even exist inside the tree).
+                filetime::set_symlink_file_times(&p, clamp, clamp)?;
+            }
+        }
+        let meta = std::fs::symlink_metadata(&d)?;
+        if filetime::FileTime::from_last_modification_time(&meta) > clamp {
+            filetime::set_symlink_file_times(&d, clamp, clamp)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +552,35 @@ mod tests {
                 "recommended_size({s}) must be 4 KiB aligned for VZ"
             );
         }
+    }
+
+    /// The determinism clamp: newer-than-epoch mtimes (freshly written
+    /// files) snap to the epoch; older, tar-carried mtimes survive.
+    /// Symlinks are clamped via lutimes (never following the target).
+    #[test]
+    fn clamp_mtimes_clamps_new_and_keeps_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/fresh"), b"now").unwrap(); // wall clock, > epoch
+        std::fs::write(root.join("old"), b"then").unwrap();
+        let old = filetime::FileTime::from_unix_time(1_000_000, 0); // 1970s
+        filetime::set_file_mtime(root.join("old"), old).unwrap();
+        std::os::unix::fs::symlink("missing-target", root.join("dangling")).unwrap();
+
+        clamp_mtimes(root).unwrap();
+
+        let mt = |p: &str| {
+            let m = std::fs::symlink_metadata(root.join(p)).unwrap();
+            filetime::FileTime::from_last_modification_time(&m).unix_seconds()
+        };
+        assert_eq!(mt("sub/fresh"), DETERMINISTIC_EPOCH_SECS as i64);
+        assert_eq!(mt("sub"), DETERMINISTIC_EPOCH_SECS as i64);
+        assert_eq!(mt("old"), 1_000_000, "pre-epoch mtimes are preserved");
+        assert_eq!(
+            mt("dangling"),
+            DETERMINISTIC_EPOCH_SECS as i64,
+            "symlink itself is clamped without following its target"
+        );
     }
 }
