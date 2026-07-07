@@ -174,11 +174,6 @@ async fn drain_wave_teleports_every_session_off_host_a() {
     // the shared store, so B can restore without A's local cache).
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-drain-wave\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let baker = Builder::new(DockerCli::new(), chunk_store.clone());
     let outcome = baker

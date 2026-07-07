@@ -104,7 +104,7 @@ log "==> step 2/3: enable image over app-gRPC (blocks until the enable job is re
 # collapses the old "POST /enabled-images then poll /enable-jobs/:id"
 # into one command. `set -e` aborts on a non-zero exit.
 T0=$(date +%s.%N)
-if ! "$ENGRAM_CLI" image enable --uri "$IMAGE_URI" >&2; then
+if ! "$ENGRAM_CLI" image enable --uri "$IMAGE_URI" --config deploy/demo/image-config.toml >&2; then
     log "ERROR: enabling $IMAGE_URI failed (enable job did not reach ready)"
     exit 1
 fi

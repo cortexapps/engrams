@@ -280,18 +280,19 @@ impl Ext4Packer for RecordingPacker {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn build_runs_orchestration_and_writes_manifest_plus_rootfs() {
+async fn build_runs_orchestration_and_extracts_runtime_defaults() {
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(src.path(), r#"name = "cortex-api""#);
+    write_source_repo(src.path(), "");
 
     let docker = RecordingDocker::new()
         .with_fake_rootfs(vec![
             (PathBuf::from("README.md"), b"# starter\n".to_vec()),
             (PathBuf::from("scripts/run.sh"), b"#!/bin/sh\n".to_vec()),
         ])
-        // The Dockerfile's ENV + WORKDIR (engram.toml here sets neither),
-        // surfaced via `docker inspect`, must fold into the manifest.
+        // The Dockerfile's ENV + WORKDIR, surfaced via `docker inspect`,
+        // must land in the outcome's runtime_defaults (ADR 0080: the
+        // artifact's config blob carries them; there is no manifest.toml).
         .with_image_config(
             vec!["DOCKER_ONLY=yes".to_string(), "PATH=/usr/bin".to_string()],
             Some("/from-docker".to_string()),
@@ -304,26 +305,29 @@ async fn build_runs_orchestration_and_writes_manifest_plus_rootfs() {
         .await
         .unwrap();
 
-    // Manifest landed where the coordinator's ImageRegistry will look.
-    assert!(outcome.manifest_path.is_file());
-    let rendered = std::fs::read_to_string(&outcome.manifest_path).unwrap();
-    assert!(
-        rendered.contains(r#"name = "cortex-api""#),
-        "rendered manifest must carry the repo's name; got {rendered:?}",
+    // ADR 0080: the Dockerfile ENV + WORKDIR are extracted as
+    // runtime_defaults (the platform reads the OCI image config once, at
+    // bake; the coordinator persists them at enable) — and no
+    // manifest.toml is written.
+    assert_eq!(
+        outcome
+            .runtime_defaults
+            .env
+            .get("DOCKER_ONLY")
+            .map(String::as_str),
+        Some("yes"),
+    );
+    assert_eq!(
+        outcome.runtime_defaults.env.get("PATH").map(String::as_str),
+        Some("/usr/bin"),
+    );
+    assert_eq!(
+        outcome.runtime_defaults.workdir.as_deref(),
+        Some("/from-docker"),
     );
     assert!(
-        !rendered.contains("[build]"),
-        "rendered manifest must NOT carry the source-only [build] section",
-    );
-    // The Dockerfile ENV + WORKDIR were folded in (the platform reads
-    // the OCI image config so authors needn't restate them).
-    assert!(
-        rendered.contains("DOCKER_ONLY"),
-        "rendered manifest must inherit the Dockerfile ENV; got {rendered:?}",
-    );
-    assert!(
-        rendered.contains("/from-docker"),
-        "rendered manifest must inherit the Dockerfile WORKDIR; got {rendered:?}",
+        !outcome.image_dir.join("manifest.toml").exists(),
+        "ADR 0080: the bake writes no manifest.toml",
     );
 
     // Rootfs was materialized.
@@ -369,10 +373,7 @@ async fn build_does_not_bake_forge_glue_for_git_images() {
     // when a forge token is present. The baked rootfs stays clean.
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(
-        src.path(),
-        "name = \"forge-img\"\n[git]\nprovider = \"github\"\n",
-    );
+    write_source_repo(src.path(), "");
     let docker = RecordingDocker::new();
     let (cs, _csdir) = test_chunk_store();
     let builder = Builder::new(docker.clone(), cs);
@@ -404,7 +405,6 @@ async fn build_passes_build_args_to_docker() {
     write_source_repo(
         src.path(),
         r#"
-            name = "cortex-api"
             [build]
             args = { BUILD_FLAVOR = "release", LANG_VERSION = "20" }
         "#,
@@ -442,7 +442,6 @@ async fn build_passes_build_secrets_to_docker() {
     write_source_repo(
         src.path(),
         r#"
-            name = "cortex-api"
             [build]
             build_secrets = ["GH_PACKAGES_TOKEN", "BUF_TOKEN"]
         "#,
@@ -480,7 +479,6 @@ async fn build_uses_dockerfile_path_from_engram_toml() {
     std::fs::write(
         src.path().join("engram.toml"),
         r#"
-            name = "cortex-api"
             [build]
             dockerfile = "deploy/Dockerfile.runtime"
         "#,
@@ -508,7 +506,7 @@ async fn build_uses_dockerfile_path_from_engram_toml() {
 async fn build_rejects_path_traversal_in_repo_or_tag() {
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(src.path(), r#"name = "x""#);
+    write_source_repo(src.path(), "");
     let (cs, _csdir) = test_chunk_store();
     let builder = Builder::new(RecordingDocker::new(), cs);
 
@@ -534,7 +532,7 @@ async fn build_errors_when_dockerfile_is_missing() {
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
     // Only engram.toml; no Dockerfile.
-    std::fs::write(src.path().join("engram.toml"), r#"name = "x""#).unwrap();
+    std::fs::write(src.path().join("engram.toml"), "").unwrap();
     let (cs, _csdir) = test_chunk_store();
     let builder = Builder::new(RecordingDocker::new(), cs);
     let res = builder
@@ -552,26 +550,25 @@ async fn build_errors_when_dockerfile_is_missing() {
 }
 
 #[tokio::test]
-async fn build_errors_when_engram_toml_is_missing() {
+async fn build_succeeds_without_engram_toml() {
+    // ADR 0080: engram.toml is optional — a plain-Dockerfile repo bakes
+    // with all-default [build] directives.
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
     std::fs::write(src.path().join("Dockerfile"), "FROM scratch\n").unwrap();
     let (cs, _csdir) = test_chunk_store();
     let builder = Builder::new(RecordingDocker::new(), cs);
-    let res = builder
+    builder
         .build(&req(src.path(), images.path(), "x", "warm-1"))
-        .await;
-    assert!(
-        matches!(res, Err(engram_image_builder::BuildError::Config(_))),
-        "missing engram.toml must fail with Config error; got {res:?}",
-    );
+        .await
+        .expect("a repo with only a Dockerfile must bake");
 }
 
 #[tokio::test]
 async fn build_propagates_docker_build_failure_and_does_not_create_rootfs() {
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(src.path(), r#"name = "x""#);
+    write_source_repo(src.path(), "");
 
     let docker = RecordingDocker::new();
     docker.inner.lock().inject_build_err = Some(DockerError::NonZeroExit {
@@ -603,7 +600,7 @@ async fn build_propagates_docker_build_failure_and_does_not_create_rootfs() {
 async fn build_cleans_up_image_when_create_fails() {
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(src.path(), r#"name = "x""#);
+    write_source_repo(src.path(), "");
 
     let docker = RecordingDocker::new();
     docker.inner.lock().inject_create_err = Some(DockerError::NonZeroExit {
@@ -631,7 +628,7 @@ async fn build_cleans_up_image_when_create_fails() {
 async fn build_cleans_up_container_and_image_when_export_fails() {
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(src.path(), r#"name = "x""#);
+    write_source_repo(src.path(), "");
 
     let docker = RecordingDocker::new();
     docker.inner.lock().inject_export_err = Some(DockerError::NonZeroExit {
@@ -665,7 +662,7 @@ async fn build_cleans_up_container_and_image_when_export_fails() {
 async fn rebuild_overwrites_existing_image_dir() {
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(src.path(), r#"name = "x""#);
+    write_source_repo(src.path(), "");
 
     let docker = RecordingDocker::new()
         .with_fake_rootfs(vec![(PathBuf::from("v1-only.txt"), b"hi".to_vec())]);
@@ -695,11 +692,10 @@ async fn rebuild_overwrites_existing_image_dir() {
 }
 
 #[tokio::test]
-async fn manifest_round_trips_full_engram_toml_through_baker() {
-    // Lock down that every manifest field in the source engram.toml
-    // ends up in the rendered manifest.toml verbatim — important
-    // because the coordinator's ImageRegistry parses the rendered
-    // manifest and the runtime contract has to match.
+async fn bake_rejects_manifest_era_engram_toml_with_migration_pointer() {
+    // ADR 0080: a leftover manifest-era engram.toml (name/env/resources/
+    // warm at the top level) would silently do nothing — the bake fails
+    // loudly instead, pointing the author at `image enable --config`.
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
     write_source_repo(
@@ -707,43 +703,28 @@ async fn manifest_round_trips_full_engram_toml_through_baker() {
         r#"
             name = "cortex-api"
             description = "API service"
-            secret_mode = "broker"
 
             [env]
             NODE_ENV = "production"
-
-            [secrets.GITHUB_TOKEN]
-            allow_hosts = ["api.github.com"]
-            required = true
-
-            [network]
-            default = "deny"
-            allow_hosts = ["api.github.com"]
 
             [resources]
             suggested_memory_mib = 4096
 
             [build]
             dockerfile = "Dockerfile"
-            args = { LANG = "rust" }
         "#,
     );
 
     let (cs, _csdir) = test_chunk_store();
     let builder = Builder::new(RecordingDocker::new(), cs);
-    let outcome = builder
+    let res = builder
         .build(&req(src.path(), images.path(), "cortex/api", "warm-1"))
-        .await
-        .unwrap();
-    let rendered = std::fs::read_to_string(&outcome.manifest_path).unwrap();
-    let parsed: engram_core::types::ImageManifest = toml::from_str(&rendered).unwrap();
-
-    assert_eq!(parsed.name, "cortex-api");
-    assert_eq!(parsed.description.as_deref(), Some("API service"));
-    assert_eq!(parsed.env["NODE_ENV"], "production");
-    assert_eq!(parsed.resources.suggested_memory_mib, Some(4096));
-    // ADR 0057: secret_mode / [secrets] / [network] are no longer manifest
-    // fields — the source engram.toml's sections are ignored and not rendered.
+        .await;
+    let err = format!("{:?}", res.expect_err("manifest-era engram.toml must fail"));
+    assert!(
+        err.contains("image enable") && err.contains("ADR 0080"),
+        "error must point at the enable-time config: {err}",
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -771,17 +752,9 @@ async fn end_to_end_with_real_docker() {
     let images = tempfile::tempdir().unwrap();
     std::fs::write(
         src.path().join("Dockerfile"),
-        // Tiny image so the test runs fast and doesn't pull much.
-        "FROM alpine:3\nRUN echo 'hello from baker' > /greeting\n",
-    )
-    .unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        r#"
-            name = "baker-test"
-            [env]
-            BAKED = "yes"
-        "#,
+        // Tiny image so the test runs fast and doesn't pull much. The ENV
+        // must surface in runtime_defaults (ADR 0080) — no engram.toml.
+        "FROM alpine:3\nENV BAKED=yes\nRUN echo 'hello from baker' > /greeting\n",
     )
     .unwrap();
 
@@ -796,10 +769,15 @@ async fn end_to_end_with_real_docker() {
     let greeting = std::fs::read_to_string(outcome.rootfs_path.join("greeting")).unwrap();
     assert_eq!(greeting.trim(), "hello from baker");
 
-    let manifest: engram_core::types::ImageManifest =
-        toml::from_str(&std::fs::read_to_string(outcome.manifest_path).unwrap()).unwrap();
-    assert_eq!(manifest.name, "baker-test");
-    assert_eq!(manifest.env["BAKED"], "yes");
+    // The Dockerfile ENV rode `docker inspect` into runtime_defaults.
+    assert_eq!(
+        outcome
+            .runtime_defaults
+            .env
+            .get("BAKED")
+            .map(String::as_str),
+        Some("yes"),
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -814,7 +792,7 @@ async fn ext4_bake_round_trips_through_chunk_store() {
     // will silently serve corrupt blocks to FC. Lock it down.
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(src.path(), "name = \"chunk-roundtrip\"\n");
+    write_source_repo(src.path(), "");
 
     let docker = RecordingDocker::new()
         .with_fake_rootfs([(PathBuf::from("etc/hostname"), b"engram\n".to_vec())]);
@@ -851,7 +829,7 @@ async fn build_ext4_packs_rootfs_into_image_file_and_drops_directory() {
     // `image_registry::Rootfs::Ext4Image` consumes.
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(src.path(), "name = \"ext4-test\"\n");
+    write_source_repo(src.path(), "");
 
     let docker = RecordingDocker::new().with_fake_rootfs([
         (PathBuf::from("etc/hostname"), b"engram\n".to_vec()),
@@ -960,7 +938,7 @@ async fn build_directory_format_skips_packer() {
     // someone accidentally always packs.
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(src.path(), "name = \"dir-only\"\n");
+    write_source_repo(src.path(), "");
 
     let docker = RecordingDocker::new();
     let packer = RecordingPacker::default();
@@ -987,7 +965,7 @@ async fn build_ext4_propagates_packer_failure_and_keeps_rootfs_for_diagnostics()
     // that contract in.
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(src.path(), "name = \"ext4-fails\"\n");
+    write_source_repo(src.path(), "");
 
     let docker = RecordingDocker::new()
         .with_fake_rootfs([(PathBuf::from("etc/hostname"), b"engram\n".to_vec())]);
@@ -1032,7 +1010,7 @@ async fn build_directory_with_init_injection_writes_shim_only() {
 
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
-    write_source_repo(src.path(), "name = \"agent-bake-test\"\n");
+    write_source_repo(src.path(), "");
 
     let docker = RecordingDocker::new()
         .with_fake_rootfs([(PathBuf::from("etc/hostname"), b"engram\n".to_vec())]);
@@ -1090,7 +1068,7 @@ async fn build_with_init_script_override_uses_provided_script() {
     let images = tempfile::tempdir().unwrap();
     let init_src = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(init_src.path(), b"#!/bin/sh\necho custom-init\n").unwrap();
-    write_source_repo(src.path(), "name = \"agent-bake-test\"\n");
+    write_source_repo(src.path(), "");
 
     let docker = RecordingDocker::new();
     let (cs, _csdir) = test_chunk_store();

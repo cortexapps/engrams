@@ -72,11 +72,6 @@ async fn forge_credential_round_trips_over_vsock() {
         "FROM debian:bookworm-slim\nRUN mkdir -p /workspace\n",
     )
     .unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"forge-loopback-test\"\n",
-    )
-    .unwrap();
 
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");

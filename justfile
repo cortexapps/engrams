@@ -577,7 +577,8 @@ integration-evac-test:
 integration-session:
     bash deploy/dev/integration-session.sh
 
-# Bake an image from a directory containing Dockerfile + engram.toml,
+# Bake an image from a directory containing a Dockerfile (plus an
+# optional [build]-only engram.toml — ADR 0080),
 # then push it to the local OCI registry. Auto-selects cross-compile
 # target + `--transport` flag based on host arch. Tag defaults to
 # `warm-<rfc3339>`; override with `TAG=...`.
@@ -605,7 +606,7 @@ bake repo dir='.':
     STAGING="./var/bake/{{repo}}"; \
     rm -rf "$STAGING"; mkdir -p "$STAGING"; \
     cp "{{dir}}/Dockerfile"  "$STAGING/Dockerfile"; \
-    cp "{{dir}}/engram.toml" "$STAGING/engram.toml"; \
+    if [ -f "{{dir}}/engram.toml" ]; then cp "{{dir}}/engram.toml" "$STAGING/engram.toml"; fi; \
     if [ "$PLATFORM" = "linux/arm64" ]; then \
         sed -i.bak 's|^FROM \([^ ]*\)$|FROM --platform=linux/arm64 \1|' "$STAGING/Dockerfile"; \
         rm -f "$STAGING/Dockerfile.bak"; \

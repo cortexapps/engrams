@@ -100,11 +100,6 @@ async fn agentd_rolls_via_bundle_without_recapture() {
     // ---- 1. Bake a shim-only rootfs (NO agentd inside) ----
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"agentd-reexec-test\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(

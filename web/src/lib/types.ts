@@ -356,32 +356,38 @@ export interface ListRegistriesResponse {
 // path. The dashboard's image picker reads this list (not the legacy
 // filesystem-walking /api/images endpoint).
 
-/** ADR 0057: one capture-time env entry attached to an enabled image.
- * Injected into the image's `[warm]` hook at base-snapshot capture (NOT
- * a session secret). `kind` flattens the proto `value` oneof: a `literal`
- * is a plain non-secret value (a flag, a host name); a `secret_ref` is a
- * ref string (e.g. `gcp-sm://…`) resolved server-side at capture — the ref
- * itself is not secret and is safe to display. */
+/** One capture-time env entry attached to an enabled image, injected
+ * into the image's `[warm]` hook at base-snapshot capture (NOT a session
+ * secret). ADR 0080 moved these under `config.warm.env`. `kind` flattens
+ * the proto `value` oneof: a `literal` is a plain non-secret value (a
+ * flag, a host name); a `secret_ref` is a ref string (e.g. `gcp-sm://…`)
+ * resolved server-side at capture — the ref itself is not secret and is
+ * safe to display. */
 export interface CaptureEnvVar {
   name: string;
   kind: "literal" | "secret_ref";
   value: string;
 }
 
-/** Wire shape of one row from `GET /api/enabled-images`. The raw
- * manifest.toml is intentionally omitted — clients render via the
- * lifted `manifest_name` / `manifest_description` fields. */
+/** One enabled-image row, flattened from the proto's `config`
+ * (the RPC-supplied ImageConfig, ADR 0080) for rendering + the edit
+ * form's pre-fill. */
 export interface EnabledImageSummary {
   id: string;
   image_uri: string;
   manifest_digest: string;
-  manifest_name: string | null;
-  manifest_description: string | null;
+  /** `config.name` — the operator-supplied display name. */
+  name: string | null;
+  description: string | null;
+  suggested_vcpus: number | null;
+  suggested_memory_mib: number | null;
+  /** `config.warm.command` argv; empty when the image has no warm hook. */
+  warm_command: string[];
   last_refreshed_at: string;
   created_at: string;
   /**
-   * ADR 0057: capture-time env attached to this enabled image (refs,
-   * never resolved values). Drives the edit form's pre-fill. Empty when
+   * Capture-time env from `config.warm.env` (refs, never resolved
+   * values — ADR 0080). Drives the edit form's pre-fill. Empty when
    * the image has none.
    */
   capture_env: CaptureEnvVar[];

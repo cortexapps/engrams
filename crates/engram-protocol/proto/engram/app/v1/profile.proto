@@ -59,10 +59,11 @@ message Profile {
   // its session with this. At most one active default (the store clears the
   // prior when one is set).
   bool is_default = 15;
-  // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
-  // + default model/effort (catalog option ids) for this profile's sessions.
-  // Empty = inherit (deployment-default harness; the harness descriptor's
-  // default model/effort). Overridable per session at create.
+  // ADR 0062/0063: the default harness (a HarnessCatalogService catalog
+  // name) plus default model/effort (catalog option ids) for this
+  // profile's sessions. Empty = inherit (deployment-default harness; the
+  // harness descriptor's default model/effort). Overridable per session
+  // at create.
   optional string harness = 16;
   optional string model = 17;
   optional string effort = 18;

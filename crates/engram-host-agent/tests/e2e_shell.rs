@@ -129,11 +129,6 @@ async fn bake_shell_rootfs(repo: &str) -> PathBuf {
          RUN chmod +x /usr/local/bin/ttyd && mkdir -p /workspace\n",
     )
     .unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        format!("name = \"{repo}\"\n"),
-    )
-    .unwrap();
 
     let images_dir = tempfile::tempdir().expect("images");
     let images_dir_path = images_dir.path().to_path_buf();

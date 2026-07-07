@@ -377,8 +377,13 @@ fn wire_version_pinned() {
     // 11 -> 12: ADR 0079 (#543) — fencing_epoch on session-scoped host
     // RPCs (FencedSandboxRequest + the StartAgent/Restore pairs).
     // Proto-native fields only; bincode goldens unchanged.
+    // 12 -> 13: ADR 0080 phase 2a — BuildBaseSnapshotRequest gains
+    // capture_egress_bincode (coordinator-assembled capture egress);
+    // WarmConfig (inside warm_bincode) gains `env`. Neither type is in
+    // the golden corpus (SessionEgressPolicy itself is unchanged), so
+    // bincode goldens are unchanged.
     assert_eq!(
-        WIRE_VERSION, 12,
+        WIRE_VERSION, 13,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

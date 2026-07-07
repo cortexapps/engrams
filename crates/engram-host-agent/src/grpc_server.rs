@@ -659,6 +659,13 @@ impl HostService for HostServiceImpl {
         } else {
             decode_bincode(&inner.capture_env_bincode, "capture_env")?
         };
+        // Coordinator-assembled capture egress (wire v13, ADR 0080). An
+        // empty buffer decodes to `None` — an egress-less capture.
+        let capture_egress = if inner.capture_egress_bincode.is_empty() {
+            None
+        } else {
+            decode_bincode(&inner.capture_egress_bincode, "Option<SessionEgressPolicy>")?
+        };
 
         // Issue #563 review correction: 64 was tight enough that a slow
         // consumer (or a burst of keepalive + per-line progress events
@@ -677,7 +684,7 @@ impl HostService for HostServiceImpl {
         let backend_task = tokio::spawn(
             async move {
                 backend
-                    .build_base_snapshot(spec, warm, capture_env, progress_tx)
+                    .build_base_snapshot(spec, warm, capture_env, capture_egress, progress_tx)
                     .await
             }
             .instrument(span.clone()),

@@ -56,6 +56,12 @@ fn unique_uri(tag: &str) -> String {
     format!("test-registry.local/enable-jobs/{tag}:{}", Uuid::new_v4())
 }
 
+/// Minimal valid ImageConfig for job fixtures (ADR 0080: the full config
+/// rides the job).
+fn test_config() -> engram_core::types::image::ImageConfig {
+    toml::from_str("name = \"jobs-fixture\"\n[resources]\nsuggested_vcpus = 2\n").unwrap()
+}
+
 #[tokio::test]
 #[ignore]
 async fn create_or_get_dedups_active_jobs_per_uri() {
@@ -63,7 +69,7 @@ async fn create_or_get_dedups_active_jobs_per_uri() {
     let uri = unique_uri("dedup");
 
     let a = meta
-        .create_or_get_enable_job(&uri, Some("sha256:digest-a"), &[])
+        .create_or_get_enable_job(&uri, Some("sha256:digest-a"), &test_config())
         .await
         .expect("create");
     assert_eq!(a.state, EnableJobState::Pending);
@@ -72,7 +78,7 @@ async fn create_or_get_dedups_active_jobs_per_uri() {
 
     // Re-POST while in flight → same job, even with a moved digest.
     let b = meta
-        .create_or_get_enable_job(&uri, Some("sha256:digest-b"), &[])
+        .create_or_get_enable_job(&uri, Some("sha256:digest-b"), &test_config())
         .await
         .expect("re-create");
     assert_eq!(b.id, a.id, "active job must be returned, not duplicated");
@@ -86,7 +92,7 @@ async fn create_or_get_dedups_active_jobs_per_uri() {
         .await
         .expect("ready");
     let c = meta
-        .create_or_get_enable_job(&uri, None, &[])
+        .create_or_get_enable_job(&uri, None, &test_config())
         .await
         .expect("create after terminal");
     assert_ne!(c.id, a.id, "terminal jobs don't block a new enable");
@@ -98,7 +104,7 @@ async fn claim_is_exclusive_until_lease_expires() {
     let Some(meta) = connect().await else { return };
     let uri = unique_uri("claim");
     let job = meta
-        .create_or_get_enable_job(&uri, None, &[])
+        .create_or_get_enable_job(&uri, None, &test_config())
         .await
         .expect("create");
 
@@ -147,7 +153,7 @@ async fn progress_state_failure_and_retry_round_trip() {
     let Some(meta) = connect().await else { return };
     let uri = unique_uri("lifecycle");
     let job = meta
-        .create_or_get_enable_job(&uri, None, &[])
+        .create_or_get_enable_job(&uri, None, &test_config())
         .await
         .expect("create");
 
@@ -313,7 +319,7 @@ async fn failure_flips_failed_atomically_at_budget_and_on_force_terminal() {
     // --- Budget path (1a): max_attempts = 2. ---
     let uri = unique_uri("budget");
     let job = meta
-        .create_or_get_enable_job(&uri, None, &[])
+        .create_or_get_enable_job(&uri, None, &test_config())
         .await
         .expect("create");
     meta.claim_enable_jobs("pod-a", 300, 50)
@@ -351,7 +357,7 @@ async fn failure_flips_failed_atomically_at_budget_and_on_force_terminal() {
     //     hook non-zero exit) bails on attempt 1, well under a generous budget. ---
     let uri2 = unique_uri("force-terminal");
     let job2 = meta
-        .create_or_get_enable_job(&uri2, None, &[])
+        .create_or_get_enable_job(&uri2, None, &test_config())
         .await
         .expect("create 2");
     meta.claim_enable_jobs("pod-a", 300, 50)
@@ -391,7 +397,7 @@ async fn stale_claimant_writes_are_fenced_off() {
     let Some(meta) = connect().await else { return };
     let uri = unique_uri("fencing");
     let job = meta
-        .create_or_get_enable_job(&uri, None, &[])
+        .create_or_get_enable_job(&uri, None, &test_config())
         .await
         .expect("create");
 
@@ -520,7 +526,7 @@ async fn capture_progress_is_fenced_renews_lease_and_survives_failure() {
     let Some(meta) = connect().await else { return };
     let uri = unique_uri("capture-progress");
     let job = meta
-        .create_or_get_enable_job(&uri, None, &[])
+        .create_or_get_enable_job(&uri, None, &test_config())
         .await
         .expect("create");
     meta.claim_enable_jobs("pod-a", 300, 50)
@@ -629,14 +635,15 @@ async fn capture_progress_is_fenced_renews_lease_and_survives_failure() {
     );
 }
 
-/// ADR 0036 P4: content-keyed base-snapshot reuse lookup. Seeds an
-/// enabled image whose `disk_manifest_*` is a (simulated)
+/// ADR 0036 P4 / ADR 0080: content-keyed base-snapshot reuse lookup.
+/// Seeds an enabled image whose `disk_manifest_*` is a (simulated)
 /// content-derived ref + a base snapshot, then asserts the lookup
-/// finds it by content — including after soft-delete — and misses on
-/// a different manifest.toml or different content.
+/// finds it by (content, resources) — including after soft-delete,
+/// and regardless of cheap config fields (name/description/env) — and
+/// misses on different resources or different content.
 #[tokio::test]
 #[ignore]
-async fn find_enabled_image_by_content_keys_on_disk_manifest_and_toml() {
+async fn find_enabled_image_by_content_keys_on_disk_manifest_and_resources() {
     let Some(meta) = connect().await else { return };
 
     let snapshot_id = SnapshotId::new();
@@ -659,13 +666,14 @@ async fn find_enabled_image_by_content_keys_on_disk_manifest_and_toml() {
     .expect("seed base snapshot");
 
     let content_ref = ManifestRef::new(); // stands in for a content-derived ref
-    let toml = format!("name = \"p4-{}\"\n", Uuid::new_v4());
+    let config = test_config();
     let uri = unique_uri("content-reuse");
     let now = Utc::now();
     meta.upsert_enabled_image(EnabledImage {
         id: Uuid::new_v4(),
         image_uri: uri.clone(),
-        manifest_toml: toml.clone(),
+        image_config: config.clone(),
+        oci_defaults: Default::default(),
         manifest_digest: "sha256:p4-digest".into(),
         disk_manifest: Some(content_ref),
         base_snapshot_id: Some(snapshot_id),
@@ -675,31 +683,34 @@ async fn find_enabled_image_by_content_keys_on_disk_manifest_and_toml() {
         created_at: now,
         updated_at: None,
         soft_deleted_at: None,
-        capture_env: Vec::new(),
     })
     .await
     .expect("seed enabled image");
 
-    // Hit: same content + same toml → the row, regardless of URI.
+    // Hit: same content + same resources → the row, regardless of URI.
     let found = meta
-        .find_enabled_image_by_content(content_ref, &toml)
+        .find_enabled_image_by_content(content_ref, &config.resources)
         .await
         .expect("lookup")
         .expect("content match must be found");
     assert_eq!(found.image_uri, uri);
     assert_eq!(found.base_snapshot_id, Some(snapshot_id));
 
-    // Miss: same content, different manifest.toml (env change must
-    // force a fresh capture).
+    // Miss: same content, different resources (a memory/vcpu change is
+    // frozen into the snapshot, so it must force a fresh capture).
+    let bigger = engram_core::types::image::ResourceHints {
+        suggested_vcpus: Some(8),
+        ..config.resources.clone()
+    };
     assert!(meta
-        .find_enabled_image_by_content(content_ref, "name = \"other\"\n")
+        .find_enabled_image_by_content(content_ref, &bigger)
         .await
-        .expect("lookup other toml")
+        .expect("lookup other resources")
         .is_none());
 
     // Miss: different content.
     assert!(meta
-        .find_enabled_image_by_content(ManifestRef::new(), &toml)
+        .find_enabled_image_by_content(ManifestRef::new(), &config.resources)
         .await
         .expect("lookup other content")
         .is_none());
@@ -710,7 +721,7 @@ async fn find_enabled_image_by_content_keys_on_disk_manifest_and_toml() {
         .await
         .expect("soft delete");
     let found = meta
-        .find_enabled_image_by_content(content_ref, &toml)
+        .find_enabled_image_by_content(content_ref, &config.resources)
         .await
         .expect("lookup post-delete")
         .expect("soft-deleted rows must still match");
@@ -799,7 +810,7 @@ async fn begin_prestage_transitions_state_and_ref_is_listed() {
     let digest = format!("sha256:{}", Uuid::new_v4().simple());
     let uri = unique_uri("prestage-transition");
     let job = meta
-        .create_or_get_enable_job(&uri, Some(&digest), &[])
+        .create_or_get_enable_job(&uri, Some(&digest), &test_config())
         .await
         .expect("create");
     meta.claim_enable_jobs("pod-a", 300, 50)
@@ -813,7 +824,7 @@ async fn begin_prestage_transitions_state_and_ref_is_listed() {
     // `list_prestaging_refs`, proving the read filters on state, not just
     // ref-presence.
     let other_uri = unique_uri("prestage-transition-control");
-    meta.create_or_get_enable_job(&other_uri, None, &[])
+    meta.create_or_get_enable_job(&other_uri, None, &test_config())
         .await
         .expect("create control job");
 
@@ -873,7 +884,7 @@ async fn set_prestage_hosts_records_the_outcome_map() {
 
     let uri = unique_uri("prestage-outcomes");
     let job = meta
-        .create_or_get_enable_job(&uri, Some(&digest), &[])
+        .create_or_get_enable_job(&uri, Some(&digest), &test_config())
         .await
         .expect("create");
     meta.claim_enable_jobs("pod-a", 300, 50)
@@ -921,7 +932,7 @@ async fn prestage_writes_are_fenced_off_from_a_stale_claimant() {
     let digest = format!("sha256:{}", Uuid::new_v4().simple());
     let uri = unique_uri("prestage-fencing");
     let job = meta
-        .create_or_get_enable_job(&uri, Some(&digest), &[])
+        .create_or_get_enable_job(&uri, Some(&digest), &test_config())
         .await
         .expect("create");
 
@@ -1051,7 +1062,7 @@ async fn prestage_flip_and_straggler_reach_ready_via_live_host_rows() {
 
     let uri = unique_uri("prestage-live-flip");
     let job = meta
-        .create_or_get_enable_job(&uri, Some(&digest), &[])
+        .create_or_get_enable_job(&uri, Some(&digest), &test_config())
         .await
         .expect("create");
     meta.claim_enable_jobs("pod-a", 300, 50)

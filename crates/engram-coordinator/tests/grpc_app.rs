@@ -666,15 +666,18 @@ fn bearer(
     }
 }
 
-/// Minimal `EnabledImage` row for the ImageService list assertion. An
-/// empty `manifest_toml` parses to a `None` manifest and falls back to
-/// rendering the `image_uri` only (see `EnabledImageSummary::from`).
+/// Minimal `EnabledImage` row for the ImageService list assertion (ADR
+/// 0080: the summary's `config` mirrors the row's image_config).
 fn enabled_image(uri: &str) -> engram_core::types::EnabledImage {
     let now = Utc::now();
     engram_core::types::EnabledImage {
         id: uuid::Uuid::new_v4(),
         image_uri: uri.to_string(),
-        manifest_toml: String::new(),
+        image_config: engram_core::types::image::ImageConfig {
+            name: "test".into(),
+            ..Default::default()
+        },
+        oci_defaults: Default::default(),
         manifest_digest: "sha256:0000".to_string(),
         disk_manifest: None,
         base_snapshot_id: None,
@@ -684,7 +687,6 @@ fn enabled_image(uri: &str) -> engram_core::types::EnabledImage {
         created_at: now,
         updated_at: None,
         soft_deleted_at: None,
-        capture_env: Vec::new(),
     }
 }
 

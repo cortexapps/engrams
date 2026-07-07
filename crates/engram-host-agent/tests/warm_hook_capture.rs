@@ -74,6 +74,7 @@ async fn warm_hook_process_survives_base_snapshot() {
         ],
         timeout_secs: Some(60),
         workdir: None,
+        env: Vec::new(),
         network: None,
     };
 
@@ -83,6 +84,7 @@ async fn warm_hook_process_survives_base_snapshot() {
             env.spec(&rootfs),
             Some(warm),
             Default::default(),
+            None,
             progress_tx,
         )
         .await
@@ -148,6 +150,7 @@ async fn warm_hook_sees_manifest_env() {
         ],
         timeout_secs: Some(60),
         workdir: None,
+        env: Vec::new(),
         network: None,
     };
 
@@ -159,7 +162,7 @@ async fn warm_hook_sees_manifest_env() {
 
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
     let meta = pooled
-        .build_base_snapshot(spec, Some(warm), Default::default(), progress_tx)
+        .build_base_snapshot(spec, Some(warm), Default::default(), None, progress_tx)
         .await
         .expect("warm hook must see the manifest [env]; capture should succeed");
 
@@ -190,6 +193,7 @@ async fn warm_hook_nonzero_exit_fails_capture() {
         command: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
         timeout_secs: Some(60),
         workdir: None,
+        env: Vec::new(),
         network: None,
     };
 
@@ -199,6 +203,7 @@ async fn warm_hook_nonzero_exit_fails_capture() {
             env.spec(&rootfs),
             Some(warm),
             Default::default(),
+            None,
             progress_tx,
         )
         .await
@@ -302,11 +307,6 @@ impl TestEnv {
     async fn bake(&self, name: &str) -> std::path::PathBuf {
         let src = tempfile::tempdir().expect("source dir");
         std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-        std::fs::write(
-            src.path().join("engram.toml"),
-            format!("name = \"{name}\"\n"),
-        )
-        .unwrap();
         let baker = Builder::new(DockerCli::new(), self.chunk_store.clone());
         let outcome = baker
             .build(&BuildRequest {

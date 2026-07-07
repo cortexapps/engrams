@@ -328,7 +328,11 @@ async fn upsert_enabled_image_bumps_chunk_generation() {
     let image = EnabledImage {
         id: Uuid::new_v4(),
         image_uri: image_uri.clone(),
-        manifest_toml: "image = { uri = \"test\" }\n".into(),
+        image_config: engram_core::types::image::ImageConfig {
+            name: "test".into(),
+            ..Default::default()
+        },
+        oci_defaults: Default::default(),
         manifest_digest: format!("sha256:{:064x}", 0xdeadbeefu32),
         disk_manifest: None,
         base_snapshot_id: Some(seed_base_snapshot(&meta).await),
@@ -344,7 +348,6 @@ async fn upsert_enabled_image_bumps_chunk_generation() {
         created_at: Utc::now(),
         updated_at: None,
         soft_deleted_at: None,
-        capture_env: Vec::new(),
     };
     meta.upsert_enabled_image(image.clone())
         .await
@@ -359,9 +362,9 @@ async fn upsert_enabled_image_bumps_chunk_generation() {
         "INSERT path must bump chunk_generation (was {before}, now {after_insert})",
     );
 
-    // ON CONFLICT path — refresh the manifest_toml and re-upsert.
+    // ON CONFLICT path — refresh the config and re-upsert.
     let mut updated = image.clone();
-    updated.manifest_toml = "image = { uri = \"test-v2\" }\n".into();
+    updated.image_config.name = "test-v2".into();
     meta.upsert_enabled_image(updated).await.expect("update");
 
     let after_update = meta
@@ -417,7 +420,11 @@ async fn enabled_image_disk_manifest_round_trips_and_surfaces_in_pin_set() {
     let image = EnabledImage {
         id: Uuid::new_v4(),
         image_uri: image_uri.clone(),
-        manifest_toml: "image = { uri = \"test\" }\n".into(),
+        image_config: engram_core::types::image::ImageConfig {
+            name: "test".into(),
+            ..Default::default()
+        },
+        oci_defaults: Default::default(),
         manifest_digest: format!("sha256:{:064x}", 0xfeedfaceu32),
         disk_manifest: Some(mref),
         base_snapshot_id: Some(seed_base_snapshot(&meta).await),
@@ -427,7 +434,6 @@ async fn enabled_image_disk_manifest_round_trips_and_surfaces_in_pin_set() {
         created_at: Utc::now(),
         updated_at: None,
         soft_deleted_at: None,
-        capture_env: Vec::new(),
     };
     meta.upsert_enabled_image(image.clone())
         .await

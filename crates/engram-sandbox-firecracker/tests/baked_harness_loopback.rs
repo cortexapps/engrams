@@ -98,21 +98,6 @@ async fn baked_noop_harness_emits_run_started() {
          RUN chmod +x /opt/noop/harness\n",
     )
     .unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        // Custom-harness form: `name` + absolute `exec` + no
-        // `version` (the binary is whatever this Dockerfile COPY'd).
-        // The baker validates this against the rootfs at bake time
-        // (P0 `validate_custom_harness`).
-        r#"
-name = "baked-noop-test"
-
-[harness]
-name = "noop"
-exec = "/opt/noop/harness"
-"#,
-    )
-    .unwrap();
 
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");

@@ -259,10 +259,11 @@ impl HostClient for LocalHostClient {
         spec: SandboxSpec,
         warm: Option<WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        capture_egress: Option<SessionEgressPolicy>,
         progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.sandbox
-            .build_base_snapshot(spec, warm, capture_env, progress)
+            .build_base_snapshot(spec, warm, capture_env, capture_egress, progress)
             .await
     }
 

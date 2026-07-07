@@ -71,11 +71,6 @@ async fn exec_runs_inside_baked_microvm() {
         "FROM debian:bookworm-slim\n",
     )
     .unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-agent-vm-test\"\n",
-    )
-    .unwrap();
 
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");

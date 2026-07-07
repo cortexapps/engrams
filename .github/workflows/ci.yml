@@ -1309,8 +1309,7 @@ jobs:
           # stable across commits — the shared cache saves ~1-2min
           # on whichever job runs second. Shares the key with
           # artifacts-e2e-stack because their cargo build inputs are
-          # identical (engram-cli reads the image's engram.toml at bake
-          # time — not a compile input).
+          # identical (the image source is not a compile input).
           shared-key: release-musl-bake
 
       - name: Build engram-cli + static-musl agentd
@@ -1326,9 +1325,10 @@ jobs:
 
       - name: Stage ${{ matrix.variant }} source
         run: |
+          # ADR 0080: the image source is just the Dockerfile — runtime
+          # config is applied at enable time (image-config.toml), never baked.
           mkdir -p var/${{ matrix.variant }}
           cp deploy/${{ matrix.variant }}/Dockerfile  var/${{ matrix.variant }}/
-          cp deploy/${{ matrix.variant }}/engram.toml var/${{ matrix.variant }}/
 
       - name: Log in to GHCR
         uses: docker/login-action@v3

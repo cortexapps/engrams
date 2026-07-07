@@ -590,9 +590,16 @@ pub trait SandboxBackend: Send + Sync {
     /// fail-loud — it aborts the capture (and the enable).
     ///
     /// `capture_env` is the resolved capture-time env (the coordinator
-    /// already resolved any secret refs) merged over the manifest `[env]`
+    /// already resolved any secret refs) merged over the config `[env]`
     /// into the warm hook's exec environment. Empty for an image with no
-    /// capture_env or no warm hook.
+    /// warm env or no warm hook.
+    ///
+    /// `capture_egress` (ADR 0080, wire v13) is the egress policy to
+    /// register for the capture VM's guest IP while the warm hook runs —
+    /// assembled coordinator-side from the config's `warm.network` (one
+    /// egress builder for sessions and captures alike). `None` ⇒ register
+    /// nothing: the capture stays egress-less (the proxy denies unknown
+    /// guests). The backend must NOT derive egress from `warm` itself.
     ///
     /// `progress` (issue #539) receives [`crate::types::CaptureProgress`]
     /// events for the call's lifetime — see the matching doc on
@@ -602,6 +609,7 @@ pub trait SandboxBackend: Send + Sync {
         _spec: SandboxSpec,
         _warm: Option<WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _capture_egress: Option<crate::types::egress::SessionEgressPolicy>,
         _progress: tokio::sync::mpsc::Sender<crate::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(

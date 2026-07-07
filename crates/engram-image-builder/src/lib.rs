@@ -1,28 +1,28 @@
 //! Image baker.
 //!
-//! Source of truth for an image is a repo containing two files:
+//! ADR 0080: the source of truth for an image is its **Dockerfile** —
+//! the bake carries no runtime config. An optional `engram.toml` holds
+//! only the `[build]` section (Dockerfile path, context, args, build
+//! secrets). Everything the runtime needs (name/description/env/workdir/
+//! resources/warm) is supplied out-of-band at enable time via
+//! `engram image enable --config`; the artifact's config blob carries the
+//! Dockerfile-derived `runtime_defaults` (ENV/WORKDIR) so the platform
+//! never re-reads the OCI image config after enable.
 //!
-//! ```text
-//!   <repo>/
-//!     Dockerfile          # WHAT'S in the image — universal Docker syntax
-//!     engram.toml         # HOW the image is USED — secrets, network, resources
-//! ```
-//!
-//! `engram-image-builder build` reads both, runs `docker build`, exports
-//! the resulting OCI image's filesystem to the registry layout the
+//! `engram-image-builder build` runs `docker build`, exports the
+//! resulting OCI image's filesystem to the registry layout the
 //! coordinator reads:
 //!
 //! ```text
 //!   <images_dir>/<repo>/<tag>/
-//!     manifest.toml       # rendered ImageManifest (engram.toml minus [build])
 //!     rootfs/             # ProcessBackend dev path
-//!     rootfs.ext4         # FirecrackerBackend prod path (Phase 2)
+//!     rootfs.ext4         # FirecrackerBackend prod path
+//!     bundle.json         # chunk-manifest pointer (Ext4 bakes)
 //! ```
 //!
 //! For ProcessBackend dev, we extract via `docker create + docker
-//! export | tar -x`. For Firecracker prod (Phase 2), the same pipe
-//! continues into `mkfs.ext4` and bakes in `engram-agentd` + an init
-//! unit. Out of scope this round.
+//! export | tar -x`. For Firecracker prod, the same pipe continues into
+//! `mkfs.ext4` (the only injected file is the stage-1 init shim).
 
 pub mod blob;
 pub mod config;
@@ -31,7 +31,7 @@ pub mod ext4;
 
 use std::path::{Path, PathBuf};
 
-use engram_core::types::ImageManifest;
+use engram_core::types::image::OciRuntimeDefaults;
 
 pub use config::{BuildConfig, EngramRepoConfig};
 pub use docker::{DockerCli, DockerRunner};
@@ -416,7 +416,12 @@ exec /run/engram/engram-agentd --port __VSOCK_PORT__
 #[derive(Clone, Debug)]
 pub struct BuildOutcome {
     pub image_dir: PathBuf,
-    pub manifest_path: PathBuf,
+    /// ADR 0080: the built image's Dockerfile `ENV` + `WORKDIR`, read via
+    /// `docker inspect` at bake time. `push_to_registry` embeds this in
+    /// the artifact's config blob (`runtime_defaults`); the coordinator
+    /// persists it at enable so session-create merges it under the
+    /// RPC-supplied `ImageConfig` with no OCI re-read.
+    pub runtime_defaults: OciRuntimeDefaults,
     /// Path on disk where the rootfs lives (directory for
     /// `Format::Directory`; `.ext4` file for `Format::Ext4`).
     /// Kept for ProcessBackend dev path; production consumers
@@ -553,12 +558,12 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
     /// Run a single bake. Steps:
     ///
     /// 1. Validate paths in `req`.
-    /// 2. Read `<source>/engram.toml`, split into manifest + build.
+    /// 2. Read `<source>/engram.toml` (optional; `[build]` only — ADR 0080).
     /// 3. `docker build` against the source.
     /// 4. `docker create` a throwaway container; `docker export` its
     ///    filesystem to the staging tarball.
     /// 5. Extract the tarball into `<images_dir>/<repo>/<tag>/rootfs/`.
-    /// 6. Write `manifest.toml`.
+    /// 6. Extract the Dockerfile ENV/WORKDIR as `runtime_defaults`.
     /// 7. Best-effort `docker rm <container>` + remove the temporary tag.
     ///
     /// Idempotent on the registry side — overwrites any existing
@@ -622,7 +627,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         //    or fails. We don't surface cleanup errors; the bake's
         //    outcome is what matters.
         let outcome = self
-            .build_after_container(req, &cfg, &image_dir, &container_id, &docker_tag)
+            .build_after_container(req, &image_dir, &container_id, &docker_tag)
             .await;
         // Cleanup: `build_after_container` already frees the image+container
         // on its success path (after export, before the ext4 pack — see
@@ -641,14 +646,13 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         })
     }
 
-    /// Steps 5–6 of `build`: export, write manifest, optionally pack
-    /// to ext4, compute size. Factored out so the unconditional
-    /// cleanup at the bottom of `build` is symmetrical regardless of
-    /// where this fails.
+    /// Steps 5–6 of `build`: export, extract the runtime defaults,
+    /// optionally pack to ext4, compute size. Factored out so the
+    /// unconditional cleanup at the bottom of `build` is symmetrical
+    /// regardless of where this fails.
     async fn build_after_container(
         &self,
         req: &BuildRequest,
-        cfg: &EngramRepoConfig,
         image_dir: &Path,
         container_id: &str,
         docker_tag: &str,
@@ -665,17 +669,15 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             .await
             .map_err(|e| BuildError::Docker(format!("export: {e}")))?;
 
-        // Optional: inject engram-agentd + bootstrap + an init shim
-        // before we pack to ext4. Done after docker export so the
-        // rootfs the user described in their Dockerfile is the base;
-        // we just overlay the stage-1 init shim on top.
+        // Optional: inject the stage-1 init shim before we pack to ext4.
+        // Done after docker export so the rootfs the user described in
+        // their Dockerfile is the base; we just overlay the shim on top.
         //
         // ADR 0062: the image bakes NO harness. ADR 0080: it bakes NO
         // agentd either — both ride reserved bundle slots so they iterate
         // with zero re-bakes. The one engrams file in the rootfs is the
         // stage-1 init shim below (mounts the slots, copies agentd to
         // tmpfs, execs it).
-        let mut effective_manifest = cfg.to_manifest();
         if let Some(injection) = &req.init_injection {
             inject_init(&rootfs_dir, injection).await?;
         }
@@ -689,31 +691,25 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // skill edit ships fleet-wide by rolling the bundle, no re-bake.
         // The wrapper scripts + SKILL.md now live in `deploy/bundles/skills/`.
 
-        // Fold the built image's Docker config (its `ENV` + `WORKDIR`)
-        // into the manifest as defaults — the author's `engram.toml`
-        // [env]/workdir wins. The platform doesn't otherwise read the
-        // OCI image config, so this is what lets a Dockerfile's ENV /
-        // WORKDIR reach the guest (the agent at start_agent + `engram
-        // exec`). Inspect the created-but-unstarted container, whose
-        // `Config` mirrors the image's Env/WorkingDir.
-        match self.docker.inspect_config(container_id).await {
-            Ok(cfg) => {
-                effective_manifest.apply_image_config_defaults(&cfg.env, cfg.working_dir.as_deref())
+        // ADR 0080: extract the built image's Docker config (its `ENV` +
+        // `WORKDIR`) as the artifact's `runtime_defaults`. This is the ONLY
+        // place the platform reads the OCI image config — the coordinator
+        // persists it at enable and merges it UNDER the RPC-supplied
+        // ImageConfig at session create. Inspect the created-but-unstarted
+        // container, whose `Config` mirrors the image's Env/WorkingDir.
+        // HARD error: with no manifest.toml carrying a fold-in anymore, a
+        // failed inspect would silently strip the Dockerfile ENV/WORKDIR
+        // from every session of this image — fail the bake instead.
+        let runtime_defaults = match self.docker.inspect_config(container_id).await {
+            Ok(cfg) => OciRuntimeDefaults::from_docker_config(&cfg.env, cfg.working_dir.as_deref()),
+            Err(e) => {
+                return Err(BuildError::Docker(format!(
+                    "docker inspect for the image config failed: {e}. The artifact's \
+                     runtime_defaults (Dockerfile ENV/WORKDIR) can't be extracted, so the \
+                     bake is aborted rather than shipping an image that silently drops them."
+                )));
             }
-            // Non-fatal: an inspect hiccup shouldn't fail an otherwise
-            // good bake. The image still works; it just doesn't inherit
-            // the Dockerfile env/workdir (same as pre-this-feature), and
-            // the author can always set them in engram.toml.
-            Err(e) => tracing::warn!(
-                error = %e,
-                "docker inspect for image config failed; \
-                 manifest will not inherit the Dockerfile ENV/WORKDIR",
-            ),
-        }
-
-        let manifest_path = image_dir.join("manifest.toml");
-        let manifest_str = render_manifest_value(&effective_manifest)?;
-        tokio::fs::write(&manifest_path, manifest_str).await?;
+        };
 
         // Free the docker image + container NOW. The rootfs is fully
         // exported to `rootfs_dir` and the last image read (inspect_config
@@ -878,7 +874,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
 
         Ok(BuildOutcome {
             image_dir: image_dir.to_path_buf(),
-            manifest_path,
+            runtime_defaults,
             rootfs_path,
             disk_manifest,
             size_bytes: total_size,
@@ -932,16 +928,17 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             format!("{registry_uri}:{}", req.tag)
         };
 
-        let manifest_bytes = tokio::fs::read(&outcome.manifest_path)
-            .await
-            .map_err(BuildError::Io)?;
-        // Tiny config blob for introspection — registries display this
-        // and it makes Engram artifacts easy to recognize in a UI.
+        // The artifact's config blob: introspection metadata (registries
+        // display it) plus — ADR 0080 — the Dockerfile-derived
+        // `runtime_defaults` the enable pipeline persists. The bake
+        // carries NO other runtime config (engram.toml's manifest half is
+        // retired; config arrives via `image enable --config`).
         let config = serde_json::json!({
             "kind": "engram-image-v1",
             "format": match req.format { Format::Ext4 => "ext4", Format::Directory => "directory" },
             "repo":   req.repo,
             "tag":    req.tag,
+            "runtime_defaults": outcome.runtime_defaults,
         });
         let config_bytes = serde_json::to_vec(&config)
             .map_err(|e| BuildError::Config(format!("config json: {e}")))?;
@@ -1004,7 +1001,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 .collect::<Result<_, BuildError>>()?;
 
             let layers = engram_oci::ChunkedImageLayers {
-                manifest_toml: manifest_bytes,
                 config_json: config_bytes,
                 bundle_json: bundle.clone(),
                 disk_bootstrap_json,
@@ -1036,7 +1032,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         let digest = oci
             .push_image(
                 &full_uri,
-                &manifest_bytes,
                 rootfs_arg,
                 &config_bytes,
                 bundle_bytes.as_deref(),
@@ -1204,14 +1199,6 @@ fn parse_push_concurrency(raw: Option<String>) -> usize {
 pub struct RegistryPush {
     pub uri: String,
     pub manifest_digest: engram_oci::Digest256,
-}
-
-/// Render the manifest as TOML. Strips the `[build]` section since
-/// runtime doesn't need it (already filtered out by
-/// `EngramRepoConfig::to_manifest`).
-fn render_manifest_value(manifest: &ImageManifest) -> Result<String, BuildError> {
-    toml::to_string_pretty(manifest)
-        .map_err(|e| BuildError::Config(format!("render manifest: {e}")))
 }
 
 /// Write the stage-1 init shim into `<rootfs>/sbin/engram-init` — the

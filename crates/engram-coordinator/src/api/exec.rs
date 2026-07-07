@@ -88,7 +88,7 @@ async fn session_exec_env(
     // manifest bundle — inject it unconditionally so `engram-share`
     // works from `/exec` even when the bundle load above failed.
     crate::api::sessions::inject_upload_env(state, id, &mut env).await;
-    (env, bundle.and_then(|b| b.manifest.workdir))
+    (env, bundle.and_then(|b| b.config.workdir))
 }
 
 /// Helper: validate the request shape and produce an argv + sandbox

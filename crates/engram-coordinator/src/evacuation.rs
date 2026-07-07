@@ -107,12 +107,11 @@ impl std::error::Error for EvacError {
 }
 
 /// ADR 0028 Fix B: derive the disk-only recovery's cold-boot
-/// `SandboxSpec` from the session's enabled image (manifest-derived
+/// `SandboxSpec` from the session's enabled image (config-derived
 /// resources, env, bundles — `api::sessions::cold_boot_spec`).
-/// `None` when the image row is gone/unreadable or its manifest
-/// doesn't parse — callers pass that through and
-/// `evacuate_dead_source` fails structurally (`ColdBootUnavailable`)
-/// only if the recovery actually needed it.
+/// `None` when the image row is gone/unreadable — callers pass that
+/// through and `evacuate_dead_source` fails structurally
+/// (`ColdBootUnavailable`) only if the recovery actually needed it.
 pub async fn resolve_cold_boot_spec(
     meta: &Arc<dyn MetadataStore>,
     session: &Session,
@@ -137,20 +136,10 @@ pub async fn resolve_cold_boot_spec(
             return None;
         }
     };
-    let manifest: engram_core::types::ImageManifest = match toml::from_str(&enabled.manifest_toml) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session.id,
-                image = %session.image,
-                error = %e,
-                "cold-boot spec: manifest_toml parse failed",
-            );
-            return None;
-        }
-    };
+    // ADR 0080: the row carries the config as typed JSONB — no TOML parse.
+    let config = enabled.effective_config();
     // ADR 0057: disk-only recovery rebuilds the session's own egress network
-    // from its persisted policy (the manifest no longer carries network).
+    // from its persisted policy (the image config carries no network).
     let network = match meta.get_session_integration_policy(session.id).await {
         Ok(Some(json)) => engram_core::types::IntegrationPolicy::parse(&json)
             .ok()
@@ -161,7 +150,7 @@ pub async fn resolve_cold_boot_spec(
     };
     Some(crate::api::sessions::cold_boot_spec(
         &session.image,
-        &manifest,
+        &config,
         None,
         network,
     ))

@@ -118,7 +118,7 @@ pub(crate) async fn resolve_resume_agent_and_policy(
         session.mode,
         id,
         session_env,
-        b.manifest.workdir.clone(),
+        b.config.workdir.clone(),
     )
     .await
     .ok()

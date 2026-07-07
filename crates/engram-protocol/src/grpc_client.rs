@@ -598,12 +598,14 @@ impl GrpcHostClient {
         spec: SandboxSpec,
         warm: Option<engram_core::types::image::WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        capture_egress: Option<engram_core::types::egress::SessionEgressPolicy>,
         progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         let req = BuildBaseSnapshotRequest {
             spec_bincode: encode_bincode(&spec, "SandboxSpec")?,
             warm_bincode: encode_bincode(&warm, "Option<WarmConfig>")?,
             capture_env_bincode: encode_bincode(&capture_env, "capture_env")?,
+            capture_egress_bincode: encode_bincode(&capture_egress, "Option<SessionEgressPolicy>")?,
         };
         let mut stream = self
             .inner
@@ -1516,9 +1518,10 @@ impl HostClient for GrpcHostClient {
         spec: SandboxSpec,
         warm: Option<engram_core::types::image::WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        capture_egress: Option<engram_core::types::egress::SessionEgressPolicy>,
         progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        Self::build_base_snapshot(self, spec, warm, capture_env, progress).await
+        Self::build_base_snapshot(self, spec, warm, capture_env, capture_egress, progress).await
     }
 
     async fn restore_base_for_session(

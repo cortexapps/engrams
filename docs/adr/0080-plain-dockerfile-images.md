@@ -172,18 +172,45 @@ Recapture remains only for: image content, resources, warm config, and
   silently-missing secret bakes a corrupt warm snapshot.
 - **One egress builder**: the coordinator assembles the capture
   `SessionEgressPolicy` through the same code path as sessions
-  (`assemble_egress_policy`, capture flavor) and ships it in the
-  `build_base_snapshot` request; the host-side `capture_egress_policy`
-  builder retires. Enforcement (`egress::register_policy`) is already
-  unified and stays put.
+  (`assemble_capture_egress_policy` in `session_boot.rs`, the capture
+  flavor of `assemble_egress_policy`) and ships it in the
+  `build_base_snapshot` request (`capture_egress_bincode`, wire v13);
+  the host-side `capture_egress_policy` builder retires. **Phase 2a
+  divergence**: the split mirrors issue #535(c)'s session-side split —
+  the coordinator assembles the sandbox-INDEPENDENT posture half
+  (allow_all / allowlists / a synthetic teardown session_id) with
+  placeholder identity, and the host stamps the sandbox-DEPENDENT half
+  (sandbox_id + guest IP, which only exist once the capture VM boots
+  inside `build_base_snapshot`) at registration. Enforcement
+  (`egress::register_policy`) is already unified and stays put.
 - Snapshot-reuse key: `(disk_manifest, image_config->'resources')`
   replaces `(disk_manifest, manifest_toml)` (warm images already never
   reuse).
 - Surfaces: full create/edit form in the web ImagesPanel (env rows,
   resources, warm command/timeout/env-with-OrgSecretCombobox, network
-  editor mirroring the profile editor, recapture confirmation);
-  orchestrator policy-map `ImageService.UpdateImage: manage/all`; CLI
+  editor mirroring the profile editor — the wire reuses the
+  `ProfileNetwork` proto shape, recapture confirmation); orchestrator
+  policy-map `ImageService.UpdateImage: manage/all`; CLI
   `image enable/update --config <toml> [--allow-recapture]`.
+- **Phase 2a interim artifact** (retired wholesale by phase 3): the
+  bake keeps producing the chunked engram artifact, but the
+  `manifest.toml` layer is GONE (`ENGRAM_MANIFEST_MEDIA_TYPE` retired)
+  and the OCI config blob gains `runtime_defaults` — extracted at bake
+  via `docker inspect` (now a HARD bake error on failure; a silent
+  fallback would strip the Dockerfile ENV/WORKDIR from every session).
+  The enable pipeline fail-louds on artifacts missing
+  `runtime_defaults` ("re-bake with a current builder"). `engram.toml`
+  is already reduced to an OPTIONAL `[build]`-only file — a leftover
+  manifest-era key fails the bake with a pointer to
+  `image enable --config`. The host's image-cache "manifest.toml
+  exists" sentinel is replaced by the bundle/rootfs presence check
+  (nothing host-side ever read its contents).
+- **Phase 2a divergence — in-flight-config guard**: re-POSTing an
+  enable while a job is in flight returns that job
+  (`create_or_get_enable_job`'s dedup), but the in-flight job captures
+  under ITS config; if the caller supplied a DIFFERENT config the
+  request fails `Conflict`/`FailedPrecondition` (admin-visible
+  check-then-act) instead of silently dropping the edit.
 
 ### C. Host-side materialization
 
@@ -266,6 +293,18 @@ as workspace requirements). `engram-image-builder`,
 - Phase 2's migration 0094 wipes `enabled_images`/`enable_jobs`:
   quiesce sessions, re-enable each image via the new UI/CLI (dev-brain
   pays one warm capture).
+- **Profiles dangle across the wipe**: `profile.image_id` (orchestrator
+  DB) is a logical ref to `enabled_images.id`, and a post-wipe
+  re-enable mints a NEW row id — so every existing profile's ref goes
+  stale. Failure is graceful and diagnosable (task-create throws
+  `FailedPrecondition` "the profile's image is no longer enabled";
+  list views degrade the image chip to empty), but every
+  profile-driven create fails until remediated. Rollout step: before
+  applying, snapshot `SELECT id, image_uri FROM enabled_images`; after
+  re-enabling, re-point each profile at the new id — via the profile
+  editor's image picker (a handful of profiles today), or
+  `UPDATE profile SET image_id = '<new>' WHERE image_id = '<old>'`
+  against the orchestrator DB using the snapshot as the join.
 - Phase 3 requires images be pushed as standard docker images
   (dev-brain already is); enable/rebase re-materializes on a host.
 

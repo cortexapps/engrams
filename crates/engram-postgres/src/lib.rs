@@ -3898,14 +3898,15 @@ impl MetadataStore for PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO enabled_images
-                (id, image_uri, manifest_toml, manifest_digest,
+                (id, image_uri, image_config, oci_defaults, manifest_digest,
                  disk_manifest_id, disk_manifest_version, base_snapshot_id,
                  base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                  base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
-                 last_refreshed_at, created_at, updated_at, soft_deleted_at, capture_env)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULL, NULL, $14)
+                 last_refreshed_at, created_at, updated_at, soft_deleted_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL, NULL)
             ON CONFLICT (image_uri) DO UPDATE SET
-                manifest_toml         = EXCLUDED.manifest_toml,
+                image_config          = EXCLUDED.image_config,
+                oci_defaults          = EXCLUDED.oci_defaults,
                 manifest_digest       = EXCLUDED.manifest_digest,
                 disk_manifest_id      = EXCLUDED.disk_manifest_id,
                 disk_manifest_version = EXCLUDED.disk_manifest_version,
@@ -3915,7 +3916,6 @@ impl MetadataStore for PostgresStore {
                 base_snapshot_memory_manifest_id      = EXCLUDED.base_snapshot_memory_manifest_id,
                 base_snapshot_memory_manifest_version = EXCLUDED.base_snapshot_memory_manifest_version,
                 last_refreshed_at     = EXCLUDED.last_refreshed_at,
-                capture_env           = EXCLUDED.capture_env,
                 updated_at            = NOW(),
                 -- ADR 0021 P1.8: enabling an image always "undeletes" any
                 -- prior soft-delete on the same image_uri. Operator who
@@ -3929,7 +3929,8 @@ impl MetadataStore for PostgresStore {
         )
         .bind(image.id)
         .bind(&image.image_uri)
-        .bind(&image.manifest_toml)
+        .bind(sqlx::types::Json(&image.image_config))
+        .bind(sqlx::types::Json(&image.oci_defaults))
         .bind(&image.manifest_digest)
         .bind(image.disk_manifest.map(|m| m.manifest_id))
         .bind(image.disk_manifest.map(|m| m.version as i64))
@@ -3940,7 +3941,6 @@ impl MetadataStore for PostgresStore {
         .bind(image.base_snapshot_memory_manifest.map(|m| m.version as i64))
         .bind(image.last_refreshed_at)
         .bind(image.created_at)
-        .bind(sqlx::types::Json(&image.capture_env))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -3963,18 +3963,49 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn update_enabled_image_config(
+        &self,
+        image_uri: &str,
+        config: &engram_core::types::image::ImageConfig,
+    ) -> Result<(), MetaError> {
+        // ADR 0080 cheap-edit path: replace image_config in place on a
+        // live row — no snapshot work, so callers must have gated out
+        // capture-affecting diffs (resources/warm) before landing here.
+        // Same transactional NOTIFY as upsert_enabled_image so every
+        // replica's boot-bundle cache drops its copy immediately.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let res = sqlx::query(
+            "UPDATE enabled_images SET image_config = $2, updated_at = NOW() \
+             WHERE image_uri = $1 AND soft_deleted_at IS NULL",
+        )
+        .bind(image_uri)
+        .bind(sqlx::types::Json(config))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(MetaError::NotFound);
+        }
+        sqlx::query("SELECT pg_notify('enabled_image_changed', $1)")
+            .bind(image_uri)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
     async fn list_enabled_images(&self) -> Result<Vec<EnabledImage>, MetaError> {
         // ADR 0021 P1.8: live-only filter. Hosts advertise + the
         // dashboard surfaces only `soft_deleted_at IS NULL`. The
         // resume path's lookup uses `get_enabled_image_any` instead.
         let rows = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_toml, manifest_digest,
+            SELECT id, image_uri, image_config, oci_defaults, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
                    base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                    base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
-                   last_refreshed_at, created_at, updated_at, soft_deleted_at,
-                   capture_env
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE soft_deleted_at IS NULL
              ORDER BY image_uri
@@ -3993,12 +4024,11 @@ impl MetadataStore for PostgresStore {
         // `get_enabled_image_any` to look past the flag.
         let row = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_toml, manifest_digest,
+            SELECT id, image_uri, image_config, oci_defaults, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
                    base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                    base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
-                   last_refreshed_at, created_at, updated_at, soft_deleted_at,
-                   capture_env
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE image_uri = $1 AND soft_deleted_at IS NULL
             "#,
@@ -4021,12 +4051,11 @@ impl MetadataStore for PostgresStore {
         // `get_enabled_image` (live-filtered).
         let row = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_toml, manifest_digest,
+            SELECT id, image_uri, image_config, oci_defaults, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
                    base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                    base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
-                   last_refreshed_at, created_at, updated_at, soft_deleted_at,
-                   capture_env
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE image_uri = $1
             "#,
@@ -4161,24 +4190,32 @@ impl MetadataStore for PostgresStore {
     async fn find_enabled_image_by_content(
         &self,
         disk_manifest: engram_core::types::manifest::ManifestRef,
-        manifest_toml: &str,
+        resources: &engram_core::types::image::ResourceHints,
     ) -> Result<Option<EnabledImage>, MetaError> {
         // Soft-deleted rows are deliberately INCLUDED: their base
         // snapshots remain GC-pinned and restorable, and content
         // equality is what makes the reuse sound — liveness of the
         // *row* is irrelevant to the snapshot's validity.
+        //
+        // ADR 0080: the config half of the reuse key is ONLY the
+        // capture-affecting `resources` slice (JSONB containment on
+        // `image_config->'resources'`, order-insensitive) — name/
+        // description/env/workdir are applied per-session and don't
+        // invalidate a snapshot. Warm images never reach this query
+        // (caller-gated).
+        let resources_json =
+            serde_json::to_value(resources).map_err(|e| MetaError::Serialization(e.to_string()))?;
         let row = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_toml, manifest_digest,
+            SELECT id, image_uri, image_config, oci_defaults, manifest_digest,
                    disk_manifest_id, disk_manifest_version, base_snapshot_id,
                    base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
                    base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
-                   last_refreshed_at, created_at, updated_at, soft_deleted_at,
-                   capture_env
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
               FROM enabled_images
              WHERE disk_manifest_id = $1
                AND disk_manifest_version = $2
-               AND manifest_toml = $3
+               AND image_config->'resources' = $3::jsonb
                AND base_snapshot_id IS NOT NULL
              ORDER BY COALESCE(updated_at, created_at) DESC
              LIMIT 1
@@ -4186,7 +4223,7 @@ impl MetadataStore for PostgresStore {
         )
         .bind(disk_manifest.manifest_id)
         .bind(disk_manifest.version as i64)
-        .bind(manifest_toml)
+        .bind(resources_json)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4199,26 +4236,27 @@ impl MetadataStore for PostgresStore {
         &self,
         image_uri: &str,
         manifest_digest: Option<&str>,
-        capture_env: &[engram_core::types::CaptureEnvEntry],
+        image_config: &engram_core::types::image::ImageConfig,
     ) -> Result<EnableJob, MetaError> {
         // INSERT guarded by the partial unique index (one non-terminal
         // job per image_uri); on conflict fall through to SELECTing
         // the in-flight job. Re-POST = resume, never duplicate work.
-        // `capture_env` rides the job so the scanner injects it into the
-        // [warm] hook at capture (refs resolved there, values never stored).
+        // The full `image_config` rides the job (ADR 0080): the scanner
+        // captures under it (warm env refs resolved there, values never
+        // stored) and stamps it onto the enabled_images row at ready.
         let inserted = sqlx::query(
             r#"
-            INSERT INTO enable_jobs (id, image_uri, manifest_digest, capture_env)
+            INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config)
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
             DO NOTHING
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(Uuid::new_v4())
         .bind(image_uri)
         .bind(manifest_digest)
-        .bind(sqlx::types::Json(capture_env))
+        .bind(sqlx::types::Json(image_config))
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4227,7 +4265,7 @@ impl MetadataStore for PostgresStore {
         }
         let existing = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              WHERE image_uri = $1 AND state NOT IN ('ready', 'failed')
             "#,
@@ -4243,17 +4281,17 @@ impl MetadataStore for PostgresStore {
             None => {
                 let row = sqlx::query(
                     r#"
-                    INSERT INTO enable_jobs (id, image_uri, manifest_digest, capture_env)
+                    INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config)
                     VALUES ($1, $2, $3, $4)
                     ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
                     DO NOTHING
-                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
                     "#,
                 )
                 .bind(Uuid::new_v4())
                 .bind(image_uri)
                 .bind(manifest_digest)
-                .bind(sqlx::types::Json(capture_env))
+                .bind(sqlx::types::Json(image_config))
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(db_err)?
@@ -4269,7 +4307,7 @@ impl MetadataStore for PostgresStore {
 
     async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
         let row = sqlx::query(
-            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
+            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -4281,7 +4319,7 @@ impl MetadataStore for PostgresStore {
     async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              ORDER BY created_at DESC
              LIMIT $1
@@ -4316,7 +4354,7 @@ impl MetadataStore for PostgresStore {
                     LIMIT $3
                       FOR UPDATE SKIP LOCKED
              )
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(claimant)
@@ -4528,7 +4566,7 @@ impl MetadataStore for PostgresStore {
                    -- read as live until the retry's first chunk event.
                    chunks_done = 0, chunks_total = NULL
              WHERE id = $1 AND state = 'failed'
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, capture_env, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(id)

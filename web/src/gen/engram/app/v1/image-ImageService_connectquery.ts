@@ -20,6 +20,17 @@ export const listEnabledImages = ImageService.method.listEnabledImages;
 export const enableImage = ImageService.method.enableImage;
 
 /**
+ * ADR 0080: edit an enabled image's config. Cheap fields (name,
+ * description, env, workdir) apply immediately; a diff touching the
+ * capture-affecting fields (resources, anything under warm) requires
+ * `allow_recapture = true` and enqueues an enable job instead —
+ * without it the call fails FailedPrecondition naming the fields.
+ *
+ * @generated from rpc engram.app.v1.ImageService.UpdateImage
+ */
+export const updateImage = ImageService.method.updateImage;
+
+/**
  * @generated from rpc engram.app.v1.ImageService.DisableImage
  */
 export const disableImage = ImageService.method.disableImage;
