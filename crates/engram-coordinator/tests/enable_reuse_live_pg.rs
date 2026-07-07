@@ -1,42 +1,46 @@
-//! ADR 0036 P4 end-to-end (coord-level): enabling the SAME content
-//! under two different tags captures exactly ONE base snapshot.
+//! ADR 0036 P4 / ADR 0080 phase 3b end-to-end (coord-level): enabling
+//! the SAME content under two different tags materializes twice but
+//! captures exactly ONE base snapshot.
 //!
 //! Drives the real enable pipeline — `create_or_get_enable_job` →
-//! `enable_scanner` → `fetch_and_seal_artifact` → per-chunk
-//! materialize → content-keyed capture reuse → `enabled_images`
-//! upsert — against a fake in-process OCI registry and a fake capture
-//! host that counts `build_base_snapshot` calls. This is the
-//! regression guard for the moved-tag scenario: a re-bake pushed
-//! under a fresh `warm-<sha>` tag with byte-identical content must
-//! reuse the existing snapshot (no capture VM, no new lineage), while
-//! both enable jobs still reach `ready`.
+//! `enable_scanner` → host-side `materialize_image` (the REAL
+//! `engram-rootfs-materializer` pipeline: pull → flatten → inject →
+//! pack → chunk, with only the mke2fs pack swapped for a deterministic
+//! fake packer so the test needs no e2fsprogs) → content-keyed capture
+//! reuse → `enabled_images` upsert — against a fake in-process docker
+//! registry serving a STANDARD OCI image under two tags with shared
+//! layers, and a fake host that counts `materialize_image` +
+//! `build_base_snapshot` calls. This is the regression guard for the
+//! moved-tag scenario: a re-push under a fresh `warm-<sha>` tag with
+//! byte-identical content must reuse the existing snapshot (no capture
+//! VM, no new lineage), while both enable jobs still reach `ready`.
 //!
 //! What would catch it failing:
-//!   - the bake's ManifestRef regressing to a random id (content no
-//!     longer recognizable → second capture fires),
+//!   - the materializer's ManifestRef regressing to a random id
+//!     (content no longer recognizable → second capture fires),
 //!   - `find_enabled_image_by_content` drifting (ditto),
 //!   - the scanner not driving jobs to `ready`, or
-//!   - the per-chunk materialize failing against a spec-shaped
-//!     registry.
+//!   - the pull/flatten path failing against a spec-shaped registry.
 //!
 //! `#[ignore]`'d by default; requires Postgres at
 //! `ENGRAM_TEST_DATABASE_URL` (CI's Postgres-gated lane runs it).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::extract::{Path as AxPath, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path as AxPath, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
 use chrono::Utc;
-use engram_chunk_store::{Bootstrap, ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind};
+use engram_chunk_store::{Manifest, ManifestKind};
 use engram_coordinator::config::CoordinatorConfig;
 use engram_coordinator::{enable_scanner, AppState};
 use engram_core::error::SandboxError;
@@ -47,22 +51,45 @@ use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::types::SessionId;
 use engram_core::types::{HostCapacity, HostMetadata, HostStatus};
 use engram_core::{HostId, SandboxId, SnapshotId};
-use engram_oci::{AnonymousResolver, ChunkLayerRef, ChunkedImageLayers, OciClient};
+use engram_oci::{AnonymousResolver, OciClient};
+use engram_rootfs_materializer::{Ext4Error, Ext4Packer, InitInjection, Materializer, Transport};
 use parking_lot::Mutex;
+use sha2::Digest as _;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------
-// Fake OCI registry (push + pull verbs). Same shape as
-// engram-oci/tests/per_chunk_roundtrip.rs — duplicated because test
-// fixtures don't cross crate boundaries.
+// Fake docker registry (pull verbs only — the fixtures are inserted
+// directly). Same shape as the materializer's own integration tests
+// (`engram-rootfs-materializer/tests/materialize.rs`) — duplicated
+// because test fixtures don't cross crate boundaries.
 // ---------------------------------------------------------------
 
 #[derive(Clone, Default)]
 struct Registry {
+    /// digest → blob bytes (config + layers).
     blobs: Arc<Mutex<HashMap<String, Bytes>>>,
-    sessions: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    /// tag → (content_type, manifest bytes).
     manifests: Arc<Mutex<HashMap<String, (String, Bytes)>>>,
+}
+
+impl Registry {
+    fn add_blob(&self, bytes: Vec<u8>) -> (String, u64) {
+        let digest = format!("sha256:{:x}", sha2::Sha256::digest(&bytes));
+        let size = bytes.len() as u64;
+        self.blobs.lock().insert(digest.clone(), Bytes::from(bytes));
+        (digest, size)
+    }
+
+    fn add_manifest(&self, tag: &str, bytes: Vec<u8>) {
+        self.manifests.lock().insert(
+            tag.to_string(),
+            (
+                "application/vnd.oci.image.manifest.v1+json".to_string(),
+                Bytes::from(bytes),
+            ),
+        );
+    }
 }
 
 async fn v2_root() -> StatusCode {
@@ -84,93 +111,14 @@ async fn get_blob(
         .unwrap()
 }
 
-async fn begin_upload(State(reg): State<Registry>, AxPath(repo): AxPath<String>) -> Response {
-    let id = Uuid::new_v4().to_string();
-    reg.sessions.lock().insert(id.clone(), Vec::new());
-    Response::builder()
-        .status(StatusCode::ACCEPTED)
-        .header(
-            axum::http::header::LOCATION,
-            format!("/v2/{repo}/blobs/uploads/{id}"),
-        )
-        .body(axum::body::Body::empty())
-        .unwrap()
-}
-
-async fn patch_upload(
-    State(reg): State<Registry>,
-    AxPath((repo, id)): AxPath<(String, String)>,
-    body: Bytes,
-) -> Response {
-    let mut sessions = reg.sessions.lock();
-    let Some(buf) = sessions.get_mut(&id) else {
-        return (StatusCode::NOT_FOUND, "no such session").into_response();
-    };
-    buf.extend_from_slice(&body);
-    Response::builder()
-        .status(StatusCode::ACCEPTED)
-        .header(
-            axum::http::header::LOCATION,
-            format!("/v2/{repo}/blobs/uploads/{id}"),
-        )
-        .body(axum::body::Body::empty())
-        .unwrap()
-}
-
-async fn put_upload(
-    State(reg): State<Registry>,
-    AxPath((repo, id)): AxPath<(String, String)>,
-    Query(q): Query<HashMap<String, String>>,
-    body: Bytes,
-) -> Response {
-    let Some(mut buf) = reg.sessions.lock().remove(&id) else {
-        return (StatusCode::NOT_FOUND, "no such session").into_response();
-    };
-    buf.extend_from_slice(&body);
-    let Some(digest) = q.get("digest").cloned() else {
-        return (StatusCode::BAD_REQUEST, "missing digest").into_response();
-    };
-    reg.blobs.lock().insert(digest.clone(), Bytes::from(buf));
-    Response::builder()
-        .status(StatusCode::CREATED)
-        .header(
-            axum::http::header::LOCATION,
-            format!("/v2/{repo}/blobs/{digest}"),
-        )
-        .body(axum::body::Body::empty())
-        .unwrap()
-}
-
-async fn put_manifest(
-    State(reg): State<Registry>,
-    AxPath((repo, tag)): AxPath<(String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/vnd.oci.image.manifest.v1+json")
-        .to_string();
-    reg.manifests.lock().insert(tag, (content_type, body));
-    Response::builder()
-        .status(StatusCode::CREATED)
-        .header(
-            axum::http::header::LOCATION,
-            format!("/v2/{repo}/manifests/x"),
-        )
-        .body(axum::body::Body::empty())
-        .unwrap()
-}
-
 async fn get_manifest(
     State(reg): State<Registry>,
-    AxPath((_repo, tag)): AxPath<(String, String)>,
+    AxPath((_repo, reference)): AxPath<(String, String)>,
 ) -> Response {
-    let Some((content_type, body)) = reg.manifests.lock().get(&tag).cloned() else {
+    let Some((content_type, body)) = reg.manifests.lock().get(&reference).cloned() else {
         return (StatusCode::NOT_FOUND, "no such manifest").into_response();
     };
-    let digest = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(&body));
+    let digest = format!("sha256:{:x}", sha2::Sha256::digest(&body));
     Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, content_type)
@@ -180,27 +128,13 @@ async fn get_manifest(
         .unwrap()
 }
 
-/// Minimal valid ImageConfig for enable jobs (ADR 0080: the full config
-/// rides the job; ADR 0048: suggested_vcpus required).
-fn test_config() -> engram_core::types::image::ImageConfig {
-    toml::from_str("name = \"reuse-fixture\"\n[resources]\nsuggested_vcpus = 2\n").unwrap()
-}
-
-async fn spawn_registry() -> (SocketAddr, oneshot::Sender<()>) {
+async fn spawn_registry() -> (SocketAddr, Registry, oneshot::Sender<()>) {
     let reg = Registry::default();
     let app = Router::new()
         .route("/v2/", get(v2_root))
         .route("/v2/:repo/blobs/:digest", get(get_blob))
-        .route("/v2/:repo/blobs/uploads/", post(begin_upload))
-        .route(
-            "/v2/:repo/blobs/uploads/:id",
-            axum::routing::patch(patch_upload).put(put_upload),
-        )
-        .route(
-            "/v2/:repo/manifests/:tag",
-            put(put_manifest).get(get_manifest),
-        )
-        .with_state(reg);
+        .route("/v2/:repo/manifests/:reference", get(get_manifest))
+        .with_state(reg.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
@@ -212,18 +146,92 @@ async fn spawn_registry() -> (SocketAddr, oneshot::Sender<()>) {
             .await
             .unwrap();
     });
-    (addr, tx)
+    (addr, reg, tx)
+}
+
+/// Minimal valid ImageConfig for enable jobs (ADR 0080: the full config
+/// rides the job; ADR 0048: suggested_vcpus required).
+fn test_config() -> engram_core::types::image::ImageConfig {
+    toml::from_str("name = \"reuse-fixture\"\n[resources]\nsuggested_vcpus = 2\n").unwrap()
+}
+
+/// Gzipped tar layer with `entries` as regular files.
+fn gzip_layer(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut tar = tar::Builder::new(gz);
+    for (path, body) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        tar.append_data(&mut header, path, *body).unwrap();
+    }
+    tar.into_inner().unwrap().finish().unwrap()
 }
 
 // ---------------------------------------------------------------
-// Fake capture host: counts `build_base_snapshot` calls, returns a
-// fixed synthetic snapshot whose (empty) disk manifest is pre-seeded
-// in BlobStorage so HEAD-verify passes.
+// Deterministic fake ext4 packer: serializes the flattened tree
+// (sorted walk of paths + bytes) instead of running mke2fs, so
+// "identical tree ⇒ identical packed bytes ⇒ identical content_ref"
+// holds without pinning e2fsprogs in the live-PG lane. Everything
+// upstream of the pack (pull, flatten, init inject, chunking) is the
+// REAL pipeline.
+// ---------------------------------------------------------------
+
+struct FakeTreePacker;
+
+#[async_trait]
+impl Ext4Packer for FakeTreePacker {
+    async fn pack(
+        &self,
+        src_dir: &Path,
+        dst_image: &Path,
+        _size_bytes: u64,
+    ) -> Result<(), Ext4Error> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<u8>) -> std::io::Result<()> {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+            entries.sort_by_key(|e| e.file_name());
+            for e in entries {
+                let path = e.path();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                let meta = std::fs::symlink_metadata(&path)?;
+                out.extend_from_slice(rel.to_string_lossy().as_bytes());
+                out.push(0);
+                if meta.file_type().is_symlink() {
+                    out.extend_from_slice(std::fs::read_link(&path)?.to_string_lossy().as_bytes());
+                } else if meta.is_dir() {
+                    walk(&path, root, out)?;
+                } else {
+                    out.extend_from_slice(&std::fs::read(&path)?);
+                }
+                out.push(0);
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        walk(src_dir, src_dir, &mut out)?;
+        std::fs::write(dst_image, out)?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------
+// Fake host: `materialize_image` runs the REAL materializer (fake
+// packer) into the SHARED test chunk store; `build_base_snapshot`
+// counts calls and returns a fixed synthetic snapshot whose (empty)
+// disk manifest is pre-seeded in BlobStorage so HEAD-verify passes.
 // ---------------------------------------------------------------
 
 struct FakeCaptureHost {
+    materializes: AtomicUsize,
     captures: AtomicUsize,
-    disk_manifest: engram_core::types::manifest::ManifestRef,
+    /// Shares the coordinator's LocalBlobStorage, exactly like the real
+    /// host's write-through chunk store shares BlobStorage (ADR 0078).
+    chunk_store: engram_chunk_store::ChunkStore,
+    scratch: std::path::PathBuf,
+    snapshot_disk_ref: engram_core::types::manifest::ManifestRef,
 }
 
 #[async_trait]
@@ -302,21 +310,79 @@ impl HostClient for FakeCaptureHost {
     ) -> Result<(), SandboxError> {
         unreachable!()
     }
+
+    /// ADR 0080 phase 3b: the real materializer pipeline, minus mke2fs.
+    async fn materialize_image(
+        &self,
+        image_uri: &str,
+        platform_os: &str,
+        platform_arch: &str,
+        _registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
+    ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
+        self.materializes.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(platform_os, "linux");
+        // The fixture manifest is single-platform (no index), so the
+        // pull resolves regardless of the coordinator's arch; the
+        // Platform enum only drives index selection.
+        let platform = match platform_arch {
+            "arm64" => engram_rootfs_materializer::Platform::LinuxArm64,
+            _ => engram_rootfs_materializer::Platform::LinuxAmd64,
+        };
+        let materializer = Materializer::with_packer(
+            OciClient::new(Arc::new(AnonymousResolver)),
+            InitInjection {
+                vsock_port: 1024,
+                transport: Transport::Vsock,
+                init_script: None,
+            },
+            Arc::new(FakeTreePacker),
+        );
+        let out = materializer
+            .materialize(
+                image_uri,
+                platform,
+                &self.scratch,
+                &self.chunk_store,
+                Some(progress),
+            )
+            .await
+            .map_err(|e| {
+                SandboxError::MaterializeFailed(engram_core::types::MaterializeFailure {
+                    kind: engram_core::types::MaterializeFailureKind::Internal,
+                    message: format!("fake host materialize: {e}"),
+                })
+            })?;
+        Ok(engram_core::types::MaterializedImage {
+            disk_manifest: out.disk_manifest,
+            oci_defaults: out.oci_defaults,
+            manifest_digest: out.manifest_digest,
+            ext4_size_bytes: out.ext4_size_bytes,
+        })
+    }
+
     async fn build_base_snapshot(
         &self,
-        _spec: SandboxSpec,
+        spec: SandboxSpec,
         _warm: Option<engram_core::types::image::WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
         _capture_egress: Option<engram_core::types::egress::SessionEgressPolicy>,
         _progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.captures.fetch_add(1, Ordering::SeqCst);
+        // ADR 0080 phase 3b: the capture boots from the freshly
+        // materialized chunked ext4 — the coordinator must thread the
+        // row's disk manifest as the explicit rootfs override.
+        assert!(
+            spec.rootfs_manifest.is_some(),
+            "capture spec must carry the materialized rootfs_manifest"
+        );
         Ok(SnapshotMetadata {
             id: SnapshotId::new(),
             size_bytes: 4096,
             created_at: Utc::now(),
             image_version: "reuse-fixture".into(),
-            disk_manifest: Some(self.disk_manifest),
+            disk_manifest: Some(self.snapshot_disk_ref),
             memory_manifest: None, // cold-boot shape (VZ-like)
             base_memory_manifest: None,
             migration_source: None,
@@ -371,81 +437,49 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
     store.migrate().await.expect("migrate");
     let meta: Arc<dyn MetadataStore> = Arc::new(store);
 
-    // ---- fixture artifact: 3 chunks, content-derived ManifestRef ----
-    let chunk_size = 16u64;
-    let bodies: [&[u8]; 3] = [b"0123456789abcdef", b"fedcba9876543210", b"tail"];
-    let mut chunks = Vec::new();
-    let mut offset = 0u64;
-    for b in &bodies {
-        chunks.push(ChunkRef {
-            offset,
-            hash: ChunkHash::of(b),
-        });
-        offset += chunk_size;
-    }
-    let total_bytes = 2 * chunk_size + bodies[2].len() as u64;
-    let image_manifest = Manifest {
-        schema_version: 1,
-        kind: ManifestKind::Disk,
-        total_bytes,
-        chunk_size: ChunkSize::bytes(chunk_size),
-        chunks,
-        parent: None,
-        working_set_trace: None,
-        annotations: serde_json::Value::Null,
-    };
-    let content_ref = image_manifest.content_ref();
-    let bootstrap = Bootstrap::build_per_chunk(&image_manifest);
-    assert!(bootstrap.is_per_chunk());
-
-    let bundle_json = serde_json::json!({
-        "schema_version": 2,
-        "disk_manifest": content_ref,
-        "bootstrap_disk_available": true,
-    });
-
-    // ---- push the SAME artifact under two tags ----
-    let (addr, _shutdown) = spawn_registry().await;
+    // ---- fixture: a STANDARD docker image under two tags, shared layers ----
+    let (addr, reg, _shutdown) = spawn_registry().await;
     let repo = format!("127.0.0.1:{}/reuse-{}", addr.port(), Uuid::new_v4());
     let uri_a = format!("{repo}:warm-aaaaaaa");
     let uri_b = format!("{repo}:warm-bbbbbbb");
 
-    let oci = OciClient::new(Arc::new(AnonymousResolver));
-    for uri in [&uri_a, &uri_b] {
-        for b in &bodies {
-            let digest = format!("sha256:{}", ChunkHash::of(b).to_hex());
-            if !oci.blob_exists(uri, &digest).await.expect("HEAD") {
-                oci.push_chunk_blob(uri, &digest, b)
-                    .await
-                    .expect("push chunk");
-            }
-        }
-        let chunk_refs: Vec<ChunkLayerRef> = bootstrap
-            .entries
-            .iter()
-            .map(|e| ChunkLayerRef {
-                digest: e.blob_digest.clone().unwrap(),
-                size: e.length as u64,
-            })
-            .collect();
-        oci.push_chunked_image_manifest(
-            uri,
-            ChunkedImageLayers {
-                // ADR 0080: the config blob must carry runtime_defaults —
-                // the pipeline fail-louds on a pre-0080 artifact.
-                config_json:
-                    br#"{"kind":"engram-image-v1","runtime_defaults":{"env":{},"workdir":null}}"#
-                        .to_vec(),
-                bundle_json: serde_json::to_vec(&bundle_json).unwrap(),
-                disk_bootstrap_json: serde_json::to_vec(&bootstrap).unwrap(),
+    let (cfg_digest, cfg_size) = reg.add_blob(
+        br#"{"config":{"Env":["FIXTURE=1","PATH=/usr/bin"],"WorkingDir":"/w"}}"#.to_vec(),
+    );
+    let layer1 = gzip_layer(&[
+        ("bin/tool", b"#!/bin/sh\necho hi\n".as_slice()),
+        ("etc/base", b"base-layer".as_slice()),
+    ]);
+    let layer2 = gzip_layer(&[("etc/upper", b"upper-layer".as_slice())]);
+    let (l1_digest, l1_size) = reg.add_blob(layer1);
+    let (l2_digest, l2_size) = reg.add_blob(layer2);
+    let manifest_json = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": cfg_digest,
+            "size": cfg_size,
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": l1_digest,
+                "size": l1_size,
             },
-            &chunk_refs,
-        )
-        .await
-        .expect("push manifest");
-    }
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": l2_digest,
+                "size": l2_size,
+            },
+        ],
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest_json).unwrap();
+    // Two TAGS, same layers (the moved-tag re-push shape).
+    reg.add_manifest("warm-aaaaaaa", manifest_bytes.clone());
+    reg.add_manifest("warm-bbbbbbb", manifest_bytes);
 
-    // ---- coordinator state: shared blob store + fake capture host ----
+    // ---- coordinator state: shared blob store + fake host ----
     let blob_dir = tempfile::tempdir().expect("tempdir");
     let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
         engram_storage_local::LocalBlobStorage::new(blob_dir.path().to_path_buf()),
@@ -474,18 +508,22 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         oci: Arc::new(OciClient::new(Arc::new(AnonymousResolver))),
         auth_resolver: Arc::new(AnonymousResolver),
         blob: blob.clone(),
-        chunk_store,
+        chunk_store: chunk_store.clone(),
         host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
     };
     // `AppState::new` would auto-register `services.host` (the
-    // ProcessBackend stub, which can't capture) and `pick_capture_host`
-    // could pick it. Build the registry by hand with ONLY the counting
-    // fake capture host.
+    // ProcessBackend stub, which can't materialize or capture) and
+    // `pick_capture_host` could pick it. Build the registry by hand
+    // with ONLY the counting fake host.
     let host_id = HostId::new();
+    let scratch_dir = tempfile::tempdir().expect("scratch");
     let capture_host = Arc::new(FakeCaptureHost {
+        materializes: AtomicUsize::new(0),
         captures: AtomicUsize::new(0),
-        disk_manifest: snapshot_disk_ref,
+        chunk_store: chunk_store.clone(),
+        scratch: scratch_dir.path().to_path_buf(),
+        snapshot_disk_ref,
     });
     let host_registry = Arc::new(engram_coordinator::host_registry::HostRegistry::new(
         meta.clone(),
@@ -507,6 +545,8 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
             used_mib: 0,
             running_sandboxes: 0,
         },
+        // Unmeasured disk → the ADR 0078 disk floor is soft (no veto);
+        // the fake host stays pickable.
         utilization: Default::default(),
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
@@ -568,6 +608,11 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         .expect("job a");
     wait_ready(job_a.id).await;
     assert_eq!(
+        capture_host.materializes.load(Ordering::SeqCst),
+        1,
+        "first enable materializes once"
+    );
+    assert_eq!(
         capture_host.captures.load(Ordering::SeqCst),
         1,
         "first enable must capture exactly once"
@@ -577,19 +622,21 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         .create_or_get_enable_job(&uri_b, None, &test_config())
         .await
         .expect("job b");
-    let job_b = wait_ready(job_b.id).await;
+    wait_ready(job_b.id).await;
+    assert_eq!(
+        capture_host.materializes.load(Ordering::SeqCst),
+        2,
+        "the second tag still materializes (its own pull), producing the same content ref"
+    );
     assert_eq!(
         capture_host.captures.load(Ordering::SeqCst),
         1,
         "second tag with identical content must NOT boot a capture VM"
     );
-    assert_eq!(
-        job_b.chunks_total,
-        Some(bootstrap.entries.len() as u32),
-        "progress total must reflect the bootstrap"
-    );
 
-    // Both rows exist and share the SAME base snapshot lineage.
+    // Both rows exist, share the SAME content-derived disk manifest
+    // (the deterministic double-materialize) and the SAME base
+    // snapshot lineage, and carry the Dockerfile-derived defaults.
     let row_a = meta
         .get_enabled_image(&uri_a)
         .await
@@ -600,10 +647,32 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         .await
         .expect("get b")
         .expect("row b");
-    assert_eq!(row_a.disk_manifest, Some(content_ref));
-    assert_eq!(row_b.disk_manifest, Some(content_ref));
+    assert!(row_a.disk_manifest.is_some(), "row a carries a manifest");
+    assert_eq!(
+        row_a.disk_manifest, row_b.disk_manifest,
+        "identical content must reproduce the same content-derived ManifestRef"
+    );
     assert_eq!(
         row_a.base_snapshot_id, row_b.base_snapshot_id,
         "both tags must restore from the same reused base snapshot"
     );
+    assert!(
+        row_a.manifest_digest.starts_with("sha256:"),
+        "manifest_digest stamped from the docker platform manifest: {}",
+        row_a.manifest_digest
+    );
+    assert_eq!(
+        row_a.oci_defaults.env.get("FIXTURE").map(String::as_str),
+        Some("1"),
+        "Dockerfile ENV must ride oci_defaults onto the row"
+    );
+    assert_eq!(row_a.oci_defaults.workdir.as_deref(), Some("/w"));
+
+    // The materialized manifest is durable and resolvable through the
+    // coordinator's chunk store (the write-through seam the real host
+    // provides via BlobStorage).
+    chunk_store
+        .get_manifest(row_a.disk_manifest.unwrap())
+        .await
+        .expect("materialized manifest resolvable from BlobStorage");
 }

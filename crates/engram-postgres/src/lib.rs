@@ -4455,6 +4455,44 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    /// ADR 0080 phase 3b: persist one `MaterializeProgress` frame onto
+    /// the job row. Post-3b the `materializing` stage runs HOST-side —
+    /// there is no coordinator chunk counter anymore, so the honest
+    /// operator surface is a rendered progress line in `output_tail`
+    /// (the same column the capture phase's hook output rides). Fenced
+    /// + claim-renewing exactly like
+    /// [`Self::update_enable_job_capture_progress`].
+    async fn update_enable_job_materialize_progress(
+        &self,
+        id: Uuid,
+        claimant: &str,
+        progress: &engram_core::types::MaterializeProgress,
+    ) -> Result<(), MetaError> {
+        let line = match &progress.detail {
+            Some(detail) => format!("materialize[{}] {detail}", progress.stage),
+            None => format!("materialize[{}]", progress.stage),
+        };
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET output_tail = $3,
+                   claimed_at = NOW(),
+                   updated_at = NOW()
+             WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(id)
+        .bind(claimant)
+        .bind(&line)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(self.enable_job_fence_miss(id, claimant).await);
+        }
+        Ok(())
+    }
+
     async fn set_enable_job_state(
         &self,
         id: Uuid,

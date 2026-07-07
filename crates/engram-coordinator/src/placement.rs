@@ -572,14 +572,8 @@ fn named_host_fit_veto(
     free_mib_of: &impl Fn(HostId) -> Option<i64>,
     cpu_fits: &impl Fn(HostId) -> bool,
 ) -> Option<&'static str> {
-    if h.utilization.disk_total_mib > 0 {
-        let free_disk_mib = h
-            .utilization
-            .disk_total_mib
-            .saturating_sub(h.utilization.disk_used_mib);
-        if free_disk_mib < engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB {
-            return Some("disk_full");
-        }
+    if !host_disk_floor_ok(h) {
+        return Some("disk_full");
     }
     let need_mib = ctx.memory_mib.unwrap_or(0) as i64;
     if free_mib_of(h.id).is_some_and(|free| free < need_mib) {
@@ -786,9 +780,15 @@ pub async fn pick_specific_host(
     Ok((host_id, backend))
 }
 
-/// ADR 0020 P1: any schedulable host for a base-snapshot capture — NOT
-/// gated on image readiness or capacity (the capture host
-/// lazy-materializes the rootfs from BlobStorage).
+/// ADR 0020 P1: any schedulable host for a base-snapshot capture or an
+/// ADR 0080 image materialize — NOT gated on image readiness or RAM/CPU
+/// capacity (the capture host lazy-materializes the rootfs from
+/// BlobStorage), but it IS gated on the ADR 0078 tier-0 disk floor:
+/// both jobs write image-sized data under the host's work dir, so a
+/// host already below the chunk-cache floor (about to disk-evict its
+/// cache) must never be handed more disk work. Fixed here for both
+/// consumers (the old capture picker ignored disk entirely — the
+/// `capture-host picker ignores disk` incident class).
 pub async fn pick_capture_host(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,
@@ -805,6 +805,9 @@ pub async fn pick_capture_host(
             host_is_schedulable(h, now, ttl)
                 // ADR 0068: base gate only — see `pick_specific_host`.
                 && host_meets_capabilities(h, &CapabilityRequirements::default()).is_ok()
+                // ADR 0078 tier-0 disk veto (same floor + same
+                // unmeasured-is-soft posture as `named_host_fit_veto`).
+                && host_disk_floor_ok(h)
         })
         .map(|h| h.id)
         .ok_or(PickError::NoCapacity)?;
@@ -813,6 +816,22 @@ pub async fn pick_capture_host(
         .await
         .map_err(|e| PickError::HostUnreachable(id, e.to_string()))?;
     Ok((id, backend))
+}
+
+/// ADR 0078's tier-0 disk floor as a standalone predicate: free
+/// work_dir space at or above [`engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB`].
+/// Unmeasured (`disk_total_mib == 0`) is soft — no veto, the same
+/// posture as unmeasured RAM (brand-new / dev hosts). Kept in lockstep
+/// with the disk arm of [`named_host_fit_veto`].
+fn host_disk_floor_ok(h: &HostRecord) -> bool {
+    if h.utilization.disk_total_mib == 0 {
+        return true;
+    }
+    let free_disk_mib = h
+        .utilization
+        .disk_total_mib
+        .saturating_sub(h.utilization.disk_used_mib);
+    free_disk_mib >= engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB
 }
 
 /// Pick a host for `ctx`, then `restore` from `metadata` on it. (The
@@ -1326,6 +1345,32 @@ mod tests {
         c.memory_mib = Some(8_000); // doesn't fit h2's 1,000 free
         let pick = pick_from(&[other, ram_full], &HashMap::new(), &c, Utc::now(), TTL).unwrap();
         assert_eq!(pick, hid(1), "RAM-full snapshot_host → soft fallback");
+    }
+
+    /// ADR 0080 phase 3b: the capture/materialize picker's disk gate —
+    /// `host_disk_floor_ok` shares the exact floor + unmeasured-is-soft
+    /// posture with `named_host_fit_veto`'s `disk_full` arm, so a host
+    /// the resume path would veto for disk can't be handed an
+    /// image-sized materialize/capture either.
+    #[test]
+    fn capture_picker_disk_floor_matches_the_tier0_veto() {
+        // Unmeasured disk (dev / brand-new host): soft, no veto.
+        assert!(host_disk_floor_ok(&host(1)));
+
+        // One MiB below the floor: vetoed.
+        let mut pressured = host(2);
+        pressured.utilization.disk_total_mib = 200_000;
+        pressured.utilization.disk_used_mib =
+            200_000 - (engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB - 1);
+        assert!(!host_disk_floor_ok(&pressured));
+
+        // Exactly at the floor: allowed (>= semantics, same as the
+        // named-host veto's `<` reject).
+        let mut at_floor = host(3);
+        at_floor.utilization.disk_total_mib = 200_000;
+        at_floor.utilization.disk_used_mib =
+            200_000 - engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB;
+        assert!(host_disk_floor_ok(&at_floor));
     }
 
     /// ADR 0078 re-review (finding #1): a tier-0 veto must not be

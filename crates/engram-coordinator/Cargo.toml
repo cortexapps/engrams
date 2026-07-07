@@ -87,6 +87,10 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 engram-harness-proto.workspace = true
 engram-secrets-dev.workspace = true
 engram-git-dev.workspace = true
+# ADR 0080 phase 3b: enable_reuse_live_pg's fake host runs the REAL
+# materializer (with a deterministic fake ext4 packer) against a mock
+# docker registry.
+engram-rootfs-materializer.workspace = true
 futures = { workspace = true }
 http-body-util = "0.1"
 parking_lot.workspace = true

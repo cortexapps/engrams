@@ -474,6 +474,17 @@ pub struct PooledBackend {
     /// from racing on the same manifest_id+version file. Held only
     /// for the materialize critical section, not the whole call.
     materialize_lock: Mutex<()>,
+    /// ADR 0080 §C: scratch root for image materialization
+    /// (`MaterializeImage` RPC) — per-run subdirs live under it and
+    /// are scrubbed by the materializer's guard + the startup
+    /// reconcile. `None` = this host can't materialize (no scratch
+    /// wired; dev/in-process compositions).
+    materialize_scratch: Option<PathBuf>,
+    /// ADR 0080 §C: the ≤1-concurrent-materialize-per-host gate. A
+    /// `try_lock` miss returns the retryable `Busy` failure — the
+    /// coordinator re-picks a host instead of queueing image pulls
+    /// behind each other on one NVMe.
+    materialize_gate: Arc<tokio::sync::Mutex<()>>,
     /// ADR 0008 Phase 5: OCI client used as the *origin tier* of the
     /// tiered chunk-fault path. When `Some`, `resolve_rootfs` checks
     /// `cached.is_disk_chunked_oci()` and builds a
@@ -1512,6 +1523,8 @@ impl PooledBackend {
             bundle_dir,
             chunk_cache: None,
             materialize_lock: Mutex::new(()),
+            materialize_scratch: None,
+            materialize_gate: Arc::new(tokio::sync::Mutex::new(())),
             oci_client: None,
             nbd_pool: None,
             #[cfg(target_os = "linux")]
@@ -3271,6 +3284,16 @@ impl PooledBackend {
     pub fn with_chunk_store(mut self, chunk_store: ChunkStore, materialize_dir: PathBuf) -> Self {
         self.chunk_store = Some(chunk_store);
         self.materialize_dir = Some(materialize_dir);
+        self
+    }
+
+    /// ADR 0080 §C: attach the image-materialize scratch root (the
+    /// `MaterializeImage` RPC's working space; same volume as the
+    /// chunk cache so the statvfs headroom check measures the disk
+    /// that actually fills). Without it, `materialize_image` errors
+    /// InvalidSpec — this host can't take enable-time materializes.
+    pub fn with_materialize_scratch(mut self, dir: PathBuf) -> Self {
+        self.materialize_scratch = Some(dir);
         self
     }
 
@@ -7048,6 +7071,59 @@ impl SandboxBackend for PooledBackend {
         // none was registered).
         self.unregister_capture_egress(capture_egress);
         captured
+    }
+
+    /// ADR 0080 §C: the `MaterializeImage` engine — validation, the
+    /// ≤1-concurrent gate, and the pipeline all live in
+    /// [`crate::materialize::run`]; this method owns only the pieces
+    /// that are per-host state (the scratch root, the chunk store, the
+    /// ambient OCI client, the gate).
+    #[tracing::instrument(name = "host.materialize_image", skip_all, fields(image_uri))]
+    async fn materialize_image(
+        &self,
+        image_uri: &str,
+        platform_os: &str,
+        platform_arch: &str,
+        registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
+    ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
+        let Some(scratch) = self.materialize_scratch.clone() else {
+            return Err(SandboxError::InvalidSpec(
+                "this host has no materialize scratch dir wired (with_materialize_scratch)".into(),
+            ));
+        };
+        let Some(chunk_store) = self.chunk_store.clone() else {
+            return Err(SandboxError::InvalidSpec(
+                "this host has no chunk store wired; cannot materialize images".into(),
+            ));
+        };
+        // ≤1 concurrent materialize per host: an image pull + flatten +
+        // pack saturates NVMe/network; queueing a second behind it
+        // just serializes with extra memory pressure. `try_lock` (not
+        // `lock`) so the second caller gets the retryable `busy` and
+        // the coordinator re-picks a host.
+        let gate = self.materialize_gate.clone();
+        let Ok(_permit) = gate.try_lock() else {
+            return Err(SandboxError::MaterializeFailed(
+                engram_core::types::MaterializeFailure {
+                    kind: engram_core::types::MaterializeFailureKind::Busy,
+                    message: "a materialize is already running on this host (≤1 concurrent); \
+                              retry re-picks a host"
+                        .into(),
+                },
+            ));
+        };
+        crate::materialize::run(
+            self.oci_client.clone(),
+            &chunk_store,
+            &scratch,
+            image_uri,
+            platform_os,
+            platform_arch,
+            registry_auth,
+            progress,
+        )
+        .await
     }
 
     #[tracing::instrument(name = "host.restore_base_for_session", skip_all)]

@@ -617,6 +617,26 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
+    /// ADR 0080 §C: materialize a STANDARD docker/OCI image into a
+    /// chunked bootable ext4 — the host half of the enable pipeline's
+    /// `materializing` stage. Implemented on `PooledBackend` (which
+    /// owns the chunk store, the OCI client, and the scratch root);
+    /// default errors so non-pooled backends opt out cleanly. See
+    /// [`crate::traits::HostClient::materialize_image`] for the full
+    /// contract (platform validation, auth, progress cadence).
+    async fn materialize_image(
+        &self,
+        _image_uri: &str,
+        _platform_os: &str,
+        _platform_arch: &str,
+        _registry_auth: Option<crate::types::registry::ResolvedRegistryAuth>,
+        _progress: tokio::sync::mpsc::Sender<crate::types::MaterializeProgress>,
+    ) -> Result<crate::types::MaterializedImage, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `materialize_image` (needs the pooled chunk-store wrapper)".into(),
+        ))
+    }
+
     /// ADR 0020 P1: merge per-session env (manifest env + resolved
     /// literal secrets + ENGRAM_SESSION_* ) into a restored sandbox's
     /// environment, so `exec` and the harness see it. A base snapshot is

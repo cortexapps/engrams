@@ -30,13 +30,14 @@ use engram_protocol::grpc::{
     CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
     DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
     ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse,
-    InterruptHarnessRequest, ListSandboxesResponse, MigrationCaptureResponse, MigrationExportRef,
-    MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse, PostCopyCaptureResponse,
-    ProbeSandboxResponse, ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose,
-    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
-    ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    InterruptHarnessRequest, ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent,
+    MaterializeImageFailed, MaterializeImageRequest, MaterializeProgress, MigrationCaptureResponse,
+    MigrationExportRef, MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse,
+    PostCopyCaptureResponse, ProbeSandboxResponse, ProxyPortData, ProxyPortMessage,
+    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing, ProxyShellPong,
+    ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
+    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
+    SnapshotBeginResponse, SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -188,6 +189,8 @@ impl HostService for HostServiceImpl {
         Pin<Box<dyn Stream<Item = Result<ProxyPortMessage, Status>> + Send + 'static>>;
     type BuildBaseSnapshotStream =
         Pin<Box<dyn Stream<Item = Result<BuildBaseSnapshotEvent, Status>> + Send + 'static>>;
+    type MaterializeImageStream =
+        Pin<Box<dyn Stream<Item = Result<MaterializeImageEvent, Status>> + Send + 'static>>;
 
     async fn ping(&self, _req: Request<Empty>) -> Result<Response<Empty>, Status> {
         Ok(Response::new(Empty {}))
@@ -749,6 +752,123 @@ impl HostService for HostServiceImpl {
         let out_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(Response::new(
             Box::pin(out_stream) as Self::BuildBaseSnapshotStream
+        ))
+    }
+
+    /// ADR 0080 §C (wire v14): server-streaming, the exact two-task
+    /// shape of `build_base_snapshot` above — a dedicated task drives
+    /// the backend call while THIS task drains its progress channel
+    /// onto the outer gRPC stream, and only once that channel closes
+    /// (the backend call returned, all `Sender`s dropped) do we await
+    /// the result and emit exactly one terminal `done`/`failed` frame.
+    /// Every progress frame therefore strictly precedes the terminal.
+    async fn materialize_image(
+        &self,
+        req: Request<MaterializeImageRequest>,
+    ) -> Result<Response<Self::MaterializeImageStream>, Status> {
+        let span = tracing::info_span!("host.materialize_image");
+        link_remote_parent(&span, &req);
+        check_wire_version(&req)?;
+        let inner = req.into_inner();
+        // An empty buffer is an unset proto field → `None` (anonymous /
+        // host-ambient auth); a populated buffer is the bincode
+        // `Option<ResolvedRegistryAuth>` (a `None` still encodes to a
+        // 1-byte discriminant).
+        let registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth> =
+            if inner.registry_auth_bincode.is_empty() {
+                None
+            } else {
+                decode_bincode(&inner.registry_auth_bincode, "Option<ResolvedRegistryAuth>")?
+            };
+
+        let (progress_tx, mut progress_rx) =
+            mpsc::channel::<engram_core::types::MaterializeProgress>(64);
+        let (tx, rx) = mpsc::channel::<Result<MaterializeImageEvent, Status>>(16);
+
+        let backend = self.inner.clone();
+        let backend_task = tokio::spawn(
+            async move {
+                backend
+                    .materialize_image(
+                        &inner.image_uri,
+                        &inner.platform_os,
+                        &inner.platform_arch,
+                        registry_auth,
+                        progress_tx,
+                    )
+                    .await
+            }
+            .instrument(span.clone()),
+        );
+
+        tokio::spawn(
+            async move {
+                while let Some(p) = progress_rx.recv().await {
+                    let event = MaterializeImageEvent {
+                        event: Some(
+                            engram_protocol::grpc::materialize_image_event::Event::Progress(
+                                MaterializeProgress {
+                                    stage: p.stage.as_str().to_string(),
+                                    detail: p.detail,
+                                },
+                            ),
+                        ),
+                    };
+                    if tx.send(Ok(event)).await.is_err() {
+                        // Client dropped the stream. Keep draining
+                        // progress_rx (cheap) so the backend task's
+                        // sends never block, but stop forwarding.
+                        while progress_rx.recv().await.is_some() {}
+                        return;
+                    }
+                }
+                let terminal = match backend_task.await {
+                    Ok(Ok(out)) => {
+                        let done = (|| -> Result<MaterializeImageDone, Status> {
+                            Ok(MaterializeImageDone {
+                                disk_manifest_bincode: encode_bincode(
+                                    &out.disk_manifest,
+                                    "ManifestRef",
+                                )?,
+                                oci_defaults_bincode: encode_bincode(
+                                    &out.oci_defaults,
+                                    "OciRuntimeDefaults",
+                                )?,
+                                manifest_digest: out.manifest_digest,
+                                ext4_size_bytes: out.ext4_size_bytes,
+                            })
+                        })();
+                        done.map(|d| MaterializeImageEvent {
+                            event: Some(
+                                engram_protocol::grpc::materialize_image_event::Event::Done(d),
+                            ),
+                        })
+                    }
+                    Ok(Err(SandboxError::MaterializeFailed(failure))) => {
+                        Ok(MaterializeImageEvent {
+                            event: Some(
+                                engram_protocol::grpc::materialize_image_event::Event::Failed(
+                                    MaterializeImageFailed {
+                                        message: failure.message,
+                                        kind: failure.kind.as_str().to_string(),
+                                    },
+                                ),
+                            ),
+                        })
+                    }
+                    Ok(Err(other)) => Err(sandbox_to_status(other)),
+                    Err(join_err) => Err(Status::internal(format!(
+                        "materialize_image backend task panicked: {join_err}"
+                    ))),
+                };
+                let _ = tx.send(terminal).await;
+            }
+            .instrument(span),
+        );
+
+        let out_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Ok(Response::new(
+            Box::pin(out_stream) as Self::MaterializeImageStream
         ))
     }
 
@@ -1572,6 +1692,11 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         // a `CaptureFailed` through a non-streaming RPC — fall back to a
         // plain internal status rather than losing the error.
         SandboxError::CaptureFailed(failure) => Status::internal(failure.to_string()),
+        // ADR 0080: the streaming `materialize_image` handler emits a
+        // structured `MaterializeImageFailed` frame for this variant
+        // (so the kind survives the wire); same defensive fallback as
+        // CaptureFailed for any future non-streaming caller.
+        SandboxError::MaterializeFailed(failure) => Status::internal(failure.to_string()),
     }
 }
 

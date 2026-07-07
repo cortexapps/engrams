@@ -108,6 +108,19 @@ service HostService {
   // host-owned job row; only the progress *sink* changes.
   rpc BuildBaseSnapshot(BuildBaseSnapshotRequest) returns (stream BuildBaseSnapshotEvent);
 
+  // ADR 0080 §C (wire v14): materialize a STANDARD docker/OCI image into
+  // a chunked bootable ext4 on this host — pull, whiteout-aware flatten,
+  // stage-1 init injection, deterministic mke2fs pack, chunk into the
+  // host's chunk store (write-through to BlobStorage, so the returned
+  // manifest is durable and coordinator-readable). Sibling of
+  // BuildBaseSnapshot: zero-or-more `progress` frames (host keepalive at
+  // least every 30 s — each doubles as the enable scanner's claim-lease
+  // renewal), then exactly one terminal `done`/`failed` frame. The host
+  // enforces the enable-time size cap, a ≤1-concurrent-materialize gate
+  // (`failed.kind = "busy"`, retryable), and a scratch disk-headroom
+  // check before pulling any bytes.
+  rpc MaterializeImage(MaterializeImageRequest) returns (stream MaterializeImageEvent);
+
   // ADR 0020 P1: restore a per-image base snapshot for a session and
   // late-bind the session's harness via the option-D drive swap (the
   // base snapshot was captured with a stub harness). Returns the
@@ -531,6 +544,61 @@ message CaptureFailed {
   string kind = 2;
   optional string warm_stage = 3;
   string output_tail = 4;
+}
+
+// ADR 0080 §C (wire v14) — see the MaterializeImage rpc comment.
+message MaterializeImageRequest {
+  // Standard docker/OCI image reference (tag or digest form).
+  string image_uri = 1;
+  // OCI platform strings ("linux" / "amd64"|"arm64"). The coordinator
+  // stamps its own arch (coord + hosts are same-arch per deployment);
+  // the host validates against ITS arch and fails loud on a mismatch.
+  string platform_os = 2;
+  string platform_arch = 3;
+  // bincode-encoded `Option<engram_core::types::registry::ResolvedRegistryAuth>`
+  // — static basic-auth creds the coordinator decrypted via CredCipher.
+  // An empty buffer decodes as `None`: anonymous, or the host's ambient
+  // resolver (GCP workload identity via the coord-backed HTTP resolver).
+  bytes registry_auth_bincode = 4;
+}
+
+// One progress frame of an in-flight materialize. `stage` is
+// `engram_core::types::MaterializeStage` as its snake_case string:
+// "pull" | "flatten" | "pack" | "chunk".
+message MaterializeProgress {
+  string stage = 1;
+  optional string detail = 2;
+}
+
+// Terminal success frame.
+message MaterializeImageDone {
+  // bincode-encoded `engram_core::types::manifest::ManifestRef` — the
+  // content-derived ref of the packed disk's chunk manifest (durable in
+  // BlobStorage via the host chunk store's write-through).
+  bytes disk_manifest_bincode = 1;
+  // bincode-encoded `engram_core::types::image::OciRuntimeDefaults` —
+  // Dockerfile ENV/WORKDIR from the image config blob.
+  bytes oci_defaults_bincode = 2;
+  // Digest ("sha256:<hex>") of the platform-resolved docker manifest —
+  // the enabled_images row's `manifest_digest`.
+  string manifest_digest = 3;
+  uint64 ext4_size_bytes = 4;
+}
+
+// Terminal failure frame. `kind` is
+// `engram_core::types::MaterializeFailureKind` snake_case (e.g. "busy",
+// "too_large", "disk_full") — the coordinator's retry classifier.
+message MaterializeImageFailed {
+  string message = 1;
+  string kind = 2;
+}
+
+message MaterializeImageEvent {
+  oneof event {
+    MaterializeProgress progress = 1;
+    MaterializeImageDone done = 2;
+    MaterializeImageFailed failed = 3;
+  }
 }
 
 message RestoreBaseForSessionRequest {

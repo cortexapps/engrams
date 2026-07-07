@@ -62,6 +62,15 @@ pub enum ApiError {
         kind: engram_core::types::CaptureFailureKind,
         message: String,
     },
+    /// ADR 0080 phase 3b: a structured image-materialize failure —
+    /// carries the [`engram_core::types::MaterializeFailureKind`] so
+    /// `classify_materialize_error` (`enable_scanner.rs`) can decide
+    /// retryable (busy/disk/registry/store/transport) vs. deterministic
+    /// bail-fast (too-large/image-content) without string-matching.
+    MaterializeFailed {
+        kind: engram_core::types::MaterializeFailureKind,
+        message: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -86,6 +95,7 @@ impl ApiError {
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::CaptureFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::MaterializeFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -105,12 +115,15 @@ impl ApiError {
             Self::BadGateway(_) => "bad_gateway",
             Self::Internal(_) => "internal",
             Self::CaptureFailed { .. } => "capture_failed",
+            Self::MaterializeFailed { .. } => "materialize_failed",
         }
     }
 
     pub(crate) fn message(&self) -> &str {
         match self {
-            Self::CaptureFailed { message, .. } => message,
+            Self::CaptureFailed { message, .. } | Self::MaterializeFailed { message, .. } => {
+                message
+            }
             Self::BadRequest(m)
             | Self::NotFound(m)
             | Self::Conflict(m)

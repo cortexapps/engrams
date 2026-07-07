@@ -251,6 +251,66 @@ in the request; GCP workload identity resolved host-side
 (`engram-oci-auth`). Per-session latency: zero — materialize is
 enable/rebase-time only.
 
+**Phase 3b divergences (implementation):**
+
+- **Wire v14** — `MaterializeImage` is the exact two-task
+  server-streaming shape of `BuildBaseSnapshot` (progress frames
+  strictly precede the one terminal frame; stream-death before a
+  terminal synthesizes the retryable `transport` kind, the sibling of
+  `WarmExecTransport`). The `done` frame ALSO carries
+  `manifest_digest`: the host's `pull_docker_manifest` resolves the
+  platform manifest anyway (for the pre-pull size cap), so the digest
+  ships back instead of the coordinator making a second platform-aware
+  pull. Digest-pinning for capture is kept, but the capture VM boots
+  from the freshly materialized chunked ext4 via
+  `spec.rootfs_manifest` (the ADR 0028 Fix-B override) — there is no
+  artifact for the host's image cache to pull; the pinned URI is
+  record-keeping.
+- **Chunk-store seam** — no explicit upload step. The host's pooled
+  chunk store is `ChunkStore::new(blob)` (BlobStorage-durable) with
+  the NVMe cache as a write-through *local* tier (ADR 0078 phase 1),
+  so the materializer's `chunk_file` + `put_manifest` land durably in
+  BlobStorage as a side effect and the coordinator (and every
+  prefetching host) reads the manifest directly — the same seam the
+  snapshot path uses.
+- **Auth split, concretely** — the coordinator resolves + `CredCipher`-
+  decrypts only `Static` rows and ships user/pass (`Option<
+  ResolvedRegistryAuth>` bincode, redacted `Debug`); GcpWorkloadIdentity /
+  Anonymous / no-row ship `None`, and the host then uses its EXISTING
+  ambient resolver — the image-cache `OciClient` whose
+  `HttpAuthResolver` asks the coordinator per pull (covering GCP WI
+  centrally), falling back to anonymous on hosts without one.
+- **Platform** — the request carries `linux/<coordinator arch>`
+  (deployments are same-arch coord+hosts) and the HOST validates it
+  against its own arch, failing loud on a mismatch. A mixed-arch fleet
+  needs an arch-aware materialize/capture picker before it can work —
+  recorded as an explicit non-goal here.
+- **Disk veto placement** — the ADR 0078 tier-0 disk floor went INTO
+  `pick_capture_host` (now shared verbatim by capture and materialize)
+  as `host_disk_floor_ok`, kept in lockstep with
+  `named_host_fit_veto`'s `disk_full` arm — fixing the pre-existing
+  "capture picker ignores disk" gap for both jobs at once.
+- **Scratch location** — `<work_dir>/materialize-scratch`, a SIBLING
+  of `chunk-cache` (same volume, so the statvfs headroom check
+  measures the disk that fills) rather than inside the cache root:
+  the cache sweeper owns that directory's contents and must not race
+  a live materialize. Orphaned per-run subdirs (host-agent death
+  mid-run) are swept by a startup reconcile.
+- **Job progress mapping** — the enable job's `chunks_done/chunks_total`
+  counters are vestigial post-3b (the coordinator no longer pushes
+  chunks); stage frames render as `materialize[<stage>] <detail>` into
+  the existing `output_tail` column via a new claim-renewing
+  `update_enable_job_materialize_progress` (no schema change), and the
+  host re-sends the latest stage every 20 s as the ≤30 s keepalive.
+- **Enqueue-time validation** — a KB-sized `pull_docker_manifest`
+  probe (coordinator arch, sibling-arch fallback, either accepted)
+  replaces the artifact metadata pull; `create_or_get_enable_job` now
+  takes `manifest_digest = None` and the digest is stamped at
+  materialize time from the platform manifest actually used.
+- **3a API extension** — `Materializer::materialize` grew an optional
+  progress sender (stage transitions only; keepalive cadence is the
+  caller's) and `Materialized`/`PulledImage` gained `manifest_digest`.
+
 ### D. Purification
 
 ttyd → `guest-tools` bundle (agentd's `shell.rs` resolves it from the

@@ -1849,6 +1849,31 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// ADR 0080 phase 3b: persist one `MaterializeProgress` frame from
+    /// the streaming `MaterializeImage` RPC onto the job row — the
+    /// `materializing`-stage counterpart of
+    /// [`Self::update_enable_job_capture_progress`], now that the
+    /// stage runs host-side (the coordinator-side chunk push and its
+    /// `chunks_done/chunks_total` counters are retired; those columns
+    /// stay NULL for post-3b jobs). Renders the frame into
+    /// `output_tail` (`materialize[<stage>] <detail>` — the job's
+    /// operator-facing progress line) and ALSO renews the claim
+    /// (`claimed_at = NOW()`), so the host's ≤30 s keepalive carries
+    /// the lease exactly like capture frames do.
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    async fn update_enable_job_materialize_progress(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        progress: &crate::types::MaterializeProgress,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant, progress);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
     /// Move the job's state forward (also renews the claim, clears
     /// `error` on non-failed targets, and releases the claim on
     /// terminal states).

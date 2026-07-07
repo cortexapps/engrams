@@ -86,6 +86,10 @@ pub struct PulledImage {
     pub oci_defaults: OciRuntimeDefaults,
     /// Sum of the layers' compressed sizes (the scratch-budget input).
     pub compressed_bytes: u64,
+    /// Digest (`sha256:<hex>`) of the PLATFORM-resolved image manifest
+    /// (not the index) — what the enable pipeline stamps as the row's
+    /// `manifest_digest` (ADR 0080 phase 3b).
+    pub manifest_digest: String,
 }
 
 #[derive(Debug)]
@@ -218,6 +222,7 @@ pub async fn pull_image(
         layers,
         oci_defaults,
         compressed_bytes,
+        manifest_digest: manifest.manifest_digest.as_str().to_string(),
     })
 }
 

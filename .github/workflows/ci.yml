@@ -682,15 +682,19 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           sudo chmod 0666 /dev/userfaultfd
 
-      # `mke2fs` (e2fsprogs) is needed by the exec_real_vm test for
-      # ext4 packing. `musl-tools` is for the static agentd build that
-      # the same test bakes into the rootfs. `squashfs-tools` (mksquashfs)
-      # is for `just bundles-squashfs`, which stages the `browser` bundle
-      # the e2e_vnc test mounts (ADR 0064).
-      - name: Install build deps (musl-tools, e2fsprogs, squashfs-tools)
+      # `mke2fs` (e2fsprogs) is needed by the exec_real_vm +
+      # materialize_boot tests for ext4 packing. `musl-tools` is for the
+      # static agentd build that the same tests bake into the rootfs.
+      # `squashfs-tools` (mksquashfs) is for `just bundles-squashfs`,
+      # which stages the `browser` bundle the e2e_vnc test mounts (ADR
+      # 0064), and for the agentd-bundle staging in
+      # agentd_bundle_reexec/materialize_boot. `busybox-static` is the
+      # materialize_boot guest's entire userland (ADR 0080 phase 3b —
+      # the synthetic docker image's one real binary).
+      - name: Install build deps (musl-tools, e2fsprogs, squashfs-tools, busybox-static)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq musl-tools e2fsprogs squashfs-tools
+          sudo apt-get install -y -qq musl-tools e2fsprogs squashfs-tools busybox-static
 
       # Stock firecracker — matches the deployed fork's upstream base (v1.16.0)
       # so the existing FC suite + the stock<->fork compat test exercise the
@@ -858,6 +862,7 @@ jobs:
             --test snapshot_uffd \
             --test exec_real_vm \
             --test agentd_bundle_reexec \
+            --test materialize_boot \
             --test baked_harness_loopback \
             --test forge_loopback \
             --test upload_loopback \

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Bake the canonical demo image to the local registry, register it
+# Build + push the canonical demo image to the local registry as a
+# PLAIN docker image (ADR 0080 phase 3b — the engram-artifact bake is
+# retired from this path; enable materializes host-side), register it
 # with the running coord, and wait for the host-agent's prefetch
 # supervisor to report the manifest_digest ready. Factored out of
 # `integration-test.sh` so the CI e2e lane and the local smoke test
@@ -8,16 +10,17 @@
 # Preconditions:
 #   - the stack is up via `just dev` (PG, registry, fake-gcs, coord,
 #     host-agent are all up).
-#   - host-target engram-cli at ./target/release/engram-cli.
-#   - musl-target engram-agentd at
-#     ./target/x86_64-unknown-linux-musl/release/engram-agentd.
-#   (the script will cargo-build them if missing.)
+#   - docker (for `docker build && docker push`).
+#   - host-target engram-cli at ./target/release/engram-cli (for
+#     `image enable` + the readiness polls).
+#   (the script will cargo-build engram-cli if missing.)
 #
 # Side effects:
-#   - Pushes a chunked-OCI artifact to localhost:5001 under
+#   - Pushes a standard docker image to localhost:5001 under
 #     integration-test/demo:warm-<short-sha>.
 #   - Enables the image on the local coord over app-gRPC
-#     (`engram-cli image enable`).
+#     (`engram-cli image enable`) — the coordinator drives the
+#     host-side MaterializeImage + base-snapshot capture.
 #
 # On stdout, prints (and only prints) the final IMAGE_URI of the
 # enabled image on success, so callers can:
@@ -63,39 +66,52 @@ fi
 
 SHORT=$(git rev-parse --short HEAD)
 LOCAL_REGISTRY="localhost:5001"
-# Bake the canonical `demo` image. ADR 0062: the image carries NO harness —
+# Build the canonical `demo` image. ADR 0062: the image carries NO harness —
 # the built-in `claude` harness is a per-session selection that rides the fleet
 # `current_bundles` stamp (the e2e stages it via ENGRAM_HARNESS_CLAUDE_TREE +
-# `just bundles-squashfs`), not baked in here.
+# `just bundles-squashfs`), not baked in here. ADR 0080: no agentd, no init
+# shim, no engram tooling in the image at all — enable-time materialization
+# injects the stage-1 shim and agentd rides its bundle slot.
 IMAGE_URI="$LOCAL_REGISTRY/integration-test/demo:warm-$SHORT"
 
-log "==> step 1/3: bake demo image"
+log "==> step 1/3: docker build + push demo image"
 log "    target: $IMAGE_URI"
 
-# Re-build only if the binaries are missing; the CI lane downloads
+# Re-build only if the binary is missing; the CI lane downloads
 # release artifacts produced by an upstream job, and we want to
 # respect those rather than re-compile.
 if [ ! -x ./target/release/engram-cli ]; then
     log "    building engram-cli (host) — not present in target/release"
     cargo build --release -p engram-cli >&2
 fi
-if [ ! -x ./target/x86_64-unknown-linux-musl/release/engram-agentd ]; then
-    log "    building engram-agentd (musl) — not present in target/x86_64-unknown-linux-musl/release"
-    cargo build --release --target x86_64-unknown-linux-musl -p engram-agentd >&2
+
+# ADR 0080 phase 3b: a PLAIN `docker build && docker push` — the exact
+# user contract the materializer consumes. Keep bake-demo.sh's arm64
+# FROM pin: on Apple Silicon the guest is arm64, and docker would
+# otherwise build the host's default (amd64 under emulation on some
+# setups), producing an image the arm64 fleet can't materialize.
+case "$(uname -m)" in
+    arm64 | aarch64) ARM=1 ;;
+    x86_64 | amd64) ARM=0 ;;
+    *)
+        log "ERROR: unsupported host arch $(uname -m)"
+        exit 1
+        ;;
+esac
+STAGING="./var/integration/demo-build"
+rm -rf "$STAGING"
+mkdir -p "$STAGING"
+cp -R deploy/demo/. "$STAGING/"
+if [ "$ARM" = "1" ]; then
+    sed -i.bak 's|^FROM |FROM --platform=linux/arm64 |' "$STAGING/Dockerfile"
+    rm -f "$STAGING/Dockerfile.bak"
 fi
 
 T0=$(date +%s.%N)
-./target/release/engram-cli image build \
-    --repo integration-test/demo \
-    --tag "warm-$SHORT" \
-    --source deploy/demo \
-    --format ext4 \
-    --images-dir ./var/integration/images \
-    --inject-init \
-    --push "$IMAGE_URI" \
-    >&2 2>&1
+docker build -t "$IMAGE_URI" "$STAGING" >&2
+docker push "$IMAGE_URI" >&2
 T1=$(date +%s.%N)
-log "    bake+push elapsed: $(echo "$T1 - $T0" | bc)s"
+log "    build+push elapsed: $(echo "$T1 - $T0" | bc)s"
 
 log ""
 log "==> step 2/3: enable image over app-gRPC (blocks until the enable job is ready)"
