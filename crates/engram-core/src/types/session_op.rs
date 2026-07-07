@@ -421,6 +421,25 @@ impl InMemoryOpLog {
         any
     }
 
+    /// Wake queued ops of `kind` (reset `not_before` to now). Mirrors
+    /// `MetadataStore::op_wake_queued_kind` for mock stores. Returns rows
+    /// woken.
+    pub fn wake_queued_kind(&self, session_id: SessionId, kind: OpKind) -> u64 {
+        let now = Utc::now();
+        let mut inner = self.inner.lock().unwrap();
+        let mut woken = 0;
+        for op in inner.ops.iter_mut().filter(|o| {
+            o.session_id == session_id
+                && o.kind == kind
+                && o.state == OpState::Queued
+                && o.not_before.map(|nb| nb > now).unwrap_or(false)
+        }) {
+            op.not_before = Some(now);
+            woken += 1;
+        }
+        woken
+    }
+
     /// A queued-or-running op of `kind` exists for the session — the
     /// duplicate-enqueue guard's read (see
     /// `MetadataStore::op_pending_exists`).
@@ -497,23 +516,6 @@ impl InMemoryOpLog {
     /// All rows (test assertions).
     pub fn all(&self) -> Vec<SessionOp> {
         self.inner.lock().unwrap().ops.clone()
-    }
-
-    /// Test hook: clear a queued row's `not_before` backoff so a test can
-    /// re-drive it deterministically instead of sleeping the backoff out.
-    pub fn clear_backoff(&self, op_id: i64) -> bool {
-        let mut inner = self.inner.lock().unwrap();
-        match inner
-            .ops
-            .iter_mut()
-            .find(|o| o.id == op_id && o.state == OpState::Queued)
-        {
-            Some(op) => {
-                op.not_before = None;
-                true
-            }
-            None => false,
-        }
     }
 
     /// Test hook: force a RUNNING op's `attempts` and `step` (simulates a

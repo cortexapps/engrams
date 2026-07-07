@@ -2302,6 +2302,14 @@ pub(crate) mod tests {
             Ok(self.ops.cancel_queued(session_id, kind))
         }
 
+        async fn op_wake_queued_kind(
+            &self,
+            session_id: SessionId,
+            kind: engram_core::types::session_op::OpKind,
+        ) -> Result<u64, MetaError> {
+            Ok(self.ops.wake_queued_kind(session_id, kind))
+        }
+
         async fn op_cancel_by_id(&self, op_id: i64) -> Result<bool, MetaError> {
             Ok(self.ops.cancel_by_id(op_id))
         }

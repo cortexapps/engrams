@@ -928,3 +928,59 @@ async fn orphaned_pending_detected_only_without_active_create_boot() {
         "a Pending session with an active create_boot op is not orphaned",
     );
 }
+
+/// ADR 0079 latency fix: a backed-off queued op is woken (not_before → now)
+/// by op_wake_queued_kind, so the completion re-drive claims it immediately
+/// instead of waiting out the 5s fallback poll. Models the deliver-behind-
+/// for_delivery-resume path: the deliver requeues with a failure backoff,
+/// the resume completes and wakes it, and it becomes due at once.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn wake_queued_kind_pulls_not_before_to_now() {
+    let Some(meta) = connect().await else { return };
+    let sid = seed_session(&meta).await;
+
+    // A deliver op, claimed then requeued with a long backoff (the
+    // ordering-wait shape) — not due for 60s.
+    let d = match meta
+        .op_enqueue_and_claim(sid, OpKind::Deliver, serde_json::json!({}), None, "pod-a")
+        .await
+        .expect("enqueue deliver")
+    {
+        EnqueueOutcome::Claimed(op) => op,
+        other => panic!("expected Claimed, got {other:?}"),
+    };
+    meta.op_requeue_with_backoff(
+        d.id,
+        d.epoch.unwrap(),
+        std::time::Duration::from_secs(60),
+        "wait",
+    )
+    .await
+    .expect("requeue");
+    // Backed off → not claimable.
+    assert!(
+        meta.op_claim_head(sid, "pod-a").await.unwrap().is_none(),
+        "backed-off deliver must not be due",
+    );
+
+    // Wake it → due now → claimable immediately.
+    let woken = meta
+        .op_wake_queued_kind(sid, OpKind::Deliver)
+        .await
+        .expect("wake");
+    assert_eq!(woken, 1, "one queued deliver woken");
+    let claimed = meta.op_claim_head(sid, "pod-a").await.unwrap();
+    assert!(
+        claimed.is_some(),
+        "woken deliver must be immediately claimable (no poll wait)",
+    );
+    // A second wake with nothing backed-off is a no-op (idempotent).
+    assert_eq!(
+        meta.op_wake_queued_kind(sid, OpKind::Deliver)
+            .await
+            .unwrap(),
+        0,
+        "no queued deliver left to wake",
+    );
+}

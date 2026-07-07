@@ -940,10 +940,11 @@ mod tests {
     /// ADR 0079 pass 2, the headline ordering property: a Deliver op on
     /// a non-Active (Idle) session enqueues a RESUME op and requeues
     /// itself with backoff — the resume (higher id, due) becomes the
-    /// claimable head via `op_claim_head`'s due-gating and runs FIRST;
-    /// the deliver's retry then completes against the settled state.
-    /// Fully deterministic — the "wait out the backoff" leg is driven by
-    /// the `clear_backoff` test hook, zero sleeps.
+    /// claimable head via `op_claim_head`'s due-gating and runs FIRST.
+    /// The latency fix then WAKES the backed-off deliver the instant the
+    /// resume reaches terminal (`op_wake_queued_kind`), so the same
+    /// drive_claimed pass re-drives the deliver to completion against the
+    /// settled state — one pass, zero sleeps, no manual backoff clear.
     #[tokio::test]
     async fn deliver_on_idle_enqueues_resume_and_completes_after_it() {
         let id = SessionId::new();
@@ -998,16 +999,6 @@ mod tests {
             "no snapshot seeded → the resume fails terminal-gone, got {:?}",
             resume.error,
         );
-        let deliver_row = mini.ops.get(deliver_id).expect("deliver row");
-        assert_eq!(
-            deliver_row.state,
-            OpState::Queued,
-            "the deliver op retries after the resume (requeued with backoff)"
-        );
-        assert!(
-            deliver_row.not_before.is_some(),
-            "the requeue must carry the backoff that made the resume the due head"
-        );
         let session = state.services.meta.get_session(id).await.unwrap();
         assert_eq!(
             session.status,
@@ -1015,16 +1006,17 @@ mod tests {
             "the resume verb's own outcome landed before the deliver retry"
         );
 
-        // The deliver retry (backoff waived via the test hook): the session
-        // settled terminal, so the verb drops the row (consumed-by-
-        // termination, the Gone→Terminal arm) and completes.
-        assert!(mini.ops.clear_backoff(deliver_id), "deliver is queued");
-        crate::session_ops::drive_session(&state, id).await;
+        // ADR 0079 latency fix: the for_delivery resume reaching terminal
+        // WAKES the backed-off deliver (op_wake_queued_kind resets its
+        // not_before), so drive_claimed's own completion re-drive claims
+        // it immediately — in this SAME pass, with no 5 s poll wait and no
+        // manual backoff clear. The session settled Dead, so the woken
+        // deliver drops the row (the Gone→Terminal arm) and completes.
         let deliver_row = mini.ops.get(deliver_id).expect("deliver row");
         assert_eq!(
             deliver_row.state,
             OpState::Done,
-            "the deliver retry completes after the resume settled: {:?}",
+            "the woken deliver re-drives and completes in the same pass: {:?}",
             deliver_row.error,
         );
         assert!(

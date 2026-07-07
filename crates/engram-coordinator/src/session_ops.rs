@@ -622,6 +622,7 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     let outcome = crate::session_verbs::dispatch(&ctx).await;
     drop(heartbeat);
     let meta = &state.services.meta;
+    let terminal = !matches!(outcome, OpOutcome::Retry(_));
     let _ = match outcome {
         OpOutcome::Done => meta.op_finish(op.id, epoch, OpState::Done, None).await,
         OpOutcome::Cancelled => meta.op_finish(op.id, epoch, OpState::Cancelled, None).await,
@@ -636,6 +637,27 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
                 .await
         }
     };
+    // ADR 0079 latency fix: a `for_delivery` resume the DELIVER verb
+    // enqueued (on an Idle session) leaves the deliver op requeued with a
+    // failure backoff — but the resume reaching terminal is NOT a failure,
+    // and the backed-off deliver would otherwise wait out the 5 s poll
+    // after the session is already Active (prod: prompt-after-idle ~10 s →
+    // ~21 s). Wake the sibling deliver so the loop's next claim forwards
+    // the prompt in <100 ms. Only on the resume's TERMINAL (never while it
+    // retries — the deliver stays correctly backed off then), and the
+    // one-running slot already blocked the deliver during the resume, so
+    // this cannot spin.
+    if terminal
+        && op.kind == OpKind::Resume
+        && op.payload.get("flavor").and_then(|f| f.as_str()) == Some("for_delivery")
+    {
+        if let Err(e) = meta
+            .op_wake_queued_kind(op.session_id, OpKind::Deliver)
+            .await
+        {
+            tracing::debug!(session_id = %op.session_id, error = %e, "deliver wake after for_delivery resume failed (5s poll backstops)");
+        }
+    }
 }
 
 /// Linear backoff, capped — mirrors the outbox driver's posture: an op
