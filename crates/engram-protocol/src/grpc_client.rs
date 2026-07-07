@@ -284,14 +284,12 @@ impl GrpcHostClient {
     pub async fn migration_capture(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
         let resp = self
             .inner
             .clone()
-            .migration_capture(req)
+            .migration_capture(fenced_request(id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -333,14 +331,12 @@ impl GrpcHostClient {
     pub async fn migration_presetup(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: id.as_uuid().as_bytes().to_vec(),
-        };
         let resp = self
             .inner
             .clone()
-            .migration_presetup(req)
+            .migration_presetup(fenced_request(id, fence))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -371,10 +367,13 @@ impl GrpcHostClient {
         &self,
         id: SandboxId,
         export_id: &str,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
         let req = MigrationExportRef {
             sandbox_id: id.as_uuid().as_bytes().to_vec(),
             export_id: export_id.to_string(),
+            fencing_epoch: fence.epoch,
+            session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
         };
         let resp = self
             .inner
@@ -504,12 +503,15 @@ impl GrpcHostClient {
         &self,
         id: SandboxId,
         export_id: &str,
+        fence: SessionFence,
     ) -> Result<(), SandboxError> {
         self.inner
             .clone()
             .migration_commit(MigrationExportRef {
                 sandbox_id: id.as_uuid().as_bytes().to_vec(),
                 export_id: export_id.to_string(),
+                fencing_epoch: fence.epoch,
+                session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
             })
             .await
             .map_err(grpc_to_sandbox_err)?;
@@ -521,12 +523,15 @@ impl GrpcHostClient {
         &self,
         id: SandboxId,
         export_id: &str,
+        fence: SessionFence,
     ) -> Result<(), SandboxError> {
         self.inner
             .clone()
             .migration_abort(MigrationExportRef {
                 sandbox_id: id.as_uuid().as_bytes().to_vec(),
                 export_id: export_id.to_string(),
+                fencing_epoch: fence.epoch,
+                session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
             })
             .await
             .map_err(grpc_to_sandbox_err)?;
@@ -1425,23 +1430,26 @@ impl HostClient for GrpcHostClient {
     async fn migration_capture(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
-        Self::migration_capture(self, id).await
+        Self::migration_capture(self, id, fence).await
     }
 
     async fn migration_presetup(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
-        Self::migration_presetup(self, id).await
+        Self::migration_presetup(self, id, fence).await
     }
 
     async fn migration_capture_postcopy(
         &self,
         id: SandboxId,
         export_id: &str,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
-        Self::migration_capture_postcopy(self, id, export_id).await
+        Self::migration_capture_postcopy(self, id, export_id, fence).await
     }
 
     async fn migration_drain_wait(
@@ -1465,12 +1473,22 @@ impl HostClient for GrpcHostClient {
         Self::migration_fetch(self, export_id, items).await
     }
 
-    async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
-        Self::migration_commit(self, id, export_id).await
+    async fn migration_commit(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
+        Self::migration_commit(self, id, export_id, fence).await
     }
 
-    async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
-        Self::migration_abort(self, id, export_id).await
+    async fn migration_abort(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
+        Self::migration_abort(self, id, export_id, fence).await
     }
 
     async fn commit_snapshot(

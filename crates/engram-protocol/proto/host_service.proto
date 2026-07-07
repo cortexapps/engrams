@@ -62,14 +62,23 @@ service HostService {
   // chunk bytes), gated by the export_id nonce + a server-side
   // allowlist. Commit destroys the source VM + drops the export; Abort
   // un-pauses the guest in place and unfences (zero loss).
-  rpc MigrationCapture(SandboxIdMessage) returns (MigrationCaptureResponse);
+  //
+  // ADR 0079: the FIVE source-mutating RPCs (Capture, Presetup,
+  // CapturePostCopy, Commit, Abort) carry the (session_id,
+  // fencing_epoch) fence — Capture/Presetup via `FencedSandboxRequest`,
+  // the export-scoped three via the fence fields on `MigrationExportRef`
+  // — so the host's `check_session_epoch` gate rejects a stale
+  // (reclaimed-out) teleport holder. MigrationFetch (host-to-host,
+  // export-nonce gated) and MigrationDrainWait (dest-side wait) are NOT
+  // fenced: they make no source-mutating write on behalf of the holder.
+  rpc MigrationCapture(FencedSandboxRequest) returns (MigrationCaptureResponse);
   rpc MigrationFetch(MigrationFetchRequest) returns (stream MigrationFrame);
   rpc MigrationCommit(MigrationExportRef) returns (Empty);
   rpc MigrationAbort(MigrationExportRef) returns (Empty);
   // ADR 0045 C2 post-copy: the pre-pause presetup (export identity +
   // the restore package sans state.bin), the blackout capture
   // (vmstate-only + pagemap seal), and the destination's drain await.
-  rpc MigrationPresetup(SandboxIdMessage) returns (MigrationPresetupResponse);
+  rpc MigrationPresetup(FencedSandboxRequest) returns (MigrationPresetupResponse);
   rpc MigrationCapturePostCopy(MigrationExportRef) returns (PostCopyCaptureResponse);
   rpc MigrationDrainWait(SandboxIdMessage) returns (DrainOutcomeResponse);
   rpc Restore(RestoreRequest) returns (SandboxIdMessage);
@@ -337,6 +346,11 @@ message MigrationCaptureResponse {
 message MigrationExportRef {
   bytes sandbox_id = 1;
   string export_id = 2;
+  // ADR 0079: the (session_id, fencing_epoch) fence — see
+  // `FencedSandboxRequest`. Rides MigrationCapturePostCopy / Commit /
+  // Abort (the export-scoped source-mutating RPCs). 0 = unfenced interim.
+  uint64 fencing_epoch = 3;
+  bytes session_id = 4;      // 16-byte session UUID; ignored when fencing_epoch == 0
 }
 
 // ADR 0045 C2: see MigrationPresetupOut in engram-core for field

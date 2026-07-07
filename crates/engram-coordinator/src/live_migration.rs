@@ -274,7 +274,10 @@ pub async fn migrate_session_live(
 
     // ---- 1. Presetup on the source (NO pause — the guest runs) ----
     let t_presetup = std::time::Instant::now();
-    let presetup = match source_backend.migration_presetup(sandbox_id).await {
+    let presetup = match source_backend
+        .migration_presetup(sandbox_id, claim.fence())
+        .await
+    {
         Ok(p) => p,
         Err(SandboxError::InvalidSpec(reason)) => {
             return Err(MigrateError::Unsupported(reason));
@@ -409,7 +412,7 @@ pub async fn migrate_session_live(
     // ---- 4. THE BLACKOUT: vmstate-only capture + pagemap seal ----
     let t_blackout = std::time::Instant::now();
     let capture = match source_backend
-        .migration_capture_postcopy(sandbox_id, &presetup.export_id)
+        .migration_capture_postcopy(sandbox_id, &presetup.export_id, claim.fence())
         .await
     {
         Ok(c) => c,
@@ -457,7 +460,7 @@ pub async fn migrate_session_live(
             // sound. Anything else is ambiguous: parachute.
             if e.to_string().contains("postcopy-never-loaded") {
                 let abort_ok = source_backend
-                    .migration_abort(sandbox_id, &presetup.export_id)
+                    .migration_abort(sandbox_id, &presetup.export_id, claim.fence())
                     .await
                     .is_ok();
                 if abort_ok && walk_back_to_active(state, session_id).await {
@@ -851,7 +854,7 @@ pub async fn migrate_session_live(
 
         // 7b. Release the source (destroy; the export retires with it).
         if let Err(e) = source_backend
-            .migration_commit(sandbox_id, &export_id)
+            .migration_commit(sandbox_id, &export_id, claim.fence())
             .await
         {
             tracing::warn!(%session_id, %sandbox_id, error = %e,

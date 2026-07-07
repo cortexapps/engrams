@@ -301,7 +301,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
     let mut moved_vms = Vec::with_capacity(SESSIONS);
     for (i, s) in live.iter().enumerate() {
         let cap = client_a
-            .migration_capture(s.vm)
+            .migration_capture(s.vm, engram_core::traits::SessionFence::unfenced())
             .await
             .expect("capture on A");
         let mut metadata = s.ckpt.clone();
@@ -327,7 +327,10 @@ async fn drain_wave_teleports_every_session_off_host_a() {
             sidecar_json: Vec::new(),
         });
 
-        let moved = client_b.restore(metadata).await.expect("restore on B");
+        let moved = client_b
+            .restore(metadata, engram_core::traits::SessionFence::unfenced())
+            .await
+            .expect("restore on B");
 
         // The post-checkpoint sentinel survived the move (a genuine live
         // teleport, not a cold rehome from the checkpoint).
@@ -399,7 +402,11 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         // Commit on A: the frozen source is destroyed. This is what
         // empties the victim host one session at a time.
         client_a
-            .migration_commit(s.vm, &cap.export_id)
+            .migration_commit(
+                s.vm,
+                &cap.export_id,
+                engram_core::traits::SessionFence::unfenced(),
+            )
             .await
             .expect("commit on A");
         moved_vms.push(moved);

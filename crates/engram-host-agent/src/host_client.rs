@@ -169,6 +169,7 @@ impl HostClient for LocalHostClient {
     async fn migration_presetup(
         &self,
         id: SandboxId,
+        _fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
         self.sandbox.migration_presetup(id).await
     }
@@ -177,6 +178,7 @@ impl HostClient for LocalHostClient {
         &self,
         id: SandboxId,
         export_id: &str,
+        _fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
         self.sandbox.migration_capture_postcopy(id, export_id).await
     }
@@ -191,6 +193,7 @@ impl HostClient for LocalHostClient {
     async fn migration_capture(
         &self,
         id: SandboxId,
+        _fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
         self.sandbox.migration_capture(id).await
     }
@@ -209,11 +212,21 @@ impl HostClient for LocalHostClient {
         self.sandbox.migration_fetch(export_id, items).await
     }
 
-    async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+    async fn migration_commit(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         self.sandbox.migration_commit(id, export_id).await
     }
 
-    async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+    async fn migration_abort(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         self.sandbox.migration_abort(id, export_id).await
     }
 

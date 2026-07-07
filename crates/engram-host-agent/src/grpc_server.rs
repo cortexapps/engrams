@@ -331,15 +331,17 @@ impl HostService for HostServiceImpl {
 
     async fn migration_capture(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<MigrationCaptureResponse>, Status> {
         let span = tracing::info_span!("host.migration_capture");
         link_remote_parent(&span, &req);
         async move {
-            let id = decode_sandbox_id(&req.into_inner().uuid)?;
+            let r = req.into_inner();
+            let id = decode_sandbox_id(&r.uuid)?;
+            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
             let out = self
                 .inner
-                .migration_capture(id)
+                .migration_capture(id, fence)
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(MigrationCaptureResponse {
@@ -428,8 +430,9 @@ impl HostService for HostServiceImpl {
     ) -> Result<Response<Empty>, Status> {
         let req = req.into_inner();
         let id = decode_sandbox_id(&req.sandbox_id)?;
+        let fence = self.check_session_epoch(&req.session_id, req.fencing_epoch)?;
         self.inner
-            .migration_commit(id, &req.export_id)
+            .migration_commit(id, &req.export_id, fence)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
@@ -441,8 +444,9 @@ impl HostService for HostServiceImpl {
     ) -> Result<Response<Empty>, Status> {
         let req = req.into_inner();
         let id = decode_sandbox_id(&req.sandbox_id)?;
+        let fence = self.check_session_epoch(&req.session_id, req.fencing_epoch)?;
         self.inner
-            .migration_abort(id, &req.export_id)
+            .migration_abort(id, &req.export_id, fence)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
@@ -450,12 +454,14 @@ impl HostService for HostServiceImpl {
 
     async fn migration_presetup(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<MigrationPresetupResponse>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        let r = req.into_inner();
+        let id = decode_sandbox_id(&r.uuid)?;
+        let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
         let out = self
             .inner
-            .migration_presetup(id)
+            .migration_presetup(id, fence)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(MigrationPresetupResponse {
@@ -476,9 +482,10 @@ impl HostService for HostServiceImpl {
     ) -> Result<Response<PostCopyCaptureResponse>, Status> {
         let req = req.into_inner();
         let id = decode_sandbox_id(&req.sandbox_id)?;
+        let fence = self.check_session_epoch(&req.session_id, req.fencing_epoch)?;
         let out = self
             .inner
-            .migration_capture_postcopy(id, &req.export_id)
+            .migration_capture_postcopy(id, &req.export_id, fence)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(PostCopyCaptureResponse {

@@ -178,6 +178,7 @@ pub trait HostClient: Send + Sync {
     async fn migration_capture(
         &self,
         _id: SandboxId,
+        _fence: SessionFence,
     ) -> Result<crate::types::snapshot::MigrationCaptureOut, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `migration_capture`".into(),
@@ -206,6 +207,7 @@ pub trait HostClient: Send + Sync {
     async fn migration_presetup(
         &self,
         _id: SandboxId,
+        _fence: SessionFence,
     ) -> Result<crate::types::snapshot::MigrationPresetupOut, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `migration_presetup`".into(),
@@ -217,6 +219,7 @@ pub trait HostClient: Send + Sync {
         &self,
         _id: SandboxId,
         _export_id: &str,
+        _fence: SessionFence,
     ) -> Result<crate::types::snapshot::PostCopyCaptureOut, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `migration_capture_postcopy`".into(),
@@ -234,14 +237,24 @@ pub trait HostClient: Send + Sync {
     }
 
     /// ADR 0045 C1: see `SandboxBackend::migration_commit`.
-    async fn migration_commit(&self, _id: SandboxId, _export_id: &str) -> Result<(), SandboxError> {
+    async fn migration_commit(
+        &self,
+        _id: SandboxId,
+        _export_id: &str,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `migration_commit`".into(),
         ))
     }
 
     /// ADR 0045 C1: see `SandboxBackend::migration_abort`.
-    async fn migration_abort(&self, _id: SandboxId, _export_id: &str) -> Result<(), SandboxError> {
+    async fn migration_abort(
+        &self,
+        _id: SandboxId,
+        _export_id: &str,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `migration_abort`".into(),
         ))

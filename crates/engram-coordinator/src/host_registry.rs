@@ -583,18 +583,22 @@ impl HostClient for HostRegistry {
     async fn migration_presetup(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
-        backend.migration_presetup(id).await
+        backend.migration_presetup(id, fence).await
     }
 
     async fn migration_capture_postcopy(
         &self,
         id: SandboxId,
         export_id: &str,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
-        backend.migration_capture_postcopy(id, export_id).await
+        backend
+            .migration_capture_postcopy(id, export_id, fence)
+            .await
     }
 
     async fn migration_drain_wait(
@@ -608,19 +612,30 @@ impl HostClient for HostRegistry {
     async fn migration_capture(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
-        backend.migration_capture(id).await
+        backend.migration_capture(id, fence).await
     }
 
-    async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+    async fn migration_commit(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
-        backend.migration_commit(id, export_id).await
+        backend.migration_commit(id, export_id, fence).await
     }
 
-    async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+    async fn migration_abort(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
-        backend.migration_abort(id, export_id).await
+        backend.migration_abort(id, export_id, fence).await
     }
 
     async fn commit_snapshot(
