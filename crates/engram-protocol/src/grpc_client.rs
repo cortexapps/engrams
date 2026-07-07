@@ -605,10 +605,7 @@ impl GrpcHostClient {
             spec_bincode: encode_bincode(&spec, "SandboxSpec")?,
             warm_bincode: encode_bincode(&warm, "Option<WarmConfig>")?,
             capture_env_bincode: encode_bincode(&capture_env, "capture_env")?,
-            capture_egress_bincode: encode_bincode(
-                &capture_egress,
-                "Option<SessionEgressPolicy>",
-            )?,
+            capture_egress_bincode: encode_bincode(&capture_egress, "Option<SessionEgressPolicy>")?,
         };
         let mut stream = self
             .inner

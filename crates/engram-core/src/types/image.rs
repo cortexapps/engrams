@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 // rootfs format differs.
 // ---------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 // ADR 0080: `deny_unknown_fields` is back — the config never comes from a
 // baked artifact anymore (ADR 0057's reason for dropping it), so strict
 // parsing is a feature again: a typo in the CLI's --config TOML or a
@@ -205,9 +205,7 @@ impl OciRuntimeDefaults {
                 out.env.insert(k.to_string(), v.to_string());
             }
         }
-        out.workdir = working_dir
-            .filter(|w| !w.is_empty())
-            .map(|w| w.to_string());
+        out.workdir = working_dir.filter(|w| !w.is_empty()).map(|w| w.to_string());
         out
     }
 }
@@ -228,10 +226,7 @@ impl ImageConfig {
     pub fn merged_with(&self, defaults: &OciRuntimeDefaults) -> ImageConfig {
         let mut merged = self.clone();
         for (k, v) in &defaults.env {
-            merged
-                .env
-                .entry(k.clone())
-                .or_insert_with(|| v.clone());
+            merged.env.entry(k.clone()).or_insert_with(|| v.clone());
         }
         if merged.workdir.is_none() {
             merged.workdir = defaults.workdir.clone();
@@ -377,7 +372,7 @@ pub struct NetworkPolicy {
     pub allow_host_patterns: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceHints {
     pub suggested_memory_mib: Option<u32>,
@@ -453,7 +448,7 @@ mod tests {
         // Dockerfile WORKDIR fills the unset config workdir.
         assert_eq!(m.workdir.as_deref(), Some("/workspace/engrams"));
         // The original config is untouched (merge is read-side).
-        assert!(c.env.get("PATH").is_none());
+        assert!(!c.env.contains_key("PATH"));
     }
 
     #[test]
@@ -542,18 +537,15 @@ mod tests {
         let err = c.validate().unwrap_err();
         assert!(err.contains("suggested_vcpus"), "{err}");
 
-        let c: ImageConfig = toml::from_str(
-            "name = \"  \"\n[resources]\nsuggested_vcpus = 2\n",
-        )
-        .unwrap();
+        let c: ImageConfig =
+            toml::from_str("name = \"  \"\n[resources]\nsuggested_vcpus = 2\n").unwrap();
         let err = c.validate().unwrap_err();
         assert!(err.contains("name"), "{err}");
 
-        let c: ImageConfig = toml::from_str(
-            "name = \"x\"\n[resources]\nsuggested_vcpus = 2\n",
-        )
-        .unwrap();
-        c.validate().expect("name + vcpus is the minimal valid config");
+        let c: ImageConfig =
+            toml::from_str("name = \"x\"\n[resources]\nsuggested_vcpus = 2\n").unwrap();
+        c.validate()
+            .expect("name + vcpus is the minimal valid config");
     }
 
     #[test]

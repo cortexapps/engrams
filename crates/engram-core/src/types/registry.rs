@@ -412,7 +412,6 @@ fn default_prestage_hosts() -> serde_json::Value {
 mod tests {
     use super::*;
 
-
     #[test]
     fn auth_spec_serde_round_trip_static() {
         let spec = RegistryAuthSpec::Static {

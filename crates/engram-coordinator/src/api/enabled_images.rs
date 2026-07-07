@@ -2,58 +2,52 @@
 //! URIs that sessions may reference.
 //!
 //! Stage C (and ADR 0015 M5): this is the single source of truth for
-//! "what images can a session use." Postgres stores the URI plus a
-//! snapshot of the manifest.toml fetched at enable time, so
-//! `POST /sessions` resolves the manifest from a Postgres row without
-//! going to the registry on the hot path. The dashboard's image
-//! picker reads from here.
+//! "what images can a session use." ADR 0080: Postgres stores the URI
+//! plus the RPC-supplied `image_config` (name/description/env/workdir/
+//! resources/warm) and the artifact's Dockerfile-derived `oci_defaults`
+//! — the bake carries no metadata — so `POST /sessions` resolves the
+//! effective config from a Postgres row without going to the registry
+//! on the hot path. The dashboard's image picker reads from here.
 //!
-//! ADR 0015 M5: enable is now atomic and simple — fetch the OCI
-//! artifact, validate the manifest, push the chunked rootfs into
-//! BlobStorage so hosts can prefetch from it, upsert the row.
-//! The `templates` cascade (snapshot materialization, warm-pool
-//! waiting) is gone; hosts diff `enabled_images` against their local
-//! `ready_images` set on every heartbeat and prefetch what's
-//! missing.
+//! ADR 0015 M5: enable is asynchronous but simple — fetch the OCI
+//! artifact metadata, validate the config, push the chunked rootfs into
+//! BlobStorage so hosts can prefetch from it, capture the base snapshot
+//! under the job's config, upsert the row. The `templates` cascade
+//! (snapshot materialization, warm-pool waiting) is gone; hosts diff
+//! `enabled_images` against their local `ready_images` set on every
+//! heartbeat and prefetch what's missing.
 //!
-//! Verbs:
-//! - `POST /api/enabled-images   { image_uri }` — enable an image
-//!   (or undelete a previously soft-deleted row).
-//! - `GET  /api/enabled-images`                — list live rows
-//!   (`soft_deleted_at IS NULL`).
-//! - `POST /api/enabled-images/refresh { image_uri }` — re-fetch the
-//!   manifest from the registry and update `manifest_toml` +
-//!   `manifest_digest`. Useful when an image tag is moved.
-//! - `POST /api/enabled-images/disable { image_uri }` — soft-delete
-//!   the row. ADR 0021 P1.8: rather than physical DELETE, flip
-//!   `soft_deleted_at = NOW()` so existing idle sessions can still
-//!   resume against the same chunk lineage. Refuses (409) when one
-//!   or more sessions in `{pending, created, active, evacuating}`
-//!   still reference the image — the response lists the blocking
-//!   sessions so the operator can decide. Re-enabling an
-//!   image_uri via POST clears `soft_deleted_at`.
-//!
-//! URI as path-segment: image URIs contain `/` and `:`, which axum's
-//! Path extractor will URL-decode but the dashboard's HTTP client
-//! would have to encode. POSTing the URI in the body keeps both ends
-//! simple and avoids the bikeshed.
+//! The verbs live on the app-gRPC `ImageService` (`grpc_app/image.rs`):
+//! EnableImage (config inherit-on-unset; required first enable),
+//! UpdateImage (ADR 0080 — cheap fields in place, capture-affecting
+//! fields behind `allow_recapture`), RefreshImage (re-pull, config
+//! carried forward), DisableImage (guarded soft-delete, ADR 0021 P1.8:
+//! existing idle sessions still resume against the same chunk lineage;
+//! re-enabling clears `soft_deleted_at`).
 
 use chrono::Utc;
+use engram_core::types::image::{ImageConfig, OciRuntimeDefaults};
 use engram_core::types::snapshot::SnapshotRecord;
-use engram_core::types::{EnabledImage, ImageManifest};
+use engram_core::types::EnabledImage;
 use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
 
-/// Pull the full engram OCI artifact at `image_uri` and validate it.
-/// Returns the `EnabledImage` row ready to upsert, the parsed
-/// `ImageManifest`, and the full `TemplateArtifacts` (so the
-/// caller can push chunked-rootfs layers into BlobStorage).
-pub(crate) async fn fetch_and_seal_manifest(
+/// Pull the engram OCI artifact metadata at `image_uri` and build the
+/// `EnabledImage` row ready to upsert (ADR 0080: `config` is the
+/// RPC-supplied ImageConfig riding the enable job — the artifact carries
+/// no runtime config; only the Dockerfile-derived `runtime_defaults` in
+/// its config blob). Also returns the full `TemplateArtifacts` so the
+/// caller can push chunked-rootfs layers into BlobStorage.
+pub(crate) async fn fetch_and_seal_artifact(
     state: &SharedState,
     image_uri: &str,
-) -> Result<(EnabledImage, ImageManifest, engram_oci::TemplateArtifacts), ApiError> {
+    config: &ImageConfig,
+) -> Result<(EnabledImage, engram_oci::TemplateArtifacts), ApiError> {
+    config
+        .validate()
+        .map_err(|e| ApiError::BadRequest(format!("image config for `{image_uri}`: {e}")))?;
     let artifacts = state
         .services
         .oci
@@ -67,29 +61,20 @@ pub(crate) async fn fetch_and_seal_manifest(
             ))
         })?;
 
-    let manifest_toml = String::from_utf8(artifacts.manifest_toml.clone()).map_err(|e| {
-        ApiError::BadRequest(format!(
-            "manifest layer for `{image_uri}` is not valid UTF-8: {e}"
-        ))
-    })?;
-
-    let manifest: ImageManifest = toml::from_str(&manifest_toml).map_err(|e| {
-        ApiError::BadRequest(format!(
-            "manifest.toml at `{image_uri}` failed to parse as engram ImageManifest: {e}"
-        ))
-    })?;
-
-    // ADR 0048: an enabled image MUST declare its vCPU count so
-    // placement can pack against a host's CPU budget. (A stale manifest
-    // using the old `suggested_vcpus` key already fails the parse above
-    // via `deny_unknown_fields`.)
-    validate_enabled_manifest(&manifest, image_uri).map_err(ApiError::BadRequest)?;
+    // ADR 0080: the artifact's config blob must carry the
+    // Dockerfile-derived `runtime_defaults`. FAIL LOUD on a pre-0080
+    // artifact (which shipped manifest.toml instead) — silently
+    // defaulting would strip the Dockerfile ENV/WORKDIR from every
+    // session of this image.
+    let oci_defaults = extract_runtime_defaults(&artifacts.config_json)
+        .map_err(|e| ApiError::BadRequest(format!("artifact config blob at `{image_uri}`: {e}")))?;
 
     let now = Utc::now();
     let row = EnabledImage {
         id: Uuid::new_v4(),
         image_uri: image_uri.to_string(),
-        manifest_toml,
+        image_config: config.clone(),
+        oci_defaults,
         manifest_digest: artifacts.manifest_digest.as_str().to_string(),
         // Stamped by the caller after `materialize_disk_chunks`
         // returns the bake's ManifestRef (or `None` for harness-only).
@@ -110,11 +95,55 @@ pub(crate) async fn fetch_and_seal_manifest(
         // explicitly, so even an existing soft-deleted row gets
         // undeleted by re-enabling.
         soft_deleted_at: None,
-        // Stamped by the enable scanner from the triggering job's
-        // capture_env before capture (the manifest carries no secrets).
-        capture_env: Vec::new(),
     };
-    Ok((row, manifest, artifacts))
+    Ok((row, artifacts))
+}
+
+/// Shared enable/update/refresh tail: validate the artifact (metadata
+/// pull, ADR 0080 runtime_defaults check) and create-or-get the enable
+/// job carrying `config`.
+///
+/// In-flight-config guard (check-then-act, admin-visible): re-POSTing an
+/// enable is a resume, so `create_or_get_enable_job` returns the
+/// in-flight job — but that job captures under ITS config. If the caller
+/// asked for a DIFFERENT config, silently returning the old job would
+/// drop the edit; fail `Conflict` instead so the operator retries once
+/// the in-flight job settles.
+pub(crate) async fn enqueue_enable_job(
+    state: &SharedState,
+    image_uri: &str,
+    config: &ImageConfig,
+) -> Result<engram_core::types::EnableJob, ApiError> {
+    let (_row, artifacts) = fetch_and_seal_artifact(state, image_uri, config).await?;
+    let job = state
+        .services
+        .meta
+        .create_or_get_enable_job(image_uri, Some(artifacts.manifest_digest.as_str()), config)
+        .await?;
+    if &job.image_config != config {
+        return Err(ApiError::Conflict(format!(
+            "an enable job for `{image_uri}` is already in flight (id {}, state {}) with a \
+             different config; wait for it to finish (or retry it to terminal), then re-send \
+             this edit",
+            job.id,
+            job.state.as_str(),
+        )));
+    }
+    Ok(job)
+}
+
+/// Parse the artifact config blob's `runtime_defaults` (ADR 0080). A
+/// missing key means a pre-0080 artifact — an actionable error, not a
+/// default.
+fn extract_runtime_defaults(config_json: &[u8]) -> Result<OciRuntimeDefaults, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(config_json).map_err(|e| format!("not valid JSON: {e}"))?;
+    let field = v.get("runtime_defaults").cloned().ok_or_else(|| {
+        "missing `runtime_defaults` — this artifact predates ADR 0080; re-bake and re-push \
+         the image with a current `engram image build`"
+            .to_string()
+    })?;
+    serde_json::from_value(field).map_err(|e| format!("malformed `runtime_defaults`: {e}"))
 }
 
 /// ADR 0015 M5: push the chunked rootfs into BlobStorage at the
@@ -270,7 +299,6 @@ async fn reuse_candidate_chunks_present(
 pub(crate) async fn capture_and_record_base_snapshot(
     state: &SharedState,
     row: &EnabledImage,
-    manifest: &ImageManifest,
     // Issue #539: live `CaptureProgress` events for the whole call.
     // Unused (no events sent) on the content/digest-reuse fast paths
     // below — no host RPC is made there, so there's nothing to report.
@@ -286,34 +314,39 @@ pub(crate) async fn capture_and_record_base_snapshot(
     ),
     ApiError,
 > {
+    // The effective config (RPC-supplied config merged over the
+    // Dockerfile-derived defaults) is what the capture VM boots with —
+    // the warm hook needs the image's env (JAVA_HOME, PATH, …).
+    let config = row.effective_config();
     // A `[warm]` hook captures live process state (plus the resolved
-    // capture_env secrets) that is NOT a pure function of (rootfs bytes,
-    // manifest.toml): two enables with identical content can differ in
-    // capture_env or in the live external state the warm boot reaches. So
+    // warm-env secrets) that is NOT a pure function of (rootfs bytes,
+    // config): two enables with identical content can differ in warm env
+    // or in the live external state the warm boot reaches. So
     // content/digest reuse is unsound for warm images — always re-capture.
-    // (This is also what makes a capture_env rotate actually take effect:
+    // (This is also what makes a warm-secret rotate actually take effect:
     // a re-enable with the same digest must not short-circuit to the stale
     // snapshot.)
-    let reuse_ok = manifest.warm.is_none();
+    let reuse_ok = config.warm.is_none();
 
-    // ADR 0036 P4: content-keyed reuse. A base snapshot is a function
-    // of (rootfs bytes, manifest.toml) — the bundle generations it
-    // embeds are only the fallback pin, because session-create swaps
-    // aux drives to the host's CURRENT staged generation (ADR 0035
-    // Invariant 2; `restore_in_jail`'s `swap_aux_to_current`). So if
-    // ANY enabled image (soft-deleted included — its snapshot stays
-    // GC-pinned) was captured from the same disk content with the
-    // same manifest.toml, that snapshot is equivalent to what a fresh
-    // capture would produce: reuse it instead of booting a capture
-    // VM. With deterministic bakes + content-derived ManifestRefs,
-    // this is what makes a no-op re-bake's enable near-instant — and
-    // hosts already hold the reused snapshot's chunks on NVMe, so no
-    // fleet-wide re-prefetch either.
+    // ADR 0036 P4 / ADR 0080: content-keyed reuse. A base snapshot is a
+    // function of (rootfs bytes, capture-affecting resources) — the
+    // bundle generations it embeds are only the fallback pin, because
+    // session-create swaps aux drives to the host's CURRENT staged
+    // generation (ADR 0035 Invariant 2). Name/description/env/workdir
+    // are applied per-session, so they're deliberately NOT in the key.
+    // If ANY enabled image (soft-deleted included — its snapshot stays
+    // GC-pinned) was captured from the same disk content with the same
+    // resources, that snapshot is equivalent to what a fresh capture
+    // would produce: reuse it instead of booting a capture VM. With
+    // deterministic bakes + content-derived ManifestRefs, this is what
+    // makes a no-op re-bake's enable near-instant — and hosts already
+    // hold the reused snapshot's chunks on NVMe, so no fleet-wide
+    // re-prefetch either.
     if let Some(disk_ref) = row.disk_manifest.filter(|_| reuse_ok) {
         if let Some(existing) = state
             .services
             .meta
-            .find_enabled_image_by_content(disk_ref, &row.manifest_toml)
+            .find_enabled_image_by_content(disk_ref, &row.image_config.resources)
             .await?
         {
             if let Some(id) = existing.base_snapshot_id {
@@ -440,7 +473,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
         allow_hosts: Vec::new(),
         allow_host_patterns: Vec::new(),
     };
-    let spec = crate::api::sessions::cold_boot_spec(&capture_uri, manifest, None, capture_network);
+    let spec = crate::api::sessions::cold_boot_spec(&capture_uri, &config, None, capture_network);
 
     let (host_id, host) =
         crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
@@ -457,13 +490,32 @@ pub(crate) async fn capture_and_record_base_snapshot(
         host_id = %host_id,
         "capturing base snapshot for image enable",
     );
-    // Resolve the capture-time env for the `[warm]` hook: literals pass
-    // through, secret refs resolve through the same SecretStore a session
-    // uses. The host receives only resolved values (never the refs). The
-    // values flow coord→host→capture-exec and whatever the warm processes
-    // persist lands in the base snapshot — which we treat as secret-bearing
-    // (see ADR 0007 storage model); the refs themselves never leave the DB.
-    let capture_env = resolve_capture_env(state, &row.image_uri, &row.capture_env).await;
+    // Resolve the capture-time env for the `[warm]` hook (`warm.env`, ADR
+    // 0080): literals pass through, secret refs resolve through the same
+    // SecretStore a session uses — FAIL-LOUD: an unresolvable ref aborts
+    // the capture here rather than baking a corrupt "warm" snapshot. The
+    // host receives only resolved values (never the refs). The values
+    // flow coord→host→capture-exec and whatever the warm processes
+    // persist lands in the base snapshot — which we treat as
+    // secret-bearing (see ADR 0007 storage model); the refs themselves
+    // never leave the DB.
+    let warm_env = config
+        .warm
+        .as_ref()
+        .map(|w| w.env.as_slice())
+        .unwrap_or(&[]);
+    let capture_env = resolve_capture_env(state, &row.image_uri, warm_env).await?;
+
+    // ADR 0080 (wire v13): assemble the `[warm]` hook's capture egress
+    // policy HERE (one egress builder for sessions and captures alike)
+    // and ship it ready-to-register; the host stamps the
+    // sandbox-dependent identity (sandbox_id, guest IP) at registration.
+    // `None` ⇒ the capture VM stays egress-less.
+    let capture_egress = config
+        .warm
+        .as_ref()
+        .and_then(|w| w.network.as_ref())
+        .and_then(crate::session_boot::assemble_capture_egress_policy);
 
     // Thread the image's optional `[warm]` hook into capture: the host
     // runs it in the live VM before the snapshot freezes, so a warmed
@@ -475,7 +527,13 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // the call's lifetime — the caller (`enable_scanner::advance_one`)
     // drains it into a fenced `enable_jobs` write per event.
     let meta = host
-        .build_base_snapshot(spec, manifest.warm.clone(), capture_env, progress)
+        .build_base_snapshot(
+            spec,
+            config.warm.clone(),
+            capture_env,
+            capture_egress,
+            progress,
+        )
         .await
         .map_err(|e| match e {
             engram_core::SandboxError::CaptureFailed(failure) => ApiError::CaptureFailed {
@@ -587,67 +645,62 @@ pub(crate) async fn capture_and_record_base_snapshot(
     Ok((meta.id, disk_manifest, meta.memory_manifest))
 }
 
-/// ADR 0048: enable-time manifest validation. An enabled image must
-/// declare `[resources] suggested_vcpus = N` so placement can reserve CPU
-/// and pack hosts against a budget. Pure (no I/O) so it's unit-tested directly.
-/// Resolve an enabled image's `capture_env` into concrete `name → value`
-/// pairs for the `[warm]` hook. Literals pass through; secret refs resolve
-/// through the same [`engram_core::traits::SecretStore`] a session uses
-/// (`SecretContext` built from the image ref, mirroring
-/// `session_boot::resolve_inject_entries`). A ref that doesn't resolve is
-/// skipped with a warning — the warm hook is fail-loud, so a genuinely
-/// needed-but-missing secret surfaces as a hook failure that aborts the
-/// capture, rather than silently injecting an empty value.
+/// Resolve an image's warm env (`config.warm.env`, ADR 0080) into
+/// concrete `name → value` pairs for the `[warm]` hook. Literals pass
+/// through; secret refs resolve through the same
+/// [`engram_core::traits::SecretStore`] a session uses — the ref is
+/// consulted both as a name (org-secret store) and as the schema's
+/// deployment `ref` (backends like GCP SM that honor explicit refs).
+///
+/// FAIL-LOUD (ADR 0080): an unresolvable or erroring ref fails the
+/// capture with an actionable error. The pre-0080 behavior (warn + skip)
+/// let a missing secret silently bake a corrupt "warm" base snapshot
+/// that every session then inherited.
 async fn resolve_capture_env(
     state: &SharedState,
     image_uri: &str,
-    capture_env: &[engram_core::types::CaptureEnvEntry],
-) -> std::collections::HashMap<String, String> {
+    warm_env: &[engram_core::types::CaptureEnvEntry],
+) -> Result<std::collections::HashMap<String, String>, ApiError> {
     use engram_core::types::CaptureEnvValue;
-    if capture_env.is_empty() {
-        return std::collections::HashMap::new();
+    if warm_env.is_empty() {
+        return Ok(std::collections::HashMap::new());
     }
     let (repo, image_tag) = engram_core::types::session::split_image_ref(image_uri);
     let ctx = engram_core::traits::SecretContext { repo, image_tag };
-    let schema = engram_core::types::image::SecretSchema::default();
-    let mut out = std::collections::HashMap::with_capacity(capture_env.len());
-    for entry in capture_env {
+    let mut out = std::collections::HashMap::with_capacity(warm_env.len());
+    for entry in warm_env {
         let value = match &entry.value {
             CaptureEnvValue::Literal { value } => value.clone(),
             CaptureEnvValue::SecretRef { secret_ref } => {
+                let schema = engram_core::types::image::SecretSchema {
+                    r#ref: Some(secret_ref.clone()),
+                    required: true,
+                    ..Default::default()
+                };
                 match state.services.secrets.get(&ctx, secret_ref, &schema).await {
                     Ok(Some(v)) => v,
                     Ok(None) => {
-                        tracing::warn!(
-                            name = %entry.name, secret_ref = %secret_ref,
-                            "capture_env secret_ref not resolvable; omitting from the [warm] hook env",
-                        );
-                        continue;
+                        return Err(ApiError::BadRequest(format!(
+                            "warm env `{}` references secret `{secret_ref}`, which is not \
+                             resolvable (checked the org-secret store and the deployment \
+                             secret backend). Add the secret or fix the ref, then retry \
+                             the enable — capturing without it would bake a corrupt warm \
+                             snapshot.",
+                            entry.name,
+                        )));
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            name = %entry.name, secret_ref = %secret_ref, error = %e,
-                            "capture_env secret_ref resolution failed; omitting from the [warm] hook env",
-                        );
-                        continue;
+                        return Err(ApiError::Internal(format!(
+                            "warm env `{}`: resolving secret `{secret_ref}` failed: {e}",
+                            entry.name,
+                        )));
                     }
                 }
             }
         };
         out.insert(entry.name.clone(), value);
     }
-    out
-}
-
-fn validate_enabled_manifest(manifest: &ImageManifest, image_uri: &str) -> Result<(), String> {
-    if manifest.resources.suggested_vcpus.is_none() {
-        return Err(format!(
-            "manifest.toml at `{image_uri}` must declare `[resources] suggested_vcpus = N` \
-             (ADR 0048: placement reserves CPU). Re-bake the image with a suggested_vcpus \
-             declaration and retry the enable."
-        ));
-    }
-    Ok(())
+    Ok(out)
 }
 
 /// Parse the bake's bundle.json and pull out its `disk_manifest`
@@ -843,29 +896,23 @@ mod tests {
     use engram_storage_local::LocalBlobStorage;
     use std::sync::Arc;
 
+    /// ADR 0080: the artifact config blob must carry `runtime_defaults`;
+    /// a pre-0080 artifact (or a malformed blob) fails the enable with an
+    /// actionable "re-bake" error instead of silently dropping the
+    /// Dockerfile ENV/WORKDIR.
     #[test]
-    fn enable_validation_requires_a_suggested_vcpus_declaration() {
-        // No [resources] at all → rejected.
-        let bare: ImageManifest = toml::from_str("name = \"x\"\n").unwrap();
-        let err = validate_enabled_manifest(&bare, "r/x:t").unwrap_err();
-        assert!(
-            err.contains("suggested_vcpus"),
-            "error must name the field: {err}"
-        );
+    fn extract_runtime_defaults_requires_the_field_and_parses_it() {
+        let ok = br#"{"kind":"engram-image-v1","runtime_defaults":{"env":{"PATH":"/usr/bin"},"workdir":"/w"}}"#;
+        let d = extract_runtime_defaults(ok).expect("well-formed blob");
+        assert_eq!(d.env.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(d.workdir.as_deref(), Some("/w"));
 
-        // [resources] present but suggested_vcpus omitted → rejected.
-        let no_vcpus: ImageManifest =
-            toml::from_str("name = \"x\"\n[resources]\nsuggested_memory_mib = 2048\n").unwrap();
-        assert!(validate_enabled_manifest(&no_vcpus, "r/x:t").is_err());
+        // Pre-0080 artifact: config blob without runtime_defaults.
+        let err = extract_runtime_defaults(br#"{"kind":"engram-image-v1"}"#).unwrap_err();
+        assert!(err.contains("re-bake"), "must be actionable: {err}");
 
-        // Declared → accepted.
-        let ok: ImageManifest =
-            toml::from_str("name = \"x\"\n[resources]\nsuggested_vcpus = 4\n").unwrap();
-        assert!(validate_enabled_manifest(&ok, "r/x:t").is_ok());
-
-        // The renamed `vcpus` key fails the PARSE (deny_unknown_fields),
-        // so it never reaches validation — only `suggested_vcpus` is valid.
-        assert!(toml::from_str::<ImageManifest>("name = \"x\"\n[resources]\nvcpus = 2\n").is_err());
+        // Not JSON at all.
+        assert!(extract_runtime_defaults(b"not-json").is_err());
     }
 
     /// Regression guard for the OCI → BlobStorage materializer.

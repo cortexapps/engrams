@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use engram_core::traits::{SecretContext, SessionFence};
+use engram_core::types::image::ImageConfig;
 use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
-use engram_core::types::{ImageManifest, Session, SessionSpec, SessionState};
+use engram_core::types::{Session, SessionSpec, SessionState};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
@@ -24,8 +25,8 @@ pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
 /// skill-agnostic (skills bind via `patch_drive`, never resize memory), so
 /// memory-heavy tooling (e.g. browser) is an image-sizing concern —
 /// declare `suggested_memory_mib` on the image, not a per-session skill.
-pub(crate) fn resolved_memory_mib(manifest: &engram_core::types::ImageManifest) -> u32 {
-    manifest
+pub(crate) fn resolved_memory_mib(config: &ImageConfig) -> u32 {
+    config
         .resources
         .suggested_memory_mib
         .unwrap_or(DEFAULT_MEMORY_MIB)
@@ -36,8 +37,8 @@ pub(crate) fn resolved_memory_mib(manifest: &engram_core::types::ImageManifest) 
 /// declaration is present for enabled images; `DEFAULT_VCPUS` is the
 /// defensive fallback for the test / non-enabled paths, mirroring
 /// `resolved_memory_mib`. This is the budget placement reserves.
-pub(crate) fn resolved_vcpus(manifest: &engram_core::types::ImageManifest) -> u32 {
-    manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS)
+pub(crate) fn resolved_vcpus(config: &ImageConfig) -> u32 {
+    config.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS)
 }
 
 /// The system's cold-boot `SandboxSpec` shape — a fresh kernel boot
@@ -53,7 +54,7 @@ pub(crate) fn resolved_vcpus(manifest: &engram_core::types::ImageManifest) -> u3
 ///   mounting the session's evolved rootfs lineage.
 pub(crate) fn cold_boot_spec(
     image_uri: &str,
-    manifest: &engram_core::types::ImageManifest,
+    config: &ImageConfig,
     rootfs_manifest: Option<engram_core::types::manifest::ManifestRef>,
     // ADR 0057: network is no longer on the manifest. The caller supplies it —
     // base-snapshot capture uses allow-all (a trusted, ephemeral build step;
@@ -63,9 +64,9 @@ pub(crate) fn cold_boot_spec(
 ) -> engram_core::types::sandbox::SandboxSpec {
     use engram_core::types::sandbox::{AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 
-    let vcpus = resolved_vcpus(manifest);
-    let memory_mib = resolved_memory_mib(manifest);
-    let disk_gib = manifest
+    let vcpus = resolved_vcpus(config);
+    let memory_mib = resolved_memory_mib(config);
+    let disk_gib = config
         .resources
         .suggested_disk_gib
         .unwrap_or(DEFAULT_DISK_GIB);
@@ -89,7 +90,7 @@ pub(crate) fn cold_boot_spec(
         },
         disk: DiskLimit { max_gib: disk_gib },
         ttl: None,
-        env: manifest.env.clone(),
+        env: config.env.clone(),
         workdir: None,
         network,
         aux_ro_drives,
@@ -227,13 +228,14 @@ pub(crate) async fn seal_session_secrets(
 }
 
 /// Material returned by [`resume_manifest_bundle`] — everything the
-/// resume path needs from the image manifest and its secret schema
-/// to (1) build the post-resume launch env and (2) rebuild the
-/// per-session egress policy (§A.1.7) without a second SecretStore
+/// resume path needs from the image's effective config (ADR 0080: the
+/// RPC-supplied ImageConfig merged over the Dockerfile-derived
+/// defaults) to (1) build the post-resume launch env and (2) rebuild
+/// the per-session egress policy (§A.1.7) without a second SecretStore
 /// round-trip.
 pub(crate) struct ResumeManifestBundle {
-    pub manifest: ImageManifest,
-    /// `manifest.env` with the session policy's secrets applied (ADR 0057:
+    pub config: ImageConfig,
+    /// `config.env` with the session policy's secrets applied (ADR 0057:
     /// literal values / broker placeholders). Per-request overrides from
     /// `load_session_secrets` are NOT folded in here — the caller layers them on.
     pub env: HashMap<String, String>,
@@ -279,12 +281,8 @@ pub(crate) async fn resume_manifest_bundle(
                 session.image,
             ))
         })?;
-    let manifest: ImageManifest = toml::from_str(&enabled.manifest_toml).map_err(|e| {
-        ApiError::Internal(format!(
-            "stored manifest for `{}` failed to parse: {e}",
-            session.image,
-        ))
-    })?;
+    // ADR 0080: the row carries the config as typed JSONB — no TOML parse.
+    let config = enabled.effective_config();
     let (repo, tag) = split_image_ref(&session.image);
     let secret_ctx = SecretContext {
         repo,
@@ -297,9 +295,9 @@ pub(crate) async fn resume_manifest_bundle(
     let policy = load_session_policy(state, session.id).await;
     let (policy_secret_env, _egress) =
         resolve_policy_secrets(state, policy.as_ref(), &secret_ctx, session.id).await;
-    let mut env: HashMap<String, String> = manifest.env.clone();
+    let mut env: HashMap<String, String> = config.env.clone();
     env.extend(policy_secret_env);
-    Ok(ResumeManifestBundle { manifest, env })
+    Ok(ResumeManifestBundle { config, env })
 }
 
 /// ADR 0057: re-read + parse the persisted per-session integration policy.
@@ -1267,9 +1265,9 @@ async fn prepare_inner(
         let (r, t) = split_image_ref(image_uri);
         (r.to_string(), t.to_string())
     };
-    // Issue #535 (a): the manifest was parsed ONCE at bundle-fill time (bake
-    // or cache-refresh), not per create — no `toml::from_str` on this path.
-    let manifest = &bundle.manifest;
+    // Issue #535 (a): the effective config was computed ONCE at
+    // bundle-fill time (enable or cache-refresh), not per create.
+    let config = &bundle.config;
     // ADR 0062: the harness is no longer baked into the image — it's selected
     // per session and resolved from the catalog below (`resolve_harness`). The
     // image's `[harness]` block, if any legacy one survives, is ignored here.
@@ -1293,7 +1291,7 @@ async fn prepare_inner(
     // -------- Build the sandbox env --------
     // Base = image manifest `[env]`; then the policy's secrets (literal values /
     // broker placeholders) layered on.
-    let mut spec_env: HashMap<String, String> = manifest.env.clone();
+    let mut spec_env: HashMap<String, String> = config.env.clone();
     spec_env.extend(policy_secret_env);
 
     // The map that gets sealed into `session_secrets` and replayed on resume.
@@ -1355,7 +1353,7 @@ async fn prepare_inner(
         mode,
         session_id,
         session_env.clone(),
-        manifest.workdir.clone(),
+        config.workdir.clone(),
     )
     .await?
     {
@@ -1961,7 +1959,6 @@ pub(crate) async fn resolve_harness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engram_core::types::ImageManifest;
     use engram_core::SandboxId;
 
     /// ADR 0055: memory is purely the image's `suggested_memory_mib` (or the
@@ -1971,7 +1968,7 @@ mod tests {
     #[test]
     fn resolved_memory_mib_is_suggested_or_default() {
         let mk = |mem: Option<u32>| {
-            let mut m = ImageManifest {
+            let mut m = ImageConfig {
                 name: "x".into(),
                 ..Default::default()
             };

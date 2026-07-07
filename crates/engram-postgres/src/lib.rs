@@ -4203,8 +4203,8 @@ impl MetadataStore for PostgresStore {
         // description/env/workdir are applied per-session and don't
         // invalidate a snapshot. Warm images never reach this query
         // (caller-gated).
-        let resources_json = serde_json::to_value(resources)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let resources_json =
+            serde_json::to_value(resources).map_err(|e| MetaError::Serialization(e.to_string()))?;
         let row = sqlx::query(
             r#"
             SELECT id, image_uri, image_config, oci_defaults, manifest_digest,

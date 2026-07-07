@@ -1030,7 +1030,12 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         };
 
         let digest = oci
-            .push_image(&full_uri, rootfs_arg, &config_bytes, bundle_bytes.as_deref())
+            .push_image(
+                &full_uri,
+                rootfs_arg,
+                &config_bytes,
+                bundle_bytes.as_deref(),
+            )
             .await
             .map_err(|e| BuildError::Docker(format!("oci push: {e}")))?;
 

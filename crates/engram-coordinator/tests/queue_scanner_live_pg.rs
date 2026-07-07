@@ -232,7 +232,11 @@ async fn seed_enabled_image(meta: &Arc<dyn MetadataStore>, image_uri: &str) -> S
     meta.upsert_enabled_image(EnabledImage {
         id: Uuid::new_v4(),
         image_uri: image_uri.to_string(),
-        manifest_toml: format!("name = \"queue-scanner-fixture-{}\"\n", Uuid::new_v4()),
+        image_config: engram_core::types::image::ImageConfig {
+            name: "test".into(),
+            ..Default::default()
+        },
+        oci_defaults: Default::default(),
         manifest_digest: digest.clone(),
         disk_manifest: None,
         base_snapshot_id: Some(snapshot_id),
@@ -242,7 +246,6 @@ async fn seed_enabled_image(meta: &Arc<dyn MetadataStore>, image_uri: &str) -> S
         created_at: now,
         updated_at: None,
         soft_deleted_at: None,
-        capture_env: Vec::new(),
     })
     .await
     .expect("seed enabled image");

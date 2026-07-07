@@ -14,6 +14,24 @@ pub struct AppImageService {
     pub auth: Arc<auth::BearerAuth>,
 }
 
+/// Thin wrapper over [`crate::api::enabled_images::enqueue_enable_job`]
+/// mapping its `ApiError` (incl. the in-flight-different-config
+/// `Conflict`) onto a gRPC `Status`.
+fn enqueue(
+    state: &SharedState,
+    image_uri: &str,
+    config: &engram_core::types::image::ImageConfig,
+) -> impl std::future::Future<Output = Result<engram_core::types::EnableJob, Status>> {
+    let state = state.clone();
+    let image_uri = image_uri.to_string();
+    let config = config.clone();
+    async move {
+        crate::api::enabled_images::enqueue_enable_job(&state, &image_uri, &config)
+            .await
+            .map_err(into_status)
+    }
+}
+
 // EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
 #[tonic::async_trait]
 impl app::image_service_server::ImageService for AppImageService {
@@ -49,40 +67,98 @@ impl app::image_service_server::ImageService for AppImageService {
         if image_uri.trim().is_empty() {
             return Err(Status::invalid_argument("image_uri must not be empty"));
         }
-        let requested_capture_env =
-            convert::capture_env_from_proto(&req.capture_env).map_err(Status::invalid_argument)?;
-        // Inherit-when-empty: an empty list keeps the already-enabled row's
-        // capture_env (so a plain re-enable / re-bake roll doesn't wipe it);
-        // a non-empty list replaces it (the add/remove/rotate edit). Clearing
-        // is "send the remaining entries"; clearing ALL is a disable+enable.
-        let capture_env = if requested_capture_env.is_empty() {
-            self.state
+        // ADR 0080: inherit-when-unset — an absent config keeps the
+        // already-enabled row's config (so a plain re-enable / re-bake
+        // roll doesn't wipe it); a set config replaces it wholesale. A
+        // FIRST enable must supply it (there is nothing to inherit).
+        let config = match &req.config {
+            Some(c) => convert::image_config_from_proto(c).map_err(Status::invalid_argument)?,
+            None => self
+                .state
                 .services
                 .meta
                 .get_enabled_image_any(&image_uri)
                 .await
                 .map_err(|e| into_status(crate::error::ApiError::from(e)))?
-                .map(|r| r.capture_env)
-                .unwrap_or_default()
-        } else {
-            requested_capture_env
+                .map(|r| r.image_config)
+                .ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "image `{image_uri}` is not enabled yet, so `config` is required \
+                         on the first enable (name, [resources] suggested_vcpus, …)"
+                    ))
+                })?,
         };
-        let (_row, _manifest, artifacts) =
-            crate::api::enabled_images::fetch_and_seal_manifest(&self.state, &image_uri)
-                .await
-                .map_err(into_status)?;
-        let job = self
+        config
+            .validate()
+            .map_err(|e| Status::invalid_argument(format!("image config: {e}")))?;
+        let job = enqueue(&self.state, &image_uri, &config).await?;
+        Ok(Response::new(app::EnableImageResponse {
+            job: Some(convert::enable_job_to_proto(&job)),
+        }))
+    }
+
+    async fn update_image(
+        &self,
+        req: Request<app::UpdateImageRequest>,
+    ) -> Result<Response<app::UpdateImageResponse>, Status> {
+        self.auth.check(&req)?;
+        let req = req.into_inner();
+        let image_uri = req.image_uri;
+        if image_uri.trim().is_empty() {
+            return Err(Status::invalid_argument("image_uri must not be empty"));
+        }
+        let Some(config) = req.config.as_ref() else {
+            return Err(Status::invalid_argument(
+                "config is required (full replace)",
+            ));
+        };
+        let config = convert::image_config_from_proto(config).map_err(Status::invalid_argument)?;
+        config
+            .validate()
+            .map_err(|e| Status::invalid_argument(format!("image config: {e}")))?;
+        // Live rows only — editing a disabled image is a re-enable's job.
+        let existing = self
             .state
             .services
             .meta
-            .create_or_get_enable_job(
-                &image_uri,
-                Some(artifacts.manifest_digest.as_str()),
-                &capture_env,
-            )
+            .get_enabled_image(&image_uri)
             .await
-            .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
-        Ok(Response::new(app::EnableImageResponse {
+            .map_err(|e| into_status(crate::error::ApiError::from(e)))?
+            .ok_or_else(|| {
+                into_status(crate::error::ApiError::NotFound(format!(
+                    "image `{image_uri}` is not enabled; enable it first"
+                )))
+            })?;
+
+        // ADR 0080 mutability split: resources + anything under warm only
+        // take effect through a base-snapshot recapture; everything else
+        // (name/description/env/workdir) applies in place immediately.
+        let mut recapture_fields: Vec<&str> = Vec::new();
+        if existing.image_config.resources != config.resources {
+            recapture_fields.push("resources");
+        }
+        if existing.image_config.warm != config.warm {
+            recapture_fields.push("warm");
+        }
+        if recapture_fields.is_empty() {
+            self.state
+                .services
+                .meta
+                .update_enabled_image_config(&image_uri, &config)
+                .await
+                .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
+            return Ok(Response::new(app::UpdateImageResponse { job: None }));
+        }
+        if !req.allow_recapture {
+            return Err(Status::failed_precondition(format!(
+                "this edit changes {} — capture-affecting fields only take effect \
+                 through a base-snapshot recapture (minutes; the enable pipeline \
+                 re-runs). Re-send with allow_recapture = true to proceed.",
+                recapture_fields.join(" and "),
+            )));
+        }
+        let job = enqueue(&self.state, &image_uri, &config).await?;
+        Ok(Response::new(app::UpdateImageResponse {
             job: Some(convert::enable_job_to_proto(&job)),
         }))
     }
@@ -158,23 +234,9 @@ impl app::image_service_server::ImageService for AppImageService {
                 "image `{image_uri}` is not enabled; enable it first"
             ))));
         };
-        let (_row, _manifest, artifacts) =
-            crate::api::enabled_images::fetch_and_seal_manifest(&self.state, &image_uri)
-                .await
-                .map_err(into_status)?;
-        // Refresh carries the existing capture_env forward (no field to set on
+        // Refresh carries the existing config forward (no field to set on
         // the refresh request), so a re-pull of the same tag doesn't wipe it.
-        let job = self
-            .state
-            .services
-            .meta
-            .create_or_get_enable_job(
-                &image_uri,
-                Some(artifacts.manifest_digest.as_str()),
-                &existing.capture_env,
-            )
-            .await
-            .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
+        let job = enqueue(&self.state, &image_uri, &existing.image_config).await?;
         Ok(Response::new(app::RefreshImageResponse {
             job: Some(convert::enable_job_to_proto(&job)),
         }))

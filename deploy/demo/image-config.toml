@@ -1,0 +1,16 @@
+# ADR 0080: the demo image's runtime config, applied OUT-OF-BAND at
+# enable time (`engram image enable --uri <uri> --config <this file>`)
+# — the bake carries no metadata; deploy/demo/ is a plain Dockerfile.
+#
+# Egress is session policy (ADR 0057): set network allow-lists on the
+# session profile, not here. A capture-time [warm] hook (with its own
+# [[warm.env]] secrets + [warm.network] egress) would also live in this
+# file; the demo image declares none.
+
+name = "demo"
+description = "Canonical workspace image: debian:bookworm-slim + git + ttyd. ADR 0062: the image bakes NO harness — the harness is a per-session selection (the built-in `claude` rides the fleet stamp; custom harnesses are uploaded via RegisterHarness), so a session selects `harness = \"claude\"` to run the Claude agent, or `dev_vm` mode for a shell-only / dev-VM workload. This image is just the workspace."
+
+# ADR 0048: an enabled image must declare its vCPU count — placement
+# reserves it against the host's CPU budget so packing has a CPU bound.
+[resources]
+suggested_vcpus = 2

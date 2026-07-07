@@ -771,7 +771,11 @@ async fn end_to_end_with_real_docker() {
 
     // The Dockerfile ENV rode `docker inspect` into runtime_defaults.
     assert_eq!(
-        outcome.runtime_defaults.env.get("BAKED").map(String::as_str),
+        outcome
+            .runtime_defaults
+            .env
+            .get("BAKED")
+            .map(String::as_str),
         Some("yes"),
     );
 }

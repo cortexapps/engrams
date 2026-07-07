@@ -830,9 +830,9 @@ impl TestFixture {
     /// lets the next session create through. Production hosts
     /// populate this set via the prefetch supervisor; tests have
     /// no chunks to fault so we just declare the host ready.
-    fn write_image(&self, repo: &str, tag: &str, manifest_toml: &str) {
+    fn write_image(&self, repo: &str, tag: &str, config_toml: &str) {
         let uri = format!("{repo}:{tag}");
-        let digest = seed_enabled(&self.meta, &uri, manifest_toml);
+        let digest = seed_enabled(&self.meta, &uri, config_toml);
         self.mark_host_ready_for(digest);
     }
 
@@ -856,7 +856,7 @@ impl TestFixture {
 fn seed_enabled(
     store: &MockMetadataStore,
     uri: &str,
-    manifest_toml: &str,
+    config_toml: &str,
 ) -> engram_protocol::heartbeat::ManifestDigest {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -892,7 +892,8 @@ fn seed_enabled(
         engram_core::types::EnabledImage {
             id: uuid::Uuid::new_v4(),
             image_uri: uri.to_string(),
-            manifest_toml: manifest_toml.to_string(),
+            image_config: toml::from_str(config_toml).expect("fixture config TOML parses"),
+            oci_defaults: Default::default(),
             manifest_digest: digest.clone(),
             disk_manifest: None,
             base_snapshot_id: Some(base_snapshot_id),
@@ -908,7 +909,6 @@ fn seed_enabled(
             created_at: now,
             updated_at: None,
             soft_deleted_at: None,
-            capture_env: Vec::new(),
         },
     );
     engram_protocol::heartbeat::ManifestDigest::new(&digest)

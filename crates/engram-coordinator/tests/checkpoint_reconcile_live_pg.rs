@@ -325,7 +325,11 @@ async fn prune_orphan_base_snapshots_reaps_superseded_only() {
     meta.upsert_enabled_image(EnabledImage {
         id: Uuid::new_v4(),
         image_uri: format!("localhost:5001/demo:base-reaper-{}", Uuid::new_v4()),
-        manifest_toml: String::new(),
+        image_config: engram_core::types::image::ImageConfig {
+            name: "test".into(),
+            ..Default::default()
+        },
+        oci_defaults: Default::default(),
         manifest_digest: "sha256:base-reaper".into(),
         disk_manifest: None,
         base_snapshot_id: Some(current_base.id),
@@ -335,7 +339,6 @@ async fn prune_orphan_base_snapshots_reaps_superseded_only() {
         created_at: now,
         updated_at: None,
         soft_deleted_at: None,
-        capture_env: Vec::new(),
     })
     .await
     .expect("enable image");

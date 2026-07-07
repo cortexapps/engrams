@@ -220,7 +220,11 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
         .upsert_enabled_image(EnabledImage {
             id: Uuid::new_v4(),
             image_uri: image_uri.clone(),
-            manifest_toml: "image = { uri = \"phase-c\" }\n".into(),
+            image_config: engram_core::types::image::ImageConfig {
+                name: "test".into(),
+                ..Default::default()
+            },
+            oci_defaults: Default::default(),
             manifest_digest: format!("sha256:{:064x}", 1u32),
             disk_manifest: Some(img_disk),
             base_snapshot_id: Some(base_snap),
@@ -230,7 +234,6 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
             created_at: Utc::now(),
             updated_at: None,
             soft_deleted_at: None,
-            capture_env: Vec::new(),
         })
         .await
         .expect("upsert enabled image");
@@ -383,7 +386,11 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
         .upsert_enabled_image(EnabledImage {
             id: Uuid::new_v4(),
             image_uri: image_uri.clone(),
-            manifest_toml: "image = { uri = \"phase-c\" }\n".into(),
+            image_config: engram_core::types::image::ImageConfig {
+                name: "test".into(),
+                ..Default::default()
+            },
+            oci_defaults: Default::default(),
             manifest_digest: format!("sha256:{:064x}", 2u32),
             disk_manifest: Some(pinned_mref),
             base_snapshot_id: Some(base_snap),
@@ -393,7 +400,6 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
             created_at: Utc::now(),
             updated_at: None,
             soft_deleted_at: None,
-            capture_env: Vec::new(),
         })
         .await
         .expect("upsert enabled image");
@@ -526,7 +532,11 @@ async fn promote_skips_candidate_that_became_repinned() {
         .upsert_enabled_image(EnabledImage {
             id: Uuid::new_v4(),
             image_uri: image_uri.clone(),
-            manifest_toml: "image = { uri = \"phase-c\" }\n".into(),
+            image_config: engram_core::types::image::ImageConfig {
+                name: "test".into(),
+                ..Default::default()
+            },
+            oci_defaults: Default::default(),
             manifest_digest: format!("sha256:{:064x}", 3u32),
             disk_manifest: Some(img_disk),
             base_snapshot_id: Some(base_snap),
@@ -536,7 +546,6 @@ async fn promote_skips_candidate_that_became_repinned() {
             created_at: Utc::now(),
             updated_at: None,
             soft_deleted_at: None,
-            capture_env: Vec::new(),
         })
         .await
         .expect("upsert enabled image");
@@ -806,7 +815,11 @@ async fn base_snapshot_memfile_pinned_even_when_snapshot_not_recoverable() {
         .upsert_enabled_image(EnabledImage {
             id: Uuid::new_v4(),
             image_uri: format!("adr-0022-memfile-pin:warm-{}", Uuid::new_v4()),
-            manifest_toml: "image = { uri = \"adr-0022\" }\n".into(),
+            image_config: engram_core::types::image::ImageConfig {
+                name: "test".into(),
+                ..Default::default()
+            },
+            oci_defaults: Default::default(),
             manifest_digest: format!("sha256:{:064x}", 22u32),
             disk_manifest: None,
             base_snapshot_id: Some(base_snap),
@@ -816,7 +829,6 @@ async fn base_snapshot_memfile_pinned_even_when_snapshot_not_recoverable() {
             created_at: Utc::now(),
             updated_at: None,
             soft_deleted_at: None,
-            capture_env: Vec::new(),
         })
         .await
         .expect("upsert enabled image");
