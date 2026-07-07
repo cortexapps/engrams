@@ -300,7 +300,7 @@ impl OpClaim {
 
     /// Background heartbeat for straight-line pipelines with no touch
     /// loop of their own (the manual snapshot's capture body). Keeps the
-    /// running row's `heartbeat_at` fresh so the reclaim sweep (60s
+    /// running row's `heartbeat_at` fresh so the reclaim sweep (180s
     /// staleness) never fences a healthy holder. Dropping the returned
     /// handle aborts the loop (RAII, tied to the claim's scope).
     pub(crate) fn spawn_heartbeat(&self, step: &'static str) -> OpClaimHeartbeat {

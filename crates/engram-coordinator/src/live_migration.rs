@@ -184,6 +184,20 @@ pub async fn migrate_session_live(
         Err(e) => return Err(MigrateError::Fatal(format!("op claim acquire: {e}"))),
     };
 
+    // ADR 0079 (re-review finding #1): keep the claim's `heartbeat_at`
+    // fresh for the ENTIRE synchronous move body (presetup → concurrent
+    // restore-await → blackout → rebind → reactivate below). Without this
+    // beat the row's only liveness stamp is `try_acquire`'s, so a move
+    // whose body outlives `RECLAIM_STALE` (180s — a large VM over a slow
+    // inter-host link) is reclaimed out from under a PERFECTLY HEALTHY
+    // holder, which then keeps driving un-fenced migration RPCs while the
+    // successor's reclaim fails the row (double-drive). The manual-snapshot
+    // inline claim already beats its body this way (`api::snapshot`); the
+    // teleport body did not. Dropped explicitly right before the finalize
+    // task spawns (that task runs its own `claim.touch` beat across the
+    // drain); any early `?`/return arm drops it via RAII.
+    let move_heartbeat = claim.spawn_heartbeat("teleport-move");
+
     // The destination must be takeable and the source addressable
     // before we freeze anything.
     let (_, dest_backend) = crate::placement::pick_specific_host(
@@ -668,6 +682,11 @@ pub async fn migrate_session_live(
     let state2 = state.clone();
     let export_id = presetup.export_id.clone();
     let finalize_span = tracing::Span::current();
+    // The synchronous body is done; the finalize task keeps the claim alive
+    // via its own `claim.touch` beat across the drain, so hand liveness off
+    // by dropping the body heartbeat here (avoids two beats racing on the
+    // same row — harmless, but tidy).
+    drop(move_heartbeat);
     tokio::spawn(
         async move {
         let claim = claim;
@@ -701,9 +720,9 @@ pub async fn migrate_session_live(
             for attempt in 0..DRAIN_RETRY_BUDGET {
                 // Refresh the op claim's heartbeat across attempts the
                 // same way the wait below does, so a multi-attempt retry
-                // isn't reclaimed out from under us (20s < the executor's
-                // 60s staleness bound) and never stomps a session a
-                // successor re-claimed.
+                // isn't reclaimed out from under us (20s ≪ the executor's
+                // 180s staleness bound, `RECLAIM_STALE`) and never stomps a
+                // session a successor re-claimed.
                 let mut touch = tokio::time::interval(std::time::Duration::from_secs(20));
                 touch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 touch.tick().await;
