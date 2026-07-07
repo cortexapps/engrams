@@ -296,7 +296,10 @@ pub trait HostClient: Send + Sync {
     /// `warm` is the image's optional capture-time prewarm hook
     /// ([`WarmConfig`]), threaded down to the backend. `capture_env` is the
     /// resolved capture-time env injected into the warm hook (refs already
-    /// resolved coordinator-side).
+    /// resolved coordinator-side). `capture_egress` (ADR 0080, wire v13) is
+    /// the coordinator-assembled egress policy the host registers for the
+    /// capture VM while the hook runs — `None` keeps the capture
+    /// egress-less.
     ///
     /// Issue #539: `progress` receives [`crate::types::CaptureProgress`]
     /// events for the lifetime of the call — `phase=boot` once the capture
@@ -313,6 +316,7 @@ pub trait HostClient: Send + Sync {
         _spec: SandboxSpec,
         _warm: Option<WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _capture_egress: Option<crate::types::egress::SessionEgressPolicy>,
         _progress: tokio::sync::mpsc::Sender<crate::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(

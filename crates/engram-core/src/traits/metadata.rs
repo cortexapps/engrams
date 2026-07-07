@@ -1652,6 +1652,23 @@ pub trait MetadataStore: Send + Sync {
     // but that's lazy + cached separately by digest.
 
     async fn upsert_enabled_image(&self, image: EnabledImage) -> Result<(), MetaError>;
+    /// ADR 0080 cheap-edit path: replace `image_config` on a live row
+    /// WITHOUT touching the base snapshot. Only correct for edits
+    /// that don't affect capture (name/description/env/workdir —
+    /// callers gate resources/warm changes behind a recapture job).
+    /// Implementations must notify boot-bundle-cache listeners so
+    /// coordinator replicas drop their cached copy. `NotFound` when
+    /// no live row exists for `image_uri`.
+    async fn update_enabled_image_config(
+        &self,
+        image_uri: &str,
+        config: &crate::types::image::ImageConfig,
+    ) -> Result<(), MetaError> {
+        let _ = (image_uri, config);
+        Err(MetaError::Migration(
+            "enabled-image config updates unsupported by this store".into(),
+        ))
+    }
     /// Live-only — filters `soft_deleted_at IS NULL`. Used by host
     /// advertisement, the dashboard's enabled-images list, and the
     /// session-create handler (where a disabled image must fail with
@@ -1692,26 +1709,31 @@ pub trait MetadataStore: Send + Sync {
     /// from BlobStorage.
     async fn delete_enabled_image(&self, image_uri: &str) -> Result<(), MetaError>;
 
-    /// ADR 0036 P4: content-keyed base-snapshot reuse. Find an
-    /// enabled image (INCLUDING soft-deleted rows — their snapshots
-    /// stay GC-pinned and restorable) whose bake produced the same
-    /// disk content (`disk_manifest_*`, content-derived since ADR
-    /// 0036) AND the same `manifest_toml`, and which carries a base
-    /// snapshot. The enable pipeline reuses that snapshot instead of
-    /// booting a capture VM: with both inputs equal, a fresh capture
-    /// is equivalent for every session created from it (bundle
-    /// generations are swapped to the host's current staging at
-    /// session create — ADR 0035 Invariant 2 — so reuse does not
-    /// freeze bundle freshness).
+    /// ADR 0036 P4 / ADR 0080: content-keyed base-snapshot reuse.
+    /// Find an enabled image (INCLUDING soft-deleted rows — their
+    /// snapshots stay GC-pinned and restorable) whose bake produced
+    /// the same disk content (`disk_manifest_*`, content-derived
+    /// since ADR 0036) AND the same capture-affecting `resources`
+    /// (the only non-warm config that's frozen into the memory
+    /// snapshot — ADR 0080 keys reuse on `image_config->'resources'`
+    /// alone; name/description/env/workdir are applied per-session),
+    /// and which carries a base snapshot. The enable pipeline reuses
+    /// that snapshot instead of booting a capture VM: with both
+    /// inputs equal, a fresh capture is equivalent for every session
+    /// created from it (bundle generations are swapped to the host's
+    /// current staging at session create — ADR 0035 Invariant 2 — so
+    /// reuse does not freeze bundle freshness). Warm images never
+    /// reuse (gated by the caller — a warm hook makes captures
+    /// non-equivalent by definition).
     ///
     /// Default `None`: stores without the query surface (test mocks)
     /// simply never reuse.
     async fn find_enabled_image_by_content(
         &self,
         disk_manifest: ManifestRef,
-        manifest_toml: &str,
+        resources: &crate::types::image::ResourceHints,
     ) -> Result<Option<EnabledImage>, MetaError> {
-        let _ = (disk_manifest, manifest_toml);
+        let _ = (disk_manifest, resources);
         Ok(None)
     }
 
@@ -1733,12 +1755,16 @@ pub trait MetadataStore: Send + Sync {
         &self,
         image_uri: &str,
         manifest_digest: Option<&str>,
-        // Capture-time env for this enable's `[warm]` hook (resolved at
-        // capture, never stored as values). Carried from the triggering
-        // request (enable) or inherited from the existing row (refresh).
-        capture_env: &[crate::types::CaptureEnvEntry],
+        // The full image config this enable will capture under (ADR
+        // 0080). Rides the job and is stamped onto the enabled_images
+        // row only when the job reaches `ready` — capture-affecting
+        // edits stay invisible to session-create until the new base
+        // snapshot actually exists. Carried from the triggering
+        // request (enable/update) or inherited from the existing row
+        // (refresh).
+        image_config: &crate::types::image::ImageConfig,
     ) -> Result<EnableJob, MetaError> {
-        let _ = (image_uri, manifest_digest, capture_env);
+        let _ = (image_uri, manifest_digest, image_config);
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))

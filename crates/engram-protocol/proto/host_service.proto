@@ -470,16 +470,26 @@ message BuildBaseSnapshotRequest {
   // image's optional capture-time `[warm]` hook. When `Some`, the host
   // runs it in the live VM (via exec) after agentd-ready and before the
   // snapshot freezes, so a long-lived process it spawns (e.g. a gradle
-  // daemon) is captured into the base snapshot. Empty/absent on older
-  // callers decodes to `None` (coord+host roll together, so this is just
-  // additive). A warm failure is fail-loud — it aborts the capture.
+  // daemon) is captured into the base snapshot. A warm failure is
+  // fail-loud — it aborts the capture. Wire v13 (ADR 0080): the host
+  // executes only `command`/`timeout_secs`/`workdir` from this; the
+  // hook's env arrives resolved in `capture_env_bincode` and its egress
+  // arrives assembled in `capture_egress_bincode` — the host never
+  // interprets `warm.env` / `warm.network` itself.
   bytes warm_bincode = 2;
   // bincode-encoded `HashMap<String, String>` — the RESOLVED capture-time
   // env injected into the `[warm]` hook's exec (the coordinator resolved any
   // secret refs against the SecretStore before this call; the host never
-  // sees the refs). Merged over the manifest `[env]`. Empty map for an image
-  // with no capture_env or no warm hook. Wire v6.
+  // sees the refs). Merged over the config `[env]`. Empty map for an image
+  // with no warm env or no warm hook. Wire v6.
   bytes capture_env_bincode = 3;
+  // bincode-encoded `Option<engram_core::types::egress::SessionEgressPolicy>`
+  // — the egress policy to register for the capture VM's guest IP while the
+  // `[warm]` hook runs, ASSEMBLED COORDINATOR-SIDE (wire v13, ADR 0080: one
+  // egress-policy builder; the host's own capture builder retired). `None`
+  // ⇒ register nothing: the capture VM stays egress-less (the proxy denies
+  // unknown guests). Ignored when `warm_bincode` is `None`.
+  bytes capture_egress_bincode = 4;
 }
 message BuildBaseSnapshotResponse {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.

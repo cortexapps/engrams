@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package engram.app.v1;
 
+import "engram/app/v1/profile.proto";
+
 // Image curation + registry credentials (ADR 0051 §2.3, rev
 // 2026-06-10). The caller is a single trusted service (bearer-authed);
 // authz lives in the orchestrator.
@@ -12,6 +14,12 @@ service ImageService {
   // drives the heavy pipeline. Re-calling while a job is in flight
   // returns the existing job (idempotent).
   rpc EnableImage(EnableImageRequest) returns (EnableImageResponse);
+  // ADR 0080: edit an enabled image's config. Cheap fields (name,
+  // description, env, workdir) apply immediately; a diff touching the
+  // capture-affecting fields (resources, anything under warm) requires
+  // `allow_recapture = true` and enqueues an enable job instead —
+  // without it the call fails FailedPrecondition naming the fields.
+  rpc UpdateImage(UpdateImageRequest) returns (UpdateImageResponse);
   rpc DisableImage(DisableImageRequest) returns (DisableImageResponse);
   rpc RefreshImage(RefreshImageRequest) returns (RefreshImageResponse);
   rpc ListEnableJobs(ListEnableJobsRequest) returns (ListEnableJobsResponse);
@@ -29,18 +37,18 @@ message ListEnabledImagesResponse {
 }
 
 // Mirrors engram_core::types::EnabledImageSummary — one live row of the
-// operator-curated image allow-list. The raw manifest.toml is
-// intentionally omitted; clients render via the lifted manifest_*
-// fields.
+// operator-curated image allow-list. `config` is the operator-supplied
+// ImageConfig the row was enabled/updated with (secret refs shown by
+// name, values never returned).
 message EnabledImageSummary {
   string id = 1;
   // Full OCI URI: <host>[/path]/<repo>:<tag>.
   string image_uri = 2;
   string manifest_digest = 3;
-  // Lifted from the parsed manifest.toml; unset when the stored toml
-  // fails to parse (the row stays listed so an operator can disable it).
-  optional string manifest_name = 4;
-  optional string manifest_description = 5;
+  // ADR 0080: retired `manifest_name` (4) / `manifest_description` (5) —
+  // the baked manifest.toml is gone; clients render from `config`.
+  reserved 4, 5;
+  reserved "manifest_name", "manifest_description";
   // ADR 0062: retired `harness_name` (field 6). The image carries no harness
   // identity now — harnesses are a per-session selection (the harness catalog),
   // decoupled from image choice. Reserved so the field number is never reused.
@@ -50,27 +58,75 @@ message EnabledImageSummary {
   string last_refreshed_at = 7;
   // ISO-8601.
   string created_at = 8;
-  // Capture-time env attached to this enabled image (refs, never resolved
-  // values). Lets the dashboard's edit form pre-fill the current set.
-  repeated CaptureEnvEntry capture_env = 9;
+  // ADR 0080: retired standalone `capture_env` (9) — capture env is
+  // `config.warm.env` now.
+  reserved 9;
+  reserved "capture_env";
+  ImageConfig config = 10;
+}
+
+// ADR 0080: the consolidated per-image runtime config. Mirrors
+// engram_core::types::image::ImageConfig — supplied out-of-band on
+// EnableImage/UpdateImage, stored as JSONB, never baked into the image.
+message ImageConfig {
+  // Display name (required, non-empty).
+  string name = 1;
+  optional string description = 2;
+  // Non-secret env applied to every sandbox of this image. Merged OVER
+  // the Dockerfile ENV (extracted at enable time), UNDER session env.
+  map<string, string> env = 3;
+  // Default working directory; falls back to the Dockerfile WORKDIR.
+  optional string workdir = 4;
+  ImageResources resources = 5;
+  // Optional capture-time prewarm hook. Everything under here is
+  // recapture-affecting by definition.
+  optional ImageWarmConfig warm = 6;
+}
+
+// Mirrors engram_core::types::image::ResourceHints.
+message ImageResources {
+  optional uint32 suggested_memory_mib = 1;
+  // ADR 0048: required at enable time — placement reserves it against
+  // the host CPU budget.
+  optional uint32 suggested_vcpus = 2;
+  optional uint32 suggested_disk_gib = 3;
+}
+
+// Mirrors engram_core::types::image::WarmConfig (ADR 0080: absorbs the
+// retired standalone capture_env — warm secrets are `env` here — and the
+// capture-time egress policy `network`, previously frozen in the baked
+// manifest).
+message ImageWarmConfig {
+  // argv of the warm command (non-empty). Run inside the capture VM.
+  repeated string command = 1;
+  optional uint64 timeout_secs = 2;
+  optional string workdir = 3;
+  // Capture-time env: literals + secret refs (refs resolved at capture,
+  // FAIL-LOUD; values never persisted or echoed back).
+  repeated CaptureEnvEntry env = 4;
+  // Egress policy for the capture VM while the warm hook runs. Unset =
+  // egress-less capture. Same shape as a profile's network allow-list.
+  optional ProfileNetwork network = 5;
 }
 
 message EnableImageRequest {
   // Full OCI URI. The host portion must match a registry credential row
   // for non-anonymous pulls; missing rows fall through to anonymous.
   string image_uri = 1;
-  // Capture-time env for the image's [warm] hook (resolved at base-snapshot
-  // capture, never persisted as values). An EMPTY list inherits the
-  // already-enabled row's capture_env (so a plain re-enable/refresh doesn't
-  // wipe it); a NON-EMPTY list replaces it (the add/remove/rotate edit). Not
-  // part of the image manifest (ADR 0057).
-  repeated CaptureEnvEntry capture_env = 2;
+  // ADR 0080: retired standalone `capture_env` (2) — set `config.warm.env`.
+  reserved 2;
+  reserved "capture_env";
+  // The image's full config. UNSET inherits the already-enabled row's
+  // config (so a plain re-enable / re-bake roll doesn't wipe it); it is
+  // required — InvalidArgument — on a first enable. SET replaces the
+  // config wholesale (validated: non-empty name, suggested_vcpus, …).
+  optional ImageConfig config = 3;
 }
 
 // One capture-time env entry for an image's [warm] hook. The value is a
 // literal (non-secret) or a secret ref resolved at capture through the same
-// SecretStore a session uses. Set on EnableImage; mirrored on
-// EnabledImageSummary so the edit form can pre-fill.
+// SecretStore a session uses. Set via ImageConfig.warm.env; mirrored on
+// EnabledImageSummary.config so the edit form can pre-fill.
 message CaptureEnvEntry {
   string name = 1;
   oneof value {
@@ -85,6 +141,26 @@ message CaptureEnvEntry {
 // the entity-wrapping convention.
 message EnableImageResponse {
   EnableJob job = 1;
+}
+
+// ADR 0080: full-replace config edit for an already-enabled image.
+message UpdateImageRequest {
+  string image_uri = 1;
+  // The complete new config (full replace, not a patch — read the
+  // current config from EnabledImageSummary, edit, send back).
+  ImageConfig config = 2;
+  // Must be true for a diff touching resources or warm: those only take
+  // effect through a base-snapshot recapture (minutes, and the job may
+  // fail). Without it such a diff fails FailedPrecondition naming the
+  // fields, so a UI can confirm with the operator first.
+  bool allow_recapture = 3;
+}
+
+message UpdateImageResponse {
+  // Set iff the diff was capture-affecting and a recapture job was
+  // enqueued (`allow_recapture = true`). Unset = the edit applied
+  // immediately (cheap fields only); the new config is already live.
+  optional EnableJob job = 1;
 }
 
 // Mirrors engram_core::types::EnableJob (ADR 0036) — an asynchronous

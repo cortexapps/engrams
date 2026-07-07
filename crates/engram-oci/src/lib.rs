@@ -132,32 +132,32 @@ impl OciClient {
         }
     }
 
-    /// Push a bake image artifact. Up to three layers:
+    /// Push a bake image artifact. Layers (ADR 0080: no manifest.toml —
+    /// the bake carries no runtime config; the config blob carries the
+    /// Dockerfile-derived `runtime_defaults`):
     ///
-    /// - layer 0: `manifest.toml` content (uncompressed bytes)
-    /// - layer 1 (optional): `rootfs.ext4` content (raw bytes,
+    /// - layer 0 (optional): `rootfs.ext4` content (raw bytes,
     ///   large). Skipped when `bundle_json` is `Some` — ADR 0007
     ///   chunked storage moves disk bytes into the chunk store, so
     ///   pushing the full ext4 in the OCI layer is wire-redundant
     ///   (every push would otherwise transfer the disk twice:
     ///   chunks via BlobStorage, then bytes via the registry).
-    /// - layer 2 (optional): `bundle.json` — ADR 0007 chunk-manifest
+    /// - layer 1 (optional): `bundle.json` — ADR 0007 chunk-manifest
     ///   pointer set (tiny). Pullers that understand the bundle
     ///   resolve disk bytes from the chunk store via its
     ///   `disk_manifest`.
     ///
     /// At least one of `rootfs_ext4` or `bundle_json` must be
-    /// provided — a pure-manifest push has no consumable disk
+    /// provided — a layer-less push has no consumable disk
     /// bytes, and we return a typed error so callers can't push
     /// half-formed artifacts.
     ///
-    /// `config_json` is small JSON metadata (format, agent version,
-    /// transport) used by the host-agent at pull time to validate
-    /// compatibility before fetching the rootfs blob.
+    /// `config_json` is small JSON metadata (format, repo/tag, and — ADR
+    /// 0080 — `runtime_defaults`, the Dockerfile ENV/WORKDIR the enable
+    /// pipeline persists).
     pub async fn push_image(
         &self,
         uri: &str,
-        manifest_toml: &[u8],
         rootfs_ext4: Option<&Path>,
         config_json: &[u8],
         bundle_json: Option<&[u8]>,
@@ -173,12 +173,7 @@ impl OciClient {
         let client = self.client_for(&reference);
         let auth = self.auth_for(&reference).await?;
 
-        let manifest_layer = ImageLayer::new(
-            manifest_toml.to_vec(),
-            ENGRAM_MANIFEST_MEDIA_TYPE.to_string(),
-            None,
-        );
-        let mut layers = vec![manifest_layer];
+        let mut layers = Vec::new();
         if let Some(rootfs_path) = rootfs_ext4 {
             let rootfs_bytes = read_file_bytes(rootfs_path).await?;
             layers.push(ImageLayer::new(
@@ -243,17 +238,11 @@ impl OciClient {
             .await
             .map_err(OciError::Io)?;
 
-        let mut manifest_path = None;
         let mut rootfs_path = None;
         let mut bundle_path = None;
         let mut disk_bootstrap_path = None;
         for desc in &manifest.layers {
             match desc.media_type.as_str() {
-                ENGRAM_MANIFEST_MEDIA_TYPE => {
-                    let p = dest.join("manifest.toml");
-                    pull_layer_to_file(client, &reference, desc, &p).await?;
-                    manifest_path = Some(p);
-                }
                 ENGRAM_ROOTFS_EXT4_MEDIA_TYPE => {
                     let p = dest.join("rootfs.ext4");
                     pull_layer_to_file(client, &reference, desc, &p).await?;
@@ -279,9 +268,6 @@ impl OciClient {
                 }
             }
         }
-        let manifest_path = manifest_path.ok_or_else(|| {
-            OciError::Distribution("pulled artifact missing engram manifest layer".into())
-        })?;
         // ADR 0007 Phase 6: the rootfs.ext4 layer is optional when
         // the artifact carries a `bundle.json` (disk bytes flow
         // through the chunk store instead). Reject only when *all*
@@ -295,7 +281,6 @@ impl OciClient {
         }
 
         Ok(PulledImage {
-            manifest_path,
             rootfs_path,
             bundle_path,
             disk_bootstrap_path,
@@ -303,12 +288,12 @@ impl OciClient {
         })
     }
 
-    /// ADR 0014 M1.11 / ADR 0007 / ADR 0036: pull the *metadata*
-    /// layers of the engram artifact at `uri` — manifest, bundle,
-    /// disk-bootstrap (all small) — into memory. Chunk layers are
-    /// **never** downloaded here; the coord's `enable_image`
-    /// materializer fetches each chunk it actually needs via
-    /// [`OciClient::pull_chunk`], so the coord's RAM stays bounded
+    /// ADR 0014 M1.11 / ADR 0007 / ADR 0036: pull the *metadata* of the
+    /// engram artifact at `uri` — the config blob (ADR 0080: carries
+    /// `runtime_defaults`), bundle, disk-bootstrap (all small) — into
+    /// memory. Chunk layers are **never** downloaded here; the coord's
+    /// `enable_image` materializer fetches each chunk it actually needs
+    /// via [`OciClient::pull_chunk`], so the coord's RAM stays bounded
     /// regardless of rootfs size.
     ///
     /// This replaces an earlier variant that pulled the whole chunk blob
@@ -332,15 +317,12 @@ impl OciClient {
 
         let mut out = TemplateArtifacts {
             manifest_digest: Digest256(manifest_digest),
-            manifest_toml: Vec::new(),
+            config_json: Vec::new(),
             bundle_json: None,
             disk_bootstrap_json: None,
         };
         for desc in &manifest.layers {
             match desc.media_type.as_str() {
-                ENGRAM_MANIFEST_MEDIA_TYPE => {
-                    out.manifest_toml = pull_layer_to_vec(client, &reference, desc).await?;
-                }
                 ENGRAM_BUNDLE_MEDIA_TYPE => {
                     out.bundle_json = Some(pull_layer_to_vec(client, &reference, desc).await?);
                 }
@@ -355,9 +337,14 @@ impl OciClient {
                 _ => {}
             }
         }
-        if out.manifest_toml.is_empty() {
+        // ADR 0080: the config blob is required metadata now — it carries
+        // the Dockerfile-derived `runtime_defaults` the enable pipeline
+        // persists. Every OCI manifest has a config descriptor; fetch it
+        // like any blob.
+        out.config_json = pull_layer_to_vec(client, &reference, &manifest.config).await?;
+        if out.config_json.is_empty() {
             return Err(OciError::Distribution(
-                "pulled artifact missing engram manifest layer".into(),
+                "pulled artifact has an empty config blob".into(),
             ));
         }
         Ok(out)
@@ -640,9 +627,8 @@ impl OciClient {
 
         // Push the small layers + config as blobs, collecting
         // descriptors as we go.
-        let mut descriptors = Vec::with_capacity(3 + chunks.len());
+        let mut descriptors = Vec::with_capacity(2 + chunks.len());
         for (bytes, media_type) in [
-            (&layers.manifest_toml, ENGRAM_MANIFEST_MEDIA_TYPE),
             (&layers.bundle_json, ENGRAM_BUNDLE_MEDIA_TYPE),
             (
                 &layers.disk_bootstrap_json,
@@ -844,7 +830,10 @@ pub fn digest_pinned_uri(image_uri: &str, digest: &Digest256) -> String {
 /// OOM-kills the coord pod.
 #[derive(Clone, Debug)]
 pub struct TemplateArtifacts {
-    pub manifest_toml: Vec<u8>,
+    /// The artifact's OCI config blob (ADR 0080): introspection metadata
+    /// plus the Dockerfile-derived `runtime_defaults` the enable pipeline
+    /// persists onto the enabled_images row.
+    pub config_json: Vec<u8>,
     pub manifest_digest: Digest256,
     pub bundle_json: Option<Vec<u8>>,
     pub disk_bootstrap_json: Option<Vec<u8>>,
@@ -852,7 +841,6 @@ pub struct TemplateArtifacts {
 
 #[derive(Clone, Debug)]
 pub struct PulledImage {
-    pub manifest_path: PathBuf,
     /// ADR 0007: `None` when the registry artifact carried only the
     /// `bundle.json` (chunked-storage path; rootfs bytes live in
     /// the chunk store, indexed by the bundle's `disk_manifest`).
@@ -879,7 +867,6 @@ pub struct PulledImage {
 /// individually via [`OciClient::push_chunk_blob`].
 #[derive(Clone, Debug)]
 pub struct ChunkedImageLayers {
-    pub manifest_toml: Vec<u8>,
     pub config_json: Vec<u8>,
     /// `bundle.json` v2 — carries the bake's `disk_manifest` ref so
     /// consumers can resolve chunks through the chunk store.
@@ -1132,13 +1119,7 @@ mod tests {
         // registry to surface the error.
         let client = OciClient::new(std::sync::Arc::new(AnonymousResolver));
         let err = client
-            .push_image(
-                "localhost:5000/test:t1",
-                b"manifest = 'toml'",
-                None,
-                b"{}",
-                None,
-            )
+            .push_image("localhost:5000/test:t1", None, b"{}", None)
             .await
             .expect_err("must reject neither-source push");
         match err {
