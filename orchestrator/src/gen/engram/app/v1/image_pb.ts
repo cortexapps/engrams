@@ -4,13 +4,15 @@
 
 import type { GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv1";
 import { fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv1";
+import type { ProfileNetwork } from "./profile_pb";
+import { file_engram_app_v1_profile } from "./profile_pb";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file engram/app/v1/image.proto.
  */
 export const file_engram_app_v1_image: GenFile = /*@__PURE__*/
-  fileDesc("ChllbmdyYW0vYXBwL3YxL2ltYWdlLnByb3RvEg1lbmdyYW0uYXBwLnYxIhoKGExpc3RFbmFibGVkSW1hZ2VzUmVxdWVzdCJPChlMaXN0RW5hYmxlZEltYWdlc1Jlc3BvbnNlEjIKBmltYWdlcxgBIAMoCzIiLmVuZ3JhbS5hcHAudjEuRW5hYmxlZEltYWdlU3VtbWFyeSKvAgoTRW5hYmxlZEltYWdlU3VtbWFyeRIKCgJpZBgBIAEoCRIRCglpbWFnZV91cmkYAiABKAkSFwoPbWFuaWZlc3RfZGlnZXN0GAMgASgJEhoKDW1hbmlmZXN0X25hbWUYBCABKAlIAIgBARIhChRtYW5pZmVzdF9kZXNjcmlwdGlvbhgFIAEoCUgBiAEBEhkKEWxhc3RfcmVmcmVzaGVkX2F0GAcgASgJEhIKCmNyZWF0ZWRfYXQYCCABKAkSMwoLY2FwdHVyZV9lbnYYCSADKAsyHi5lbmdyYW0uYXBwLnYxLkNhcHR1cmVFbnZFbnRyeUIQCg5fbWFuaWZlc3RfbmFtZUIXChVfbWFuaWZlc3RfZGVzY3JpcHRpb25KBAgGEAdSDGhhcm5lc3NfbmFtZSJcChJFbmFibGVJbWFnZVJlcXVlc3QSEQoJaW1hZ2VfdXJpGAEgASgJEjMKC2NhcHR1cmVfZW52GAIgAygLMh4uZW5ncmFtLmFwcC52MS5DYXB0dXJlRW52RW50cnkiUQoPQ2FwdHVyZUVudkVudHJ5EgwKBG5hbWUYASABKAkSEQoHbGl0ZXJhbBgCIAEoCUgAEhQKCnNlY3JldF9yZWYYAyABKAlIAEIHCgV2YWx1ZSI8ChNFbmFibGVJbWFnZVJlc3BvbnNlEiUKA2pvYhgBIAEoCzIYLmVuZ3JhbS5hcHAudjEuRW5hYmxlSm9iItoDCglFbmFibGVKb2ISCgoCaWQYASABKAkSEQoJaW1hZ2VfdXJpGAIgASgJEhwKD21hbmlmZXN0X2RpZ2VzdBgDIAEoCUgAiAEBEg0KBXN0YXRlGAQgASgJEhkKDGNodW5rc190b3RhbBgFIAEoDUgBiAEBEhMKC2NodW5rc19kb25lGAYgASgNEhAKCGF0dGVtcHRzGAcgASgNEhIKBWVycm9yGAggASgJSAKIAQESEgoKY3JlYXRlZF9hdBgJIAEoCRISCgp1cGRhdGVkX2F0GAogASgJEhoKDWNhcHR1cmVfcGhhc2UYCyABKAlIA4gBARIXCgp3YXJtX3N0YWdlGAwgASgJSASIAQESIgoVd2FybV9zdGFnZV9zdGFydGVkX2F0GA0gASgJSAWIAQESGAoLb3V0cHV0X3RhaWwYDiABKAlIBogBARIWCg5wcmVzdGFnZV9ob3N0cxgPIAEoCUISChBfbWFuaWZlc3RfZGlnZXN0Qg8KDV9jaHVua3NfdG90YWxCCAoGX2Vycm9yQhAKDl9jYXB0dXJlX3BoYXNlQg0KC193YXJtX3N0YWdlQhgKFl93YXJtX3N0YWdlX3N0YXJ0ZWRfYXRCDgoMX291dHB1dF90YWlsIigKE0Rpc2FibGVJbWFnZVJlcXVlc3QSEQoJaW1hZ2VfdXJpGAEgASgJIhYKFERpc2FibGVJbWFnZVJlc3BvbnNlIigKE1JlZnJlc2hJbWFnZVJlcXVlc3QSEQoJaW1hZ2VfdXJpGAEgASgJIj0KFFJlZnJlc2hJbWFnZVJlc3BvbnNlEiUKA2pvYhgBIAEoCzIYLmVuZ3JhbS5hcHAudjEuRW5hYmxlSm9iIhcKFUxpc3RFbmFibGVKb2JzUmVxdWVzdCJAChZMaXN0RW5hYmxlSm9ic1Jlc3BvbnNlEiYKBGpvYnMYASADKAsyGC5lbmdyYW0uYXBwLnYxLkVuYWJsZUpvYiIlChNHZXRFbmFibGVKb2JSZXF1ZXN0Eg4KBmpvYl9pZBgBIAEoCSI9ChRHZXRFbmFibGVKb2JSZXNwb25zZRIlCgNqb2IYASABKAsyGC5lbmdyYW0uYXBwLnYxLkVuYWJsZUpvYiInChVSZXRyeUVuYWJsZUpvYlJlcXVlc3QSDgoGam9iX2lkGAEgASgJIj8KFlJldHJ5RW5hYmxlSm9iUmVzcG9uc2USJQoDam9iGAEgASgLMhguZW5ncmFtLmFwcC52MS5FbmFibGVKb2IiFwoVTGlzdFJlZ2lzdHJpZXNSZXF1ZXN0IlYKFkxpc3RSZWdpc3RyaWVzUmVzcG9uc2USPAoKcmVnaXN0cmllcxgBIAMoCzIoLmVuZ3JhbS5hcHAudjEuUmVnaXN0cnlDcmVkZW50aWFsU3VtbWFyeSK9AQoZUmVnaXN0cnlDcmVkZW50aWFsU3VtbWFyeRIKCgJpZBgBIAEoCRIVCg1yZWdpc3RyeV9ob3N0GAIgASgJEhEKCWF1dGhfa2luZBgDIAEoCRIbCg5hdXRoX3ByaW5jaXBhbBgEIAEoCUgAiAEBEhIKCmNyZWF0ZWRfYXQYBSABKAkSFwoKdXBkYXRlZF9hdBgGIAEoCUgBiAEBQhEKD19hdXRoX3ByaW5jaXBhbEINCgtfdXBkYXRlZF9hdCLrAQoSQWRkUmVnaXN0cnlSZXF1ZXN0EgwKBGhvc3QYASABKAkSMwoGc3RhdGljGAIgASgLMiEuZW5ncmFtLmFwcC52MS5TdGF0aWNSZWdpc3RyeUF1dGhIABJPChVnY3Bfd29ya2xvYWRfaWRlbnRpdHkYAyABKAsyLi5lbmdyYW0uYXBwLnYxLkdjcFdvcmtsb2FkSWRlbnRpdHlSZWdpc3RyeUF1dGhIABI5Cglhbm9ueW1vdXMYBCABKAsyJC5lbmdyYW0uYXBwLnYxLkFub255bW91c1JlZ2lzdHJ5QXV0aEgAQgYKBGF1dGgiOAoSU3RhdGljUmVnaXN0cnlBdXRoEhAKCHVzZXJuYW1lGAEgASgJEhAKCHBhc3N3b3JkGAIgASgJIlEKH0djcFdvcmtsb2FkSWRlbnRpdHlSZWdpc3RyeUF1dGgSGwoOaW1wZXJzb25hdGVfc2EYASABKAlIAIgBAUIRCg9faW1wZXJzb25hdGVfc2EiFwoVQW5vbnltb3VzUmVnaXN0cnlBdXRoInIKE0FkZFJlZ2lzdHJ5UmVzcG9uc2USCgoCaWQYASABKAkSDAoEaG9zdBgCIAEoCRIRCglhdXRoX2tpbmQYAyABKAkSGwoOYXV0aF9wcmluY2lwYWwYBCABKAlIAIgBAUIRCg9fYXV0aF9wcmluY2lwYWwiJQoVRGVsZXRlUmVnaXN0cnlSZXF1ZXN0EgwKBGhvc3QYASABKAkiGAoWRGVsZXRlUmVnaXN0cnlSZXNwb25zZTKpBwoMSW1hZ2VTZXJ2aWNlEmYKEUxpc3RFbmFibGVkSW1hZ2VzEicuZW5ncmFtLmFwcC52MS5MaXN0RW5hYmxlZEltYWdlc1JlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLkxpc3RFbmFibGVkSW1hZ2VzUmVzcG9uc2USVAoLRW5hYmxlSW1hZ2USIS5lbmdyYW0uYXBwLnYxLkVuYWJsZUltYWdlUmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuRW5hYmxlSW1hZ2VSZXNwb25zZRJXCgxEaXNhYmxlSW1hZ2USIi5lbmdyYW0uYXBwLnYxLkRpc2FibGVJbWFnZVJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLkRpc2FibGVJbWFnZVJlc3BvbnNlElcKDFJlZnJlc2hJbWFnZRIiLmVuZ3JhbS5hcHAudjEuUmVmcmVzaEltYWdlUmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuUmVmcmVzaEltYWdlUmVzcG9uc2USXQoOTGlzdEVuYWJsZUpvYnMSJC5lbmdyYW0uYXBwLnYxLkxpc3RFbmFibGVKb2JzUmVxdWVzdBolLmVuZ3JhbS5hcHAudjEuTGlzdEVuYWJsZUpvYnNSZXNwb25zZRJXCgxHZXRFbmFibGVKb2ISIi5lbmdyYW0uYXBwLnYxLkdldEVuYWJsZUpvYlJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLkdldEVuYWJsZUpvYlJlc3BvbnNlEl0KDlJldHJ5RW5hYmxlSm9iEiQuZW5ncmFtLmFwcC52MS5SZXRyeUVuYWJsZUpvYlJlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLlJldHJ5RW5hYmxlSm9iUmVzcG9uc2USXQoOTGlzdFJlZ2lzdHJpZXMSJC5lbmdyYW0uYXBwLnYxLkxpc3RSZWdpc3RyaWVzUmVxdWVzdBolLmVuZ3JhbS5hcHAudjEuTGlzdFJlZ2lzdHJpZXNSZXNwb25zZRJUCgtBZGRSZWdpc3RyeRIhLmVuZ3JhbS5hcHAudjEuQWRkUmVnaXN0cnlSZXF1ZXN0GiIuZW5ncmFtLmFwcC52MS5BZGRSZWdpc3RyeVJlc3BvbnNlEl0KDkRlbGV0ZVJlZ2lzdHJ5EiQuZW5ncmFtLmFwcC52MS5EZWxldGVSZWdpc3RyeVJlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkRlbGV0ZVJlZ2lzdHJ5UmVzcG9uc2ViBnByb3RvMw");
+  fileDesc("ChllbmdyYW0vYXBwL3YxL2ltYWdlLnByb3RvEg1lbmdyYW0uYXBwLnYxIhoKGExpc3RFbmFibGVkSW1hZ2VzUmVxdWVzdCJPChlMaXN0RW5hYmxlZEltYWdlc1Jlc3BvbnNlEjIKBmltYWdlcxgBIAMoCzIiLmVuZ3JhbS5hcHAudjEuRW5hYmxlZEltYWdlU3VtbWFyeSKAAgoTRW5hYmxlZEltYWdlU3VtbWFyeRIKCgJpZBgBIAEoCRIRCglpbWFnZV91cmkYAiABKAkSFwoPbWFuaWZlc3RfZGlnZXN0GAMgASgJEhkKEWxhc3RfcmVmcmVzaGVkX2F0GAcgASgJEhIKCmNyZWF0ZWRfYXQYCCABKAkSKgoGY29uZmlnGAogASgLMhouZW5ncmFtLmFwcC52MS5JbWFnZUNvbmZpZ0oECAQQBUoECAUQBkoECAYQB0oECAkQClINbWFuaWZlc3RfbmFtZVIUbWFuaWZlc3RfZGVzY3JpcHRpb25SDGhhcm5lc3NfbmFtZVILY2FwdHVyZV9lbnYiswIKC0ltYWdlQ29uZmlnEgwKBG5hbWUYASABKAkSGAoLZGVzY3JpcHRpb24YAiABKAlIAIgBARIwCgNlbnYYAyADKAsyIy5lbmdyYW0uYXBwLnYxLkltYWdlQ29uZmlnLkVudkVudHJ5EhQKB3dvcmtkaXIYBCABKAlIAYgBARIwCglyZXNvdXJjZXMYBSABKAsyHS5lbmdyYW0uYXBwLnYxLkltYWdlUmVzb3VyY2VzEjEKBHdhcm0YBiABKAsyHi5lbmdyYW0uYXBwLnYxLkltYWdlV2FybUNvbmZpZ0gCiAEBGioKCEVudkVudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAFCDgoMX2Rlc2NyaXB0aW9uQgoKCF93b3JrZGlyQgcKBV93YXJtIrYBCg5JbWFnZVJlc291cmNlcxIhChRzdWdnZXN0ZWRfbWVtb3J5X21pYhgBIAEoDUgAiAEBEhwKD3N1Z2dlc3RlZF92Y3B1cxgCIAEoDUgBiAEBEh8KEnN1Z2dlc3RlZF9kaXNrX2dpYhgDIAEoDUgCiAEBQhcKFV9zdWdnZXN0ZWRfbWVtb3J5X21pYkISChBfc3VnZ2VzdGVkX3ZjcHVzQhUKE19zdWdnZXN0ZWRfZGlza19naWIi3gEKD0ltYWdlV2FybUNvbmZpZxIPCgdjb21tYW5kGAEgAygJEhkKDHRpbWVvdXRfc2VjcxgCIAEoBEgAiAEBEhQKB3dvcmtkaXIYAyABKAlIAYgBARIrCgNlbnYYBCADKAsyHi5lbmdyYW0uYXBwLnYxLkNhcHR1cmVFbnZFbnRyeRIzCgduZXR3b3JrGAUgASgLMh0uZW5ncmFtLmFwcC52MS5Qcm9maWxlTmV0d29ya0gCiAEBQg8KDV90aW1lb3V0X3NlY3NCCgoIX3dvcmtkaXJCCgoIX25ldHdvcmsidgoSRW5hYmxlSW1hZ2VSZXF1ZXN0EhEKCWltYWdlX3VyaRgBIAEoCRIvCgZjb25maWcYAyABKAsyGi5lbmdyYW0uYXBwLnYxLkltYWdlQ29uZmlnSACIAQFCCQoHX2NvbmZpZ0oECAIQA1ILY2FwdHVyZV9lbnYiUQoPQ2FwdHVyZUVudkVudHJ5EgwKBG5hbWUYASABKAkSEQoHbGl0ZXJhbBgCIAEoCUgAEhQKCnNlY3JldF9yZWYYAyABKAlIAEIHCgV2YWx1ZSI8ChNFbmFibGVJbWFnZVJlc3BvbnNlEiUKA2pvYhgBIAEoCzIYLmVuZ3JhbS5hcHAudjEuRW5hYmxlSm9iImwKElVwZGF0ZUltYWdlUmVxdWVzdBIRCglpbWFnZV91cmkYASABKAkSKgoGY29uZmlnGAIgASgLMhouZW5ncmFtLmFwcC52MS5JbWFnZUNvbmZpZxIXCg9hbGxvd19yZWNhcHR1cmUYAyABKAgiSQoTVXBkYXRlSW1hZ2VSZXNwb25zZRIqCgNqb2IYASABKAsyGC5lbmdyYW0uYXBwLnYxLkVuYWJsZUpvYkgAiAEBQgYKBF9qb2Ii2gMKCUVuYWJsZUpvYhIKCgJpZBgBIAEoCRIRCglpbWFnZV91cmkYAiABKAkSHAoPbWFuaWZlc3RfZGlnZXN0GAMgASgJSACIAQESDQoFc3RhdGUYBCABKAkSGQoMY2h1bmtzX3RvdGFsGAUgASgNSAGIAQESEwoLY2h1bmtzX2RvbmUYBiABKA0SEAoIYXR0ZW1wdHMYByABKA0SEgoFZXJyb3IYCCABKAlIAogBARISCgpjcmVhdGVkX2F0GAkgASgJEhIKCnVwZGF0ZWRfYXQYCiABKAkSGgoNY2FwdHVyZV9waGFzZRgLIAEoCUgDiAEBEhcKCndhcm1fc3RhZ2UYDCABKAlIBIgBARIiChV3YXJtX3N0YWdlX3N0YXJ0ZWRfYXQYDSABKAlIBYgBARIYCgtvdXRwdXRfdGFpbBgOIAEoCUgGiAEBEhYKDnByZXN0YWdlX2hvc3RzGA8gASgJQhIKEF9tYW5pZmVzdF9kaWdlc3RCDwoNX2NodW5rc190b3RhbEIICgZfZXJyb3JCEAoOX2NhcHR1cmVfcGhhc2VCDQoLX3dhcm1fc3RhZ2VCGAoWX3dhcm1fc3RhZ2Vfc3RhcnRlZF9hdEIOCgxfb3V0cHV0X3RhaWwiKAoTRGlzYWJsZUltYWdlUmVxdWVzdBIRCglpbWFnZV91cmkYASABKAkiFgoURGlzYWJsZUltYWdlUmVzcG9uc2UiKAoTUmVmcmVzaEltYWdlUmVxdWVzdBIRCglpbWFnZV91cmkYASABKAkiPQoUUmVmcmVzaEltYWdlUmVzcG9uc2USJQoDam9iGAEgASgLMhguZW5ncmFtLmFwcC52MS5FbmFibGVKb2IiFwoVTGlzdEVuYWJsZUpvYnNSZXF1ZXN0IkAKFkxpc3RFbmFibGVKb2JzUmVzcG9uc2USJgoEam9icxgBIAMoCzIYLmVuZ3JhbS5hcHAudjEuRW5hYmxlSm9iIiUKE0dldEVuYWJsZUpvYlJlcXVlc3QSDgoGam9iX2lkGAEgASgJIj0KFEdldEVuYWJsZUpvYlJlc3BvbnNlEiUKA2pvYhgBIAEoCzIYLmVuZ3JhbS5hcHAudjEuRW5hYmxlSm9iIicKFVJldHJ5RW5hYmxlSm9iUmVxdWVzdBIOCgZqb2JfaWQYASABKAkiPwoWUmV0cnlFbmFibGVKb2JSZXNwb25zZRIlCgNqb2IYASABKAsyGC5lbmdyYW0uYXBwLnYxLkVuYWJsZUpvYiIXChVMaXN0UmVnaXN0cmllc1JlcXVlc3QiVgoWTGlzdFJlZ2lzdHJpZXNSZXNwb25zZRI8CgpyZWdpc3RyaWVzGAEgAygLMiguZW5ncmFtLmFwcC52MS5SZWdpc3RyeUNyZWRlbnRpYWxTdW1tYXJ5Ir0BChlSZWdpc3RyeUNyZWRlbnRpYWxTdW1tYXJ5EgoKAmlkGAEgASgJEhUKDXJlZ2lzdHJ5X2hvc3QYAiABKAkSEQoJYXV0aF9raW5kGAMgASgJEhsKDmF1dGhfcHJpbmNpcGFsGAQgASgJSACIAQESEgoKY3JlYXRlZF9hdBgFIAEoCRIXCgp1cGRhdGVkX2F0GAYgASgJSAGIAQFCEQoPX2F1dGhfcHJpbmNpcGFsQg0KC191cGRhdGVkX2F0IusBChJBZGRSZWdpc3RyeVJlcXVlc3QSDAoEaG9zdBgBIAEoCRIzCgZzdGF0aWMYAiABKAsyIS5lbmdyYW0uYXBwLnYxLlN0YXRpY1JlZ2lzdHJ5QXV0aEgAEk8KFWdjcF93b3JrbG9hZF9pZGVudGl0eRgDIAEoCzIuLmVuZ3JhbS5hcHAudjEuR2NwV29ya2xvYWRJZGVudGl0eVJlZ2lzdHJ5QXV0aEgAEjkKCWFub255bW91cxgEIAEoCzIkLmVuZ3JhbS5hcHAudjEuQW5vbnltb3VzUmVnaXN0cnlBdXRoSABCBgoEYXV0aCI4ChJTdGF0aWNSZWdpc3RyeUF1dGgSEAoIdXNlcm5hbWUYASABKAkSEAoIcGFzc3dvcmQYAiABKAkiUQofR2NwV29ya2xvYWRJZGVudGl0eVJlZ2lzdHJ5QXV0aBIbCg5pbXBlcnNvbmF0ZV9zYRgBIAEoCUgAiAEBQhEKD19pbXBlcnNvbmF0ZV9zYSIXChVBbm9ueW1vdXNSZWdpc3RyeUF1dGgicgoTQWRkUmVnaXN0cnlSZXNwb25zZRIKCgJpZBgBIAEoCRIMCgRob3N0GAIgASgJEhEKCWF1dGhfa2luZBgDIAEoCRIbCg5hdXRoX3ByaW5jaXBhbBgEIAEoCUgAiAEBQhEKD19hdXRoX3ByaW5jaXBhbCIlChVEZWxldGVSZWdpc3RyeVJlcXVlc3QSDAoEaG9zdBgBIAEoCSIYChZEZWxldGVSZWdpc3RyeVJlc3BvbnNlMv8HCgxJbWFnZVNlcnZpY2USZgoRTGlzdEVuYWJsZWRJbWFnZXMSJy5lbmdyYW0uYXBwLnYxLkxpc3RFbmFibGVkSW1hZ2VzUmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuTGlzdEVuYWJsZWRJbWFnZXNSZXNwb25zZRJUCgtFbmFibGVJbWFnZRIhLmVuZ3JhbS5hcHAudjEuRW5hYmxlSW1hZ2VSZXF1ZXN0GiIuZW5ncmFtLmFwcC52MS5FbmFibGVJbWFnZVJlc3BvbnNlElQKC1VwZGF0ZUltYWdlEiEuZW5ncmFtLmFwcC52MS5VcGRhdGVJbWFnZVJlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLlVwZGF0ZUltYWdlUmVzcG9uc2USVwoMRGlzYWJsZUltYWdlEiIuZW5ncmFtLmFwcC52MS5EaXNhYmxlSW1hZ2VSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5EaXNhYmxlSW1hZ2VSZXNwb25zZRJXCgxSZWZyZXNoSW1hZ2USIi5lbmdyYW0uYXBwLnYxLlJlZnJlc2hJbWFnZVJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLlJlZnJlc2hJbWFnZVJlc3BvbnNlEl0KDkxpc3RFbmFibGVKb2JzEiQuZW5ncmFtLmFwcC52MS5MaXN0RW5hYmxlSm9ic1JlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkxpc3RFbmFibGVKb2JzUmVzcG9uc2USVwoMR2V0RW5hYmxlSm9iEiIuZW5ncmFtLmFwcC52MS5HZXRFbmFibGVKb2JSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5HZXRFbmFibGVKb2JSZXNwb25zZRJdCg5SZXRyeUVuYWJsZUpvYhIkLmVuZ3JhbS5hcHAudjEuUmV0cnlFbmFibGVKb2JSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5SZXRyeUVuYWJsZUpvYlJlc3BvbnNlEl0KDkxpc3RSZWdpc3RyaWVzEiQuZW5ncmFtLmFwcC52MS5MaXN0UmVnaXN0cmllc1JlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkxpc3RSZWdpc3RyaWVzUmVzcG9uc2USVAoLQWRkUmVnaXN0cnkSIS5lbmdyYW0uYXBwLnYxLkFkZFJlZ2lzdHJ5UmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuQWRkUmVnaXN0cnlSZXNwb25zZRJdCg5EZWxldGVSZWdpc3RyeRIkLmVuZ3JhbS5hcHAudjEuRGVsZXRlUmVnaXN0cnlSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5EZWxldGVSZWdpc3RyeVJlc3BvbnNlYgZwcm90bzM", [file_engram_app_v1_profile]);
 
 /**
  * @generated from message engram.app.v1.ListEnabledImagesRequest
@@ -44,9 +46,9 @@ export const ListEnabledImagesResponseSchema: GenMessage<ListEnabledImagesRespon
 
 /**
  * Mirrors engram_core::types::EnabledImageSummary — one live row of the
- * operator-curated image allow-list. The raw manifest.toml is
- * intentionally omitted; clients render via the lifted manifest_*
- * fields.
+ * operator-curated image allow-list. `config` is the operator-supplied
+ * ImageConfig the row was enabled/updated with (secret refs shown by
+ * name, values never returned).
  *
  * @generated from message engram.app.v1.EnabledImageSummary
  */
@@ -69,19 +71,6 @@ export type EnabledImageSummary = Message<"engram.app.v1.EnabledImageSummary"> &
   manifestDigest: string;
 
   /**
-   * Lifted from the parsed manifest.toml; unset when the stored toml
-   * fails to parse (the row stays listed so an operator can disable it).
-   *
-   * @generated from field: optional string manifest_name = 4;
-   */
-  manifestName?: string;
-
-  /**
-   * @generated from field: optional string manifest_description = 5;
-   */
-  manifestDescription?: string;
-
-  /**
    * ISO-8601.
    *
    * @generated from field: string last_refreshed_at = 7;
@@ -96,12 +85,9 @@ export type EnabledImageSummary = Message<"engram.app.v1.EnabledImageSummary"> &
   createdAt: string;
 
   /**
-   * Capture-time env attached to this enabled image (refs, never resolved
-   * values). Lets the dashboard's edit form pre-fill the current set.
-   *
-   * @generated from field: repeated engram.app.v1.CaptureEnvEntry capture_env = 9;
+   * @generated from field: engram.app.v1.ImageConfig config = 10;
    */
-  captureEnv: CaptureEnvEntry[];
+  config?: ImageConfig;
 };
 
 /**
@@ -110,6 +96,144 @@ export type EnabledImageSummary = Message<"engram.app.v1.EnabledImageSummary"> &
  */
 export const EnabledImageSummarySchema: GenMessage<EnabledImageSummary> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_image, 2);
+
+/**
+ * ADR 0080: the consolidated per-image runtime config. Mirrors
+ * engram_core::types::image::ImageConfig — supplied out-of-band on
+ * EnableImage/UpdateImage, stored as JSONB, never baked into the image.
+ *
+ * @generated from message engram.app.v1.ImageConfig
+ */
+export type ImageConfig = Message<"engram.app.v1.ImageConfig"> & {
+  /**
+   * Display name (required, non-empty).
+   *
+   * @generated from field: string name = 1;
+   */
+  name: string;
+
+  /**
+   * @generated from field: optional string description = 2;
+   */
+  description?: string;
+
+  /**
+   * Non-secret env applied to every sandbox of this image. Merged OVER
+   * the Dockerfile ENV (extracted at enable time), UNDER session env.
+   *
+   * @generated from field: map<string, string> env = 3;
+   */
+  env: { [key: string]: string };
+
+  /**
+   * Default working directory; falls back to the Dockerfile WORKDIR.
+   *
+   * @generated from field: optional string workdir = 4;
+   */
+  workdir?: string;
+
+  /**
+   * @generated from field: engram.app.v1.ImageResources resources = 5;
+   */
+  resources?: ImageResources;
+
+  /**
+   * Optional capture-time prewarm hook. Everything under here is
+   * recapture-affecting by definition.
+   *
+   * @generated from field: optional engram.app.v1.ImageWarmConfig warm = 6;
+   */
+  warm?: ImageWarmConfig;
+};
+
+/**
+ * Describes the message engram.app.v1.ImageConfig.
+ * Use `create(ImageConfigSchema)` to create a new message.
+ */
+export const ImageConfigSchema: GenMessage<ImageConfig> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_image, 3);
+
+/**
+ * Mirrors engram_core::types::image::ResourceHints.
+ *
+ * @generated from message engram.app.v1.ImageResources
+ */
+export type ImageResources = Message<"engram.app.v1.ImageResources"> & {
+  /**
+   * @generated from field: optional uint32 suggested_memory_mib = 1;
+   */
+  suggestedMemoryMib?: number;
+
+  /**
+   * ADR 0048: required at enable time — placement reserves it against
+   * the host CPU budget.
+   *
+   * @generated from field: optional uint32 suggested_vcpus = 2;
+   */
+  suggestedVcpus?: number;
+
+  /**
+   * @generated from field: optional uint32 suggested_disk_gib = 3;
+   */
+  suggestedDiskGib?: number;
+};
+
+/**
+ * Describes the message engram.app.v1.ImageResources.
+ * Use `create(ImageResourcesSchema)` to create a new message.
+ */
+export const ImageResourcesSchema: GenMessage<ImageResources> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_image, 4);
+
+/**
+ * Mirrors engram_core::types::image::WarmConfig (ADR 0080: absorbs the
+ * retired standalone capture_env — warm secrets are `env` here — and the
+ * capture-time egress policy `network`, previously frozen in the baked
+ * manifest).
+ *
+ * @generated from message engram.app.v1.ImageWarmConfig
+ */
+export type ImageWarmConfig = Message<"engram.app.v1.ImageWarmConfig"> & {
+  /**
+   * argv of the warm command (non-empty). Run inside the capture VM.
+   *
+   * @generated from field: repeated string command = 1;
+   */
+  command: string[];
+
+  /**
+   * @generated from field: optional uint64 timeout_secs = 2;
+   */
+  timeoutSecs?: bigint;
+
+  /**
+   * @generated from field: optional string workdir = 3;
+   */
+  workdir?: string;
+
+  /**
+   * Capture-time env: literals + secret refs (refs resolved at capture,
+   * FAIL-LOUD; values never persisted or echoed back).
+   *
+   * @generated from field: repeated engram.app.v1.CaptureEnvEntry env = 4;
+   */
+  env: CaptureEnvEntry[];
+
+  /**
+   * Egress policy for the capture VM while the warm hook runs. Unset =
+   * egress-less capture. Same shape as a profile's network allow-list.
+   *
+   * @generated from field: optional engram.app.v1.ProfileNetwork network = 5;
+   */
+  network?: ProfileNetwork;
+};
+
+/**
+ * Describes the message engram.app.v1.ImageWarmConfig.
+ * Use `create(ImageWarmConfigSchema)` to create a new message.
+ */
+export const ImageWarmConfigSchema: GenMessage<ImageWarmConfig> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_image, 5);
 
 /**
  * @generated from message engram.app.v1.EnableImageRequest
@@ -124,15 +248,14 @@ export type EnableImageRequest = Message<"engram.app.v1.EnableImageRequest"> & {
   imageUri: string;
 
   /**
-   * Capture-time env for the image's [warm] hook (resolved at base-snapshot
-   * capture, never persisted as values). An EMPTY list inherits the
-   * already-enabled row's capture_env (so a plain re-enable/refresh doesn't
-   * wipe it); a NON-EMPTY list replaces it (the add/remove/rotate edit). Not
-   * part of the image manifest (ADR 0057).
+   * The image's full config. UNSET inherits the already-enabled row's
+   * config (so a plain re-enable / re-bake roll doesn't wipe it); it is
+   * required — InvalidArgument — on a first enable. SET replaces the
+   * config wholesale (validated: non-empty name, suggested_vcpus, …).
    *
-   * @generated from field: repeated engram.app.v1.CaptureEnvEntry capture_env = 2;
+   * @generated from field: optional engram.app.v1.ImageConfig config = 3;
    */
-  captureEnv: CaptureEnvEntry[];
+  config?: ImageConfig;
 };
 
 /**
@@ -140,13 +263,13 @@ export type EnableImageRequest = Message<"engram.app.v1.EnableImageRequest"> & {
  * Use `create(EnableImageRequestSchema)` to create a new message.
  */
 export const EnableImageRequestSchema: GenMessage<EnableImageRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 3);
+  messageDesc(file_engram_app_v1_image, 6);
 
 /**
  * One capture-time env entry for an image's [warm] hook. The value is a
  * literal (non-secret) or a secret ref resolved at capture through the same
- * SecretStore a session uses. Set on EnableImage; mirrored on
- * EnabledImageSummary so the edit form can pre-fill.
+ * SecretStore a session uses. Set via ImageConfig.warm.env; mirrored on
+ * EnabledImageSummary.config so the edit form can pre-fill.
  *
  * @generated from message engram.app.v1.CaptureEnvEntry
  */
@@ -183,7 +306,7 @@ export type CaptureEnvEntry = Message<"engram.app.v1.CaptureEnvEntry"> & {
  * Use `create(CaptureEnvEntrySchema)` to create a new message.
  */
 export const CaptureEnvEntrySchema: GenMessage<CaptureEnvEntry> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 4);
+  messageDesc(file_engram_app_v1_image, 7);
 
 /**
  * Today's HTTP route returns 202 + the bare EnableJob; wrapped here per
@@ -203,7 +326,65 @@ export type EnableImageResponse = Message<"engram.app.v1.EnableImageResponse"> &
  * Use `create(EnableImageResponseSchema)` to create a new message.
  */
 export const EnableImageResponseSchema: GenMessage<EnableImageResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 5);
+  messageDesc(file_engram_app_v1_image, 8);
+
+/**
+ * ADR 0080: full-replace config edit for an already-enabled image.
+ *
+ * @generated from message engram.app.v1.UpdateImageRequest
+ */
+export type UpdateImageRequest = Message<"engram.app.v1.UpdateImageRequest"> & {
+  /**
+   * @generated from field: string image_uri = 1;
+   */
+  imageUri: string;
+
+  /**
+   * The complete new config (full replace, not a patch — read the
+   * current config from EnabledImageSummary, edit, send back).
+   *
+   * @generated from field: engram.app.v1.ImageConfig config = 2;
+   */
+  config?: ImageConfig;
+
+  /**
+   * Must be true for a diff touching resources or warm: those only take
+   * effect through a base-snapshot recapture (minutes, and the job may
+   * fail). Without it such a diff fails FailedPrecondition naming the
+   * fields, so a UI can confirm with the operator first.
+   *
+   * @generated from field: bool allow_recapture = 3;
+   */
+  allowRecapture: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.UpdateImageRequest.
+ * Use `create(UpdateImageRequestSchema)` to create a new message.
+ */
+export const UpdateImageRequestSchema: GenMessage<UpdateImageRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_image, 9);
+
+/**
+ * @generated from message engram.app.v1.UpdateImageResponse
+ */
+export type UpdateImageResponse = Message<"engram.app.v1.UpdateImageResponse"> & {
+  /**
+   * Set iff the diff was capture-affecting and a recapture job was
+   * enqueued (`allow_recapture = true`). Unset = the edit applied
+   * immediately (cheap fields only); the new config is already live.
+   *
+   * @generated from field: optional engram.app.v1.EnableJob job = 1;
+   */
+  job?: EnableJob;
+};
+
+/**
+ * Describes the message engram.app.v1.UpdateImageResponse.
+ * Use `create(UpdateImageResponseSchema)` to create a new message.
+ */
+export const UpdateImageResponseSchema: GenMessage<UpdateImageResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_image, 10);
 
 /**
  * Mirrors engram_core::types::EnableJob (ADR 0036) — an asynchronous
@@ -329,7 +510,7 @@ export type EnableJob = Message<"engram.app.v1.EnableJob"> & {
  * Use `create(EnableJobSchema)` to create a new message.
  */
 export const EnableJobSchema: GenMessage<EnableJob> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 6);
+  messageDesc(file_engram_app_v1_image, 11);
 
 /**
  * @generated from message engram.app.v1.DisableImageRequest
@@ -346,7 +527,7 @@ export type DisableImageRequest = Message<"engram.app.v1.DisableImageRequest"> &
  * Use `create(DisableImageRequestSchema)` to create a new message.
  */
 export const DisableImageRequestSchema: GenMessage<DisableImageRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 7);
+  messageDesc(file_engram_app_v1_image, 12);
 
 /**
  * Today's HTTP handler returns 204 No Content on success (idempotently
@@ -367,7 +548,7 @@ export type DisableImageResponse = Message<"engram.app.v1.DisableImageResponse">
  * Use `create(DisableImageResponseSchema)` to create a new message.
  */
 export const DisableImageResponseSchema: GenMessage<DisableImageResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 8);
+  messageDesc(file_engram_app_v1_image, 13);
 
 /**
  * @generated from message engram.app.v1.RefreshImageRequest
@@ -387,7 +568,7 @@ export type RefreshImageRequest = Message<"engram.app.v1.RefreshImageRequest"> &
  * Use `create(RefreshImageRequestSchema)` to create a new message.
  */
 export const RefreshImageRequestSchema: GenMessage<RefreshImageRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 9);
+  messageDesc(file_engram_app_v1_image, 14);
 
 /**
  * Refresh runs the identical async pipeline as enable (the upsert
@@ -409,7 +590,7 @@ export type RefreshImageResponse = Message<"engram.app.v1.RefreshImageResponse">
  * Use `create(RefreshImageResponseSchema)` to create a new message.
  */
 export const RefreshImageResponseSchema: GenMessage<RefreshImageResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 10);
+  messageDesc(file_engram_app_v1_image, 15);
 
 /**
  * @generated from message engram.app.v1.ListEnableJobsRequest
@@ -422,7 +603,7 @@ export type ListEnableJobsRequest = Message<"engram.app.v1.ListEnableJobsRequest
  * Use `create(ListEnableJobsRequestSchema)` to create a new message.
  */
 export const ListEnableJobsRequestSchema: GenMessage<ListEnableJobsRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 11);
+  messageDesc(file_engram_app_v1_image, 16);
 
 /**
  * Recent jobs, newest first (server-bounded — 50 today).
@@ -441,7 +622,7 @@ export type ListEnableJobsResponse = Message<"engram.app.v1.ListEnableJobsRespon
  * Use `create(ListEnableJobsResponseSchema)` to create a new message.
  */
 export const ListEnableJobsResponseSchema: GenMessage<ListEnableJobsResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 12);
+  messageDesc(file_engram_app_v1_image, 17);
 
 /**
  * @generated from message engram.app.v1.GetEnableJobRequest
@@ -458,7 +639,7 @@ export type GetEnableJobRequest = Message<"engram.app.v1.GetEnableJobRequest"> &
  * Use `create(GetEnableJobRequestSchema)` to create a new message.
  */
 export const GetEnableJobRequestSchema: GenMessage<GetEnableJobRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 13);
+  messageDesc(file_engram_app_v1_image, 18);
 
 /**
  * @generated from message engram.app.v1.GetEnableJobResponse
@@ -475,7 +656,7 @@ export type GetEnableJobResponse = Message<"engram.app.v1.GetEnableJobResponse">
  * Use `create(GetEnableJobResponseSchema)` to create a new message.
  */
 export const GetEnableJobResponseSchema: GenMessage<GetEnableJobResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 14);
+  messageDesc(file_engram_app_v1_image, 19);
 
 /**
  * Re-queue a "failed" job to "pending" — the explicit admin trigger
@@ -495,7 +676,7 @@ export type RetryEnableJobRequest = Message<"engram.app.v1.RetryEnableJobRequest
  * Use `create(RetryEnableJobRequestSchema)` to create a new message.
  */
 export const RetryEnableJobRequestSchema: GenMessage<RetryEnableJobRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 15);
+  messageDesc(file_engram_app_v1_image, 20);
 
 /**
  * @generated from message engram.app.v1.RetryEnableJobResponse
@@ -512,7 +693,7 @@ export type RetryEnableJobResponse = Message<"engram.app.v1.RetryEnableJobRespon
  * Use `create(RetryEnableJobResponseSchema)` to create a new message.
  */
 export const RetryEnableJobResponseSchema: GenMessage<RetryEnableJobResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 16);
+  messageDesc(file_engram_app_v1_image, 21);
 
 /**
  * @generated from message engram.app.v1.ListRegistriesRequest
@@ -525,7 +706,7 @@ export type ListRegistriesRequest = Message<"engram.app.v1.ListRegistriesRequest
  * Use `create(ListRegistriesRequestSchema)` to create a new message.
  */
 export const ListRegistriesRequestSchema: GenMessage<ListRegistriesRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 17);
+  messageDesc(file_engram_app_v1_image, 22);
 
 /**
  * @generated from message engram.app.v1.ListRegistriesResponse
@@ -542,7 +723,7 @@ export type ListRegistriesResponse = Message<"engram.app.v1.ListRegistriesRespon
  * Use `create(ListRegistriesResponseSchema)` to create a new message.
  */
 export const ListRegistriesResponseSchema: GenMessage<ListRegistriesResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 18);
+  messageDesc(file_engram_app_v1_image, 23);
 
 /**
  * Mirrors engram_core::types::registry::RegistryCredentialSummary.
@@ -598,7 +779,7 @@ export type RegistryCredentialSummary = Message<"engram.app.v1.RegistryCredentia
  * Use `create(RegistryCredentialSummarySchema)` to create a new message.
  */
 export const RegistryCredentialSummarySchema: GenMessage<RegistryCredentialSummary> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 19);
+  messageDesc(file_engram_app_v1_image, 24);
 
 /**
  * api/registries.rs AddRegistryAuth is an internally-tagged serde union
@@ -647,7 +828,7 @@ export type AddRegistryRequest = Message<"engram.app.v1.AddRegistryRequest"> & {
  * Use `create(AddRegistryRequestSchema)` to create a new message.
  */
 export const AddRegistryRequestSchema: GenMessage<AddRegistryRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 20);
+  messageDesc(file_engram_app_v1_image, 25);
 
 /**
  * @generated from message engram.app.v1.StaticRegistryAuth
@@ -672,7 +853,7 @@ export type StaticRegistryAuth = Message<"engram.app.v1.StaticRegistryAuth"> & {
  * Use `create(StaticRegistryAuthSchema)` to create a new message.
  */
 export const StaticRegistryAuthSchema: GenMessage<StaticRegistryAuth> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 21);
+  messageDesc(file_engram_app_v1_image, 26);
 
 /**
  * @generated from message engram.app.v1.GcpWorkloadIdentityRegistryAuth
@@ -693,7 +874,7 @@ export type GcpWorkloadIdentityRegistryAuth = Message<"engram.app.v1.GcpWorkload
  * Use `create(GcpWorkloadIdentityRegistryAuthSchema)` to create a new message.
  */
 export const GcpWorkloadIdentityRegistryAuthSchema: GenMessage<GcpWorkloadIdentityRegistryAuth> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 22);
+  messageDesc(file_engram_app_v1_image, 27);
 
 /**
  * Public registry — no auth material. Stored as a row so the catalog
@@ -710,7 +891,7 @@ export type AnonymousRegistryAuth = Message<"engram.app.v1.AnonymousRegistryAuth
  * Use `create(AnonymousRegistryAuthSchema)` to create a new message.
  */
 export const AnonymousRegistryAuthSchema: GenMessage<AnonymousRegistryAuth> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 23);
+  messageDesc(file_engram_app_v1_image, 28);
 
 /**
  * @generated from message engram.app.v1.AddRegistryResponse
@@ -747,7 +928,7 @@ export type AddRegistryResponse = Message<"engram.app.v1.AddRegistryResponse"> &
  * Use `create(AddRegistryResponseSchema)` to create a new message.
  */
 export const AddRegistryResponseSchema: GenMessage<AddRegistryResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 24);
+  messageDesc(file_engram_app_v1_image, 29);
 
 /**
  * @generated from message engram.app.v1.DeleteRegistryRequest
@@ -767,7 +948,7 @@ export type DeleteRegistryRequest = Message<"engram.app.v1.DeleteRegistryRequest
  * Use `create(DeleteRegistryRequestSchema)` to create a new message.
  */
 export const DeleteRegistryRequestSchema: GenMessage<DeleteRegistryRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 25);
+  messageDesc(file_engram_app_v1_image, 30);
 
 /**
  * Today's HTTP handler returns 204 No Content — no body to mirror.
@@ -782,7 +963,7 @@ export type DeleteRegistryResponse = Message<"engram.app.v1.DeleteRegistryRespon
  * Use `create(DeleteRegistryResponseSchema)` to create a new message.
  */
 export const DeleteRegistryResponseSchema: GenMessage<DeleteRegistryResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_image, 26);
+  messageDesc(file_engram_app_v1_image, 31);
 
 /**
  * Image curation + registry credentials (ADR 0051 §2.3, rev
@@ -812,6 +993,20 @@ export const ImageService: GenService<{
     methodKind: "unary";
     input: typeof EnableImageRequestSchema;
     output: typeof EnableImageResponseSchema;
+  },
+  /**
+   * ADR 0080: edit an enabled image's config. Cheap fields (name,
+   * description, env, workdir) apply immediately; a diff touching the
+   * capture-affecting fields (resources, anything under warm) requires
+   * `allow_recapture = true` and enqueues an enable job instead —
+   * without it the call fails FailedPrecondition naming the fields.
+   *
+   * @generated from rpc engram.app.v1.ImageService.UpdateImage
+   */
+  updateImage: {
+    methodKind: "unary";
+    input: typeof UpdateImageRequestSchema;
+    output: typeof UpdateImageResponseSchema;
   },
   /**
    * @generated from rpc engram.app.v1.ImageService.DisableImage
