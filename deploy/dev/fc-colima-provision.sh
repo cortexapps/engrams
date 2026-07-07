@@ -181,31 +181,65 @@ udevadm trigger --name-match=kvm 2>/dev/null || true
 
 # --- loopback forwarders: preserve the Mac dev stack's loopback literalism
 # (localhost:5001 image refs, STORAGE_EMULATOR_HOST=http://localhost:4443,
-# OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317) unmodified inside the VM
-# by forwarding to the Lima host gateway (ADR 0068 "Networking" — VM -> Mac
-# direction). The host-agent env uses these localhost:PORT values as-is. ---
-install_fwd_unit() {
-    name="$1"
-    listen_port="$2"
-    target_port="$3"
-    cat >"/etc/systemd/system/engram-fwd-${name}.service" <<UNIT
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317) unmodified inside the VM by
+# routing them to the Lima host gateway (ADR 0068 "Networking" — VM -> Mac). The
+# host-agent env uses these localhost:PORT values as-is.
+#
+# We DNAT the loopback destination to the gateway rather than run a socat
+# LISTENER on 127.0.0.1. Lima's default portForwards forward EVERY guest
+# 127.0.0.1 listener back to the Mac's 127.0.0.1 (the `guestIP: 127.0.0.1` rule
+# colima generates), and colima 0.9.x exposes no knob to suppress it. So a socat
+# listener on 127.0.0.1:5001 gets surfaced onto the Mac's :5001 and SHADOWS the
+# real registry there — 127.0.0.1 beats the deps' 0.0.0.0 forward, so every
+# Mac-side `localhost:5001` (bake push, coordinator dial) hits the VM loop and
+# fails. An OUTPUT DNAT has no listener for Lima to forward, so nothing is
+# shadowed, while the guest's own `localhost:PORT` still reaches the Mac dep via
+# the gateway — and engram-oci's loopback-only-plaintext allowance still applies
+# because the ref STRING is unchanged. MASQUERADE rewrites the loopback source so
+# the gateway's replies route back. route_localnet lets the kernel DNAT a
+# loopback-destined packet out to a remote (same trick the egress proxy uses).
+cat >/usr/local/bin/engram-dev-fwd.sh <<'FWD'
+#!/usr/bin/env bash
+# Route the VM's localhost:{5001,4443,4317} to the Mac dev stack via the Lima
+# gateway WITHOUT a loopback listener (Lima would forward a listener back to the
+# Mac and shadow the real deps). See fc-colima-provision.sh for the rationale.
+set -euo pipefail
+sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null
+sysctl -w net.ipv4.conf.lo.route_localnet=1 >/dev/null
+gw=192.168.5.2
+for port in 5001 4443 4317; do
+    dnat="-p tcp -d 127.0.0.1 --dport $port -m comment --comment engram-dev-fwd -j DNAT --to-destination $gw:$port"
+    masq="-p tcp -d $gw --dport $port -m comment --comment engram-dev-fwd -j MASQUERADE"
+    iptables -t nat -C OUTPUT $dnat 2>/dev/null || iptables -t nat -A OUTPUT $dnat
+    iptables -t nat -C POSTROUTING $masq 2>/dev/null || iptables -t nat -A POSTROUTING $masq
+done
+FWD
+chmod +x /usr/local/bin/engram-dev-fwd.sh
+cat >/etc/systemd/system/engram-dev-fwd.service <<'UNIT'
 [Unit]
-Description=engram dev: forward localhost:${listen_port} -> 192.168.5.2:${target_port}
-After=network.target
+Description=engram dev: route localhost:{5001,4443,4317} to the Mac dev stack (DNAT; no shadowing listener)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/socat TCP-LISTEN:${listen_port},fork,reuseaddr,bind=127.0.0.1 TCP:192.168.5.2:${target_port}
-Restart=always
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/engram-dev-fwd.sh
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-}
-install_fwd_unit registry 5001 5001   # OCI registry (image pulls)
-install_fwd_unit gcs 4443 4443        # fake-gcs-server (chunk store)
-install_fwd_unit jaeger 4317 4317     # OTLP/gRPC (ADR 0019 tracing)
+# Retire the old socat forwarders if a prior provision installed them — their
+# 127.0.0.1 listeners are exactly what Lima surfaced onto the Mac and shadowed
+# the real deps with.
+for old in registry gcs jaeger; do
+    if [ -e "/etc/systemd/system/engram-fwd-${old}.service" ]; then
+        systemctl disable --now "engram-fwd-${old}.service" 2>/dev/null || true
+        rm -f "/etc/systemd/system/engram-fwd-${old}.service"
+    fi
+done
 systemctl daemon-reload
-systemctl enable --now engram-fwd-registry.service engram-fwd-gcs.service engram-fwd-jaeger.service
+systemctl enable --now engram-dev-fwd.service
 
 # --- working dirs for the host-agent ---
 mkdir -p /opt/engram-dev/bin /opt/engram-dev/shared /opt/engram-dev/var
@@ -254,9 +288,8 @@ Provisioned inside the VM:
   - packages: build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file socat iptables squashfs-tools e2fsprogs
   - /usr/local/bin/firecracker ($FC_VERSION)
   - nbd loaded (nbds_max=16), vm.unprivileged_userfaultfd=1, /dev/kvm mode 0666 (persisted)
-  - engram-fwd-registry.service (localhost:5001 -> 192.168.5.2:5001)
-  - engram-fwd-gcs.service      (localhost:4443 -> 192.168.5.2:4443)
-  - engram-fwd-jaeger.service   (localhost:4317 -> 192.168.5.2:4317)
+  - engram-dev-fwd.service (DNAT localhost:{5001,4443,4317} -> 192.168.5.2, no
+    shadowing loopback listener — see the script comment for why not socat)
   - /opt/engram-dev/{bin,shared,var}
 
 Contract paths:

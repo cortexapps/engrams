@@ -87,11 +87,14 @@ Two directions, two mechanisms, zero changes to address strings where possible:
    chunks).** Lima guests reach Mac-loopback services via the host gateway
    (`192.168.5.2`). The coordinator endpoint is set to
    `http://192.168.5.2:8090` directly. The registry and GCS emulator instead
-   get **socat forwarders inside the VM** (`localhost:5001 → gateway:5001`,
-   `localhost:4443 → gateway:4443`) so that the image refs baked into the DB
-   (`localhost:5001/...`) and `engram-oci`'s loopback-only plaintext allowance
-   keep working *unmodified*. We deliberately do not widen the OCI client's
-   insecure-HTTP heuristic.
+   get an **OUTPUT DNAT inside the VM** (`localhost:{5001,4443,4317} →
+   gateway:PORT`, via `route_localnet` + MASQUERADE) so that the image refs
+   baked into the DB (`localhost:5001/...`) and `engram-oci`'s loopback-only
+   plaintext allowance keep working *unmodified*. We deliberately do not widen
+   the OCI client's insecure-HTTP heuristic. (This started as socat listeners on
+   `127.0.0.1:PORT`, but Lima auto-forwards guest loopback listeners back to the
+   Mac, where they shadow the real deps — see Phase log P3. DNAT has no listener
+   to shadow.)
 
 ### Tilt wiring
 
@@ -175,3 +178,23 @@ When `ENGRAM_FC_COLIMA_PROFILE` is set, the Tiltfile:
   `colima-<profile>` VM socket — so the deps can never silently land in the VM
   again (a direct `tilt up` under the stolen context is now a clear error, not a
   half-broken stack).
+- P3: **the socat loopback forwarders shadow the Mac deps once the deps are
+  correctly on the Mac.** The §Networking design used per-service socat units
+  listening on the VM's `127.0.0.1:{5001,4443,4317}` and forwarding to the
+  gateway. But Lima's default `portForwards` includes a blanket `guestIP:
+  127.0.0.1 → hostIP: 127.0.0.1` rule, so it surfaces those socat listeners onto
+  the *Mac's* loopback — where `127.0.0.1:5001` beats the deps' `0.0.0.0:5001`
+  forward and shadows the real registry. Every Mac-side `localhost:5001` (bake
+  push, coordinator dial) then loops back into the VM and fails with an empty
+  reply. It stayed hidden only because the deps had been (wrongly) in the VM, so
+  `localhost:5001` resolved locally and the socat/shadow never mattered — the P2
+  context-pin, by moving the deps onto the Mac as intended, is what exposed it.
+  colima 0.9.x regenerates `lima.yaml` on start and exposes no `portForwards`
+  passthrough, so the ignore-rule route is unavailable. Fix: replace the socat
+  units with an OUTPUT **DNAT** (`127.0.0.1:PORT → gateway:PORT`, `route_localnet`
+  + MASQUERADE) — no loopback *listener*, so Lima has nothing to surface, while
+  the guest's own `localhost:PORT` still reaches the Mac dep and engram-oci's
+  loopback-plaintext allowance still applies (the ref string is unchanged).
+  `fc-colima-provision.sh` now installs `engram-dev-fwd.service` (a boot-time
+  oneshot running the DNAT) and retires any pre-existing `engram-fwd-*` socat
+  units.
