@@ -2,7 +2,8 @@
 //! clean-break replacement of C1's stop-and-copy; snapshot-rehome is
 //! the only fallback).
 //!
-//! `migrate_session_live` under the session lease + the R8 host gate:
+//! `migrate_session_live` under the session's op-log claim (ADR 0079,
+//! kind = teleport) + the R8 host gate:
 //! `migration_presetup` on the source (pre-pause: export identity +
 //! the dest's restore package) → SPAWN the dest restore as a task (it
 //! pre-stages netns/FC/handler concurrently with everything below; its
@@ -43,7 +44,6 @@ use engram_core::SandboxError;
 use engram_core::{HostId, SessionId};
 use tracing::Instrument;
 
-use crate::idle_evictor::SessionLeaseGuard;
 use crate::state::{SessionEvent, SharedState};
 
 #[derive(Debug)]
@@ -83,7 +83,8 @@ pub fn live_teleport_enabled() -> bool {
 /// ADR 0045 C2 (R8): at most ONE in-flight migration per host endpoint
 /// — a consolidation wave would otherwise double P2P+GCS pressure on a
 /// single source/dest. Process-local (coordinator pods are effectively
-/// singular today; the session lease already serializes per-session).
+/// singular today; the per-session op claim already serializes
+/// per-session).
 static MIGRATION_GATE: std::sync::LazyLock<dashmap::DashMap<HostId, SessionId>> =
     std::sync::LazyLock::new(dashmap::DashMap::new);
 
@@ -161,15 +162,41 @@ pub async fn migrate_session_live(
     let Some(sandbox_id) = session.sandbox_id else {
         return Err(MigrateError::Fatal("no bound sandbox".into()));
     };
-    let lease = match SessionLeaseGuard::try_acquire(state, session_id, Some(sandbox_id)).await {
-        Ok(Some(g)) => g,
+    // ADR 0079: the op-log claim (kind = teleport) is the per-session
+    // exclusion — one running op per session. Claim-or-give-up; if this
+    // pod dies mid-move the reclaim sweep re-claims the row and the
+    // teleport verb arm terminally fails it (the ADR 0018 parachute /
+    // evac machinery owns recovery), freeing the lane.
+    let claim = match crate::session_ops::OpClaim::try_acquire(
+        state,
+        session_id,
+        engram_core::types::session_op::OpKind::Teleport,
+        serde_json::json!({ "target_host_id": target_host_id.to_string() }),
+    )
+    .await
+    {
+        Ok(Some(c)) => c,
         Ok(None) => {
             return Err(MigrateError::Fatal(
-                "session is mid-resume/eviction/migration (lease held)".into(),
+                "session is mid-resume/eviction/migration (an op owns it)".into(),
             ))
         }
-        Err(e) => return Err(MigrateError::Fatal(format!("lease acquire: {e}"))),
+        Err(e) => return Err(MigrateError::Fatal(format!("op claim acquire: {e}"))),
     };
+
+    // ADR 0079 (re-review finding #1): keep the claim's `heartbeat_at`
+    // fresh for the ENTIRE synchronous move body (presetup → concurrent
+    // restore-await → blackout → rebind → reactivate below). Without this
+    // beat the row's only liveness stamp is `try_acquire`'s, so a move
+    // whose body outlives `RECLAIM_STALE` (180s — a large VM over a slow
+    // inter-host link) is reclaimed out from under a PERFECTLY HEALTHY
+    // holder, which then keeps driving un-fenced migration RPCs while the
+    // successor's reclaim fails the row (double-drive). The manual-snapshot
+    // inline claim already beats its body this way (`api::snapshot`); the
+    // teleport body did not. Dropped explicitly right before the finalize
+    // task spawns (that task runs its own `claim.touch` beat across the
+    // drain); any early `?`/return arm drops it via RAII.
+    let move_heartbeat = claim.spawn_heartbeat("teleport-move");
 
     // The destination must be takeable and the source addressable
     // before we freeze anything.
@@ -247,7 +274,10 @@ pub async fn migrate_session_live(
 
     // ---- 1. Presetup on the source (NO pause — the guest runs) ----
     let t_presetup = std::time::Instant::now();
-    let presetup = match source_backend.migration_presetup(sandbox_id).await {
+    let presetup = match source_backend
+        .migration_presetup(sandbox_id, claim.fence())
+        .await
+    {
         Ok(p) => p,
         Err(SandboxError::InvalidSpec(reason)) => {
             return Err(MigrateError::Unsupported(reason));
@@ -338,7 +368,9 @@ pub async fn migrate_session_live(
     let restore_task = {
         let dest = dest_backend.clone();
         let restore_span = tracing::Span::current();
-        tokio::spawn(async move { dest.restore(metadata).await }.instrument(restore_span))
+        // ADR 0079: the teleport claim's epoch fences the dest restore.
+        let fence = claim.fence();
+        tokio::spawn(async move { dest.restore(metadata, fence).await }.instrument(restore_span))
     };
 
     // ---- 3. Arm the parachute ----
@@ -380,7 +412,7 @@ pub async fn migrate_session_live(
     // ---- 4. THE BLACKOUT: vmstate-only capture + pagemap seal ----
     let t_blackout = std::time::Instant::now();
     let capture = match source_backend
-        .migration_capture_postcopy(sandbox_id, &presetup.export_id)
+        .migration_capture_postcopy(sandbox_id, &presetup.export_id, claim.fence())
         .await
     {
         Ok(c) => c,
@@ -390,7 +422,7 @@ pub async fn migrate_session_live(
             // conservative un-freeze (idempotent enough: resuming a
             // running VM is a benign FC error).
             restore_task.abort();
-            let _ = source_backend.resume(sandbox_id).await;
+            let _ = source_backend.resume(sandbox_id, claim.fence()).await;
             let _ = state
                 .services
                 .meta
@@ -428,7 +460,7 @@ pub async fn migrate_session_live(
             // sound. Anything else is ambiguous: parachute.
             if e.to_string().contains("postcopy-never-loaded") {
                 let abort_ok = source_backend
-                    .migration_abort(sandbox_id, &presetup.export_id)
+                    .migration_abort(sandbox_id, &presetup.export_id, claim.fence())
                     .await
                     .is_ok();
                 if abort_ok && walk_back_to_active(state, session_id).await {
@@ -481,12 +513,21 @@ pub async fn migrate_session_live(
         //
         // Issue #211: guard the rebind on the row still being the
         // `Evacuating` row bound to the SOURCE sandbox we're migrating
-        // off. A `DELETE /sessions/:id` (or a reconcile strike) racing
-        // the copy can flip the row terminal and/or clear its sandbox;
-        // a blind rebind would re-bind the new live VM onto that terminal
-        // row, the ownership oracle would answer `owned = true`, and the
-        // orphan reap would never fire. On `Conflict` we drop into the
-        // error arm below, which destroys `new_sandbox_id` and parachutes.
+        // off. A reconcile strike racing the copy can flip the row
+        // and/or clear its sandbox; a blind rebind would re-bind the new
+        // live VM onto that row, the ownership oracle would answer
+        // `owned = true`, and the orphan reap would never fire. On
+        // `Conflict` we drop into the error arm below, which destroys
+        // `new_sandbox_id` and parachutes.
+        //
+        // ADR 0079 note: this stays `rebind_session_guarded` (state-list
+        // guard) rather than `fenced_assign_sandbox` even though DELETE
+        // now rides the op log (a destroy op queues behind this claim):
+        // the fleet detectors (reconcile's strike-out, dead_host) still
+        // write session rows WITHOUT bumping `current_epoch`, so the
+        // epoch predicate alone cannot see their flips. The state guard
+        // collapses into the fence once the detectors' writes become
+        // fenced enqueues (the ADR's "NOT deleted" list).
         state
             .services
             .meta
@@ -509,7 +550,7 @@ pub async fn migrate_session_live(
     }
     .await;
     if let Err(e) = rebind {
-        let _ = dest_backend.destroy(new_sandbox_id).await;
+        let _ = dest_backend.destroy(new_sandbox_id, claim.fence()).await;
         let _ = state
             .services
             .meta
@@ -571,6 +612,7 @@ pub async fn migrate_session_live(
                 &session_refreshed,
                 new_sandbox_id,
                 false,
+                claim.fence(),
             )
             .await
             {
@@ -633,7 +675,7 @@ pub async fn migrate_session_live(
     );
 
     // ---- 7. Finalize: drain → commit source → Full checkpoint → row ----
-    // The lease + the R8 gate ride into the task. The dest keeps
+    // The op claim + the R8 gate ride into the task. The dest keeps
     // serving the user throughout; the SOURCE stays alive as a page
     // server until DrainDone.
     //
@@ -643,9 +685,14 @@ pub async fn migrate_session_live(
     let state2 = state.clone();
     let export_id = presetup.export_id.clone();
     let finalize_span = tracing::Span::current();
+    // The synchronous body is done; the finalize task keeps the claim alive
+    // via its own `claim.touch` beat across the drain, so hand liveness off
+    // by dropping the body heartbeat here (avoids two beats racing on the
+    // same row — harmless, but tidy).
+    drop(move_heartbeat);
     tokio::spawn(
         async move {
-        let lease = lease;
+        let claim = claim;
         let _gate_guard = gate_guard;
 
         // 7a. The drain: every sealed chunk lands on the dest. Wrapped in
@@ -674,10 +721,12 @@ pub async fn migrate_session_live(
         let mut last_err: Option<engram_core::SandboxError> = None;
         let drain_outcome = 'retry: {
             for attempt in 0..DRAIN_RETRY_BUDGET {
-                // Refresh the lease across attempts the same way the wait
-                // below does, so a multi-attempt retry doesn't outlive the
-                // lease and stomp a session another holder re-acquired.
-                let mut touch = tokio::time::interval(std::time::Duration::from_secs(60));
+                // Refresh the op claim's heartbeat across attempts the
+                // same way the wait below does, so a multi-attempt retry
+                // isn't reclaimed out from under us (20s ≪ the executor's
+                // 180s staleness bound, `RECLAIM_STALE`) and never stomps a
+                // session a successor re-claimed.
+                let mut touch = tokio::time::interval(std::time::Duration::from_secs(20));
                 touch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 touch.tick().await;
 
@@ -687,19 +736,19 @@ pub async fn migrate_session_live(
                     tokio::select! {
                         res = &mut drain => break res,
                         _ = touch.tick() => {
-                            match lease.touch_checked().await {
-                                crate::idle_evictor::LeaseTouch::Held => {}
+                            match claim.touch("finalize").await {
+                                crate::session_ops::OpTouch::Held => {}
                                 // A transport blip on the touch is NOT loss
-                                // (CASE: lease touch). Keep waiting; the
-                                // 180s reaper still backstops a truly dead
+                                // (CASE: claim touch). Keep waiting; the
+                                // reclaim sweep still backstops a truly dead
                                 // holder, and the drain RPC remains in flight.
-                                crate::idle_evictor::LeaseTouch::TransientError(e) => {
+                                crate::session_ops::OpTouch::TransientError(e) => {
                                     tracing::warn!(%session_id, error = %e,
-                                        "post-copy finalize: lease touch transport error — retrying, not abandoning");
+                                        "post-copy finalize: claim touch transport error — retrying, not abandoning");
                                 }
-                                crate::idle_evictor::LeaseTouch::Lost => {
+                                crate::session_ops::OpTouch::Lost => {
                                     tracing::error!(%session_id,
-                                        "post-copy finalize: lease lost mid-drain (reaped/re-acquired)");
+                                        "post-copy finalize: op claim fenced mid-drain (successor re-claimed)");
                                     return;
                                 }
                             }
@@ -767,7 +816,11 @@ pub async fn migrate_session_live(
             // `false` (rebind landed), so its TTL destroys it.
             metrics::counter!(crate::metrics::MIGRATION_TOTAL, "outcome" => "peer_lost_rewind")
                 .increment(1);
-            let _ = state2.services.host.destroy(new_sandbox_id).await;
+            let _ = state2
+                .services
+                .host
+                .destroy(new_sandbox_id, claim.fence())
+                .await;
             state2.host_registry.invalidate_sandbox(new_sandbox_id);
             if state2
                 .services
@@ -787,13 +840,21 @@ pub async fn migrate_session_live(
                     )
                     .await;
             }
-            let _ = parachute_or_kill(&state2, session_id, durable_row.is_some(), detail).await;
+            let _ =
+                parachute_or_kill(&state2, session_id, durable_row.is_some(), detail.clone())
+                    .await;
+            claim
+                .finish(
+                    engram_core::types::session_op::OpState::Failed,
+                    Some(&detail),
+                )
+                .await;
             return;
         }
 
         // 7b. Release the source (destroy; the export retires with it).
         if let Err(e) = source_backend
-            .migration_commit(sandbox_id, &export_id)
+            .migration_commit(sandbox_id, &export_id, claim.fence())
             .await
         {
             tracing::warn!(%session_id, %sandbox_id, error = %e,
@@ -814,6 +875,9 @@ pub async fn migrate_session_live(
         // the guest is live on the dest and the source is released.
         tracing::info!(%session_id,
             "post-copy migration finalized (source released; durability rides the periodic cadence)");
+        claim
+            .finish(engram_core::types::session_op::OpState::Done, None)
+            .await;
     }
     .instrument(finalize_span),
     );
@@ -1003,20 +1067,17 @@ mod tests {
         );
         let after = meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionState::Active, "session untouched");
-        // Lease released (Drop spawns a detached DELETE — poll briefly).
+        // The op claim releases (Drop spawns a detached finish — poll
+        // briefly): the session's op lane must free for a follow-up.
         let mut released = false;
         for _ in 0..40 {
-            if meta
-                .try_acquire_session_lease(session_id, None, "follow-up")
-                .await
-                .unwrap()
-            {
+            if meta.ops.running_for(session_id).is_none() {
                 released = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(released, "lease must release after the fallback");
+        assert!(released, "the op claim must release after the fallback");
     }
 
     /// The dest-failure arm: capture succeeds (the source is frozen),
@@ -1709,17 +1770,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn held_lease_refuses_migration() {
+    async fn busy_op_lane_refuses_migration() {
         let session = active_session();
         let session_id = session.id;
         let (state, meta, target) = build_state(session);
-        assert!(meta
-            .try_acquire_session_lease(session_id, None, "rival")
-            .await
-            .unwrap());
+        meta.ops
+            .seed_running(session_id, engram_core::types::session_op::OpKind::Evict);
         let err = migrate_session_live(&state, session_id, target)
             .await
-            .expect_err("held lease must refuse");
+            .expect_err("a running op must refuse the migration");
         assert!(matches!(err, MigrateError::Fatal(_)));
     }
 }

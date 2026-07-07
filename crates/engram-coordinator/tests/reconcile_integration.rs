@@ -767,7 +767,11 @@ impl engram_core::traits::HostClient for ProbeBackend {
     ) -> Result<SandboxId, engram_core::SandboxError> {
         unreachable!()
     }
-    async fn destroy(&self, _: SandboxId) -> Result<(), engram_core::SandboxError> {
+    async fn destroy(
+        &self,
+        _: SandboxId,
+        _: engram_core::traits::SessionFence,
+    ) -> Result<(), engram_core::SandboxError> {
         unreachable!()
     }
     async fn list(&self) -> Result<Vec<SandboxId>, engram_core::SandboxError> {
@@ -792,12 +796,14 @@ impl engram_core::traits::HostClient for ProbeBackend {
     async fn snapshot(
         &self,
         _: SandboxId,
+        _: engram_core::traits::SessionFence,
     ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError> {
         unreachable!()
     }
     async fn restore(
         &self,
         _: engram_core::types::snapshot::SnapshotMetadata,
+        _: engram_core::traits::SessionFence,
     ) -> Result<SandboxId, engram_core::SandboxError> {
         unreachable!()
     }
@@ -806,6 +812,7 @@ impl engram_core::traits::HostClient for ProbeBackend {
         _: SandboxId,
         _: engram_core::types::sandbox::AgentSpec,
         _: engram_core::types::egress::SessionEgressPolicy,
+        _: engram_core::traits::SessionFence,
     ) -> Result<(), engram_core::SandboxError> {
         unreachable!()
     }

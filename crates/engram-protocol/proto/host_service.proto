@@ -19,21 +19,28 @@ package engram.host.v1;
 
 service HostService {
   // ---- sandbox lifecycle ----
+  //
+  // ADR 0079 (wire v12): every session-scoped lifecycle RPC carries a
+  // (session_id, fencing_epoch) stamp — see `FencedSandboxRequest` —
+  // checked by the host's `check_session_epoch` gate right after the
+  // wire-version gate. Sandbox-scoped-but-not-lifecycle RPCs (harness
+  // routing, proxies, COW diagnostics, migration internals) are NOT
+  // fenced: they never make the writes the op executor serializes.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
-  rpc DestroySandbox(SandboxIdMessage) returns (Empty);
+  rpc DestroySandbox(FencedSandboxRequest) returns (Empty);
   rpc ListSandboxes(Empty) returns (ListSandboxesResponse);
-  rpc Snapshot(SandboxIdMessage) returns (SnapshotResponse);
+  rpc Snapshot(FencedSandboxRequest) returns (SnapshotResponse);
   // ADR 0014 issue #1/#2: signal that a just-produced snapshot's
   // downstream pipeline (record_snapshot → destroy → mark Idle)
   // fully succeeded; the host clears its in-flight tracking and the
   // snapshot artifacts are now PG-owned. Idempotent.
-  rpc CommitSnapshot(SandboxIdMessage) returns (Empty);
+  rpc CommitSnapshot(FencedSandboxRequest) returns (Empty);
   // ADR 0014 issue #1/#2: signal that a just-produced snapshot's
   // downstream pipeline failed; the host removes the local
   // snapshot dir + the per-snapshot opaque blobs (state.bin,
   // sidecar.json, working_set.json) so they don't accumulate as
   // 4 GiB-per-attempt leaks during retry storms. Idempotent.
-  rpc AbortSnapshot(SandboxIdMessage) returns (Empty);
+  rpc AbortSnapshot(FencedSandboxRequest) returns (Empty);
   // ADR 0045 D5: the teardown reorder. SnapshotBegin runs only the
   // pause-side capture (pause -> NBD drain -> FC create; for eviction
   // the VM stays paused) and spawns the chunk+upload work as a host-side
@@ -42,8 +49,8 @@ service HostService {
   // between the two — user-visible teardown ends at Begin. The legacy
   // Snapshot RPC stays as the composed begin+wait (periodic checkpoints,
   // drain paths, old coordinators).
-  rpc SnapshotBegin(SandboxIdMessage) returns (SnapshotBeginResponse);
-  rpc SnapshotWait(SandboxIdMessage) returns (SnapshotResponse);
+  rpc SnapshotBegin(FencedSandboxRequest) returns (SnapshotBeginResponse);
+  rpc SnapshotWait(FencedSandboxRequest) returns (SnapshotResponse);
   // ADR 0045 Phase C1: live-teleport source-side surface.
   // MigrationCapture freezes the sandbox for a move: pause + NBD drain +
   // FC diff capture + LOCAL-sink re-chunk (no GCS on the pause path);
@@ -55,14 +62,23 @@ service HostService {
   // chunk bytes), gated by the export_id nonce + a server-side
   // allowlist. Commit destroys the source VM + drops the export; Abort
   // un-pauses the guest in place and unfences (zero loss).
-  rpc MigrationCapture(SandboxIdMessage) returns (MigrationCaptureResponse);
+  //
+  // ADR 0079: the FIVE source-mutating RPCs (Capture, Presetup,
+  // CapturePostCopy, Commit, Abort) carry the (session_id,
+  // fencing_epoch) fence — Capture/Presetup via `FencedSandboxRequest`,
+  // the export-scoped three via the fence fields on `MigrationExportRef`
+  // — so the host's `check_session_epoch` gate rejects a stale
+  // (reclaimed-out) teleport holder. MigrationFetch (host-to-host,
+  // export-nonce gated) and MigrationDrainWait (dest-side wait) are NOT
+  // fenced: they make no source-mutating write on behalf of the holder.
+  rpc MigrationCapture(FencedSandboxRequest) returns (MigrationCaptureResponse);
   rpc MigrationFetch(MigrationFetchRequest) returns (stream MigrationFrame);
   rpc MigrationCommit(MigrationExportRef) returns (Empty);
   rpc MigrationAbort(MigrationExportRef) returns (Empty);
   // ADR 0045 C2 post-copy: the pre-pause presetup (export identity +
   // the restore package sans state.bin), the blackout capture
   // (vmstate-only + pagemap seal), and the destination's drain await.
-  rpc MigrationPresetup(SandboxIdMessage) returns (MigrationPresetupResponse);
+  rpc MigrationPresetup(FencedSandboxRequest) returns (MigrationPresetupResponse);
   rpc MigrationCapturePostCopy(MigrationExportRef) returns (PostCopyCaptureResponse);
   rpc MigrationDrainWait(SandboxIdMessage) returns (DrainOutcomeResponse);
   rpc Restore(RestoreRequest) returns (SandboxIdMessage);
@@ -71,8 +87,8 @@ service HostService {
   // pause vCPUs without snapshotting, destroying, or changing session
   // state. An admin affordance to exercise + observe the pause/flush
   // path; maps to SandboxBackend::pause / ::resume.
-  rpc PauseSandbox(SandboxIdMessage) returns (Empty);
-  rpc ResumeSandbox(SandboxIdMessage) returns (Empty);
+  rpc PauseSandbox(FencedSandboxRequest) returns (Empty);
+  rpc ResumeSandbox(FencedSandboxRequest) returns (Empty);
 
   // ADR 0020 P1: boot the image to agentd-ready with a stub harness,
   // take a portable FC snapshot (chunked memory + uploaded
@@ -257,6 +273,25 @@ message SandboxIdMessage {
   bytes uuid = 1;
 }
 
+// ADR 0079: the fenced form of `SandboxIdMessage`, shared by every
+// session-scoped lifecycle RPC the coordinator's op executor drives
+// (destroy / snapshot family / pause / resume). One message instead of
+// N so the fence rides uniformly.
+//
+// `fencing_epoch` is `sessions.current_epoch` as stamped on the op at
+// claim time; the host persists a per-SESSION monotonic high-water
+// (`SessionEpochStore`, one file per session under work_dir/epochs —
+// per-session, not per-sandbox, so it survives sandbox replacement)
+// and rejects `incoming < stored` with FAILED_PRECONDITION.
+// `fencing_epoch = 0` is the interim "verb not yet migrated to the op
+// executor" marker: allowed and NOT advanced. TODO(#543): reject 0
+// once the coordinator threads real epochs on every lifecycle verb.
+message FencedSandboxRequest {
+  bytes uuid = 1;            // 16-byte sandbox UUID
+  uint64 fencing_epoch = 2;  // 0 = unfenced interim caller (see above)
+  bytes session_id = 3;      // 16-byte session UUID; ignored when fencing_epoch == 0
+}
+
 // --- CreateSandbox ---
 
 message CreateSandboxRequest {
@@ -311,6 +346,11 @@ message MigrationCaptureResponse {
 message MigrationExportRef {
   bytes sandbox_id = 1;
   string export_id = 2;
+  // ADR 0079: the (session_id, fencing_epoch) fence — see
+  // `FencedSandboxRequest`. Rides MigrationCapturePostCopy / Commit /
+  // Abort (the export-scoped source-mutating RPCs). 0 = unfenced interim.
+  uint64 fencing_epoch = 3;
+  bytes session_id = 4;      // 16-byte session UUID; ignored when fencing_epoch == 0
 }
 
 // ADR 0045 C2: see MigrationPresetupOut in engram-core for field
@@ -416,6 +456,9 @@ message SnapshotResponse {
 message RestoreRequest {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.
   bytes metadata_bincode = 1;
+  // ADR 0079: (session_id, fencing_epoch) — see `FencedSandboxRequest`.
+  bytes session_id = 2;      // 16-byte session UUID; ignored when fencing_epoch == 0
+  uint64 fencing_epoch = 3;  // 0 = unfenced interim caller
 }
 message BuildBaseSnapshotRequest {
   // bincode-encoded `engram_core::types::sandbox::SandboxSpec` — the
@@ -500,6 +543,9 @@ message RestoreBaseForSessionRequest {
   // slots (dyn_0..). The host `patch_drive`s each over its sentinel slot in the
   // paused restore window. Empty = no dynamic skills (slots stay sentinel).
   bytes selected_mounts_bincode = 5;
+  // ADR 0079: (session_id, fencing_epoch) — see `FencedSandboxRequest`.
+  bytes session_id = 6;      // 16-byte session UUID; ignored when fencing_epoch == 0
+  uint64 fencing_epoch = 7;  // 0 = unfenced interim caller
 }
 
 // --- GuestIp ---
@@ -572,6 +618,9 @@ message StartAgentRequest {
   // serialises an `SessionEgressPolicy::empty()`-shaped struct so
   // the host has uniform handling.
   bytes policy_bincode = 3;
+  // ADR 0079: (session_id, fencing_epoch) — see `FencedSandboxRequest`.
+  bytes session_id = 4;      // 16-byte session UUID; ignored when fencing_epoch == 0
+  uint64 fencing_epoch = 5;  // 0 = unfenced interim caller
 }
 
 message ApplyEgressPolicyRequest {

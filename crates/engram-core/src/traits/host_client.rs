@@ -35,11 +35,45 @@ use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
 use crate::types::{SandboxId, SessionId};
 
+/// ADR 0079: the (session_id, fencing_epoch) stamp carried by every
+/// session-scoped lifecycle host RPC (destroy / snapshot family /
+/// pause / resume / restore / start_agent). `epoch` is
+/// `sessions.current_epoch` as CAS-bumped at op claim; the host
+/// persists a per-session monotonic high-water and rejects a stale
+/// caller with `FAILED_PRECONDITION`, so a fenced-out executor's late
+/// RPC can never act on a session a successor already re-claimed.
+///
+/// Distinct from ADR 0073's `binding_epoch` (which fences harness
+/// attaches, not lifecycle ops) — the two coexist deliberately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionFence {
+    pub session_id: SessionId,
+    pub epoch: u64,
+}
+
+impl SessionFence {
+    pub fn new(session_id: SessionId, epoch: u64) -> Self {
+        Self { session_id, epoch }
+    }
+
+    /// ADR 0079 interim: a call site whose verb has not yet migrated to
+    /// the op executor. Encodes `fencing_epoch = 0` on the wire, which
+    /// the host allows WITHOUT advancing its high-water. TODO(#543):
+    /// delete this constructor (and flip the host to reject 0) once the
+    /// coordinator threads real epochs on every lifecycle verb.
+    pub fn unfenced() -> Self {
+        Self {
+            session_id: SessionId(uuid::Uuid::nil()),
+            epoch: 0,
+        }
+    }
+}
+
 #[async_trait]
 pub trait HostClient: Send + Sync {
     // ---- sandbox lifecycle ----
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
-    async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError>;
+    async fn destroy(&self, id: SandboxId, fence: SessionFence) -> Result<(), SandboxError>;
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError>;
 
     /// Cheap liveness probe. Returns `Ok(())` if the host answers an
@@ -99,7 +133,11 @@ pub trait HostClient: Send + Sync {
         })
     }
 
-    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
+    async fn snapshot(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError>;
     /// ADR 0045 D5: the pause-side half of an eviction snapshot — pause +
     /// drain + FC capture, then the guest is re-paused (it's being torn
     /// down; today's pipeline already discards post-capture execution).
@@ -115,6 +153,7 @@ pub trait HostClient: Send + Sync {
     async fn snapshot_begin(
         &self,
         _id: SandboxId,
+        _fence: SessionFence,
     ) -> Result<crate::types::SnapshotId, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `snapshot_begin`".into(),
@@ -124,7 +163,11 @@ pub trait HostClient: Send + Sync {
     /// [`Self::snapshot_begin`] and return the durable
     /// [`SnapshotMetadata`]. Idempotent w.r.t. reconnects — the upload
     /// is host-autonomous once begun.
-    async fn snapshot_wait(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot_wait(
+        &self,
+        _id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `snapshot_wait`".into(),
         ))
@@ -135,6 +178,7 @@ pub trait HostClient: Send + Sync {
     async fn migration_capture(
         &self,
         _id: SandboxId,
+        _fence: SessionFence,
     ) -> Result<crate::types::snapshot::MigrationCaptureOut, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `migration_capture`".into(),
@@ -163,6 +207,7 @@ pub trait HostClient: Send + Sync {
     async fn migration_presetup(
         &self,
         _id: SandboxId,
+        _fence: SessionFence,
     ) -> Result<crate::types::snapshot::MigrationPresetupOut, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `migration_presetup`".into(),
@@ -174,6 +219,7 @@ pub trait HostClient: Send + Sync {
         &self,
         _id: SandboxId,
         _export_id: &str,
+        _fence: SessionFence,
     ) -> Result<crate::types::snapshot::PostCopyCaptureOut, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `migration_capture_postcopy`".into(),
@@ -191,14 +237,24 @@ pub trait HostClient: Send + Sync {
     }
 
     /// ADR 0045 C1: see `SandboxBackend::migration_commit`.
-    async fn migration_commit(&self, _id: SandboxId, _export_id: &str) -> Result<(), SandboxError> {
+    async fn migration_commit(
+        &self,
+        _id: SandboxId,
+        _export_id: &str,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `migration_commit`".into(),
         ))
     }
 
     /// ADR 0045 C1: see `SandboxBackend::migration_abort`.
-    async fn migration_abort(&self, _id: SandboxId, _export_id: &str) -> Result<(), SandboxError> {
+    async fn migration_abort(
+        &self,
+        _id: SandboxId,
+        _export_id: &str,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `migration_abort`".into(),
         ))
@@ -208,15 +264,27 @@ pub trait HostClient: Send + Sync {
     /// for the contract. Default impl returns Ok so HostClients backed by
     /// backends that don't need a commit phase (Process, VZ-dev) work
     /// unchanged.
-    async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
+    async fn commit_snapshot(
+        &self,
+        _id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
     /// ADR 0014 issue #1/#2: abort a snapshot whose downstream pipeline
     /// failed. Idempotent. See `SandboxBackend::abort_snapshot`.
-    async fn abort_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
+    async fn abort_snapshot(
+        &self,
+        _id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
+    async fn restore(
+        &self,
+        metadata: SnapshotMetadata,
+        fence: SessionFence,
+    ) -> Result<SandboxId, SandboxError>;
 
     /// ADR 0020 P1: boot the image to agentd-ready, snapshot it, tear
     /// the capture VM down, and return the portable snapshot metadata.
@@ -263,6 +331,7 @@ pub trait HostClient: Send + Sync {
         _metadata: SnapshotMetadata,
         _session_env: std::collections::HashMap<String, String>,
         _selected_mounts: Vec<crate::types::sandbox::AuxRoDrive>,
+        _fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `restore_base_for_session`".into(),
@@ -280,6 +349,7 @@ pub trait HostClient: Send + Sync {
         id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
+        fence: SessionFence,
     ) -> Result<(), SandboxError>;
 
     /// Apply an egress policy to the host's local proxy registry
@@ -383,13 +453,21 @@ pub trait HostClient: Send + Sync {
     /// work). Default no-op for harness-less fakes; the `HostRegistry`,
     /// gRPC client, and `LocalHostClient` override it to reach the
     /// backend's [`crate::traits::SandboxBackend::pause`].
-    async fn pause(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+    async fn pause(
+        &self,
+        _sandbox_id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
 
     /// ADR 0045 Phase F: unfreeze a [`Self::pause`]d microVM — resume
     /// its vCPUs in place. Symmetric with `pause`; same overrides.
-    async fn resume(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+    async fn resume(
+        &self,
+        _sandbox_id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
 

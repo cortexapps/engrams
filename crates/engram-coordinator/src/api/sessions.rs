@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use engram_core::traits::SecretContext;
+use engram_core::traits::{SecretContext, SessionFence};
 use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
 use engram_core::types::{ImageManifest, Session, SessionSpec, SessionState};
 use engram_core::SessionId;
@@ -869,7 +869,19 @@ async fn boot_prepared(
     let boot_span = tracing::Span::current();
     let boot_handle = tokio::spawn(
         async move {
-            match crate::session_boot::boot_on_reserved_host(&st, inputs, host_id).await {
+            // ADR 0079: the direct (capacity-available) create pipeline is
+            // deliberately out-of-op — see the epoch-0 disposition note in
+            // the host's `check_session_epoch` — so the boot RPCs are
+            // unfenced here. The queued-create path fences via the
+            // create_boot verb.
+            match crate::session_boot::boot_on_reserved_host(
+                &st,
+                inputs,
+                host_id,
+                SessionFence::unfenced(),
+            )
+            .await
+            {
                 Ok(()) => Ok(()),
                 Err(crate::session_boot::BootError::NotStarted(e)) => {
                     // The sandbox never came up; release the reservation row so
@@ -1425,130 +1437,89 @@ pub struct ListSessionsResponse {
     pub sessions: Vec<SessionListItem>,
 }
 
+/// ADR 0079: how long `delete_session_core` observes its just-enqueued
+/// destroy op before returning the retryable "teardown in flight" 409.
+/// Short: the destroy verb's user-visible work (terminal flip + destroy
+/// RPC dispatch) lands in seconds; only an op queued behind a slow
+/// in-flight resume/evict outlasts this, and the retry is idempotent.
+const DESTROY_OBSERVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// ADR 0051: terminate a session + tear down its sandbox (gRPC
 /// `DeleteSession`). Idempotent: an already-terminal or unknown-then-raced
-/// session returns `Ok(())`. Holds the SAME hardened terminate-first /
-/// CAS-guarded teardown logic as the axum `delete_session` handler — only
-/// the return shape changed (`StatusCode` → `()`).
+/// session returns `Ok(())`.
+///
+/// ADR 0079: the teardown body (the terminate-first / fenced-teardown
+/// pipeline) is the DESTROY VERB (`session_verbs::destroy`); this handler
+/// only enqueues (idempotency key `"destroy"` — one destroy per session,
+/// ever) and bounded-observes the op. An in-flight resume/evict op ahead
+/// in the queue runs first — the terminate-races-resume #211 interleaving
+/// is closed by ordering, and the destroy claim's epoch bump fences any
+/// stale predecessor's writes.
 pub(crate) async fn delete_session_core(
     state: &SharedState,
     id: SessionId,
 ) -> Result<(), ApiError> {
-    // Drive the session to its FSM-legal terminal BEFORE destroying the
-    // sandbox. `terminate_session` reads the current state and picks the
-    // terminal `SessionState::terminal_target` permits — `Completed` for
-    // states that ran, `Failed` for the early states (Pending / Created)
-    // that never became usable (this is what fixes the
-    // `5fadd364` phantom: deleting a `Created` session used to drive an
-    // illegal Created→Completed that surfaced as Conflict, destroying the
-    // sandbox but leaving the row non-terminal). Terminating first also
-    // removes this row from the heartbeat reconcile's "active session whose
-    // sandbox is missing" view, so reconcile can't race us into HostLost
-    // during the (best-effort, can-take-seconds) destroy RPC below.
-    //
-    // - `Ok(None)`: already terminal — idempotent 204, nothing to tear down.
-    // - `Ok(Some((prev, target)))`: transitioned; emit + drop the broker
-    //   token, then destroy.
-    // - `Conflict`: a sibling (drain, dead-host detector, eviction scanner)
-    //   raced us to terminal — best-effort tear down, then 204. (ADR 0034:
-    //   deleting mid-eviction works this way — the scanner's racing
-    //   transition_session(Idle) then fails against the terminal row, fires
-    //   abort_inflight_snapshot, and releases the lease.)
-    //
-    // An unknown id surfaces as 404 from `terminate_session`'s own
-    // `get_session` — matching the get/exec contract — before any teardown.
-    //
-    // Capture the live sandbox binding (PG authority, read through the
-    // per-replica cache) BEFORE the terminal transition clears it, so the
-    // teardown below works on any replica (ADR 0047) — not just the pod
-    // that cached the bind. Without this, a delete fielded by a non-owning
-    // replica would `unbind` nothing and leak the sandbox (host reconcile
-    // GC is the backstop, but we tear down promptly here).
-    let bound_sandbox = state.resolve_sandbox(id).await;
-    match state.services.meta.terminate_session(id).await {
-        Ok(None) => return Ok(()),
-        Ok(Some((prev, target))) => {
-            state
-                .emit(
-                    id,
-                    SessionEvent::StatusChanged {
-                        from: prev,
-                        to: target,
-                        at: chrono::Utc::now(),
-                    },
-                )
-                .await?;
-            // ADR 0023: drop the session's credential-broker token so a
-            // terminated session can no longer mint git credentials.
-            // ADR 0047: the PG row is the authority; the map is a cache.
-            state.git_broker_tokens.remove(&id);
-            if let Err(e) = state.services.meta.delete_broker_token(id).await {
-                tracing::warn!(session_id = %id, error = %e,
-                    "delete_broker_token failed; ON DELETE CASCADE is the backstop");
+    use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState};
+    // An unknown id surfaces as 404 before any enqueue — matching the
+    // get/exec contract (and the retired inline body's `terminate_session`
+    // lookup).
+    state.services.meta.get_session(id).await?;
+
+    let outcome = crate::session_ops::enqueue(
+        state,
+        id,
+        OpKind::Destroy,
+        serde_json::json!({}),
+        Some("destroy"),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("destroy enqueue failed: {e}")))?;
+    // `Duplicate` = a prior DELETE already enqueued/ran the destroy (the
+    // burned idempotency key) — observe the session row alone.
+    let op_id = match outcome {
+        EnqueueOutcome::Claimed(op) | EnqueueOutcome::Queued(op) => Some(op.id),
+        EnqueueOutcome::Duplicate => None,
+    };
+
+    let deadline = std::time::Instant::now() + DESTROY_OBSERVE_TIMEOUT;
+    loop {
+        // The terminal flip is the user-visible outcome; it lands before
+        // the (best-effort, can-take-seconds) sandbox destroy finishes.
+        match state.services.meta.get_session(id).await {
+            Ok(s) if s.status.is_terminal() => return Ok(()),
+            Ok(_) => {}
+            // Row hard-deleted (FK cascade) — idempotent 204.
+            Err(engram_core::MetaError::NotFound) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        if let Some(op_id) = op_id {
+            if let Ok(Some(op)) = state.services.meta.op_get(op_id).await {
+                match op.state {
+                    OpState::Done => return Ok(()),
+                    OpState::Failed => {
+                        return Err(ApiError::Internal(format!(
+                            "session teardown failed: {}",
+                            op.error.as_deref().unwrap_or("destroy op failed")
+                        )));
+                    }
+                    OpState::Cancelled => {
+                        return Err(ApiError::Conflict(
+                            "session teardown was cancelled; retry the delete".into(),
+                        ));
+                    }
+                    OpState::Queued | OpState::Running => {}
+                }
             }
         }
-        Err(engram_core::MetaError::Conflict(msg)) => {
-            tracing::info!(
-                session_id = %id,
-                error = %msg,
-                "delete_session: state machine raced us (likely reconciler flipped to terminal first); returning 204 idempotently"
-            );
-            // Still tear down whatever's left for tidiness, then 204.
-            if let Some(sandbox_id) = bound_sandbox {
-                let _ = state.services.host.destroy(sandbox_id).await;
-            }
-            state.services.host.unbind_session(id).await;
-            return Ok(());
+        if std::time::Instant::now() >= deadline {
+            return Err(ApiError::Conflict(
+                "session teardown in flight (destroy op enqueued behind an in-flight \
+                 op); retry shortly"
+                    .into(),
+            ));
         }
-        Err(e) => return Err(e.into()),
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-
-    // Status is now terminal; reconcile won't touch this row anymore.
-    // Now tear down the sandbox and clear the routing columns.
-    if let Some(sandbox_id) = bound_sandbox {
-        if let Err(e) = state.services.host.destroy(sandbox_id).await {
-            tracing::warn!(
-                session_id = %id,
-                sandbox_id = %sandbox_id,
-                error = %e,
-                "sandbox destroy failed during session delete; host-agent reconcile will GC",
-            );
-        }
-        // ADR 0006: the host-agent unregisters its local proxy
-        // entry as part of `destroy`. No coordinator-side cleanup.
-    }
-
-    // Clear sandbox_id since the sandbox is destroyed; the session
-    // row is now terminal and won't be repopulated by startup
-    // routing rebuild even if it kept the column set, but tidy
-    // anyway so an audit query "what sandboxes does the coordinator
-    // think exist" matches reality.
-    //
-    // Issue #211: guard the clear on the EXACT sandbox we read +
-    // destroyed (`bound_sandbox`). The row is terminal, so a competing
-    // rebind onto it can't happen anymore — but a stale read elsewhere
-    // shouldn't be able to null a column that something else legitimately
-    // re-populated either. `Some(bound_sandbox)` means "only clear if the
-    // row still points at the sandbox I destroyed"; a `Conflict` (the
-    // binding already moved on) is benign here, so it's logged not failed.
-    if let Some(sandbox_id) = bound_sandbox {
-        if let Err(e) = state
-            .services
-            .meta
-            .assign_session_sandbox_guarded(id, None, Some(Some(sandbox_id)), &[])
-            .await
-        {
-            tracing::debug!(
-                session_id = %id,
-                sandbox_id = %sandbox_id,
-                error = %e,
-                "delete_session: guarded sandbox clear was a no-op (binding already \
-                 changed) — leaving it for the new owner",
-            );
-        }
-    }
-    state.services.host.unbind_session(id).await;
-    Ok(())
 }
 
 /// ADR 0023: when a forge is configured and the image declares `[git]`,

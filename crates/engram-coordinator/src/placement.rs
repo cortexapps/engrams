@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use engram_core::traits::{HostClient, MetadataStore};
+use engram_core::traits::{HostClient, MetadataStore, SessionFence};
 use engram_core::types::host::{CapStatus, HostRecord, HostStatus, ReservedBudget};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId};
@@ -785,15 +785,19 @@ pub async fn pick_capture_host(
 /// Pick a host for `ctx`, then `restore` from `metadata` on it. (The
 /// pre-0047 `HostRegistry::restore_for_session`, relocated.) Caller is
 /// responsible for `assign_session_host`.
+///
+/// `fence`: the resume verb's op epoch (ADR 0079) — stamps the restore
+/// RPC so a superseded executor's restore is rejected host-side.
 #[tracing::instrument(name = "coord.restore_for_session", skip_all)]
 pub async fn restore_for_session(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,
     ctx: &ScheduleContext<'_>,
     metadata: SnapshotMetadata,
+    fence: SessionFence,
 ) -> Result<(HostId, SandboxId), SandboxError> {
     let (host_id, backend) = pick_for_session(meta, registry, ctx).await?;
-    let sandbox_id = backend.restore(metadata).await?;
+    let sandbox_id = backend.restore(metadata, fence).await?;
     registry.record_sandbox_owner(sandbox_id, host_id);
     Ok((host_id, sandbox_id))
 }

@@ -45,7 +45,7 @@
 //! (ADR 0014 #7) makes back-to-back flushes idempotent.
 //!
 //! The subtle race is **post-snapshot writes that escape via the
-//! scheduler**. Inside `evict_idle_session`, `host.snapshot()`
+//! scheduler**. Inside the evict pipeline, `host.snapshot()`
 //! does pause→state.bin→resume (FC is RUNNING after that point),
 //! then the pipeline proceeds to `record_snapshot` → unbind →
 //! `transition_session(Idle)` → `destroy()`. Between FC's post-

@@ -1,5 +1,6 @@
 //! Idle-session eviction: the snapshot+destroy+mark-Idle *pipeline*
-//! plus (ADR 0034) the *eviction scanner* that drives it.
+//! (the evict VERB's body, ADR 0079) plus (ADR 0034) the *eviction
+//! scanner* that keeps `Evicting` rows enqueued.
 //!
 //! ADR 0013 + ADR 0011 follow-up #2 retired the polling driver that
 //! lived here. In a stateless coord, no single pod's local
@@ -7,22 +8,19 @@
 //! host owns that view. The host scans its local hub on a tick and
 //! POSTs candidates to `/api/hosts/:id/idle-eviction-candidates`.
 //!
-//! ADR 0034 split nomination from execution. The receiving handler
-//! only flips `Active → Evicting` (the pre-0034 inline pipeline died
-//! by cancellation whenever an eviction outlived the host's POST
-//! timeout — prod session 0782bea5). [`spawn_eviction_scanner`]
-//! sweeps `status='evicting'` on a 10s tick and runs
-//! [`evict_idle_session`] to completion outside any request
-//! lifetime; its first tick after coord startup is also what
-//! recovers rows wedged across a deploy. The pipeline is idempotent
-//! (registry guard at the top short-circuits if another pod already
-//! evicted the sandbox), so re-entry is safe.
+//! ADR 0034 split nomination from execution; ADR 0079 made execution a
+//! durable `session_ops` row. The nomination side (idle detector /
+//! handler) flips `Active → Evicting` and ENQUEUES the evict op; the
+//! op executor (`session_ops.rs`) drives [`run_evict_pipeline`] to a
+//! terminal row state, detached from any request lifetime, resuming at
+//! the recorded step after a coordinator death. [`spawn_eviction_scanner`]
+//! is now only the backstop that (re-)enqueues evict ops for `Evicting`
+//! rows whose op went missing (e.g. cancelled by an ascent that then
+//! never resumed) — it drives no pipeline itself.
 //!
 //! Auto-resume on next request is wired separately (`api/sessions.rs`
-//! exec/exec_stream/SSE handlers): if status is `Idle`, call the
-//! existing `resume` path before routing.
-
-use std::sync::Arc;
+//! exec/exec_stream/SSE handlers): if status is `Idle`, enqueue-and-
+//! observe the resume op before routing.
 
 use chrono::Utc;
 use engram_core::traits::SandboxBackend;
@@ -30,50 +28,40 @@ use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::SessionState;
 use engram_core::{SandboxId, SessionId};
 
+use crate::session_ops::OpCtx;
 use crate::state::{SessionEvent, SharedState};
 
-/// Tri-state result of [`evict_session_to_state`] / [`evict_idle_session`].
+/// Terminal shape of one [`run_evict_pipeline`] drive.
 ///
-/// Issue #214: the pipeline has three legitimate "no-op" arms that
-/// return without evacuating (lease already held, K5 status guard,
-/// registry guard). Before this enum they all collapsed to `Ok(())`,
-/// indistinguishable from a genuine evacuation. The `teleport_session`
-/// handler pinned the destination on the session row, ran the pipeline,
-/// and returned 202 "evacuating" on any `Ok(())` — so a skip left the
-/// pin set while the session NEVER entered `Evacuating`. No evac-resumer
-/// pass consumed the pin; it then strictly hijacked the session's *next*
-/// (unrelated) evacuation onto a possibly-full/gone host.
-///
-/// Returning the outcome lets callers distinguish the two: teleport
-/// removes the pin and returns 409 Conflict on `Skipped`, instead of
-/// pretending the move is in flight.
+/// Issue #214 heritage: the pipeline has legitimate "no-op" arms that
+/// return without evacuating (the K5 status guard). Distinguishing them
+/// lets the verb complete the op honestly and lets synchronous
+/// observers (admin `EvictIdle`) report what actually happened.
 #[derive(Debug, Clone)]
 pub enum EvictOutcome {
-    /// The pipeline ran: the session was (or is being, for the D5
-    /// background-finalize fast path) suspended to the target state.
+    /// The pipeline ran: the session was suspended to the target state
+    /// (for the D5 fast path, the host-owned finalize row also landed
+    /// or the bounded watch expired — the op held through it).
     Evacuated,
     /// ADR 0074 rung 2: the host had memory headroom, so instead of a
     /// full snapshot+destroy the VM was PAUSED in place (park_rung=2,
     /// session stays Evicting, harness alive in RAM). A returning
     /// user's prompt un-pauses it in <100ms (the rung-2 ascent); a
-    /// later pressure/dwell sweep descends it to a full eviction. The
-    /// scanner treats this like a completed nomination (the session is
-    /// no longer a fresh idle-evict candidate) but does NOT unbind.
+    /// later pressure/dwell sweep descends it via a FRESH evict op.
     ParkedPaused,
-    /// A re-entry / liveness guard fired; the session was NOT evacuated
-    /// by this call. The reason is operator-facing (surfaced in a 409).
+    /// A re-entry guard fired; the session was NOT evacuated by this
+    /// call (a concurrent op moved it first). The op completes Done.
     Skipped { reason: &'static str },
+    /// A fenced step/write: a successor re-claimed the op — this
+    /// executor stopped silently mid-pipeline.
+    Fenced,
+    /// The op's cooperative cancel flag was observed BEFORE any capture
+    /// side effect (the rung-1 window): the session is exactly as the
+    /// nomination left it (`Evicting`, VM untouched); the canceller's
+    /// `Active` transition owns the ascent.
+    CancelRequested,
 }
 
-/// Run the suspend pipeline for one sandbox. Pure function over
-/// `SharedState`; the loop above is just the driver. Multi-host
-/// production refactors the driver onto each host-agent and keeps
-/// this function as the canonical pipeline.
-///
-/// Backwards-compatible wrapper: transitions the session to `Idle`,
-/// matching the historical idle-eviction shape. Operator-driven
-/// drains (ADR 0018 commit 12) use [`evict_session_to_state`]
-/// directly with `target_state = Evacuating`.
 /// ADR 0074 rung-2 park bookkeeping, run after a successful `pause`:
 /// stamp `park_rung=2`/`parked_at`, and make the STATUS say what the VM
 /// is doing. The natural path enters already `Evicting` (nominated); the
@@ -83,24 +71,37 @@ pub enum EvictOutcome {
 /// Active-arm un-park stays as the backstop for the crash window between
 /// the pause and this transition.)
 async fn park_paused_bookkeeping(
-    state: &SharedState,
+    ctx: &OpCtx<'_>,
     session_id: SessionId,
     entry_status: SessionState,
 ) -> Result<(), engram_core::MetaError> {
-    state
+    let state = ctx.state;
+    // ADR 0079 (review finding #6): FENCED — a fenced-out predecessor must
+    // not stamp park_rung=2 over a successor's fresh state. Ok(false) =
+    // fenced; surface it as the `fenced:` Conflict the caller already maps
+    // to `EvictOutcome::Fenced`.
+    if !state
         .services
         .meta
-        .set_session_park_rung(session_id, 2, Some(Utc::now()))
-        .await?;
+        .fenced_set_session_park_rung(session_id, ctx.epoch, 2, Some(Utc::now()))
+        .await?
+    {
+        return Err(engram_core::MetaError::Conflict(
+            "fenced: successor re-claimed during park bookkeeping".into(),
+        ));
+    }
     if entry_status == SessionState::Active {
-        state
-            .services
-            .meta
-            .transition_session(session_id, SessionState::Evicting)
-            .await?;
+        crate::session_ops::transition_with_fence(
+            state,
+            session_id,
+            ctx.fence(),
+            SessionState::Evicting,
+        )
+        .await?;
         let _ = state
-            .emit(
+            .emit_fenced(
                 session_id,
+                ctx.fence(),
                 crate::state::SessionEvent::StatusChanged {
                     from: SessionState::Active,
                     to: SessionState::Evicting,
@@ -174,142 +175,170 @@ fn park_headroom_floor_pct() -> u8 {
         .unwrap_or(30)
 }
 
-pub async fn evict_idle_session(
-    state: &SharedState,
-    session_id: SessionId,
-    sandbox_id: SandboxId,
-) -> Result<EvictOutcome, EvictError> {
-    // The idle-evict entry point allows parking (ADR 0074 rung 2): if
-    // the host has memory headroom the VM is paused in place instead of
-    // fully captured. The rung reaper's DESCENT path calls
-    // `evict_session_to_state(.., allow_park=false)` to force the full
-    // capture even when headroom exists.
-    evict_session_to_state(state, session_id, sandbox_id, SessionState::Idle, true).await
-}
-
-/// ADR 0018 commit 12: parameterized suspend pipeline. Same pause →
-/// flush → memory-snapshot → destroy sequence as the legacy
-/// `evict_idle_session`, but the terminal state-machine transition
-/// is configurable. `Idle` is the user-paused (manual /resume)
-/// shape; `Evacuating` is the operator-drain / host-loss shape
-/// where the coord-side `evac_resumer` background task will pick
-/// the session up and drive it through `Evacuating → Created →
-/// Active` on a peer host.
+/// ADR 0079: the evict VERB's pipeline — the same pause → flush →
+/// memory-snapshot → destroy sequence the legacy `evict_session_to_state`
+/// ran, now driven under an op claim (the mutual exclusion; the
+/// `session_ops_one_running` index replaces the session lease) with
+/// durable step markers (`park_or_capture → mark_idle`).
 ///
-/// The non-target-state code paths (snapshot capture, registry
-/// unbind, sandbox destroy, event emission, snapshot commit) are
-/// IDENTICAL between the two — only the `transition_session`
-/// target and the resulting `StatusChanged` event payload differ.
-/// Sharing the pipeline guarantees both flows have the same
-/// recoverability invariants: snapshot is durable in BlobStorage
-/// before destroy, sandbox is force-flushed and paused before the
-/// memory dump, and the PG transition commits before the
-/// (best-effort) destroy so reconcile can't race the orphan path.
-pub async fn evict_session_to_state(
-    state: &SharedState,
-    session_id: SessionId,
-    sandbox_id: SandboxId,
+/// `target_state = Idle` is the user-paused (manual /resume) shape;
+/// `Evacuating` is the operator-drain shape where the `evac_resumer`
+/// scanner drives `Evacuating → Created → Active` on a peer host — the
+/// non-target-state code paths are IDENTICAL, so both flows share the
+/// recoverability invariants (snapshot durable before destroy, PG flips
+/// before the best-effort destroy so reconcile can't race the orphan
+/// path).
+///
+/// `nominated = true` (idle-detector / scanner / rung-descent ops)
+/// tightens the entry guard to `status == Evicting`: a rung-1/2 ascent
+/// that flipped the session back to `Active` is an authoritative cancel,
+/// and a nominated op that claims after it must no-op — this is what
+/// makes the cancel-then-transition in `try_cancel_nominated_eviction`
+/// race-free without a lease. Admin/drain ops (`nominated = false`)
+/// accept `Active | Evicting` (the ADR 0044 K5 legal-entry set).
+pub(crate) async fn run_evict_pipeline(
+    ctx: &OpCtx<'_>,
     target_state: SessionState,
     allow_park: bool,
+    nominated: bool,
 ) -> Result<EvictOutcome, EvictError> {
+    let state = ctx.state;
+    let session_id = ctx.op.session_id;
     // The pipeline only knows about Idle and Evacuating as legal
     // targets. Both share the "Active → captured-snapshot → suspended"
     // semantic; any other target would skip half the steps and break
     // the recovery invariants. Reject early with a clean error.
     if !matches!(target_state, SessionState::Idle | SessionState::Evacuating) {
         return Err(EvictError::Meta(format!(
-            "evict_session_to_state: target {target_state:?} not supported \
+            "run_evict_pipeline: target {target_state:?} not supported \
              (only Idle and Evacuating)",
         )));
     }
-    // ADR 0016 §A.1.5c: cross-replica re-entry guard backed by the
-    // `session_lease` PG table. Replaces A.1.5b's per-pod
-    // DashMap. If two callers (different coord pods, operator
-    // drain, future evacuation primitive) race into
-    // `evict_idle_session` for the same session, the second one's
-    // INSERT ... ON CONFLICT DO NOTHING returns 0 rows; we early-
-    // return Ok(()) with an info log. The first owns the pipeline.
-    // The RAII guard's Drop spawns a best-effort DELETE so the
-    // lease releases on every exit path (success, error, panic).
-    let _guard = match SessionLeaseGuard::try_acquire(state, session_id, Some(sandbox_id)).await {
-        Ok(Some(g)) => g,
-        Ok(None) => {
-            tracing::info!(
-                session_id = %session_id,
-                sandbox_id = %sandbox_id,
-                "idle eviction skipped: pipeline already in flight (session_lease row held)",
-            );
-            return Ok(EvictOutcome::Skipped {
-                reason: "eviction pipeline already in flight (session lease held)",
-            });
-        }
+
+    // ADR 0044 K5: race-free re-entry guard on the authoritative PG
+    // state. The op claim is the exclusion, so once we hold it any
+    // concurrent lifecycle op has *fully* completed — read the state and
+    // skip if the session is no longer evictable. Anything outside the
+    // legal-entry set (already `Idle`, mid-`Evacuating`, terminal, or —
+    // for nominated ops — back at `Active` via an ascent) means a peer
+    // already handled it.
+    let session = match state.services.meta.get_session(session_id).await {
+        Ok(s) => s,
         Err(e) => {
-            // Lease store unavailable. Honest failure mode: bail out
-            // and let the host's tick retry, rather than running an
-            // unguarded pipeline that might race a peer pod. The
-            // host-side gate (§A.1.5a) suppresses the storm.
             return Err(EvictError::Meta(format!(
-                "session lease acquire failed: {e}"
+                "evict: read session state under the op claim: {e}"
             )));
         }
     };
-
-    // ADR 0044 K5: race-free re-entry guard on the authoritative PG state.
-    // The lease above is held until after the PG transition, so once we hold
-    // it any concurrent eviction (idle-evict, admin drain, dead-host recovery)
-    // has *fully* completed — re-read the state and skip if the session is no
-    // longer evictable. `Active` (direct idle-evict / drain) and `Evicting`
-    // (backstop-nominated, scanner finishing the job) are the legal inputs;
-    // anything else (already `Idle`, mid-`Evacuating`, terminal) means a peer
-    // already handled it. The registry guard below catches the stale in-memory
-    // binding; this catches the case that wedged a session when an idle-evict
-    // completed exactly as a drain dispatched it — already `Idle`, but the
-    // drain still drove it to `Evacuating` on a destroyed sandbox.
-    let entry_status = match state.services.meta.get_session(session_id).await {
-        Ok(s) if !matches!(s.status, SessionState::Active | SessionState::Evicting) => {
-            tracing::info!(
-                session_id = %session_id,
-                state = s.status.as_str(),
-                "evict skipped: session no longer evictable (a concurrent eviction won the lease first)",
-            );
+    let entry_status = session.status;
+    let entry_legal = if nominated {
+        entry_status == SessionState::Evicting
+    } else {
+        matches!(entry_status, SessionState::Active | SessionState::Evicting)
+    };
+    if !entry_legal {
+        tracing::info!(
+            session_id = %session_id,
+            state = entry_status.as_str(),
+            nominated,
+            "evict skipped: session no longer evictable (a concurrent op moved it first)",
+        );
+        return Ok(EvictOutcome::Skipped {
+            reason: "session no longer evictable (a concurrent op moved it first)",
+        });
+    }
+    // The binding read here (PG authority, ADR 0047) replaces the old
+    // "sandbox_id param still bound?" guard — the row IS the binding.
+    let Some(sandbox_id) = session.sandbox_id else {
+        // Structurally inconsistent for a nominated row (`Evicting`
+        // implies a live VM): fall back to HostLost exactly as the
+        // retired scanner arm did — HostLost is not Active (no detector
+        // re-nominates) and not Idle (no durable snapshot is implied).
+        if nominated {
+            match crate::session_ops::transition_with_fence(
+                state,
+                session_id,
+                ctx.fence(),
+                SessionState::HostLost,
+            )
+            .await
+            {
+                Ok(prev) => {
+                    tracing::warn!(
+                        %session_id,
+                        "evict op: Evicting row has no bound sandbox; falling back to HostLost",
+                    );
+                    let _ = state
+                        .emit_fenced(
+                            session_id,
+                            ctx.fence(),
+                            SessionEvent::StatusChanged {
+                                from: prev,
+                                to: SessionState::HostLost,
+                                at: Utc::now(),
+                            },
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(%session_id, error = %e,
+                        "evict op: no-sandbox HostLost fallback transition failed");
+                }
+            }
             return Ok(EvictOutcome::Skipped {
-                reason: "session no longer evictable (a concurrent eviction won the lease first)",
+                reason: "Evicting row had no bound sandbox (fell back to HostLost)",
             });
         }
-        Ok(s) => s.status,
-        Err(e) => {
-            return Err(EvictError::Meta(format!(
-                "evict: re-read session state after lease: {e}"
-            )));
-        }
+        // Admin/drain flavor: nothing to evict — another actor already
+        // unbound it. A no-op, not an error (retrying can't grow a
+        // sandbox back; the admin entry points gate on a binding before
+        // enqueueing anyway).
+        return Ok(EvictOutcome::Skipped {
+            reason: "session has no bound sandbox (already evicted or relocated)",
+        });
     };
 
-    // ADR 0016 A.1.1: entry log. Was silent before — a coord pod
-    // running the pipeline repeatedly (e.g. retry storm, post-roll
-    // race) showed up only as host-side `chunked NBD disk flushed`
-    // lines with no coord-side counterpart, making the snapshot
-    // source impossible to attribute. Pair this with the
-    // "completed"/"skipping" logs below and the per-step warn arms
-    // so the full pipeline is auditable end-to-end.
+    // Cooperative cancel — honored ONLY here, before any capture side
+    // effect (the rung-1 window): the session is exactly as we found it
+    // (`Evicting` with the VM untouched, or `Active` for an admin op),
+    // and the canceller's `Active` transition owns the ascent. Once the
+    // capture starts we run the pipeline to completion — a post-capture
+    // cancel would strand host-side finalize state, and the standard
+    // resume-behind-evict ordering already covers the returning user.
+    if ctx.cancel_requested().await {
+        tracing::info!(%session_id, %sandbox_id, "evict op cancelled before capture (rung-1 ascent)");
+        return Ok(EvictOutcome::CancelRequested);
+    }
+
+    // ADR 0016 A.1.1: entry log. Pair this with the "completed"/
+    // "skipping" logs and the per-step warn arms so the full pipeline is
+    // auditable end-to-end.
     tracing::info!(
         session_id = %session_id,
         sandbox_id = %sandbox_id,
-        "idle eviction pipeline started",
+        target = target_state.as_str(),
+        allow_park,
+        "eviction pipeline started (op claim held)",
     );
 
-    // Guard: if the live binding (read through to PG — this scanner may
-    // run on a replica that never cached the bind, ADR 0047) is no
-    // longer this sandbox, the session was already evicted or relocated
-    // by some other path (operator, dead-host detector). No-op cleanly.
-    if state.resolve_sandbox(session_id).await != Some(sandbox_id) {
-        tracing::info!(
-            session_id = %session_id,
-            sandbox_id = %sandbox_id,
-            "idle eviction skipped: sandbox no longer bound",
-        );
-        return Ok(EvictOutcome::Skipped {
-            reason: "sandbox no longer bound (already evicted or relocated)",
-        });
+    // Durable step boundary: park-or-capture begins. A crash after this
+    // point resumes here; every leg below is idempotent-from-step (the
+    // host's snapshot_begin re-observes its pending job, the composed
+    // capture re-captures, the PG flips are legality/fence-guarded).
+    if !ctx.step("park_or_capture").await {
+        return Ok(EvictOutcome::Fenced);
+    }
+
+    // ADR 0074 rung descent: a parked-paused VM (park_rung == 2) being
+    // force-evicted (`allow_park = false`, the reaper's descent op) must
+    // be UN-PAUSED first so the capture pipeline (browser reap, flush,
+    // guest agent RPCs) talks to a live guest. Idempotent-from-step: a
+    // re-driven op re-issues the resume; un-pausing a running VM is a
+    // host-side no-op.
+    if session.park_rung == 2 && !allow_park {
+        if let Err(e) = state.services.host.resume(sandbox_id, ctx.fence()).await {
+            return Err(EvictError::Sandbox(e));
+        }
     }
 
     // Step 1: take a snapshot. ADR 0007 Phase 6: backend owns its
@@ -346,8 +375,8 @@ pub async fn evict_session_to_state(
         // `allow_park == false` is the reaper's DESCENT path (already
         // parked, now forcing the full capture) — it must never re-park.
         if allow_park && host_has_memory_headroom(state, session_id).await {
-            match state.services.host.pause(sandbox_id).await {
-                Ok(()) => match park_paused_bookkeeping(state, session_id, entry_status).await {
+            match state.services.host.pause(sandbox_id, ctx.fence()).await {
+                Ok(()) => match park_paused_bookkeeping(ctx, session_id, entry_status).await {
                     Ok(()) => {
                         ::metrics::counter!(crate::metrics::EVICTION_PARKED_PAUSED_TOTAL)
                             .increment(1);
@@ -355,14 +384,21 @@ pub async fn evict_session_to_state(
                                 "rung-2 park: VM paused in place (host has memory headroom)");
                         return Ok(EvictOutcome::ParkedPaused);
                     }
+                    // Fenced mid-bookkeeping: stop silently — never
+                    // compensate (un-pause) from a fenced executor.
+                    Err(engram_core::MetaError::Conflict(msg)) if msg.starts_with("fenced:") => {
+                        return Ok(EvictOutcome::Fenced);
+                    }
                     Err(e) => {
                         tracing::warn!(session_id = %session_id, error = %e,
                                 "rung-2 park: bookkeeping failed; un-pausing and falling through to full eviction");
-                        let _ = state.services.host.resume(sandbox_id).await;
+                        let _ = state.services.host.resume(sandbox_id, ctx.fence()).await;
+                        // Fenced compensation (review finding #6): a no-op
+                        // if a successor re-claimed — never wipe its rung.
                         let _ = state
                             .services
                             .meta
-                            .set_session_park_rung(session_id, 0, None)
+                            .fenced_set_session_park_rung(session_id, ctx.epoch, 0, None)
                             .await;
                     }
                 },
@@ -380,11 +416,15 @@ pub async fn evict_session_to_state(
         // snapshot so a live Chrome is never frozen into it (re-lazy-started on
         // the next EnsureBrowser after resume). Best-effort; never blocks eviction.
         let _ = state.services.host.stop_browser(sandbox_id).await;
-        match state.services.host.snapshot_begin(sandbox_id).await {
+        match state
+            .services
+            .host
+            .snapshot_begin(sandbox_id, ctx.fence())
+            .await
+        {
             Ok(snapshot_id) => {
-                finish_eviction_background(state, session_id, sandbox_id, snapshot_id, _guard)
-                    .await?;
-                return Ok(EvictOutcome::Evacuated);
+                return finish_eviction_d5(ctx, session_id, sandbox_id, snapshot_id, &session)
+                    .await;
             }
             Err(engram_core::SandboxError::InvalidSpec(reason)) => {
                 tracing::debug!(
@@ -400,7 +440,7 @@ pub async fn evict_session_to_state(
     let metadata = state
         .services
         .host
-        .snapshot(sandbox_id)
+        .snapshot(sandbox_id, ctx.fence())
         .await
         .map_err(EvictError::Sandbox)?;
 
@@ -462,9 +502,34 @@ pub async fn evict_session_to_state(
         events_cursor,
         fc_snapshot_version,
     };
-    if let Err(e) = state.services.meta.record_snapshot(record.clone()).await {
-        abort_inflight_snapshot(state, session_id, sandbox_id, "record_snapshot").await;
-        return Err(EvictError::Meta(e.to_string()));
+    // ADR 0079 (re-review findings #3/#4): record the row UNDER OUR FENCE.
+    // The whole `park_or_capture` step brackets pause → snapshot → record →
+    // commit with no intermediate `ctx.step()` fence check, and the capture
+    // leg can run minutes; a coord↔PG partition that outlasts `RECLAIM_STALE`
+    // lets a successor re-claim this session (bumping `current_epoch`) while
+    // we're mid-capture. A plain INSERT here would land a phantom
+    // `recoverable` row a resume could pick (the 89f7984d durability-lie
+    // class), and we'd then issue `commit_snapshot` under the stale epoch.
+    // `fenced_record_snapshot` writes NOTHING when the epoch has moved:
+    match state
+        .services
+        .meta
+        .fenced_record_snapshot(record.clone(), ctx.epoch)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            // Fenced out mid-capture: do NOT record, do NOT commit. Abort
+            // the host's in-flight snapshot (best-effort — rejected if the
+            // successor already advanced the host high-water, which is fine)
+            // and stop; the successor op owns the capture now.
+            abort_inflight_snapshot(ctx, session_id, sandbox_id, "fenced_record_snapshot").await;
+            return Ok(EvictOutcome::Fenced);
+        }
+        Err(e) => {
+            abort_inflight_snapshot(ctx, session_id, sandbox_id, "record_snapshot").await;
+            return Err(EvictError::Meta(e.to_string()));
+        }
     }
 
     // ADR 0034 durability: commit the host's in-flight snapshot NOW —
@@ -481,7 +546,12 @@ pub async fn evict_session_to_state(
     // 89f7984d (2026-06-04). Best-effort: a genuine host RPC failure
     // here is rare and backstopped by resume-time blob verification
     // (see `api::snapshot::resume_from_idle`).
-    if let Err(e) = state.services.host.commit_snapshot(sandbox_id).await {
+    if let Err(e) = state
+        .services
+        .host
+        .commit_snapshot(sandbox_id, ctx.fence())
+        .await
+    {
         tracing::warn!(
             session_id = %session_id,
             sandbox_id = %sandbox_id,
@@ -511,43 +581,76 @@ pub async fn evict_session_to_state(
     // bookkeeping (proxy unregister, jail teardown) still runs;
     // a failed destroy() is best-effort the same as before.
 
+    // Durable step boundary: the capture is committed; what remains is
+    // the PG flip + destroy. A crash-resume from here re-runs the guard
+    // (already-Idle → Skipped) or re-captures (idempotent — a second
+    // snapshot row is a fresh checkpoint).
+    if !ctx.step("mark_idle").await {
+        return Ok(EvictOutcome::Fenced);
+    }
+
     // Step 3 (PG, Idle-before-destroy): clear sandbox_id on the
     // session row — ADR 0047, this is the authoritative unbind (no
-    // in-memory registry to drop).
-    if let Err(e) = state
+    // in-memory registry to drop). Fenced; `host_id` is re-written
+    // unchanged (the fenced write sets both columns) to preserve the
+    // resume path's origin-affinity hint.
+    match state
         .services
         .meta
-        .assign_session_sandbox(session_id, None)
+        .fenced_assign_sandbox(session_id, ctx.epoch, None, session.host_id)
         .await
     {
-        tracing::warn!(
-            session_id = %session_id,
-            error = %e,
-            "idle eviction: assign_session_sandbox(None) failed",
-        );
+        Ok(true) => {}
+        Ok(false) => return Ok(EvictOutcome::Fenced),
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "idle eviction: fenced_assign_sandbox(None) failed",
+            );
+        }
     }
-    // Step 3c (PG, Idle-before-destroy): flip to Idle. Once this
+    // Step 3c (PG, Idle-before-destroy): flip to the target. Once this
     // commits, the reconciler will no-op on every subsequent
     // heartbeat for this session because the reconcile pass keys
     // on Active status only.
-    let prev = match state
-        .services
-        .meta
-        .transition_session(session_id, target_state)
-        .await
+    let prev = match crate::session_ops::transition_with_fence(
+        state,
+        session_id,
+        ctx.fence(),
+        target_state,
+    )
+    .await
     {
         Ok(prev) => prev,
+        // Fenced (a successor re-claimed): stop silently — never
+        // compensate from a fenced executor; the successor owns the
+        // in-flight snapshot's fate.
+        Err(engram_core::MetaError::Conflict(msg)) if msg.starts_with("fenced:") => {
+            return Ok(EvictOutcome::Fenced);
+        }
         Err(e) => {
-            abort_inflight_snapshot(state, session_id, sandbox_id, "transition_session").await;
+            abort_inflight_snapshot(ctx, session_id, sandbox_id, "transition_session").await;
             return Err(EvictError::Meta(e.to_string()));
         }
     };
+    // The parking ladder leaves no trace in the terminal state — a
+    // descent (or a plain eviction of a never-parked session, where this
+    // is a no-op) clears the rung with the Idle flip.
+    if session.park_rung != 0 {
+        // Fenced (review finding #6): clears the rung under OUR epoch only.
+        let _ = state
+            .services
+            .meta
+            .fenced_set_session_park_rung(session_id, ctx.epoch, 0, None)
+            .await;
+    }
 
     // Step 4 (host destroy, post-PG): now the session is Idle,
     // destroy the sandbox. Best-effort — failures don't bubble
     // because the PG state is already correct; the host's
     // orphan_reap background task cleans up a stuck sandbox.
-    if let Err(e) = state.services.host.destroy(sandbox_id).await {
+    if let Err(e) = state.services.host.destroy(sandbox_id, ctx.fence()).await {
         tracing::warn!(
             session_id = %session_id,
             sandbox_id = %sandbox_id,
@@ -558,9 +661,14 @@ pub async fn evict_session_to_state(
     // ADR 0006: host-agent unregisters its local proxy entry as
     // part of `destroy`. No coordinator-side cleanup needed.
 
+    // Review finding #6: fenced emits. Ok(None) = a successor re-claimed
+    // between our committed transition and here — stop emitting silently
+    // (never compensate/abort from a fenced predecessor); the transition
+    // already committed under our epoch, so the eviction is done.
     if let Err(e) = state
-        .emit(
+        .emit_fenced(
             session_id,
+            ctx.fence(),
             SessionEvent::SnapshotTaken {
                 snapshot_id: metadata.id,
                 size_bytes: metadata.size_bytes,
@@ -569,19 +677,20 @@ pub async fn evict_session_to_state(
         )
         .await
     {
-        abort_inflight_snapshot(state, session_id, sandbox_id, "emit SnapshotTaken").await;
+        abort_inflight_snapshot(ctx, session_id, sandbox_id, "emit SnapshotTaken").await;
         return Err(EvictError::Emit(e.to_string()));
     }
     if let Err(e) = state
-        .emit(session_id, SessionEvent::Evicted { at: now })
+        .emit_fenced(session_id, ctx.fence(), SessionEvent::Evicted { at: now })
         .await
     {
-        abort_inflight_snapshot(state, session_id, sandbox_id, "emit Evicted").await;
+        abort_inflight_snapshot(ctx, session_id, sandbox_id, "emit Evicted").await;
         return Err(EvictError::Emit(e.to_string()));
     }
     if let Err(e) = state
-        .emit(
+        .emit_fenced(
             session_id,
+            ctx.fence(),
             SessionEvent::StatusChanged {
                 from: prev,
                 to: target_state,
@@ -590,7 +699,7 @@ pub async fn evict_session_to_state(
         )
         .await
     {
-        abort_inflight_snapshot(state, session_id, sandbox_id, "emit StatusChanged").await;
+        abort_inflight_snapshot(ctx, session_id, sandbox_id, "emit StatusChanged").await;
         return Err(EvictError::Emit(e.to_string()));
     }
 
@@ -607,67 +716,91 @@ pub async fn evict_session_to_state(
     Ok(EvictOutcome::Evacuated)
 }
 
-/// ADR 0045 D5 (rewritten for issue #529): the fast-path tail of an idle
-/// eviction. The capture has landed (`snapshot_begin` returned) and —
-/// unlike the pre-#529 shape — the finalize is now a HOST-OWNED job: the
-/// host durably persisted its inputs before `snapshot_begin` returned,
-/// and it will eventually land the snapshot row itself via the
-/// heartbeat reconcile (`api/host_http.rs::heartbeat`), survive this
-/// coordinator dying, restarting, or never seeing the upload complete.
+/// ADR 0045 D5 (rewritten for issue #529, then ADR 0079): the fast-path
+/// tail of an idle eviction. The capture has landed (`snapshot_begin`
+/// returned) and the finalize is a HOST-OWNED job: the host durably
+/// persisted its inputs before `snapshot_begin` returned, and it lands
+/// the snapshot row itself via the heartbeat reconcile
+/// (`api/host_http.rs::heartbeat`) — surviving this coordinator dying,
+/// restarting, or never seeing the upload complete.
 ///
-/// So this function's job shrinks to: mark the session Idle NOW
-/// (user-visible teardown ends here — unchanged), then hold the lease
-/// — the thing that serializes a concurrent resume against an in-flight
-/// finalize (a resume during upload still 409s, exactly as before) —
-/// until the row it's waiting for actually lands, or a generous deadline
-/// passes. No host RPCs, no `record_snapshot`, no `commit_snapshot`, no
-/// `abort_snapshot`, no `destroy` — the coordinator never touches the
-/// sandbox or the artifacts again on this path. A coordinator death
-/// mid-watch degrades gracefully: the 180s lease reaper frees resume,
-/// worst case resume briefly sees the prior checkpoint while the row
-/// lands via heartbeat regardless — bounded staleness, never loss.
-async fn finish_eviction_background(
-    state: &SharedState,
+/// This function marks the session Idle NOW (user-visible teardown ends
+/// here) and FINISHES THE EVICT OP immediately — it does NOT hold the
+/// session's one-running op lane for the upload (ADR 0079 review finding
+/// #11: an earlier draft watched the finalize row and blocked a queued
+/// resume/deliver for up to the upload's duration, reintroducing the
+/// evict-then-resume stall this epic exists to kill). The finalize is
+/// host-owned: the upload proceeds on the host, and the coordinator
+/// learns the durable snapshot row via the heartbeat reconcile
+/// (`api/host_http.rs::heartbeat`), independent of any op. The instant
+/// the session is Idle it is resumable; a resume that arrives before the
+/// row lands falls back to the prior periodic checkpoint (ADR 0028's
+/// documented-acceptable bounded loss), never waits on the upload.
+async fn finish_eviction_d5(
+    ctx: &OpCtx<'_>,
     session_id: SessionId,
     sandbox_id: SandboxId,
     snapshot_id: engram_core::types::SnapshotId,
-    lease: SessionLeaseGuard,
-) -> Result<(), EvictError> {
+    session: &engram_core::types::Session,
+) -> Result<EvictOutcome, EvictError> {
+    let state = ctx.state;
     let now = Utc::now();
 
+    if !ctx.step("mark_idle").await {
+        return Ok(EvictOutcome::Fenced);
+    }
     // Idle-before-durable: PG sandbox detach (the authoritative unbind,
-    // ADR 0047 — no in-memory registry), then state flip.
-    if let Err(e) = state
+    // ADR 0047 — no in-memory registry), then state flip. Fenced;
+    // `host_id` is re-written unchanged to preserve resume affinity.
+    match state
         .services
         .meta
-        .assign_session_sandbox(session_id, None)
+        .fenced_assign_sandbox(session_id, ctx.epoch, None, session.host_id)
         .await
     {
-        tracing::warn!(session_id = %session_id, error = %e,
-            "D5 eviction: assign_session_sandbox(None) failed");
+        Ok(true) => {}
+        Ok(false) => return Ok(EvictOutcome::Fenced),
+        Err(e) => {
+            tracing::warn!(session_id = %session_id, error = %e,
+                "D5 eviction: fenced_assign_sandbox(None) failed");
+        }
     }
-    let prev = match state
-        .services
-        .meta
-        .transition_session(session_id, SessionState::Idle)
-        .await
+    let prev = match crate::session_ops::transition_with_fence(
+        state,
+        session_id,
+        ctx.fence(),
+        SessionState::Idle,
+    )
+    .await
     {
         Ok(prev) => prev,
+        Err(engram_core::MetaError::Conflict(msg)) if msg.starts_with("fenced:") => {
+            return Ok(EvictOutcome::Fenced);
+        }
         Err(e) => {
             // Issue #529: the host's finalize artifacts are ALREADY
             // durable (snapshot_begin returned) — there is nothing to
-            // abort or destroy here. The eviction scanner's retry hits
-            // the idempotent `snapshot_begin` and re-observes the same
-            // pending job rather than re-capturing.
+            // abort or destroy here. The op's retry hits the idempotent
+            // `snapshot_begin` and re-observes the same pending job
+            // rather than re-capturing.
             return Err(EvictError::Meta(e.to_string()));
         }
     };
+    if session.park_rung != 0 {
+        // Fenced (review finding #6).
+        let _ = state
+            .services
+            .meta
+            .fenced_set_session_park_rung(session_id, ctx.epoch, 0, None)
+            .await;
+    }
     let _ = state
-        .emit(session_id, SessionEvent::Evicted { at: now })
+        .emit_fenced(session_id, ctx.fence(), SessionEvent::Evicted { at: now })
         .await;
     let _ = state
-        .emit(
+        .emit_fenced(
             session_id,
+            ctx.fence(),
             SessionEvent::StatusChanged {
                 from: prev,
                 to: SessionState::Idle,
@@ -683,304 +816,41 @@ async fn finish_eviction_background(
          job (issue #529) — the row lands via the heartbeat reconcile",
     );
 
-    // The row-watcher. Owns the lease (heartbeat-touched every 60s, via
-    // the same `spawn_heartbeat` the resume pipeline uses, so the 180s
-    // reaper never fires mid-wait — issue #147's secondary bug, same
-    // fix, reused rather than hand-rolled here) until the row lands or
-    // the deadline passes.
-    let state = state.clone();
-    tokio::spawn(async move {
-        let _heartbeat = lease.spawn_heartbeat(std::time::Duration::from_secs(60));
-        let deadline_secs = std::env::var("ENGRAM_EVICT_FINALIZE_WAIT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(900);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
-        // Overridable so tests don't eat a real 2s per poll tick.
-        let poll_ms = std::env::var("ENGRAM_EVICT_FINALIZE_POLL_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(2_000);
-        let mut poll = tokio::time::interval(std::time::Duration::from_millis(poll_ms));
-        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            poll.tick().await;
-            match state.services.meta.get_snapshot(snapshot_id).await {
-                Ok(Some(_)) => {
-                    tracing::info!(
-                        session_id = %session_id,
-                        sandbox_id = %sandbox_id,
-                        snapshot_id = %snapshot_id,
-                        "idle eviction finalize row landed (host-owned, issue #529)",
-                    );
-                    break;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        snapshot_id = %snapshot_id,
-                        error = %e,
-                        "D5 row-watcher: get_snapshot failed; retrying",
-                    );
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                ::metrics::counter!(crate::metrics::EVICTION_FINALIZE_ROW_WAIT_TIMEOUT_TOTAL)
-                    .increment(1);
-                tracing::warn!(
-                    session_id = %session_id,
-                    sandbox_id = %sandbox_id,
-                    snapshot_id = %snapshot_id,
-                    deadline_secs,
-                    "D5 row-watcher: deadline passed before the finalize row landed; \
-                     releasing the lease — the host-owned job keeps retrying \
-                     independently and the row will land whenever it lands",
-                );
-                break;
-            }
-        }
-        // `_heartbeat` and `lease` drop here, releasing both.
-    });
-    Ok(())
-}
-
-/// ADR 0016 §A.1.5c: RAII guard around the `session_lease` PG
-/// row. `try_acquire` does INSERT ... ON CONFLICT DO NOTHING; on
-/// 1 row affected returns `Ok(Some(Self))`, on 0 rows affected
-/// returns `Ok(None)` (lease held by another caller). Drop spawns
-/// a best-effort DELETE so the lease releases on every exit path
-/// (success, error, panic). A stale row that survives a panic /
-/// pod crash is reaped by `spawn_session_lease_reaper` at 180s.
-///
-/// Held by both the idle-eviction pipeline (`evict_session_to_state`)
-/// and the resume path (`api::snapshot::resume_session`) so the two
-/// can never drive one session concurrently — without it, a resume
-/// racing an eviction (or two resumes) builds a live VM before the
-/// serializing state transition and orphans a sandbox. `sandbox_id`
-/// is diagnostic: `Some` for an eviction, `None` for a resume (no
-/// sandbox exists yet).
-pub(crate) struct SessionLeaseGuard {
-    meta: Arc<dyn engram_core::traits::MetadataStore>,
-    session_id: SessionId,
-    locked_by: String,
-}
-
-impl SessionLeaseGuard {
-    pub(crate) async fn try_acquire(
-        state: &SharedState,
-        session_id: SessionId,
-        sandbox_id: Option<SandboxId>,
-    ) -> Result<Option<Self>, engram_core::MetaError> {
-        let acquired = state
-            .services
-            .meta
-            .try_acquire_session_lease(session_id, sandbox_id, state.pod_id.as_str())
-            .await?;
-        if acquired {
-            Ok(Some(Self {
-                meta: state.services.meta.clone(),
-                session_id,
-                locked_by: state.pod_id.to_string(),
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// ADR 0045 D5 / issue #147: refresh `locked_at` so a long-running
-    /// holder (the eviction finalize task awaiting a slow upload) is
-    /// never reaped mid-work by `sweep_stale_session_leases`.
-    ///
-    /// Distinguishes a genuine "lease gone" (`Lost` — the row no longer
-    /// belongs to this holder, reaped or re-acquired) from a transient
-    /// transport error against PG (`TransientError`). Issue #209: a
-    /// holder whose abandonment destroys live state (the migration
-    /// finalize tearing down a VM, the idle-evict finalize destroying a
-    /// sandbox) must retry on `TransientError` rather than collapse one
-    /// PG blip into "lost ownership" and abandon the work. Only `Lost` is
-    /// authoritative.
-    pub(crate) async fn touch_checked(&self) -> LeaseTouch {
-        match self
-            .meta
-            .touch_session_lease(self.session_id, &self.locked_by)
-            .await
-        {
-            Ok(true) => LeaseTouch::Held,
-            Ok(false) => LeaseTouch::Lost,
-            Err(e) => LeaseTouch::TransientError(e),
-        }
-    }
-
-    /// Issue #212: spawn a background task that refreshes this lease's
-    /// `locked_at` every `interval` for as long as the returned
-    /// `LeaseHeartbeat` is alive. Use this for holders whose pipeline is a
-    /// straight-line sequence of multi-second host RPCs that don't already
-    /// have a `select!`/touch loop of their own — chiefly the resume
-    /// pipeline (`api::snapshot`), whose restore RPC deadline (240s)
-    /// exceeds the 180s reap window. Without it the resume guard is reaped
-    /// mid-pipeline, another holder re-acquires, and the original guard's
-    /// (now holder-scoped) release no-ops while two pipelines briefly race
-    /// the session — the heartbeat prevents the reap in the first place.
-    ///
-    /// A `LeaseTouch::Lost` from the heartbeat is logged but does NOT abort
-    /// the pipeline here: the holder-scoped release + the binding-write CAS
-    /// guards are the authoritative safety net, and the heartbeat is a
-    /// reap-avoidance optimisation, not a control-flow signal. Dropping the
-    /// handle aborts the loop (RAII, tied to the guard's scope).
-    pub(crate) fn spawn_heartbeat(&self, interval: std::time::Duration) -> LeaseHeartbeat {
-        let meta = self.meta.clone();
-        let session_id = self.session_id;
-        let locked_by = self.locked_by.clone();
-        let handle = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            tick.tick().await; // consume the immediate first tick
-            loop {
-                tick.tick().await;
-                match meta.touch_session_lease(session_id, &locked_by).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::warn!(
-                            %session_id,
-                            %locked_by,
-                            "lease heartbeat: touch affected 0 rows — lease reaped or \
-                             stolen; holder-scoped release/CAS guards remain authoritative",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            %session_id,
-                            %locked_by,
-                            error = %e,
-                            "lease heartbeat: touch transport error — will retry next tick",
-                        );
-                    }
-                }
-            }
-        });
-        LeaseHeartbeat { handle }
-    }
-}
-
-/// RAII handle for a lease heartbeat task (see
-/// [`SessionLeaseGuard::spawn_heartbeat`]). Dropping it aborts the touch
-/// loop, so the heartbeat is scoped to whatever owns this handle —
-/// typically held alongside the moved `SessionLeaseGuard` inside the
-/// resume pipeline task.
-pub(crate) struct LeaseHeartbeat {
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for LeaseHeartbeat {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
-
-/// Outcome of a lease `touch_checked`. `Lost` is authoritative (the row
-/// is gone or owned by someone else — give up ownership); a
-/// `TransientError` is a PG-transport blip the caller may retry through.
-pub(crate) enum LeaseTouch {
-    Held,
-    Lost,
-    TransientError(engram_core::MetaError),
-}
-
-impl Drop for SessionLeaseGuard {
-    fn drop(&mut self) {
-        // Drop is sync; release runs as a detached tokio task. Best-
-        // effort: if the runtime is shutting down or the DELETE fails,
-        // the stale-lease reaper (`spawn_session_lease_reaper`)
-        // cleans it up at the next 180s tick.
-        let meta = self.meta.clone();
-        let session_id = self.session_id;
-        let locked_by = self.locked_by.clone();
-        tokio::spawn(async move {
-            match meta.release_session_lease(session_id, &locked_by).await {
-                Ok(true) => {}
-                // 0-row delete: this holder no longer owned the row. It was
-                // reaped (held >180s without a touch) and possibly already
-                // re-acquired by another holder. The scoped DELETE protected
-                // the new holder from a blind delete; warn for forensics.
-                Ok(false) => {
-                    tracing::warn!(
-                        %session_id,
-                        %locked_by,
-                        "session lease release affected 0 rows — lease was reaped \
-                         or stolen before Drop; another holder may now own it",
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        %session_id,
-                        %locked_by,
-                        error = %e,
-                        "session lease release failed; stale-lease reaper will retry",
-                    );
-                }
-            }
-        });
-    }
-}
-
-/// ADR 0016 §A.1.5c stale-lease reaper. Background task spawned at
-/// coord startup. Every 30s, deletes `session_lease` rows older
-/// than `max_age` (default 180s — 6× the prior host-side timeout,
-/// matches the §A.1.5a sweep threshold). One `tracing::warn!` per
-/// reaped row carries `(session_id, sandbox_id, locked_by,
-/// locked_at)` for operator postmortems.
-///
-/// Returns the spawned `JoinHandle` so the caller can hold it for
-/// the process lifetime; dropping the handle aborts the loop.
-pub fn spawn_session_lease_reaper(
-    meta: Arc<dyn engram_core::traits::MetadataStore>,
-    max_age: std::time::Duration,
-    poll_interval: std::time::Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(poll_interval);
-        // Skip the first immediate tick — gives PG a moment to
-        // settle after coord startup before we start sweeping.
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            match meta.sweep_stale_session_leases(max_age).await {
-                Ok(reaped) => {
-                    for lease in reaped {
-                        tracing::warn!(
-                            session_id = %lease.session_id,
-                            sandbox_id = ?lease.sandbox_id,
-                            locked_by = %lease.locked_by,
-                            locked_at = %lease.locked_at,
-                            max_age_secs = max_age.as_secs(),
-                            "ADR 0016 §A.1.5c: reaped stale session lease",
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "session lease reaper sweep failed; will retry next tick",
-                    );
-                }
-            }
-        }
-    })
+    // ADR 0079 (review finding #11): the evict op FINISHES here — the
+    // instant the session is durably Idle. The 900s inline finalize
+    // row-watch that used to live here HELD the session's one-running op
+    // lane for the whole upload, blocking any queued resume/deliver behind
+    // it (the very "evict-then-resume collision gone" property the op log
+    // is meant to deliver would fail on the full-evict path). The finalize
+    // is genuinely host-owned: the host durably persisted its inputs
+    // before `snapshot_begin` returned and lands the snapshot row itself
+    // via the heartbeat reconcile, surviving this coordinator dying — so
+    // there is nothing the coordinator must hold the lane to watch. A
+    // resume that arrives before the row lands falls back to the prior
+    // checkpoint (ADR 0028 — "the same blast radius as an active host
+    // death"), which is the accepted tradeoff for making the session
+    // resumable the INSTANT it's Idle.
+    Ok(EvictOutcome::Evacuated)
 }
 
 /// ADR 0014 issue #1/#2: best-effort `abort_snapshot` after a
-/// downstream pipeline failure in [`evict_idle_session`]. Logs but
+/// downstream pipeline failure in [`run_evict_pipeline`]. Logs but
 /// never propagates — the caller's pipeline error is what surfaces.
 /// Hosts implement abort idempotently so spurious double-calls are
 /// safe.
 async fn abort_inflight_snapshot(
-    state: &SharedState,
+    ctx: &OpCtx<'_>,
     session_id: SessionId,
     sandbox_id: SandboxId,
     scope: &'static str,
 ) {
-    if let Err(e) = state.services.host.abort_snapshot(sandbox_id).await {
+    if let Err(e) = ctx
+        .state
+        .services
+        .host
+        .abort_snapshot(sandbox_id, ctx.fence())
+        .await
+    {
         tracing::warn!(
             session_id = %session_id,
             sandbox_id = %sandbox_id,
@@ -1022,15 +892,18 @@ impl std::error::Error for EvictError {
 
 // The TTL env helpers + the soft/hard-TTL detection driver live on
 // the host-agent (`engram_host_agent::idle_evictor`). The coord owns
-// the `evict_idle_session` pipeline above and (ADR 0034) the
-// eviction scanner below that drives it for `Evicting` rows.
+// the `run_evict_pipeline` verb body above and (ADR 0034 / ADR 0079)
+// the eviction scanner below that keeps `Evicting` rows ENQUEUED.
 
-// ─── ADR 0034: eviction scanner ──────────────────────────────────
+// ─── ADR 0034 / ADR 0079: eviction scanner ───────────────────────
 //
-// Same shape as `evac_resumer`: spawn loop → per-tick list-by-status
-// → per-session attempt-bump + budget → primitive. The nomination
-// side (handler / detection backstop) only flips Active → Evicting;
-// everything heavy happens here, detached from any request lifetime.
+// The nomination side (idle detector / handler) flips Active →
+// Evicting and enqueues the evict op; the op EXECUTOR drives the
+// pipeline. This scanner is the backstop only: an `Evicting` row with
+// no queued/running evict op (its op was cancelled by an ascent that
+// then never resumed, or was enqueued by a pre-op-log coordinator) is
+// re-enqueued. It drives no pipeline itself — the retry budget lives
+// on the op row (`session_verbs::EVICT_MAX_ATTEMPTS`).
 
 #[derive(Clone, Debug)]
 pub struct EvictionScannerConfig {
@@ -1038,21 +911,12 @@ pub struct EvictionScannerConfig {
     /// `EvacResumerConfig::poll_interval` — same operational cadence
     /// for all session-lifecycle scanners.
     pub poll_interval: std::time::Duration,
-    /// Retry budget per session before falling back to `HostLost`.
-    /// At the 10s cadence, 20 attempts is ~3 minutes of continuous
-    /// pipeline failure (blob-store flake, host gRPC errors). The
-    /// fallback is HostLost — NOT Active (would re-nominate forever),
-    /// NOT Idle (lies: no durable snapshot exists and the sandbox is
-    /// still running), NOT Dead (destroys a healthy runtime over a
-    /// coord-side failure). See ADR 0034.
-    pub max_attempts: u32,
 }
 
 impl Default for EvictionScannerConfig {
     fn default() -> Self {
         Self {
             poll_interval: std::time::Duration::from_secs(10),
-            max_attempts: 20,
         }
     }
 }
@@ -1061,10 +925,10 @@ impl Default for EvictionScannerConfig {
 /// JoinHandle for the process lifetime; dropping aborts the loop.
 /// Mirrors [`crate::evac_resumer::spawn`].
 ///
-/// The first sweep after coord startup is the deploy-recovery story:
-/// a row left `Evicting` by a pod that died mid-pipeline is picked
-/// up here and re-driven (the pipeline is idempotent; the session
-/// lease serializes against any surviving peer pod).
+/// The first sweep after coord startup is part of the deploy-recovery
+/// story: a row left `Evicting` with no op (see the module doc) gets a
+/// fresh evict op here; a row whose op is still queued/running is left
+/// to the op executor (its reclaim sweep owns a dead pod's op).
 pub fn spawn_eviction_scanner(
     cfg: EvictionScannerConfig,
     state: SharedState,
@@ -1073,7 +937,7 @@ pub fn spawn_eviction_scanner(
         let mut tick = tokio::time::interval(cfg.poll_interval);
         loop {
             tick.tick().await;
-            if let Err(e) = scanner_run_once(&cfg, &state).await {
+            if let Err(e) = scanner_run_once(&state).await {
                 tracing::warn!(error = %e, "eviction scanner tick failed; will retry");
             }
         }
@@ -1083,7 +947,6 @@ pub fn spawn_eviction_scanner(
 /// Single scanner tick. `pub(crate)` so tests can drive the scanner
 /// deterministically without `tokio::spawn`-ing the loop.
 pub(crate) async fn scanner_run_once(
-    cfg: &EvictionScannerConfig,
     state: &SharedState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let candidates = state.services.meta.list_evicting_sessions().await?;
@@ -1098,18 +961,17 @@ pub(crate) async fn scanner_run_once(
         count = candidates.len(),
         "eviction scanner found Evicting sessions"
     );
-    for (session, attempts) in candidates {
+    for (session, _attempts) in candidates {
         // ADR 0074 rungs 2-3: a PARKED session (park_rung >= 2) is not a
-        // fresh eviction to drive — the reaper owns its dwell/pressure
-        // descent. Route it there instead of the eviction pipeline (which
-        // `scanner_advance_one` also guards against, defensively).
+        // fresh eviction to enqueue — the reaper owns its dwell/pressure
+        // descent. Route it there.
         if session.park_rung >= 2 {
             if let Err(e) = park_reaper_advance_one(state, session).await {
                 tracing::warn!(error = %e, "park reaper per-session advance failed");
             }
             continue;
         }
-        if let Err(e) = scanner_advance_one(cfg, state, session, attempts).await {
+        if let Err(e) = scanner_advance_one(state, session).await {
             // Keep going — one wedged session shouldn't stall the
             // sweep.
             tracing::warn!(error = %e, "eviction scanner per-session advance failed");
@@ -1119,44 +981,25 @@ pub(crate) async fn scanner_run_once(
 }
 
 // ADR 0019 / telemetry restoration (#526): scanner-driven work has no
-// request span to inherit — give it an explicit root so the pipeline's
+// request span to inherit — give it an explicit root so the enqueue's
 // spans correlate by `session_id` instead of exporting as disconnected
 // roots with no shared attribute.
 #[tracing::instrument(name = "idle_evictor.advance_one", skip_all, fields(session_id = %session.id))]
 async fn scanner_advance_one(
-    cfg: &EvictionScannerConfig,
     state: &SharedState,
     session: engram_core::types::Session,
-    attempts: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_id = session.id;
 
-    // ADR 0074 rungs 2-3: a session left Evicting at a PARKED rung
-    // (park_rung >= 2) has already been through the pipeline — it is
-    // deliberately holding at a resource-cheaper rung (paused in RAM /
-    // data-plane retained on host), NOT a fresh eviction to drive. The
-    // rung reaper (`park_reaper_advance_one`) owns descending it on
-    // dwell/pressure. If this scanner drove the pipeline again it would
-    // re-pause an already-parked VM and bump evict_attempts every tick
-    // until the budget exhausted the session straight to HostLost.
-    if session.park_rung >= 2 {
-        return Ok(());
-    }
-
-    // Budget exhausted, or an inconsistent row (Evicting without a
-    // bound sandbox — nothing to evict): fall back to HostLost. The
-    // existing HostLost machinery (dead-host second stage, host-side
-    // orphan reap, manual /resume) owns recovery from there, and
-    // HostLost is not Active so neither detector re-nominates — the
-    // loop is broken by construction.
-    let fallback_reason = if attempts >= cfg.max_attempts {
-        Some("retry budget exhausted")
-    } else if session.sandbox_id.is_none() {
-        Some("Evicting row has no bound sandbox")
-    } else {
-        None
-    };
-    if let Some(reason) = fallback_reason {
+    // An Evicting row with no bound sandbox is structurally
+    // inconsistent (nothing to evict): fall back to HostLost NOW rather
+    // than enqueue a guaranteed no-op. The existing HostLost machinery
+    // (dead-host second stage, host-side orphan reap, manual /resume)
+    // owns recovery from there, and HostLost is not Active so neither
+    // detector re-nominates — the loop is broken by construction.
+    // (The evict verb has the same fallback for a binding that vanishes
+    // between this enqueue and its claim.)
+    if session.sandbox_id.is_none() {
         match state
             .services
             .meta
@@ -1167,10 +1010,7 @@ async fn scanner_advance_one(
                 ::metrics::counter!(crate::metrics::EVICTION_BUDGET_EXHAUSTED_TOTAL).increment(1);
                 tracing::warn!(
                     %session_id,
-                    attempts,
-                    max_attempts = cfg.max_attempts,
-                    reason,
-                    "eviction scanner gave up; session falls back to HostLost",
+                    "eviction scanner: Evicting row has no bound sandbox; falling back to HostLost",
                 );
                 let _ = state
                     .emit(
@@ -1195,30 +1035,37 @@ async fn scanner_advance_one(
         }
         return Ok(());
     }
-    // Checked Some() above via fallback_reason.
-    let sandbox_id = session.sandbox_id.expect("checked above");
 
-    // Bump pre-pipeline: a failure leaves the counter incremented and
-    // the session at Evicting — next tick retries until the budget
-    // runs out. `transition_session(Evicting)` resets the counter on
-    // every (re-)entry per migration 0050's CASE expression.
-    let new_attempts = state.services.meta.bump_evict_attempts(session_id).await?;
-    tracing::info!(
-        %session_id,
-        %sandbox_id,
-        attempt = new_attempts,
-        max_attempts = cfg.max_attempts,
-        "eviction scanner: starting pipeline attempt",
-    );
+    // A running evict op already owns this row — nothing to do. (Queued
+    // dedup rides the idempotency key below.)
+    if let Some(op) = state.services.meta.op_running_for(session_id).await? {
+        if op.kind == engram_core::types::session_op::OpKind::Evict {
+            return Ok(());
+        }
+    }
 
-    let started = std::time::Instant::now();
-    evict_idle_session(state, session_id, sandbox_id).await?;
-    // Only successful runs are recorded — the histogram answers "how
-    // long does a completed eviction take" (the pre-0034 bug would
-    // reappear as nominations without completions, not as a latency
-    // shift).
-    ::metrics::histogram!(crate::metrics::EVICTION_PIPELINE_SECONDS)
-        .record(started.elapsed().as_secs_f64());
+    // (Re-)enqueue the evict op. The idempotency key is stable per
+    // NOMINATION (`last_active_at` is stamped by the Active → Evicting
+    // transition and doesn't move while the row stays Evicting), so a
+    // 10s-tick scanner enqueues at most ONE op per nomination — a
+    // duplicate sweep (or a sibling replica's) hits `Duplicate`. A
+    // cancelled/failed op burns the key; the next NOMINATION mints a new
+    // one (and a cancelled-op session that stays Evicting because its
+    // canceller never resumed it gets re-enqueued via a fresh key only
+    // after re-nomination — the ascent's Active transition is what
+    // normally ends that state).
+    let key = format!("evict:{}", session.last_active_at.timestamp_millis());
+    let outcome = crate::session_ops::enqueue(
+        state,
+        session_id,
+        engram_core::types::session_op::OpKind::Evict,
+        serde_json::json!({ "target": "idle", "allow_park": true, "nominated": true }),
+        Some(&key),
+    )
+    .await?;
+    if let engram_core::types::session_op::EnqueueOutcome::Claimed(_) = outcome {
+        tracing::info!(%session_id, "eviction scanner: enqueued evict op (claimed)");
+    }
     Ok(())
 }
 
@@ -1245,20 +1092,21 @@ fn park_dwell_cap() -> chrono::Duration {
 ///   parking was to use spare RAM; once it's scarce the parked VM must
 ///   yield.
 ///
-/// Descending un-pauses the VM (so `stop_browser` + the capture see a
-/// live guest) and re-drives the eviction pipeline with `allow_park =
-/// false`, which forces the full snapshot+destroy regardless of
-/// headroom. On success the session lands at `Idle` with a durable
-/// snapshot, exactly like a plain idle eviction — the parking was a
-/// transparent latency optimization that left no trace in the terminal
-/// state.
+/// ADR 0079: descending ENQUEUES an evict op with `allow_park = false`
+/// (forcing the full snapshot+destroy regardless of headroom); the verb
+/// un-pauses the VM as its first pipeline leg. The idempotency key is
+/// stable per park instant, so repeat ticks while the op is in flight
+/// dedup to `Duplicate`. On success the session lands at `Idle` with a
+/// durable snapshot and `park_rung` cleared, exactly like a plain idle
+/// eviction — the parking was a transparent latency optimization that
+/// left no trace in the terminal state.
 #[tracing::instrument(name = "idle_evictor.park_reaper", skip_all, fields(session_id = %session.id, park_rung = session.park_rung))]
 async fn park_reaper_advance_one(
     state: &SharedState,
     session: engram_core::types::Session,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_id = session.id;
-    let Some(sandbox_id) = session.sandbox_id else {
+    let Some(_sandbox_id) = session.sandbox_id else {
         // A parked row with no bound sandbox is inconsistent (park
         // implies a live VM). Clear the rung and let the normal scanner
         // path fall it back to HostLost on the next tick.
@@ -1291,34 +1139,38 @@ async fn park_reaper_advance_one(
         return Ok(());
     };
 
-    tracing::info!(%session_id, %sandbox_id, reason, "park reaper: descending parked-paused VM to full eviction");
-    // Un-pause first so the capture pipeline (browser reap, flush, guest
-    // agent RPCs) talks to a live guest. A failed un-pause is transient —
-    // leave the session parked and retry next tick.
-    if let Err(e) = state.services.host.resume(sandbox_id).await {
-        tracing::warn!(%session_id, %sandbox_id, error = %e,
-            "park reaper: un-pause before descent failed; will retry next tick");
-        return Ok(());
+    // Key the descent to the park instant: at most one descent op per
+    // park, dedup'd across ticks and replicas.
+    let key = format!(
+        "evict-descend:{}",
+        session
+            .parked_at
+            .map(|t| t.timestamp_millis())
+            .unwrap_or_default()
+    );
+    let outcome = crate::session_ops::enqueue(
+        state,
+        session_id,
+        engram_core::types::session_op::OpKind::Evict,
+        serde_json::json!({ "target": "idle", "allow_park": false, "nominated": true }),
+        Some(&key),
+    )
+    .await?;
+    if !matches!(
+        outcome,
+        engram_core::types::session_op::EnqueueOutcome::Duplicate
+    ) {
+        ::metrics::counter!(crate::metrics::EVICTION_PARK_DESCEND_TOTAL, "reason" => reason)
+            .increment(1);
+        tracing::info!(%session_id, reason, "park reaper: enqueued descent op (parked-paused → full eviction)");
     }
-    ::metrics::counter!(crate::metrics::EVICTION_PARK_DESCEND_TOTAL, "reason" => reason)
-        .increment(1);
-
-    // Full capture with parking disabled. The pipeline stamps park_rung
-    // back to 0 as part of landing the session at Idle (see the Idle
-    // transition below), so a completed descent leaves no parked state.
-    evict_session_to_state(state, session_id, sandbox_id, SessionState::Idle, false).await?;
-    let _ = state
-        .services
-        .meta
-        .set_session_park_rung(session_id, 0, None)
-        .await;
     Ok(())
 }
 
 /// Marker that this module exists so unused-arg checkers don't
 /// flag the `Arc<dyn SandboxBackend>` we explicitly take below.
 #[allow(dead_code)]
-fn _backend_unused_check<B: SandboxBackend>(_: Arc<B>) {}
+fn _backend_unused_check<B: SandboxBackend>(_: std::sync::Arc<B>) {}
 
 #[cfg(test)]
 mod tests {
@@ -1329,14 +1181,55 @@ mod tests {
     use crate::state::AppState;
     use crate::Services;
     use engram_cloud_mock::MockCloud;
+    use engram_core::traits::SessionFence;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
     use engram_core::types::session::SessionMode;
+    use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp};
     use engram_core::types::{Session, SessionState};
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
     use std::path::Path;
+    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    /// Claim an evict op for `id` and drive it to a terminal row state —
+    /// the executor's own drive path, run synchronously so tests are
+    /// deterministic. Returns the terminal op row.
+    async fn drive_evict(
+        state: &SharedState,
+        id: engram_core::SessionId,
+        allow_park: bool,
+        nominated: bool,
+    ) -> SessionOp {
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                id,
+                OpKind::Evict,
+                serde_json::json!({
+                    "target": "idle", "allow_park": allow_park, "nominated": nominated
+                }),
+                None,
+                "test-pod",
+            )
+            .await
+            .expect("enqueue+claim")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy at claim: {other:?}"),
+        };
+        let op_id = op.id;
+        crate::session_ops::drive_claimed(state, op).await;
+        state
+            .services
+            .meta
+            .op_get(op_id)
+            .await
+            .expect("op_get")
+            .expect("op row exists")
+    }
 
     fn build_state_with_session(session: Session, sandbox_root: &Path) -> SharedState {
         build_state_and_meta(session, sandbox_root).0
@@ -1616,9 +1509,14 @@ mod tests {
     /// notice it via `get_snapshot` polling and release its lease
     /// without the coordinator ever calling `commit_snapshot`/`destroy`
     /// on this path.
+    /// Review finding #11: the D5 evict op FINISHES the instant the
+    /// session is durably Idle — it does NOT hold the session's one-running
+    /// op lane through the (host-owned) finalize upload. The old inline
+    /// 900s finalize row-watch blocked any queued resume/deliver behind
+    /// it; now the finalize is genuinely host-owned (lands via the
+    /// heartbeat reconcile) and the lane is free the moment it's Idle.
     #[tokio::test]
-    async fn d5_eviction_is_idle_before_durable_and_row_watcher_observes_the_host_landed_row() {
-        std::env::set_var("ENGRAM_EVICT_FINALIZE_POLL_MS", "20");
+    async fn d5_eviction_is_idle_and_frees_the_lane_without_watching_finalize() {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
@@ -1626,89 +1524,6 @@ mod tests {
             host_id: None,
             sandbox_id: None,
             image: "test/repo:d5".into(),
-            mode: SessionMode::Agent,
-            created_at: chrono::Utc::now(),
-            last_active_at: chrono::Utc::now(),
-            live_disk_manifest: None,
-            park_rung: 0,
-            parked_at: None,
-        };
-        let sandbox_root = TempDir::new().unwrap();
-        let (state, meta, stashed) = d5_state(session, sandbox_root.path());
-        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state
-            .services
-            .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
-            .await
-            .unwrap();
-
-        evict_session_to_state(&state, session_id, sandbox_id, SessionState::Idle, false)
-            .await
-            .expect("evict");
-
-        // Idle immediately; NO row yet, NO commit/destroy call — the
-        // coordinator's job here is done except for the row-watcher.
-        let m = meta.clone();
-        wait_for("session Idle", move || {
-            m.session.lock().status == SessionState::Idle
-        })
-        .await;
-        assert!(
-            meta.snapshots.lock().is_empty(),
-            "row-only-at-host-finalize: no snapshot row before the host lands it"
-        );
-        assert!(
-            futures::executor::block_on(state.services.host.list())
-                .unwrap()
-                .contains(&sandbox_id),
-            "the coordinator must NOT destroy the sandbox on this path — that's the \
-             host-owned finalize job's job now",
-        );
-
-        // Simulate the host's heartbeat reconcile landing the row —
-        // the finalize job this harness doesn't itself run.
-        let metadata = stashed.lock().take().expect("snapshot_begin ran");
-        let record = SnapshotRecord {
-            id: metadata.id,
-            session_id: Some(session_id),
-            host_id: None,
-            image_version: metadata.image_version,
-            size_bytes: metadata.size_bytes,
-            created_at: metadata.created_at,
-            last_accessed_at: Utc::now(),
-            disk_manifest: metadata.disk_manifest,
-            memory_manifest: metadata.memory_manifest,
-            recoverable: true,
-            aux_bundles: metadata.aux_bundles,
-            events_cursor: None,
-            fc_snapshot_version: None,
-        };
-        state.services.meta.record_snapshot(record).await.unwrap();
-
-        let m = meta.clone();
-        wait_for("row-watcher observes the landed row", move || {
-            !m.snapshots.lock().is_empty()
-        })
-        .await;
-        std::env::remove_var("ENGRAM_EVICT_FINALIZE_POLL_MS");
-    }
-
-    /// Issue #529: the row-watcher's deadline is bounded — a finalize
-    /// that never lands a row (e.g. quarantined) doesn't hang the
-    /// watcher task forever; it releases the lease at the deadline
-    /// (verified indirectly: the lease becomes acquirable again).
-    #[tokio::test]
-    async fn d5_row_watcher_releases_the_lease_at_its_deadline() {
-        std::env::set_var("ENGRAM_EVICT_FINALIZE_POLL_MS", "10");
-        std::env::set_var("ENGRAM_EVICT_FINALIZE_WAIT_SECS", "0");
-        let session_id = engram_core::SessionId::new();
-        let session = Session {
-            id: session_id,
-            status: SessionState::Active,
-            host_id: None,
-            sandbox_id: None,
-            image: "test/repo:d5-timeout".into(),
             mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
@@ -1726,36 +1541,52 @@ mod tests {
             .await
             .unwrap();
 
-        evict_session_to_state(&state, session_id, sandbox_id, SessionState::Idle, false)
-            .await
-            .expect("evict");
-
-        // No row ever lands. With WAIT_SECS=0 the watcher's very first
-        // tick is already past its deadline; the lease releases quickly.
-        wait_for(
-            "lease released after the row-watcher's deadline",
-            move || {
-                futures::executor::block_on(SessionLeaseGuard::try_acquire(
-                    &state, session_id, None,
-                ))
-                .ok()
-                .flatten()
-                .is_some()
-            },
-        )
-        .await;
+        // The evict op returns Done promptly — NO finalize watch to wait
+        // out (this would have blocked up to 900s before finding #11).
+        let op = drive_evict(&state, session_id, false, false).await;
+        assert_eq!(
+            op.state,
+            OpState::Done,
+            "the evict op finishes the instant the session is Idle, not after finalize",
+        );
+        assert_eq!(meta.session.lock().status, SessionState::Idle);
         assert!(
             meta.snapshots.lock().is_empty(),
-            "the deadline path must never fabricate a row"
+            "row-only-at-host-finalize: no snapshot row before the host lands it",
         );
-        std::env::remove_var("ENGRAM_EVICT_FINALIZE_POLL_MS");
-        std::env::remove_var("ENGRAM_EVICT_FINALIZE_WAIT_SECS");
-        // Session stays Idle (resume falls back to the prior checkpoint).
-        assert_eq!(meta.session.lock().status, SessionState::Idle);
+        assert!(
+            state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "the coordinator must NOT destroy the sandbox — that's the host-owned \
+             finalize job's job now",
+        );
+        // The lane is FREE the instant it's Idle: a fresh resume op claims
+        // immediately (the finding-#11 property — no 900s block).
+        let resume = state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Resume,
+                serde_json::json!({}),
+                None,
+                "pod",
+            )
+            .await
+            .expect("enqueue resume");
+        assert!(
+            matches!(resume, EnqueueOutcome::Claimed(_)),
+            "a resume must claim the lane immediately after the evict op finishes; got {resume:?}",
+        );
     }
 
     #[tokio::test]
-    async fn evict_idle_session_runs_full_pipeline() {
+    async fn evict_op_runs_full_pipeline() {
         // ADR 0005: the eviction pipeline is now snapshot + destroy +
         // mark-Idle only. The auto-checkpoint pre-step is gone — git
         // is no longer the platform's durability primitive.
@@ -1796,9 +1627,8 @@ mod tests {
 
         let mut sub = state.events.subscribe(session_id);
 
-        evict_idle_session(&state, session_id, sandbox_id)
-            .await
-            .expect("eviction should succeed");
+        let op = drive_evict(&state, session_id, true, false).await;
+        assert_eq!(op.state, OpState::Done, "eviction op should succeed");
 
         // Session is Idle and its sandbox_id is cleared (PG authority).
         let after = state.services.meta.get_session(session_id).await.unwrap();
@@ -1841,7 +1671,7 @@ mod tests {
     /// is exactly the failure mode that filled `engrams-fc-xngk` in
     /// 13 minutes.
     #[tokio::test]
-    async fn evict_idle_session_aborts_snapshot_when_record_snapshot_fails() {
+    async fn evict_op_aborts_snapshot_when_record_snapshot_fails() {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc as StdArc;
 
@@ -1865,8 +1695,9 @@ mod tests {
             async fn destroy(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.destroy(id).await
+                self.inner.destroy(id, fence).await
             }
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
@@ -1889,37 +1720,42 @@ mod tests {
             async fn snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError>
             {
-                self.inner.snapshot(id).await
+                self.inner.snapshot(id, fence).await
             }
             async fn commit_snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
                 self.commits.fetch_add(1, Ordering::SeqCst);
-                self.inner.commit_snapshot(id).await
+                self.inner.commit_snapshot(id, fence).await
             }
             async fn abort_snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
                 self.aborts.fetch_add(1, Ordering::SeqCst);
-                self.inner.abort_snapshot(id).await
+                self.inner.abort_snapshot(id, fence).await
             }
             async fn restore(
                 &self,
                 metadata: engram_core::types::snapshot::SnapshotMetadata,
+                fence: SessionFence,
             ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
-                self.inner.restore(metadata).await
+                self.inner.restore(metadata, fence).await
             }
             async fn start_agent(
                 &self,
                 id: engram_core::SandboxId,
                 agent: engram_core::types::sandbox::AgentSpec,
                 policy: engram_core::types::egress::SessionEgressPolicy,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.start_agent(id, agent, policy).await
+                self.inner.start_agent(id, agent, policy, fence).await
             }
             async fn apply_egress_policy(
                 &self,
@@ -2037,13 +1873,20 @@ mod tests {
             .await
             .unwrap();
 
-        let err = evict_idle_session(&state, session_id, sandbox_id)
-            .await
-            .expect_err("record_snapshot failure must bubble out of evict_idle_session");
-        match err {
-            EvictError::Meta(_) => {}
-            other => panic!("expected EvictError::Meta, got {other:?}"),
-        }
+        let op = drive_evict(&state, session_id, false, false).await;
+        assert_eq!(
+            op.state,
+            OpState::Queued,
+            "a record_snapshot failure is retryable — the op requeues with backoff",
+        );
+        assert!(
+            op.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("idle evict meta"),
+            "the pipeline error is recorded on the row: {:?}",
+            op.error,
+        );
 
         assert_eq!(
             aborts.load(Ordering::SeqCst),
@@ -2059,7 +1902,7 @@ mod tests {
 
     /// Sanity inverse: full pipeline success → commit fires, no abort.
     #[tokio::test]
-    async fn evict_idle_session_commits_snapshot_on_full_success() {
+    async fn evict_op_commits_snapshot_on_full_success() {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc as StdArc;
 
@@ -2081,8 +1924,9 @@ mod tests {
             async fn destroy(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.destroy(id).await
+                self.inner.destroy(id, fence).await
             }
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
@@ -2105,37 +1949,42 @@ mod tests {
             async fn snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError>
             {
-                self.inner.snapshot(id).await
+                self.inner.snapshot(id, fence).await
             }
             async fn commit_snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
                 self.commits.fetch_add(1, Ordering::SeqCst);
-                self.inner.commit_snapshot(id).await
+                self.inner.commit_snapshot(id, fence).await
             }
             async fn abort_snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
                 self.aborts.fetch_add(1, Ordering::SeqCst);
-                self.inner.abort_snapshot(id).await
+                self.inner.abort_snapshot(id, fence).await
             }
             async fn restore(
                 &self,
                 metadata: engram_core::types::snapshot::SnapshotMetadata,
+                fence: SessionFence,
             ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
-                self.inner.restore(metadata).await
+                self.inner.restore(metadata, fence).await
             }
             async fn start_agent(
                 &self,
                 id: engram_core::SandboxId,
                 agent: engram_core::types::sandbox::AgentSpec,
                 policy: engram_core::types::egress::SessionEgressPolicy,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.start_agent(id, agent, policy).await
+                self.inner.start_agent(id, agent, policy, fence).await
             }
             async fn apply_egress_policy(
                 &self,
@@ -2249,9 +2098,8 @@ mod tests {
             .await
             .unwrap();
 
-        evict_idle_session(&state, session_id, sandbox_id)
-            .await
-            .expect("full pipeline must succeed");
+        let op = drive_evict(&state, session_id, false, false).await;
+        assert_eq!(op.state, OpState::Done, "full pipeline must succeed");
 
         assert_eq!(
             commits.load(Ordering::SeqCst),
@@ -2275,7 +2123,7 @@ mod tests {
     /// `recoverable=true` — bricking the resume (prod incident
     /// 89f7984d). Asserts the call order snapshot → commit → destroy.
     #[tokio::test]
-    async fn evict_idle_session_commits_before_destroy() {
+    async fn evict_op_commits_before_destroy() {
         use std::sync::Arc as StdArc;
         use std::sync::Mutex as StdMutex;
 
@@ -2296,9 +2144,10 @@ mod tests {
             async fn destroy(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
                 self.seq.lock().unwrap().push("destroy");
-                self.inner.destroy(id).await
+                self.inner.destroy(id, fence).await
             }
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
@@ -2321,38 +2170,43 @@ mod tests {
             async fn snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError>
             {
                 self.seq.lock().unwrap().push("snapshot");
-                self.inner.snapshot(id).await
+                self.inner.snapshot(id, fence).await
             }
             async fn commit_snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
                 self.seq.lock().unwrap().push("commit");
-                self.inner.commit_snapshot(id).await
+                self.inner.commit_snapshot(id, fence).await
             }
             async fn abort_snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
                 self.seq.lock().unwrap().push("abort");
-                self.inner.abort_snapshot(id).await
+                self.inner.abort_snapshot(id, fence).await
             }
             async fn restore(
                 &self,
                 metadata: engram_core::types::snapshot::SnapshotMetadata,
+                fence: SessionFence,
             ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
-                self.inner.restore(metadata).await
+                self.inner.restore(metadata, fence).await
             }
             async fn start_agent(
                 &self,
                 id: engram_core::SandboxId,
                 agent: engram_core::types::sandbox::AgentSpec,
                 policy: engram_core::types::egress::SessionEgressPolicy,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.start_agent(id, agent, policy).await
+                self.inner.start_agent(id, agent, policy, fence).await
             }
             async fn apply_egress_policy(
                 &self,
@@ -2464,9 +2318,8 @@ mod tests {
             .await
             .unwrap();
 
-        evict_idle_session(&state, session_id, sandbox_id)
-            .await
-            .expect("full pipeline must succeed");
+        let op = drive_evict(&state, session_id, false, false).await;
+        assert_eq!(op.state, OpState::Done, "full pipeline must succeed");
 
         let seq = seq.lock().unwrap().clone();
         let snapshot_pos = seq
@@ -2496,15 +2349,13 @@ mod tests {
         );
     }
 
-    /// ADR 0016 §A.1.5c regression guard. With a peer pod's lease
-    /// pre-installed in the `session_lease` table (simulated
-    /// via MiniMeta's in-memory mirror), a fresh
-    /// `evict_idle_session` call must short-circuit to Ok(())
-    /// without touching the session. Once the peer's lease is
-    /// released, a follow-on call must acquire cleanly and run
-    /// the pipeline to completion.
+    /// ADR 0079 regression guard (the retired session-lease's job): with
+    /// a rival pod's op RUNNING on the session, a fresh evict enqueue
+    /// QUEUES behind it — the session is untouched until the rival
+    /// finishes, at which point the queue drive runs the eviction to
+    /// completion, in order.
     #[tokio::test]
-    async fn evict_idle_session_lease_serializes_concurrent_calls() {
+    async fn op_claim_serializes_concurrent_drivers() {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
@@ -2520,7 +2371,7 @@ mod tests {
             parked_at: None,
         };
         let sandbox_root = TempDir::new().unwrap();
-        let state = build_state_with_session(session, sandbox_root.path());
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
 
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
         state
@@ -2530,76 +2381,49 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate a peer coord pod holding the lease — direct
-        // insert into MiniMeta's in-memory mirror is the
-        // equivalent of another pod's prior
-        // `try_acquire_session_lease` having returned `true`.
-        state
+        // A rival pod's op is mid-flight (one running op per session —
+        // the `session_ops_one_running` invariant).
+        let rival = meta.ops.seed_running(session_id, OpKind::Resume);
+
+        // A fresh evict enqueue must QUEUE, not claim.
+        let outcome = state
             .services
             .meta
-            .try_acquire_session_lease(session_id, Some(sandbox_id), "peer-pod-fixture")
-            .await
-            .expect("MiniMeta lease acquire never errors")
-            .then_some(())
-            .expect("peer's lease must acquire cleanly");
-
-        evict_idle_session(&state, session_id, sandbox_id)
-            .await
-            .expect("contention must short-circuit to Ok(()), not error");
-
-        // Session was untouched — the early return happened before
-        // any pipeline work.
-        let after = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(
-            after.status,
-            SessionState::Active,
-            "lease guard must short-circuit before transitioning session",
-        );
-        assert!(
-            after.sandbox_id.is_some(),
-            "lease guard must short-circuit before unbinding",
-        );
-
-        // Release the peer's lease and verify a fresh call now
-        // runs the full pipeline. The successful call's RAII
-        // Drop releases its own lease, so a third call would also
-        // succeed (asserted via the post-state assertion below).
-        state
-            .services
-            .meta
-            .release_session_lease(session_id, "peer-pod-fixture")
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({ "target": "idle", "allow_park": false, "nominated": false }),
+                None,
+                "test-pod",
+            )
             .await
             .unwrap();
+        assert!(
+            matches!(outcome, EnqueueOutcome::Queued(_)),
+            "an enqueue behind a running op must queue, got {outcome:?}",
+        );
 
-        evict_idle_session(&state, session_id, sandbox_id)
-            .await
-            .expect("call with no contention must run the pipeline");
+        // Session untouched while the rival runs.
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(after.status, SessionState::Active);
+        assert!(after.sandbox_id.is_some());
+
+        // The rival finishes; the queue drive picks the evict up in
+        // order and runs it to completion.
+        assert!(meta
+            .ops
+            .finish(rival.id, rival.epoch.unwrap(), OpState::Done, None));
+        crate::session_ops::drive_session(&state, session_id).await;
 
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(
             after.status,
             SessionState::Idle,
-            "after the peer lease releases, a fresh eviction must complete",
+            "after the rival op finishes, the queued eviction must complete",
         );
-
-        // Yield once so the detached release tokio::spawn from
-        // the successful call's RAII Drop has a chance to run
-        // before we observe the in-memory mirror.
-        tokio::task::yield_now().await;
-        // 5ms is overkill but cheap; covers slower CI hosts.
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-
-        // Sniff MiniMeta's mirror via the trait surface: a fresh
-        // try_acquire should succeed (lease was released by Drop).
-        let could_acquire_again = state
-            .services
-            .meta
-            .try_acquire_session_lease(session_id, Some(sandbox_id), "post-test-probe")
-            .await
-            .unwrap();
         assert!(
-            could_acquire_again,
-            "guard's Drop must release the lease on the success path",
+            meta.ops.running_for(session_id).is_none(),
+            "no op left running after the drive",
         );
     }
 
@@ -2613,11 +2437,11 @@ mod tests {
     ///
     /// This test wraps the standard HostClient stack with a spy
     /// whose `destroy()` reads `MiniMeta`'s current session status
-    /// at call time and stashes it. After `evict_idle_session`
+    /// at call time and stashes it. After the evict op
     /// completes, the stashed status must be Idle — proving the
     /// transition committed before destroy() was invoked.
     #[tokio::test]
-    async fn evict_idle_session_transitions_to_idle_before_destroy() {
+    async fn evict_op_transitions_to_idle_before_destroy() {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc as StdArc;
 
@@ -2640,6 +2464,7 @@ mod tests {
             async fn destroy(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
                 self.destroys.fetch_add(1, Ordering::SeqCst);
                 // Read the session's status straight from MiniMeta
@@ -2649,7 +2474,7 @@ mod tests {
                 if snapshot.id == self.session_id {
                     *self.status_at_destroy.lock() = Some(snapshot.status);
                 }
-                self.inner.destroy(id).await
+                self.inner.destroy(id, fence).await
             }
             async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
                 self.inner.list().await
@@ -2672,35 +2497,40 @@ mod tests {
             async fn snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError>
             {
-                self.inner.snapshot(id).await
+                self.inner.snapshot(id, fence).await
             }
             async fn commit_snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.commit_snapshot(id).await
+                self.inner.commit_snapshot(id, fence).await
             }
             async fn abort_snapshot(
                 &self,
                 id: engram_core::SandboxId,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.abort_snapshot(id).await
+                self.inner.abort_snapshot(id, fence).await
             }
             async fn restore(
                 &self,
                 metadata: engram_core::types::snapshot::SnapshotMetadata,
+                fence: SessionFence,
             ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
-                self.inner.restore(metadata).await
+                self.inner.restore(metadata, fence).await
             }
             async fn start_agent(
                 &self,
                 id: engram_core::SandboxId,
                 agent: engram_core::types::sandbox::AgentSpec,
                 policy: engram_core::types::egress::SessionEgressPolicy,
+                fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.start_agent(id, agent, policy).await
+                self.inner.start_agent(id, agent, policy, fence).await
             }
             async fn apply_egress_policy(
                 &self,
@@ -2817,9 +2647,12 @@ mod tests {
             .await
             .unwrap();
 
-        evict_idle_session(&state, session_id, sandbox_id)
-            .await
-            .expect("full pipeline must succeed under the reordered steps");
+        let op = drive_evict(&state, session_id, false, false).await;
+        assert_eq!(
+            op.state,
+            OpState::Done,
+            "full pipeline must succeed under the reordered steps"
+        );
 
         assert_eq!(
             destroys.load(Ordering::SeqCst),
@@ -2843,104 +2676,11 @@ mod tests {
         assert_eq!(after.status, SessionState::Idle);
     }
 
-    /// ADR 0016 §A.1.5c stale-lease reaper. Leases older than the
-    /// max-age threshold are removed; fresh leases survive. Uses
-    /// MiniMeta's in-memory mirror — we backdate one entry by
-    /// hand, then call sweep with a small threshold.
     #[tokio::test]
-    async fn sweep_stale_session_leases_reaps_old_entries() {
-        let session_id = engram_core::SessionId::new();
-        let session = Session {
-            id: session_id,
-            status: SessionState::Active,
-            host_id: None,
-            sandbox_id: None,
-            image: "test/repo:reap".into(),
-            mode: SessionMode::Agent,
-            created_at: chrono::Utc::now(),
-            last_active_at: chrono::Utc::now(),
-            live_disk_manifest: None,
-            park_rung: 0,
-            parked_at: None,
-        };
-        let sandbox_root = TempDir::new().unwrap();
-        let state = build_state_with_session(session, sandbox_root.path());
-
-        // Acquire a fresh lease, then backdate it to simulate a
-        // wedged pipeline. Need MiniMeta-typed access for the
-        // backdate; downcast via `Any` would work but is ugly,
-        // so the test reaches into the concrete type by leaning
-        // on the fact that `services.meta` was wired as
-        // `Arc<MiniMeta>`.
-        let sandbox_id = engram_core::SandboxId::new();
-        let stale_session = engram_core::SessionId::new();
-        let fresh_session = engram_core::SessionId::new();
-        state
-            .services
-            .meta
-            .try_acquire_session_lease(stale_session, Some(sandbox_id), "stale-pod")
-            .await
-            .unwrap();
-        state
-            .services
-            .meta
-            .try_acquire_session_lease(fresh_session, Some(sandbox_id), "fresh-pod")
-            .await
-            .unwrap();
-
-        // Age both leases past the sweep's `max_age` deterministically.
-        // The earlier draft of this test passed `max_age = 0s` and
-        // relied on `locked_at < now()` being true for both leases
-        // by virtue of "the acquires happened before the sweep
-        // call". On a fast machine `chrono::Utc::now()` can return
-        // the same microsecond for two adjacent calls; the strict
-        // `<` in MiniMeta::sweep_stale_session_leases (state.rs)
-        // then skipped the second lease and `reaped_ids.contains(&fresh_session)`
-        // failed intermittently. Sleeping ≥1 ms past `max_age = 1ms`
-        // makes the assertion structurally deterministic regardless
-        // of clock tick boundaries — no production-code change
-        // needed.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let reaped = state
-            .services
-            .meta
-            .sweep_stale_session_leases(std::time::Duration::from_millis(1))
-            .await
-            .unwrap();
-        let reaped_ids: std::collections::HashSet<_> =
-            reaped.iter().map(|l| l.session_id).collect();
-        assert!(reaped_ids.contains(&stale_session));
-        assert!(reaped_ids.contains(&fresh_session));
-        for lease in &reaped {
-            assert_eq!(lease.sandbox_id, Some(sandbox_id));
-        }
-
-        // After reap, both should be re-acquirable.
-        assert!(state
-            .services
-            .meta
-            .try_acquire_session_lease(stale_session, Some(sandbox_id), "post-reap")
-            .await
-            .unwrap());
-
-        // And a sweep with a huge max_age must reap NOTHING.
-        let reaped2 = state
-            .services
-            .meta
-            .sweep_stale_session_leases(std::time::Duration::from_secs(3600))
-            .await
-            .unwrap();
-        assert!(
-            reaped2.is_empty(),
-            "no fresh lease should be reaped under a long max_age",
-        );
-    }
-
-    #[tokio::test]
-    async fn evict_idle_session_is_a_noop_when_sandbox_already_unbound() {
-        // Race-safe path: another evictor / operator already
-        // unbound the sandbox. evict_idle_session should return
-        // Ok(()) without touching anything else.
+    async fn evict_op_is_a_noop_when_sandbox_already_unbound() {
+        // Race-safe path: another actor already unbound the sandbox
+        // before this op claimed. The pipeline must complete as a no-op
+        // (op Done) without touching anything else.
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
@@ -2958,68 +2698,10 @@ mod tests {
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
 
-        // Don't bind any sandbox; pass a random SandboxId.
-        evict_idle_session(&state, session_id, engram_core::SandboxId::new())
-            .await
-            .expect("noop on already-unbound");
+        let op = drive_evict(&state, session_id, false, false).await;
+        assert_eq!(op.state, OpState::Done, "unbound session evict is a no-op");
 
         // Session stays Active (no eviction happened).
-        let after = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(after.status, SessionState::Active);
-    }
-
-    /// Issue #214: a `Skipped` outcome from `evict_session_to_state` must
-    /// be distinguishable from a real evacuation. Here a peer's session
-    /// lease is pre-held, so the lease guard fires the first skip arm.
-    #[tokio::test]
-    async fn evict_session_to_state_reports_skipped_when_lease_held() {
-        let session_id = engram_core::SessionId::new();
-        let session = Session {
-            id: session_id,
-            status: SessionState::Active,
-            host_id: None,
-            sandbox_id: None,
-            image: "test/repo:skip".into(),
-            mode: SessionMode::Agent,
-            created_at: chrono::Utc::now(),
-            last_active_at: chrono::Utc::now(),
-            live_disk_manifest: None,
-            park_rung: 0,
-            parked_at: None,
-        };
-        let sandbox_root = TempDir::new().unwrap();
-        let state = build_state_with_session(session, sandbox_root.path());
-        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state
-            .services
-            .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
-            .await
-            .unwrap();
-
-        // A peer pod holds the lease → the pipeline must report Skipped,
-        // not Evacuated.
-        state
-            .services
-            .meta
-            .try_acquire_session_lease(session_id, Some(sandbox_id), "peer-pod")
-            .await
-            .unwrap();
-
-        let outcome = evict_session_to_state(
-            &state,
-            session_id,
-            sandbox_id,
-            SessionState::Evacuating,
-            false,
-        )
-        .await
-        .expect("a guarded skip is not an error");
-        assert!(
-            matches!(outcome, EvictOutcome::Skipped { .. }),
-            "lease-held pipeline must report Skipped, got {outcome:?}",
-        );
-        // The session was untouched.
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionState::Active);
     }
@@ -3059,10 +2741,20 @@ mod tests {
             .await
             .unwrap();
 
-        scanner_run_once(&EvictionScannerConfig::default(), &state)
-            .await
-            .expect("scanner tick");
+        // The scanner ENQUEUES the evict op (claimed → driven on a
+        // detached task); observe the outcome.
+        scanner_run_once(&state).await.expect("scanner tick");
 
+        let st = state.clone();
+        wait_for("scanner-enqueued evict op lands the session at Idle", {
+            let st = st.clone();
+            move || {
+                futures::executor::block_on(st.services.meta.get_session(session_id))
+                    .map(|s| s.status == SessionState::Idle)
+                    .unwrap_or(false)
+            }
+        })
+        .await;
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionState::Idle);
         assert_eq!(after.sandbox_id, None);
@@ -3075,12 +2767,12 @@ mod tests {
         assert_eq!(snaps.len(), 1, "pipeline recorded its snapshot");
     }
 
-    /// A failed pipeline attempt leaves the row Evicting with the
-    /// attempt counter bumped — the next tick retries. (This is the
-    /// crash-/flake-tolerant replacement for the pre-0034 silent
-    /// cancellation.)
+    /// A failed pipeline attempt leaves the row Evicting with the op
+    /// REQUEUED (backoff + attempt counted on the row) — the executor
+    /// retries. (This is the crash-/flake-tolerant replacement for the
+    /// pre-0034 silent cancellation.)
     #[tokio::test]
-    async fn scanner_failure_stays_evicting_and_bumps_attempts() {
+    async fn scanner_failure_stays_evicting_and_requeues_the_op() {
         let session_id = engram_core::SessionId::new();
         let sandbox_root = TempDir::new().unwrap();
         let (state, mini) = build_state_and_meta(evicting_session(session_id), sandbox_root.path());
@@ -3096,39 +2788,85 @@ mod tests {
         // Force the pipeline's record_snapshot step to fail once.
         *mini.fail_next_record_snapshot.lock() = true;
 
-        scanner_run_once(&EvictionScannerConfig::default(), &state)
+        scanner_run_once(&state)
             .await
-            .expect("tick itself succeeds; per-session failure is swallowed");
+            .expect("tick itself succeeds; per-session failure rides the op row");
 
+        // The scanner's enqueue claimed + spawned the drive; wait for the
+        // failed attempt to land back at queued-with-backoff.
+        let m = mini.clone();
+        wait_for(
+            "evict op requeued with backoff after the failure",
+            move || {
+                m.ops.all().iter().any(|o| {
+                    o.kind == OpKind::Evict
+                        && o.state == OpState::Queued
+                        && o.attempts == 1
+                        && o.not_before.is_some()
+                        && o.error.is_some()
+                })
+            },
+        )
+        .await;
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(
             after.status,
             SessionState::Evicting,
             "stays in lane for retry"
         );
-        let listed = state.services.meta.list_evicting_sessions().await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].1, 1, "attempt counter bumped pre-pipeline");
     }
 
     /// Budget exhaustion falls back to HostLost (not Active — would
     /// re-nominate forever; not Idle — no durable snapshot exists;
-    /// not Dead — the runtime is healthy). max_attempts=0 trips the
-    /// arm immediately.
+    /// not Dead — the runtime is healthy). The budget now lives on the
+    /// op row (`attempts`, bumped at every claim): drive the verb with a
+    /// hand-aged attempt count past `EVICT_MAX_ATTEMPTS` and a failing
+    /// pipeline.
     #[tokio::test]
-    async fn scanner_budget_exhaustion_falls_back_to_host_lost() {
+    async fn evict_op_budget_exhaustion_falls_back_to_host_lost() {
         let session_id = engram_core::SessionId::new();
         let sandbox_root = TempDir::new().unwrap();
-        let mut session = evicting_session(session_id);
-        session.sandbox_id = Some(engram_core::SandboxId::new());
-        let state = build_state_with_session(session, sandbox_root.path());
+        let (state, mini) = build_state_and_meta(evicting_session(session_id), sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+        *mini.fail_next_record_snapshot.lock() = true;
 
         let mut sub = state.events.subscribe(session_id);
-        let cfg = EvictionScannerConfig {
-            max_attempts: 0,
-            ..EvictionScannerConfig::default()
+        // Claim honestly (epoch is real), then age the attempt count on
+        // the ctx's view of the row — the verb reads `op.attempts`.
+        let mut op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({ "target": "idle", "allow_park": false, "nominated": true }),
+                None,
+                "test-pod",
+            )
+            .await
+            .unwrap()
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("expected Claimed, got {other:?}"),
         };
-        scanner_run_once(&cfg, &state).await.expect("tick");
+        op.attempts = 21; // past session_verbs::EVICT_MAX_ATTEMPTS
+        let epoch = op.epoch.expect("claimed");
+        let ctx = crate::session_ops::OpCtx {
+            state: &state,
+            op: &op,
+            epoch,
+        };
+        let outcome = crate::session_verbs::dispatch(&ctx).await;
+        assert!(
+            matches!(outcome, crate::session_ops::OpOutcome::Failed(_)),
+            "budget exhaustion must be terminal",
+        );
 
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionState::HostLost);
@@ -3155,9 +2893,7 @@ mod tests {
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(evicting_session(session_id), sandbox_root.path());
 
-        scanner_run_once(&EvictionScannerConfig::default(), &state)
-            .await
-            .expect("tick");
+        scanner_run_once(&state).await.expect("tick");
 
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionState::HostLost);
@@ -3172,20 +2908,16 @@ mod tests {
         session.status = SessionState::Active;
         let state = build_state_with_session(session, sandbox_root.path());
 
-        scanner_run_once(&EvictionScannerConfig::default(), &state)
-            .await
-            .expect("tick");
+        scanner_run_once(&state).await.expect("tick");
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionState::Active, "untouched");
     }
 
-    /// The session lease releases asynchronously (the RAII guard's Drop
-    /// spawns a best-effort DELETE). Production callers retry on the
-    /// resulting transient 409; tests poll here so the next
-    /// lease-acquiring step doesn't race the release.
-    async fn wait_for_lease_free(meta: &Arc<MiniMeta>, id: engram_core::SessionId) {
-        wait_for("session lease released", || {
-            !meta.session_leases.lock().contains_key(&id)
+    /// Op finishes may land from a detached drive task; tests poll here
+    /// so the next claim-acquiring step doesn't race the finish.
+    async fn wait_for_op_lane_free(meta: &Arc<MiniMeta>, id: engram_core::SessionId) {
+        wait_for("session op lane free", || {
+            meta.ops.running_for(id).is_none()
         })
         .await;
     }
@@ -3253,13 +2985,8 @@ mod tests {
         meta.session.lock().host_id = Some(host_id); // headroom resolves via PG now
         seed_host_with_free_ram(&meta, host_id, 60_000); // ~91% free ≥ 30 floor
 
-        let outcome = evict_idle_session(&state, session_id, sandbox_id)
-            .await
-            .expect("evict");
-        assert!(
-            matches!(outcome, EvictOutcome::ParkedPaused),
-            "headroom → parked, got {outcome:?}"
-        );
+        let op = drive_evict(&state, session_id, true, false).await;
+        assert_eq!(op.state, OpState::Done, "park completes the op early");
         let s = meta.session.lock().clone();
         assert_eq!(s.status, SessionState::Evicting, "parked holds at Evicting");
         assert_eq!(s.park_rung, 2);
@@ -3280,8 +3007,8 @@ mod tests {
         );
 
         // Ascent: the user comes back → un-pause + flip Active. Wait for
-        // the park pipeline's lease to release first (prod retries this).
-        wait_for_lease_free(&meta, session_id).await;
+        // the park op's lane to free first (prod retries this).
+        wait_for_op_lane_free(&meta, session_id).await;
         let cancelled = crate::api::snapshot::try_cancel_nominated_eviction(&state, session_id)
             .await
             .unwrap();
@@ -3326,10 +3053,9 @@ mod tests {
         seed_host_with_free_ram(&meta, host_id, 60_000);
 
         // Park first.
-        let outcome = evict_idle_session(&state, session_id, sandbox_id)
-            .await
-            .expect("evict");
-        assert!(matches!(outcome, EvictOutcome::ParkedPaused));
+        let op = drive_evict(&state, session_id, true, false).await;
+        assert_eq!(op.state, OpState::Done);
+        assert_eq!(meta.session.lock().park_rung, 2, "parked-paused");
 
         // Backdate the park entry beyond the dwell cap (default 600s).
         let stale = chrono::Utc::now() - chrono::Duration::seconds(3600);
@@ -3341,11 +3067,10 @@ mod tests {
             .unwrap();
 
         // A scanner tick routes the parked row to the reaper, which
-        // descends it (host still has headroom, so the trigger is dwell).
-        wait_for_lease_free(&meta, session_id).await;
-        scanner_run_once(&EvictionScannerConfig::default(), &state)
-            .await
-            .expect("tick");
+        // ENQUEUES the descent op (host still has headroom, so the
+        // trigger is dwell); the claimed op drives on a detached task.
+        wait_for_op_lane_free(&meta, session_id).await;
+        scanner_run_once(&state).await.expect("tick");
 
         {
             let m = meta.clone();
@@ -3406,9 +3131,7 @@ mod tests {
             .await
             .unwrap();
 
-        scanner_run_once(&EvictionScannerConfig::default(), &state)
-            .await
-            .expect("tick");
+        scanner_run_once(&state).await.expect("tick");
 
         let s = meta.session.lock().clone();
         assert_eq!(

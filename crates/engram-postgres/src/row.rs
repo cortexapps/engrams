@@ -3,6 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use engram_core::types::session::SessionMode;
+use engram_core::types::session_op::{OpKind, OpState, SessionOp};
 use engram_core::types::{
     EnableJob, EnableJobState, EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus,
     HostUtilization, PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionState,
@@ -244,6 +245,39 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         aux_bundles,
         events_cursor,
         fc_snapshot_version,
+    })
+}
+
+/// ADR 0079: a `session_ops` row → [`SessionOp`]. Every query that
+/// projects an op row uses `lib.rs`'s `OP_COLUMNS` list, so all fourteen
+/// columns are always present — strict decode, no missing-column
+/// tolerance. `kind`/`state` are exhaustive parses: an unknown wire
+/// string is a hard `Serialization` error, never a silent default (a
+/// defaulted state could resurrect a terminal op into the executor).
+pub(crate) fn session_op_from_row(row: &PgRow) -> Result<SessionOp, MetaError> {
+    let session_id: Uuid = row.try_get("session_id").map_err(col_err)?;
+    let kind_s: String = row.try_get("kind").map_err(col_err)?;
+    let kind = OpKind::parse(&kind_s)
+        .ok_or_else(|| MetaError::Serialization(format!("unknown session_ops.kind {kind_s:?}")))?;
+    let state_s: String = row.try_get("state").map_err(col_err)?;
+    let state = OpState::parse(&state_s).ok_or_else(|| {
+        MetaError::Serialization(format!("unknown session_ops.state {state_s:?}"))
+    })?;
+    Ok(SessionOp {
+        id: row.try_get("id").map_err(col_err)?,
+        session_id: SessionId(session_id),
+        kind,
+        payload: row.try_get("payload").map_err(col_err)?,
+        state,
+        step: row.try_get("step").map_err(col_err)?,
+        epoch: row.try_get("epoch").map_err(col_err)?,
+        attempts: row.try_get("attempts").map_err(col_err)?,
+        not_before: row.try_get("not_before").map_err(col_err)?,
+        idempotency_key: row.try_get("idempotency_key").map_err(col_err)?,
+        claimed_by: row.try_get("claimed_by").map_err(col_err)?,
+        error: row.try_get("error").map_err(col_err)?,
+        created_at: row.try_get("created_at").map_err(col_err)?,
+        finished_at: row.try_get("finished_at").map_err(col_err)?,
     })
 }
 

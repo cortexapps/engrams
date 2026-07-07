@@ -18,6 +18,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde::Serialize;
 
+use engram_core::traits::SessionFence;
 use engram_core::SessionId;
 
 use crate::error::ApiError;
@@ -144,7 +145,7 @@ pub(crate) async fn flush_now_core(
 //   the list of session_ids being evacuated.
 //
 // The pause-before-flush ordering is what unblocks cross-host disk
-// fidelity: `evict_session_to_state` runs Pause → Flush → Snapshot
+// fidelity: the evict pipeline runs Pause → Flush → Snapshot
 // → Destroy → transition_session, so the on-disk manifest the
 // scanner restores from is bit-identical to what the source saw at
 // pause time (no flush-vs-pause race; see ADR 0018 §"Commit 12
@@ -191,21 +192,51 @@ pub(crate) async fn evacuate_session_core(
     };
 
     // Fire the shared eviction pipeline with `target_state =
-    // Evacuating`. Same pause → flush → memory-snapshot → destroy →
-    // PG transition the legacy `evict_idle_session` uses for Idle
-    // suspends — the *only* difference is the terminal state, so
-    // both flows inherit the same recoverability invariants (snapshot
-    // durable in BlobStorage before destroy, PG state flips before
-    // host-side destroy).
-    crate::idle_evictor::evict_session_to_state(
+    // Evacuating` under an inline op claim (ADR 0079 — the claim is the
+    // per-session exclusion; the pipeline is the SAME evict-verb body,
+    // step-recorded, so a coordinator death mid-drive is re-driven by
+    // the executor's reclaim sweep from the recorded step). The only
+    // difference from an idle eviction is the terminal state, so both
+    // flows inherit the same recoverability invariants (snapshot durable
+    // in BlobStorage before destroy, PG state flips before host-side
+    // destroy).
+    let claim = crate::session_ops::OpClaim::try_acquire(
         state,
         session_id,
-        sandbox_id,
-        engram_core::types::SessionState::Evacuating,
-        false,
+        engram_core::types::session_op::OpKind::Evict,
+        serde_json::json!({ "target": "evacuating", "allow_park": false, "nominated": false }),
     )
     .await
-    .map_err(|e| ApiError::Internal(format!("evac pipeline: {e}")))?;
+    .map_err(|e| ApiError::Internal(format!("op claim acquire failed: {e}")))?
+    .ok_or_else(|| {
+        ApiError::Conflict(format!(
+            "session {session_id} is busy (an op is in flight); retry shortly",
+        ))
+    })?;
+    let _ = sandbox_id; // the pipeline re-reads the binding under the claim
+    let result = crate::idle_evictor::run_evict_pipeline(
+        &claim.as_ctx(),
+        engram_core::types::SessionState::Evacuating,
+        false,
+        false,
+    )
+    .await;
+    match &result {
+        Ok(_) => {
+            claim
+                .finish(engram_core::types::session_op::OpState::Done, None)
+                .await
+        }
+        Err(e) => {
+            claim
+                .finish(
+                    engram_core::types::session_op::OpState::Failed,
+                    Some(&e.to_string()),
+                )
+                .await
+        }
+    }
+    result.map_err(|e| ApiError::Internal(format!("evac pipeline: {e}")))?;
 
     tracing::info!(
         %session_id,
@@ -222,18 +253,19 @@ pub(crate) async fn evacuate_session_core(
 #[derive(Serialize)]
 pub struct EvictIdleResponse {
     pub session_id: SessionId,
-    /// The pipeline's actual outcome: "idle" (full suspend — paused,
-    /// flushed, snapshotted, sandbox destroyed, resume rebinds), the
+    /// The evict op's observed outcome: "idle" (full suspend — paused,
+    /// flushed, snapshotted, sandbox destroyed, resume rebinds) or the
     /// ADR 0074 rung-2 "evicting (parked-paused, rung 2)" (VM paused in
-    /// place, un-parked by the next prompt), or a lease-race "skipped".
+    /// place, un-parked by the next prompt). A busy op lane / no-op
+    /// completion surfaces as a retryable Conflict instead.
     pub status: &'static str,
 }
 
 /// Transport-agnostic core for the idle-eviction primitive (ADR 0051,
 /// restored on the gRPC surface as `SessionService::EvictIdle`). The
-/// explicit admin trigger for the idle-eviction pipeline: fires the exact
-/// same primitive (`idle_evictor::evict_idle_session`) the host-side idle
-/// detector and the coord `idle_detect_backstop` scanner drive on a timeout,
+/// explicit admin trigger for the idle-eviction pipeline: enqueues the
+/// exact same evict verb (`idle_evictor::run_evict_pipeline`) the idle
+/// detector's nomination enqueues on a timeout,
 /// so it is a faithful stand-in for "the session went idle" — without waiting
 /// out (or globally lowering) the idle TTL. Pre: Active session with a bound
 /// sandbox. Post: session at `Idle`, memory snapshot durable in BlobStorage,
@@ -257,24 +289,18 @@ pub(crate) async fn evict_idle_core(
         )));
     };
 
-    let outcome = crate::idle_evictor::evict_idle_session(state, session_id, sandbox_id)
-        .await
-        .map_err(|e| ApiError::Internal(format!("idle-evict pipeline: {e}")))?;
-
-    // Report what actually happened — with ADR 0074 rung 2 the pipeline
-    // may PARK (pause in place, session Evicting + park_rung=2) instead
-    // of suspending to Idle, and a lease race skips entirely. The old
-    // hardcoded "idle" misreported both.
-    let status = match &outcome {
-        crate::idle_evictor::EvictOutcome::ParkedPaused => "evicting (parked-paused, rung 2)",
-        crate::idle_evictor::EvictOutcome::Skipped { .. } => "skipped (pipeline already in flight)",
-        _ => "idle",
+    // ADR 0079: enqueue the evict verb (parking allowed — this is the
+    // faithful stand-in for "the session went idle") and observe the op.
+    let observed = crate::api::snapshot::enqueue_and_observe_evict(state, session_id, true).await?;
+    let status = match observed {
+        crate::api::snapshot::ObservedEvict::ParkedPaused => "evicting (parked-paused, rung 2)",
+        crate::api::snapshot::ObservedEvict::Idle => "idle",
     };
     tracing::info!(
         %session_id,
         %sandbox_id,
-        ?outcome,
-        "admin evict-idle: idle-eviction primitive completed",
+        ?observed,
+        "admin evict-idle: evict op completed",
     );
 
     Ok(EvictIdleResponse { session_id, status })
@@ -308,10 +334,11 @@ pub async fn pause_session(
             "session has no live sandbox to pause — it is idle or not yet started".into(),
         )
     })?;
+    // ADR 0079: epoch threaded by the op executor; 0 until the verb migrates.
     state
         .services
         .host
-        .pause(sandbox_id)
+        .pause(sandbox_id, SessionFence::unfenced())
         .await
         .map_err(|e| ApiError::Internal(format!("pause sandbox: {e}")))?;
     tracing::info!(%session_id, %sandbox_id, "admin: froze microVM in place");
@@ -334,10 +361,11 @@ pub async fn resume_session(
             "session has no live sandbox to resume in place — it is idle or not yet started".into(),
         )
     })?;
+    // ADR 0079: epoch threaded by the op executor; 0 until the verb migrates.
     state
         .services
         .host
-        .resume(sandbox_id)
+        .resume(sandbox_id, SessionFence::unfenced())
         .await
         .map_err(|e| ApiError::Internal(format!("resume sandbox: {e}")))?;
     tracing::info!(%session_id, %sandbox_id, "admin: unfroze microVM in place");
@@ -432,8 +460,8 @@ pub struct DrainFailure {
     pub error: String,
 }
 
-/// `POST /api/admin/hosts/:id/drain` — cordon the host, then fire
-/// `evict_session_to_state(Evacuating)` for every Active session on
+/// `POST /api/admin/hosts/:id/drain` — cordon the host, then run the
+/// evict pipeline (target `Evacuating`) for every Active session on
 /// it. Returns 202 with the per-session outcomes; the `evac_resumer`
 /// scanner is responsible for completing each transition to Active
 /// on a peer host.
@@ -531,7 +559,6 @@ pub(crate) async fn admin_drain_host_core(
         for a in &assignments {
             let st = state.clone();
             let sid = a.session_id;
-            let sb = a.sandbox_id;
             let mem_budget = a.mem_budget_mib;
             let cpu_budget = a.cpu_budget_vcpus;
             tasks.spawn(async move {
@@ -628,20 +655,51 @@ pub(crate) async fn admin_drain_host_core(
                         }
                     }
                 }
-                let outcome = crate::idle_evictor::evict_session_to_state(
+                // ADR 0079: inline op claim + the shared evict-verb
+                // pipeline (target Evacuating). A busy op lane (a
+                // concurrent eviction/resume owns the session) is not a
+                // drain failure: the session is being moved / handled by
+                // the other actor — fold to success, like `Skipped`.
+                let claim = match crate::session_ops::OpClaim::try_acquire(
                     &st,
                     sid,
-                    sb,
+                    engram_core::types::session_op::OpKind::Evict,
+                    serde_json::json!({
+                        "target": "evacuating", "allow_park": false, "nominated": false
+                    }),
+                )
+                .await
+                {
+                    Ok(Some(c)) => c,
+                    Ok(None) => return (sid, Ok(())),
+                    Err(e) => return (sid, Err(format!("op claim acquire: {e}"))),
+                };
+                let outcome = crate::idle_evictor::run_evict_pipeline(
+                    &claim.as_ctx(),
                     engram_core::types::SessionState::Evacuating,
+                    false,
                     false,
                 )
                 .await;
-                // A `Skipped` here (a concurrent eviction won the lease, the
-                // session was already relocated, etc.) is not a drain failure:
-                // the session is being / has been moved off this host by the
-                // other actor. Drain doesn't pin a destination, so unlike
-                // teleport (issue #214) there is no stale pin to unwind — fold
-                // both Ok arms to success. Errors still surface as failures.
+                match &outcome {
+                    Ok(_) => {
+                        claim
+                            .finish(engram_core::types::session_op::OpState::Done, None)
+                            .await
+                    }
+                    Err(e) => {
+                        claim
+                            .finish(
+                                engram_core::types::session_op::OpState::Failed,
+                                Some(&e.to_string()),
+                            )
+                            .await
+                    }
+                }
+                // A `Skipped` (the session was already relocated, etc.)
+                // is folded to success — drain doesn't pin a destination,
+                // so unlike teleport (issue #214) there is no stale pin
+                // to unwind. Errors still surface as failures.
                 (sid, outcome.map(|_| ()).map_err(|e| e.to_string()))
             });
         }

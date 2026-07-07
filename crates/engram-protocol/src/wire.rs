@@ -70,7 +70,12 @@ use serde::{Deserialize, Serialize};
 // PG column (migration 0090), and the fleet-view proto count (reserved 7).
 // Clean break — coord+host roll together; skewed hosts drain off scheduling
 // via `host_wire_version_ok` until the host MIG rolls.
-pub const WIRE_VERSION: u32 = 11;
+// v12 (ADR 0079 / #543): fencing_epoch on session-scoped host RPCs — the
+// SandboxIdMessage-shaped lifecycle RPCs (destroy / snapshot family /
+// pause / resume) migrate to `FencedSandboxRequest{uuid, fencing_epoch,
+// session_id}`; StartAgent / Restore / RestoreBaseForSession gain the
+// same (session_id, fencing_epoch) pair. Lockstep coord+host roll.
+pub const WIRE_VERSION: u32 = 12;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

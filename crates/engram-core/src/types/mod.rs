@@ -22,6 +22,7 @@ pub mod registry;
 pub mod runtime_spec;
 pub mod sandbox;
 pub mod session;
+pub mod session_op;
 pub mod shell;
 pub mod snapshot;
 

@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use engram_core::traits::HostClient;
+use engram_core::traits::{HostClient, SessionFence};
 use engram_core::SandboxError;
 use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
@@ -29,11 +29,11 @@ use engram_protocol::grpc::{
     BuildBaseSnapshotResponse, CaptureFailed, CaptureProgress, CowStateAllResponse,
     CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
     DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
-    ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse, InterruptHarnessRequest,
-    ListSandboxesResponse, MigrationCaptureResponse, MigrationExportRef, MigrationFetchRequest,
-    MigrationFrame, MigrationPresetupResponse, PostCopyCaptureResponse, ProbeSandboxResponse,
-    ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
-    ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse,
+    InterruptHarnessRequest, ListSandboxesResponse, MigrationCaptureResponse, MigrationExportRef,
+    MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse, PostCopyCaptureResponse,
+    ProbeSandboxResponse, ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose,
+    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
     ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
     SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
     UnbindHarnessSessionRequest,
@@ -44,6 +44,8 @@ use std::pin::Pin;
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
+
+use crate::session_epochs::{EpochError, SessionEpochStore};
 
 /// Link a handler span to the caller's distributed trace (ADR 0019) by
 /// reading the W3C `traceparent` the coord's [`TraceparentInjector`] put
@@ -66,16 +68,89 @@ fn link_remote_parent<T>(span: &tracing::Span, req: &Request<T>) {
 pub struct HostServiceImpl {
     inner: Arc<dyn HostClient>,
     admin: Option<Arc<dyn HostAdminHandler>>,
+    /// ADR 0079: per-session fencing-epoch high-water, durable under
+    /// work_dir. Gates every session-scoped lifecycle RPC.
+    epochs: SessionEpochStore,
 }
 
 impl HostServiceImpl {
-    pub fn new(inner: Arc<dyn HostClient>) -> Self {
-        Self { inner, admin: None }
+    pub fn new(inner: Arc<dyn HostClient>, epochs: SessionEpochStore) -> Self {
+        Self {
+            inner,
+            admin: None,
+            epochs,
+        }
     }
 
     pub fn with_admin_handler(mut self, admin: Arc<dyn HostAdminHandler>) -> Self {
         self.admin = Some(admin);
         self
+    }
+
+    /// ADR 0079: the fencing-epoch gate, called at the top of every
+    /// session-scoped lifecycle handler right after [`check_wire_version`]
+    /// (the same transport-level-gate move). Rejections are
+    /// `failed_precondition` carrying stored vs incoming so the
+    /// coordinator sees an explicit fence, never a decode error.
+    ///
+    /// Returns the decoded [`SessionFence`] so the handler can thread it
+    /// to the inner `HostClient` without re-decoding.
+    ///
+    /// `fencing_epoch == 0` (allow WITHOUT advancing the high-water; the
+    /// store's `check_and_advance` holds the reject-zero semantics for
+    /// whenever this arm is removed) — the coordinator's REMAINING
+    /// out-of-op callers, all deliberate (#543 pass 2 disposition):
+    ///
+    /// - the direct (capacity-available) create pipeline
+    ///   (`session_boot::boot_on_reserved_host` via `create_session_core`
+    ///   — restore/start_agent/teardown-destroy); only the QUEUED-create
+    ///   path rides the create_boot op. Sound: the session is brand new,
+    ///   no competing executor can exist before its first op claim.
+    /// - the rung-1/2 ascent from the wire (`ensure_active` →
+    ///   `try_cancel_nominated_eviction` → `ascend_evicting_to_active`),
+    ///   which un-pauses only after proving no op is running.
+    /// - `preemption_drain`'s shutdown destroys — best-effort teardown
+    ///   of sandboxes on a host that is going away; nothing
+    ///   epoch-protected is written.
+    /// - the admin in-place `pause`/`resume` debug endpoints
+    ///   (`api/admin.rs`) — operator tools, no lifecycle writes.
+    ///
+    /// TODO(#543): flip 0 to reject once those paths migrate onto ops /
+    /// fenced enqueues (the ADR 0079 divergence log records the deferral).
+    fn check_session_epoch(
+        &self,
+        session_id: &[u8],
+        fencing_epoch: u64,
+    ) -> Result<SessionFence, Status> {
+        if fencing_epoch == 0 {
+            return Ok(SessionFence::unfenced());
+        }
+        let session_id = decode_session_id(session_id)?;
+        self.epochs
+            .check_and_advance(session_id, fencing_epoch)
+            .map_err(|e| match e {
+                EpochError::Stale { stored, incoming } => {
+                    ::metrics::counter!("engram_host_fencing_epoch_rejections_total").increment(1);
+                    tracing::warn!(
+                        %session_id,
+                        stored,
+                        incoming,
+                        "rejecting session-scoped RPC: stale fencing epoch (a successor \
+                         executor already re-claimed this session)",
+                    );
+                    Status::failed_precondition(format!(
+                        "fencing epoch stale for session {session_id}: stored high-water \
+                         {stored}, incoming {incoming}"
+                    ))
+                }
+                EpochError::Zero => Status::failed_precondition(format!(
+                    "fencing epoch 0 is never valid (session {session_id})"
+                )),
+                EpochError::Io(err) => {
+                    Status::internal(format!("session epoch store for {session_id}: {err}"))
+                }
+            })?;
+        Ok(SessionFence::new(session_id, fencing_epoch))
     }
 }
 
@@ -87,8 +162,9 @@ pub async fn boot(
     listen_addr: std::net::SocketAddr,
     inner: Arc<dyn HostClient>,
     admin: Option<Arc<dyn HostAdminHandler>>,
+    epochs: SessionEpochStore,
 ) -> Result<(), tonic::transport::Error> {
-    let mut svc = HostServiceImpl::new(inner);
+    let mut svc = HostServiceImpl::new(inner, epochs);
     if let Some(a) = admin {
         svc = svc.with_admin_handler(a);
     }
@@ -139,10 +215,16 @@ impl HostService for HostServiceImpl {
 
     async fn destroy_sandbox(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<Empty>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
-        self.inner.destroy(id).await.map_err(sandbox_to_status)?;
+        check_wire_version(&req)?;
+        let r = req.into_inner();
+        let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+        let id = decode_sandbox_id(&r.uuid)?;
+        self.inner
+            .destroy(id, fence)
+            .await
+            .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
     }
 
@@ -177,13 +259,20 @@ impl HostService for HostServiceImpl {
 
     async fn snapshot(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
         let span = tracing::info_span!("host.snapshot");
         link_remote_parent(&span, &req);
+        check_wire_version(&req)?;
         async move {
-            let id = decode_sandbox_id(&req.into_inner().uuid)?;
-            let metadata = self.inner.snapshot(id).await.map_err(sandbox_to_status)?;
+            let r = req.into_inner();
+            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+            let id = decode_sandbox_id(&r.uuid)?;
+            let metadata = self
+                .inner
+                .snapshot(id, fence)
+                .await
+                .map_err(sandbox_to_status)?;
             Ok(Response::new(SnapshotResponse {
                 metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
             }))
@@ -194,15 +283,18 @@ impl HostService for HostServiceImpl {
 
     async fn snapshot_begin(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<SnapshotBeginResponse>, Status> {
         let span = tracing::info_span!("host.snapshot_begin");
         link_remote_parent(&span, &req);
+        check_wire_version(&req)?;
         async move {
-            let id = decode_sandbox_id(&req.into_inner().uuid)?;
+            let r = req.into_inner();
+            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+            let id = decode_sandbox_id(&r.uuid)?;
             let snapshot_id = self
                 .inner
-                .snapshot_begin(id)
+                .snapshot_begin(id, fence)
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(SnapshotBeginResponse {
@@ -215,15 +307,18 @@ impl HostService for HostServiceImpl {
 
     async fn snapshot_wait(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
         let span = tracing::info_span!("host.snapshot_wait");
         link_remote_parent(&span, &req);
+        check_wire_version(&req)?;
         async move {
-            let id = decode_sandbox_id(&req.into_inner().uuid)?;
+            let r = req.into_inner();
+            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+            let id = decode_sandbox_id(&r.uuid)?;
             let metadata = self
                 .inner
-                .snapshot_wait(id)
+                .snapshot_wait(id, fence)
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(SnapshotResponse {
@@ -236,15 +331,17 @@ impl HostService for HostServiceImpl {
 
     async fn migration_capture(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<MigrationCaptureResponse>, Status> {
         let span = tracing::info_span!("host.migration_capture");
         link_remote_parent(&span, &req);
         async move {
-            let id = decode_sandbox_id(&req.into_inner().uuid)?;
+            let r = req.into_inner();
+            let id = decode_sandbox_id(&r.uuid)?;
+            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
             let out = self
                 .inner
-                .migration_capture(id)
+                .migration_capture(id, fence)
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(MigrationCaptureResponse {
@@ -333,8 +430,9 @@ impl HostService for HostServiceImpl {
     ) -> Result<Response<Empty>, Status> {
         let req = req.into_inner();
         let id = decode_sandbox_id(&req.sandbox_id)?;
+        let fence = self.check_session_epoch(&req.session_id, req.fencing_epoch)?;
         self.inner
-            .migration_commit(id, &req.export_id)
+            .migration_commit(id, &req.export_id, fence)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
@@ -346,8 +444,9 @@ impl HostService for HostServiceImpl {
     ) -> Result<Response<Empty>, Status> {
         let req = req.into_inner();
         let id = decode_sandbox_id(&req.sandbox_id)?;
+        let fence = self.check_session_epoch(&req.session_id, req.fencing_epoch)?;
         self.inner
-            .migration_abort(id, &req.export_id)
+            .migration_abort(id, &req.export_id, fence)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
@@ -355,12 +454,14 @@ impl HostService for HostServiceImpl {
 
     async fn migration_presetup(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<MigrationPresetupResponse>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        let r = req.into_inner();
+        let id = decode_sandbox_id(&r.uuid)?;
+        let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
         let out = self
             .inner
-            .migration_presetup(id)
+            .migration_presetup(id, fence)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(MigrationPresetupResponse {
@@ -381,9 +482,10 @@ impl HostService for HostServiceImpl {
     ) -> Result<Response<PostCopyCaptureResponse>, Status> {
         let req = req.into_inner();
         let id = decode_sandbox_id(&req.sandbox_id)?;
+        let fence = self.check_session_epoch(&req.session_id, req.fencing_epoch)?;
         let out = self
             .inner
-            .migration_capture_postcopy(id, &req.export_id)
+            .migration_capture_postcopy(id, &req.export_id, fence)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(PostCopyCaptureResponse {
@@ -438,11 +540,14 @@ impl HostService for HostServiceImpl {
 
     async fn commit_snapshot(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<Empty>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        check_wire_version(&req)?;
+        let r = req.into_inner();
+        let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+        let id = decode_sandbox_id(&r.uuid)?;
         self.inner
-            .commit_snapshot(id)
+            .commit_snapshot(id, fence)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
@@ -450,11 +555,14 @@ impl HostService for HostServiceImpl {
 
     async fn abort_snapshot(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<Empty>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        check_wire_version(&req)?;
+        let r = req.into_inner();
+        let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+        let id = decode_sandbox_id(&r.uuid)?;
         self.inner
-            .abort_snapshot(id)
+            .abort_snapshot(id, fence)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
@@ -463,19 +571,31 @@ impl HostService for HostServiceImpl {
     // ADR 0045 Phase F: freeze / unfreeze a running microVM in place.
     async fn pause_sandbox(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<Empty>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
-        self.inner.pause(id).await.map_err(sandbox_to_status)?;
+        check_wire_version(&req)?;
+        let r = req.into_inner();
+        let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+        let id = decode_sandbox_id(&r.uuid)?;
+        self.inner
+            .pause(id, fence)
+            .await
+            .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
     }
 
     async fn resume_sandbox(
         &self,
-        req: Request<SandboxIdMessage>,
+        req: Request<FencedSandboxRequest>,
     ) -> Result<Response<Empty>, Status> {
-        let id = decode_sandbox_id(&req.into_inner().uuid)?;
-        self.inner.resume(id).await.map_err(sandbox_to_status)?;
+        check_wire_version(&req)?;
+        let r = req.into_inner();
+        let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+        let id = decode_sandbox_id(&r.uuid)?;
+        self.inner
+            .resume(id, fence)
+            .await
+            .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
     }
 
@@ -487,10 +607,12 @@ impl HostService for HostServiceImpl {
         link_remote_parent(&span, &req);
         check_wire_version(&req)?;
         async move {
-            let metadata = decode_bincode(&req.into_inner().metadata_bincode, "SnapshotMetadata")?;
+            let r = req.into_inner();
+            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+            let metadata = decode_bincode(&r.metadata_bincode, "SnapshotMetadata")?;
             let id = self
                 .inner
-                .restore(metadata)
+                .restore(metadata, fence)
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(SandboxIdMessage {
@@ -632,6 +754,7 @@ impl HostService for HostServiceImpl {
         check_wire_version(&req)?;
         async move {
             let inner = req.into_inner();
+            let fence = self.check_session_epoch(&inner.session_id, inner.fencing_epoch)?;
             let metadata = decode_bincode(&inner.metadata_bincode, "SnapshotMetadata")?;
             // ADR 0055: empty bytes (old coord / no skills) decode to an empty Vec.
             let selected_mounts = if inner.selected_mounts_bincode.is_empty() {
@@ -641,7 +764,7 @@ impl HostService for HostServiceImpl {
             };
             let id = self
                 .inner
-                .restore_base_for_session(metadata, inner.session_env, selected_mounts)
+                .restore_base_for_session(metadata, inner.session_env, selected_mounts, fence)
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(SandboxIdMessage {
@@ -780,13 +903,14 @@ impl HostService for HostServiceImpl {
         check_wire_version(&req)?;
         async move {
             let r = req.into_inner();
+            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
             let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
             let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
             let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
             let phase_start = std::time::Instant::now();
             let result = self
                 .inner
-                .start_agent(sandbox_id, agent, policy)
+                .start_agent(sandbox_id, agent, policy, fence)
                 .await
                 .map_err(sandbox_to_status);
             let outcome = if result.is_ok() {

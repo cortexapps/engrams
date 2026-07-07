@@ -225,7 +225,11 @@ impl HostClient for FakeCaptureHost {
     async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         unreachable!()
     }
-    async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
+    async fn destroy(
+        &self,
+        _id: SandboxId,
+        _fence: engram_core::traits::SessionFence,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
@@ -244,10 +248,18 @@ impl HostClient for FakeCaptureHost {
     ) -> Result<ExecStream, SandboxError> {
         unreachable!()
     }
-    async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(
+        &self,
+        _id: SandboxId,
+        _fence: engram_core::traits::SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         unreachable!()
     }
-    async fn restore(&self, _md: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(
+        &self,
+        _md: SnapshotMetadata,
+        _fence: engram_core::traits::SessionFence,
+    ) -> Result<SandboxId, SandboxError> {
         unreachable!()
     }
     async fn start_agent(
@@ -255,6 +267,7 @@ impl HostClient for FakeCaptureHost {
         _id: SandboxId,
         _agent: engram_core::types::sandbox::AgentSpec,
         _policy: engram_core::types::egress::SessionEgressPolicy,
+        _fence: engram_core::traits::SessionFence,
     ) -> Result<(), SandboxError> {
         unreachable!()
     }

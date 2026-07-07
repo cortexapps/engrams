@@ -57,13 +57,6 @@ struct MockMetadataStore {
     /// test host here and `mark_host_ready_for` mutates its
     /// `ready_images`.
     hosts: Mutex<HashMap<HostId, HostRecord>>,
-    /// Issue #213: simulate the per-session lease being held by another
-    /// holder (a concurrent eviction / resume / live migration). When
-    /// set, `try_acquire_session_lease` returns `false`, so the
-    /// lease-acquiring handlers (snapshot, evict_local) must back off and
-    /// refuse rather than mutate. Default `false` = the lease is free
-    /// (preserves the existing tests' behaviour).
-    lease_held: std::sync::atomic::AtomicBool,
     /// Issue #231: simulate `touch_host_heartbeat` failing (a saturated
     /// coord PG pool). When set, the per-heartbeat persist returns an
     /// error so the test can assert the handler now returns 5xx (and
@@ -342,20 +335,6 @@ impl MetadataStore for MockMetadataStore {
         id: engram_core::types::SnapshotId,
     ) -> Result<Option<SnapshotRecord>, MetaError> {
         Ok(self.snapshots_by_id.lock().get(&id).cloned())
-    }
-
-    // Issue #213: the lease is the serializer the snapshot / evict_local
-    // handlers now acquire. `lease_held` lets a test pin it "held by
-    // another holder" so those handlers must back off (Conflict) instead
-    // of mutating. Default (false) returns `true` like the trait default,
-    // so every other test acquires freely.
-    async fn try_acquire_session_lease(
-        &self,
-        _session_id: SessionId,
-        _sandbox_id: Option<engram_core::SandboxId>,
-        _locked_by: &str,
-    ) -> Result<bool, MetaError> {
-        Ok(!self.lease_held.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     async fn list_snapshots_for_session(
