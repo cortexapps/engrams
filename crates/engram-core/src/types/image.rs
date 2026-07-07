@@ -3,31 +3,36 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------
-// ImageManifest — the per-image declarative spec.
+// ImageConfig — the per-image runtime config (ADR 0080).
 //
-// Rendered from `<image_root>/manifest.toml`. Tells the coordinator
-// what env to set, which secrets the image expects, what network it's
-// allowed to reach, and what resources it wants. Identical schema for
-// production (Firecracker rootfs.ext4) and dev (ProcessBackend
-// directory) — only the rootfs format differs.
+// Supplied OUT-OF-BAND via the ImageService (EnableImage / UpdateImage)
+// and stored as JSONB on the `enabled_images` row — the bake carries no
+// metadata (engram.toml is retired). Also parseable from a
+// repo-versioned TOML file handed to `engram-cli image enable/update
+// --config`. Tells the coordinator what env to set, what resources the
+// guest gets, and how to run the capture-time warm hook (command +
+// secrets + egress). Identical schema for every backend — only the
+// rootfs format differs.
 // ---------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-// ADR 0057: NO `deny_unknown_fields`. Manifests baked before the strip still
-// carry `[secrets]`/`[network]`/`secret_mode`; the coordinator parses those
-// manifests fine and ignores those sections — session network/secrets now come
-// from the profile-compiled policy, not the image.
-pub struct ImageManifest {
+// ADR 0080: `deny_unknown_fields` is back — the config never comes from a
+// baked artifact anymore (ADR 0057's reason for dropping it), so strict
+// parsing is a feature again: a typo in the CLI's --config TOML or a
+// hand-edited JSONB value fails loudly instead of silently dropping a key.
+#[serde(deny_unknown_fields)]
+pub struct ImageConfig {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
 
     /// Non-secret environment variables applied to every sandbox
-    /// spawned from this image. Includes the image's Dockerfile `ENV`,
-    /// folded in at bake time as a base (see
-    /// [`ImageManifest::apply_image_config_defaults`]); an `engram.toml`
-    /// `[env]` key overrides the Dockerfile value for the same key, and
-    /// a session-supplied env value in turn overrides this.
+    /// spawned from this image. The image's Dockerfile `ENV` arrives
+    /// separately as [`OciRuntimeDefaults`] (extracted from the OCI
+    /// image config at enable time) and is merged UNDER these by
+    /// [`ImageConfig::merged_with`] — a config `[env]` key overrides the
+    /// Dockerfile value for the same key, and a session-supplied env
+    /// value in turn overrides this.
     #[serde(default)]
     pub env: HashMap<String, String>,
 
@@ -35,13 +40,12 @@ pub struct ImageManifest {
     /// the harness at `start_agent`, and `engram exec` when the request
     /// doesn't carry its own `workdir`.
     ///
-    /// Resolution, highest precedence first: an explicit `engram.toml`
-    /// `workdir`, else the Dockerfile `WORKDIR` (the baker reads the
-    /// image config and folds it in via
-    /// [`ImageManifest::apply_image_config_defaults`]), else the sandbox
-    /// default cwd `/` (`None`). The directory must already exist in the
-    /// rootfs; like a bad `exec` path, an absent `workdir` fails the
-    /// spawn.
+    /// Resolution, highest precedence first: an explicit config
+    /// `workdir`, else the Dockerfile `WORKDIR` (arriving as
+    /// [`OciRuntimeDefaults`], merged in by [`ImageConfig::merged_with`]),
+    /// else the sandbox default cwd `/` (`None`). The directory must
+    /// already exist in the rootfs; like a bad `exec` path, an absent
+    /// `workdir` fails the spawn.
     #[serde(default)]
     pub workdir: Option<String>,
 
@@ -92,11 +96,13 @@ pub struct ImageManifest {
 /// snapshot that claims to be warm.
 ///
 /// **Hermetic by default, egress opt-in:** the warm command runs without
-/// per-session secrets (the capture VM carries the manifest `[env]` +
-/// `capture_env`, not a session's `[secrets]`) and, absent [`Self::network`],
-/// **no network** — driven off baked, offline caches. An image whose warm
-/// boot genuinely needs the network (eager OIDC discovery, an `op inject`)
-/// opts in via `[warm.network]`.
+/// per-session secrets (the capture VM carries the config `[env]` +
+/// [`Self::env`]'s resolved capture entries, not a session's secrets) and,
+/// absent [`Self::network`], **no network** — driven off baked, offline
+/// caches. An image whose warm boot genuinely needs the network (eager
+/// OIDC discovery, a gradle dependency fetch) opts in via `[warm.network]`.
+/// ADR 0080: both knobs are first-class parts of this config — RPC-set and
+/// editable (with a recapture), never baked.
 ///
 /// **Backend note:** `build_base_snapshot` (where the hook runs) is
 /// implemented only on `PooledBackend`'s memory-snapshot path
@@ -118,6 +124,16 @@ pub struct WarmConfig {
     /// `workdir` (and ultimately the sandbox default `/`) when omitted.
     #[serde(default)]
     pub workdir: Option<String>,
+
+    /// Capture-time environment for the hook: literals and secret refs
+    /// (resolved through the `SecretStore` at capture; refs persisted,
+    /// values never). ADR 0080: absorbs the retired standalone
+    /// `capture_env` column/RPC field — warm secrets are part of the warm
+    /// config, one shape, one edit surface. Resolution is FAIL-LOUD: an
+    /// unresolvable ref aborts the capture (a silently-missing secret
+    /// bakes a corrupt warm snapshot).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<CaptureEnvEntry>,
 
     /// Network policy for the capture VM while the `[warm]` hook runs.
     /// Absent (the default) → the capture stays **egress-less**: it gets a
@@ -162,35 +178,113 @@ impl WarmConfig {
     }
 }
 
-impl ImageManifest {
-    /// Fold a built image's Docker config (its `ENV` as raw
-    /// `KEY=VALUE` strings + `WORKDIR`) in as **defaults** — the
-    /// author's `engram.toml` always wins:
-    /// - env: a `KEY` already present in `[env]` is left untouched;
-    ///   only Dockerfile-only keys are added.
-    /// - workdir: an explicit manifest `workdir` overrides; otherwise
-    ///   the Dockerfile `WORKDIR` applies; absent both, the sandbox
-    ///   default (`/`) stands (left `None`).
-    ///
-    /// The baker calls this before rendering `manifest.toml`, so every
-    /// downstream consumer (enable, create, resume, `/exec`) sees one
-    /// merged manifest and the platform never has to re-read the OCI
-    /// image config. Malformed env entries (no `=`) are skipped; an
-    /// empty `WORKDIR` is treated as unset by the caller.
-    pub fn apply_image_config_defaults(&mut self, env: &[String], working_dir: Option<&str>) {
+/// Dockerfile-derived runtime defaults, extracted from the OCI image's
+/// config blob (`ENV` + `WORKDIR`) at bake time and persisted alongside
+/// the admin [`ImageConfig`] on the `enabled_images` row (ADR 0080).
+/// Merged UNDER the admin config by [`ImageConfig::merged_with`] — kept
+/// separate so a cheap config edit never has to re-read (or lose) what
+/// the Dockerfile declared.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OciRuntimeDefaults {
+    /// Dockerfile `ENV`, already split into key/value pairs.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Dockerfile `WORKDIR` (`None` when unset or empty).
+    #[serde(default)]
+    pub workdir: Option<String>,
+}
+
+impl OciRuntimeDefaults {
+    /// Build from a Docker/OCI image config's raw `ENV` (`KEY=VALUE`
+    /// strings) + `WORKDIR`. Malformed env entries (no `=`) are
+    /// skipped; an empty `WORKDIR` is treated as unset.
+    pub fn from_docker_config(env: &[String], working_dir: Option<&str>) -> Self {
+        let mut out = Self::default();
         for kv in env {
             if let Some((k, v)) = kv.split_once('=') {
-                self.env
-                    .entry(k.to_string())
-                    .or_insert_with(|| v.to_string());
+                out.env.insert(k.to_string(), v.to_string());
             }
         }
-        if self.workdir.is_none() {
-            if let Some(wd) = working_dir.filter(|w| !w.is_empty()) {
-                self.workdir = Some(wd.to_string());
-            }
-        }
+        out.workdir = working_dir
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_string());
+        out
     }
+}
+
+impl ImageConfig {
+    /// The effective per-image config: this admin-authored config with
+    /// the image's Dockerfile-derived [`OciRuntimeDefaults`] folded in
+    /// as **defaults** — the admin config always wins:
+    /// - env: a `KEY` already present in `[env]` is left untouched;
+    ///   only Dockerfile-only keys are added.
+    /// - workdir: an explicit config `workdir` overrides; otherwise the
+    ///   Dockerfile `WORKDIR` applies; absent both, the sandbox default
+    ///   (`/`) stands (left `None`).
+    ///
+    /// Every runtime consumer (enable/capture, create, resume, `/exec`)
+    /// reads through this one merge, so the platform never re-reads the
+    /// OCI image config after enable.
+    pub fn merged_with(&self, defaults: &OciRuntimeDefaults) -> ImageConfig {
+        let mut merged = self.clone();
+        for (k, v) in &defaults.env {
+            merged
+                .env
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
+        if merged.workdir.is_none() {
+            merged.workdir = defaults.workdir.clone();
+        }
+        merged
+    }
+
+    /// Validate an RPC/CLI-supplied config. Called at EnableImage /
+    /// UpdateImage (the user-facing rejection point) and again by the
+    /// enable scanner before capture (defense in depth).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("config `name` must be non-empty".into());
+        }
+        // ADR 0048: vCPUs are a DECLARATION placement reserves against
+        // the host budget, not a hint — required.
+        if self.resources.suggested_vcpus.is_none() {
+            return Err(
+                "config `[resources] suggested_vcpus` is required (ADR 0048: placement \
+                 reserves it against the host CPU budget)"
+                    .into(),
+            );
+        }
+        if let Some(warm) = &self.warm {
+            warm.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// One capture-time environment entry for an image's `[warm]` hook
+/// ([`WarmConfig::env`]). The value is either a literal (a non-secret
+/// flag) or a secret ref resolved at capture through the same
+/// `SecretStore` a session uses (e.g. an org-secret name). The
+/// coordinator stores the ref, resolves it transiently at capture, and
+/// never logs or persists the resolved value.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureEnvEntry {
+    /// Environment variable name the warm hook sees.
+    pub name: String,
+    pub value: CaptureEnvValue,
+}
+
+/// The value half of a [`CaptureEnvEntry`]: a literal, or a secret ref.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CaptureEnvValue {
+    /// A literal, non-secret value (a flag, a host name).
+    Literal { value: String },
+    /// A secret ref resolved at capture via the `SecretStore`. The ref is
+    /// what's persisted; the resolved value is transient.
+    SecretRef { secret_ref: String },
 }
 
 /// How an image wants its resolved secret values delivered to the
@@ -300,75 +394,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_parses_minimal_toml() {
+    fn config_parses_minimal_toml() {
         let src = r#"
             name = "cortex-api"
         "#;
-        let m: ImageManifest = toml::from_str(src).unwrap();
-        assert_eq!(m.name, "cortex-api");
-        assert!(m.env.is_empty());
+        let c: ImageConfig = toml::from_str(src).unwrap();
+        assert_eq!(c.name, "cortex-api");
+        assert!(c.env.is_empty());
     }
 
-    /// ADR 0057: `[git]` was retired (D2) along with `secrets`/`secret_mode`/
-    /// `network` (B2b) — all session policy now. A manifest baked BEFORE the
-    /// strip with any of those sections must still parse (the fields are gone +
-    /// `deny_unknown_fields` is off), the sections simply ignored.
+    /// ADR 0080: the config is RPC/CLI-authored (never from a baked
+    /// artifact), so `deny_unknown_fields` is back — retired manifest-era
+    /// sections and typos are REJECTED, not ignored.
     #[test]
-    fn manifest_ignores_retired_git_block() {
-        let m: ImageManifest = toml::from_str(
-            r#"
-            name = "dev-engrams"
-            [git]
-            provider = "github"
-            owner = "cortexapps"
-        "#,
-        )
-        .expect("a pre-strip [git] block must still parse (ignored)");
-        assert_eq!(m.name, "dev-engrams");
-    }
-
-    /// ADR 0057: `secrets`/`secret_mode`/`network` were removed from the
-    /// manifest (they're session policy now). A manifest baked BEFORE the strip
-    /// still carries those sections; with `deny_unknown_fields` dropped, such a
-    /// manifest must still parse — the coordinator ignores the stripped sections
-    /// (session network/secrets come from the profile-compiled policy). The kept
-    /// fields (name/description/env/resources) still parse normally.
-    #[test]
-    fn manifest_ignores_pre_strip_secrets_and_network_sections() {
-        let src = r#"
-            name = "cortex-api"
-            description = "Backend API service"
-            secret_mode = "broker"
-
-            [env]
-            PYTHONUNBUFFERED = "1"
-
-            [secrets.GITHUB_TOKEN]
-            allow_hosts = ["api.github.com"]
-            allow_host_patterns = ["*.githubusercontent.com"]
-            description = "Read+write to org cortex/"
-
-            [network]
-            default = "deny"
-            allow_hosts = ["api.github.com", "registry.npmjs.org"]
-
-            [resources]
-            suggested_memory_mib = 4096
-            suggested_vcpus = 2
-        "#;
-        // The stripped sections are ignored, not rejected (no deny_unknown_fields).
-        let m: ImageManifest = toml::from_str(src).unwrap();
-        assert_eq!(m.name, "cortex-api");
-        assert_eq!(m.description.as_deref(), Some("Backend API service"));
-        assert_eq!(m.env.get("PYTHONUNBUFFERED").map(String::as_str), Some("1"));
-        assert_eq!(m.resources.suggested_memory_mib, Some(4096));
-        assert_eq!(m.resources.suggested_vcpus, Some(2));
+    fn config_rejects_retired_manifest_sections_and_typos() {
+        for src in [
+            "name = \"x\"\n[git]\nprovider = \"github\"\n",
+            "name = \"x\"\nsecret_mode = \"broker\"\n",
+            "name = \"x\"\n[network]\ndefault = \"deny\"\n",
+            "name = \"x\"\nenviroment = { FOO = \"bar\" }\n",
+        ] {
+            assert!(
+                toml::from_str::<ImageConfig>(src).is_err(),
+                "must reject: {src}"
+            );
+        }
     }
 
     #[test]
-    fn apply_image_config_defaults_folds_env_and_workdir() {
-        // engram.toml that overrides one var + sets nothing for workdir.
-        let mut m: ImageManifest = toml::from_str(
+    fn merged_with_folds_env_and_workdir_under_config() {
+        let c: ImageConfig = toml::from_str(
             r#"
             name = "x"
             [env]
@@ -376,15 +431,16 @@ mod tests {
         "#,
         )
         .unwrap();
-        m.apply_image_config_defaults(
+        let defaults = OciRuntimeDefaults::from_docker_config(
             &[
                 "PATH=/opt/cargo/bin:/usr/bin".to_string(),
-                "RUSTC_WRAPPER=should-not-win".to_string(), // manifest wins
+                "RUSTC_WRAPPER=should-not-win".to_string(), // config wins
                 "malformed-no-equals".to_string(),          // skipped
             ],
             Some("/workspace/engrams"),
         );
-        // Dockerfile-only key added; manifest's value preserved.
+        let m = c.merged_with(&defaults);
+        // Dockerfile-only key added; config's value preserved.
         assert_eq!(
             m.env.get("PATH").map(String::as_str),
             Some("/opt/cargo/bin:/usr/bin")
@@ -394,94 +450,124 @@ mod tests {
             Some("sccache")
         );
         assert!(!m.env.contains_key("malformed-no-equals"));
-        // Dockerfile WORKDIR fills the unset manifest workdir.
+        // Dockerfile WORKDIR fills the unset config workdir.
         assert_eq!(m.workdir.as_deref(), Some("/workspace/engrams"));
+        // The original config is untouched (merge is read-side).
+        assert!(c.env.get("PATH").is_none());
     }
 
     #[test]
-    fn apply_image_config_defaults_respects_explicit_workdir_and_empty() {
-        let mut m: ImageManifest =
-            toml::from_str("name = \"x\"\nworkdir = \"/manifest-wins\"").unwrap();
-        m.apply_image_config_defaults(&[], Some("/from-docker"));
+    fn merged_with_respects_explicit_workdir_and_empty() {
+        let c: ImageConfig = toml::from_str("name = \"x\"\nworkdir = \"/config-wins\"").unwrap();
+        let d = OciRuntimeDefaults::from_docker_config(&[], Some("/from-docker"));
         assert_eq!(
-            m.workdir.as_deref(),
-            Some("/manifest-wins"),
-            "explicit manifest workdir wins"
+            c.merged_with(&d).workdir.as_deref(),
+            Some("/config-wins"),
+            "explicit config workdir wins"
         );
 
         // Empty Dockerfile WORKDIR must not shadow the default `/`.
-        let mut m: ImageManifest = toml::from_str(r#"name = "x""#).unwrap();
-        m.apply_image_config_defaults(&[], Some(""));
-        assert_eq!(m.workdir, None);
-        m.apply_image_config_defaults(&[], None);
-        assert_eq!(m.workdir, None);
-    }
-
-    #[test]
-    fn manifest_with_env_and_workdir_round_trips_through_toml() {
-        // Guards the baker's re-render: a non-empty [env] table *and* a
-        // top-level `workdir` scalar must serialize + parse back intact
-        // (toml must tolerate the scalar after the table).
-        let mut m: ImageManifest = toml::from_str(r#"name = "x""#).unwrap();
-        m.apply_image_config_defaults(
-            &["PATH=/opt/cargo/bin:/usr/bin".to_string()],
-            Some("/workspace"),
-        );
-        let rendered = toml::to_string(&m).unwrap();
-        let back: ImageManifest = toml::from_str(&rendered).unwrap();
-        assert_eq!(back.workdir.as_deref(), Some("/workspace"));
+        let c: ImageConfig = toml::from_str(r#"name = "x""#).unwrap();
         assert_eq!(
-            back.env.get("PATH").map(String::as_str),
-            Some("/opt/cargo/bin:/usr/bin")
+            OciRuntimeDefaults::from_docker_config(&[], Some("")).workdir,
+            None
         );
+        assert_eq!(c.merged_with(&OciRuntimeDefaults::default()).workdir, None);
     }
 
     #[test]
-    fn manifest_ignores_unknown_top_level_keys() {
-        // ADR 0057: `deny_unknown_fields` was dropped so the coordinator can
-        // parse manifests baked BEFORE the secrets/network/secret_mode strip
-        // (those carry the now-removed sections) during the rollout window. The
-        // tradeoff: unknown/legacy top-level keys are silently ignored, not
-        // rejected — so a baker-side typo no longer fails the parse here.
+    fn config_round_trips_through_toml_and_json() {
+        // Guards the CLI's --config path (TOML) and the JSONB column
+        // (JSON): a full config must survive both.
         let src = r#"
-            name = "cortex-api"
-            secret_mode = "broker"
-            enviroment = { FOO = "bar" }
+            name = "dev-brain"
+            description = "Cortex development"
+            workdir = "/workspace"
+
+            [env]
+            PATH = "/opt/cargo/bin:/usr/bin"
+
+            [resources]
+            suggested_memory_mib = 24576
+            suggested_vcpus = 8
+
+            [warm]
+            command = ["bash", "-lc", "gradle --daemon help"]
+            timeout_secs = 900
+            workdir = "/workspace/brain-backend"
+
+            [[warm.env]]
+            name = "GITHUB_PASSWORD"
+            value = { kind = "secret_ref", secret_ref = "github-image-bot-pat" }
+
+            [[warm.env]]
+            name = "GRADLE_OPTS"
+            value = { kind = "literal", value = "-Xmx4g" }
+
+            [warm.network]
+            default = "deny"
+            allow_hosts = ["repo.maven.apache.org"]
+            allow_host_patterns = ["*.gradle.org"]
         "#;
-        let m: ImageManifest = toml::from_str(src).expect("legacy/unknown keys are ignored");
-        assert_eq!(m.name, "cortex-api");
+        let c: ImageConfig = toml::from_str(src).unwrap();
+        c.validate().expect("full config validates");
+        let w = c.warm.as_ref().unwrap();
+        assert_eq!(w.env.len(), 2);
+        assert_eq!(w.env[0].name, "GITHUB_PASSWORD");
+        assert!(matches!(
+            &w.env[0].value,
+            CaptureEnvValue::SecretRef { secret_ref } if secret_ref == "github-image-bot-pat"
+        ));
+        let net = w.network.as_ref().unwrap();
+        assert_eq!(net.default, NetworkDefault::Deny);
+        assert_eq!(net.allow_hosts, vec!["repo.maven.apache.org"]);
+
+        let json = serde_json::to_string(&c).unwrap();
+        let back: ImageConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "dev-brain");
+        assert_eq!(back.warm.as_ref().unwrap().env.len(), 2);
+        assert_eq!(
+            back.warm.as_ref().unwrap().network,
+            c.warm.as_ref().unwrap().network
+        );
+
+        let rendered = toml::to_string(&c).unwrap();
+        let back: ImageConfig = toml::from_str(&rendered).unwrap();
+        assert_eq!(back.warm.unwrap().env.len(), 2);
     }
 
     #[test]
-    fn manifest_parses_warm_block() {
+    fn validate_requires_name_and_vcpus() {
+        let c: ImageConfig = toml::from_str(r#"name = "x""#).unwrap();
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("suggested_vcpus"), "{err}");
+
+        let c: ImageConfig = toml::from_str(
+            "name = \"  \"\n[resources]\nsuggested_vcpus = 2\n",
+        )
+        .unwrap();
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("name"), "{err}");
+
+        let c: ImageConfig = toml::from_str(
+            "name = \"x\"\n[resources]\nsuggested_vcpus = 2\n",
+        )
+        .unwrap();
+        c.validate().expect("name + vcpus is the minimal valid config");
+    }
+
+    #[test]
+    fn config_parses_warm_block() {
         // No [warm] → none, and nothing rendered out.
-        let plain: ImageManifest = toml::from_str(r#"name = "x""#).unwrap();
+        let plain: ImageConfig = toml::from_str(r#"name = "x""#).unwrap();
         assert!(plain.warm.is_none());
         assert!(
             !toml::to_string(&plain).unwrap().contains("warm"),
             "a warm-less image must not render a [warm] table"
         );
 
-        // Full block: command + timeout + workdir.
-        let m: ImageManifest = toml::from_str(
-            r#"
-            name = "dev-brain"
-            [warm]
-            command = ["bash", "-lc", "gradle --daemon help"]
-            timeout_secs = 900
-            workdir = "/workspace/brain-backend"
-        "#,
-        )
-        .unwrap();
-        let w = m.warm.expect("warm table parsed");
-        assert_eq!(w.command, vec!["bash", "-lc", "gradle --daemon help"]);
-        assert_eq!(w.timeout_secs, Some(900));
-        assert_eq!(w.workdir.as_deref(), Some("/workspace/brain-backend"));
-        assert_eq!(w.timeout().as_secs(), 900);
-        w.validate().expect("non-empty command is valid");
-
-        // Minimal block: just a command; timeout/workdir default.
-        let min: ImageManifest = toml::from_str(
+        // Minimal block: just a command; timeout/workdir/env default.
+        let min: ImageConfig = toml::from_str(
             r#"
             name = "x"
             [warm]
@@ -492,6 +578,7 @@ mod tests {
         let w = min.warm.unwrap();
         assert!(w.timeout_secs.is_none());
         assert!(w.workdir.is_none());
+        assert!(w.env.is_empty());
         assert_eq!(w.timeout().as_secs(), WarmConfig::DEFAULT_TIMEOUT_SECS);
     }
 
@@ -502,6 +589,7 @@ mod tests {
             command: vec![],
             timeout_secs: None,
             workdir: None,
+            env: Vec::new(),
             network: None,
         };
         assert!(empty.validate().is_err(), "empty command must be rejected");
@@ -511,6 +599,7 @@ mod tests {
             command: vec!["  ".into(), "\t".into()],
             timeout_secs: None,
             workdir: None,
+            env: Vec::new(),
             network: None,
         };
         assert!(
@@ -522,6 +611,7 @@ mod tests {
             command: vec!["echo".into(), "ok".into()],
             timeout_secs: None,
             workdir: None,
+            env: Vec::new(),
             network: None,
         }
         .validate()
@@ -532,7 +622,7 @@ mod tests {
     fn warm_block_rejects_unknown_field() {
         // deny_unknown_fields guards typos in the block.
         assert!(
-            toml::from_str::<ImageManifest>(
+            toml::from_str::<ImageConfig>(
                 r#"
                 name = "x"
                 [warm]
@@ -543,6 +633,29 @@ mod tests {
             .is_err(),
             "typo `timeout` (vs timeout_secs) must be rejected"
         );
+    }
+
+    /// The JSONB shape of a capture-env entry is a wire contract (the
+    /// proto conversion + the web form both build it) — pin it.
+    #[test]
+    fn capture_env_entry_jsonb_shape_round_trips() {
+        let entries = vec![
+            CaptureEnvEntry {
+                name: "FLAG".into(),
+                value: CaptureEnvValue::Literal { value: "1".into() },
+            },
+            CaptureEnvEntry {
+                name: "TOKEN".into(),
+                value: CaptureEnvValue::SecretRef {
+                    secret_ref: "org-secret-name".into(),
+                },
+            },
+        ];
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(json.contains("\"kind\":\"literal\""), "{json}");
+        assert!(json.contains("\"kind\":\"secret_ref\""), "{json}");
+        let back: Vec<CaptureEnvEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, entries);
     }
 
     #[test]

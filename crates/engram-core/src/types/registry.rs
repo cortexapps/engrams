@@ -177,21 +177,29 @@ pub struct SessionSecrets {
     pub created_at: DateTime<Utc>,
 }
 
-/// One row in `enabled_images`. The manifest content is fetched
-/// from the registry at enable time and stored on the row, so
-/// session-create has zero network dependency on the manifest path
-/// — the host-agent still pulls the rootfs blob, but that's lazy
-/// and cached separately by digest.
+/// One row in `enabled_images`. ADR 0080: the per-image config is
+/// supplied out-of-band via the ImageService (EnableImage/UpdateImage)
+/// and stored here as JSONB — the artifact carries no metadata — so
+/// session-create has zero network dependency on any config path; the
+/// host-agent still pulls the rootfs blob, but that's lazy and cached
+/// separately by digest.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnabledImage {
     pub id: Uuid,
     /// Full OCI reference: `host[:port]/repo[/path]:tag`.
     pub image_uri: String,
-    /// Verbatim `manifest.toml` from the registry — parsed at use
-    /// site rather than persisted as JSON, since the upstream
-    /// `ImageManifest` carries `deny_unknown_fields` and we want
-    /// the original byte-for-byte representation when refreshing.
-    pub manifest_toml: String,
+    /// The admin-authored [`ImageConfig`] (ADR 0080): name, description,
+    /// env, workdir, resources, and the whole warm block (command +
+    /// capture env + capture egress). Set at EnableImage, replaced by
+    /// UpdateImage; capture-affecting fields only become visible here
+    /// once the recapture's enable job reaches `ready` (the job carries
+    /// the pending config).
+    pub image_config: crate::types::image::ImageConfig,
+    /// Dockerfile-derived `ENV`/`WORKDIR` defaults extracted from the OCI
+    /// image config blob at enable time, merged UNDER `image_config` by
+    /// [`Self::effective_config`].
+    #[serde(default)]
+    pub oci_defaults: crate::types::image::OciRuntimeDefaults,
     /// `sha256:...` digest of the OCI manifest layer holding the
     /// toml. Used to short-circuit refresh: if the registry's tag
     /// still resolves to the same digest, the row is already current.
@@ -252,86 +260,43 @@ pub struct EnabledImage {
     /// whose image was disabled while it was idle can still resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soft_deleted_at: Option<DateTime<Utc>>,
-    /// Capture-time environment for the image's `[warm]` hook (see
-    /// [`CaptureEnvEntry`]). Set by the admin at enable/update time — NOT
-    /// from the image manifest (ADR 0057: the image declares only what it
-    /// *is*, not what a capture may hold). Resolved to values at
-    /// base-snapshot capture and merged into the warm hook's exec env; these
-    /// are *build/capture* secrets, distinct from a session's profile-injected
-    /// runtime secrets. Stored as refs, never resolved values. Empty for an
-    /// image with no `[warm]` hook (or one that needs no secrets).
-    #[serde(default)]
-    pub capture_env: Vec<CaptureEnvEntry>,
 }
 
-/// One capture-time environment entry for an image's `[warm]` hook. The
-/// value is either a literal (a non-secret flag) or a secret ref resolved
-/// at capture through the same [`crate::traits::SecretStore`] a session
-/// uses (e.g. `gcp-sm://…`). Set on the *enable action*, persisted on the
-/// [`EnabledImage`] row, and carried into a capture via the [`EnableJob`].
-/// The coordinator stores the ref, resolves it transiently at capture, and
-/// never logs or persists the resolved value.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CaptureEnvEntry {
-    /// Environment variable name the warm hook sees.
-    pub name: String,
-    pub value: CaptureEnvValue,
+impl EnabledImage {
+    /// The effective per-image config: the admin [`ImageConfig`] with the
+    /// Dockerfile-derived defaults merged under it. Every runtime
+    /// consumer (boot bundle, session create/resume, evacuation
+    /// recovery, capture) reads through this.
+    pub fn effective_config(&self) -> crate::types::image::ImageConfig {
+        self.image_config.merged_with(&self.oci_defaults)
+    }
 }
 
-/// The value half of a [`CaptureEnvEntry`]: a literal, or a secret ref.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CaptureEnvValue {
-    /// A literal, non-secret value (a flag, a host name).
-    Literal { value: String },
-    /// A secret ref resolved at capture via the `SecretStore`. The ref is
-    /// what's persisted; the resolved value is transient.
-    SecretRef { secret_ref: String },
-}
-
-/// Public summary view used by `GET /api/enabled-images`. Strips
-/// the raw `manifest_toml` blob (clients re-render via the parsed
-/// `ImageManifest` fields they care about — name, description,
-/// secret schemas).
+/// Public summary view used by `ImageService.ListEnabledImages`. Carries
+/// the full admin [`ImageConfig`] (refs only for warm secrets — never
+/// resolved values) so the dashboard's edit form pre-fills everything.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnabledImageSummary {
     pub id: Uuid,
     pub image_uri: String,
     pub manifest_digest: String,
-    /// Parsed manifest name/description/secret-schemas — what the
-    /// dashboard renders. Decoupled from the raw toml so a
-    /// hand-edited row that fails to parse can still report a
-    /// fallback summary.
-    pub manifest_name: Option<String>,
-    pub manifest_description: Option<String>,
+    /// The admin-authored config (ADR 0080). What the dashboard renders
+    /// AND edits — `config.name` / `config.description` replace the
+    /// retired lifted `manifest_name`/`manifest_description` fields.
+    pub config: crate::types::image::ImageConfig,
     pub last_refreshed_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
-    /// Capture-time env attached to this enabled image (refs, never resolved
-    /// values) — lets the dashboard's edit form pre-fill the current set.
-    #[serde(default)]
-    pub capture_env: Vec<CaptureEnvEntry>,
 }
 
 impl From<EnabledImage> for EnabledImageSummary {
     fn from(row: EnabledImage) -> Self {
-        // Try to lift display fields out of the parsed manifest. A
-        // parse failure here just leaves them None — the row stays
-        // in the list so an operator can still disable it; the
-        // dashboard falls back to rendering `image_uri` only.
-        let manifest: Option<crate::types::ImageManifest> = toml::from_str(&row.manifest_toml).ok();
-        let (manifest_name, manifest_description) = match manifest {
-            Some(m) => (Some(m.name), m.description),
-            None => (None, None),
-        };
         Self {
             id: row.id,
             image_uri: row.image_uri,
             manifest_digest: row.manifest_digest,
-            manifest_name,
-            manifest_description,
+            config: row.image_config,
             last_refreshed_at: row.last_refreshed_at,
             created_at: row.created_at,
-            capture_env: row.capture_env,
         }
     }
 }
@@ -401,14 +366,15 @@ pub struct EnableJob {
     /// this exceeds its budget.
     pub attempts: u32,
     pub error: Option<String>,
-    /// Capture-time env for this enable's `[warm]` hook, carried from the
-    /// triggering request (enable/update) or inherited from the existing
-    /// enabled-image row (refresh). The scanner stamps it onto the
-    /// `EnabledImage` row before capture; `capture_and_record_base_snapshot`
-    /// resolves the refs and injects them into the warm hook. See
-    /// [`CaptureEnvEntry`].
-    #[serde(default)]
-    pub capture_env: Vec<CaptureEnvEntry>,
+    /// ADR 0080: the [`ImageConfig`](crate::types::image::ImageConfig)
+    /// this enable/refresh/update runs under, carried from the triggering
+    /// request (or inherited from the existing enabled-image row). The
+    /// scanner stamps it onto the `EnabledImage` row only at `ready` —
+    /// which is what keeps a capture-affecting UpdateImage invisible to
+    /// session-create until the new base snapshot exists. The capture
+    /// stage resolves `warm.env` refs and assembles the `warm.network`
+    /// egress policy from it.
+    pub image_config: crate::types::image::ImageConfig,
     /// ADR 0036 amendment (issue #538): per-host prestage outcome map,
     /// written once at the end of the `Prestaging` stage —
     /// `{"<host-uuid>": {"outcome": "staged"|"timed_out"|"unschedulable",
@@ -446,37 +412,6 @@ fn default_prestage_hosts() -> serde_json::Value {
 mod tests {
     use super::*;
 
-    #[test]
-    fn capture_env_entry_jsonb_shape_round_trips() {
-        // The JSONB shape persisted on enabled_images/enable_jobs. A tagged
-        // `kind` discriminates literal vs secret_ref so the value is never
-        // ambiguous.
-        let entries = vec![
-            CaptureEnvEntry {
-                name: "FLAG".into(),
-                value: CaptureEnvValue::Literal {
-                    value: "true".into(),
-                },
-            },
-            CaptureEnvEntry {
-                name: "OP_TOKEN".into(),
-                value: CaptureEnvValue::SecretRef {
-                    secret_ref: "gcp-sm://p/secrets/op/versions/latest".into(),
-                },
-            },
-        ];
-        let json = serde_json::to_value(&entries).unwrap();
-        assert_eq!(json[0]["name"], "FLAG");
-        assert_eq!(json[0]["value"]["kind"], "literal");
-        assert_eq!(json[0]["value"]["value"], "true");
-        assert_eq!(json[1]["value"]["kind"], "secret_ref");
-        assert_eq!(
-            json[1]["value"]["secret_ref"],
-            "gcp-sm://p/secrets/op/versions/latest"
-        );
-        let back: Vec<CaptureEnvEntry> = serde_json::from_value(json).unwrap();
-        assert_eq!(back, entries);
-    }
 
     #[test]
     fn auth_spec_serde_round_trip_static() {
