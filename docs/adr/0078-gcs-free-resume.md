@@ -238,6 +238,28 @@ evidence; "LAN beats GCS ~20×" is a code comment, not an independent
 measurement. Re-measure at the Phase-5 flip; never present the peer-fill
 wins without the fleet-stability precondition.
 
+### Phase-2 re-review fixes (2026-07)
+
+- **The tier-0 `disk_full` veto was nullified by `prefer_host`.** The
+  resume path passes the snapshot host as BOTH `snapshot_host` (tier 0)
+  and `prefer_host` (tier 2), and the prefer arm re-checked only
+  ranked-membership + RAM/CPU — so a disk-pressured snapshot host that
+  tier 0 correctly vetoed (and counted as a fallback) was re-picked one
+  arm later, and the fallback metric lied. Fixed by extracting the
+  disk/RAM/CPU gate into one shared `named_host_fit_veto` applied by
+  both arms (`placement.rs`) — those three are exactly the vetoes
+  `rank_hosts` does not enforce.
+- **`PickError::HostUnreachable`/`Internal` were terminal on the resume
+  verb.** Both are transient by contract, but mapped through
+  `SandboxError::Vm → ApiError::Internal` into `OpOutcome::Failed`;
+  pre-0079 the wire caller retried around that, the verb now owns the
+  only attempt. They map to the typed `SandboxError::Unavailable`
+  (→ 503 → `Retry` under `RESUME_MAX_ATTEMPTS`).
+- **The Idle→Queued no-capacity arm is fenced** (ADR 0079):
+  `enqueue_session_resume` gains the op-epoch predicate and the Queued
+  StatusChanged rides `emit_fenced`, so a reclaimed-away zombie executor
+  can't fork the state machine.
+
 ### Phase-2 review note: affinity asserts locality it cannot verify
 
 `snapshots.host_id` is a capture-time fact with no possession freshness —

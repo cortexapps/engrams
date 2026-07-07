@@ -1541,15 +1541,26 @@ async fn resume_from_fc_snapshot(
     if matches!(session.status, SessionState::Idle) {
         match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
             Ok(c) if c.hosts.is_empty() => {
-                state
+                // ADR 0079 (0078 re-review finding #4): fenced, like every
+                // sibling write in this pipeline — an unfenced Idle→Queued
+                // here let a reclaimed-away zombie executor fork the state
+                // machine. `false` = the epoch moved (successor re-claimed)
+                // or the row left Idle under us: stop silently, no event
+                // (the `fenced:` Conflict convention — the verb's Retry
+                // re-reads the session and dispatches on its real state).
+                let queued = state
                     .services
                     .meta
-                    .enqueue_session_resume(id)
+                    .enqueue_session_resume(id, op_ctx.epoch)
                     .await
                     .map_err(|e| ApiError::Internal(format!("enqueue_session_resume: {e}")))?;
+                if !queued {
+                    return Err(fenced_error());
+                }
                 let _ = state
-                    .emit(
+                    .emit_fenced(
                         id,
+                        op_ctx.fence(),
                         SessionEvent::StatusChanged {
                             from: SessionState::Idle,
                             to: SessionState::Queued,
@@ -2932,6 +2943,163 @@ mod evicting_gate_tests {
             after.sandbox_id,
             Some(residual),
             "the residual binding is the live binding — no destroy, no double-restore",
+        );
+    }
+}
+
+/// ADR 0079 (0078 re-review finding #4): the resume verb's
+/// Idle-with-empty-candidates arm (`Idle → Queued` via
+/// `enqueue_session_resume`) is FENCED like every sibling write in the op
+/// pipeline — a reclaimed-away zombie executor must not fork the state
+/// machine or land a stale StatusChanged event.
+#[cfg(test)]
+mod resume_queue_fence_tests {
+    use super::*;
+    use engram_core::types::session::SessionMode;
+    use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState};
+
+    fn idle_session(id: SessionId) -> Session {
+        Session {
+            id,
+            status: SessionState::Idle,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:queue-fence".into(),
+            mode: SessionMode::Agent,
+            created_at: Utc::now(),
+            last_active_at: Utc::now(),
+            live_disk_manifest: None,
+            park_rung: 0,
+            parked_at: None,
+        }
+    }
+
+    /// A disk-only record: `snapshot_artifacts_present` passes it without
+    /// touching blob storage (only memory-bearing FC snapshots re-verify),
+    /// so the resume reaches the placement arm deterministically.
+    fn disk_only_record(id: SessionId) -> SnapshotRecord {
+        SnapshotRecord {
+            id: engram_core::types::SnapshotId::new(),
+            session_id: Some(id),
+            host_id: None,
+            image_version: "queue-fence".into(),
+            size_bytes: 1,
+            created_at: Utc::now(),
+            last_accessed_at: Utc::now(),
+            disk_manifest: None,
+            memory_manifest: None,
+            recoverable: true,
+            aux_bundles: Vec::new(),
+            events_cursor: None,
+            fc_snapshot_version: None,
+        }
+    }
+
+    /// Happy path: under the CURRENT epoch, an empty candidate set queues
+    /// the session (Idle → Queued) and emits the fenced StatusChanged.
+    #[tokio::test]
+    async fn no_capacity_resume_queues_under_current_fence() {
+        let id = SessionId::new();
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(idle_session(id));
+        mini.snapshots.lock().push(disk_only_record(id));
+        // No hosts staged → `candidates_for` yields an empty set.
+
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Resume, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue+claim")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        let ctx = crate::session_ops::OpCtx {
+            state: &state,
+            op: &op,
+            epoch: op.epoch.unwrap(),
+        };
+        let session = state.services.meta.get_session(id).await.unwrap();
+        let resp = resume_from_idle(&ctx, session).await.expect("queued");
+        assert_eq!(resp.note, "queued");
+        assert_eq!(
+            mini.session.lock().status,
+            SessionState::Queued,
+            "no capacity → the resume parks the session in the queue",
+        );
+        assert!(
+            mini.events
+                .lock()
+                .iter()
+                .any(|e| e.kind == "status_changed"),
+            "the Idle→Queued flip must emit its StatusChanged event",
+        );
+    }
+
+    /// A STALE fence (a successor re-claimed the session) must not queue
+    /// the session or emit — the zombie stops on the `fenced:` Conflict.
+    #[tokio::test]
+    async fn stale_fenced_resume_cannot_fork_idle_to_queued() {
+        let id = SessionId::new();
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(idle_session(id));
+        mini.snapshots.lock().push(disk_only_record(id));
+
+        // Claim + finish op1 (epoch 1), then claim op2 (epoch 2) — the
+        // mock CAS-bumps `current_epoch` on each claim, so epoch 1 is now
+        // a reclaimed-away predecessor's fence.
+        let op1 = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Resume, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue+claim op1")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        assert!(mini
+            .ops
+            .finish(op1.id, op1.epoch.unwrap(), OpState::Done, None));
+        let _op2 = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Resume, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue+claim op2")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+
+        let stale_ctx = crate::session_ops::OpCtx {
+            state: &state,
+            op: &op1,
+            epoch: op1.epoch.unwrap(), // 1 — superseded by op2's claim
+        };
+        let session = state.services.meta.get_session(id).await.unwrap();
+        let err = match resume_from_idle(&stale_ctx, session).await {
+            Err(e) => e,
+            Ok(resp) => panic!(
+                "a stale fence must not queue the session, got Ok({:?})",
+                resp.note
+            ),
+        };
+        assert!(
+            err.to_string().contains("fenced"),
+            "the stop must ride the `fenced:` Conflict convention, got: {err}",
+        );
+        assert_eq!(
+            mini.session.lock().status,
+            SessionState::Idle,
+            "the zombie executor must NOT fork Idle → Queued",
+        );
+        assert!(
+            !mini
+                .events
+                .lock()
+                .iter()
+                .any(|e| e.kind == "status_changed"),
+            "no stale StatusChanged event may land",
         );
     }
 }

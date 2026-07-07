@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 // v11 (issue #548 / ADR 0078): the never-populated `local_snapshots`
 // heartbeat mirror is retired end-to-end — the `Heartbeat.local_snapshots`
 // wire field, `HostRecord`/`HostHeartbeat` fields, the `hosts.local_snapshots`
-// PG column (migration 0090), and the fleet-view proto count (reserved 7).
+// PG column (migration 0091), and the fleet-view proto count (reserved 7).
 // Clean break — coord+host roll together; skewed hosts drain off scheduling
 // via `host_wire_version_ok` until the host MIG rolls.
 // v12 (ADR 0079 / #543): fencing_epoch on session-scoped host RPCs — the

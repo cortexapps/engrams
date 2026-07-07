@@ -391,7 +391,6 @@ This section documents the design for **coordinator ↔ host-agent** and **host 
    │              │                             │              │
    │              │ ──── Heartbeat (5s) ──────► │              │
    │              │ ──── CapacityReport ──────► │              │
-   │              │ ──── LocalSnapshots ──────► │              │
    │              │                             │              │
    │              │ ◄─── AssignSession ──────── │              │
    │              │ ◄─── RevokeSession ──────── │              │

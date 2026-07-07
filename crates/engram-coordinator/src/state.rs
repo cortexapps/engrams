@@ -1794,6 +1794,29 @@ pub(crate) mod tests {
             }
             Ok(prev)
         }
+        // ADR 0079 (0078 re-review finding #4): mirror the PG semantics —
+        // Idle → Queued gated on BOTH `status='idle'` and the fencing
+        // epoch — so the resume verb's no-capacity queue arm is testable
+        // against a stale fence (the default trait impl returns
+        // `Ok(false)`, which would make the happy path vacuous).
+        async fn enqueue_session_resume(
+            &self,
+            id: engram_core::SessionId,
+            epoch: i64,
+        ) -> Result<bool, MetaError> {
+            if self.ops.current_epoch(id) != epoch {
+                return Ok(false);
+            }
+            let mut s = self.session.lock();
+            if id != s.id {
+                return Err(MetaError::NotFound);
+            }
+            if s.status != SessionState::Idle {
+                return Ok(false);
+            }
+            s.status = SessionState::Queued;
+            Ok(true)
+        }
         // ADR 0074 parking ladder: mirror the PG UPDATE into the
         // in-memory session so the reaper/ascent paths read the stamped
         // rung back (the default trait impl is a no-op, which would make

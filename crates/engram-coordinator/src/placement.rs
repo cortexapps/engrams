@@ -189,10 +189,16 @@ impl From<PickError> for SandboxError {
             PickError::NoCapacity => {
                 SandboxError::Vm("no host has free capacity for this session".into())
             }
+            // Both variants are transient by contract (see the enum docs):
+            // map to the typed `Unavailable`, which the API layer surfaces
+            // as a retryable 503 and the resume verb as `OpOutcome::Retry`.
+            // The old catch-all `Vm` mapping landed `ApiError::Internal` →
+            // terminal `Failed` — pre-0079 the wire caller retried around
+            // that, but the verb now owns the only attempt.
             PickError::HostUnreachable(h, msg) => {
-                SandboxError::Vm(format!("picked host {h} is unreachable: {msg}").into())
+                SandboxError::Unavailable(format!("picked host {h} is unreachable: {msg}"))
             }
-            PickError::Internal(msg) => SandboxError::Vm(format!("placement read: {msg}").into()),
+            PickError::Internal(msg) => SandboxError::Unavailable(format!("placement read: {msg}")),
         }
     }
 }
@@ -380,7 +386,9 @@ pub fn rank_hosts(
 ///    `host_passes_filters` gate plus disk/RAM/CPU — an affinity host that
 ///    can't take the resume falls through to the soft tiers, counted in
 ///    `engram_resume_affinity_fallback_total`),
-/// 2. `prefer_host` if it fits both dimensions,
+/// 2. `prefer_host` if it passes the same disk + RAM/CPU fit gate as
+///    tier 0 (`named_host_fit_veto` — shared so a host tier-0 vetoed,
+///    e.g. for `disk_full`, can't be re-picked via prefer),
 /// 3. BEST-FIT: smallest free RAM among hosts that fit BOTH `memory_mib`
 ///    and the CPU budget (ADR 0048 — pack, don't spread),
 /// 4. fallback: the first ranked candidate (hosts without an
@@ -446,14 +454,20 @@ pub fn pick_from(
             }
         }
     }
-    // 2. soft host-affinity, when it fits both dims (unknown RAM counts
-    //    as fitting — same posture as `choose_placement_host`).
+    // 2. soft host-affinity. Membership in `ranked` covers the
+    //    schedulability gates; `named_host_fit_veto` covers disk +
+    //    RAM/CPU — the SAME gate tier-0 applies. Without it, a
+    //    snapshot host tier-0 just vetoed (e.g. `disk_full`) is
+    //    re-picked here, because the resume path passes the same host
+    //    as `prefer_host` — nullifying the veto and falsifying the
+    //    fallback metric.
     if let Some(want) = ctx.prefer_host {
-        if ranked.hosts.contains(&want)
-            && free_mib_of(want).is_none_or(|f| f >= need_mib)
-            && cpu_fits(want)
-        {
-            return Ok(want);
+        if ranked.hosts.contains(&want) {
+            if let Some(h) = hosts.iter().find(|h| h.id == want) {
+                if named_host_fit_veto(h, ctx, &free_mib_of, &cpu_fits).is_none() {
+                    return Ok(want);
+                }
+            }
         }
     }
     // 3. best-fit: SMALLEST measured free RAM that fits both dims.
@@ -533,27 +547,46 @@ fn snapshot_host_veto(
     {
         return Some("digest_not_ready".into());
     }
-    // Disk: a host with free work_dir below the chunk-cache floor is
-    // disk-pressured and about to evict cache — placing a resume there
-    // defeats the whole point. `disk_total_mib == 0` (unmeasured) is soft
-    // (no veto), same posture as unmeasured RAM.
+    // Disk + capacity: the shared named-host fit gate (also applied by
+    // the tier-2 prefer arm) so the two can never drift.
+    named_host_fit_veto(h, ctx, free_mib_of, cpu_fits).map(Into::into)
+}
+
+/// The disk + capacity gates any NAMED steering target must pass — the
+/// tier-0 `snapshot_host` and the tier-2 `prefer_host` alike. These are
+/// exactly the vetoes `rank_hosts` does NOT enforce (a ranked host can
+/// still be disk-pressured or budget-full), so every arm that picks a
+/// specific host by name must apply them; one shared predicate instead of
+/// two drifting copies. Returns the
+/// `engram_resume_affinity_fallback_total{reason}` label, `None` = fits.
+///
+/// - `disk_full`: free work_dir below the chunk-cache floor — the host is
+///   about to disk-evict its cache, a pointless locality target.
+///   `disk_total_mib == 0` (unmeasured) is soft (no veto), same posture
+///   as unmeasured RAM.
+/// - `ram_full` / `cpu_full`: the session's committed budget doesn't fit
+///   (unmeasured RAM / an unreported CPU budget are soft).
+fn named_host_fit_veto(
+    h: &HostRecord,
+    ctx: &ScheduleContext<'_>,
+    free_mib_of: &impl Fn(HostId) -> Option<i64>,
+    cpu_fits: &impl Fn(HostId) -> bool,
+) -> Option<&'static str> {
     if h.utilization.disk_total_mib > 0 {
         let free_disk_mib = h
             .utilization
             .disk_total_mib
             .saturating_sub(h.utilization.disk_used_mib);
         if free_disk_mib < engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB {
-            return Some("disk_full".into());
+            return Some("disk_full");
         }
     }
-    // Capacity: the session's committed RAM/CPU budget must fit
-    // (unmeasured RAM is soft). Real veto, not a vibe.
     let need_mib = ctx.memory_mib.unwrap_or(0) as i64;
-    if free_mib_of(sh).is_some_and(|free| free < need_mib) {
-        return Some("ram_full".into());
+    if free_mib_of(h.id).is_some_and(|free| free < need_mib) {
+        return Some("ram_full");
     }
-    if !cpu_fits(sh) {
-        return Some("cpu_full".into());
+    if !cpu_fits(h.id) {
+        return Some("cpu_full");
     }
     None
 }
@@ -1293,6 +1326,53 @@ mod tests {
         c.memory_mib = Some(8_000); // doesn't fit h2's 1,000 free
         let pick = pick_from(&[other, ram_full], &HashMap::new(), &c, Utc::now(), TTL).unwrap();
         assert_eq!(pick, hid(1), "RAM-full snapshot_host → soft fallback");
+    }
+
+    /// ADR 0078 re-review (finding #1): a tier-0 veto must not be
+    /// nullified by the tier-2 prefer arm. The resume path passes the
+    /// SAME host as both `snapshot_host` and `prefer_host`
+    /// (`api/snapshot.rs`: `prefer_host: record.host_id.or(...)`), so the
+    /// prefer arm must apply the same disk/RAM/CPU fit gate — otherwise
+    /// the disk-pressured host tier-0 just rejected (and counted as a
+    /// fallback) is re-picked one arm later.
+    #[test]
+    fn disk_vetoed_snapshot_host_is_not_repicked_via_prefer() {
+        let mut disk_full = host(2);
+        disk_full.utilization.disk_total_mib = 200_000;
+        disk_full.utilization.disk_used_mib =
+            200_000 - (engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB - 1);
+        let mut c = ctx();
+        c.snapshot_host = Some(hid(2));
+        c.prefer_host = Some(hid(2)); // the resume path's exact shape
+        let pick = pick_from(
+            &[host(1), disk_full.clone()],
+            &HashMap::new(),
+            &c,
+            Utc::now(),
+            TTL,
+        )
+        .unwrap();
+        assert_eq!(
+            pick,
+            hid(1),
+            "a disk-vetoed snapshot host must not sneak back in as prefer_host"
+        );
+
+        // The prefer arm applies the gate on its own too (uniform fix):
+        // a disk-pressured prefer host with NO snapshot affinity in play
+        // falls through the same way.
+        let mut c = ctx();
+        c.prefer_host = Some(hid(2));
+        let pick = pick_from(&[host(1), disk_full], &HashMap::new(), &c, Utc::now(), TTL).unwrap();
+        assert_eq!(pick, hid(1), "disk-pressured prefer_host → falls through");
+
+        // A healthy prefer host still wins over row order (the soft
+        // preference itself is unchanged — host(2) is unmeasured, so
+        // without prefer the fallback would pick host(1)).
+        let mut c = ctx();
+        c.prefer_host = Some(hid(2));
+        let pick = pick_from(&[host(1), host(2)], &HashMap::new(), &c, Utc::now(), TTL).unwrap();
+        assert_eq!(pick, hid(2), "a healthy prefer_host is still preferred");
     }
 
     #[test]

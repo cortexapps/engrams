@@ -1345,18 +1345,22 @@ impl MetadataStore for PostgresStore {
         Ok(flipped)
     }
 
-    async fn enqueue_session_resume(&self, id: SessionId) -> Result<(), MetaError> {
+    async fn enqueue_session_resume(&self, id: SessionId, epoch: i64) -> Result<bool, MetaError> {
         // Idle → queued (resume origin). Gated on `status='idle'` so a
-        // racing resume that already advanced the row is a clean no-op.
+        // racing resume that already advanced the row is a clean no-op,
+        // AND on the resume op's fencing epoch (ADR 0079) so a
+        // reclaimed-away zombie executor can't fork the state machine —
+        // same predicate shape as `fenced_transition_session`.
         let n = sqlx::query(
             r#"
             UPDATE sessions
                SET status = 'queued', queued_at = NOW(), queue_origin = 'resume',
                    last_active_at = NOW()
-             WHERE id = $1 AND status = 'idle'
+             WHERE id = $1 AND status = 'idle' AND current_epoch = $2
             "#,
         )
         .bind(id.as_uuid())
+        .bind(epoch)
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -1372,7 +1376,7 @@ impl MetadataStore for PostgresStore {
             // pure overhead.
             self.notify_placement_changed("enqueued").await;
         }
-        Ok(())
+        Ok(n > 0)
     }
 
     async fn list_queued_sessions_fifo(
