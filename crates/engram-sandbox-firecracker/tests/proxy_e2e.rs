@@ -227,11 +227,12 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     let mut proxy_cfg = engram_egress_proxy::ProxyConfig::new(proxy_bind, registry.clone(), mint);
     proxy_cfg.resolver = resolver;
     let proxy = engram_egress_proxy::Proxy::new(proxy_cfg);
+    // Bind synchronously (ADR 0075) — the listener is up before serve
+    // spawns, so no sleep-to-wait-for-bind is needed.
+    let listeners = proxy.bind().await.expect("egress proxy bind");
     tokio::spawn(async move {
-        let _ = proxy.run().await;
+        proxy.serve(listeners).await;
     });
-    // Give the listener a tick to bind.
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // ---- 3. Bake a rootfs with engram-agentd + curl + /etc/hosts seed ----
     let src = tempfile::tempdir().expect("source dir");

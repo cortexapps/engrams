@@ -332,11 +332,15 @@ async fn spawn_real_proxy() -> (u16, String, Arc<engram_egress_proxy::Registry>)
     // never actually exercise the real-upstream path; that's the
     // whole point of these tests.
     let proxy = engram_egress_proxy::Proxy::new(proxy_cfg);
+    // Bind synchronously (fail-closed, ADR 0075) so a port collision
+    // surfaces here rather than inside the detached serve task; then
+    // spawn the accept loop.
+    let listeners = proxy.bind().await.expect("egress proxy bind");
     tokio::spawn(async move {
-        let _ = proxy.run().await;
+        proxy.serve(listeners).await;
     });
     // Gate on the proxy's TCP intercept listener actually binding
-    // (`Proxy::run` binds `bind_addr` = proxy_bind) instead of a fixed
+    // (`Proxy::bind` binds `bind_addr` = proxy_bind) instead of a fixed
     // sleep. The bind is on 0.0.0.0; probe it via loopback.
     let proxy_probe = std::net::SocketAddr::from(([127, 0, 0, 1], proxy_port));
     assert!(
