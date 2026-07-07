@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   listEnabledImages,
   enableImage,
+  updateImage,
   disableImage,
   refreshImage,
   listEnableJobs,
@@ -17,9 +18,26 @@ function protoImageToLegacy(img: ProtoEnabledImageSummary): EnabledImageSummary 
     manifest_digest: img.manifestDigest,
     name: img.config?.name ?? null,
     description: img.config?.description ?? null,
+    env: img.config?.env ?? {},
+    workdir: img.config?.workdir ?? null,
     suggested_vcpus: img.config?.resources?.suggestedVcpus ?? null,
     suggested_memory_mib: img.config?.resources?.suggestedMemoryMib ?? null,
+    suggested_disk_gib: img.config?.resources?.suggestedDiskGib ?? null,
     warm_command: img.config?.warm?.command ?? [],
+    // uint64 on the wire; any plausible hook timeout fits a JS number, and
+    // the edit form round-trips it back through BigInt() losslessly.
+    warm_timeout_secs:
+      img.config?.warm?.timeoutSecs != null ? Number(img.config.warm.timeoutSecs) : null,
+    warm_workdir: img.config?.warm?.workdir ?? null,
+    warm_network: img.config?.warm?.network
+      ? {
+          // The proto carries a plain string; the writer (this form + the
+          // profile editor) only ever sends "deny" | "allow".
+          default: img.config.warm.network.default === "allow" ? "allow" : "deny",
+          allow_hosts: img.config.warm.network.allowHosts,
+          allow_host_patterns: img.config.warm.network.allowHostPatterns,
+        }
+      : null,
     last_refreshed_at: img.lastRefreshedAt,
     created_at: img.createdAt,
     // Flatten the proto `value` oneof: secretRef → "secret_ref", everything
@@ -56,6 +74,35 @@ export function useEnableImage() {
   const qc = useQueryClient();
   return useMutation(enableImage, {
     onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: createConnectQueryKey({
+          schema: listEnableJobs,
+          input: {},
+          cardinality: "finite",
+        }),
+      });
+    },
+  });
+}
+
+/** Mutation: edit an enabled image's config (ADR 0080, full replace).
+ * Cheap fields (name/description/env/workdir) apply immediately — the
+ * enabled row changes in place; a diff touching resources or warm needs
+ * `allowRecapture: true` and spawns a recapture EnableJob instead (and
+ * fails FailedPrecondition naming the fields without it). Invalidate
+ * both list consumers: the row for the cheap path, the jobs table for
+ * the recapture path. */
+export function useUpdateImage() {
+  const qc = useQueryClient();
+  return useMutation(updateImage, {
+    onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: createConnectQueryKey({
+          schema: listEnabledImages,
+          input: {},
+          cardinality: "finite",
+        }),
+      });
       qc.invalidateQueries({
         queryKey: createConnectQueryKey({
           schema: listEnableJobs,

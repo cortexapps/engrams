@@ -369,9 +369,20 @@ export interface CaptureEnvVar {
   value: string;
 }
 
+/** `config.warm.network` — the capture VM's egress policy while the
+ * warm hook runs (ADR 0080; same shape as a profile's network
+ * allow-list). Absent (or deny with no hosts) = egress-less capture. */
+export interface WarmNetworkView {
+  default: "deny" | "allow";
+  allow_hosts: string[];
+  allow_host_patterns: string[];
+}
+
 /** One enabled-image row, flattened from the proto's `config`
  * (the RPC-supplied ImageConfig, ADR 0080) for rendering + the edit
- * form's pre-fill. */
+ * form's pre-fill. The edit form re-assembles the FULL ImageConfig from
+ * these fields, so every config field must round-trip through here —
+ * an absent optional stays `null`, never collapses to a default. */
 export interface EnabledImageSummary {
   id: string;
   image_uri: string;
@@ -379,10 +390,21 @@ export interface EnabledImageSummary {
   /** `config.name` — the operator-supplied display name. */
   name: string | null;
   description: string | null;
+  /** `config.env` — non-secret env applied to every sandbox of this
+   * image (merged over Dockerfile ENV, under session env). */
+  env: Record<string, string>;
+  /** `config.workdir` — default working directory override. */
+  workdir: string | null;
   suggested_vcpus: number | null;
   suggested_memory_mib: number | null;
+  suggested_disk_gib: number | null;
   /** `config.warm.command` argv; empty when the image has no warm hook. */
   warm_command: string[];
+  /** `config.warm.timeout_secs` (proto uint64, safe as a number for any
+   * plausible hook timeout). */
+  warm_timeout_secs: number | null;
+  warm_workdir: string | null;
+  warm_network: WarmNetworkView | null;
   last_refreshed_at: string;
   created_at: string;
   /**
