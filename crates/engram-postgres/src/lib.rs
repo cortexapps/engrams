@@ -2023,9 +2023,15 @@ impl MetadataStore for PostgresStore {
         prompt_id: &str,
         delay: std::time::Duration,
     ) -> Result<(), MetaError> {
+        // `attempts` counts every delivery *try*, deferred or delivered —
+        // `failure_backoff(attempts)` only grows if defers bump it too. (It
+        // used to bump only on mark_delivered, so a row failing before the
+        // forward — e.g. ensure_active erroring — retried at the floor
+        // backoff forever and read as attempts=0 in every investigation.)
         sqlx::query(
             "UPDATE session_outbox
-             SET not_before = now() + make_interval(secs => $2)
+             SET not_before = now() + make_interval(secs => $2),
+                 attempts = attempts + 1
              WHERE prompt_id = $1 AND acked_at IS NULL",
         )
         .bind(prompt_id)

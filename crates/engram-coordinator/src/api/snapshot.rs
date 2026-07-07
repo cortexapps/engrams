@@ -574,7 +574,13 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
         SessionState::Dead => Err(ApiError::Gone(
             "session is dead — chunked manifests are gone or never existed".into(),
         )),
-        SessionState::Failed | SessionState::Completed => Err(ApiError::Conflict(format!(
+        // Terminal is GONE, not Conflict: a 409 reads as "retry later" to
+        // every caller, and the outbox driver in particular deferred a
+        // completed session's un-acked rows every backoff-tick forever
+        // (prod: 3 rows spinning the driver for hours). Gone maps to the
+        // driver's Terminal arm — the row is dropped — and to an honest
+        // 410 for exec/upload/relay callers.
+        SessionState::Failed | SessionState::Completed => Err(ApiError::Gone(format!(
             "session is {} (terminal); no work to dispatch",
             session.status.as_str()
         ))),
@@ -2683,7 +2689,9 @@ mod evicting_gate_tests {
             .expect_err("Completed session has no work to dispatch");
         flipper.await.unwrap();
 
-        assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
+        // Terminal is GONE (410), not a retryable 409: the outbox driver
+        // maps Gone to its Terminal drop arm instead of deferring forever.
+        assert_eq!(err.status(), axum::http::StatusCode::GONE);
         assert!(
             err.to_string().contains("terminal"),
             "must surface the terminal-state error, not the mid-eviction 409, got: {err}",

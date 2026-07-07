@@ -135,6 +135,19 @@ async fn delivered_row_rearms_after_ack_timeout() {
         .await
         .expect("defer");
     assert!(meta.outbox_next_due(sid).await.unwrap().is_none());
+
+    // Defers count as attempts too — `failure_backoff(attempts)` only
+    // grows if a row failing BEFORE the forward (ensure_active error,
+    // NotFound) bumps the counter; it used to sit at the floor backoff
+    // forever and read as attempts=0 in every investigation.
+    meta.outbox_defer(&row.prompt_id, Duration::ZERO)
+        .await
+        .expect("re-defer to now");
+    let re = meta.outbox_next_due(sid).await.unwrap().expect("due again");
+    assert_eq!(
+        re.attempts, 3,
+        "each defer bumps attempts (1 delivery + 2 defers)"
+    );
 }
 
 #[tokio::test]
