@@ -10,34 +10,27 @@
 // the exact proto-shaped request objects the component sends.
 
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { cleanup, screen, waitFor } from "@testing-library/react";
+import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ConnectError, Code, createRouterTransport } from "@connectrpc/connect";
+import { create, equals } from "@bufbuild/protobuf";
 import { renderWithProviders } from "../../test-utils";
 import { ImagesPanel } from "./ImagesPanel";
-import { ImageService } from "../../gen/engram/app/v1/image_pb";
+import {
+  EnabledImageSummarySchema,
+  ImageConfigSchema,
+  ImageService,
+} from "../../gen/engram/app/v1/image_pb";
 import type {
   EnableImageRequest,
+  UpdateImageRequest,
   DisableImageRequest,
   RefreshImageRequest,
   CaptureEnvEntry as ProtoCaptureEnvEntry,
   EnabledImageSummary as ProtoEnabledImageSummary,
   EnableJob as ProtoEnableJob,
 } from "../../gen/engram/app/v1/image_pb";
-
-// A proto-shaped capture-env entry (the oneof flattened to the case the
-// component reads/writes).
-function makeCaptureEnv(
-  name: string,
-  kind: "literal" | "secretRef",
-  value: string,
-): ProtoCaptureEnvEntry {
-  return {
-    $typeName: "engram.app.v1.CaptureEnvEntry",
-    name,
-    value: { case: kind, value },
-  };
-}
+import { OrgSecretService } from "../../gen/engram/app/v1/org_secret_pb";
 
 // Minimal proto-shaped enabled-image row for tests that need a row in the
 // list. ADR 0080: the row carries the RPC-supplied ImageConfig; capture env
@@ -98,23 +91,43 @@ function makeProtoJob(
 
 interface Captures {
   enableCalls: EnableImageRequest[];
+  updateCalls: UpdateImageRequest[];
   disableCalls: DisableImageRequest[];
   refreshCalls: RefreshImageRequest[];
 }
 
-/** Build a transport that records image-mutation calls with controllable list state. */
+/** Build a transport that records image-mutation calls with controllable
+ * list state. With `updateRequiresRecapture`, UpdateImage mimics the ADR
+ * 0080 server contract for a capture-affecting diff: reject
+ * FailedPrecondition (naming the fields) unless `allowRecapture` is set. */
 function installCapturingTransport(
   initialImages: ProtoEnabledImageSummary[] = [],
   initialJobs: ProtoEnableJob[] = [],
   disableError?: unknown,
+  updateRequiresRecapture = false,
 ): { transport: ReturnType<typeof createRouterTransport>; captures: Captures } {
-  const captures: Captures = { enableCalls: [], disableCalls: [], refreshCalls: [] };
+  const captures: Captures = {
+    enableCalls: [],
+    updateCalls: [],
+    disableCalls: [],
+    refreshCalls: [],
+  };
   const transport = createRouterTransport((router) => {
     router.service(ImageService, {
       listEnabledImages: () => ({ images: initialImages }),
       listEnableJobs: () => ({ jobs: initialJobs }),
       enableImage: (req: EnableImageRequest) => {
         captures.enableCalls.push(req);
+        return { job: undefined };
+      },
+      updateImage: (req: UpdateImageRequest) => {
+        captures.updateCalls.push(req);
+        if (updateRequiresRecapture && !req.allowRecapture) {
+          throw new ConnectError(
+            "changing resources.suggested_vcpus requires allow_recapture",
+            Code.FailedPrecondition,
+          );
+        }
         return { job: undefined };
       },
       disableImage: (req: DisableImageRequest) => {
@@ -131,6 +144,12 @@ function installCapturingTransport(
       listRegistries: () => ({ registries: [] }),
       addRegistry: () => ({ id: "", host: "", authKind: "", authPrincipal: undefined }),
       deleteRegistry: () => ({}),
+    });
+    // The panel's warm-env secret-ref combobox lists org-secret names.
+    router.service(OrgSecretService, {
+      listSecrets: () => ({ secrets: [] }),
+      putSecret: () => ({ secret: undefined }),
+      deleteSecret: () => ({}),
     });
   });
   return { transport, captures };
@@ -207,57 +226,153 @@ describe("ImagesPanel RPC contract", () => {
     expect(req.config?.warm?.env[0].value).toEqual({ case: "literal", value: "beta,fast" });
   });
 
-  test("edit config pre-fills the form and re-submits the full config", async () => {
-    // An enabled image already carrying a warm hook with a secret-ref env
-    // var. The edit affordance opens the same form, pinned to the URI +
-    // pre-filled from the row's config; a plain re-submit round-trips it
-    // (ADR 0080: the form always sends the full config, which replaces).
+  test("cheap edit (rename) goes through UpdateImage without recapture confirmation", async () => {
+    // ADR 0080 phase 2b: the edit path is UpdateImage, sent optimistically
+    // with allowRecapture=false. A cheap diff (name) applies immediately —
+    // no confirm UI, no EnableImage fallback, dialog closes.
     const { transport, captures } = installCapturingTransport([
-      makeProtoImage("ghcr.io/cortex/api:warm-1", [
-        makeCaptureEnv(
-          "OPENAI_API_KEY",
-          "secretRef",
-          "gcp-sm://projects/p/secrets/k/versions/latest",
-        ),
-      ]),
+      makeProtoImage("ghcr.io/cortex/api:warm-1"),
     ]);
     renderWithProviders(<ImagesPanel />, { transport });
 
     const user = userEvent.setup();
     await screen.findByText("ghcr.io/cortex/api:warm-1");
-
     await user.click(screen.getByRole("button", { name: /edit config/i }));
 
-    // Pre-filled from the row's current config.
-    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("cortex-api");
-    expect((screen.getByLabelText("vCPUs") as HTMLInputElement).value).toBe("2");
-    expect((screen.getByLabelText(/warm command/i) as HTMLInputElement).value).toBe(
-      "/opt/engram/warm.sh",
-    );
-    expect((screen.getByLabelText("Variable name") as HTMLInputElement).value).toBe(
-      "OPENAI_API_KEY",
-    );
-    expect((screen.getByLabelText("Variable value") as HTMLInputElement).value).toBe(
-      "gcp-sm://projects/p/secrets/k/versions/latest",
-    );
-
-    // Re-submit (edit path is a re-enable with the full config).
+    const name = screen.getByLabelText("Name") as HTMLInputElement;
+    expect(name.value).toBe("cortex-api");
+    await user.clear(name);
+    await user.type(name, "renamed-api");
     await user.click(screen.getByRole("button", { name: /^save$/i }));
 
     await waitFor(() => {
-      expect(captures.enableCalls.length).toBe(1);
+      expect(captures.updateCalls.length).toBe(1);
     });
-    const req = captures.enableCalls[0];
+    const req = captures.updateCalls[0];
     expect(req.imageUri).toBe("ghcr.io/cortex/api:warm-1");
-    expect(req.config?.name).toBe("cortex-api");
-    expect(req.config?.resources?.suggestedVcpus).toBe(2);
-    expect(req.config?.warm?.command).toEqual(["/opt/engram/warm.sh"]);
-    expect(req.config?.warm?.env).toHaveLength(1);
-    expect(req.config?.warm?.env[0].name).toBe("OPENAI_API_KEY");
-    expect(req.config?.warm?.env[0].value).toEqual({
-      case: "secretRef",
-      value: "gcp-sm://projects/p/secrets/k/versions/latest",
+    expect(req.allowRecapture).toBe(false);
+    expect(req.config?.name).toBe("renamed-api");
+    // Edit never goes through EnableImage anymore.
+    expect(captures.enableCalls).toHaveLength(0);
+    // No recapture confirmation appeared, and the dialog closed.
+    expect(screen.queryByText("This edit changes capture-affecting fields")).toBeNull();
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Name")).toBeNull();
     });
+  });
+
+  test("capture-affecting edit confirms, then re-sends with allowRecapture=true", async () => {
+    // ADR 0080 phase 2b: a diff touching resources/warm is refused with
+    // FailedPrecondition on the first (allowRecapture=false) attempt; the
+    // dialog surfaces the server's message in an inline confirm block, and
+    // "Recapture and apply" re-sends the SAME config with
+    // allowRecapture=true (spawning the recapture job).
+    const { transport, captures } = installCapturingTransport(
+      [makeProtoImage("ghcr.io/cortex/api:warm-1")],
+      [],
+      undefined,
+      /* updateRequiresRecapture */ true,
+    );
+    renderWithProviders(<ImagesPanel />, { transport });
+
+    const user = userEvent.setup();
+    await screen.findByText("ghcr.io/cortex/api:warm-1");
+    await user.click(screen.getByRole("button", { name: /edit config/i }));
+
+    const vcpus = screen.getByLabelText("vCPUs") as HTMLInputElement;
+    await user.clear(vcpus);
+    await user.type(vcpus, "4");
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    // The confirm block appears, carrying the server's field-naming message.
+    await screen.findByText("This edit changes capture-affecting fields");
+    expect(screen.getByText(/resources\.suggested_vcpus/)).toBeTruthy();
+    expect(captures.updateCalls).toHaveLength(1);
+    expect(captures.updateCalls[0].allowRecapture).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: /recapture and apply/i }));
+
+    await waitFor(() => {
+      expect(captures.updateCalls.length).toBe(2);
+    });
+    expect(captures.updateCalls[1].allowRecapture).toBe(true);
+    expect(captures.updateCalls[1].config?.resources?.suggestedVcpus).toBe(4);
+    // Same config both attempts — confirming must not rebuild/mutate it.
+    expect(
+      equals(ImageConfigSchema, captures.updateCalls[0].config!, captures.updateCalls[1].config!),
+    ).toBe(true);
+  });
+
+  test("untouched edit round-trips the row's config exactly (server sees a no-op)", async () => {
+    // THE correctness property of the edit form (ADR 0080): pre-fill from
+    // the row, submit untouched → the UpdateImageRequest config deep-equals
+    // the row's config. Any drift (an absent description becoming "", a
+    // dropped bigint timeout, a defaulted map) would make every innocent
+    // rename read as a capture-affecting diff server-side. The fixture sets
+    // EVERY config field except description — which stays ABSENT to pin the
+    // absent-stays-absent half of the invariant.
+    const rowConfig = create(ImageConfigSchema, {
+      name: "cortex-api",
+      env: { RUST_LOG: "info", CARGO_HOME: "/cache/cargo" },
+      workdir: "/workspace",
+      resources: {
+        suggestedVcpus: 4,
+        suggestedMemoryMib: 4096,
+        suggestedDiskGib: 32,
+      },
+      warm: {
+        command: ["/opt/engram/warm.sh", "--all"],
+        timeoutSecs: 900n,
+        workdir: "/srv",
+        env: [
+          { name: "FEATURE_FLAGS", value: { case: "literal", value: "beta,fast" } },
+          { name: "OPENAI_API_KEY", value: { case: "secretRef", value: "openai-key" } },
+        ],
+        network: {
+          default: "deny",
+          allowHosts: ["registry.npmjs.org", "proxy.golang.org"],
+          allowHostPatterns: ["*.pypi.org"],
+        },
+      },
+    });
+    const image = create(EnabledImageSummarySchema, {
+      id: "row-1",
+      imageUri: "ghcr.io/cortex/api:warm-1",
+      manifestDigest: "sha256:abc",
+      lastRefreshedAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      config: rowConfig,
+    });
+    const { transport, captures } = installCapturingTransport([image]);
+    renderWithProviders(<ImagesPanel />, { transport });
+
+    const user = userEvent.setup();
+    await screen.findByText("ghcr.io/cortex/api:warm-1");
+    await user.click(screen.getByRole("button", { name: /edit config/i }));
+
+    // Spot-check the pre-fill (the secret-ref value renders in the
+    // org-secret combobox trigger, not an input — scope to the dialog since
+    // the table's capture-env cell shows the same ref).
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("cortex-api");
+    expect((screen.getByLabelText("vCPUs") as HTMLInputElement).value).toBe("4");
+    expect((screen.getByLabelText(/warm command/i) as HTMLInputElement).value).toBe(
+      "/opt/engram/warm.sh --all",
+    );
+    expect(within(screen.getByRole("dialog")).getByText("openai-key")).toBeTruthy();
+
+    // Submit with zero edits.
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(captures.updateCalls.length).toBe(1);
+    });
+    const req = captures.updateCalls[0];
+    expect(req.imageUri).toBe("ghcr.io/cortex/api:warm-1");
+    expect(req.allowRecapture).toBe(false);
+    // Proto-semantic deep equality — bigint timeout, env map, oneofs,
+    // repeated fields, and ABSENT optionals (description) all included.
+    expect(req.config).toBeDefined();
+    expect(equals(ImageConfigSchema, req.config!, rowConfig)).toBe(true);
   });
 
   test("disable button sends {imageUri} to ImageService.DisableImage", async () => {

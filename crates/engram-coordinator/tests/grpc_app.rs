@@ -570,6 +570,23 @@ impl MetadataStore for MockMetadataStore {
         Ok(())
     }
 
+    /// ADR 0080 cheap-edit path: replace `image_config` in place (the
+    /// mock analog of the PG `UPDATE … WHERE soft_deleted_at IS NULL`;
+    /// this map only holds live rows, so no extra filter is needed).
+    async fn update_enabled_image_config(
+        &self,
+        image_uri: &str,
+        config: &engram_core::types::image::ImageConfig,
+    ) -> Result<(), MetaError> {
+        match self.enabled.lock().get_mut(image_uri) {
+            Some(row) => {
+                row.image_config = config.clone();
+                Ok(())
+            }
+            None => Err(MetaError::NotFound),
+        }
+    }
+
     async fn get_session_secrets(
         &self,
         _: SessionId,
@@ -666,8 +683,11 @@ fn bearer(
     }
 }
 
-/// Minimal `EnabledImage` row for the ImageService list assertion (ADR
-/// 0080: the summary's `config` mirrors the row's image_config).
+/// Minimal `EnabledImage` row for the ImageService list + update tests
+/// (ADR 0080: the summary's `config` mirrors the row's image_config).
+/// `suggested_vcpus` is set because `ImageConfig::validate` requires it
+/// (ADR 0048), so an UpdateImage that round-trips this config validates
+/// AND diffs clean against the row (no phantom `resources` change).
 fn enabled_image(uri: &str) -> engram_core::types::EnabledImage {
     let now = Utc::now();
     engram_core::types::EnabledImage {
@@ -675,6 +695,10 @@ fn enabled_image(uri: &str) -> engram_core::types::EnabledImage {
         image_uri: uri.to_string(),
         image_config: engram_core::types::image::ImageConfig {
             name: "test".into(),
+            resources: engram_core::types::image::ResourceHints {
+                suggested_vcpus: Some(1),
+                ..Default::default()
+            },
             ..Default::default()
         },
         oci_defaults: Default::default(),
@@ -1083,6 +1107,245 @@ async fn image_list_enabled_images_reflects_store() {
         uris.contains(&"localhost:5001/demo:warm"),
         "enabled image must be listed; got {uris:?}"
     );
+
+    server.abort();
+}
+
+// =====================================================================
+// ImageService.UpdateImage (ADR 0080 phase 2b) — the mutability split:
+// cheap fields (name/description/env/workdir) apply in place with NO
+// job; resources/warm diffs are gated behind allow_recapture. The
+// allow_recapture=true arm enqueues a real enable job (registry pull),
+// so it's covered by the e2e stack, not here.
+// =====================================================================
+
+const UPDATE_URI: &str = "localhost:5001/demo:warm";
+
+/// The proto twin of `enabled_image(...)`'s stored config — round-trips
+/// clean (validates, and diffs empty against the seeded row). Tests
+/// tweak fields off this base.
+fn update_base_config() -> app::ImageConfig {
+    app::ImageConfig {
+        name: "test".into(),
+        description: None,
+        env: HashMap::new(),
+        workdir: None,
+        resources: Some(app::ImageResources {
+            suggested_memory_mib: None,
+            suggested_vcpus: Some(1),
+            suggested_disk_gib: None,
+        }),
+        warm: None,
+    }
+}
+
+fn update_request(config: app::ImageConfig, allow_recapture: bool) -> app::UpdateImageRequest {
+    app::UpdateImageRequest {
+        image_uri: UPDATE_URI.to_string(),
+        config: Some(config),
+        allow_recapture,
+    }
+}
+
+/// Cheap edit (name/description only): succeeds WITHOUT allow_recapture,
+/// returns NO job, and the store's row config is replaced in place.
+#[tokio::test]
+async fn image_update_cheap_edit_applies_in_place_without_job() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    meta.upsert_enabled_image(enabled_image(UPDATE_URI))
+        .await
+        .expect("seed enabled image");
+
+    let (addr, server) = serve(state).await;
+    let channel = dial(addr).await;
+    let mut client = app::image_service_client::ImageServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    );
+
+    let edited = app::ImageConfig {
+        name: "renamed".into(),
+        description: Some("now with a description".into()),
+        ..update_base_config()
+    };
+    let resp = client
+        .update_image(update_request(edited, false))
+        .await
+        .expect("cheap edit must succeed without allow_recapture")
+        .into_inner();
+    assert!(
+        resp.job.is_none(),
+        "cheap edit must NOT enqueue a recapture job; got {resp:?}"
+    );
+
+    // The row's config was replaced in place (the cheap-edit write path).
+    let row = meta
+        .get_enabled_image(UPDATE_URI)
+        .await
+        .expect("get row")
+        .expect("row still enabled");
+    assert_eq!(row.image_config.name, "renamed", "name must be updated");
+    assert_eq!(
+        row.image_config.description.as_deref(),
+        Some("now with a description"),
+        "description must be updated"
+    );
+    assert_eq!(
+        row.image_config.resources.suggested_vcpus,
+        Some(1),
+        "untouched resources must round-trip verbatim"
+    );
+
+    server.abort();
+}
+
+/// Capture-affecting edits (resources / warm) WITHOUT allow_recapture →
+/// FailedPrecondition naming the offending field, and the row is left
+/// untouched.
+#[tokio::test]
+async fn image_update_capture_affecting_diff_requires_allow_recapture() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    meta.upsert_enabled_image(enabled_image(UPDATE_URI))
+        .await
+        .expect("seed enabled image");
+
+    let (addr, server) = serve(state).await;
+    let channel = dial(addr).await;
+    let mut client = app::image_service_client::ImageServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    );
+
+    // resources diff: bump suggested_vcpus 1 → 2.
+    let resources_edit = app::ImageConfig {
+        resources: Some(app::ImageResources {
+            suggested_vcpus: Some(2),
+            ..Default::default()
+        }),
+        ..update_base_config()
+    };
+    let err = client
+        .update_image(update_request(resources_edit, false))
+        .await
+        .expect_err("resources diff without allow_recapture must be refused");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    assert!(
+        err.message().contains("resources"),
+        "gate must name the `resources` field: {}",
+        err.message()
+    );
+
+    // warm diff: add a [warm] hook.
+    let warm_edit = app::ImageConfig {
+        warm: Some(app::ImageWarmConfig {
+            command: vec!["true".into()],
+            timeout_secs: None,
+            workdir: None,
+            env: Vec::new(),
+            network: None,
+        }),
+        ..update_base_config()
+    };
+    let err = client
+        .update_image(update_request(warm_edit, false))
+        .await
+        .expect_err("warm diff without allow_recapture must be refused");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    assert!(
+        err.message().contains("warm"),
+        "gate must name the `warm` field: {}",
+        err.message()
+    );
+
+    // Neither refused edit touched the row.
+    let row = meta
+        .get_enabled_image(UPDATE_URI)
+        .await
+        .expect("get row")
+        .expect("row still enabled");
+    assert_eq!(
+        row.image_config,
+        enabled_image(UPDATE_URI).image_config,
+        "a refused capture-affecting edit must leave the config untouched"
+    );
+
+    server.abort();
+}
+
+/// UpdateImage against a uri that isn't enabled → NotFound (editing a
+/// disabled image is a re-enable's job, not an update's).
+#[tokio::test]
+async fn image_update_unknown_uri_is_not_found() {
+    let (state, _meta) = test_state(vec![TEST_TOKEN.into()]);
+    let (addr, server) = serve(state).await;
+    let channel = dial(addr).await;
+    let mut client = app::image_service_client::ImageServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    );
+
+    let err = client
+        .update_image(update_request(update_base_config(), false))
+        .await
+        .expect_err("update of a never-enabled uri must error");
+    assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+
+    server.abort();
+}
+
+/// Structurally invalid configs → InvalidArgument before any store work:
+/// missing config, empty name, and a missing `[resources] suggested_vcpus`
+/// (required, ADR 0048).
+#[tokio::test]
+async fn image_update_invalid_config_is_invalid_argument() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    meta.upsert_enabled_image(enabled_image(UPDATE_URI))
+        .await
+        .expect("seed enabled image");
+
+    let (addr, server) = serve(state).await;
+    let channel = dial(addr).await;
+    let mut client = app::image_service_client::ImageServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    );
+
+    // No config at all (the field is required — full replace).
+    let err = client
+        .update_image(app::UpdateImageRequest {
+            image_uri: UPDATE_URI.to_string(),
+            config: None,
+            allow_recapture: false,
+        })
+        .await
+        .expect_err("missing config must error");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+
+    // Empty name.
+    let err = client
+        .update_image(update_request(
+            app::ImageConfig {
+                name: "".into(),
+                ..update_base_config()
+            },
+            false,
+        ))
+        .await
+        .expect_err("empty name must error");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+
+    // Missing suggested_vcpus (ADR 0048: a declaration, not a hint).
+    let err = client
+        .update_image(update_request(
+            app::ImageConfig {
+                resources: None,
+                ..update_base_config()
+            },
+            false,
+        ))
+        .await
+        .expect_err("missing suggested_vcpus must error");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
 
     server.abort();
 }

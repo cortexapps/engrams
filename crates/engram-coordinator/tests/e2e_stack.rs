@@ -40,6 +40,7 @@ use std::time::Duration;
 use engram_core::SessionId;
 use engram_protocol::app;
 use engram_protocol::app::fleet_service_client::FleetServiceClient;
+use engram_protocol::app::image_service_client::ImageServiceClient;
 use engram_protocol::app::session_service_client::SessionServiceClient;
 use serde_json::Value;
 use tonic::codegen::InterceptedService;
@@ -113,12 +114,14 @@ impl tonic::service::Interceptor for BearerFn {
 
 type SessClient = SessionServiceClient<InterceptedService<Channel, BearerFn>>;
 type FleetClient = FleetServiceClient<InterceptedService<Channel, BearerFn>>;
+type ImageClient = ImageServiceClient<InterceptedService<Channel, BearerFn>>;
 
 /// gRPC driver for the live coordinator. Holds one shared channel and the
 /// service clients the tests exercise.
 struct Driver {
     sess: SessClient,
     fleet: FleetClient,
+    images: ImageClient,
 }
 
 impl Driver {
@@ -140,8 +143,13 @@ impl Driver {
 
         let interceptor = BearerFn { token };
         let sess = SessionServiceClient::with_interceptor(channel.clone(), interceptor.clone());
-        let fleet = FleetServiceClient::with_interceptor(channel, interceptor);
-        Self { sess, fleet }
+        let fleet = FleetServiceClient::with_interceptor(channel.clone(), interceptor.clone());
+        let images = ImageServiceClient::with_interceptor(channel, interceptor);
+        Self {
+            sess,
+            fleet,
+            images,
+        }
     }
 
     fn image_uri() -> String {
@@ -527,6 +535,46 @@ impl Driver {
             .await
             .expect("ChunkGc sweep")
             .into_inner()
+    }
+
+    /// `ImageService.ListEnabledImages` — the enabled-image summaries
+    /// (ADR 0080: each carries its full editable `config`).
+    async fn list_enabled_images(&mut self) -> Vec<app::EnabledImageSummary> {
+        self.images
+            .list_enabled_images(app::ListEnabledImagesRequest {})
+            .await
+            .expect("ListEnabledImages")
+            .into_inner()
+            .images
+    }
+
+    /// The enabled-image summary for `uri` — panics if the image isn't
+    /// enabled on the stack (the bake step enables the demo image).
+    async fn enabled_image_summary(&mut self, uri: &str) -> app::EnabledImageSummary {
+        self.list_enabled_images()
+            .await
+            .into_iter()
+            .find(|s| s.image_uri == uri)
+            .unwrap_or_else(|| panic!("image {uri} must be enabled on the e2e stack"))
+    }
+
+    /// `ImageService.UpdateImage` (ADR 0080) — full-replace config edit.
+    /// Returns the raw `Result` so tests can assert on both the happy path
+    /// and the recapture-gate `FailedPrecondition`.
+    async fn update_image(
+        &mut self,
+        uri: &str,
+        config: app::ImageConfig,
+        allow_recapture: bool,
+    ) -> Result<app::UpdateImageResponse, tonic::Status> {
+        self.images
+            .update_image(app::UpdateImageRequest {
+                image_uri: uri.to_string(),
+                config: Some(config),
+                allow_recapture,
+            })
+            .await
+            .map(|r| r.into_inner())
     }
 
     /// Poll `GetSession` until `status == want` or the deadline elapses.
@@ -1375,6 +1423,108 @@ async fn e2e_chunk_gc_sweep_does_not_delete_live_image_chunks() {
 
     driver.delete(sid_1).await;
     driver.delete(sid_2).await;
+}
+
+/// ADR 0080 phase 2b: `ImageService.UpdateImage` against the live stack —
+/// the two arms that involve NO capture work:
+///
+///   - **Cheap edit end-to-end**: change ONLY the description (everything
+///     else round-tripped verbatim from the listed summary's config, so
+///     nothing capture-affecting diffs) → success with NO job, and the new
+///     description is visible on a re-list. Because the coordinator serves
+///     enabled-image reads through its boot-bundle cache, the re-list
+///     proving the edit is visible also proves the cheap-edit
+///     NOTIFY/cache-invalidation path end to end.
+///   - **Recapture gate**: bump `resources.suggested_memory_mib` WITHOUT
+///     `allow_recapture` → `FailedPrecondition` naming `resources`. This
+///     is cheap by construction — the handler refuses before any capture
+///     work — so the multi-minute recapture arm itself is intentionally
+///     NOT exercised here (it would re-run the enable pipeline and mutate
+///     the shared demo image every CI run).
+///
+/// The test restores the original description before returning — other
+/// tests share this stack's demo image.
+#[tokio::test]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+async fn e2e_update_image_cheap_edit_and_recapture_gate() {
+    let mut driver = Driver::from_env().await;
+    let image = Driver::image_uri();
+
+    // The enabled demo image's live config — the base every edit
+    // round-trips so only the intended field diffs.
+    let original = driver
+        .enabled_image_summary(&image)
+        .await
+        .config
+        .expect("enabled-image summary must carry its config (ADR 0080)");
+
+    // ---- Cheap edit: description only, allow_recapture = false ----
+    let marker = format!("e2e cheap edit {}", uuid::Uuid::new_v4());
+    let edited = app::ImageConfig {
+        description: Some(marker.clone()),
+        ..original.clone()
+    };
+    let resp = driver
+        .update_image(&image, edited, false)
+        .await
+        .expect("description-only edit must succeed without allow_recapture");
+    assert!(
+        resp.job.is_none(),
+        "cheap edit must apply in place with NO recapture job; got {resp:?}",
+    );
+
+    // Visible on a re-list (the row + boot-bundle cache path).
+    let relisted = driver
+        .enabled_image_summary(&image)
+        .await
+        .config
+        .expect("re-listed summary must carry its config");
+    assert_eq!(
+        relisted.description.as_deref(),
+        Some(marker.as_str()),
+        "the cheap edit must be visible on a re-list",
+    );
+
+    // ---- Recapture gate: resources diff without allow_recapture ----
+    let mut resources = original.resources.unwrap_or_default();
+    resources.suggested_memory_mib = Some(resources.suggested_memory_mib.unwrap_or(0) + 1024);
+    let capture_edit = app::ImageConfig {
+        resources: Some(resources),
+        ..original.clone()
+    };
+    let err = driver
+        .update_image(&image, capture_edit, false)
+        .await
+        .expect_err("a resources diff without allow_recapture must be refused");
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "recapture gate must map to FailedPrecondition; got {err:?}",
+    );
+    assert!(
+        err.message().contains("resources"),
+        "the gate must name the offending field so a UI can confirm; got: {}",
+        err.message(),
+    );
+
+    // ---- Restore the original description (leave the stack as found) ----
+    let restored = driver
+        .update_image(&image, original.clone(), false)
+        .await
+        .expect("restoring the original config must be a cheap edit");
+    assert!(
+        restored.job.is_none(),
+        "the restore must not enqueue a job; got {restored:?}",
+    );
+    let after = driver
+        .enabled_image_summary(&image)
+        .await
+        .config
+        .expect("post-restore summary must carry its config");
+    assert_eq!(
+        after.description, original.description,
+        "the original description must be restored for the tests sharing this stack",
+    );
 }
 
 /// ADR 0018 Phase C RPC shape coverage.
