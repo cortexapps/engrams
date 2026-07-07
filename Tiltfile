@@ -475,7 +475,7 @@ else:
 if sandbox_backend == 'firecracker':
     print('engram dev: NBD devices discovered = %r (two_hosts=%s)' % (_nbd, two_hosts))
 
-def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress_proxy_port):
+def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress_proxy_port, egress_dns_port):
     env = {
         # `kernel_key` is only non-None for vz/firecracker, both of
         # which force `dev_split`, so this always lands on the
@@ -532,6 +532,13 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # its policy network.allow_hosts + ANTHROPIC_API_KEY for the call to
         # succeed (ADR 0006/0057).
         'ENGRAM_EGRESS_PROXY_PORT': egress_proxy_port,
+        # DNS-filter proxy port. Like the proxy/gRPC/metrics ports, it must be
+        # distinct per host-agent on the SHARED netns of the two-host e2e stack
+        # (host-agent-b gets dns_base+1 below) — else the second host-agent
+        # fails closed on `0.0.0.0:5353 Address already in use` (ADR 0075). The
+        # host-agent wires this same value into the FC iptables `:53 -> dns`
+        # REDIRECT, so the two can't drift.
+        'ENGRAM_EGRESS_DNS_PORT': egress_dns_port,
         'ENGRAM_HOST_METRICS_ADDR': '0.0.0.0:' + metrics_port,
         # ADR 0019: same OTLP target as the coord, so the host-side
         # restore/boot spans land in the same Jaeger trace.
@@ -794,8 +801,12 @@ if dev_split:
 # on a bind collision — 8443 is verified free in the fc-dev VM.)
 _proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT',
                          '8443' if fc_colima_profile else '0'))
+# DNS-filter proxy base port. Always a real port (unlike the proxy port, which
+# has a 0-footgun default): the DNS listener always binds. host-agent-b takes
+# _dns_base + 1 so the two hosts don't collide on the shared netns.
+_dns_base = int(env_or('ENGRAM_EGRESS_DNS_PORT', '5353'))
 if dev_split:
-    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base))
+    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base), str(_dns_base))
     if fc_colima_profile:
         # ADR 0068: the coordinator dials the host-agent's advertised
         # 127.0.0.1:9101 (and scrapes metrics on :9100) — reachable only via a
@@ -840,10 +851,12 @@ if dev_split:
             resource_deps=['host-agent'],
             labels=['setup'])
     if two_hosts:
-        # Distinct proxy port for the second host-agent; 0 (disabled)
-        # stays 0 so the dev default is unchanged.
+        # Distinct proxy + DNS ports for the second host-agent (they share the
+        # netns). Proxy: 0 (disabled) stays 0 so the dev default is unchanged.
+        # DNS: always +1 (the DNS listener always binds), else host-agent-b
+        # fails closed on `0.0.0.0:5353 Address already in use` (ADR 0075).
         _proxy_b = str(_proxy_base + 1) if _proxy_base > 0 else '0'
-        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b)
+        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b, str(_dns_base + 1))
 
 # ----------------------------------------------------------------
 # Orchestrator (Bun/Hono, ADR 0051) — the web's BFF.
