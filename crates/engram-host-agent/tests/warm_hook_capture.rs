@@ -26,6 +26,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -35,7 +37,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{InitInjection, BuildRequest, Builder, DockerCli, Format};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -212,7 +214,8 @@ async fn warm_hook_nonzero_exit_fails_capture() {
 
 struct TestEnv {
     kernel: std::path::PathBuf,
-    agent: std::path::PathBuf,
+    /// ADR 0080: the staged agentd bundle every backend/spec references.
+    staged: common::StagedAgentdBundle,
     work: tempfile::TempDir,
     images: tempfile::TempDir,
     chunk_store: engram_chunk_store::ChunkStore,
@@ -234,7 +237,7 @@ impl TestEnv {
             eprintln!("SKIP: /dev/kvm not present");
             return None;
         }
-        for bin in ["firecracker", "docker", "mke2fs"] {
+        for bin in ["firecracker", "docker", "mke2fs", "mksquashfs"] {
             let missing = std::env::var_os("PATH")
                 .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
                 .unwrap_or(true);
@@ -256,6 +259,9 @@ impl TestEnv {
         }
         let work = tempfile::tempdir().expect("work dir");
         let images = tempfile::tempdir().expect("images dir");
+        // ADR 0080: agentd rides its reserved bundle slot — stage the
+        // fixture bundle once for every backend this fixture builds.
+        let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
         let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
             engram_storage_local::LocalBlobStorage::new(work.path().join("blob")),
         );
@@ -263,7 +269,7 @@ impl TestEnv {
         std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
         Some(Self {
             kernel,
-            agent,
+            staged,
             work,
             images,
             chunk_store,
@@ -272,6 +278,7 @@ impl TestEnv {
 
     fn pooled(&self) -> Arc<PooledBackend> {
         let mut cfg = FirecrackerConfig::with_kernel(self.kernel.clone());
+        cfg.bundle_dir = self.staged.bundle_dir.clone();
         cfg.net_pool = None;
         cfg.restore_mode = RestoreMode::File;
         cfg.default_boot_args =
@@ -308,8 +315,7 @@ impl TestEnv {
                 tag: "warm-1".into(),
                 images_dir: self.images.path().to_path_buf(),
                 format: Format::Ext4,
-                agent_injection: Some(AgentInjection {
-                    agent_binary: self.agent.clone(),
+                init_injection: Some(InitInjection {
                     vsock_port: ENGRAM_AGENTD_PORT,
                     transport: engram_image_builder::Transport::Vsock,
                     init_script: None,
@@ -333,7 +339,7 @@ impl TestEnv {
             env: HashMap::new(),
             workdir: None,
             network: Default::default(),
-            aux_ro_drives: Vec::new(),
+            aux_ro_drives: vec![self.staged.agentd_slot()],
         }
     }
 }

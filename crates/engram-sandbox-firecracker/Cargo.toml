@@ -44,6 +44,7 @@ rtnetlink.workspace = true
 
 [dev-dependencies]
 engram-image-builder.workspace = true
+sha2.workspace = true
 engram-egress-proxy.workspace = true
 engram-storage-local.workspace = true
 futures.workspace = true

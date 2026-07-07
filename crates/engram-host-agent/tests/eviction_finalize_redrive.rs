@@ -39,6 +39,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,7 +51,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::checkpoint::CheckpointRecord;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{InitInjection, BuildRequest, Builder, DockerCli, Format};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -114,7 +116,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         eprintln!("SKIP: /dev/kvm not present");
         return;
     }
-    for bin in ["firecracker", "docker", "mke2fs"] {
+    for bin in ["firecracker", "docker", "mke2fs", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)
@@ -159,8 +161,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -180,6 +181,10 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
 
     let mut cfg = FirecrackerConfig::with_kernel(kernel.clone());
     cfg.net_pool = None;
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.restore_mode = RestoreMode::File;
     cfg.track_dirty_pages = true; // required for snapshot_begin's diff-checkpoint gate
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
@@ -204,7 +209,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
     let sandbox = pooled_a.create(spec).await.expect("create");

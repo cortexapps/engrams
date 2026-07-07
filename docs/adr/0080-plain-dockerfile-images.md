@@ -90,27 +90,34 @@ thing the restore path already swaps: the aux RO bundle drives
   from tmpfs makes a later drive swap harmless: agentd's text pages
   are guest memory, nothing executes from the drive (the same
   asymmetry that makes the harness swap safe).
-- **Capture**: the coordinator's capture spec resolves the agentd slot
-  explicitly against the fleet bundle catalog (stamp key `agentd`) —
-  explicit rather than host-side because VZ attaches only *resolved*
-  drives, and the capture VM must boot agentd on both backends. The
-  other slots stay symbolic (host resolves them to the sentinel, as
-  today). A fleet that stages no `agentd` bundle cannot capture — loud.
+- **Capture (and any cold boot)**: the spec's agentd slot stays
+  *symbolic* and the **host** resolves it against its own stamp
+  (`current.json[agentd]`) — the same ownership as the sentinel
+  resolution (ADR 0035: "attach whatever this host currently stages"),
+  and it makes the evacuation Fix-B cold-boot recovery work with no
+  coordinator changes. FC resolves it in the cold-boot attach; VZ —
+  which skips unresolved (sentinel) slots — resolves the agentd slot
+  the same way before its skip. A host that stages no `agentd` bundle
+  cannot cold-boot — loud.
 - **Session create (fresh restore)**: the coordinator appends an
   agentd `AuxRoDrive` (slot 1, sha resolved from the fleet catalog) to
   `selected_mounts`, exactly like the harness. The host `patch_drive`s
-  it in the paused window. After resume, before any session state
-  binds, the host sends a new **`WireRequest::RefreshAgent`**
-  (append-only wire enum). agentd: re-mounts the bundle mounts
-  (`remount::remount_bundle_mounts`, the ADR 0035 §3 dance), reads the
+  it in the paused window. **Latency guard (boot time is paramount):**
+  the restore records whether the agentd slot's content actually
+  changed vs. the snapshot's pin (`LiveSandbox.agentd_slot_swapped`);
+  when it didn't — the steady state — `refresh_agent` returns without
+  any guest round-trip, so the whole mechanism adds **zero** to the
+  create path. Only when the slot content changed does the host send
+  the new **`WireRequest::RefreshAgent`** (append-only wire enum),
+  after resume and before any session state binds. agentd then:
+  re-mounts the bundle mounts (the ADR 0035 §3 dance), reads the
   slot's `agentd.sha256`, compares `/run/engram/agentd.sha256`:
-  - equal → replies `UpToDate`. Steady-state cost: one stat/read.
+  - equal → replies `UpToDate` (backstop; the host normally skips).
   - differ → copies binary + stamp to `/run/engram/` (temp + rename),
     replies `Restarting`, flushes, and `execv`s itself with its own
-    argv (PID 1 exec; env preserved). The host treats `Restarting` (or
-    a dropped connection) as "poll agentd ready again", exactly like
-    boot. Cost: ~tens of ms, paid only on the first creates after an
-    agentd roll.
+    argv (PID 1 exec; env preserved). The host re-polls readiness with
+    a tight 20 ms cadence. Cost: ~tens of ms, paid only on the first
+    creates after an agentd roll.
   `refresh_agent` failures are **non-fatal** (warn + proceed with the
   captured agentd — the pre-roll behavior): a transitional old-model
   snapshot or a staging hiccup degrades to yesterday's agentd, never

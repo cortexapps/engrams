@@ -39,7 +39,7 @@ use engram_harness_proto::{
     read_msg, write_msg, HarnessAttach, HarnessAttachAck, HarnessEvent, HarnessFrame,
     HARNESS_VSOCK_PORT,
 };
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{InitInjection, BuildRequest, Builder, DockerCli, Format};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::time::timeout;
 
@@ -52,7 +52,7 @@ async fn baked_noop_harness_emits_run_started() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") {
+    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
 
@@ -128,8 +128,7 @@ exec = "/opt/noop/harness"
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agentd_bin,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -141,6 +140,10 @@ exec = "/opt/noop/harness"
     // ---- 2. Set up FC backend + harness sink ---------------------
     let work = tempfile::tempdir().expect("work dir");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle (agentd + stamp + sentinel) and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agentd_bin);
+    cfg.bundle_dir = staged.bundle_dir.clone();
     // Unprivileged test — matches lifecycle.rs / exec_real_vm.rs.
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
@@ -172,7 +175,7 @@ exec = "/opt/noop/harness"
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let sandbox_id = backend.create(spec).await.expect("create sandbox");
 

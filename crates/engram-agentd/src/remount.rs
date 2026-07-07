@@ -100,3 +100,27 @@ fn remount_one(device: &str, target: &str) -> RemountOutcome {
 pub fn remount_bundle_mounts() -> Vec<(String, RemountOutcome)> {
     Vec::new()
 }
+
+/// [`remount_bundle_mounts`] + the standard per-outcome logging. Shared
+/// by the session-bind path (`HarnessSupervisor::spawn`) and the ADR
+/// 0080 `RefreshAgent` path, which both need the same "re-parse every
+/// possibly-swapped device" dance with the same loudness contract.
+pub fn remount_and_log() {
+    for (target, outcome) in remount_bundle_mounts() {
+        match outcome {
+            RemountOutcome::Remounted => {
+                tracing::info!(%target, "ADR 0035: bundle mount re-parsed");
+            }
+            RemountOutcome::KeptBusy => {
+                tracing::debug!(%target, "ADR 0035: bundle mount in use (resume); kept");
+            }
+            RemountOutcome::Failed(e) => {
+                // Loud: a swapped device under a stale mount is the
+                // 2026-06-03 incident class — the session will come up
+                // with broken skills (or a stale agentd) if this fires
+                // after a swap.
+                tracing::error!(%target, error = %e, "ADR 0035: bundle remount FAILED");
+            }
+        }
+    }
+}

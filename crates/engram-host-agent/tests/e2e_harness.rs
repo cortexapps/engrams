@@ -43,10 +43,17 @@ use std::time::Duration;
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{AgentSpec, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format, Transport};
+use engram_image_builder::{InitInjection, BuildRequest, Builder, DockerCli, Format, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use parking_lot::Mutex;
 use tokio::time::sleep;
+
+/// ADR 0080: the musl agentd the staged bundle fixture packs (the same
+/// binary the old bake used to inject into the rootfs).
+fn agentd_musl_bin() -> PathBuf {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    Path::new(&manifest).join("../../target/x86_64-unknown-linux-musl/release/engram-agentd")
+}
 
 mod common;
 
@@ -290,8 +297,7 @@ exec = "/opt/engram/harness/harness"
             tag: "warm-1".into(),
             images_dir: images_path.clone(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent_bin,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: Transport::Vsock,
                 init_script: None,
@@ -663,6 +669,10 @@ async fn e2e_harness_cold_via_pooled_backend() {
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agentd_musl_bin());
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
     cfg.egress_proxy_port = Some(proxy_port);
     let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
@@ -684,7 +694,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
     let endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
@@ -731,6 +741,10 @@ async fn e2e_harness_warm_via_pooled_backend() {
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agentd_musl_bin());
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
     cfg.egress_proxy_port = Some(proxy_port);
     let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
@@ -752,7 +766,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
 
     // Cold create → wait → snapshot → destroy → restore. The settle
@@ -853,6 +867,10 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agentd_musl_bin());
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
     cfg.egress_proxy_port = Some(proxy_port);
     let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
@@ -874,7 +892,7 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
     let _endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;

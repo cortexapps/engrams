@@ -39,7 +39,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_harness_proto::{read_msg, write_msg, RelayAck, RelayConnect, PROXY_PORT_VSOCK_PORT};
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{InitInjection, BuildRequest, Builder, DockerCli, Format};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -71,7 +71,7 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") {
+    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
 
@@ -124,8 +124,7 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agentd_bin,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -137,6 +136,10 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
     // ---- 2. FC backend + sandbox. ----
     let work = tempfile::tempdir().expect("work dir");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle (agentd + stamp + sentinel) and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agentd_bin);
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
     let backend = FirecrackerBackend::new(work.path(), cfg);
@@ -153,7 +156,7 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let sandbox_id = backend.create(spec).await.expect("create sandbox");
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");

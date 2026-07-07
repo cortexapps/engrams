@@ -179,14 +179,33 @@ impl AuxRoDrive {
     /// ADR 0062: reserved slot index for the harness catalog. Slot 0 (`dyn_0`)
     /// carries the content-addressed catalog squashfs (every registered harness
     /// under `<name>/`); the session `exec`s `/opt/engram/dyn/0/<name>/<exec>`.
-    /// Skills assign to `dyn_1..` (one fewer slot than `RESERVED_SLOTS`). The
-    /// harness is `exec`'d, so unlike a skill its slot must be coordinator-known
-    /// up front to build `argv[0]`.
+    /// Skills assign to `dyn_2..` (slot 1 is agentd, ADR 0080). The harness is
+    /// `exec`'d, so unlike a skill its slot must be coordinator-known up front
+    /// to build `argv[0]`.
     pub const HARNESS_SLOT_INDEX: usize = 0;
 
-    /// ADR 0062: skill slots start after the harness slot, so a session may
-    /// carry at most this many skills (the harness occupies `dyn_0`).
-    pub const MAX_SKILL_SLOTS: usize = Self::RESERVED_SLOTS - 1;
+    /// ADR 0080: reserved slot index for the agentd bundle. Slot 1 (`dyn_1`)
+    /// carries `engram-agentd` + its `agentd.sha256` content stamp. Unlike
+    /// every other slot it must be **resolved at capture** (stamp key
+    /// [`Self::AGENTD_STAMP_KEY`], not the sentinel): the capture VM's stage-1
+    /// init copies agentd out of this mount to tmpfs and execs it — no agentd
+    /// is baked into the rootfs. On a fresh-create restore the coordinator
+    /// pins the fleet's current generation here (like the harness slot) and
+    /// the host's post-resume `RefreshAgent` lets the captured agentd re-exec
+    /// the swapped-in binary — that's how an agentd roll reaches new sessions
+    /// with zero image recapture.
+    pub const AGENTD_SLOT_INDEX: usize = 1;
+
+    /// ADR 0080: stamp key (in `current.json`) for the agentd bundle
+    /// generation this host stages.
+    pub const AGENTD_STAMP_KEY: &'static str = "agentd";
+
+    /// ADR 0062/0080: skill slots start after the harness + agentd slots, so a
+    /// session may carry at most this many skills.
+    pub const MAX_SKILL_SLOTS: usize = Self::RESERVED_SLOTS - 2;
+
+    /// ADR 0080: first reserved slot index skills may occupy (`dyn_2`).
+    pub const FIRST_SKILL_SLOT_INDEX: usize = Self::AGENTD_SLOT_INDEX + 1;
 
     /// Firecracker `drive_id` for reserved dynamic slot `i` (`"dyn_<i>"`).
     /// Underscore, NOT hyphen: FC rejects a `PUT /drives/<id>` whose id isn't

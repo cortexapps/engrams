@@ -258,3 +258,113 @@ pub async fn wait_for_log_count(
     let _ = met;
     last
 }
+
+/// ADR 0080: a staged agentd bundle fixture — the test-side mirror of the
+/// host's `/var/lib/engram/shared` staging. Builds a squashfs carrying
+/// `engram-agentd` + its `agentd.sha256` content stamp, stages it
+/// content-addressed under `bundle_dir`, and writes a `current.json`
+/// stamping both `agentd` and `sentinel` (the sentinel is a minimal
+/// `mount.json` placeholder so symbolic slot resolution finds every key
+/// it needs). Point `FirecrackerConfig.bundle_dir` at `bundle_dir` and
+/// include [`agentd_slot`](Self::agentd_slot) (symbolic) in the spec's
+/// `aux_ro_drives` — the backend resolves it exactly like prod.
+pub struct StagedAgentdBundle {
+    pub bundle_dir: PathBuf,
+    /// sha256 of the staged agentd squashfs (the `current.json[agentd]`
+    /// value / staged file name).
+    pub squashfs_sha: String,
+    /// Content stamp of the agentd binary itself (`agentd.sha256`
+    /// inside the bundle — what RefreshAgent compares).
+    pub binary_sha: String,
+}
+
+impl StagedAgentdBundle {
+    /// The symbolic agentd reserved slot to include in a spec (the
+    /// backend resolves it against the staged stamp).
+    pub fn agentd_slot(&self) -> engram_core::types::sandbox::AuxRoDrive {
+        engram_core::types::sandbox::AuxRoDrive::reserved_slot(
+            engram_core::types::sandbox::AuxRoDrive::AGENTD_SLOT_INDEX,
+        )
+    }
+}
+
+/// Stage an agentd bundle + sentinel into `bundle_dir` (created if
+/// missing). Requires `mksquashfs` — gate callers with
+/// `require_bin("mksquashfs")`.
+pub fn stage_agentd_bundle(bundle_dir: &Path, agentd_binary: &Path) -> StagedAgentdBundle {
+    use engram_core::types::sandbox::AuxRoDrive;
+    std::fs::create_dir_all(bundle_dir).expect("bundle_dir");
+
+    let sha_hex = |bytes: &[u8]| -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let pack = |tree: &Path| -> Vec<u8> {
+        let out = tempfile::tempdir().expect("squashfs out dir");
+        let out_path = out.path().join("bundle.squashfs");
+        // Mirrors the reproducible recipe in deploy/bundles/_pack.sh /
+        // coordinator squashfs.rs.
+        let status = std::process::Command::new("mksquashfs")
+            .arg(tree)
+            .arg(&out_path)
+            .args(["-comp", "zstd", "-all-root", "-noappend", "-no-xattrs"])
+            .env("SOURCE_DATE_EPOCH", "0")
+            .status()
+            .expect("spawn mksquashfs (is squashfs-tools installed?)");
+        assert!(status.success(), "mksquashfs failed");
+        std::fs::read(&out_path).expect("read squashfs")
+    };
+    let stage = |bytes: &[u8]| -> String {
+        let sha = sha_hex(bytes);
+        std::fs::write(bundle_dir.join(AuxRoDrive::staged_file_name(&sha)), bytes)
+            .expect("stage squashfs");
+        sha
+    };
+
+    // agentd bundle: the binary + its content stamp.
+    let binary = std::fs::read(agentd_binary).expect("read agentd binary");
+    let binary_sha = sha_hex(&binary);
+    let tree = tempfile::tempdir().expect("agentd tree");
+    std::fs::write(tree.path().join("engram-agentd"), &binary).expect("write agentd");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            tree.path().join("engram-agentd"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod agentd");
+    }
+    std::fs::write(
+        tree.path().join("agentd.sha256"),
+        format!("{binary_sha}\n"),
+    )
+    .expect("write agentd stamp");
+    let agentd_sha = stage(&pack(tree.path()));
+
+    // Sentinel: the minimal placeholder every other reserved slot
+    // resolves to at capture.
+    let sentinel_tree = tempfile::tempdir().expect("sentinel tree");
+    std::fs::write(
+        sentinel_tree.path().join("mount.json"),
+        "{\"kind\":\"sentinel\"}\n",
+    )
+    .expect("write sentinel mount.json");
+    let sentinel_sha = stage(&pack(sentinel_tree.path()));
+
+    let stamp = format!(
+        "{{\"{}\":\"{agentd_sha}\",\"{}\":\"{sentinel_sha}\"}}\n",
+        AuxRoDrive::AGENTD_STAMP_KEY,
+        AuxRoDrive::SENTINEL_STAMP_KEY,
+    );
+    std::fs::write(bundle_dir.join(AuxRoDrive::CURRENT_STAMP), stamp).expect("write stamp");
+
+    StagedAgentdBundle {
+        bundle_dir: bundle_dir.to_path_buf(),
+        squashfs_sha: agentd_sha,
+        binary_sha,
+    }
+}
