@@ -1,0 +1,37 @@
+[package]
+name = "engram-rootfs-materializer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ADR 0080: materialize a standard OCI/Docker image into a bootable engram rootfs — pull, whiteout-aware flatten, stage-1 init injection, deterministic ext4 pack, chunk."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-core.workspace = true
+engram-chunk-store.workspace = true
+engram-oci.workspace = true
+async-trait.workspace = true
+filetime.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+xattr.workspace = true
+zstd.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+axum.workspace = true
+bytes.workspace = true
+engram-storage-local.workspace = true
+http.workspace = true
+parking_lot.workspace = true
+sha2.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net"] }

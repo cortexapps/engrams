@@ -20,6 +20,9 @@ path = "src/main.rs"
 engram-core.workspace = true
 engram-chunk-store.workspace = true
 engram-oci.workspace = true
+# ADR 0080: ext4 packing + the stage-1 init shim moved to the
+# materializer crate (one shim source, one packer); re-exported below.
+engram-rootfs-materializer.workspace = true
 engram-postgres.workspace = true
 engram-storage-local.workspace = true
 engram-storage-gcs.workspace = true
