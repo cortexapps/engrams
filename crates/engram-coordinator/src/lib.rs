@@ -12,6 +12,7 @@ use engram_core::traits::{BlobStorage, CloudBackend, HostClient, MetadataStore, 
 pub mod api;
 pub mod base_snapshot_retention;
 pub mod blob;
+pub mod boot_bundle;
 pub mod builtin_harness;
 pub mod bundle_gc;
 pub mod checkpoint_retention;
@@ -19,7 +20,6 @@ pub mod chunk_gc;
 pub mod config;
 pub mod cow_state;
 pub mod dead_host;
-pub mod desync_watchdog;
 pub mod enable_scanner;
 pub mod error;
 pub mod evac_resumer;
@@ -28,13 +28,14 @@ pub mod grpc_app;
 pub mod harness_catalog;
 pub mod harness_paths;
 pub mod host_registry;
-pub mod idle_detect_backstop;
+pub mod idle_detector;
 pub mod idle_evictor;
 pub mod integration_ops;
 pub mod integrations;
 pub mod live_migration;
 pub mod metrics;
 pub mod org_secrets;
+pub mod outbox_delivery;
 pub mod pg_listener;
 pub mod placement;
 pub mod preemption_drain;
@@ -42,8 +43,11 @@ pub mod queue_scanner;
 pub mod reconcile;
 pub mod scheduler;
 pub mod session_boot;
+pub mod session_shell_pin;
 pub mod skill_pack;
 pub mod snapshot_blob_gc;
+#[cfg(test)]
+mod span_parenting_tests;
 pub mod squashfs;
 pub mod state;
 
@@ -92,11 +96,15 @@ pub struct Services {
     /// `PooledBackend` (materialize-on-create) and the coord's
     /// admin GC endpoint (sweep unreferenced chunks).
     pub chunk_store: engram_chunk_store::ChunkStore,
-    /// ADR 0007: where the in-process host-agent (active in
-    /// `--mode=all`) materializes chunked manifests. `Some` when
-    /// running `--mode=all`; `None` in `--mode=coordinator` (the
-    /// admin reaper endpoint then becomes a multi-host fanout —
-    /// out of scope for this slice).
+    /// ADR 0007: where an in-process host-agent would materialize
+    /// chunked manifests, for the admin orphan-reap endpoint.
+    /// Currently always `None`: `--mode=all`'s only backend is
+    /// `ProcessBackend` (the FC/VZ in-proc arms were retired, #530
+    /// item f), which has no chunk store / materialize wiring, and
+    /// `--mode=coordinator`'s reap would need a multi-host fanout
+    /// that doesn't exist yet. Kept as a field (not deleted) since a
+    /// real `--mode=all` materialize-dir producer would plug back in
+    /// here without a wire change.
     pub materialize_dir: Option<std::path::PathBuf>,
 }
 
@@ -176,6 +184,12 @@ pub async fn run_with_registry_and_local(
         tracing::warn!(error = %e, "startup host-registry prewarm failed");
     }
 
+    // ADR 0048 (queue fairness): shared wake handle between the pg
+    // listener (fires it on `placement_changed` NOTIFYs) and the queue
+    // scanner (parks on it instead of a pure poll). One per coord
+    // replica — see the `queue_scanner` module doc.
+    let queue_wake = Arc::new(tokio::sync::Notify::new());
+
     // Phase 3c HA: every replica subscribes to the shared
     // `session_events` channel so SSE clients connected to any one
     // replica see events emitted via any other. The same listener
@@ -190,6 +204,9 @@ pub async fn run_with_registry_and_local(
         state.events.clone(),
         state.host_registry.clone(),
         state.integrations.clone(),
+        state.boot_bundles.clone(),
+        queue_wake.clone(),
+        state.outbox_wake.clone(),
     );
 
     // Phase 3d follow-up: dead-host auto-detector. Opens its own
@@ -222,11 +239,18 @@ pub async fn run_with_registry_and_local(
         evac_resumer::spawn(evac_resumer::EvacResumerConfig::default(), state.clone());
 
     // ADR 0048: the session queue scanner. Drives `queued` sessions to
-    // placement (best-fit, FIFO) as capacity frees / the fleet scales up,
-    // or times them out. Lease-guarded → replica-safe. Without it, a
-    // session enqueued on no-capacity sits forever.
-    let _queue_scanner =
-        queue_scanner::spawn(queue_scanner::QueueScannerConfig::default(), state.clone());
+    // placement (best-fit, per-fit-class FIFO) as capacity frees / the
+    // fleet scales up, or times them out. Lease-guarded → replica-safe.
+    // Without it, a session enqueued on no-capacity sits forever.
+    // Push-driven via `queue_wake` (see above); polling is the fallback.
+    // ADR 0073 phase 2: the outbox delivery driver — resume-behind-
+    // enqueue + at-least-once forward + redelivery-until-acked.
+    let _outbox_delivery = outbox_delivery::spawn(state.clone(), state.outbox_wake.clone());
+    let _queue_scanner = queue_scanner::spawn(
+        queue_scanner::QueueScannerConfig::default(),
+        state.clone(),
+        queue_wake,
+    );
 
     // ADR 0028 Fix A: prune aged-out per-session checkpoint rows
     // (latest-per-session always kept; the window doubles as the
@@ -254,7 +278,7 @@ pub async fn run_with_registry_and_local(
     // POST /api/enabled-images. Lease-claimed per job, so multiple
     // coord pods cooperate instead of duplicating pipelines.
     let _enable_scanner = enable_scanner::spawn(
-        enable_scanner::EnableScannerConfig::default(),
+        enable_scanner::EnableScannerConfig::from_env(),
         state.clone(),
     );
 
@@ -293,18 +317,16 @@ pub async fn run_with_registry_and_local(
     // nominates attached harnesses) by reading the durable activity
     // record — session_events — instead. Hard-TTL only; nominates
     // into the same Evicting lane the host path uses.
-    let _idle_backstop = idle_detect_backstop::spawn(
-        idle_detect_backstop::BackstopConfig::from_env(),
-        state.clone(),
-    );
+    // ADR 0073 phase 4: THE idle detector (the host detection plane +
+    // the L3 backstop are unified here — see idle_detector.rs).
+    let _idle_detector =
+        idle_detector::spawn(idle_detector::IdleDetectorConfig::from_env(), state.clone());
 
     // Track A: harness-desync watchdog. Catches the wedge class the
     // silence-only backstop misses — a harness whose event stream desynced
     // from the run state machine (a run-scoped event with no open run, or a
     // stuck-open run) — and recovers it with a non-destructive harness
     // re-handshake, escalating to the eviction lane if the nudges don't take.
-    let _desync_watchdog =
-        desync_watchdog::spawn(desync_watchdog::WatchdogConfig::from_env(), state.clone());
 
     // Phase 4 Track D: preemption best-effort drain. Subscribes to
     // `cloud.preemption_signal()` (engram-cloud-gcp polls the GCE

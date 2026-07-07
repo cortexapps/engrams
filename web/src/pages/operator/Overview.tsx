@@ -60,6 +60,7 @@ export function Overview() {
     { label: "Draining", tone: "caution", count: m.draining, lit: m.draining > 0 },
     { label: "At capacity", tone: "critical", lit: m.capPct >= 90 },
     { label: "RPO stale", tone: "caution", count: m.rpoStale, lit: m.rpoStale > 0 },
+    { label: "Caps failing", tone: "caution", count: m.capsFailing, lit: m.capsFailing > 0 },
   ];
 
   const fleet = [

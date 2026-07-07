@@ -192,6 +192,8 @@ exec = "/opt/noop/harness"
 
     let session_id = SessionId::new();
     let agent = AgentSpec {
+        // ADR 0067: epoch 1 = the test's sole binding generation.
+        binding_epoch: 1,
         argv: vec![
             "/opt/noop/harness".into(),
             "--port".into(),
@@ -226,6 +228,7 @@ exec = "/opt/noop/harness"
         &mut stream,
         &HarnessAttachAck {
             ok: true,
+            reject: None,
             message: None,
         },
     )

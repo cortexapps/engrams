@@ -674,6 +674,17 @@ impl HostClient for HostRegistry {
         backend.start_agent(id, agent, policy).await
     }
 
+    /// ADR 0068: same single-resolve delegation as `start_agent` — this
+    /// mode=all convenience impl has exactly one connected host in
+    /// practice, so no retry logic is warranted for a read-only probe.
+    async fn probe_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.probe_sandbox(id).await
+    }
+
     async fn apply_egress_policy(
         &self,
         policy: engram_core::types::egress::SessionEgressPolicy,
@@ -698,9 +709,11 @@ impl HostClient for HostRegistry {
         backend.guest_ip(id).await
     }
 
-    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
+    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId, binding_epoch: u64) {
         if let Ok((_, backend)) = self.resolve_owner(sandbox_id).await {
-            backend.bind_session(session_id, sandbox_id).await;
+            backend
+                .bind_session(session_id, sandbox_id, binding_epoch)
+                .await;
         }
     }
 
@@ -762,11 +775,6 @@ impl HostClient for HostRegistry {
         backend.interrupt(sandbox_id).await
     }
 
-    async fn rehandshake(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.rehandshake(sandbox_id).await
-    }
-
     async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.pause(sandbox_id).await
@@ -775,11 +783,6 @@ impl HostClient for HostRegistry {
     async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.resume(sandbox_id).await
-    }
-
-    async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.acquire_shell(sandbox_id).await
     }
 
     async fn start_browser(
@@ -793,16 +796,6 @@ impl HostClient for HostRegistry {
     async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.stop_browser(sandbox_id).await
-    }
-
-    async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.release_shell(sandbox_id).await
-    }
-
-    async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.renew_shell(sandbox_id).await
     }
 
     async fn proxy_shell(
@@ -878,13 +871,19 @@ mod tests {
         ) -> Result<engram_core::SessionId, engram_core::MetaError> {
             unreachable!("host_registry tests don't create sessions")
         }
-        async fn create_session_created(
+        async fn transition_session_created(
             &self,
             _: engram_core::SessionId,
-            _: engram_core::types::session::SessionSpec,
-            _: HostId,
             _: SandboxId,
         ) -> Result<(), engram_core::MetaError> {
+            unreachable!()
+        }
+        async fn reserve_and_persist_create(
+            &self,
+            _: engram_core::traits::SessionCreateWriteSet,
+            _: &[HostId],
+            _: usize,
+        ) -> Result<engram_core::traits::CreateDisposition, engram_core::MetaError> {
             unreachable!()
         }
         async fn get_session(
@@ -972,7 +971,7 @@ mod tests {
         async fn record_snapshot(
             &self,
             _: engram_core::types::snapshot::SnapshotRecord,
-        ) -> Result<(), engram_core::MetaError> {
+        ) -> Result<bool, engram_core::MetaError> {
             unreachable!()
         }
         async fn list_snapshots_for_session(
@@ -1087,12 +1086,6 @@ mod tests {
             unreachable!()
         }
         async fn delete_enabled_image(&self, _: &str) -> Result<(), engram_core::MetaError> {
-            unreachable!()
-        }
-        async fn upsert_session_secrets(
-            &self,
-            _: engram_core::types::registry::SessionSecrets,
-        ) -> Result<(), engram_core::MetaError> {
             unreachable!()
         }
         async fn get_session_secrets(

@@ -46,7 +46,7 @@ lazy_static = { version = "1", default-features = false, features = ["spin_no_st
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
-nix = { version = "0.31", default-features = false, features = ["fs", "sched", "signal", "uio"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "mman", "sched", "signal", "uio"] }
 num-bigint = { version = "0.4" }
 num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }

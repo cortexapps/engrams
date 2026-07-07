@@ -21,14 +21,17 @@ use crate::image_cache::ImageCache;
 
 pub mod admin_handler;
 pub mod base_shm_gc;
+pub mod bindings;
 pub mod blob;
 pub mod bundles;
+pub mod capabilities;
 pub mod checkpoint;
 pub mod config;
 pub mod coord_client;
 pub mod dirty_map;
 pub mod disk_daemon;
 pub mod egress;
+pub mod eviction_finalize;
 pub mod grpc_server;
 pub mod harness;
 pub mod host_client;
@@ -45,45 +48,15 @@ pub mod orphan_reap;
 pub mod pooled_backend;
 pub mod proxy_port;
 pub mod proxy_shell;
+pub mod ram_ledger;
 pub mod resource;
 pub mod snapshot;
 pub mod teardown_reconcile;
 pub mod trace_scope;
 pub mod util;
+pub mod warm_progress;
 
 pub use config::HostAgentConfig;
-
-/// ADR 0014 M1.12 / ADR 0020: materialize the host's 16 MiB empty ext4
-/// stub harness (idempotent — rebuilt only if missing or wrong-sized).
-/// Both the warm-pool restore path and ADR 0020's base-snapshot capture
-/// attach it as the harness drive; `swap_harness_drive` re-points it at
-/// the session's real harness at lease/restore time. Returned path is
-/// canonicalized so the FC drive symlink resolves. Lives in the lib so
-/// both the `engram-host-agent` (mode=host) and `engram-coordinator`
-/// (mode=all) binaries wire the same stub.
-pub async fn ensure_stub_harness(path: &std::path::Path) -> Result<PathBuf, String> {
-    const STUB_SIZE_BYTES: u64 = 16 * 1024 * 1024;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("mkdir stub parent {}: {e}", parent.display()))?;
-    }
-    let needs_build = match tokio::fs::metadata(path).await {
-        Ok(meta) => meta.len() != STUB_SIZE_BYTES,
-        Err(_) => true,
-    };
-    if needs_build {
-        let scratch = tempfile::tempdir().map_err(|e| format!("stub tempdir: {e}"))?;
-        use engram_image_builder::{Ext4Packer, Mke2fsPacker};
-        Mke2fsPacker::default()
-            .pack(scratch.path(), path, STUB_SIZE_BYTES)
-            .await
-            .map_err(|e| format!("mke2fs stub harness: {e}"))?;
-    }
-    tokio::fs::canonicalize(path)
-        .await
-        .map_err(|e| format!("canonicalize stub harness {}: {e}", path.display()))
-}
 
 pub struct HostAgent {
     pub cfg: HostAgentConfig,
@@ -317,7 +290,13 @@ impl HostAgent {
                 if self.chunk_store.is_some() && checkpoints_supported {
                     p = p.with_checkpoint_dir(self.cfg.work_dir.join("checkpoints"));
                 }
-                Arc::new(p)
+                let arc = Arc::new(p);
+                // Issue #529: must run before anything spawns a finalize
+                // job against this backend (the checkpoint driver, an
+                // incoming snapshot_begin, or resume_pending_finalizes
+                // below all rely on it for the terminal destroy call).
+                arc.set_self_ref(&arc);
+                arc
             };
             // ADR 0045 C1: the migration export TTL sweep — the
             // dumb-host rule. An export past EXPORT_TTL means the
@@ -600,6 +579,18 @@ impl HostAgent {
             } else {
                 None
             };
+
+            // Issue #529: re-drive every un-acked eviction finalize
+            // record left on disk by a prior host-agent process (crash /
+            // OOM / rolling update mid-upload) — the crash-recovery half
+            // of the host-durable finalize redesign. No-ops when there
+            // are none (the common case).
+            {
+                let pooled_for_finalize_redrive = pooled.clone();
+                tokio::spawn(async move {
+                    pooled_for_finalize_redrive.resume_pending_finalizes().await;
+                });
+            }
             // ADR 0013: every harness event POSTs to the coord via
             // HTTP. Any coord pod can serve the POST (the
             // `state.emit` path on the receiving pod handles
@@ -630,7 +621,10 @@ impl HostAgent {
                     }
                 }
             });
-            let harness_hub = std::sync::Arc::new(crate::harness::HarnessHub::new(event_sink));
+            let bindings = crate::bindings::BindingStore::open(self.cfg.work_dir.join("bindings"))
+                .expect("open binding store under work_dir (ADR 0073)");
+            let harness_hub =
+                std::sync::Arc::new(crate::harness::HarnessHub::new(event_sink, bindings));
             // Plumb the hub into the FC/VZ backend's vsock-accept
             // sink so inbound harness connections land on the local
             // hub's adapter loop. Without this the FC backend drops
@@ -767,6 +761,26 @@ impl HostAgent {
                     as std::sync::Arc<dyn engram_protocol::admin::HostAdminHandler>
             });
 
+            // ADR 0068: resolve once, up front — the SAME `ProbeInputs`
+            // feeds both the register POST below and every heartbeat
+            // tick's re-probe. `bundle_dir` is hoisted here (out of the
+            // later ADR 0035 bundle-supervisor block) so the register
+            // POST carries an honest `bundle_stamp` from the first
+            // attempt, not `Unknown` until the first heartbeat.
+            let bundle_dir = self.sandbox.bundle_dir().to_path_buf();
+            let probe_inputs = capabilities::ProbeInputs {
+                backend: self.cfg.backend_name.clone(),
+                grpc_probe_addr: self.cfg.grpc_listen_addr,
+                bundle_dir: bundle_dir.clone(),
+                fc: self.fc_for_reattach.as_ref().map(|fc| {
+                    let cfg = fc.config();
+                    capabilities::FcProbeInputs {
+                        firecracker_bin: cfg.firecracker_bin.clone(),
+                        uffd_base_dir: cfg.uffd_base_dir.clone(),
+                    }
+                }),
+            };
+
             // ADR 0013: per-process CoordClient for HTTP traffic
             // (register, heartbeat, registry-auth, harness-events,
             // idle-eviction).
@@ -802,6 +816,12 @@ impl HostAgent {
                     .ok()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| format!("host-{host_id}"));
+                // ADR 0068: probe BEFORE the first register, not after —
+                // a host that can't yet prove `grpc_self_connect` /
+                // `bundle_stamp` should say so on its very first row,
+                // not claim `schema: 0` (soft-tolerated) until its
+                // first heartbeat 5s later.
+                let capabilities = capabilities::probe_all(&probe_inputs).await;
                 let register_req = coord_client::RegisterRequest {
                     host_id,
                     hostname,
@@ -809,10 +829,10 @@ impl HostAgent {
                     agent_version: env!("CARGO_PKG_VERSION").to_string(),
                     wire_version: engram_protocol::WIRE_VERSION,
                     cloud_metadata: None,
+                    capabilities,
                 };
                 let cc = coord_client.clone();
                 let pooled_for_rehydrate = pooled.clone();
-                let harness_hub_for_rebind = harness_hub.clone();
                 registration_task = Some(tokio::spawn(async move {
                     let mut backoff = std::time::Duration::from_millis(500);
                     let cap = std::time::Duration::from_secs(30);
@@ -825,17 +845,13 @@ impl HostAgent {
                                     rehydrate_sandboxes = resp.rehydrate_sandboxes.len(),
                                     "registered with coord via /api/hosts/register",
                                 );
-                                // Restore harness-hub routing for survivors
-                                // BEFORE the disk rehydrate below: the in-guest
-                                // harness is already re-dialing, and its attach
-                                // is rejected ("no sandbox bound to this
-                                // session_id") until this lands. Platform-neutral
-                                // (the hub exists on every backend); FC is where
-                                // survivors actually occur. (Session b9b28452.)
-                                rebind_survivor_sessions(
-                                    &harness_hub_for_rebind,
-                                    &resp.rehydrate_sandboxes,
-                                );
+                                // ADR 0073: no harness-hub rebind pass here.
+                                // Binding records live on disk under work_dir
+                                // and survive the roll, so the survivor
+                                // harness's re-dial validates against the
+                                // durable record with zero rebuild step (the
+                                // b9b28452/#447 gap is closed by construction,
+                                // not by replay).
                                 // Issue #229: the coord echoes the wire
                                 // version it understands. Previously this was
                                 // deserialized and silently dropped. A skew is
@@ -961,6 +977,21 @@ impl HostAgent {
                 })
             });
 
+            // Issue #540: the host RAM ledger. One long-lived instance
+            // holds the pending-base-shm-charge registry; `image_prefetch`
+            // registers a charge before each prewarm write and the
+            // heartbeat tick's `sample()` reads it back out every tick.
+            let ram_ledger = std::sync::Arc::new(ram_ledger::RamLedger::new());
+            // Published once per heartbeat tick (issue #540). ADR 0073
+            // deleted the channel's only local subscriber (the host
+            // eviction tick's pressure gate — now coordinator-side,
+            // reading the hosts.utilization these snapshots feed); the
+            // tx side stays as the heartbeat's single measurement
+            // source, and the watch shape stays so a future local
+            // consumer (epic #545's rung residency) subscribes cheaply.
+            let (ram_ledger_tx, _ram_ledger_rx) =
+                tokio::sync::watch::channel(ram_ledger::RamLedgerSnapshot::default());
+
             // ADR 0015 M5: image-prefetch supervisor. Watches the
             // heartbeat-ack's `enabled_images` set and pulls the
             // chunked rootfs for any image not yet local on this
@@ -970,6 +1001,12 @@ impl HostAgent {
             // (production hosts; dev-process backend lacks both and
             // simply never reports ready).
             let readiness = image_prefetch::ImageReadiness::new();
+            // The heartbeat's `stages_images` field (below) must exactly
+            // track whether the supervisor spawn below actually happens —
+            // derive both from the same pure gate rather than letting
+            // `enabled_images_tx.is_some()` implicitly stand in for it.
+            let stages_images =
+                stages_images_gate(self.chunk_store.is_some(), self.chunk_cache.is_some());
             let enabled_images_tx = match (
                 self.chunk_store.as_ref().map(|(cs, _)| cs.clone()),
                 self.chunk_cache.clone(),
@@ -1000,6 +1037,7 @@ impl HostAgent {
                         chunk_cache,
                         readiness.clone(),
                         base_memfile_dir,
+                        ram_ledger.clone(),
                     );
                     Some(tx)
                 }
@@ -1011,6 +1049,11 @@ impl HostAgent {
                     None
                 }
             };
+            debug_assert_eq!(
+                enabled_images_tx.is_some(),
+                stages_images,
+                "stages_images_gate must track the image-prefetch supervisor's actual spawn condition",
+            );
 
             // ADR 0035: bundle store + supervisor. The stamp is read once
             // (hosts are immutable; only a host-agent pod restart changes it). The
@@ -1024,7 +1067,6 @@ impl HostAgent {
             // config, which silently defaulted elsewhere — a host could then
             // advertise a sha it couldn't attach.) The supervisor materializes
             // pinned generations into the same dir.
-            let bundle_dir = self.sandbox.bundle_dir().to_path_buf();
             let bundle_ext = self.sandbox.bundle_file_ext();
             let current_bundles = bundles::read_stamp(&bundle_dir).await;
             let live_bundles_tx = self.chunk_store.as_ref().map(|(cs, _)| {
@@ -1038,49 +1080,21 @@ impl HostAgent {
                 )
             });
 
-            // ADR 0050 D: gRPC readiness gate. Heartbeating is what makes
-            // this host schedulable + routable, so don't start until our
-            // own gRPC server is actually accepting connections — else the
-            // coord can register us and dispatch a restore/exec before the
-            // server is up, which the lazy-dialing pool surfaces as a
-            // transient `Unavailable` (the load test's fresh-host 500s and
-            // truncated streams). A successful TCP connect to the listen
-            // port proves the listener is bound + backlogging.
-            if let Some(addr) = self.cfg.grpc_listen_addr {
-                let probe_addr = if addr.ip().is_unspecified() {
-                    match addr.ip() {
-                        std::net::IpAddr::V4(_) => std::net::SocketAddr::new(
-                            std::net::Ipv4Addr::LOCALHOST.into(),
-                            addr.port(),
-                        ),
-                        std::net::IpAddr::V6(_) => std::net::SocketAddr::new(
-                            std::net::Ipv6Addr::LOCALHOST.into(),
-                            addr.port(),
-                        ),
-                    }
-                } else {
-                    addr
-                };
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-                loop {
-                    match tokio::net::TcpStream::connect(probe_addr).await {
-                        Ok(_) => {
-                            tracing::info!(%addr,
-                                "gRPC server accepting; host ready to heartbeat");
-                            break;
-                        }
-                        Err(_) if tokio::time::Instant::now() < deadline => {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        Err(e) => {
-                            tracing::error!(%addr, error = %e,
-                                "gRPC server still not accepting after 30s; \
-                                 heartbeating anyway to avoid stranding the host");
-                            break;
-                        }
-                    }
-                }
-            }
+            // ADR 0068: the blocking "gRPC readiness gate" (ADR 0050 D)
+            // that used to live here — a synchronous up-to-30s TCP-connect
+            // retry loop with a "heartbeat anyway" optimism escape hatch
+            // once it gave up — is RETIRED, not hardened. The heartbeat
+            // loop below now starts immediately and its every-tick
+            // `capabilities::probe_all` re-runs this exact TCP self-connect
+            // as the `grpc_self_connect` capability; a still-binding
+            // listener just reports `Failed` on this tick (and `Ok` on a
+            // later one) instead of the host racing to heartbeat before it
+            // can actually serve anything. The coordinator's placement
+            // filter (`host_meets_capabilities`, PR 2) requires
+            // `grpc_self_connect: Ok` for ANY placement, so the same
+            // "coord can't dispatch before the listener is up" failure
+            // mode this gate closed is now closed at the scheduler instead
+            // of at host-agent startup.
 
             // ADR 0013: HTTP heartbeat loop. Posts
             // {capacity, local_snapshots, running_sandboxes,
@@ -1092,10 +1106,19 @@ impl HostAgent {
             // against the local ready set.
             let heartbeat_interval = self.cfg.heartbeat_interval;
             let coord_for_heartbeat = coord_client.clone();
+            let harness_hub_for_heartbeat = harness_hub.clone();
             let pooled_for_heartbeat = pooled.clone();
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
             let util_work_dir = self.cfg.work_dir.clone();
+            let probe_inputs_for_heartbeat = probe_inputs.clone();
+            let ram_ledger_for_heartbeat = ram_ledger.clone();
+            let ram_ledger_tx_for_heartbeat = ram_ledger_tx;
+            let stages_images_for_heartbeat = stages_images;
+            // ENGRAM_FC_UFFD_BASE_DIR doesn't change at runtime; resolve
+            // once outside the loop (same pattern `base_memfile_dir`
+            // above uses).
+            let base_shm_dir_for_heartbeat = engram_sandbox_firecracker::uffd_base_dir_from_env();
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(heartbeat_interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1134,19 +1157,72 @@ impl HostAgent {
                     // never a stale value. Error-tolerant + non-blocking
                     // (telemetry must not gate the workload); absent on
                     // VZ/non-Linux (guest_memory_stats → None).
-                    // ADR 0046: also feed Σ guest-PSS into the heartbeat's
-                    // `allocatable_mib` (UtilizationProbe::sample = MemAvailable
-                    // + Σ guest-resident), so placement nets out the baseline.
-                    let guest_pss_mib = match pooled_for_heartbeat.guest_memory_stats().await {
-                        Some(mem) => {
-                            ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PSS_BYTES)
-                                .set(mem.pss_bytes as f64);
-                            ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_RSS_BYTES)
-                                .set(mem.rss_bytes as f64);
-                            mem.pss_bytes / (1024 * 1024)
-                        }
-                        None => 0,
-                    };
+                    let guest_mem = pooled_for_heartbeat.guest_memory_stats().await;
+                    if let Some(mem) = &guest_mem {
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PSS_BYTES)
+                            .set(mem.pss_bytes as f64);
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_RSS_BYTES)
+                            .set(mem.rss_bytes as f64);
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PARKED_PSS_BYTES)
+                            .set(mem.parked_pss_bytes as f64);
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PARKED_RSS_BYTES)
+                            .set(mem.parked_rss_bytes as f64);
+                    }
+                    // Issue #540: one RAM-ledger snapshot per tick — the
+                    // meminfo read, the guest-PSS running/parked split
+                    // above, and this ledger's own pending base-shm
+                    // charges. Both `UtilizationProbe::sample` (below) and
+                    // the idle-evictor's pressure gate (via the watch
+                    // channel) derive their numbers from THIS snapshot, so
+                    // the two can never disagree.
+                    let ram_snapshot = ram_ledger_for_heartbeat.sample(
+                        base_shm_dir_for_heartbeat.as_deref(),
+                        &guest_mem.unwrap_or_default(),
+                    );
+                    ram_ledger_tx_for_heartbeat.send_replace(ram_snapshot);
+                    // Issue #540 review finding 3: gate every ledger gauge
+                    // on `measured` — VZ/Process/non-Linux backends (and a
+                    // genuine `/proc/meminfo` parse failure) never took a
+                    // real sample, so `ram_snapshot` is the all-zero
+                    // default. Emitting that as a value would look like
+                    // "this host has 0 MiB of everything" on a dashboard
+                    // instead of "unmeasured" — matches the acceptance
+                    // criterion's "gauges not emitted" posture.
+                    if ram_snapshot.measured {
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "running_vms")
+                            .set(ram_snapshot.running_vm_pss_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "parked_paused")
+                            .set(ram_snapshot.parked_paused_pss_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "base_shm")
+                            .set(ram_snapshot.base_shm_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "base_shm_pending")
+                            .set(ram_snapshot.base_shm_pending_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_LEDGER_MIB, "category" => "parked_local_memfiles")
+                            .set(ram_snapshot.parked_local_memfile_mib as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_RAM_ALLOCATABLE_MIB)
+                            .set(ram_snapshot.allocatable_mib() as f64);
+                        ::metrics::gauge!(crate::metrics::HOST_BASE_SHM_TMPFS_TOTAL_MIB)
+                            .set(ram_snapshot.base_shm_tmpfs_total_mib as f64);
+                        // Issue #540 review finding 5: this is the tmpfs
+                        // mount's own `statfs` used figure (`f_blocks -
+                        // f_bfree`), NOT `base_shm_mib` (this ledger's
+                        // st_blocks walk over known files) — the two can
+                        // legitimately diverge (an unlinked-but-open file,
+                        // a stray subdir) and this gauge exists specifically
+                        // to catch that divergence during an ENOSPC-class
+                        // incident.
+                        ::metrics::gauge!(crate::metrics::HOST_BASE_SHM_TMPFS_USED_MIB)
+                            .set(ram_snapshot.base_shm_tmpfs_used_mib as f64);
+                    }
+                    // Issue #540: single emission site for this gauge (was
+                    // previously only set inside the idle-evictor's
+                    // pressure-aware branch, so it read stale/unset when
+                    // that mode was off). Every tick now, unconditionally
+                    // (still gated on `measured` via `free_pct()`'s own
+                    // `None` return).
+                    if let Some(pct) = ram_snapshot.free_pct() {
+                        ::metrics::gauge!(crate::metrics::HOST_MEM_FREE_PCT).set(f64::from(pct));
+                    }
                     // ADR 0028 Fix A: re-advertise every un-acked
                     // durable checkpoint record until a coord acks it
                     // into PG. Empty when checkpointing is disabled.
@@ -1167,9 +1243,16 @@ impl HostAgent {
                             aux_bundles: r.aux_bundles.clone(),
                             paused_at: r.paused_at,
                             captured_at: r.captured_at,
+                            kind: r.kind,
                         })
                         .collect();
-                    let utilization = util_probe.sample(&util_work_dir, guest_pss_mib);
+                    let utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
+                    // ADR 0068: re-run every probe this tick. Cheap
+                    // (statfs/stat/one TCP connect/a memfd-backed uffd
+                    // self-test; the FC binary version is cached after
+                    // its first call) — this IS the retry for whatever
+                    // the old blocking gRPC gate used to loop on.
+                    let capabilities = capabilities::probe_all(&probe_inputs_for_heartbeat).await;
                     let req = coord_client::HeartbeatRequest {
                         capacity: engram_protocol::heartbeat::HostCapacityReport {
                             total_mib: host_total_mib,
@@ -1189,21 +1272,45 @@ impl HostAgent {
                         total_vcpus: std::thread::available_parallelism()
                             .map(|n| n.get() as u32)
                             .unwrap_or(0),
+                        // ADR 0073 phase 4: harness-attach liveness for the
+                        // coordinator's disagreement alarm.
+                        harness_attached: harness_hub_for_heartbeat.attached_sandboxes(),
                         // Issue #229: report our bincode wire version so the
                         // coordinator drains us off scheduling on a skew
                         // (mixed-version fleet mid rolling deploy).
                         wire_version: engram_protocol::WIRE_VERSION,
+                        // ADR 0036 amendment (issue #538): true iff the
+                        // image-prefetch supervisor actually spawned
+                        // (chunk_store + chunk_cache configured — see
+                        // `stages_images_gate` + the gating a few hundred
+                        // lines up). The scanner's prestage stage waits
+                        // only on hosts reporting this.
+                        stages_images: stages_images_for_heartbeat,
+                        capabilities,
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {
                             if let Some(tx) = enabled_images_tx.as_ref() {
+                                // ADR 0036 amendment (issue #538): the
+                                // supervisor watches the UNION of
+                                // enabled + prestaging images — it needs
+                                // zero changes to warm a prestaging
+                                // image, since from its point of view
+                                // that's just another image to fetch,
+                                // pin, and report ready. The coordinator's
+                                // enable-scanner is the one reading
+                                // `ready_images` back out during its wait.
+                                let union = image_prefetch::union_image_refs(
+                                    &resp.enabled_images,
+                                    &resp.prestage_images,
+                                );
                                 // send_modify avoids notifying on
                                 // no-op (same set as last tick).
                                 tx.send_if_modified(|cur| {
-                                    if *cur == resp.enabled_images {
+                                    if *cur == union {
                                         false
                                     } else {
-                                        *cur = resp.enabled_images;
+                                        *cur = union;
                                         true
                                     }
                                 });
@@ -1245,215 +1352,23 @@ impl HostAgent {
                 }
             });
 
-            // ADR 0011 follow-up #2: host owns idle-eviction
-            // detection (its HarnessHub is authoritative for "last
-            // harness activity"). Push candidates to coord via
-            // HTTP; coord-side pipeline (`evict_idle_session`)
-            // runs the snapshot+destroy+mark-Idle dance on whatever
-            // pod receives the POST. Idempotent across pods.
-            let eviction_hub = harness_hub.clone();
-            let eviction_coord = coord_client.clone();
-            let eviction_pooled = pooled.clone();
-            let idle_soft_ttl = idle_evictor::idle_ttl_from_env();
-            let idle_hard_ttl = idle_evictor::idle_hard_ttl_from_env();
-            // ADR 0014 issue #4: disk-pressure floor. When free disk
-            // on the work_dir falls below this, we pause pushing
-            // idle-evict candidates — coord-side retry storms (every
-            // one of which writes ~4 GiB of FC memory dump pre-fix)
-            // can't fill the disk if we never push them. The
-            // companion fixes from #1/#2 also stop the per-retry
-            // leak; this is the defense-in-depth backstop for any
-            // future leak class we haven't anticipated.
-            let eviction_work_dir = self.cfg.work_dir.clone();
-            let eviction_floor_bytes = idle_evictor::disk_floor_bytes_from_env();
-            // Tier 1 (pressure-aware idle eviction): default-off. When on,
-            // soft-idle sandboxes are only nominated under real memory
-            // pressure (< mem floor % free) — a warm VM stays resident on
-            // a host with RAM to spare instead of paying snapshot+cold-
-            // resume churn. Hard-idle sandboxes always proceed.
-            let eviction_pressure_aware = idle_evictor::pressure_aware_from_env();
-            let eviction_mem_floor_pct = idle_evictor::mem_floor_pct_from_env();
-            let eviction_task = tokio::spawn(async move {
-                let mut tick = tokio::time::interval(idle_evictor::DEFAULT_POLL_INTERVAL);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tick.tick().await;
-                    let (allow, free) =
-                        idle_evictor::disk_pressure_check(&eviction_work_dir, eviction_floor_bytes);
-                    if let Some(b) = free {
-                        ::metrics::gauge!(crate::metrics::HOST_DISK_FREE_BYTES).set(b as f64);
-                    }
-                    if !allow {
-                        ::metrics::counter!(crate::metrics::IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL)
-                            .increment(1);
-                        tracing::warn!(
-                            host_id = %host_id,
-                            free_bytes = ?free,
-                            floor_bytes = eviction_floor_bytes,
-                            "idle-evict paused: disk pressure (free < floor)",
-                        );
-                        continue;
-                    }
-                    // ADR 0016 §A.1.5a: sweep wedged in-flight markers
-                    // before reading candidates. A spawned POST that
-                    // got stuck (reqwest future hung past its own
-                    // 120s timeout for some pathological reason)
-                    // would otherwise permanently block re-eviction of
-                    // its sandbox. 180s is 1.5× the per-request
-                    // timeout — by that point the POST is unambiguously
-                    // dead, even if the spawned task somehow hasn't
-                    // returned.
-                    let stale =
-                        eviction_hub.sweep_stale_evictions(std::time::Duration::from_secs(180));
-                    if !stale.is_empty() {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            count = stale.len(),
-                            "swept stale eviction-inflight markers (>180s); spawned POSTs presumed wedged",
-                        );
-                    }
-                    // Issue #219: same hardening for `shell_attached`.
-                    // A shell pin is acquired/released by two independent
-                    // coord→host RPCs from the coord's WS bridge task. If
-                    // that task dies without sending ReleaseShell (coord
-                    // pod killed mid-session, dropped WS), the pin would
-                    // stay ≥1 forever, exempting the sandbox from idle
-                    // eviction — hard-TTL backstop included. The coord
-                    // bridge renews live pins on its keepalive interval;
-                    // reap any pin we've stopped hearing about so it
-                    // falls back under the normal TTLs.
-                    let stale_shells =
-                        eviction_hub.sweep_stale_shells(crate::harness::SHELL_PIN_STALE_AGE);
-                    if !stale_shells.is_empty() {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            count = stale_shells.len(),
-                            "swept stale shell pins (un-renewed past SHELL_PIN_STALE_AGE); \
-                             coord WS bridge presumed dead",
-                        );
-                    }
-                    // `idle_sandboxes` now skips sandboxes whose prior
-                    // POST is still in flight (ADR 0016 §A.1.5a).
-                    let mut pairs = eviction_hub.idle_sandboxes(idle_soft_ttl, idle_hard_ttl);
-                    // ADR 0045 C2: sandboxes mid-post-copy are never
-                    // idle-evict candidates — the frozen SOURCE is
-                    // maximally "quiet" and would be nominated every
-                    // tick; the DEST's durability isn't caught up yet.
-                    // The session lease blocks the pipeline anyway;
-                    // this keeps the nominations (and the lease-handoff
-                    // race window) out entirely.
-                    pairs.retain(|(_, sb, _)| eviction_pooled.migration_role(*sb).is_none());
-                    // Tier 1 (pressure-aware idle eviction): with the mode
-                    // on and the host NOT under memory pressure, drop the
-                    // `Soft` candidates — keep the warm VMs resident and
-                    // let a live human resume instantly instead of paying a
-                    // cold restore. `Hard` candidates (the never-emits-Idle
-                    // backstop) always survive, and the coord's own hard-TTL
-                    // backstop remains the absolute residency ceiling. When
-                    // the mode is off this whole block is skipped, so the
-                    // nomination set is byte-identical to the historical
-                    // TTL-only behavior.
-                    if eviction_pressure_aware {
-                        let (under_pressure, free_pct) =
-                            idle_evictor::mem_pressure_check(eviction_mem_floor_pct);
-                        if let Some(pct) = free_pct {
-                            ::metrics::gauge!(crate::metrics::HOST_MEM_FREE_PCT)
-                                .set(f64::from(pct));
-                        }
-                        if !under_pressure {
-                            let before = pairs.len();
-                            pairs.retain(|(_, _, kind)| *kind == crate::harness::IdleKind::Hard);
-                            let kept = before - pairs.len();
-                            if kept > 0 {
-                                ::metrics::counter!(crate::metrics::IDLE_EVICT_KEPT_RESIDENT_TOTAL)
-                                    .increment(kept as u64);
-                                tracing::debug!(
-                                    host_id = %host_id,
-                                    kept,
-                                    free_pct = ?free_pct,
-                                    floor_pct = eviction_mem_floor_pct,
-                                    "idle-evict: kept soft-idle sandboxes resident (no memory pressure)",
-                                );
-                            }
-                        }
-                    }
-                    if pairs.is_empty() {
-                        continue;
-                    }
-                    let sandbox_ids: Vec<SandboxId> = pairs.iter().map(|(_, sb, _)| *sb).collect();
-                    let candidates: Vec<coord_client::IdleCandidate> = pairs
-                        .into_iter()
-                        .map(|(session_id, sandbox_id, _)| coord_client::IdleCandidate {
-                            session_id,
-                            sandbox_id,
-                            idle_since: None,
-                        })
-                        .collect();
-                    // Mark BEFORE the spawn so the next tick (10s
-                    // away) can't double-post. The clear runs in the
-                    // spawned task's finally block — covers success,
-                    // transport error, and timeout uniformly.
-                    for sb in &sandbox_ids {
-                        eviction_hub.mark_eviction_inflight(*sb);
-                    }
-                    // Fire-and-forget: don't block the tick loop on
-                    // the POST. Since ADR 0034 the POST is a fast
-                    // nomination (coord flips Active→Evicting and
-                    // returns; its eviction scanner runs the
-                    // pipeline), so the marker clears in seconds and
-                    // re-nomination dedup comes from the coord side
-                    // (non-Active candidate → accepted no-op). The
-                    // marker + 180s stale sweep stay as the
-                    // within-tick guard (ADR 0016 §A.1.5a).
-                    //
-                    // Shutdown caveat: `eviction_task.abort()` on
-                    // process exit will not wait for these spawned
-                    // children. Detached POSTs may be torn down mid-
-                    // flight. Acceptable — the coord-side pipeline
-                    // is idempotent (the registry guard at the top
-                    // of `evict_idle_session` short-circuits on
-                    // re-entry per A.1.5b).
-                    let coord = eviction_coord.clone();
-                    let hub = eviction_hub.clone();
-                    let sandbox_ids_for_clear = sandbox_ids.clone();
-                    tokio::spawn(async move {
-                        let outcome = coord
-                            .push_idle_eviction_candidates(host_id, candidates)
-                            .await;
-                        // Finally: clear in-flight markers regardless
-                        // of outcome. A failed POST should NOT keep
-                        // the sandbox blocked from a retry on the
-                        // next tick — but the next tick will only
-                        // happen after this completes, which is the
-                        // whole point of the gate.
-                        for sb in &sandbox_ids_for_clear {
-                            hub.clear_eviction_inflight(*sb);
-                        }
-                        match outcome {
-                            Ok(resp) => {
-                                tracing::debug!(
-                                    %host_id,
-                                    accepted = resp.accepted,
-                                    failed = resp.failed,
-                                    "idle-eviction POST completed",
-                                );
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    %host_id,
-                                    error = %e,
-                                    "idle-eviction POST failed; \
-                                     will retry on next tick after clear",
-                                );
-                            }
-                        }
-                    });
-                }
-            });
+            // ADR 0073 phase 4: no host-side idle detection. The
+            // coordinator's PG-derived idle detector (idle_detector.rs)
+            // is the ONLY detection plane — same soft/hard TTL
+            // semantics, sourced from the durable event log instead of
+            // hub memory (which went amnesiac on every detach/restart;
+            // the reason the L3 backstop existed). The disk-pressure
+            // brake and pressure-aware gating moved with it, reading
+            // the heartbeat-persisted hosts.utilization.
+            // Issue #540 note: the RAM ledger still feeds the heartbeat's
+            // allocatable_mib (its watch channel is consumed by the
+            // heartbeat tick above); the deleted eviction tick was its
+            // OTHER consumer, and that pressure gate now lives in the
+            // coordinator's detector reading hosts.utilization — the
+            // same ledger numbers, one hop later.
 
             shutdown_signal().await;
             heartbeat_task.abort();
-            eviction_task.abort();
             if let Some(t) = grpc_task {
                 t.abort();
             }
@@ -1570,29 +1485,15 @@ impl HostAgent {
 /// hosts where the publisher never landed a value) are skipped
 /// with a debug log. They run "untracked" until the next eviction
 /// snapshot.
-/// Restore harness-hub routing for every survivor the coord re-handed us
-/// on (re)registration. SEPARATE from disk rehydration and platform-neutral:
-/// a host-agent roll / restart rebuilds the hub's `session_to_sandbox` map
-/// EMPTY, so the in-guest harness — which survives the roll and keeps
-/// re-dialing — has its attach answered "no sandbox bound to this
-/// session_id" and (pre-fix) exited, wedging the session `active` forever
-/// (session b9b28452). `reattach_pass` + `rehydrate_survivors` restore the
-/// VM and the disk/egress plane but never touch the harness hub; this closes
-/// that gap. Idempotent (a later bind replaces an earlier one).
-fn rebind_survivor_sessions(
-    harness_hub: &harness::HarnessHub,
-    survivors: &[coord_client::RehydrateSandboxRef],
-) {
-    if survivors.is_empty() {
-        return;
-    }
-    for s in survivors {
-        harness_hub.bind_session(s.session_id, s.sandbox_id);
-    }
-    tracing::info!(
-        count = survivors.len(),
-        "rebound harness-hub routing for survivor sessions after (re)registration",
-    );
+/// ADR 0036 amendment (issue #538): whether this host's heartbeat should
+/// advertise `stages_images: true` — the queue-scanner's prestage-wait
+/// gates on this flag, so it must exactly track whether the
+/// image-prefetch supervisor actually spawned (`run`'s gate at the
+/// `enabled_images_tx` match, which needs both a `ChunkStore` and a
+/// `ChunkCache` configured). Pure so the boolean derivation is
+/// unit-testable without wiring a real supervisor.
+fn stages_images_gate(has_chunk_store: bool, has_chunk_cache: bool) -> bool {
+    has_chunk_store && has_chunk_cache
 }
 
 #[cfg(target_os = "linux")]
@@ -1714,46 +1615,59 @@ mod tests {
     use super::*;
     use engram_core::SessionId;
 
-    fn noop_hub() -> harness::HarnessHub {
-        harness::HarnessHub::new(std::sync::Arc::new(|_, _, _| Box::new(Box::pin(async {}))))
+    fn noop_hub_over(dir: &std::path::Path) -> harness::HarnessHub {
+        harness::HarnessHub::new(
+            std::sync::Arc::new(|_, _, _| Box::new(Box::pin(async {}))),
+            bindings::BindingStore::open(dir).expect("open binding store"),
+        )
     }
 
-    /// Regression (session b9b28452): after a host-agent roll the harness
-    /// hub's session→sandbox map is rebuilt EMPTY, so the surviving in-guest
-    /// harness's re-dial is rejected with "no sandbox bound to this
-    /// session_id". `rebind_survivor_sessions` must repopulate routing for
-    /// every survivor the coord re-hands us, so the harness re-attach lands
-    /// instead of the session wedging `active` forever.
+    /// ADR 0073 replacement for the retired `rebind_survivor_sessions`
+    /// coverage (regression b9b28452 / #447): a host-agent restart must
+    /// accept a survivor harness's re-dial with ZERO rebuild pass. The
+    /// binding record on disk IS the routing — a hub constructed fresh
+    /// over a pre-populated bindings dir (what a restarted process
+    /// sees) resolves the survivor immediately.
     #[test]
-    fn rebind_survivor_sessions_restores_harness_routing() {
-        let hub = noop_hub();
+    fn fresh_hub_over_surviving_bindings_dir_routes_survivors() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let session_id = SessionId::new();
         let sandbox_id = SandboxId::new();
 
-        // Fresh post-roll process: nothing bound → an attach would be rejected.
-        assert!(hub.bound_sandbox(session_id).is_none());
+        // "Old" process binds, then dies (dropped hub).
+        {
+            let hub = noop_hub_over(dir.path());
+            hub.bind_session(session_id, sandbox_id, 1).expect("bind@1");
+        }
 
-        let survivors = vec![coord_client::RehydrateSandboxRef {
-            session_id,
-            sandbox_id,
-            // A survivor with no disk manifest is skipped by the disk
-            // rehydrate, but STILL needs its harness routing restored.
-            disk_manifest_id: None,
-            disk_manifest_version: None,
-        }];
-        rebind_survivor_sessions(&hub, &survivors);
-
+        // "New" process: fresh hub, same dir, no coordinator involved.
+        let hub = noop_hub_over(dir.path());
         assert_eq!(
             hub.bound_sandbox(session_id),
             Some(sandbox_id),
-            "survivor's harness routing must be restored so its re-attach succeeds",
+            "survivor binding must be readable by a restarted host-agent",
         );
     }
 
+    /// An empty bindings dir routes nothing — parity with the old
+    /// empty-list no-op behavior.
     #[test]
-    fn rebind_survivor_sessions_is_a_noop_for_empty_list() {
-        let hub = noop_hub();
-        rebind_survivor_sessions(&hub, &[]);
+    fn fresh_hub_over_empty_bindings_dir_routes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hub = noop_hub_over(dir.path());
         assert!(hub.bound_sandbox(SessionId::new()).is_none());
+    }
+
+    /// The image-prefetch supervisor only spawns (and this host only
+    /// reports `stages_images: true`) when BOTH a chunk_store and a
+    /// chunk_cache are configured — a dev `Process` backend missing
+    /// either must never advertise it stages images, or the coordinator's
+    /// enable-scanner would wait forever on a prestage this host can't do.
+    #[test]
+    fn stages_images_gate_requires_both_chunk_store_and_chunk_cache() {
+        assert!(stages_images_gate(true, true));
+        assert!(!stages_images_gate(true, false));
+        assert!(!stages_images_gate(false, true));
+        assert!(!stages_images_gate(false, false));
     }
 }

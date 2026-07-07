@@ -59,7 +59,7 @@ use std::time::Duration;
 use chrono::Utc;
 use engram_core::types::{Session, SessionState};
 
-use crate::api::snapshot::{bind_session_routing, finish_resume_to_active, FinishResumeOutcome};
+use crate::api::snapshot::{finish_resume_to_active, FinishResumeOutcome};
 use crate::evacuation::{evacuate_dead_source, resolve_cold_boot_spec, EvacError};
 use crate::state::{SessionEvent, SharedState};
 
@@ -155,6 +155,11 @@ pub(crate) async fn run_once(
     Ok(())
 }
 
+// ADR 0019 / telemetry restoration (#526): scanner-driven work has no
+// request span to inherit — an explicit root (carrying `session_id`) so
+// the relocation pipeline's spans correlate instead of exporting as
+// disconnected roots.
+#[tracing::instrument(name = "evac_resumer.advance_one", skip_all, fields(session_id = %session.id))]
 async fn advance_one(
     cfg: &EvacResumerConfig,
     state: &SharedState,
@@ -435,7 +440,9 @@ async fn run_resume_pipeline(
         )
         .await;
 
-    bind_session_routing(state, session_id, receipt.new_sandbox_id).await;
+    // ADR 0073: evac restore is a fresh-spawn generation — mint.
+    crate::api::snapshot::bind_session_routing_minted(state, session_id, receipt.new_sandbox_id)
+        .await;
 
     // ADR 0028 A.log: warm rung-1 recovery — rewind the transcript to
     // the checkpoint's cursor + emit the recovery boundary. Gated on
@@ -524,6 +531,9 @@ mod tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: live_disk,
+            selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         }
     }
 

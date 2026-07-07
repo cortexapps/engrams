@@ -11,8 +11,10 @@
 //! author COPY'd it). There's no drive mount, no NBD page-in on the
 //! spawn hot path; the supervisor just exec's argv. The egress-proxy
 //! CA reaches the child via env vars pointing at the canonical
-//! [`crate::cacerts`] install paths — the host's `InstallHostCa` RPC
-//! ran during `start_agent`, before the SpawnHarness call landed.
+//! [`crate::cacerts`] install paths — 2026-07 core-ops fold: the
+//! handler installs the CA (carried on this same `SpawnHarness`
+//! frame) before calling into [`HarnessSupervisor::spawn`], so those
+//! paths are always populated by the time the child execs.
 //!
 //! Concurrency contract: at most one spawn-in-flight per agent.
 //! Concurrent SpawnHarness calls serialise on the inner mutex;
@@ -207,9 +209,10 @@ impl HarnessSupervisor {
             cmd.current_dir(cwd);
         }
         // Point TLS libraries at the canonical CA paths the
-        // CaCertInstaller writes (ADR 0021 P1.1). The host called
-        // InstallHostCa before SpawnHarness, so these files exist
-        // by the time the harness child starts. NODE_EXTRA_CA_CERTS
+        // CaCertInstaller writes (ADR 0021 P1.1). The handler installs
+        // the CA (2026-07 fold: carried on this SpawnHarness frame)
+        // before calling into `spawn`, so these files exist by the
+        // time the harness child starts. NODE_EXTRA_CA_CERTS
         // wants the single engram cert file (Node doesn't read the
         // system bundle by default); the bundle env vars cover
         // OpenSSL / libcurl / Python requests.
@@ -349,6 +352,7 @@ mod tests {
                 argv: vec![],
                 env: HashMap::new(),
                 session_env: session_env.clone(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -362,6 +366,7 @@ mod tests {
                 argv: vec![],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -380,6 +385,7 @@ mod tests {
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()],
             env: HashMap::new(),
             session_env: HashMap::new(),
+            host_ca_pem: None,
         };
         let pid1 = sup.spawn(long.clone()).await.unwrap().expect("pid");
         // The teleport-handshake shape: SpawnHarness while running.
@@ -400,6 +406,7 @@ mod tests {
             argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
             env: HashMap::new(),
             session_env: HashMap::new(),
+            host_ca_pem: None,
         };
         let sup2 = HarnessSupervisor::new();
         let pid3 = sup2.spawn(short.clone()).await.unwrap().expect("pid");
@@ -416,6 +423,7 @@ mod tests {
                 argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -436,6 +444,7 @@ mod tests {
                 argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -444,6 +453,7 @@ mod tests {
                 argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -475,6 +485,7 @@ mod tests {
                 ],
                 env: HashMap::new(),
                 session_env: HashMap::new(),
+                host_ca_pem: None,
             })
             .await
             .unwrap();
@@ -517,6 +528,7 @@ mod tests {
                 ],
                 env,
                 session_env,
+                host_ca_pem: None,
             })
             .await
             .unwrap();

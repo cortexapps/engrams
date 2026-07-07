@@ -623,3 +623,45 @@ gating host "ready for scheduling" on prefetch completion.
 - ADR 0015 (system design v2; enabled_images, deleted `templates` table)
 - ADR 0018 (session evacuation; §12p vsock/harness path re-anchoring)
 - E2B infra reference: `~/test/infra/packages/orchestrator/pkg/sandbox/`
+
+## Amendment (2026-07-01): the Phase 0 pipeline regressed, silently, for months
+
+The 173-span cross-process trace and per-host otelcol collectors this
+ADR documents above were built against the **GCE/packer** fleet. ADR
+0044's K8s host-fleet migration ported the host-agent workload to a
+DaemonSet but never carried the collector or its `OTEL_EXPORTER_OTLP_
+ENDPOINT` env forward — `engram-telemetry` (correctly) no-ops without
+it, so the omission failed silently. Combined with the #210/#213
+cancellation-hardening work moving lifecycle pipeline bodies into bare
+`tokio::spawn`s (severing the tracing context), the measurement floor
+this ADR built quietly collapsed: by the 2026-07-01 evidence pass,
+every host-side span exported nowhere, and every coordinator trace was
+a single unparented root (`session.create.grpc` at 47s with no
+breakdown) — exactly the "measure-then-optimize" waterfall this ADR's
+Phase 0 exists to provide, gone.
+
+The telemetry-restoration issue (#526) is the fix: host-fleet DaemonSet
+OTLP export (mirroring the coord sidecar pattern — native sidecar, no
+readinessProbe), `.instrument(Span::current())` on every detached
+lifecycle spawn so the trace tree re-stitches under its request span, a
+GMP `PodMonitoring` template so fleet metrics survive the routine pod
+churn this fleet shape produces, and a first batch of per-mechanism
+effectiveness counters (`engram_resume_prefault_*`,
+`engram_chunk_fetch_seconds{tier="nvme"}`, `engram_chunk_fill_*`,
+`engram_session_resume_total{placement=...}`). In-guest agentd export
+(the `engram_otel=` boot-arg + a guest→collector firewall pinhole) is
+deliberately deferred — prototype-first, tracked as a follow-up — so
+the resume-side guest boot spans still don't stitch onto the create
+trace; everything else in the waterfall does.
+
+**New-mechanism rule** (the standing assertion, enforced going forward,
+not just for this PR): any optimization or recovery-path PR **must**
+ship an effectiveness counter for the mechanism it adds, and name that
+counter's zero-rate alarm condition in the PR description. The prefault
+mechanism went inert three separate times (`d0e5ecf3`, `cf6e4d32`,
+`7c2a7226`) because "the logs looked fine" was the only signal; a
+shipped-but-inert mechanism should be visible in one PromQL query, not
+recoverable only by an engineer reading traces weeks later. The paired
+per-image lifecycle canary that *asserts* on these counters at runtime
+is a separate, later issue (`prompt-receipt-timestamp-slo-canary`) —
+this amendment records the rule the counters exist to serve.

@@ -166,6 +166,9 @@ async fn build_app_state(
         state.events.clone(),
         state.host_registry.clone(),
         state.integrations.clone(),
+        state.boot_bundles.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
     ));
     state
 }
@@ -296,6 +299,8 @@ async fn cross_replica_scheduling_pins_and_tokens() {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                stages_images: false,
+                capabilities: engram_core::types::host::HostCapabilities::default(),
             })
             .await
             .expect("seed host");
@@ -317,6 +322,8 @@ async fn cross_replica_scheduling_pins_and_tokens() {
                     current_bundles: Vec::new(),
                     total_vcpus: 8,
                     wire_version: engram_protocol::WIRE_VERSION,
+                    stages_images: false,
+                    capabilities: engram_core::types::host::HostCapabilities::default(),
                 },
             )
             .await
@@ -344,6 +351,7 @@ async fn cross_replica_scheduling_pins_and_tokens() {
         )),
         exclude_host: None,
         prefer_host: None,
+        caps: Default::default(),
     };
     let (picked, _) = placement::pick_for_session(meta_b.as_ref(), &registry_b, &ctx)
         .await

@@ -230,6 +230,8 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .start_agent(
             vm,
             engram_core::types::sandbox::AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: vec![
                     "/bin/sh".into(),
                     "-c".into(),
@@ -332,6 +334,8 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .start_agent(
             moved,
             engram_core::types::sandbox::AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: vec![
                     "/bin/sh".into(),
                     "-c".into(),
@@ -438,8 +442,9 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
 /// A faithful `claude`(libuv) stdin reader for the Phase 4 spike: hold a pipe
 /// open, register it with EPOLL, then block in `epoll_wait` for the next line,
 /// appending each to OUT. The point is to freeze a real `eppoll_entry` on the
-/// pipe's wait queue — the exact machinery ADR 0037 flagged under File-restore —
-/// NOT just a blocking `read()` (a strictly weaker property). Compiled static
+/// pipe's wait queue — the exact machinery flagged by the unmerged ADR 0037
+/// draft's File-restore wedge finding (recorded in ADR 0052) — NOT just a
+/// blocking `read()` (a strictly weaker property). Compiled static
 /// in a throwaway gcc stage so the slim runtime needs no toolchain.
 /// argv: `<fifo> <out> <pid> <ready>`.
 const EPOLL_READER_C: &str = r#"
@@ -508,8 +513,9 @@ int main(int argc, char **argv) {
 /// an `eppoll_entry` registered on the pipe, the event loop parked waiting for
 /// the next user line) survives the live UFFD teleport AND resumes — its epoll
 /// fires for a write delivered AFTER the move. This is the EXACT mechanism
-/// ADR 0037 found wedged under File-restore; here we prove it holds across a
-/// real two-host UFFD teleport. The sibling reattach arm proves the process
+/// the unmerged ADR 0037 draft's File-restore wedge finding (recorded in ADR
+/// 0052) describes; here we prove it holds across a real two-host UFFD
+/// teleport. The sibling reattach arm proves the process
 /// survives with its PID; this proves its epoll-registered stdin pipe survives
 /// too, so a streaming agent crosses warm mid-turn and keeps consuming input —
 /// no turn restart. The harness-engine half (a connection bounce doesn't abort
@@ -620,6 +626,8 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         .start_agent(
             vm,
             engram_core::types::sandbox::AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: reader_argv.clone(),
                 env: HashMap::new(),
                 session_env: HashMap::new(),
@@ -705,6 +713,8 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         .start_agent(
             moved,
             engram_core::types::sandbox::AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: reader_argv.clone(),
                 env: HashMap::new(),
                 session_env: HashMap::new(),
@@ -761,7 +771,8 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         consumed, MARKER,
         "epoll survived the teleport: the reader's frozen epoll_wait woke for a \
          post-move write to the held pipe (the libuv streaming-claude warm-cross \
-         guarantee — the ADR 0037 File-restore wedge does NOT occur under UFFD)"
+         guarantee — the unmerged ADR 0037 draft's File-restore wedge finding \
+         (recorded in ADR 0052) does NOT occur under UFFD)"
     );
 
     client_a

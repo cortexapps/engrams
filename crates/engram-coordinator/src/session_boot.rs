@@ -3,20 +3,27 @@
 //! just from a live HTTP request.
 //!
 //! `create_session` does request-parse → resolve (manifest / secrets /
-//! env / harness) → reserve a host → **boot on that host**. This module
-//! owns the last step — everything after a host is reserved:
-//! restore the base snapshot → persist the `Created` row → bind routing
-//! → ship egress → `start_agent` → `Active` + events. Both the create
-//! handler and the queue scanner build a [`BootInputs`] and call
-//! [`boot_on_reserved_host`], so the launch env, the egress policy, and
-//! the lifecycle events can't drift between the two paths.
+//! env / harness, from the boot-bundle cache — issue #535 (a)) →
+//! transactionally reserve-and-persist the WHOLE write-set (issue #535
+//! (b)) → **boot on that host**. This module owns the last step —
+//! everything after a host is reserved AND the row/satellites already
+//! committed: overlap the restore RPC with the sandbox-independent
+//! env/egress leg (issue #535 (c)) → flip the row to `Created` + bind
+//! `sandbox_id` → ship egress → `start_agent` → `Active` + events →
+//! deliver the (possibly initial) prompt over the wire (issue #535 (d)).
+//! Both the create handler and the queue scanner build a [`BootInputs`]
+//! and call [`boot_on_reserved_host`], so the launch env, the egress
+//! policy, and the lifecycle events can't drift between the two paths.
 //!
 //! Failure disposition is the CALLER's, not this module's: a boot can
 //! fail [`BootError::NotStarted`] (sandbox never came up / was torn down,
 //! the row is still `pending` — requeue or release the reservation) or
 //! [`BootError::Started`] (the sandbox booted but a later step failed,
 //! the row reached `Created` — terminal, fail the session). The create
-//! handler maps these to 503/500; the scanner to requeue/Failed.
+//! handler maps these to 503/500; the scanner to requeue/Failed. A
+//! prompt-delivery failure past the reattach budget is also `Started`
+//! (terminal) — a session that can't receive the prompt that created it
+//! is broken.
 
 use std::collections::HashMap;
 
@@ -37,6 +44,10 @@ pub(crate) struct BootInputs {
     pub spec: SessionSpec,
     /// The image's base snapshot to restore from.
     pub base_snapshot_id: SnapshotId,
+    /// Issue #535 (a): the snapshot row itself, resolved ONCE at boot-bundle
+    /// fill time (bake or cache-refresh) rather than per create — subsumes
+    /// the `get_snapshot` call `boot_on_reserved_host` used to make here.
+    pub base_snapshot: engram_core::types::SnapshotRecord,
     /// The env baked into the restored sandbox (manifest `[env]` +
     /// resolved secrets + `ENGRAM_SESSION_ID`). Also the placeholder
     /// source for the egress policy.
@@ -44,9 +55,11 @@ pub(crate) struct BootInputs {
     /// The resolved harness to spawn. `None` for dev-VM / harness-less
     /// images — a readiness-probe `AgentSpec` is synthesized from
     /// `session_env`. The per-spawn forge/upload broker tokens are NOT
-    /// injected here: their PG rows FK to `sessions.id`, which doesn't
-    /// exist until `create_session_created` runs in `boot_on_reserved_host`,
-    /// so the injection is deferred to there (after the row materializes).
+    /// injected here: minting is a per-spawn, not a durable, write, so it's
+    /// deferred to `boot_on_reserved_host`'s overlapped env/egress leg
+    /// (issue #535 (c)) — the FK it needs (`sessions.id`) has been
+    /// satisfiable since `reserve_and_persist_create` committed, well
+    /// before `prepare_inner` even returns this struct.
     pub agent: Option<AgentSpec>,
     /// The durable session env agentd applies to harness, `/exec`, and
     /// the shell. Used to synthesize the readiness-probe agent when
@@ -63,30 +76,41 @@ pub(crate) struct BootInputs {
     /// ADR 0055: per-session skills resolved from the profile + assigned to
     /// reserved slots (dyn_0..). Patched into the restored VM load-paused.
     pub selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
-    /// ADR 0056: the profile-granted capabilities (parsed + validated), bound
-    /// to `session_capabilities` once the session row exists. Empty on the
-    /// queued re-prepare (those were bound at enqueue), so the bind is a no-op.
+    /// ADR 0055 / issue #535 (b): the RAW selected skill names (before slot
+    /// resolution) — persisted into `sessions.selected_skills` by
+    /// `reserve_and_persist_create` so a queued create's boot re-prepare
+    /// (`prepare_from_row`) can reconstruct the selection (the
+    /// `selected_mounts` above are already-resolved-to-slots and re-derived
+    /// fresh on every prepare instead — the sha may have rolled while queued).
+    pub selected_skills: Vec<String>,
+    /// ADR 0056: the profile-granted capabilities (parsed + validated).
+    /// Issue #535 (b): bound to `session_capabilities` by `reserve_and_
+    /// persist_create` BEFORE `boot_on_reserved_host` ever runs — this field
+    /// is carried on `BootInputs` only because `prepare_inner` is shared by
+    /// both the live-request and queued-re-prepare paths, not because the
+    /// boot pipeline binds it (it doesn't any more).
     pub capabilities: Vec<engram_core::types::Capability>,
     /// ADR 0056 (B′): the orchestrator-compiled integration policy, if any. Its
     /// inject `secret_ref`s are resolved host-side into the egress policy's
     /// inject entries at boot. `None` on the queued/resume re-prepare for now
     /// (persistence + re-inject is Phase 3b-2).
     pub integration_policy: Option<engram_core::types::IntegrationPolicy>,
-    /// ADR 0062: the selected harness name (catalog key), persisted once the
-    /// session row exists so the queue scanner + resume can reconstruct it.
+    /// ADR 0062: the selected harness name (catalog key). Issue #535 (b):
+    /// persisted by `reserve_and_persist_create`, not the boot pipeline.
     /// `None` for a dev-VM session.
     pub selected_harness: Option<String>,
-    /// Per-request `secrets` overrides to seal into `session_secrets`
-    /// once the row exists (so resume rebuilds the harness env). `None`
-    /// when there are none.
+    /// Per-request `secrets` overrides. Issue #535 (b): sealed (KEK, pure
+    /// crypto) by `boot_prepared` BEFORE `reserve_and_persist_create`, which
+    /// persists the sealed row in the same transaction as everything else —
+    /// this field only carries the PLAINTEXT overrides through `prepare_
+    /// inner`'s shared shape; nothing downstream of `boot_prepared` reads it
+    /// any more.
     pub deferred_session_secrets: Option<HashMap<String, String>>,
-    /// An initial prompt to record as a user-role message once Active.
+    /// The create-time initial prompt. Read ONCE by `create_session_core`
+    /// (right after the session row commits) to enqueue it onto the durable
+    /// outbox via `send_prompt_core` — the same path every follow-up uses
+    /// (ADR 0073). The boot pipeline itself no longer reads it.
     pub prompt: Option<String>,
-    /// The session's resolved RAM budget (MiB) — carried so a queued
-    /// create can report its exact demand without re-resolving.
-    pub memory_mib: u32,
-    /// The session's resolved vCPU budget.
-    pub cpu_budget_vcpus: u32,
 }
 
 /// The product of resolving a session's manifest / secrets / env /
@@ -100,6 +124,17 @@ pub(crate) struct PreparedBoot {
     pub cpu_budget_vcpus: u32,
     pub image_repo: String,
     pub image_tag: String,
+    /// ADR 0036 amendment (issue #538): the enabled image's OCI manifest
+    /// digest, so the reserve-side `ScheduleContext.required_image_digest`
+    /// gates placement onto hosts that have actually prefetched this
+    /// image's base snapshot — the per-host half of the fleet chunk-
+    /// prestage invariant (the enable-scanner's `prestaging` stage is the
+    /// other half).
+    pub manifest_digest: String,
+    /// ADR 0068: the enabled image's base snapshot carries a memory
+    /// manifest — this create needs a host reporting a healthy FC UFFD
+    /// substrate (`placement::CapabilityRequirements::needs_uffd_substrate`).
+    pub needs_uffd_substrate: bool,
 }
 
 /// Why a boot failed, carrying the caller-facing error and — crucially —
@@ -116,11 +151,21 @@ pub(crate) enum BootError {
     Started(ApiError),
 }
 
-/// Restore + launch a session on an ALREADY-RESERVED host (the create
-/// path reserved it via `reserve_placement`; the queue scanner via
-/// `place_queued_session`). Drives the row `pending → created → active`
-/// and emits the matching lifecycle events. See the module docs for the
-/// failure contract.
+/// Restore + launch a session on an ALREADY-RESERVED host (the create path
+/// reserved it via `reserve_and_persist_create`; the queue scanner via
+/// `place_queued_session`). Drives the row `pending → created → active` and
+/// emits the matching lifecycle events. See the module docs for the failure
+/// contract.
+///
+/// Issue #535 (b): the row AND every satellite (secrets, capabilities,
+/// integration policy, harness, selected skills) are already committed by
+/// the time this runs — `reserve_and_persist_create` wrote them all in one
+/// transaction before any host RPC. This function does exactly ONE write of
+/// its own before `start_agent`: `transition_session_created` (a slim
+/// `pending → created` + `sandbox_id` bind), because the sandbox doesn't
+/// exist until the restore RPC returns. The FK-ordering bug class this
+/// replaces (a satellite write racing the row's own insert) is dead by
+/// construction, not by "call it after the row" convention.
 pub(crate) async fn boot_on_reserved_host(
     state: &SharedState,
     inputs: BootInputs,
@@ -130,40 +175,46 @@ pub(crate) async fn boot_on_reserved_host(
         session_id,
         spec,
         base_snapshot_id,
+        base_snapshot: record,
         spec_env,
         mut agent,
         session_env,
         egress_secrets,
         network,
         selected_mounts,
-        capabilities,
+        selected_skills: _,
+        capabilities: _,
         integration_policy,
-        selected_harness,
-        deferred_session_secrets,
-        prompt,
-        memory_mib: _,
-        cpu_budget_vcpus: _,
+        selected_harness: _,
+        deferred_session_secrets: _,
+        // The create-time prompt was enqueued to the outbox by
+        // `create_session_core`; the boot pipeline no longer delivers it.
+        prompt: _,
     } = inputs;
 
     // ADR 0056: the image ref doubles as the SecretContext for resolving the
-    // integration policy's inject `secret_ref`s; capture it before `spec` is
-    // moved into `create_session_created` below.
+    // integration policy's inject `secret_ref`s.
     let image_ref = spec.image.clone();
 
-    // ---- restore the base snapshot on the reserved host ----
-    let record = match state.services.meta.get_snapshot(base_snapshot_id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return Err(BootError::NotStarted(ApiError::Internal(format!(
-                "enabled image references base snapshot {base_snapshot_id} but its row is gone"
-            ))));
-        }
-        Err(e) => {
-            return Err(BootError::NotStarted(ApiError::Internal(format!(
-                "get_snapshot {base_snapshot_id} for base restore: {e}"
-            ))));
-        }
-    };
+    // Issue #535 (c): overlap the two independent legs of the boot instead
+    // of serializing them behind the restore RPC.
+    //
+    // - Restore leg: `restore_base_on_host` — the ~0.4-0.7s VM-side work.
+    // - Env/egress leg: mint the per-spawn forge/upload broker token
+    //   (`inject_harness_env`) + resolve the integration policy's Plane-B
+    //   injections (`resolve_inject_entries`, which can round-trip an
+    //   external provider API for a mint-mode connector). BOTH need only
+    //   `session_id` / `image_ref` / `integration_policy` — none of them
+    //   touch the sandbox, and the session row has existed (at `pending`)
+    //   since `reserve_and_persist_create` committed, well before this
+    //   function ever ran, so the broker-token FK has been satisfiable the
+    //   whole time. This is where the external mint round trip moves OFF
+    //   the serial tail (fully-lazy minting at first proxied use is
+    //   explicitly out of scope — this is overlap only).
+    //
+    // A restore failure discards whatever the env/egress leg produced —
+    // cheap, and no different from today's "resolve then maybe fail later"
+    // shape.
     let metadata = engram_core::types::snapshot::SnapshotMetadata {
         base_memory_manifest: None,
         migration_source: None,
@@ -185,126 +236,109 @@ pub(crate) async fn boot_on_reserved_host(
         // always falls back to full-manifest memory-chunk prefetch.
         working_set_blob_key: None,
         aux_bundles: record.aux_bundles,
+        // Issue #529: restore-side reconstruction, not a fresh capture.
+        paused_at: None,
     };
+    let restore_leg = state.host_registry.restore_base_on_host(
+        host_id,
+        metadata,
+        spec_env.clone(),
+        selected_mounts,
+    );
+    let env_egress_leg = async {
+        if let Some(a) = agent.as_mut() {
+            crate::api::sessions::inject_harness_env(state, session_id, &mut a.env).await;
+        }
+        resolve_inject_entries(state, session_id, integration_policy.as_ref(), &image_ref).await
+    };
+    // Issue #535 correction: neither `coord_prepare` nor `coord_finalize`
+    // covers this join itself — `coord_finalize` only starts once it
+    // returns (below) — so a slow env/egress leg (an external mint-mode
+    // connector round trip) was invisible to both. Time the whole overlap
+    // unconditionally; a restore failure still paid for this wall time
+    // before erroring out below.
+    let overlap_start = std::time::Instant::now();
+    let (restore_result, injects) = tokio::join!(restore_leg, env_egress_leg);
+    ::metrics::histogram!(crate::metrics::COORD_BOOT_OVERLAP_SECONDS)
+        .record(overlap_start.elapsed().as_secs_f64());
+    // Issue #535 (observability): `coord_finalize` starts HERE — restore
+    // returned, whatever its outcome. The phase ends at the Active
+    // transition below (a failure returns before recording it — this phase
+    // measures the successful tail only, matching `coord_prepare`'s
+    // success-path framing).
+    let finalize_start = std::time::Instant::now();
 
-    let sandbox_id = match state
-        .host_registry
-        .restore_base_on_host(host_id, metadata, spec_env.clone(), selected_mounts)
-        .await
-    {
+    let sandbox_id = match restore_result {
         Ok(sb) => sb,
         Err(e) => {
             return Err(BootError::NotStarted(map_restore_error(e)));
         }
     };
 
-    // ---- persist the Created row (pending → created upsert) ----
+    // ---- flip the (already-committed) row to Created + bind sandbox_id ----
+    // Issue #535 (c): the row itself, and every satellite, are already
+    // committed (by `reserve_and_persist_create`, before this function ever
+    // ran) — this is a single slim UPDATE, not an upsert.
     if let Err(e) = state
         .services
         .meta
-        .create_session_created(session_id, spec, host_id, sandbox_id)
+        .transition_session_created(session_id, sandbox_id)
         .await
     {
         tracing::error!(
             %session_id, %sandbox_id, %host_id, error = %e,
-            "session row insert failed after sandbox create; tearing sandbox down",
+            "session row transition-to-created failed after sandbox create; tearing sandbox down",
         );
         if let Err(de) = state.services.host.destroy(sandbox_id).await {
             tracing::error!(
                 %session_id, %sandbox_id, error = %de,
-                "sandbox teardown after insert failure also failed — host reconcile will GC",
+                "sandbox teardown after transition failure also failed — host reconcile will GC",
             );
         }
         return Err(BootError::NotStarted(e.into()));
     }
 
-    // Seal per-request secret overrides now the FK is satisfiable.
-    if let Some(overrides) = deferred_session_secrets {
-        if let Err(e) =
-            crate::api::sessions::persist_session_secrets(state, session_id, &overrides).await
-        {
-            tracing::warn!(
-                %session_id, error = %e,
-                "session secrets persistence failed; resume will lose secrets",
-            );
-        }
-    }
-
-    // ADR 0056: bind the profile-granted capabilities now the FK target row
-    // exists — same placement + rationale as the secret-persistence above. A
-    // no-op on an empty set (the queued-then-booted path: the rows were bound
-    // at enqueue), so this never clobbers them.
-    if let Err(e) = state
-        .services
-        .meta
-        .bind_session_capabilities(session_id, &capabilities)
-        .await
-    {
-        tracing::warn!(
-            %session_id, error = %e,
-            "session capabilities bind failed; the broker will see no granted capabilities",
-        );
-    }
-
-    // ADR 0056 (B′): persist the compiled integration policy now the FK target
-    // row exists, so a queued re-prepare / post-eviction resume rebuilds the
-    // egress injections without the orchestrator. Same placement + warn-not-
-    // fatal posture as the secret/capability persistence above.
-    persist_integration_policy(state, session_id, integration_policy.as_ref()).await;
-
-    // ADR 0062: persist the selected harness now the row exists, so a queued
-    // re-prepare / resume reconstructs which harness to mount + exec. Warn-not-
-    // fatal, like the policy/capability persistence above.
-    if let Err(e) = state
-        .services
-        .meta
-        .set_session_harness(session_id, selected_harness.as_deref())
-        .await
-    {
-        tracing::warn!(%session_id, error = %e,
-            "persisting session harness failed; a queued re-prepare may not find it");
-    }
-
-    // Inject the per-spawn forge/upload broker tokens NOW the session row
-    // exists. These mint a `session_broker_tokens` row that FKs to
-    // `sessions.id`, so doing it any earlier (e.g. while `prepare_inner`
-    // builds the AgentSpec, before the row is committed) fails the FK and is
-    // silently swallowed to a no-op — which is exactly how git credential
-    // injection broke on the gRPC create path (ADR 0051 + the ADR 0047
-    // PG-backed broker tokens). Mirrors the secret-persistence above: same
-    // row, same FK, same "after create_session_created" placement.
-    if let Some(a) = agent.as_mut() {
-        crate::api::sessions::inject_harness_env(state, session_id, &mut a.env).await;
-    }
-
-    // ADR 0047: the session→sandbox binding is persisted by
-    // `create_session_created` above; no in-memory registry to update.
-
-    // Egress policy from the resolved guest IP (None on backends without one).
-    let egress_policy = build_egress_policy(
+    // Egress policy from the resolved guest IP (None on backends without
+    // one) + the injects/observes already resolved by the overlapped leg.
+    let observes = build_observe_entries(integration_policy.as_ref());
+    let egress_policy = assemble_egress_policy(
         state,
         session_id,
         sandbox_id,
         egress_secrets,
         &network,
-        &image_ref,
-        integration_policy.as_ref(),
+        injects,
+        observes,
     )
     .await;
 
+    // ADR 0073: mint the binding generation for this fresh-spawn bind.
+    // The epoch fences out any surviving older-generation harness for
+    // this session (Superseded at attach) and rides both the durable
+    // host record (bind below) and the harness spawn env (spec stamp).
+    let binding_epoch = match state.services.meta.mint_binding_epoch(session_id).await {
+        Ok(e) => e,
+        Err(e) => {
+            return Err(BootError::Started(ApiError::Internal(format!(
+                "mint binding epoch: {e}"
+            ))));
+        }
+    };
     state
         .services
         .host
-        .bind_session(session_id, sandbox_id)
+        .bind_session(session_id, sandbox_id, binding_epoch)
         .await;
 
     // ---- start the agent ----
-    let agent = agent.unwrap_or_else(|| AgentSpec {
+    let mut agent = agent.unwrap_or_else(|| AgentSpec {
         argv: Vec::new(),
         env: HashMap::new(),
         session_env,
         host_ca_pem: None,
+        binding_epoch: 0,
     });
+    agent.binding_epoch = binding_epoch;
     let policy = egress_policy.unwrap_or_else(|| engram_core::types::egress::SessionEgressPolicy {
         session_id,
         sandbox_id,
@@ -378,29 +412,17 @@ pub(crate) async fn boot_on_reserved_host(
         tracing::warn!(%session_id, error = %e, "emit created→active failed; continuing");
     }
 
-    // Record the initial prompt as a user-role message (best-effort).
-    if let Some(text) = prompt.as_deref().filter(|s| !s.is_empty()) {
-        if let Err(e) = state
-            .emit(
-                session_id,
-                SessionEvent::HarnessAgentMessage {
-                    run_id: String::new(),
-                    message_id: format!("user-{}", uuid::Uuid::new_v4()),
-                    role: engram_harness_proto::AgentRole::User,
-                    text: text.to_string(),
-                    // Initial-prompt client id threading is deferred (see
-                    // create_request_from_proto); the web loads the session
-                    // view from server events, so there's no optimistic
-                    // first-bubble to dedupe against.
-                    prompt_id: None,
-                    at: chrono::Utc::now(),
-                },
-            )
-            .await
-        {
-            tracing::warn!(%session_id, error = %e, "emit initial prompt event failed");
-        }
-    }
+    // Issue #535 (observability): `coord_finalize` ends here — restore
+    // returned → Active, the coordinator-owned tail after the host handed
+    // back a live sandbox.
+    ::metrics::histogram!(crate::metrics::SESSION_BOOT_SECONDS, "phase" => "coord_finalize")
+        .record(finalize_start.elapsed().as_secs_f64());
+
+    // ADR 0073 (completion): the create-time prompt's user echo + outbox row
+    // are written by `send_prompt_core` in `create_session_core` when the
+    // session is first created (the same path every follow-up uses), so the
+    // boot finalize records nothing prompt-related here. The delivery driver
+    // forwards the enqueued prompt once this boot brings the harness up.
 
     Ok(())
 }
@@ -419,17 +441,23 @@ fn map_restore_error(e: engram_core::SandboxError) -> ApiError {
     }
 }
 
-/// Build the per-session egress policy from the resolved guest IP, or
-/// `None` when the backend exposes no guest IP (process backend / some
-/// VZ configs) — the caller synthesizes an unspecified-IP fallback.
-async fn build_egress_policy(
+/// Issue #535 (c): the SANDBOX-INDEPENDENT half of what `build_egress_
+/// policy` used to compute inline — `injects` (`resolve_inject_entries`,
+/// which can round-trip an external mint provider) and `observes` are both
+/// resolved by the overlapped env/egress leg in `boot_on_reserved_host`,
+/// concurrently with the restore RPC, since neither needs a `sandbox_id`.
+/// This function is the remaining sandbox-DEPENDENT half: fetch `guest_ip`
+/// and assemble the final policy. `None` when the backend exposes no guest
+/// IP (process backend / some VZ configs) — the caller synthesizes an
+/// unspecified-IP fallback.
+async fn assemble_egress_policy(
     state: &SharedState,
     session_id: SessionId,
     sandbox_id: SandboxId,
     egress_secrets: Vec<engram_core::types::egress::EgressSecretEntry>,
     network: &engram_core::types::image::NetworkPolicy,
-    image: &str,
-    integration_policy: Option<&engram_core::types::IntegrationPolicy>,
+    injects: Vec<engram_core::types::egress::EgressInjectEntry>,
+    observes: Vec<engram_core::types::egress::EgressObserveEntry>,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip = state.services.host.guest_ip(sandbox_id).await?;
     Some(engram_core::types::egress::SessionEgressPolicy {
@@ -442,8 +470,8 @@ async fn build_egress_policy(
         // ADR 0057: precomputed in `prepare_inner`/resume from the policy secrets
         // (broker entries only; literals are already in the guest env).
         secrets: egress_secrets,
-        injects: resolve_inject_entries(state, session_id, integration_policy, image).await,
-        observes: build_observe_entries(integration_policy),
+        injects,
+        observes,
         // ADR 0057: per-secret mode replaces a session-level mode; the proxy
         // substitutes per `EgressSecretEntry`. Kept Broker for the (vestigial)
         // wire field — substitution is driven by the entries, not this flag.
@@ -636,37 +664,11 @@ async fn mint_inject_header(
     }
 }
 
-/// ADR 0056 (B′): persist the compiled integration policy (as its JSON) so a
-/// queued re-prepare or post-eviction resume can rebuild the egress injections
-/// without the orchestrator. No-op when the session has no policy. Warn-not-
-/// fatal: a persist miss only loses Plane-B injection on a later resume, not
-/// the live session. Shared by the boot + enqueue create paths.
-pub(crate) async fn persist_integration_policy(
-    state: &SharedState,
-    session_id: SessionId,
-    policy: Option<&engram_core::types::IntegrationPolicy>,
-) {
-    let Some(policy) = policy else {
-        return;
-    };
-    let json = match serde_json::to_string(policy) {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::warn!(%session_id, error = %e,
-                "serialize integration policy failed; not persisting");
-            return;
-        }
-    };
-    if let Err(e) = state
-        .services
-        .meta
-        .bind_session_integration_policy(session_id, &json)
-        .await
-    {
-        tracing::warn!(%session_id, error = %e,
-            "integration policy persist failed; resume/queued boot will lose Plane-B injection");
-    }
-}
+// Issue #535 (b): `persist_integration_policy` (ADR 0056 B′) retired — the
+// compiled policy is now serialized once in `boot_prepared` and persisted by
+// `reserve_and_persist_create`'s transaction, alongside the row and every
+// other satellite. `MetadataStore::bind_session_integration_policy` stays on
+// the trait (still directly exercised by the checkpoint/reconcile PG tests).
 
 // ADR 0057: `egress_secret_entries` (manifest-secret → egress pairing) is
 // retired — the per-secret broker entries are built in

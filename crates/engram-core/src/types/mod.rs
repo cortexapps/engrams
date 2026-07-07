@@ -2,6 +2,7 @@
 //! and backend implementations.
 
 pub mod capability;
+pub mod capture_progress;
 pub mod catalog;
 pub mod cow_state;
 pub mod egress;
@@ -15,6 +16,7 @@ pub mod image;
 pub mod integration;
 pub mod manifest;
 pub mod org_secret;
+pub mod outbox;
 pub mod port;
 pub mod registry;
 pub mod sandbox;
@@ -23,6 +25,7 @@ pub mod shell;
 pub mod snapshot;
 
 pub use capability::*;
+pub use capture_progress::*;
 pub use catalog::*;
 pub use cow_state::*;
 pub use egress::*;

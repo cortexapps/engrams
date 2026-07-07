@@ -54,6 +54,16 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         }),
         _ => None,
     };
+    // Issue #535 (b): migration 0082's TEXT[] NOT NULL DEFAULT '{}' column.
+    // Missing-column-tolerant (defaults empty) so a SELECT that doesn't
+    // project it (e.g. `list_evacuating_sessions`/`list_evicting_sessions`,
+    // which don't need it) still decodes.
+    let selected_skills: Vec<String> = row.try_get("selected_skills").unwrap_or_default();
+    // ADR 0074 parking ladder: park_rung added in migration 0087.
+    // SELECTs that don't project it (or pre-migration rows) fall back
+    // to 0 = "not parked".
+    let park_rung: i16 = row.try_get("park_rung").unwrap_or(0);
+    let parked_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("parked_at").ok().flatten();
     Ok(Session {
         id: SessionId(id),
         status: parse_session_state(&status)?,
@@ -64,6 +74,9 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         created_at,
         last_active_at,
         live_disk_manifest,
+        selected_skills,
+        park_rung,
+        parked_at,
     })
 }
 
@@ -75,14 +88,12 @@ pub(crate) fn queued_session_from_row(
     let origin = engram_core::types::session::QueueOrigin::parse(&origin_str).ok_or_else(|| {
         MetaError::Serialization(format!("queue_origin: unknown value {origin_str:?}"))
     })?;
-    let prompt: Option<String> = row.try_get("queue_prompt").map_err(col_err)?;
     let mem_budget_mib: i64 = row.try_get("mem_budget_mib").map_err(col_err)?;
     let cpu_budget_vcpus: i32 = row.try_get("cpu_budget_vcpus").map_err(col_err)?;
     let queued_at: DateTime<Utc> = row.try_get("queued_at").map_err(col_err)?;
     Ok(engram_core::types::session::QueuedSession {
         session,
         origin,
-        prompt,
         mem_budget_mib,
         cpu_budget_vcpus,
         queued_at,
@@ -103,6 +114,14 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let util_mem_used_mib: i64 = row.try_get("util_mem_used_mib").map_err(col_err)?;
     let util_cpu_pct: f32 = row.try_get("util_cpu_pct").map_err(col_err)?;
     let util_allocatable_mib: i64 = row.try_get("allocatable_mib").map_err(col_err)?;
+    // Issue #540 (host RAM ledger attribution, migration 0078).
+    // `base_shm_pending_mib` has no PG column (transient host-local
+    // state, already folded into `util_allocatable_mib` above) — it
+    // stays 0 across a DB round-trip; the host's own `/metrics` is the
+    // source of truth for it.
+    let util_base_shm_mib: i64 = row.try_get("util_base_shm_mib").map_err(col_err)?;
+    let util_parked_pss_mib: i64 = row.try_get("util_parked_pss_mib").map_err(col_err)?;
+    let util_running_pss_mib: i64 = row.try_get("util_running_pss_mib").map_err(col_err)?;
     let status: String = row.try_get("status").map_err(col_err)?;
     let last_heartbeat_at: DateTime<Utc> = row.try_get("last_heartbeat_at").map_err(col_err)?;
     let cloud_metadata: HostMetadata =
@@ -121,6 +140,16 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let total_vcpus: i32 = row.try_get("total_vcpus").map_err(col_err)?;
     // Issue #229: the host's reported bincode wire version (migration 0066).
     let wire_version: i32 = row.try_get("wire_version").map_err(col_err)?;
+    // Issue #538: whether this host runs the image-prefetch supervisor
+    // (migration 0081).
+    let stages_images: bool = row.try_get("stages_images").map_err(col_err)?;
+    // ADR 0068 (migration 0080): the self-verified capability vector.
+    // `#[serde(default)]` on every `HostCapabilities` field means a
+    // pre-0068 row's `'{}'::jsonb` default decodes cleanly to
+    // `schema: 0` — the same soft posture `wire_version == 0` gets.
+    let capabilities: engram_core::types::host::HostCapabilities =
+        serde_json::from_value(row.try_get("capabilities").map_err(col_err)?)
+            .map_err(|e| MetaError::Serialization(format!("hosts.capabilities decode: {e}")))?;
     Ok(HostRecord {
         id: HostId(id),
         hostname: row.try_get("hostname").map_err(col_err)?,
@@ -139,6 +168,10 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
             mem_used_mib: util_mem_used_mib.max(0) as u64,
             allocatable_mib: util_allocatable_mib.max(0) as u64,
             cpu_pct: util_cpu_pct.max(0.0),
+            base_shm_mib: util_base_shm_mib.max(0) as u64,
+            base_shm_pending_mib: 0,
+            parked_pss_mib: util_parked_pss_mib.max(0) as u64,
+            running_pss_mib: util_running_pss_mib.max(0) as u64,
         },
         status: parse_host_status(&status)?,
         last_heartbeat_at,
@@ -149,6 +182,8 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         cordoned,
         total_vcpus: total_vcpus.max(0) as u32,
         wire_version: wire_version.max(0) as u32,
+        stages_images,
+        capabilities,
     })
 }
 
@@ -195,6 +230,11 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
     // ADR 0028 A.log (migration 0053): the event-log leg of the
     // coherence triple. NULL on pre-0053 rows + template snapshots.
     let events_cursor: Option<i64> = row.try_get("events_cursor").map_err(col_err)?;
+    // ADR 0068 (migration 0080): the capturing host's FC snapshot-version
+    // pairing key. NULL on pre-0068 rows, VZ/Process captures, and
+    // captures recorded without a known host.
+    let fc_snapshot_version: Option<String> =
+        row.try_get("fc_snapshot_version").map_err(col_err)?;
     Ok(SnapshotRecord {
         id: SnapshotId(id),
         session_id: session_id.map(SessionId),
@@ -208,6 +248,7 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         recoverable,
         aux_bundles,
         events_cursor,
+        fc_snapshot_version,
     })
 }
 
@@ -374,6 +415,42 @@ fn capture_env_from_row(
     }
 }
 
+/// Issue #539: `enable_jobs.warm_stages` is a nullable JSONB column —
+/// `NULL` means "no stage history yet" (outside/before a capture ever
+/// wrote progress). Every current query projects this column (added by
+/// migration 0079 alongside the row's other four new columns, all of
+/// which use `.map_err(col_err)` — see `enable_job_from_row`); a missing
+/// column is a real bug (e.g. a future SELECT/RETURNING that forgets it),
+/// not a legacy-row case to default through silently.
+fn warm_stages_from_row(
+    row: &PgRow,
+) -> Result<Vec<engram_core::types::WarmStageRecord>, MetaError> {
+    match row
+        .try_get::<Option<serde_json::Value>, _>("warm_stages")
+        .map_err(col_err)?
+    {
+        Some(v) => serde_json::from_value(v).map_err(|e| MetaError::Serialization(e.to_string())),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn capture_phase_from_row(
+    row: &PgRow,
+) -> Result<Option<engram_core::types::CapturePhase>, MetaError> {
+    match row
+        .try_get::<Option<String>, _>("capture_phase")
+        .map_err(col_err)?
+    {
+        Some(s) => Ok(match s.as_str() {
+            "boot" => Some(engram_core::types::CapturePhase::Boot),
+            "warm" => Some(engram_core::types::CapturePhase::Warm),
+            "snapshot" => Some(engram_core::types::CapturePhase::Snapshot),
+            _ => None,
+        }),
+        None => Ok(None),
+    }
+}
+
 pub(crate) fn session_secrets_from_row(row: &PgRow) -> Result<SessionSecrets, MetaError> {
     let session_id: Uuid = row.try_get("session_id").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
@@ -404,7 +481,6 @@ fn parse_session_state(s: &str) -> Result<SessionState, MetaError> {
         "pending" => SessionState::Pending,
         "queued" => SessionState::Queued,
         "created" => SessionState::Created,
-        "guest_ready" => SessionState::GuestReady,
         "active" => SessionState::Active,
         "idle" => SessionState::Idle,
         "host_lost" => SessionState::HostLost,
@@ -430,6 +506,7 @@ pub(crate) fn parse_enable_job_state(s: &str) -> Result<EnableJobState, MetaErro
         "pending" => EnableJobState::Pending,
         "materializing" => EnableJobState::Materializing,
         "capturing" => EnableJobState::Capturing,
+        "prestaging" => EnableJobState::Prestaging,
         "ready" => EnableJobState::Ready,
         "failed" => EnableJobState::Failed,
         other => {
@@ -445,6 +522,8 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
     let chunks_total: Option<i32> = row.try_get("chunks_total").map_err(col_err)?;
     let chunks_done: i32 = row.try_get("chunks_done").map_err(col_err)?;
     let attempts: i32 = row.try_get("attempts").map_err(col_err)?;
+    // Migration 0081: NOT NULL DEFAULT '{}'::jsonb, so every row has it.
+    let prestage_hosts: serde_json::Value = row.try_get("prestage_hosts").map_err(col_err)?;
     Ok(EnableJob {
         id: row.try_get("id").map_err(col_err)?,
         image_uri: row.try_get("image_uri").map_err(col_err)?,
@@ -455,6 +534,12 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
         attempts: attempts.max(0) as u32,
         error: row.try_get("error").map_err(col_err)?,
         capture_env: capture_env_from_row(row, "capture_env")?,
+        prestage_hosts,
+        capture_phase: capture_phase_from_row(row)?,
+        warm_stage: row.try_get("warm_stage").map_err(col_err)?,
+        warm_stage_started_at: row.try_get("warm_stage_started_at").map_err(col_err)?,
+        warm_stages: warm_stages_from_row(row)?,
+        output_tail: row.try_get("output_tail").map_err(col_err)?,
         created_at: row.try_get("created_at").map_err(col_err)?,
         updated_at: row.try_get("updated_at").map_err(col_err)?,
     })
@@ -479,17 +564,15 @@ mod tests {
 
     /// Each enum variant must round-trip through the wire format the
     /// migration uses. ADR 0015 M2 expanded the set: `created`,
-    /// `guest_ready`, `host_lost` join the original six. If you add
-    /// a new variant, extend this test and `parse_session_state`
-    /// together — the column is `TEXT` with no CHECK constraint, so
-    /// the parser is the only enforcement.
+    /// `host_lost` join the original six. If you add a new variant,
+    /// extend this test, `parse_session_state`, and the `sessions`
+    /// status CHECK constraint together.
     #[test]
     fn session_state_parses_every_variant() {
         let variants = [
             ("pending", SessionState::Pending),
             ("queued", SessionState::Queued),
             ("created", SessionState::Created),
-            ("guest_ready", SessionState::GuestReady),
             ("active", SessionState::Active),
             ("idle", SessionState::Idle),
             ("host_lost", SessionState::HostLost),
@@ -539,6 +622,7 @@ mod tests {
             ("pending", EnableJobState::Pending),
             ("materializing", EnableJobState::Materializing),
             ("capturing", EnableJobState::Capturing),
+            ("prestaging", EnableJobState::Prestaging),
             ("ready", EnableJobState::Ready),
             ("failed", EnableJobState::Failed),
         ];

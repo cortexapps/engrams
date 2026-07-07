@@ -5,7 +5,7 @@
 //! (vsock in production, UDS for tests). On each received
 //! [`HarnessEvent`] the hub:
 //!
-//! 1. updates the per-sandbox `last_event_at` (the idle evictor reads
+//! 1. forwards it into the `EventSink` (the coordinator's durable log —
 //!    this to decide who to suspend),
 //! 2. invokes the configured [`EventSink`] callback so the host-agent
 //!    forwards the event into `session_events` (where the SSE bus,
@@ -23,10 +23,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use engram_core::{SandboxId, SessionId};
 use engram_harness_proto::{
-    read_msg, write_msg, Answers, CheckpointReason, HarnessAttach, HarnessAttachAck,
+    read_msg, write_msg, Answers, AttachReject, CheckpointReason, HarnessAttach, HarnessAttachAck,
     HarnessCommand, HarnessEvent, HarnessFrame,
 };
 use parking_lot::Mutex;
@@ -39,32 +38,6 @@ use tokio::sync::{mpsc, oneshot};
 /// proceeds without the durability guarantee.
 pub const CHECKPOINT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a `shell_attached` pin may go un-renewed before the host's
-/// eviction tick reaps it (issue #219). The coord shell bridge renews
-/// the pin every [`SHELL_PIN_RENEW_INTERVAL`] while the WS is live, so
-/// a healthy session refreshes the stamp ~5× before this fires. A pin
-/// older than this means the renewer is gone (coord pod died mid-
-/// session, or the bridge task was torn down without a `ReleaseShell`)
-/// and the sandbox must fall back under the normal idle TTLs. Chosen
-/// well above the renew interval so transient renew failures or coord
-/// GC pauses don't prematurely un-pin a session a human is using.
-pub const SHELL_PIN_STALE_AGE: Duration = Duration::from_secs(300);
-
-/// How often the coord shell bridge renews a live `shell_attached`
-/// pin (issue #219). Piggybacks the WS keepalive cadence. Must stay
-/// comfortably below [`SHELL_PIN_STALE_AGE`] so a few dropped renewals
-/// don't trip the host-side stale sweep.
-pub const SHELL_PIN_RENEW_INTERVAL: Duration = Duration::from_secs(60);
-
-/// How long `send_prompt` waits for the harness connection to appear
-/// before giving up with `NotAttached`. Covers the post-resume window
-/// where ensure_active has returned but the in-VM bootstrap+harness
-/// handshake hasn't finished — typically a few hundred ms after FC
-/// restore. Generous enough to absorb cold-restore variance, tight
-/// enough that a session whose harness genuinely never reattaches
-/// surfaces an error in user-visible time.
-const SEND_PROMPT_ATTACH_WAIT_SECS: u64 = 10;
-
 /// ADR 0052 Phase 2 (clean-idle-shutdown): grace handed to the in-guest
 /// harness to drain `claude` before an idle-eviction snapshot. The
 /// `Shutdown { grace_secs }` closes claude's held stdin; an idle session
@@ -73,23 +46,6 @@ const SEND_PROMPT_ATTACH_WAIT_SECS: u64 = 10;
 /// eviction fires (after grace the harness kills the child). Kept short:
 /// idle eviction shouldn't stall on a stuck agent.
 pub const IDLE_DRAIN_GRACE_SECS: u32 = 10;
-
-/// Why a sandbox is an idle-eviction candidate this tick.
-///
-/// The soft path fires on `last_idle_at` (the adapter emitted `Idle` and
-/// stayed quiet past the soft TTL) — an ordinary think-pause candidate.
-/// The hard path fires on `last_event_at` (the sandbox went fully silent
-/// past the hard TTL) — the backstop for adapters that never emit `Idle`.
-/// [`crate::idle_evictor`]'s pressure-aware gate uses this: a `Soft`
-/// candidate is only reclaimed under real memory pressure, while a `Hard`
-/// candidate is always nominated (`Hard` wins when both fire).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdleKind {
-    /// Idle past the soft TTL — a reclaim candidate only under memory pressure.
-    Soft,
-    /// Silent past the hard TTL — always nominated (the never-emits-`Idle` backstop).
-    Hard,
-}
 
 /// Slack added on top of [`IDLE_DRAIN_GRACE_SECS`] when waiting for the
 /// harness's vsock connection to drop after a drain — covers the harness
@@ -119,88 +75,31 @@ pub struct HarnessHub {
     inner: Arc<HubInner>,
 }
 
-/// CANONICAL LOCK ORDER (issue #217).
-///
-/// Several of `HubInner`'s fields are independent `parking_lot::Mutex`es
-/// that some paths must hold simultaneously. parking_lot mutexes are
-/// thread-blocking with no deadlock detection, so any two paths that
-/// nest the same pair of locks in opposite orders can wedge forever
-/// (ABBA) — and once wedged here, the whole harness plane stalls while
-/// heartbeats keep the host looking healthy to coord.
-///
-/// To make nesting safe, every site that holds more than one of these
-/// at once MUST acquire them in this order (acquire a prefix; a path
-/// may skip locks it doesn't need but must not reorder):
-///
-/// 1. `last_event_at`
-/// 2. `last_idle_at`
-/// 3. `connections`
-/// 4. `shell_attached`
-/// 5. `eviction_inflight`
-///
-/// `idle_sandboxes` holds the whole chain and defines this order. The
-/// only path that previously inverted it was `send_prompt`, which held
-/// `connections` while acquiring `last_idle_at`; it now drops the
-/// `connections` guard first (clones `cmd_tx` into an owned value)
-/// before touching `last_idle_at`, so it no longer nests the two.
-/// `session_to_sandbox` and per-connection locks (`pending_checkpoint`)
-/// are leaf locks not nested with this chain.
+/// Locking (post-ADR 0073): ONE leaf mutex. The issue #217 "CANONICAL
+/// LOCK ORDER" era — eight mutexed maps, a documented acquisition
+/// order, and an ABBA wedge that stalled the whole harness plane while
+/// heartbeats looked healthy — ended when the 0070 phases deleted the
+/// other seven maps (replay buffers → the durable outbox; routing →
+/// the on-disk binding records; TTL / shell-pin / eviction bookkeeping
+/// → the coordinator's PG detector + shell-pin column). `connections`
+/// is never held across an await and never nested with another lock;
+/// keep it that way — the ADR records full actor-ization as
+/// moot-by-deletion, so a second long-lived mutex here needs to make
+/// that case again.
 struct HubInner {
     /// Per-sandbox connection state. Populated by `accept_connection`,
     /// removed when the harness disconnects (clean or error).
     connections: Mutex<HashMap<SandboxId, ConnectionHandle>>,
-    /// Per-sandbox last-event-of-any-kind timestamp. Drives the
-    /// **hard** TTL — backstop for stuck adapters that never emit
-    /// `Idle`. Updated on every inbound `HarnessEvent`.
-    last_event_at: Mutex<HashMap<SandboxId, DateTime<Utc>>>,
-    /// Per-sandbox last-`Idle`-event timestamp. Drives the **soft**
-    /// TTL — "agent is awaiting user input." Set on `HarnessEvent::Idle`,
-    /// cleared (set to None / removed) on any other event so a long
-    /// tool call doesn't trip the soft TTL mid-call. Also cleared on
-    /// `send_prompt` so the host's "we just gave you work" closes
-    /// the slow-adapter race.
-    last_idle_at: Mutex<HashMap<SandboxId, DateTime<Utc>>>,
     /// Event-emit callback supplied at construction. Invoked for every
-    /// inbound `HarnessEvent` after the local maps are updated.
+    /// inbound `HarnessEvent`.
     event_sink: EventSink,
-    /// SessionId → SandboxId routing for the TCP listener path.
-    /// Populated by `bind_session` when the host-agent spawns a
-    /// harness; cleared by `unbind_session` (or implicitly on
-    /// `destroy()`). The listener reads HarnessAttach off an incoming
-    /// connection, looks up the sandbox here, and hands the stream to
-    /// the existing connection logic.
-    session_to_sandbox: Mutex<HashMap<SessionId, SandboxId>>,
-    /// Sandboxes with at least one external long-lived client
-    /// connected (today: a browser shell WebSocket). Counted so a
-    /// future second client doesn't accidentally let the first one
-    /// release the keep-alive. While the count is > 0 for a sandbox,
-    /// `idle_sandboxes` skips it — the human is actively poking at
-    /// the box and we don't snapshot-and-evict under their feet.
-    ///
-    /// Each entry is `(count, last_renewed)`. The pin is acquired and
-    /// released by two independent coord→host RPCs from the same axum
-    /// task that bridges the WS (`api/shell.rs`). If the coord pod dies
-    /// mid-session (rolling deploy) or the `ReleaseShell` RPC fails,
-    /// that task never sends the release and the count would otherwise
-    /// stay ≥ 1 forever — permanently exempting the sandbox from idle
-    /// eviction, hard-TTL backstop included (issue #219). To bound the
-    /// drift, the coord bridge renews the pin on its WS keepalive
-    /// interval (`renew_shell` stamps `last_renewed`), and the host's
-    /// eviction tick reaps entries not renewed within
-    /// [`SHELL_PIN_STALE_AGE`] (`sweep_stale_shells`) — exactly mirroring
-    /// the `eviction_inflight` hardening below.
-    shell_attached: Mutex<HashMap<SandboxId, (u32, Instant)>>,
-    /// ADR 0016 §A.1.5a: per-sandbox "an idle-eviction POST for this
-    /// sandbox is currently in flight on coord". Marked just before
-    /// the host's eviction-task POSTs candidates; cleared when the
-    /// fire-and-forget spawned task observes the POST's outcome
-    /// (success, transport error, or timeout). `idle_sandboxes`
-    /// filters out anything still in this map, so a second POST
-    /// can't race ahead of the first while coord is mid-pipeline.
-    /// Stored as `Instant` so the periodic stale sweep can reap
-    /// entries whose spawned task wedged (>180s — see eviction
-    /// task code).
-    eviction_inflight: Mutex<HashMap<SandboxId, Instant>>,
+    /// Host-durable session→sandbox binding records (ADR 0073).
+    /// `bind_session` writes a record; every attach — vsock and TCP
+    /// alike — validates the presented token against the record ON
+    /// DISK, never an in-memory map, so a freshly restarted host-agent
+    /// accepts survivor re-dials with zero rebuild pass and a stale
+    /// generation is rejected `Superseded` deterministically.
+    bindings: crate::bindings::BindingStore,
     /// Monotonic generation counter (issue #218). Each `drive_attached`
     /// task takes a fresh value via `fetch_add` before it inserts its
     /// `ConnectionHandle`, stamping the handle with that generation.
@@ -212,47 +111,6 @@ struct HubInner {
     /// on uniqueness + the `connections` mutex serializing the compare,
     /// not on cross-thread happens-before of the counter itself.
     next_gen: AtomicU64,
-    /// ADR 0052: per-sandbox prompts that were forwarded to a harness
-    /// connection but not yet *confirmed received* (no `RunStarted{prompt_id}`
-    /// / `PromptQueued`/`PromptEdited`/`PromptDequeued` for them yet). The
-    /// host→harness command channel is otherwise fire-and-forget — a prompt
-    /// buffered into a connection that then bounces (checkpoint / live move /
-    /// idle-evict / SIGUSR1 reconnect) dies with it, wedging the session with
-    /// a forever-greyed bubble (prod `8c165749`). This is the command-side
-    /// twin of the harness's `held` event slot: every fresh connection
-    /// REPLAYS these on attach, and a confirming event CLEARS them. The
-    /// harness dedupes by `prompt_id`, so a replay of an already-processed
-    /// prompt (its confirmation lost in the same bounce) is a no-op.
-    ///
-    /// **Leaf lock** — never held while acquiring another `HubInner` mutex
-    /// (record/clear/replay each take it alone), so it's outside the
-    /// `last_event_at → last_idle_at → connections` order (issue #217).
-    undelivered_prompts: Mutex<HashMap<SandboxId, Vec<UndeliveredPrompt>>>,
-    /// ADR 0054: per-sandbox interactive answers forwarded but not yet
-    /// confirmed (no `QuestionAnswered{tool_call_id}` seen). The exact
-    /// `undelivered_prompts` story for answers: an `AnswerQuestion` buffered
-    /// into a connection that then bounces (the answer triggers a resume
-    /// from idle — precisely when a bounce is likely) would otherwise be
-    /// lost, leaving the question forever awaiting-input. Replayed on every
-    /// (re)attach, retired by `QuestionAnswered`; the harness's resume is
-    /// idempotent (the deferred tool yields one tool_result), so re-delivery
-    /// is a no-op. **Leaf lock**, like `undelivered_prompts`.
-    undelivered_answers: Mutex<HashMap<SandboxId, Vec<UndeliveredAnswer>>>,
-}
-
-/// A prompt forwarded to the harness but not yet confirmed received.
-#[derive(Clone)]
-struct UndeliveredPrompt {
-    prompt_id: String,
-    text: String,
-}
-
-/// An interactive answer forwarded to the harness but not yet confirmed
-/// (no `QuestionAnswered` for its `tool_call_id` yet). ADR 0054.
-#[derive(Clone)]
-struct UndeliveredAnswer {
-    tool_call_id: String,
-    answers: Answers,
 }
 
 struct ConnectionHandle {
@@ -265,7 +123,6 @@ struct ConnectionHandle {
     /// Session this harness belongs to (from `HarnessAttach`).
     /// Stored on the connection so the idle evictor can return
     /// `(SessionId, SandboxId)` pairs without a separate lookup.
-    session_id: SessionId,
     /// Per-hub-unique generation stamped at insert (issue #218). The
     /// teardown epilogue compares the live entry's generation against
     /// its own before removing, so a stale connection never evicts the
@@ -292,115 +149,55 @@ impl HarnessHub {
         Box::into_pin(fut).await;
     }
 
-    pub fn new(event_sink: EventSink) -> Self {
+    pub fn new(event_sink: EventSink, bindings: crate::bindings::BindingStore) -> Self {
         Self {
             inner: Arc::new(HubInner {
                 connections: Mutex::new(HashMap::new()),
-                last_event_at: Mutex::new(HashMap::new()),
-                last_idle_at: Mutex::new(HashMap::new()),
                 event_sink,
-                session_to_sandbox: Mutex::new(HashMap::new()),
-                shell_attached: Mutex::new(HashMap::new()),
-                eviction_inflight: Mutex::new(HashMap::new()),
-                undelivered_prompts: Mutex::new(HashMap::new()),
-                undelivered_answers: Mutex::new(HashMap::new()),
+                bindings,
                 next_gen: AtomicU64::new(0),
             }),
         }
     }
 
-    /// Mark a sandbox as having an active external shell client. While
-    /// the count is non-zero, the soft/hard idle TTLs are suppressed:
-    /// the user opening a browser shell is unambiguous "I'm using this
-    /// session, leave it alone" intent. Symmetrically released by
-    /// `release_shell`. Reference-counted so a future second client
-    /// (e.g. a second tab) doesn't release the keep-alive when the
-    /// first disconnects.
-    pub fn acquire_shell(&self, sandbox_id: SandboxId) {
-        let mut map = self.inner.shell_attached.lock();
-        let slot = map.entry(sandbox_id).or_insert((0, Instant::now()));
-        slot.0 += 1;
-        // (Re)stamp on every acquire so a fresh client always resets
-        // the stale clock — a second tab opening must not inherit a
-        // near-expired stamp from the first.
-        slot.1 = Instant::now();
-    }
-
-    /// Refresh the stale clock on an existing shell pin (issue #219).
-    /// Called by the coord shell bridge on its WS-keepalive interval so
-    /// the host's `sweep_stale_shells` can distinguish a live session
-    /// from one whose renewer (the coord bridge task) has died. A no-op
-    /// if the sandbox has no pin — renewal must never resurrect a pin
-    /// that `release_shell`/`clear_shell` already cleared.
-    pub fn renew_shell(&self, sandbox_id: SandboxId) {
-        if let Some(slot) = self.inner.shell_attached.lock().get_mut(&sandbox_id) {
-            slot.1 = Instant::now();
-        }
-    }
-
-    /// Decrement the shell-attached count for `sandbox_id`. The
-    /// sandbox falls back under the normal idle eviction policy once
-    /// the count hits zero.
-    pub fn release_shell(&self, sandbox_id: SandboxId) {
-        let mut map = self.inner.shell_attached.lock();
-        if let Some(slot) = map.get_mut(&sandbox_id) {
-            slot.0 = slot.0.saturating_sub(1);
-            if slot.0 == 0 {
-                map.remove(&sandbox_id);
-            }
-        }
-    }
-
-    /// Drop the shell pin for `sandbox_id` outright, ignoring the
-    /// refcount (issue #219). Called from the destroy path: once the
-    /// sandbox is gone the pin is meaningless, and leaving it behind
-    /// leaks an entry forever (the WS bridge for a destroyed sandbox
-    /// can never deliver its `ReleaseShell`). Idempotent.
-    pub fn clear_shell(&self, sandbox_id: SandboxId) {
-        self.inner.shell_attached.lock().remove(&sandbox_id);
-    }
-
-    /// Tell the hub that an upcoming harness connection identifying
-    /// itself with `session_id` should be routed to `sandbox_id`. The
-    /// host-agent calls this when it spawns a harness as part of
-    /// `SandboxBackend::create()`. Idempotent; later binds replace
-    /// earlier ones (so a re-spawned harness on resume routes to the
-    /// new sandbox).
-    pub fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
+    /// Record the durable binding for `session_id` (ADR 0073): an
+    /// upcoming harness connection presenting this exact token routes
+    /// to `sandbox_id`. Called when the host-agent spawns/starts a
+    /// harness. Monotonic in `binding_epoch` — a stale caller's write
+    /// is refused, so resume races converge to the newest generation
+    /// regardless of RPC arrival order.
+    pub fn bind_session(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        binding_epoch: u64,
+    ) -> Result<(), crate::bindings::BindError> {
         self.inner
-            .session_to_sandbox
-            .lock()
-            .insert(session_id, sandbox_id);
+            .bindings
+            .bind(session_id, sandbox_id, binding_epoch)
+            .map(|_| ())
     }
 
-    /// Drop the session→sandbox binding. Called from `destroy()` paths
-    /// so a stale TCP connection identifying with the old session_id
-    /// can't accidentally attach to a freshly-created replacement
-    /// sandbox.
+    /// Drop the durable binding. Called from `destroy()` paths so a
+    /// late dial from the torn-down generation gets `UnknownBinding`
+    /// (transient) instead of routing anywhere.
     pub fn unbind_session(&self, session_id: SessionId) {
-        let sandbox_id = self.inner.session_to_sandbox.lock().remove(&session_id);
-        // ADR 0052: a torn-down session can't re-attach, so drop any
-        // un-confirmed prompts we were holding to replay — avoids leaking
-        // the buffer (sandbox_ids are unique, so they'd never be re-delivered
-        // to a replacement anyway).
-        if let Some(sandbox_id) = sandbox_id {
-            self.inner.undelivered_prompts.lock().remove(&sandbox_id);
-            // ADR 0054: same reasoning for un-confirmed answers.
-            self.inner.undelivered_answers.lock().remove(&sandbox_id);
+        if let Err(e) = self.inner.bindings.unbind(session_id) {
+            tracing::warn!(session_id = %session_id, error = %e, "binding unbind failed");
         }
     }
 
-    /// The sandbox currently bound to `session_id`, if any. The
-    /// session-lookup attach path consults the same map, so this answers
-    /// "would an in-guest harness re-dial for this session route, or get
-    /// rejected with no-sandbox-bound?" — used by the survivor rebind on
-    /// host (re)start and in tests.
+    /// The sandbox currently bound to `session_id`, if any — read from
+    /// the durable record (the same source every attach validates
+    /// against), so this answers "would an in-guest harness re-dial
+    /// for this session route?" even on a freshly restarted host-agent.
     pub fn bound_sandbox(&self, session_id: SessionId) -> Option<SandboxId> {
         self.inner
-            .session_to_sandbox
-            .lock()
-            .get(&session_id)
-            .copied()
+            .bindings
+            .read(session_id)
+            .ok()
+            .flatten()
+            .map(|r| r.sandbox_id)
     }
 
     /// Accept an anonymous connection from a harness — used by the
@@ -445,13 +242,6 @@ impl HarnessHub {
         tokio::spawn(async move {
             run_connection(inner, sandbox_id, expected_session_id, stream).await;
         });
-    }
-
-    /// Most recent harness event for `sandbox_id`, if any. Track B
-    /// reads this to decide who's idle. `None` means "no events ever
-    /// — either the harness never attached, or it just dropped".
-    pub fn last_event_at(&self, sandbox_id: SandboxId) -> Option<DateTime<Utc>> {
-        self.inner.last_event_at.lock().get(&sandbox_id).copied()
     }
 
     /// Send a one-shot `Checkpoint { reason }` and wait for ack with
@@ -540,68 +330,25 @@ impl HarnessHub {
         Ok(())
     }
 
-    /// Track A: tell the attached harness to drop its connection and
-    /// re-dial in-band (the SIGUSR1 nudge's twin). The re-attach re-emits
-    /// `Idle` when idle, resyncing a session whose event stream desynced
-    /// from the run state machine — without touching the running agent.
-    /// `NotAttached` if no harness is bound. No ack: the fresh attach (and
-    /// its re-emitted `Idle`) flowing back up is the signal of completion.
-    pub async fn rehandshake(&self, sandbox_id: SandboxId) -> Result<(), HarnessError> {
-        let cmd_tx = {
-            let conns = self.inner.connections.lock();
-            conns
-                .get(&sandbox_id)
-                .ok_or(HarnessError::NotAttached)?
-                .cmd_tx
-                .clone()
-        };
-        cmd_tx
-            .send(HarnessFrame::Command(HarnessCommand::Rehandshake))
-            .await
-            .map_err(|_| HarnessError::WriterClosed)?;
-        Ok(())
-    }
-
-    /// Acquire the connection's command sender, briefly retrying for the
-    /// post-resume attach race (see `send_prompt`'s call site), and clear
-    /// `last_idle_at` so the soft idle-TTL doesn't fire while the adapter
-    /// boots. Shared by `send_prompt` and `answer_question` — both deliver
-    /// work that resumes an idle session and must survive the same race.
-    async fn acquire_cmd_tx_waiting(
+    /// Acquire the connection's command sender. ADR 0073: NO
+    /// attach-wait — a missing connection is an immediate
+    /// `NotAttached`; the durable retry lives in the coordinator's
+    /// outbox, and idle detection reads the durable event log (the
+    /// prompt's own run_started resets the soft TTL there).
+    fn acquire_cmd_tx(
         &self,
         sandbox_id: SandboxId,
     ) -> Result<mpsc::Sender<HarnessFrame>, HarnessError> {
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(SEND_PROMPT_ATTACH_WAIT_SECS);
-        loop {
-            // Clone `cmd_tx` out into an owned Option so the `connections`
-            // guard is fully released before we touch `last_idle_at`.
-            // Holding `connections` across the `last_idle_at.lock()` would
-            // invert the canonical lock order (see HubInner docs) versus
-            // `idle_sandboxes`, which takes last_idle_at → connections — a
-            // classic ABBA deadlock under the prompt/eviction-tick race
-            // (issue #217). Never nest these two locks.
-            let cmd_tx_opt = self
-                .inner
-                .connections
-                .lock()
-                .get(&sandbox_id)
-                .map(|h| h.cmd_tx.clone());
-            if let Some(cmd_tx) = cmd_tx_opt {
-                self.inner.last_idle_at.lock().remove(&sandbox_id);
-                return Ok(cmd_tx);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(HarnessError::NotAttached);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        self.inner
+            .connections
+            .lock()
+            .get(&sandbox_id)
+            .map(|h| h.cmd_tx.clone())
+            .ok_or(HarnessError::NotAttached)
     }
 
     /// Push a prompt to the running adapter. Adapter starts a
-    /// fresh run (or queues if a run is in flight). Atomically
-    /// clears `last_idle_at` so the soft idle-eviction TTL doesn't
-    /// fire while the adapter is starting Claude.
+    /// fresh run (or queues if a run is in flight).
     ///
     /// Returns `NotAttached` if no harness is bound to `sandbox_id`
     /// (e.g., session is `Idle` and needs auto-resume first — call
@@ -612,31 +359,11 @@ impl HarnessHub {
         prompt_id: String,
         text: String,
     ) -> Result<(), HarnessError> {
-        // Look up the connection, retrying briefly if it isn't there
-        // yet. The post-resume race: `ensure_active` returns once
-        // `start_agent` has written the SpawnHarness frame, but
-        // agentd's harness supervisor still needs to (a) read the
-        // frame, (b) kill the previous adapter, (c) spawn the new
-        // one, (d) let the new adapter dial back over vsock and
-        // finish HarnessAttach. That's a few hundred ms in practice.
-        // Without a wait here, the user's prompt that triggered the
-        // resume races the handshake and bounces with NotAttached
-        // even though the system is healthy.
-        let cmd_tx = self.acquire_cmd_tx_waiting(sandbox_id).await?;
-        // ADR 0052: remember this prompt as un-confirmed until the harness
-        // emits a RunStarted/PromptQueued/… for it. If the connection we're
-        // about to write to bounces before the harness processes the frame,
-        // the next attach replays it (see `replay_undelivered`) — without
-        // this the prompt is lost and the session wedges (prod `8c165749`).
-        self.inner
-            .undelivered_prompts
-            .lock()
-            .entry(sandbox_id)
-            .or_default()
-            .push(UndeliveredPrompt {
-                prompt_id: prompt_id.clone(),
-                text: text.clone(),
-            });
+        // ADR 0073: fail fast when unattached. The coordinator's outbox
+        // driver owns retries (and the reattach), and the mpsc handoff
+        // below is fire-and-forget by design — durability is the PG row
+        // + the ack loop, not host memory.
+        let cmd_tx = self.acquire_cmd_tx(sandbox_id)?;
         cmd_tx
             .send(HarnessFrame::Command(HarnessCommand::Prompt {
                 prompt_id,
@@ -648,10 +375,9 @@ impl HarnessHub {
     }
 
     /// Phase 1b: forward a queue-mutation command (Edit/Dequeue) to the
-    /// attached harness. Unlike `send_prompt` it neither waits/retries for
-    /// attach nor clears `last_idle_at` — the target prompt was already
-    /// queued (so the harness is attached); if it isn't, the prompt is
-    /// gone and `NotAttached` is the correct answer.
+    /// attached harness. The target prompt was already queued (so the
+    /// harness is attached); if it isn't, the prompt is gone and
+    /// `NotAttached` is the correct answer.
     async fn send_queue_command(
         &self,
         sandbox_id: SandboxId,
@@ -692,29 +418,17 @@ impl HarnessHub {
             .await
     }
 
-    /// ADR 0054: deliver a user's answer to a deferred `UserQuestion`. Like
-    /// `send_prompt` it waits out the post-resume attach race (answering an
-    /// idle session resumes it) and records the answer as un-confirmed for
-    /// at-least-once replay — retired when the harness emits
-    /// `QuestionAnswered{tool_call_id}`. The harness stashes the answer and
-    /// re-fires the deferred tool via `--resume`; re-delivery is idempotent
-    /// (the deferred tool yields exactly one tool_result).
+    /// ADR 0054: deliver a user's answer to a deferred `UserQuestion`.
+    /// ADR 0073: fail-fast like `send_prompt` — the coordinator's outbox
+    /// row (`answer:<tool_call_id>`) is the at-least-once machinery, and
+    /// redelivery is idempotent (one tool_result per deferred tool).
     pub async fn answer_question(
         &self,
         sandbox_id: SandboxId,
         tool_call_id: String,
         answers: Answers,
     ) -> Result<(), HarnessError> {
-        let cmd_tx = self.acquire_cmd_tx_waiting(sandbox_id).await?;
-        self.inner
-            .undelivered_answers
-            .lock()
-            .entry(sandbox_id)
-            .or_default()
-            .push(UndeliveredAnswer {
-                tool_call_id: tool_call_id.clone(),
-                answers: answers.clone(),
-            });
+        let cmd_tx = self.acquire_cmd_tx(sandbox_id)?;
         cmd_tx
             .send(HarnessFrame::Command(HarnessCommand::AnswerQuestion {
                 tool_call_id,
@@ -723,6 +437,13 @@ impl HarnessHub {
             .await
             .map_err(|_| HarnessError::WriterClosed)?;
         Ok(())
+    }
+
+    /// ADR 0073 phase 4: sandboxes with a live harness connection —
+    /// the heartbeat's `harness_attached` liveness set (the coordinator
+    /// compares it against its own view as a disagreement alarm).
+    pub fn attached_sandboxes(&self) -> Vec<SandboxId> {
+        self.inner.connections.lock().keys().copied().collect()
     }
 
     /// Number of currently-attached harnesses. Diagnostic / test helper.
@@ -789,145 +510,6 @@ impl HarnessHub {
         );
         true
     }
-
-    /// Sandboxes due for idle eviction under the two-tier policy.
-    ///
-    /// Returns `(SessionId, SandboxId)` pairs that satisfy EITHER:
-    /// - **Soft TTL fired:** `last_idle_at` is older than
-    ///   `soft_ttl`. The agent emitted `Idle` (= "awaiting user
-    ///   input") and stayed quiet that long. Normal "user afk"
-    ///   case; Idle eviction frees the host slot.
-    /// - **Hard TTL fired:** `last_event_at` is older than
-    ///   `hard_ttl`. The adapter went silent without ever emitting
-    ///   `Idle` — stuck in a tool call, infinite loop, etc. Backstop
-    ///   so a buggy adapter can't pin a sandbox forever.
-    ///
-    /// A long-running tool call (e.g. 5-minute pytest) doesn't
-    /// trip the soft TTL — `last_idle_at` is None during the call.
-    /// `hard_ttl` is the operator's safety net; default 30 min.
-    ///
-    /// Only returns sandboxes with an attached harness; bare
-    /// sandboxes (no adapter) aren't tracked here — deliberately.
-    /// A running-but-detached sandbox (harness vsock dropped, hub
-    /// maps wiped at reader-loop exit) is caught by the coord's
-    /// PG-derived detection backstop (ADR 0034,
-    /// `engram_coordinator::idle_detect_backstop`), which reads the
-    /// durable session_events record instead of this in-memory view.
-    pub fn idle_sandboxes(
-        &self,
-        soft_ttl: std::time::Duration,
-        hard_ttl: std::time::Duration,
-    ) -> Vec<(SessionId, SandboxId, IdleKind)> {
-        let now = Utc::now();
-        let soft_cutoff = now
-            - chrono::Duration::from_std(soft_ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
-        let hard_cutoff = now
-            - chrono::Duration::from_std(hard_ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
-        let event_at = self.inner.last_event_at.lock();
-        let idle_at = self.inner.last_idle_at.lock();
-        let conns = self.inner.connections.lock();
-        let shell = self.inner.shell_attached.lock();
-        // ADR 0016 §A.1.5a: skip sandboxes whose prior eviction POST
-        // is still in flight on coord. Without this, the 10s tick
-        // re-includes them while coord is still running the prior
-        // eviction's snapshot pipeline (typically 30s+), which
-        // produced the prod retry storm on 2026-05-24.
-        let inflight = self.inner.eviction_inflight.lock();
-        let mut out = Vec::new();
-        for (sandbox_id, handle) in conns.iter() {
-            // Browser-shell connections express explicit "user is
-            // poking at this session" intent. Suppress eviction while
-            // any shell is open — the count drops to zero (and the
-            // sandbox falls back under the normal TTLs) when the
-            // user closes the tab or otherwise drops the WebSocket.
-            if shell.contains_key(sandbox_id) {
-                continue;
-            }
-            if inflight.contains_key(sandbox_id) {
-                continue;
-            }
-            let soft = idle_at
-                .get(sandbox_id)
-                .map(|at| *at <= soft_cutoff)
-                .unwrap_or(false);
-            let hard = event_at
-                .get(sandbox_id)
-                .map(|at| *at <= hard_cutoff)
-                .unwrap_or(false);
-            // `Hard` wins when both fire: a silent-past-hard-TTL session
-            // must be nominated regardless of memory pressure.
-            if hard {
-                out.push((handle.session_id, *sandbox_id, IdleKind::Hard));
-            } else if soft {
-                out.push((handle.session_id, *sandbox_id, IdleKind::Soft));
-            }
-        }
-        out
-    }
-
-    /// ADR 0016 §A.1.5a: mark a sandbox as having an eviction POST
-    /// currently in flight on coord. Idempotent (re-marking refreshes
-    /// the Instant — used by the stale sweep to detect wedged
-    /// spawned tasks).
-    pub fn mark_eviction_inflight(&self, sandbox_id: SandboxId) {
-        self.inner
-            .eviction_inflight
-            .lock()
-            .insert(sandbox_id, Instant::now());
-    }
-
-    /// ADR 0016 §A.1.5a: clear the eviction-in-flight marker. Called
-    /// by the fire-and-forget spawned task in its finally block
-    /// regardless of POST outcome (success, transport error, timeout).
-    /// Idempotent; safe to call on an already-cleared entry.
-    pub fn clear_eviction_inflight(&self, sandbox_id: SandboxId) {
-        self.inner.eviction_inflight.lock().remove(&sandbox_id);
-    }
-
-    /// ADR 0016 §A.1.5a: sweep entries older than `max_age` and
-    /// return the sandbox_ids removed. Called at the top of each
-    /// eviction tick so a spawned task that wedged (e.g. reqwest
-    /// future hung forever) can't permanently block re-eviction of
-    /// the sandbox.
-    pub fn sweep_stale_evictions(&self, max_age: Duration) -> Vec<SandboxId> {
-        let mut guard = self.inner.eviction_inflight.lock();
-        let now = Instant::now();
-        let mut removed = Vec::new();
-        guard.retain(|sandbox_id, marked_at| {
-            if now.duration_since(*marked_at) >= max_age {
-                removed.push(*sandbox_id);
-                false
-            } else {
-                true
-            }
-        });
-        removed
-    }
-
-    /// Issue #219: reap shell pins not renewed within `max_age` and
-    /// return the sandbox_ids removed. Direct analogue of
-    /// `sweep_stale_evictions` for the `shell_attached` map. A live
-    /// coord shell bridge renews its pin every
-    /// [`SHELL_PIN_RENEW_INTERVAL`]; a pin older than `max_age`
-    /// (typically [`SHELL_PIN_STALE_AGE`]) means the renewer is gone —
-    /// coord pod died mid-session, or the bridge task was torn down
-    /// without sending `ReleaseShell` — so the sandbox must fall back
-    /// under the normal idle TTLs instead of staying pinned forever.
-    /// Called from the host's eviction tick.
-    pub fn sweep_stale_shells(&self, max_age: Duration) -> Vec<SandboxId> {
-        let mut guard = self.inner.shell_attached.lock();
-        let now = Instant::now();
-        let mut removed = Vec::new();
-        guard.retain(|sandbox_id, (_count, last_renewed)| {
-            if now.duration_since(*last_renewed) >= max_age {
-                removed.push(*sandbox_id);
-                false
-            } else {
-                true
-            }
-        });
-        removed
-    }
 }
 
 async fn run_connection<S>(
@@ -949,27 +531,48 @@ async fn run_connection<S>(
     };
     if let Some(expected) = expected_session_id {
         if attach.session_id != expected {
-            let ack = HarnessAttachAck {
-                ok: false,
-                message: Some("session_id mismatch".into()),
-            };
-            let _ = write_msg(&mut writer, &ack).await;
-            tracing::warn!(
-                expected = %expected,
-                got = %attach.session_id,
-                sandbox_id = %sandbox_id,
-                "harness attach rejected: session_id mismatch",
-            );
+            reject_attach(
+                &mut writer,
+                &attach,
+                AttachReject::SessionMismatch,
+                "session_id mismatch",
+            )
+            .await;
             return;
         }
     }
-    drive_attached(inner, sandbox_id, attach, reader, writer).await;
+    // ADR 0073: even with a transport-derived sandbox_id, the token is
+    // validated against the durable record — the transport tells us
+    // where the bytes came from, the record tells us which GENERATION
+    // currently owns the session. The epoch is the fence; the token's
+    // sandbox_id is informational only (a live-moved harness carries
+    // its old sandbox in a frozen env — ADR 0045 C1 — and is still
+    // the current generation). Connection state is keyed on the
+    // TRANSPORT sandbox: on a live move the record may briefly lag
+    // the VM the bytes actually arrived from.
+    match validate_attach(&inner, &attach) {
+        Ok(record) => {
+            if attach.sandbox_id != sandbox_id || record.sandbox_id != sandbox_id {
+                tracing::debug!(
+                    session_id = %attach.session_id,
+                    transport_sandbox = %sandbox_id,
+                    token_sandbox = %attach.sandbox_id,
+                    record_sandbox = %record.sandbox_id,
+                    "attach token/record sandbox differs from transport (live-move shape)",
+                );
+            }
+            drive_attached(inner, sandbox_id, attach, reader, writer).await;
+        }
+        Err(reject) => {
+            reject_attach(&mut writer, &attach, reject, reject_reason(reject)).await;
+        }
+    }
 }
 
-/// TCP-listener path: read HarnessAttach, look up the bound
-/// sandbox_id (set by `bind_session()` when the host-agent spawns
-/// the harness), then run the same post-attach loop as
-/// `run_connection`. Closes with `ok: false` if no binding exists.
+/// TCP-listener path (Process backend, tests): read HarnessAttach,
+/// resolve the sandbox from the DURABLE binding record (ADR 0073 —
+/// never an in-memory map), validate the token, then run the same
+/// post-attach loop as `run_connection`.
 async fn run_connection_with_session_lookup<S>(inner: Arc<HubInner>, stream: S)
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -982,32 +585,78 @@ where
             return;
         }
     };
-    let bound = {
-        // Scope the guard so it drops before the AsyncWrite below.
-        // parking_lot guards aren't Send, and the writer may be
-        // awaited across threads via tokio::spawn.
-        inner
-            .session_to_sandbox
-            .lock()
-            .get(&attach.session_id)
-            .copied()
-    };
-    let sandbox_id = match bound {
-        Some(id) => id,
-        None => {
-            let ack = HarnessAttachAck {
-                ok: false,
-                message: Some("no sandbox bound to this session_id".into()),
-            };
-            let _ = write_msg(&mut writer, &ack).await;
+    match validate_attach(&inner, &attach) {
+        Ok(record) => {
+            let sandbox_id = record.sandbox_id;
+            drive_attached(inner, sandbox_id, attach, reader, writer).await;
+        }
+        Err(reject) => {
+            reject_attach(&mut writer, &attach, reject, reject_reason(reject)).await;
+        }
+    }
+}
+
+/// ADR 0073 attach-token validation, shared by both connection paths.
+/// The EPOCH is the entire fence:
+/// - no record / unreadable record → `UnknownBinding` (transient);
+/// - presented epoch < record        → `Superseded` (fatal);
+/// - presented epoch > record        → `UnknownBinding` (the bind for
+///   the harness's own generation hasn't landed yet — retry);
+/// - equal epoch → accept. The token's sandbox_id is deliberately NOT
+///   compared: a live-moved harness (ADR 0045 C1) presents its frozen
+///   spawn-time sandbox while remaining the current generation.
+fn validate_attach(
+    inner: &HubInner,
+    attach: &HarnessAttach,
+) -> Result<crate::bindings::BindingRecord, AttachReject> {
+    let record = match inner.bindings.read(attach.session_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Err(AttachReject::UnknownBinding),
+        Err(e) => {
             tracing::warn!(
                 session_id = %attach.session_id,
-                "harness attach rejected: no sandbox bound",
+                error = %e,
+                "binding record unreadable at attach",
             );
-            return;
+            return Err(AttachReject::UnknownBinding);
         }
     };
-    drive_attached(inner, sandbox_id, attach, reader, writer).await;
+    if attach.binding_epoch < record.binding_epoch {
+        return Err(AttachReject::Superseded);
+    }
+    if attach.binding_epoch > record.binding_epoch {
+        return Err(AttachReject::UnknownBinding);
+    }
+    Ok(record)
+}
+
+fn reject_reason(reject: AttachReject) -> &'static str {
+    match reject {
+        AttachReject::UnknownBinding => "no current binding record for this session",
+        AttachReject::Superseded => "binding superseded by a newer generation",
+        AttachReject::SessionMismatch => "attach token does not match the binding record",
+    }
+}
+
+async fn reject_attach<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    attach: &HarnessAttach,
+    reject: AttachReject,
+    message: &str,
+) {
+    let ack = HarnessAttachAck {
+        ok: false,
+        reject: Some(reject),
+        message: Some(message.into()),
+    };
+    let _ = write_msg(writer, &ack).await;
+    tracing::warn!(
+        session_id = %attach.session_id,
+        sandbox_id = %attach.sandbox_id,
+        binding_epoch = attach.binding_epoch,
+        reject = ?reject,
+        "harness attach rejected",
+    );
 }
 
 /// Shared post-attach work: send `ok: true`, register the
@@ -1026,6 +675,7 @@ async fn drive_attached<R, W>(
 {
     let ack = HarnessAttachAck {
         ok: true,
+        reject: None,
         message: None,
     };
     if let Err(e) = write_msg(&mut writer, &ack).await {
@@ -1056,115 +706,29 @@ async fn drive_attached<R, W>(
     let handle = ConnectionHandle {
         cmd_tx: cmd_tx.clone(),
         pending_checkpoint: Mutex::new(None),
-        session_id: attach.session_id,
         generation: my_generation,
     };
     inner.connections.lock().insert(sandbox_id, handle);
-    // Seed only `last_event_at` at attach — the hard TTL needs an
-    // origin so a never-emits-anything adapter still gets reaped
-    // eventually. `last_idle_at` is **deliberately not seeded**:
-    // soft TTL must mean "harness explicitly emitted Idle and has
-    // been quiet since", not "harness attached and is still booting
-    // its agent". Every harness in our tree emits `HarnessEvent::
-    // Idle` itself when it has no work
-    // (`engram-harness-claude` line ~326 when `next_prompt.is_none()`;
-    // `engram-harness-noop` at the end of its scripted run), so the
-    // "attached and awaiting Prompt" case is covered by the harness
-    // contract, not the hub.
-    //
-    // Prod-found 2026-05-28 against session `43fe13b4`: the old
-    // seed-at-attach made the soft TTL fire at T+30s on every fresh
-    // session whose harness needed >30s to emit its first event —
-    // claude's ~7-9s cold-boot plus first-prompt processing easily
-    // crosses that line. The eviction pause-suspended agentd, which
-    // surfaced to the user as "no harness response + shell timeout".
-    let now = Utc::now();
-    inner.last_event_at.lock().insert(sandbox_id, now);
+    // ADR 0073 phase 3: no TTL bookkeeping here. Idle detection reads
+    // the durable event log coordinator-side (idle_detector.rs), which
+    // inherits the seed-at-attach lesson structurally: a session's
+    // clock starts at its created_at/last event, never at attach
+    // (prod 43fe13b4: seed-at-attach soft-TTL'd fresh sessions whose
+    // harness needed >30s to emit its first event).
 
     let writer_task = tokio::spawn(writer_loop(writer, cmd_rx));
 
-    // ADR 0052: replay un-confirmed prompts onto this fresh connection
-    // (command-side at-least-once — the twin of the harness's `held` event
-    // slot). A prompt buffered into a connection that bounced before the
-    // harness processed it would otherwise be lost (prod `8c165749`); here
-    // every (re)attach re-delivers it until a confirming event retires it.
-    // The harness dedupes by `prompt_id`, so replaying an already-processed
-    // prompt is a no-op. We then DROP our sender clone so the writer task
-    // can still observe "all senders gone" at teardown.
-    {
-        let pending = inner
-            .undelivered_prompts
-            .lock()
-            .get(&sandbox_id)
-            .cloned()
-            .unwrap_or_default();
-        if !pending.is_empty() {
-            tracing::debug!(
-                sandbox_id = %sandbox_id,
-                count = pending.len(),
-                "replaying un-confirmed prompts onto fresh harness connection",
-            );
-        }
-        for p in pending {
-            if cmd_tx
-                .send(HarnessFrame::Command(HarnessCommand::Prompt {
-                    prompt_id: p.prompt_id,
-                    text: p.text,
-                }))
-                .await
-                .is_err()
-            {
-                break; // writer already gone — next attach will retry
-            }
-        }
-    }
-    // ADR 0054: replay un-confirmed answers the same way. An answer dropped
-    // with a bounced connection would otherwise leave the question stuck
-    // awaiting-input; re-delivery is idempotent (one tool_result per tool).
-    {
-        let pending = inner
-            .undelivered_answers
-            .lock()
-            .get(&sandbox_id)
-            .cloned()
-            .unwrap_or_default();
-        if !pending.is_empty() {
-            tracing::debug!(
-                sandbox_id = %sandbox_id,
-                count = pending.len(),
-                "replaying un-confirmed answers onto fresh harness connection",
-            );
-        }
-        for a in pending {
-            if cmd_tx
-                .send(HarnessFrame::Command(HarnessCommand::AnswerQuestion {
-                    tool_call_id: a.tool_call_id,
-                    answers: a.answers,
-                }))
-                .await
-                .is_err()
-            {
-                break; // writer already gone — next attach will retry
-            }
-        }
-    }
+    // ADR 0073: no replay pass. Command-side at-least-once now lives in
+    // the coordinator's session_outbox (redelivered until the confirming
+    // event acks the row) — host memory holds nothing durable.
     drop(cmd_tx);
 
     let reader_outcome = reader_loop(reader, &inner, attach.session_id, sandbox_id).await;
-    // Issue #218: guarded teardown. Only remove the per-sandbox entries
-    // if the live `connections` registration is STILL ours — i.e. no
-    // newer connection has replaced us under the same `sandbox_id`. A
-    // reconnect inserts a fresh handle with a higher generation; if we
-    // see a different generation (or no entry), a newer connection now
-    // owns these entries and we must leave all three untouched.
-    //
-    // We acquire all three locks in the canonical order (last_event_at
-    // → last_idle_at → connections; see HubInner docs / issue #217) and
-    // hold them across the compare-and-remove so the decision and the
-    // removals are atomic versus a concurrent attach/eviction tick.
+    // Issue #218: guarded teardown. Only remove the registration if it
+    // is STILL ours — a reconnect inserts a fresh handle with a higher
+    // generation; seeing a different generation (or no entry) means a
+    // newer connection owns it and we must leave it untouched.
     {
-        let mut event_at = inner.last_event_at.lock();
-        let mut idle_at = inner.last_idle_at.lock();
         let mut conns = inner.connections.lock();
         let still_ours = conns
             .get(&sandbox_id)
@@ -1172,8 +736,6 @@ async fn drive_attached<R, W>(
             .unwrap_or(false);
         if still_ours {
             conns.remove(&sandbox_id);
-            event_at.remove(&sandbox_id);
-            idle_at.remove(&sandbox_id);
         }
     }
     let _ = writer_task.await;
@@ -1184,23 +746,6 @@ async fn drive_attached<R, W>(
             error = %e,
             "harness reader loop ended",
         );
-    }
-}
-
-/// The `prompt_id` a harness event confirms the harness has received, if
-/// any (ADR 0052 — drives `undelivered_prompts` retirement). `RunStarted`
-/// confirms only when it carries a `prompt_id` (the env-seeded initial
-/// prompt has none and was never tracked).
-fn confirmed_prompt_id(ev: &HarnessEvent) -> Option<&str> {
-    match ev {
-        HarnessEvent::RunStarted {
-            prompt_id: Some(id),
-            ..
-        } => Some(id.as_str()),
-        HarnessEvent::PromptQueued { prompt_id, .. }
-        | HarnessEvent::PromptEdited { prompt_id, .. }
-        | HarnessEvent::PromptDequeued { prompt_id } => Some(prompt_id.as_str()),
-        _ => None,
     }
 }
 
@@ -1224,45 +769,15 @@ where
         };
         match frame {
             HarnessFrame::Event(ev) => {
-                let now = Utc::now();
-                hub.last_event_at.lock().insert(sandbox_id, now);
-                // Soft TTL bookkeeping: Idle SETS last_idle_at;
-                // anything else CLEARS it. A long tool call has
-                // ToolCallStarted recently and no Idle, so soft
-                // doesn't trip; the agent finishes, emits Idle,
-                // soft starts ticking from there.
-                match &ev {
-                    HarnessEvent::Idle => {
-                        hub.last_idle_at.lock().insert(sandbox_id, now);
-                    }
-                    _ => {
-                        hub.last_idle_at.lock().remove(&sandbox_id);
-                    }
-                }
-                // ADR 0052: a RunStarted/PromptQueued/PromptEdited/
-                // PromptDequeued for a prompt means the harness HAS it —
-                // retire it from the un-delivered replay set so a later
-                // reattach won't re-send it.
-                if let Some(confirmed) = confirmed_prompt_id(&ev) {
-                    let mut undelivered = hub.undelivered_prompts.lock();
-                    if let Some(v) = undelivered.get_mut(&sandbox_id) {
-                        v.retain(|p| p.prompt_id != confirmed);
-                        if v.is_empty() {
-                            undelivered.remove(&sandbox_id);
-                        }
-                    }
-                }
-                // ADR 0054: a QuestionAnswered for a tool_call_id means the
-                // harness delivered the answer — retire it from the replay set.
-                if let HarnessEvent::QuestionAnswered { tool_call_id, .. } = &ev {
-                    let mut undelivered = hub.undelivered_answers.lock();
-                    if let Some(v) = undelivered.get_mut(&sandbox_id) {
-                        v.retain(|a| &a.tool_call_id != tool_call_id);
-                        if v.is_empty() {
-                            undelivered.remove(&sandbox_id);
-                        }
-                    }
-                }
+                // ADR 0073: no host-side TTL bookkeeping — the sink
+                // lands the event in the coordinator's durable log,
+                // which IS the idle detector's input (an `Idle` event
+                // becoming newest starts the soft clock; any other
+                // event resets it — the same set/clear rule the old
+                // in-memory maps implemented). Confirming events
+                // (RunStarted{prompt_id} / PromptQueued /
+                // QuestionAnswered) also ack the outbox row at the
+                // coordinator's emit choke point.
                 let fut = (hub.event_sink)(session_id, sandbox_id, ev);
                 fut.await;
             }
@@ -1409,6 +924,18 @@ mod tests {
         (sink, collected)
     }
 
+    /// ADR 0073: hub over an ephemeral binding store. Tests exercise
+    /// the same disk-validated attach path as production.
+    fn test_hub(sink: EventSink) -> HarnessHub {
+        HarnessHub::new(
+            sink,
+            crate::bindings::BindingStore::open(
+                std::env::temp_dir().join(format!("engram-hub-test-{}", uuid::Uuid::new_v4())),
+            )
+            .expect("binding store"),
+        )
+    }
+
     /// Convenience: build a paired in-memory stream for harness ↔ host.
     /// Returns (host_side, harness_side). Either end can read/write.
     fn duplex_pair() -> (DuplexStream, DuplexStream) {
@@ -1418,19 +945,27 @@ mod tests {
     /// Drives the harness side of a connection: sends `HarnessAttach`,
     /// reads ack, then runs `body` with read/write handles to the host.
     async fn drive_harness<F, Fut>(
+        hub: &HarnessHub,
         harness_side: DuplexStream,
         session_id: SessionId,
+        sandbox_id: SandboxId,
         body: F,
     ) -> HarnessAttachAck
     where
         F: FnOnce(tokio::io::ReadHalf<DuplexStream>, tokio::io::WriteHalf<DuplexStream>) -> Fut,
         Fut: Future<Output = ()>,
     {
+        // ADR 0073: bind (epoch 1) so the attach token validates —
+        // the same choreography the host-agent runs before a spawn.
+        // Idempotent for tests that already bound.
+        let _ = hub.bind_session(session_id, sandbox_id, 1);
         let (mut harness_r, mut harness_w) = tokio::io::split(harness_side);
         write_msg(
             &mut harness_w,
             &HarnessAttach {
                 session_id,
+                sandbox_id,
+                binding_epoch: 1,
                 harness_version: "test/0.1".into(),
             },
         )
@@ -1458,32 +993,40 @@ mod tests {
     #[tokio::test]
     async fn attach_then_event_flows_into_sink() {
         let (sink, collected) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         let sandbox_id = SandboxId::new();
         let session_id = SessionId::new();
         let (host_side, harness_side) = duplex_pair();
 
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
+
         hub.accept_connection(sandbox_id, Some(session_id), host_side);
 
-        let ack = drive_harness(harness_side, session_id, |_r, mut w| async move {
-            write_msg(
-                &mut w,
-                &HarnessFrame::Event(HarnessEvent::ToolCallCompleted {
-                    run_id: "r1".into(),
-                    tool_call_id: "t1".into(),
-                    tool_name: "Bash".into(),
-                    ok: true,
-                    duration_ms: 1,
-                    result_summary: Some("line".into()),
-                }),
-            )
-            .await
-            .unwrap();
-            // Hold the connection open long enough for the host to
-            // process the event before the test exits and tears
-            // everything down.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        })
+        let ack = drive_harness(
+            &hub,
+            harness_side,
+            session_id,
+            sandbox_id,
+            |_r, mut w| async move {
+                write_msg(
+                    &mut w,
+                    &HarnessFrame::Event(HarnessEvent::ToolCallCompleted {
+                        run_id: "r1".into(),
+                        tool_call_id: "t1".into(),
+                        tool_name: "Bash".into(),
+                        ok: true,
+                        duration_ms: 1,
+                        result_summary: Some("line".into()),
+                    }),
+                )
+                .await
+                .unwrap();
+                // Hold the connection open long enough for the host to
+                // process the event before the test exits and tears
+                // everything down.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            },
+        )
         .await;
         assert!(ack.ok);
 
@@ -1496,21 +1039,29 @@ mod tests {
             HarnessEvent::ToolCallCompleted { tool_name, .. } => assert_eq!(tool_name, "Bash"),
             other => panic!("unexpected event: {other:?}"),
         }
-        assert!(hub.last_event_at(sandbox_id).is_some());
     }
 
     #[tokio::test]
     async fn session_id_mismatch_closes_connection_cleanly() {
         let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         let sandbox_id = SandboxId::new();
         let expected = SessionId::new();
         let attached_with = SessionId::new();
         let (host_side, harness_side) = duplex_pair();
 
+        hub.bind_session(expected, sandbox_id, 1).expect("bind");
+
         hub.accept_connection(sandbox_id, Some(expected), host_side);
 
-        let ack = drive_harness(harness_side, attached_with, |_r, _w| async {}).await;
+        let ack = drive_harness(
+            &hub,
+            harness_side,
+            attached_with,
+            sandbox_id,
+            |_r, _w| async {},
+        )
+        .await;
         assert!(!ack.ok, "host must reject mismatched session_id");
 
         // Mismatch leaves the maps untouched.
@@ -1523,10 +1074,12 @@ mod tests {
     #[tokio::test]
     async fn shutdown_command_reaches_harness() {
         let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         let sandbox_id = SandboxId::new();
         let session_id = SessionId::new();
         let (host_side, harness_side) = duplex_pair();
+
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
 
         hub.accept_connection(sandbox_id, Some(session_id), host_side);
 
@@ -1538,6 +1091,8 @@ mod tests {
                 &mut hw,
                 &HarnessAttach {
                     session_id,
+                    sandbox_id,
+                    binding_epoch: 1,
                     harness_version: "test/0.1".into(),
                 },
             )
@@ -1570,10 +1125,12 @@ mod tests {
         // (b) not return until the harness's connection drops — the signal
         // that claude + the harness have exited and the snapshot is safe.
         let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         let sandbox_id = SandboxId::new();
         let session_id = SessionId::new();
         let (host_side, harness_side) = duplex_pair();
+
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
 
         hub.accept_connection(sandbox_id, Some(session_id), host_side);
 
@@ -1585,6 +1142,8 @@ mod tests {
                 &mut hw,
                 &HarnessAttach {
                     session_id,
+                    sandbox_id,
+                    binding_epoch: 1,
                     harness_version: "test/0.1".into(),
                 },
             )
@@ -1620,7 +1179,7 @@ mod tests {
         // No harness bound → nothing to drain → the snapshot is already
         // claude-free, so drain succeeds immediately (no waiting).
         let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         assert!(hub.drain(SandboxId::new(), 2).await);
     }
 
@@ -1632,10 +1191,12 @@ mod tests {
         // SIGINT-the-claude-child leaf is Linux + claude-runtime specific
         // and is covered by the manual spike documented in the ADR.
         let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         let sandbox_id = SandboxId::new();
         let session_id = SessionId::new();
         let (host_side, harness_side) = duplex_pair();
+
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
 
         hub.accept_connection(sandbox_id, Some(session_id), host_side);
 
@@ -1645,6 +1206,8 @@ mod tests {
                 &mut hw,
                 &HarnessAttach {
                     session_id,
+                    sandbox_id,
+                    binding_epoch: 1,
                     harness_version: "test/0.1".into(),
                 },
             )
@@ -1668,7 +1231,7 @@ mod tests {
     #[tokio::test]
     async fn interrupt_returns_not_attached_for_unknown_sandbox() {
         let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         let err = hub.interrupt(SandboxId::new()).await.unwrap_err();
         assert!(matches!(err, HarnessError::NotAttached));
     }
@@ -1678,21 +1241,25 @@ mod tests {
     #[tokio::test]
     async fn answer_question_reaches_harness_and_retires_on_confirmation() {
         let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         let sandbox_id = SandboxId::new();
         let session_id = SessionId::new();
         let (host_side, harness_side) = duplex_pair();
 
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
+
         hub.accept_connection(sandbox_id, Some(session_id), host_side);
 
-        // Harness: attach, read one AnswerQuestion, then emit QuestionAnswered
-        // to confirm delivery (which retires the replay-buffer entry).
+        // Harness: attach, read one AnswerQuestion, then emit
+        // QuestionAnswered (the coordinator-side ack signal).
         let harness_task = tokio::spawn(async move {
             let (mut hr, mut hw) = tokio::io::split(harness_side);
             write_msg(
                 &mut hw,
                 &HarnessAttach {
                     session_id,
+                    sandbox_id,
+                    binding_epoch: 1,
                     harness_version: "test/0.1".into(),
                 },
             )
@@ -1731,72 +1298,15 @@ mod tests {
 
         let received = harness_task.await.unwrap();
         assert!(received, "harness should receive an AnswerQuestion frame");
-
-        assert!(
-            wait_until(|| hub
-                .inner
-                .undelivered_answers
-                .lock()
-                .get(&sandbox_id)
-                .is_none())
-            .await,
-            "QuestionAnswered should retire the un-confirmed answer",
-        );
-    }
-
-    #[tokio::test]
-    async fn rehandshake_command_reaches_harness() {
-        // Track A: hub.rehandshake() must deliver a
-        // HarnessCommand::Rehandshake to the attached harness (which drops
-        // + re-dials in-band, re-emitting Idle). The connection-layer
-        // drop/re-dial leaf is exercised by the engram-harness-claude
-        // forward_commands path.
-        let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
-        let sandbox_id = SandboxId::new();
-        let session_id = SessionId::new();
-        let (host_side, harness_side) = duplex_pair();
-
-        hub.accept_connection(sandbox_id, Some(session_id), host_side);
-
-        let harness_task = tokio::spawn(async move {
-            let (mut hr, mut hw) = tokio::io::split(harness_side);
-            write_msg(
-                &mut hw,
-                &HarnessAttach {
-                    session_id,
-                    harness_version: "test/0.1".into(),
-                },
-            )
-            .await
-            .unwrap();
-            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
-            let frame: HarnessFrame = read_msg(&mut hr).await.unwrap();
-            matches!(frame, HarnessFrame::Command(HarnessCommand::Rehandshake))
-        });
-
-        assert!(
-            wait_until(|| hub.attached_count() == 1).await,
-            "harness should attach within the 1s deadline"
-        );
-
-        hub.rehandshake(sandbox_id).await.expect("rehandshake");
-        let received = harness_task.await.unwrap();
-        assert!(received, "harness should receive a Rehandshake frame");
-    }
-
-    #[tokio::test]
-    async fn rehandshake_returns_not_attached_for_unknown_sandbox() {
-        let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
-        let err = hub.rehandshake(SandboxId::new()).await.unwrap_err();
-        assert!(matches!(err, HarnessError::NotAttached));
+        // ADR 0073: no host-side replay buffer to assert on — the
+        // QuestionAnswered event flows to the coordinator, whose emit
+        // path acks the `answer:<tool_call_id>` outbox row instead.
     }
 
     #[tokio::test]
     async fn checkpoint_returns_not_attached_for_unknown_sandbox() {
         let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         let err = hub
             .checkpoint(SandboxId::new(), CheckpointReason::Idle)
             .await
@@ -1805,277 +1315,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_sandboxes_returns_pairs_past_ttl() {
-        // Soft TTL fires only after the harness has explicitly
-        // emitted `Idle`. Prod-found 2026-05-28: previously the hub
-        // seeded `last_idle_at` at attach time, which made the soft
-        // TTL fire 30 s after attach on every fresh session whose
-        // harness was still cold-booting. Now the soft TTL is purely
-        // event-driven — the test drives a real Idle frame before
-        // asserting it fires.
-        let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
-        let sandbox_id = SandboxId::new();
-        let session_id = SessionId::new();
-        let (host_side, harness_side) = duplex_pair();
-
-        hub.accept_connection(sandbox_id, Some(session_id), host_side);
-
-        // Drive the harness side: attach, emit Idle, then keep the
-        // connection alive without further events.
-        let _harness_task = tokio::spawn(async move {
-            let (mut hr, mut hw) = tokio::io::split(harness_side);
-            write_msg(
-                &mut hw,
-                &HarnessAttach {
-                    session_id,
-                    harness_version: "test/0.1".into(),
-                },
-            )
-            .await
-            .unwrap();
-            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
-            write_msg(&mut hw, &HarnessFrame::Event(HarnessEvent::Idle))
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        });
-
-        assert!(
-            wait_until(|| hub.attached_count() == 1).await,
-            "harness should attach"
-        );
-
-        // Fresh attach with no Idle yet: long TTLs see no idle
-        // sandbox AND short soft TTL also sees none (we did not
-        // seed `last_idle_at` at attach — that's the bug we fixed).
-        // Hard TTL still has its origin from attach so a zero hard
-        // TTL would fire; test that separately below.
-        let fresh = hub.idle_sandboxes(Duration::from_secs(60), Duration::from_secs(3600));
-        assert!(fresh.is_empty(), "fresh attach is not idle: {fresh:?}");
-
-        // Wait for the harness's Idle frame to be processed.
-        assert!(
-            wait_until(|| hub.last_event_at(sandbox_id).is_some()).await,
-            "Idle event should reach the hub",
-        );
-
-        // Now the soft TTL has its anchor. Zero soft TTL fires.
-        let aged = hub.idle_sandboxes(Duration::from_millis(0), Duration::from_secs(3600));
-        assert_eq!(aged.len(), 1);
-        assert_eq!(aged[0].0, session_id);
-        assert_eq!(aged[0].1, sandbox_id);
-    }
-
-    /// Tier 1 (pressure-aware idle eviction): the pressure gate must tell a
-    /// soft-idle candidate (reclaim only under memory pressure) from a
-    /// hard-idle one (always nominated — the never-emits-`Idle` backstop),
-    /// and `Hard` must win when both TTLs have fired.
-    #[tokio::test]
-    async fn idle_sandboxes_classifies_soft_vs_hard() {
-        let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
-        let sandbox_id = SandboxId::new();
-        let session_id = SessionId::new();
-        let (host_side, harness_side) = duplex_pair();
-        hub.accept_connection(sandbox_id, Some(session_id), host_side);
-
-        let _harness_task = tokio::spawn(async move {
-            let (mut hr, mut hw) = tokio::io::split(harness_side);
-            write_msg(
-                &mut hw,
-                &HarnessAttach {
-                    session_id,
-                    harness_version: "test/0.1".into(),
-                },
-            )
-            .await
-            .unwrap();
-            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
-            write_msg(&mut hw, &HarnessFrame::Event(HarnessEvent::Idle))
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        });
-        assert!(
-            wait_until(|| hub.last_event_at(sandbox_id).is_some()).await,
-            "Idle event should reach the hub",
-        );
-
-        // Soft TTL fired, hard TTL far in the future → `Soft`.
-        let soft = hub.idle_sandboxes(Duration::from_millis(0), Duration::from_secs(3600));
-        assert_eq!(soft.len(), 1);
-        assert_eq!(soft[0].2, IdleKind::Soft);
-
-        // Both TTLs fired (zero hard TTL) → `Hard` wins.
-        let hard = hub.idle_sandboxes(Duration::from_millis(0), Duration::from_millis(0));
-        assert_eq!(hard.len(), 1);
-        assert_eq!(hard[0].2, IdleKind::Hard, "Hard wins when both fire");
-    }
-
-    #[tokio::test]
-    async fn soft_ttl_does_not_fire_before_explicit_idle_emit() {
-        // Prod regression guard (2026-05-28 session 43fe13b4):
-        // the hub previously seeded `last_idle_at` at attach time
-        // so the soft TTL fired at attach + soft_ttl seconds, even
-        // if the harness had never emitted `Idle`. The result in
-        // prod: every fresh agent session whose harness took more
-        // than the soft TTL to produce its first event got hot-
-        // suspended mid-cold-boot.
-        //
-        // This test reproduces the regression with `soft_ttl = 0ms`,
-        // `hard_ttl = 1h`: with the seed in place, the zero soft TTL
-        // would immediately fire because `last_idle_at` is the
-        // attach instant (`attach_instant <= now - 0ms` is true).
-        // With the fix, `last_idle_at` is None for a not-yet-Idled
-        // harness, so the soft check short-circuits to false and
-        // the result is empty.
-        let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
-        let sandbox_id = SandboxId::new();
-        let session_id = SessionId::new();
-        let (host_side, harness_side) = duplex_pair();
-
-        hub.accept_connection(sandbox_id, Some(session_id), host_side);
-
-        let _harness_task = tokio::spawn(async move {
-            let (mut hr, mut hw) = tokio::io::split(harness_side);
-            write_msg(
-                &mut hw,
-                &HarnessAttach {
-                    session_id,
-                    harness_version: "test/0.1".into(),
-                },
-            )
-            .await
-            .unwrap();
-            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
-            // Stay attached but never emit anything. Mirrors a
-            // harness in the middle of its agent-cold-boot window
-            // (claude takes ~7-9s before its first event).
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        });
-
-        assert!(wait_until(|| hub.attached_count() == 1).await);
-
-        // Zero soft TTL + long hard TTL. With the seed-at-attach bug,
-        // soft fires immediately (the assertion below trips with a
-        // non-empty result). Without the bug, soft check returns
-        // false because `last_idle_at` is None.
-        let result = hub.idle_sandboxes(Duration::from_millis(0), Duration::from_secs(3600));
-        assert!(
-            result.is_empty(),
-            "soft TTL must not fire before the harness emits Idle; \
-             got {result:?} — this regression caused the prod \
-             session 43fe13b4 hot-suspension on 2026-05-28",
-        );
-    }
-
-    #[tokio::test]
-    async fn hard_ttl_fires_on_silent_adapter_without_idle() {
-        // The companion case to the soft-TTL fix above. An adapter
-        // that attaches and never emits *anything* (buggy harness,
-        // stuck in cold boot indefinitely) must still get reaped —
-        // that's what the hard TTL exists for. We seed
-        // `last_event_at` at attach so its clock is the attach
-        // moment, even though `last_idle_at` is left None.
-        let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
-        let sandbox_id = SandboxId::new();
-        let session_id = SessionId::new();
-        let (host_side, harness_side) = duplex_pair();
-
-        hub.accept_connection(sandbox_id, Some(session_id), host_side);
-
-        let _harness_task = tokio::spawn(async move {
-            let (mut hr, mut hw) = tokio::io::split(harness_side);
-            write_msg(
-                &mut hw,
-                &HarnessAttach {
-                    session_id,
-                    harness_version: "test/0.1".into(),
-                },
-            )
-            .await
-            .unwrap();
-            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
-            // Never emit any frame; just keep the connection alive.
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        });
-
-        assert!(wait_until(|| hub.attached_count() == 1).await);
-
-        // Long soft TTL alone sees nothing — `last_idle_at` is None.
-        let none = hub.idle_sandboxes(Duration::from_secs(3600), Duration::from_secs(3600));
-        assert!(none.is_empty(), "no idle emit + long TTLs: {none:?}");
-
-        // Zero hard TTL with `last_event_at` seeded at attach fires.
-        let aged = hub.idle_sandboxes(Duration::from_secs(3600), Duration::from_millis(0));
-        assert_eq!(aged.len(), 1);
-        assert_eq!(aged[0].0, session_id);
-        assert_eq!(aged[0].1, sandbox_id);
-    }
-
-    #[tokio::test]
-    async fn long_tool_call_does_not_trip_soft_ttl() {
-        // The motivating case for the two-tier rewrite: an adapter
-        // emits ToolCallStarted, runs a 5-min pytest, and emits
-        // ToolCallCompleted. The soft TTL must NOT fire on
-        // last_event_at staleness — only `last_idle_at`.
-        let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
-        let sandbox_id = SandboxId::new();
-        let session_id = SessionId::new();
-        let (host_side, harness_side) = duplex_pair();
-        hub.accept_connection(sandbox_id, Some(session_id), host_side);
-
-        let _harness_task = tokio::spawn(async move {
-            let (mut hr, mut hw) = tokio::io::split(harness_side);
-            write_msg(
-                &mut hw,
-                &HarnessAttach {
-                    session_id,
-                    harness_version: "test/0.1".into(),
-                },
-            )
-            .await
-            .unwrap();
-            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
-            // Emit ToolCallStarted, then sit silent.
-            write_msg(
-                &mut hw,
-                &HarnessFrame::Event(HarnessEvent::ToolCallStarted {
-                    run_id: "r".into(),
-                    tool_call_id: "t".into(),
-                    tool_name: "Bash".into(),
-                    args_summary: Some("sleep 300".into()),
-                }),
-            )
-            .await
-            .unwrap();
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        });
-
-        assert!(wait_until(|| hub.attached_count() == 1).await);
-        // Wait for ToolCallStarted to be processed.
-        assert!(wait_until(|| hub.last_event_at(sandbox_id).is_some()).await);
-
-        // Soft TTL of 0ms — should NOT fire (last_idle_at was cleared
-        // by the ToolCallStarted event). Hard TTL of 1h — also not.
-        let none = hub.idle_sandboxes(Duration::from_millis(0), Duration::from_secs(3600));
-        assert!(
-            none.is_empty(),
-            "tool-call-in-flight must not be idle: {none:?}",
-        );
-    }
-
-    #[tokio::test]
     async fn harness_disconnect_clears_last_event_at_and_attached_count() {
         let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         let sandbox_id = SandboxId::new();
         let session_id = SessionId::new();
         let (host_side, harness_side) = duplex_pair();
+
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
 
         hub.accept_connection(sandbox_id, Some(session_id), host_side);
 
@@ -2086,6 +1333,8 @@ mod tests {
                 &mut hw,
                 &HarnessAttach {
                     session_id,
+                    sandbox_id,
+                    binding_epoch: 1,
                     harness_version: "test/0.1".into(),
                 },
             )
@@ -2103,10 +1352,6 @@ mod tests {
             wait_until(|| hub.attached_count() == 0).await,
             "connection map should clear on EOF",
         );
-        assert!(
-            hub.last_event_at(sandbox_id).is_none(),
-            "last_event_at cleared on disconnect",
-        );
     }
 
     #[tokio::test]
@@ -2116,10 +1361,10 @@ mod tests {
         // over a real TCP socket, observe an event arrive at the
         // collecting sink keyed on the *bound* sandbox_id.
         let (sink, collected) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         let session_id = SessionId::new();
         let sandbox_id = SandboxId::new();
-        hub.bind_session(session_id, sandbox_id);
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
 
         let (addr, _listener_task) =
             spawn_tcp_listener(hub.clone(), "127.0.0.1:0".parse().unwrap())
@@ -2133,6 +1378,8 @@ mod tests {
             &mut conn,
             &HarnessAttach {
                 session_id,
+                sandbox_id,
+                binding_epoch: 1,
                 harness_version: "tcp-test/0.1".into(),
             },
         )
@@ -2157,7 +1404,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_listener_rejects_attach_for_unbound_session() {
         let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
 
         let (addr, _listener_task) =
             spawn_tcp_listener(hub.clone(), "127.0.0.1:0".parse().unwrap())
@@ -2169,6 +1416,8 @@ mod tests {
             &mut conn,
             &HarnessAttach {
                 session_id: SessionId::new(), // not bound
+                sandbox_id: SandboxId::new(),
+                binding_epoch: 1,
                 harness_version: "tcp-test/0.1".into(),
             },
         )
@@ -2179,362 +1428,6 @@ mod tests {
     }
 
     // ADR 0016 §A.1.5a — eviction in-flight gate -----------------
-
-    fn noop_sink() -> EventSink {
-        Arc::new(|_, _, _| Box::new(Box::pin(async {})))
-    }
-
-    #[tokio::test]
-    async fn idle_sandboxes_skips_evictions_in_flight() {
-        // Attach a sandbox, mark its last_idle_at to a value past the
-        // soft TTL, then mark it as "eviction in flight". `idle_sandboxes`
-        // should NOT return it. Clearing the marker un-suppresses.
-        let hub = HarnessHub::new(noop_sink());
-        let sandbox_id = SandboxId::new();
-        let session_id = SessionId::new();
-        let (host_side, harness_side) = duplex_pair();
-        hub.accept_connection(sandbox_id, Some(session_id), host_side);
-        let _ack = drive_harness(harness_side, session_id, |_r, _w| async {}).await;
-
-        // Force the soft-idle bookkeeping past the TTL.
-        hub.inner
-            .last_idle_at
-            .lock()
-            .insert(sandbox_id, Utc::now() - chrono::Duration::seconds(120));
-
-        // Sanity: without the gate, this sandbox WOULD be returned.
-        let before = hub.idle_sandboxes(Duration::from_secs(30), Duration::from_secs(1800));
-        assert_eq!(before.len(), 1, "soft TTL should have fired");
-        assert_eq!(before[0].1, sandbox_id);
-
-        // Mark eviction in flight; same call now returns nothing.
-        hub.mark_eviction_inflight(sandbox_id);
-        let during = hub.idle_sandboxes(Duration::from_secs(30), Duration::from_secs(1800));
-        assert!(
-            during.is_empty(),
-            "eviction-in-flight should suppress the candidate; got {during:?}",
-        );
-
-        // Clear; sandbox re-appears as a candidate.
-        hub.clear_eviction_inflight(sandbox_id);
-        let after = hub.idle_sandboxes(Duration::from_secs(30), Duration::from_secs(1800));
-        assert_eq!(
-            after.len(),
-            1,
-            "clearing the marker should re-expose the candidate"
-        );
-    }
-
-    #[tokio::test]
-    async fn sweep_stale_evictions_reaps_old_entries() {
-        // Mark two sandboxes as in-flight, force one to be "old", run
-        // the sweep with a short max_age, assert only the old one is
-        // reaped and the still-fresh one is preserved.
-        let hub = HarnessHub::new(noop_sink());
-        let fresh = SandboxId::new();
-        let stale = SandboxId::new();
-        hub.mark_eviction_inflight(fresh);
-        hub.mark_eviction_inflight(stale);
-
-        // Backdate the stale entry's Instant. `Instant` doesn't have a
-        // public "set to past" API, but we can reach into the inner
-        // mutex to swap the value (the field is private; this is in-
-        // crate code so the test can access it).
-        {
-            let mut guard = hub.inner.eviction_inflight.lock();
-            let old = Instant::now()
-                .checked_sub(Duration::from_secs(300))
-                .unwrap_or_else(Instant::now);
-            guard.insert(stale, old);
-        }
-
-        let reaped = hub.sweep_stale_evictions(Duration::from_secs(180));
-        assert_eq!(reaped, vec![stale], "only the stale entry should be reaped");
-
-        // Fresh entry survives.
-        assert!(
-            hub.inner.eviction_inflight.lock().contains_key(&fresh),
-            "fresh entry must survive the sweep",
-        );
-        // Stale entry is gone.
-        assert!(
-            !hub.inner.eviction_inflight.lock().contains_key(&stale),
-            "stale entry must be removed",
-        );
-    }
-
-    #[test]
-    fn mark_eviction_inflight_is_idempotent() {
-        // Re-marking the same sandbox refreshes the Instant (used by
-        // the stale sweep to defer the deadline). Subsequent clears
-        // remove the single entry.
-        let hub = HarnessHub::new(noop_sink());
-        let sb = SandboxId::new();
-        hub.mark_eviction_inflight(sb);
-        let first = *hub.inner.eviction_inflight.lock().get(&sb).unwrap();
-        std::thread::sleep(Duration::from_millis(5));
-        hub.mark_eviction_inflight(sb);
-        let second = *hub.inner.eviction_inflight.lock().get(&sb).unwrap();
-        assert!(
-            second > first,
-            "re-marking must refresh the Instant (second={second:?} first={first:?})",
-        );
-        hub.clear_eviction_inflight(sb);
-        assert!(
-            !hub.inner.eviction_inflight.lock().contains_key(&sb),
-            "clear must remove the entry",
-        );
-    }
-
-    // Issue #219 — shell-pin keep-alive leak hardening --------------
-
-    /// Core regression for issue #219: a shell pin whose coord-side
-    /// renewer has died (no `release_shell`, no `renew_shell`) must be
-    /// reaped by the host's stale sweep so the sandbox falls back under
-    /// idle eviction — including the hard-TTL backstop. Without the fix,
-    /// `shell_attached` had no timestamp and no sweep, so the pin (and
-    /// the unconditional `continue` in `idle_sandboxes`) stuck forever.
-    #[tokio::test]
-    async fn stale_shell_pin_is_reaped_and_sandbox_becomes_evictable() {
-        let hub = HarnessHub::new(noop_sink());
-        let sandbox_id = SandboxId::new();
-        let session_id = SessionId::new();
-        let (host_side, harness_side) = duplex_pair();
-        hub.accept_connection(sandbox_id, Some(session_id), host_side);
-        let _ack = drive_harness(harness_side, session_id, |_r, _w| async {}).await;
-
-        // Push the sandbox past the soft TTL so it WOULD be a candidate.
-        hub.inner
-            .last_idle_at
-            .lock()
-            .insert(sandbox_id, Utc::now() - chrono::Duration::seconds(120));
-
-        // Open a shell: the pin now suppresses eviction.
-        hub.acquire_shell(sandbox_id);
-        let pinned = hub.idle_sandboxes(Duration::from_secs(30), Duration::from_secs(1800));
-        assert!(
-            pinned.is_empty(),
-            "an attached shell must suppress idle eviction; got {pinned:?}",
-        );
-
-        // Simulate the coord bridge dying: the pin stops being renewed.
-        // Backdate the stamp past the stale window (the count stays ≥1 —
-        // this is exactly the leaked state the bug produced).
-        {
-            let mut guard = hub.inner.shell_attached.lock();
-            let entry = guard.get_mut(&sandbox_id).expect("pin present");
-            entry.1 = Instant::now()
-                .checked_sub(SHELL_PIN_STALE_AGE + Duration::from_secs(60))
-                .unwrap_or_else(Instant::now);
-            assert!(entry.0 >= 1, "count must stay non-zero — the leak");
-        }
-
-        // The eviction tick's sweep reaps the un-renewed pin.
-        let reaped = hub.sweep_stale_shells(SHELL_PIN_STALE_AGE);
-        assert_eq!(reaped, vec![sandbox_id], "stale pin must be reaped");
-
-        // Sandbox is once again an idle-eviction candidate.
-        let after = hub.idle_sandboxes(Duration::from_secs(30), Duration::from_secs(1800));
-        assert_eq!(
-            after.len(),
-            1,
-            "after the stale sweep the sandbox must be evictable again; got {after:?}",
-        );
-        assert_eq!(after[0].1, sandbox_id);
-    }
-
-    /// A pin renewed within the window is NOT reaped — a live shell
-    /// session keeps its sandbox pinned across many sweep ticks.
-    #[test]
-    fn renewed_shell_pin_survives_the_sweep() {
-        let hub = HarnessHub::new(noop_sink());
-        let sandbox_id = SandboxId::new();
-        hub.acquire_shell(sandbox_id);
-
-        // Backdate near the edge, then renew — the renew must reset the
-        // clock so the immediately-following sweep keeps it.
-        {
-            let mut guard = hub.inner.shell_attached.lock();
-            let entry = guard.get_mut(&sandbox_id).unwrap();
-            entry.1 = Instant::now()
-                .checked_sub(SHELL_PIN_STALE_AGE + Duration::from_secs(10))
-                .unwrap_or_else(Instant::now);
-        }
-        hub.renew_shell(sandbox_id);
-
-        let reaped = hub.sweep_stale_shells(SHELL_PIN_STALE_AGE);
-        assert!(
-            reaped.is_empty(),
-            "a freshly-renewed pin must survive the sweep; reaped {reaped:?}",
-        );
-        assert!(
-            hub.inner.shell_attached.lock().contains_key(&sandbox_id),
-            "renewed pin must remain",
-        );
-    }
-
-    /// `renew_shell` must never resurrect a pin that was already
-    /// released/cleared — otherwise a late renewal RPC from a dying
-    /// bridge could re-pin a sandbox the host just freed.
-    #[test]
-    fn renew_shell_does_not_resurrect_a_released_pin() {
-        let hub = HarnessHub::new(noop_sink());
-        let sandbox_id = SandboxId::new();
-        hub.acquire_shell(sandbox_id);
-        hub.release_shell(sandbox_id);
-        assert!(
-            !hub.inner.shell_attached.lock().contains_key(&sandbox_id),
-            "release must clear the entry at count 0",
-        );
-        hub.renew_shell(sandbox_id);
-        assert!(
-            !hub.inner.shell_attached.lock().contains_key(&sandbox_id),
-            "renew on a missing pin must be a no-op, not a resurrection",
-        );
-    }
-
-    /// Multi-tab refcount semantics are preserved across the new
-    /// `(count, Instant)` representation: two acquires need two releases
-    /// before the pin clears.
-    #[test]
-    fn shell_pin_refcount_survives_the_instant_pairing() {
-        let hub = HarnessHub::new(noop_sink());
-        let sandbox_id = SandboxId::new();
-        hub.acquire_shell(sandbox_id);
-        hub.acquire_shell(sandbox_id);
-        assert_eq!(
-            hub.inner.shell_attached.lock().get(&sandbox_id).unwrap().0,
-            2,
-            "two tabs → count 2",
-        );
-        hub.release_shell(sandbox_id);
-        assert!(
-            hub.inner.shell_attached.lock().contains_key(&sandbox_id),
-            "first release must NOT clear while a second tab is open",
-        );
-        hub.release_shell(sandbox_id);
-        assert!(
-            !hub.inner.shell_attached.lock().contains_key(&sandbox_id),
-            "second release clears the pin",
-        );
-    }
-
-    /// `clear_shell` (the destroy-path cleanup) empties the pin
-    /// regardless of refcount — once the sandbox is gone the pin is
-    /// meaningless and must not leak.
-    #[test]
-    fn clear_shell_empties_pin_regardless_of_count() {
-        let hub = HarnessHub::new(noop_sink());
-        let sandbox_id = SandboxId::new();
-        hub.acquire_shell(sandbox_id);
-        hub.acquire_shell(sandbox_id);
-        hub.clear_shell(sandbox_id);
-        assert!(
-            !hub.inner.shell_attached.lock().contains_key(&sandbox_id),
-            "destroy-time clear must empty the map even with count > 1",
-        );
-        // Idempotent on an already-clear entry.
-        hub.clear_shell(sandbox_id);
-    }
-
-    /// Regression for issue #217: ABBA lock-order inversion between
-    /// `send_prompt` (held `connections` then acquired `last_idle_at`)
-    /// and `idle_sandboxes` (acquires `last_idle_at` then `connections`).
-    ///
-    /// These two run concurrently by design — `send_prompt` on every
-    /// prompt RPC, `idle_sandboxes` on the eviction tick. Under the
-    /// buggy ordering one interleaving wedges both `parking_lot::Mutex`es
-    /// forever (no detection, no poisoning), stalling the entire harness
-    /// plane while the host still looks healthy to coord.
-    ///
-    /// The test hammers both paths from dedicated OS threads against an
-    /// attached sandbox, under a watchdog. With the bug present it
-    /// deadlocks and the watchdog trips; with the fix (`send_prompt`
-    /// drops the `connections` guard before touching `last_idle_at`) the
-    /// loops complete well within the budget.
-    ///
-    /// Run on a multi-thread runtime so the racing tasks land on
-    /// distinct worker threads (a current-thread runtime would serialize
-    /// them and never expose the inversion).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn send_prompt_and_idle_sandboxes_do_not_deadlock() {
-        let hub = HarnessHub::new(noop_sink());
-        let sandbox_id = SandboxId::new();
-        let session_id = SessionId::new();
-        let (host_side, harness_side) = duplex_pair();
-
-        hub.accept_connection(sandbox_id, Some(session_id), host_side);
-
-        // Keep the harness side alive (drain frames) for the whole test
-        // so the connection stays in the `connections` map — that's what
-        // makes `send_prompt`'s lookup take the contended path. Without a
-        // reader the bounded writer channel could fill and change timing.
-        let harness_task = tokio::spawn(async move {
-            let (mut r, mut w) = tokio::io::split(harness_side);
-            write_msg(
-                &mut w,
-                &HarnessAttach {
-                    session_id,
-                    harness_version: "test/0.1".into(),
-                },
-            )
-            .await
-            .expect("attach");
-            let _ack: HarnessAttachAck = read_msg(&mut r).await.expect("ack");
-            // Drain inbound prompt frames until the host closes the link.
-            while read_msg::<_, HarnessFrame>(&mut r).await.is_ok() {}
-        });
-
-        // Wait for the connection to be established before racing.
-        assert!(
-            wait_until(|| hub.attached_count() == 1).await,
-            "harness should attach before the stress loop",
-        );
-
-        const ITERS: usize = 20_000;
-        let hub_idle = hub.clone();
-        // `idle_sandboxes` loop on its own OS thread (mirrors the
-        // eviction tick). Spawn-blocking so it runs on a blocking
-        // thread, not a tokio worker — a wedge here must not be able to
-        // starve the watchdog.
-        let idle_loop = tokio::task::spawn_blocking(move || {
-            for _ in 0..ITERS {
-                // Tiny TTLs so the lock body does its full work each call.
-                let _ = hub_idle.idle_sandboxes(
-                    std::time::Duration::from_millis(0),
-                    std::time::Duration::from_millis(0),
-                );
-            }
-        });
-
-        // `send_prompt` loop — the connection is attached, so each call
-        // hits the `connections`-then-`last_idle_at` critical section.
-        let hub_prompt = hub.clone();
-        let prompt_loop = tokio::spawn(async move {
-            for i in 0..ITERS {
-                // Ignore the result: WriterClosed at teardown is fine —
-                // we only care that the call returns at all (no wedge).
-                let _ = hub_prompt
-                    .send_prompt(sandbox_id, format!("pid{i}"), format!("p{i}"))
-                    .await;
-            }
-        });
-
-        // Watchdog: on the buggy code the two loops deadlock and neither
-        // join future ever resolves. A generous budget keeps a slow CI
-        // runner from flaking while still catching a real wedge.
-        let work = async {
-            let _ = idle_loop.await;
-            let _ = prompt_loop.await;
-        };
-        tokio::time::timeout(Duration::from_secs(30), work)
-            .await
-            .expect("send_prompt/idle_sandboxes deadlocked (issue #217 ABBA inversion)");
-
-        // Tear down the harness reader.
-        harness_task.abort();
-        let _ = harness_task.await;
-    }
 
     /// Regression for issue #218: a stale connection's teardown must
     /// never remove the registration a newer reconnect installed under
@@ -2559,11 +1452,12 @@ mod tests {
     #[tokio::test]
     async fn stale_teardown_does_not_evict_replacement_connection() {
         let (sink, _) = collecting_sink();
-        let hub = HarnessHub::new(sink);
+        let hub = test_hub(sink);
         let sandbox_id = SandboxId::new();
         let session_id = SessionId::new();
 
         // --- Connection A: attach and register. ---
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
         let (host_a, harness_a) = duplex_pair();
         hub.accept_connection(sandbox_id, Some(session_id), host_a);
         let (mut a_r, mut a_w) = tokio::io::split(harness_a);
@@ -2571,6 +1465,8 @@ mod tests {
             &mut a_w,
             &HarnessAttach {
                 session_id,
+                sandbox_id,
+                binding_epoch: 1,
                 harness_version: "test-A/0.1".into(),
             },
         )
@@ -2600,6 +1496,8 @@ mod tests {
             &mut b_w,
             &HarnessAttach {
                 session_id,
+                sandbox_id,
+                binding_epoch: 1,
                 harness_version: "test-B/0.1".into(),
             },
         )

@@ -51,9 +51,18 @@ impl LocalHostClient {
     /// where the harness path isn't exercised). Builds a `HarnessHub`
     /// with a no-op `EventSink` so the trait surface is satisfied.
     pub fn with_noop_hub(sandbox: Arc<dyn SandboxBackend>) -> Self {
-        let hub = Arc::new(HarnessHub::new(crate::harness::event_sink_to(
-            |_, _, _| async {},
-        )));
+        // Ephemeral bindings dir: callers of this constructor never
+        // exercise the attach path (tests / in-process glue), and an
+        // ephemeral dir keeps the ADR 0073 validation code identical
+        // rather than special-cased.
+        let dir =
+            std::env::temp_dir().join(format!("engram-noop-hub-bindings-{}", uuid::Uuid::new_v4()));
+        let bindings = crate::bindings::BindingStore::open(dir)
+            .expect("open ephemeral binding store for noop hub");
+        let hub = Arc::new(HarnessHub::new(
+            crate::harness::event_sink_to(|_, _, _| async {}),
+            bindings,
+        ));
         Self::new(sandbox, hub)
     }
 
@@ -77,19 +86,21 @@ impl HostClient for LocalHostClient {
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
-        // Issue #219: drop any lingering shell pin for this sandbox.
-        // The pin's release is normally driven by the coord WS bridge,
-        // but once the sandbox is gone that bridge can never deliver
-        // its `ReleaseShell` — leaving the entry to leak forever. Clear
-        // it here (the only host-side layer that both runs on the
-        // production destroy path and holds the hub) so the map can't
-        // accumulate stale entries over the host's lifetime.
-        self.harness_hub.clear_shell(id);
+        // ADR 0073 phase 4: no shell pin to clear — the pin is a PG
+        // column stamped by the coordinator's relay and lapses by
+        // itself (the issue #219 leak class is gone with the refcount).
         self.sandbox.destroy(id).await
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         self.sandbox.list().await
+    }
+
+    async fn probe_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        self.sandbox.probe_sandbox(id).await
     }
 
     async fn exec_stream(
@@ -210,9 +221,10 @@ impl HostClient for LocalHostClient {
         spec: SandboxSpec,
         warm: Option<WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.sandbox
-            .build_base_snapshot(spec, warm, capture_env)
+            .build_base_snapshot(spec, warm, capture_env, progress)
             .await
     }
 
@@ -233,6 +245,27 @@ impl HostClient for LocalHostClient {
         agent: AgentSpec,
         policy: SessionEgressPolicy,
     ) -> Result<(), SandboxError> {
+        // ADR 0073: persist the binding record BEFORE the harness can
+        // dial (the spawn below), so the first attach validates instead
+        // of bouncing UnknownBinding. Monotonic: a stale caller's bind
+        // is refused, which is the fence working as designed.
+        if agent.binding_epoch > 0 && !agent.argv.is_empty() {
+            if let Err(e) =
+                self.harness_hub
+                    .bind_session(policy.session_id, id, agent.binding_epoch)
+            {
+                tracing::warn!(
+                    session_id = %policy.session_id,
+                    sandbox_id = %id,
+                    binding_epoch = agent.binding_epoch,
+                    error = %e,
+                    "start_agent bind refused (stale epoch) — not spawning a superseded harness",
+                );
+                return Err(SandboxError::InvalidSpec(
+                    "binding superseded by a newer generation".into(),
+                ));
+            }
+        }
         // ADR 0013 atomicity: apply the policy *first* so the egress
         // proxy registry is live before the agent process spawns and
         // tries to dial out. Both ops touch the inner SandboxBackend
@@ -252,8 +285,16 @@ impl HostClient for LocalHostClient {
             .map(|ep| ep.egress_identity)
     }
 
-    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
-        self.harness_hub.bind_session(session_id, sandbox_id);
+    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId, binding_epoch: u64) {
+        if let Err(e) = self
+            .harness_hub
+            .bind_session(session_id, sandbox_id, binding_epoch)
+        {
+            // A refused bind means a NEWER generation already owns the
+            // record (monotonicity) — the caller is stale, and the
+            // correct outcome is exactly "this bind does not take".
+            tracing::warn!(%session_id, %sandbox_id, binding_epoch, error = %e, "bind_session refused");
+        }
     }
 
     async fn unbind_session(&self, session_id: SessionId) {
@@ -314,13 +355,6 @@ impl HostClient for LocalHostClient {
             .map_err(harness_err_to_sandbox)
     }
 
-    async fn rehandshake(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        self.harness_hub
-            .rehandshake(sandbox_id)
-            .await
-            .map_err(harness_err_to_sandbox)
-    }
-
     // ADR 0045 Phase F: freeze/unfreeze the microVM in place — pure
     // delegation to the inner backend (no harness involvement).
     async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
@@ -329,21 +363,6 @@ impl HostClient for LocalHostClient {
 
     async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.sandbox.resume(sandbox_id).await
-    }
-
-    async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        self.harness_hub.acquire_shell(sandbox_id);
-        Ok(())
-    }
-
-    async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        self.harness_hub.release_shell(sandbox_id);
-        Ok(())
-    }
-
-    async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        self.harness_hub.renew_shell(sandbox_id);
-        Ok(())
     }
 
     async fn proxy_shell(

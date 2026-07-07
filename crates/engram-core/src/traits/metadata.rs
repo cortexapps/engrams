@@ -35,25 +35,55 @@ pub enum DisableEnabledImageOutcome {
     Blocked(Vec<(SessionId, String)>),
 }
 
-/// Track A: an `Active` session the desync watchdog flagged as wedged —
-/// the harness event stream desynced from the run state machine, leaving
-/// the session stuck without reaching a clean idle resting state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DesyncedSession {
+/// Issue #535 (b): the durable write-set for a new session — one logical
+/// fact ("this session exists with these secrets/capabilities/policy/
+/// harness/skills") passed to [`MetadataStore::reserve_and_persist_create`]
+/// to commit in a single transaction, before any host RPC.
+#[derive(Clone, Debug)]
+pub struct SessionCreateWriteSet {
     pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
-    /// The kind of the latest (non-rewound) event the session is stuck on.
-    pub latest_kind: String,
-    /// Which signature tripped: `"orphan_after_close"` (a run-scoped event
-    /// with no open run — the `bf3dbbcb` shape) or `"stuck_open_run"` (a
-    /// `run_started` that produced zero events since).
-    pub signature: String,
-    /// The session's `last_event_at` (COALESCEd to `created_at`). The
-    /// watchdog escalates from re-handshake to eviction once this ages past
-    /// the escalate TTL: a successful re-handshake re-emits `Idle`, bumping
-    /// this and dropping the session out of the flagged set, so a still-old
-    /// value means the nudges aren't taking.
+    pub spec: SessionSpec,
+    pub mem_budget_mib: i64,
+    pub cpu_budget_vcpus: i32,
+    /// KEK-sealed BEFORE this call — async crypto has no place inside a DB
+    /// transaction. `None` when there are no per-request secret overrides.
+    pub sealed_secrets: Option<SessionSecrets>,
+    /// ADR 0056: profile-granted capabilities, already parsed + validated.
+    pub capabilities: Vec<Capability>,
+    /// ADR 0056 (B′): the compiled integration policy, pre-serialized to
+    /// JSON (mirrors `bind_session_integration_policy`'s wire shape).
+    pub integration_policy_json: Option<String>,
+    /// ADR 0062: the selected harness catalog key.
+    pub selected_harness: Option<String>,
+    /// ADR 0055 TODO(P1-D) fix: the profile-selected skill names, persisted
+    /// so a queued create's boot re-prepare (`prepare_from_row`) can
+    /// reconstruct the selection instead of silently dropping it.
+    pub selected_skills: Vec<String>,
+}
+
+/// Outcome of [`MetadataStore::reserve_and_persist_create`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateDisposition {
+    /// A candidate host fit both budgets; the row is `pending` on this
+    /// host, ready for `boot_on_reserved_host`.
+    Placed(HostId),
+    /// No candidate fit; the row is `queued` for the scanner, carrying the
+    /// identical satellites its later re-prepare will find.
+    Queued,
+}
+
+/// ADR 0073 phase 4: one idle-scan candidate row (Active + bound).
+#[derive(Clone, Debug)]
+pub struct IdleScanCandidate {
+    pub session_id: SessionId,
+    pub sandbox_id: Option<crate::SandboxId>,
+    pub host_id: Option<crate::HostId>,
+    /// Newest session_event time, falling back to the session's
+    /// created_at when no events exist yet.
     pub last_event_at: chrono::DateTime<chrono::Utc>,
+    /// Kind of the newest event (`None` = no events yet).
+    pub last_event_kind: Option<String>,
+    pub shell_pinned_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Authoritative source of truth. Postgres-backed in v1; trait exists so
@@ -101,20 +131,30 @@ pub trait MetadataStore: Send + Sync {
     /// reason we don't do that today: SessionSpec doesn't carry
     /// vm_spec / harness resolution context, and capturing it
     /// requires schema work that's bigger than the v1 fix.
-    async fn create_session_created(
+    ///
+    /// Issue #535 (c): flip an already-`pending` row (committed by
+    /// [`MetadataStore::reserve_and_persist_create`] before any host RPC
+    /// ran) to `Created`, binding `sandbox_id`. Replaces the old
+    /// `create_session_created`'s INSERT-or-UPDATE upsert — the row is now
+    /// GUARANTEED to already exist, so this is a single `UPDATE`. The
+    /// UPDATE is still guarded on `status = 'pending'`: a delete or a
+    /// stale-pending requeue can race the in-flight restore RPC that
+    /// precedes this call, so "exists" is not "still pending". Returns
+    /// [`MetaError::NotFound`] if the row is gone or no longer `pending`,
+    /// so the caller's teardown arm runs instead of silently binding
+    /// `sandbox_id` onto an inconsistent row.
+    async fn transition_session_created(
         &self,
         session_id: SessionId,
-        spec: SessionSpec,
-        host_id: HostId,
         sandbox_id: SandboxId,
     ) -> Result<(), MetaError>;
 
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
 
     /// Every live (non-terminal, non-`host_lost`) session: `pending`,
-    /// `created`, `guest_ready`, `active`, `idle`, `evacuating`,
-    /// `evicting`. This is the rehydration source for the coord's
-    /// in-memory routing maps (`repopulate_routing`) — every state
+    /// `created`, `active`, `idle`, `evacuating`, `evicting`. This is
+    /// the rehydration source for the coord's in-memory routing maps
+    /// (`repopulate_routing`) — every state
     /// that can carry a live `sandbox_id` binding (`evicting`
     /// included: the sandbox stays bound while the eviction pipeline
     /// runs) MUST be listed here, or a coord restart strands the
@@ -132,28 +172,51 @@ pub trait MetadataStore: Send + Sync {
         Ok(0)
     }
 
-    /// ADR 0046/0048: atomically pick a host from `candidates` (ranked — the
-    /// affinity/readiness order) and reserve BOTH `mem_budget_mib` and
-    /// `cpu_budget_vcpus` on it, returning the chosen host, or `None` when no
-    /// candidate fits both dimensions (RAM: `allocatable − reserved`; CPU:
-    /// `total_vcpus × overcommit − reserved`). The Postgres impl runs under
-    /// `SELECT … FROM hosts … FOR UPDATE` so concurrent placers (any
-    /// coordinator replica) serialize and a burst can't overcommit; it inserts
-    /// a `pending`, sandbox-less session row as the reservation — later
-    /// finalized by `create_session_created` (an upsert) after boot, or
-    /// released by `delete_pending_session` on boot failure. Default impl (mock
-    /// stores) just returns the first candidate, no capacity check or row insert.
-    async fn reserve_placement(
+    /// Issue #535 (b): the ENTIRE session write-set — one logical fact
+    /// ("this session exists with these secrets/capabilities/policy/
+    /// harness/skills") — committed in ONE transaction, before any host RPC.
+    /// Subsumes the old `reserve_placement` (ADR 0046/0048 atomic pick-a-
+    /// host-from-`candidates` + reserve both `mem_budget_mib` and
+    /// `cpu_budget_vcpus`, RAM: `allocatable − reserved`, CPU: `total_vcpus
+    /// × overcommit − reserved`) AND `enqueue_session_create` (the no-
+    /// capacity fallback) AND the satellite writes both the boot path and
+    /// the enqueue path used to make SEPARATELY, after the row already
+    /// existed, each individually warn-and-continue: `persist_session_
+    /// secrets`, `bind_session_capabilities`, `bind_session_integration_
+    /// policy`, `set_session_harness`.
+    ///
+    /// Returns [`CreateDisposition::Placed`] (a candidate fit — the row is
+    /// `pending` on that host, ready for `boot_on_reserved_host`) or
+    /// [`CreateDisposition::Queued`] (none fit — the row is `queued` for the
+    /// scanner, carrying the identical satellites so its later re-prepare
+    /// finds them). The FK-ordering bug class (minting a broker token or
+    /// binding a capability before the row exists silently no-ops — the
+    /// ADR 0051 forge-token regression) is dead by construction: nothing
+    /// downstream of this call can observe a partially-written session.
+    ///
+    /// The Postgres impl extends `reserve_placement`'s `FOR UPDATE`
+    /// transaction (concurrent placers, any replica, serialize on the
+    /// candidate host rows) to also insert the satellite rows in the SAME
+    /// transaction. The KEK seal (async crypto) and any external credential
+    /// mint are NOT this call's concern — they happen before
+    /// (`ws.sealed_secrets` arrives pre-sealed) or after (broker-token mint,
+    /// deferred to the boot pipeline where the FK is already satisfiable).
+    ///
+    /// No default: unlike the old `reserve_placement`'s "just pick a
+    /// candidate, don't reserve anything" fallback, this call's job now
+    /// includes the row insert — there's no harmless no-op shape for that
+    /// (mirrors why the old `create_session_created` it partly replaces was
+    /// also required). Every `MetadataStore` impl must decide honestly: a
+    /// mock that never exercises the create path can `unreachable!()`, like
+    /// it already does for other unexercised trait surface; one that does
+    /// (the coordinator's HTTP/gRPC integration-test mocks) implements the
+    /// real in-memory equivalent.
+    async fn reserve_and_persist_create(
         &self,
-        _session_id: SessionId,
-        _spec: &SessionSpec,
-        _mem_budget_mib: i64,
-        _cpu_budget_vcpus: i32,
+        ws: SessionCreateWriteSet,
         candidates: &[HostId],
-        _affinity_len: usize,
-    ) -> Result<Option<HostId>, MetaError> {
-        Ok(candidates.first().copied())
-    }
+        affinity_len: usize,
+    ) -> Result<CreateDisposition, MetaError>;
 
     /// ADR 0046: release a reservation whose boot failed, by deleting its
     /// `pending`, sandbox-less row. Default impl (mocks) is a no-op.
@@ -162,21 +225,6 @@ pub trait MetadataStore: Send + Sync {
     }
 
     // ---- ADR 0048: session queue ----
-
-    /// Insert a create that found no capacity as a `queued` row (host_id
-    /// NULL, the budgets the scanner will reserve with, `queued_at` =
-    /// NOW(), `queue_origin = 'create'`, the initial prompt). The queue
-    /// scanner re-attempts placement FIFO. Default impl (mocks) no-op.
-    async fn enqueue_session_create(
-        &self,
-        _id: SessionId,
-        _spec: &SessionSpec,
-        _mem_budget_mib: i64,
-        _cpu_budget_vcpus: i32,
-        _prompt: Option<&str>,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
 
     /// Park an `Idle` session that hit no capacity on resume back in the
     /// queue (`Idle → queued`, `queue_origin = 'resume'`). Default no-op.
@@ -192,7 +240,7 @@ pub trait MetadataStore: Send + Sync {
 
     /// Atomically re-attempt placement for a `queued` session: pick a
     /// host from `candidates` (same best-fit 2D logic as
-    /// `reserve_placement`) and, if one fits, flip the row
+    /// `reserve_and_persist_create`'s placement leg) and, if one fits, flip the row
     /// `queued → pending` with the host bound + `last_active_at` bumped,
     /// returning the host. `None` = nothing fit (stay queued) or the row
     /// already left `queued` (lost a race). Default impl (mocks): place
@@ -338,7 +386,7 @@ pub trait MetadataStore: Send + Sync {
 
     /// ADR 0047/0048: per-host reserved budget (Σ `mem_budget_mib` AND
     /// Σ `cpu_budget_vcpus` over the memory-reserving session states) —
-    /// the read-side twin of `reserve_placement`'s aggregate, for the
+    /// the read-side twin of `reserve_and_persist_create`'s aggregate, for the
     /// capacity-soft resume/evac picker and the fleet view. Default impl
     /// (mocks): empty map (no reservations).
     async fn per_host_reserved(
@@ -403,8 +451,8 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0048: deregister a drained host immediately — its `hosts` row
     /// is deleted so the operator's scale-down doesn't wait ~30-40s for
     /// the dead-host detector. REFUSES (returns the bound count) if any
-    /// session is still bound (`pending`/`created`/`guest_ready`/`active`/
-    /// `evacuating`/`evicting`); idempotent (a missing row = `Ok(Deleted)`).
+    /// session is still bound (`pending`/`created`/`active`/`evacuating`/
+    /// `evicting`); idempotent (a missing row = `Ok(Deleted)`).
     /// Default impl (mocks): `Deleted`.
     async fn delete_host(&self, _id: HostId) -> Result<DeleteHostOutcome, MetaError> {
         Ok(DeleteHostOutcome::Deleted)
@@ -522,6 +570,155 @@ pub trait MetadataStore: Send + Sync {
         id: SessionId,
         sandbox_id: Option<SandboxId>,
     ) -> Result<(), MetaError>;
+
+    /// ADR 0073: mint the next binding epoch for `id` — one atomic
+    /// `UPDATE … SET binding_epoch = binding_epoch + 1 … RETURNING`.
+    /// Called by the coordinator at the moment it commits to binding
+    /// the session to a NEW sandbox for a fresh-spawn flow (create,
+    /// idle resume, cold recovery, evac). Live moves do NOT mint — the
+    /// harness process survives a teleport and its generation is
+    /// unchanged (see `current_binding_epoch`).
+    ///
+    /// Default (mock stores): a constant `1` — mocks get "no fencing",
+    /// which is the pre-0067 behavior; the Postgres store overrides
+    /// with the real per-session counter. Same degradation pattern as
+    /// the guarded-CAS defaults above.
+    async fn mint_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
+        let _ = id;
+        Ok(1)
+    }
+
+    /// ADR 0073: the session's current binding epoch, without minting.
+    /// Read by flows where the harness process may SURVIVE the
+    /// transition (live migration; in-place reattach on the same
+    /// sandbox) so the spec they build matches the standing record.
+    ///
+    /// Default (mock stores): constant `1`, paired with
+    /// [`Self::mint_binding_epoch`]'s default.
+    async fn current_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
+        let _ = id;
+        Ok(1)
+    }
+
+    /// ADR 0073 phase 4: one row per Active+bound session for the idle
+    /// scan — newest event (kind + time), host, and the shell pin. The
+    /// detector classifies soft/hard client-side so the TTL policy
+    /// lives in one place.
+    async fn list_idle_scan_candidates(
+        &self,
+        soft_ttl_secs: i64,
+        hard_ttl_secs: i64,
+    ) -> Result<Vec<IdleScanCandidate>, MetaError> {
+        let _ = (soft_ttl_secs, hard_ttl_secs);
+        Ok(Vec::new())
+    }
+
+    /// ADR 0074: stamp the parking-ladder rung (and its entry time;
+    /// `None` clears both). Bookkeeping only — the FSM `status` stays
+    /// authoritative for lifecycle legality.
+    async fn set_session_park_rung(
+        &self,
+        id: SessionId,
+        rung: i16,
+        parked_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), MetaError> {
+        let _ = (id, rung, parked_at);
+        Ok(())
+    }
+
+    /// ADR 0073 phase 4: stamp/renew the shell keep-alive pin. The WS
+    /// bridge calls this on its keepalive; passing a past instant (or
+    /// letting it lapse) un-pins.
+    async fn stamp_shell_pin(
+        &self,
+        id: SessionId,
+        pinned_until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), MetaError> {
+        let _ = (id, pinned_until);
+        Ok(())
+    }
+
+    /// ADR 0073 phase 2: durably enqueue a command for delivery.
+    /// Idempotent on `prompt_id` (INSERT … ON CONFLICT DO NOTHING) so a
+    /// caller retry never duplicates a row. The Postgres impl also
+    /// fires `pg_notify('session_outbox', session_id)` in the same
+    /// round trip to wake every replica's delivery driver.
+    ///
+    /// Default (mock stores): drops the row — mocks get pre-0067
+    /// fire-and-forget delivery semantics; tests that assert outbox
+    /// behavior use a store that overrides these.
+    async fn outbox_enqueue(&self, row: &crate::types::outbox::OutboxRow) -> Result<(), MetaError> {
+        let _ = row;
+        Ok(())
+    }
+
+    /// Sessions with at least one due, un-acked row (`acked_at IS NULL
+    /// AND not_before <= now()`). The delivery driver fans out from
+    /// this set. Default (mocks): empty.
+    async fn outbox_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// The OLDEST due, un-acked row for a session — per-session
+    /// delivery order is row order (created_at). Default (mocks): none.
+    async fn outbox_next_due(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<crate::types::outbox::OutboxRow>, MetaError> {
+        let _ = session_id;
+        Ok(None)
+    }
+
+    /// Record a relay handoff: stamp `delivered_at`, bump `attempts`,
+    /// and push `not_before` to `now() + ack_timeout` so the row
+    /// re-becomes due by itself if the confirming event never lands.
+    async fn outbox_mark_delivered(
+        &self,
+        prompt_id: &str,
+        ack_timeout: std::time::Duration,
+    ) -> Result<(), MetaError> {
+        let _ = (prompt_id, ack_timeout);
+        Ok(())
+    }
+
+    /// Push a row's `not_before` out (delivery failed; retry later).
+    async fn outbox_defer(
+        &self,
+        prompt_id: &str,
+        delay: std::time::Duration,
+    ) -> Result<(), MetaError> {
+        let _ = (prompt_id, delay);
+        Ok(())
+    }
+
+    /// Terminal ack: the confirming harness event was ingested.
+    /// Returns whether a row was newly acked (false = unknown id or
+    /// already acked — both fine; acks are at-least-once too).
+    async fn outbox_ack(&self, prompt_id: &str) -> Result<bool, MetaError> {
+        let _ = prompt_id;
+        Ok(false)
+    }
+
+    /// Phase-1b type-ahead edit for a row the relay has NOT yet handed
+    /// off (`delivered_at IS NULL AND acked_at IS NULL`): swap the
+    /// prompt text in place. Returns false when no such row exists
+    /// (the prompt already reached the harness queue — edit it there).
+    async fn outbox_update_prompt_text(
+        &self,
+        prompt_id: &str,
+        text: &str,
+    ) -> Result<bool, MetaError> {
+        let _ = (prompt_id, text);
+        Ok(false)
+    }
+
+    /// Phase-1b dequeue for an undelivered row: delete it. Returns
+    /// false when the row was already delivered/acked (dequeue via the
+    /// harness queue instead).
+    async fn outbox_delete_undelivered(&self, prompt_id: &str) -> Result<bool, MetaError> {
+        let _ = prompt_id;
+        Ok(false)
+    }
 
     /// ADR 0045 C2: the `Committing` persist — rebind a session's host
     /// AND sandbox in one step. The ownership oracle
@@ -691,6 +888,26 @@ pub trait MetadataStore: Send + Sync {
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError>;
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
 
+    /// ADR 0071: `hosts.capabilities.fc_snapshot_version` for one host —
+    /// the value the eviction pipeline and the checkpoint-advert
+    /// reconcile stamp onto a freshly-recorded `snapshots` row so
+    /// placement can later pair a restore against the exact FC
+    /// snapshot-data-format version that captured it. Default derives
+    /// from `list_active_hosts()` (an O(active hosts) scan is fine for
+    /// a per-capture call, which already round-trips several times);
+    /// `None` when the host isn't found or hasn't reported a version.
+    async fn fc_snapshot_version_for_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Option<String>, MetaError> {
+        Ok(self
+            .list_active_hosts()
+            .await?
+            .into_iter()
+            .find(|h| h.id == host_id)
+            .and_then(|h| h.capabilities.fc_snapshot_version))
+    }
+
     /// Record a heartbeat from `host_id`: bump `last_heartbeat_at` to
     /// NOW(), set the host-reported `status`, and persist the full
     /// [`HostHeartbeat`] payload — capacity, utilization, and (ADR
@@ -751,7 +968,13 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError>;
 
     // ---- snapshots ----
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError>;
+    /// Idempotent upsert (`ON CONFLICT (id) DO UPDATE`) keyed by
+    /// `snap.id`. Returns `true` iff this call INSERTed a fresh row,
+    /// `false` on a re-record of an existing one — issue #529: the
+    /// heartbeat reconcile uses this to emit `SnapshotTaken` exactly
+    /// once, on the row's first landing, regardless of which coord (if
+    /// any) survived the original capture.
+    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError>;
     async fn list_snapshots_for_session(
         &self,
         sid: SessionId,
@@ -956,6 +1179,33 @@ pub trait MetadataStore: Send + Sync {
         _events_cursor: i64,
     ) -> Result<crate::types::event::RewindSummary, MetaError> {
         Ok(crate::types::event::RewindSummary::default())
+    }
+
+    /// Issue #527 Phase 1: resolve the prompt→run-start latency for a given
+    /// `prompt_id` — the coordinator-authoritative "the user asked at time
+    /// T" receipt's age, written as the first PG side-effect of
+    /// `send_prompt_core` (before auto-resume). Used by the harness-event
+    /// sink to record `engram_prompt_to_run_started_seconds` when the
+    /// matching `HarnessRunStarted{prompt_id}` lands. Returns `Ok(None)`
+    /// when no receipt exists — the env-seeded initial prompt carries no
+    /// `prompt_id` and never gets one, so this is an expected, non-error
+    /// case the caller skips silently rather than treating as a bug.
+    ///
+    /// PR #556 review finding #1: the elapsed seconds are computed
+    /// PG-side (`NOW() - created_at`, one clock) rather than by handing
+    /// the receipt's `created_at` back for the caller to diff against a
+    /// coordinator-process `Utc::now()` — mixing those two clocks biases
+    /// (or, under skew, silently drops) exactly the samples this metric
+    /// exists to capture.
+    ///
+    /// Default `Ok(None)` so mocks without an event log are a clean no-op
+    /// (they simply never emit the derived histogram).
+    async fn prompt_received_seconds_ago(
+        &self,
+        _session_id: SessionId,
+        _prompt_id: &str,
+    ) -> Result<Option<f64>, MetaError> {
+        Ok(None)
     }
 
     // ---- file artifacts (ADR 0026) ----
@@ -1174,6 +1424,28 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// Issue #539: persist one `CaptureProgress` event from the streaming
+    /// `BuildBaseSnapshot` RPC onto the job row — the live capture-phase
+    /// counterpart to [`Self::update_enable_job_progress`] (which only
+    /// covers the materialize step). ALSO renews the claim
+    /// (`claimed_at = NOW()`), which is what lets `enable_scanner` delete
+    /// its blind capture-lease-renewal ticker: the host's >=30s keepalive
+    /// is well under the 300s lease, and a transport death stops renewals
+    /// exactly when a peer should legitimately re-claim.
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    async fn update_enable_job_capture_progress(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        progress: &crate::types::CaptureProgress,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant, progress);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
     /// Move the job's state forward (also renews the claim, clears
     /// `error` on non-failed targets, and releases the claim on
     /// terminal states).
@@ -1237,6 +1509,65 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    // ---- ADR 0036 amendment: fleet chunk prestage (issue #538) ----
+    //
+    // A fourth, non-terminal enable-job stage between `capturing` and
+    // `ready`: the scanner advertises the freshly-captured base snapshot
+    // as a `prestage_images` heartbeat-ack entry and waits for every
+    // eligible (`stages_images`) host to report the digest in
+    // `ready_images` before the `enabled_images` upsert makes it visible
+    // to session-create. See `docs/adr/0036-*.md`'s "prestage stage
+    // (interim)" amendment.
+
+    /// Stamp the wire-shape prestage ref (a JSON-encoded
+    /// `engram_protocol::heartbeat::EnabledImageRef` — this trait can't
+    /// depend on the protocol crate, so the caller serializes it) and flip
+    /// the job to `Prestaging` in ONE fenced write (renews the claim, same
+    /// as `set_enable_job_state`).
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    /// Returns [`MetaError::Conflict`] when the lease has moved on.
+    async fn begin_enable_job_prestage(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        prestage_ref: serde_json::Value,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant, prestage_ref);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Record the per-host prestage outcome map (`{"<host-uuid>":
+    /// {"outcome": "staged"|"timed_out"|"unschedulable", "waited_ms": u64}}`),
+    /// written once at the end of the prestage wait — the audit /
+    /// dashboard record.
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    /// Returns [`MetaError::Conflict`] when the lease has moved on.
+    async fn set_enable_job_prestage_hosts(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        outcomes: serde_json::Value,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant, outcomes);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// The `prestage_ref` of every job currently in `prestaging`, raw JSON
+    /// (the coordinator's heartbeat-ack builder deserializes each into
+    /// `engram_protocol::heartbeat::EnabledImageRef` — this trait doesn't
+    /// depend on the protocol crate, matching the existing dependency
+    /// direction rather than laundering a stringly type). Read on every
+    /// heartbeat ack; best-effort on the caller's side.
+    async fn list_prestaging_refs(&self) -> Result<Vec<serde_json::Value>, MetaError> {
+        Ok(Vec::new())
+    }
+
     // ---- session secrets ----
     //
     // Per-request `secrets` overrides supplied at session-create,
@@ -1244,8 +1575,9 @@ pub trait MetadataStore: Send + Sync {
     // sealed blob to rebuild the post-resume harness's launch env;
     // without persistence the in-VM bootstrap respawns a Claude
     // child with no OAuth token and the user gets re-prompted to
-    // log in.
-    async fn upsert_session_secrets(&self, secrets: SessionSecrets) -> Result<(), MetaError>;
+    // log in. The write happens inside `reserve_and_persist_create`'s
+    // transaction (`SessionCreateWriteSet::sealed_secrets`) — there is no
+    // standalone upsert; only `get`/`delete` remain as trait methods.
     async fn get_session_secrets(
         &self,
         session_id: SessionId,
@@ -1301,19 +1633,9 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
-    /// ADR 0062: persist the session's selected harness name (the catalog key)
-    /// so the queue scanner + resume can reconstruct which harness to mount on
-    /// `dyn_0` + exec. `None` for a dev-VM session.
-    async fn set_session_harness(
-        &self,
-        session_id: SessionId,
-        harness: Option<&str>,
-    ) -> Result<(), MetaError> {
-        let _ = (session_id, harness);
-        Ok(())
-    }
-
-    /// ADR 0062: the session's persisted harness selection, or `None`.
+    /// ADR 0062: the session's persisted harness selection, or `None`. The
+    /// write happens inside `reserve_and_persist_create`'s transaction
+    /// (issue #535 (b)) — there is no standalone setter.
     async fn get_session_harness(
         &self,
         session_id: SessionId,
@@ -1823,26 +2145,6 @@ pub trait MetadataStore: Send + Sync {
         &self,
         _idle_for_secs: i64,
     ) -> Result<Vec<(SessionId, SandboxId, chrono::DateTime<chrono::Utc>)>, MetaError> {
-        Ok(Vec::new())
-    }
-
-    /// Track A: `Active` sessions with a bound sandbox that the desync
-    /// watchdog flags as wedged. Two signatures the idle backstop is blind
-    /// to (it keys only off event *silence* — `MAX(created_at)`):
-    /// - `orphan_after_close`: the latest event is a run-scoped event
-    ///   (`agent_message` / `tool_call_*`) but no run is open — an event
-    ///   arrived after the run closed (the `bf3dbbcb` incident shape).
-    /// - `stuck_open_run`: a `run_started` is the latest event — the run
-    ///   opened and produced zero events since.
-    ///
-    /// Both gated on `last_event_at` older than `stuck_for_secs` (so a
-    /// healthy in-progress run, which keeps emitting, is never flagged).
-    /// The watchdog re-handshakes the flagged sessions. Default empty for
-    /// non-PG mocks.
-    async fn list_active_sessions_desynced(
-        &self,
-        _stuck_for_secs: i64,
-    ) -> Result<Vec<DesyncedSession>, MetaError> {
         Ok(Vec::new())
     }
 

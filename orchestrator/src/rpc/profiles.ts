@@ -1,5 +1,5 @@
 /**
- * Native ProfileService implementation (ADR 0052).
+ * Native ProfileService implementation (ADR 0053).
  *
  * Orchestrator-native (like TaskService): registered on the ConnectRouter,
  * NEVER proxied. Self-gates with the same CASL machinery as everything else.

@@ -30,7 +30,7 @@ message CreateTaskRequest {
   // "chat" is the only accepted value for now;
   // linear_issue/dependabot/incident later.
   string type = 1;
-  // ADR 0052: sessions now start from a profile, not a raw image. The image
+  // ADR 0053: sessions now start from a profile, not a raw image. The image
   // is resolved server-side from the profile's image_id.
   reserved 2;
   reserved "image_uri";
@@ -78,7 +78,7 @@ message TaskSessionRef {
   // `optional` on a message-typed field is redundant but kept to make
   // the unset case explicit.
   optional Session session = 3;
-  // ADR 0052: resolved profile identity for the session's originating profile,
+  // ADR 0053: resolved profile identity for the session's originating profile,
   // for the app-wide chip (§9). Unset for legacy / profile-less sessions.
   optional ProfileSnapshot profile = 4;
 }

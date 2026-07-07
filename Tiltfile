@@ -327,11 +327,6 @@ coord_env = {
     'RUST_LOG': 'info,engram=debug',
 }
 
-# Kernel env var only applies to a real-virt backend (mode=all + vz, or
-# the host-agent under split). `process` boots no kernel.
-if kernel_key and not dev_split:
-    coord_env[kernel_key] = kernel_path
-
 # The process backend is insecure (un-isolated host subprocesses), so
 # the binary refuses to start it unless explicitly allowed. `just dev`
 # on a virt-less box is exactly the sanctioned dev case, so opt in here.
@@ -459,7 +454,10 @@ if sandbox_backend == 'firecracker':
 
 def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress_proxy_port):
     env = {
-        # Same per-image kernel as the coord-side mode=all path uses.
+        # `kernel_key` is only non-None for vz/firecracker, both of
+        # which force `dev_split`, so this always lands on the
+        # host-agent (there's no coord-side mode=all + real-virt path
+        # any more — #530 item f made mode=all Process-only).
         kernel_key: kernel_path,
         'ENGRAM_SANDBOX_WORK_DIR': work_dir,
         'ENGRAM_SANDBOX_BACKEND': sandbox_backend,

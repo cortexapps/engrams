@@ -278,6 +278,11 @@ async fn evict_host(
     };
     if let Some(client) = probe_client {
         if host_responds(&client).await {
+            // ADR 0068: no behavioral change — this probe already existed
+            // (added in `7fcc4c3c`). Graphing it alongside the reconcile
+            // probe's rescue counter (`RECONCILE_PROBE_RESCUES_TOTAL`)
+            // makes both rescue paths visible together.
+            ::metrics::counter!(crate::metrics::DEAD_HOST_PROBE_RESCUES_TOTAL).increment(1);
             tracing::warn!(
                 host_id = %host_id,
                 "stale row but live host — host answered Ping while last_heartbeat_at is stale; SKIPPING eviction. Check heartbeat persistence (coord PG pool saturation?) — see engram_heartbeat_persist_failures_total (issue #231)",
@@ -457,6 +462,12 @@ mod tests {
         async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
             unimplemented!()
         }
+        async fn probe_sandbox(
+            &self,
+            _id: SandboxId,
+        ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+            unimplemented!()
+        }
         async fn exec_stream(
             &self,
             _id: SandboxId,
@@ -487,7 +498,12 @@ mod tests {
         async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
             unimplemented!()
         }
-        async fn bind_session(&self, _session_id: SessionId, _sandbox_id: SandboxId) {
+        async fn bind_session(
+            &self,
+            _session_id: SessionId,
+            _sandbox_id: SandboxId,
+            _binding_epoch: u64,
+        ) {
             unimplemented!()
         }
         async fn unbind_session(&self, _session_id: SessionId) {
@@ -499,12 +515,6 @@ mod tests {
             _prompt_id: String,
             _text: String,
         ) -> Result<(), SandboxError> {
-            unimplemented!()
-        }
-        async fn acquire_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
-            unimplemented!()
-        }
-        async fn release_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
             unimplemented!()
         }
     }

@@ -23,10 +23,10 @@
  *       b. Promote via docker compose exec psql (Bun.spawn; idempotent).
  *       c. Fresh sign-in → admin cookie.
  *       d. Admin ListHosts → 200 with hosts array.
- *      7b. Admin CreateProfile (ADR 0052): wrap a no-harness enabled image in a
+ *      7b. Admin CreateProfile (ADR 0053): wrap a no-harness enabled image in a
  *          profile the member tests launch from (tasks start from a profile, not
  *          a raw image). Cleaned up in afterAll.
- *   8.  Task lifecycle (native TaskService — Task 19; ADR 0052 profiles):
+ *   8.  Task lifecycle (native TaskService — Task 19; ADR 0053 profiles):
  *       8. CreateTask(chat, profile_id) → task returned with live session state
  *       9. ListTasks → task visible with session; GetTask → task returned
  *      10. DeleteTask → ListTasks empty (member's view of created task)
@@ -147,7 +147,7 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   let memberCookie = "";
 
   // Admin cookie (set in test 7) + the profile created from it (test 7b).
-  // ADR 0052: tasks now start from an admin-curated profile, not a raw image,
+  // ADR 0053: tasks now start from an admin-curated profile, not a raw image,
   // so the member task tests below launch from `smokeProfileId`.
   let adminCookie = "";
   let smokeProfileId = "";
@@ -321,7 +321,7 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   );
 
   // -------------------------------------------------------------------------
-  // 7b. Create a session profile (ADR 0052) — admin-only.
+  // 7b. Create a session profile (ADR 0053) — admin-only.
   //
   // Tasks now start from an admin-curated profile, not a raw image. Wrap the
   // first no-harness enabled image in a profile; the member task tests below
@@ -374,7 +374,7 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   );
 
   // -------------------------------------------------------------------------
-  // 8–10. Task lifecycle — native TaskService (Task 19; ADR 0052 profiles)
+  // 8–10. Task lifecycle — native TaskService (Task 19; ADR 0053 profiles)
   //
   // Uses the member account provisioned in test 2 (memberCookie) and the
   // profile created in test 7b (smokeProfileId). The created task id is shared
@@ -724,7 +724,7 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   test.skipIf(!SMOKE)(
     "14b/14b shell WS member → terminal responds with 'hi'",
     async () => {
-      // Create a task for a live session (ADR 0052: from the smoke profile).
+      // Create a task for a live session (ADR 0053: from the smoke profile).
       if (!smokeProfileId) {
         console.log("Smoke 14b SKIP: no smoke profile available");
         return;

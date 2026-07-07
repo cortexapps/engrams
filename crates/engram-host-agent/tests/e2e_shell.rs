@@ -10,7 +10,8 @@
 //!   coord-side `proxy_shell` →
 //!     `PooledBackend.start_shell(id)` (vsock → in-VM agentd → ttyd) →
 //!     `PooledBackend.guest_endpoints(id)` →
-//!     `open_shell_tunnel_at(...)` (cold = direct dial, warm = netns) →
+//!     relay over the vsock port relay when available, else
+//!     `open_shell_tunnel_at(...)` (direct `dial_ip` dial) →
 //!     WS-frame round-trip with ttyd.
 //!
 //! That's the path prod session 5c8d0ce5 (2026-05-20) silently
@@ -22,10 +23,10 @@
 //! Coverage matrix:
 //!   - shell_cold: cold-created FC sandbox, dial from host root.
 //!   - shell_warm: cold → snapshot → destroy → restore (per-VM
-//!     netns), dial INSIDE the netns. Catches the
+//!     netns), dial `GuestEndpoints::dial_ip`. Catches the
 //!     `PooledBackend.guest_endpoints` forwarding bug too — without
-//!     it, the dial happens from host root and never reaches the
-//!     netns'd VM.
+//!     it, the dial targets the netns's SNAT slot instead and never
+//!     reaches the netns'd VM.
 //!
 //! Run on the dev VM:
 //!

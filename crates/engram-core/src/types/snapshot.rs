@@ -97,6 +97,17 @@ pub struct SnapshotMetadata {
     /// bundle-GC pin set. Empty for snapshots without aux drives.
     #[serde(default)]
     pub aux_bundles: Vec<super::sandbox::AuxBundleRef>,
+    /// Issue #529: the pause instant the host captured — set by
+    /// `SnapshotFinisher::finish` from `SnapshotCapture::paused_at`.
+    /// The coord's composed eviction path resolves the `session_events`
+    /// coherence cursor from THIS (the exact pause instant) instead of
+    /// its own wall-clock `now` sampled after the capture completes,
+    /// closing the skew that made the cursor land past the coord's own
+    /// `Evicted`/`StatusChanged` events. `None` for backends that don't
+    /// set it (pre-wire-bump hosts during a mixed roll; the composed
+    /// path falls back to `now`, unchanged from today).
+    #[serde(default)]
+    pub paused_at: Option<DateTime<Utc>>,
 }
 
 /// Persisted row in the `snapshots` table.
@@ -167,6 +178,17 @@ pub struct SnapshotRecord {
     /// tombstoning".
     #[serde(default)]
     pub events_cursor: Option<i64>,
+    /// ADR 0068: the capturing host's `firecracker --snapshot-version`
+    /// at capture time (migration 0080), copied from
+    /// `hosts.capabilities ->> 'fc_snapshot_version'` when the
+    /// recording host is known. `None` on pre-0068 rows, VZ/Process
+    /// captures, and captures recorded without a known host. Placement
+    /// (`host_meets_capabilities`) requires an exact match against the
+    /// restoring host's reported version when both are `Some` — the
+    /// value that closes the cross-`SNAPSHOT_VERSION` restore-corruption
+    /// class at placement time instead of at guest-boot failure.
+    #[serde(default)]
+    pub fc_snapshot_version: Option<String>,
 }
 
 /// ADR 0045 C1: the destination-side rider on a migration restore's

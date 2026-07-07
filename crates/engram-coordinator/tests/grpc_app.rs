@@ -1,5 +1,5 @@
-//! In-process integration tests for the app-gRPC surface (ADR 0039 /
-//! ADR 0051). The coordinator's web-facing REST surface is gone; the
+//! In-process integration tests for the app-gRPC surface (ADR 0051).
+//! The coordinator's web-facing REST surface is gone; the
 //! orchestrator drives the coordinator exclusively over the four tonic
 //! services in `grpc_app/` (SessionService, ShellRelayService,
 //! FleetService, ImageService). This file is the gRPC replacement for the
@@ -84,31 +84,61 @@ impl MetadataStore for MockMetadataStore {
             mode: spec.mode,
             last_active_at: Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         };
         self.sessions.lock().insert(id, session);
         Ok(id)
     }
 
-    async fn create_session_created(
+    async fn transition_session_created(
         &self,
         session_id: SessionId,
-        spec: SessionSpec,
-        host_id: engram_core::HostId,
         sandbox_id: engram_core::SandboxId,
     ) -> Result<(), MetaError> {
-        let session = Session {
-            id: session_id,
-            status: SessionState::Created,
-            host_id: Some(host_id),
-            sandbox_id: Some(sandbox_id),
-            created_at: Utc::now(),
-            image: spec.image,
-            mode: spec.mode,
-            last_active_at: Utc::now(),
-            live_disk_manifest: None,
-        };
-        self.sessions.lock().insert(session_id, session);
+        let mut g = self.sessions.lock();
+        let s = g.get_mut(&session_id).ok_or(MetaError::NotFound)?;
+        s.status = SessionState::Created;
+        s.sandbox_id = Some(sandbox_id);
+        s.last_active_at = Utc::now();
         Ok(())
+    }
+
+    async fn reserve_and_persist_create(
+        &self,
+        ws: engram_core::traits::SessionCreateWriteSet,
+        candidates: &[HostId],
+        _affinity_len: usize,
+    ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
+        // Mirrors the pre-refactor `reserve_placement` default (mocks don't
+        // model real 2D-fit capacity): place on the first candidate, or
+        // queue if there are none. Real atomicity is the Postgres impl's
+        // contract (covered by its own live-PG test), not this mock's.
+        let now = Utc::now();
+        let (status, host_id) = match candidates.first().copied() {
+            Some(host_id) => (SessionState::Pending, Some(host_id)),
+            None => (SessionState::Queued, None),
+        };
+        let session = Session {
+            id: ws.session_id,
+            status,
+            host_id,
+            sandbox_id: None,
+            created_at: now,
+            image: ws.spec.image,
+            mode: ws.spec.mode,
+            last_active_at: now,
+            live_disk_manifest: None,
+            selected_skills: ws.selected_skills,
+            park_rung: 0,
+            parked_at: None,
+        };
+        self.sessions.lock().insert(ws.session_id, session);
+        Ok(match host_id {
+            Some(h) => engram_core::traits::CreateDisposition::Placed(h),
+            None => engram_core::traits::CreateDisposition::Queued,
+        })
     }
 
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
@@ -254,8 +284,12 @@ impl MetadataStore for MockMetadataStore {
         Ok(affected)
     }
 
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<(), MetaError> {
-        self.snapshots_by_id.lock().insert(snap.id, snap.clone());
+    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
+        let inserted = self
+            .snapshots_by_id
+            .lock()
+            .insert(snap.id, snap.clone())
+            .is_none();
         if let Some(sid) = snap.session_id {
             let mut by_session = self.snapshots.lock();
             let rows = by_session.entry(sid).or_default();
@@ -265,7 +299,7 @@ impl MetadataStore for MockMetadataStore {
                 rows.push(snap);
             }
         }
-        Ok(())
+        Ok(inserted)
     }
 
     async fn get_snapshot(
@@ -439,13 +473,6 @@ impl MetadataStore for MockMetadataStore {
         Ok(())
     }
 
-    async fn upsert_session_secrets(
-        &self,
-        _: engram_core::types::SessionSecrets,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-
     async fn get_session_secrets(
         &self,
         _: SessionId,
@@ -565,7 +592,7 @@ fn enabled_image(uri: &str) -> engram_core::types::EnabledImage {
 }
 
 // =====================================================================
-// Auth (ADR 0039 §5) — replaces tests/api.rs auth_* REST middleware tests
+// Auth (ADR 0051 §5) — replaces tests/api.rs auth_* REST middleware tests
 // =====================================================================
 
 /// Happy path: a server configured with `TEST_TOKEN`, called with a

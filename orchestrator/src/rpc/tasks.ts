@@ -6,7 +6,7 @@
  * control plane. The web client sees one uniform generated API.
  *
  * Session status mapping (control-plane → task status):
- *   pending | created | guest_ready | active | idle | evacuating | evicting
+ *   pending | created | active | idle | evacuating | evicting
  *     → "working"   (session is alive / in progress)
  *   completed
  *     → "done"      (session ran to completion)
@@ -124,9 +124,9 @@ export interface TaskDeps {
   harnessCatalog?: HarnessCatalogClient;
   /** Per-user KEK-sealed session secret store (ADR 0051 Drip A). */
   secrets?: UserSecretStore;
-  /** Admin-curated session profiles (ADR 0052). */
+  /** Admin-curated session profiles (ADR 0053). */
   profiles?: ProfileStore;
-  /** Enabled-image catalog client (ADR 0052) — resolves image_id → image_uri. */
+  /** Enabled-image catalog client (ADR 0053) — resolves image_id → image_uri. */
   images?: ImagesClient;
   /** Connector catalog (ADR 0057) — custom connectors merged with built-in seeds. */
   connectors?: CustomConnectorSource;
@@ -162,11 +162,11 @@ async function requireUser(
 /**
  * Map a control-plane session status string to a task status string.
  *
- * Session status ∈ { pending, created, guest_ready, active, idle,
+ * Session status ∈ { pending, created, active, idle,
  *                    evacuating, evicting, completed, failed, dead, host_lost }
  *
  * Mapping (documented in module JSDoc above):
- *   pending | created | guest_ready | active | idle | evacuating | evicting → working
+ *   pending | created | active | idle | evacuating | evicting → working
  *   completed → done
  *   failed | dead | host_lost → failed
  *   (anything else) → null (caller keeps persisted task status)
@@ -175,7 +175,6 @@ function sessionStatusToTaskStatus(sessionStatus: string): string | null {
   switch (sessionStatus) {
     case "pending":
     case "created":
-    case "guest_ready":
     case "active":
     case "idle":
     case "evacuating":

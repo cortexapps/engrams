@@ -1,4 +1,4 @@
-# ADR 0042 — supporting evidence (verified research findings)
+# ADR 0072 — supporting evidence (verified research findings)
 
 Companion to [0042](0042-substrate-architecture-survey.md). Verbatim record of the verified findings from the deep-research passes (adversarially verified, 2/3-refute kill threshold) and the direct E2B source analysis, so the evidence survives independent of the synthesis. **Pass 1** (competitive) is recorded below. **Pass 2** (live-migration / network-disk-for-memory / state-of-the-art) will be appended when it lands.
 

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use engram_core::traits::{HostClient, MetadataStore};
-use engram_core::types::host::{HostRecord, HostStatus, ReservedBudget};
+use engram_core::types::host::{CapStatus, HostRecord, HostStatus, ReservedBudget};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SnapshotId};
 use engram_protocol::heartbeat::ManifestDigest;
@@ -56,6 +56,108 @@ pub struct ScheduleContext<'a> {
     /// last host (warm chunk cache + base shm). Falls through on any
     /// miss; ranked below snapshot-affinity.
     pub prefer_host: Option<HostId>,
+    /// ADR 0068: capability requirements this placement actually
+    /// needs. `Default` (both fields `false`/`None`) imposes no
+    /// capability constraint beyond the base gate every FC placement
+    /// gets (`grpc_self_connect` + `bundle_stamp` — see
+    /// `host_meets_capabilities`).
+    pub caps: CapabilityRequirements,
+}
+
+/// ADR 0068: what a specific placement needs from a host's capability
+/// vector, derived by the caller from the session/image/snapshot being
+/// placed — NOT a static property of the host. `host_meets_capabilities`
+/// is the pure predicate that reads a [`HostRecord`] against this.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CapabilityRequirements {
+    /// This placement restores/creates against a memory manifest, so
+    /// it needs the FC UFFD substrate: `base_shm_tmpfs` +
+    /// `uffd_minor_shmem` + `nbd` must all be `Ok` on the candidate
+    /// host. Derived per call site — e.g. `snapshot.memory_manifest.is_some()`
+    /// on resume, the enabled image's `base_snapshot_memory_manifest`
+    /// presence on create.
+    pub needs_uffd_substrate: bool,
+    /// The snapshot row's recorded capture-time FC snapshot version,
+    /// when known (`SnapshotRecord::fc_snapshot_version`). `Some(v)`
+    /// requires the candidate host's reported `fc_snapshot_version` to
+    /// equal `v` exactly — closes the cross-`SNAPSHOT_VERSION` restore-
+    /// corruption class at placement instead of at guest-boot failure.
+    /// `None` (pre-migration snapshot rows, VZ/Process) imposes no
+    /// constraint.
+    pub fc_snapshot_version: Option<String>,
+}
+
+/// ADR 0068: does `h`'s capability vector satisfy `req`? Pure — no I/O,
+/// unit-tested directly against a matrix of vectors.
+///
+/// Gate semantics:
+/// - `h.capabilities.schema == 0` (never reported — a pre-0068 row, or
+///   a host mid-roll between the coord and host-agent deploys) passes
+///   everything: the same soft posture `host_wire_version_ok` gives
+///   `wire_version == 0`. Once the fleet rolls, every row carries a
+///   real vector.
+/// - `schema >= 1`: `grpc_self_connect` and `bundle_stamp` must be `Ok`
+///   for ANY FC placement (a host that can't prove its own gRPC
+///   listener is up, or has no bundle generation staged, can't safely
+///   take any session). Each capability `req` actually asks for
+///   (`needs_uffd_substrate` → `base_shm_tmpfs` + `uffd_minor_shmem` +
+///   `nbd`) must be `Ok` **or** `NotApplicable` — `NotApplicable` is
+///   the honest report of an ADR 0022 File-backend host (the substrate
+///   was never configured, so there's nothing to probe): it must not
+///   be treated the same as `Failed`/`Unknown`, or a File-mode fleet
+///   is 100% `NoCapacity` for every memory-manifest placement. Only
+///   `Failed` (probe ran, broke) and `Unknown` (never probed, but
+///   `schema >= 1` so it should have been) fail a *required*
+///   capability.
+/// - `fc_snapshot_version`: when `req` names a version AND the host
+///   reports one, they must match exactly. Either side being `None`
+///   imposes no constraint.
+pub fn host_meets_capabilities(
+    h: &HostRecord,
+    req: &CapabilityRequirements,
+) -> Result<(), &'static str> {
+    let caps = &h.capabilities;
+    if caps.schema == 0 {
+        return Ok(());
+    }
+    if !caps.grpc_self_connect.is_ok() {
+        return Err("grpc_self_connect");
+    }
+    if !caps.bundle_stamp.is_ok() {
+        return Err("bundle_stamp");
+    }
+    // A required substrate capability passes when the probe ran and
+    // succeeded (`Ok`) OR when the host honestly reports it doesn't
+    // apply (`NotApplicable` — e.g. an ADR 0022 File-backend host that
+    // never configured the UFFD substrate). Only `Failed`/`Unknown`
+    // withhold placement.
+    let substrate_ok = |c: &CapStatus| matches!(c, CapStatus::Ok(_) | CapStatus::NotApplicable);
+    if req.needs_uffd_substrate {
+        if !substrate_ok(&caps.base_shm_tmpfs) {
+            return Err("base_shm_tmpfs");
+        }
+        if !substrate_ok(&caps.uffd_minor_shmem) {
+            return Err("uffd_minor_shmem");
+        }
+        if !substrate_ok(&caps.nbd) {
+            return Err("nbd");
+        }
+    }
+    if let (Some(want), Some(have)) = (&req.fc_snapshot_version, &caps.fc_snapshot_version) {
+        if want != have {
+            // The exclusion reason is a static str; surface the actual pair
+            // here — a mismatch between two hosts running the same binary
+            // is otherwise undiagnosable from the NoCapacity summary alone.
+            tracing::warn!(
+                host_id = %h.id,
+                want = %want,
+                have = %have,
+                "fc_snapshot_version gate mismatch"
+            );
+            return Err("fc_snapshot_version");
+        }
+    }
+    Ok(())
 }
 
 /// Why a pick couldn't place a session.
@@ -175,10 +277,68 @@ fn host_passes_filters(
     if !host_is_schedulable(h, now, ttl) {
         return false;
     }
+    if host_meets_capabilities(h, &ctx.caps).is_err() {
+        return false;
+    }
     match ctx.required_image_digest.as_ref() {
         Some(d) => h.ready_images.iter().any(|r| r == d.as_str()),
         None => true,
     }
+}
+
+/// ADR 0068: the first reason each host in `hosts` is excluded from
+/// `ctx`, in row order — the "no capacity with free hosts" mystery mode
+/// killer. `host_wire_version_ok` used to silently drop a skewed host
+/// from the candidate set with the caller seeing only bare
+/// `PickError::NoCapacity`; this makes the drop visible. Pure (no I/O) —
+/// callers log/metric it themselves, only on the `NoCapacity` path (this
+/// walks every host, so it's not free — don't call it on the happy
+/// path).
+///
+/// One reason per host, first-match order: `excluded` (an explicit
+/// `exclude_host`) → `not_ready` (`HostStatus != Ready`) → `cordoned` →
+/// `wire_skew` → `stale` (heartbeat older than `ttl`) → `cap:<name>` (a
+/// required capability failed) → `digest_not_ready` (image not
+/// prefetched) → `no_fit` (schedulable but this predicate found nothing
+/// else wrong — a capacity-dimension miss the caller's own fit logic
+/// will re-discover).
+pub fn exclusion_summary(
+    hosts: &[HostRecord],
+    ctx: &ScheduleContext<'_>,
+    now: DateTime<Utc>,
+    ttl: Duration,
+) -> Vec<(HostId, String)> {
+    hosts
+        .iter()
+        .map(|h| {
+            let reason = if Some(h.id) == ctx.exclude_host {
+                "excluded".to_string()
+            } else if h.status != HostStatus::Ready {
+                "not_ready".to_string()
+            } else if h.cordoned {
+                "cordoned".to_string()
+            } else if !host_wire_version_ok(h) {
+                "wire_skew".to_string()
+            } else if now
+                .signed_duration_since(h.last_heartbeat_at)
+                .to_std()
+                .is_ok_and(|age| age > ttl)
+            {
+                "stale".to_string()
+            } else if let Err(cap) = host_meets_capabilities(h, &ctx.caps) {
+                format!("cap:{cap}")
+            } else if ctx
+                .required_image_digest
+                .as_ref()
+                .is_some_and(|d| !h.ready_images.iter().any(|r| r == d.as_str()))
+            {
+                "digest_not_ready".to_string()
+            } else {
+                "no_fit".to_string()
+            };
+            (h.id, reason)
+        })
+        .collect()
 }
 
 /// Pure ranking: filter to schedulable candidates and put the
@@ -362,6 +522,54 @@ pub async fn candidates_for(
     Ok(rank_hosts(&hosts, ctx, Utc::now(), placement_ttl()))
 }
 
+/// ADR 0068 (core-ops-batch correction pass): shared exclusion-visibility
+/// helper for every "empty candidate set" placement failure — not just
+/// `pick_for_session`'s `NoCapacity`. `#564`'s review found three other
+/// call sites (`api/sessions.rs`'s create path, and `queue_scanner.rs`'s
+/// `place_create` + `resume_has_capacity`) that returned an empty
+/// candidate set with zero visibility into why, so a wire-skewed or
+/// capability-failing fleet looked identical to a genuinely full one on
+/// every path except resume. Call this whenever a candidate set turns up
+/// empty; it re-reads `list_active_hosts` (this only runs on the
+/// uncommon failure path, so the extra read doesn't cost the common
+/// case), emits the bounded `exclusion_summary` per host as both the
+/// `PLACEMENT_EXCLUDED_TOTAL` counter (labeled `origin` + `reason`) and a
+/// `tracing::warn!` naming every host.
+///
+/// `origin` is one of the 4 values documented on
+/// `metrics::PLACEMENT_EXCLUDED_TOTAL` — pass a `'static` string literal
+/// from that fixed set so the label cardinality stays bounded.
+pub async fn log_empty_candidates(
+    meta: &dyn MetadataStore,
+    ctx: &ScheduleContext<'_>,
+    origin: &'static str,
+) {
+    let hosts = match meta.list_active_hosts().await {
+        Ok(hosts) => hosts,
+        Err(e) => {
+            tracing::debug!(origin, error = %e,
+                "log_empty_candidates: list_active_hosts failed; skipping exclusion visibility");
+            return;
+        }
+    };
+    let summary = exclusion_summary(&hosts, ctx, Utc::now(), placement_ttl());
+    for (_host_id, reason) in &summary {
+        ::metrics::counter!(
+            crate::metrics::PLACEMENT_EXCLUDED_TOTAL,
+            "origin" => origin,
+            "reason" => reason.clone(),
+        )
+        .increment(1);
+    }
+    tracing::warn!(
+        repo = ctx.repo,
+        image_version = ctx.image_version,
+        origin,
+        exclusions = ?summary,
+        "placement: empty candidate set — per-host exclusion reasons",
+    );
+}
+
 /// Session scheduler for the resume/evac path: pick from the hosts rows
 /// and resolve the backend (dialing through the PG `host_addr` when this
 /// replica hasn't seen the host yet). Emits the ADR 0044 K4
@@ -380,6 +588,11 @@ pub async fn pick_for_session(
         Err(PickError::Internal(_)) => "internal",
     };
     ::metrics::counter!(crate::metrics::SESSION_PLACEMENT_TOTAL, "outcome" => outcome).increment(1);
+    // ADR 0068: on NoCapacity ONLY, name why — kills the "no capacity
+    // with free hosts" mystery mode.
+    if matches!(result, Err(PickError::NoCapacity)) {
+        log_empty_candidates(meta, ctx, "resume").await;
+    }
     result
 }
 
@@ -419,6 +632,14 @@ pub async fn pick_specific_host(
     if !host_is_schedulable(h, now, ttl) {
         return Err(PickError::NoCapacity);
     }
+    // ADR 0068: an operator pin still gets the BASE gate (a host that
+    // can't prove its own gRPC listener is up or has no bundle staged
+    // can't safely take any session) — but not the requirement-specific
+    // gates (`needs_uffd_substrate`/`fc_snapshot_version`), which stay
+    // soft for an explicit pin.
+    if host_meets_capabilities(h, &CapabilityRequirements::default()).is_err() {
+        return Err(PickError::NoCapacity);
+    }
     let alloc = h.utilization.allocatable_mib as i64;
     let reserved_mib = reserved.get(&host_id).map(|r| r.mem_mib).unwrap_or(0);
     if alloc > 0 && alloc - reserved_mib <= 0 {
@@ -446,7 +667,11 @@ pub async fn pick_capture_host(
     let ttl = placement_ttl();
     let id = hosts
         .iter()
-        .find(|h| host_is_schedulable(h, now, ttl))
+        .find(|h| {
+            host_is_schedulable(h, now, ttl)
+                // ADR 0068: base gate only — see `pick_specific_host`.
+                && host_meets_capabilities(h, &CapabilityRequirements::default()).is_ok()
+        })
         .map(|h| h.id)
         .ok_or(PickError::NoCapacity)?;
     let backend = registry
@@ -543,11 +768,328 @@ mod tests {
             // placement filter. Tests that exercise the skew gate set this
             // to a concrete version explicitly.
             wire_version: 0,
+            stages_images: false,
+            capabilities: engram_core::types::host::HostCapabilities::default(),
         }
     }
 
     fn hid(id: u128) -> HostId {
         HostId(uuid::Uuid::from_u128(id))
+    }
+
+    mod capability_gate {
+        use super::*;
+        use engram_core::types::host::CapStatus;
+
+        fn caps_with(
+            grpc: CapStatus,
+            bundle: CapStatus,
+            base_shm: CapStatus,
+            uffd_minor: CapStatus,
+            nbd: CapStatus,
+            fc_snapshot_version: Option<&str>,
+        ) -> engram_core::types::host::HostCapabilities {
+            engram_core::types::host::HostCapabilities {
+                schema: 1,
+                backend: "firecracker".to_string(),
+                grpc_self_connect: grpc,
+                base_shm_tmpfs: base_shm,
+                uffd_minor_shmem: uffd_minor,
+                nbd,
+                bundle_stamp: bundle,
+                fc_snapshot_version: fc_snapshot_version.map(str::to_string),
+                wire_version: 7,
+            }
+        }
+
+        fn fully_ok() -> engram_core::types::host::HostCapabilities {
+            caps_with(
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                None,
+            )
+        }
+
+        /// `schema == 0` (never reported) passes EVERY requirement,
+        /// including `needs_uffd_substrate` — the soft posture that
+        /// keeps a pre-0068 row / mid-roll host placeable.
+        #[test]
+        fn schema_zero_passes_every_requirement() {
+            let mut h = host(1);
+            h.capabilities = engram_core::types::host::HostCapabilities::default();
+            assert_eq!(h.capabilities.schema, 0);
+            let req = CapabilityRequirements {
+                needs_uffd_substrate: true,
+                fc_snapshot_version: Some("v10.0.0".to_string()),
+            };
+            assert!(host_meets_capabilities(&h, &req).is_ok());
+        }
+
+        /// `schema >= 1` with no substrate/version requirement still
+        /// demands the BASE gate: grpc_self_connect + bundle_stamp.
+        #[test]
+        fn base_gate_required_even_with_no_extra_requirement() {
+            let mut h = host(1);
+            h.capabilities = caps_with(
+                CapStatus::Failed("connect refused".into()),
+                CapStatus::Ok(None),
+                CapStatus::NotApplicable,
+                CapStatus::NotApplicable,
+                CapStatus::NotApplicable,
+                None,
+            );
+            assert_eq!(
+                host_meets_capabilities(&h, &CapabilityRequirements::default()),
+                Err("grpc_self_connect"),
+            );
+
+            let mut h2 = host(2);
+            h2.capabilities = caps_with(
+                CapStatus::Ok(None),
+                CapStatus::Failed("no stamp".into()),
+                CapStatus::NotApplicable,
+                CapStatus::NotApplicable,
+                CapStatus::NotApplicable,
+                None,
+            );
+            assert_eq!(
+                host_meets_capabilities(&h2, &CapabilityRequirements::default()),
+                Err("bundle_stamp"),
+            );
+        }
+
+        /// `Failed` (probe ran, broke) and `Unknown` (never probed,
+        /// though `schema >= 1` says it should have been) both fail a
+        /// REQUIRED substrate capability.
+        #[test]
+        fn required_uffd_substrate_rejects_failed_and_unknown() {
+            for bad in [CapStatus::Failed("EINVAL".into()), CapStatus::Unknown] {
+                let mut h = host(1);
+                h.capabilities = caps_with(
+                    CapStatus::Ok(None),
+                    CapStatus::Ok(None),
+                    bad.clone(),
+                    CapStatus::Ok(None),
+                    CapStatus::Ok(None),
+                    None,
+                );
+                let req = CapabilityRequirements {
+                    needs_uffd_substrate: true,
+                    fc_snapshot_version: None,
+                };
+                assert_eq!(
+                    host_meets_capabilities(&h, &req),
+                    Err("base_shm_tmpfs"),
+                    "base_shm_tmpfs={bad:?} must fail a required substrate placement",
+                );
+            }
+        }
+
+        /// ADR 0022: `NotApplicable` on the substrate caps is the
+        /// honest report of a File-backend FC host (the UFFD substrate
+        /// was never configured, so there's nothing to probe) — it
+        /// must PASS a required substrate placement, not fail it like
+        /// `Failed`/`Unknown` do. A File-mode fleet must stay
+        /// placeable for memory-manifest restores (finding 1,
+        /// PR #564 review): it serves them via the File-backend path
+        /// instead of UFFD.
+        #[test]
+        fn required_uffd_substrate_passes_when_not_applicable() {
+            let mut h = host(1);
+            h.capabilities = caps_with(
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::NotApplicable,
+                CapStatus::NotApplicable,
+                CapStatus::NotApplicable,
+                None,
+            );
+            let req = CapabilityRequirements {
+                needs_uffd_substrate: true,
+                fc_snapshot_version: None,
+            };
+            assert!(
+                host_meets_capabilities(&h, &req).is_ok(),
+                "a File-mode host (substrate caps NotApplicable) must remain placeable \
+                 for memory-manifest sessions"
+            );
+        }
+
+        #[test]
+        fn uffd_substrate_ok_when_all_three_caps_ok() {
+            let mut h = host(1);
+            h.capabilities = fully_ok();
+            let req = CapabilityRequirements {
+                needs_uffd_substrate: true,
+                fc_snapshot_version: None,
+            };
+            assert!(host_meets_capabilities(&h, &req).is_ok());
+        }
+
+        #[test]
+        fn uffd_substrate_not_required_ignores_substrate_caps() {
+            let mut h = host(1);
+            h.capabilities = caps_with(
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Failed("not mounted".into()),
+                CapStatus::Failed("no kernel support".into()),
+                CapStatus::Failed("module absent".into()),
+                None,
+            );
+            // needs_uffd_substrate: false (default) — the base gate is
+            // all that's checked.
+            assert!(host_meets_capabilities(&h, &CapabilityRequirements::default()).is_ok());
+        }
+
+        #[test]
+        fn fc_snapshot_version_mismatch_rejects() {
+            let mut h = host(1);
+            h.capabilities = caps_with(
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                Some("v9.0.0"),
+            );
+            let req = CapabilityRequirements {
+                needs_uffd_substrate: false,
+                fc_snapshot_version: Some("v10.0.0".to_string()),
+            };
+            assert_eq!(
+                host_meets_capabilities(&h, &req),
+                Err("fc_snapshot_version")
+            );
+        }
+
+        #[test]
+        fn fc_snapshot_version_match_passes() {
+            let mut h = host(1);
+            h.capabilities = caps_with(
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                Some("v10.0.0"),
+            );
+            let req = CapabilityRequirements {
+                needs_uffd_substrate: false,
+                fc_snapshot_version: Some("v10.0.0".to_string()),
+            };
+            assert!(host_meets_capabilities(&h, &req).is_ok());
+        }
+
+        /// Either side `None` on the version pairing imposes no
+        /// constraint — pre-migration snapshot rows / VZ / a host that
+        /// hasn't probed it yet must not be spuriously excluded.
+        #[test]
+        fn fc_snapshot_version_either_side_none_is_unconstrained() {
+            let mut host_no_version = host(1);
+            host_no_version.capabilities = fully_ok();
+            let req_wants_version = CapabilityRequirements {
+                needs_uffd_substrate: false,
+                fc_snapshot_version: Some("v10.0.0".to_string()),
+            };
+            assert!(host_meets_capabilities(&host_no_version, &req_wants_version).is_ok());
+
+            let mut host_with_version = host(2);
+            host_with_version.capabilities = caps_with(
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                Some("v10.0.0"),
+            );
+            assert!(host_meets_capabilities(
+                &host_with_version,
+                &CapabilityRequirements::default()
+            )
+            .is_ok());
+        }
+
+        /// `host_passes_filters` wires the gate in: a schedulable host
+        /// that fails a required capability is excluded from
+        /// `rank_hosts`.
+        #[test]
+        fn rank_hosts_excludes_a_host_failing_required_capabilities() {
+            let mut ready = host(1);
+            ready.capabilities = fully_ok();
+            let mut substrate_broken = host(2);
+            substrate_broken.capabilities = caps_with(
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::Failed("not mounted".into()),
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                None,
+            );
+            let mut c = ctx();
+            c.caps = CapabilityRequirements {
+                needs_uffd_substrate: true,
+                fc_snapshot_version: None,
+            };
+            let ranked = rank_hosts(&[ready, substrate_broken], &c, Utc::now(), TTL);
+            assert_eq!(ranked.hosts, vec![hid(1)]);
+        }
+
+        /// ADR 0068 "no capacity with free hosts" mystery-mode killer:
+        /// `exclusion_summary` names the FIRST reason each host is
+        /// excluded, in the documented precedence order.
+        #[test]
+        fn exclusion_summary_names_the_first_matching_reason() {
+            let mut cordoned = host(1);
+            cordoned.cordoned = true;
+            let mut skewed = host(2);
+            skewed.wire_version = engram_protocol::WIRE_VERSION + 1;
+            let mut stale = host(3);
+            stale.last_heartbeat_at = Utc::now() - chrono::Duration::hours(1);
+            let mut cap_failed = host(4);
+            cap_failed.capabilities = fully_ok();
+            cap_failed.capabilities.grpc_self_connect = CapStatus::Failed("refused".into());
+            let fine = host(5);
+
+            let c = ctx();
+            let summary = exclusion_summary(
+                &[
+                    cordoned.clone(),
+                    skewed.clone(),
+                    stale.clone(),
+                    cap_failed.clone(),
+                    fine.clone(),
+                ],
+                &c,
+                Utc::now(),
+                TTL,
+            );
+            assert_eq!(
+                summary,
+                vec![
+                    (hid(1), "cordoned".to_string()),
+                    (hid(2), "wire_skew".to_string()),
+                    (hid(3), "stale".to_string()),
+                    (hid(4), "cap:grpc_self_connect".to_string()),
+                    (hid(5), "no_fit".to_string()),
+                ],
+            );
+        }
+
+        #[test]
+        fn exclusion_summary_names_the_excluded_host_first() {
+            let target = host(1);
+            let c = {
+                let mut c = ctx();
+                c.exclude_host = Some(hid(1));
+                c
+            };
+            let summary = exclusion_summary(&[target], &c, Utc::now(), TTL);
+            assert_eq!(summary, vec![(hid(1), "excluded".to_string())]);
+        }
     }
 
     fn ctx<'a>() -> ScheduleContext<'a> {
@@ -560,6 +1102,7 @@ mod tests {
             required_image_digest: None,
             exclude_host: None,
             prefer_host: None,
+            caps: CapabilityRequirements::default(),
         }
     }
 
@@ -635,6 +1178,34 @@ mod tests {
         let reserved = mem_reserved(&[(hid(1), 28_000)]);
         let pick = pick_from(&[h1, h2], &reserved, &ctx(), Utc::now(), TTL).unwrap();
         assert_eq!(pick, hid(1), "best-fit packs the tighter host");
+    }
+
+    #[test]
+    fn parked_resident_on_one_host_never_gets_placed_on() {
+        // Issue #540: both hosts have 32,000 MiB physical RAM and zero
+        // reservations, but h1 "parks" a 12,288 MiB (12 GiB) resident VM
+        // (epic-parking-ladder rungs 2-3) while h2 has nothing resident.
+        // The ledger's `allocatable_mib` NEVER adds parked PSS back in
+        // (`RamLedgerSnapshot::allocatable_mib`, engram-host-agent), so
+        // by the time placement sees these two hosts, h1's allocatable
+        // is already 12,288 MiB lower than h2's — exactly as if that RAM
+        // were simply unavailable. Placement (which only ever sees the
+        // final `allocatable_mib`, never ledger internals) must route a
+        // session that needs more than h1's remaining headroom to h2,
+        // never double-counting the parked VM's bytes as free on h1.
+        let mut h1 = host(1);
+        h1.utilization.allocatable_mib = 32_000 - 12_288; // parked VM already excluded
+        let mut h2 = host(2);
+        h2.utilization.allocatable_mib = 32_000; // nothing resident
+        let mut c = ctx();
+        c.memory_mib = Some(24_000); // fits h2 only; h1 has 19,712 free
+        let pick = pick_from(&[h1, h2], &HashMap::new(), &c, Utc::now(), TTL).unwrap();
+        assert_eq!(
+            pick,
+            hid(2),
+            "a session too big for h1's parked-excluded headroom must land on h2, \
+             not get double-counted onto the parking host",
+        );
     }
 
     #[test]

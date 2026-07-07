@@ -224,8 +224,9 @@ async fn ensure_harness_artifacts() -> (PathBuf, PathBuf) {
 /// Dockerfile COPYs the prebuilt harness wrapper + claude CLI from
 /// the build context; engram.toml declares the custom-harness
 /// launch contract. The egress CA reaches the guest at runtime via
-/// `AgentSpec.host_ca_pem`, which triggers an `InstallHostCa` vsock
-/// RPC before SpawnHarness.
+/// `AgentSpec.host_ca_pem`, which rides the `SpawnHarness` vsock RPC
+/// (2026-07 core-ops fold: agentd installs the CA before spawning,
+/// one first-contact call instead of two).
 async fn bake_harness_rootfs(repo: &str, harness_bin: &Path, claude_bin: &Path) -> PathBuf {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let target_root = Path::new(&manifest).join("..").join("..").join("target");
@@ -245,9 +246,10 @@ async fn bake_harness_rootfs(repo: &str, harness_bin: &Path, claude_bin: &Path) 
     std::fs::copy(claude_bin, src.path().join("claude")).unwrap();
     // No in-container network — the dev-vm's Docker daemon has DNS
     // issues during apt-get. debian-slim already has /bin/sh + the
-    // base TLS libraries; ca-certificates is wired by agentd's
-    // `InstallHostCa` install + `SSL_CERT_FILE` env-var family it
-    // exports onto every harness child.
+    // base TLS libraries; ca-certificates is wired by agentd's CA
+    // install (now part of the `SpawnHarness` handler) + the
+    // `SSL_CERT_FILE` env-var family it exports onto every harness
+    // child.
     std::fs::write(
         src.path().join("Dockerfile"),
         "FROM debian:bookworm-slim\n\
@@ -368,18 +370,28 @@ async fn wait_for_guest_endpoints(
     }
 }
 
-/// Set up a HarnessSink that captures events into a shared Vec.
-/// Returns the sink + the Vec. Mirrors harness_loopback's sink
-/// pattern: handshake (read attach, ack ok) then drain frames.
+/// Set up a HarnessSink that captures events into a shared Vec, and can also
+/// push `HarnessCommand`s down to the attached harness (issue #535 (d): the
+/// initial prompt now arrives over the wire instead of an env var, so this
+/// test needs to actually deliver one — a hand-rolled minimal stand-in for
+/// the real `HarnessHub`, since this test drives `SandboxBackend` directly
+/// with no coordinator/hub in the loop).
+/// Returns the sink + the collected-events Vec + a command sender. Mirrors
+/// harness_loopback's sink pattern: handshake (read attach, ack ok) then
+/// drain frames, now also forwarding any queued commands to the writer half.
 fn capture_sink() -> (
     engram_core::traits::HarnessSink,
     Arc<Mutex<Vec<engram_harness_proto::HarnessEvent>>>,
+    tokio::sync::mpsc::Sender<engram_harness_proto::HarnessCommand>,
 ) {
     let collected: Arc<Mutex<Vec<engram_harness_proto::HarnessEvent>>> =
         Arc::new(Mutex::new(Vec::new()));
     let collected_for_sink = collected.clone();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<engram_harness_proto::HarnessCommand>(4);
+    let cmd_rx = Arc::new(tokio::sync::Mutex::new(cmd_rx));
     let sink: engram_core::traits::HarnessSink = Arc::new(move |mut stream| {
         let collected = collected_for_sink.clone();
+        let cmd_rx = cmd_rx.clone();
         tokio::spawn(async move {
             let (mut reader, mut writer) = tokio::io::split(stream.as_mut());
             let _attach: engram_harness_proto::HarnessAttach =
@@ -392,24 +404,42 @@ fn capture_sink() -> (
                 };
             let ack = engram_harness_proto::HarnessAttachAck {
                 ok: true,
+                reject: None,
                 message: None,
             };
             if let Err(e) = engram_harness_proto::write_msg(&mut writer, &ack).await {
                 eprintln!("--- sink ack write failed: {e} ---");
                 return;
             }
-            while let Ok(frame) =
-                engram_harness_proto::read_msg::<_, engram_harness_proto::HarnessFrame>(&mut reader)
-                    .await
-            {
-                if let engram_harness_proto::HarnessFrame::Event(ev) = frame {
-                    eprintln!("--- captured HarnessEvent: {ev:?} ---");
-                    collected.lock().push(ev);
+            let mut cmd_rx = cmd_rx.lock().await;
+            loop {
+                tokio::select! {
+                    frame = engram_harness_proto::read_msg::<_, engram_harness_proto::HarnessFrame>(&mut reader) => {
+                        match frame {
+                            Ok(engram_harness_proto::HarnessFrame::Event(ev)) => {
+                                eprintln!("--- captured HarnessEvent: {ev:?} ---");
+                                collected.lock().push(ev);
+                            }
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    Some(cmd) = cmd_rx.recv() => {
+                        if let Err(e) = engram_harness_proto::write_msg(
+                            &mut writer,
+                            &engram_harness_proto::HarnessFrame::Command(cmd),
+                        )
+                        .await
+                        {
+                            eprintln!("--- sink command write failed: {e} ---");
+                            break;
+                        }
+                    }
                 }
             }
         });
     });
-    (sink, collected)
+    (sink, collected, cmd_tx)
 }
 
 /// Run one Claude harness session against api.anthropic.com (with a
@@ -422,6 +452,7 @@ async fn drive_harness(
     session_id: engram_core::SessionId,
     ca_pem: &str,
     captured: Arc<Mutex<Vec<engram_harness_proto::HarnessEvent>>>,
+    cmd_tx: tokio::sync::mpsc::Sender<engram_harness_proto::HarnessCommand>,
 ) {
     let port = engram_harness_proto::HARNESS_VSOCK_PORT.to_string();
     // ADR 0021 P1.5: harness lives in the rootfs at /opt/engram/harness/
@@ -435,7 +466,6 @@ async fn drive_harness(
         session_id.to_string(),
     ];
     let mut env: HashMap<String, String> = HashMap::new();
-    env.insert("ENGRAM_INITIAL_PROMPT".into(), "say hi briefly".into());
     // Bogus token — Claude API will 401. We're not testing API
     // semantics; we're testing the chain works end-to-end. A 401
     // proves the request was issued, the response was received,
@@ -463,11 +493,14 @@ async fn drive_harness(
         .start_agent(
             sandbox_id,
             AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv,
                 env,
                 session_env: HashMap::new(),
-                // ADR 0021 P1.1+P1.2: triggers `InstallHostCa` over
-                // vsock right before SpawnHarness, so the in-VM
+                // ADR 0021 P1.1+P1.2: rides the `SpawnHarness` vsock
+                // RPC (2026-07 core-ops fold: CA install and harness
+                // spawn are one first-contact call), so the in-VM
                 // trust store carries the engram proxy CA before
                 // the harness's first outbound TLS dial.
                 host_ca_pem: Some(ca_pem.to_string()),
@@ -475,6 +508,21 @@ async fn drive_harness(
         )
         .await
         .expect("start_agent");
+
+    // Issue #535 (d): deliver the initial prompt over the wire — the same
+    // `HarnessCommand::Prompt` frame path a follow-up `SendPrompt` rides in
+    // production (`deliver_prompt`), not an env var. `cmd_tx` queues into
+    // the sink's forwarder regardless of whether the harness has attached
+    // yet (bounded channel, no receiver required to enqueue); once the
+    // harness's own vsock dial completes the handshake, the sink's select
+    // loop picks this up and writes it.
+    cmd_tx
+        .send(engram_harness_proto::HarnessCommand::Prompt {
+            prompt_id: uuid::Uuid::new_v4().to_string(),
+            text: "say hi briefly".to_string(),
+        })
+        .await
+        .expect("queue initial prompt over the wire");
 
     // Wait for the run to terminate, not just start. RunStarted
     // proves bootstrap exec'd the harness and the vsock attach
@@ -621,7 +669,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
     fc.host_startup().await.expect("host_startup");
     let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
 
-    let (sink, captured) = capture_sink();
+    let (sink, captured, cmd_tx) = capture_sink();
     fc.set_harness_sink(sink);
 
     let spec = SandboxSpec {
@@ -639,17 +687,13 @@ async fn e2e_harness_cold_via_pooled_backend() {
         aux_ro_drives: Vec::new(),
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
-    let _endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
+    let endpoints = wait_for_guest_endpoints(&pooled, sandbox_id, Duration::from_secs(30)).await;
 
     // Register the session in the proxy registry. For COLD path
     // egress_identity and dial_ip are the same (no SNAT indirection)
     // so we use egress_identity.
     let session_id = engram_core::SessionId::new();
-    let guest_ip: std::net::Ipv4Addr = pooled
-        .guest_endpoints(sandbox_id)
-        .await
-        .expect("guest_endpoints")
-        .egress_identity;
+    let guest_ip: std::net::Ipv4Addr = endpoints.egress_identity;
     let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
     let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {
@@ -662,7 +706,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
         observes: Vec::new(),
     });
 
-    drive_harness(&pooled, sandbox_id, session_id, &ca_pem, captured).await;
+    drive_harness(&pooled, sandbox_id, session_id, &ca_pem, captured, cmd_tx).await;
 
     pooled.destroy(sandbox_id).await.expect("destroy");
     cleanup_host_state();
@@ -693,7 +737,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
     fc.host_startup().await.expect("host_startup");
     let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
 
-    let (sink, captured) = capture_sink();
+    let (sink, captured, cmd_tx) = capture_sink();
     fc.set_harness_sink(sink);
 
     let spec = SandboxSpec {
@@ -721,7 +765,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
     pooled.destroy(cold_id).await.expect("destroy cold");
 
     let warm_id = pooled.restore(metadata).await.expect("restore");
-    let _ = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
+    let warm_endpoints = wait_for_guest_endpoints(&pooled, warm_id, Duration::from_secs(30)).await;
     // INTENTIONAL fixed settle (not converted to a poll): this gates on the
     // warm-restore network path — per-VM netns + SNAT + warm-path REDIRECT —
     // being fully wired before the harness's first outbound dials the proxy.
@@ -738,11 +782,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
     // this matching the registry's key, Registry::lookup misses
     // and the proxy drops the harness's outbound.
     let session_id = engram_core::SessionId::new();
-    let guest_ip: std::net::Ipv4Addr = pooled
-        .guest_endpoints(warm_id)
-        .await
-        .expect("guest_endpoints")
-        .egress_identity;
+    let guest_ip: std::net::Ipv4Addr = warm_endpoints.egress_identity;
     let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
     let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {
@@ -755,7 +795,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
         observes: Vec::new(),
     });
 
-    drive_harness(&pooled, warm_id, session_id, &ca_pem, captured).await;
+    drive_harness(&pooled, warm_id, session_id, &ca_pem, captured, cmd_tx).await;
 
     pooled.destroy(warm_id).await.expect("destroy warm");
     cleanup_host_state();
@@ -775,7 +815,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
 /// `engram-coordinator/tests/api.rs::create_session_dev_vm_mode_skips_harness_on_harnessed_image`
 /// against a mock backend. This is the real-FC counterpart — it
 /// proves the whole chain (cold create → `wait_agent_ready` →
-/// `InstallHostCa` → empty-argv `SpawnHarness` → Active) survives a
+/// empty-argv `SpawnHarness` with a CA payload → Active) survives a
 /// real microVM with no harness child running.
 ///
 /// Assertions:
@@ -819,7 +859,7 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
     fc.host_startup().await.expect("host_startup");
     let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
 
-    let (sink, captured) = capture_sink();
+    let (sink, captured, _cmd_tx) = capture_sink();
     fc.set_harness_sink(sink);
 
     let spec = SandboxSpec {
@@ -848,6 +888,8 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
         .start_agent(
             sandbox_id,
             AgentSpec {
+                // ADR 0073: epoch 1 = the test's sole binding generation.
+                binding_epoch: 1,
                 argv: Vec::new(),
                 env: HashMap::new(),
                 session_env: HashMap::new(),
@@ -871,9 +913,9 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
 
     // Prove agentd is reachable on the *same* vsock path that
     // start_agent used. `exec` is a `WireRequest::Exec` over
-    // ENGRAM_AGENTD_PORT — same connect path as InstallHostCa /
-    // SpawnHarness. Success here means the dev VM is fully usable
-    // for shell-tab / ad-hoc commands without a harness driving it.
+    // ENGRAM_AGENTD_PORT — same connect path as SpawnHarness.
+    // Success here means the dev VM is fully usable for shell-tab /
+    // ad-hoc commands without a harness driving it.
     let exec_handle = pooled
         .exec(
             sandbox_id,

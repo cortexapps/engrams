@@ -49,7 +49,7 @@ pub const DEFAULT_DIRTY_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 /// limits (mirrors the memory prefetch + re-chunk bound).
 const DISK_FLUSH_UPLOAD_CONCURRENCY: usize = 32;
 
-/// ADR 0061: bounded concurrency for the per-chunk fetches of a single
+/// ADR 0071: bounded concurrency for the per-chunk fetches of a single
 /// NBD read that spans multiple 16 MiB chunks. The fetches are
 /// order-independent (each `read_chunk` resolves dirty/pending/mem/base
 /// on its own); we fan them out and reassemble in order. Most NBD reads
@@ -148,6 +148,26 @@ pub struct PendingDiskFlush {
     new_chunks: Vec<(usize, ChunkHash, Bytes)>,
     /// Held across the publish; see `ChunkedDiskBackend::flush_pipeline`.
     flush_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl PendingDiskFlush {
+    /// Issue #529: the eviction finalize flavor persists these drained
+    /// chunks to `<dest>/disk-pending/` BEFORE `snapshot_begin` returns
+    /// (durability boundary moves earlier), then re-reads them from disk
+    /// in the (possibly re-driven, possibly cross-process) background
+    /// finalize job — it never calls `flush_upload` on this handle
+    /// directly, so there's no live-backend rebase to preserve and
+    /// nothing left to serialize once these bytes are extracted. Consumes
+    /// `self`, dropping the flush-pipeline guard immediately.
+    ///
+    /// Its only caller is `PooledBackend::snapshot_begin`'s
+    /// `#[cfg(target_os = "linux")]` disk-pending block (NBD is
+    /// Linux-only) — `#[cfg]`'d rather than `#[allow(dead_code)]`'d so a
+    /// non-Linux build doesn't carry an unreachable-by-construction method.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn into_chunks(self) -> Vec<(usize, ChunkHash, Bytes)> {
+        self.new_chunks
+    }
 }
 
 /// ADR 0045 C2 disk post-copy: the frozen source's sealed disk state
@@ -2098,7 +2118,7 @@ mod tests {
         assert!(bytes.iter().all(|b| *b == 0xbb));
     }
 
-    /// ADR 0061 (#2): a read that straddles chunk boundaries fans the
+    /// ADR 0071 (#2): a read that straddles chunk boundaries fans the
     /// per-chunk fetches out concurrently (`buffered`) and must reassemble
     /// them IN ORDER — chunk 0's bytes before chunk 1's before chunk 2's, no
     /// transposition from out-of-order fetch completion.
@@ -3605,6 +3625,14 @@ mod tests {
         let chunk_size = 4096u64;
         let total = 3 * chunk_size;
         let base = synth_manifest(total, chunk_size, vec![]);
+
+        // A near-full dev/CI disk (e.g. the dev VM at >90% used) trips the
+        // cache's default 20%-free-space floor and evicts the just-flushed
+        // chunk before this test can observe it, independent of `budget_bytes`
+        // — see the same fix in two_host_drain_wave.rs / migration_source.rs.
+        // Nextest runs each test in its own process, so this env override
+        // is safe.
+        std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
 
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));

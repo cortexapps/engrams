@@ -40,32 +40,32 @@ impl MetadataStore for MiniMeta {
                 mode: spec.mode,
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
+                selected_skills: Vec::new(),
+                park_rung: 0,
+                parked_at: None,
             },
         );
         Ok(id)
     }
-    async fn create_session_created(
+    async fn transition_session_created(
         &self,
         session_id: SessionId,
-        spec: SessionSpec,
-        host_id: engram_core::HostId,
         sandbox_id: engram_core::SandboxId,
     ) -> Result<(), MetaError> {
-        self.sessions.lock().insert(
-            session_id,
-            Session {
-                id: session_id,
-                status: SessionState::Created,
-                host_id: Some(host_id),
-                sandbox_id: Some(sandbox_id),
-                created_at: Utc::now(),
-                image: spec.image,
-                mode: spec.mode,
-                last_active_at: Utc::now(),
-                live_disk_manifest: None,
-            },
-        );
+        let mut g = self.sessions.lock();
+        let s = g.get_mut(&session_id).ok_or(MetaError::NotFound)?;
+        s.status = SessionState::Created;
+        s.sandbox_id = Some(sandbox_id);
+        s.last_active_at = Utc::now();
         Ok(())
+    }
+    async fn reserve_and_persist_create(
+        &self,
+        _ws: engram_core::traits::SessionCreateWriteSet,
+        _candidates: &[HostId],
+        _affinity_len: usize,
+    ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
+        unreachable!("dead-host tests seed sessions via create_session, not the create path")
     }
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
         self.sessions
@@ -150,8 +150,8 @@ impl MetadataStore for MiniMeta {
         }
         Ok(affected)
     }
-    async fn record_snapshot(&self, _s: SnapshotRecord) -> Result<(), MetaError> {
-        Ok(())
+    async fn record_snapshot(&self, _s: SnapshotRecord) -> Result<bool, MetaError> {
+        Ok(true)
     }
     async fn list_snapshots_for_session(
         &self,
@@ -255,12 +255,6 @@ impl MetadataStore for MiniMeta {
     async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
         Ok(())
     }
-    async fn upsert_session_secrets(
-        &self,
-        _: engram_core::types::SessionSecrets,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
     async fn get_session_secrets(
         &self,
         _: SessionId,
@@ -298,7 +292,6 @@ fn legal_path_from_pending(target: SessionState) -> &'static [SessionState] {
         Pending => &[],
         Queued => &[Queued],
         Created => &[Created],
-        GuestReady => &[Created, GuestReady],
         Active => &[Created, Active],
         Idle => &[Created, Active, Idle],
         HostLost => &[Created, Active, HostLost],

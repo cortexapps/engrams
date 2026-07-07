@@ -77,11 +77,7 @@ pub(crate) async fn cow_state_core(
 ) -> Result<Option<CowStateView>, ApiError> {
     let session = state.services.meta.get_session(id).await?;
     let (host_id, sandbox_id) = match (session.host_id, session.sandbox_id, session.status) {
-        (
-            Some(h),
-            Some(sb),
-            SessionState::Active | SessionState::Created | SessionState::GuestReady,
-        ) => (h, sb),
+        (Some(h), Some(sb), SessionState::Active | SessionState::Created) => (h, sb),
         _ => {
             // No live sandbox for this session (Idle, HostLost,
             // terminal, or still Pending).
@@ -229,6 +225,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         }
     }
 

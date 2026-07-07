@@ -19,7 +19,7 @@ pub(crate) mod forge;
 // registry doesn't exist anymore (the harness is an image property
 // baked at image-bake time).
 mod health;
-mod host_http;
+pub(crate) mod host_http;
 pub(crate) mod hosts;
 pub(crate) mod interrupt;
 pub(crate) mod prompt;
@@ -68,10 +68,6 @@ pub fn router(state: SharedState) -> Router {
         .route(
             "/hosts/:id/sessions/:session_id/sandboxes/:sandbox_id/ownership",
             get(host_http::sandbox_ownership),
-        )
-        .route(
-            "/hosts/:id/idle-eviction-candidates",
-            post(host_http::idle_eviction_candidates),
         )
         .route(
             "/hosts/:id/live-manifest",

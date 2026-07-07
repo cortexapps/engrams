@@ -244,17 +244,8 @@ impl ChunkedMemoryBackend {
         session_ref: engram_core::types::manifest::ManifestRef,
         blob: Arc<dyn BlobStorage>,
         cache_root: &Path,
-        cache_budget_bytes: u64,
     ) -> Result<Self, ChunkedBackendError> {
-        Self::from_blob_with_session_json(
-            canonical_ref,
-            session_ref,
-            None,
-            blob,
-            cache_root,
-            cache_budget_bytes,
-        )
-        .await
+        Self::from_blob_with_session_json(canonical_ref, session_ref, None, blob, cache_root).await
     }
 
     /// ADR 0045 C1: like [`Self::from_blob`], but when
@@ -271,7 +262,6 @@ impl ChunkedMemoryBackend {
         session_manifest_json: Option<&Path>,
         blob: Arc<dyn BlobStorage>,
         cache_root: &Path,
-        cache_budget_bytes: u64,
     ) -> Result<Self, ChunkedBackendError> {
         let store = engram_chunk_store::ChunkStore::new(blob);
         // ADR 0045 C1: when the canonical and session refs coincide on a
@@ -309,8 +299,16 @@ impl ChunkedMemoryBackend {
             }
             None => store.get_manifest(session_ref).await?,
         };
+        // ADR 0070: this handler POPULATES the shared cache_root (a
+        // faulted chunk's write-through is the whole point of the
+        // locality win) but never EVICTS from it — the host-agent, which
+        // holds the pin set, is the one process per host that evicts.
+        // `budget_bytes` is therefore irrelevant here (eviction_enabled
+        // gates the sweep before budget_bytes is ever consulted); it's
+        // left at the `new()` default rather than plumbed from a
+        // deleted --cache-budget-bytes flag.
         let mut cfg = engram_chunk_store::cache::ChunkCacheConfig::new(cache_root.to_path_buf());
-        cfg.budget_bytes = cache_budget_bytes;
+        cfg.eviction_enabled = false;
         let cache = ChunkCache::new(cfg);
         Self::new(&canonical, &session, cache, store)
     }
@@ -453,6 +451,36 @@ mod tests {
     /// representative of production hash semantics.
     fn h(byte: u8) -> ChunkHash {
         ChunkHash::of(&[byte])
+    }
+
+    /// ADR 0070: every cache this handler builds from a blob store must
+    /// have eviction disabled — the host-agent (holding the pin set) is
+    /// the one process per host that evicts. This is the single-evictor
+    /// invariant `--cache-budget-bytes` used to violate.
+    #[tokio::test]
+    async fn from_blob_built_cache_has_eviction_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let cs = ChunkStore::new(blob.clone());
+        let canonical = synth_manifest(512, 512, vec![(0, h(1))]);
+        let canonical_ref = engram_core::types::manifest::ManifestRef {
+            manifest_id: uuid::Uuid::new_v4(),
+            version: 1,
+        };
+        cs.put_manifest(canonical_ref, &canonical).await.unwrap();
+
+        let backend = ChunkedMemoryBackend::from_blob(
+            canonical_ref,
+            canonical_ref,
+            blob,
+            &dir.path().join("cache"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !backend.cache.eviction_enabled(),
+            "the handler must never evict from the shared cache_root",
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@
 //! `sessions.sandbox_id == publish.sandbox_id` guard drops stale
 //! publishes from destroyed bindings — see commit 3.)
 //!
-//! ## Interaction with the idle evictor (ADR 0009 + A.1.5/A.1.6)
+//! ## Interaction with the idle evictor (ADR 0016 + A.1.5/A.1.6)
 //!
 //! The scheduler runs in parallel with the eviction pipeline. Both
 //! call `ChunkedDiskBackend::flush()` on the same backend (and the
@@ -147,7 +147,7 @@ impl FlushSchedulerConfig {
 ///
 /// **`sandbox_id`, not `session_id`**: the publisher is responsible
 /// for resolving the session binding (via the host-agent's
-/// `session_bindings: DashMap<SandboxId, SessionId>` from ADR 0006
+/// `session_bindings: DashMap<SandboxId, SessionId>` from ADR 0017
 /// or any equivalent index) and short-circuiting the POST when the
 /// sandbox is unbound (e.g. warm-pool, post-`destroy` race). This
 /// shape lets warm-pool sandboxes share the same scheduler without

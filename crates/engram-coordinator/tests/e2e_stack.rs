@@ -374,6 +374,38 @@ impl Driver {
         self.sess.resume(req).await.expect("Resume");
     }
 
+    /// `SessionService.ListSessionEvents` — unary, paginated, unfiltered
+    /// read of the persistent event log (ADR 0060). Issue #529: used to
+    /// assert a clean evict→resume cycle emits no `recovered_from_checkpoint`
+    /// (the rewind, now kind-scoped to guest-derived events, no-ops on the
+    /// coordinator's own lifecycle events). Pages until `next_after_idx`
+    /// stops advancing — the session histories these tests produce are
+    /// small, so one or two pages cover it.
+    async fn list_events(&mut self, sid: SessionId) -> Vec<app::SessionEvent> {
+        let mut out = Vec::new();
+        let mut after_idx: Option<i64> = None;
+        loop {
+            let req = app::ListSessionEventsRequest {
+                session_id: sid.to_string(),
+                after_idx,
+                limit: Some(500),
+            };
+            let resp = self
+                .sess
+                .list_session_events(req)
+                .await
+                .expect("ListSessionEvents")
+                .into_inner();
+            let got_any = !resp.events.is_empty();
+            out.extend(resp.events);
+            if !got_any || Some(resp.next_after_idx) == after_idx {
+                break;
+            }
+            after_idx = Some(resp.next_after_idx);
+        }
+        out
+    }
+
     /// `SessionService.GetCowState`. ADR 0016 Phase A diagnostic. Returns
     /// `Some(state)` when the sandbox is NBD-tracked (Phase B's chunked-disk
     /// pipeline live), `None` when the host fell back to materialize-to-file
@@ -541,6 +573,18 @@ impl Driver {
         let mut captured: Vec<(String, String)> = Vec::new();
         let started = std::time::Instant::now();
 
+        // ADR 0073 (create-prompt regression guard): the auth error is only a
+        // valid signal if it came from a RUN the CREATE-TIME PROMPT triggered —
+        // `run_started` proves the prompt was actually delivered to the harness
+        // and accepted as a turn. Without this gate the test passes even when
+        // the create-time prompt is silently DROPPED (the #542 env-var-with-no-
+        // consumer bug): the Claude CLI surfaces "Invalid API key" during its
+        // own startup warmup, independent of any prompt, so a bare
+        // agent_message match masks a broken delivery path. Requiring a
+        // preceding `run_started` makes the dropped-prompt case time out (fail)
+        // instead of falsely passing.
+        let mut saw_run_started = false;
+
         loop {
             let Some(remaining) = deadline.checked_sub(started.elapsed()) else {
                 return AuthFailureSignal::TimedOut(captured);
@@ -556,8 +600,15 @@ impl Driver {
                 Ok(Ok(Some(ev))) => ev,
             };
 
-            // Signal 1: an agent_message carrying the expected text.
-            if ev.kind == "agent_message" {
+            // The create-time prompt reached the harness and started a turn —
+            // this is what the env-var-with-no-consumer bug broke.
+            if ev.kind == "run_started" {
+                saw_run_started = true;
+            }
+
+            // Signal 1: an agent_message carrying the expected text — but only
+            // once the prompt-triggered run is under way (see `saw_run_started`).
+            if saw_run_started && ev.kind == "agent_message" {
                 if let Some(text) = payload_str(&ev.payload_json, "text") {
                     if text.contains(expected_substr) {
                         return AuthFailureSignal::ErrorMessage(text);
@@ -568,7 +619,8 @@ impl Driver {
             // Signal 2: run_completed with ok == false. Give the stream a
             // short grace so a trailing agent_message with the error text
             // (if any) can land first — the harness emits run_completed
-            // AFTER forwarding agent_messages.
+            // AFTER forwarding agent_messages. (A run_completed implies its
+            // run_started already landed, so no extra gate is needed here.)
             if ev.kind == "run_completed" && payload_bool(&ev.payload_json, "ok") == Some(false) {
                 captured.push((ev.kind.clone(), ev.payload_json.clone()));
                 let grace = std::time::Instant::now() + Duration::from_millis(500);
@@ -1133,6 +1185,35 @@ async fn e2e_resume_preserves_disk_and_memory() {
             .await,
         "session should be Active after resume",
     );
+
+    // Issue #529: a clean evict→resume cycle must emit NO
+    // `recovered_from_checkpoint` event. Pre-#529, `rewind_session_to_cursor`
+    // tombstoned every event kind past the cursor — including the
+    // coordinator's own `evicted`/`status_changed`/`snapshot_taken` facts
+    // this exact cycle appends — so `apply_rung1_rewind` always saw
+    // `rolled_back > 0` and emitted the event even on a perfectly clean
+    // cycle (prod evidence: 45/45 sampled resumes). The rewind is now
+    // scoped to guest-derived kinds only, so this session (no guest
+    // activity between snapshot and evict) must roll back nothing.
+    let events = driver.list_events(sid).await;
+    assert!(
+        !events.iter().any(|e| e.kind == "recovered_from_checkpoint"),
+        "a clean evict→resume cycle must not emit recovered_from_checkpoint \
+         (kind-scoped rewind regression) — events: {:?}",
+        events.iter().map(|e| &e.kind).collect::<Vec<_>>(),
+    );
+    // The lifecycle facts themselves must still be on the record (rewind
+    // scoping excludes them from tombstoning, not from ever being
+    // appended) — a sanity check that this evict→resume cycle actually
+    // ran, so the assertion above isn't vacuously true on a no-op.
+    for expected_kind in ["evicted", "snapshot_taken"] {
+        assert!(
+            events.iter().any(|e| e.kind == expected_kind),
+            "expected a `{expected_kind}` event from the evict→resume cycle; \
+             got kinds: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>(),
+        );
+    }
 
     // Disk survived byte-identical.
     let readback = driver.exec(sid, "cat /var/sentinel.txt").await;

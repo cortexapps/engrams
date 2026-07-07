@@ -1,4 +1,4 @@
-//! Orchestrator-facing app gRPC surface (ADR 0039 §2.3). Lives beside
+//! Orchestrator-facing app gRPC surface (ADR 0051 §2.3). Lives beside
 //! the axum API during the migration; the axum web routes retire in
 //! Phase 5.
 //!
@@ -7,7 +7,7 @@
 //! implementations over the same `AppState` the axum handlers use.
 //! The caller is a single trusted service (the orchestrator),
 //! authenticated per-RPC by a static bearer ([`auth::BearerAuth`],
-//! ADR 0039 §5 — fail closed when no tokens are configured); per-user
+//! ADR 0051 §5 — fail closed when no tokens are configured); per-user
 //! authz lives over there, not here.
 
 pub mod auth;
@@ -96,6 +96,7 @@ pub(crate) fn into_status(err: ApiError) -> Status {
         // 502 it is on the axum side.
         ApiError::BadGateway(_) => Code::Unavailable,
         ApiError::Internal(_) => Code::Internal,
+        ApiError::CaptureFailed { .. } => Code::Internal,
     };
     let slug = err.slug();
     let mut status = Status::new(code, err.message().to_string());
@@ -108,7 +109,7 @@ pub(crate) fn into_status(err: ApiError) -> Status {
     status
 }
 
-/// ADR 0039 §9.4: keepalive PINGs so a dead orchestrator's streams
+/// ADR 0051 §9.4: keepalive PINGs so a dead orchestrator's streams
 /// are detected and torn down (releasing leases/subscriptions)
 /// instead of leaking until TCP gives up.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
@@ -394,7 +395,7 @@ mod into_status_tests {
 
 #[cfg(test)]
 mod convention {
-    //! Source-scan guard for the fail-closed auth convention (ADR 0039
+    //! Source-scan guard for the fail-closed auth convention (ADR 0051
     //! §5): EVERY app-gRPC RPC body must begin with `self.auth.check(&req)?`
     //! before it does anything else. The service impls hand-roll
     //! that line in each method (no tower layer — see `auth::BearerAuth`),
@@ -474,7 +475,7 @@ mod convention {
                 "AUTH CONVENTION VIOLATED in src/grpc_app/{name}: found {rpc_count} \
                  `async fn ` RPC method(s) but {check_count} `{AUTH_CHECK}` call(s). \
                  Every app-gRPC RPC body MUST begin with `{AUTH_CHECK}` before any \
-                 other logic (ADR 0039 §5, fail-closed machine auth — see \
+                 other logic (ADR 0051 §5, fail-closed machine auth — see \
                  src/grpc_app/auth.rs). Open src/grpc_app/{name}, find the RPC `async fn` \
                  that is missing the leading `{AUTH_CHECK}`, and add it. If you added a \
                  NEW per-service file, also add it to the `SOURCES` list in this test \

@@ -1,4 +1,4 @@
-//! `SessionService` over gRPC (ADR 0039 §2.3). Each RPC is a thin
+//! `SessionService` over gRPC (ADR 0051 §2.3). Each RPC is a thin
 //! transport adapter: auth-check, decode the request, delegate to a
 //! transport-agnostic core in `crate::api::*` (the SAME core the axum
 //! handler calls), encode the response. The cores carry no principal and
@@ -287,7 +287,7 @@ impl app::session_service_server::SessionService for AppSessionService {
 
     type ExecStream = BoxStream<app::ExecOutput>;
 
-    // ADR 0039 Task 12: streaming Exec over gRPC.
+    // ADR 0051 Task 12: streaming Exec over gRPC.
     //
     // Proto framing (session.proto ExecOutput oneof):
     //   first  → started { exec_id }
@@ -510,7 +510,7 @@ impl app::session_service_server::SessionService for AppSessionService {
 
     type GetArtifactStream = BoxStream<app::GetArtifactResponse>;
 
-    // ADR 0039 Task 12: streaming GetArtifact.
+    // ADR 0051 Task 12: streaming GetArtifact.
     //
     // Proto framing (session.proto GetArtifactResponse oneof):
     //   first  → metadata { media_type, size_bytes, file_name }

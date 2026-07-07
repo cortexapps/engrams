@@ -394,7 +394,7 @@ describe("authz.matrix — fail-closed: no POLICY entry → PermissionDenied (ze
   });
 });
 
-describe("Profile subject (ADR 0052)", () => {
+describe("Profile subject (ADR 0053)", () => {
   test("member can read Profile but not manage", () => {
     const a = abilityFor({ id: "m", role: "user" });
     expect(a.can("read", "Profile")).toBe(true);

@@ -3,7 +3,7 @@
 //! generated proto types (`engram_protocol::app`). No business logic
 //! lives here — every function is a mechanical field-by-field copy.
 //!
-//! The proto `Session` is the JSON wire shape minus `user_id` (ADR 0039
+//! The proto `Session` is the JSON wire shape minus `user_id` (ADR 0051
 //! §2.1: attribution leaves the contract). Timestamps cross as ISO-8601
 //! strings, exactly as the JSON wire serializes them; the string-literal
 //! status/mode unions stay strings via the core types' `as_str()`.
@@ -23,7 +23,7 @@ use crate::error::ApiError;
 use engram_core::types::session::SessionMode;
 
 /// `engram_core::types::Session` → proto `Session`. Drops `user_id`
-/// (off-contract per ADR 0039 §2.1: attribution leaves the contract) and
+/// (off-contract per ADR 0051 §2.1: attribution leaves the contract) and
 /// `live_disk_manifest` (internal coord state, not on the wire shape).
 ///
 /// The exhaustive destructure below is the totality guard — if a field is
@@ -40,6 +40,9 @@ pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session 
         created_at,
         last_active_at,
         live_disk_manifest: _, // Internal coord state (ADR 0016 Phase B); not on the wire shape.
+        selected_skills: _,    // Internal coord state (issue #535); not on the wire shape.
+        park_rung: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
+        parked_at: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
     } = s;
     app::Session {
         id: id.to_string(),
@@ -331,6 +334,14 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         cpu_budget_vcpus,
         reserved_vcpus,
         free_vcpus,
+        // ADR 0068: the capability-vector fleet-view surface.
+        failing_capabilities,
+        fc_snapshot_version,
+        capabilities_schema,
+        // Issue #540: the RAM ledger's attribution fields.
+        util_base_shm_mib,
+        util_parked_pss_mib,
+        util_running_pss_mib,
     } = v;
     app::HostView {
         id: id.to_string(),
@@ -356,6 +367,12 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         cpu_budget_vcpus: *cpu_budget_vcpus,
         reserved_vcpus: *reserved_vcpus,
         free_vcpus: *free_vcpus,
+        failing_capabilities: failing_capabilities.clone(),
+        fc_snapshot_version: fc_snapshot_version.clone().unwrap_or_default(),
+        capabilities_schema: *capabilities_schema,
+        util_base_shm_mib: *util_base_shm_mib,
+        util_parked_pss_mib: *util_parked_pss_mib,
+        util_running_pss_mib: *util_running_pss_mib,
     }
 }
 
@@ -603,6 +620,18 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         // at capture); it is not surfaced on the job's API response — the
         // operator sees it on EnabledImageSummary.
         capture_env: _,
+        prestage_hosts,
+        capture_phase,
+        warm_stage,
+        warm_stage_started_at,
+        // The full stage history is an internal/debugging shape (also
+        // rides the `enable_jobs.warm_stages` JSONB column); the app
+        // surface exposes only the CURRENT stage + tail, not the whole
+        // history — issue #539's plan scopes the proto to fields 11-14
+        // (prestage_hosts is field 15 — renumbered post-merge, ADR 0036
+        // amendment landed after issue #539's 11-14 allocation).
+        warm_stages: _,
+        output_tail,
         created_at,
         updated_at,
     } = j;
@@ -617,6 +646,14 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         error: error.clone(),
         created_at: created_at.to_rfc3339(),
         updated_at: updated_at.to_rfc3339(),
+        capture_phase: capture_phase.map(|p| p.as_str().to_string()),
+        warm_stage: warm_stage.clone(),
+        warm_stage_started_at: warm_stage_started_at.map(|t| t.to_rfc3339()),
+        output_tail: output_tail.clone(),
+        // ADR 0036 amendment (issue #538): JSON-encoded per-host prestage
+        // outcome map. `prestage_hosts` is NOT NULL DEFAULT '{}'::jsonb
+        // (migration 0081), so `to_string()` always yields valid JSON.
+        prestage_hosts: prestage_hosts.to_string(),
     }
 }
 
@@ -746,6 +783,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         }
     }
 

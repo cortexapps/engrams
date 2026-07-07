@@ -6,7 +6,8 @@ for the per-phase bookends and the commit chain.
 
 ## Context
 
-Prod session `bf3dbbcb` wedged: a warm-reattached harness (ADR 0037) desynced
+Prod session `bf3dbbcb` wedged: a warm-reattached harness (ADR 0037 — an
+unmerged draft; its findings are recorded here) desynced
 after a periodic checkpoint — it emitted a bare `agent_message` with **no
 enclosing `run_started` and no `run_completed`**, then went silent, while the
 VM stayed healthy. The root cause is an inference defect in the current

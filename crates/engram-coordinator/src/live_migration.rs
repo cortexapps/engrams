@@ -41,6 +41,7 @@ use engram_core::types::snapshot::MigrationSourceInfo;
 use engram_core::types::SessionState;
 use engram_core::SandboxError;
 use engram_core::{HostId, SessionId};
+use tracing::Instrument;
 
 use crate::idle_evictor::SessionLeaseGuard;
 use crate::state::{SessionEvent, SharedState};
@@ -131,6 +132,13 @@ impl Drop for MigrationGateGuard {
     }
 }
 
+// ADR 0019 / telemetry restoration (#526): this verb is driven both from
+// an admin request fan-out and (indirectly) from scanner-driven drain —
+// neither reliably supplies a request span. An explicit root (carrying
+// `session_id`/`target_host_id`) means the pipeline's own detached spawns
+// below (dest restore, drain+commit finalize) have something real to
+// `.instrument(Span::current())` onto instead of orphaning.
+#[tracing::instrument(name = "live_migration.migrate_session_live", skip_all, fields(%session_id, %target_host_id))]
 pub async fn migrate_session_live(
     state: &SharedState,
     session_id: SessionId,
@@ -317,10 +325,20 @@ pub async fn migrate_session_live(
             .map(|r| r.aux_bundles.clone())
             .or_else(|| base_row.as_ref().map(|r| r.aux_bundles.clone()))
             .unwrap_or_default(),
+        // Issue #529: restore-side reconstruction, not a fresh capture —
+        // no pause instant to carry.
+        paused_at: None,
     };
+    // ADR 0019 / telemetry restoration (#526): `dest.restore` makes a
+    // gRPC call to the target host-agent; the `TraceparentInjector`
+    // interceptor propagates whatever span is current at call time onto
+    // the wire. Detaching via bare `tokio::spawn` would send an empty
+    // traceparent and orphan the host-side restore spans from this
+    // migration trace.
     let restore_task = {
         let dest = dest_backend.clone();
-        tokio::spawn(async move { dest.restore(metadata).await })
+        let restore_span = tracing::Span::current();
+        tokio::spawn(async move { dest.restore(metadata).await }.instrument(restore_span))
     };
 
     // ---- 3. Arm the parachute ----
@@ -499,7 +517,16 @@ pub async fn migrate_session_live(
             .await;
         return Err(parachute_or_kill(state, session_id, durable_row.is_some(), e).await);
     }
-    crate::api::snapshot::bind_session_routing(state, session_id, new_sandbox_id).await;
+    // ADR 0073: live move — the harness process SURVIVES the teleport
+    // (agentd C1 reattach), so its generation is unchanged: bind the
+    // target host's record at the CURRENT epoch (re-point, no mint).
+    let epoch = state
+        .services
+        .meta
+        .current_binding_epoch(session_id)
+        .await
+        .unwrap_or(0);
+    crate::api::snapshot::bind_session_routing(state, session_id, new_sandbox_id, epoch).await;
     // CASE 1 (issue #209): the teleport_target pin's ONLY job is to aim
     // the parachute at the dest while the move is in flight. The rebind
     // above committed the ownership flip — the dest is now the durable
@@ -609,9 +636,15 @@ pub async fn migrate_session_live(
     // The lease + the R8 gate ride into the task. The dest keeps
     // serving the user throughout; the SOURCE stays alive as a page
     // server until DrainDone.
+    //
+    // ADR 0019 / telemetry restoration (#526): re-parent onto the
+    // migration span so the finalize (drain + source commit) stitches
+    // under the same trace instead of exporting as an orphaned root.
     let state2 = state.clone();
     let export_id = presetup.export_id.clone();
-    tokio::spawn(async move {
+    let finalize_span = tracing::Span::current();
+    tokio::spawn(
+        async move {
         let lease = lease;
         let _gate_guard = gate_guard;
 
@@ -781,7 +814,9 @@ pub async fn migrate_session_live(
         // the guest is live on the dest and the source is released.
         tracing::info!(%session_id,
             "post-copy migration finalized (source released; durability rides the periodic cadence)");
-    });
+    }
+    .instrument(finalize_span),
+    );
     Ok(())
 }
 
@@ -890,6 +925,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         }
     }
 
@@ -1125,6 +1163,8 @@ mod tests {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                stages_images: false,
+                capabilities: engram_core::types::host::HostCapabilities::default(),
             });
         meta.snapshots
             .lock()
@@ -1141,6 +1181,7 @@ mod tests {
                 recoverable: true,
                 aux_bundles: Vec::new(),
                 events_cursor: None,
+                fc_snapshot_version: None,
             });
 
         let err = migrate_session_live(&state, session_id, target)
@@ -1315,6 +1356,8 @@ mod tests {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                stages_images: false,
+                capabilities: engram_core::types::host::HostCapabilities::default(),
             });
         meta.snapshots
             .lock()
@@ -1331,6 +1374,7 @@ mod tests {
                 recoverable: true,
                 aux_bundles: Vec::new(),
                 events_cursor: None,
+                fc_snapshot_version: None,
             });
 
         migrate_session_live(&state, session_id, target)
@@ -1602,6 +1646,8 @@ mod tests {
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,
+                stages_images: false,
+                capabilities: engram_core::types::host::HostCapabilities::default(),
             });
         meta.snapshots
             .lock()
@@ -1618,6 +1664,7 @@ mod tests {
                 recoverable: true,
                 aux_bundles: Vec::new(),
                 events_cursor: None,
+                fc_snapshot_version: None,
             });
 
         // The verb returns Ok — the move LANDED; the finalize runs async.

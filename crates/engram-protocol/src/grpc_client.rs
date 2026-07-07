@@ -18,7 +18,7 @@ use engram_core::traits::HostClient;
 use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
-    AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
+    AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
@@ -40,9 +40,8 @@ use crate::grpc::{
     InterruptHarnessRequest, MigrationExportRef, MigrationFetchRequest, MigrationItem,
     ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
     ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
-    ReapMaterializeDirRequest, RehandshakeHarnessRequest, RestoreBaseForSessionRequest,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest, StringList,
-    UnbindHarnessSessionRequest,
+    ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, StartAgentRequest, StringList, UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -187,6 +186,34 @@ impl GrpcHostClient {
             .iter()
             .map(|b| decode_sandbox_id(b))
             .collect()
+    }
+
+    /// ADR 0068 probe-before-host_lost: ground-truth liveness for ONE
+    /// sandbox. `Unimplemented` (an old host-agent mid-roll — a proto
+    /// RPC ADDITION is protobuf-compatible, so this needs no
+    /// `WIRE_VERSION` bump) maps to the dedicated `Unsupported` variant
+    /// rather than `grpc_to_sandbox_err`'s generic `Unimplemented →
+    /// InvalidSpec` mapping (that shared mapping serves a DIFFERENT
+    /// purpose — the `snapshot_begin`/`snapshot_wait` "fall back to the
+    /// composed call" fallback — and conflating the two would make
+    /// `reconcile::flip_missing` unable to tell "can't probe, proceed
+    /// with the flip" apart from "the spec was rejected").
+    pub async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self.inner.clone().probe_sandbox(req).await.map_err(|s| {
+            if s.code() == tonic::Code::Unimplemented {
+                SandboxError::Unsupported(s.message().to_string())
+            } else {
+                grpc_to_sandbox_err(s)
+            }
+        })?;
+        let resp = resp.into_inner();
+        Ok(SandboxProbe {
+            known_to_backend: resp.known_to_backend,
+            process_alive: resp.process_alive,
+        })
     }
 
     pub async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
@@ -532,25 +559,101 @@ impl GrpcHostClient {
         decode_sandbox_id(&resp.uuid)
     }
 
+    /// Issue #539: `BuildBaseSnapshot` is server-streaming (wire v8) —
+    /// zero or more `progress` frames (host keepalive every <=30 s)
+    /// forwarded onto `progress`, then exactly one terminal frame
+    /// (`done` decodes to `Ok`, `failed` decodes to a structured
+    /// `SandboxError::CaptureFailed`). A stream that ends (or errors)
+    /// before a terminal frame arrives is `WarmExecTransport` — the
+    /// only retryable capture-failure kind (`classify_capture_error`,
+    /// `enable_scanner.rs`).
     pub async fn build_base_snapshot(
         &self,
         spec: SandboxSpec,
         warm: Option<engram_core::types::image::WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         let req = BuildBaseSnapshotRequest {
             spec_bincode: encode_bincode(&spec, "SandboxSpec")?,
             warm_bincode: encode_bincode(&warm, "Option<WarmConfig>")?,
             capture_env_bincode: encode_bincode(&capture_env, "capture_env")?,
         };
-        let resp = self
+        let mut stream = self
             .inner
             .clone()
             .build_base_snapshot(req)
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
-        decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
+
+        loop {
+            let frame = match stream.message().await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    return Err(SandboxError::CaptureFailed(
+                        engram_core::types::CaptureFailure {
+                            kind: engram_core::types::CaptureFailureKind::WarmExecTransport,
+                            stage: None,
+                            tail: String::new(),
+                            message: "build_base_snapshot stream closed before a terminal frame"
+                                .into(),
+                        },
+                    ));
+                }
+                Err(status) => {
+                    return Err(SandboxError::CaptureFailed(
+                        engram_core::types::CaptureFailure {
+                            kind: engram_core::types::CaptureFailureKind::WarmExecTransport,
+                            stage: None,
+                            tail: String::new(),
+                            message: format!("build_base_snapshot stream error: {status}"),
+                        },
+                    ));
+                }
+            };
+            match frame.event {
+                Some(crate::grpc::build_base_snapshot_event::Event::Progress(p)) => {
+                    let warm_stages = if p.warm_stages_bincode.is_empty() {
+                        Vec::new()
+                    } else {
+                        decode_bincode(&p.warm_stages_bincode, "Vec<WarmStageRecord>")?
+                    };
+                    let phase = match p.phase.as_str() {
+                        "boot" => engram_core::types::CapturePhase::Boot,
+                        "snapshot" => engram_core::types::CapturePhase::Snapshot,
+                        _ => engram_core::types::CapturePhase::Warm,
+                    };
+                    let event = engram_core::types::CaptureProgress {
+                        phase,
+                        warm_stage: p.warm_stage,
+                        detail: p.detail,
+                        output_tail: p.output_tail,
+                        warm_stages,
+                    };
+                    // A slow/dropped consumer must not stall the capture —
+                    // best-effort forward.
+                    let _ = progress.try_send(event);
+                }
+                Some(crate::grpc::build_base_snapshot_event::Event::Done(done)) => {
+                    return decode_bincode(&done.metadata_bincode, "SnapshotMetadata");
+                }
+                Some(crate::grpc::build_base_snapshot_event::Event::Failed(failed)) => {
+                    let kind = parse_capture_failure_kind(&failed.kind);
+                    return Err(SandboxError::CaptureFailed(
+                        engram_core::types::CaptureFailure {
+                            kind,
+                            stage: failed.warm_stage,
+                            tail: failed.output_tail,
+                            message: failed.message,
+                        },
+                    ));
+                }
+                None => {
+                    tracing::warn!("build_base_snapshot: empty stream frame; ignoring");
+                }
+            }
+        }
     }
 
     pub async fn restore_base_for_session(
@@ -588,10 +691,12 @@ impl GrpcHostClient {
         &self,
         session_id: SessionId,
         sandbox_id: SandboxId,
+        binding_epoch: u64,
     ) -> Result<(), SandboxError> {
         let req = BindHarnessSessionRequest {
             session_id: session_id.as_uuid().as_bytes().to_vec(),
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+            binding_epoch,
         };
         self.inner
             .clone()
@@ -703,18 +808,6 @@ impl GrpcHostClient {
         Ok(())
     }
 
-    pub async fn rehandshake_harness(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let req = RehandshakeHarnessRequest {
-            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
-        };
-        self.inner
-            .clone()
-            .rehandshake_harness(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?;
-        Ok(())
-    }
-
     /// ADR 0045 Phase F: freeze the microVM in place.
     pub async fn pause_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let req = SandboxIdMessage {
@@ -783,18 +876,6 @@ impl GrpcHostClient {
         Ok(())
     }
 
-    pub async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
-        };
-        self.inner
-            .clone()
-            .acquire_shell(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?;
-        Ok(())
-    }
-
     pub async fn start_browser(
         &self,
         sandbox_id: SandboxId,
@@ -822,31 +903,6 @@ impl GrpcHostClient {
         self.inner
             .clone()
             .stop_browser(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?;
-        Ok(())
-    }
-
-    pub async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
-        };
-        self.inner
-            .clone()
-            .release_shell(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?;
-        Ok(())
-    }
-
-    /// Issue #219: refresh a live shell pin's keep-alive stamp.
-    pub async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let req = SandboxIdMessage {
-            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
-        };
-        self.inner
-            .clone()
-            .renew_shell(req)
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -1244,6 +1300,21 @@ fn decode_bincode<T: serde::de::DeserializeOwned>(
         .map_err(|e| SandboxError::InvalidSpec(format!("bincode decode {kind}: {e}")))
 }
 
+/// Decode a `CaptureFailed.kind` wire string back to
+/// [`engram_core::types::CaptureFailureKind`]. An unrecognized value
+/// (future host, older coord) falls back to `WarmExitNonZero` — a
+/// deterministic, non-retryable classification, so an unknown kind never
+/// accidentally gets the retry treatment reserved for `WarmExecTransport`.
+fn parse_capture_failure_kind(kind: &str) -> engram_core::types::CaptureFailureKind {
+    engram_core::types::CaptureFailureKind::parse(kind).unwrap_or_else(|| {
+        tracing::warn!(
+            kind,
+            "unrecognized CaptureFailureKind on the wire; treating as WarmExitNonZero"
+        );
+        engram_core::types::CaptureFailureKind::WarmExitNonZero
+    })
+}
+
 fn decode_sandbox_id(bytes: &[u8]) -> Result<SandboxId, SandboxError> {
     if bytes.len() != 16 {
         return Err(SandboxError::InvalidSpec(format!(
@@ -1273,6 +1344,10 @@ impl HostClient for GrpcHostClient {
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         self.list_sandboxes().await
+    }
+
+    async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+        GrpcHostClient::probe_sandbox(self, id).await
     }
 
     async fn ping(&self) -> Result<(), SandboxError> {
@@ -1377,8 +1452,9 @@ impl HostClient for GrpcHostClient {
         spec: SandboxSpec,
         warm: Option<engram_core::types::image::WarmConfig>,
         capture_env: std::collections::HashMap<String, String>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        Self::build_base_snapshot(self, spec, warm, capture_env).await
+        Self::build_base_snapshot(self, spec, warm, capture_env, progress).await
     }
 
     async fn restore_base_for_session(
@@ -1407,9 +1483,12 @@ impl HostClient for GrpcHostClient {
         Self::guest_ip(self, id).await
     }
 
-    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
-        if let Err(e) = self.bind_harness_session(session_id, sandbox_id).await {
-            tracing::warn!(%session_id, %sandbox_id, error = %e, "gRPC bind_harness_session failed");
+    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId, binding_epoch: u64) {
+        if let Err(e) = self
+            .bind_harness_session(session_id, sandbox_id, binding_epoch)
+            .await
+        {
+            tracing::warn!(%session_id, %sandbox_id, binding_epoch, error = %e, "gRPC bind_harness_session failed");
         }
     }
 
@@ -1461,20 +1540,12 @@ impl HostClient for GrpcHostClient {
         self.interrupt_harness(sandbox_id).await
     }
 
-    async fn rehandshake(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        self.rehandshake_harness(sandbox_id).await
-    }
-
     async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.pause_sandbox(sandbox_id).await
     }
 
     async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.resume_sandbox(sandbox_id).await
-    }
-
-    async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        Self::acquire_shell(self, sandbox_id).await
     }
 
     async fn start_browser(
@@ -1486,14 +1557,6 @@ impl HostClient for GrpcHostClient {
 
     async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         Self::stop_browser(self, sandbox_id).await
-    }
-
-    async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        Self::release_shell(self, sandbox_id).await
-    }
-
-    async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        Self::renew_shell(self, sandbox_id).await
     }
 
     async fn proxy_shell(

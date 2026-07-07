@@ -13,7 +13,7 @@ use crate::types::endpoints::GuestEndpoints;
 use crate::types::ids::SandboxId;
 use crate::types::image::WarmConfig;
 use crate::types::sandbox::{
-    AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxSpec,
+    AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
 };
 use crate::types::snapshot::SnapshotMetadata;
 
@@ -76,11 +76,32 @@ pub type UploadSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
 /// single-template-per-host case.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GuestMemoryStats {
+    /// Σ PSS/RSS over sandboxes NOT flagged `parked` — i.e. sandboxes
+    /// whose session holds a coordinator memory reservation
+    /// (`SessionState::reserves_host_memory`). This is the figure the
+    /// RAM ledger (`ram_ledger.rs`, issue #540) adds back into
+    /// `allocatable_mib`.
     pub pss_bytes: u64,
     pub rss_bytes: u64,
     /// How many sandboxes were successfully sampled (a dead/unreadable
     /// process is skipped, never fatal).
     pub sampled: u32,
+    /// Σ PSS over sandboxes flagged `parked` — RAM-resident but
+    /// reservation-free (epic-parking-ladder rungs 2-3). `0` until a
+    /// backend ever parks a sandbox (today: always 0, no backend sets
+    /// the flag yet). Never added back into `allocatable_mib` — see
+    /// [`GuestMemoryStats::pss_bytes`].
+    pub parked_pss_bytes: u64,
+    /// Σ RSS over sandboxes flagged `parked` — measured alongside
+    /// `parked_pss_bytes` (the same `smaps_rollup` read returns both)
+    /// but previously discarded. Without this, the density signal
+    /// (`Σpss/Σrss < 1.0`) can never be evaluated for parked residents
+    /// once the parking ladder lands — the exact population the density
+    /// math cares about. Never folded into `allocatable_mib`; a
+    /// gauge-only figure, same posture as `parked_pss_bytes`.
+    pub parked_rss_bytes: u64,
+    /// How many parked sandboxes were successfully sampled.
+    pub parked_sampled: u32,
 }
 
 /// ADR 0045 C2: see [`SandboxBackend::post_copy_source_view`].
@@ -468,17 +489,6 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
-    /// ADR 0020 P1: the host-local stub harness ext4 the base-snapshot
-    /// capture attaches as the harness drive (so the captured snapshot
-    /// carries a harness drive slot that `swap_harness_drive` can
-    /// re-point per session at restore time). `None` when no stub is
-    /// configured — `build_base_snapshot` then fails fast. Only the FC
-    /// backend (which holds `FirecrackerConfig.stub_harness_path`)
-    /// returns a path.
-    fn stub_harness_path(&self) -> Option<PathBuf> {
-        None
-    }
-
     /// ADR 0035/0062: the directory this backend reads its RO bundle stamp
     /// (`current.json`) and staged `<sha>.squashfs` generations from — i.e.
     /// where `restore_fresh` resolves a selected skill/harness sha to a file
@@ -569,11 +579,16 @@ pub trait SandboxBackend: Send + Sync {
     /// already resolved any secret refs) merged over the manifest `[env]`
     /// into the warm hook's exec environment. Empty for an image with no
     /// capture_env or no warm hook.
+    ///
+    /// `progress` (issue #539) receives [`crate::types::CaptureProgress`]
+    /// events for the call's lifetime — see the matching doc on
+    /// [`crate::traits::HostClient::build_base_snapshot`].
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
         _warm: Option<WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _progress: tokio::sync::mpsc::Sender<crate::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `build_base_snapshot` (needs the pooled chunk-store wrapper)".into(),
@@ -633,6 +648,19 @@ pub trait SandboxBackend: Send + Sync {
     /// `hot_chunks` rider so the destination warms the guest's hot set
     /// first. `None` = backend has no per-sandbox trace (VZ, process).
     fn working_set_trace_path(&self, _id: SandboxId) -> Option<PathBuf> {
+        None
+    }
+
+    /// ADR 0019 / telemetry restoration (#526): where this sandbox's
+    /// uffd-handler dumps its per-jail prefault-effectiveness snapshot
+    /// (`PrefaultStats` in `engram-uffd-handler`), a sibling of
+    /// [`working_set_trace_path`](Self::working_set_trace_path) in the
+    /// same jail dir. `PooledBackend::restore` reads it after a resume
+    /// completes and emits `engram_resume_prefault_*` — the standing
+    /// detector for "prefault shipped but silently stopped firing" (it
+    /// went inert three separate, undetected ways before this). `None`
+    /// = backend has no per-sandbox prefault detector (VZ, process).
+    fn prefault_stats_path(&self, _id: SandboxId) -> Option<PathBuf> {
         None
     }
 
@@ -735,6 +763,25 @@ pub trait SandboxBackend: Send + Sync {
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError>;
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError>;
+
+    /// ADR 0068 probe-before-host_lost: ground-truth liveness for ONE
+    /// sandbox. Default impl (VZ/Process — neither backend has an
+    /// orphan-VM mode: the process IS the sandbox, so the live
+    /// in-memory map member already is ground truth) reports
+    /// `known_to_backend` from `list()` membership and mirrors it into
+    /// `process_alive`. FC overrides this with an INDEPENDENT check —
+    /// reading the persisted per-sandbox manifest's three-axis pid
+    /// identity (the same one the survivor-reattach pass trusts)
+    /// rather than trusting the in-memory map, since the in-memory map
+    /// (or its heartbeat-carried mirror `running_sandboxes`) being
+    /// wrong is exactly the desync this probe exists to catch.
+    async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+        let known_to_backend = self.list().await?.contains(&id);
+        Ok(SandboxProbe {
+            known_to_backend,
+            process_alive: known_to_backend,
+        })
+    }
 
     /// The sandbox's guest-network identity — a single coherent value
     /// replacing the retired `guest_ip` / `netns_name_for` /

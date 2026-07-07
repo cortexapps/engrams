@@ -36,7 +36,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 /// `PodMonitoring` CRD have a stable target.
 pub fn init(addr: SocketAddr) {
     // Histogram buckets sized for sub-second boot latencies that
-    // ADR 0007 targets (warm path: ~100ms; cold path: seconds).
+    // ADR 0020 targets (warm path: ~100ms; cold path: seconds).
     // The bucket boundaries skew toward the fast end because that's
     // where we want resolution; the upper bound catches outliers
     // without distorting the percentile estimates.
@@ -54,6 +54,29 @@ pub fn init(addr: SocketAddr) {
     // so this Full() rule beats the Suffix("_seconds") default.
     let eviction_buckets = &[1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 180.0, 300.0];
 
+    // ADR 0036 amendment (issue #538): the prestage wait is minutes-class
+    // (dev-brain-sized images pull ~33 GB through a 16-permit semaphore) —
+    // same regime as eviction, needs its own spread for the same reason.
+    let prestage_buckets = &[
+        1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1200.0, 1800.0,
+    ];
+
+    // ADR 0048 (queue fairness): queue waits are minutes-scale, not
+    // seconds-scale — a stuck queue can wait the full 30-minute timeout.
+    // Same Full()-beats-Suffix() precedence as the eviction override above.
+    let queue_wait_buckets = &[
+        1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 3600.0,
+    ];
+
+    // Issue #527 Phase 1: prompt→run-start is the same wide-regime problem
+    // as eviction — the prod evidence this metric replaces the proxy for
+    // shows p50 ≈24.5s, p90 ≈140s, max 1,703s (a resume can be a full cold
+    // FC boot). The default `_seconds` buckets top out at 30s, which would
+    // collapse essentially the entire observed distribution into +Inf.
+    let prompt_to_run_started_buckets = &[
+        1.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0,
+    ];
+
     let builder = PrometheusBuilder::new()
         .with_http_listener(addr)
         .set_buckets_for_metric(
@@ -61,6 +84,21 @@ pub fn init(addr: SocketAddr) {
             eviction_buckets,
         )
         .expect("install eviction histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(ENABLE_PRESTAGE_SECONDS.to_string()),
+            prestage_buckets,
+        )
+        .expect("install prestage histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(QUEUE_WAIT_SECONDS.to_string()),
+            queue_wait_buckets,
+        )
+        .expect("install queue-wait histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(PROMPT_TO_RUN_STARTED_SECONDS.to_string()),
+            prompt_to_run_started_buckets,
+        )
+        .expect("install prompt-to-run-started histogram buckets")
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Suffix("_seconds".to_string()),
             buckets,
@@ -86,15 +124,27 @@ pub fn init(addr: SocketAddr) {
 
 /// Histogram. Time from `POST /sessions` handler entry to the
 /// handler returning the SessionCreated response. Labels:
-/// - `phase`: emitted today only as `total` (end-to-end including
-///   scheduling, host gRPC, in-VM boot, and the harness
-///   handshake). Per-sub-phase emissions live on the host-agent
-///   under `engram_sandbox_boot_seconds` (matching `phase` taxonomy:
-///   `image_resolve` / `materialize` / `fc_boot` / `agent_handshake`
-///   / `warm_lease`) because the coord delegates each phase to the
-///   host over gRPC; the coord stack frame only has the rollup to
-///   time. Comparing coord-`total` against the sum of host-side
-///   phases surfaces network and scheduler overhead.
+/// - `phase`:
+///   - `total` (default/pre-existing): end-to-end including scheduling,
+///     host gRPC, in-VM boot, and the harness handshake. Per-sub-phase
+///     emissions live on the host-agent under `engram_sandbox_boot_seconds`
+///     (matching `phase` taxonomy: `image_resolve` / `materialize` /
+///     `fc_boot` / `agent_handshake` / `warm_lease`) because the coord
+///     delegates each phase to the host over gRPC; the coord stack frame
+///     only has the rollup to time. Comparing coord-`total` against the
+///     sum of host-side phases surfaces network and scheduler overhead.
+///   - `coord_prepare` (issue #535): `create_session_core` entry through
+///     `reserve_and_persist_create`'s commit — the serial coordinator-side
+///     prefix ahead of the (now-concurrent, host-side) restore work.
+///     Recorded on the Placed path only (a Queued disposition never
+///     dispatches a restore).
+///   - `coord_finalize` (issue #535): the restore RPC returning through the
+///     `created → active` transition — the coordinator-owned tail after
+///     the host hands back a live sandbox. Success path only (an error
+///     returns before recording it). These two together are the
+///     measurable target for the issue's "coordinator serial tail" claim;
+///     `total` minus (`coord_prepare` + `coord_finalize`) is the actual
+///     host-side restore RPC wall time.
 /// - `outcome`: `success` / `bad_request` / `image_not_enabled` /
 ///   `scheduling_rejected` / `internal`.
 /// - `kind`: `restored` (booted via base-snapshot restore — the
@@ -102,6 +152,20 @@ pub fn init(addr: SocketAddr) {
 ///   ADR 0048) or `unknown` (errored before the path was chosen).
 ///   Sourced from `CreateSessionResponse.kind` on success.
 pub const SESSION_BOOT_SECONDS: &str = "engram_session_boot_seconds";
+
+/// Histogram (issue #535 correction pass). Wall time of the
+/// `tokio::join!` in `session_boot.rs::restore_base_on_host` that
+/// overlaps the restore leg (`restore_base_on_host` on the host, ~0.4-0.7s)
+/// against the env/egress leg (`inject_harness_env` + `resolve_inject_entries`,
+/// which can round-trip an external mint-mode connector). Neither
+/// `coord_prepare` nor `coord_finalize` (see `SESSION_BOOT_SECONDS`'s
+/// `phase` doc) covers this window — `coord_finalize` starts only once the
+/// join returns — so a slow env/egress leg (a slow external mint call) was
+/// invisible to both. No labels: this is always the two-leg join,
+/// recorded unconditionally once it resolves (restore success or
+/// failure — the failure path still paid for the full join before
+/// erroring out, so it's still the relevant wall time to see).
+pub const COORD_BOOT_OVERLAP_SECONDS: &str = "engram_coord_boot_overlap_seconds";
 
 /// Counter. Sessions that reached `Active`. Labels: `outcome`
 /// (`success` / `scheduling_rejected` / `sandbox_failed` /
@@ -118,6 +182,49 @@ pub const SESSIONS_ACTIVE: &str = "engram_sessions_active";
 /// `host_registry`). Should equal the count of `ready` rows in
 /// Postgres for the slice of time both views are consistent.
 pub const HOSTS_READY: &str = "engram_hosts_ready";
+
+/// Counter (ADR 0073). Outbox rows handed to the host relay. The gap
+/// between this and OUTBOX_ACKED going nonzero-and-growing is the
+/// alarmed "delivered but never acked" signal.
+pub const OUTBOX_DELIVERED_TOTAL: &str = "engram_outbox_delivered_total";
+
+/// Counter (ADR 0073 phase 4, moved from the host detector). A host
+/// whose reported free disk is under the floor had its idle
+/// nominations held this tick (ADR 0014 issue #4 brake).
+pub const IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL: &str =
+    "engram_idle_evict_disk_pressure_holds_total";
+/// Counter (ADR 0073 phase 4, moved from the host detector). Soft-idle
+/// candidates kept resident because the host is not under memory
+/// pressure (pressure-aware mode only).
+pub const IDLE_EVICT_KEPT_RESIDENT_TOTAL: &str = "engram_idle_evict_kept_resident_total";
+/// Counter (ADR 0074 rung 1). Nominated evictions cancelled by a
+/// returning user before capture began — each one is a full
+/// snapshot+destroy+rebuild (p50 12.2s) the user did not pay.
+pub const EVICTION_CANCELLED_TOTAL: &str = "engram_eviction_cancelled_total";
+/// Counter (ADR 0074 rung 2). Idle sessions PARKED PAUSED (VM paused in
+/// place, not evicted) because the host had memory headroom — each is a
+/// full snapshot+destroy+rebuild the returning user avoids.
+pub const EVICTION_PARKED_PAUSED_TOTAL: &str = "engram_eviction_parked_paused_total";
+/// Counter (ADR 0074 rung 2 ascent). Parked-paused sessions un-paused
+/// back to Active because the user returned — the fast-path win the
+/// rung buys (un-pause in <100ms vs a full snapshot rebuild).
+pub const EVICTION_UNPARKED_PAUSED_TOTAL: &str = "engram_eviction_unparked_paused_total";
+/// Counter (ADR 0074 rung reaper). Parked sessions DESCENDED to a full
+/// eviction — the user never returned within the dwell cap, or the host
+/// came under memory pressure and the parked VM's RAM had to be
+/// reclaimed. Labelled by `reason` (`dwell` | `pressure`).
+pub const EVICTION_PARK_DESCEND_TOTAL: &str = "engram_eviction_park_descend_total";
+/// Counter (ADR 0073 phase 4). Heartbeats reporting a RUNNING sandbox
+/// for an Active session with NO attached harness — the demoted
+/// belt-and-braces liveness alarm (was the desync watchdog's job).
+/// Alert on a sustained nonzero rate.
+pub const HARNESS_ATTACH_DISAGREEMENT_TOTAL: &str = "engram_harness_attach_disagreement_total";
+/// Counter (ADR 0073). Rows terminally acked by a confirming event.
+pub const OUTBOX_ACKED_TOTAL: &str = "engram_outbox_acked_total";
+/// Counter (ADR 0073). Delivery attempts deferred to backoff.
+pub const OUTBOX_DEFERRED_TOTAL: &str = "engram_outbox_deferred_total";
+/// Counter (ADR 0073). Rows dropped because the session went terminal.
+pub const OUTBOX_DROPPED_TERMINAL_TOTAL: &str = "engram_outbox_dropped_terminal_total";
 
 /// ADR 0045 C1: live-teleport leg timings. Labels: leg =
 /// capture|restore|total, outcome = success|error|fallback.
@@ -143,22 +250,15 @@ pub const EVICTION_PIPELINE_SECONDS: &str = "engram_eviction_pipeline_seconds";
 /// means hosts are going blind to running sandboxes).
 pub const EVICTION_NOMINATED_TOTAL: &str = "engram_eviction_nominated_total";
 
-/// Counter (Track A). Active sessions the desync watchdog flagged as
-/// wedged — the harness event stream desynced from the run state machine.
-/// Label: `signature` = `orphan_after_close` (a run-scoped event with no
-/// open run, the `bf3dbbcb` shape) or `stuck_open_run` (a `run_started`
-/// with zero progress). Should be ~0; a sustained nonzero rate means
-/// harnesses are desyncing — alarm-worthy until the streaming rewrite
-/// (ADR 0052) removes the inference that causes it.
-pub const HARNESS_DESYNC_DETECTED_TOTAL: &str = "engram_harness_desync_detected_total";
-
-/// Counter (Track A). Non-destructive harness re-handshakes the desync
-/// watchdog issued to resync a wedged session. A successful one re-emits
-/// `Idle` and the session drops out of the flagged set; a session that
-/// keeps getting re-handshaked (its `last_event_at` never advances) is
-/// escalated to the eviction lane (counted under
-/// `engram_eviction_nominated_total{source="desync_watchdog"}`).
-pub const HARNESS_REHANDSHAKE_TOTAL: &str = "engram_harness_rehandshake_total";
+/// Counter (issue #529). The D5 row-watcher's wait for the eviction's
+/// snapshot row (landed host-side via the heartbeat reconcile) hit its
+/// `ENGRAM_EVICT_FINALIZE_WAIT_SECS` deadline before the row appeared.
+/// Not itself data loss (the host-owned finalize keeps retrying and the
+/// row lands eventually; the lease reaper frees resume in the
+/// meantime) — but a sustained nonzero rate means finalize jobs are
+/// taking pathologically long and warrants investigation.
+pub const EVICTION_FINALIZE_ROW_WAIT_TIMEOUT_TOTAL: &str =
+    "engram_eviction_finalize_row_wait_timeout_total";
 
 /// Counter (ADR 0034 Track A). In-place harness reattaches the desync
 /// watchdog issued when `rehandshake` returned `NotFound` (the harness vsock
@@ -211,6 +311,26 @@ pub const SESSIONS_QUEUED_MIB: &str = "engram_sessions_queued_mib";
 /// `outcome` = `placed` / `requeued` / `failed` / `timeout`.
 pub const QUEUE_OUTCOME_TOTAL: &str = "engram_queue_outcome_total";
 
+/// Histogram (ADR 0048, queue-fairness). `queued_at` → placement/terminal,
+/// seconds. This is OUTSIDE `engram_session_boot_seconds`: the create
+/// handler returns 201 `{kind:"queued"}` immediately on enqueue, so the
+/// entire queue wait previously fell outside every latency histogram we
+/// have. Labels:
+/// - `origin`: `create` / `resume`.
+/// - `outcome`: `placed` (create: the durable `queued → pending` flip;
+///   resume: dequeue to `Idle`) / `timeout`.
+///
+/// A requeued-then-placed session emits one `placed` sample per successful
+/// placement, each measuring cumulative wait since the ORIGINAL
+/// `queued_at` (`requeue_session` deliberately doesn't reset it).
+pub const QUEUE_WAIT_SECONDS: &str = "engram_queue_wait_seconds";
+
+/// Gauge (ADR 0048, queue-fairness). Age in seconds of the oldest queued
+/// row (0 when the queue is empty), sampled once per scanner sweep. The
+/// "is the queue stuck" pager signal complementing `engram_sessions_queued`
+/// (which only tells you the queue is nonempty, not for how long).
+pub const QUEUE_HEAD_AGE_SECONDS: &str = "engram_queue_head_age_seconds";
+
 /// Counter (issue #231). The per-tick `touch_host_heartbeat` persist
 /// failed — the host's `last_heartbeat_at` row did NOT advance even
 /// though the agent's heartbeat reached this pod. Sustained nonzero is
@@ -221,3 +341,84 @@ pub const QUEUE_OUTCOME_TOTAL: &str = "engram_queue_outcome_total";
 /// No `host_id` label — the cardinality convention above forbids
 /// per-host labels; the paired `warn!` carries the id for forensics.
 pub const HEARTBEAT_PERSIST_FAILURES_TOTAL: &str = "engram_heartbeat_persist_failures_total";
+
+/// Histogram (ADR 0036 amendment, issue #538). Wall time of the enable
+/// scanner's `prestaging` stage — the fleet chunk-prestage wait between
+/// base-snapshot capture and the `enabled_images` upsert. Labels:
+/// `outcome` = `complete` (every eligible host staged) / `partial`
+/// (deadline hit with ≥1 staged) / `empty_fleet` (vacuous pass, no
+/// eligible hosts) / `timeout_zero` (deadline hit with 0 staged —
+/// transient, retried under the attempts budget). Minutes-class for a
+/// large image; the per-image SLO canary is the end-to-end guard that
+/// first-create-after-refresh stays inside budget.
+pub const ENABLE_PRESTAGE_SECONDS: &str = "engram_enable_prestage_seconds";
+
+/// Counter (ADR 0036 amendment, issue #538). Per-host prestage outcomes
+/// recorded at the end of each `prestaging` stage. Labels: `outcome` =
+/// `staged` / `timed_out` / `unschedulable`. No `host_id` label — the
+/// cardinality convention above forbids per-host labels; the durable
+/// per-host record lives on the `enable_jobs.prestage_hosts` column.
+pub const ENABLE_PRESTAGE_HOST_OUTCOMES_TOTAL: &str = "engram_enable_prestage_host_outcomes_total";
+
+/// Counter (ADR 0068; `origin` label added in the core-ops-batch
+/// correction pass). Per-host exclusion reasons whenever a placement
+/// attempt turns up an empty candidate set — kills the "no capacity
+/// with free hosts" mystery mode (a wire-skewed or capability-failing
+/// host used to vanish from the candidate set with the caller seeing
+/// only a bare `NoCapacity`/empty-`RankedCandidates`). Emitted from
+/// `placement::log_empty_candidates`, the one call site every
+/// empty-candidates path shares. Labels:
+/// - `reason` = the bounded `placement::exclusion_summary` vocabulary
+///   (`excluded` / `not_ready` / `cordoned` / `wire_skew` / `stale` /
+///   `cap:<name>` — one of the ~6 named capabilities, so still bounded
+///   / `digest_not_ready` / `no_fit`).
+/// - `origin` = which call site hit the empty set: `create` (fresh
+///   session, `api/sessions.rs::boot_prepared`) / `queue_create`
+///   (queue-scanner re-placing a create-origin queued session) /
+///   `queue_resume_precheck` (queue-scanner's resume dequeue capacity
+///   check) / `resume` (the resume/evac path, `pick_for_session`).
+///   Bounded to these 4 values — do not add a 5th without updating this
+///   doc.
+///
+/// No `host_id` label — see the cardinality convention above; the
+/// paired `warn!` names hosts.
+pub const PLACEMENT_EXCLUDED_TOTAL: &str = "engram_placement_excluded_total";
+
+/// Counter (ADR 0068). `reconcile::flip_missing` probed the sandbox
+/// directly and found it alive (`process_alive == true`) despite being
+/// absent from the host's self-reported `running_sandboxes` — the flip
+/// to `host_lost` was skipped and the strike counter reset. Sustained
+/// nonzero means the delivery/binding desync class (epic-binding-epoch-
+/// delivery) is still producing false `running_sandboxes` misses; this
+/// metric graphs how often the probe is rescuing sessions from it.
+pub const RECONCILE_PROBE_RESCUES_TOTAL: &str = "engram_reconcile_probe_rescues_total";
+
+/// Counter (ADR 0068). The dead-host detector's own `Ping` probe
+/// (`dead_host.rs`, added in `7fcc4c3c`) found the host alive despite a
+/// stale `last_heartbeat_at` row, and skipped the eviction. No
+/// behavioral change from this issue — added alongside the reconcile
+/// rescue counter above so both rescue paths are graphable together.
+pub const DEAD_HOST_PROBE_RESCUES_TOTAL: &str = "engram_dead_host_probe_rescues_total";
+
+/// Counter (ADR 0019 / telemetry restoration #526). Same-host vs
+/// cross-host resume split, emitted in `api/snapshot.rs::resume_from_fc_snapshot`
+/// once placement resolves. Labels: `placement` = `same_host` (the
+/// chosen host == the snapshot record's capturing host — the
+/// zero-cost hot-tier hit ADR 0007's local-dir cache exists for) /
+/// `cross_host` (relocated — the host materializes from chunked
+/// manifests) / `unknown_prior_host` (the record carries no `host_id`,
+/// e.g. a pre-ADR-0007 row or one written before the capturing host
+/// was recorded — can't classify).
+pub const SESSION_RESUME_PLACEMENT_TOTAL: &str = "engram_session_resume_total";
+
+/// Histogram (issue #527 Phase 1). Wall-clock from a `prompt_received`
+/// receipt (the first PG write of `send_prompt_core`, before auto-resume)
+/// to the matching `run_started{prompt_id}` landing in `session_events`.
+/// The true prompt→first-token *lower bound* — replaces the old
+/// `idle→created` proxy, which post-dates the resume and therefore
+/// undercounts. No labels: this is a single fleet-wide SLO signal, not
+/// per-image (the per-image breakdown is the Phase 2 canary's job).
+/// Recorded once per run-start that carries a `prompt_id`; the env-seeded
+/// initial prompt (no `prompt_id`, no receipt row) never contributes a
+/// sample.
+pub const PROMPT_TO_RUN_STARTED_SECONDS: &str = "engram_prompt_to_run_started_seconds";

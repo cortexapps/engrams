@@ -355,46 +355,6 @@ impl CoordClient {
         let body: Resp = resp.json().await.map_err(CoordClientError::Transport)?;
         Ok(body.owned)
     }
-
-    pub async fn push_idle_eviction_candidates(
-        &self,
-        host_id: HostId,
-        candidates: Vec<IdleCandidate>,
-    ) -> Result<IdleEvictionCandidatesResponse, CoordClientError> {
-        let url = self.endpoint(&format!("/hosts/{host_id}/idle-eviction-candidates"));
-        let body = IdleEvictionCandidatesRequest { candidates };
-        // ADR 0034 retired ADR 0016 §A.1.5a's per-request 120s
-        // override: the handler is a fast Active→Evicting nomination
-        // now (one PG UPDATE per candidate) — the snapshot pipeline
-        // runs on the coord's eviction scanner, detached from this
-        // request. The shared client's 30s default is ample. (The
-        // 120s override was also the cancellation fuse in the
-        // 0782bea5 incident: the timeout aborted the then-inline
-        // pipeline mid-snapshot.)
-        let builder = self.http.post(&url);
-        let resp = match self.auth(builder, &body).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                // ADR 0016 §A.1.3: structured transport-error log
-                // so we can attribute pool-staleness vs DNS vs
-                // genuine connect-refused. The caller's existing
-                // "POST failed; retrying next tick" line in
-                // `lib.rs::eviction_task` loses this detail.
-                tracing::debug!(
-                    %host_id,
-                    is_connect = e.is_connect(),
-                    is_timeout = e.is_timeout(),
-                    is_request = e.is_request(),
-                    is_body = e.is_body(),
-                    error = %e,
-                    "idle-eviction transport error (reqwest); \
-                     `is_connect=true` usually means stale pool conn",
-                );
-                return Err(CoordClientError::Transport(e));
-            }
-        };
-        decode_json(resp, "idle_eviction_candidates").await
-    }
 }
 
 async fn decode_json<T: serde::de::DeserializeOwned>(
@@ -463,6 +423,11 @@ pub struct RegisterRequest {
     pub wire_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud_metadata: Option<engram_core::types::host::HostMetadata>,
+    /// ADR 0068: the probed capability vector, computed once before this
+    /// register POST. `#[serde(default)]` on the coord side gives
+    /// mixed-fleet interop with a pre-0068 host-agent.
+    #[serde(default)]
+    pub capabilities: engram_core::types::host::HostCapabilities,
 }
 
 #[derive(Deserialize)]
@@ -537,12 +502,28 @@ pub struct HeartbeatRequest {
     /// `#[serde(default)]` for interop both ways (0 = unknown).
     #[serde(default)]
     pub total_vcpus: u32,
+    /// ADR 0073 phase 4: sandboxes with a live harness connection on
+    /// this host's hub. The coordinator compares this against its own
+    /// Active+bound view purely as a DISAGREEMENT ALARM (metric) — it
+    /// is the demoted belt-and-braces liveness signal, never a
+    /// detection input.
+    #[serde(default)]
+    pub harness_attached: Vec<SandboxId>,
     /// Issue #229: this host's bincode `engram_protocol::WIRE_VERSION`.
     /// The coordinator's scheduler drains a host reporting a version that
     /// differs from its own, so a non-atomic rolling deploy degrades
     /// gracefully instead of surfacing as 400 decode errors.
     #[serde(default)]
     pub wire_version: u32,
+    /// ADR 0036 amendment (issue #538): true iff this host's image-prefetch
+    /// supervisor is spawned. The coordinator's enable-scanner prestage
+    /// stage waits only on hosts reporting this bit — a fleet with zero
+    /// eligible staging hosts passes the stage vacuously.
+    #[serde(default)]
+    pub stages_images: bool,
+    /// ADR 0068: this tick's re-probed capability vector.
+    #[serde(default)]
+    pub capabilities: engram_core::types::host::HostCapabilities,
 }
 
 #[derive(Deserialize)]
@@ -555,6 +536,15 @@ pub struct HeartbeatResponse {
     /// ready.
     #[serde(default)]
     pub enabled_images: Vec<engram_protocol::heartbeat::EnabledImageRef>,
+    /// ADR 0036 amendment (issue #538): base-snapshot refs of images
+    /// currently `prestaging` on the coordinator. The host-agent's
+    /// heartbeat loop pushes the deduped union of this and `enabled_images`
+    /// into the prefetch supervisor's watch channel, so a host warms an
+    /// image BEFORE it's visible to session-create. `#[serde(default)]`:
+    /// an old coord's ack decodes as empty (no prestage work) — exactly
+    /// pre-fix behavior.
+    #[serde(default)]
+    pub prestage_images: Vec<engram_protocol::heartbeat::EnabledImageRef>,
     /// ADR 0035 §5: the coord's bundle pin set (every generation some
     /// snapshot row references). The host's bundle supervisor
     /// prefetches missing pinned generations and sweeps staged files
@@ -604,19 +594,6 @@ pub struct IntegrationAssetReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fetchable_url: Option<String>,
     pub at: DateTime<Utc>,
-}
-
-#[derive(Serialize)]
-pub struct IdleCandidate {
-    pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub idle_since: Option<DateTime<Utc>>,
-}
-
-#[derive(Serialize)]
-pub struct IdleEvictionCandidatesRequest {
-    pub candidates: Vec<IdleCandidate>,
 }
 
 #[derive(Deserialize)]
@@ -734,6 +711,9 @@ mod tests {
             utilization: Default::default(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
+            stages_images: false,
+            capabilities: Default::default(),
+            harness_attached: Vec::new(),
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");

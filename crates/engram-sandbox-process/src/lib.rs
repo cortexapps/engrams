@@ -180,6 +180,12 @@ impl SandboxBackend for ProcessBackend {
         if self.agent_children.contains_key(&id) {
             return Ok(());
         }
+        // ADR 0067: stamp the attach token into the harness child env —
+        // the backend is the only party that knows the sandbox id
+        // pre-boot; the epoch was minted coordinator-side into the spec.
+        let token_env = agent.attach_token_env(id);
+        let mut agent = agent;
+        agent.env.extend(token_env);
         spawn_agent(
             &self.agent_children,
             id,
@@ -419,6 +425,10 @@ impl SandboxBackend for ProcessBackend {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            // Issue #529: no real pause instant when run unwrapped by
+            // `PooledBackend` (which stamps it from its own capture_phase);
+            // dev-only backend, so the composed path's `now` fallback is fine.
+            paused_at: None,
         })
     }
 
@@ -985,6 +995,7 @@ mod tests {
         // Agent argv is supplied at start_agent time, not on the
         // SandboxSpec — see the trait docs for why.
         let agent = AgentSpec {
+            binding_epoch: 1,
             argv: vec![
                 "sh".into(),
                 "-c".into(),
@@ -1125,6 +1136,7 @@ mod tests {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            paused_at: None,
         };
         let res = b.restore(meta).await;
         assert!(matches!(res, Err(SandboxError::Snapshot(_))));

@@ -1,0 +1,310 @@
+//! Host-durable session→sandbox binding records (ADR 0073).
+//!
+//! One JSON file per session under the host-agent's `bindings_dir`
+//! (a work_dir sibling that survives pod rolls). The hub validates
+//! every harness attach against these records — never an in-memory
+//! map — which is what closes the #447 host-roll orphan gap by
+//! construction: the file survives the roll, so the survivor
+//! harness's first re-dial validates with zero coordinator
+//! involvement and zero rebuild pass.
+//!
+//! Monotonicity is the fencing property: [`BindingStore::bind`]
+//! refuses to lower `binding_epoch`, so no matter how a resume race
+//! interleaves its bind RPCs, the record converges to the newest
+//! generation and every stale harness is rejected `Superseded`.
+//!
+//! Atomic write: temp file + rename in the same directory (the same
+//! primitive as `sandbox_manifest.rs`); records are tiny and written
+//! off the hot path (bind/unbind only), so synchronous `std::fs` is
+//! fine. Node death loses the directory — that is the PG re-bind
+//! path's job, not ours (ADR 0073 §Consequences).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use chrono::{DateTime, Utc};
+use engram_core::{SandboxId, SessionId};
+use serde::{Deserialize, Serialize};
+
+/// Bump when the on-disk shape changes incompatibly. Readers reject
+/// unknown versions (fail loud, never guess).
+const BINDING_SCHEMA_VERSION: u32 = 1;
+
+/// The durable attach token, as persisted on the host.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BindingRecord {
+    pub schema_version: u32,
+    pub session_id: SessionId,
+    pub sandbox_id: SandboxId,
+    pub binding_epoch: u64,
+    pub bound_at: DateTime<Utc>,
+}
+
+/// Why a [`BindingStore::bind`] write was refused.
+#[derive(Debug)]
+pub enum BindError {
+    /// The on-disk record carries a strictly newer epoch — the caller
+    /// is acting on a stale view of the session. The record is left
+    /// untouched.
+    Stale {
+        existing: u64,
+        presented: u64,
+    },
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for BindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BindError::Stale {
+                existing,
+                presented,
+            } => write!(
+                f,
+                "stale bind: on-disk epoch {existing} > presented {presented}"
+            ),
+            BindError::Io(e) => write!(f, "binding io: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for BindError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BindError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for BindError {
+    fn from(e: std::io::Error) -> Self {
+        BindError::Io(e)
+    }
+}
+
+/// Directory-backed store. Cheap to clone.
+#[derive(Clone, Debug)]
+pub struct BindingStore {
+    dir: PathBuf,
+}
+
+impl BindingStore {
+    /// Open (creating the directory if needed). The directory must be
+    /// on storage that survives a host-agent restart for the ADR 0073
+    /// guarantees to hold — the host-agent wires its work_dir.
+    pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+
+    fn path_for(&self, session_id: SessionId) -> PathBuf {
+        self.dir.join(format!("{session_id}.json"))
+    }
+
+    /// Record (or refresh) the binding for `session_id`. Monotonic in
+    /// `binding_epoch`: a lower epoch is refused `Stale`. An
+    /// EQUAL-epoch write may re-point the sandbox — that is the live
+    /// move shape (ADR 0045 C1: the harness process survives a
+    /// teleport, so its generation is unchanged while the VM identity
+    /// changes; the record follows the VM). Same-epoch writers are
+    /// serialized upstream by the session lease.
+    pub fn bind(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        binding_epoch: u64,
+    ) -> Result<BindingRecord, BindError> {
+        if let Some(existing) = self.read(session_id)? {
+            if existing.binding_epoch > binding_epoch {
+                return Err(BindError::Stale {
+                    existing: existing.binding_epoch,
+                    presented: binding_epoch,
+                });
+            }
+            if existing.binding_epoch == binding_epoch && existing.sandbox_id != sandbox_id {
+                tracing::info!(
+                    session_id = %session_id,
+                    from = %existing.sandbox_id,
+                    to = %sandbox_id,
+                    binding_epoch,
+                    "binding re-pointed at same epoch (live-move shape)",
+                );
+            }
+        }
+        let record = BindingRecord {
+            schema_version: BINDING_SCHEMA_VERSION,
+            session_id,
+            sandbox_id,
+            binding_epoch,
+            bound_at: Utc::now(),
+        };
+        self.write_atomic(&record)?;
+        Ok(record)
+    }
+
+    /// The current record for `session_id`, if any. Unknown schema
+    /// versions and unparseable files surface as errors — a corrupt
+    /// record must fail the attach loudly (`UnknownBinding` at the
+    /// hub), not silently pass validation.
+    pub fn read(&self, session_id: SessionId) -> std::io::Result<Option<BindingRecord>> {
+        let path = self.path_for(session_id);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let record: BindingRecord = serde_json::from_slice(&bytes).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("binding record {}: {e}", path.display()),
+            )
+        })?;
+        if record.schema_version != BINDING_SCHEMA_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "binding record {}: schema {} (want {BINDING_SCHEMA_VERSION})",
+                    path.display(),
+                    record.schema_version
+                ),
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    /// Remove the record, returning what it was. Called on
+    /// unbind/destroy so a late dial from the torn-down generation
+    /// gets `UnknownBinding` (transient) rather than routing anywhere.
+    pub fn unbind(&self, session_id: SessionId) -> std::io::Result<Option<BindingRecord>> {
+        let prior = self.read(session_id).unwrap_or(None);
+        match std::fs::remove_file(self.path_for(session_id)) {
+            Ok(()) => Ok(prior),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// All records currently on disk. Used by the host-agent at
+    /// startup for logging/metrics parity (the records themselves are
+    /// the rebind — nothing needs replaying into memory).
+    pub fn list(&self) -> std::io::Result<HashMap<SessionId, BindingRecord>> {
+        let mut out = HashMap::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            // Skip torn temp files and records we can't parse; they
+            // can only cause UnknownBinding, never a wrong accept.
+            if let Ok(bytes) = std::fs::read(entry.path()) {
+                if let Ok(record) = serde_json::from_slice::<BindingRecord>(&bytes) {
+                    if record.schema_version == BINDING_SCHEMA_VERSION {
+                        out.insert(record.session_id, record);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn write_atomic(&self, record: &BindingRecord) -> std::io::Result<()> {
+        let final_path = self.path_for(record.session_id);
+        // Writer-unique temp name (PR #437's lesson: fixed temp names
+        // race across writers; include pid + a counter).
+        let tmp = self.dir.join(format!(
+            ".{}.{}.{}.tmp",
+            record.session_id,
+            std::process::id(),
+            record.binding_epoch,
+        ));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(record)?)?;
+        std::fs::rename(&tmp, &final_path)?;
+        Ok(())
+    }
+}
+
+/// In-memory store for tests and the coordinator's replay-only hub
+/// (which never validates an attach). Backed by a tempdir so the
+/// production code path is exercised unchanged.
+#[cfg(test)]
+pub fn ephemeral() -> BindingStore {
+    let dir = std::env::temp_dir().join(format!("engram-bindings-{}", uuid::Uuid::new_v4()));
+    BindingStore::open(dir).expect("ephemeral binding store")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> BindingStore {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = BindingStore::open(dir.path().join("bindings")).expect("open");
+        // Leak the tempdir guard so the dir outlives the test body's
+        // store usage; the OS reaps temp dirs.
+        std::mem::forget(dir);
+        s
+    }
+
+    #[test]
+    fn bind_read_roundtrip() {
+        let s = store();
+        let (sid, sbx) = (SessionId::new(), SandboxId::new());
+        let rec = s.bind(sid, sbx, 3).expect("bind");
+        assert_eq!(rec.binding_epoch, 3);
+        let read = s.read(sid).expect("read").expect("some");
+        assert_eq!(read, rec);
+    }
+
+    #[test]
+    fn bind_is_monotonic_in_epoch() {
+        let s = store();
+        let (sid, a, b) = (SessionId::new(), SandboxId::new(), SandboxId::new());
+        s.bind(sid, a, 5).expect("bind@5");
+        // Higher epoch wins regardless of arrival order…
+        s.bind(sid, b, 6).expect("bind@6");
+        // …and the stale generation is refused, leaving 6 in place.
+        let err = s.bind(sid, a, 5).expect_err("stale bind must fail");
+        assert!(matches!(
+            err,
+            BindError::Stale {
+                existing: 6,
+                presented: 5
+            }
+        ));
+        assert_eq!(s.read(sid).unwrap().unwrap().sandbox_id, b);
+    }
+
+    #[test]
+    fn same_epoch_write_refreshes_or_repoints() {
+        let s = store();
+        let (sid, sbx) = (SessionId::new(), SandboxId::new());
+        s.bind(sid, sbx, 1).expect("first");
+        s.bind(sid, sbx, 1).expect("refresh");
+        // Live-move shape (ADR 0045 C1): the harness generation is
+        // unchanged while the VM identity changes — the record follows.
+        let moved = SandboxId::new();
+        s.bind(sid, moved, 1).expect("same-epoch re-point");
+        assert_eq!(s.read(sid).unwrap().unwrap().sandbox_id, moved);
+    }
+
+    #[test]
+    fn unbind_removes_and_returns_prior() {
+        let s = store();
+        let (sid, sbx) = (SessionId::new(), SandboxId::new());
+        s.bind(sid, sbx, 2).expect("bind");
+        let prior = s.unbind(sid).expect("unbind").expect("prior");
+        assert_eq!(prior.sandbox_id, sbx);
+        assert!(s.read(sid).expect("read").is_none());
+        assert!(s.unbind(sid).expect("second unbind").is_none());
+    }
+
+    #[test]
+    fn corrupt_record_reads_as_error_not_silent_none() {
+        let s = store();
+        let sid = SessionId::new();
+        std::fs::write(s.path_for(sid), b"{not json").expect("write garbage");
+        assert!(s.read(sid).is_err());
+    }
+}

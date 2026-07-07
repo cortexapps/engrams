@@ -10,6 +10,27 @@ use serde::{Deserialize, Serialize};
 use super::ids::SandboxId;
 use super::image::NetworkPolicy;
 
+/// ADR 0068 probe-before-host_lost: the answer to "is this specific
+/// sandbox actually there", from GROUND TRUTH — not the in-memory
+/// sandbox map `SandboxBackend::list()` reads (that map, or its
+/// heartbeat-carried mirror `running_sandboxes`, being wrong is exactly
+/// the desync `reconcile::flip_missing` uses this to rescue sessions
+/// from). On FC: `process_alive` comes from the persisted per-sandbox
+/// manifest (the same three-axis pid/start-time/comm identity the
+/// survivor-reattach pass already trusts), read independently of the
+/// in-memory map. On VZ/Process (no orphan-VM mode exists there): the
+/// live child-process handle IS the ground truth, so both fields
+/// mirror it — see `SandboxBackend::probe_sandbox`'s default impl.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SandboxProbe {
+    /// Present in the backend's in-memory sandbox map (`list()`
+    /// membership).
+    pub known_to_backend: bool,
+    /// The VMM process for this sandbox is alive on this host, checked
+    /// independently of `known_to_backend`.
+    pub process_alive: bool,
+}
+
 /// Spec for creating a sandbox via `SandboxBackend::create`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxSpec {
@@ -275,14 +296,30 @@ pub struct AgentSpec {
     /// exec/shell still need it.
     #[serde(default)]
     pub session_env: HashMap<String, String>,
+    /// ADR 0073: binding generation for the harness attach token,
+    /// minted by the coordinator (one PG counter per session) at the
+    /// moment it commits to this (re)bind — BEFORE the sandbox exists,
+    /// which is why it rides the spec instead of the sandbox row. The
+    /// backend stamps it (with the sandbox id it minted) into the
+    /// harness child env; the hub's durable binding record is monotonic
+    /// in it. Zero is never minted: a 0 here means a caller skipped the
+    /// mint, and the attach will be rejected `UnknownBinding` — loud,
+    /// per the no-silent-Ok rule.
+    #[serde(default)]
+    pub binding_epoch: u64,
     /// Per-host egress-proxy CA cert in PEM form (ADR 0021 P1).
     /// Populated by the host-agent *after* receiving the spec from
     /// coord, immediately before handing it to the sandbox backend —
-    /// only the host knows its own CA. The Firecracker backend pushes
-    /// this via `InstallHostCa` over vsock right after `wait_agent_ready`
-    /// and before `SpawnHarness`, replacing the pre-0021 path where the
-    /// CA rode in on the harness drive. `None` skips the install — used
+    /// only the host knows its own CA. `None` skips the install — used
     /// by tests, dev backends, and any deploy without egress proxying.
+    ///
+    /// 2026-07 core-ops fold: this rides the guest-bound `SpawnHarness`
+    /// wire frame (`engram_agentd::proto::SpawnHarnessRequest`) as a
+    /// single first-contact RPC that both installs the CA and spawns
+    /// the harness — there is no separate CA-install round trip
+    /// anymore. Firecracker and VZ both wire it through (VZ used to
+    /// silently drop this field); the Process backend is N/A — no
+    /// agentd wire, no guest boundary, so it always sends `None`.
     ///
     /// **Wire format note**: this field intentionally does NOT carry
     /// `#[serde(skip_serializing_if = "Option::is_none")]`. AgentSpec
@@ -399,6 +436,32 @@ pub struct ExecRusage {
     pub sys_cpu_ms: Option<u64>,
 }
 
+/// ADR 0073: env key carrying the sandbox identity half of the harness
+/// attach token. Stamped by the BACKEND at spawn (the only party that
+/// knows the sandbox id pre-boot); read by the harness; presented in
+/// `HarnessAttach`.
+pub const SANDBOX_ID_ENV: &str = "ENGRAM_SANDBOX_ID";
+
+/// ADR 0073: env key carrying the binding-generation half of the attach
+/// token. Minted coordinator-side into [`AgentSpec::binding_epoch`];
+/// stamped into the harness child env by the backend at spawn.
+pub const BINDING_EPOCH_ENV: &str = "ENGRAM_BINDING_EPOCH";
+
+impl AgentSpec {
+    /// The two attach-token env entries a backend must add to the
+    /// harness child env at spawn (ADR 0073). Kept as a helper so the
+    /// three backends cannot drift on key names or formatting.
+    pub fn attach_token_env(&self, sandbox_id: crate::SandboxId) -> [(String, String); 2] {
+        [
+            (SANDBOX_ID_ENV.to_string(), sandbox_id.to_string()),
+            (
+                BINDING_EPOCH_ENV.to_string(),
+                self.binding_epoch.to_string(),
+            ),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +478,7 @@ mod tests {
     #[test]
     fn agent_spec_bincode_roundtrips_with_none_and_some_host_ca_pem() {
         let none = AgentSpec {
+            binding_epoch: 0,
             argv: vec!["/bin/sh".into(), "-c".into(), "echo hi".into()],
             env: HashMap::from_iter([("FOO".into(), "bar".into())]),
             session_env: HashMap::from_iter([("RUSTC_WRAPPER".into(), "sccache".into())]),
@@ -428,6 +492,7 @@ mod tests {
         assert!(back.host_ca_pem.is_none());
 
         let some = AgentSpec {
+            binding_epoch: 0,
             argv: vec!["/opt/engram/harness/harness".into()],
             env: HashMap::new(),
             session_env: HashMap::new(),

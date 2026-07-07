@@ -127,6 +127,12 @@ impl HostClient for FakeBackend {
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         Ok(vec![])
     }
+    async fn probe_sandbox(
+        &self,
+        _id: SandboxId,
+    ) -> Result<engram_core::types::sandbox::SandboxProbe, SandboxError> {
+        unimplemented!()
+    }
     async fn exec_stream(
         &self,
         _id: SandboxId,
@@ -150,6 +156,7 @@ impl HostClient for FakeBackend {
             rootfs_blob_key: None,
             working_set_blob_key: None,
             aux_bundles: vec![],
+            paused_at: None,
         })
     }
     async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
@@ -185,7 +192,13 @@ impl HostClient for FakeBackend {
     async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
         None
     }
-    async fn bind_session(&self, _session_id: SessionId, _sandbox_id: SandboxId) {}
+    async fn bind_session(
+        &self,
+        _session_id: SessionId,
+        _sandbox_id: SandboxId,
+        _binding_epoch: u64,
+    ) {
+    }
     async fn unbind_session(&self, _session_id: SessionId) {}
     async fn send_prompt(
         &self,
@@ -193,12 +206,6 @@ impl HostClient for FakeBackend {
         _prompt_id: String,
         _text: String,
     ) -> Result<(), SandboxError> {
-        unreachable!()
-    }
-    async fn acquire_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        unreachable!()
-    }
-    async fn release_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
         unreachable!()
     }
     fn harness_dial(&self) -> HarnessDial {
@@ -240,6 +247,8 @@ async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: 
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
+        stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
     })
     .await
     .expect("upsert_host");
@@ -278,6 +287,8 @@ async fn seed_host_with(
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
+        stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
     })
     .await
     .expect("upsert_host");
@@ -394,6 +405,7 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
         recoverable: true,
         aux_bundles: vec![],
         events_cursor: None,
+        fc_snapshot_version: None,
     })
     .await
     .expect("record snapshot");
@@ -750,6 +762,7 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
         required_image_digest: None,
         exclude_host: None,
         prefer_host: None,
+        caps: Default::default(),
     };
     let (first_pick, _) = placement::pick_for_session(meta.as_ref(), &registry, &ctx)
         .await
@@ -790,6 +803,8 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
             current_bundles: Vec::new(),
             total_vcpus: 8,
             wire_version: engram_protocol::WIRE_VERSION,
+            stages_images: false,
+            capabilities: engram_core::types::host::HostCapabilities::default(),
         },
     )
     .await
@@ -852,6 +867,8 @@ async fn seed_ready_host(
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
+        stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
     })
     .await
     .expect("seed host row");
@@ -1074,6 +1091,8 @@ async fn drain_dont_strand_guard_blocks_when_no_survivor_fits() {
                     current_bundles: Vec::new(),
                     total_vcpus: vcpus,
                     wire_version: engram_protocol::WIRE_VERSION,
+                    stages_images: false,
+                    capabilities: engram_core::types::host::HostCapabilities::default(),
                 },
             )
             .await
@@ -1093,6 +1112,7 @@ async fn drain_dont_strand_guard_blocks_when_no_survivor_fits() {
         required_image_digest: None,
         exclude_host: Some(victim),
         prefer_host: None,
+        caps: Default::default(),
     };
 
     // 8 GiB session, survivor has 4 GiB free → no fit → would strand.

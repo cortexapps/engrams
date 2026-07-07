@@ -575,7 +575,7 @@ so the replay/persistence the sketch wanted is **already built** — for free.
 ## Default profile (`is_default`, orchestrator-only, net-new)
 
 A trigger has no UI to pick a profile, so a triggered session launches with the
-org's **default profile**. Profiles are orchestrator-owned (ADR 0052; the control
+org's **default profile**. Profiles are orchestrator-owned (ADR 0053; the control
 plane never learns about them), so this is a purely orchestrator-side addition — no
 coordinator or proto change on the control-plane side.
 

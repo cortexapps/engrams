@@ -207,13 +207,19 @@ mod tests {
         async fn create_session(&self, _: SessionSpec) -> Result<SessionId, MetaError> {
             unreachable!()
         }
-        async fn create_session_created(
+        async fn transition_session_created(
             &self,
             _: SessionId,
-            _: SessionSpec,
-            _: engram_core::HostId,
             _: engram_core::SandboxId,
         ) -> Result<(), MetaError> {
+            unreachable!()
+        }
+        async fn reserve_and_persist_create(
+            &self,
+            _: engram_core::traits::SessionCreateWriteSet,
+            _: &[engram_core::HostId],
+            _: usize,
+        ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
             unreachable!()
         }
         async fn get_session(&self, _: SessionId) -> Result<Session, MetaError> {
@@ -276,8 +282,8 @@ mod tests {
         ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
             Ok(vec![])
         }
-        async fn record_snapshot(&self, _: SnapshotRecord) -> Result<(), MetaError> {
-            Ok(())
+        async fn record_snapshot(&self, _: SnapshotRecord) -> Result<bool, MetaError> {
+            Ok(true)
         }
         async fn list_snapshots_for_session(
             &self,
@@ -384,12 +390,6 @@ mod tests {
             Ok(engram_core::traits::DisableEnabledImageOutcome::Disabled)
         }
         async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
-            Ok(())
-        }
-        async fn upsert_session_secrets(
-            &self,
-            _: engram_core::types::SessionSecrets,
-        ) -> Result<(), MetaError> {
             Ok(())
         }
         async fn get_session_secrets(

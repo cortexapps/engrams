@@ -171,7 +171,7 @@ function makeFakeTokens(
 }
 
 // ---------------------------------------------------------------------------
-// Fake profile store + image catalog (ADR 0052)
+// Fake profile store + image catalog (ADR 0053)
 // ---------------------------------------------------------------------------
 
 const PROFILE_ID = "test-profile";
@@ -259,7 +259,7 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
 });
 
 // ---------------------------------------------------------------------------
-// buildProfileMap resilience (ADR 0052): task reads must survive an
+// buildProfileMap resilience (ADR 0053): task reads must survive an
 // unavailable image catalog. ListTasks/GetTask both join via buildProfileMap,
 // so a thrown listEnabledImages must not take down the whole read — the
 // snapshot is still returned, only imageUri falls back to "".
@@ -525,7 +525,7 @@ describe("TaskService — type validation", () => {
   test("CreateTask when the profile's image is no longer enabled → FailedPrecondition", async () => {
     // Profile resolves fine (getActive returns it with imageId "img-1"), but the
     // enabled-image catalog is empty, so the profile's image is not enabled →
-    // ADR 0052 §5 step 2 rejection.
+    // ADR 0053 §5 step 2 rejection.
     const srv2 = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: makeFakeSessions({ existing: [] }),
@@ -1031,7 +1031,7 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
 
 // ---------------------------------------------------------------------------
 // 6b. Harness env injection — include_user_tokens gate + env_vars precedence
-// (ADR 0052)
+// (ADR 0053)
 //
 // The per-user Claude token rides CreateSession.harness_env as
 // { CLAUDE_CODE_OAUTH_TOKEN: <token> } ONLY when the profile sets
@@ -1050,7 +1050,7 @@ function oneCreatedSession(prefix: string): FakeSession {
   };
 }
 
-describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0052)", () => {
+describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0053)", () => {
   test("include_user_tokens=true + token present → harness_env carries the token", async () => {
     const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-tok")], existing: [] });
     const srv = await spawnServer({
@@ -1284,7 +1284,6 @@ describe("TaskService — session status → task status mapping", () => {
   const cases: Array<[string, string]> = [
     ["pending", "working"],
     ["created", "working"],
-    ["guest_ready", "working"],
     ["active", "working"],
     ["idle", "working"],
     ["evacuating", "working"],

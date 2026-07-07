@@ -28,7 +28,9 @@ use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::image::WarmConfig;
 use crate::types::port::PortTunnel;
-use crate::types::sandbox::{AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
+use crate::types::sandbox::{
+    AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+};
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
 use crate::types::{SandboxId, SessionId};
@@ -53,6 +55,19 @@ pub trait HostClient: Send + Sync {
     async fn ping(&self) -> Result<(), SandboxError> {
         self.list().await.map(|_| ())
     }
+
+    /// ADR 0068 probe-before-host_lost: ground-truth liveness for ONE
+    /// sandbox, called by `reconcile::flip_missing` before flipping a
+    /// session to `host_lost` on nothing but absence from a
+    /// self-reported list. Deliberately has NO default `Ok`-shaped
+    /// implementation — a defaulted `Ok` would make "can't probe"
+    /// indistinguishable from "alive", exactly the silent-Ok failure
+    /// mode this issue exists to close. Every transport implements it
+    /// honestly: the gRPC client maps `Unimplemented` (an old host-agent
+    /// mid-roll) to `SandboxError::Unsupported` so the caller can treat
+    /// "no probe available" as "proceed with the flip" without confusing
+    /// it with a real answer.
+    async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError>;
 
     async fn exec_stream(
         &self,
@@ -91,8 +106,12 @@ pub trait HostClient: Send + Sync {
     /// The chunk+upload work runs as a host-side background task; await it via
     /// [`Self::snapshot_wait`]. Returns the new snapshot's id once the
     /// capture itself has succeeded — the point where the coordinator
-    /// may mark the session Idle. Default errs so non-FC hosts and
-    /// pre-D5 host-agents fall back to the composed [`Self::snapshot`].
+    /// may mark the session Idle. Default errs so backends without the
+    /// split path (VZ, Process) fall back to the composed
+    /// [`Self::snapshot`]. The fleet's hard `WIRE_VERSION` lockstep gate
+    /// (skewed hosts are dropped by `host_wire_version_ok`) means this
+    /// default is never reached because a host is running old code —
+    /// only because its backend genuinely has no split-eviction concept.
     async fn snapshot_begin(
         &self,
         _id: SandboxId,
@@ -210,11 +229,23 @@ pub trait HostClient: Send + Sync {
     /// ([`WarmConfig`]), threaded down to the backend. `capture_env` is the
     /// resolved capture-time env injected into the warm hook (refs already
     /// resolved coordinator-side).
+    ///
+    /// Issue #539: `progress` receives [`crate::types::CaptureProgress`]
+    /// events for the lifetime of the call — `phase=boot` once the capture
+    /// VM is up, `phase=warm` stage/heartbeat events while the `[warm]`
+    /// hook runs (a host keepalive at least every 30 s even if the hook is
+    /// silent-but-healthy), then `phase=snapshot` before the memory/disk
+    /// capture. A slow consumer must not block the capture — implementors
+    /// send best-effort (`try_send`). On failure the returned
+    /// `SandboxError::CaptureFailed` carries the same stage + tail the last
+    /// progress event reported, so a dropped/backed-up consumer still gets
+    /// the diagnosis on the terminal error even if it missed live updates.
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
         _warm: Option<WarmConfig>,
         _capture_env: std::collections::HashMap<String, String>,
+        _progress: tokio::sync::mpsc::Sender<crate::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `build_base_snapshot`".into(),
@@ -263,12 +294,15 @@ pub trait HostClient: Send + Sync {
 
     // ---- harness routing ----
     /// Tell this host that an upcoming harness connection identifying
-    /// itself with `session_id` should be routed to `sandbox_id`.
-    /// Errors are infallible locally (the local hub just inserts into
-    /// a HashMap); remote impls swallow transport failures into a
-    /// warning log because the harness can still attach via the
-    /// session-id lookup path on its end.
-    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId);
+    /// itself with `session_id` should be routed to `sandbox_id`,
+    /// fenced by `binding_epoch` (ADR 0073): the host persists the
+    /// token as a durable binding record and validates every attach
+    /// against it. The write is monotonic in the epoch — a stale
+    /// caller's bind is refused host-side, so races converge to the
+    /// newest generation. Remote impls swallow transport failures into
+    /// a warning log (the record also rides the spawn path; the next
+    /// delivery attempt re-binds).
+    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId, binding_epoch: u64);
 
     /// Drop the session→sandbox binding.
     async fn unbind_session(&self, session_id: SessionId);
@@ -342,17 +376,6 @@ pub trait HostClient: Send + Sync {
         Ok(())
     }
 
-    /// Track A: non-destructive harness re-handshake — tell the attached
-    /// harness for `sandbox_id` to drop + re-dial its host connection so
-    /// the re-attach re-emits `Idle`, resyncing a session whose event
-    /// stream desynced from the run state machine. The running agent is
-    /// untouched. Used by the coordinator's desync watchdog. `NotFound`
-    /// if no harness is bound. Default no-op for harness-less fakes; the
-    /// `HostRegistry`, gRPC client, and `LocalHostClient` override it.
-    async fn rehandshake(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        Ok(())
-    }
-
     /// ADR 0045 Phase F: freeze the running microVM for `sandbox_id`
     /// *in place* — pause its vCPUs without snapshotting, destroying, or
     /// changing session state. An admin affordance to drive + observe
@@ -367,38 +390,6 @@ pub trait HostClient: Send + Sync {
     /// ADR 0045 Phase F: unfreeze a [`Self::pause`]d microVM — resume
     /// its vCPUs in place. Symmetric with `pause`; same overrides.
     async fn resume(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        Ok(())
-    }
-
-    /// ADR 0013 + ADR 0011 follow-up #3: pin a sandbox against idle
-    /// eviction while a shell WebSocket is open. The local hub is the
-    /// only source of truth for "is a shell attached to this sandbox?"
-    /// — the in-proc `LocalHostClient` reaches its hub directly;
-    /// remote impls route to the host that owns the harness session.
-    /// Reference-counted in the hub so a future second client doesn't
-    /// decrement to zero prematurely.
-    async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError>;
-
-    /// Release a `acquire_shell` reference. Called on shell bridge
-    /// exit (success or error). Symmetric with `acquire_shell`; the
-    /// hub silently swallows underflow rather than erroring so a buggy
-    /// caller can't poison the count.
-    async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError>;
-
-    /// Issue #219: refresh the keep-alive stamp on an existing shell
-    /// pin. The coord shell bridge calls this periodically (piggybacking
-    /// its WS keepalive) so the host can distinguish a live shell from
-    /// one whose coord-side bridge task died without sending
-    /// `release_shell` (rolling deploy, crash, dropped WS). The host's
-    /// eviction tick reaps pins not renewed within its stale window,
-    /// closing the "pinned forever" leak. A no-op if no pin exists for
-    /// the sandbox — renewal must never resurrect a released pin.
-    ///
-    /// Default impl is a no-op so backends that don't own a hub (mocks,
-    /// remote impls in tests) need no change; the in-proc
-    /// `LocalHostClient` and the gRPC client override it.
-    async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let _ = sandbox_id;
         Ok(())
     }
 

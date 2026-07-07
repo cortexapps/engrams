@@ -133,6 +133,12 @@ async fn run_drain(state: &SharedState, notice: PreemptionNotice) {
 /// over `SharedState`; the caller (the cloud-signal consumer or, in
 /// multi-host production, the host-agent's preemption handler)
 /// wraps it in the appropriate fan-out.
+///
+/// ADR 0019 / telemetry restoration (#526): each drain runs concurrently
+/// with its siblings inside `join_all`, with no request span to inherit
+/// — an explicit root (carrying `session_id`/`sandbox_id`) so the drain
+/// steps correlate instead of exporting as disconnected roots.
+#[tracing::instrument(name = "preemption_drain.drain_session", skip_all, fields(%session_id, %sandbox_id))]
 pub async fn drain_session(
     state: &SharedState,
     session_id: SessionId,
@@ -359,6 +365,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         }
     }
 

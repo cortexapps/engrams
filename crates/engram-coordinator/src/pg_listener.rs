@@ -20,7 +20,9 @@ use engram_core::traits::MetadataStore;
 use engram_core::{HostId, SessionId};
 use serde::Deserialize;
 use sqlx::postgres::PgListener;
+use tokio::sync::Notify;
 
+use crate::boot_bundle::BootBundleCache;
 use crate::host_registry::HostRegistry;
 use crate::integrations::IntegrationBroker;
 use crate::state::{IndexedEvent, SessionEvent, SessionEventBus};
@@ -46,26 +48,45 @@ struct DeltaNotifyPayload {
 /// follow-up wraps this in an exp-backoff supervisor; for 3c the
 /// coordinator restarts on connection loss because there's nothing
 /// else useful to do without Postgres.
+#[allow(clippy::too_many_arguments)] // cohesive listener wiring: state caches + NOTIFY wakes
 pub fn spawn(
     database_url: String,
     meta: Arc<dyn MetadataStore>,
     events: Arc<SessionEventBus>,
     host_registry: Arc<HostRegistry>,
     integrations: IntegrationBroker,
+    boot_bundles: Arc<BootBundleCache>,
+    queue_wake: Arc<Notify>,
+    outbox_wake: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run(&database_url, meta, events, host_registry, integrations).await {
+        if let Err(e) = run(
+            &database_url,
+            meta,
+            events,
+            host_registry,
+            integrations,
+            boot_bundles,
+            queue_wake,
+            outbox_wake,
+        )
+        .await
+        {
             tracing::error!(error = %e, "pg listener task exited");
         }
     })
 }
 
+#[allow(clippy::too_many_arguments)] // cohesive listener wiring (mirrors spawn)
 async fn run(
     database_url: &str,
     meta: Arc<dyn MetadataStore>,
     events: Arc<SessionEventBus>,
     host_registry: Arc<HostRegistry>,
     integrations: IntegrationBroker,
+    boot_bundles: Arc<BootBundleCache>,
+    queue_wake: Arc<Notify>,
+    outbox_wake: Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listener = PgListener::connect(database_url).await?;
     listener.listen("session_events").await?;
@@ -73,13 +94,43 @@ async fn run(
     listener.listen("host_dead").await?;
     // ADR 0057 C2: org-secret writes/rotations invalidate the mint-engine cache.
     listener.listen("org_secret_changed").await?;
+    // Issue #535 (a): boot-bundle cache invalidation. `enabled_image_changed`
+    // fires on every enable/soft-delete/delete of an `enabled_images` row;
+    // `fleet_catalog_changed` fires on every host INSERT (a new host's first
+    // bundle stamp) and, on UPDATE, only when `current_bundles` actually
+    // changes (the migration's UPDATE-trigger WHEN guard) — not on every
+    // heartbeat.
+    listener.listen("enabled_image_changed").await?;
+    listener.listen("fleet_catalog_changed").await?;
+    // ADR 0048 (queue fairness): placement-feasibility events wake the
+    // queue scanner (crate::queue_scanner) so a dequeue doesn't wait for
+    // its poll fallback.
+    listener.listen("placement_changed").await?;
+    // ADR 0073: every outbox enqueue (any replica) NOTIFYs this
+    // channel; the delivery driver's poll interval is only the
+    // crash-recovery fallback.
+    listener.listen("session_outbox").await?;
     tracing::info!(
-        "pg_listener subscribed to session_events + session_event_deltas + host_dead + org_secret_changed"
+        "pg_listener subscribed to session_events + session_event_deltas + host_dead + \
+         org_secret_changed + enabled_image_changed + fleet_catalog_changed + placement_changed"
     );
 
     loop {
         let notification = listener.recv().await?;
         match notification.channel() {
+            "session_outbox" => {
+                outbox_wake.notify_one();
+                continue;
+            }
+            "placement_changed" => {
+                // Informational reason string only (see
+                // `PostgresStore::notify_placement_changed`); we don't
+                // need to parse it, just wake the scanner. `Notify`
+                // coalesces a storm of these into a single permit, so no
+                // debounce machinery is needed here.
+                queue_wake.notify_one();
+                continue;
+            }
             "host_dead" => {
                 // Payload is just `<uuid>` (no JSON wrapper) — the
                 // detector emits it as a plain text NOTIFY.
@@ -110,6 +161,28 @@ async fn run(
                 tracing::info!(
                     secret = notification.payload(),
                     "org secret changed; invalidated mint-engine cache",
+                );
+                continue;
+            }
+            "enabled_image_changed" => {
+                // Issue #535 (a): the payload is the plain `image_uri` text
+                // (no JSON wrapper), matching `host_dead`'s convention.
+                boot_bundles.invalidate_image(notification.payload());
+                tracing::debug!(
+                    image_uri = notification.payload(),
+                    "enabled image changed; invalidated boot-bundle cache entry",
+                );
+                continue;
+            }
+            "fleet_catalog_changed" => {
+                // Issue #535 (a): any host's `current_bundles` stamp changed
+                // (a host roll) — invalidate the whole cached catalog rather
+                // than tracking which host the cached view came from (see
+                // `BootBundleCache::invalidate_fleet_catalog` docs).
+                boot_bundles.invalidate_fleet_catalog();
+                tracing::debug!(
+                    host_id = notification.payload(),
+                    "fleet bundle stamp changed; invalidated fleet-catalog cache",
                 );
                 continue;
             }

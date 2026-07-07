@@ -29,8 +29,7 @@ use chrono::{DateTime, Utc};
 use engram_core::types::host::{
     HostCapacity, HostHeartbeat, HostLocalSnapshot, HostMetadata, HostRecord, HostStatus,
 };
-use engram_core::types::SessionState;
-use engram_core::{HostId, MetaError, SandboxId, SessionId};
+use engram_core::{HostId, SandboxId, SessionId};
 use engram_harness_proto::HarnessEvent;
 use engram_protocol::heartbeat::{
     EnabledImageRef, HostCapacityReport, LocalSnapshotReport, ManifestDigest,
@@ -57,6 +56,12 @@ pub struct RegisterRequest {
     pub wire_version: u32,
     #[serde(default)]
     pub cloud_metadata: Option<HostMetadata>,
+    /// ADR 0068: the host's self-verified capability vector, probed
+    /// before this register POST. `#[serde(default)]` for interop with
+    /// a pre-0068 host-agent (decodes to `schema: 0`, soft-tolerated by
+    /// `host_meets_capabilities`).
+    #[serde(default)]
+    pub capabilities: engram_core::types::host::HostCapabilities,
 }
 
 #[derive(Serialize)]
@@ -166,6 +171,14 @@ pub async fn register(
         // The first heartbeat persists the version the scheduler filters
         // on; carry it here so the in-memory record is consistent.
         wire_version: req.wire_version,
+        // ADR 0036 amendment (issue #538): scheduling state, same as
+        // `wire_version` above — the first heartbeat persists the real
+        // value; `upsert_host` doesn't write this column at all.
+        stages_images: false,
+        // ADR 0068: persist the register-time vector too — see the
+        // `upsert_host` doc comment on why a first-row host shouldn't
+        // sit at `schema: 0` until its first heartbeat.
+        capabilities: req.capabilities,
     };
     state.services.meta.upsert_host(record).await?;
 
@@ -327,6 +340,23 @@ pub struct HeartbeatRequest {
     /// mid-roll, which the placement filter tolerates.
     #[serde(default)]
     pub wire_version: u32,
+    /// ADR 0036 amendment (issue #538): true iff this host's image-prefetch
+    /// supervisor is spawned (`chunk_store` + `chunk_cache` configured). The
+    /// enable scanner's prestage stage waits only on hosts reporting this —
+    /// a fleet with zero eligible staging hosts passes the stage vacuously.
+    /// `#[serde(default)]` → `false` from a pre-0538 host-agent mid-roll,
+    /// the safe/exempt posture.
+    #[serde(default)]
+    pub stages_images: bool,
+    /// ADR 0068: this tick's re-probed capability vector.
+    /// `#[serde(default)]` → `schema: 0` (soft-tolerated) from a
+    /// pre-0068 host-agent mid-roll.
+    #[serde(default)]
+    pub capabilities: engram_core::types::host::HostCapabilities,
+    /// ADR 0073 phase 4: hub-attached sandboxes (see the host-side
+    /// twin). Disagreement-alarm input only.
+    #[serde(default)]
+    pub harness_attached: Vec<SandboxId>,
 }
 
 #[derive(Serialize)]
@@ -342,6 +372,15 @@ pub struct HeartbeatResponse {
     /// `ready_images` and pulls missing chunks.
     #[serde(default)]
     pub enabled_images: Vec<EnabledImageRef>,
+    /// ADR 0036 amendment (issue #538): base-snapshot refs of images
+    /// currently in the `prestaging` enable-job stage — advertised so
+    /// eligible hosts warm them via the SAME prefetch supervisor path as
+    /// `enabled_images` (the supervisor consumes the deduped union), before
+    /// the enable scanner's `enabled_images` upsert makes the digest
+    /// visible to session-create. `#[serde(default)]` for interop: a
+    /// pre-0538 host-agent ignores the field.
+    #[serde(default)]
+    pub prestage_images: Vec<EnabledImageRef>,
     /// ADR 0035 §5: the bundle pin set (every generation some
     /// snapshot row references). Drives the host's bundle
     /// prefetch + sweep supervisor. Always present — the host side
@@ -402,45 +441,22 @@ pub async fn heartbeat(
         }
     }
 
-    // ADR 0009 §1-§3: reconcile first, so subsequent state updates
-    // reflect the post-flip view. Same dispatch as the WS
-    // supervisor loop (`api/hosts.rs:266-284`).
+    // ADR 0068: persist BEFORE reconcile (was the reverse — see the
+    // git history on this handler). A heartbeat the coordinator
+    // refuses to ack (5xx on persist failure, issue #231) must not
+    // have ALREADY driven session flips from its `running_sandboxes`
+    // payload — "Postgres is the authority" means reconcile can only
+    // act on a heartbeat that's actually landed. This closes one of
+    // the two candidate producers of the fbd3794c incident shape (the
+    // other, the dead-host detector's own probe, already gates
+    // correctly — see `dead_host.rs`).
     //
-    // Issue #215: skip reconcile when the host couldn't enumerate its
-    // sandboxes this tick (`running_sandboxes_known == false`). The
-    // empty `running_sandboxes` it sends is "no information", not "no
-    // sandboxes running"; reconciling against it would strike every
-    // active session on the host on a single host-side `list()` blip.
-    if !hb.running_sandboxes_known {
-        tracing::warn!(
-            host_id = %host_id,
-            "heartbeat: host reported running_sandboxes_known=false (backend.list() failed); skipping reconcile this tick",
-        );
-    } else {
-        let flipped = state
-            .reconciler
-            .reconcile_host(&state, host_id, &hb.running_sandboxes)
-            .await;
-        if !flipped.is_empty() {
-            tracing::info!(
-                host_id = %host_id,
-                count = flipped.len(),
-                "heartbeat reconcile flipped missing-sandbox sessions",
-            );
-        }
-    }
-
-    // Bump the routing cache's freshness stamp for this host (ADR
-    // 0015 M3). The scheduling payload itself goes to PG below — ADR
-    // 0047 removed the in-memory scheduler mirror.
-    state.host_registry.touch_seen(host_id);
-
     // ADR 0047: the single per-heartbeat persist — capacity +
     // utilization + the scheduling state every coordinator replica
     // places from (ready_images / local_snapshots / current_bundles /
-    // total_vcpus). `status` is the HOST-reported side (`draining` =
-    // the agent's own shutdown flag); the coordinator-owned `cordoned`
-    // bit is deliberately not written here.
+    // total_vcpus / capabilities). `status` is the HOST-reported side
+    // (`draining` = the agent's own shutdown flag); the
+    // coordinator-owned `cordoned` bit is deliberately not written here.
     //
     // Issue #231: this persist is NOT best-effort. It advances the
     // host's `last_heartbeat_at`, which is exactly what the dead-host
@@ -488,6 +504,8 @@ pub async fn heartbeat(
         current_bundles: hb.current_bundles.clone(),
         total_vcpus: hb.total_vcpus,
         wire_version: hb.wire_version,
+        stages_images: hb.stages_images,
+        capabilities: hb.capabilities.clone(),
     };
     if let Err(e) = state
         .services
@@ -502,6 +520,70 @@ pub async fn heartbeat(
         )));
     }
 
+    // ADR 0009 §1-§3: reconcile AFTER the persist above lands — a
+    // heartbeat we 5xx'd never reaches here (early return above).
+    // Same dispatch as the WS supervisor loop (`api/hosts.rs:266-284`).
+    //
+    // Issue #215: skip reconcile when the host couldn't enumerate its
+    // sandboxes this tick (`running_sandboxes_known == false`). The
+    // empty `running_sandboxes` it sends is "no information", not "no
+    // sandboxes running"; reconciling against it would strike every
+    // active session on the host on a single host-side `list()` blip.
+    if !hb.running_sandboxes_known {
+        tracing::warn!(
+            host_id = %host_id,
+            "heartbeat: host reported running_sandboxes_known=false (backend.list() failed); skipping reconcile this tick",
+        );
+    } else {
+        let flipped = state
+            .reconciler
+            .reconcile_host(&state, host_id, &hb.running_sandboxes)
+            .await;
+        if !flipped.is_empty() {
+            tracing::info!(
+                host_id = %host_id,
+                count = flipped.len(),
+                "heartbeat reconcile flipped missing-sandbox sessions",
+            );
+        }
+    }
+
+    // Bump the routing cache's freshness stamp for this host (ADR
+    // 0015 M3). The scheduling payload itself lives in PG above — ADR
+    // 0047 removed the in-memory scheduler mirror.
+    state.host_registry.touch_seen(host_id);
+    // ADR 0073 phase 4: the demoted belt-and-braces liveness check.
+    // Compare the host's hub-attached set against OUR view (Active
+    // sessions bound to this host whose sandbox the host also reports
+    // running) and count disagreements — the metric's rate IS the
+    // health signal; nothing is healed from here (delivery redelivers
+    // via the outbox, detection reads the event log). Best-effort and
+    // deliberately coarse: sessions mid-create/resume legitimately
+    // have no attach yet, so only sessions the host itself lists as
+    // RUNNING but not ATTACHED count.
+    if hb.running_sandboxes_known && !hb.running_sandboxes.is_empty() {
+        let attached: std::collections::HashSet<_> = hb.harness_attached.iter().collect();
+        if let Ok(active) = state
+            .services
+            .meta
+            .list_active_sandbox_assignments_on_host(host_id)
+            .await
+        {
+            for (session_id, sandbox_id) in active {
+                if hb.running_sandboxes.contains(&sandbox_id) && !attached.contains(&sandbox_id) {
+                    ::metrics::counter!(crate::metrics::HARNESS_ATTACH_DISAGREEMENT_TOTAL)
+                        .increment(1);
+                    tracing::debug!(
+                        host_id = %host_id,
+                        %session_id,
+                        %sandbox_id,
+                        "heartbeat: running sandbox with no attached harness (disagreement alarm)",
+                    );
+                }
+            }
+        }
+    }
+
     // ADR 0015 M5: ship the coord's authoritative enabled-images
     // set so the host's prefetch loop drives from heartbeat alone.
     // Best-effort: a PG hiccup degrades to no-images for this tick.
@@ -509,6 +591,31 @@ pub async fn heartbeat(
         Ok(rows) => enabled_image_refs_from_rows(rows),
         Err(e) => {
             tracing::debug!(host_id = %host_id, error = %e, "list_enabled_images failed");
+            Vec::new()
+        }
+    };
+
+    // ADR 0036 amendment (issue #538): ship the base-snapshot refs of
+    // every enable job currently `prestaging`, so eligible hosts warm them
+    // BEFORE the scanner's `enabled_images` upsert makes the digest
+    // visible to session-create. Best-effort, same posture as
+    // `enabled_images` above — a PG hiccup degrades to no prestage work
+    // for this tick; the scanner's poll loop just sees one more empty
+    // heartbeat and keeps waiting. A row that fails to deserialize (wire
+    // skew mid-roll) is skipped + logged rather than failing the whole ack.
+    let prestage_images = match state.services.meta.list_prestaging_refs().await {
+        Ok(raw) => raw
+            .into_iter()
+            .filter_map(|v| match serde_json::from_value::<EnabledImageRef>(v) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(host_id = %host_id, error = %e, "prestage_ref failed to deserialize; skipping");
+                    None
+                }
+            })
+            .collect(),
+        Err(e) => {
+            tracing::debug!(host_id = %host_id, error = %e, "list_prestaging_refs failed");
             Vec::new()
         }
     };
@@ -557,9 +664,36 @@ pub async fn heartbeat(
             recoverable,
             aux_bundles: adv.aux_bundles.clone(),
             events_cursor,
+            // ADR 0068: this heartbeat's own capability vector already
+            // carries the recording host's FC snapshot-version — no
+            // separate lookup needed (unlike the eviction pipeline,
+            // which stamps from a different host's perspective and has
+            // to ask PG for it).
+            fc_snapshot_version: hb.capabilities.fc_snapshot_version.clone(),
         };
         match state.services.meta.record_snapshot(record).await {
-            Ok(()) => acked_checkpoints.push(adv.snapshot_id),
+            Ok(inserted) => {
+                acked_checkpoints.push(adv.snapshot_id);
+                // Issue #529: the eviction finalize job is host-owned and
+                // never talks to the coordinator again once
+                // `snapshot_begin` returns — THIS reconcile, on the row's
+                // first landing, is now the only place `SnapshotTaken`
+                // emits for a D5 eviction. A periodic checkpoint's row
+                // (or a re-record of either kind) must NOT re-emit it.
+                if inserted && adv.kind == engram_protocol::heartbeat::CheckpointKind::EvictionFinal
+                {
+                    let _ = state
+                        .emit(
+                            adv.session_id,
+                            SessionEvent::SnapshotTaken {
+                                snapshot_id: adv.snapshot_id,
+                                size_bytes: adv.size_bytes,
+                                at: Utc::now(),
+                            },
+                        )
+                        .await;
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     host_id = %host_id,
@@ -583,6 +717,7 @@ pub async fn heartbeat(
         server_time: Utc::now(),
         revoked_sessions: Vec::new(),
         enabled_images,
+        prestage_images,
         live_bundles,
         acked_checkpoints,
     }))
@@ -595,42 +730,48 @@ pub async fn heartbeat(
 fn enabled_image_refs_from_rows(
     rows: Vec<engram_core::types::EnabledImage>,
 ) -> Vec<EnabledImageRef> {
-    rows.into_iter()
-        .filter_map(|row| {
-            // base_snapshot_disk_manifest is NOT NULL (migration 0042), so a
-            // persisted row always has it — the Option is only the build-then-
-            // stamp shape. Defensively skip (rather than panic) the impossible
-            // None so one malformed row can't break the whole advertisement.
-            let Some(base_snapshot_disk_manifest) = row.base_snapshot_disk_manifest else {
-                tracing::error!(
-                    image_uri = %row.image_uri,
-                    "enabled image has no base_snapshot_disk_manifest (NOT NULL invariant violated); not advertising",
-                );
-                return None;
-            };
-            // ADR 0022 Option A: base_snapshot_id is NOT NULL (migration 0038);
-            // same defensive skip — the host needs it to key the per-template
-            // memfile residency path.
-            let Some(base_snapshot_id) = row.base_snapshot_id else {
-                tracing::error!(
-                    image_uri = %row.image_uri,
-                    "enabled image has no base_snapshot_id (NOT NULL invariant violated); not advertising",
-                );
-                return None;
-            };
-            // ADR 0021 P2 (memory residency): nullable since migration 0049.
-            // `None` for cold-boot backends (VZ) that capture a disk-only base
-            // snapshot — advertise the row anyway; the host's prefetch warms
-            // only the disk tier when memory is absent.
-            Some(EnabledImageRef {
-                image_uri: row.image_uri,
-                manifest_digest: ManifestDigest(row.manifest_digest),
-                base_snapshot_id,
-                base_snapshot_disk_manifest,
-                base_snapshot_memory_manifest: row.base_snapshot_memory_manifest,
-            })
-        })
-        .collect()
+    rows.iter().filter_map(enabled_image_ref).collect()
+}
+
+/// ADR 0036 amendment (issue #538): the single-row half of
+/// [`enabled_image_refs_from_rows`]'s projection, shared with
+/// `enable_scanner`'s `Prestaging`-stage advertisement so the two build
+/// paths can't drift — a row the enable scanner just captured (about to be
+/// upserted) and a row already live in `enabled_images` project to the
+/// SAME wire shape.
+pub(crate) fn enabled_image_ref(row: &engram_core::types::EnabledImage) -> Option<EnabledImageRef> {
+    // base_snapshot_disk_manifest is NOT NULL on a persisted row (migration
+    // 0042); the Option here is only the build-then-stamp shape.
+    // Defensively skip (rather than panic) the impossible None so one
+    // malformed row can't break the whole advertisement.
+    let Some(base_snapshot_disk_manifest) = row.base_snapshot_disk_manifest else {
+        tracing::error!(
+            image_uri = %row.image_uri,
+            "enabled image has no base_snapshot_disk_manifest (NOT NULL invariant violated); not advertising",
+        );
+        return None;
+    };
+    // ADR 0022 Option A: base_snapshot_id is NOT NULL (migration 0038); same
+    // defensive skip — the host needs it to key the per-template memfile
+    // residency path.
+    let Some(base_snapshot_id) = row.base_snapshot_id else {
+        tracing::error!(
+            image_uri = %row.image_uri,
+            "enabled image has no base_snapshot_id (NOT NULL invariant violated); not advertising",
+        );
+        return None;
+    };
+    // ADR 0021 P2 (memory residency): nullable since migration 0049. `None`
+    // for cold-boot backends (VZ) that capture a disk-only base snapshot —
+    // advertise the row anyway; the host's prefetch warms only the disk
+    // tier when memory is absent.
+    Some(EnabledImageRef {
+        image_uri: row.image_uri.clone(),
+        manifest_digest: ManifestDigest(row.manifest_digest.clone()),
+        base_snapshot_id,
+        base_snapshot_disk_manifest,
+        base_snapshot_memory_manifest: row.base_snapshot_memory_manifest,
+    })
 }
 
 // ---- POST /api/hosts/:id/auth/resolve-registry ----
@@ -749,31 +890,6 @@ pub async fn integration_asset_ingest(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ---- POST /api/hosts/:id/idle-eviction-candidates (ADR 0011 #2) ----
-
-#[derive(Deserialize)]
-pub struct IdleEvictionCandidatesRequest {
-    /// One entry per candidate. `idle_since` is the host's
-    /// last-seen activity timestamp for that sandbox; coord-side
-    /// can use it for telemetry and for deciding which pipeline
-    /// (snapshot+destroy vs immediate dead) to run.
-    pub candidates: Vec<IdleCandidate>,
-}
-
-#[derive(Deserialize)]
-pub struct IdleCandidate {
-    pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
-    #[serde(default)]
-    pub idle_since: Option<DateTime<Utc>>,
-}
-
-#[derive(Serialize, Default)]
-pub struct IdleEvictionCandidatesResponse {
-    pub accepted: usize,
-    pub failed: usize,
-}
-
 // ---- POST /api/hosts/:id/live-manifest (ADR 0016 Phase B) ----
 
 #[derive(Deserialize)]
@@ -890,92 +1006,6 @@ pub struct SandboxOwnershipResponse {
     pub owned: bool,
 }
 
-pub async fn idle_eviction_candidates(
-    State(state): State<SharedState>,
-    Path(host_id): Path<HostId>,
-    Json(req): Json<IdleEvictionCandidatesRequest>,
-) -> Result<Json<IdleEvictionCandidatesResponse>, ApiError> {
-    let mut accepted = 0usize;
-    let mut failed = 0usize;
-    for candidate in req.candidates {
-        let session = match state.services.meta.get_session(candidate.session_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(
-                    host_id = %host_id,
-                    session_id = %candidate.session_id,
-                    sandbox_id = %candidate.sandbox_id,
-                    error = %e,
-                    "idle-eviction candidate: session lookup failed",
-                );
-                continue;
-            }
-        };
-        if session.status != SessionState::Active {
-            // Already Evicting (the common re-nomination case) or
-            // moved on entirely (deleted, host-lost). Either way the
-            // work is queued or moot — accepted no-op.
-            accepted += 1;
-            continue;
-        }
-        match state
-            .services
-            .meta
-            .transition_session(candidate.session_id, SessionState::Evicting)
-            .await
-        {
-            Ok(prev) => {
-                accepted += 1;
-                ::metrics::counter!(crate::metrics::EVICTION_NOMINATED_TOTAL, "source" => "host")
-                    .increment(1);
-                tracing::info!(
-                    host_id = %host_id,
-                    session_id = %candidate.session_id,
-                    sandbox_id = %candidate.sandbox_id,
-                    idle_since = ?candidate.idle_since,
-                    "idle session nominated for eviction (scanner drives the pipeline)",
-                );
-                if let Err(e) = state
-                    .emit(
-                        candidate.session_id,
-                        SessionEvent::StatusChanged {
-                            from: prev,
-                            to: SessionState::Evicting,
-                            at: Utc::now(),
-                        },
-                    )
-                    .await
-                {
-                    // Status is committed; a lost event is timeline
-                    // cosmetics, not lifecycle state. Don't fail the
-                    // candidate over it.
-                    tracing::warn!(
-                        session_id = %candidate.session_id,
-                        error = %e,
-                        "idle-eviction nomination: StatusChanged emit failed",
-                    );
-                }
-            }
-            // Lost the Active-check race (another pod's nomination,
-            // a concurrent delete): the row is wherever the winner
-            // put it — accepted no-op, same as the pre-check path.
-            Err(MetaError::Conflict(_)) => accepted += 1,
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(
-                    host_id = %host_id,
-                    session_id = %candidate.session_id,
-                    sandbox_id = %candidate.sandbox_id,
-                    error = %e,
-                    "idle-eviction candidate: transition to Evicting failed",
-                );
-            }
-        }
-    }
-    Ok(Json(IdleEvictionCandidatesResponse { accepted, failed }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,12 +1018,13 @@ mod tests {
     use engram_core::traits::SandboxBackend;
     use engram_core::types::session::SessionMode;
     use engram_core::types::Session;
+    use engram_core::types::SessionState;
     use engram_sandbox_process::ProcessBackend;
     use engram_secrets_dev::InMemorySecretStore;
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn build_state_for_session(session: Session) -> (SharedState, TempDir) {
+    fn build_state_for_session(session: Session) -> (SharedState, Arc<MiniMeta>, TempDir) {
         let local = TempDir::new().unwrap();
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(local.path().join("sandboxes")));
@@ -1033,7 +1064,7 @@ mod tests {
             ..CoordinatorConfig::default()
         };
         let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
-        (state, local)
+        (state, meta, local)
     }
 
     fn session_with_status(
@@ -1051,19 +1082,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
-        }
-    }
-
-    fn candidates_req(
-        session_id: SessionId,
-        sandbox_id: SandboxId,
-    ) -> IdleEvictionCandidatesRequest {
-        IdleEvictionCandidatesRequest {
-            candidates: vec![IdleCandidate {
-                session_id,
-                sandbox_id,
-                idle_since: None,
-            }],
+            selected_skills: Vec::new(),
+            park_rung: 0,
+            parked_at: None,
         }
     }
 
@@ -1099,133 +1120,67 @@ mod tests {
         );
     }
 
-    /// ADR 0034 happy path: the handler flips Active → Evicting,
-    /// emits StatusChanged, and returns — it does NOT run the
-    /// pipeline (status is Evicting, not Idle; the sandbox binding
-    /// is untouched for the scanner to use).
+    /// ADR 0068 / issue #531 regression (PR #564): a heartbeat whose
+    /// `touch_host_heartbeat` persist fails must 5xx AND must never
+    /// reach `reconcile_host` for this tick — "Postgres is the
+    /// authority" means reconcile can only act on a heartbeat that
+    /// actually landed. Proves the EARLY RETURN, not just "no flip
+    /// happened" — this fixture's `apply_missing_sandbox_strikes` never
+    /// flips regardless (the trait's no-op default), so a weaker
+    /// "assert no flip" test would pass even if the persist/reconcile
+    /// order were swapped back. `reconcile_probe_calls` counts entry
+    /// into `list_active_sandbox_assignments_on_host` — the call
+    /// `Reconciler::reconcile_with_deps` makes on every tick it
+    /// actually runs — so it distinguishes "reconcile ran and found
+    /// nothing" from "reconcile never ran".
     #[tokio::test]
-    async fn handler_nominates_active_session_and_returns() {
-        let session_id = engram_core::SessionId::new();
+    async fn heartbeat_persist_failure_skips_reconcile_this_tick() {
+        let host_id = HostId::new();
         let sandbox_id = SandboxId::new();
-        let (state, _local) = build_state_for_session(session_with_status(
-            session_id,
-            sandbox_id,
-            SessionState::Active,
-        ));
+        let session_id = engram_core::SessionId::new();
+        let mut session = session_with_status(session_id, sandbox_id, SessionState::Active);
+        session.host_id = Some(host_id);
+        let (state, meta, _local) = build_state_for_session(session);
 
-        let resp = idle_eviction_candidates(
-            State(state.clone()),
-            Path(HostId::new()),
-            Json(candidates_req(session_id, sandbox_id)),
-        )
-        .await
-        .expect("handler");
-        assert_eq!(resp.0.accepted, 1);
-        assert_eq!(resp.0.failed, 0);
+        let hb_json = serde_json::json!({
+            "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 1 },
+            "running_sandboxes": [sandbox_id],
+        });
 
-        let session = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(session.status, SessionState::Evicting);
-        assert_eq!(
-            session.sandbox_id,
-            Some(sandbox_id),
-            "nomination must not unbind the sandbox — the scanner's pipeline needs it"
-        );
-
-        // StatusChanged(Active → Evicting) landed on the event log.
-        let events = state
-            .services
-            .meta
-            .list_session_events_since(session_id, -1, -1)
-            .await
-            .unwrap();
+        // Tick 1: force the persist to fail.
+        *meta.fail_next_heartbeat_persist.lock() = true;
+        let hb: HeartbeatRequest =
+            serde_json::from_value(hb_json.clone()).expect("deserialize heartbeat");
+        let result = heartbeat(State(state.clone()), Path(host_id), Json(hb)).await;
         assert!(
-            events
-                .iter()
-                .any(|e| e.kind == "status_changed"
-                    && e.payload["to"] == serde_json::json!("evicting")),
-            "expected a status_changed→evicting event, got {events:?}"
+            result.is_err(),
+            "a heartbeat whose persist fails must 5xx, not silently ack"
         );
-    }
+        assert_eq!(
+            *meta.reconcile_probe_calls.lock(),
+            0,
+            "reconcile must not run this tick — the persist never landed"
+        );
 
-    /// Re-nomination of an already-Evicting sandbox (the host's 10s
-    /// tick while the pipeline runs) is an accepted no-op: no second
-    /// transition, no second event.
-    #[tokio::test]
-    async fn handler_renomination_of_evicting_is_accepted_noop() {
-        let session_id = engram_core::SessionId::new();
-        let sandbox_id = SandboxId::new();
-        let (state, _local) = build_state_for_session(session_with_status(
-            session_id,
-            sandbox_id,
-            SessionState::Evicting,
-        ));
-
-        let resp = idle_eviction_candidates(
-            State(state.clone()),
-            Path(HostId::new()),
-            Json(candidates_req(session_id, sandbox_id)),
-        )
-        .await
-        .expect("handler");
-        assert_eq!(resp.0.accepted, 1, "re-nomination is accepted");
-        assert_eq!(resp.0.failed, 0);
-
-        let session = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(session.status, SessionState::Evicting, "unchanged");
-        let events = state
-            .services
-            .meta
-            .list_session_events_since(session_id, -1, -1)
-            .await
-            .unwrap();
-        assert!(events.is_empty(), "no event for a no-op, got {events:?}");
-    }
-
-    /// A candidate whose session moved on entirely (terminal) is an
-    /// accepted no-op — the host must not see it as a failure and
-    /// retry-storm it.
-    #[tokio::test]
-    async fn handler_nonactive_candidate_is_accepted_noop() {
-        let session_id = engram_core::SessionId::new();
-        let sandbox_id = SandboxId::new();
-        let (state, _local) = build_state_for_session(session_with_status(
-            session_id,
-            sandbox_id,
-            SessionState::Completed,
-        ));
-
-        let resp = idle_eviction_candidates(
-            State(state.clone()),
-            Path(HostId::new()),
-            Json(candidates_req(session_id, sandbox_id)),
-        )
-        .await
-        .expect("handler");
-        assert_eq!(resp.0.accepted, 1);
-        assert_eq!(resp.0.failed, 0);
-        let session = state.services.meta.get_session(session_id).await.unwrap();
-        assert_eq!(session.status, SessionState::Completed, "untouched");
-    }
-
-    /// An unknown session is the one genuine failure shape.
-    #[tokio::test]
-    async fn handler_unknown_session_counts_failed() {
-        let session_id = engram_core::SessionId::new();
-        let sandbox_id = SandboxId::new();
-        let (state, _local) = build_state_for_session(session_with_status(
-            engram_core::SessionId::new(), // different id than nominated
-            sandbox_id,
-            SessionState::Active,
-        ));
-
-        let resp = idle_eviction_candidates(
-            State(state),
-            Path(HostId::new()),
-            Json(candidates_req(session_id, sandbox_id)),
-        )
-        .await
-        .expect("handler");
-        assert_eq!(resp.0.accepted, 0);
-        assert_eq!(resp.0.failed, 1);
+        // Tick 2: persist succeeds, so reconcile DOES run — proves the
+        // zero count above is specifically caused by the persist
+        // failure, not some other reason this fixture never reconciles.
+        let hb2: HeartbeatRequest = serde_json::from_value(hb_json).expect("deserialize heartbeat");
+        let result2 = heartbeat(State(state.clone()), Path(host_id), Json(hb2)).await;
+        assert!(
+            result2.is_ok(),
+            "a heartbeat with a healthy persist must succeed: {:?}",
+            result2.err()
+        );
+        // ADR 0073: the disagreement-alarm liveness check (added by the
+        // binding-epoch work) ALSO probes `list_active_sandbox_assignments_
+        // on_host` after a successful persist, so the exact count is ≥1 (not
+        // exactly 1 as on pre-binding-epoch main). The load-bearing assertion
+        // is the 0-vs-nonzero split: tick 1 (persist failed) probed 0, tick 2
+        // (persist succeeded) probed at least once — proving the early return.
+        assert!(
+            *meta.reconcile_probe_calls.lock() >= 1,
+            "reconcile must run once the persist succeeds"
+        );
     }
 }

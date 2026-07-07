@@ -77,6 +77,7 @@ fn checkpoint_row(
         recoverable: true,
         aux_bundles: vec![],
         events_cursor,
+        fc_snapshot_version: None,
     }
 }
 
@@ -97,6 +98,7 @@ fn base_row(created_at: chrono::DateTime<Utc>) -> SnapshotRecord {
         recoverable: true,
         aux_bundles: vec![],
         events_cursor: None,
+        fc_snapshot_version: None,
     }
 }
 
@@ -145,6 +147,49 @@ async fn events_cursor_round_trips_and_survives_null_rerecord() {
         .expect("lookup")
         .expect("row present");
     assert_eq!(back.events_cursor, Some(99));
+}
+
+/// Finding 7 (issue #529 Testing item): `record_snapshot`'s `RETURNING
+/// (xmax = 0) AS inserted` idiom against REAL Postgres — `true` on the
+/// first (INSERT) landing, `false` on every idempotent re-record
+/// (UPDATE via `ON CONFLICT (id) DO UPDATE`). The heartbeat reconcile
+/// uses this bool to emit `SnapshotTaken` exactly once; the mocks
+/// (`state.rs` MiniMeta, `api.rs`, `grpc_app.rs`) hand-roll the same
+/// logic in Rust, so a misreport in the actual SQL has no other red
+/// test.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn record_snapshot_returns_inserted_true_on_insert_false_on_rerecord() {
+    let Some(meta) = pg().await else { return };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    let mut row = checkpoint_row(session_id, Utc::now(), Some(1));
+    let inserted = meta
+        .record_snapshot(row.clone())
+        .await
+        .expect("first record");
+    assert!(inserted, "the first landing of a snapshot id must INSERT");
+
+    // Idempotent re-record of the SAME id (e.g. a heartbeat retry, or the
+    // reconciler re-ingesting a checkpoint the eviction pipeline already
+    // recorded) must UPDATE, not INSERT.
+    row.last_accessed_at = Utc::now();
+    let inserted_again = meta
+        .record_snapshot(row.clone())
+        .await
+        .expect("idempotent re-record");
+    assert!(
+        !inserted_again,
+        "a re-record of an existing snapshot id must UPDATE (xmax != 0), not INSERT again"
+    );
+
+    // A genuinely new snapshot id is, again, an INSERT.
+    let other = checkpoint_row(session_id, Utc::now(), Some(2));
+    let inserted_other = meta.record_snapshot(other).await.expect("second record");
+    assert!(
+        inserted_other,
+        "a distinct snapshot id must INSERT even though a row already exists for the session"
+    );
 }
 
 /// `latest_event_idx_at_or_before` resolves the pause-instant cursor
@@ -481,6 +526,238 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
         "the post-recovery event (idx > cursor, still live) is rolled back",
     );
     assert_eq!(re.recovery_epoch, 2, "epoch bumps again: 1 → 2");
+}
+
+/// Issue #529: `rewind_session_to_cursor` must NOT tombstone the
+/// coordinator's own eviction/resume lifecycle events — `evicted`,
+/// `status_changed`, `snapshot_taken`, `resumed`,
+/// `recovered_from_checkpoint`. A clean evict→resume cycle appends
+/// exactly this family past the cursor; tombstoning them is what made
+/// every resume look like a rewind even when nothing guest-derived was
+/// lost.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn rewind_is_kind_scoped_to_guest_derived_events() {
+    let Some(meta) = pg().await else { return };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    let cursor = meta
+        .append_session_event(
+            session_id,
+            "agent_message",
+            serde_json::json!({"text": "before eviction"}),
+        )
+        .await
+        .expect("append e0");
+
+    // The exact four-event family a clean D5 evict→resume appends past
+    // the cursor (idle_evictor.rs `Evicted` + `StatusChanged(->idle)` +
+    // `SnapshotTaken`, then the resume's `StatusChanged(->created)`).
+    for (kind, payload) in [
+        ("evicted", serde_json::json!({})),
+        (
+            "status_changed",
+            serde_json::json!({"from": "active", "to": "idle"}),
+        ),
+        (
+            "snapshot_taken",
+            serde_json::json!({"snapshot_id": Uuid::new_v4(), "size_bytes": 1}),
+        ),
+        (
+            "status_changed",
+            serde_json::json!({"from": "idle", "to": "created"}),
+        ),
+    ] {
+        meta.append_session_event(session_id, kind, payload)
+            .await
+            .expect("append lifecycle event");
+    }
+
+    let lifecycle_only = meta
+        .rewind_session_to_cursor(session_id, cursor)
+        .await
+        .expect("rewind over lifecycle-only span");
+    assert_eq!(
+        lifecycle_only.rolled_back, 0,
+        "coordinator lifecycle events must not be tombstoned by a rewind"
+    );
+    assert_eq!(
+        lifecycle_only.recovery_epoch, 0,
+        "no-op rewind (nothing guest-derived rolled back) must not bump the epoch"
+    );
+
+    // Now interleave a genuinely guest-derived event past the same
+    // cursor — that one, and only that one, must be tombstoned.
+    meta.append_session_event(
+        session_id,
+        "agent_message",
+        serde_json::json!({"text": "guest replay candidate"}),
+    )
+    .await
+    .expect("append guest event");
+
+    let mixed = meta
+        .rewind_session_to_cursor(session_id, cursor)
+        .await
+        .expect("rewind over mixed span");
+    assert_eq!(
+        mixed.rolled_back, 1,
+        "only the guest-derived event is tombstoned; lifecycle events are excluded"
+    );
+    assert_eq!(
+        mixed.recovery_epoch, 1,
+        "epoch bumps once real work rolled back"
+    );
+
+    let events = meta
+        .list_session_events_since(session_id, -1, 1000)
+        .await
+        .expect("replay");
+    let lifecycle_rewound = events
+        .iter()
+        .filter(|e| {
+            e.idx > cursor
+                && matches!(
+                    e.kind.as_str(),
+                    "evicted" | "status_changed" | "snapshot_taken"
+                )
+        })
+        .any(|e| e.rewound_at.is_some());
+    assert!(
+        !lifecycle_rewound,
+        "no lifecycle-kind event is ever tombstoned"
+    );
+}
+
+/// Issue #527 Phase 1: `prompt_received` is a coordinator-authoritative
+/// receipt ("the user asked at time T") that stays true across a
+/// guest-state rewind — a rung-1 recovery rewinds the HARNESS's view of
+/// the world, not whether the user sent the prompt. It must survive
+/// `rewind_session_to_cursor` untombstoned and uncounted, or every
+/// resume-with-rollback would inflate `rolled_back` by one and mask the
+/// signal this issue exists to measure.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn rewind_excludes_prompt_received_from_tombstone_and_rolled_back_count() {
+    let Some(meta) = pg().await else { return };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    let cursor = meta
+        .append_session_event(
+            session_id,
+            "agent_message",
+            serde_json::json!({"text": "before"}),
+        )
+        .await
+        .expect("append e0");
+
+    // Post-checkpoint span: the receipt for the very prompt whose auto-
+    // resume is what's being rewound (the realistic shape — the resume's
+    // own lifecycle events land after the checkpoint cursor today), plus an
+    // ordinary harness event that SHOULD tombstone normally.
+    let receipt_idx = meta
+        .append_session_event(
+            session_id,
+            "prompt_received",
+            serde_json::json!({"prompt_id": "p-527", "at": chrono::Utc::now()}),
+        )
+        .await
+        .expect("append prompt_received");
+    meta.append_session_event(
+        session_id,
+        "agent_message",
+        serde_json::json!({"text": "after"}),
+    )
+    .await
+    .expect("append e1");
+
+    let summary = meta
+        .rewind_session_to_cursor(session_id, cursor)
+        .await
+        .expect("rewind");
+    assert_eq!(
+        summary.rolled_back, 1,
+        "only the ordinary post-cursor event counts; prompt_received is excluded",
+    );
+
+    let events = meta
+        .list_session_events_since(session_id, -1, 1000)
+        .await
+        .expect("replay");
+    let receipt_row = events
+        .iter()
+        .find(|e| e.idx == receipt_idx)
+        .expect("receipt row present");
+    assert_eq!(receipt_row.kind, "prompt_received");
+    assert!(
+        receipt_row.rewound_at.is_none(),
+        "prompt_received must survive the rewind untombstoned",
+    );
+
+    let other_rolled: Vec<_> = events
+        .iter()
+        .filter(|e| e.idx > cursor && e.idx != receipt_idx && e.rewound_at.is_some())
+        .collect();
+    assert_eq!(
+        other_rolled.len(),
+        1,
+        "the ordinary harness event is tombstoned as usual",
+    );
+}
+
+/// Issue #527 Phase 1: `prompt_received_seconds_ago` resolves the receipt
+/// row's age by `(session_id, prompt_id)` — the join key
+/// `engram_prompt_to_run_started_seconds` uses — and correctly returns
+/// `None` for an unknown / never-received prompt_id (the env-seeded
+/// initial prompt's case), never an error.
+///
+/// PR #556 review finding #1: the elapsed seconds are computed PG-side
+/// (`NOW() - created_at`) rather than handed back as a raw `created_at`
+/// timestamp for the caller to diff against its own process clock — this
+/// test asserts the *elapsed* value directly, which is what makes the
+/// live-Postgres assertion below immune to coordinator/test-process clock
+/// skew in the first place.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn prompt_received_seconds_ago_resolves_by_prompt_id_and_misses_cleanly() {
+    let Some(meta) = pg().await else { return };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    assert!(
+        meta.prompt_received_seconds_ago(session_id, "never-sent")
+            .await
+            .expect("lookup miss")
+            .is_none(),
+        "an unknown prompt_id must resolve to None, not an error",
+    );
+
+    let before = Utc::now();
+    meta.append_session_event(
+        session_id,
+        "prompt_received",
+        serde_json::json!({"prompt_id": "p-resolve", "at": before}),
+    )
+    .await
+    .expect("append receipt");
+
+    let secs_ago = meta
+        .prompt_received_seconds_ago(session_id, "p-resolve")
+        .await
+        .expect("lookup hit")
+        .expect("receipt present");
+    assert!(
+        (0.0..5.0).contains(&secs_ago),
+        "receipt was just inserted, so its age must be small and non-negative, \
+         got {secs_ago}",
+    );
+
+    // A different prompt_id on the same session is a clean miss, not a
+    // false-positive match against the sibling receipt.
+    assert!(meta
+        .prompt_received_seconds_ago(session_id, "p-other")
+        .await
+        .expect("lookup miss 2")
+        .is_none(),);
 }
 
 /// ADR 0056 Phase 2: a session's profile-granted capabilities round-trip
