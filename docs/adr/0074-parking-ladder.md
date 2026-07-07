@@ -144,3 +144,47 @@ ladder descends to.
   this (the `ensure_active` hold loop; the next scanner tick); the unit
   tests poll `wait_for_lease_free` before the follow-on step. No product
   code change — the retry paths already existed for rung 1.
+
+### Post-ship incident: the un-pause vsock black-hole (2026-07-06)
+
+The first prod deploy of rung 2 wedged every un-parked session: the
+ascent's `host.resume` returned Ok in ~30ms, but the returning prompt
+never ran — `send_prompt` kept succeeding into an intact hub connection
+(outbox rows showed `attempts=N, delivered, never acked`), in-guest exec
+hung, and the FC event-loop thread burned 100% of a core while the vCPUs
+idled. Two wrong theories died on the way to the root cause: the
+harness→hub binding is NOT lost across a pause (the hub tears down only
+on reader-loop EOF, and pause is a pure vCPU freeze), and the harness
+has NO self-reattach to wait for (its connection never EOFs; it re-dials
+only on a dropped link or agentd's SIGUSR1) — which invalidated the
+first fix attempt (#594, an outbox "self-reattach window" that was also
+unreachable dead code because `outbox_defer` didn't increment
+`attempts`).
+
+The real cause is in Firecracker itself — **upstream v1.16, inherited by
+the fork**: `Vmm::resume_vm()` calls `kick_virtio_devices()` on *every*
+resume, and the vsock device's `kick()` unconditionally arms
+`pending_event_ack`, the RX gate that blocks all host→guest vsock
+delivery until the guest acks a `TRANSPORT_RESET`. That is correct after
+a snapshot (`prepare_save` queued a reset for the guest to ack) but a
+plain pause→resume queues NOTHING: the gate arms with no reset to ack
+and never clears. Rung 2's park/un-pause is exactly a plain
+pause→resume, so it turned a latent VMM bug (also reachable via the
+ADR 0045 admin pause/resume and migration-abort resume) into a hot path.
+
+Fix (fork commit `engram/fix-vsock-rx-gate-plain-resume`): `kick()`
+signals only when the gate is *already* armed and never arms it itself;
+`prepare_save` (in-process) and `restore()` (cross-snapshot, re-armed
+from the saved `virtio_state.activated` flag — an activated snapshot
+always carries a queued reset) own the arming. Snapshot byte-format
+unchanged. Regression proof: `tests/pause_resume_vsock.rs` (fork binary
+via `ENGRAM_FC_FORK_BIN`, same gating as the stock/fork compat test) —
+exec over vsock, plain pause→resume, exec again within a bounded budget.
+Engrams-side hardening shipped with it: parked-paused now uniformly
+means `Evicting` (the admin `EvictIdle` path used to park an ACTIVE
+session), the ascent clears `park_rung` as soon as the un-pause lands
+(Active→Active transitions conflict by design), the headroom gate
+resolves the host via PG `sessions.host_id` (the in-memory registry made
+parking a per-replica coin flip), and `ensure_active` maps terminal
+sessions to Gone so the outbox driver drops their rows instead of
+deferring forever. Follow-up: file the plain-resume gate bug upstream.
