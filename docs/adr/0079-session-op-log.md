@@ -455,3 +455,84 @@ regression-tested) reshaped several of the postures above.
   observes the op row now, not a synchronous `SnapshotResponse`, and the
   op-observe path carries no snapshot id. Low-value contract regression;
   left as-is.
+
+### Post-merge adversarial re-review (the two deferrals)
+
+A second adversarial pass stress-tested the shared justification behind
+the two deferrals (#1c proactive host-epoch-advance; #7 migration-RPC
+fencing): *"a reclaim only fires on a GENUINELY DEAD executor, which
+issues no more host RPCs."* That claim is **false** under a coord↔PG
+partition — ADR 0013 makes coord→host a SEPARATE gRPC/HTTP2 transport
+from coord↔PG (Postgres protocol), so a PG-partitioned-but-host-connected
+executor is reclaimed at `RECLAIM_STALE` while fully ALIVE and CAN still
+issue host RPCs. Five findings; the first four are now FIXED, #1c stays
+deferred but is re-grounded as a pure optimization.
+
+- **(re-#1) FIXED — teleport claim now heartbeats its synchronous body.**
+  `migrate_session_live` held its `OpClaim` across presetup → restore-await
+  → blackout → rebind → reactivate with NO liveness beat (the first
+  `claim.touch` is in the finalize drain, AFTER the body). A move whose body
+  outlives `RECLAIM_STALE` (large VM / slow inter-host link) was reclaimed
+  out from under a HEALTHY holder — no partition even required. Now
+  `claim.spawn_heartbeat("teleport-move")` covers the body (parity with the
+  manual-snapshot claim), dropped just before the finalize task takes over
+  its own beat.
+- **(re-#7) FIXED (was DEFERRED) — the five source-mutating migration RPCs
+  now carry the fence.** `migration_capture`/`_presetup` take
+  `FencedSandboxRequest`; `MigrationExportRef` gains `fencing_epoch` +
+  `session_id` (`_capture_postcopy`/`_commit`/`_abort`); the host-agent gRPC
+  server runs `check_session_epoch` on each and the teleport pipeline stamps
+  `claim.fence()` at every call site. `SandboxBackend` stays fence-free
+  (backend-local) — only the `HostClient` wire seam threads it. The ripple
+  landed smaller than the deferral estimated (`SandboxBackend` and its
+  `PooledBackend` impls did NOT change; the coordinator "mocks" turned out
+  to be `SandboxBackend`, not `HostClient`, impls). `MigrationFetch`
+  (host-to-host, export-nonce gated) and `MigrationDrainWait` (dest-side)
+  stay unfenced — no source-mutating write on the holder's behalf. No
+  `WIRE_VERSION` bump: the fields ride the unreleased v12 (clean break).
+  This also surfaced + fixed a pre-existing green-local/red-CI hole — the
+  base commit fenced `GrpcHostClient::restore` but left the
+  `cfg(target_os="linux")` FC-teleport tests' `restore`/`migration_*` calls
+  un-updated (invisible to macOS clippy).
+- **(re-#3/#4) FIXED — `record_snapshot` at op-driven capture sites is now
+  fenced.** The eviction `park_or_capture` step brackets pause → snapshot →
+  record → commit with no intermediate `ctx.step()` fence check, and
+  `record_snapshot` was a PLAIN unfenced INSERT: a successor re-claim during
+  a >`RECLAIM_STALE` partition let the fenced-out predecessor land a phantom
+  `recoverable` row a resume could pick (the 89f7984d durability-lie class)
+  and then issue `commit_snapshot` under the stale epoch (the host's
+  per-session high-water is only eventually-consistent with PG — a reclaim
+  bumps PG but not the host until the successor's first fenced RPC).
+  `MetadataStore::fenced_record_snapshot(snap, epoch)` writes the row ONLY
+  while `current_epoch == epoch`, atomically (`FOR UPDATE` fence read + write
+  in one tx), returning `Ok(false)` when fenced; the Postgres impl routes
+  both variants through one `record_snapshot_guarded(fence: Option<i64>)` so
+  the INSERT + generation bump + durable-head advance stay identical. The
+  eviction pipeline and the manual-snapshot `recoverable=true` promote use
+  it and bail (no row, no `commit_snapshot`) when fenced. Live-PG regression
+  `fenced_record_snapshot_writes_only_under_current_epoch`.
+- **(re-#1c) STILL DEFERRED — but demoted from "unnecessary" to a pure
+  optimization.** The re-review confirmed the real safety was never "dead
+  executors issue no RPCs"; it is that **PG is the authority and every
+  op-side write is fenced**. With re-#3/#4, the coordinator no longer lands
+  a phantom row or issues `commit_snapshot` when fenced, so the host-side
+  epoch high-water's eventual-consistency window (open between a PG reclaim
+  and the successor's first fenced host RPC) is now harmless-by-construction
+  — a stale host RPC that slips through in that window can no longer be
+  paired with a durable PG row. Proactively advancing the host high-water at
+  reclaim would still shrink that window, but it is no longer a correctness
+  requirement, so it stays deferred (it needs a reclaim-time RPC to a host
+  the reclaiming pod may not be addressing).
+- **(re-#5) FIXED — stale `RECLAIM_STALE` comments.** Two comments still
+  said "60s staleness" after finding #1 raised it to 180s (the
+  live_migration drain-loop touch comment and `OpClaim::spawn_heartbeat`'s
+  doc); both corrected.
+
+**Regression re-verification (no new defects).**
+`op_enqueue_and_claim_exclusive` rolls the whole tx back on a busy lane (no
+orphan row); `fenced_transition_session` reads the epoch before the legality
+check (fence-first); the executor's within-step heartbeat is RAII-aborted
+before `op_finish`; op-path emits/park-writes route through the fenced
+variants; no `session_ops`↔`sessions` lock-order cycle (the op-claim family
+locks `session_ops` then `sessions`; `fenced_transition_session` locks only
+`sessions`).
