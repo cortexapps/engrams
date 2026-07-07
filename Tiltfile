@@ -789,7 +789,28 @@ if dev_split:
             serve_cmd=(
                 'export PATH="/opt/homebrew/bin:$PATH" && ' +
                 'cfg="$(mktemp)" && colima ssh-config ' + fc_colima_profile +
-                ' > "$cfg" && exec ssh -F "$cfg" -N ' +
+                ' > "$cfg" && ' +
+                # Drop any forwards a prior colima mux master still holds on
+                # 9101/9100 (see ControlPath=none note below). `-O cancel`
+                # removes just those forwards WITHOUT killing the master, so the
+                # host-agent's own colima-ssh session riding that master stays
+                # up. No-op once nothing forwards over the shared master.
+                '( ssh -F "$cfg" -O cancel ' +
+                '-L 127.0.0.1:9101:127.0.0.1:9101 ' +
+                '-L 127.0.0.1:9100:127.0.0.1:9100 ' +
+                'colima-' + fc_colima_profile + ' 2>/dev/null || true ) && ' +
+                'exec ssh -F "$cfg" -N ' +
+                # colima's ssh-config sets `ControlMaster auto` + `ControlPersist
+                # yes`. Left as-is, our `-N` forward would set up the shared
+                # master, then ControlPersist DAEMONIZES it into the background
+                # and the foreground ssh returns 0 immediately — Tilt sees the
+                # serve_cmd "exit 0", flags the resource dead, and the retry
+                # then trips ExitOnForwardFailure (the backgrounded master still
+                # owns the ports). Force a dedicated, non-multiplexed connection
+                # so `-N` blocks HERE in the foreground where Tilt supervises it
+                # and it dies cleanly on kill (verified: default cfg → exit 0;
+                # ControlPath=none → blocks). Must be BEFORE the -L flags.
+                '-o ControlMaster=no -o ControlPath=none ' +
                 '-o ExitOnForwardFailure=yes -o ServerAliveInterval=5 ' +
                 '-o ServerAliveCountMax=3 ' +
                 '-L 127.0.0.1:9101:127.0.0.1:9101 ' +
