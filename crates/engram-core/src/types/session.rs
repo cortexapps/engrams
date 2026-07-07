@@ -215,7 +215,13 @@ impl SessionState {
                 target,
                 Idle | HostLost | Evacuating | Evicting | Failed | Completed | Dead
             ),
-            Idle => matches!(target, Created | Dead | Completed | Queued),
+            // ADR 0077 phase 4 (Revive): Idle -> Active directly — a
+            // successful resume binds the sandbox and reattaches the
+            // harness, then flips straight to Active in ONE step, with
+            // no `Created` limbo (Created stays the start_agent-FAILED
+            // resting state, /exec 409). Created remains legal for the
+            // create path and for the harness-failed resume arm.
+            Idle => matches!(target, Active | Created | Dead | Completed | Queued),
             HostLost => matches!(target, Created | Idle | Dead | Completed),
             Evacuating => matches!(target, Created | Idle | Dead | Completed),
             // ADR 0074 rung 1: `Active` is the cancel edge — a returning
@@ -483,13 +489,6 @@ pub struct Session {
     /// pre-Phase-B sessions).
     #[serde(default)]
     pub live_disk_manifest: Option<crate::types::manifest::ManifestRef>,
-    /// Issue #535 (b): profile-selected skill names, persisted at create
-    /// (the create-write-set's `selected_skills`) so a queued session's
-    /// boot re-prepare can reconstruct its dynamic mounts (ADR 0055
-    /// TODO(P1-D) fix — the scanner used to boot every queued session with
-    /// base skills only, since the queue row never carried the selection).
-    #[serde(default)]
-    pub selected_skills: Vec<String>,
     /// ADR 0074 parking ladder: which rung this session's sandbox is
     /// currently parked at. `0` = not parked (normal). `1` = nominated
     /// for eviction (still Active, cancellable). `2` = parked-paused
@@ -606,6 +605,9 @@ mod tests {
             // in the 2026-07 overhaul (lease-guarded; see
             // try_cancel_nominated_eviction).
             (Evicting, Active),
+            // ADR 0077 phase 4: the Revive edge — a resumed session
+            // reattaches its harness and flips Idle -> Active directly.
+            (Idle, Active),
             (Evicting, Idle),
             (Evicting, HostLost),
             (Evicting, Dead),
@@ -760,7 +762,6 @@ mod tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         };

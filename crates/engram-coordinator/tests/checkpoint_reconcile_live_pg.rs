@@ -854,3 +854,100 @@ async fn session_integration_policy_round_trip() {
     assert_eq!(policy.injects[0].secret_ref, "datadog-api-key");
     assert_eq!(policy.injects[0].methods, vec!["GET".to_string()]);
 }
+
+/// ADR 0077 phase 1: `record_snapshot` advances the session's durable
+/// head in the SAME transaction, monotonically by created_at — a newer
+/// commit advances it, an older/out-of-order re-record never regresses
+/// it, and a base capture (session_id IS NULL) never touches it.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn record_snapshot_advances_durable_head_monotonically() {
+    let Some(meta) = pg().await else { return };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    assert!(
+        meta.durable_head_snapshot(session_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "fresh session has no durable head",
+    );
+
+    let t0 = Utc::now();
+    let older = checkpoint_row(session_id, t0, Some(10));
+    let newer = checkpoint_row(session_id, t0 + ChronoDuration::seconds(30), Some(20));
+
+    meta.record_snapshot(older.clone()).await.unwrap();
+    assert_eq!(
+        meta.durable_head_snapshot(session_id).await.unwrap(),
+        Some(older.id),
+        "first commit becomes the head",
+    );
+
+    meta.record_snapshot(newer.clone()).await.unwrap();
+    assert_eq!(
+        meta.durable_head_snapshot(session_id).await.unwrap(),
+        Some(newer.id),
+        "a newer commit advances the head",
+    );
+
+    // Out-of-order re-record of the OLDER row must NOT regress the head.
+    meta.record_snapshot(older.clone()).await.unwrap();
+    assert_eq!(
+        meta.durable_head_snapshot(session_id).await.unwrap(),
+        Some(newer.id),
+        "an older re-record must not regress the durable head",
+    );
+
+    // A base capture never touches a session head (no session_id).
+    meta.record_snapshot(base_row(t0 + ChronoDuration::seconds(60)))
+        .await
+        .unwrap();
+    assert_eq!(
+        meta.durable_head_snapshot(session_id).await.unwrap(),
+        Some(newer.id),
+        "a base capture must not touch any session's durable head",
+    );
+}
+
+/// ADR 0077 phase 3: the RuntimeSpec round-trips, and a session with no
+/// spec row reads `None` (the pre-0071 fallback that boots with base
+/// skills — the queued-skills TODO(P1-D) fix is opt-in on the write).
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn runtime_spec_round_trips_and_absent_reads_none() {
+    let Some(meta) = pg().await else { return };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    assert!(
+        meta.get_session_runtime_spec(session_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a session with no spec row reads None",
+    );
+
+    let spec = engram_core::types::runtime_spec::RuntimeSpec::new(
+        vec!["git".into(), "browser".into()],
+        Some("claude".into()),
+        Some("/workspace".into()),
+    );
+    meta.put_session_runtime_spec(session_id, &spec)
+        .await
+        .unwrap();
+    assert_eq!(
+        meta.get_session_runtime_spec(session_id).await.unwrap(),
+        Some(spec.clone()),
+        "the persisted spec round-trips (the queued/resume boot re-resolves these skills)",
+    );
+
+    // Upsert replaces.
+    let spec2 = engram_core::types::runtime_spec::RuntimeSpec::new(vec!["git".into()], None, None);
+    meta.put_session_runtime_spec(session_id, &spec2)
+        .await
+        .unwrap();
+    assert_eq!(
+        meta.get_session_runtime_spec(session_id).await.unwrap(),
+        Some(spec2),
+    );
+}

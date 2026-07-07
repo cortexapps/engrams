@@ -1398,6 +1398,38 @@ pub async fn finish_resume_to_active(
         }
     }
     if start_agent_failed {
+        // ADR 0077 phase 4: with the Created limbo removed from the
+        // happy path, the direct-resume caller arrives here at Idle, so
+        // a start_agent failure must PARK the session at Created
+        // explicitly (the /exec-409 resting contract). Idempotent for
+        // the evac/dead-host callers that pre-transitioned to Created.
+        // The park EMITS its StatusChanged like every other transition —
+        // the event log is the UI's view, and a silent park left clients
+        // offering Idle actions (prompt/resume) the API then 409s. A
+        // transition failure PROPAGATES: reporting CreatedHarnessFailed
+        // for a row that never left Idle would double the divergence.
+        if session.status == SessionState::Idle {
+            state
+                .services
+                .meta
+                .transition_session(id, SessionState::Created)
+                .await
+                .map_err(|e| {
+                    ApiError::Internal(format!(
+                        "resume: parking harness-failed session at Created failed: {e}"
+                    ))
+                })?;
+            let _ = state
+                .emit(
+                    id,
+                    SessionEvent::StatusChanged {
+                        from: SessionState::Idle,
+                        to: SessionState::Created,
+                        at: Utc::now(),
+                    },
+                )
+                .await;
+        }
         return Ok(FinishResumeOutcome::CreatedHarnessFailed);
     }
     let prev_for_active = state
@@ -1695,28 +1727,13 @@ async fn resume_from_fc_snapshot(
     )
     .increment(1);
     bind_resumed_session(&state, id, host_id, new_sandbox_id).await?;
-    // ADR 0015 M2: resume re-runs the create-shape transitions on
-    // the new sandbox — Idle → Created (now that a host + sandbox
-    // are bound). [`finish_resume_to_active`] handles the rest
-    // (harness rebuild + → Active) so the same primitive is shared
-    // with evac (commits land in `dead_host.rs`, the admin endpoint,
-    // and the new `/resume from Created` arm).
-    let now = Utc::now();
-    let prev_for_created = state
-        .services
-        .meta
-        .transition_session(id, SessionState::Created)
-        .await?;
-    state
-        .emit(
-            id,
-            SessionEvent::StatusChanged {
-                from: prev_for_created,
-                to: SessionState::Created,
-                at: now,
-            },
-        )
-        .await?;
+    // ADR 0077 phase 4 (Revive): NO `Idle → Created` pre-transition.
+    // The session stays Idle across the restore + harness rebuild and
+    // flips STRAIGHT to Active (Idle → Active) in finish_resume_to_active
+    // once the harness reattaches — one transition + one event on the
+    // happy path instead of Idle→Created→Active, and no window where a
+    // resumed-but-not-yet-active session sits at Created. A start_agent
+    // failure parks it at Created there (the /exec-409 contract).
     // ADR 0028 A.log: this is a rung-1 restore (coherent memory
     // checkpoint) — rewind the transcript to the checkpoint's cursor
     // before the harness comes back, so the resumed agent's first
@@ -2503,7 +2520,6 @@ mod evicting_gate_tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         }
@@ -2836,7 +2852,6 @@ mod evicting_gate_tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: None,
-            selected_skills: Vec::new(),
             park_rung: 0,
             parked_at: None,
         }

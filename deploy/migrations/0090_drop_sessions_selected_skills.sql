@@ -1,0 +1,11 @@
+-- ADR 0077 phase 3: retire #566's interim `sessions.selected_skills`
+-- column. A session's boot inputs (selected skills / harness / workdir)
+-- now live in ONE persisted document — the `session_runtime_specs` row
+-- (migration 0089) — written in the create transaction and consumed by
+-- queue re-prepare / resume / evac instead of re-derived. #535 explicitly
+-- deferred subsuming this column to the transactional-snapshots epic;
+-- this is that subsumption. Clean break — no dual persistence.
+--
+-- Numbered 0090: follows this PR's 0088/0089. Never edit an applied
+-- migration.
+ALTER TABLE sessions DROP COLUMN IF EXISTS selected_skills;

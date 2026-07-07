@@ -53,12 +53,16 @@ pub struct SessionCreateWriteSet {
     /// ADR 0056 (B′): the compiled integration policy, pre-serialized to
     /// JSON (mirrors `bind_session_integration_policy`'s wire shape).
     pub integration_policy_json: Option<String>,
-    /// ADR 0062: the selected harness catalog key.
-    pub selected_harness: Option<String>,
-    /// ADR 0055 TODO(P1-D) fix: the profile-selected skill names, persisted
-    /// so a queued create's boot re-prepare (`prepare_from_row`) can
-    /// reconstruct the selection instead of silently dropping it.
-    pub selected_skills: Vec<String>,
+    /// ADR 0077 phase 3: the session's boot inputs as ONE persisted
+    /// document — `selected_skills` (the TODO(P1-D) fix), `selected_harness`
+    /// (ADR 0062 catalog key), and `workdir`. Written into the
+    /// `session_runtime_specs` row in the SAME create transaction, and
+    /// consumed by queue re-prepare instead of re-derived. This is the
+    /// single source that subsumes #566's interim
+    /// `sessions.selected_skills` column (retired, migration 0090).
+    /// `reserve_and_persist_create` also mirrors `runtime_spec
+    /// .selected_harness` into the pre-existing `sessions.harness` column.
+    pub runtime_spec: crate::types::runtime_spec::RuntimeSpec,
 }
 
 /// Outcome of [`MetadataStore::reserve_and_persist_create`].
@@ -968,13 +972,54 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError>;
 
     // ---- snapshots ----
+    /// ADR 0077 phase 3: persist a session's RuntimeSpec (upsert). Written
+    /// in the create transaction (`reserve_and_persist_create`) and
+    /// refreshed at eviction finalize; the boot inputs a queue re-prepare /
+    /// resume / evac consumes instead of re-deriving. The SINGLE source of
+    /// a session's selected skills/harness/workdir — it SUBSUMES #566's
+    /// interim `sessions.selected_skills` column (retired, migration 0090).
+    /// Default (mock): no-op.
+    async fn put_session_runtime_spec(
+        &self,
+        session_id: SessionId,
+        spec: &crate::types::runtime_spec::RuntimeSpec,
+    ) -> Result<(), MetaError> {
+        let _ = (session_id, spec);
+        Ok(())
+    }
+
+    /// ADR 0077 phase 3: read a session's persisted RuntimeSpec. `None` =
+    /// none written yet (pre-0074 sessions). Default (mock): `None`.
+    async fn get_session_runtime_spec(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<crate::types::runtime_spec::RuntimeSpec>, MetaError> {
+        let _ = session_id;
+        Ok(None)
+    }
+
     /// Idempotent upsert (`ON CONFLICT (id) DO UPDATE`) keyed by
     /// `snap.id`. Returns `true` iff this call INSERTed a fresh row,
     /// `false` on a re-record of an existing one — issue #529: the
     /// heartbeat reconcile uses this to emit `SnapshotTaken` exactly
-    /// once, on the row's first landing, regardless of which coord (if
-    /// any) survived the original capture.
+    /// once, on the row's first landing. ADR 0077 phase 1: the SAME
+    /// transaction advances the session's `durable_head`.
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError>;
+
+    /// ADR 0077 phase 1: the session's durable head — the newest
+    /// snapshot whose blobs AND row are both committed (advanced in
+    /// `record_snapshot`'s transaction). `None` = no committed
+    /// snapshot yet. Phase 5 makes this the resume selector; phase 1
+    /// exposes it read-side for the SLO canary and tests.
+    ///
+    /// Default (mock stores): `None` — mocks get pre-0074 behavior.
+    async fn durable_head_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<crate::types::SnapshotId>, MetaError> {
+        let _ = session_id;
+        Ok(None)
+    }
     async fn list_snapshots_for_session(
         &self,
         sid: SessionId,

@@ -19,6 +19,7 @@ pub mod org_secret;
 pub mod outbox;
 pub mod port;
 pub mod registry;
+pub mod runtime_spec;
 pub mod sandbox;
 pub mod session;
 pub mod shell;

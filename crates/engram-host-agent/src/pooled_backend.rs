@@ -3480,7 +3480,7 @@ impl PooledBackend {
                 self.flush_config.dirty_threshold_bytes,
                 // Disk-only cold recovery resumes the session's OWN evolved
                 // manifest — already a private id, so tick, don't fork.
-                /*fork_on_first_flush=*/
+                /*fork_at_attach=*/
                 false,
             )
             .await
@@ -3611,7 +3611,7 @@ impl PooledBackend {
             self.flush_config.dirty_threshold_bytes,
             // ADR 0049 follow-up: FRESH create from the shared base image —
             // fork the disk manifest to a private per-session id on first write.
-            /*fork_on_first_flush=*/
+            /*fork_at_attach=*/
             true,
         )
         .await
@@ -7595,7 +7595,7 @@ impl PooledBackend {
             self.flush_config.dirty_threshold_bytes,
             // Resume attaches the session's OWN already-forked manifest id
             // (from its prior snapshot) — tick, don't fork.
-            /*fork_on_first_flush=*/
+            /*fork_at_attach=*/
             false,
         )
         .await
