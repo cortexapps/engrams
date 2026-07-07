@@ -337,7 +337,7 @@ fc-colima-provision profile='fc-dev':
 # Use it to reclaim disk or get a clean slate before a re-bake. Talks to the
 # coordinator app-gRPC via ENGRAM_APP_GRPC_ADDR / ENGRAM_APP_GRPC_TOKEN (dev
 # defaults below); the stack must be up.
-reap-sessions profile='':
+reap-sessions profile='' mac_docker_context='colima':
     #!/usr/bin/env bash
     set -euo pipefail
     export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
@@ -434,10 +434,29 @@ reap-sessions profile='':
         #    snapshot-id set from Postgres (via the always-up dev container) and
         #    pass it (space-joined) to the VM sweeper; anything else is orphaned.
         echo "==> sweeping orphaned base-snapshot dirs in the VM"
-        live_snaps="$(docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
+        # The compose deps (Postgres) live on the MAC docker daemon, but
+        # `colima start --profile <p>` persistently repoints the docker CLI at
+        # the VM daemon (currentContext=colima-<p>). So a bare `docker compose
+        # exec postgres` here hits the VM — which has no Postgres — the query
+        # fails, and (guarded in reap-vm-snapshots.sh) the sweep is refused
+        # rather than nuking every base snapshot. Pin the Mac docker context
+        # like `dev-fc` does. Default `colima`; for Docker Desktop:
+        # `just reap-sessions {{profile}} desktop-linux`.
+        mac_host="$(docker context inspect '{{mac_docker_context}}' 2>/dev/null \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["Endpoints"]["docker"]["Host"])' 2>/dev/null || true)"
+        if [ -z "$mac_host" ]; then
+            echo "    docker context '{{mac_docker_context}}' not found or has no endpoint. Available:" >&2
+            docker context ls >&2
+            echo "    Pass the Mac context, e.g.: just reap-sessions $fc_profile desktop-linux" >&2
+            exit 1
+        fi
+        # No `2>/dev/null` on the query: a failure must be VISIBLE (paired with
+        # the empty-set guard in the sweeper) — a silently-swallowed error used
+        # to abort with a cryptic exit code, or worse, feed an empty live set.
+        live_snaps="$(DOCKER_HOST="$mac_host" docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
             psql -U engram -d engram -tAc \
             "select id::text from snapshots union select base_snapshot_id::text from enabled_images where base_snapshot_id is not null" \
-            2>/dev/null | tr '\n' ' ' | tr -s ' ')"
+            | tr '\n' ' ' | tr -s ' ')"
         colima ssh --profile "$fc_profile" -- sudo bash -s -- "$live_snaps" < deploy/dev/reap-vm-snapshots.sh
     elif command -v colima >/dev/null 2>&1; then
         echo "==> SKIPPING fc-colima VM stages (bundles + orphaned snapshots) — no profile."

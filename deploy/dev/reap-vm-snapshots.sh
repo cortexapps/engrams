@@ -9,6 +9,18 @@
 # anything on disk not in that set is swept. Piped to `sudo bash -s -- "<ids>"`.
 set -euo pipefail
 live="${1:-}"
+# Fail closed on an empty live set. The caller gathers the live snapshot ids
+# from Postgres; if that query fails (DB unreachable, wrong docker context, a
+# schema change) it yields an empty string — and an empty `live` makes the loop
+# below treat EVERY dir as orphaned and rm -rf the lot (each a GiB-sized memory
+# dump). An empty set is never legitimate here (the enabled images alone pin
+# their base snapshots), so refuse rather than nuke everything.
+if [ -z "${live//[[:space:]]/}" ]; then
+    echo "  VM: refusing to sweep — live snapshot set is EMPTY (the coordinator DB" >&2
+    echo "      query returned nothing / failed). Sweeping now would delete every" >&2
+    echo "      base snapshot. Aborting; fix the query and re-run." >&2
+    exit 1
+fi
 d=/opt/engram-dev/var/sandboxes/snapshots
 [ -d "$d" ] || { echo "  (VM: no $d — skip)"; exit 0; }
 shopt -s nullglob
