@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 
+use engram_core::traits::SessionFence;
 use engram_core::types::sandbox::AgentSpec;
 use engram_core::types::session::{SessionSpec, SessionState};
 use engram_core::types::SnapshotId;
@@ -171,6 +172,11 @@ pub(crate) async fn boot_on_reserved_host(
     state: &SharedState,
     inputs: BootInputs,
     host_id: HostId,
+    // ADR 0079: the caller's fencing epoch, stamped into every session-
+    // scoped host RPC below. The create_boot verb threads its op fence;
+    // the direct (capacity-available) create pipeline is out-of-op and
+    // passes `SessionFence::unfenced()`.
+    fence: SessionFence,
 ) -> Result<(), BootError> {
     let BootInputs {
         session_id,
@@ -245,6 +251,7 @@ pub(crate) async fn boot_on_reserved_host(
         metadata,
         spec_env.clone(),
         selected_mounts,
+        fence,
     );
     let env_egress_leg = async {
         if let Some(a) = agent.as_mut() {
@@ -290,7 +297,7 @@ pub(crate) async fn boot_on_reserved_host(
             %session_id, %sandbox_id, %host_id, error = %e,
             "session row transition-to-created failed after sandbox create; tearing sandbox down",
         );
-        if let Err(de) = state.services.host.destroy(sandbox_id).await {
+        if let Err(de) = state.services.host.destroy(sandbox_id, fence).await {
             tracing::error!(
                 %session_id, %sandbox_id, error = %de,
                 "sandbox teardown after transition failure also failed — host reconcile will GC",
@@ -374,7 +381,7 @@ pub(crate) async fn boot_on_reserved_host(
     if let Err(e) = state
         .services
         .host
-        .start_agent(sandbox_id, agent, policy)
+        .start_agent(sandbox_id, agent, policy, fence)
         .await
     {
         tracing::error!(

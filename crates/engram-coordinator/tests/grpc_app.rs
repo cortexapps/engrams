@@ -57,7 +57,9 @@ struct MockMetadataStore {
     live_disk_manifests: Mutex<HashMap<SessionId, engram_core::types::manifest::ManifestRef>>,
     chunk_generation: std::sync::atomic::AtomicU64,
     hosts: Mutex<HashMap<HostId, HostRecord>>,
-    lease_held: std::sync::atomic::AtomicBool,
+    /// ADR 0079: DeleteSession (and any verb-riding RPC) drives the real
+    /// op executor — the reference in-memory op log makes that honest.
+    ops: engram_core::types::session_op::InMemoryOpLog,
 }
 
 impl MockMetadataStore {
@@ -72,6 +74,112 @@ impl MockMetadataStore {
 
 #[async_trait]
 impl MetadataStore for MockMetadataStore {
+    // ---- ADR 0079: delegate the op log to the reference mock ----
+    async fn op_enqueue_and_claim(
+        &self,
+        session_id: SessionId,
+        kind: engram_core::types::session_op::OpKind,
+        payload: serde_json::Value,
+        idempotency_key: Option<&str>,
+        claimed_by: &str,
+    ) -> Result<engram_core::types::session_op::EnqueueOutcome, MetaError> {
+        Ok(self
+            .ops
+            .enqueue_and_claim(session_id, kind, payload, idempotency_key, claimed_by))
+    }
+    async fn op_claim_head(
+        &self,
+        session_id: SessionId,
+        claimed_by: &str,
+    ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
+        Ok(self.ops.claim_head(session_id, claimed_by))
+    }
+    async fn op_record_step(&self, op_id: i64, epoch: i64, step: &str) -> Result<bool, MetaError> {
+        Ok(self.ops.record_step(op_id, epoch, step))
+    }
+    async fn op_finish(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        state: engram_core::types::session_op::OpState,
+        error: Option<&str>,
+    ) -> Result<bool, MetaError> {
+        Ok(self.ops.finish(op_id, epoch, state, error))
+    }
+    async fn op_requeue_with_backoff(
+        &self,
+        op_id: i64,
+        epoch: i64,
+        backoff: std::time::Duration,
+        error: &str,
+    ) -> Result<bool, MetaError> {
+        Ok(self.ops.requeue_with_backoff(op_id, epoch, backoff, error))
+    }
+    async fn op_cancel_queued(
+        &self,
+        session_id: SessionId,
+        kind: engram_core::types::session_op::OpKind,
+    ) -> Result<bool, MetaError> {
+        Ok(self.ops.cancel_queued(session_id, kind))
+    }
+    async fn op_cancel_by_id(&self, op_id: i64) -> Result<bool, MetaError> {
+        Ok(self.ops.cancel_by_id(op_id))
+    }
+    async fn op_request_cancel_running(
+        &self,
+        session_id: SessionId,
+        kind: engram_core::types::session_op::OpKind,
+    ) -> Result<bool, MetaError> {
+        Ok(self.ops.request_cancel_running(session_id, kind))
+    }
+    async fn op_cancel_requested(&self, op_id: i64) -> Result<bool, MetaError> {
+        Ok(self.ops.cancel_requested(op_id))
+    }
+    async fn op_running_for(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
+        Ok(self.ops.running_for(session_id))
+    }
+    async fn op_get(
+        &self,
+        op_id: i64,
+    ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
+        Ok(self.ops.get(op_id))
+    }
+    async fn op_pending_exists(
+        &self,
+        session_id: SessionId,
+        kind: engram_core::types::session_op::OpKind,
+    ) -> Result<bool, MetaError> {
+        Ok(self.ops.pending_exists(session_id, kind))
+    }
+    async fn fenced_transition_session(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        to: SessionState,
+    ) -> Result<Option<SessionState>, MetaError> {
+        if self.ops.current_epoch(session_id) != epoch {
+            return Ok(None);
+        }
+        self.transition_session(session_id, to).await.map(Some)
+    }
+    async fn fenced_assign_sandbox(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        sandbox_id: Option<engram_core::SandboxId>,
+        host_id: Option<HostId>,
+    ) -> Result<bool, MetaError> {
+        if self.ops.current_epoch(session_id) != epoch {
+            return Ok(false);
+        }
+        self.assign_session_sandbox(session_id, sandbox_id).await?;
+        self.assign_session_host(session_id, host_id).await?;
+        Ok(true)
+    }
+
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
         let id = SessionId::new();
         let session = Session {
@@ -305,15 +413,6 @@ impl MetadataStore for MockMetadataStore {
         id: engram_core::types::SnapshotId,
     ) -> Result<Option<SnapshotRecord>, MetaError> {
         Ok(self.snapshots_by_id.lock().get(&id).cloned())
-    }
-
-    async fn try_acquire_session_lease(
-        &self,
-        _session_id: SessionId,
-        _sandbox_id: Option<engram_core::SandboxId>,
-        _locked_by: &str,
-    ) -> Result<bool, MetaError> {
-        Ok(!self.lease_held.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     async fn list_snapshots_for_session(

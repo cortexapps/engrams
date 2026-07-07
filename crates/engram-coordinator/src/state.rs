@@ -35,10 +35,10 @@ pub enum SessionEvent {
         at: DateTime<Utc>,
     },
     /// Issue #527 Phase 1: the durable "the user asked at time T" fact.
-    /// Emitted as the FIRST PG write of `send_prompt_core`, before
-    /// `ensure_active_and_resolve` (the auto-resume) — unlike the
-    /// user-echo `HarnessAgentMessage`, which is deliberately ordered
-    /// AFTER the resume to satisfy ADR 0052 type-ahead rendering. This
+    /// Emitted as the FIRST PG write of `send_prompt_core`, before the
+    /// outbox enqueue whose deliver op auto-resumes the session — unlike
+    /// the user-echo `HarnessAgentMessage`, which is deliberately ordered
+    /// AFTER the receipt to satisfy ADR 0052 type-ahead rendering. This
     /// event exists purely for measurement: it is the receipt anchor
     /// `engram_prompt_to_run_started_seconds` joins against
     /// `run_started{prompt_id}` to compute true prompt→first-token
@@ -686,6 +686,8 @@ pub struct AppState {
     pub boot_bundles: Arc<crate::boot_bundle::BootBundleCache>,
     /// ADR 0073: wakes the outbox delivery driver on local enqueues.
     pub outbox_wake: Arc<tokio::sync::Notify>,
+    /// ADR 0079: wakes the session-op executor on `pg_notify('session_ops', …)`.
+    pub session_ops_wake: Arc<tokio::sync::Notify>,
     /// Bound address of the harness TCP listener (set by `lib::run`
     /// once the listener has accepted a port from the OS — `127.0.0.1:0`
     /// becomes e.g. `127.0.0.1:54123`). The session-create handler
@@ -701,14 +703,6 @@ pub struct AppState {
     /// through this to avoid storming the host on web-app polling.
     /// 1s TTL; cache eviction on host unregister.
     pub cow_state_cache: Arc<crate::cow_state::CowStateCache>,
-    /// ADR 0016 §A.1.5c: stable identifier for this coord pod —
-    /// stamped on the `session_lease.locked_by` column so
-    /// `SELECT * FROM session_lease` tells an operator which
-    /// pod is mid-eviction on which session. Defaults to
-    /// `hostname` (the k8s pod name in prod); cheap to override
-    /// via the `ENGRAM_COORD_POD_ID` env var if local tests want
-    /// a deterministic value.
-    pub pod_id: Arc<String>,
     /// ADR 0023/0047: per-session credential-broker tokens (session →
     /// expected bearer). PURE READ-THROUGH CACHE over the KEK-sealed
     /// `session_broker_tokens` PG rows (the authority — minted
@@ -792,10 +786,10 @@ impl AppState {
             // ADR 0073: local fast-path wake for the outbox delivery
             // driver (the PG NOTIFY covers cross-pod).
             outbox_wake: Arc::new(tokio::sync::Notify::new()),
+            session_ops_wake: Arc::new(tokio::sync::Notify::new()),
             harness_listen_addr: parking_lot::Mutex::new(None),
             reconciler,
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
-            pod_id: Arc::new(resolve_pod_id()),
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
             preview_conns: Arc::new(PreviewConnLimiter::from_env()),
             integrations: crate::integrations::IntegrationBroker::new(),
@@ -909,6 +903,60 @@ impl AppState {
         );
         Ok(idx)
     }
+
+    /// ADR 0079 (review finding #6): emit a lifecycle event under an op's
+    /// fence. Appends (and re-broadcasts) ONLY when
+    /// `sessions.current_epoch == fence.epoch`; a fenced-out predecessor
+    /// gets `Ok(None)` and its stale event never lands after the
+    /// successor's. `fence.epoch == 0` (an out-of-op caller) falls back to
+    /// the unfenced [`Self::emit`]. Use this for every StatusChanged /
+    /// Evicted / SnapshotTaken authored from within an op pipeline.
+    pub async fn emit_fenced(
+        &self,
+        session: SessionId,
+        fence: engram_core::traits::SessionFence,
+        event: SessionEvent,
+    ) -> Result<Option<i64>, crate::error::ApiError> {
+        if fence.epoch == 0 {
+            return self.emit(session, event).await.map(Some);
+        }
+        let kind = event.kind();
+        let payload = serde_json::to_value(&event)
+            .map_err(|e| crate::error::ApiError::Internal(format!("event serialize: {e}")))?;
+        let idx = match self
+            .services
+            .meta
+            .append_session_event_fenced(session, fence.epoch as i64, kind, payload)
+            .await?
+        {
+            Some(idx) => idx,
+            None => {
+                // Fenced: a successor owns the event-log tail now.
+                ::metrics::counter!(crate::metrics::SESSION_OP_FENCED_WRITES_TOTAL).increment(1);
+                return Ok(None);
+            }
+        };
+        if let Some(ack_id) = outbox_ack_id(&event) {
+            match self.services.meta.outbox_ack(&ack_id).await {
+                Ok(true) => {
+                    ::metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(session_id = %session, ack_id, error = %e, "outbox ack failed");
+                }
+            }
+        }
+        self.events.publish(
+            session,
+            IndexedEvent {
+                idx,
+                event,
+                ephemeral: false,
+            },
+        );
+        Ok(Some(idx))
+    }
 }
 
 /// ADR 0073: which outbox row (if any) does this event confirm?
@@ -933,25 +981,6 @@ fn outbox_ack_id(event: &SessionEvent) -> Option<String> {
 }
 
 pub type SharedState = Arc<AppState>;
-
-/// ADR 0016 §A.1.5c: resolve a stable pod identifier for the
-/// `session_lease.locked_by` column. Precedence:
-///   1. `ENGRAM_COORD_POD_ID` env (explicit override for local tests).
-///   2. `HOSTNAME` env (set by k8s on every pod).
-///   3. `unknown` string (no panic; the column is diagnostic).
-fn resolve_pod_id() -> String {
-    if let Ok(v) = std::env::var("ENGRAM_COORD_POD_ID") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    if let Ok(v) = std::env::var("HOSTNAME") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    "unknown".to_string()
-}
 
 /// Replay a harness event that arrived from a remote host (via
 /// `NotifyKind::HarnessEvent`) through the coord's local hub. The
@@ -1483,11 +1512,6 @@ pub(crate) mod tests {
         /// when true, the next `record_snapshot` call returns an error.
         /// Reset to false on use.
         pub(crate) fail_next_record_snapshot: PlMutex<bool>,
-        /// ADR 0016 §A.1.5c: in-memory mirror of the
-        /// `session_lease` PG table for the trait's three
-        /// lease methods. Tests insert directly here to simulate
-        /// a peer coord pod holding a lease.
-        pub(crate) session_leases: PlMutex<SessionLeaseMap>,
         /// ADR 0016 Phase B: in-memory mirror of
         /// `sessions.live_disk_manifest_*` for tests that exercise
         /// the `update_live_disk_manifest` trait. Keyed by
@@ -1549,6 +1573,17 @@ pub(crate) mod tests {
         /// no-op returning `Ok(false)`, which would make such an assertion
         /// vacuous — so the mock records for real.
         pub(crate) acked_outbox: PlMutex<Vec<String>>,
+        /// ADR 0079: the in-memory op log (claims, epochs, fenced step
+        /// writes) — the reference mock in `engram_core::types::session_op`,
+        /// so the op-verb entry points (enqueue-and-observe, OpClaim, the
+        /// executor's drive) are exercised for real against this mock.
+        pub(crate) ops: engram_core::types::session_op::InMemoryOpLog,
+        /// ADR 0079 pass 2: an honest in-memory `session_outbox` (rows +
+        /// due/deliver/defer/ack semantics) so the DELIVER VERB's drain
+        /// loop is exercisable in unit tests — the trait defaults drop
+        /// rows on the floor, which would make any deliver-ordering
+        /// assertion vacuous.
+        pub(crate) outbox: PlMutex<Vec<engram_core::types::outbox::OutboxRow>>,
     }
 
     /// Alias so `clippy::type_complexity` stays happy on MiniMeta's
@@ -1558,20 +1593,6 @@ pub(crate) mod tests {
     pub(crate) type TeleportPinMap = std::collections::HashMap<
         SessionId,
         (engram_core::HostId, Option<chrono::DateTime<chrono::Utc>>),
-    >;
-
-    /// Alias so the `clippy::type_complexity` lint stays happy on
-    /// MiniMeta's leases field. Mirrors `session_lease`'s
-    /// shape: `session_id → (sandbox_id?, locked_by, locked_at)` —
-    /// `sandbox_id` is `None` for a resume lease, `Some` for an
-    /// eviction.
-    pub(crate) type SessionLeaseMap = std::collections::HashMap<
-        SessionId,
-        (
-            Option<engram_core::SandboxId>,
-            String,
-            chrono::DateTime<chrono::Utc>,
-        ),
     >;
 
     impl MiniMeta {
@@ -1611,7 +1632,6 @@ pub(crate) mod tests {
                 snapshots: PlMutex::new(Vec::new()),
                 hosts: PlMutex::new(Vec::new()),
                 fail_next_record_snapshot: PlMutex::new(false),
-                session_leases: PlMutex::new(std::collections::HashMap::new()),
                 live_disk_manifests: PlMutex::new(std::collections::HashMap::new()),
                 chunk_generation: PlMutex::new(0),
                 evac_attempts: PlMutex::new(std::collections::HashMap::new()),
@@ -1620,6 +1640,8 @@ pub(crate) mod tests {
                 fail_next_heartbeat_persist: PlMutex::new(false),
                 reconcile_probe_calls: PlMutex::new(0),
                 acked_outbox: PlMutex::new(Vec::new()),
+                ops: engram_core::types::session_op::InMemoryOpLog::default(),
+                outbox: PlMutex::new(Vec::new()),
             }
         }
     }
@@ -1789,6 +1811,19 @@ pub(crate) mod tests {
             s.park_rung = rung;
             s.parked_at = parked_at;
             Ok(())
+        }
+        async fn fenced_set_session_park_rung(
+            &self,
+            id: engram_core::SessionId,
+            epoch: i64,
+            rung: i16,
+            parked_at: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<bool, MetaError> {
+            if self.ops.current_epoch(id) != epoch {
+                return Ok(false);
+            }
+            self.set_session_park_rung(id, rung, parked_at).await?;
+            Ok(true)
         }
         async fn assign_session_host(
             &self,
@@ -1989,9 +2024,102 @@ pub(crate) mod tests {
             });
             Ok(idx)
         }
+        async fn append_session_event_fenced(
+            &self,
+            session_id: engram_core::SessionId,
+            epoch: i64,
+            kind: &str,
+            payload: serde_json::Value,
+        ) -> Result<Option<i64>, MetaError> {
+            // Honor the fence (review finding #6): a fenced-out predecessor
+            // gets Ok(None), so its stale lifecycle event never lands.
+            if self.ops.current_epoch(session_id) != epoch {
+                return Ok(None);
+            }
+            self.append_session_event(session_id, kind, payload)
+                .await
+                .map(Some)
+        }
         async fn outbox_ack(&self, prompt_id: &str) -> Result<bool, MetaError> {
             self.acked_outbox.lock().push(prompt_id.to_string());
-            Ok(true)
+            let mut rows = self.outbox.lock();
+            match rows.iter_mut().find(|r| r.prompt_id == prompt_id) {
+                Some(r) if r.acked_at.is_none() => {
+                    r.acked_at = Some(chrono::Utc::now());
+                    Ok(true)
+                }
+                Some(_) => Ok(false),
+                // Rows never enqueued through the mock (event-driven
+                // acks in tests that don't seed the outbox) still record
+                // as "newly acked" — the pre-pass-2 behavior.
+                None => Ok(true),
+            }
+        }
+        async fn outbox_enqueue(
+            &self,
+            row: &engram_core::types::outbox::OutboxRow,
+        ) -> Result<(), MetaError> {
+            let mut rows = self.outbox.lock();
+            // Idempotent on prompt_id (PG: INSERT … ON CONFLICT DO NOTHING).
+            if rows.iter().any(|r| r.prompt_id == row.prompt_id) {
+                return Ok(());
+            }
+            rows.push(row.clone());
+            Ok(())
+        }
+        async fn outbox_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
+            let now = chrono::Utc::now();
+            let mut out: Vec<SessionId> = self
+                .outbox
+                .lock()
+                .iter()
+                .filter(|r| r.acked_at.is_none() && r.not_before <= now)
+                .map(|r| r.session_id)
+                .collect();
+            out.dedup();
+            Ok(out)
+        }
+        async fn outbox_next_due(
+            &self,
+            session_id: SessionId,
+        ) -> Result<Option<engram_core::types::outbox::OutboxRow>, MetaError> {
+            let now = chrono::Utc::now();
+            Ok(self
+                .outbox
+                .lock()
+                .iter()
+                .filter(|r| {
+                    r.session_id == session_id && r.acked_at.is_none() && r.not_before <= now
+                })
+                .min_by_key(|r| r.created_at)
+                .cloned())
+        }
+        async fn outbox_mark_delivered(
+            &self,
+            prompt_id: &str,
+            ack_timeout: std::time::Duration,
+        ) -> Result<(), MetaError> {
+            let mut rows = self.outbox.lock();
+            if let Some(r) = rows.iter_mut().find(|r| r.prompt_id == prompt_id) {
+                r.delivered_at = Some(chrono::Utc::now());
+                r.attempts += 1;
+                r.not_before = chrono::Utc::now()
+                    + chrono::Duration::milliseconds(ack_timeout.as_millis() as i64);
+            }
+            Ok(())
+        }
+        async fn outbox_defer(
+            &self,
+            prompt_id: &str,
+            delay: std::time::Duration,
+        ) -> Result<(), MetaError> {
+            let mut rows = self.outbox.lock();
+            if let Some(r) = rows.iter_mut().find(|r| r.prompt_id == prompt_id) {
+                r.attempts += 1;
+                r.not_before =
+                    chrono::Utc::now() + chrono::Duration::milliseconds(delay.as_millis() as i64);
+            }
+            Ok(())
         }
         async fn list_session_events_since(
             &self,
@@ -2093,70 +2221,150 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        // ADR 0016 §A.1.5c: in-memory mirror of the
-        // `session_lease` PG table so the trait's lease
-        // semantics are exercised end-to-end by the idle_evictor
-        // unit tests.
-        async fn try_acquire_session_lease(
+        // ADR 0079: the op log — delegate to the reference in-memory
+        // implementation so claim exclusion, epoch bumps, and fenced
+        // writes are exercised end-to-end by the unit tests.
+        async fn op_enqueue_and_claim(
             &self,
             session_id: SessionId,
-            sandbox_id: Option<engram_core::SandboxId>,
-            locked_by: &str,
+            kind: engram_core::types::session_op::OpKind,
+            payload: serde_json::Value,
+            idempotency_key: Option<&str>,
+            claimed_by: &str,
+        ) -> Result<engram_core::types::session_op::EnqueueOutcome, MetaError> {
+            Ok(self
+                .ops
+                .enqueue_and_claim(session_id, kind, payload, idempotency_key, claimed_by))
+        }
+
+        async fn op_enqueue_and_claim_exclusive(
+            &self,
+            session_id: SessionId,
+            kind: engram_core::types::session_op::OpKind,
+            payload: serde_json::Value,
+            claimed_by: &str,
+        ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
+            Ok(self
+                .ops
+                .enqueue_and_claim_exclusive(session_id, kind, payload, claimed_by))
+        }
+
+        async fn op_claim_head(
+            &self,
+            session_id: SessionId,
+            claimed_by: &str,
+        ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
+            Ok(self.ops.claim_head(session_id, claimed_by))
+        }
+
+        async fn op_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
+            Ok(self.ops.due_sessions())
+        }
+
+        async fn op_record_step(
+            &self,
+            op_id: i64,
+            epoch: i64,
+            step: &str,
         ) -> Result<bool, MetaError> {
-            let mut guard = self.session_leases.lock();
-            if guard.contains_key(&session_id) {
+            Ok(self.ops.record_step(op_id, epoch, step))
+        }
+
+        async fn op_heartbeat(&self, op_id: i64, epoch: i64) -> Result<bool, MetaError> {
+            Ok(self.ops.heartbeat(op_id, epoch))
+        }
+
+        async fn op_finish(
+            &self,
+            op_id: i64,
+            epoch: i64,
+            state: engram_core::types::session_op::OpState,
+            error: Option<&str>,
+        ) -> Result<bool, MetaError> {
+            Ok(self.ops.finish(op_id, epoch, state, error))
+        }
+
+        async fn op_requeue_with_backoff(
+            &self,
+            op_id: i64,
+            epoch: i64,
+            backoff: std::time::Duration,
+            error: &str,
+        ) -> Result<bool, MetaError> {
+            Ok(self.ops.requeue_with_backoff(op_id, epoch, backoff, error))
+        }
+
+        async fn op_cancel_queued(
+            &self,
+            session_id: SessionId,
+            kind: engram_core::types::session_op::OpKind,
+        ) -> Result<bool, MetaError> {
+            Ok(self.ops.cancel_queued(session_id, kind))
+        }
+
+        async fn op_cancel_by_id(&self, op_id: i64) -> Result<bool, MetaError> {
+            Ok(self.ops.cancel_by_id(op_id))
+        }
+
+        async fn op_request_cancel_running(
+            &self,
+            session_id: SessionId,
+            kind: engram_core::types::session_op::OpKind,
+        ) -> Result<bool, MetaError> {
+            Ok(self.ops.request_cancel_running(session_id, kind))
+        }
+
+        async fn op_cancel_requested(&self, op_id: i64) -> Result<bool, MetaError> {
+            Ok(self.ops.cancel_requested(op_id))
+        }
+
+        async fn op_running_for(
+            &self,
+            session_id: SessionId,
+        ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
+            Ok(self.ops.running_for(session_id))
+        }
+
+        async fn op_get(
+            &self,
+            op_id: i64,
+        ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
+            Ok(self.ops.get(op_id))
+        }
+
+        async fn op_pending_exists(
+            &self,
+            session_id: SessionId,
+            kind: engram_core::types::session_op::OpKind,
+        ) -> Result<bool, MetaError> {
+            Ok(self.ops.pending_exists(session_id, kind))
+        }
+
+        async fn fenced_transition_session(
+            &self,
+            session_id: SessionId,
+            epoch: i64,
+            to: engram_core::types::SessionState,
+        ) -> Result<Option<engram_core::types::SessionState>, MetaError> {
+            if self.ops.current_epoch(session_id) != epoch {
+                return Ok(None);
+            }
+            self.transition_session(session_id, to).await.map(Some)
+        }
+
+        async fn fenced_assign_sandbox(
+            &self,
+            session_id: SessionId,
+            epoch: i64,
+            sandbox_id: Option<engram_core::SandboxId>,
+            host_id: Option<HostId>,
+        ) -> Result<bool, MetaError> {
+            if self.ops.current_epoch(session_id) != epoch {
                 return Ok(false);
             }
-            guard.insert(
-                session_id,
-                (sandbox_id, locked_by.to_string(), chrono::Utc::now()),
-            );
+            self.assign_session_sandbox(session_id, sandbox_id).await?;
+            self.assign_session_host(session_id, host_id).await?;
             Ok(true)
-        }
-
-        async fn release_session_lease(
-            &self,
-            session_id: SessionId,
-            locked_by: &str,
-        ) -> Result<bool, MetaError> {
-            // Mirror PG's `AND locked_by = $2`: only remove the row if THIS
-            // holder still owns it, so a reaped-then-re-acquired lease can't
-            // be blind-deleted by the old holder's late Drop.
-            let mut guard = self.session_leases.lock();
-            match guard.get(&session_id) {
-                Some((_, owner, _)) if owner == locked_by => {
-                    guard.remove(&session_id);
-                    Ok(true)
-                }
-                _ => Ok(false),
-            }
-        }
-
-        async fn sweep_stale_session_leases(
-            &self,
-            max_age: std::time::Duration,
-        ) -> Result<Vec<engram_core::traits::StaleSessionLease>, MetaError> {
-            let mut guard = self.session_leases.lock();
-            let now = chrono::Utc::now();
-            let cutoff = match chrono::Duration::from_std(max_age) {
-                Ok(d) => now - d,
-                Err(_) => return Ok(Vec::new()),
-            };
-            let mut reaped = Vec::new();
-            guard.retain(|session_id, (sandbox_id, locked_by, locked_at)| {
-                if *locked_at < cutoff {
-                    reaped.push(engram_core::traits::StaleSessionLease {
-                        session_id: *session_id,
-                        sandbox_id: *sandbox_id,
-                        locked_by: locked_by.clone(),
-                        locked_at: *locked_at,
-                    });
-                    false
-                } else {
-                    true
-                }
-            });
-            Ok(reaped)
         }
 
         // ADR 0016 Phase B: in-memory mirror of

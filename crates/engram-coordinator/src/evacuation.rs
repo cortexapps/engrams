@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use engram_core::traits::MetadataStore;
+use engram_core::traits::{MetadataStore, SessionFence};
 use engram_core::types::evacuation::{EvacLoss, EvacReceipt};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::session::{Session, SessionState};
@@ -226,6 +226,7 @@ fn pick_evac_disk_manifest(
 ///
 /// Leaves the session at `Created` on the new host. Caller is
 /// responsible for the start_agent + Active transition.
+#[allow(clippy::too_many_arguments)] // cohesive relocation inputs; threading a struct buys nothing
 pub async fn evacuate_dead_source(
     registry: &Arc<HostRegistry>,
     meta: &Arc<dyn MetadataStore>,
@@ -249,6 +250,9 @@ pub async fn evacuate_dead_source(
     // there); movers (drain, dead-host) pass `None` — they are moving
     // AWAY by definition.
     prefer_host: Option<engram_core::HostId>,
+    // ADR 0079: the caller's op/claim epoch, stamped into the restore
+    // RPC (the evac-resumer claim, the resume verb's disk-only path).
+    fence: SessionFence,
 ) -> Result<EvacReceipt, EvacError> {
     let session_id = session.id;
     let old_sandbox_id = session.sandbox_id;
@@ -429,7 +433,7 @@ pub async fn evacuate_dead_source(
                 paused_at: None,
             };
             target_backend
-                .restore(metadata)
+                .restore(metadata, fence)
                 .await
                 .map_err(EvacError::RestoreFailed)?
         }
@@ -522,7 +526,7 @@ mod tests {
                 None => SandboxId::new(),
             })
         }
-        async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        async fn destroy(&self, _id: SandboxId, _fence: SessionFence) -> Result<(), SandboxError> {
             Ok(())
         }
         async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
@@ -541,7 +545,11 @@ mod tests {
         ) -> Result<ExecStream, SandboxError> {
             unreachable!()
         }
-        async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        async fn snapshot(
+            &self,
+            _id: SandboxId,
+            _fence: SessionFence,
+        ) -> Result<SnapshotMetadata, SandboxError> {
             if self.fail_snapshot.load(Ordering::SeqCst) > 0 {
                 return Err(SandboxError::Vm(Box::new(SimpleErr(
                     "snapshot failed".into(),
@@ -565,13 +573,25 @@ mod tests {
                 paused_at: None,
             })
         }
-        async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        async fn commit_snapshot(
+            &self,
+            _id: SandboxId,
+            _fence: SessionFence,
+        ) -> Result<(), SandboxError> {
             Ok(())
         }
-        async fn abort_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        async fn abort_snapshot(
+            &self,
+            _id: SandboxId,
+            _fence: SessionFence,
+        ) -> Result<(), SandboxError> {
             Ok(())
         }
-        async fn restore(&self, md: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(
+            &self,
+            md: SnapshotMetadata,
+            _fence: SessionFence,
+        ) -> Result<SandboxId, SandboxError> {
             *self.last_restore_metadata.lock() = Some(md);
             if self.fail_restore.load(Ordering::SeqCst) > 0 {
                 return Err(SandboxError::Vm(Box::new(SimpleErr(
@@ -593,6 +613,7 @@ mod tests {
             _id: SandboxId,
             _agent: engram_core::types::sandbox::AgentSpec,
             _policy: engram_core::types::egress::SessionEgressPolicy,
+            _fence: SessionFence,
         ) -> Result<(), SandboxError> {
             unreachable!("evac primitive does not call start_agent")
         }
@@ -1025,6 +1046,7 @@ mod tests {
             None,
             None,
             None,
+            SessionFence::unfenced(),
         )
         .await
         .expect("rung-1 happy path");
@@ -1082,6 +1104,7 @@ mod tests {
             None,
             None,
             None,
+            SessionFence::unfenced(),
         )
         .await
         .expect("snapshot-only happy path");
@@ -1130,6 +1153,7 @@ mod tests {
             None,
             None,
             Some(origin),
+            SessionFence::unfenced(),
         )
         .await
         .expect("origin-affinity happy path");
@@ -1183,6 +1207,7 @@ mod tests {
             Some(test_cold_boot_spec()),
             None,
             None,
+            SessionFence::unfenced(),
         )
         .await
         .expect("disk-only cold-boot happy path");
@@ -1228,6 +1253,7 @@ mod tests {
             None,
             None,
             None,
+            SessionFence::unfenced(),
         )
         .await;
         match &result {
@@ -1257,6 +1283,7 @@ mod tests {
             None,
             None,
             None,
+            SessionFence::unfenced(),
         )
         .await;
         assert!(matches!(result, Err(EvacError::NoRecoverableState)));
@@ -1286,6 +1313,7 @@ mod tests {
             Some(test_cold_boot_spec()),
             None,
             None,
+            SessionFence::unfenced(),
         )
         .await;
         assert!(matches!(result, Err(EvacError::NoTargetAvailable(_))));

@@ -234,6 +234,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         addr,
         serve_inner,
         None,
+        engram_host_agent::session_epochs::ephemeral(),
     ));
     assert!(
         common::wait_tcp_bound(addr, std::time::Duration::from_secs(5)).await,

@@ -459,7 +459,11 @@ mod tests {
         async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
             unimplemented!()
         }
-        async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        async fn destroy(
+            &self,
+            _id: SandboxId,
+            _fence: engram_core::traits::SessionFence,
+        ) -> Result<(), SandboxError> {
             unimplemented!()
         }
         async fn probe_sandbox(
@@ -475,10 +479,18 @@ mod tests {
         ) -> Result<ExecStream, SandboxError> {
             unimplemented!()
         }
-        async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        async fn snapshot(
+            &self,
+            _id: SandboxId,
+            _fence: engram_core::traits::SessionFence,
+        ) -> Result<SnapshotMetadata, SandboxError> {
             unimplemented!()
         }
-        async fn restore(&self, _metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(
+            &self,
+            _metadata: SnapshotMetadata,
+            _fence: engram_core::traits::SessionFence,
+        ) -> Result<SandboxId, SandboxError> {
             unimplemented!()
         }
         async fn start_agent(
@@ -486,6 +498,7 @@ mod tests {
             _id: SandboxId,
             _agent: AgentSpec,
             _policy: SessionEgressPolicy,
+            _fence: engram_core::traits::SessionFence,
         ) -> Result<(), SandboxError> {
             unimplemented!()
         }

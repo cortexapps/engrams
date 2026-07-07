@@ -121,7 +121,11 @@ impl HostClient for FakeBackend {
     async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         Ok(SandboxId::new())
     }
-    async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
+    async fn destroy(
+        &self,
+        _id: SandboxId,
+        _fence: engram_core::traits::SessionFence,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
@@ -140,7 +144,11 @@ impl HostClient for FakeBackend {
     ) -> Result<ExecStream, SandboxError> {
         unreachable!()
     }
-    async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(
+        &self,
+        _id: SandboxId,
+        _fence: engram_core::traits::SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         Ok(SnapshotMetadata {
             id: SnapshotId::new(),
             size_bytes: 1024,
@@ -159,13 +167,25 @@ impl HostClient for FakeBackend {
             paused_at: None,
         })
     }
-    async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
+    async fn commit_snapshot(
+        &self,
+        _id: SandboxId,
+        _fence: engram_core::traits::SessionFence,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
-    async fn abort_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
+    async fn abort_snapshot(
+        &self,
+        _id: SandboxId,
+        _fence: engram_core::traits::SessionFence,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
-    async fn restore(&self, _md: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(
+        &self,
+        _md: SnapshotMetadata,
+        _fence: engram_core::traits::SessionFence,
+    ) -> Result<SandboxId, SandboxError> {
         // Tests always preload an id; the fallback is defensive.
         // Match-based dispatch avoids clippy's unwrap_or_default lint
         // (Default for SandboxId would mint a nil UUID, masking
@@ -180,6 +200,7 @@ impl HostClient for FakeBackend {
         _id: SandboxId,
         _agent: engram_core::types::sandbox::AgentSpec,
         _policy: engram_core::types::egress::SessionEgressPolicy,
+        _fence: engram_core::traits::SessionFence,
     ) -> Result<(), SandboxError> {
         unreachable!()
     }
@@ -415,9 +436,18 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
         .expect("latest_snapshot lookup")
         .expect("snapshot present");
 
-    let receipt = evacuate_dead_source(&registry, &meta, session, Some(snapshot), None, None, None)
-        .await
-        .expect("dead-source evac succeeds");
+    let receipt = evacuate_dead_source(
+        &registry,
+        &meta,
+        session,
+        Some(snapshot),
+        None,
+        None,
+        None,
+        engram_core::traits::SessionFence::unfenced(),
+    )
+    .await
+    .expect("dead-source evac succeeds");
     assert_eq!(receipt.new_host_id, target_host);
     assert_eq!(receipt.new_sandbox_id, new_sandbox);
     assert_eq!(receipt.loss, EvacLoss::None);
@@ -468,6 +498,7 @@ async fn evacuate_dead_source_disk_only_records_memory_loss() {
         Some(test_cold_boot_spec()),
         None,
         None,
+        engram_core::traits::SessionFence::unfenced(),
     )
     .await
     .expect("disk-only evac succeeds");
@@ -499,7 +530,17 @@ async fn evacuate_dead_source_no_state_returns_no_recoverable() {
         .expect("Active → HostLost");
 
     let session = meta.get_session(session_id).await.expect("get session");
-    let result = evacuate_dead_source(&registry, &meta, session, None, None, None, None).await;
+    let result = evacuate_dead_source(
+        &registry,
+        &meta,
+        session,
+        None,
+        None,
+        None,
+        None,
+        engram_core::traits::SessionFence::unfenced(),
+    )
+    .await;
     assert!(matches!(result, Err(EvacError::NoRecoverableState)));
 
     // PG row sits at HostLost — the caller routes it to Dead next.

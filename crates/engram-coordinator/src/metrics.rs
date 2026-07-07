@@ -187,6 +187,24 @@ pub const HOSTS_READY: &str = "engram_hosts_ready";
 /// between this and OUTBOX_ACKED going nonzero-and-growing is the
 /// alarmed "delivered but never acked" signal.
 pub const OUTBOX_DELIVERED_TOTAL: &str = "engram_outbox_delivered_total";
+/// ADR 0079: enqueue->claim latency (seconds). The kernel's hotness
+/// proof — a poll-hop executor shows up here as multi-second p99.
+pub const SESSION_OP_CLAIM_LATENCY_SECONDS: &str = "engram_session_op_claim_latency_seconds";
+/// ADR 0079: fenced writes observed (a successor re-claimed; the old
+/// writer stopped silently). Nonzero under pod churn; a sustained rate
+/// without churn means something is double-driving.
+pub const SESSION_OP_FENCED_WRITES_TOTAL: &str = "engram_session_op_fenced_writes_total";
+/// ADR 0079: stale running ops re-claimed by the sweep (fence-then-resume).
+pub const SESSION_OP_RECLAIMS_TOTAL: &str = "engram_session_op_reclaims_total";
+/// ADR 0079 (review finding #1): resume ops that hit their retry budget
+/// and failed terminally (the livelock terminator). Should be ~0 in a
+/// healthy fleet; a sustained rate means resumes are persistently failing.
+pub const SESSION_OP_RESUME_BUDGET_EXHAUSTED_TOTAL: &str =
+    "engram_session_op_resume_budget_exhausted_total";
+/// ADR 0079 (review finding #5): orphaned Pending sessions (placed but
+/// no active create_boot op) re-enqueued by the reclaim sweep backstop.
+pub const SESSION_OP_PENDING_ORPHANS_RECOVERED_TOTAL: &str =
+    "engram_session_op_pending_orphans_recovered_total";
 
 /// Counter (ADR 0073 phase 4, moved from the host detector). A host
 /// whose reported free disk is under the floor had its idle
@@ -234,7 +252,7 @@ pub const MIGRATION_LEG_SECONDS: &str = "engram_migration_leg_seconds";
 pub const MIGRATION_TOTAL: &str = "engram_migration_total";
 
 /// Histogram (ADR 0034). Wall-clock of one successful
-/// `evict_session_to_state` pipeline run as driven by the eviction
+/// `run_evict_pipeline` run as driven by the evict verb / eviction
 /// scanner — pause + snapshot + upload + record + destroy. Custom
 /// buckets to 300s (see `init`): the pre-0034 bug was precisely that
 /// these runs exceed request-timeout scales, so the histogram must
@@ -250,15 +268,10 @@ pub const EVICTION_PIPELINE_SECONDS: &str = "engram_eviction_pipeline_seconds";
 /// means hosts are going blind to running sandboxes).
 pub const EVICTION_NOMINATED_TOTAL: &str = "engram_eviction_nominated_total";
 
-/// Counter (issue #529). The D5 row-watcher's wait for the eviction's
-/// snapshot row (landed host-side via the heartbeat reconcile) hit its
-/// `ENGRAM_EVICT_FINALIZE_WAIT_SECS` deadline before the row appeared.
-/// Not itself data loss (the host-owned finalize keeps retrying and the
-/// row lands eventually; the lease reaper frees resume in the
-/// meantime) — but a sustained nonzero rate means finalize jobs are
-/// taking pathologically long and warrants investigation.
-pub const EVICTION_FINALIZE_ROW_WAIT_TIMEOUT_TOTAL: &str =
-    "engram_eviction_finalize_row_wait_timeout_total";
+// ADR 0079 (review finding #11): the D5 inline finalize row-watch is
+// gone — the evict op finishes the instant the session is Idle and the
+// host-owned finalize lands the row via the heartbeat reconcile. Its
+// `EVICTION_FINALIZE_ROW_WAIT_TIMEOUT_TOTAL` counter went with it.
 
 /// Counter (ADR 0034 Track A). In-place harness reattaches the desync
 /// watchdog issued when `rehandshake` returned `NotFound` (the harness vsock
@@ -308,7 +321,9 @@ pub const SESSIONS_QUEUED: &str = "engram_sessions_queued";
 pub const SESSIONS_QUEUED_MIB: &str = "engram_sessions_queued_mib";
 
 /// Counter (ADR 0048). Queue-scanner per-session outcomes. Labels:
-/// `outcome` = `placed` / `requeued` / `failed` / `timeout`.
+/// `outcome` = `placed` / `failed` / `timeout` / `image_gone`. (ADR 0079:
+/// `requeued` is gone — a placed create's boot retries on its create_boot
+/// op row instead of bouncing back to the queue.)
 pub const QUEUE_OUTCOME_TOTAL: &str = "engram_queue_outcome_total";
 
 /// Histogram (ADR 0048, queue-fairness). `queued_at` → placement/terminal,
@@ -320,9 +335,9 @@ pub const QUEUE_OUTCOME_TOTAL: &str = "engram_queue_outcome_total";
 /// - `outcome`: `placed` (create: the durable `queued → pending` flip;
 ///   resume: dequeue to `Idle`) / `timeout`.
 ///
-/// A requeued-then-placed session emits one `placed` sample per successful
-/// placement, each measuring cumulative wait since the ORIGINAL
-/// `queued_at` (`requeue_session` deliberately doesn't reset it).
+/// Measures wait since the original `queued_at`; once placed, boot retry
+/// moves onto the create_boot op row (ADR 0079) and no further samples
+/// are emitted for the session.
 pub const QUEUE_WAIT_SECONDS: &str = "engram_queue_wait_seconds";
 
 /// Gauge (ADR 0048, queue-fairness). Age in seconds of the oldest queued

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use engram_core::error::SandboxError;
-use engram_core::traits::{HarnessDial, HarnessSink, HostClient, SandboxBackend};
+use engram_core::traits::{HarnessDial, HarnessSink, HostClient, SandboxBackend, SessionFence};
 use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::image::WarmConfig;
@@ -85,7 +85,11 @@ impl HostClient for LocalHostClient {
         self.sandbox.create(spec).await
     }
 
-    async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+    // ADR 0079: the `fence` params below are checked by the gRPC
+    // server's `check_session_epoch` gate BEFORE it delegates here —
+    // the local composition is behind the fence, not the fence itself
+    // (and in --mode=all there is no second writer to fence out).
+    async fn destroy(&self, id: SandboxId, _fence: SessionFence) -> Result<(), SandboxError> {
         // ADR 0073 phase 4: no shell pin to clear — the pin is a PG
         // column stamped by the coordinator's relay and lapses by
         // itself (the issue #219 leak class is gone with the refcount).
@@ -111,13 +115,18 @@ impl HostClient for LocalHostClient {
         self.sandbox.exec_stream(id, cmd).await
     }
 
-    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(
+        &self,
+        id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         self.sandbox.snapshot(id).await
     }
 
     async fn snapshot_begin(
         &self,
         id: SandboxId,
+        _fence: SessionFence,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
         // ADR 0052 Phase 2 (clean-idle-shutdown). The two-phase
         // `snapshot_begin` is the IDLE-eviction capture entry: the
@@ -149,7 +158,11 @@ impl HostClient for LocalHostClient {
         self.sandbox.snapshot_begin(id).await
     }
 
-    async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot_wait(
+        &self,
+        id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         self.sandbox.snapshot_wait(id).await
     }
 
@@ -204,15 +217,27 @@ impl HostClient for LocalHostClient {
         self.sandbox.migration_abort(id, export_id).await
     }
 
-    async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+    async fn commit_snapshot(
+        &self,
+        id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         self.sandbox.commit_snapshot(id).await
     }
 
-    async fn abort_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+    async fn abort_snapshot(
+        &self,
+        id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         self.sandbox.abort_snapshot(id).await
     }
 
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(
+        &self,
+        metadata: SnapshotMetadata,
+        _fence: SessionFence,
+    ) -> Result<SandboxId, SandboxError> {
         self.sandbox.restore(metadata).await
     }
 
@@ -233,6 +258,7 @@ impl HostClient for LocalHostClient {
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
+        _fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
         self.sandbox
             .restore_base_for_session(metadata, session_env, selected_mounts)
@@ -244,6 +270,7 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
+        _fence: SessionFence,
     ) -> Result<(), SandboxError> {
         // ADR 0073: persist the binding record BEFORE the harness can
         // dial (the spawn below), so the first attach validates instead
@@ -357,11 +384,15 @@ impl HostClient for LocalHostClient {
 
     // ADR 0045 Phase F: freeze/unfreeze the microVM in place — pure
     // delegation to the inner backend (no harness involvement).
-    async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+    async fn pause(&self, sandbox_id: SandboxId, _fence: SessionFence) -> Result<(), SandboxError> {
         self.sandbox.pause(sandbox_id).await
     }
 
-    async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+    async fn resume(
+        &self,
+        sandbox_id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         self.sandbox.resume(sandbox_id).await
     }
 

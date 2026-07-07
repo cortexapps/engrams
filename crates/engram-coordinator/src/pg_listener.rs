@@ -58,6 +58,7 @@ pub fn spawn(
     boot_bundles: Arc<BootBundleCache>,
     queue_wake: Arc<Notify>,
     outbox_wake: Arc<Notify>,
+    session_ops_wake: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run(
@@ -69,6 +70,7 @@ pub fn spawn(
             boot_bundles,
             queue_wake,
             outbox_wake,
+            session_ops_wake,
         )
         .await
         {
@@ -87,6 +89,7 @@ async fn run(
     boot_bundles: Arc<BootBundleCache>,
     queue_wake: Arc<Notify>,
     outbox_wake: Arc<Notify>,
+    session_ops_wake: Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listener = PgListener::connect(database_url).await?;
     listener.listen("session_events").await?;
@@ -110,6 +113,7 @@ async fn run(
     // channel; the delivery driver's poll interval is only the
     // crash-recovery fallback.
     listener.listen("session_outbox").await?;
+    listener.listen("session_ops").await?;
     tracing::info!(
         "pg_listener subscribed to session_events + session_event_deltas + host_dead + \
          org_secret_changed + enabled_image_changed + fleet_catalog_changed + placement_changed"
@@ -118,6 +122,12 @@ async fn run(
     loop {
         let notification = listener.recv().await?;
         match notification.channel() {
+            "session_ops" => {
+                // ADR 0079: wake the op executor (the enqueue's NOTIFY —
+                // the kernel's hot path; the 5s poll is fallback only).
+                session_ops_wake.notify_waiters();
+                continue;
+            }
             "session_outbox" => {
                 outbox_wake.notify_one();
                 continue;

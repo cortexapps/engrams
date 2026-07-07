@@ -79,8 +79,8 @@ async fn ensure_host(meta: &Arc<dyn MetadataStore>, host_id: HostId) {
 }
 
 /// Walk a fresh session to `Idle` with `sandbox_id` cleared — the exact
-/// shape `resume_from_idle` dispatches on (it holds the lease, clears any
-/// residual sandbox to NULL, then restores + binds).
+/// shape `resume_from_idle` dispatches on (the resume op's claim held,
+/// it restores + binds).
 async fn seed_idle_unbound(meta: &Arc<dyn MetadataStore>) -> SessionId {
     let id = meta
         .create_session(SessionSpec {

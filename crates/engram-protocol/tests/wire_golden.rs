@@ -374,8 +374,11 @@ fn wire_version_pinned() {
     // 10 -> 11: ADR 0078 phase 2 (epic #548) — the heartbeat drops the
     // never-populated `local_snapshots` advert (placement affinity reads
     // PG `snapshots.host_id` instead). Goldens regenerated.
+    // 11 -> 12: ADR 0079 (#543) — fencing_epoch on session-scoped host
+    // RPCs (FencedSandboxRequest + the StartAgent/Restore pairs).
+    // Proto-native fields only; bincode goldens unchanged.
     assert_eq!(
-        WIRE_VERSION, 11,
+        WIRE_VERSION, 12,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

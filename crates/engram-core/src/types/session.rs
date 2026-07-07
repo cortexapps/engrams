@@ -74,13 +74,12 @@ pub enum SessionState {
     /// ADR 0034: durable idle-eviction intent marker. The candidates
     /// handler (or the PG detection backstop) transitions
     /// `Active → Evicting` and returns immediately; the coord-side
-    /// eviction scanner sweeps this state and drives the snapshot
-    /// pipeline (`evict_session_to_state`) to its terminal
-    /// `Evicting → Idle`. A *pre-pipeline* marker, not the pipeline's
-    /// target: the pipeline's internals (lease, registry guard,
-    /// abort-on-failure) are unchanged, and a coord restart
-    /// mid-eviction leaves a row the next pod's scanner picks up on
-    /// its first tick. Unlike `Idle`/`Evacuating`, the sandbox is
+    /// evict op's pipeline (ADR 0079, `run_evict_pipeline`) drives it
+    /// to its terminal `Evicting → Idle`. A *pre-pipeline* marker, not
+    /// the pipeline's target: the pipeline's internals (op claim, K5
+    /// guard, abort-on-failure) are unchanged, and a coord restart
+    /// mid-eviction leaves an op row the executor's reclaim sweep (or
+    /// the scanner's re-enqueue) picks up. Unlike `Idle`/`Evacuating`, the sandbox is
     /// (usually) still RUNNING — `sandbox_id` stays bound until the
     /// pipeline nulls it, and `/exec`/`/prompt`/`/resume` return a
     /// retryable 409 rather than auto-resuming. After 20 failed

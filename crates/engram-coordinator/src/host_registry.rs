@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use engram_core::traits::{HarnessDial, HostClient, MetadataStore};
+use engram_core::traits::{HarnessDial, HostClient, MetadataStore, SessionFence};
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::session::SessionState;
 use engram_core::types::snapshot::SnapshotMetadata;
@@ -317,13 +317,14 @@ impl HostRegistry {
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
+        fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
         // The capacity decision already happened in `reserve_placement`; just
         // resolve the chosen host's backend (dialing through PG if this
         // replica hasn't seen the host yet — ADR 0047).
         let backend = self.backend_for(host_id).await?;
         let sandbox_id = backend
-            .restore_base_for_session(metadata, session_env, selected_mounts)
+            .restore_base_for_session(metadata, session_env, selected_mounts, fence)
             .await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok(sandbox_id)
@@ -552,22 +553,31 @@ impl HostClient for HostRegistry {
         }
     }
 
-    async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
-        backend.snapshot(id).await
+        backend.snapshot(id, fence).await
     }
 
     async fn snapshot_begin(
         &self,
         id: SandboxId,
+        fence: SessionFence,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
-        backend.snapshot_begin(id).await
+        backend.snapshot_begin(id, fence).await
     }
 
-    async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+    async fn snapshot_wait(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
-        backend.snapshot_wait(id).await
+        backend.snapshot_wait(id, fence).await
     }
 
     async fn migration_presetup(
@@ -613,24 +623,32 @@ impl HostClient for HostRegistry {
         backend.migration_abort(id, export_id).await
     }
 
-    async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+    async fn commit_snapshot(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
-        backend.commit_snapshot(id).await
+        backend.commit_snapshot(id, fence).await
     }
 
-    async fn abort_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
+    async fn abort_snapshot(&self, id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
-        backend.abort_snapshot(id).await
+        backend.abort_snapshot(id, fence).await
     }
 
-    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(
+        &self,
+        metadata: SnapshotMetadata,
+        fence: SessionFence,
+    ) -> Result<SandboxId, SandboxError> {
         let (host_id, backend) = self.pick_any().ok_or_else(Self::no_host_error)?;
-        let sandbox_id = backend.restore(metadata).await?;
+        let sandbox_id = backend.restore(metadata, fence).await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok(sandbox_id)
     }
 
-    async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+    async fn destroy(&self, id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
         // ADR 0050 E: retry transient `Unavailable` so a gRPC blip during
         // teardown doesn't leak the FC on the happy path (the host-local
         // teardown reconcile is the floor, but retrying here destroys it
@@ -645,7 +663,7 @@ impl HostClient for HostRegistry {
                 Ok((_, b)) => b,
                 Err(e) => break Err(e),
             };
-            match backend.destroy(id).await {
+            match backend.destroy(id, fence).await {
                 Err(SandboxError::Unavailable(msg)) if attempt < MAX_ATTEMPTS => {
                     tracing::debug!(
                         sandbox_id = %id, attempt, error = %msg,
@@ -669,9 +687,10 @@ impl HostClient for HostRegistry {
         id: SandboxId,
         agent: AgentSpec,
         policy: engram_core::types::egress::SessionEgressPolicy,
+        fence: SessionFence,
     ) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
-        backend.start_agent(id, agent, policy).await
+        backend.start_agent(id, agent, policy, fence).await
     }
 
     /// ADR 0068: same single-resolve delegation as `start_agent` — this
@@ -775,14 +794,14 @@ impl HostClient for HostRegistry {
         backend.interrupt(sandbox_id).await
     }
 
-    async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+    async fn pause(&self, sandbox_id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.pause(sandbox_id).await
+        backend.pause(sandbox_id, fence).await
     }
 
-    async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+    async fn resume(&self, sandbox_id: SandboxId, fence: SessionFence) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.resume(sandbox_id).await
+        backend.resume(sandbox_id, fence).await
     }
 
     async fn start_browser(
@@ -1143,7 +1162,9 @@ mod tests {
             Some(host)
         );
 
-        reg.destroy(sandbox_id).await.unwrap();
+        reg.destroy(sandbox_id, SessionFence::unfenced())
+            .await
+            .unwrap();
         assert!(
             reg.sandbox_owner.get(&sandbox_id).is_none(),
             "destroy must drop the ownership row",
@@ -1221,7 +1242,7 @@ mod tests {
         // says the host is the binding owner, and returns HostLost
         // because we can't reach it.
         let err = reg
-            .destroy(sandbox)
+            .destroy(sandbox, SessionFence::unfenced())
             .await
             .expect_err("no backend registered yet");
         assert!(
@@ -1241,7 +1262,9 @@ mod tests {
 
         // The (idempotent) destroy on a ProcessBackend with an unknown
         // sandbox_id returns Ok — the wire round-trip we care about.
-        reg.destroy(sandbox).await.expect("routing reaches backend");
+        reg.destroy(sandbox, SessionFence::unfenced())
+            .await
+            .expect("routing reaches backend");
     }
 
     // ---------- ADR 0015 M3 ----------
