@@ -374,15 +374,38 @@ pub(crate) async fn snapshot_core(
                     if recoverable {
                         let mut promoted = record;
                         promoted.recoverable = true;
-                        if let Err(e) = st.services.meta.record_snapshot(promoted).await {
-                            tracing::warn!(
-                                session_id = %id,
-                                snapshot_id = %metadata.id,
-                                error = %e,
-                                "snapshot: failed to promote recoverable=true after commit; \
-                                 row stays recoverable=false (resume-time verification will \
-                                 re-promote on the next capture)",
-                            );
+                        // ADR 0079 (re-review findings #3/#4): promote UNDER OUR
+                        // FENCE. This manual-snapshot claim can be reclaimed if a
+                        // coord↔PG partition outlasts `RECLAIM_STALE` mid-capture;
+                        // a plain insert would then land a phantom `recoverable=true`
+                        // row a resume could pick (the 89f7984d durability-lie
+                        // class). `Ok(false)` = fenced out → leave the row
+                        // recoverable=false; the successor op owns the session.
+                        match st
+                            .services
+                            .meta
+                            .fenced_record_snapshot(promoted, fence.epoch as i64)
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tracing::info!(
+                                    session_id = %id,
+                                    snapshot_id = %metadata.id,
+                                    "snapshot: fenced by a successor op before promote; \
+                                     leaving row recoverable=false and stopping",
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    session_id = %id,
+                                    snapshot_id = %metadata.id,
+                                    error = %e,
+                                    "snapshot: failed to promote recoverable=true after commit; \
+                                     row stays recoverable=false (resume-time verification will \
+                                     re-promote on the next capture)",
+                                );
+                            }
                         }
                     }
                 }
@@ -1976,7 +1999,7 @@ pub(crate) async fn enqueue_and_observe_evict(
     let deadline = std::time::Instant::now() + OP_OBSERVE_TIMEOUT;
     loop {
         // Status settles first (mark_idle / the park bookkeeping land
-        // before the op row finishes its finalize watch).
+        // before the op row finishes).
         let session = state.services.meta.get_session(id).await?;
         match session.status {
             SessionState::Idle => return Ok(ObservedEvict::Idle),
@@ -2762,7 +2785,7 @@ mod evicting_gate_tests {
         assert_eq!(after.status, SessionState::Completed);
 
         // ADR 0079: the delete rode a DESTROY op; the observe returns on
-        // the terminal flip, which lands before the op's finalize step
+        // the terminal flip, which lands before the op finishes
         // (sandbox teardown) finishes. Wait for the op to settle so the
         // evict enqueue below deterministically claims the free lane.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

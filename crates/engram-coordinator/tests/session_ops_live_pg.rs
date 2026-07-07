@@ -274,6 +274,108 @@ async fn fenced_write_zero_rows_after_reclaim() {
     assert_eq!(prev, SessionState::Pending);
 }
 
+/// Re-review findings #3/#4: `fenced_record_snapshot` writes the row ONLY
+/// while `sessions.current_epoch` still equals the op's claimed epoch. A
+/// reclaimed-out predecessor (epoch behind the successor's) writes NOTHING
+/// and gets `Ok(false)` — so it can never land a phantom `recoverable` row
+/// a resume would pick (the 89f7984d durability-lie class), and it never
+/// reaches the `commit_snapshot` that follows in the eviction pipeline.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn fenced_record_snapshot_writes_only_under_current_epoch() {
+    use engram_core::types::snapshot::SnapshotRecord;
+    use engram_core::types::SnapshotId;
+
+    let Some(meta) = connect().await else { return };
+    let sid = seed_session(&meta).await;
+
+    let mk = |recoverable: bool| SnapshotRecord {
+        id: SnapshotId::new(),
+        session_id: Some(sid),
+        host_id: None,
+        image_version: "fenced-snap-test".into(),
+        size_bytes: 2048,
+        created_at: chrono::Utc::now(),
+        last_accessed_at: chrono::Utc::now(),
+        disk_manifest: None,
+        memory_manifest: None,
+        recoverable,
+        aux_bundles: vec![],
+        events_cursor: None,
+        fc_snapshot_version: None,
+    };
+
+    // Claim an op → current_epoch = 1.
+    let op = claimed(
+        meta.op_enqueue_and_claim(sid, OpKind::Evict, serde_json::json!({}), None, "pod-1")
+            .await
+            .expect("enqueue+claim"),
+    );
+    assert_eq!(op.epoch, Some(1));
+
+    // Under the current fence (epoch 1): the row lands.
+    let under = mk(true);
+    let under_id = under.id;
+    assert!(
+        meta.fenced_record_snapshot(under, 1)
+            .await
+            .expect("fenced record under current epoch"),
+        "epoch-1 write lands while current_epoch == 1",
+    );
+
+    // Reclaim → current_epoch = 2 (the successor fences the predecessor).
+    sqlx::query("UPDATE session_ops SET heartbeat_at = now() - interval '2 hours' WHERE id = $1")
+        .bind(op.id)
+        .execute(meta.pool())
+        .await
+        .expect("age heartbeat");
+    let reclaimed = meta
+        .op_reclaim_stale(Duration::from_secs(3600), "pod-2")
+        .await
+        .expect("reclaim");
+    assert_eq!(
+        reclaimed.iter().find(|r| r.id == op.id).unwrap().epoch,
+        Some(2),
+        "reclaim CAS-bumps the epoch",
+    );
+
+    // The fenced-out predecessor (still epoch 1) writes NOTHING.
+    let stale = mk(true);
+    let stale_id = stale.id;
+    assert!(
+        !meta
+            .fenced_record_snapshot(stale, 1)
+            .await
+            .expect("stale fenced record"),
+        "epoch-1 write must fence (0 rows) after the reclaim bumped current_epoch to 2",
+    );
+
+    // The successor (epoch 2) writes normally.
+    let fresh = mk(true);
+    let fresh_id = fresh.id;
+    assert!(
+        meta.fenced_record_snapshot(fresh, 2)
+            .await
+            .expect("fresh fenced record"),
+        "epoch-2 write lands under the current fence",
+    );
+
+    let rows = meta
+        .list_snapshots_for_session(sid)
+        .await
+        .expect("list snapshots");
+    let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+    assert!(
+        ids.contains(&under_id),
+        "the epoch-1-under-fence row persisted"
+    );
+    assert!(
+        !ids.contains(&stale_id),
+        "the fenced-out predecessor's phantom row must NOT exist",
+    );
+    assert!(ids.contains(&fresh_id), "the successor's row persisted");
+}
+
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn requeue_with_backoff_leaves_not_before() {

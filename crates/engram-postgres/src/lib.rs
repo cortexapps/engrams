@@ -564,6 +564,182 @@ mod placement_tests {
     }
 }
 
+impl PostgresStore {
+    /// The shared INSERT-or-idempotent-UPDATE body behind `record_snapshot`
+    /// / `fenced_record_snapshot` (ADR 0079 re-review #3/#4). `fence = None`
+    /// writes unconditionally; `Some(epoch)` gates the write on the
+    /// session's `current_epoch` atomically. Returns `None` when fenced
+    /// (nothing written), else `Some(inserted)`.
+    async fn record_snapshot_guarded(
+        &self,
+        snap: SnapshotRecord,
+        fence: Option<i64>,
+    ) -> Result<Option<bool>, MetaError> {
+        // ADR 0007: single-tier durability. Every snapshot row
+        // references chunked manifests in `BlobStorage` via the
+        // `disk_manifest_*` / `memory_manifest_*` quartet. The
+        // previous hot-tier (`local_path`) + cold-tier (envelope-
+        // encrypted blob ref) columns retired with Phase 7
+        // (migration 0020).
+        //
+        // ADR 0016 Phase C: bump `chunk_generation` in the same TX
+        // so the GC barrier sees the new pin-set entry atomically
+        // with the row write. Without this, a sweep that read the
+        // pin set before the row committed would miss the snapshot's
+        // chunks; with the bump, the sweep's post-collection
+        // generation read catches the divergence and restarts.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // ADR 0079 (re-review findings #3/#4): the optional fence. When
+        // `Some(epoch)`, gate the write on the session's `current_epoch`
+        // in the SAME transaction (the fence read + the write serialize
+        // against a concurrent claim/reclaim CAS via `FOR UPDATE`). A
+        // mismatch means the op executor was fenced by a successor's
+        // re-claim: write NOTHING (a reclaimed-out predecessor must never
+        // land a phantom `recoverable` row a resume would pick — the
+        // 89f7984d durability-lie class) and return `Ok(None)`.
+        if let Some(epoch) = fence {
+            let session_id = snap.session_id.ok_or_else(|| {
+                MetaError::Serialization(
+                    "fenced_record_snapshot requires a session-scoped snapshot".into(),
+                )
+            })?;
+            let stored: Option<i64> =
+                sqlx::query_scalar("SELECT current_epoch FROM sessions WHERE id = $1 FOR UPDATE")
+                    .bind(session_id.as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            if stored != Some(epoch) {
+                let _ = tx.rollback().await;
+                return Ok(None);
+            }
+        }
+        // Issue #529: `RETURNING (xmax = 0)` tells the caller whether this
+        // call INSERTed a fresh row or UPDATEd an existing one — Postgres's
+        // standard idiom for "was this an insert". The heartbeat reconcile
+        // uses it to emit `SnapshotTaken` exactly once, on the row's first
+        // landing, regardless of which coord (if any) survived the
+        // original capture.
+        let row = sqlx::query(
+            r#"
+            INSERT INTO snapshots
+                (id, session_id, host_id,
+                 image_version, size_bytes, created_at, last_accessed_at,
+                 disk_manifest_id, disk_manifest_version,
+                 memory_manifest_id, memory_manifest_version,
+                 recoverable, aux_bundles, events_cursor, fc_snapshot_version)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            ON CONFLICT (id) DO UPDATE SET
+                last_accessed_at        = EXCLUDED.last_accessed_at,
+                disk_manifest_id        = EXCLUDED.disk_manifest_id,
+                disk_manifest_version   = EXCLUDED.disk_manifest_version,
+                memory_manifest_id      = EXCLUDED.memory_manifest_id,
+                memory_manifest_version = EXCLUDED.memory_manifest_version,
+                recoverable             = EXCLUDED.recoverable,
+                aux_bundles             = EXCLUDED.aux_bundles,
+                -- ADR 0028 A.log: never clobber a resolved cursor with
+                -- NULL on an idempotent re-record (the reconciler may
+                -- re-ingest a checkpoint the eviction pipeline already
+                -- recorded with a cursor, or vice versa).
+                events_cursor           = COALESCE(EXCLUDED.events_cursor, snapshots.events_cursor),
+                -- ADR 0068: same idempotency guard — a re-record (e.g.
+                -- the checkpoint-advert reconcile re-ingesting a row the
+                -- eviction pipeline already stamped) must not blank out
+                -- an already-known capture-time FC snapshot version.
+                fc_snapshot_version     = COALESCE(EXCLUDED.fc_snapshot_version, snapshots.fc_snapshot_version),
+                updated_at              = NOW()
+            RETURNING (xmax = 0) AS inserted
+            "#,
+        )
+        .bind(snap.id.as_uuid())
+        .bind(snap.session_id.map(|s| s.as_uuid()))
+        .bind(snap.host_id.map(|h| h.as_uuid()))
+        .bind(&snap.image_version)
+        .bind(snap.size_bytes as i64)
+        .bind(snap.created_at)
+        .bind(snap.last_accessed_at)
+        .bind(snap.disk_manifest.map(|m| m.manifest_id))
+        .bind(snap.disk_manifest.map(|m| m.version as i64))
+        .bind(snap.memory_manifest.map(|m| m.manifest_id))
+        .bind(snap.memory_manifest.map(|m| m.version as i64))
+        .bind(snap.recoverable)
+        .bind(
+            serde_json::to_value(&snap.aux_bundles)
+                .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
+        )
+        .bind(snap.events_cursor)
+        .bind(&snap.fc_snapshot_version)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let inserted: bool = sqlx::Row::try_get(&row, "inserted").map_err(db_err)?;
+        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        // ADR 0077 phase 1: advance the per-session durable head in the
+        // SAME transaction as the row write — row existence ==
+        // durability. Monotonic by created_at: a re-record or an
+        // out-of-order reconcile (the host re-advertises an older
+        // checkpoint) never regresses the head. Base captures
+        // (session_id IS NULL) skip this — their head is
+        // enabled_images.base_snapshot_id.
+        //
+        // GATED ON `recoverable`: the issue-#213 two-phase capture and the
+        // resume demote path both record rows with recoverable=false, and
+        // the head's contract is "newest snapshot whose blobs AND row are
+        // committed" — an unrecoverable row must never hold it (the next
+        // abort-inflight tick deletes its blobs while the monotonic guard
+        // would block an older good snapshot from ever reclaiming the
+        // pointer). A demote that hits the CURRENT head re-points it to
+        // the newest still-recoverable snapshot instead.
+        if let Some(session_id) = snap.session_id {
+            if snap.recoverable {
+                sqlx::query(
+                    r#"
+                    UPDATE sessions
+                    SET durable_head_snapshot_id = $2
+                    WHERE id = $1
+                      AND (
+                        durable_head_snapshot_id IS NULL
+                        OR $3 >= COALESCE(
+                            (SELECT created_at FROM snapshots WHERE id = sessions.durable_head_snapshot_id),
+                            'epoch'::timestamptz
+                        )
+                      )
+                    "#,
+                )
+                .bind(session_id.as_uuid())
+                .bind(snap.id.as_uuid())
+                .bind(snap.created_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            } else {
+                sqlx::query(
+                    r#"
+                    UPDATE sessions
+                    SET durable_head_snapshot_id = (
+                        SELECT id FROM snapshots
+                        WHERE session_id = $1 AND recoverable AND id <> $2
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    )
+                    WHERE id = $1 AND durable_head_snapshot_id = $2
+                    "#,
+                )
+                .bind(session_id.as_uuid())
+                .bind(snap.id.as_uuid())
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(Some(inserted))
+    }
+}
+
 #[async_trait]
 impl MetadataStore for PostgresStore {
     async fn ping(&self) -> Result<(), MetaError> {
@@ -2910,143 +3086,30 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
-        // ADR 0007: single-tier durability. Every snapshot row
-        // references chunked manifests in `BlobStorage` via the
-        // `disk_manifest_*` / `memory_manifest_*` quartet. The
-        // previous hot-tier (`local_path`) + cold-tier (envelope-
-        // encrypted blob ref) columns retired with Phase 7
-        // (migration 0020).
-        //
-        // ADR 0016 Phase C: bump `chunk_generation` in the same TX
-        // so the GC barrier sees the new pin-set entry atomically
-        // with the row write. Without this, a sweep that read the
-        // pin set before the row committed would miss the snapshot's
-        // chunks; with the bump, the sweep's post-collection
-        // generation read catches the divergence and restarts.
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
-        // Issue #529: `RETURNING (xmax = 0)` tells the caller whether this
-        // call INSERTed a fresh row or UPDATEd an existing one — Postgres's
-        // standard idiom for "was this an insert". The heartbeat reconcile
-        // uses it to emit `SnapshotTaken` exactly once, on the row's first
-        // landing, regardless of which coord (if any) survived the
-        // original capture.
-        let row = sqlx::query(
-            r#"
-            INSERT INTO snapshots
-                (id, session_id, host_id,
-                 image_version, size_bytes, created_at, last_accessed_at,
-                 disk_manifest_id, disk_manifest_version,
-                 memory_manifest_id, memory_manifest_version,
-                 recoverable, aux_bundles, events_cursor, fc_snapshot_version)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            ON CONFLICT (id) DO UPDATE SET
-                last_accessed_at        = EXCLUDED.last_accessed_at,
-                disk_manifest_id        = EXCLUDED.disk_manifest_id,
-                disk_manifest_version   = EXCLUDED.disk_manifest_version,
-                memory_manifest_id      = EXCLUDED.memory_manifest_id,
-                memory_manifest_version = EXCLUDED.memory_manifest_version,
-                recoverable             = EXCLUDED.recoverable,
-                aux_bundles             = EXCLUDED.aux_bundles,
-                -- ADR 0028 A.log: never clobber a resolved cursor with
-                -- NULL on an idempotent re-record (the reconciler may
-                -- re-ingest a checkpoint the eviction pipeline already
-                -- recorded with a cursor, or vice versa).
-                events_cursor           = COALESCE(EXCLUDED.events_cursor, snapshots.events_cursor),
-                -- ADR 0068: same idempotency guard — a re-record (e.g.
-                -- the checkpoint-advert reconcile re-ingesting a row the
-                -- eviction pipeline already stamped) must not blank out
-                -- an already-known capture-time FC snapshot version.
-                fc_snapshot_version     = COALESCE(EXCLUDED.fc_snapshot_version, snapshots.fc_snapshot_version),
-                updated_at              = NOW()
-            RETURNING (xmax = 0) AS inserted
-            "#,
-        )
-        .bind(snap.id.as_uuid())
-        .bind(snap.session_id.map(|s| s.as_uuid()))
-        .bind(snap.host_id.map(|h| h.as_uuid()))
-        .bind(&snap.image_version)
-        .bind(snap.size_bytes as i64)
-        .bind(snap.created_at)
-        .bind(snap.last_accessed_at)
-        .bind(snap.disk_manifest.map(|m| m.manifest_id))
-        .bind(snap.disk_manifest.map(|m| m.version as i64))
-        .bind(snap.memory_manifest.map(|m| m.manifest_id))
-        .bind(snap.memory_manifest.map(|m| m.version as i64))
-        .bind(snap.recoverable)
-        .bind(
-            serde_json::to_value(&snap.aux_bundles)
-                .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
-        )
-        .bind(snap.events_cursor)
-        .bind(&snap.fc_snapshot_version)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        let inserted: bool = sqlx::Row::try_get(&row, "inserted").map_err(db_err)?;
-        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        // ADR 0077 phase 1: advance the per-session durable head in the
-        // SAME transaction as the row write — row existence ==
-        // durability. Monotonic by created_at: a re-record or an
-        // out-of-order reconcile (the host re-advertises an older
-        // checkpoint) never regresses the head. Base captures
-        // (session_id IS NULL) skip this — their head is
-        // enabled_images.base_snapshot_id.
-        //
-        // GATED ON `recoverable`: the issue-#213 two-phase capture and the
-        // resume demote path both record rows with recoverable=false, and
-        // the head's contract is "newest snapshot whose blobs AND row are
-        // committed" — an unrecoverable row must never hold it (the next
-        // abort-inflight tick deletes its blobs while the monotonic guard
-        // would block an older good snapshot from ever reclaiming the
-        // pointer). A demote that hits the CURRENT head re-points it to
-        // the newest still-recoverable snapshot instead.
-        if let Some(session_id) = snap.session_id {
-            if snap.recoverable {
-                sqlx::query(
-                    r#"
-                    UPDATE sessions
-                    SET durable_head_snapshot_id = $2
-                    WHERE id = $1
-                      AND (
-                        durable_head_snapshot_id IS NULL
-                        OR $3 >= COALESCE(
-                            (SELECT created_at FROM snapshots WHERE id = sessions.durable_head_snapshot_id),
-                            'epoch'::timestamptz
-                        )
-                      )
-                    "#,
-                )
-                .bind(session_id.as_uuid())
-                .bind(snap.id.as_uuid())
-                .bind(snap.created_at)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            } else {
-                sqlx::query(
-                    r#"
-                    UPDATE sessions
-                    SET durable_head_snapshot_id = (
-                        SELECT id FROM snapshots
-                        WHERE session_id = $1 AND recoverable AND id <> $2
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                    )
-                    WHERE id = $1 AND durable_head_snapshot_id = $2
-                    "#,
-                )
-                .bind(session_id.as_uuid())
-                .bind(snap.id.as_uuid())
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            }
-        }
-        tx.commit().await.map_err(db_err)?;
-        Ok(inserted)
+        Ok(self
+            .record_snapshot_guarded(snap, None)
+            .await?
+            .expect("unfenced record_snapshot always writes a row"))
+    }
+
+    /// ADR 0079 (re-review findings #3/#4): record a snapshot row ONLY
+    /// while the session's `current_epoch` still equals `epoch`. `Ok(false)`
+    /// means a successor op re-claimed the session (the epoch moved) and the
+    /// row was NOT written — the fenced-out op executor must stop, never
+    /// commit the capture. PG is the authority; this closes the window the
+    /// host-side per-session epoch high-water leaves open between a PG
+    /// reclaim and the successor's first fenced host RPC (so the proactive
+    /// host-epoch-advance-at-reclaim, ADR 0079 deferral #1c, stays a pure
+    /// optimization rather than a correctness requirement).
+    async fn fenced_record_snapshot(
+        &self,
+        snap: SnapshotRecord,
+        epoch: i64,
+    ) -> Result<bool, MetaError> {
+        Ok(self
+            .record_snapshot_guarded(snap, Some(epoch))
+            .await?
+            .is_some())
     }
 
     async fn durable_head_snapshot(

@@ -237,8 +237,8 @@ const EVICT_MAX_ATTEMPTS: i32 = 20;
 /// The evict verb: the idle-eviction / drain pipeline
 /// (`idle_evictor::run_evict_pipeline` — park or capture + destroy +
 /// mark-idle). Payload: `{"target": "idle"|"evacuating", "allow_park":
-/// bool, "nominated": bool}`; steps `park_or_capture → mark_idle →
-/// finalize` are recorded inside the pipeline.
+/// bool, "nominated": bool}`; steps `park_or_capture → mark_idle` are
+/// recorded inside the pipeline.
 async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
     let payload = &ctx.op.payload;
     let target = match payload.get("target").and_then(|v| v.as_str()) {

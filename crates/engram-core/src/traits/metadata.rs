@@ -1266,6 +1266,29 @@ pub trait MetadataStore: Send + Sync {
     /// transaction advances the session's `durable_head`.
     async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError>;
 
+    /// ADR 0079 (re-review findings #3/#4): the fenced counterpart to
+    /// [`record_snapshot`]. Writes the row ONLY while the session's
+    /// `current_epoch` still equals `epoch`, atomically in one transaction.
+    /// Returns `Ok(false)` when the op executor has been fenced by a
+    /// successor's re-claim (the epoch moved) — NOTHING is written, so a
+    /// reclaimed-out predecessor can never land a phantom `recoverable` row
+    /// a resume would later pick (the 89f7984d durability-lie class). The
+    /// op-driven capture sites (idle eviction, manual snapshot) use this
+    /// instead of the plain insert; the host-heartbeat reconcile and
+    /// image-enable base captures keep [`record_snapshot`] (not op-fenced).
+    ///
+    /// The default delegates to [`record_snapshot`] (fence-less) — fine for
+    /// in-memory test mocks that never exercise a reclaim; the Postgres
+    /// impl overrides it with the real, atomic epoch gate.
+    async fn fenced_record_snapshot(
+        &self,
+        snap: SnapshotRecord,
+        epoch: i64,
+    ) -> Result<bool, MetaError> {
+        let _ = epoch;
+        self.record_snapshot(snap).await
+    }
+
     /// ADR 0077 phase 1: the session's durable head — the newest
     /// snapshot whose blobs AND row are both committed (advanced in
     /// `record_snapshot`'s transaction). `None` = no committed

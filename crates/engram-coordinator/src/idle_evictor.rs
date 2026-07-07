@@ -179,7 +179,7 @@ fn park_headroom_floor_pct() -> u8 {
 /// memory-snapshot → destroy sequence the legacy `evict_session_to_state`
 /// ran, now driven under an op claim (the mutual exclusion; the
 /// `session_ops_one_running` index replaces the session lease) with
-/// durable step markers (`park_or_capture → mark_idle → finalize`).
+/// durable step markers (`park_or_capture → mark_idle`).
 ///
 /// `target_state = Idle` is the user-paused (manual /resume) shape;
 /// `Evacuating` is the operator-drain shape where the `evac_resumer`
@@ -502,9 +502,34 @@ pub(crate) async fn run_evict_pipeline(
         events_cursor,
         fc_snapshot_version,
     };
-    if let Err(e) = state.services.meta.record_snapshot(record.clone()).await {
-        abort_inflight_snapshot(ctx, session_id, sandbox_id, "record_snapshot").await;
-        return Err(EvictError::Meta(e.to_string()));
+    // ADR 0079 (re-review findings #3/#4): record the row UNDER OUR FENCE.
+    // The whole `park_or_capture` step brackets pause → snapshot → record →
+    // commit with no intermediate `ctx.step()` fence check, and the capture
+    // leg can run minutes; a coord↔PG partition that outlasts `RECLAIM_STALE`
+    // lets a successor re-claim this session (bumping `current_epoch`) while
+    // we're mid-capture. A plain INSERT here would land a phantom
+    // `recoverable` row a resume could pick (the 89f7984d durability-lie
+    // class), and we'd then issue `commit_snapshot` under the stale epoch.
+    // `fenced_record_snapshot` writes NOTHING when the epoch has moved:
+    match state
+        .services
+        .meta
+        .fenced_record_snapshot(record.clone(), ctx.epoch)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            // Fenced out mid-capture: do NOT record, do NOT commit. Abort
+            // the host's in-flight snapshot (best-effort — rejected if the
+            // successor already advanced the host high-water, which is fine)
+            // and stop; the successor op owns the capture now.
+            abort_inflight_snapshot(ctx, session_id, sandbox_id, "fenced_record_snapshot").await;
+            return Ok(EvictOutcome::Fenced);
+        }
+        Err(e) => {
+            abort_inflight_snapshot(ctx, session_id, sandbox_id, "record_snapshot").await;
+            return Err(EvictError::Meta(e.to_string()));
+        }
     }
 
     // ADR 0034 durability: commit the host's in-flight snapshot NOW —
@@ -700,16 +725,17 @@ pub(crate) async fn run_evict_pipeline(
 /// restarting, or never seeing the upload complete.
 ///
 /// This function marks the session Idle NOW (user-visible teardown ends
-/// here — unchanged) and then keeps the OP RUNNING through the
-/// `finalize` step, watching for the host-landed row. The running op is
-/// what serializes a concurrent resume against the in-flight finalize (a
-/// resume enqueued during upload queues BEHIND this op — the retired
-/// lease's touch_checked choreography is gone; each watch tick re-records
-/// the `finalize` step, which doubles as the op heartbeat AND the fence
-/// check). A coordinator death mid-watch degrades gracefully: the
-/// reclaim sweep re-claims the op and terminates it at the recorded
-/// step, while the row lands via heartbeat regardless — bounded
-/// staleness, never loss.
+/// here) and FINISHES THE EVICT OP immediately — it does NOT hold the
+/// session's one-running op lane for the upload (ADR 0079 review finding
+/// #11: an earlier draft watched the finalize row and blocked a queued
+/// resume/deliver for up to the upload's duration, reintroducing the
+/// evict-then-resume stall this epic exists to kill). The finalize is
+/// host-owned: the upload proceeds on the host, and the coordinator
+/// learns the durable snapshot row via the heartbeat reconcile
+/// (`api/host_http.rs::heartbeat`), independent of any op. The instant
+/// the session is Idle it is resumable; a resume that arrives before the
+/// row lands falls back to the prior periodic checkpoint (ADR 0028's
+/// documented-acceptable bounded loss), never waits on the upload.
 async fn finish_eviction_d5(
     ctx: &OpCtx<'_>,
     session_id: SessionId,
