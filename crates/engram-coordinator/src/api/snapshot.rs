@@ -489,15 +489,14 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
     let session = state.services.meta.get_session(id).await?;
     match session.status {
         SessionState::Active => {
-            // ADR 0074 rung-2: a session can be Active AND parked-paused
-            // (`park_rung == 2`, VM frozen) — the admin `EvictIdle` path parks
-            // from Active, and `evict_session_to_state`'s park branch returns
-            // WITHOUT a status transition, so it inherits `Active`. Returning Ok
-            // would advertise a live session over a PAUSED VM and stall the next
-            // prompt on a frozen harness. Un-pause it first (the natural
-            // nomination path parks from `Evicting`, routing through the
-            // `try_cancel` ascent; this covers the Active/paused shape). No-op
-            // for the common not-parked Active session.
+            // ADR 0074 rung-2 backstop: parked-paused now uniformly means
+            // `Evicting` (the park branch transitions the admin path's
+            // Active entry too), so Active + `park_rung == 2` only occurs
+            // in the crash window between the host `pause` landing and the
+            // park's PG bookkeeping committing. Returning Ok would
+            // advertise a live session over a PAUSED VM and stall the next
+            // prompt on a frozen harness — un-pause it first. No-op for
+            // the common not-parked Active session.
             if session.park_rung == 2 {
                 let _ = try_cancel_nominated_eviction(state, id).await?;
             }
@@ -574,7 +573,13 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
         SessionState::Dead => Err(ApiError::Gone(
             "session is dead — chunked manifests are gone or never existed".into(),
         )),
-        SessionState::Failed | SessionState::Completed => Err(ApiError::Conflict(format!(
+        // Terminal is GONE, not Conflict: a 409 reads as "retry later" to
+        // every caller, and the outbox driver in particular deferred a
+        // completed session's un-acked rows every backoff-tick forever
+        // (prod: 3 rows spinning the driver for hours). Gone maps to the
+        // driver's Terminal arm — the row is dropped — and to an honest
+        // 410 for exec/upload/relay callers.
+        SessionState::Failed | SessionState::Completed => Err(ApiError::Gone(format!(
             "session is {} (terminal); no work to dispatch",
             session.status.as_str()
         ))),
@@ -626,6 +631,14 @@ pub(crate) async fn try_cancel_nominated_eviction(
                 return Ok(false);
             }
         }
+        // Clear the park stamp the moment the un-pause lands, NOT in the
+        // transition's Ok arm: the `ensure_active` Active-arm backstop
+        // un-parks a session that is already Active (the pause-then-crash
+        // window before the park's Evicting transition), and Active→Active
+        // below is a same-state Conflict — tying the clear to the Ok arm
+        // left `park_rung=2` advertised forever over a running VM.
+        let _ = state.services.meta.set_session_park_rung(id, 0, None).await;
+        ::metrics::counter!(crate::metrics::EVICTION_UNPARKED_PAUSED_TOTAL).increment(1);
     }
     let result = match state
         .services
@@ -634,11 +647,7 @@ pub(crate) async fn try_cancel_nominated_eviction(
         .await
     {
         Ok(prev) => {
-            let _ = state.services.meta.set_session_park_rung(id, 0, None).await;
             ::metrics::counter!(crate::metrics::EVICTION_CANCELLED_TOTAL).increment(1);
-            if parked_paused {
-                ::metrics::counter!(crate::metrics::EVICTION_UNPARKED_PAUSED_TOTAL).increment(1);
-            }
             tracing::info!(
                 session_id = %id,
                 park_rung = if parked_paused { 2 } else { 1 },
@@ -2683,7 +2692,9 @@ mod evicting_gate_tests {
             .expect_err("Completed session has no work to dispatch");
         flipper.await.unwrap();
 
-        assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
+        // Terminal is GONE (410), not a retryable 409: the outbox driver
+        // maps Gone to its Terminal drop arm instead of deferring forever.
+        assert_eq!(err.status(), axum::http::StatusCode::GONE);
         assert!(
             err.to_string().contains("terminal"),
             "must surface the terminal-state error, not the mid-eviction 409, got: {err}",

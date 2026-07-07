@@ -222,9 +222,10 @@ pub(crate) async fn evacuate_session_core(
 #[derive(Serialize)]
 pub struct EvictIdleResponse {
     pub session_id: SessionId,
-    /// "idle" — the session was paused, flushed, snapshotted, and its
-    /// local sandbox destroyed; the PG row is at `Idle` and a subsequent
-    /// `Resume` rebinds it.
+    /// The pipeline's actual outcome: "idle" (full suspend — paused,
+    /// flushed, snapshotted, sandbox destroyed, resume rebinds), the
+    /// ADR 0074 rung-2 "evicting (parked-paused, rung 2)" (VM paused in
+    /// place, un-parked by the next prompt), or a lease-race "skipped".
     pub status: &'static str,
 }
 
@@ -256,20 +257,27 @@ pub(crate) async fn evict_idle_core(
         )));
     };
 
-    crate::idle_evictor::evict_idle_session(state, session_id, sandbox_id)
+    let outcome = crate::idle_evictor::evict_idle_session(state, session_id, sandbox_id)
         .await
         .map_err(|e| ApiError::Internal(format!("idle-evict pipeline: {e}")))?;
 
+    // Report what actually happened — with ADR 0074 rung 2 the pipeline
+    // may PARK (pause in place, session Evicting + park_rung=2) instead
+    // of suspending to Idle, and a lease race skips entirely. The old
+    // hardcoded "idle" misreported both.
+    let status = match &outcome {
+        crate::idle_evictor::EvictOutcome::ParkedPaused => "evicting (parked-paused, rung 2)",
+        crate::idle_evictor::EvictOutcome::Skipped { .. } => "skipped (pipeline already in flight)",
+        _ => "idle",
+    };
     tracing::info!(
         %session_id,
         %sandbox_id,
-        "admin evict-idle: session suspended to Idle via the idle-eviction primitive",
+        ?outcome,
+        "admin evict-idle: idle-eviction primitive completed",
     );
 
-    Ok(EvictIdleResponse {
-        session_id,
-        status: "idle",
-    })
+    Ok(EvictIdleResponse { session_id, status })
 }
 
 // ---------------------------------------------------------------------

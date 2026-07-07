@@ -867,6 +867,7 @@ jobs:
             --test diff_snapshot \
             --test file_restore_shared_rss \
             --test stock_fork_snapshot_compat \
+            --test pause_resume_vsock \
             --test vmstate_only_snapshot \
             --test substrate_kernel_capabilities \
             --test substrate_uffd_base \
