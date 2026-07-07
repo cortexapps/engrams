@@ -622,7 +622,13 @@ async fn build_host_egress(
     let bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_proxy_port)
         .parse()
         .map_err(|e| format!("parse bind addr: {e}"))?;
-    engram_host_agent::egress::HostEgress::spawn(source, bind, observe_sink)
+    // The DNS proxy binds the port the FC iptables `:53 -> dns` REDIRECT
+    // targets (`net::DEFAULT_DNS_PORT`); they must agree or the guest
+    // can't resolve. Kept in lockstep at 5353 — see main.rs:335.
+    let dns_bind: std::net::SocketAddr = "0.0.0.0:5353"
+        .parse()
+        .map_err(|e| format!("parse dns bind addr: {e}"))?;
+    engram_host_agent::egress::HostEgress::spawn(source, bind, Some(dns_bind), observe_sink)
         .await
         .map_err(|e| e.to_string())
 }
