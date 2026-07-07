@@ -877,6 +877,7 @@ async fn destroy(ctx: &OpCtx<'_>) -> OpOutcome {
         {
             Ok(true) => {}
             Ok(false) => {
+                crate::metrics::note_fenced_write();
                 tracing::debug!(session_id = %id, %sandbox_id,
                     "destroy op: fenced binding clear was a no-op (successor re-claimed)");
             }

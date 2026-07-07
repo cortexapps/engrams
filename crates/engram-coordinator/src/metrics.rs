@@ -194,6 +194,15 @@ pub const SESSION_OP_CLAIM_LATENCY_SECONDS: &str = "engram_session_op_claim_late
 /// writer stopped silently). Nonzero under pod churn; a sustained rate
 /// without churn means something is double-driving.
 pub const SESSION_OP_FENCED_WRITES_TOTAL: &str = "engram_session_op_fenced_writes_total";
+
+/// Count a fenced-out (0-row) session write. One helper so EVERY fence —
+/// step markers, transitions, event emits, snapshot records, binding
+/// clears, park rungs — lands in the same counter; a fence that skips it
+/// is invisible during exactly the partition-race incident class the
+/// fences exist to stop (re-review of ADR 0079).
+pub fn note_fenced_write() {
+    ::metrics::counter!(SESSION_OP_FENCED_WRITES_TOTAL).increment(1);
+}
 /// ADR 0079: stale running ops re-claimed by the sweep (fence-then-resume).
 pub const SESSION_OP_RECLAIMS_TOTAL: &str = "engram_session_op_reclaims_total";
 /// ADR 0079 (review finding #1): resume ops that hit their retry budget

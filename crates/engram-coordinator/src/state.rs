@@ -932,7 +932,7 @@ impl AppState {
             Some(idx) => idx,
             None => {
                 // Fenced: a successor owns the event-log tail now.
-                ::metrics::counter!(crate::metrics::SESSION_OP_FENCED_WRITES_TOTAL).increment(1);
+                crate::metrics::note_fenced_write();
                 return Ok(None);
             }
         };

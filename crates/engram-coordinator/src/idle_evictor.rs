@@ -86,6 +86,7 @@ async fn park_paused_bookkeeping(
         .fenced_set_session_park_rung(session_id, ctx.epoch, 2, Some(Utc::now()))
         .await?
     {
+        crate::metrics::note_fenced_write();
         return Err(engram_core::MetaError::Conflict(
             "fenced: successor re-claimed during park bookkeeping".into(),
         ));
@@ -395,11 +396,16 @@ pub(crate) async fn run_evict_pipeline(
                         let _ = state.services.host.resume(sandbox_id, ctx.fence()).await;
                         // Fenced compensation (review finding #6): a no-op
                         // if a successor re-claimed — never wipe its rung.
-                        let _ = state
-                            .services
-                            .meta
-                            .fenced_set_session_park_rung(session_id, ctx.epoch, 0, None)
-                            .await;
+                        if matches!(
+                            state
+                                .services
+                                .meta
+                                .fenced_set_session_park_rung(session_id, ctx.epoch, 0, None)
+                                .await,
+                            Ok(false)
+                        ) {
+                            crate::metrics::note_fenced_write();
+                        }
                     }
                 },
                 Err(engram_core::SandboxError::InvalidSpec(_)) => {
@@ -519,6 +525,7 @@ pub(crate) async fn run_evict_pipeline(
     {
         Ok(true) => {}
         Ok(false) => {
+            crate::metrics::note_fenced_write();
             // Fenced out mid-capture: do NOT record, do NOT commit. Abort
             // the host's in-flight snapshot (best-effort — rejected if the
             // successor already advanced the host high-water, which is fine)
@@ -601,7 +608,10 @@ pub(crate) async fn run_evict_pipeline(
         .await
     {
         Ok(true) => {}
-        Ok(false) => return Ok(EvictOutcome::Fenced),
+        Ok(false) => {
+            crate::metrics::note_fenced_write();
+            return Ok(EvictOutcome::Fenced);
+        }
         Err(e) => {
             tracing::warn!(
                 session_id = %session_id,
@@ -639,11 +649,16 @@ pub(crate) async fn run_evict_pipeline(
     // is a no-op) clears the rung with the Idle flip.
     if session.park_rung != 0 {
         // Fenced (review finding #6): clears the rung under OUR epoch only.
-        let _ = state
-            .services
-            .meta
-            .fenced_set_session_park_rung(session_id, ctx.epoch, 0, None)
-            .await;
+        if matches!(
+            state
+                .services
+                .meta
+                .fenced_set_session_park_rung(session_id, ctx.epoch, 0, None)
+                .await,
+            Ok(false)
+        ) {
+            crate::metrics::note_fenced_write();
+        }
     }
 
     // Step 4 (host destroy, post-PG): now the session is Idle,
