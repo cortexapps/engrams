@@ -104,7 +104,7 @@ impl OpCtx<'_> {
         {
             Ok(true) => true,
             Ok(false) => {
-                ::metrics::counter!(crate::metrics::SESSION_OP_FENCED_WRITES_TOTAL).increment(1);
+                crate::metrics::note_fenced_write();
                 tracing::info!(
                     op_id = self.op.id,
                     session_id = %self.op.session_id,
@@ -198,7 +198,7 @@ pub(crate) async fn transition_with_fence(
     {
         Some(prev) => Ok(prev),
         None => {
-            ::metrics::counter!(crate::metrics::SESSION_OP_FENCED_WRITES_TOTAL).increment(1);
+            crate::metrics::note_fenced_write();
             Err(engram_core::MetaError::Conflict(format!(
                 "fenced: session {session_id} was re-claimed by a successor op (epoch moved past {})",
                 fence.epoch,
@@ -605,7 +605,15 @@ pub(crate) async fn drive_claimed(state: &SharedState, op: SessionOp) {
 /// continuation.
 async fn drive_one(state: &SharedState, op: SessionOp) {
     let epoch = op.epoch.expect("claimed op carries its epoch");
-    let claim_age_ms = (chrono::Utc::now() - op.created_at).num_milliseconds();
+    // Enqueue→claim latency, from when the row became CLAIMABLE — for a
+    // backed-off retry that's `not_before`, not `created_at` (re-review:
+    // measuring retries from creation records the whole prior attempt's
+    // duration and permanently pollutes the p99 that proves the executor
+    // is NOTIFY-hot; a real poll-hop regression would be invisible).
+    let due_at = op
+        .not_before
+        .map_or(op.created_at, |nb| nb.max(op.created_at));
+    let claim_age_ms = (chrono::Utc::now() - due_at).num_milliseconds();
     ::metrics::histogram!(crate::metrics::SESSION_OP_CLAIM_LATENCY_SECONDS)
         .record((claim_age_ms.max(0) as f64) / 1000.0);
     let ctx = OpCtx {
@@ -622,6 +630,8 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     let outcome = crate::session_verbs::dispatch(&ctx).await;
     drop(heartbeat);
     let meta = &state.services.meta;
+    let terminal = !matches!(outcome, OpOutcome::Retry(_));
+    let finished_done = matches!(outcome, OpOutcome::Done);
     let _ = match outcome {
         OpOutcome::Done => meta.op_finish(op.id, epoch, OpState::Done, None).await,
         OpOutcome::Cancelled => meta.op_finish(op.id, epoch, OpState::Cancelled, None).await,
@@ -636,6 +646,44 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
                 .await
         }
     };
+    // ADR 0079 latency fix: a `for_delivery` resume the DELIVER verb
+    // enqueued (on an Idle session) leaves the deliver op requeued with a
+    // failure backoff — but the resume SUCCEEDING is not a failure, and
+    // the backed-off deliver would otherwise wait out the 5 s poll after
+    // the session is already Active (prod: prompt-after-idle ~10 s →
+    // ~21 s). Wake the sibling deliver so the loop's next claim forwards
+    // the prompt in <100 ms.
+    //
+    // Gated on Done-or-session-terminal (re-review): a resume that fails
+    // terminally while the session stays RESUMABLE (a deterministic
+    // non-`gone:` failure, e.g. a corrupt disk-only manifest) must NOT
+    // wake the deliver — the woken deliver would instantly enqueue a
+    // fresh resume, whose failure wakes it again, resetting the deliver's
+    // growing backoff every cycle into an unpaced failure loop. The
+    // session-terminal arm keeps the `gone:` path fast (session flipped
+    // Dead → the woken deliver drops its rows and completes). Never fired
+    // while the resume merely retries — the deliver stays backed off.
+    if terminal
+        && op.kind == OpKind::Resume
+        && op.payload.get("flavor").and_then(|f| f.as_str()) == Some("for_delivery")
+    {
+        let wake = if finished_done {
+            true
+        } else {
+            matches!(
+                meta.get_session(op.session_id).await,
+                Ok(s) if s.status.is_terminal()
+            )
+        };
+        if wake {
+            if let Err(e) = meta
+                .op_wake_queued_kind(op.session_id, OpKind::Deliver)
+                .await
+            {
+                tracing::debug!(session_id = %op.session_id, error = %e, "deliver wake after for_delivery resume failed (5s poll backstops)");
+            }
+        }
+    }
 }
 
 /// Linear backoff, capped — mirrors the outbox driver's posture: an op

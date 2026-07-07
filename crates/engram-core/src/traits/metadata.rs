@@ -766,6 +766,26 @@ pub trait MetadataStore: Send + Sync {
         Ok(true)
     }
 
+    /// Wake every QUEUED op of `kind` for this session by resetting its
+    /// `not_before` to now (and NOTIFY). ADR 0079 latency fix: the deliver
+    /// verb, on an Idle session, enqueues a Resume op and requeues itself
+    /// with a FAILURE backoff — but the resume completing is not a
+    /// failure, and the backed-off deliver would otherwise wait out the
+    /// 5 s fallback poll after the resume finishes (prod: prompt-after-
+    /// idle regressed ~10 s → ~21 s). When a `for_delivery` resume reaches
+    /// terminal, we wake its sibling deliver so the executor's completion
+    /// re-drive claims it in <100 ms. A no-spin wake (only fired on the
+    /// resume's terminal, never while it runs — the one-running slot
+    /// already blocks the deliver during the resume). Returns rows woken.
+    async fn op_wake_queued_kind(
+        &self,
+        session_id: SessionId,
+        kind: crate::types::session_op::OpKind,
+    ) -> Result<u64, MetaError> {
+        let _ = (session_id, kind);
+        Ok(0)
+    }
+
     /// Cancel a still-queued op (`queued → cancelled`). Running ops are
     /// cancelled cooperatively via [`Self::op_cancel_requested`].
     async fn op_cancel_queued(

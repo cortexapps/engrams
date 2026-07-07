@@ -389,6 +389,7 @@ pub(crate) async fn snapshot_core(
                         {
                             Ok(true) => {}
                             Ok(false) => {
+                                crate::metrics::note_fenced_write();
                                 tracing::info!(
                                     session_id = %id,
                                     snapshot_id = %metadata.id,

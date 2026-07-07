@@ -5093,6 +5093,36 @@ impl MetadataStore for PostgresStore {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn op_wake_queued_kind(
+        &self,
+        session_id: SessionId,
+        kind: OpKind,
+    ) -> Result<u64, MetaError> {
+        // ADR 0079 latency fix: pull a backed-off queued op's not_before
+        // to now so the completion re-drive claims it immediately, then
+        // NOTIFY so any replica's executor wakes even if the completion
+        // re-drive already passed.
+        let res = sqlx::query(
+            "UPDATE session_ops SET not_before = now()
+              WHERE session_id = $1 AND kind = $2 AND state = 'queued'
+                AND not_before > now()",
+        )
+        .bind(session_id.as_uuid())
+        .bind(kind.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let woken = res.rows_affected();
+        if woken > 0 {
+            sqlx::query("SELECT pg_notify('session_ops', $1)")
+                .bind(session_id.as_uuid().to_string())
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?;
+        }
+        Ok(woken)
+    }
+
     async fn op_request_cancel_running(
         &self,
         session_id: SessionId,
