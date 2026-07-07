@@ -337,10 +337,16 @@ fc-colima-provision profile='fc-dev':
 # Use it to reclaim disk or get a clean slate before a re-bake. Talks to the
 # coordinator app-gRPC via ENGRAM_APP_GRPC_ADDR / ENGRAM_APP_GRPC_TOKEN (dev
 # defaults below); the stack must be up.
-reap-sessions:
+reap-sessions profile='':
     #!/usr/bin/env bash
     set -euo pipefail
     export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
+    # fc-colima profile for the VM-side stages (3 bundles, 4 snapshots). The
+    # `{{profile}}` param wins; else fall back to ENGRAM_FC_COLIMA_PROFILE. Unlike
+    # `just dev-fc`, a bare `just reap-sessions` has NO env var set (dev-fc sets it
+    # inline for tilt only), so the VM stages used to silently skip — pass the
+    # profile explicitly: `just reap-sessions fc-dev`.
+    fc_profile="{{profile}}"; [ -z "$fc_profile" ] && fc_profile="${ENGRAM_FC_COLIMA_PROFILE:-}"
     sandboxes_dir="${ENGRAM_HOST_SANDBOX_DIR:-var/host-sandboxes}"
     # Disk usage of the sandbox dir in KiB (0 if it doesn't exist yet). `du -k`
     # is portable across macOS/Linux and reports actual allocated blocks, so
@@ -418,9 +424,9 @@ reap-sessions:
     # helper piped to `sudo bash -s` over stdin (NOT a heredoc: an unindented
     # heredoc terminator would break `just`'s recipe indentation, and colima
     # ssh doesn't run remote args through a shell anyway).
-    if [ -n "${ENGRAM_FC_COLIMA_PROFILE:-}" ] && command -v colima >/dev/null 2>&1; then
-        echo "==> pruning stale bundles inside the fc-colima VM ($ENGRAM_FC_COLIMA_PROFILE)"
-        colima ssh --profile "$ENGRAM_FC_COLIMA_PROFILE" -- sudo bash -s < deploy/dev/reap-vm-bundles.sh
+    if [ -n "$fc_profile" ] && command -v colima >/dev/null 2>&1; then
+        echo "==> pruning stale bundles inside the fc-colima VM ($fc_profile)"
+        colima ssh --profile "$fc_profile" -- sudo bash -s < deploy/dev/reap-vm-bundles.sh
         # 4. Sweep orphaned base-snapshot dirs in the VM: the coordinator's
         #    snapshot GC works off DB rows, so a snapshot dir left by a hard DB
         #    delete or a failed capture is never reclaimed — and each carries a
@@ -432,7 +438,11 @@ reap-sessions:
             psql -U engram -d engram -tAc \
             "select id::text from snapshots union select base_snapshot_id::text from enabled_images where base_snapshot_id is not null" \
             2>/dev/null | tr '\n' ' ' | tr -s ' ')"
-        colima ssh --profile "$ENGRAM_FC_COLIMA_PROFILE" -- sudo bash -s -- "$live_snaps" < deploy/dev/reap-vm-snapshots.sh
+        colima ssh --profile "$fc_profile" -- sudo bash -s -- "$live_snaps" < deploy/dev/reap-vm-snapshots.sh
+    elif command -v colima >/dev/null 2>&1; then
+        echo "==> SKIPPING fc-colima VM stages (bundles + orphaned snapshots) — no profile."
+        echo "    The VM holds the GiB-sized base-snapshot dumps; pass the profile to sweep them:"
+        echo "      just reap-sessions fc-dev"
     fi
     after_kb="$(dir_kb "$sandboxes_dir")"; after_kb="${after_kb:-0}"
     reclaimed_kb=$(( before_kb > after_kb ? before_kb - after_kb : 0 ))
