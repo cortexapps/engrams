@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::SnapshotId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
 use engram_sandbox_firecracker::client::{FirecrackerClient, SnapshotType};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 
@@ -62,7 +62,7 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") {
+    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
@@ -103,8 +103,7 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -116,6 +115,10 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
     // ---- 2. Boot with dirty tracking armed ----
     let work = tempfile::tempdir().expect("work dir");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle (agentd + stamp + sentinel) and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = None; // unprivileged test — see lifecycle.rs
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
     // ADR 0028: cold creates arm KVM dirty tracking via machine-config;
@@ -135,7 +138,7 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
     let vm1 = backend.create(spec).await.expect("create");

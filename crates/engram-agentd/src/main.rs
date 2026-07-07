@@ -405,53 +405,70 @@ async fn run_transport(
     // virtio-console transport had no ready-port device, which is why this used
     // to be gated on `supports_ready_port()`; with vsock everywhere the dial
     // always has a listener, so we always run the handshake.
-    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-        match transport
-            .dial(engram_agentd::ENGRAM_AGENTD_READY_PORT)
-            .await
-        {
-            Ok(mut conn) => {
-                let ready = engram_agentd::AgentReady {
-                    agent_version: agent_version.clone(),
-                };
-                match engram_agentd::write_msg(&mut conn, &ready).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
+    // ADR 0080: a re-exec'd agentd (RefreshAgent adopting a swapped bundle
+    // generation) is NOT a cold boot — the restored VM's host binds no
+    // ready listener (the captured agentd pre-set the ready watch), so
+    // this dial would spin against nothing for the full 90 s deadline
+    // BEFORE the accept loop starts, leaving the guest deaf to the host's
+    // post-re-exec `Ping` re-poll (dev-vm-found on the first KVM run of
+    // `agentd_bundle_reexec`). That re-poll IS the readiness signal here;
+    // skip the handshake and start serving immediately.
+    let skip_ready_dial = std::env::var_os(engram_agentd::refresh::REEXEC_ENV).is_some();
+    if skip_ready_dial {
+        tracing::info!(
+            marker = engram_agentd::refresh::REEXEC_ENV,
+            "re-exec'd agentd: skipping the boot-time ready dial; serving immediately",
+        );
+    }
+    if !skip_ready_dial {
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match transport
+                .dial(engram_agentd::ENGRAM_AGENTD_READY_PORT)
+                .await
+            {
+                Ok(mut conn) => {
+                    let ready = engram_agentd::AgentReady {
+                        agent_version: agent_version.clone(),
+                    };
+                    match engram_agentd::write_msg(&mut conn, &ready).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
+                                attempt,
+                                "AgentReady frame written to host",
+                            );
+                            let _ = tokio::io::AsyncWriteExt::shutdown(&mut conn).await;
+                            break;
+                        }
+                        Err(e) => tracing::debug!(
+                            error = %e,
                             attempt,
-                            "AgentReady frame written to host",
-                        );
-                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut conn).await;
-                        break;
+                            "AgentReady write failed; will re-dial",
+                        ),
                     }
-                    Err(e) => tracing::debug!(
-                        error = %e,
-                        attempt,
-                        "AgentReady write failed; will re-dial",
-                    ),
                 }
+                Err(e) => tracing::debug!(
+                    error = %e,
+                    attempt,
+                    port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
+                    "ready-port dial failed; will re-dial (likely FC vsock starved by slow rootfs I/O on a cold boot)",
+                ),
             }
-            Err(e) => tracing::debug!(
-                error = %e,
-                attempt,
-                port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
-                "ready-port dial failed; will re-dial (likely FC vsock starved by slow rootfs I/O on a cold boot)",
-            ),
+            if std::time::Instant::now() >= ready_deadline {
+                tracing::warn!(
+                    attempt,
+                    port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
+                    "ready-port handshake did not complete within deadline; host start_agent will \
+                     block until its own deadline. Proceeding to serve RPCs anyway (may be a restored \
+                     sandbox with no host listener, or a genuinely broken transport).",
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        if std::time::Instant::now() >= ready_deadline {
-            tracing::warn!(
-                attempt,
-                port = engram_agentd::ENGRAM_AGENTD_READY_PORT,
-                "ready-port handshake did not complete within deadline; host start_agent will \
-                 block until its own deadline. Proceeding to serve RPCs anyway (may be a restored \
-                 sandbox with no host listener, or a genuinely broken transport).",
-            );
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     let mut shutdown = Box::pin(tokio::signal::ctrl_c());

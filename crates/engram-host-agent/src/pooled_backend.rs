@@ -7109,6 +7109,31 @@ impl SandboxBackend for PooledBackend {
             self.seed_checkpoint_chain_forked(id, memory_ref).await;
         }
 
+        // ADR 0080: let the captured agentd adopt the agentd bundle
+        // generation the fresh flavor just patched into its slot —
+        // BEFORE any session state (env, harness, policy) binds, so a
+        // re-exec loses nothing. Non-fatal by design: a pre-ADR-0080
+        // snapshot (agentd baked into the rootfs, no bundle slot), a
+        // bundle staging hiccup, or a typed skew error all degrade to
+        // the captured agentd — one generation stale beats a failed
+        // create.
+        match self.inner.refresh_agent(id).await {
+            Ok(engram_core::traits::AgentRefresh::UpToDate) => {}
+            Ok(engram_core::traits::AgentRefresh::Restarted) => {
+                tracing::info!(
+                    sandbox_id = %id,
+                    "agentd refreshed onto the host's current bundle generation",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    error = %e,
+                    "agentd refresh degraded; session keeps the captured agentd",
+                );
+            }
+        }
+
         // Inject the per-session env (manifest env + secrets + session
         // id). The base snapshot is shared, so per-session values can't
         // be baked into it — in cold-create they rode vm_spec.env.
@@ -7213,6 +7238,17 @@ impl SandboxBackend for PooledBackend {
     /// forward was missing.
     async fn start_shell(&self, id: SandboxId) -> Result<u16, SandboxError> {
         self.inner.start_shell(id).await
+    }
+
+    /// ADR 0080: forward to inner, exactly as `start_shell` does — without
+    /// this the trait default (`Ok(UpToDate)`) would run and the FC
+    /// backend's actual vsock RefreshAgent RPC to in-VM agentd would never
+    /// fire, silently pinning every session to its capture-time agentd.
+    async fn refresh_agent(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::traits::AgentRefresh, SandboxError> {
+        self.inner.refresh_agent(id).await
     }
 
     /// ADR 0065: forward to inner, exactly as `start_shell` does — without

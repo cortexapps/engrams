@@ -24,7 +24,7 @@
 //! are verified by `tests/snapshot.rs` and `tests/snapshot_uffd.rs`.
 //!
 //! End-to-end `tests/exec_real_vm.rs` bakes a debian-slim rootfs with
-//! a static-musl `engram-agentd` injected at `/sbin/engram-agentd`,
+//! a static-musl `engram-agentd` exec'd out of its bundle slot (ADR 0080),
 //! boots it under FC with `init=/sbin/engram-init`, and round-trips
 //! an exec through the agent over vsock — the whole `SandboxBackend`
 //! contract works against a real microVM.
@@ -79,7 +79,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest};
-use engram_core::traits::sandbox::{HarnessByteStream, SandboxBackend};
+use engram_core::traits::sandbox::{AgentRefresh, HarnessByteStream, SandboxBackend};
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
@@ -656,6 +656,16 @@ struct LiveSandbox {
     /// lazily in the vsock-fallback case because the agent's eth0
     /// needs IP_PNP DHCP+kernel boot before it can answer.
     guest_endpoints: parking_lot::Mutex<Option<GuestEndpoints>>,
+    /// ADR 0080: true iff this sandbox's fresh-create restore patched
+    /// the agentd slot (`AuxRoDrive::AGENTD_SLOT_INDEX`) to a DIFFERENT
+    /// content generation than the snapshot pinned. `refresh_agent`
+    /// consults this to skip the in-guest RefreshAgent RPC when nothing
+    /// changed — the steady state — so the swap machinery adds zero
+    /// latency to the create path except on the first creates after an
+    /// actual agentd roll. Always `false` for cold creates (the boot
+    /// copies the attached generation by construction), resumes (never
+    /// swapped), and reattached survivors (already running).
+    agentd_slot_swapped: bool,
     /// ADR 0015 M1: receiver for the agentd-readiness signal.
     /// Switches to `true` when the in-VM agentd successfully dials
     /// `<vsock_uds>_<ENGRAM_AGENTD_READY_PORT>` and writes its
@@ -1360,6 +1370,7 @@ impl FirecrackerBackend {
                 guest_endpoints: parking_lot::Mutex::new(None),
                 #[cfg(target_os = "linux")]
                 parked: false,
+                agentd_slot_swapped: false,
                 agent_ready: ready_rx,
             },
         );
@@ -2023,20 +2034,35 @@ impl FirecrackerBackend {
         // generation (`current.json`'s `sentinel` key). Per-session skill
         // selection happens later, at restore, by `patch_drive`-ing real skill
         // shas into slots — never here.
+        // ADR 0080: the ONE exception is the agentd slot, which resolves to
+        // the host's staged `agentd` bundle — the cold-booting guest's
+        // stage-1 init copies agentd out of that mount and execs it (no
+        // agentd is baked into the rootfs), so a cold boot without it can't
+        // come up. Loud when unstaged.
         if spec.aux_ro_drives.iter().any(|d| d.sha256.is_none()) {
             let stamp = self.read_bundle_stamp().await?;
-            let sentinel_sha = stamp.get(AuxRoDrive::SENTINEL_STAMP_KEY).ok_or_else(|| {
-                SandboxError::InvalidSpec(format!(
-                    "reserved aux slots requested but this host's bundle stamp \
-                     ({}/{}) carries no `{}` entry — re-bake or roll the host image",
-                    self.config.bundle_dir.display(),
-                    AuxRoDrive::CURRENT_STAMP,
-                    AuxRoDrive::SENTINEL_STAMP_KEY,
-                ))
-            })?;
+            let stamp_for = |key: &str| {
+                stamp.get(key).cloned().ok_or_else(|| {
+                    SandboxError::InvalidSpec(format!(
+                        "reserved aux slots requested but this host's bundle stamp \
+                         ({}/{}) carries no `{key}` entry — re-bake or roll the host image",
+                        self.config.bundle_dir.display(),
+                        AuxRoDrive::CURRENT_STAMP,
+                    ))
+                })
+            };
             for drive in &mut spec.aux_ro_drives {
                 if drive.sha256.is_none() {
-                    drive.sha256 = Some(sentinel_sha.clone());
+                    // Lazy per-slot: only demand the stamp keys the spec's
+                    // symbolic slots actually reference (a sentinel-only
+                    // spec must not require an agentd entry, and vice
+                    // versa).
+                    let key = if drive.slot_index() == Some(AuxRoDrive::AGENTD_SLOT_INDEX) {
+                        AuxRoDrive::AGENTD_STAMP_KEY
+                    } else {
+                        AuxRoDrive::SENTINEL_STAMP_KEY
+                    };
+                    drive.sha256 = Some(stamp_for(key)?);
                 }
             }
         }
@@ -2299,6 +2325,7 @@ impl FirecrackerBackend {
                 guest_endpoints: parking_lot::Mutex::new(None),
                 #[cfg(target_os = "linux")]
                 parked: false,
+                agentd_slot_swapped: false,
                 agent_ready: agent_ready_rx,
             },
         );
@@ -2665,6 +2692,15 @@ impl FirecrackerBackend {
                 }
             }
         }
+        // ADR 0080: does this restore actually change the agentd slot's
+        // content? Computed against the snapshot's pinned generation
+        // BEFORE the loop below overwrites it on the live spec.
+        // `refresh_agent` skips the in-guest RPC when this stays false
+        // (the steady state), keeping the create path's added latency at
+        // zero except on the first creates after an agentd roll.
+        let agentd_drive_id =
+            AuxRoDrive::slot_drive_id(engram_core::types::sandbox::AuxRoDrive::AGENTD_SLOT_INDEX);
+        let mut agentd_slot_swapped = false;
         // ADR 0055: per-session skill selection. The coordinator assigned each
         // selected skill to a reserved slot (dyn_i) + content sha; plan a
         // `patch_drive` over that slot's sentinel and record it on the live spec
@@ -2696,6 +2732,12 @@ impl FirecrackerBackend {
                 .iter_mut()
                 .find(|d| d.drive_id == sel.drive_id)
             {
+                // ADR 0080: an agentd-slot selection that differs from the
+                // snapshot's pin is the (rare) "agentd rolled since capture"
+                // case `refresh_agent` acts on.
+                if sel.drive_id == agentd_drive_id && slot.sha256 != sel.sha256 {
+                    agentd_slot_swapped = true;
+                }
                 slot.sha256 = sel.sha256.clone();
             }
         }
@@ -3257,6 +3299,7 @@ impl FirecrackerBackend {
                 guest_endpoints: parking_lot::Mutex::new(None),
                 #[cfg(target_os = "linux")]
                 parked: false,
+                agentd_slot_swapped,
                 agent_ready: ready_rx,
             },
         );
@@ -4565,6 +4608,112 @@ impl SandboxBackend for FirecrackerBackend {
         Some(ep)
     }
 
+    /// ADR 0080: one `RefreshAgent` round against the restored guest's
+    /// agentd, then — when it re-execs — a bounded `Ping` re-poll until
+    /// the new agentd answers. Fresh-create restores only (the caller,
+    /// `PooledBackend::restore_base_for_session`, treats every error
+    /// here as non-fatal: a degraded refresh keeps the captured agentd,
+    /// never fails the create).
+    ///
+    /// Two shapes of "it's restarting" are equivalent: the typed
+    /// `AgentRefreshed { restarting: true }` reply, and a connection
+    /// error after the request was sent (the reply raced the exec's
+    /// connection teardown) — both fall through to the re-poll. A typed
+    /// `Error` reply is the old-agentd skew shape (pre-ADR-0080 bake):
+    /// surfaced as an error for the caller to log-and-proceed.
+    async fn refresh_agent(&self, id: SandboxId) -> Result<AgentRefresh, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or_else(|| {
+                SandboxError::Vm(format!("refresh_agent: no live sandbox {id}").into())
+            })?;
+            // Latency guard: the restore recorded whether the agentd
+            // slot's content actually changed vs. the snapshot's pin.
+            // Unchanged (the steady state) ⇒ same binary bytes ⇒ nothing
+            // to adopt — skip the in-guest round entirely, adding ZERO to
+            // the create path. Only the first creates after an agentd
+            // roll pay the RPC + re-exec.
+            if !live.agentd_slot_swapped {
+                return Ok(AgentRefresh::UpToDate);
+            }
+            live.state.vsock_uds_path.clone()
+        };
+
+        let round = async {
+            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await
+                .map_err(|e| {
+                    SandboxError::Vm(format!("refresh_agent: vsock connect: {e}").into())
+                })?;
+            engram_agentd::write_msg(&mut conn, &WireRequest::RefreshAgent)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("refresh_agent: send: {e}").into()))?;
+            let resp: Result<engram_agentd::WireResponse, _> =
+                engram_agentd::read_msg(&mut conn).await;
+            match resp {
+                Ok(engram_agentd::WireResponse::AgentRefreshed { restarting, sha256 }) => {
+                    tracing::debug!(sandbox_id = %id, restarting, ?sha256, "RefreshAgent reply");
+                    Ok(restarting)
+                }
+                Ok(engram_agentd::WireResponse::Error { kind, message }) => Err(SandboxError::Vm(
+                    format!("refresh_agent: agentd error ({kind}): {message}").into(),
+                )),
+                Ok(other) => Err(SandboxError::Vm(
+                    format!("refresh_agent: unexpected response: {other:?}").into(),
+                )),
+                // The reply can race the re-exec's connection teardown:
+                // the request landed, the exec closed the CLOEXEC'd
+                // socket before (or while) the reply flushed. Treat as
+                // restarting and let the re-poll below arbitrate.
+                Err(e) => {
+                    tracing::debug!(
+                        sandbox_id = %id,
+                        error = %e,
+                        "RefreshAgent reply lost; assuming re-exec and re-polling",
+                    );
+                    Ok(true)
+                }
+            }
+        };
+        let restarting = tokio::time::timeout(Duration::from_secs(10), round)
+            .await
+            .map_err(|_| SandboxError::Vm("refresh_agent: timed out".into()))??;
+        if !restarting {
+            return Ok(AgentRefresh::UpToDate);
+        }
+
+        // Re-exec in flight: poll until the new agentd's listener
+        // answers a Ping. ~10 ms typical (copy+exec of a small static
+        // binary), so poll tight — this sits on the session-create
+        // path. The 10 s ceiling is pure paranoia.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let probe = async {
+                let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+                    .await
+                    .ok()?;
+                engram_agentd::write_msg(&mut conn, &WireRequest::Ping)
+                    .await
+                    .ok()?;
+                match engram_agentd::read_msg(&mut conn).await {
+                    Ok(engram_agentd::WireResponse::Pong) => Some(()),
+                    _ => None,
+                }
+            };
+            match tokio::time::timeout(Duration::from_millis(1000), probe).await {
+                Ok(Some(())) => {
+                    tracing::info!(sandbox_id = %id, "agentd re-exec'd onto the staged bundle generation");
+                    return Ok(AgentRefresh::Restarted);
+                }
+                _ if tokio::time::Instant::now() >= deadline => {
+                    return Err(SandboxError::Vm(
+                        "refresh_agent: agentd never answered after re-exec".into(),
+                    ));
+                }
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    }
+
     /// Ask agentd to ensure `ttyd` is running and accepting on its
     /// port. Returns the bound port. ADR 0014 follow-up: replaces
     /// the prior assumption that the snapshot's in-VM init script
@@ -5852,6 +6001,36 @@ mod tests {
         }
     }
 
+    /// ADR 0080: the agentd slot resolves against the `agentd` stamp key —
+    /// and a stamp without it is loud (a host that can't boot the agentd
+    /// slot can't cold-boot at all). The lookup is lazy per-slot: the
+    /// sentinel-only specs above never demand an `agentd` entry.
+    #[tokio::test]
+    async fn create_with_agentd_slot_demands_agentd_stamp_key() {
+        let (b, d) = backend();
+        std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
+        let rootfs = d.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"not-really-ext4").unwrap();
+        let bundle_dir = d.path().join("bundles");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        let sha = "a".repeat(64);
+        // Stamp carries only the sentinel — the agentd slot must fail loud.
+        std::fs::write(
+            bundle_dir.join(AuxRoDrive::CURRENT_STAMP),
+            format!("{{\"{}\": \"{sha}\"}}", AuxRoDrive::SENTINEL_STAMP_KEY),
+        )
+        .unwrap();
+        let mut sp = spec();
+        sp.rootfs_source = Some(rootfs.clone());
+        sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(AuxRoDrive::AGENTD_SLOT_INDEX)];
+        match b.create(sp).await {
+            Err(SandboxError::InvalidSpec(msg)) => {
+                assert!(msg.contains(AuxRoDrive::AGENTD_STAMP_KEY), "{msg}");
+            }
+            other => panic!("expected InvalidSpec(missing agentd), got {other:?}"),
+        }
+    }
+
     /// The stub honours the "trait shape stays valid" contract — list
     /// of an empty backend returns an empty vec, not an error.
     #[tokio::test]
@@ -6436,6 +6615,7 @@ mod tests {
                 guest_endpoints: parking_lot::Mutex::new(None),
                 #[cfg(target_os = "linux")]
                 parked: false,
+                agentd_slot_swapped: false,
                 agent_ready,
             }
         };
@@ -6509,6 +6689,7 @@ mod tests {
                 netns: None,
                 guest_endpoints: parking_lot::Mutex::new(None),
                 parked: false,
+                agentd_slot_swapped: false,
                 agent_ready: agent_ready.clone(),
             },
         );
@@ -6525,6 +6706,7 @@ mod tests {
                 netns: None,
                 guest_endpoints: parking_lot::Mutex::new(None),
                 parked: false,
+                agentd_slot_swapped: false,
                 agent_ready: agent_ready.clone(),
             },
         );
@@ -6667,6 +6849,7 @@ mod tests {
                 guest_endpoints: parking_lot::Mutex::new(None),
                 #[cfg(target_os = "linux")]
                 parked: false,
+                agentd_slot_swapped: false,
                 agent_ready,
             },
         );

@@ -33,8 +33,8 @@ pub use metadata::{
     SessionCreateWriteSet, SnapshotTotals, UpdateOutcome,
 };
 pub use sandbox::{
-    BrowserStart, ForgeSink, HarnessByteStream, HarnessDial, HarnessSink, SandboxBackend,
-    UploadSink,
+    AgentRefresh, BrowserStart, ForgeSink, HarnessByteStream, HarnessDial, HarnessSink,
+    SandboxBackend, UploadSink,
 };
 pub use secrets::{
     LayeredSecretStore, ResolvedSecret, SecretBundle, SecretContext, SecretStore, StaticSecretStore,

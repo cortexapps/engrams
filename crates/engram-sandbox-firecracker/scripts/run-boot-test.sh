@@ -26,7 +26,7 @@ cargo build \
   --release
 
 case "${1:-all}" in
-  boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|baked_harness_loopback|forge_loopback|upload_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e|diff_snapshot|file_restore_shared_rss)
+  boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|agentd_bundle_reexec|baked_harness_loopback|forge_loopback|upload_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e|diff_snapshot|file_restore_shared_rss)
     # Root-required tests: snapshot_net + host_startup + proxy_e2e
     # all use real TAP / iptables / netns. Detect and re-exec via
     # sudo when not already root.
@@ -47,6 +47,7 @@ case "${1:-all}" in
     cargo test -p engram-sandbox-firecracker --test snapshot               -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test snapshot_uffd          -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test exec_real_vm           -- --ignored --nocapture
+    cargo test -p engram-sandbox-firecracker --test agentd_bundle_reexec   -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test baked_harness_loopback -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test forge_loopback         -- --ignored --nocapture
     cargo test -p engram-sandbox-firecracker --test upload_loopback        -- --ignored --nocapture
@@ -58,7 +59,7 @@ case "${1:-all}" in
     cargo test -p engram-sandbox-firecracker --test file_restore_shared_rss -- --ignored --nocapture
     ;;
   *)
-    echo "usage: $0 [boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|baked_harness_loopback|forge_loopback|upload_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e|diff_snapshot|file_restore_shared_rss|all]" >&2
+    echo "usage: $0 [boot|lifecycle|snapshot|snapshot_uffd|exec_real_vm|agentd_bundle_reexec|baked_harness_loopback|forge_loopback|upload_loopback|multi_restore|cross_host_restore|restore_chain|snapshot_net|host_startup|proxy_e2e|diff_snapshot|file_restore_shared_rss|all]" >&2
     exit 2
     ;;
 esac

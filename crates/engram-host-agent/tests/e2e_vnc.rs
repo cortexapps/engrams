@@ -49,7 +49,7 @@ use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
 };
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format, Transport};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
@@ -58,6 +58,13 @@ use tokio::time::timeout;
 // guest-IP poll) — the same module `e2e_shell` uses.
 mod common;
 use common::{cleanup_host_state, fc_preflight, require_root, wait_for_guest_endpoints};
+
+/// ADR 0080: the musl agentd the staged bundle fixture packs (the same
+/// binary the old bake used to inject into the rootfs).
+fn agentd_musl_bin() -> PathBuf {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    Path::new(&manifest).join("../../target/x86_64-unknown-linux-musl/release/engram-agentd")
+}
 
 /// Where `just bundles-squashfs` stages the content-addressed squashfs bundles
 /// (`<sha>.squashfs` + `current.json`) in the repo checkout. The FC backend's
@@ -188,8 +195,7 @@ async fn bake_browser_rootfs(repo: &str) -> PathBuf {
             tag: "warm-1".into(),
             images_dir: images_dir_path.clone(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent_bin,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: Transport::Vsock,
                 init_script: None,
@@ -279,9 +285,21 @@ async fn e2e_vnc_cold_via_pooled_backend() {
     // ---- 2. Wrap FC in PooledBackend, pointing bundle_dir at var/shared ----
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agentd_musl_bin());
+    // One bundle_dir per backend: copy the repo-staged browser squashfs
+    // into the fixture dir (the browser rides a resolved sha in the spec,
+    // so only its staged file must exist there).
+    std::fs::copy(
+        bundle_dir.join(AuxRoDrive::staged_file_name(&browser_sha)),
+        staged
+            .bundle_dir
+            .join(AuxRoDrive::staged_file_name(&browser_sha)),
+    )
+    .expect("copy browser bundle into fixture dir");
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
-    // The FC backend resolves aux drives at `<bundle_dir>/<sha>.squashfs`.
-    cfg.bundle_dir = bundle_dir;
     let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
     fc.host_startup().await.expect("host_startup");
     let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
@@ -301,7 +319,7 @@ async fn e2e_vnc_cold_via_pooled_backend() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: vec![browser_aux_drive(browser_sha)],
+        aux_ro_drives: vec![browser_aux_drive(browser_sha.clone()), staged.agentd_slot()],
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
 

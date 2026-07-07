@@ -1136,6 +1136,37 @@ async fn resolve_selected_skills(
     assign_skill_slots(&view, names)
 }
 
+/// ADR 0080: the agentd bundle's reserved-slot mount for a fresh create,
+/// pinned to the fleet's current `agentd` generation. `None` (with a LOUD
+/// warn) when no host reports one: the restore then keeps the snapshot's
+/// pinned agentd — which the host's restore staging hard-checks — so the
+/// session runs a stale-but-working agentd instead of failing the create.
+/// Deliberately soft, unlike skills: the Process backend runs no guest
+/// agentd at all, and on FC the *capture* path already hard-fails a fleet
+/// that stages no agentd bundle, so mis-staging can't compound silently.
+async fn resolve_agentd_mount(
+    state: &SharedState,
+) -> Result<Option<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
+    use engram_core::types::sandbox::AuxRoDrive;
+    let catalog = fleet_bundle_catalog(state).await?;
+    let Some(sha) = catalog.get(AuxRoDrive::AGENTD_STAMP_KEY) else {
+        tracing::warn!(
+            "ADR 0080: no host reports a staged `{}` bundle — new sessions keep \
+             their base snapshot's pinned agentd generation (agentd rolls are \
+             NOT reaching this fleet; stage bundle-agentd via node-assets / \
+             `just bundles-squashfs`)",
+            AuxRoDrive::AGENTD_STAMP_KEY,
+        );
+        return Ok(None);
+    };
+    Ok(Some(AuxRoDrive {
+        drive_id: AuxRoDrive::slot_drive_id(AuxRoDrive::AGENTD_SLOT_INDEX),
+        guest_mount: AuxRoDrive::slot_guest_mount(AuxRoDrive::AGENTD_SLOT_INDEX),
+        fs_type: "squashfs".into(),
+        sha256: Some(sha.clone()),
+    }))
+}
+
 /// The fleet's baked bundle catalog: any active host's `current_bundles`
 /// (name -> staged sha256). All hosts bake the same generations, so the first
 /// non-empty report is authoritative; empty if no host has reported yet. Shared
@@ -1173,8 +1204,9 @@ fn assign_skill_slots(
     }
     let mut mounts = Vec::with_capacity(names.len());
     for (i, name) in names.iter().enumerate() {
-        // Skills occupy dyn_1.. — slot 0 is reserved for the harness (ADR 0062).
-        let slot = AuxRoDrive::HARNESS_SLOT_INDEX + 1 + i;
+        // Skills occupy dyn_2.. — slot 0 is the harness (ADR 0062), slot 1
+        // is agentd (ADR 0080).
+        let slot = AuxRoDrive::FIRST_SKILL_SLOT_INDEX + i;
         let sha = catalog.get(name.as_str()).ok_or_else(|| {
             ApiError::BadRequest(format!(
                 "skill `{name}` is unknown (not a staged fleet bundle and not in the \
@@ -1347,7 +1379,17 @@ async fn prepare_inner(
     // mounts against the fleet's staged bundles (name -> sha). Capped at
     // RESERVED_SLOTS; an unknown skill name is a 400.
     let mut selected_mounts = resolve_selected_skills(state, &selected_skills).await?;
-    // ADR 0062: the harness catalog rides `dyn_0` alongside the skills (dyn_1..),
+    // ADR 0080: pin the fleet's current agentd generation to its reserved
+    // slot (`dyn_1`) — the identical paused-window patch_drive path. The
+    // host compares this pin against the snapshot's and only when they
+    // differ does the captured agentd re-exec (RefreshAgent), so an agentd
+    // roll reaches new sessions with zero recapture and zero steady-state
+    // latency. `None` (bundle-less fleet: Process dev, mid-bring-up) keeps
+    // the snapshot's pinned generation.
+    if let Some(mount) = resolve_agentd_mount(state).await? {
+        selected_mounts.push(mount);
+    }
+    // ADR 0062: the harness catalog rides `dyn_0` alongside the skills (dyn_2..),
     // bound through the identical paused-window patch_drive path.
     if let Some(mount) = harness_mount {
         selected_mounts.push(mount);
@@ -2025,23 +2067,33 @@ mod tests {
         // Empty selection → empty mounts.
         assert!(assign_skill_slots(&catalog, &[]).unwrap().is_empty());
 
-        // ADR 0062: slot 0 is the harness, so skills start at dyn_1. Two skills
-        // → two drives at dyn_1 / dyn_2 with the catalog shas, in request order.
+        // ADR 0062/0080: slot 0 is the harness, slot 1 is agentd, so skills
+        // start at dyn_2. Two skills → two drives at dyn_2 / dyn_3 with the
+        // catalog shas, in request order.
         let mounts = assign_skill_slots(&catalog, &["skills".into(), "browser".into()]).unwrap();
         assert_eq!(mounts.len(), 2);
-        assert_eq!(mounts[0].drive_id, AuxRoDrive::slot_drive_id(1));
-        assert_eq!(mounts[0].guest_mount, AuxRoDrive::slot_guest_mount(1));
+        assert_eq!(
+            mounts[0].drive_id,
+            AuxRoDrive::slot_drive_id(AuxRoDrive::FIRST_SKILL_SLOT_INDEX)
+        );
+        assert_eq!(
+            mounts[0].guest_mount,
+            AuxRoDrive::slot_guest_mount(AuxRoDrive::FIRST_SKILL_SLOT_INDEX)
+        );
         assert_eq!(mounts[0].fs_type, "squashfs");
         assert_eq!(mounts[0].sha256.as_deref(), Some("sha_a"));
-        assert_eq!(mounts[1].drive_id, AuxRoDrive::slot_drive_id(2));
+        assert_eq!(
+            mounts[1].drive_id,
+            AuxRoDrive::slot_drive_id(AuxRoDrive::FIRST_SKILL_SLOT_INDEX + 1)
+        );
         assert_eq!(mounts[1].sha256.as_deref(), Some("sha_b"));
 
         // Unknown skill → 400.
         let err = assign_skill_slots(&catalog, &["nope".into()]).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
 
-        // Over the skill-slot cap (RESERVED_SLOTS - 1, since the harness takes
-        // slot 0) → 400, even if every name is known.
+        // Over the skill-slot cap (RESERVED_SLOTS - 2: harness slot 0,
+        // agentd slot 1) → 400, even if every name is known.
         let too_many: Vec<String> = (0..AuxRoDrive::MAX_SKILL_SLOTS + 1)
             .map(|_| "skills".to_string())
             .collect();

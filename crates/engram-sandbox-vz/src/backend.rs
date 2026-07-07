@@ -217,6 +217,52 @@ impl VzBackend {
         dir.join(format!("{id}.vsock"))
     }
 
+    /// ADR 0080: resolve a symbolic agentd slot (`sha256 = None` at
+    /// `AuxRoDrive::AGENTD_SLOT_INDEX`) against this host's staged
+    /// stamp (`<bundle_dir>/current.json`, key `agentd`) — the VZ
+    /// mirror of the FC cold-boot resolution. Loud when the stamp or
+    /// the key is missing: the guest's stage-1 init execs agentd out
+    /// of this mount, so a cold boot without it can't come up. A
+    /// no-op when no symbolic agentd slot is present (resolved specs,
+    /// bundle-less test specs).
+    fn resolve_agentd_slot(&self, drives: &mut [AuxRoDrive]) -> Result<(), SandboxError> {
+        let needs = drives
+            .iter()
+            .any(|d| d.sha256.is_none() && d.slot_index() == Some(AuxRoDrive::AGENTD_SLOT_INDEX));
+        if !needs {
+            return Ok(());
+        }
+        let stamp_path = self.cfg.bundle_dir.join(AuxRoDrive::CURRENT_STAMP);
+        let bytes = std::fs::read(&stamp_path).map_err(|e| {
+            SandboxError::InvalidSpec(format!(
+                "read bundle stamp {}: {e} — this host stages no bundles; it \
+                 can't boot the agentd slot",
+                stamp_path.display()
+            ))
+        })?;
+        let stamp: std::collections::HashMap<String, String> = serde_json::from_slice(&bytes)
+            .map_err(|e| {
+                SandboxError::InvalidSpec(format!(
+                    "parse bundle stamp {}: {e}",
+                    stamp_path.display()
+                ))
+            })?;
+        let sha = stamp.get(AuxRoDrive::AGENTD_STAMP_KEY).ok_or_else(|| {
+            SandboxError::InvalidSpec(format!(
+                "bundle stamp {} carries no `{}` entry — restage bundles \
+                 (`just bundles-vz`)",
+                stamp_path.display(),
+                AuxRoDrive::AGENTD_STAMP_KEY,
+            ))
+        })?;
+        for d in drives.iter_mut() {
+            if d.sha256.is_none() && d.slot_index() == Some(AuxRoDrive::AGENTD_SLOT_INDEX) {
+                d.sha256 = Some(sha.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// ADR 0007 Phase 6: per-snapshot staging dir, owned by the
     /// backend. Lives under `<work_dir>/snapshots/<id>/` rather
     /// than the per-sandbox dir, so destroy(sandbox) doesn't
@@ -515,6 +561,14 @@ impl SandboxBackend for VzBackend {
             "vz: cloned bake rootfs to per-sandbox path"
         );
 
+        // ADR 0080: resolve the (symbolic) agentd slot against this host's
+        // staged stamp BEFORE building the VM config. The cold-booting
+        // guest's stage-1 init copies agentd out of this mount and execs
+        // it — no agentd is baked into the rootfs — so unlike the sentinel
+        // slots (which VZ deliberately skips) this one must attach.
+        let mut aux_ro_drives = spec.aux_ro_drives.clone();
+        self.resolve_agentd_slot(&mut aux_ro_drives)?;
+
         let vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
             rootfs_path.clone(),
@@ -523,8 +577,9 @@ impl SandboxBackend for VzBackend {
         )
         // ADR 0061: attach this spec's skill bundles. During base-snapshot
         // capture these are sentinel placeholders (sha = None) and attach
-        // nothing; a plain cold-create with resolved drives attaches them.
-        .with_aux_ro_drives(spec.aux_ro_drives.clone(), self.cfg.bundle_dir.clone());
+        // nothing (except the agentd slot, resolved above); a plain
+        // cold-create with resolved drives attaches them.
+        .with_aux_ro_drives(aux_ro_drives, self.cfg.bundle_dir.clone());
         let vm = VzVm::new(vm_cfg)?;
 
         // Start the VM; if start fails, drop the VM via the early

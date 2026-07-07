@@ -321,14 +321,14 @@ enum ImageCmd {
         #[arg(long, value_parser = parse_image_format, default_value = "directory")]
         format: Format,
 
-        /// Inject a static-musl `engram-agentd` binary into the
-        /// rootfs at `/sbin/engram-agentd` and write a `/sbin/engram-init`
-        /// shim that exec's it on the reserved vsock port (1024).
-        /// Required for Firecracker images; without it the host
-        /// can't `exec()` against the VM. Pre-build the binary with
-        /// `cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release`.
+        /// Write the ADR 0080 stage-1 `/sbin/engram-init` shim into the
+        /// rootfs: it mounts the aux bundle slots, copies `engram-agentd`
+        /// out of its reserved bundle slot to tmpfs, and exec's it on the
+        /// reserved vsock port (1024). Required for Firecracker/VZ
+        /// images; agentd itself is NEVER baked — it ships as
+        /// `bundle-agentd`, staged host-side.
         #[arg(long)]
-        inject_agent: Option<PathBuf>,
+        inject_init: bool,
 
         /// Which `engram-transport` impl the in-VM binaries should
         /// select at runtime. The init shim writes
@@ -526,7 +526,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 images_dir,
                 docker_bin,
                 format,
-                inject_agent,
+                inject_init,
                 transport,
                 push,
             },
@@ -539,7 +539,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             images_dir,
             docker_bin.as_deref(),
             *format,
-            inject_agent.as_deref(),
+            *inject_init,
             *transport,
             push.as_deref(),
         )
@@ -1125,15 +1125,14 @@ async fn image_build(
     images_dir: &Path,
     docker_bin: Option<&str>,
     format: Format,
-    inject_agent: Option<&Path>,
+    inject_init: bool,
     transport: engram_image_builder::Transport,
     push: Option<&str>,
 ) -> Result<(), CliError> {
     let resolved_tag = tag
         .map(str::to_string)
         .unwrap_or_else(|| format!("warm-{}", Utc::now().format("%Y%m%dT%H%M%SZ")));
-    let agent_injection = inject_agent.map(|p| engram_image_builder::AgentInjection {
-        agent_binary: p.to_path_buf(),
+    let init_injection = inject_init.then_some(engram_image_builder::InitInjection {
         // Reserved port engram-agentd listens on inside the guest.
         // Hard-coded here (and in engram-sandbox-firecracker as
         // ENGRAM_AGENTD_PORT) so the bake and the host's connect
@@ -1148,7 +1147,7 @@ async fn image_build(
         tag: resolved_tag.clone(),
         images_dir: images_dir.to_path_buf(),
         format,
-        agent_injection,
+        init_injection,
     };
     let docker = match docker_bin {
         Some(bin) => DockerCli::with_binary(bin.to_string()),

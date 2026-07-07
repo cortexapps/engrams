@@ -3,9 +3,9 @@ name: Bake dev image (reusable)
 # Reusable workflow: bake a project's engrams dev image and push it to GHCR.
 #
 # A consuming repo (e.g. cortexapps/engineering-blog) calls this with its image
-# source path + target GHCR repo. It pulls the golden engram-cli + engram-agentd
+# source path + target GHCR repo. It pulls the golden engram-cli
 # from THIS repo's `cli-tools` GHCR artifact (publish-cli-tools in
-# bake-images.yml), then runs `engram-cli image build --inject-agent ... --push`.
+# bake-images.yml), then runs `engram-cli image build --inject-init ... --push`.
 # No Rust toolchain and no engrams source checkout — the binaries are pre-built,
 # CI-tested, and version-matched to the deployed coordinator at the `main` tag
 # (same contract the FC-host bakes get from host-binaries:main).
@@ -83,20 +83,22 @@ jobs:
 
       - uses: oras-project/setup-oras@v1
 
-      - name: Pull golden cli-tools (engram-cli + engram-agentd + mke2fs)
+      - name: Pull golden cli-tools (engram-cli + mke2fs)
         env:
           REF: ${{ inputs.engrams_ref }}
         run: |
           set -euo pipefail
-          # Drops engram-cli + engram-agentd + the pinned mke2fs into cwd. oras
-          # doesn't preserve the executable bit, so re-set it. ADR 0036: the
-          # bundled mke2fs (e2fsprogs >= 1.47.1) is what makes `engram-cli image
-          # build` byte-deterministic — engram-cli resolves it as a sibling, so
-          # no nix/apt setup step is needed here. (Determinism is a property of
-          # the tool, not this workflow.)
+          # Drops engram-cli + the pinned mke2fs into cwd. oras doesn't
+          # preserve the executable bit, so re-set it. ADR 0036: the bundled
+          # mke2fs (e2fsprogs >= 1.47.1) is what makes `engram-cli image
+          # build` byte-deterministic — engram-cli resolves it as a sibling,
+          # so no nix/apt setup step is needed here. (Determinism is a
+          # property of the tool, not this workflow.) ADR 0080: no agentd —
+          # the bake injects only the stage-1 init shim; agentd rides the
+          # fleet's `bundle-agentd` and reaches every guest at boot/restore.
           oras pull "ghcr.io/cortexapps/engrams/cli-tools:${REF}"
-          chmod +x engram-cli engram-agentd mke2fs
-          file engram-cli engram-agentd mke2fs
+          chmod +x engram-cli mke2fs
+          file engram-cli mke2fs
 
       - name: Bake + push image
         env:
@@ -119,7 +121,7 @@ jobs:
             --source "${SOURCE}" \
             --format "${FORMAT}" \
             --images-dir ./var/engram/images \
-            --inject-agent ./engram-agentd \
+            --inject-init \
             --push "${PUSH_URI}"
           # Hand the URI to later steps.
           echo "PUSH_URI=${PUSH_URI}" >> "$GITHUB_ENV"

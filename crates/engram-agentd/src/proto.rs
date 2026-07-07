@@ -289,6 +289,31 @@ pub enum WireRequest {
     /// [`WireResponse::BrowserStopped`].
     /// Appended last: see the APPEND-ONLY note above.
     StopBrowser,
+    /// ADR 0080: adopt the agentd bundle generation now attached at the
+    /// reserved agentd slot (`AuxRoDrive::AGENTD_SLOT_INDEX`). Sent by
+    /// the host once per **fresh-create restore**, after resume and
+    /// before any session state binds. The agent re-mounts the bundle
+    /// mounts (the ADR 0035 §3 dance — the host may have `patch_drive`d
+    /// the slot in the paused window), compares the slot's
+    /// `agentd.sha256` stamp against the one it booted from
+    /// (`/run/engram/agentd.sha256`, written by the stage-1 init), and:
+    ///
+    /// - match → replies [`WireResponse::AgentRefreshed`]
+    ///   `{ restarting: false }`. The steady state: one stat.
+    /// - mismatch → stages the slot's binary over its tmpfs copy
+    ///   (temp + rename; the running inode is untouched), replies
+    ///   `{ restarting: true }`, flushes, and **`execv`s itself** (PID 1
+    ///   exec — same argv/env). The caller must re-poll readiness
+    ///   (`Ping`) before proceeding; the connection drops at exec.
+    ///
+    /// This is how an agentd roll reaches new sessions with zero image
+    /// recapture: the bundle publish swaps the slot's content, the
+    /// captured agentd re-execs onto it at the next create. Sent to an
+    /// older baked agentd that predates the variant, the decode fails
+    /// into the typed skew `Error` above and the host degrades to the
+    /// captured agentd (warn, never a failed create) — by design.
+    /// Appended last: see the APPEND-ONLY note above.
+    RefreshAgent,
 }
 
 /// Body of [`WireRequest::SpawnHarness`]. ADR 0021 P1.4 dropped the
@@ -407,6 +432,18 @@ pub enum WireResponse {
     /// torn down (or there was nothing running).
     /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
     BrowserStopped,
+    /// Reply to [`WireRequest::RefreshAgent`]. `restarting = false`: the
+    /// running agentd already matches the attached bundle's stamp (or no
+    /// agentd bundle is mounted — logged in-guest, never an error).
+    /// `restarting = true`: the reply is the agent's last act before it
+    /// `execv`s the staged binary — the caller re-polls readiness.
+    /// `sha256` is the content stamp the agent runs (post-exec, when
+    /// restarting) — `None` when no stamp could be determined.
+    /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
+    AgentRefreshed {
+        restarting: bool,
+        sha256: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

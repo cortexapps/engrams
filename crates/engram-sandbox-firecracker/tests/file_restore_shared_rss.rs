@@ -732,7 +732,7 @@ async fn bake_spike_rootfs() -> Baked {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: None,
+            init_injection: None,
         })
         .await
         .expect("ext4 bake");

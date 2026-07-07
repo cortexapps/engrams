@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 
 use common::{drain, fc_preflight, require_bin};
@@ -40,7 +40,7 @@ async fn vsock_delivers_after_plain_pause_resume() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") {
+    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
     // Fork-only: stock v1.16's snapshot-only kick() arms the RX gate on plain
@@ -94,8 +94,7 @@ async fn vsock_delivers_after_plain_pause_resume() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -107,6 +106,10 @@ async fn vsock_delivers_after_plain_pause_resume() {
     // ---- 2. Boot the microVM on the FORK binary ----
     let work = tempfile::tempdir().expect("work dir");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
+    // bundle (agentd + stamp + sentinel) and point the backend at it.
+    let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
+    cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = None; // unprivileged test — see lifecycle.rs
     cfg.firecracker_bin = fork_bin;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
@@ -124,7 +127,7 @@ async fn vsock_delivers_after_plain_pause_resume() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let sandbox_id = backend.create(spec).await.expect("create");
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");

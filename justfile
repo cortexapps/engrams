@@ -361,6 +361,26 @@ bundles-squashfs:
         stamp="$stamp$sep\"harness-claude\": \"$sha\""
         sep=", "
     fi
+    # ADR 0080: the agentd bundle (reserved slot dyn_1) — MANDATORY, not
+    # best-effort: without it no guest can boot (the stage-1 init execs
+    # agentd out of this mount) and no capture can run. CI/e2e hands the
+    # built musl binary in via ENGRAM_AGENTD_BIN; a local run cross-builds
+    # it for the host arch (FC guests match the host).
+    agentd_bin="${ENGRAM_AGENTD_BIN:-}"
+    if [ -z "$agentd_bin" ]; then
+        case "$(uname -m)" in
+            arm64 | aarch64) atarget=aarch64-unknown-linux-musl ;;
+            *)               atarget=x86_64-unknown-linux-musl ;;
+        esac
+        cargo build --release --target "$atarget" -p engram-agentd
+        agentd_bin="target/$atarget/release/engram-agentd"
+    fi
+    tmp="var/shared/.agentd.build.squashfs"
+    deploy/bundles/agentd/build.sh "$agentd_bin" "$tmp"
+    sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
+    mv "$tmp" "var/shared/$sha.squashfs"
+    stamp="$stamp$sep\"agentd\": \"$sha\""
+    sep=", "
     echo "$stamp}" > var/shared/current.json
     cat var/shared/current.json
 
@@ -497,6 +517,31 @@ bundles-vz:
         # externally-provided ENGRAM_HARNESS_CLAUDE_TREE is left untouched.
         [ "$harness_tree" = "$PWD/var/shared/.harness-claude.stage" ] && rm -rf "$harness_tree"
     fi
+    # ADR 0080: the agentd bundle (reserved slot dyn_1) — MANDATORY: the
+    # stage-1 init execs agentd out of this mount, so a stamp without it
+    # boots nothing. The VZ guest is arm64 Linux (Kata kernel); build the
+    # musl agentd for that arch (ENGRAM_AGENTD_BIN overrides).
+    agentd_bin="${ENGRAM_AGENTD_BIN:-}"
+    if [ -z "$agentd_bin" ]; then
+        case "$(uname -m)" in
+            arm64 | aarch64) atarget=aarch64-unknown-linux-musl ;;
+            *)               atarget=x86_64-unknown-linux-musl ;;
+        esac
+        cargo build --release --target "$atarget" -p engram-agentd
+        agentd_bin="target/$atarget/release/engram-agentd"
+    fi
+    tree="$PWD/var/shared/.agentd.stage"
+    rm -rf "$tree"; mkdir -p "$tree"
+    install -m 0755 "$agentd_bin" "$tree/engram-agentd"
+    sha256_of "$tree/engram-agentd" > "$tree/agentd.sha256"
+    out="var/shared/.agentd.build.erofs"
+    rm -f "$out"
+    pack_erofs "$out" "$tree"
+    rm -rf "$tree"
+    sha="$(sha256_of "$out")"
+    mv "$out" "var/shared/$sha.erofs"
+    stamp="$stamp$sep\"agentd\": \"$sha\""
+    sep=", "
     echo "$stamp}" > var/shared/current.json
     cat var/shared/current.json
 
@@ -550,14 +595,12 @@ bake repo dir='.':
     @set -e; \
     : "${ENGRAM_KEK_MASTER_KEY:?run \`just bootstrap\` first to generate a KEK}"; \
     if [ "$(uname -s -m)" = "Darwin arm64" ]; then \
-        TARGET=aarch64-unknown-linux-musl; PLATFORM=linux/arm64; TRANSPORT=console; \
+        PLATFORM=linux/arm64; \
     elif [ "$(uname -s -m)" = "Linux x86_64" ]; then \
-        TARGET=x86_64-unknown-linux-musl; PLATFORM=linux/amd64; TRANSPORT=vsock; \
+        PLATFORM=linux/amd64; \
     else \
         echo "unsupported host: $(uname -s -m)" >&2; exit 1; \
     fi; \
-    rustup target add $TARGET >/dev/null 2>&1 || true; \
-    cargo build -p engram-agentd --target $TARGET --release; \
     TAG="${TAG:-warm-$(date -u +%Y%m%dT%H%M%SZ)}"; \
     STAGING="./var/bake/{{repo}}"; \
     rm -rf "$STAGING"; mkdir -p "$STAGING"; \
@@ -574,8 +617,7 @@ bake repo dir='.':
         --source $STAGING \
         --format ext4 \
         --images-dir ./var/bake/_staging \
-        --transport $TRANSPORT \
-        --inject-agent "target/$TARGET/release/engram-agentd" \
+        --inject-init \
         --push localhost:5001/{{repo}}; \
     echo ""; \
     echo "✓ pushed localhost:5001/{{repo}}:$TAG"; \

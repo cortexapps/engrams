@@ -33,7 +33,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_core::types::snapshot::MigrationSourceInfo;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{AgentInjection, BuildRequest, Builder, DockerCli, Format};
+use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -52,16 +52,27 @@ fn build_host(
     kernel: &Path,
     handler: &Path,
     blob_root: &Path,
+    bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
-    build_host_with_nbd(label, kernel, handler, blob_root, chunk_store, None)
+    build_host_with_nbd(
+        label,
+        kernel,
+        handler,
+        blob_root,
+        bundle_dir,
+        chunk_store,
+        None,
+    )
 }
 
+#[allow(clippy::too_many_arguments)] // cohesive host-fixture inputs
 fn build_host_with_nbd(
     label: &str,
     kernel: &Path,
     handler: &Path,
     blob_root: &Path,
+    bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
     nbd_device: Option<&Path>,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
@@ -71,6 +82,8 @@ fn build_host_with_nbd(
         .expect("host workdir");
     let mut cfg = FirecrackerConfig::with_kernel(kernel.to_path_buf());
     cfg.net_pool = None;
+    // ADR 0080: both hosts stage the same agentd bundle dir (the fleet mirror).
+    cfg.bundle_dir = bundle_dir.to_path_buf();
     cfg.restore_mode = RestoreMode::File;
     cfg.uffd_handler_bin = handler.to_path_buf();
     cfg.uffd_blob_root = Some(blob_root.to_path_buf());
@@ -175,8 +188,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -185,8 +197,24 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .await
         .expect("bake");
 
-    let (pooled_a, _work_a) = build_host("a", &kernel, &handler, &blob_root, &chunk_store);
-    let (pooled_b, _work_b) = build_host("b", &kernel, &handler, &blob_root, &chunk_store);
+    // ADR 0080: one staged agentd bundle dir shared by both hosts.
+    let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
+    let (pooled_a, _work_a) = build_host(
+        "a",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
+    let (pooled_b, _work_b) = build_host(
+        "b",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
@@ -205,7 +233,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let vm = host_a.pooled.create(spec).await.expect("create on A");
     let _ = exec(&host_a.pooled, vm, "true").await;
@@ -584,8 +612,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -594,8 +621,24 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         .await
         .expect("bake");
 
-    let (pooled_a, _work_a) = build_host("pipe-a", &kernel, &handler, &blob_root, &chunk_store);
-    let (pooled_b, _work_b) = build_host("pipe-b", &kernel, &handler, &blob_root, &chunk_store);
+    // ADR 0080: one staged agentd bundle dir shared by both hosts.
+    let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
+    let (pooled_a, _work_a) = build_host(
+        "pipe-a",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
+    let (pooled_b, _work_b) = build_host(
+        "pipe-b",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
@@ -613,7 +656,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let vm = host_a.pooled.create(spec).await.expect("create on A");
     let _ = exec(&host_a.pooled, vm, "true").await;
@@ -887,8 +930,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -900,11 +942,14 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         .disk_manifest
         .expect("ext4 bake produces a chunked disk manifest");
 
+    // ADR 0080: one staged agentd bundle dir shared by both hosts.
+    let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
     let (pooled_a, _work_a) = build_host_with_nbd(
         "nbd-a",
         &kernel,
         &handler,
         &blob_root,
+        &staged.bundle_dir,
         &chunk_store,
         Some(&nbd_a),
     );
@@ -913,6 +958,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         &kernel,
         &handler,
         &blob_root,
+        &staged.bundle_dir,
         &chunk_store,
         Some(&nbd_b),
     );
@@ -935,7 +981,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let vm = host_a.pooled.create(spec).await.expect("create on A");
     let _ = exec(&host_a.pooled, vm, "true").await;
@@ -1090,8 +1136,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
             tag: "warm-1".into(),
             images_dir: images.path().to_path_buf(),
             format: Format::Ext4,
-            agent_injection: Some(AgentInjection {
-                agent_binary: agent,
+            init_injection: Some(InitInjection {
                 vsock_port: ENGRAM_AGENTD_PORT,
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
@@ -1100,8 +1145,24 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         .await
         .expect("bake");
 
-    let (pooled_a, _work_a) = build_host("ka", &kernel, &handler, &blob_root, &chunk_store);
-    let (pooled_b, _work_b) = build_host("kb", &kernel, &handler, &blob_root, &chunk_store);
+    // ADR 0080: one staged agentd bundle dir shared by both hosts.
+    let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
+    let (pooled_a, _work_a) = build_host(
+        "ka",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
+    let (pooled_b, _work_b) = build_host(
+        "kb",
+        &kernel,
+        &handler,
+        &blob_root,
+        &staged.bundle_dir,
+        &chunk_store,
+    );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
     let client_a = dial(host_a.addr).await;
@@ -1119,7 +1180,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![staged.agentd_slot()],
     };
     let vm = host_a.pooled.create(spec).await.expect("create on A");
     let _ = exec(&host_a.pooled, vm, "true").await;
@@ -1202,7 +1263,7 @@ fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
         eprintln!("SKIP: /dev/kvm not present");
         return None;
     }
-    for bin in ["firecracker", "docker", "mke2fs"] {
+    for bin in ["firecracker", "docker", "mke2fs", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)

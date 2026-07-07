@@ -129,6 +129,20 @@ pub struct BrowserStart {
     pub warning: Option<String>,
 }
 
+/// ADR 0080: outcome of [`SandboxBackend::refresh_agent`] — did the
+/// restored guest's agentd already match the attached bundle
+/// generation, or did it re-exec onto a newer one?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentRefresh {
+    /// The running agentd already matches the slot's content stamp
+    /// (the steady state: one stat inside the guest, nothing spawned).
+    UpToDate,
+    /// The slot carried a different generation; agentd re-exec'd onto
+    /// it and answered ready again. New sessions on this host run the
+    /// fleet's current agentd without any image recapture.
+    Restarted,
+}
+
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
@@ -613,6 +627,22 @@ pub trait SandboxBackend: Send + Sync {
         _env: std::collections::HashMap<String, String>,
     ) -> Result<(), SandboxError> {
         Ok(())
+    }
+
+    /// ADR 0080: ask the restored guest's agentd to adopt the agentd
+    /// bundle generation now attached at its reserved slot
+    /// (`AuxRoDrive::AGENTD_SLOT_INDEX`). The captured agentd re-mounts
+    /// the bundle slots, compares the slot's content stamp against the
+    /// one it booted from, and — if they differ — re-execs itself onto
+    /// the new binary before any session state binds. Called by the
+    /// fresh-create restore path only (resumes keep their pinned
+    /// agentd; the version is per-session).
+    ///
+    /// Default: `UpToDate` no-op. VZ cold-boots every restore, so its
+    /// stage-1 init always picks the attached generation; Process runs
+    /// no guest agentd at all.
+    async fn refresh_agent(&self, _id: SandboxId) -> Result<AgentRefresh, SandboxError> {
+        Ok(AgentRefresh::UpToDate)
     }
 
     /// ADR 0020 P1: restore a per-image base snapshot for a session and

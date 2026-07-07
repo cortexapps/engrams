@@ -65,24 +65,24 @@ pub struct BuildRequest {
     /// Firecracker. Defaults to `Directory` so existing callers keep
     /// working.
     pub format: Format,
-    /// Optional: bake `engram-agentd` into the rootfs at
-    /// `/sbin/engram-agentd` plus a small init shim at
-    /// `/sbin/engram-init` that mounts the essentials and exec's
-    /// the agent on a vsock port. When `Some`, the resulting image
-    /// boots straight into the agent — pair with FC's
-    /// `default_boot_args = "... init=/sbin/engram-init"` and the
-    /// host's `exec_stream` reaches the in-guest agent over vsock.
-    pub agent_injection: Option<AgentInjection>,
+    /// Optional: write the ADR 0080 stage-1 init shim to
+    /// `/sbin/engram-init`. The shim mounts the essentials, mounts the
+    /// aux bundle slots, copies `engram-agentd` out of its reserved
+    /// bundle slot to tmpfs, and exec's the copy on a vsock port —
+    /// agentd itself is NEVER baked into the rootfs. Pair with FC's
+    /// `default_boot_args = "... init=/sbin/engram-init"` and a host
+    /// that stages `bundle-agentd`.
+    pub init_injection: Option<InitInjection>,
 }
 
-/// How to put `engram-agentd` inside the rootfs at bake time. Optional
-/// because the dev backend doesn't need it — only Firecracker images
-/// do.
+/// How to put the stage-1 init shim inside the rootfs at bake time.
+/// Optional because the dev backend doesn't need it — only Firecracker
+/// (and VZ) images do. ADR 0080: this used to also bake the agentd
+/// binary; agentd now rides its reserved bundle slot so it iterates
+/// with zero re-bakes, and the shim is the only engrams file in the
+/// rootfs.
 #[derive(Clone, Debug)]
-pub struct AgentInjection {
-    /// Linux-built `engram-agentd` binary on the host. Copied verbatim
-    /// to `/sbin/engram-agentd` inside the rootfs and chmod'd 0755.
-    pub agent_binary: PathBuf,
+pub struct InitInjection {
     /// Vsock port the agent should listen on inside the guest. Pair
     /// this with the host-side `ENGRAM_AGENTD_PORT` constant
     /// (`engram_sandbox_firecracker::ENGRAM_AGENTD_PORT`, currently
@@ -102,7 +102,7 @@ pub struct AgentInjection {
 }
 
 /// Which `engram-transport` implementation the in-VM binaries should
-/// select at runtime. Set on [`AgentInjection`] at bake time; the
+/// select at runtime. Set on [`InitInjection`] at bake time; the
 /// default init shim writes `ENGRAM_TRANSPORT=<value>` into the rootfs
 /// so `engram-transport::from_env` picks the right impl.
 ///
@@ -135,9 +135,6 @@ impl Transport {
     }
 }
 
-/// Where the agent binary lands inside the rootfs (relative to root).
-const AGENT_PATH: &str = "sbin/engram-agentd";
-
 /// Where the init shim lands inside the rootfs (relative to root).
 /// Pair with kernel boot arg `init=/sbin/engram-init`.
 const INIT_PATH: &str = "sbin/engram-init";
@@ -153,7 +150,7 @@ const VSOCK_PORT_PLACEHOLDER: &str = "__VSOCK_PORT__";
 const TRANSPORT_PLACEHOLDER: &str = "__TRANSPORT__";
 
 /// Default init shim. Written to `/sbin/engram-init` when an
-/// [`AgentInjection`] is requested without an explicit override.
+/// [`InitInjection`] is requested without an explicit override.
 /// Requires `/bin/sh` in the rootfs (alpine, debian-slim, ubuntu —
 /// all standard bases ship it).
 ///
@@ -193,6 +190,14 @@ mount -t devpts devpts /dev/pts 2>/dev/null || true
 # /tmp in our guest, so that path fails too. A real /dev/shm is the fix.
 mkdir -p /dev/shm 2>/dev/null || true
 mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /dev/shm 2>/dev/null || true
+# /run as tmpfs — standard Linux init behavior, and load-bearing for
+# ADR 0080: agentd executes from a tmpfs COPY (/run/engram/) so its
+# text pages are guest memory and the host's paused-window
+# patch_drive swap of the agentd bundle device can never fault a
+# running binary's pages from swapped bytes (the same asymmetry that
+# makes the harness-slot swap safe). Everything staged below
+# (.ca-stage, engram/harnesses, engram/) lands on this tmpfs.
+mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run 2>/dev/null || true
 # /tmp must be the standard world-writable, sticky 1777 dir. Our rootfs
 # ships it as 0755 owned by the session user, which blocks writes from any
 # other uid — e.g. a root `engram exec`, or chromium's renderer running with
@@ -252,6 +257,19 @@ fi
 # dev server). Seed the loopback names if /etc/hosts is empty.
 if [ ! -s /etc/hosts ]; then
     printf '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n' > /etc/hosts
+fi
+# ADR 0080: seed the SHELL-tab ergonomics (colors + a two-tone prompt)
+# if the image doesn't ship its own — engrams-owned polish that no
+# longer belongs in the user's Dockerfile. Quoted heredoc: zero
+# interpolation, the PS1 escapes land verbatim.
+if [ ! -s /root/.bashrc ]; then
+    cat > /root/.bashrc <<'ENGRAM_BASHRC'
+export TERM=xterm-256color
+alias ls="ls --color=auto"
+alias ll="ls -lah --color=auto"
+alias grep="grep --color=auto"
+PS1='\[\e[36m\]\u@\h\[\e[0m\]:\[\e[34m\]\w\[\e[0m\]\$ '
+ENGRAM_BASHRC
 fi
 # ADR 0014 M1.12 (option D) + ADR 0015 M1: engram-init no longer
 # leaves a persistent mount of the harness substrate at
@@ -365,7 +383,34 @@ fi
 # on every session create, and only a tiny fraction of sessions
 # actually use the SHELL tab.
 mark exec_agentd
-exec /sbin/engram-agentd --port __VSOCK_PORT__
+# ADR 0080: agentd is NOT baked into this rootfs — it rides its
+# reserved bundle slot (engram-agentd + agentd.sha256). Probe the
+# mounted slots for it (position-independent: FC keeps dyn/<i> ==
+# slot i, VZ compacts resolved drives), copy binary + content stamp
+# to tmpfs, and exec the COPY. The stamp is what a later
+# RefreshAgent compares against the (possibly patch_drive-swapped)
+# slot to decide a re-exec. PID 1 exiting panics the kernel
+# (panic=1) — a boot without the agentd bundle fails loud, with the
+# reason on the guest console.
+AGENTD_DIR=""
+for d in /opt/engram/dyn/*; do
+    if [ -x "$d/engram-agentd" ]; then
+        AGENTD_DIR="$d"
+        break
+    fi
+done
+if [ -z "$AGENTD_DIR" ]; then
+    echo "engram-init: FATAL: no agentd bundle mounted under /opt/engram/dyn — stage bundle-agentd on the host (ADR 0080)" >&2
+    exit 1
+fi
+mkdir -p /run/engram
+cp "$AGENTD_DIR/engram-agentd" /run/engram/engram-agentd
+chmod 0755 /run/engram/engram-agentd
+if [ -f "$AGENTD_DIR/agentd.sha256" ]; then
+    cp "$AGENTD_DIR/agentd.sha256" /run/engram/agentd.sha256
+fi
+mark agentd_staged
+exec /run/engram/engram-agentd --port __VSOCK_PORT__
 "#;
 
 #[derive(Clone, Debug)]
@@ -623,15 +668,16 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // Optional: inject engram-agentd + bootstrap + an init shim
         // before we pack to ext4. Done after docker export so the
         // rootfs the user described in their Dockerfile is the base;
-        // we just overlay our agent / bootstrap on top.
+        // we just overlay the stage-1 init shim on top.
         //
-        // ADR 0062: the image bakes NO harness. Harnesses are a per-session
-        // selection mounted on `dyn_0` from their own squashfs bundle (the
-        // harness catalog), so there is nothing harness-specific to inject
-        // here — only the agent / bootstrap overlay below.
+        // ADR 0062: the image bakes NO harness. ADR 0080: it bakes NO
+        // agentd either — both ride reserved bundle slots so they iterate
+        // with zero re-bakes. The one engrams file in the rootfs is the
+        // stage-1 init shim below (mounts the slots, copies agentd to
+        // tmpfs, execs it).
         let mut effective_manifest = cfg.to_manifest();
-        if let Some(injection) = &req.agent_injection {
-            inject_agent(&rootfs_dir, injection).await?;
+        if let Some(injection) = &req.init_injection {
+            inject_init(&rootfs_dir, injection).await?;
         }
 
         // ADR 0027: the share-file skill + the git forge glue is no
@@ -1168,7 +1214,7 @@ fn render_manifest_value(manifest: &ImageManifest) -> Result<String, BuildError>
         .map_err(|e| BuildError::Config(format!("render manifest: {e}")))
 }
 
-/// Copy the agent binary into `<rootfs>/sbin/engram-agentd`, write the
+/// Write the stage-1 init shim into `<rootfs>/sbin/engram-init` — the
 /// init shim to `<rootfs>/sbin/engram-init`, and chmod 0755 on both.
 /// Mirrors the layout the kernel boot args expect:
 /// `init=/sbin/engram-init`.
@@ -1177,21 +1223,11 @@ fn render_manifest_value(manifest: &ImageManifest) -> Result<String, BuildError>
 /// host-side: `cfg.harnesses_dir` is mounted into every sandbox at
 /// `/run/engram/harnesses` via virtio-fs, so the rootfs no longer
 /// carries them.
-async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(), BuildError> {
-    if !injection.agent_binary.exists() {
-        return Err(BuildError::Config(format!(
-            "agent_binary {} does not exist",
-            injection.agent_binary.display()
-        )));
-    }
-
-    let agent_dst = rootfs_dir.join(AGENT_PATH);
+async fn inject_init(rootfs_dir: &Path, injection: &InitInjection) -> Result<(), BuildError> {
     let init_dst = rootfs_dir.join(INIT_PATH);
-    if let Some(parent) = agent_dst.parent() {
+    if let Some(parent) = init_dst.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-
-    install_file(&injection.agent_binary, &agent_dst, "agent").await?;
 
     match &injection.init_script {
         Some(src) => install_file(src, &init_dst, "init").await?,
