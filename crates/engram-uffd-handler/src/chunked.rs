@@ -54,7 +54,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use engram_chunk_store::{ChunkCache, ChunkHash, ChunkStore, Manifest, ManifestKind};
+use engram_chunk_store::reader::ChunkCacheReader;
+use engram_chunk_store::{ChunkHash, ChunkStore, Manifest, ManifestKind};
 use engram_core::traits::BlobStorage;
 
 /// What the per-fault resolver returns. Route B has no mmap, so the
@@ -153,9 +154,18 @@ impl PositionalManifest {
 pub struct ChunkedMemoryBackend {
     canonical: PositionalManifest,
     session: PositionalManifest,
-    cache: ChunkCache,
-    /// Backend the cache calls into on miss. Held here (rather
-    /// than on the cache itself) so the cache stays
+    /// ADR 0075: the READ-ONLY view of the shared cache dir. The
+    /// handler cannot mutate the directory by construction.
+    reader: ChunkCacheReader,
+    /// ADR 0075: the populate channel to the one writer (the
+    /// host-agent). `None` = no writer configured (unit tests, and
+    /// the explicit fallback-only mode) — misses go straight to the
+    /// direct-blob fallback.
+    populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
+    /// Blob store for the LAST-RESORT fallback fetch (writer
+    /// unreachable — e.g. a host-agent mid-roll; ADR 0044 K2 handlers
+    /// outlive rolls). Served from memory, never written to the cache
+    /// dir, counted via `engram_substrate_fallback_fetch_total`.
     /// backend-agnostic — see the docstring on `ChunkCache`.
     store: ChunkStore,
 }
@@ -204,13 +214,14 @@ impl From<engram_chunk_store::ChunkStoreError> for ChunkedBackendError {
 }
 
 impl ChunkedMemoryBackend {
-    /// Build from already-loaded canonical + session manifests
-    /// and a chunk cache + the store the cache should miss
-    /// through.
+    /// Build from already-loaded canonical + session manifests, the
+    /// read-only cache view, the populate channel to the writer, and
+    /// the store for the fallback path.
     pub fn new(
         canonical: &Manifest,
         session: &Manifest,
-        cache: ChunkCache,
+        reader: ChunkCacheReader,
+        populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
         store: ChunkStore,
     ) -> Result<Self, ChunkedBackendError> {
         let canonical = PositionalManifest::from_manifest(canonical)?;
@@ -230,7 +241,8 @@ impl ChunkedMemoryBackend {
         Ok(Self {
             canonical,
             session,
-            cache,
+            reader,
+            populate,
             store,
         })
     }
@@ -244,8 +256,17 @@ impl ChunkedMemoryBackend {
         session_ref: engram_core::types::manifest::ManifestRef,
         blob: Arc<dyn BlobStorage>,
         cache_root: &Path,
+        populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
     ) -> Result<Self, ChunkedBackendError> {
-        Self::from_blob_with_session_json(canonical_ref, session_ref, None, blob, cache_root).await
+        Self::from_blob_with_session_json(
+            canonical_ref,
+            session_ref,
+            None,
+            blob,
+            cache_root,
+            populate,
+        )
+        .await
     }
 
     /// ADR 0045 C1: like [`Self::from_blob`], but when
@@ -262,6 +283,7 @@ impl ChunkedMemoryBackend {
         session_manifest_json: Option<&Path>,
         blob: Arc<dyn BlobStorage>,
         cache_root: &Path,
+        populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
     ) -> Result<Self, ChunkedBackendError> {
         let store = engram_chunk_store::ChunkStore::new(blob);
         // ADR 0045 C1: when the canonical and session refs coincide on a
@@ -299,18 +321,14 @@ impl ChunkedMemoryBackend {
             }
             None => store.get_manifest(session_ref).await?,
         };
-        // ADR 0070: this handler POPULATES the shared cache_root (a
-        // faulted chunk's write-through is the whole point of the
-        // locality win) but never EVICTS from it — the host-agent, which
-        // holds the pin set, is the one process per host that evicts.
-        // `budget_bytes` is therefore irrelevant here (eviction_enabled
-        // gates the sweep before budget_bytes is ever consulted); it's
-        // left at the `new()` default rather than plumbed from a
-        // deleted --cache-budget-bytes flag.
-        let mut cfg = engram_chunk_store::cache::ChunkCacheConfig::new(cache_root.to_path_buf());
-        cfg.eviction_enabled = false;
-        let cache = ChunkCache::new(cfg);
-        Self::new(&canonical, &session, cache, store)
+        // ADR 0075: the handler holds a READ-ONLY view of the shared
+        // cache_root — population happens in the one writer (the
+        // host-agent) via the substrate socket, so its global
+        // singleflight / pin set / budget govern this handler's
+        // traffic too. The #437/#522-era per-handler ChunkCache (and
+        // its eviction_enabled:false half-measure) is gone.
+        let reader = ChunkCacheReader::new(cache_root);
+        Self::new(&canonical, &session, reader, populate, store)
     }
 
     /// Bytes per chunk. UFFDIO_COPY copies a full chunk at a time
@@ -376,14 +394,57 @@ impl ChunkedMemoryBackend {
         self.canonical.chunks.get(chunk_idx).copied().flatten()
     }
 
-    /// Bytes for a session-divergent chunk. Routes through the
-    /// `ChunkCache`'s singleflight + local-NVMe layer so multiple
-    /// faults on the same chunk in flight share one fetch.
+    /// Bytes for a session-divergent chunk — the ADR 0075 3-step read
+    /// path: (1) resident on NVMe → serve (trust-on-read, unchanged);
+    /// (2) ask the one writer to populate and read back the fd —
+    /// cross-process misses collapse in the WRITER's singleflight;
+    /// (3) writer unreachable past its retry budget (host-agent
+    /// mid-roll) → direct blob fetch served from memory, never written
+    /// to the cache dir. Step 3 keeps the fault path independent of
+    /// the control plane (ADR 0044 K2) while preserving the
+    /// single-writer invariant.
     pub async fn fetch_chunk(&self, hash: ChunkHash) -> Result<Bytes, ChunkedBackendError> {
-        self.cache
-            .get(hash, || self.store.get_chunk(hash))
-            .await
-            .map_err(Into::into)
+        // 1. Fast path: resident.
+        if let Some(bytes) = self.reader.read(hash).map_err(ChunkedBackendError::Io)? {
+            return Ok(Bytes::from(bytes));
+        }
+        // 2. Populate via the writer. Sync UDS I/O — hop off the
+        // runtime worker (the fault loop block_on's this future on the
+        // handler's small private runtime).
+        if let Some(client) = &self.populate {
+            let client = client.clone();
+            let res = tokio::task::spawn_blocking(move || client.request(hash))
+                .await
+                .map_err(|e| {
+                    ChunkedBackendError::Io(std::io::Error::other(format!(
+                        "populate task join: {e}"
+                    )))
+                })?;
+            match res {
+                Ok(bytes) => return Ok(Bytes::from(bytes)),
+                Err(crate::populate_client::PopulateError::WriterUnreachable(msg)) => {
+                    // The handler exports no Prometheus metrics (it is a
+                    // per-VM leaf process; its telemetry rides logs + the
+                    // stats-file pattern). This WARN is the alarm signal —
+                    // sustained occurrences mean the writer is unreachable
+                    // — and the writer-side populate counter going quiet
+                    // corroborates. (ADR 0075 divergence note.)
+                    tracing::warn!(
+                        %hash,
+                        %msg,
+                        "substrate writer unreachable; direct-blob fallback (uncached)",
+                    );
+                    // fall through to 3
+                }
+                Err(e) => {
+                    return Err(ChunkedBackendError::Io(std::io::Error::other(format!(
+                        "populate: {e}"
+                    ))));
+                }
+            }
+        }
+        // 3. Last resort — memory-only, never written to the cache dir.
+        self.store.get_chunk(hash).await.map_err(Into::into)
     }
 
     /// Chunk-start byte offsets where the session manifest holds
@@ -412,7 +473,7 @@ impl ChunkedMemoryBackend {
 mod tests {
     use super::*;
     use engram_chunk_store::manifest::{ChunkRef, MANIFEST_SCHEMA_VERSION};
-    use engram_chunk_store::{cache::ChunkCacheConfig, ChunkSize, ChunkStore};
+    use engram_chunk_store::{ChunkSize, ChunkStore};
     use engram_storage_local::LocalBlobStorage;
 
     fn synth_manifest(
@@ -435,13 +496,11 @@ mod tests {
         }
     }
 
-    fn make_cache_and_store() -> (ChunkCache, ChunkStore, tempfile::TempDir) {
+    fn make_cache_and_store() -> (ChunkCacheReader, ChunkStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         let cs = ChunkStore::new(blob);
-        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
-        cfg.budget_bytes = 64 * 1024 * 1024;
-        (ChunkCache::new(cfg), cs, dir)
+        (ChunkCacheReader::new(dir.path().join("cache")), cs, dir)
     }
 
     /// Synthesize a distinct ChunkHash per byte tag. The actual
@@ -474,13 +533,72 @@ mod tests {
             canonical_ref,
             blob,
             &dir.path().join("cache"),
+            None,
         )
         .await
         .unwrap();
+        // ADR 0075: the handler's view is read-only BY TYPE — there is
+        // no cache field to mis-configure anymore; the eviction_enabled
+        // assertion this replaced is unrepresentable.
+        let _ = &backend;
+    }
+
+    /// ADR 0075 roll-survival: with the populate socket dead (a
+    /// host-agent mid-roll), a fault still resolves via the direct-blob
+    /// fallback within the retry budget, serves correct bytes, and
+    /// writes NOTHING to the cache dir (the single-writer invariant
+    /// holds even in degraded mode).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_serves_from_blob_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let cs = ChunkStore::new(blob);
+        let bytes = bytes::Bytes::from(vec![9u8; 2048]);
+        let hash = cs.put_chunk(&bytes).await.unwrap();
+
+        let cache_root = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let canonical = synth_manifest(2048, 2048, vec![(0, hash)]);
+        let dead_sock = dir.path().join("nonexistent.sock");
+        let b = ChunkedMemoryBackend::new(
+            &canonical,
+            &canonical,
+            ChunkCacheReader::new(cache_root.clone()),
+            Some(std::sync::Arc::new(
+                crate::populate_client::PopulateClient::new(dead_sock),
+            )),
+            cs,
+        )
+        .unwrap();
+
+        let got = b.fetch_chunk(hash).await.expect("fallback fetch");
+        assert_eq!(got, bytes, "fallback must serve correct bytes");
+
+        // The single-writer invariant in degraded mode: nothing landed
+        // in the cache dir.
+        let entries: Vec<_> = walk(&cache_root);
         assert!(
-            !backend.cache.eviction_enabled(),
-            "the handler must never evict from the shared cache_root",
+            entries.is_empty(),
+            "fallback must not write to the cache dir, found {entries:?}",
         );
+    }
+
+    fn walk(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        out
     }
 
     #[test]
@@ -491,7 +609,7 @@ mod tests {
         let canonical = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let (cache, store, _dir) = make_cache_and_store();
-        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         assert!(matches!(
             b.resolve(0),
             Some(ResolvedPage::Canonical {
@@ -513,7 +631,7 @@ mod tests {
         let canonical = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(7))]);
         let (cache, store, _dir) = make_cache_and_store();
-        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         match b.resolve(512) {
             Some(ResolvedPage::Chunk { hash }) => assert_eq!(hash, h(7)),
             other => panic!("expected Chunk(h(7)), got {other:?}"),
@@ -529,7 +647,7 @@ mod tests {
         let canonical = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let (cache, store, _dir) = make_cache_and_store();
-        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         let r = b.resolve(600).unwrap();
         match r {
             ResolvedPage::Canonical { canonical_offset } => assert_eq!(canonical_offset, 512),
@@ -545,7 +663,7 @@ mod tests {
         let canonical = synth_manifest(1024, 512, vec![(0, h(1))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1))]);
         let (cache, store, _dir) = make_cache_and_store();
-        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         assert!(matches!(
             b.resolve(512),
             Some(ResolvedPage::Zero { offset: 512 })
@@ -562,7 +680,7 @@ mod tests {
         let canonical = synth_manifest(1024, 512, vec![(0, h(1)), (512, h(2))]);
         let session = synth_manifest(1024, 512, vec![(0, h(1))]);
         let (cache, store, _dir) = make_cache_and_store();
-        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         match b.resolve(512) {
             Some(ResolvedPage::Zero { offset }) => assert_eq!(offset, 512),
             other => {
@@ -576,7 +694,7 @@ mod tests {
         let canonical = synth_manifest(1024, 512, vec![]);
         let session = synth_manifest(1024, 512, vec![]);
         let (cache, store, _dir) = make_cache_and_store();
-        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, store).unwrap();
+        let b = ChunkedMemoryBackend::new(&canonical, &session, cache, None, store).unwrap();
         assert!(b.resolve(1024).is_none(), "exactly at total_bytes");
         assert!(b.resolve(99999).is_none(), "past total_bytes");
     }
@@ -589,7 +707,7 @@ mod tests {
         // `ChunkedMemoryBackend` doesn't impl Debug (its ChunkStore /
         // ChunkCache don't), so we can't use `unwrap_err`. Match by
         // hand.
-        match ChunkedMemoryBackend::new(&canonical, &session, cache, store) {
+        match ChunkedMemoryBackend::new(&canonical, &session, cache, None, store) {
             Ok(_) => panic!("chunk_size mismatch must reject"),
             Err(e) => assert!(format!("{e}").contains("chunk_size")),
         }
@@ -600,7 +718,7 @@ mod tests {
         let canonical = synth_manifest(2048, 512, vec![]);
         let session = synth_manifest(1024, 512, vec![]);
         let (cache, store, _dir) = make_cache_and_store();
-        match ChunkedMemoryBackend::new(&canonical, &session, cache, store) {
+        match ChunkedMemoryBackend::new(&canonical, &session, cache, None, store) {
             Ok(_) => panic!("total_bytes mismatch must reject"),
             Err(e) => assert!(format!("{e}").contains("total_bytes")),
         }
@@ -612,7 +730,7 @@ mod tests {
         disk.kind = ManifestKind::Disk;
         let session = synth_manifest(1024, 512, vec![]);
         let (cache, store, _dir) = make_cache_and_store();
-        match ChunkedMemoryBackend::new(&disk, &session, cache, store) {
+        match ChunkedMemoryBackend::new(&disk, &session, cache, None, store) {
             Ok(_) => panic!("non-memory manifest must reject"),
             Err(e) => assert!(format!("{e}").contains("Memory")),
         }
