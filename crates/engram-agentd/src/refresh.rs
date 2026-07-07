@@ -133,15 +133,27 @@ fn stage(bundle: &std::path::Path, sha256: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Env marker [`exec_staged`] sets so the re-exec'd agentd knows it is
+/// NOT a cold boot: it must skip the boot-time ready-port dial
+/// (`main.rs`'s retry loop). A restored VM's host binds no ready
+/// listener — the captured agentd pre-set the ready watch — so the
+/// dial would spin against nothing for its full 90 s deadline BEFORE
+/// the accept loop starts, leaving the guest deaf to the host's
+/// post-re-exec `Ping` re-poll (dev-vm-found on the first KVM run of
+/// `agentd_bundle_reexec`). The re-exec'd agentd's readiness signal IS
+/// that Ping re-poll.
+pub const REEXEC_ENV: &str = "ENGRAM_AGENTD_REEXEC";
+
 /// `execv` the staged binary with this process's own argv (env rides
-/// along — `execv` keeps `environ`). PID 1 exec: the process image is
-/// replaced in place; every fd is CLOEXEC (Rust std default) so the
-/// wire connection and the old listener close, and the new agentd
-/// re-binds and answers the host's readiness re-poll. Only returns on
-/// error.
+/// along — `execv` keeps `environ`, including the [`REEXEC_ENV`]
+/// marker set here). PID 1 exec: the process image is replaced in
+/// place; every fd is CLOEXEC (Rust std default) so the wire
+/// connection and the old listener close, and the new agentd re-binds
+/// and answers the host's readiness re-poll. Only returns on error.
 #[cfg(target_os = "linux")]
 pub fn exec_staged() -> io::Error {
     use std::ffi::CString;
+    std::env::set_var(REEXEC_ENV, "1");
     let argv: Vec<CString> = std::env::args_os()
         .enumerate()
         .filter_map(|(i, a)| {
