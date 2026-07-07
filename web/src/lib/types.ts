@@ -150,7 +150,6 @@ export interface HostView {
   capacity_total_mib: number;
   capacity_used_mib: number;
   running_sandboxes: number;
-  local_snapshots: number;
   /** Observed utilization from the latest heartbeat — disk/mem in
    *  MiB, cpu as a 0–100 percentage. 0 until the host's first
    *  heartbeat after the migration; rendered as an empty bar. */

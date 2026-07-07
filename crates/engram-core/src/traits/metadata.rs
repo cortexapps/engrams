@@ -892,7 +892,7 @@ pub trait MetadataStore: Send + Sync {
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError>;
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
 
-    /// ADR 0071: `hosts.capabilities.fc_snapshot_version` for one host —
+    /// ADR 0068: `hosts.capabilities.fc_snapshot_version` for one host —
     /// the value the eviction pipeline and the checkpoint-advert
     /// reconcile stamp onto a freshly-recorded `snapshots` row so
     /// placement can later pair a restore against the exact FC

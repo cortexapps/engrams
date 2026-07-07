@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use engram_core::traits::{HostClient, MetadataStore};
 use engram_core::types::host::{CapStatus, HostRecord, HostStatus, ReservedBudget};
 use engram_core::types::snapshot::SnapshotMetadata;
-use engram_core::{HostId, SandboxError, SandboxId, SnapshotId};
+use engram_core::{HostId, SandboxError, SandboxId};
 use engram_protocol::heartbeat::ManifestDigest;
 
 use crate::host_registry::HostRegistry;
@@ -36,9 +36,16 @@ use crate::host_registry::HostRegistry;
 pub struct ScheduleContext<'a> {
     pub repo: &'a str,
     pub image_version: &'a str,
-    /// Snapshot id to prefer (zero-cost hot tier hit). `None` for fresh
-    /// sessions; `Some` when resuming or migrating.
-    pub prefer_snapshot_id: Option<SnapshotId>,
+    /// ADR 0078 (GCS-free resume) tier-0 authoritative affinity: the host
+    /// that holds this snapshot's chunks on its NVMe, read from the ONE
+    /// owner of that fact — `SnapshotRecord::host_id` in PG. `None` for
+    /// fresh sessions, or for a resume whose snapshot row has a NULL
+    /// `host_id` (the capturing host was already deleted). Replaces the
+    /// dead `prefer_snapshot_id × HostRecord::local_snapshots` tier (the
+    /// heartbeat mirror was never populated). When `Some` and the host is
+    /// schedulable with disk + RAM/CPU headroom, `pick_from` selects it
+    /// authoritatively; every veto is counted, never silent.
+    pub snapshot_host: Option<HostId>,
     /// Memory hint for capacity ranking. `None` falls through to
     /// "any host with > 0 free capacity" rather than a strict fit.
     pub memory_mib: Option<u32>,
@@ -350,31 +357,29 @@ pub fn rank_hosts(
     now: DateTime<Utc>,
     ttl: Duration,
 ) -> RankedCandidates {
+    // ADR 0078: the authoritative `snapshot_host` tier-0 is decided in
+    // `pick_from` (it needs the reserved-budget map for the RAM/CPU +
+    // disk-headroom veto). `rank_hosts` just yields the schedulable
+    // candidate set in row order; there is no longer a capacity-blind
+    // affinity prefix baked in here (the dead `local_snapshots` tier).
     let mut ranked: Vec<HostId> = Vec::new();
-    if let Some(target) = ctx.prefer_snapshot_id {
-        for h in hosts {
-            if host_passes_filters(h, ctx, now, ttl)
-                && h.local_snapshots.iter().any(|s| s.snapshot_id == target)
-            {
-                ranked.push(h.id);
-            }
-        }
-    }
-    let affinity_len = ranked.len();
     for h in hosts {
-        if host_passes_filters(h, ctx, now, ttl) && !ranked.contains(&h.id) {
+        if host_passes_filters(h, ctx, now, ttl) {
             ranked.push(h.id);
         }
     }
     RankedCandidates {
         hosts: ranked,
-        affinity_len,
+        affinity_len: 0,
     }
 }
 
 /// Pure pick for the resume/evac path. Ranking tiers:
 ///
-/// 1. snapshot-affinity (capacity-blind — the hot-tier hit is worth it),
+/// 1. snapshot-affinity (capacity-CHECKED: the tier-0 veto mirrors every
+///    `host_passes_filters` gate plus disk/RAM/CPU — an affinity host that
+///    can't take the resume falls through to the soft tiers, counted in
+///    `engram_resume_affinity_fallback_total`),
 /// 2. `prefer_host` if it fits both dimensions,
 /// 3. BEST-FIT: smallest free RAM among hosts that fit BOTH `memory_mib`
 ///    and the CPU budget (ADR 0048 — pack, don't spread),
@@ -400,10 +405,6 @@ pub fn pick_from(
             None => Err(PickError::NoCapacity),
         };
     }
-    // 1. snapshot-affinity prefix.
-    if ranked.affinity_len > 0 {
-        return Ok(ranked.hosts[0]);
-    }
     let need_mib = ctx.memory_mib.unwrap_or(0) as i64;
     let need_vcpus = ctx.cpu_budget_vcpus.unwrap_or(0) as i64;
     // Free RAM for `id`: None ⇒ unmeasured (treated as "fits" softly).
@@ -426,6 +427,25 @@ pub fn pick_from(
         }
         budget - reserved.get(&id).map(|r| r.vcpus).unwrap_or(0) >= need_vcpus
     };
+    // Tier 0 (ADR 0078): authoritative snapshot-host affinity. If the
+    // host that holds this snapshot's chunks is alive, schedulable, and
+    // has disk + RAM/CPU headroom, place there ALWAYS — its NVMe already
+    // holds the divergent set, so the resume is a local read. Every veto
+    // is counted (`engram_resume_affinity_fallback_total{reason}`) so the
+    // fallback is never again silent; then we fall through to the soft
+    // tiers below, exactly as a fresh session would.
+    if let Some(sh) = ctx.snapshot_host {
+        match snapshot_host_veto(sh, hosts, ctx, now, ttl, &free_mib_of, &cpu_fits) {
+            None => return Ok(sh),
+            Some(reason) => {
+                metrics::counter!(
+                    "engram_resume_affinity_fallback_total",
+                    "reason" => reason.into_owned(),
+                )
+                .increment(1);
+            }
+        }
+    }
     // 2. soft host-affinity, when it fits both dims (unknown RAM counts
     //    as fitting — same posture as `choose_placement_host`).
     if let Some(want) = ctx.prefer_host {
@@ -455,6 +475,87 @@ pub fn pick_from(
     }
     // 4. capacity-soft fallback.
     Ok(ranked.hosts[0])
+}
+
+/// ADR 0078 tier-0: why (if at all) the authoritative `snapshot_host` is
+/// NOT usable for this placement — the label for
+/// `engram_resume_affinity_fallback_total{reason}`. `None` means "usable,
+/// place there". First-match order mirrors [`exclusion_summary`], then
+/// adds the disk + capacity vetoes tier-0 layers on top:
+/// `dead` (gone from the fleet / not Ready / stale heartbeat) → `cordoned`
+/// → `wire_skew` → `cap:<name>` / `digest_not_ready` (schedulability) →
+/// `disk_full` (free work_dir below the chunk-cache floor — a host about
+/// to disk-evict its cache is a pointless affinity target) → `ram_full` /
+/// `cpu_full` (won't fit the session's committed budget).
+fn snapshot_host_veto(
+    sh: HostId,
+    hosts: &[HostRecord],
+    ctx: &ScheduleContext<'_>,
+    now: DateTime<Utc>,
+    ttl: Duration,
+    free_mib_of: &impl Fn(HostId) -> Option<i64>,
+    cpu_fits: &impl Fn(HostId) -> bool,
+) -> Option<std::borrow::Cow<'static, str>> {
+    let Some(h) = hosts.iter().find(|h| h.id == sh) else {
+        // The capturing host row is gone (deleted / never re-registered).
+        return Some("dead".into());
+    };
+    // Schedulability, in the same order `exclusion_summary` reports.
+    if Some(h.id) == ctx.exclude_host {
+        return Some("excluded".into());
+    }
+    if h.status != HostStatus::Ready {
+        return Some("dead".into());
+    }
+    if h.cordoned {
+        return Some("cordoned".into());
+    }
+    if !host_wire_version_ok(h) {
+        return Some("wire_skew".into());
+    }
+    if now
+        .signed_duration_since(h.last_heartbeat_at)
+        .to_std()
+        .is_ok_and(|age| age > ttl)
+    {
+        return Some("dead".into());
+    }
+    if let Err(cap) = host_meets_capabilities(h, &ctx.caps) {
+        // `cap:<name>` — a fleet-wide fallback spike labeled by WHICH
+        // capability failed (fc_snapshot_version vs bundle_stamp vs
+        // base_shm_tmpfs need very different remediations).
+        return Some(format!("cap:{cap}").into());
+    }
+    if ctx
+        .required_image_digest
+        .as_ref()
+        .is_some_and(|d| !h.ready_images.iter().any(|r| r == d.as_str()))
+    {
+        return Some("digest_not_ready".into());
+    }
+    // Disk: a host with free work_dir below the chunk-cache floor is
+    // disk-pressured and about to evict cache — placing a resume there
+    // defeats the whole point. `disk_total_mib == 0` (unmeasured) is soft
+    // (no veto), same posture as unmeasured RAM.
+    if h.utilization.disk_total_mib > 0 {
+        let free_disk_mib = h
+            .utilization
+            .disk_total_mib
+            .saturating_sub(h.utilization.disk_used_mib);
+        if free_disk_mib < engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB {
+            return Some("disk_full".into());
+        }
+    }
+    // Capacity: the session's committed RAM/CPU budget must fit
+    // (unmeasured RAM is soft). Real veto, not a vibe.
+    let need_mib = ctx.memory_mib.unwrap_or(0) as i64;
+    if free_mib_of(sh).is_some_and(|free| free < need_mib) {
+        return Some("ram_full".into());
+    }
+    if !cpu_fits(sh) {
+        return Some("cpu_full".into());
+    }
+    None
 }
 
 async fn hosts_and_reserved(
@@ -738,10 +839,7 @@ pub async fn fleet_snapshot(meta: &dyn MetadataStore) -> Result<FleetSnapshot, P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engram_core::types::host::{
-        HostCapacity, HostLocalSnapshot, HostMetadata, HostUtilization,
-    };
-    use engram_core::SessionId;
+    use engram_core::types::host::{HostCapacity, HostMetadata, HostUtilization};
 
     fn host(id: u128) -> HostRecord {
         HostRecord {
@@ -760,7 +858,6 @@ mod tests {
             last_heartbeat_at: Utc::now(),
             host_addr: None,
             ready_images: Vec::new(),
-            local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             cordoned: false,
             total_vcpus: 0,
@@ -1096,7 +1193,7 @@ mod tests {
         ScheduleContext {
             repo: "r",
             image_version: "v",
-            prefer_snapshot_id: None,
+            snapshot_host: None,
             memory_mib: None,
             cpu_budget_vcpus: None,
             required_image_digest: None,
@@ -1130,27 +1227,68 @@ mod tests {
         assert_eq!(ranked.hosts, vec![hid(4)]);
     }
 
+    /// ADR 0078 tier 0: an alive, headroom-OK `snapshot_host` is picked
+    /// authoritatively — even over a host with more free RAM (h1) that
+    /// best-fit would otherwise prefer. The bytes are on h2's NVMe.
     #[test]
-    fn snapshot_affinity_hosts_form_the_prefix() {
-        let snap = SnapshotId(uuid::Uuid::from_u128(99));
-        let mut with_snap = host(2);
-        with_snap.local_snapshots.push(HostLocalSnapshot {
-            snapshot_id: snap,
-            session_id: SessionId(uuid::Uuid::from_u128(1)),
-            size_bytes: 1,
-            replicated: true,
-            last_accessed_at: Utc::now(),
-        });
-        let hosts = [host(1), with_snap];
+    fn authoritative_snapshot_host_wins_when_healthy() {
+        let mut h1 = host(1);
+        h1.utilization.allocatable_mib = 64_000; // more free than h2
+        let mut h2 = host(2);
+        h2.utilization.allocatable_mib = 16_000;
         let mut c = ctx();
-        c.prefer_snapshot_id = Some(snap);
-        let ranked = rank_hosts(&hosts, &c, Utc::now(), TTL);
-        assert_eq!(ranked.affinity_len, 1);
-        assert_eq!(ranked.hosts, vec![hid(2), hid(1)]);
-        // And the pick takes the affinity host even though h1 has more
-        // measured free RAM.
-        let pick = pick_from(&hosts, &HashMap::new(), &c, Utc::now(), TTL).unwrap();
-        assert_eq!(pick, hid(2));
+        c.snapshot_host = Some(hid(2));
+        let pick = pick_from(&[h1, h2], &HashMap::new(), &c, Utc::now(), TTL).unwrap();
+        assert_eq!(
+            pick,
+            hid(2),
+            "tier-0 places on the host that holds the chunks"
+        );
+    }
+
+    /// ADR 0078 tier 0 fallbacks: each unusable `snapshot_host` state
+    /// falls through to the soft tiers (here: the other live host) —
+    /// acceptance criterion #3. (The `reason` label is emitted as a
+    /// metric; this asserts the fallback *behaviour*.)
+    #[test]
+    fn snapshot_host_vetoes_fall_through_to_soft_tiers() {
+        // dead: snapshot_host not in the fleet.
+        let mut c = ctx();
+        c.snapshot_host = Some(hid(9)); // absent
+        let pick = pick_from(&[host(1)], &HashMap::new(), &c, Utc::now(), TTL).unwrap();
+        assert_eq!(pick, hid(1), "dead snapshot_host → soft fallback");
+
+        // cordoned: present but cordoned → fall through to the other host.
+        let mut cordoned = host(2);
+        cordoned.cordoned = true;
+        let mut c = ctx();
+        c.snapshot_host = Some(hid(2));
+        let pick = pick_from(&[host(1), cordoned], &HashMap::new(), &c, Utc::now(), TTL).unwrap();
+        assert_eq!(pick, hid(1), "cordoned snapshot_host → soft fallback");
+
+        // disk_full: free work_dir below the chunk-cache floor.
+        let mut disk_full = host(2);
+        disk_full.utilization.disk_total_mib = 200_000;
+        disk_full.utilization.disk_used_mib =
+            200_000 - (engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB - 1);
+        let mut c = ctx();
+        c.snapshot_host = Some(hid(2));
+        let pick = pick_from(&[host(1), disk_full], &HashMap::new(), &c, Utc::now(), TTL).unwrap();
+        assert_eq!(pick, hid(1), "disk-pressured snapshot_host → soft fallback");
+
+        // ram_full: session budget exceeds the snapshot_host's free RAM.
+        let mut ram_full = host(2);
+        ram_full.utilization.allocatable_mib = 1_000;
+        let other = {
+            let mut h = host(1);
+            h.utilization.allocatable_mib = 64_000;
+            h
+        };
+        let mut c = ctx();
+        c.snapshot_host = Some(hid(2));
+        c.memory_mib = Some(8_000); // doesn't fit h2's 1,000 free
+        let pick = pick_from(&[other, ram_full], &HashMap::new(), &c, Utc::now(), TTL).unwrap();
+        assert_eq!(pick, hid(1), "RAM-full snapshot_host → soft fallback");
     }
 
     #[test]

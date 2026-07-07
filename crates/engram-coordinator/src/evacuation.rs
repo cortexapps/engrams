@@ -310,7 +310,7 @@ pub async fn evacuate_dead_source(
     let ctx = ScheduleContext {
         repo: image_repo,
         image_version: image_tag,
-        prefer_snapshot_id: snapshot.as_ref().map(|s| s.id),
+        snapshot_host: snapshot.as_ref().and_then(|s| s.host_id),
         memory_mib: None,
         cpu_budget_vcpus: None,
         // Target-selection: image-cache-warm preference is a future
@@ -670,7 +670,6 @@ mod tests {
                     last_heartbeat_at: chrono::Utc::now(),
                     host_addr: None,
                     ready_images: Vec::new(),
-                    local_snapshots: Vec::new(),
                     current_bundles: Vec::new(),
                     cordoned: false,
                     total_vcpus: 0,

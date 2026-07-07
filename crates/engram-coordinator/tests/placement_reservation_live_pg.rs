@@ -72,7 +72,6 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
         last_heartbeat_at: Utc::now(),
         host_addr: Some(format!("http://{hostname}:9101")),
         ready_images: Vec::new(),
-        local_snapshots: Vec::new(),
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
@@ -92,7 +91,6 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
                 ..HostUtilization::default()
             },
             ready_images: Vec::new(),
-            local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
@@ -391,7 +389,6 @@ async fn ram_ledger_util_columns_round_trip_through_real_pg() {
                 ..HostUtilization::default()
             },
             ready_images: Vec::new(),
-            local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,

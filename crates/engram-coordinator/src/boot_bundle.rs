@@ -471,7 +471,6 @@ mod tests {
                 last_heartbeat_at: chrono::Utc::now(),
                 host_addr: None,
                 ready_images: Vec::new(),
-                local_snapshots: Vec::new(),
                 current_bundles: vec![engram_core::types::sandbox::AuxBundleRef {
                     drive_id: "claude".into(),
                     sha256: "sha256:cafe".into(),

@@ -1260,7 +1260,6 @@ impl HostAgent {
                             used_mib: 0,
                             running_sandboxes: running_count,
                         },
-                        local_snapshots: Vec::new(),
                         running_sandboxes,
                         running_sandboxes_known,
                         draining: false,

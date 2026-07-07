@@ -2507,7 +2507,7 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
-                   ready_images, local_snapshots, current_bundles,
+                   ready_images, current_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
@@ -2541,12 +2541,11 @@ impl MetadataStore for PostgresStore {
     ) -> Result<(), MetaError> {
         // ADR 0047: the single per-heartbeat UPDATE — capacity +
         // utilization + the scheduling state every replica reads
-        // (ready_images / local_snapshots / current_bundles /
-        // total_vcpus). `cordoned` is deliberately absent: it is
-        // coordinator-owned and only `set_host_cordoned` writes it.
+        // (ready_images / current_bundles / total_vcpus). `cordoned` is
+        // deliberately absent: it is coordinator-owned and only
+        // `set_host_cordoned` writes it. (ADR 0078 retired the dead
+        // `local_snapshots` mirror.)
         let ready_images = serde_json::to_value(&hb.ready_images)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
-        let local_snapshots = serde_json::to_value(&hb.local_snapshots)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let current_bundles = serde_json::to_value(&hb.current_bundles)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
@@ -2580,15 +2579,14 @@ impl MetadataStore for PostgresStore {
                       util_cpu_pct = $10,
                       allocatable_mib = $11,
                       ready_images = $12,
-                      local_snapshots = $13,
-                      current_bundles = $14,
-                      total_vcpus = $15,
-                      wire_version = $16,
-                      util_base_shm_mib = $17,
-                      util_parked_pss_mib = $18,
-                      util_running_pss_mib = $19,
-                      capabilities = $20,
-                      stages_images = $21,
+                      current_bundles = $13,
+                      total_vcpus = $14,
+                      wire_version = $15,
+                      util_base_shm_mib = $16,
+                      util_parked_pss_mib = $17,
+                      util_running_pss_mib = $18,
+                      capabilities = $19,
+                      stages_images = $20,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
@@ -2605,7 +2603,6 @@ impl MetadataStore for PostgresStore {
         .bind(hb.utilization.cpu_pct)
         .bind(hb.utilization.allocatable_mib as i64)
         .bind(ready_images)
-        .bind(local_snapshots)
         .bind(current_bundles)
         .bind(hb.total_vcpus as i32)
         .bind(hb.wire_version as i32)
@@ -2660,7 +2657,7 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
-                   ready_images, local_snapshots, current_bundles,
+                   ready_images, current_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
                    last_heartbeat_at, status, host_addr
               FROM hosts

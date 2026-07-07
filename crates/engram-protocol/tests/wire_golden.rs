@@ -371,10 +371,11 @@ fn wire_version_pinned() {
     // 9 -> 10: ADR 0073 (epic #542) — bind_session + AgentSpec carry
     // binding_epoch, the shell-pin/rehandshake RPCs are deleted, heartbeat
     // gains harness_attached. Goldens regenerated in the same change.
-    // (Rebased onto main past #590, which left main at wire 9; this bumps
-    // to 10. The overhaul train's #548 later bumps 10 -> 11.)
+    // 10 -> 11: ADR 0078 phase 2 (epic #548) — the heartbeat drops the
+    // never-populated `local_snapshots` advert (placement affinity reads
+    // PG `snapshots.host_id` instead). Goldens regenerated.
     assert_eq!(
-        WIRE_VERSION, 10,
+        WIRE_VERSION, 11,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

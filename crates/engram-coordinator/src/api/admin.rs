@@ -558,7 +558,7 @@ pub(crate) async fn admin_drain_host_core(
                 let fit_ctx = crate::placement::ScheduleContext {
                     repo: &repo,
                     image_version: &tag,
-                    prefer_snapshot_id: None,
+                    snapshot_host: None,
                     memory_mib: Some(mem_budget.max(0) as u32),
                     cpu_budget_vcpus: Some(cpu_budget.max(0) as u32),
                     required_image_digest: None,
@@ -590,7 +590,7 @@ pub(crate) async fn admin_drain_host_core(
                     let ctx = crate::placement::ScheduleContext {
                         repo: &repo,
                         image_version: &tag,
-                        prefer_snapshot_id: None,
+                        snapshot_host: None,
                         memory_mib: Some(mem_budget.max(0) as u32),
                         cpu_budget_vcpus: Some(cpu_budget.max(0) as u32),
                         required_image_digest: None,

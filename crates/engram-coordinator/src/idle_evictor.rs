@@ -3219,7 +3219,6 @@ mod tests {
                 last_heartbeat_at: chrono::Utc::now(),
                 host_addr: Some("http://127.0.0.1:1".into()),
                 ready_images: Vec::new(),
-                local_snapshots: Vec::new(),
                 current_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,

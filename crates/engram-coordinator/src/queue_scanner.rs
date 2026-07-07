@@ -508,7 +508,7 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
     let ctx = crate::placement::ScheduleContext {
         repo,
         image_version: tag,
-        prefer_snapshot_id: None,
+        snapshot_host: None,
         memory_mib: Some(q.mem_budget_mib.max(0) as u32),
         cpu_budget_vcpus: Some(q.cpu_budget_vcpus.max(0) as u32),
         required_image_digest,
@@ -655,7 +655,7 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<b
     let ctx = crate::placement::ScheduleContext {
         repo,
         image_version: tag,
-        prefer_snapshot_id: None,
+        snapshot_host: None,
         memory_mib: Some(q.mem_budget_mib.max(0) as u32),
         cpu_budget_vcpus: Some(q.cpu_budget_vcpus.max(0) as u32),
         required_image_digest: None,

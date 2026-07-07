@@ -26,14 +26,10 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use engram_core::types::host::{
-    HostCapacity, HostHeartbeat, HostLocalSnapshot, HostMetadata, HostRecord, HostStatus,
-};
+use engram_core::types::host::{HostCapacity, HostHeartbeat, HostMetadata, HostRecord, HostStatus};
 use engram_core::{HostId, SandboxId, SessionId};
 use engram_harness_proto::HarnessEvent;
-use engram_protocol::heartbeat::{
-    EnabledImageRef, HostCapacityReport, LocalSnapshotReport, ManifestDigest,
-};
+use engram_protocol::heartbeat::{EnabledImageRef, HostCapacityReport, ManifestDigest};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -161,7 +157,6 @@ pub async fn register(
         // NOTE: `upsert_host` deliberately does not write `cordoned` —
         // a re-registering host must not clear an operator cordon.
         ready_images: Vec::new(),
-        local_snapshots: Vec::new(),
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
@@ -281,8 +276,6 @@ pub struct HeartbeatRequest {
     /// the redundant `host_id` (which travels in the URL) and
     /// `sent_at` (which the coord doesn't read today).
     pub capacity: HostCapacityReport,
-    #[serde(default)]
-    pub local_snapshots: Vec<LocalSnapshotReport>,
     #[serde(default)]
     pub running_sandboxes: Vec<SandboxId>,
     /// Issue #215: `false` iff the host's `backend.list()` failed this
@@ -453,7 +446,7 @@ pub async fn heartbeat(
     //
     // ADR 0047: the single per-heartbeat persist — capacity +
     // utilization + the scheduling state every coordinator replica
-    // places from (ready_images / local_snapshots / current_bundles /
+    // places from (ready_images / current_bundles /
     // total_vcpus / capabilities). `status` is the HOST-reported side
     // (`draining` = the agent's own shutdown flag); the
     // coordinator-owned `cordoned` bit is deliberately not written here.
@@ -489,17 +482,6 @@ pub async fn heartbeat(
             .ready_images
             .iter()
             .map(|d| d.as_str().to_string())
-            .collect(),
-        local_snapshots: hb
-            .local_snapshots
-            .iter()
-            .map(|s| HostLocalSnapshot {
-                snapshot_id: s.snapshot_id,
-                session_id: s.session_id,
-                size_bytes: s.size_bytes,
-                replicated: s.replicated,
-                last_accessed_at: s.last_accessed_at,
-            })
             .collect(),
         current_bundles: hb.current_bundles.clone(),
         total_vcpus: hb.total_vcpus,

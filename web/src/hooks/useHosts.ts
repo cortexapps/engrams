@@ -11,7 +11,6 @@ function protoHostToLegacy(h: ProtoHostView): HostView {
     capacity_total_mib: Number(h.capacityTotalMib),
     capacity_used_mib: Number(h.capacityUsedMib),
     running_sandboxes: h.runningSandboxes,
-    local_snapshots: Number(h.localSnapshots),
     util_disk_total_mib: Number(h.utilDiskTotalMib),
     util_disk_used_mib: Number(h.utilDiskUsedMib),
     util_mem_total_mib: Number(h.utilMemTotalMib),

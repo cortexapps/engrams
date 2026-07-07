@@ -146,7 +146,6 @@ async fn seed_ready_host(
         last_heartbeat_at: Utc::now(),
         host_addr: None,
         ready_images: Vec::new(),
-        local_snapshots: Vec::new(),
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
@@ -172,7 +171,6 @@ async fn seed_ready_host(
                 ..HostUtilization::default()
             },
             ready_images: ready_images.to_vec(),
-            local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             total_vcpus,
             // Issue #229: report the coordinator's wire version so the

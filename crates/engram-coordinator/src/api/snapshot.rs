@@ -1528,20 +1528,33 @@ async fn resume_from_fc_snapshot(
     // becomes the tag.
     let (image_repo, image_tag) =
         engram_core::types::session::split_image_ref(&session_for_ctx.image);
+    // ADR 0078: feed the tier-0 RAM/CPU veto real budgets instead of
+    // `None` (capacity-blind), so "the snapshot-host is hard-full" is a
+    // real veto rather than a vibe. Best-effort: if the session's spec
+    // can't be resolved (image un-enabled, etc.) we fall back to the
+    // pre-0072 soft `None` posture — the tier-0 DISK veto (the primary
+    // locality signal) still fires regardless.
+    let resume_budget = crate::evacuation::resolve_cold_boot_spec(&state.services.meta, &session)
+        .await
+        .map(|spec| (spec.memory.max_mib, spec.cpu.vcpus));
     let ctx = ScheduleContext {
         repo: image_repo,
         image_version: image_tag,
-        prefer_snapshot_id: Some(record.id),
-        memory_mib: None,
-        cpu_budget_vcpus: None,
+        // ADR 0078: authoritative affinity — the host that holds this
+        // snapshot's chunks (PG `snapshots.host_id`), NOT the dead
+        // `local_snapshots` mirror. `None` if the row's host was deleted.
+        snapshot_host: record.host_id,
+        memory_mib: resume_budget.map(|(mib, _)| mib),
+        cpu_budget_vcpus: resume_budget.map(|(_, vcpus)| vcpus),
         // Restore from a snapshot reuses an existing in-memory image —
         // no chunked-rootfs prefetch needed on the resume path. Snapshot
         // affinity already constrains to a host that has the bytes.
         required_image_digest: None,
         exclude_host: None,
-        // ADR 0045 D4 / ADR 0039: soft preference for the host whose
+        // ADR 0045 D4 / ADR 0039: soft preference (tier 2) for the host whose
         // chunk cache + per-image base shm are warm — the capturing
-        // host first, else wherever the session last ran.
+        // host first, else wherever the session last ran. Ranked below
+        // the authoritative `snapshot_host` tier 0.
         prefer_host: record.host_id.or(session.host_id),
         // ADR 0068: a memory-manifest snapshot restores via the FC UFFD
         // substrate; a candidate host must also match the snapshot's
