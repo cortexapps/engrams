@@ -176,6 +176,60 @@ migrate-orchestrator:
         ORCHESTRATOR_DATABASE_URL=postgres://engram:engram@localhost:5435/engram_orchestrator \
         bunx drizzle-kit migrate
 
+# Provision an orchestrator login (ADR 0051 better-auth). Prompts for
+# email / admin? / password, then creates the user through the running
+# orchestrator's sign-up endpoint (so the password is hashed exactly like
+# a real sign-up) and, if you asked for admin, promotes the role via SQL.
+# Assumes the stack is already up (`just dev`) — it talks to the live
+# orchestrator on :8787 and the postgres container. Idempotent: an
+# already-existing email is tolerated and (if admin) still gets promoted.
+orchestrator-user:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ORIGIN="http://localhost:5173"
+    PORT="${ORCHESTRATOR_PORT:-8787}"
+    URL="http://127.0.0.1:${PORT}/api/auth/sign-up/email"
+
+    read -rp "Email: " EMAIL
+    [[ -n "$EMAIL" ]] || { echo "email is required" >&2; exit 1; }
+    read -rp "Admin? [y/N]: " ADMIN_ANS
+    read -rsp "Password (min 8 chars): " PASSWORD; echo
+    [[ ${#PASSWORD} -ge 8 ]] || { echo "password must be at least 8 characters" >&2; exit 1; }
+    NAME="${EMAIL%@*}"
+
+    echo "→ creating ${EMAIL} via ${URL}"
+    # Password goes through jq's env (not argv) and reaches curl over stdin,
+    # so it never lands in a process arg list.
+    BODY="$(PW="$PASSWORD" jq -n --arg e "$EMAIL" --arg n "$NAME" \
+        '{email:$e, password:env.PW, name:$n}')"
+    CODE="$(printf '%s' "$BODY" | curl -sS -o /tmp/orchestrator-user.out -w '%{http_code}' \
+        -X POST "$URL" -H 'content-type: application/json' -H "origin: ${ORIGIN}" --data @-)"
+
+    if [[ "$CODE" == "200" ]]; then
+        echo "✓ user created"
+    elif grep -qi 'already' /tmp/orchestrator-user.out; then
+        echo "• user already exists — continuing"
+    else
+        echo "✗ sign-up failed (HTTP ${CODE}):" >&2
+        cat /tmp/orchestrator-user.out >&2; echo >&2
+        echo "  (is the orchestrator running? \`just dev\`)" >&2
+        exit 1
+    fi
+    rm -f /tmp/orchestrator-user.out
+
+    if [[ "$ADMIN_ANS" =~ ^[Yy] ]]; then
+        EMAIL_SQL="${EMAIL//\'/\'\'}"
+        echo "→ promoting ${EMAIL} to admin"
+        docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
+            psql -U engram -d engram_orchestrator \
+            -c "UPDATE \"user\" SET role='admin' WHERE email='${EMAIL_SQL}'"
+        echo "✓ role set to admin — sign out and back in to pick it up"
+    fi
+
+    docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
+        psql -U engram -d engram_orchestrator \
+        -c "SELECT email, coalesce(role,'user') AS role FROM \"user\" WHERE email='${EMAIL//\'/\'\'}'"
+
 # Drop the dev DB volume (destructive). Use when migrations diverge.
 db-reset:
     docker compose -f deploy/docker-compose.dev.yml down -v
@@ -368,13 +422,41 @@ reap-sessions:
     fi
     echo "reap-sessions: done. Checkpoints GC in the background once their sessions are gone."
 
-# Build the Claude harness from source, publish it to the local OCI
-# registry, and bake deploy/demo-claude/ against it — pushing the image
-# to localhost:5001 (the registry `just dev` runs). Arch + transport are
-# detected; no per-backend recipe. Requires `just bootstrap` (KEK) and a
-# running local registry (it's up under `just dev`, or `just registry-up`).
+# Bake the canonical `demo` image (deploy/demo/) and push it to the local OCI
+# registry as demo:warm-1 (localhost:5001, the registry `just dev` runs). Arch +
+# transport are detected; no per-backend recipe. ADR 0062: the image carries NO
+# harness — the built-in `claude` harness is a per-session selection staged on
+# the fleet, not baked in. Requires `just bootstrap` (KEK) and a running local
+# registry (it's up under `just dev`, or `just registry-up`). This only PUSHES;
+# use `just bake-demo-enable` to also make it live on the coord.
 bake-demo:
     bash deploy/dev/bake-demo.sh
+
+# Bake the demo image AND make it live on the running coord in one step — the
+# inner-loop cycle after editing deploy/demo/ (engram.toml vcpus/mem, or the
+# rootfs). `bake-demo` only pushes; this then registers it and BLOCKS until the
+# base-snapshot capture (the enable job) reports ready, exiting non-zero if it
+# fails. Because `warm-1` is a fixed tag, a re-bake moves it to a NEW digest: if
+# the image is already enabled we `image refresh` (re-fetch the moved tag + force
+# a re-capture), since `image enable` is idempotent on an already-enabled URI and
+# would keep serving the STALE base snapshot. Requires the stack up
+# (`just dev` / `just dev-fc`).
+bake-demo-enable:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash deploy/dev/bake-demo.sh
+    export ENGRAM_APP_GRPC_ADDR="${ENGRAM_APP_GRPC_ADDR:-http://127.0.0.1:50061}"
+    export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
+    cli=./target/release/engram-cli
+    uri=localhost:5001/demo:warm-1
+    if "$cli" --json image list \
+        | python3 -c "import sys,json; sys.exit(0 if any(i.get('image_uri')=='$uri' for i in json.load(sys.stdin).get('images',[])) else 1)"; then
+        echo "==> $uri already enabled — refreshing (re-fetch moved tag + re-capture base snapshot)"
+        "$cli" image refresh --uri "$uri"
+    else
+        echo "==> enabling $uri (captures base snapshot)"
+        "$cli" image enable --uri "$uri"
+    fi
 
 # Fetch the kernel artifact this host's backend needs (VZ → Kata arm64
 # kernel; Firecracker → FC test kernel+rootfs; process → nothing).
