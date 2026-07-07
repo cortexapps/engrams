@@ -1562,7 +1562,10 @@ impl ChunkedDiskBackend {
                         // ADR 0019: span each dirty-chunk upload under an
                         // active operation so this (now post-resume)
                         // flush still shows in the op's trace.
-                        let put = store.put_chunk(&bytes);
+                        // ADR 0078 move 5: dirty flush chunks are freshly
+                        // re-chunked and new by construction — skip the
+                        // per-chunk `exists()` GCS HEAD that always missed.
+                        let put = store.put_chunk_unchecked(&bytes);
                         match op {
                             Some(op) => {
                                 let span = op.span.in_scope(|| {
@@ -1579,13 +1582,20 @@ impl ChunkedDiskBackend {
                                 put.await?;
                             }
                         }
-                        // ADR 0039 (sticky-everywhere): write-through to the
-                        // local cache so the flushing host keeps its OWN
-                        // just-uploaded chunks and never re-fetches its writes
-                        // from GCS (`put_chunk` is upload-only). Best-effort:
-                        // the chunk is durable in GCS, so a local-cache write
-                        // failure (ENOSPC/perms) is logged, not fatal — reads
-                        // fall back to GCS.
+                        // ADR 0039 (sticky-everywhere): write-through to
+                        // the local cache so the flushing host keeps its
+                        // OWN just-uploaded chunks. Rides the backend's
+                        // explicit cache handle: the store's internal
+                        // write-through (ADR 0078 move 5) only fires when
+                        // the store was built with a cache wired — prod
+                        // wiring, but not a structural guarantee (cache
+                        // and store travel separately into this backend).
+                        // Prod double-writes 16 MiB per chunk as a result;
+                        // collapsing to one cache identity is substrated
+                        // (ADR 0076) territory, not this PR's. Best-effort:
+                        // the chunk is durable in GCS, so a cache-write
+                        // failure is a missed optimization, never
+                        // incorrect (reads fall back).
                         if let Err(e) = cache.put(hash, &bytes).await {
                             tracing::warn!(
                                 chunk = chunk_idx,

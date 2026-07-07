@@ -115,6 +115,18 @@ impl ChunkStore {
     /// PUT a chunk. Computes its hash, writes to
     /// `chunks/sha256/<hex>` (idempotent — same bytes write to the
     /// same key), returns the hash for inclusion in a manifest.
+    ///
+    /// Keeps the `exists()` dedup HEAD: this is the entry point for
+    /// **capture / enable-scale** uploads, where the HEAD is
+    /// load-bearing dedup (a re-bake would otherwise re-upload tens of
+    /// GiB). Flush paths that produce freshly re-chunked (by-construction
+    /// new) data use [`Self::put_chunk_unchecked`] to skip the HEAD.
+    ///
+    /// Either way the local cache is warmed via [`Self::warm_local`] —
+    /// including on the `exists()` short-circuit (ADR 0078 move 4): a
+    /// chunk that is remotely present but locally evicted must still
+    /// re-warm the producing host's cache, or every future resume on
+    /// that host re-fetches from GCS what it already uploaded.
     pub async fn put_chunk(&self, body: &[u8]) -> Result<ChunkHash> {
         let hash = ChunkHash::of(body);
         let key = hash.storage_key();
@@ -122,24 +134,63 @@ impl ChunkStore {
         // For S3/GCS this is a HEAD round-trip; for local fs it's
         // a stat. Both cheap relative to a multi-MB PUT.
         if self.inner.exists(&key).await? {
+            // ADR 0078 move 4: warm the local cache even on the dedup
+            // short-circuit. The chunk is durable in `inner`; if it is
+            // remotely present but locally evicted, this is the only
+            // thing that re-warms it on the producing host.
+            self.warm_local(hash, body).await;
+            metrics::counter!("engram_chunk_put_total", "mode" => "checked", "outcome" => "deduped")
+                .increment(1);
             return Ok(hash);
         }
         let bytes = Bytes::copy_from_slice(body);
         let _ = self.inner.put(&key, bytes).await?;
-        // Write-through the local cache (if wired): the host that produced
-        // this chunk should read it back locally (μs) rather than re-fetch
-        // it from the blob store (~110 ms) on the next resume — symmetric
-        // with the read path's populate-on-miss. `write_local` runs the
-        // cache's *debounced* budget sweep, so a burst of write-throughs
-        // (e.g. an idle-eviction re-chunk) enforces the free-space floor at
-        // most once per interval — it does NOT skip eviction the way
-        // `put_no_evict` would, which on a disk-pressured host could overshoot
-        // the floor. LRU then retains these fresh chunks and evicts stale
-        // ones, exactly the set we want warm for the resume. `hash` was just
-        // computed above, so `write_local` skips a redundant re-hash.
-        // Best-effort: the chunk is already durable in `inner`, so a cache
-        // write failure is a missed optimization, never incorrect (reads
-        // fall back to the blob store).
+        self.warm_local(hash, body).await;
+        metrics::counter!("engram_chunk_put_total", "mode" => "checked", "outcome" => "uploaded")
+            .increment(1);
+        tracing::trace!(hash = %hash, bytes = body.len(), "chunk PUT");
+        Ok(hash)
+    }
+
+    /// PUT a chunk WITHOUT the `exists()` dedup HEAD (ADR 0078 move 5).
+    ///
+    /// For the flush paths — the NBD disk flush and the teleport memory
+    /// catch-up — whose input is freshly re-chunked dirty data that is
+    /// **new by construction** (a content boundary shifted, so the hash
+    /// changed). The HEAD there is pure waste: O(dirty) GCS round-trips
+    /// per flush that always miss. Content-addressed PUTs are idempotent,
+    /// so the rare identical-content revert re-uploads one 16 MiB chunk
+    /// harmlessly. Unconditional PUT + unconditional local warm.
+    ///
+    /// Not for capture/enable uploads — see [`Self::put_chunk`], where
+    /// the dedup HEAD saves re-uploading tens of GiB on a re-bake.
+    pub async fn put_chunk_unchecked(&self, body: &[u8]) -> Result<ChunkHash> {
+        let hash = ChunkHash::of(body);
+        let key = hash.storage_key();
+        let bytes = Bytes::copy_from_slice(body);
+        let _ = self.inner.put(&key, bytes).await?;
+        self.warm_local(hash, body).await;
+        metrics::counter!("engram_chunk_put_total", "mode" => "unchecked", "outcome" => "uploaded")
+            .increment(1);
+        tracing::trace!(hash = %hash, bytes = body.len(), "chunk PUT (unchecked)");
+        Ok(hash)
+    }
+
+    /// Write-through the local cache (if wired): the host that produced
+    /// this chunk should read it back locally (μs) rather than re-fetch
+    /// it from the blob store (~110 ms) on the next resume — symmetric
+    /// with the read path's populate-on-miss. `write_local` runs the
+    /// cache's *debounced* budget sweep, so a burst of write-throughs
+    /// (e.g. an idle-eviction re-chunk) enforces the free-space floor at
+    /// most once per interval — it does NOT skip eviction the way
+    /// `put_no_evict` would, which on a disk-pressured host could overshoot
+    /// the floor. LRU then retains these fresh chunks and evicts stale
+    /// ones, exactly the set we want warm for the resume. `hash` is
+    /// pre-computed by the caller, so `write_local` skips a redundant
+    /// re-hash. Best-effort: the chunk is already durable in `inner`, so
+    /// a cache write failure is a missed optimization, never incorrect
+    /// (reads fall back to the blob store).
+    async fn warm_local(&self, hash: ChunkHash, body: &[u8]) {
         if let Some(cache) = &self.cache {
             if let Err(e) = cache.write_local(hash, body).await {
                 tracing::debug!(
@@ -150,8 +201,6 @@ impl ChunkStore {
                 );
             }
         }
-        tracing::trace!(hash = %hash, bytes = body.len(), "chunk PUT");
-        Ok(hash)
     }
 
     /// GET a chunk's bytes. The resolver verifies the returned
@@ -555,5 +604,167 @@ mod tests {
         let back = s.get_chunk(h).await.unwrap();
         assert_eq!(&back[..], body);
         assert!(s.chunk_exists(h).await.unwrap());
+    }
+
+    // ---- ADR 0078 Phase 1: write-through floor ----
+
+    /// A `BlobStorage` that wraps a real local store and counts the
+    /// `exists()` (HEAD) and `put()` (upload) calls the chunk-store
+    /// makes, so tests can assert the flush-path HEAD is gone and the
+    /// dedup HEAD is preserved.
+    struct CountingBlob {
+        inner: Arc<dyn BlobStorage>,
+        exists_calls: std::sync::atomic::AtomicUsize,
+        put_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl CountingBlob {
+        fn wrap(inner: Arc<dyn BlobStorage>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                exists_calls: std::sync::atomic::AtomicUsize::new(0),
+                put_calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn exists_count(&self) -> usize {
+            self.exists_calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn put_count(&self) -> usize {
+            self.put_calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    #[async_trait::async_trait]
+    impl BlobStorage for CountingBlob {
+        async fn put_streaming(
+            &self,
+            key: &str,
+            body: engram_core::traits::storage::ByteStream,
+        ) -> std::result::Result<u64, engram_core::error::BlobError> {
+            self.put_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.put_streaming(key, body).await
+        }
+        async fn get_streaming(
+            &self,
+            key: &str,
+        ) -> std::result::Result<
+            engram_core::traits::storage::ByteStream,
+            engram_core::error::BlobError,
+        > {
+            self.inner.get_streaming(key).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> std::result::Result<
+            engram_core::traits::storage::BlobObjectMeta,
+            engram_core::error::BlobError,
+        > {
+            self.exists_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.head(key).await
+        }
+        async fn delete(
+            &self,
+            key: &str,
+        ) -> std::result::Result<(), engram_core::error::BlobError> {
+            self.inner.delete(key).await
+        }
+        async fn list_prefix(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<Vec<String>, engram_core::error::BlobError> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    /// A store over a `CountingBlob`, with a wired write-through cache.
+    /// Returns the counting handle + cache so tests can assert both the
+    /// blob-call counts and local residency.
+    async fn counting_store_with_cache(
+    ) -> (ChunkStore, Arc<CountingBlob>, ChunkCache, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
+        let counting = CountingBlob::wrap(inner);
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig::from_env_or_default(dir.path().join("cache")),
+            0.0,
+        );
+        let store = ChunkStore::new(counting.clone()).with_chunk_cache(cache.clone());
+        (store, counting, cache, dir)
+    }
+
+    /// ADR 0078 move 4: the `exists()` dedup short-circuit must STILL
+    /// warm the local cache — a chunk that is remotely present but
+    /// locally evicted is re-warmed by a put, closing the
+    /// "write-through … failed"-adjacent re-miss class.
+    #[tokio::test]
+    async fn put_chunk_exists_arm_warms_local_cache() {
+        let (s, _counting, cache, _d) = counting_store_with_cache().await;
+        let body = b"a chunk that already lives in the blob store";
+        // First put lands it in the blob store AND the cache.
+        let h = s.put_chunk(body).await.unwrap();
+        // Simulate a local eviction while the blob remains durable.
+        cache.evict_on_disk_for_test(h);
+        assert!(!cache.contains_on_disk(h), "precondition: locally evicted");
+        // A second put hits the exists() short-circuit — but must
+        // re-warm the local cache anyway.
+        let h2 = s.put_chunk(body).await.unwrap();
+        assert_eq!(h, h2);
+        assert!(
+            cache.contains_on_disk(h),
+            "exists()-arm put must re-warm the locally-evicted chunk",
+        );
+    }
+
+    /// ADR 0078 move 5: `put_chunk_unchecked` issues ZERO `exists()`
+    /// HEADs, uploads unconditionally, and warms the local cache.
+    #[tokio::test]
+    async fn put_chunk_unchecked_skips_head_and_warms_cache() {
+        let (s, counting, cache, _d) = counting_store_with_cache().await;
+        let body = b"freshly re-chunked dirty flush data";
+        let h = s.put_chunk_unchecked(body).await.unwrap();
+        assert_eq!(counting.exists_count(), 0, "unchecked put issues no HEAD");
+        assert_eq!(counting.put_count(), 1, "unchecked put uploads once");
+        assert!(
+            cache.contains_on_disk(h),
+            "unchecked put must warm the local cache",
+        );
+        // Round-trips.
+        assert_eq!(&s.get_chunk(h).await.unwrap()[..], body);
+    }
+
+    /// A flush of N dirty chunks via `put_chunk_unchecked` issues ZERO
+    /// `exists()` HEADs (baseline was N HEADs) — the acceptance-criteria
+    /// #2 property.
+    #[tokio::test]
+    async fn flush_of_n_dirty_chunks_issues_zero_heads() {
+        let (s, counting, _cache, _d) = counting_store_with_cache().await;
+        for i in 0..16u32 {
+            let body = format!("dirty chunk {i}");
+            s.put_chunk_unchecked(body.as_bytes()).await.unwrap();
+        }
+        assert_eq!(counting.exists_count(), 0, "no HEADs across the flush");
+        assert_eq!(counting.put_count(), 16, "one PUT per dirty chunk");
+    }
+
+    /// The capture-path `put_chunk` STILL dedups via the `exists()`
+    /// HEAD — a second put of identical bytes issues the HEAD and skips
+    /// the upload (regression guard: move 5 must not change `put_chunk`).
+    #[tokio::test]
+    async fn put_chunk_still_dedups_on_second_identical_put() {
+        let (s, counting, _cache, _d) = counting_store_with_cache().await;
+        let body = b"capture-path chunk, deduped on re-put";
+        s.put_chunk(body).await.unwrap();
+        let after_first_puts = counting.put_count();
+        s.put_chunk(body).await.unwrap();
+        assert_eq!(
+            counting.put_count(),
+            after_first_puts,
+            "second identical put_chunk must dedup (no re-upload)",
+        );
+        assert!(
+            counting.exists_count() >= 2,
+            "put_chunk keeps its dedup HEAD on every call",
+        );
     }
 }
