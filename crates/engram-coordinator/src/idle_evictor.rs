@@ -74,7 +74,45 @@ pub enum EvictOutcome {
 /// matching the historical idle-eviction shape. Operator-driven
 /// drains (ADR 0018 commit 12) use [`evict_session_to_state`]
 /// directly with `target_state = Evacuating`.
-/// ADR 0074 rung 2: does `sandbox_id`'s host have memory headroom to
+/// ADR 0074 rung-2 park bookkeeping, run after a successful `pause`:
+/// stamp `park_rung=2`/`parked_at`, and make the STATUS say what the VM
+/// is doing. The natural path enters already `Evicting` (nominated); the
+/// admin `EvictIdle` path enters `Active`, and returning `ParkedPaused`
+/// without a transition used to leave an ACTIVE session over a frozen VM
+/// — `park_rung == 2` uniformly means `Evicting` now. (The `ensure_active`
+/// Active-arm un-park stays as the backstop for the crash window between
+/// the pause and this transition.)
+async fn park_paused_bookkeeping(
+    state: &SharedState,
+    session_id: SessionId,
+    entry_status: SessionState,
+) -> Result<(), engram_core::MetaError> {
+    state
+        .services
+        .meta
+        .set_session_park_rung(session_id, 2, Some(Utc::now()))
+        .await?;
+    if entry_status == SessionState::Active {
+        state
+            .services
+            .meta
+            .transition_session(session_id, SessionState::Evicting)
+            .await?;
+        let _ = state
+            .emit(
+                session_id,
+                crate::state::SessionEvent::StatusChanged {
+                    from: SessionState::Active,
+                    to: SessionState::Evicting,
+                    at: Utc::now(),
+                },
+            )
+            .await;
+    }
+    Ok(())
+}
+
+/// ADR 0074 rung 2: does the session's host have memory headroom to
 /// keep a VM PAUSED (rung 2) rather than fully evicting it? Reads the
 /// heartbeat-persisted `hosts.utilization`. Fails CLOSED (no headroom →
 /// full eviction) on a telemetry gap: a paused VM frees no RAM, so
@@ -85,8 +123,17 @@ pub enum EvictOutcome {
 /// Headroom threshold reuses the detector's mem floor (default 15% free)
 /// plus a margin, so a host that is not "under pressure" for eviction
 /// purposes has room to hold a paused VM.
-async fn host_has_memory_headroom(state: &SharedState, sandbox_id: SandboxId) -> bool {
-    let Some(host_id) = state.host_registry.host_of(sandbox_id) else {
+async fn host_has_memory_headroom(state: &SharedState, session_id: SessionId) -> bool {
+    // Resolve the host through PG, NOT the in-memory `host_registry`: this
+    // runs on whichever coord replica took the RPC / scanner tick, and a
+    // replica that never cached the sandbox→host bind would fail closed
+    // here — silently degrading every park into a full eviction on that
+    // pod (a coin flip in a 2-replica deployment).
+    let host_id = match state.services.meta.get_session(session_id).await {
+        Ok(s) => s.host_id,
+        Err(_) => return false,
+    };
+    let Some(host_id) = host_id else {
         return false;
     };
     let hosts = match state.services.meta.list_active_hosts().await {
@@ -218,7 +265,7 @@ pub async fn evict_session_to_state(
     // binding; this catches the case that wedged a session when an idle-evict
     // completed exactly as a drain dispatched it — already `Idle`, but the
     // drain still drove it to `Evacuating` on a destroyed sandbox.
-    match state.services.meta.get_session(session_id).await {
+    let entry_status = match state.services.meta.get_session(session_id).await {
         Ok(s) if !matches!(s.status, SessionState::Active | SessionState::Evicting) => {
             tracing::info!(
                 session_id = %session_id,
@@ -229,13 +276,13 @@ pub async fn evict_session_to_state(
                 reason: "session no longer evictable (a concurrent eviction won the lease first)",
             });
         }
-        Ok(_) => {}
+        Ok(s) => s.status,
         Err(e) => {
             return Err(EvictError::Meta(format!(
                 "evict: re-read session state after lease: {e}"
             )));
         }
-    }
+    };
 
     // ADR 0016 A.1.1: entry log. Was silent before — a coord pod
     // running the pipeline repeatedly (e.g. retry storm, post-roll
@@ -298,26 +345,27 @@ pub async fn evict_session_to_state(
         // idle-evict path parks; drain/evac (Evacuating) always captures.
         // `allow_park == false` is the reaper's DESCENT path (already
         // parked, now forcing the full capture) — it must never re-park.
-        if allow_park && host_has_memory_headroom(state, sandbox_id).await {
+        if allow_park && host_has_memory_headroom(state, session_id).await {
             match state.services.host.pause(sandbox_id).await {
-                Ok(()) => {
-                    if let Err(e) = state
-                        .services
-                        .meta
-                        .set_session_park_rung(session_id, 2, Some(Utc::now()))
-                        .await
-                    {
-                        tracing::warn!(session_id = %session_id, error = %e,
-                            "rung-2 park: park_rung stamp failed; un-pausing to avoid a stuck paused VM");
-                        let _ = state.services.host.resume(sandbox_id).await;
-                    } else {
+                Ok(()) => match park_paused_bookkeeping(state, session_id, entry_status).await {
+                    Ok(()) => {
                         ::metrics::counter!(crate::metrics::EVICTION_PARKED_PAUSED_TOTAL)
                             .increment(1);
                         tracing::info!(session_id = %session_id, %sandbox_id,
-                            "rung-2 park: VM paused in place (host has memory headroom)");
+                                "rung-2 park: VM paused in place (host has memory headroom)");
                         return Ok(EvictOutcome::ParkedPaused);
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(session_id = %session_id, error = %e,
+                                "rung-2 park: bookkeeping failed; un-pausing and falling through to full eviction");
+                        let _ = state.services.host.resume(sandbox_id).await;
+                        let _ = state
+                            .services
+                            .meta
+                            .set_session_park_rung(session_id, 0, None)
+                            .await;
+                    }
+                },
                 Err(engram_core::SandboxError::InvalidSpec(_)) => {
                     // Backend can't pause (VZ/Process) — fall through to
                     // the full eviction below.
@@ -1233,7 +1281,7 @@ async fn park_reaper_advance_one(
         .parked_at
         .map(|at| Utc::now().signed_duration_since(at) >= park_dwell_cap())
         .unwrap_or(true); // no stamp → treat as long-parked (descend)
-    let has_headroom = host_has_memory_headroom(state, sandbox_id).await;
+    let has_headroom = host_has_memory_headroom(state, session_id).await;
     let reason = if !has_headroom {
         "pressure"
     } else if dwell_exceeded {
@@ -3217,6 +3265,7 @@ mod tests {
             .host_registry
             .host_of(sandbox_id)
             .expect("sandbox routed");
+        meta.session.lock().host_id = Some(host_id); // headroom resolves via PG now
         seed_host_with_free_ram(&meta, host_id, 60_000); // ~91% free ≥ 30 floor
 
         let outcome = evict_idle_session(&state, session_id, sandbox_id)
@@ -3288,6 +3337,7 @@ mod tests {
             .host_registry
             .host_of(sandbox_id)
             .expect("sandbox routed");
+        meta.session.lock().host_id = Some(host_id); // headroom resolves via PG now
         seed_host_with_free_ram(&meta, host_id, 60_000);
 
         // Park first.
@@ -3361,6 +3411,7 @@ mod tests {
             .await
             .unwrap();
         let host_id = state.host_registry.host_of(sandbox_id).expect("routed");
+        meta.session.lock().host_id = Some(host_id); // headroom resolves via PG now
         seed_host_with_free_ram(&meta, host_id, 60_000);
         // Freshly parked (within dwell) with headroom → the reaper holds.
         state
