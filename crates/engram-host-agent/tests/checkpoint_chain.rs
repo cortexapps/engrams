@@ -86,11 +86,6 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // ---- 1. Bake an agentd-injected rootfs ----
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-ckpt-chain-test\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let work = tempfile::tempdir().expect("work dir");
     let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(

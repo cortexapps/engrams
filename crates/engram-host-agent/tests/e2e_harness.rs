@@ -229,8 +229,8 @@ async fn ensure_harness_artifacts() -> (PathBuf, PathBuf) {
 /// the rootfs now, not on a separate substrate).
 ///
 /// Dockerfile COPYs the prebuilt harness wrapper + claude CLI from
-/// the build context; engram.toml declares the custom-harness
-/// launch contract. The egress CA reaches the guest at runtime via
+/// the build context (ADR 0080: no engram.toml — the bake carries no
+/// runtime config). The egress CA reaches the guest at runtime via
 /// `AgentSpec.host_ca_pem`, which rides the `SpawnHarness` vsock RPC
 /// (2026-07 core-ops fold: agentd installs the CA before spawning,
 /// one first-contact call instead of two).
@@ -264,18 +264,6 @@ async fn bake_harness_rootfs(repo: &str, harness_bin: &Path, claude_bin: &Path) 
          COPY harness /opt/engram/harness/harness\n\
          COPY claude /opt/engram/harness/claude\n\
          RUN chmod +x /opt/engram/harness/harness /opt/engram/harness/claude\n",
-    )
-    .unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        format!(
-            r#"name = "{repo}"
-
-[harness]
-name = "claude"
-exec = "/opt/engram/harness/harness"
-"#,
-        ),
     )
     .unwrap();
 

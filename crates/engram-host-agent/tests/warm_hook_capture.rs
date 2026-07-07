@@ -307,11 +307,6 @@ impl TestEnv {
     async fn bake(&self, name: &str) -> std::path::PathBuf {
         let src = tempfile::tempdir().expect("source dir");
         std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-        std::fs::write(
-            src.path().join("engram.toml"),
-            format!("name = \"{name}\"\n"),
-        )
-        .unwrap();
         let baker = Builder::new(DockerCli::new(), self.chunk_store.clone());
         let outcome = baker
             .build(&BuildRequest {

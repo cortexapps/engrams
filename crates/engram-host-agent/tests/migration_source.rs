@@ -84,11 +84,6 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     // ---- 1. Bake an agentd-injected rootfs ----
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-migration-src-test\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let work = tempfile::tempdir().expect("work dir");
     let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(

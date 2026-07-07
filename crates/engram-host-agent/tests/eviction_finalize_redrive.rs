@@ -140,11 +140,6 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
     // ---- 1. Bake an agentd-injected rootfs ----
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-evict-finalize-test\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let work = tempfile::tempdir().expect("work dir");
     let blob_root = work.path().join("blob");

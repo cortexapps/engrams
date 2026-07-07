@@ -174,11 +174,6 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     // Bake once (host A's image; the chunks land in the shared store).
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-two-host-teleport\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let baker = Builder::new(DockerCli::new(), chunk_store.clone());
     let outcome = baker
@@ -598,11 +593,6 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
          COPY --from=build /epoll_reader /usr/local/bin/epoll_reader\n",
     )
     .unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-teleport-pipe\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let baker = Builder::new(DockerCli::new(), chunk_store.clone());
     let outcome = baker
@@ -916,11 +906,6 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
 
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-teleport-nbd\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let baker = Builder::new(DockerCli::new(), chunk_store.clone());
     let outcome = baker
@@ -1122,11 +1107,6 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-kill-source-test\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let baker = Builder::new(DockerCli::new(), chunk_store.clone());
     let outcome = baker

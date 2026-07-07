@@ -248,11 +248,6 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
              curl ca-certificates iproute2 iputils-ping && rm -rf /var/lib/apt/lists/*\n",
     )
     .unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-proxy-e2e\"\n",
-    )
-    .unwrap();
     let images = tempfile::tempdir().expect("images");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(

@@ -104,11 +104,6 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
          RUN mkdir -p /workspace\n",
     )
     .unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"proxy-port-loopback-test\"\n",
-    )
-    .unwrap();
 
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");

@@ -74,11 +74,6 @@ async fn vsock_delivers_after_plain_pause_resume() {
     // ---- 1. Bake an agent-baked ext4 image (same recipe as exec_real_vm) ----
     let src = tempfile::tempdir().expect("source dir");
     std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"engram-pause-resume-test\"\n",
-    )
-    .unwrap();
 
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
