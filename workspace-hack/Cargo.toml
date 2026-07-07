@@ -96,6 +96,7 @@ zeroize = { version = "1" }
 base64 = { version = "0.22" }
 byteorder = { version = "1" }
 bytes = { version = "1", features = ["serde"] }
+cc = { version = "1", default-features = false, features = ["parallel"] }
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }

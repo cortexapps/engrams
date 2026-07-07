@@ -214,6 +214,18 @@ Recapture remains only for: image content, resources, warm config, and
 
 ### C. Host-side materialization
 
+**Phase 3a divergences (implementation):** flatten resolves ancestor
+symlinks IN-SCOPE (docker `FollowSymlinkInScope` semantics — usrmerge
+`bin -> usr/bin` layers land correctly; hostile symlink targets clamp at
+the tree root; loops fail loud), closing the symlink half of zip-slip
+that plain path checks miss. Ownership: tar `(uid,gid,mode)` rides a
+`TreeMetadata` sidecar; modes (incl. setuid) always apply; `lchown`
+applies for real under root (the 3b host RPC) and downgrades to a warn
+unprivileged (tests; same limitation the docker-export bake had) —
+mke2fs has no ownership-override table, so root-applies-to-tree is the
+seam. engram-image-builder now depends on the materializer (ext4 packer
++ init shim moved there; re-exported for existing consumers).
+
 New crate `engram-rootfs-materializer`: pull a standard OCI/Docker
 image (streaming, platform by host arch), whiteout-aware flatten
 (`.wh.`, opaque dirs, xattrs/hardlinks/setuid, ownership), extract the

@@ -8,6 +8,7 @@ members = [
     "crates/engram-host-operator",
     "crates/engram-chunk-store",
     "crates/engram-image-builder",
+    "crates/engram-rootfs-materializer",
     "crates/engram-publish-builtin-harness",
     "crates/engram-cli",
     "crates/engram-agentd",
@@ -90,6 +91,7 @@ engram-secrets-gcp = { path = "crates/engram-secrets-gcp" }
 engram-git-dev = { path = "crates/engram-git-dev" }
 engram-git-github = { path = "crates/engram-git-github" }
 engram-image-builder = { path = "crates/engram-image-builder" }
+engram-rootfs-materializer = { path = "crates/engram-rootfs-materializer" }
 engram-agentd = { path = "crates/engram-agentd" }
 engram-uffd-handler = { path = "crates/engram-uffd-handler" }
 engram-egress-proxy = { path = "crates/engram-egress-proxy" }
@@ -179,6 +181,11 @@ clap = { version = "4", features = ["derive", "env"] }
 # misc
 tar = "0.4"
 flate2 = "1"
+# ADR 0080: engram-rootfs-materializer's deterministic-pack mtime clamp
+# (regular files, dirs, AND symlinks — std can't lutimes) and its OCI
+# layer xattr application. Both are already transitive deps of `tar`.
+filetime = "0.2"
+xattr = "1"
 # ADR 0055 P2: read user-uploaded .zip skill archives. Lean: deflate + store
 # only (no bzip2/zstd/aes), and extraction is budgeted against zip bombs.
 zip = { version = "2", default-features = false, features = ["deflate"] }
