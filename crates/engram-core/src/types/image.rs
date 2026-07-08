@@ -132,7 +132,17 @@ pub struct WarmConfig {
     /// config, one shape, one edit surface. Resolution is FAIL-LOUD: an
     /// unresolvable ref aborts the capture (a silently-missing secret
     /// bakes a corrupt warm snapshot).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// NO `skip_serializing_if` here (the `WarmStageRecord` precedent —
+    /// see capture_progress.rs): `WarmConfig` ALSO crosses the coord→host
+    /// wire as bincode-positional `warm_bincode`, and skipping a
+    /// non-trailing field silently corrupts that framing (the dev-brain
+    /// enable failed decode with UnexpectedEof on exactly this). The
+    /// entries themselves never ride the wire anyway — the coordinator
+    /// strips `env`/`network` from the wire clone (internally-tagged
+    /// `CaptureEnvValue` can't bincode-decode at all) and ships the
+    /// resolved env separately.
+    #[serde(default)]
     pub env: Vec<CaptureEnvEntry>,
 
     /// Network policy for the capture VM while the `[warm]` hook runs.

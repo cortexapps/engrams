@@ -503,3 +503,46 @@ fn regen_golden() {
         },
     );
 }
+
+/// ADR 0080 prod regression (dev-brain enable): `WarmConfig.env` holds
+/// `CaptureEnvValue`, an internally-tagged serde enum — bincode cannot
+/// DECODE that representation (`deserialize_any`), so a non-empty
+/// `[[warm.env]]` crossing the wire fails host-side at capture. The
+/// coordinator therefore ships a STRIPPED wire clone (env cleared,
+/// network dropped — both are coordinator concerns per the wire-v13
+/// contract). This test pins both halves: the stripped shape
+/// round-trips, and the tagged shape still fails decode — if a future
+/// serde change makes the tagged enum bincode-safe, the second assert
+/// fires and the strip (plus this test) can be retired.
+#[test]
+fn warm_config_wire_shape_round_trips_only_when_stripped() {
+    use engram_core::types::image::{CaptureEnvEntry, CaptureEnvValue, WarmConfig};
+
+    let stripped = WarmConfig {
+        command: vec!["bash".into(), "-lc".into(), "/opt/engram/warm.sh".into()],
+        timeout_secs: Some(3300),
+        workdir: Some("/workspace".into()),
+        env: Vec::new(),
+        network: None,
+    };
+    let bytes = bincode::serialize(&Some(stripped.clone())).expect("encode stripped");
+    let back: Option<WarmConfig> = bincode::deserialize(&bytes).expect("decode stripped");
+    assert_eq!(back.as_ref().map(|w| &w.command), Some(&stripped.command));
+
+    let tagged = WarmConfig {
+        env: vec![CaptureEnvEntry {
+            name: "OP_SERVICE_ACCOUNT_TOKEN".into(),
+            value: CaptureEnvValue::SecretRef {
+                secret_ref: "gcp-sm://x".into(),
+            },
+        }],
+        ..stripped
+    };
+    let bytes = bincode::serialize(&Some(tagged)).expect("tagged encode currently succeeds");
+    let res: Result<Option<WarmConfig>, _> = bincode::deserialize(&bytes);
+    assert!(
+        res.is_err(),
+        "tagged CaptureEnvValue became bincode-decodable — retire the coordinator's \
+         wire-strip in enabled_images.rs and this pin together"
+    );
+}
