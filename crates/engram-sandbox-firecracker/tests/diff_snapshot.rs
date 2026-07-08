@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::SnapshotId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::client::{FirecrackerClient, SnapshotType};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 
@@ -62,9 +62,13 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let target_root = Path::new(&manifest).join("..").join("..").join("target");
     let agent = target_root
@@ -82,30 +86,24 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
     }
 
     // ---- 1. Bake an agentd-injected ext4 (same shape as exec_real_vm) ----
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
         engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
     );
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let baker = Builder::new(DockerCli::new(), chunk_store);
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-diff-snapshot-test".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("ext4 bake with agent injection");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |_tree| Ok(()),
+    )
+    .await;
 
     // ---- 2. Boot with dirty tracking armed ----
     let work = tempfile::tempdir().expect("work dir");

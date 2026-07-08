@@ -276,8 +276,9 @@ async fn main() -> Result<(), HostAgentError> {
     // store (snapshots chunk the rootfs clone and report the manifest
     // ref). Misconfiguration fails closed at startup — better than
     // pretending to be ready and failing every session create. Shares
-    // the same `BlobStorage` the coordinator's image-builder writes to
-    // (a shared GCS bucket in prod, a shared `local_path` in dev).
+    // the same `BlobStorage` the coordinator's chunk store (the
+    // enable-time materializer) writes to (a shared GCS bucket in
+    // prod, a shared `local_path` in dev).
     let blob = engram_host_agent::blob::from_env()
         .await
         .map_err(|e| HostAgentError::Config(format!("blob backend: {e}")))?;

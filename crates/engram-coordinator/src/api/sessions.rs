@@ -1100,13 +1100,14 @@ async fn resolve_selected_skills(
         return Ok(Vec::new());
     }
     // Cap up front so an over-cap request doesn't trigger N catalog lookups.
-    // Slot 0 is the harness (ADR 0062), so skills get RESERVED_SLOTS - 1.
+    // Slots 0-2 are the harness / agentd / guest-tools (ADR 0062/0080), so
+    // skills get RESERVED_SLOTS - 3.
     if names.len() > AuxRoDrive::MAX_SKILL_SLOTS {
         return Err(ApiError::BadRequest(format!(
-            "session requested {} skills but only {} skill slots exist (slot {} is the harness)",
+            "session requested {} skills but only {} skill slots exist \
+             (slots 0-2 are the harness / agentd / guest-tools)",
             names.len(),
             AuxRoDrive::MAX_SKILL_SLOTS,
-            AuxRoDrive::HARNESS_SLOT_INDEX,
         )));
     }
     // Start from the fleet stamp (baked admin bundles)…
@@ -1132,6 +1133,37 @@ async fn resolve_selected_skills(
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     assign_skill_slots(&view, names)
+}
+
+/// ADR 0080 §D: the guest-tools bundle's reserved-slot mount for a fresh
+/// create, pinned to the fleet's current `guest-tools` generation. Carries
+/// engrams-owned in-guest tooling (today: the static `ttyd` agentd's
+/// `shell.rs` spawns for the SHELL tab) so session images no longer bake it.
+/// `None` (with a LOUD warn) when no host reports one — soft like agentd:
+/// the Process fleet stages no bundles at all, and a session without the
+/// mount degrades to whatever `ttyd` the image itself carries (agentd warns
+/// again at StartShell when it falls back), never to a failed create.
+async fn resolve_guest_tools_mount(
+    state: &SharedState,
+) -> Result<Option<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
+    use engram_core::types::sandbox::AuxRoDrive;
+    let catalog = fleet_bundle_catalog(state).await?;
+    let Some(sha) = catalog.get(AuxRoDrive::GUEST_TOOLS_STAMP_KEY) else {
+        tracing::warn!(
+            "ADR 0080: no host reports a staged `{}` bundle — new sessions get \
+             no guest-tools mount; the SHELL tab only works if the image itself \
+             bakes ttyd (stage bundle-guest-tools via node-assets / \
+             `just bundles-squashfs`)",
+            AuxRoDrive::GUEST_TOOLS_STAMP_KEY,
+        );
+        return Ok(None);
+    };
+    Ok(Some(AuxRoDrive {
+        drive_id: AuxRoDrive::slot_drive_id(AuxRoDrive::GUEST_TOOLS_SLOT_INDEX),
+        guest_mount: AuxRoDrive::slot_guest_mount(AuxRoDrive::GUEST_TOOLS_SLOT_INDEX),
+        fs_type: "squashfs".into(),
+        sha256: Some(sha.clone()),
+    }))
 }
 
 /// ADR 0080: the agentd bundle's reserved-slot mount for a fresh create,
@@ -1194,16 +1226,16 @@ fn assign_skill_slots(
     use engram_core::types::sandbox::AuxRoDrive;
     if names.len() > AuxRoDrive::MAX_SKILL_SLOTS {
         return Err(ApiError::BadRequest(format!(
-            "session requested {} skills but only {} skill slots exist (slot {} is the harness)",
+            "session requested {} skills but only {} skill slots exist \
+             (slots 0-2 are the harness / agentd / guest-tools)",
             names.len(),
             AuxRoDrive::MAX_SKILL_SLOTS,
-            AuxRoDrive::HARNESS_SLOT_INDEX,
         )));
     }
     let mut mounts = Vec::with_capacity(names.len());
     for (i, name) in names.iter().enumerate() {
-        // Skills occupy dyn_2.. — slot 0 is the harness (ADR 0062), slot 1
-        // is agentd (ADR 0080).
+        // Skills occupy dyn_3.. — slot 0 is the harness (ADR 0062), slot 1
+        // is agentd, slot 2 is guest-tools (ADR 0080).
         let slot = AuxRoDrive::FIRST_SKILL_SLOT_INDEX + i;
         let sha = catalog.get(name.as_str()).ok_or_else(|| {
             ApiError::BadRequest(format!(
@@ -1385,6 +1417,13 @@ async fn prepare_inner(
     // latency. `None` (bundle-less fleet: Process dev, mid-bring-up) keeps
     // the snapshot's pinned generation.
     if let Some(mount) = resolve_agentd_mount(state).await? {
+        selected_mounts.push(mount);
+    }
+    // ADR 0080 §D: pin the fleet's current guest-tools generation (ttyd) to
+    // its reserved slot (`dyn_2`) — same paused-window patch_drive path as
+    // skills, soft like agentd (a bundle-less fleet warns and the SHELL tab
+    // relies on an image-baked ttyd).
+    if let Some(mount) = resolve_guest_tools_mount(state).await? {
         selected_mounts.push(mount);
     }
     // ADR 0062: the harness catalog rides `dyn_0` alongside the skills (dyn_2..),
@@ -2064,9 +2103,9 @@ mod tests {
         // Empty selection → empty mounts.
         assert!(assign_skill_slots(&catalog, &[]).unwrap().is_empty());
 
-        // ADR 0062/0080: slot 0 is the harness, slot 1 is agentd, so skills
-        // start at dyn_2. Two skills → two drives at dyn_2 / dyn_3 with the
-        // catalog shas, in request order.
+        // ADR 0062/0080: slot 0 is the harness, slot 1 is agentd, slot 2 is
+        // guest-tools, so skills start at dyn_3. Two skills → two drives at
+        // dyn_3 / dyn_4 with the catalog shas, in request order.
         let mounts = assign_skill_slots(&catalog, &["skills".into(), "browser".into()]).unwrap();
         assert_eq!(mounts.len(), 2);
         assert_eq!(
@@ -2089,8 +2128,9 @@ mod tests {
         let err = assign_skill_slots(&catalog, &["nope".into()]).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
 
-        // Over the skill-slot cap (RESERVED_SLOTS - 2: harness slot 0,
-        // agentd slot 1) → 400, even if every name is known.
+        // Over the skill-slot cap (RESERVED_SLOTS - 3: harness slot 0,
+        // agentd slot 1, guest-tools slot 2) → 400, even if every name is
+        // known.
         let too_many: Vec<String> = (0..AuxRoDrive::MAX_SKILL_SLOTS + 1)
             .map(|_| "skills".to_string())
             .collect();

@@ -1048,10 +1048,8 @@ async fn healthz_returns_ok_status_and_version() {
 // image-manifest property baked at image-bake time). The equivalent
 // post-0021 failure mode is "the image has no [harness] block, so
 // even with mode=Agent the session runs as a dev VM" — which is *not*
-// an error condition, it's the harness-less template case. The image-
-// manifest validation in engram-image-builder catches a malformed
-// `[harness]` block at bake; there's no per-session "unknown harness"
-// path anymore.
+// an error condition, it's the harness-less template case. There's no
+// per-session "unknown harness" path anymore.
 
 async fn post(app: axum::Router, uri: &str, body: Value) -> axum::http::Response<Body> {
     app.oneshot(json_request(Method::POST, uri, body))

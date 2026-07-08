@@ -7,7 +7,6 @@ members = [
     "crates/engram-host-agent",
     "crates/engram-host-operator",
     "crates/engram-chunk-store",
-    "crates/engram-image-builder",
     "crates/engram-rootfs-materializer",
     "crates/engram-publish-builtin-harness",
     "crates/engram-cli",
@@ -90,7 +89,6 @@ engram-secrets-dev = { path = "crates/engram-secrets-dev" }
 engram-secrets-gcp = { path = "crates/engram-secrets-gcp" }
 engram-git-dev = { path = "crates/engram-git-dev" }
 engram-git-github = { path = "crates/engram-git-github" }
-engram-image-builder = { path = "crates/engram-image-builder" }
 engram-rootfs-materializer = { path = "crates/engram-rootfs-materializer" }
 engram-agentd = { path = "crates/engram-agentd" }
 engram-uffd-handler = { path = "crates/engram-uffd-handler" }

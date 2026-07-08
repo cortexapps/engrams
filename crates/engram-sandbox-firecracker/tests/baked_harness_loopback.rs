@@ -39,7 +39,7 @@ use engram_harness_proto::{
     read_msg, write_msg, HarnessAttach, HarnessAttachAck, HarnessEvent, HarnessFrame,
     HARNESS_VSOCK_PORT,
 };
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::time::timeout;
 
@@ -52,9 +52,13 @@ async fn baked_noop_harness_emits_run_started() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
 
     // ---- 0. Locate prebuilt musl artifacts -----------------------
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
@@ -84,43 +88,34 @@ async fn baked_noop_harness_emits_run_started() {
     // argv (it's an FC-backend integration test, not a coord-flow
     // test), so the manifest doesn't strictly have to land — but we
     // include it so the rootfs matches what a real session-create
-    // would produce.
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::copy(&noop_bin, src.path().join("harness")).expect("copy noop into build context");
-    std::fs::write(
-        src.path().join("Dockerfile"),
-        // debian-slim has glibc + /bin/sh; matches agentd's musl
-        // contract well (musl binaries run fine on glibc rootfses).
-        // COPY drops the noop binary into the canonical baked path.
-        "FROM debian:bookworm-slim\n\
-         RUN mkdir -p /opt/noop\n\
-         COPY harness /opt/noop/harness\n\
-         RUN chmod +x /opt/noop/harness\n",
-    )
-    .unwrap();
-
+    // would produce. The customize closure is the COPY-equivalent:
+    // it drops the prebuilt noop binary into the canonical baked path.
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
     let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
         engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
     );
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let baker = Builder::new(DockerCli::new(), chunk_store);
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "baked-noop-test".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("ext4 bake with agent injection + baked noop harness");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |tree| {
+            use std::os::unix::fs::PermissionsExt;
+            let dst_dir = tree.join("opt/noop");
+            std::fs::create_dir_all(&dst_dir)?;
+            let dst = dst_dir.join("harness");
+            std::fs::copy(&noop_bin, &dst)?;
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        },
+    )
+    .await;
 
     // ---- 2. Set up FC backend + harness sink ---------------------
     let work = tempfile::tempdir().expect("work dir");

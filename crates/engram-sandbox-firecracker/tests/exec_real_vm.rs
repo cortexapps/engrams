@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 
 use common::{drain, fc_preflight, require_bin};
@@ -33,9 +33,13 @@ async fn exec_runs_inside_baked_microvm() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
 
     // The canonical entry point is `scripts/run-boot-test.sh
     // exec_real_vm`, which rebuilds the musl binaries before calling
@@ -61,40 +65,25 @@ async fn exec_runs_inside_baked_microvm() {
         return;
     }
 
-    // ---- 1. Bake an Engram-agent-baked ext4 image ----
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(
-        src.path().join("Dockerfile"),
-        // debian-slim has glibc + /bin/sh, matches our agent's libc.
-        // No package installs needed — agent + init shim are all we
-        // ship into the rootfs ourselves.
-        "FROM debian:bookworm-slim\n",
-    )
-    .unwrap();
-
+    // ---- 1. Bake an Engram-agent-baked ext4 image (docker-free) ----
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
         engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
     );
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let docker = DockerCli::new();
-    let baker = Builder::new(docker, chunk_store);
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-agent-vm-test".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("ext4 bake with agent injection");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |_tree| Ok(()),
+    )
+    .await;
     assert!(
         outcome.rootfs_path.extension().and_then(|s| s.to_str()) == Some("ext4"),
         "expected rootfs.ext4, got {}",

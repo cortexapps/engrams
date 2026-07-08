@@ -83,11 +83,10 @@ Three process classes, four storage primitives, three wire surfaces.
         └──────────────────────┘    │  (Artifact Reg /    │
                                     │   ECR / Docker Hub) │
                                     │                     │
-                                    │  - bake images      │
-                                    │    (manifest.toml + │
-                                    │     bundle.json +   │
-                                    │     optional        │
-                                    │     rootfs.ext4)    │
+                                    │  - session images   │
+                                    │    (plain OCI,      │
+                                    │     docker build +  │
+                                    │     docker push)    │
                                     │  - harness bundles  │
                                     └─────────────────────┘
 ```
@@ -98,7 +97,7 @@ Three process classes, four storage primitives, three wire surfaces.
 
 **`engram-host-agent`** — per-VM-host daemon. Dials the coordinator over WebSocket (NAT-friendly; coord never has to reach back). Composes a local `SandboxBackend` (FC / VZ / Process — the VMM driver) and a `HarnessHub` (in-VM adapter routing) into a `LocalHostClient`; that's what's served over the WS to the coord (ADR 0011 splits the trait surfaces: `SandboxBackend` = "what kind of VM," `HostClient` = "where the work happens"). Hosts the chunked-OCI image cache + tiered chunk resolver, the NBD daemon (chunked disks for FC), the chunk cache (NVMe-backed LRU), the materialize-dir orphan reaper, the filtering egress proxy on TCP/443 + UDP/53 + TCP/53 (ADRs 0006, 0010). Heartbeats `(capacity, utilization, draining, running_sandboxes)` every 5 s.
 
-**In-guest binaries** (live inside each microVM, baked into the rootfs by `engram-image-builder`):
+**In-guest binaries** (live inside each microVM; none are baked into the rootfs — the only engrams-owned file baked in is the stage-1 `/sbin/engram-init` shim, injected by the host-side rootfs materializer, ADR 0080):
 - `engram-agentd` — PID 1's exec after the init shim (which copies it out of the fleet `bundle-agentd` slot to tmpfs, ADR 0080 — an agentd change ships by republishing the bundle, no image re-bakes). The in-VM control surface: serves length-prefixed bincode RPCs over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `StartShell`, `Ping`, `Shutdown`, `SpawnHarness`. Owns the harness child process (kill+respawn on each fresh `SpawnHarness`, so the host has a clean re-spawn point on resume). On startup, dials the host on `ENGRAM_AGENTD_READY_PORT` so the host knows when the in-VM listener is bound — no boot-race polling on the host side.
 - `engram-harness-{noop,claude}` — the agent runtime (Claude Code or a deterministic test harness), exec'd as agentd's harness child on `SpawnHarness`. Reports run state + tool calls back through the harness hub.
 
@@ -116,7 +115,7 @@ Engram's durability primitive is **chunked-immutable content-addressed storage**
 **Three free COW levels** fall out of content-addressing:
 
 1. **Disk COW** — chunks shared by N sessions referencing the same image. Writes produce new chunks; per-session manifest gets new pointers for dirty offsets. The base manifest never changes.
-2. **Memory COW** — image-builder captures a canonical memory snapshot at bake time. Sessions `mmap(addr, len, MAP_PRIVATE, fd, 0)` against the canonical file. Hardware-enforced via the MMU; one canonical copy serves every session of that image.
+2. **Memory COW** — the base snapshot's `memory.bin`, captured once per image at enable/rebase time, is `mmap(addr, len, MAP_PRIVATE, fd, 0)`'d by every session of that image. Hardware-enforced via the MMU; one canonical copy serves every session.
 3. **Session-fork COW** — `fork_manifest` is a few-KB shallow copy of the parent's chunk list. The data layer is shipped; the `POST /sessions/:id/fork` API endpoint is descriptive only at the chunk-store layer today.
 
 Two consumers turn manifests into running VMs:
@@ -135,7 +134,7 @@ Three protocol layers, each with explicit version negotiation where it matters.
 | **Public API** | clients → coord | JSON over HTTP + SSE | `/v1/` prefix planned |
 | **Control plane** | coord ↔ host-agent | bincode `Frame` over WebSocket | `WIRE_VERSION=1` in `Hello`; mismatch refuses connection |
 | **In-guest** | host-agent ↔ agentd / bootstrap / harness | length-prefixed bincode over vsock (FC) or virtio-console (VZ) | first-frame token handshake |
-| **Image distribution** | host-agent → OCI registry | standard registry pull | OCI media types: `vnd.engram.manifest.v1+toml`, `vnd.engram.rootfs.ext4`, `vnd.engram.bundle.v1+json` |
+| **Image distribution** | materializer → OCI registry | standard registry pull | plain OCI/Docker image (ADR 0080); no engram-specific media types — agentd / harness / guest-tools ride host-staged bundles |
 | **Storage** | chunk-store ↔ blob backend | `BlobStorage` trait | impl-specific (GCS, S3, local fs) |
 
 **Control plane wire** (`engram-protocol`). The trait the wire serves is `HostClient` (`engram-core::traits::host_client`), which composes the sandbox surface (FC/VZ/Process) with harness routing (bind/unbind/send_prompt) and a couple of admin operations. `RemoteHostClient` in `engram-protocol::client` is the coord-side wrapper; `LocalHostClient` in `engram-host-agent::host_client` is the host-side composition. ADR 0011.
@@ -159,11 +158,11 @@ Coord scheduler picks a host:
   - capacity-fit
   ↓
 host-agent.PooledBackend.create(spec)
-  ├─ ImageCache.ensure_image(uri) → CachedImage { bundle }
+  ├─ ImageCache.ensure_image(uri) → chunked rootfs manifest
+  │   (materialized host-side at enable/rebase time, ADR 0080)
   ├─ resolve_rootfs(uri, cached):
-  │   - NBD daemon path (Linux + FC + chunked + ENGRAM_NBD_DEVICES set)
-  │   - materialize-to-file (anywhere else with a chunk_store)
-  │   - legacy rootfs.ext4 (pre-chunked images)
+  │   - NBD daemon path (Linux + FC + ENGRAM_NBD_DEVICES set)
+  │   - materialize-to-file (anywhere else, from chunks)
   └─ inner.create(spec with rootfs_source = resolved_path)
      ├─ FC: spawn firecracker; PUT machine-config / boot-source /
      │      drives/rootfs / vsock; PUT actions InstanceStart
@@ -215,7 +214,7 @@ crates/
   engram-transport                  # vsock (FC) / virtio-console (VZ) abstraction
   engram-coordinator                # binary: HTTP API + scheduler + GC scheduler
   engram-host-agent                 # binary: per-host daemon (chunked-OCI, NBD, reaper)
-  engram-image-builder              # binary: warm-image baker (Directory + Ext4)
+  engram-rootfs-materializer        # OCI image → whiteout-flattened ext4 + chunks (host-side)
   engram-cli                        # binary: ops/admin tool
   engram-agentd                     # binary: in-guest exec daemon + harness supervisor
   engram-uffd-handler               # binary: userfaultfd page-fault handler
@@ -255,14 +254,15 @@ nix develop      # drops you into a shell with everything pinned
 
 If you use [direnv](https://direnv.net), `direnv allow` once and the shell auto-activates whenever you `cd` in. Don't have Nix? The [Determinate Systems installer](https://install.determinate.systems) is one line and uninstalls cleanly.
 
-With Nix you get the **full** toolchain — including the macOS-only bake
-dependencies (`e2fsprogs` for `mke2fs`, the `aarch64`/`x86_64` musl cross
-compilers for the in-guest binaries). Nothing else to install.
+With Nix you get the **full** toolchain — including `e2fsprogs` (whose
+`mke2fs` the host-side rootfs materializer uses, ADR 0080) and the
+`aarch64`/`x86_64` musl cross compilers for building/linting the
+Linux-target crates. Nothing else to install.
 
 **Without Nix (macOS)** — on Apple Silicon `just dev` runs the
 Virtualization.framework (VZ) backend (ADR 0024 auto-detects it), and
-`just bake-demo` cross-compiles the in-guest musl binaries and builds an ext4
-rootfs. You need the full set:
+`just bake-demo` is a plain `docker build && docker push` of the demo
+image to the local registry (ADR 0080 — no local ext4 bake). You need:
 
 ```bash
 # Rust toolchain (matches rust-toolchain.toml) + the guest musl target:
@@ -272,10 +272,11 @@ brew install tilt-dev/tap/tilt                      # `just dev` orchestrator
 brew install jq                                     # smoke-test helpers
 brew install protobuf pkg-config openssl            # build deps (tonic / openssl-sys)
 brew install node pnpm                              # web SPA (skip with ENGRAM_SKIP_WEB=1)
-brew install e2fsprogs                              # mke2fs — ext4 rootfs bake
+brew install e2fsprogs                              # mke2fs — host-side rootfs materializer (ADR 0080)
 brew install FiloSottile/musl-cross/musl-cross --with-aarch64   # aarch64-linux-musl-gcc
 # Docker Desktop (or colima): the registry/postgres/jaeger/fake-gcs containers
-# and the image-bake buildx step. Xcode Command Line Tools for `codesign`.
+# and the `docker build`/`docker push` behind `just bake` / `bake-demo`.
+# Xcode Command Line Tools for `codesign`.
 ```
 
 **Without Nix (Linux + KVM)** — Rust (per `rust-toolchain.toml`), Docker, `just`,
@@ -301,9 +302,9 @@ End-to-end exec round-trip:
 
 ```bash
 # The control plane is app-gRPC (ADR 0051); drive it with the `engram` CLI.
-# Enable an image first (one-time; replace with your bake's URI —
-# e.g. localhost:5001/demo:warm-1):
-engram image enable --uri localhost:5001/cortex/api:warm-1
+# Enable an image first (one-time; runtime config is supplied out-of-band
+# at enable time via a TOML, ADR 0080 — replace with your image's URI):
+engram image enable --uri localhost:5001/cortex/api:warm-1 --config ./image-config.toml
 
 SID=$(engram session create --image localhost:5001/cortex/api:warm-1)
 
@@ -322,7 +323,7 @@ just test               # all tests via cargo nextest
 just psql               # psql into the dev Postgres
 just db-reset           # destroy + recreate the dev DB
 just dev                # full stack via Tilt; backend auto-detected per host (ADR 0024)
-just bake-demo          # build + bake the Claude demo image → local registry
+just bake-demo          # docker build + push the Claude demo image → local registry (ADR 0080)
 just pull-kernel        # fetch the kernel this host's backend needs
 just clean-var          # rm -rf the local sandbox cwds + snapshots
 ```
@@ -391,9 +392,9 @@ The Firecracker / uffd integration tests need a real Linux + KVM host: run
 them on the dev VM or let CI's `tests (linux)` / `tests (firecracker)` jobs
 cover them.
 
-## Sessions are bake-image sandboxes with chunked-immutable durability
+## Sessions are OCI-image sandboxes with chunked-immutable durability
 
-A session is one bounded unit of agent work. It's two things on the wire: an `image` (the OCI URI of a baked rootfs) and an optional `harness` (which agent process to attach). The bake image's `/workspace` is the workspace; the platform doesn't run any git operations itself.
+A session is one bounded unit of agent work. It's two things on the wire: an `image` (a plain OCI image URI — `docker build && docker push`, ADR 0080) and an optional `harness` (which agent process to attach). The image's `/workspace` is the workspace; the platform doesn't run any git operations itself.
 
 ```
 create → Created → Active                                  (sandbox bound; then agentd up + harness running)
@@ -425,55 +426,56 @@ The state machine is ADR 0015 M2 — `SessionState` in `engram-core::types::sess
 
 ## Building images
 
-Engram images are baked from a `Dockerfile` + `engram.toml` in your repo. Dockerfiles handle "what's installed"; engram.toml carries engram-specific config — workspace-level secrets schema (NPM_TOKEN, GITHUB_TOKEN, etc.), network policy, resources. Harness-level credentials (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, …) live one layer above the image and aren't declared here; the dashboard handles them per-harness at session-create time. See `DESIGN.md` for the full split.
+An Engram session image is a **plain OCI image** — `docker build && docker push` to any registry (ADR 0080). There's no engram-specific build tool, no `engram.toml`, no local ext4 bake, and nothing engrams-owned baked into the rootfs (agentd, the harness, and ttyd all ride host-staged bundle slots, swapped in per-session). The image contract is just "any linux image with `/bin/sh`". `git` / `curl` / `socat` / `iproute2` are **workspace** requirements — install them in your Dockerfile if your agent needs them (the demo image does) — not engrams requirements.
 
 ```
 my-repo/
 ├── Dockerfile
-├── engram.toml
 └── ... your code
 ```
 
+Build and push it like any other container image:
+
+```bash
+docker build -t localhost:5001/cortex/api:warm-1 .
+docker push  localhost:5001/cortex/api:warm-1
+# or, equivalently, the dev helper:
+TAG=warm-1 just bake cortex/api ./path/to/repo
+```
+
+Runtime config — name, description, env, workdir, resources, and the warm-capture command / secrets / egress — is supplied **out-of-band at enable time** via an image-config TOML. It is *not* in the image:
+
 ```toml
-# engram.toml
+# image-config.toml
 name = "cortex-api"
-secret_mode = "literal"   # use "broker" in production (proxy not yet wired — see DESIGN.md)
+description = "Backend API service"
 
 [env]
 NODE_ENV = "development"
 
-# Workspace-level secret. The agent's `git push` to the checkpoint
-# branch needs this; harness creds (Claude OAuth / API key) belong
-# above the image, not here.
-[secrets.GITHUB_TOKEN]
-allow_hosts = ["api.github.com"]
-required = true
-
 [resources]
 suggested_memory_mib = 4096
+
+# Optional warm-capture config (a command run once at enable/rebase time,
+# plus its env + egress). Omit for a cold-boot image.
+[warm]
+command = "pnpm install"
+timeout_secs = 300
 ```
 
-Bake it:
+Enable the image with that config, then create sessions against it:
 
 ```bash
-# Directory rootfs (dev backend, default)
-engram image build --repo cortex/api --source ./path/to/repo
+engram image enable --uri localhost:5001/cortex/api:warm-1 --config ./image-config.toml
+# edit config later (cheap fields apply immediately; resources / warm need --allow-recapture):
+engram image update --uri localhost:5001/cortex/api:warm-1 --config ./image-config.toml
 
-# ext4 rootfs for Firecracker
-engram image build --repo cortex/api --source ./path/to/repo --format ext4
-```
-
-`--format ext4` produces `<images_dir>/<repo>/<tag>/rootfs.ext4` (a block-device image Firecracker mounts directly), built via `mke2fs -t ext4 -F -d` from the staged Docker export — no loopback mount, no root needed. The `Directory` default produces `<images_dir>/<repo>/<tag>/rootfs/` for the dev backend.
-
-For ADR 0007 chunked storage, the bake also emits a `bundle.json` sidecar pointing at the chunked disk manifest in `BlobStorage`; the OCI push ships the bundle alongside (and skips the redundant `rootfs.ext4` layer when chunked). Opt into bake-time canonical memory capture with `BuildRequest.capture_canonical_memory` if running with FC + KVM available.
-
-Then create a session against it (the coordinator picks up the new tag automatically):
-
-```bash
 SID=$(engram session create --image localhost:5001/cortex/api:warm-1)
 ```
 
-Requires Docker on the host. Compatible with Docker Desktop, OrbStack, Colima, and Podman with the docker-compat shim. See `DESIGN.md` for the full image / secret model.
+At enable (and on rebase) the coordinator materializes the OCI image into a chunked ext4 rootfs **host-side** via the `MaterializeImage` host RPC (`engram-rootfs-materializer`: pull → whiteout-aware flatten → inject the stage-1 `/sbin/engram-init` shim → deterministic `mke2fs` pack → chunk into `BlobStorage`). That init shim is the only engrams-owned file baked into the rootfs; per-session latency is zero (materialize is enable/rebase-time only). Harness-level credentials (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, …) live one layer above the image and are handled per-harness at session-create time — see `DESIGN.md` for the full image / config / secret model.
+
+Building + pushing the image requires Docker (Docker Desktop, OrbStack, Colima, or Podman with the docker-compat shim).
 
 ## CLI
 
@@ -484,8 +486,9 @@ engram session list                                   # active sessions, table v
 engram session get <id>
 engram session delete <id>
 engram session logs <id> --since 0                    # tail SSE event log; resume after idx
-engram image build --repo <r> --source .              # bake (directory rootfs, default)
-engram image build --repo <r> --source . --format ext4  # bake ext4 image for Firecracker
+engram image list                                     # enabled images + status
+engram image enable --uri <uri> --config <toml>       # materialize + enable a plain OCI image (ADR 0080)
+engram image update --uri <uri> --config <toml>       # edit runtime config (--allow-recapture for resources/warm)
 engram host list                                      # connected hosts + capacity
 engram host drain <id>                                # mark host draining; migrate sessions away
 ```
@@ -512,7 +515,7 @@ The dev backend is for orchestration iteration. Real Firecracker needs Linux + K
 - A Linux laptop or workstation
 - CI
 
-On a Linux + KVM host, `just dev` auto-detects `/dev/kvm` and runs the Firecracker backend (no flag, no per-arch recipe — ADR 0024); `just pull-kernel` fetches a vmlinux into the standard cache. The rootfs comes from images baked with `--format ext4` (and, for `exec_stream`, with `engram-agentd` injected — see `crates/engram-image-builder/src/lib.rs::AgentInjection`).
+On a Linux + KVM host, `just dev` auto-detects `/dev/kvm` and runs the Firecracker backend (no flag, no per-arch recipe — ADR 0024); `just pull-kernel` fetches a vmlinux into the standard cache. The rootfs is materialized host-side from the enabled OCI image into chunked ext4 (ADR 0080); `engram-agentd` is not baked in — it rides the fleet `bundle-agentd` slot and the stage-1 init execs it, so `exec_stream` works against any plain image.
 
 The crate ships an integration suite that covers the full surface against real microVMs:
 
@@ -521,7 +524,7 @@ The crate ships an integration suite that covers the full surface against real m
 bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh all
 ```
 
-Tests: `boot` (kernel banner on serial), `lifecycle` (create/list/destroy round-trip), `snapshot` (file-backed restore), `snapshot_uffd` (lazy paging via the userfaultfd handler), `exec_real_vm` (bake → boot → exec through in-guest agent over vsock), `nbd_chunked_disk` (chunked disk via NBD daemon), `canonical_capture` (bake-time memory snapshot).
+Tests: `boot` (kernel banner on serial), `lifecycle` (create/list/destroy round-trip), `snapshot` (file-backed restore), `snapshot_uffd` (lazy paging via the userfaultfd handler), `exec_real_vm` (busybox-fixture rootfs → boot → exec through the in-guest agent over vsock), `nbd_chunked_disk` (chunked disk via NBD daemon), `canonical_capture` (base-snapshot memory capture).
 
 For UFFD-backed restore, the coordinator's host needs:
 - `/dev/userfaultfd` mode 0666 (set via udev rule, see `dev-vm/scripts/bootstrap-remote.sh`)
@@ -533,10 +536,9 @@ For NBD chunked disks, the host needs:
 - `modprobe nbd nbds_max=<N>` at boot
 - `ENGRAM_NBD_DEVICES=/dev/nbd0,/dev/nbd1,...` set in the host-agent env
 
-For agent-baked images, the coordinator needs:
-- A static-musl `engram-agentd` build:
-  `cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release`
-- `init=/sbin/engram-init` in the kernel boot args (set via `FirecrackerConfig::default_boot_args`)
+For the in-guest agent, the fleet needs:
+- A static-musl `engram-agentd` published as the `bundle-agentd` slot (ADR 0080) and staged on each host — the stage-1 init copies it out of the bundle to tmpfs and execs it (no rootfs bake).
+- `init=/sbin/engram-init` in the kernel boot args (set by the FC backend via `FirecrackerConfig::default_boot_args`)
 
 ## Production deployment
 

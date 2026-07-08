@@ -40,10 +40,58 @@ use tokio::time::sleep;
 /// matching constant.
 pub const DEFAULT_TTYD_PORT: u16 = 7681;
 
-/// Where the ttyd binary lives inside the canonical demo image.
-/// Other images that bake ttyd into a different prefix can override
-/// via `ENGRAM_TTYD_BIN` in the agent environment.
+/// Transitional fallback path for images that still bake ttyd (ADR 0080
+/// §D retired that from the image contract — ttyd now rides the
+/// `guest-tools` bundle slot and is resolved by [`resolve_ttyd_bin`]).
+/// Images that bake ttyd into a different prefix can override via
+/// `ENGRAM_TTYD_BIN` in the agent environment.
 const DEFAULT_TTYD_PATH: &str = "/usr/local/bin/ttyd";
+
+/// Where the init shim mounts the reserved dynamic slots (mirrors
+/// `AuxRoDrive::slot_guest_mount`; same probing rationale as
+/// `refresh::find_bundle_mount` — VZ compacts resolved drives onto
+/// sequential mounts, so position can't be trusted).
+const DYN_MOUNT_ROOT: &str = "/opt/engram/dyn";
+
+/// Locate the ttyd binary to spawn (ADR 0080 §D). Order:
+///
+/// 1. `ENGRAM_TTYD_BIN` — explicit operator/image override.
+/// 2. the `guest-tools` bundle mount — probe the dyn slots for a `ttyd`
+///    file, exactly like `refresh::find_bundle_mount` probes for agentd.
+///    This is the steady-state path: ttyd ships fleet-side, images don't
+///    carry it.
+/// 3. the legacy image-baked path, with a WARN — transitional images may
+///    still bake ttyd; a fleet that stages no guest-tools bundle degrades
+///    to it rather than losing the SHELL tab outright.
+fn resolve_ttyd_bin() -> String {
+    if let Ok(bin) = std::env::var("ENGRAM_TTYD_BIN") {
+        return bin;
+    }
+    if let Some(found) = find_guest_tools_ttyd() {
+        return found.to_string_lossy().into_owned();
+    }
+    tracing::warn!(
+        fallback = DEFAULT_TTYD_PATH,
+        "no guest-tools bundle mount carries ttyd under {DYN_MOUNT_ROOT}; \
+         falling back to the image-baked path (stage bundle-guest-tools — \
+         ADR 0080 removed ttyd from the image contract)"
+    );
+    DEFAULT_TTYD_PATH.to_string()
+}
+
+/// Probe the dyn slots for the guest-tools `ttyd`. Position-independent:
+/// FC keeps `dyn/<i> == slot i`, VZ compacts resolved drives, and either
+/// way at most one mount carries a top-level `ttyd`.
+fn find_guest_tools_ttyd() -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(DYN_MOUNT_ROOT).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join("ttyd");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
 
 /// How long to wait for ttyd to accept its first TCP connection
 /// before giving up. ttyd binds in <100ms under normal load; this is
@@ -86,10 +134,11 @@ pub struct ShellOutcome {
 }
 
 /// Ensure ttyd is running on `port` and accepting connections. On
-/// first call this spawns the binary at `ENGRAM_TTYD_BIN` (or
-/// `/usr/local/bin/ttyd` by default); on subsequent calls it checks
-/// the prior handle is still alive and the port still accepts —
-/// restarting only on failure.
+/// first call this spawns the binary [`resolve_ttyd_bin`] finds
+/// (`ENGRAM_TTYD_BIN` → the guest-tools bundle mount → the legacy
+/// image-baked path); on subsequent calls it checks the prior handle
+/// is still alive and the port still accepts — restarting only on
+/// failure.
 ///
 /// Important: the legacy bake's init script also starts ttyd in
 /// the background at VM boot, so on a freshly-restored warm VM the
@@ -169,7 +218,7 @@ pub async fn start_shell(
         }
     }
 
-    let bin = std::env::var("ENGRAM_TTYD_BIN").unwrap_or_else(|_| DEFAULT_TTYD_PATH.to_string());
+    let bin = resolve_ttyd_bin();
     let shell_bin = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
 
     tracing::info!(%bin, %shell_bin, port, "spawning ttyd");

@@ -49,7 +49,7 @@ use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
 };
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection, Transport};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
@@ -143,34 +143,7 @@ fn resolve_browser_bundle() -> Option<(PathBuf, String)> {
 /// (none needed here — the rootfs is just debian-slim + the injected agentd),
 /// so the in-container build needs no DNS (the dev-vm Docker daemon's apt DNS
 /// is flaky).
-async fn bake_browser_rootfs(repo: &str) -> PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let target_root = Path::new(&manifest).join("..").join("..").join("target");
-    let agent_bin = target_root
-        .join("x86_64-unknown-linux-musl")
-        .join("release")
-        .join("engram-agentd");
-    assert!(
-        agent_bin.exists(),
-        "musl agentd not at {} — build it first \
-         (`cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release`)",
-        agent_bin.display(),
-    );
-
-    let src = tempfile::tempdir().expect("source dir");
-
-    // debian-bookworm-slim ships glibc + /bin/sh (dash). The browser bundle
-    // (chromium + Xvfb + x11vnc + openbox) is glibc-linked against this same
-    // bookworm baseline (see deploy/bundles/browser/build.sh), so it runs
-    // here. `/workspace` mirrors e2e_shell's bake (the init shim cd's into it).
-    // No browser packages in the rootfs itself — the bundle carries them.
-    std::fs::write(
-        src.path().join("Dockerfile"),
-        "FROM debian:bookworm-slim\n\
-         RUN mkdir -p /workspace /opt/engram/dyn\n",
-    )
-    .unwrap();
-
+async fn bake_browser_rootfs(busybox: &Path) -> PathBuf {
     let images_dir = tempfile::tempdir().expect("images");
     let images_dir_path = images_dir.path().to_path_buf();
     std::mem::forget(images_dir);
@@ -182,22 +155,27 @@ async fn bake_browser_rootfs(repo: &str) -> PathBuf {
     std::mem::forget(chunk_root);
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
 
-    let baker = Builder::new(DockerCli::new(), chunk_store);
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: repo.into(),
-            tag: "warm-1".into(),
-            images_dir: images_dir_path.clone(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("bake ext4");
+    // debian-slim's userland is stood in for by the static busybox (ADR 0080
+    // §D: docker-free bake). The browser bundle (chromium + Xvfb + x11vnc +
+    // openbox) is glibc-linked and carries its own libs — it mounts as a
+    // separate RO squashfs aux drive, NOT baked into the rootfs. `/workspace`
+    // (from busybox_rootfs) + `/opt/engram/dyn` (the bundle mount point) are
+    // all the fixture needs.
+    let outcome = common::bake_fixture_ext4(
+        &images_dir_path.join("rootfs.ext4"),
+        &chunk_store,
+        busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |tree| {
+            std::fs::create_dir_all(tree.join("opt/engram/dyn"))?;
+            Ok(())
+        },
+    )
+    .await;
 
     outcome.rootfs_path
 }
@@ -272,10 +250,14 @@ async fn e2e_vnc_cold_via_pooled_backend() {
         Some(b) => b,
         None => return,
     };
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     cleanup_host_state();
 
-    // ---- 1. Bake a glibc debian rootfs with agentd (no browser baked in) ----
-    let rootfs_path = bake_browser_rootfs("engram-e2e-vnc-cold").await;
+    // ---- 1. Bake a busybox rootfs with agentd bundled (no browser baked in) ----
+    let rootfs_path = bake_browser_rootfs(&busybox).await;
 
     // ---- 2. Wrap FC in PooledBackend, pointing bundle_dir at var/shared ----
     let work = tempfile::tempdir().expect("work");

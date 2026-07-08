@@ -46,7 +46,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_core::types::shell::{ShellFrame, ShellTunnel};
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection, Transport};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::time::{sleep, timeout};
 
@@ -72,26 +72,12 @@ fn agentd_musl_bin() -> PathBuf {
 /// — every InRelease fetch timed out after 40s). So we do all the
 /// network work HOST-side (download ttyd via `curl`) and use only
 /// `COPY` inside Docker, which doesn't need DNS.
-async fn bake_shell_rootfs(repo: &str) -> PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let target_root = Path::new(&manifest).join("..").join("..").join("target");
-    let agent_bin = target_root
-        .join("x86_64-unknown-linux-musl")
-        .join("release")
-        .join("engram-agentd");
-    assert!(
-        agent_bin.exists(),
-        "musl agentd not at {} — run via \
-         `bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh e2e_shell` \
-         which builds it first",
-        agent_bin.display(),
-    );
-
+async fn bake_shell_rootfs(busybox: &Path) -> PathBuf {
     let src = tempfile::tempdir().expect("source dir");
 
-    // Download ttyd to the Docker build context (host-side, where
-    // network works). The Dockerfile then COPYs it in without any
-    // in-container network access.
+    // Download ttyd host-side (where network works). ADR 0080 §D moves ttyd
+    // to a `guest-tools` bundle and agentd falls back to /usr/local/bin/ttyd
+    // when no bundle mount exists — this baked path exercises that fallback.
     let ttyd_url = "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64";
     let ttyd_dst = src.path().join("ttyd");
     let out = std::process::Command::new("curl")
@@ -111,25 +97,6 @@ async fn bake_shell_rootfs(repo: &str) -> PathBuf {
     perms.set_mode(0o755);
     std::fs::set_permissions(&ttyd_dst, perms).unwrap();
 
-    std::fs::write(
-        src.path().join("Dockerfile"),
-        // debian-slim already ships with libc + /bin/sh (dash) which
-        // the init-shim's `SHELL_BIN=/bin/sh` finds. ttyd is a
-        // fully-static binary so it doesn't depend on anything
-        // else in the image.
-        //
-        // `/workspace` is load-bearing: the bake's init shim does
-        // `(cd /workspace && ttyd ...) &` before backgrounding ttyd.
-        // If the dir doesn't exist, the subshell exits before the
-        // ttyd exec and the shell tab silently has no listener
-        // (no `[ -d /workspace ]` guard upstream, just an unchecked
-        // `cd`). debian-slim doesn't ship with /workspace.
-        "FROM debian:bookworm-slim\n\
-         COPY ttyd /usr/local/bin/ttyd\n\
-         RUN chmod +x /usr/local/bin/ttyd && mkdir -p /workspace\n",
-    )
-    .unwrap();
-
     let images_dir = tempfile::tempdir().expect("images");
     let images_dir_path = images_dir.path().to_path_buf();
     // Keep the tempdir alive for the duration of the test.
@@ -142,27 +109,27 @@ async fn bake_shell_rootfs(repo: &str) -> PathBuf {
     std::mem::forget(chunk_root);
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
 
-    let baker = Builder::new(DockerCli::new(), chunk_store);
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: repo.into(),
-            tag: "warm-1".into(),
-            images_dir: images_dir_path.clone(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("bake ext4");
-
-    // ADR 0021 P1.5: no harness substrate — this test doesn't drive
-    // a harness anyway (it's about the SHELL tab + ttyd / proxy
-    // chain), and the substrate retired with option-D.
-    let _ = images_dir_path; // silence unused-binding if no other use lands
+    // ttyd is a fully-static binary; drop it at /usr/local/bin/ttyd. busybox
+    // supplies /bin/sh (dash stand-in) and busybox_rootfs already creates
+    // `/workspace` — load-bearing: the init shim does `(cd /workspace && ttyd
+    // ...) &`, and a missing dir silently drops the shell listener.
+    let outcome = common::bake_fixture_ext4(
+        &images_dir_path.join("rootfs.ext4"),
+        &chunk_store,
+        busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |tree| {
+            let dst = tree.join("usr/local/bin/ttyd");
+            std::fs::copy(&ttyd_dst, &dst)?;
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        },
+    )
+    .await;
 
     outcome.rootfs_path
 }
@@ -288,10 +255,14 @@ async fn e2e_shell_cold_via_pooled_backend() {
     if !require_root() {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     cleanup_host_state();
 
     // ---- 1. Bake a real rootfs with ttyd + agentd ----
-    let rootfs_path = bake_shell_rootfs("engram-e2e-shell-cold").await;
+    let rootfs_path = bake_shell_rootfs(&busybox).await;
 
     // ---- 2. Wrap FC in PooledBackend (exactly as host-agent does) ----
     let work = tempfile::tempdir().expect("work");
@@ -350,9 +321,13 @@ async fn e2e_shell_warm_via_pooled_backend() {
     if !require_root() {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     cleanup_host_state();
 
-    let rootfs_path = bake_shell_rootfs("engram-e2e-shell-warm").await;
+    let rootfs_path = bake_shell_rootfs(&busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());

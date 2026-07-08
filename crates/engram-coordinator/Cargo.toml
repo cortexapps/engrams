@@ -35,7 +35,6 @@ engram-secrets-dev.workspace = true
 engram-secrets-gcp.workspace = true
 # ADR 0023: GitHub App forge for the in-session credential + PR seam.
 engram-git-github.workspace = true
-engram-image-builder.workspace = true
 engram-egress-proxy.workspace = true
 engram-crypto.workspace = true
 engram-oci.workspace = true

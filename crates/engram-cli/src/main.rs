@@ -1,7 +1,8 @@
 //! Ops/admin CLI. Talks to the coordinator's app-gRPC API
 //! (`engram_protocol::app::*`, ADR 0051 Drip E) for session / fleet /
-//! image lifecycle operations; invokes the `engram-image-builder` library
-//! directly for `image build` (it doesn't go through the coordinator).
+//! image lifecycle operations. ADR 0080 retired the local `image build`
+//! bake: an image is now a plain `docker build && docker push`, enabled
+//! via `image enable --config` (the coordinator materializes it host-side).
 //!
 //! Every RPC authenticates with an `Authorization: Bearer <token>` gRPC
 //! metadata header via a tonic interceptor; the bearer + endpoint are
@@ -13,9 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use chrono::Utc;
 use clap::{Parser, Subcommand};
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format};
 use engram_protocol::app;
 use engram_protocol::app::fleet_service_client::FleetServiceClient;
 use engram_protocol::app::image_service_client::ImageServiceClient;
@@ -250,13 +249,6 @@ enum RegistryCmd {
 // (CI-only); user-facing `engram harness {add,list,rm}` retired with
 // the `/api/harnesses` registry in P1.5a.
 
-// `Build` has many optional path fields (rootfs source, agent
-// injection, bootstrap injection, canonical-capture kernel + FC
-// binary, …). Boxing each one to silence `large_enum_variant`
-// would just move the bytes off the stack without gaining anything
-// — clap parses this enum exactly once at startup, so the size
-// doesn't matter on any hot path.
-#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum ImageCmd {
     /// List the operator-curated set of enabled images on the
@@ -315,84 +307,6 @@ enum ImageCmd {
         #[arg(long)]
         uri: String,
     },
-    /// Bake an image from a Dockerfile + engram.toml in the source repo.
-    Build {
-        /// Repo identifier (e.g. `cortex/api`). Determines the registry
-        /// path the produced image lands at.
-        #[arg(long)]
-        repo: String,
-
-        /// Path to the source repo. Default `.`.
-        #[arg(long, default_value = ".")]
-        source: PathBuf,
-
-        /// Override the produced tag. Default `warm-<rfc3339>`.
-        #[arg(long)]
-        tag: Option<String>,
-
-        /// Where the registry lives — must match the coordinator's
-        /// `<storage_local_path>/images`.
-        #[arg(
-            long,
-            env = "ENGRAM_IMAGES_DIR",
-            default_value = "./var/snapshots/images"
-        )]
-        images_dir: PathBuf,
-
-        /// Override the docker binary (e.g. `podman`).
-        #[arg(long, env = "ENGRAM_DOCKER_BIN")]
-        docker_bin: Option<String>,
-
-        /// Output format. `directory` for the dev backend (Process),
-        /// `ext4` for Firecracker. Defaults to `directory`.
-        #[arg(long, value_parser = parse_image_format, default_value = "directory")]
-        format: Format,
-
-        /// Write the ADR 0080 stage-1 `/sbin/engram-init` shim into the
-        /// rootfs: it mounts the aux bundle slots, copies `engram-agentd`
-        /// out of its reserved bundle slot to tmpfs, and exec's it on the
-        /// reserved vsock port (1024). Required for Firecracker/VZ
-        /// images; agentd itself is NEVER baked — it ships as
-        /// `bundle-agentd`, staged host-side.
-        #[arg(long)]
-        inject_init: bool,
-
-        /// Which `engram-transport` impl the in-VM binaries should
-        /// select at runtime. The init shim writes
-        /// `ENGRAM_TRANSPORT=<value>` into the rootfs.
-        ///
-        /// `vsock` (default, only value): AF_VSOCK on Linux, used by
-        /// both the Firecracker and VZ backends. Requires
-        /// `CONFIG_VIRTIO_VSOCKETS=y` in the guest kernel (the FC-owned
-        /// kernel and the Kata VZ kernel both ship it built-in).
-        #[arg(long, value_parser = parse_transport, default_value = "vsock")]
-        transport: engram_image_builder::Transport,
-
-        /// Push the baked image to a Docker registry as an Engram OCI
-        /// artifact. Accepts either `host/repo` (auto-appends the
-        /// produced tag) or `host/repo:tag`. Format must be `ext4`.
-        ///
-        /// The bake step intentionally does NOT touch Postgres — once
-        /// pushed, an image is reachable to engram by URI alone (the
-        /// host-agent pulls via the auth resolver). Engram learns
-        /// about the image when a session references its URI.
-        #[arg(long)]
-        push: Option<String>,
-    },
-}
-
-fn parse_transport(s: &str) -> Result<engram_image_builder::Transport, String> {
-    engram_image_builder::Transport::parse(s)
-}
-
-fn parse_image_format(s: &str) -> Result<Format, String> {
-    match s {
-        "directory" | "dir" => Ok(Format::Directory),
-        "ext4" => Ok(Format::Ext4),
-        other => Err(format!(
-            "unknown format `{other}`; expected `directory` or `ext4`"
-        )),
-    }
 }
 
 #[tokio::main]
@@ -542,37 +456,6 @@ async fn build_clients(endpoint: &str, token: Option<&str>) -> Result<Clients, C
 }
 
 async fn run(cli: &Cli) -> Result<(), CliError> {
-    // `image build` is a purely-local bake — don't dial the coordinator
-    // for it (CI runs it with no coord reachable).
-    if let Cmd::Image {
-        cmd:
-            ImageCmd::Build {
-                repo,
-                source,
-                tag,
-                images_dir,
-                docker_bin,
-                format,
-                inject_init,
-                transport,
-                push,
-            },
-    } = &cli.cmd
-    {
-        return image_build(
-            repo,
-            source,
-            tag.as_deref(),
-            images_dir,
-            docker_bin.as_deref(),
-            *format,
-            *inject_init,
-            *transport,
-            push.as_deref(),
-        )
-        .await;
-    }
-
     let mut c = build_clients(&cli.grpc_endpoint, cli.token.as_deref()).await?;
     match &cli.cmd {
         Cmd::Session { cmd } => match cmd {
@@ -606,8 +489,6 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             SessionCmd::Prompt { id, text } => session_prompt(&mut c, id, text, cli.json).await,
         },
         Cmd::Image { cmd } => match cmd {
-            // Build handled above before dialing the coordinator.
-            ImageCmd::Build { .. } => unreachable!("image build handled before client setup"),
             ImageCmd::List => image_list(&mut c, cli.json).await,
             ImageCmd::Enable {
                 uri,
@@ -1148,94 +1029,6 @@ fn format_event_line(ev: &app::SessionEvent) -> String {
     let payload: Value =
         serde_json::from_str(&ev.payload_json).unwrap_or(Value::String(ev.payload_json.clone()));
     format!("[{idx:>6}] {}: {payload}", ev.kind)
-}
-
-// ---- image subcommand ---------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-async fn image_build(
-    repo: &str,
-    source: &Path,
-    tag: Option<&str>,
-    images_dir: &Path,
-    docker_bin: Option<&str>,
-    format: Format,
-    inject_init: bool,
-    transport: engram_image_builder::Transport,
-    push: Option<&str>,
-) -> Result<(), CliError> {
-    let resolved_tag = tag
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("warm-{}", Utc::now().format("%Y%m%dT%H%M%SZ")));
-    let init_injection = inject_init.then_some(engram_image_builder::InitInjection {
-        // Reserved port engram-agentd listens on inside the guest.
-        // Hard-coded here (and in engram-sandbox-firecracker as
-        // ENGRAM_AGENTD_PORT) so the bake and the host's connect
-        // logic agree without a config flow.
-        vsock_port: 1024,
-        transport,
-        init_script: None,
-    });
-    let req = BuildRequest {
-        source: source.to_path_buf(),
-        repo: repo.to_string(),
-        tag: resolved_tag.clone(),
-        images_dir: images_dir.to_path_buf(),
-        format,
-        init_injection,
-    };
-    let docker = match docker_bin {
-        Some(bin) => DockerCli::with_binary(bin.to_string()),
-        None => DockerCli::new(),
-    };
-    // ADR 0007: chunked-storage layout. Chunks land at
-    // `<images_dir>/store/` so a single bake produces a
-    // self-contained tree (mirrors the image-builder binary's
-    // wiring).
-    let chunk_root = images_dir.join("store");
-    tokio::fs::create_dir_all(&chunk_root)
-        .await
-        .map_err(|e| CliError::Other(format!("chunk store root: {e}")))?;
-    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
-        std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(chunk_root));
-    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    // OCI client for the optional registry push afterwards. Auth resolves
-    // from the standard docker config — `docker login <registry>` upstream,
-    // or any docker/login-action equivalent in CI; with no config the
-    // resolver returns no creds and push falls through to anonymous
-    // (matches public/local-registry behaviour).
-    let oci =
-        engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::DockerConfigResolver::new()));
-    let builder = Builder::new(docker, chunk_store).with_oci(oci);
-    let outcome = builder
-        .build(&req)
-        .await
-        .map_err(|e| CliError::Other(e.to_string()))?;
-    println!(
-        "{repo} {tag} -> {dir} ({size} bytes)",
-        repo = repo,
-        tag = resolved_tag,
-        dir = outcome.image_dir.display(),
-        size = outcome.size_bytes,
-    );
-
-    // Optional push to OCI registry. The bake step intentionally does
-    // NOT touch Postgres — once pushed, the image is reachable to
-    // engram by URI alone. The auth resolver wired into the host-
-    // agent's OCI client handles credential lookup at pull time.
-    if let Some(target) = push {
-        let push = builder
-            .push_to_registry(&req, &outcome, target)
-            .await
-            .map_err(|e| CliError::Other(format!("push: {e}")))?;
-        println!(
-            "✓ pushed {uri} (digest {digest})",
-            uri = push.uri,
-            digest = push.manifest_digest.as_str(),
-        );
-    }
-
-    Ok(())
 }
 
 // ---- registry subcommands ---------------------------------------------

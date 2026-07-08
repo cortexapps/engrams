@@ -14,11 +14,11 @@
 //!
 //! All three are opaque blobs (not chunked). Keys are derived from
 //! the snapshot_id so the same scheme works for base template
-//! snapshots (image-builder bake-time) and durability snapshots
-//! (host-agent runtime) alike. Lives in `engram-chunk-store` rather
-//! than `engram-host-agent` so producers in either crate (image
-//! builder + host-agent + future migration tooling) reach the same
-//! key scheme without cross-dependency.
+//! snapshots (engram-rootfs-materializer bake-time) and durability
+//! snapshots (host-agent runtime) alike. Lives in `engram-chunk-store`
+//! rather than `engram-host-agent` so producers in either crate
+//! (the rootfs materializer + host-agent + future migration tooling)
+//! reach the same key scheme without cross-dependency.
 
 use std::path::Path;
 

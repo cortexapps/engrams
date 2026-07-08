@@ -71,7 +71,8 @@ fi
 file "$OUT/vmlinux" | grep -q "ELF 64-bit" || { echo "kernel is not an ELF binary:" >&2; file "$OUT/vmlinux" >&2; exit 1; }
 
 # ── RO session bundles (ADR 0027 → 0055 → 0058) ─────────────────────────────
-# The sentinel + skills + integrations-cli + browser + harness-claude + agentd squashfs bundles + the current.json stamp
+# The sentinel + skills + integrations-cli + browser + harness-claude +
+# agentd + guest-tools squashfs bundles + the current.json stamp
 # (logical name -> sha256). The host-agent reads these from
 # /var/lib/engram/shared at startup; the engram-host-fleet init container copies
 # them out of this image. ADR 0055: skills are profile-selected per session — the
@@ -120,9 +121,14 @@ harness_claude_sha="$(stage_bundle harness-claude)"
 # An agentd change ships by republishing this bundle: no image re-bake, no
 # base-snapshot recapture.
 agentd_sha="$(stage_bundle agentd)"
+# ADR 0080 §D: guest-tools — the pinned static ttyd agentd spawns for the
+# SHELL tab (reserved slot dyn_2). Not boot-critical (soft resolution
+# coordinator-side), but the fleet stages it so no session image has to
+# bake ttyd.
+guest_tools_sha="$(stage_bundle guest-tools)"
 # Stamp: logical name -> sha256, matching AuxRoDrive::CURRENT_STAMP / read_stamp().
-printf '{"sentinel":"%s","skills":"%s","integrations-cli":"%s","browser":"%s","harness-claude":"%s","agentd":"%s"}\n' \
-  "$sentinel_sha" "$skills_sha" "$integrations_cli_sha" "$browser_sha" "$harness_claude_sha" "$agentd_sha" \
+printf '{"sentinel":"%s","skills":"%s","integrations-cli":"%s","browser":"%s","harness-claude":"%s","agentd":"%s","guest-tools":"%s"}\n' \
+  "$sentinel_sha" "$skills_sha" "$integrations_cli_sha" "$browser_sha" "$harness_claude_sha" "$agentd_sha" "$guest_tools_sha" \
   > "$BUNDLES_OUT/current.json"
 
 echo "==> staged into ${OUT}:"

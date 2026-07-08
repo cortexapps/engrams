@@ -74,8 +74,8 @@ jobs:
       # don't ship) and trips a lane iff a changed crate is in that closure.
       # This can't silently drift the way `crates/** minus !denylist` did:
       # that list wrongly excluded engram-postgres / engram-agentd /
-      # engram-image-builder / engram-harness-proto, all of which bake into
-      # the FC-host binaries — a change to them never rebaked the host.
+      # engram-harness-proto, all of which bake into the FC-host binaries —
+      # a change to them never rebaked the host.
       #   images        = closure(coordinator, host-agent) + web/docker/migrations
       #   host_binaries = closure(host-agent, uffd-handler) + toolchain  (thin bake)
       #   host_base     = deploy/packer + deploy/otel                    (base bake)
@@ -427,16 +427,17 @@ jobs:
           echo "Published forked firecracker -> $REPO:$FC_SHA"
 
   # Compile the ops CLI ONCE — the exact, CI-tested binary — and publish it to
-  # GHCR as an OCI artifact keyed by SHA. The reusable bake-dev-image.yml
-  # workflow (and any consuming repo's dev-image bake) pulls this instead of
+  # GHCR as an OCI artifact keyed by SHA. Dogfood dev-image bakes (and any
+  # consuming repo) pull this to drive `engram` admin commands instead of
   # compiling from a private source checkout — exactly how the FC-host bakes
   # consume publish-host-binaries, and for the same reason: the bake that
   # ships is the bake CI tested, and the consuming workflow needs no Rust
-  # toolchain. ADR 0080: engram-agentd LEFT this artifact — no bake injects
-  # agentd anymore; it ships as `bundle-agentd` via publish-bundles and every
-  # guest execs it out of the staged bundle slot. engram-cli is the
-  # runner-native gnu build — it only ever runs on the ubuntu bake runner, so
-  # gnu is correct and dodges a musl reqwest/TLS rebuild.
+  # toolchain. ADR 0080: engram-agentd LEFT this artifact (it ships as
+  # `bundle-agentd`), and the local `image build` bake + its bundled mke2fs
+  # retired too — cli-tools is now JUST the ops CLI (session / image enable /
+  # registry). engram-cli is the runner-native gnu build — it only ever runs
+  # on the ubuntu bake runner, so gnu is correct and dodges a musl reqwest/TLS
+  # rebuild.
   publish-cli-tools:
     needs: detect
     if: needs.detect.outputs.cli_tools == 'true' || github.event_name == 'workflow_dispatch'
@@ -473,27 +474,10 @@ jobs:
           cp target/release/engram-cli dist/
           file dist/engram-cli
 
-      # ADR 0036: bundle the pinned STATIC mke2fs (e2fsprogs >= 1.47.1, honors
-      # SOURCE_DATE_EPOCH) INTO cli-tools, alongside engram-cli. Then every
-      # consumer of these golden binaries — the reusable bake-dev-image workflow,
-      # engrams-internal's dev-brain bake, all downstream dogfood repos — gets a
-      # byte-deterministic `engram-cli image build` with ZERO setup: engram-cli
-      # resolves the `mke2fs` sibling next to itself (ext4.rs resolve_mke2fs),
-      # never the runner's apt <= 1.47.0. One pinned rev (flake.lock) for the
-      # whole fleet; determinism is a property of the tool, not each workflow.
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v22
-      - name: Bundle the pinned static mke2fs
-        run: |
-          set -euo pipefail
-          MK="$(nix build .#mke2fs-static --no-link --print-out-paths)/sbin/mke2fs"
-          cp "$MK" dist/mke2fs
-          chmod 0755 dist/mke2fs   # nix store output is read-only + unstripped
-          strip dist/mke2fs        # trims symbols (~9M->8M; static code dominates);
-                                   # mke2fs's *output* (the ext4) is unaffected
-          file dist/mke2fs
-          dist/mke2fs -V           # fail loud if strip broke the static binary
-
+      # ADR 0080: cli-tools no longer bundles mke2fs. The local `image build`
+      # bake it fed is retired; the only mke2fs left is the enable-time
+      # materializer, which runs in the host-agent image
+      # (docker/host-agent.Dockerfile pins e2fsprogs >= 1.47.1 there).
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -511,13 +495,11 @@ jobs:
           set -euo pipefail
           REPO="ghcr.io/${{ github.repository }}/cli-tools"
           SHORT="${SHA:0:7}"
-          # Both as one artifact tagged by full SHA. `oras pull
-          # <repo>/cli-tools:<ref>` drops engram-cli + the pinned mke2fs into
-          # cwd (consumers chmod +x — oras doesn't preserve the bit).
+          # `oras pull <repo>/cli-tools:<ref>` drops engram-cli into cwd
+          # (consumers chmod +x — oras doesn't preserve the bit).
           oras push "$REPO:$SHA" \
             --artifact-type application/vnd.engrams.cli-tools.v1 \
-            engram-cli:application/octet-stream \
-            mke2fs:application/octet-stream
+            engram-cli:application/octet-stream
           oras tag "$REPO:$SHA" "$SHORT"
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
             oras tag "$REPO:$SHA" "main"
@@ -703,6 +685,10 @@ jobs:
           # bundle by the stage-1 init; an agentd change ships fleet-wide by
           # republishing this (zero image re-bakes / recaptures).
           deploy/bundles/agentd/build.sh target/x86_64-unknown-linux-musl/release/engram-agentd dist/agentd.squashfs
+          # ADR 0080 §D: guest-tools — the pinned static ttyd for the SHELL
+          # tab. Downloads + sha256-verifies the release binary; a ttyd bump
+          # ships by editing the pin and republishing (no image re-bakes).
+          deploy/bundles/guest-tools/build.sh dist/guest-tools.squashfs x86_64
           ls -l dist/
 
       - name: Log in to GHCR
@@ -721,7 +707,7 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${SHA:0:7}"
-          for name in sentinel skills integrations-cli browser harness-claude agentd; do
+          for name in sentinel skills integrations-cli browser harness-claude agentd guest-tools; do
             REPO="ghcr.io/${{ github.repository }}/bundle-$name"
             # `oras pull <repo>:<sha>` drops <name>.squashfs into cwd verbatim.
             oras push "$REPO:$SHA" \

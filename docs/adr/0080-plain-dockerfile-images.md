@@ -1,6 +1,6 @@
 # 0080 — Plain-Dockerfile session images: dynamic agentd, out-of-band ImageConfig, host-side materialization
 
-Status: Proposed (2026-07-07)
+Status: Accepted (2026-07-07)
 
 Builds on: ADR 0036 (per-chunk artifacts + async enable), ADR 0055
 (uniform dynamic mounts), ADR 0057 (unified session policy — the half
@@ -321,6 +321,70 @@ as workspace requirements). `engram-image-builder`,
 `just bake-demo` are deleted; dev flow becomes
 `docker build && docker push localhost:5001/… && engram image enable
 --config …`.
+
+**Phase 4 divergences (implementation):**
+
+- **`guest-tools` slot layout** — `GUEST_TOOLS_SLOT_INDEX = 2`
+  (`dyn_2`, stamp key `guest-tools`), skills shift to `dyn_3..`
+  (`FIRST_SKILL_SLOT_INDEX = 3`, `MAX_SKILL_SLOTS = RESERVED_SLOTS - 3`).
+  Unlike agentd (§A, HARD at capture), guest-tools is SOFT everywhere:
+  the coordinator's `resolve_guest_tools_mount` pins the fleet
+  generation on fresh creates but warns + returns `None` on a
+  bundle-less fleet; VZ's `resolve_agentd_slot` resolves it if staged
+  and otherwise leaves the slot symbolic (skipped at attach); agentd's
+  `shell.rs::resolve_ttyd_bin` probes the dyn mounts for `ttyd`
+  (`ENGRAM_TTYD_BIN` → bundle mount → the legacy `/usr/local/bin/ttyd`
+  image path, with a loud warn on fallback). The `guest-tools` bundle
+  (`deploy/bundles/guest-tools/build.sh`) downloads a **pinned,
+  per-arch sha256-verified** static ttyd (tsl0922 GitHub release
+  1.7.7) and packs it reproducibly via `_pack.sh`. Detector: it lives
+  entirely under `deploy/bundles/` (a pinned download, no crate), so
+  `bundles |= guest_tools_changed` is already covered by the
+  `BUNDLES_PATHS` path rule — no closure term needed (contrast agentd,
+  a compiled crate).
+- **Fixture migration, no docker** — retiring `engram-image-builder`
+  broke every FC/host-agent integration test that baked a rootfs via
+  `Builder` + `docker build`. They now bake through a shared
+  `common::bake_fixture_ext4`: a static-busybox userland (every
+  `busybox --list` applet symlinked) + the stage-1 `inject_init` +
+  the SAME `Mke2fsPacker` the materializer uses, chunked into the test
+  chunk store. Tests that needed real tools get them WITHOUT an apt
+  layer: `copy_host_tool_with_closure` copies a host `socat`/`curl` +
+  its `ldd` closure (proxy tests), and the epoll probe is compiled
+  host-side with `cc -static` (two_host_live_teleport). Each test's
+  asserted property is unchanged; `require_bin("docker")` gates
+  dropped, a static-busybox gate added. e2e_shell now exercises the
+  `/usr/local/bin/ttyd` fallback path (the bundle-resolve path is
+  covered by the coordinator + VZ resolution above).
+- **mke2fs moves to the host-agent image** — the only mke2fs left is
+  the enable-time materializer's, which runs in the host-agent
+  container. `debian:trixie` (the runtime base) ships e2fsprogs
+  1.47.2 (matches the flake pin), so `docker/host-agent.Dockerfile`
+  keeps the apt `e2fsprogs` but adds a build-time
+  `mke2fs -V >= 1.47.1` assertion (fail loud if a base bump regresses
+  determinism) and `ENV ENGRAM_MKE2FS=/usr/sbin/mke2fs`. `cli-tools`
+  no longer bundles the static mke2fs (its `nix build .#mke2fs-static`
+  step + the detector's flake→cli_tools trigger retired). macOS/VZ dev
+  points `ENGRAM_MKE2FS` at homebrew's keg-only e2fsprogs in the
+  Tiltfile.
+- **Bake-path deletions** — `bake-dev-image.yml` (the reusable
+  external-repo bake) deleted; `ci.yml`'s `bake-demo-image` converted
+  from an `engram-cli image build --push` job to a plain
+  `docker/build-push-action` buildx build+push (the prod demo image
+  still publishes, just as a standard OCI image); `just bake` +
+  `deploy/dev/{bake-demo,integration-bake-demo}.sh` are
+  `docker build && docker push`. `deploy/demo/Dockerfile` drops the
+  ttyd multi-stage COPY and the `.bashrc` bake (both now engrams-owned
+  via the guest-tools bundle + stage-1 init).
+
+## Commit chain
+
+- P1 (dynamic agentd): #603 `3ea55caf`
+- P2a (ImageConfig + UpdateImage core/wire): #604 `a1e478e2`
+- P2b (surface: web form + orchestrator authz + e2e): #605 `9b9526e6`
+- P3a (`engram-rootfs-materializer` crate + fixture tests): #606 `286ecbf5`
+- P3b (`MaterializeImage` host RPC, wire v14 + pipeline switch): #607
+- P4 (purification + retirement, this branch): flips this ADR to Accepted.
 
 ## Alternatives rejected
 

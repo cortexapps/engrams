@@ -7,10 +7,9 @@
 //! mount, no root needed. This is the same flow Firecracker's CI uses
 //! to bake their published `ubuntu-*.ext4` artifacts.
 //!
-//! ADR 0080: this module moved here from `engram-image-builder`
-//! (which now re-exports it) — the materializer is the one home for
-//! tree → ext4 packing, whether the tree came from `docker export`
-//! (the retiring bake) or an OCI-layer flatten (this crate).
+//! ADR 0080: this module is the single home for tree → ext4 packing,
+//! whether the tree came from `docker export` (the retiring bake) or
+//! an OCI-layer flatten (this crate).
 //!
 //! [`Ext4Packer`] is a trait so unit tests can mock it; the real
 //! binary is exercised by the packer/determinism integration tests.

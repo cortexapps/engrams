@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 
 use common::{drain, fc_preflight, require_bin};
@@ -40,9 +40,13 @@ async fn vsock_delivers_after_plain_pause_resume() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     // Fork-only: stock v1.16's snapshot-only kick() arms the RX gate on plain
     // resume (the bug under test), so asserting the property against stock
     // would just re-prove upstream's defect. Same skip contract as
@@ -72,31 +76,24 @@ async fn vsock_delivers_after_plain_pause_resume() {
     }
 
     // ---- 1. Bake an agent-baked ext4 image (same recipe as exec_real_vm) ----
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
         engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
     );
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let baker = Builder::new(DockerCli::new(), chunk_store);
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-pause-resume-test".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("ext4 bake with agent injection");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |_tree| Ok(()),
+    )
+    .await;
 
     // ---- 2. Boot the microVM on the FORK binary ----
     let work = tempfile::tempdir().expect("work dir");

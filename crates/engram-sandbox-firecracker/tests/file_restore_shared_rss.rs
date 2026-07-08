@@ -7,8 +7,8 @@
 //!   - Bake a tiny rootfs whose init fills a 64 MiB tmpfs blob (guest
 //!     RAM) and re-reads it every second — a guest working set that
 //!     every sibling re-touches after restore, so the shared pages
-//!     actually fault in and become measurable. The init is baked in
-//!     via the image builder (`mke2fs -d` builds the whole tree at FS
+//!     actually fault in and become measurable. The init is packed in
+//!     via `Mke2fsPacker` (`mke2fs -d` builds the whole tree at FS
 //!     creation, computing correct `metadata_csum` for every block) —
 //!     NOT a post-hoc `debugfs write`, which lands the file's data
 //!     blocks with mismatched checksums on some e2fsprogs versions
@@ -48,7 +48,6 @@ use std::time::{Duration, Instant};
 use engram_chunk_store::{ChunkCache, ChunkCacheConfig, ChunkStore, ManifestKind};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
 use engram_storage_local::LocalBlobStorage;
 use tempfile::TempDir;
@@ -70,13 +69,22 @@ const BLOB_MIB: u64 = 64;
 /// RSS-floor assertion (the honest signal), not a dead VM. Baked via
 /// `mke2fs -d` (see the module docs) so the guest kernel can actually
 /// `execve` it.
+///
+/// The read loop is `md5sum`, NOT `cat`: busybox `cat` copies via
+/// `sendfile(2)`, and sendfile from tmpfs to /dev/null never dereferences
+/// the page CONTENTS (the null driver discards the request without
+/// reading), so a restored sibling would never re-fault the blob from
+/// memory.bin and the RSS floor this test measures would collapse to the
+/// boot set (strace-verified: busybox cat = 2 sendfile calls, 0 reads).
+/// md5sum must pull every byte through userspace, faulting every page on
+/// every pass regardless of the coreutils flavor.
 const SPIKE_INIT: &str = "#!/bin/sh\n\
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin\n\
 mount -t proc proc /proc 2>/dev/null || true\n\
 mount -t devtmpfs dev /dev 2>/dev/null || true\n\
 mount -t tmpfs -o size=128m tmpfs /tmp 2>/dev/null || true\n\
 head -c 67108864 /dev/urandom > /tmp/blob 2>/dev/null || true\n\
-while true; do cat /tmp/blob > /dev/null 2>&1 || true; sleep 1; done\n";
+while true; do md5sum /tmp/blob > /dev/null 2>&1 || true; sleep 1; done\n";
 
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker + Docker + mke2fs; bakes a rootfs and boots microVMs"]
@@ -85,9 +93,13 @@ async fn file_backend_siblings_share_clean_pages() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") {
+    if !require_bin("mke2fs") {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
 
     // Keep the jail dir on failure so we can read firecracker.log (which
     // carries the guest serial console — lib.rs funnels console=ttyS0 +
@@ -97,7 +109,7 @@ async fn file_backend_siblings_share_clean_pages() {
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
     // ---- 1. Bake a self-driving rootfs (init baked in via mke2fs -d) ----
-    let baked = bake_spike_rootfs().await;
+    let baked = bake_spike_rootfs(&busybox).await;
 
     // ---- 2. Boot, let the blob fill, snapshot, destroy ----
     let work = tempfile::tempdir().expect("work dir");
@@ -244,12 +256,16 @@ async fn file_backend_base_create_shares_residency_memfile() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") {
+    if !require_bin("mke2fs") {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
-    let baked = bake_spike_rootfs().await;
+    let baked = bake_spike_rootfs(&busybox).await;
 
     // Prod-shaped config: idle-resume on UFFD, base session.create flipped
     // to File (ADR 0022). `restore_fresh` must therefore pick File even
@@ -426,9 +442,13 @@ async fn substrate_base_create_density_and_latency_parity() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") {
+    if !require_bin("mke2fs") {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     let fork_bin = match std::env::var("ENGRAM_FC_FORK_BIN") {
         Ok(p) if !p.is_empty() => PathBuf::from(p),
         _ => {
@@ -444,7 +464,7 @@ async fn substrate_base_create_density_and_latency_parity() {
     }
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
-    let baked = bake_spike_rootfs().await;
+    let baked = bake_spike_rootfs(&busybox).await;
 
     // ---- Source boot + snapshot (shared by both arms) ----
     let work = tempfile::tempdir().expect("work dir");
@@ -698,42 +718,34 @@ async fn substrate_base_create_density_and_latency_parity() {
 /// keep `Baked` alive for as long as the rootfs is in use.
 struct Baked {
     rootfs: PathBuf,
-    _src: TempDir,
     _images: TempDir,
     _chunk_root: TempDir,
 }
 
-async fn bake_spike_rootfs() -> Baked {
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(src.path().join("spike-init.sh"), SPIKE_INIT).expect("write init");
-    std::fs::write(
-        src.path().join("Dockerfile"),
-        "FROM debian:bookworm-slim\n\
-         COPY spike-init.sh /spike-init.sh\n\
-         RUN chmod 0755 /spike-init.sh\n",
-    )
-    .expect("write Dockerfile");
-
+async fn bake_spike_rootfs(busybox: &Path) -> Baked {
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
         std::sync::Arc::new(LocalBlobStorage::new(chunk_root.path().to_path_buf()));
     let chunk_store = ChunkStore::new(blob);
-    let baker = Builder::new(DockerCli::new(), chunk_store);
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-shared-rss-test".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: None,
-        })
-        .await
-        .expect("ext4 bake");
+    // No agentd/init injection: the guest is self-driving, booting the
+    // COPY-equivalent `/spike-init.sh` directly (see `default_boot_args`).
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        busybox,
+        None,
+        |tree| {
+            use std::os::unix::fs::PermissionsExt;
+            let init = tree.join("spike-init.sh");
+            std::fs::write(&init, SPIKE_INIT)?;
+            std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        },
+    )
+    .await;
     Baked {
         rootfs: outcome.rootfs_path,
-        _src: src,
         _images: images,
         _chunk_root: chunk_root,
     }

@@ -39,7 +39,7 @@ use engram_core::types::sandbox::{
 };
 use engram_core::types::snapshot::MigrationSourceInfo;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -154,7 +154,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some((kernel, handler, agent)) = gate() else {
+    let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
     // Low-disk hosts (the dev VM at >90% used) trip the cache's
@@ -172,25 +172,20 @@ async fn drain_wave_teleports_every_session_off_host_a() {
 
     // Bake once; every session boots the same image (the chunks land in
     // the shared store, so B can restore without A's local cache).
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
+    // Docker-free (ADR 0080 §D).
     let images = tempfile::tempdir().expect("images dir");
-    let baker = Builder::new(DockerCli::new(), chunk_store.clone());
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-drain-wave".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("bake");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |_tree| Ok(()),
+    )
+    .await;
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts (the
     // fleet stages identical generations).
@@ -454,7 +449,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
     host_b.server.abort();
 }
 
-fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
+fn gate() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let kernel = match std::env::var("FC_TEST_KERNEL") {
         Ok(p) => PathBuf::from(p),
         Err(_) => {
@@ -466,7 +461,7 @@ fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
         eprintln!("SKIP: /dev/kvm not present");
         return None;
     }
-    for bin in ["firecracker", "docker", "mke2fs", "mksquashfs"] {
+    for bin in ["firecracker", "mke2fs", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)
@@ -475,6 +470,10 @@ fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
             return None;
         }
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return None;
+    };
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let agent = Path::new(&manifest_dir)
         .join("../../target/x86_64-unknown-linux-musl/release/engram-agentd");
@@ -487,7 +486,7 @@ fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
         eprintln!("SKIP: engram-uffd-handler not built");
         return None;
     }
-    Some((kernel, handler, agent))
+    Some((kernel, handler, agent, busybox))
 }
 
 async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &str) -> String {
