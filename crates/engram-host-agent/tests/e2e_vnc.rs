@@ -336,9 +336,15 @@ async fn e2e_vnc_cold_via_pooled_backend() {
     // (RFC 6143 §7.1.1). A banner here proves the FULL chain ran: the browser
     // bundle activated → the launcher brought x11vnc up on the guest's loopback
     // → agentd's relay dialed 127.0.0.1:5900 in-guest → raw RFB bytes spliced
-    // back over vsock. (Banner-necessary-but-not-sufficient — x11vnc serves it
-    // even if chromium died — but start_browser's readiness probe already gated
-    // on x11vnc AND chromium's CDP endpoint, so a banner means the stack is live.)
+    // back over vsock. Banner-necessary-but-NOT-sufficient: chromium's own
+    // liveness is deliberately not gated anywhere on this path —
+    // `start_browser` only *warns* when CDP never answers (issue #569 chose
+    // non-fatal so a slow cold start isn't misread as failure) — so a
+    // crash-looping chrome behind a healthy x11vnc passes this test. That is
+    // exactly how the Debian chromium 150.0.7871.46 startup-crash regression
+    // (Debian bug #1141488, Jul 2026) reached prod with CI green; the guard
+    // against a broken chrome is the version pin in
+    // deploy/bundles/browser/build.sh, not this lane.
     let mut banner = [0u8; 12];
     timeout(Duration::from_secs(30), stream.read_exact(&mut banner))
         .await
