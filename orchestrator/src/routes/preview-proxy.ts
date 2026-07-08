@@ -297,14 +297,24 @@ function proxyHttp(
       if (c.req.raw.body) init.duplex = "half";
 
       fetch(`http://127.0.0.1:${localPort}${url.pathname}${url.search}`, init)
-        .then((upstream) =>
+        .then((upstream) => {
+          // WHATWG fetch transparently DECOMPRESSES a Content-Encoding'd
+          // upstream body but leaves the original entity headers in place, so
+          // forwarding `upstream.headers` verbatim sends the decompressed
+          // bytes labeled with the guest's `content-encoding: gzip` (and the
+          // compressed-size `content-length`) — the browser then fails to
+          // gunzip plain bytes (net::ERR_CONTENT_DECODING_FAILED). Strip both
+          // so the forwarded headers describe the body we actually have.
+          const headers = new Headers(upstream.headers);
+          headers.delete("content-encoding");
+          headers.delete("content-length");
           resolve(
             new Response(upstream.body, {
               status: upstream.status,
-              headers: upstream.headers,
+              headers,
             }),
-          ),
-        )
+          );
+        })
         .catch(() => {
           server.close();
           resolve(previewErrorResponse(tunnelError));
