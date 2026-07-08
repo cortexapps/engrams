@@ -1395,14 +1395,24 @@ impl HostAgent {
                             capture_jobs_for_heartbeat
                                 .ack(&resp.acked_capture_jobs)
                                 .await;
-                            // For every assignment this host doesn't
-                            // already own at the assigned epoch, claim the
-                            // full dispatch and start the executor. Each
-                            // claim is its own spawned task so a slow (or
-                            // failing) claim round trip for one job never
-                            // delays this tick's ack processing or the
-                            // next heartbeat send.
-                            for assignment in &resp.capture_assignments {
+                            // `None` = the coord's assignment read failed
+                            // (unknown) — take no action at all this tick.
+                            // `Some` is authoritative: converge-cancel any
+                            // still-running attempt absent from it (it was
+                            // reassigned away / superseded — fenced-off
+                            // work must not keep burning a VM), then claim
+                            // anything new. For every assignment this host
+                            // doesn't already own at the assigned epoch,
+                            // claim the full dispatch and start the
+                            // executor. Each claim is its own spawned task
+                            // so a slow (or failing) claim round trip for
+                            // one job never delays this tick's ack
+                            // processing or the next heartbeat send.
+                            let Some(assignments) = &resp.capture_assignments else {
+                                continue;
+                            };
+                            capture_jobs_for_heartbeat.cancel_absent(assignments);
+                            for assignment in assignments {
                                 if !capture_jobs_for_heartbeat
                                     .should_claim(assignment.job_id, assignment.epoch)
                                 {

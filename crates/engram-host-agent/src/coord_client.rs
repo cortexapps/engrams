@@ -585,9 +585,14 @@ pub struct HeartbeatResponse {
     #[serde(default)]
     pub acked_checkpoints: Vec<engram_core::types::SnapshotId>,
     /// ADR 0081 P1b: `(job_id, epoch)` assignments this host should be
-    /// running (or should claim, if it isn't yet).
+    /// running (or should claim, if it isn't yet). `None` = the coord's
+    /// read failed (unknown — take no action); `Some` is authoritative,
+    /// including `Some(vec![])`: a still-running local attempt absent
+    /// from a `Some` list was reassigned away or terminally superseded,
+    /// and its VM gets cancelled (fenced-off work must not keep burning
+    /// capacity).
     #[serde(default)]
-    pub capture_assignments: Vec<engram_core::types::CaptureJobAssignment>,
+    pub capture_assignments: Option<Vec<engram_core::types::CaptureJobAssignment>>,
     /// ADR 0081 P1b: terminal reports from this heartbeat that landed in
     /// PG. The host deletes the matching durable capture-job records.
     #[serde(default)]
@@ -771,7 +776,10 @@ mod tests {
             "live_bundles": [],
         });
         let ack: HeartbeatResponse = serde_json::from_value(old_coord_ack).unwrap();
-        assert!(ack.capture_assignments.is_empty());
+        // Absent assignments decode to None ("unknown"), NOT Some(vec![])
+        // — an old coord must never look like an authoritative "cancel
+        // everything you're running".
+        assert!(ack.capture_assignments.is_none());
         assert!(ack.acked_capture_jobs.is_empty());
     }
 }

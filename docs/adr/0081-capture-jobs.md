@@ -426,3 +426,21 @@ rework + stage-deadline scan.
   the cold-base/warm-overlay split, `cold_bases` reuse, the
   determinism test. `pick_capture_host` is called verbatim (first-fit,
   no footprint sizing) everywhere this commit needed a host pick.
+- **Review round 1 (same PR): three reconcile-loop fixes.** (a) The
+  terminal-report ack rule initially only acked applied-or-
+  same-epoch-terminal — a SUPERSEDED-epoch terminal (job reassigned
+  away) was never acked, so the old host re-advertised its fenced-off
+  record every heartbeat forever; the rule is now the pure
+  `should_ack_capture_terminal` (ack iff applied ∨ row-gone ∨
+  row.epoch > report.epoch ∨ same-epoch-terminal; a PG lookup ERROR
+  never acks — distinct from row-gone, or a blip would delete the only
+  durable copy of a finished capture). (b) The dashboard mirror is
+  gated on `applied` so a stale-epoch report can't overwrite the live
+  attempt's columns. (c) `HeartbeatResponse.capture_assignments`
+  became `Option<Vec<…>>` (None = coord read failed = do nothing;
+  collapsing the error into `[]` would have made a PG blip read as
+  "cancel everything"), enabling the new host-side convergence cancel:
+  `cancel_absent` destroys the VM of any running attempt absent from
+  an authoritative assignment list (reassigned away/superseded) —
+  WITHOUT aborting the executor task, so `run_one`'s terminal
+  bookkeeping still runs and the stale report drains via (a).

@@ -42,8 +42,8 @@ use dashmap::DashMap;
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::capture_job::{CaptureJobSpec, CaptureJobStage};
 use engram_core::types::{
-    CaptureJobId, CaptureJobProgress, CaptureJobReport, CaptureProgress, CaptureTerminalReport,
-    SandboxId,
+    CaptureJobAssignment, CaptureJobId, CaptureJobProgress, CaptureJobReport, CaptureProgress,
+    CaptureTerminalReport, SandboxId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -293,6 +293,51 @@ impl CaptureJobExecutor {
     /// the coordinator hasn't caught up to a reassignment this host
     /// already knows about), matching ADR 0081's "ignore a
     /// lower-than-running epoch" rule without a separate branch.
+    /// Convergence cancel (ADR 0081 §A): destroy the VM of any
+    /// still-running attempt whose `job_id` is entirely absent from the
+    /// coordinator's AUTHORITATIVE assignment list for this host — it was
+    /// reassigned to another host or terminally superseded, so its writes
+    /// are fenced off and its VM is pure capacity waste. Deliberately
+    /// destroys the VM WITHOUT aborting the executor task: the dying VM
+    /// makes `build_base_snapshot` fail fast, and `run_one` then walks its
+    /// normal terminal-bookkeeping path (durable record + report), whose
+    /// stale-epoch report the coordinator acks-and-discards. Aborting the
+    /// task instead would race its record/report bookkeeping.
+    ///
+    /// Call ONLY with a `Some` assignment list (a coord-side read failure
+    /// is `None` = unknown — cancelling on it would let a PG blip destroy
+    /// healthy in-flight captures fleet-wide). Epoch-mismatched entries
+    /// are NOT cancelled here — the claim path's stale-epoch cancel in
+    /// [`Self::start`] owns that transition.
+    pub fn cancel_absent(&self, assignments: &[CaptureJobAssignment]) {
+        let present: std::collections::HashSet<CaptureJobId> =
+            assignments.iter().map(|a| a.job_id).collect();
+        let stale: Vec<(CaptureJobId, i64, SandboxId)> = {
+            let running = self.running.lock().unwrap();
+            running
+                .iter()
+                .filter(|(job_id, _)| !present.contains(job_id))
+                .filter_map(|(job_id, r)| r.sandbox_id.map(|sid| (*job_id, r.epoch, sid)))
+                .collect()
+        };
+        for (job_id, epoch, sid) in stale {
+            tracing::warn!(
+                %job_id,
+                epoch,
+                sandbox_id = %sid,
+                "capture job absent from the coordinator's assignment list \
+                 (reassigned away or superseded); destroying its VM",
+            );
+            let backend = self.backend.clone();
+            tokio::spawn(async move {
+                if let Err(e) = backend.destroy(sid).await {
+                    tracing::debug!(sandbox_id = %sid, error = %e,
+                        "destroy of an unassigned capture VM failed (best-effort)");
+                }
+            });
+        }
+    }
+
     pub fn should_claim(&self, job_id: CaptureJobId, epoch: i64) -> bool {
         match self.running.lock().unwrap().get(&job_id) {
             Some(running) => epoch > running.epoch,
