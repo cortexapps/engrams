@@ -61,8 +61,30 @@ build_tree() {
         # #569) so the bundle carries its own loader instead of depending on
         # the one the base image ships.
         apt-get install -y -qq --no-install-recommends \
-            chromium xvfb x11vnc openbox fonts-liberation ca-certificates \
+            xvfb x11vnc openbox fonts-liberation ca-certificates \
             x11-xkb-utils xkb-data util-linux curl xz-utils patchelf
+
+        # Chromium is PINNED, installed from a snapshot.debian.org timestamp —
+        # never floated from bookworm-security. An unpinned `apt-get install
+        # chromium` silently rides every Debian security push into the next
+        # bundle rebuild: 150.0.7871.46-1~deb12u1 (Jul 2026) crashed on
+        # startup for everyone (Debian bug #1141488, SIGTRAP in the browser
+        # process ~100ms in), which shipped a crash-looping chrome to every
+        # prod session (black Browser tab) while CI stayed green (e2e_vnc
+        # gates on the RFB banner; chrome liveness is a warning). To BUMP:
+        # pick the new version + a snapshot timestamp that contains it from
+        # https://snapshot.debian.org/package/chromium/ and update both
+        # constants; sanity-check the new chrome actually starts in a session
+        # (Browser tab shows a page, or SessionService/Exec:
+        # `pgrep -f chrome/chrome && tail /tmp/engram-browser.chrome.log`).
+        CHROMIUM_PIN="149.0.7827.196-1~deb12u1"
+        SNAPSHOT_TS="20260630T000000Z"
+        echo "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/$SNAPSHOT_TS bookworm-security main" \
+            > /etc/apt/sources.list.d/chromium-snapshot.list
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends \
+            chromium="$CHROMIUM_PIN" chromium-common="$CHROMIUM_PIN"
+        rm /etc/apt/sources.list.d/chromium-snapshot.list
         rm -rf /var/lib/apt/lists/*
 
         mkdir -p /out/chrome /out/bin /out/lib /out/fonts
