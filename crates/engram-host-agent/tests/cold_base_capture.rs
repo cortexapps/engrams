@@ -213,14 +213,24 @@ async fn cold_base_hit_skips_the_second_cold_boot_and_dedupes_the_overlay() {
          ({miss_elapsed:?}) — no second cold boot should have happened",
     );
 
-    // (a) the overlay dedupes against the cold base: FAR fewer new
-    // chunk blobs are uploaded for the hit-leg overlay (only the
-    // hook-dirtied marker's pages are novel content) than were uploaded
-    // minting the cold base itself (the full guest image, disk + mem).
+    // (a) the overlay dedupes against the cold base: substantially fewer
+    // new chunk blobs are uploaded for the hit-leg overlay than were
+    // uploaded minting the cold base itself (the full guest image,
+    // disk + mem). The bar is HALF, deliberately loose: the overlay's
+    // novel content is the hook-dirtied marker PLUS whatever pages the
+    // guest kernel dirtied on its own during the restore→hook window
+    // (timers, kswapd, journal writeback — nondeterministic), and diff
+    // granularity is per-chunk, so one dirtied page pays a whole chunk.
+    // Observed on the CI runner: 38 vs 145 puts (74% dedup) — a broken
+    // diff (a second Full) re-puts ~everything and fails HALF by a
+    // mile, which is the regression this guards; a tighter ratio just
+    // flakes on the background-dirtying noise floor (a 1/4 bar failed
+    // CI at 26% on an otherwise-correct diff).
     assert!(
-        hit_puts * 4 < miss_puts,
+        hit_puts * 2 < miss_puts,
         "the hit-leg overlay ({hit_puts} new chunk puts) must dedupe against the cold \
-         base's chunks — expected well under 1/4 of the miss leg's {miss_puts} puts",
+         base's chunks — expected well under half of the miss leg's {miss_puts} puts \
+         (a diff, not a second Full dump)",
     );
 }
 
