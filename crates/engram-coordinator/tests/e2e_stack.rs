@@ -744,10 +744,22 @@ async fn e2e_cold_session_no_harness_can_exec_ls() {
         resp.stdout,
         resp.stderr
     );
+    // ADR 0080 §D: the image bakes NO ttyd — the SHELL tab's ttyd rides the
+    // `guest-tools` bundle (staged by the e2e lane via `just bundles-squashfs`)
+    // and agentd's shell.rs resolves it from the dyn mounts. Assert the
+    // bundle-mount path here so the guest-tools slot is exercised end to end
+    // (the image contract is `/bin/sh` only).
+    let ttyd = driver
+        .exec(
+            sid,
+            "ls /opt/engram/dyn/*/ttyd >/dev/null 2>&1 && echo MOUNTED",
+        )
+        .await;
     assert!(
-        resp.stdout.contains("ttyd"),
-        "demo image should ship ttyd at /usr/local/bin; stdout=<{}>",
-        resp.stdout
+        ttyd.stdout.contains("MOUNTED"),
+        "guest-tools bundle must provide ttyd on a dyn mount (ADR 0080); stdout=<{}> stderr=<{}>",
+        ttyd.stdout,
+        ttyd.stderr
     );
     driver.delete(sid).await;
 }
@@ -829,11 +841,9 @@ async fn e2e_cold_session_claude_harness_can_exec_ls() {
         resp.stdout,
         resp.stderr
     );
-    assert!(
-        resp.stdout.contains("ttyd"),
-        "demo image should ship ttyd; stdout=<{}>",
-        resp.stdout
-    );
+    // ADR 0080 §D: ttyd is bundle-delivered, not baked — the no-harness
+    // sibling test asserts the guest-tools mount; here plain exec working
+    // with the harness bound is the property.
     driver.delete(sid).await;
 }
 

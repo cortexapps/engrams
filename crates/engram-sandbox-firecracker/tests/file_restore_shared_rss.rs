@@ -69,13 +69,22 @@ const BLOB_MIB: u64 = 64;
 /// RSS-floor assertion (the honest signal), not a dead VM. Baked via
 /// `mke2fs -d` (see the module docs) so the guest kernel can actually
 /// `execve` it.
+///
+/// The read loop is `md5sum`, NOT `cat`: busybox `cat` copies via
+/// `sendfile(2)`, and sendfile from tmpfs to /dev/null never dereferences
+/// the page CONTENTS (the null driver discards the request without
+/// reading), so a restored sibling would never re-fault the blob from
+/// memory.bin and the RSS floor this test measures would collapse to the
+/// boot set (strace-verified: busybox cat = 2 sendfile calls, 0 reads).
+/// md5sum must pull every byte through userspace, faulting every page on
+/// every pass regardless of the coreutils flavor.
 const SPIKE_INIT: &str = "#!/bin/sh\n\
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin\n\
 mount -t proc proc /proc 2>/dev/null || true\n\
 mount -t devtmpfs dev /dev 2>/dev/null || true\n\
 mount -t tmpfs -o size=128m tmpfs /tmp 2>/dev/null || true\n\
 head -c 67108864 /dev/urandom > /tmp/blob 2>/dev/null || true\n\
-while true; do cat /tmp/blob > /dev/null 2>&1 || true; sleep 1; done\n";
+while true; do md5sum /tmp/blob > /dev/null 2>&1 || true; sleep 1; done\n";
 
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker + Docker + mke2fs; bakes a rootfs and boots microVMs"]
