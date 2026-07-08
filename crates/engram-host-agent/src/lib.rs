@@ -323,9 +323,22 @@ impl HostAgent {
             // Unconditional (no chunk-store/diff-checkpoint gate like
             // checkpointing has): a job record's persistence doesn't
             // depend on any optional subsystem.
+            // The FC snapshot-format version stamp (probed once — the
+            // binary can't change under a running host-agent; None on
+            // VZ/Process). The coordinator's finalize requires it on any
+            // capture that produced a cold base (ADR 0081 §B content
+            // key), and the host that runs the VMM is its authority.
+            let fc_snapshot_version = capabilities::fc_snapshot_version(
+                self.fc_for_reattach
+                    .as_ref()
+                    .map(|fc| fc.config().firecracker_bin.clone())
+                    .as_deref(),
+            )
+            .await;
             let capture_jobs = capture_job::CaptureJobExecutor::new(
                 pooled.clone(),
                 self.cfg.work_dir.join("capture-jobs"),
+                fc_snapshot_version,
             );
             capture_jobs.rehydrate().await;
             // ADR 0045 C1: the migration export TTL sweep — the

@@ -87,13 +87,16 @@ impl CaptureJobRecord {
     }
 }
 
-fn report_from_record(rec: &CaptureJobRecord) -> CaptureJobReport {
+fn report_from_record(
+    rec: &CaptureJobRecord,
+    fc_snapshot_version: Option<&str>,
+) -> CaptureJobReport {
     CaptureJobReport {
         job_id: rec.job_id,
         epoch: rec.epoch,
         stage: rec.stage,
         progress: None,
-        fc_snapshot_version: None,
+        fc_snapshot_version: fc_snapshot_version.map(str::to_owned),
         terminal: rec.terminal.clone(),
     }
 }
@@ -143,16 +146,30 @@ pub struct CaptureJobExecutor {
     /// shared `Arc<CaptureJobExecutor>` and call `start`/`should_claim`/
     /// etc. repeatedly on it, so `start` can't consume `self` by value.
     self_ref: std::sync::OnceLock<std::sync::Weak<Self>>,
+    /// The host's FC snapshot format version (`firecracker
+    /// --snapshot-version`, probed once at startup — the binary can't
+    /// change without a host-agent restart); `None` on VZ/Process
+    /// hosts. Stamped on every report this executor emits: the
+    /// coordinator's finalize REQUIRES it whenever a capture produced a
+    /// cold base (the content key's version dimension — ADR 0081 §B),
+    /// and the host that actually ran the VMM is the authority for it,
+    /// not the heartbeat-lagged `hosts.capabilities` row.
+    fc_snapshot_version: Option<String>,
 }
 
 impl CaptureJobExecutor {
-    pub fn new(backend: Arc<dyn SandboxBackend>, records_dir: PathBuf) -> Arc<Self> {
+    pub fn new(
+        backend: Arc<dyn SandboxBackend>,
+        records_dir: PathBuf,
+        fc_snapshot_version: Option<String>,
+    ) -> Arc<Self> {
         let arc = Arc::new(Self {
             backend,
             records_dir,
             reports: Arc::new(DashMap::new()),
             running: Mutex::new(HashMap::new()),
             self_ref: std::sync::OnceLock::new(),
+            fc_snapshot_version,
         });
         let _ = arc.self_ref.set(Arc::downgrade(&arc));
         arc
@@ -177,7 +194,10 @@ impl CaptureJobExecutor {
         let records = CaptureJobRecord::load_all(&self.records_dir).await;
         for rec in records {
             if rec.stage.is_terminal() {
-                self.reports.insert(rec.job_id, report_from_record(&rec));
+                self.reports.insert(
+                    rec.job_id,
+                    report_from_record(&rec, self.fc_snapshot_version.as_deref()),
+                );
                 continue;
             }
             tracing::warn!(
@@ -208,8 +228,10 @@ impl CaptureJobExecutor {
                 tracing::warn!(job_id = %failed.job_id, error = %e,
                     "capture job rehydrate: failed to persist the rewound terminal record");
             }
-            self.reports
-                .insert(failed.job_id, report_from_record(&failed));
+            self.reports.insert(
+                failed.job_id,
+                report_from_record(&failed, self.fc_snapshot_version.as_deref()),
+            );
         }
     }
 
@@ -379,7 +401,10 @@ impl CaptureJobExecutor {
         if let Err(e) = record.persist(&self.records_dir).await {
             tracing::warn!(%job_id, error = %e, "capture job: failed to persist initial record");
         }
-        self.reports.insert(job_id, report_from_record(&record));
+        self.reports.insert(
+            job_id,
+            report_from_record(&record, self.fc_snapshot_version.as_deref()),
+        );
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<CaptureProgress>(64);
         let backend = self.backend.clone();
@@ -421,7 +446,7 @@ impl CaptureJobExecutor {
                         detail: progress.detail.clone(),
                         log_tail: Some(progress.output_tail.clone()),
                     }),
-                    fc_snapshot_version: None,
+                    fc_snapshot_version: self.fc_snapshot_version.clone(),
                     terminal: None,
                 },
             );
@@ -467,7 +492,7 @@ impl CaptureJobExecutor {
                 epoch,
                 stage: record.stage,
                 progress: None,
-                fc_snapshot_version: None,
+                fc_snapshot_version: self.fc_snapshot_version.clone(),
                 terminal: Some(terminal),
             },
         );
@@ -638,7 +663,8 @@ mod tests {
             last_destroyed: Mutex::new(None),
         });
         let tmp = tempfile::tempdir().unwrap();
-        let executor = CaptureJobExecutor::new(backend.clone(), tmp.path().join("capture-jobs"));
+        let executor =
+            CaptureJobExecutor::new(backend.clone(), tmp.path().join("capture-jobs"), None);
 
         let job_id = CaptureJobId::new();
         assert!(executor.should_claim(job_id, 1));
@@ -670,7 +696,8 @@ mod tests {
             last_destroyed: Mutex::new(None),
         });
         let tmp = tempfile::tempdir().unwrap();
-        let executor = CaptureJobExecutor::new(backend.clone(), tmp.path().join("capture-jobs"));
+        let executor =
+            CaptureJobExecutor::new(backend.clone(), tmp.path().join("capture-jobs"), None);
 
         let job_id = CaptureJobId::new();
         executor.start(job_id, 1, spec("epoch-1"));
@@ -709,7 +736,7 @@ mod tests {
             last_destroyed: Mutex::new(None),
         });
         let tmp = tempfile::tempdir().unwrap();
-        let executor = CaptureJobExecutor::new(backend, tmp.path().join("capture-jobs"));
+        let executor = CaptureJobExecutor::new(backend, tmp.path().join("capture-jobs"), None);
         let job_id = CaptureJobId::new();
         executor.start(job_id, 5, spec("epoch-5"));
         assert!(
@@ -740,7 +767,7 @@ mod tests {
         };
         orphaned.persist(&dir).await.unwrap();
 
-        let executor = CaptureJobExecutor::new(backend.clone(), dir.clone());
+        let executor = CaptureJobExecutor::new(backend.clone(), dir.clone(), None);
         executor.rehydrate().await;
 
         assert_eq!(
@@ -780,7 +807,7 @@ mod tests {
         });
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("capture-jobs");
-        let executor = CaptureJobExecutor::new(backend, dir.clone());
+        let executor = CaptureJobExecutor::new(backend, dir.clone(), None);
         let job_id = CaptureJobId::new();
         executor.start(job_id, 1, spec("ack-test"));
         wait_for_terminal(&executor, job_id).await;
@@ -789,6 +816,47 @@ mod tests {
         executor.ack(&[job_id]).await;
         assert!(executor.current_reports().is_empty());
         assert!(CaptureJobRecord::load_all(&dir).await.is_empty());
+    }
+
+    /// PR #615 CI regression (e2e: "produced a cold base but stamped no
+    /// fc_snapshot_version"): every report the executor emits must carry
+    /// the host's probed FC snapshot version — the coordinator's finalize
+    /// hard-requires it whenever a capture produced a cold base, and
+    /// nothing else in the pipeline can supply it. All three report
+    /// producers (run_one progress, run_one terminal, record rehydrate)
+    /// stamp the executor's probe value.
+    #[tokio::test]
+    async fn reports_carry_the_hosts_fc_snapshot_version() {
+        let backend = Arc::new(MockBackend {
+            create_calls: AtomicUsize::new(0),
+            destroy_calls: AtomicUsize::new(0),
+            last_destroyed: Mutex::new(None),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("capture-jobs");
+        let executor =
+            CaptureJobExecutor::new(backend.clone(), dir.clone(), Some("10.0.0".to_string()));
+        let job_id = CaptureJobId::new();
+        executor.start(job_id, 1, spec("fc-version-stamp"));
+        wait_for_terminal(&executor, job_id).await;
+        let report = executor
+            .current_reports()
+            .into_iter()
+            .find(|r| r.job_id == job_id)
+            .expect("terminal report present");
+        assert!(report.terminal.is_some());
+        assert_eq!(report.fc_snapshot_version.as_deref(), Some("10.0.0"));
+
+        // The stamp survives a restart rehydrate (the record itself
+        // doesn't carry it — the executor's probe re-stamps).
+        let executor2 = CaptureJobExecutor::new(backend, dir.clone(), Some("10.0.0".to_string()));
+        executor2.rehydrate().await;
+        let report = executor2
+            .current_reports()
+            .into_iter()
+            .find(|r| r.job_id == job_id)
+            .expect("rehydrated terminal report present");
+        assert_eq!(report.fc_snapshot_version.as_deref(), Some("10.0.0"));
     }
 
     async fn wait_for_sandbox_id(

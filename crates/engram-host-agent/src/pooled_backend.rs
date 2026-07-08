@@ -7001,7 +7001,25 @@ impl SandboxBackend for PooledBackend {
         // as a live job record says it should, not as long as this one
         // call happens to run.
         let id = match &cold_base_plan {
-            ColdBasePlan::Hit { snapshot, .. } => self.restore((**snapshot).clone()).await?,
+            ColdBasePlan::Hit { snapshot, .. } => {
+                let memory_ref = snapshot.memory_manifest;
+                let id = self.restore((**snapshot).clone()).await?;
+                // `restore()` seeded the checkpoint chain SPARSE — at the
+                // cold base's OWN manifest lineage. Correct for a session
+                // resuming its own snapshot; WRONG here: the cold base is
+                // shared across every capture that hits it, and the first
+                // capture's overlay already published `base_id@v2`, so a
+                // second hit's diff would collide ("version conflict:
+                // attempted v2, latest is v2" — the exact FC-lane CI
+                // failure this fixes). Same rule as session-create off a
+                // shared base template: each consumer's chain must own a
+                // FRESH lineage. Replace the sparse seed with a forked one.
+                if let Some(memory_ref) = memory_ref {
+                    self.checkpoint_chains.remove(&id);
+                    self.seed_checkpoint_chain_forked(id, memory_ref).await;
+                }
+                id
+            }
             ColdBasePlan::Miss { .. } | ColdBasePlan::NotApplicable => self.create(spec).await?,
         };
 

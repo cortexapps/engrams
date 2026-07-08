@@ -736,3 +736,21 @@ verb's own doc for why fencing/lease-renewal no longer apply once
   `tests/*.rs` is its own crate; only `common/` is shared) and the
   `self_ref`/`strong_self` pattern shared with `PooledBackend` (a
   generic helper would cost more ceremony than it saves).
+- **Review round 3 (CI, real-FC + e2e failures — the joins unit mocks
+  can't see).** (a) `finalize_capture_job` hard-requires
+  `fc_snapshot_version` on any capture that produced a cold base, but
+  NOTHING host-side ever produced it — all three report-construction
+  sites stamped `None`, so every warm FC capture failed at finalize
+  ("stamped no fc_snapshot_version", both e2e lanes). The executor now
+  probes `firecracker --snapshot-version` once at construction (the
+  binary can't change under a running host-agent; `None` on
+  VZ/Process) and stamps it on every report — the host that runs the
+  VMM is the authority, not the heartbeat-lagged capabilities row.
+  Regression-tested incl. across a restart rehydrate. (b) The
+  cold-base HIT path seeded the checkpoint chain SPARSE (via
+  `restore()`'s session-resume default) — at the cold base's own
+  shared lineage, so the second capture's overlay diff collided with
+  the first's (`put manifest base_id@v2 … latest is v2`, the FC-lane
+  failure). The Hit arm now replaces the sparse seed with a FORKED
+  one — the same each-consumer-owns-a-fresh-lineage rule
+  session-create off a shared base template already documents.
