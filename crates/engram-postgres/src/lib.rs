@@ -4403,69 +4403,17 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    /// Issue #539: persist one `CaptureProgress` event onto the job row.
-    /// `warm_stage_started_at` is derived from `progress.warm_stages`' still-
-    /// open entry (the caller — `PooledBackend::run_warm_hook`/
-    /// `build_base_snapshot` via the coordinator's stream consumer — always
-    /// sends the full stage history, not a diff), not re-derived in SQL, so
-    /// a stage-name-unchanged heartbeat doesn't need a `DISTINCT FROM`
-    /// dance to avoid resetting it.
-    ///
-    /// Fenced by `claimed_by` exactly like [`Self::update_enable_job_progress`]
-    /// — see #232. Also renews the claim (`claimed_at = NOW()`), which is
-    /// what lets the enable-scanner delete its blind capture-lease ticker
-    /// (`enable_scanner.rs`): the host's >=30s keepalive comfortably beats
-    /// the 300s lease.
-    ///
-    /// DEAD CODE as of ADR 0081 P1b — see the trait method's own doc.
-    /// Deleted in ADR 0081 P4.
-    async fn update_enable_job_capture_progress(
-        &self,
-        id: Uuid,
-        claimant: &str,
-        progress: &engram_core::types::CaptureProgress,
-    ) -> Result<(), MetaError> {
-        let warm_stage_started_at = progress
-            .warm_stages
-            .iter()
-            .find(|s| s.ended_at.is_none())
-            .map(|s| s.started_at);
-        let res = sqlx::query(
-            r#"
-            UPDATE enable_jobs
-               SET capture_phase = $3,
-                   warm_stage = $4,
-                   warm_stage_started_at = $5,
-                   warm_stages = $6,
-                   output_tail = $7,
-                   claimed_at = NOW(),
-                   updated_at = NOW()
-             WHERE id = $1 AND claimed_by = $2
-            "#,
-        )
-        .bind(id)
-        .bind(claimant)
-        .bind(progress.phase.as_str())
-        .bind(progress.warm_stage.as_deref())
-        .bind(warm_stage_started_at)
-        .bind(sqlx::types::Json(&progress.warm_stages))
-        .bind(&progress.output_tail)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        if res.rows_affected() == 0 {
-            return Err(self.enable_job_fence_miss(id, claimant).await);
-        }
-        Ok(())
-    }
-
     /// ADR 0080 phase 3b: persist one `MaterializeProgress` frame onto
     /// the job row. Post-3b the `materializing` stage runs HOST-side —
     /// there is no coordinator chunk counter anymore, so the honest
     /// operator surface is a rendered progress line in `output_tail`
     /// (the same column the capture phase's hook output rides). Fenced
-    /// + claim-renewing exactly like
-    /// [`Self::update_enable_job_capture_progress`].
+    /// + claim-renewing exactly like the ADR 0081 P1b
+    /// `mirror_capture_progress_to_enable_job` (UNFENCED, unlike this
+    /// verb — see its own doc) does for the capture phase; the fenced,
+    /// claim-renewing capture-progress verb this comment used to point
+    /// at (`update_enable_job_capture_progress`) was DELETED as dead
+    /// code in ADR 0081 P4.
     async fn update_enable_job_materialize_progress(
         &self,
         id: Uuid,

@@ -1,6 +1,6 @@
 # 0081 — Capture as a durable host-owned job: `capture_jobs`, cold-base/warm-overlay split, footprint placement
 
-Status: Proposed (2026-07-08)
+Status: Accepted (2026-07-08) — P1-P4 all landed in this PR's commit chain (see the Divergence log)
 
 Issue: #546 (2026-07 core-ops overhaul, Tier 2 epic). Builds on: ADR
 0079 (the sibling durable-row + fenced-writes + scanner pattern — NOT
@@ -444,3 +444,271 @@ rework + stage-deadline scan.
   an authoritative assignment list (reassigned away/superseded) —
   WITHOUT aborting the executor task, so `run_one`'s terminal
   bookkeeping still runs and the stale report drains via (a).
+
+**P2 (placement — footprint/anti-affinity/FC-version pin) landed**:
+`pick_capture_host` gained a pure, unit-tested core
+(`pick_capture_host_from`) taking a `CaptureFootprint` and an optional
+`required_fc_version`, filtering on the ADR 0078 disk floor + the
+footprint's own headroom + `hosts_with_live_capture_jobs` anti-affinity
+(the verb P1a already shipped, previously unused) + the existing
+`CapabilityRequirements::fc_snapshot_version` gate, and ranking
+survivors by max free disk. All four call sites — `ensure_capture_job`,
+`materialize_image_on_host`, the capturing-stage retryable-failure
+reassign pick, and the stage-deadline-scan reassign pick — now compute
+and pass a real footprint.
+
+- **`CaptureFootprint::for_capture`/`for_materialize`/`floor_only`,
+  not a bare struct literal at each call site** — the ADR's own formula
+  (`2×image + mem + 4096` / `ceil(2.5×image) + 1024`) is centralized
+  once in `placement.rs` so every caller states its INTENT (a capture,
+  a materialize, or "I have no size signal") rather than restating
+  arithmetic.
+- **`materialize_image_on_host` uses `floor_only()`, loudly commented,
+  not a guess from the OCI manifest's compressed layer sizes.**
+  Materialize is what PRODUCES the disk manifest a real size could be
+  read from — there is no size signal to read yet at that point, and
+  the compressed layer sizes are a poor proxy for the flattened+packed
+  ext4 output (verified against `engram-rootfs-materializer`: the
+  pack step alone can 2-3x the compressed input). Guessing from a bad
+  proxy is worse than admitting "unknown" and falling back to the
+  floor-only, still-safe posture.
+- **`ensure_capture_job`'s footprint reads `Manifest::total_bytes` via
+  a metadata-only `chunk_store.get_manifest` call** (no chunk bytes
+  fetched) — the disk manifest is guaranteed present by the point this
+  runs (the `materializing` stage already stamped it), so this is a
+  cheap, honest read, not a fallback.
+- **`required_fc_version` is threaded through every call site's
+  signature but is `None` everywhere in P2** — no cold-base concept
+  exists yet in this commit to derive a version pin from. Populated in
+  P3 for the CLAIM's own placement decision (`ColdBasePlan`); **NOT
+  populated for the *pick* itself** — see the P3 entry's "known gap"
+  below, which is the more precise and important statement.
+- Anti-affinity is applied to the SHARED picker (captures AND
+  materializes), not a capture-only veto: both are heavy, disk/CPU-
+  bound jobs, and running two on the same host at once is exactly what
+  the anti-affinity is meant to prevent, matching the ADR's own
+  framing of `pick_capture_host` as "shared with materialize."
+
+**P3 (cold-base/warm-overlay split) landed**: `ColdBasePlan` (a
+tri-state enum — `NotApplicable`/`Miss`/`Hit` — computed ONCE,
+coordinator-side, in the claim handler's new `resolve_cold_base_plan`),
+`CaptureJobResult`/`CapturedColdBase` (replacing the bare
+`SnapshotMetadata` `result_bincode` payload), `cold_base_content_key`,
+`PooledBackend::build_base_snapshot` restructured around the plan, and
+`finalize_capture_job` recording `cold_bases` + the full
+`reuse_outcome` taxonomy.
+
+- **Migration 0096 → 0097, not a 0095 edit**: the P1a `cold_bases`
+  schema (`content_key, snapshot_id, disk_manifest, memory_manifest,
+  fc_snapshot_version, captured_at`) has no way to reconstruct a full,
+  restorable `SnapshotMetadata` — several of that struct's fields
+  (`state_blob_key`/`sidecar_blob_key` etc) ARE derivable from
+  `snapshot_id` alone by convention, but others (`aux_bundles`,
+  `paused_at`, `image_version`, `size_bytes`) are not, and
+  reconstructing a lossy approximation risked a restore silently
+  missing a real field a future capture starts using. Migration 0097
+  adds `cold_bases.snapshot_bincode` (nullable, since the table was
+  still dormant when 0097 landed — no backfill needed) storing the
+  executor's own bincode-encoded `SnapshotMetadata` verbatim; the
+  claim handler decodes it straight into `ColdBasePlan::Hit`.
+- **`ColdBasePlan` is a tri-state enum, not the ADR text's
+  `Option<ColdBaseCandidate>`.** `NotApplicable` (non-FC host, or an
+  FC host with no reported `fc_snapshot_version`), `Miss{content_key,
+  reason}`, and `Hit{content_key, snapshot}` are three semantically
+  distinct outcomes that nested `Option<Option<…>>` would blur — and
+  the `Miss`/`Hit` variants both need to carry the SAME `content_key`
+  the executor must report its outcome under (whether minting a fresh
+  cold base or restoring an existing one), which a bare
+  `Option<ColdBaseCandidate>` (candidate-or-nothing) has no slot for on
+  the `Miss` arm at all.
+- **`backend_kind` is NEVER computed host-side** (the ADR's text
+  floated adding a `SandboxBackend::kind()` trait method for this).
+  Grepped first, per instruction: `HostCapabilities::backend` already
+  exists (`"firecracker" | "vz" | "process"`, populated at host-agent
+  startup, reported every heartbeat) and the CLAIM HANDLER already
+  reads the claiming host's full `HostRecord` to check
+  `fc_snapshot_version` — so it already has `backend` for free. The
+  content key is computed ONCE, coordinator-side, and only ever echoed
+  back by the executor (`ColdBasePlan`'s own doc). This also sidesteps
+  ever needing a `resources: &ResourceHints` parameter host-side — the
+  executor operates purely on `SandboxSpec`, which has no `resources`
+  field of its own (only the resolved `memory`/`cpu`/`disk` limits
+  derived FROM it), so recomputing the key host-side would have needed
+  a NEW field on `BuildBaseSnapshotRequest` just to carry it through;
+  not computing it there at all is strictly simpler.
+- **Reused `supports_diff_checkpoints()`, did NOT add
+  `supports_diff_memory_snapshots()`.** Grepped first, per instruction:
+  the existing ADR 0028 capability is EXACTLY "does this backend
+  produce coherent, O(dirty-set) memory checkpoints" — the same
+  question a cold-base overlay asks — and it's already correctly gated
+  on FC's `track_dirty_pages` config (not just "is this FC"), which is
+  MORE precise than a static per-backend-type flag would be: an FC host
+  with dirty-page tracking disabled must ALSO hard-error on a `Hit`/
+  `Miss` plan, and `supports_diff_checkpoints()` already encodes that.
+  A second, redundantly-named method would have been the same fact
+  under two names.
+- **A capability mismatch is `CaptureFailureKind::ColdBaseCapabilityMismatch`,
+  a NEW variant** (not an existing kind pressed into service) —
+  `is_retryable() == false` (deliberately: reassigning to a fresh host
+  would often "fix" it in practice, but marking it non-retryable
+  surfaces the underlying placement bug instead of quietly
+  self-healing via reassignment every time it recurs).
+- **Executor stage plan lives ENTIRELY in `PooledBackend::
+  build_base_snapshot`, not split out into `capture_job.rs`** (the
+  ADR's own fallback: "prefer moving logic into pooled_backend.rs — it
+  owns the machinery"). `capture_job.rs`'s `run_one` is unchanged
+  beyond constructing a `BuildBaseSnapshotRequest` and bincode-encoding
+  `CaptureJobResult` instead of a bare `SnapshotMetadata` — it remains
+  a pure job-lifecycle wrapper around whatever
+  `SandboxBackend::build_base_snapshot` (default: hard error; real
+  impl: `PooledBackend`) returns.
+- **No new pause/resume/chain-seed plumbing was written.** `self.
+  snapshot(id)` already auto-seeds the checkpoint chain off a Full
+  capture's own memory manifest (`advance_checkpoint_state`, ADR 0028
+  Fix A machinery, unchanged), and `self.restore(metadata)` already
+  seeds it sparse off a restored base's memory manifest (the plain
+  session-resume path, unchanged) — so `Hit` is just `self.restore(...)`
+  instead of `self.create(...)`, and `Miss`-on-a-warm-image is just an
+  EXTRA `self.snapshot(id)` call before the hook runs. Verified: this
+  is exactly what the grounding read's "verify against
+  `seed_checkpoint_chain_sparse`'s restore path" asked for.
+- **Warm-less images: exactly ONE `snapshot()` call, not two.** The
+  ADR's own text ("the cold base IS the artifact") is followed
+  literally — there is no separate "mint the cold base" step distinct
+  from "capture the artifact" for a warm-less image; whatever `Miss`/
+  `Hit`/`NotApplicable` plan applies, the single final snapshot's own
+  metadata becomes both `CaptureJobResult::snapshot` and (when a plan
+  applies) `CapturedColdBase::snapshot`.
+- **`reuse_ok` renamed `warm_less`, not literally deleted** — the
+  GATE it names (whole-artifact reuse is warm-less-only; warm images
+  reuse the COLD BASE instead, via `ColdBasePlan`, and always re-run
+  the hook) is unchanged and still real; only the misleading generic
+  name (implying "reuse is or isn't OK" as a single axis, when P3 adds
+  a second, orthogonal reuse mechanism for warm images) was retired.
+- **The FC-version dimension on whole-artifact reuse is enforced via
+  a NEW `candidate_fc_version_known` check reading the candidate's
+  `snapshots` row directly (`get_snapshot`), not a denormalized
+  `enabled_images.base_snapshot_fc_snapshot_version` column.** Grepped
+  first: no such column/join exists (unlike `base_snapshot_disk_
+  manifest`/`base_snapshot_memory_manifest`, which ARE denormalized).
+  Adding one would need a new migration + backfill for a value only
+  read on the (rare) reuse-hit path; a plain `get_snapshot` read is
+  cheap enough there and needs no schema change. A memory-manifest-
+  bearing candidate (FC) whose `snapshots.fc_snapshot_version` is
+  `NULL` (a pre-ADR-0068 row, or a host that never reported one) is
+  now treated as NOT reusable — such a row could never be placement-
+  gated at restore time either (`fc_snapshot_version: None` is ADR
+  0068's soft "unconstrained" posture), so silently reusing it would
+  re-arm exactly the issue-#160 cross-version corruption class this
+  whole ADR exists to keep closed. Disk-only candidates (VZ,
+  `memory_manifest: None`) are exempt — no FC/UFFD restore risk exists
+  for them at all.
+- **`reuse_outcome`'s `Miss` sub-taxonomy (`no_cold_base` /
+  `chunks_missing` / `fc_version_changed`) is carried on
+  `ColdBasePlan::Miss`/`CapturedColdBase` as a `ColdBaseMissReason`
+  enum, computed ONLY by the claim handler** (which already ran the
+  `get_cold_base` lookup + the chunk-presence self-heal + the new
+  `cold_base_fc_version_changed` query) **and echoed back unchanged by
+  the executor** — the executor's own view genuinely cannot distinguish
+  these three ("no candidate" vs "candidate existed but failed
+  presence" vs "candidate existed under a different version" all look
+  identical from inside `build_base_snapshot`: "boot fresh"). A new
+  metadata verb, `cold_base_fc_version_changed(disk_manifest,
+  current_fc_version) -> bool`, answers "does a `cold_bases` row exist
+  for this rootfs under ANY OTHER version" — it matches on
+  `disk_manifest` alone (the table has no `resources` column to refine
+  further, and every row is FC's by construction, since only FC ever
+  writes one), which is a sound approximation for a TELEMETRY label,
+  explicitly not treated as a correctness gate anywhere.
+- **GC gets a 7th chunk pin-set source (`cold_base_manifest_refs`,
+  `PinSet::collect`) in ADDITION to the ADR's own ask
+  (`cold_base_snapshot_ids` joining the snapshot-blob pin-set).** A
+  cold base's disk/memory MANIFEST chunks have no OTHER root — unlike
+  the overlay it seeds, a cold base never gets its own `enabled_images`
+  row or a `recoverable=true` reason to be found by the existing 6
+  sources — so without this 7th source, a live `cold_bases` row's
+  chunks would be silently reaped by the chunk-GC sweep even while its
+  `snapshots/<id>/{state.bin,sidecar.json}` blobs stayed correctly
+  pinned by the (ADR-specified) `cold_base_snapshot_ids` addition to
+  `snapshot_blob_pin_set`. Both are unconditionally-called, no second
+  GC, matching the existing sources' shape exactly.
+- **KNOWN GAP, deliberately not closed this phase: placement does NOT
+  yet pin `fc_snapshot_version` toward an EXISTING cold base.** The
+  ADR's §B5 ("when a cold-base candidate exists, `pick_capture_host`
+  pins `CapabilityRequirements{fc_snapshot_version}` to the base's")
+  describes routing a capture toward whichever host's FC version
+  already HAS a reusable cold base — but the cold-base LOOKUP
+  (`resolve_cold_base_plan`) only runs inside the claim handler, i.e.
+  AFTER a host is already picked (`pick_capture_host` in P2 always
+  passes `required_fc_version: None`). The consequence: a capture only
+  gets a `Hit` when the RANDOMLY-picked host happens to report the
+  same `fc_snapshot_version` a prior cold base was captured under; on
+  a fleet with a mixed/rolling FC version, an otherwise-reusable cold
+  base can be missed simply because placement routed to the "wrong"
+  host. `reuse_outcome`'s `recaptured:fc_version_changed` telemetry
+  still correctly LABELS this when it happens (so it's visible, not
+  silent) — but the OPTIMIZATION this ADR section describes (steering
+  placement toward a hit) is not implemented. Closing it properly
+  needs `ensure_capture_job` to look up `cold_bases` BY
+  `(disk_manifest, resources)` across every version BEFORE calling
+  `pick_capture_host` (a query the current schema/verb surface doesn't
+  have — `get_cold_base` is keyed on the full content key, which
+  already bakes in one specific version) and thread the result's
+  version through as the `required_fc_version` pin. Left for a
+  follow-up; flagging here rather than leaving it silently unaddressed.
+- **Live-PG coverage for `finalize_capture_job`'s own `cold_bases`
+  upsert + `reuse_outcome` column write is NOT independently exercised
+  end-to-end.** `finalize_capture_job` is `pub(crate)`, reachable from
+  an external `tests/*.rs` binary only through the full enable-scanner
+  pipeline (materialize simulated, scanner ticks, a fake capture-job
+  simulator) — the same heavy shape `enable_reuse_live_pg.rs` already
+  uses for the DIFFERENT regression it guards. Its three constituent
+  layers ARE independently live-PG-verified (the `cold_bases`
+  store surface in `capture_jobs_live_pg.rs`; the claim handler's
+  `ColdBasePlan` resolution in `claim_cold_base_live_pg.rs`; the
+  executor's stage-plan → `CaptureJobResult` shape in
+  `pooled_backend.rs`'s unit tests) — but the specific wiring inside
+  `finalize_capture_job` that reads a `CaptureJobResult`, maps it to a
+  `reuse_outcome` label, and calls `upsert_cold_base` is only compile-
+  and-review-verified, not exercised by a running test. A follow-up
+  should extend `enable_reuse_live_pg.rs`'s simulator (or a sibling) to
+  drive a warm-image enable through a cold-base MISS and assert both
+  the `enable_jobs.reuse_outcome` value and a resulting `cold_bases`
+  row.
+
+**P4 (reuse-telemetry cleanup + materializer determinism gate)
+landed**: the dead `update_enable_job_capture_progress` metadata verb
+(trait default + Postgres impl + its `enable_jobs_live_pg.rs` test
+coverage) is deleted; `mirror_capture_progress_to_enable_job` (P1b) is
+confirmed as its sole replacement (unfenced, dashboard-only — see that
+verb's own doc for why fencing/lease-renewal no longer apply once
+`capture_jobs` owns execution/fencing).
+
+- **The determinism gate already existed — no new test added.**
+  `engram-rootfs-materializer`'s `materialize_is_deterministic_and_
+  scrubs_scratch` (`tests/materialize.rs`) already runs the FULL
+  pipeline (pull → flatten → inject → pack → chunk) twice over the
+  same fixture and asserts `first.disk_manifest == second.disk_manifest`
+  — a `ManifestRef` equality check IS the content-derived-ref
+  determinism gate the ADR asks for (`Manifest::content_ref()` is what
+  produces that ref). Per this ADR's own instruction ("skip if 3a's
+  fixture tests already assert this — verify at implementation"): this
+  is that assertion, verified present and still green.
+- **`progress_state_failure_and_retry_round_trip`
+  (`enable_jobs_live_pg.rs`) was adapted, not left calling the deleted
+  verb**: it now seeds capture-progress state via `mirror_capture_
+  progress_to_enable_job` (the still-live replacement) to keep proving
+  its actual point (retry clears stale progress columns); its
+  assertions on `warm_stage_started_at`/`warm_stages` were dropped
+  rather than kept as a vacuous "still None" check — the new mirror
+  verb never populates those two columns at all (P1b's already-
+  documented lossier `CaptureJobProgress` wire shape carries no stage
+  HISTORY), so nothing production-real exercises them anymore; a
+  future cleanup could drop the columns/fields themselves, out of
+  scope here.
+- **`capture_progress_is_fenced_renews_lease_and_survives_failure`
+  was deleted outright, not adapted** — its entire premise (a claim-
+  fenced write that renews the claim lease) is the deleted verb's
+  specific behavior; the replacement verb is deliberately UNFENCED
+  (own doc: `capture_jobs` owns fencing now), so there is no
+  equivalent behavior left to re-test under a different name.

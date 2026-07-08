@@ -249,11 +249,13 @@ fn cow_state() -> CowState {
 
 /// Issue #539 (historical): `Vec<WarmStageRecord>` used to cross the
 /// coord<->host wire as the `CaptureProgress.warm_stages_bincode`
-/// payload; ADR 0081 P1b deleted that RPC, so this is now purely a
-/// JSON-in-JSONB stability guard (`enable_jobs.warm_stages`,
-/// `update_enable_job_capture_progress`) — kept pinned here anyway since
-/// bincode encoding is a strictly harder guarantee than JSON and this
-/// corpus already had the fixture. Two entries: one CLOSED (`ended_at`
+/// payload; ADR 0081 P1b deleted that RPC (and P4 deleted the
+/// now-dead-code metadata verb, `update_enable_job_capture_progress`,
+/// that used to write it), so this is now purely a JSON-in-JSONB
+/// stability guard (`enable_jobs.warm_stages`) — kept pinned here
+/// anyway since bincode encoding is a strictly harder guarantee than
+/// JSON and this corpus already had the fixture. Two entries: one
+/// CLOSED (`ended_at`
 /// present, the `#[serde(skip_serializing_if)]` bincode-irrelevant but
 /// exercised anyway) and one still OPEN (`ended_at: None`) — the shape a
 /// failed or in-flight capture's stage history actually takes.

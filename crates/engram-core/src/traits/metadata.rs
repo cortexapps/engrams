@@ -1831,42 +1831,15 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// Issue #539: persist one `CaptureProgress` event from the streaming
-    /// `BuildBaseSnapshot` RPC onto the job row — the live capture-phase
-    /// counterpart to [`Self::update_enable_job_progress`] (which only
-    /// covers the materialize step). ALSO renews the claim
-    /// (`claimed_at = NOW()`), which is what lets `enable_scanner` delete
-    /// its blind capture-lease-renewal ticker: the host's >=30s keepalive
-    /// is well under the 300s lease, and a transport death stops renewals
-    /// exactly when a peer should legitimately re-claim.
-    ///
-    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
-    ///
-    /// DEAD CODE as of ADR 0081 P1b (nothing calls this anymore — the
-    /// enable-scanner's old capture-progress consumer task, its only
-    /// caller, was deleted when capture became a heartbeat-dispatched
-    /// job; `mirror_capture_progress_to_enable_job` is its UNFENCED
-    /// replacement). Left in place through P1b/P3 to keep those commits'
-    /// footprints bounded; deleted in ADR 0081 P4.
-    async fn update_enable_job_capture_progress(
-        &self,
-        id: uuid::Uuid,
-        claimant: &str,
-        progress: &crate::types::CaptureProgress,
-    ) -> Result<(), MetaError> {
-        let _ = (id, claimant, progress);
-        Err(MetaError::Migration(
-            "enable jobs unsupported by this store".into(),
-        ))
-    }
-
     /// ADR 0080 phase 3b: persist one `MaterializeProgress` frame from
     /// the streaming `MaterializeImage` RPC onto the job row — the
-    /// `materializing`-stage counterpart of
-    /// [`Self::update_enable_job_capture_progress`], now that the
-    /// stage runs host-side (the coordinator-side chunk push and its
-    /// `chunks_done/chunks_total` counters are retired; those columns
-    /// stay NULL for post-3b jobs). Renders the frame into
+    /// `materializing`-stage counterpart of the ADR 0081 P1b
+    /// `mirror_capture_progress_to_enable_job` (the capture-phase
+    /// verb's fenced, claim-renewing predecessor,
+    /// `update_enable_job_capture_progress`, was DELETED as dead code in
+    /// ADR 0081 P4 — its only caller, the enable-scanner's old capture-
+    /// progress consumer task, was removed in P1b when capture became a
+    /// heartbeat-dispatched job). Renders the frame into
     /// `output_tail` (`materialize[<stage>] <detail>` — the job's
     /// operator-facing progress line) and ALSO renews the claim
     /// (`claimed_at = NOW()`), so the host's ≤30 s keepalive carries
