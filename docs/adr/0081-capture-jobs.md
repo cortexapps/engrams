@@ -712,3 +712,27 @@ verb's own doc for why fencing/lease-renewal no longer apply once
   specific behavior; the replacement verb is deliberately UNFENCED
   (own doc: `capture_jobs` owns fencing now), so there is no
   equivalent behavior left to re-test under a different name.
+- **Review round 2 (bloat audit, same PR).** An adversarial size audit
+  of the full diff (7,443 insertions) judged it fundamentally justified
+  (~31% tests, ~10% this ADR, the rest the RPC→job swap + the §B split)
+  but surfaced real trims, applied here: (a)
+  `active_capture_job_for_enable` was DEAD — `insert_capture_job`'s
+  insert-or-get inlined its own read and nothing else called it; the
+  same shape of leftover the P4 cleanup caught for
+  `update_enable_job_capture_progress`, missed in that pass. Deleted.
+  (b) `CaptureJobRecord`'s persist/load_all/delete_acked trio was a
+  near-verbatim copy of `CheckpointRecord`'s — both now delegate to a
+  shared `durable_record` module (one owner for the
+  write+fsync+rename / torn-write-tolerant-load / idempotent-delete
+  contract). (c) `engram_protocol::heartbeat::HeartbeatAck.
+  capture_assignments` still carried the pre-review `Vec` shape (and a
+  round-trip test asserting it) after review round 1 Option-ized the
+  production HTTP mirror — aligned to `Option<Vec>` so the vestigial
+  protocol type can't teach the wrong none-vs-empty semantics. (d)
+  Three stale doc comments fixed (`req.cold_base` → the
+  `cold_base_plan` tri-state; the types module's "dormant" claim; a
+  misplaced footprint doc). Not trimmed, recorded as acceptable: the
+  per-test-binary `TestEnv` duplication in the FC tests (each
+  `tests/*.rs` is its own crate; only `common/` is shared) and the
+  `self_ref`/`strong_self` pattern shared with `PooledBackend` (a
+  generic helper would cost more ceremony than it saves).

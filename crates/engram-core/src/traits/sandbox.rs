@@ -633,8 +633,10 @@ pub trait SandboxBackend: Send + Sync {
     /// in-memory report the heartbeat loop advertises, instead of
     /// forwarding them onto a live gRPC stream.
     ///
-    /// ADR 0081 §B (P3): `req.cold_base`, when `Some`, is a claim-time-
-    /// verified cold-base candidate — the implementation restores it
+    /// ADR 0081 §B (P3): `req.cold_base_plan` is the claim-time-resolved
+    /// tri-state — `NotApplicable` (no cold-base concept: warm-less or
+    /// non-FC), `Miss` (mint a cold base before the hook), or `Hit`
+    /// (a verified candidate) — the implementation restores a `Hit`
     /// (chain auto-seeds off its own memory manifest) instead of
     /// cold-booting, runs the warm hook, and takes a DIFF snapshot as
     /// the overlay. A backend that received `Some` but genuinely can't

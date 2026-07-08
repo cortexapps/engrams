@@ -4795,27 +4795,6 @@ impl MetadataStore for PostgresStore {
         row.map(|r| row::capture_job_from_row(&r)).transpose()
     }
 
-    async fn active_capture_job_for_enable(
-        &self,
-        enable_job_id: Uuid,
-    ) -> Result<Option<CaptureJobRow>, MetaError> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
-                   oci_defaults, host_id, epoch, stage, stage_started_at, stage_progress,
-                   last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
-                   result_bincode, created_at, updated_at
-              FROM capture_jobs
-             WHERE enable_job_id = $1 AND stage NOT IN ('done', 'failed')
-            "#,
-        )
-        .bind(enable_job_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-        row.map(|r| row::capture_job_from_row(&r)).transpose()
-    }
-
     async fn latest_capture_job_for_enable(
         &self,
         enable_job_id: Uuid,

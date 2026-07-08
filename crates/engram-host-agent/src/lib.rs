@@ -31,6 +31,7 @@ pub mod config;
 pub mod coord_client;
 pub mod dirty_map;
 pub mod disk_daemon;
+pub mod durable_record;
 pub mod egress;
 pub mod eviction_finalize;
 pub mod grpc_server;

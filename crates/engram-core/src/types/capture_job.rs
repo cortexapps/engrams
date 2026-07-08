@@ -5,11 +5,10 @@
 //! re-drives from scratch — booting a second capture VM with no
 //! anti-affinity and no host-side awareness that the first attempt is
 //! stale. This module is the shared, I/O-free shape of that row plus
-//! the wire types that cross the heartbeat boundary; the executor and
-//! scanner that actually drive it land in a later commit.
-//!
-//! This commit is purely additive/dormant: nothing constructs or
-//! consumes these types yet.
+//! the wire types that cross the heartbeat boundary, plus the P3
+//! cold-base/warm-overlay plan + result shapes; the executor lives in
+//! `engram-host-agent::capture_job`, the watch-only scanner arm in
+//! `engram-coordinator::enable_scanner`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

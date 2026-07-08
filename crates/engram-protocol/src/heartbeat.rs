@@ -160,10 +160,18 @@ pub struct HeartbeatAck {
     /// (a fresh claim, or a bumped epoch on one it's already running)
     /// drives it to call the claim endpoint for the full
     /// `CaptureJobSpec`; a LOWER epoch than one already running means
-    /// the host destroys the stale attempt first. `#[serde(default)]`
-    /// for mixed-version interop during the roll.
+    /// the host destroys the stale attempt first.
+    ///
+    /// `None` = the coordinator's assignment read FAILED (unknown — the
+    /// host takes no action); `Some` is authoritative, including
+    /// `Some(vec![])` ("you own nothing" → converge-cancel). Collapsing
+    /// the error case into an empty list would let a PG blip read as
+    /// "destroy every in-flight capture" — the same reason the
+    /// production HTTP mirror (`host_http::HeartbeatResponse`) carries
+    /// an `Option`. `#[serde(default)]` (= `None`) for mixed-version
+    /// interop during the roll.
     #[serde(default)]
-    pub capture_assignments: Vec<CaptureJobAssignment>,
+    pub capture_assignments: Option<Vec<CaptureJobAssignment>>,
     /// ADR 0081: terminal `CaptureJobReport`s from this heartbeat that
     /// the coord successfully recorded into PG. The host stops
     /// re-advertising the matching durable record — mirrors
@@ -379,10 +387,10 @@ mod tests {
                     version: 1,
                 }),
             }],
-            capture_assignments: vec![CaptureJobAssignment {
+            capture_assignments: Some(vec![CaptureJobAssignment {
                 job_id: CaptureJobId::new(),
                 epoch: 3,
-            }],
+            }]),
             acked_capture_jobs: vec![CaptureJobId::new()],
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -499,7 +507,10 @@ mod tests {
             serde_json::from_value(ack_json).expect("decode ack without capture fields");
         assert!(ack.enabled_images.is_empty());
         assert!(ack.acked_checkpoints.is_empty());
-        assert!(ack.capture_assignments.is_empty());
+        // Absent assignments decode to None ("unknown"), NOT
+        // Some(vec![]) — an old coord must never read as an
+        // authoritative "cancel everything you're running".
+        assert!(ack.capture_assignments.is_none());
         assert!(ack.acked_capture_jobs.is_empty());
     }
 

@@ -2044,23 +2044,10 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// The active (non-terminal) capture job for an enable job, if any
-    /// — the read [`Self::insert_capture_job`]'s insert-or-get falls
-    /// back to, also useful for the claim endpoint to re-derive
-    /// dispatch state without a job id in hand.
-    async fn active_capture_job_for_enable(
-        &self,
-        enable_job_id: uuid::Uuid,
-    ) -> Result<Option<CaptureJobRow>, MetaError> {
-        let _ = enable_job_id;
-        Err(MetaError::Migration(
-            "capture jobs unsupported by this store".into(),
-        ))
-    }
-
     /// ADR 0081 P1b: the MOST RECENT capture job for an enable job,
-    /// terminal or not — unlike [`Self::active_capture_job_for_enable`]
-    /// (which hides a row the instant it goes `done`/`failed`), this is
+    /// terminal or not — deliberately NOT filtered to non-terminal rows
+    /// (a filtered read would hide a row the instant it goes
+    /// `done`/`failed`); this is
     /// what the enable scanner's watch-only `Capturing` arm polls: the
     /// tick that observes a fresh `done` (to finalize + advance to
     /// `prestaging`) or a terminal `failed` (to reassign-under-budget or

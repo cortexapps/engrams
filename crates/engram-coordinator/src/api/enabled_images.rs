@@ -569,9 +569,11 @@ pub(crate) async fn try_reuse_base_snapshot(
 /// env/egress assembly is deferred to the CLAIM endpoint
 /// (`host_http::claim_capture_job`), which resolves secrets fresh at
 /// claim time rather than once at job-creation time (ADR 0081 §A).
-/// ADR 0081 §C: the honest [`crate::placement::CaptureFootprint`] inputs
-/// for a capture job — `mem_mib` from the image's declared/default
-/// resources, `image_size_mib` read off the ALREADY-materialized disk
+///
+/// ADR 0081 §C: the placement pick uses the honest
+/// [`crate::placement::CaptureFootprint`] inputs for a capture job —
+/// `mem_mib` from the image's declared/default resources,
+/// `image_size_mib` read off the ALREADY-materialized disk
 /// manifest's chunk-store `Manifest::total_bytes` (a metadata-only read,
 /// no chunk bytes fetched). Falls back to [`CaptureFootprint::floor_only`]
 /// (LOUDLY logged) if the manifest can't be read — a capture must never

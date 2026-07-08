@@ -66,65 +66,24 @@ pub struct CaptureJobRecord {
 
 impl CaptureJobRecord {
     pub fn path_in(dir: &Path, id: CaptureJobId) -> PathBuf {
-        dir.join(format!("{id}.json"))
+        crate::durable_record::record_path(dir, id)
     }
 
     /// Durably persist (write + fsync via rename) into `dir`.
     pub async fn persist(&self, dir: &Path) -> std::io::Result<()> {
-        tokio::fs::create_dir_all(dir).await?;
-        let dest = Self::path_in(dir, self.job_id);
-        let tmp = dest.with_extension("json.partial");
-        let bytes = serde_json::to_vec_pretty(self)
-            .map_err(|e| std::io::Error::other(format!("serialize capture job record: {e}")))?;
-        tokio::fs::write(&tmp, &bytes).await?;
-        // fsync the temp file so the rename publishes complete bytes.
-        let f = tokio::fs::OpenOptions::new().read(true).open(&tmp).await?;
-        f.sync_all().await?;
-        tokio::fs::rename(&tmp, &dest).await?;
-        Ok(())
+        crate::durable_record::persist(dir, self.job_id, self, "capture job record").await
     }
 
     /// All records in `dir` (the heartbeat advert payload + rehydrate
     /// source). Unreadable/partial files are skipped with a warn — a
     /// torn write must not wedge the heartbeat loop.
     pub async fn load_all(dir: &Path) -> Vec<CaptureJobRecord> {
-        let mut out = Vec::new();
-        let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
-            return out;
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            match tokio::fs::read(&p).await {
-                Ok(bytes) => match serde_json::from_slice::<CaptureJobRecord>(&bytes) {
-                    Ok(r) => out.push(r),
-                    Err(e) => {
-                        tracing::warn!(path = %p.display(), error = %e,
-                            "unparseable capture job record; skipping");
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(path = %p.display(), error = %e,
-                        "unreadable capture job record; skipping");
-                }
-            }
-        }
-        out
+        crate::durable_record::load_all(dir, "capture job record").await
     }
 
     /// Coord acked these — the PG rows own the references now.
     pub async fn delete_acked(dir: &Path, acked: &[CaptureJobId]) {
-        for id in acked {
-            let p = Self::path_in(dir, *id);
-            if let Err(e) = tokio::fs::remove_file(&p).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %p.display(), error = %e,
-                        "failed to delete acked capture job record");
-                }
-            }
-        }
+        crate::durable_record::delete_acked(dir, acked.iter().copied(), "capture job record").await
     }
 }
 
