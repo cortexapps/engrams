@@ -512,9 +512,16 @@ async fn advance_one(
                     // job's epoch, and go back to watching — this does
                     // NOT touch the enable job's own attempts counter,
                     // that budget belongs to the capture_jobs row.
+                    let footprint = crate::api::enabled_images::capture_footprint_for_job_row(
+                        state,
+                        &capture_row,
+                    )
+                    .await;
                     match crate::placement::pick_capture_host(
                         state.services.meta.as_ref(),
                         &state.host_registry,
+                        footprint,
+                        None,
                     )
                     .await
                     {
@@ -852,9 +859,13 @@ async fn capture_job_deadline_scan(cfg: &EnableScannerConfig, state: &SharedStat
             "capture job exceeded its stage deadline",
         );
         if row.attempts < cfg.max_attempts {
+            let footprint =
+                crate::api::enabled_images::capture_footprint_for_job_row(state, &row).await;
             match crate::placement::pick_capture_host(
                 state.services.meta.as_ref(),
                 &state.host_registry,
+                footprint,
+                None,
             )
             .await
             {

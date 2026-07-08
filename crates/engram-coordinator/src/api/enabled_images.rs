@@ -198,15 +198,25 @@ pub(crate) async fn materialize_image_on_host(
     image_uri: &str,
     progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
 ) -> Result<engram_core::types::MaterializedImage, ApiError> {
-    let (host_id, host) =
-        crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
-            .await
-            .map_err(|e| {
-                ApiError::Unavailable(format!(
-                    "no host is available to materialize this image ({e:?}). \
-                     Register a disk-healthy host and retry the enable."
-                ))
-            })?;
+    // ADR 0081 §C: materialize is what PRODUCES the disk manifest a real
+    // size could be read from — there is no size signal to read yet at
+    // this point (the OCI manifest's compressed layer sizes are a poor
+    // proxy for the flattened+packed ext4 output, so we deliberately
+    // don't guess from them). Floor-only sizing: the ADR 0078 disk floor
+    // + anti-affinity still apply, just no footprint headroom veto.
+    let (host_id, host) = crate::placement::pick_capture_host(
+        state.services.meta.as_ref(),
+        &state.host_registry,
+        crate::placement::CaptureFootprint::floor_only(),
+        None,
+    )
+    .await
+    .map_err(|e| {
+        ApiError::Unavailable(format!(
+            "no host is available to materialize this image ({e:?}). \
+             Register a disk-healthy host and retry the enable."
+        ))
+    })?;
     let registry_auth = resolve_static_registry_auth(state, image_uri).await?;
     let arch = coord_platform_arch();
     tracing::info!(
@@ -512,6 +522,64 @@ pub(crate) async fn try_reuse_base_snapshot(
 /// env/egress assembly is deferred to the CLAIM endpoint
 /// (`host_http::claim_capture_job`), which resolves secrets fresh at
 /// claim time rather than once at job-creation time (ADR 0081 §A).
+/// ADR 0081 §C: the honest [`crate::placement::CaptureFootprint`] inputs
+/// for a capture job — `mem_mib` from the image's declared/default
+/// resources, `image_size_mib` read off the ALREADY-materialized disk
+/// manifest's chunk-store `Manifest::total_bytes` (a metadata-only read,
+/// no chunk bytes fetched). Falls back to [`CaptureFootprint::floor_only`]
+/// (LOUDLY logged) if the manifest can't be read — a capture must never
+/// fail to even GET a placement pick over a sizing-metadata hiccup.
+pub(crate) async fn capture_footprint_for(
+    state: &SharedState,
+    disk_manifest: engram_core::types::manifest::ManifestRef,
+    config: &ImageConfig,
+) -> crate::placement::CaptureFootprint {
+    let mem_mib = crate::api::sessions::resolved_memory_mib(config) as u64;
+    match state.services.chunk_store.get_manifest(disk_manifest).await {
+        Ok(manifest) => {
+            let image_size_mib = (manifest.total_bytes / (1024 * 1024)).max(1);
+            crate::placement::CaptureFootprint::for_capture(image_size_mib, mem_mib)
+        }
+        Err(e) => {
+            tracing::warn!(
+                manifest = %disk_manifest,
+                error = %e,
+                "capture footprint: could not read the disk manifest's total_bytes; \
+                 falling back to FLOOR-ONLY sizing (no footprint headroom veto) for this pick",
+            );
+            crate::placement::CaptureFootprint::floor_only()
+        }
+    }
+}
+
+/// Same as [`capture_footprint_for`] but reads its inputs off an
+/// existing `capture_jobs` row (the deadline-scan reassign pick and the
+/// scanner's retryable-failure reassign pick both already have one) —
+/// parses `row.disk_manifest` and merges `row.image_config` over
+/// `row.oci_defaults` the same way the claim handler does.
+pub(crate) async fn capture_footprint_for_job_row(
+    state: &SharedState,
+    row: &engram_core::types::capture_job::CaptureJobRow,
+) -> crate::placement::CaptureFootprint {
+    let config = row.image_config.merged_with(&row.oci_defaults);
+    match row
+        .disk_manifest
+        .parse::<engram_core::types::manifest::ManifestRef>()
+    {
+        Ok(disk_manifest) => capture_footprint_for(state, disk_manifest, &config).await,
+        Err(e) => {
+            tracing::warn!(
+                capture_job_id = %row.id,
+                disk_manifest = %row.disk_manifest,
+                error = %e,
+                "capture footprint: capture_jobs.disk_manifest failed to parse; \
+                 falling back to FLOOR-ONLY sizing for this reassign pick",
+            );
+            crate::placement::CaptureFootprint::floor_only()
+        }
+    }
+}
+
 pub(crate) async fn ensure_capture_job(
     state: &SharedState,
     row: &EnabledImage,
@@ -525,25 +593,33 @@ pub(crate) async fn ensure_capture_job(
     {
         return Ok(existing);
     }
-    let (host_id, _) =
-        crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
-            .await
-            .map_err(|e| {
-                ApiError::Unavailable(format!(
-                    "no host is available to capture this image's base snapshot \
-                     ({e:?}). Register a host and retry the enable."
-                ))
-            })?;
-    let disk_manifest = row
-        .disk_manifest
-        .ok_or_else(|| {
-            ApiError::Internal(format!(
-                "enable job for `{}` reached the capturing stage without a disk_manifest \
-                 (the materializing stage should have stamped one)",
-                row.image_uri
-            ))
-        })?
-        .to_string();
+    let disk_manifest_ref = row.disk_manifest.ok_or_else(|| {
+        ApiError::Internal(format!(
+            "enable job for `{}` reached the capturing stage without a disk_manifest \
+             (the materializing stage should have stamped one)",
+            row.image_uri
+        ))
+    })?;
+    let disk_manifest = disk_manifest_ref.to_string();
+    let config = row.effective_config();
+    let footprint = capture_footprint_for(state, disk_manifest_ref, &config).await;
+    let (host_id, _) = crate::placement::pick_capture_host(
+        state.services.meta.as_ref(),
+        &state.host_registry,
+        footprint,
+        // ADR 0081 §B5's fc_snapshot_version pin is threaded in once a
+        // cold-base candidate is looked up (P3) — this call site has no
+        // candidate to pin to yet at job-CREATION time (the claim
+        // handler resolves the candidate fresh per attempt).
+        None,
+    )
+    .await
+    .map_err(|e| {
+        ApiError::Unavailable(format!(
+            "no host is available to capture this image's base snapshot \
+             ({e:?}). Register a host and retry the enable."
+        ))
+    })?;
     tracing::info!(
         image_uri = %row.image_uri,
         host_id = %host_id,
