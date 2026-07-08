@@ -57,21 +57,24 @@ async fn warm_hook_process_survives_base_snapshot() {
     let rootfs = env.bake("engram-warm-hook-test").await;
 
     // The warm command backgrounds a long-lived process, records its PID +
-    // a marker, and exits 0. No `nohup`: agentd's exec has no controlling
-    // tty, so the shell's exit sends no SIGHUP — the backgrounded child
-    // just reparents to PID 1 (agentd) and lives (agentd's exec only
-    // SIGKILLs the direct child via kill_on_drop). Ubuntu's busybox-static
-    // also ships NO nohup applet, so a `nohup`-wrapped spawn dies with a
-    // swallowed "not found" and the capture silently goes warm-less —
-    // exactly what this test exists to catch. This is the shape a real
-    // warm hook takes (`gradle --daemon` likewise outlives the launching
-    // shell).
+    // a marker, and exits 0 — the daemon must DETACH (the documented hook
+    // contract; a gradle daemon does the same). Two busybox traps shape it:
+    // - no `nohup`: ubuntu's busybox-static ships no nohup applet, so a
+    //   wrapped spawn dies with a swallowed "not found" (and it's
+    //   unnecessary — agentd's exec has no controlling tty, no SIGHUP);
+    // - the shell's OWN stdio is re-pointed at /dev/null via `exec` UP
+    //   FRONT, instead of per-job `>/dev/null` redirections: busybox 1.36
+    //   ash leaks its redirection-SAVE fds (dups of the exec pipes, ≥10,
+    //   non-cloexec) into backgrounded children, so the daemon would hold
+    //   agentd's pipes open and the hook would "run" until the global
+    //   timeout (1.30 marks the saves cloexec; dash/bash don't leak).
     let warm = WarmConfig {
         command: vec![
             "/bin/sh".into(),
             "-c".into(),
             format!(
-                "{WARM_SENTINEL} </dev/null >/dev/null 2>&1 & \
+                "exec </dev/null >/dev/null 2>&1; \
+                 {WARM_SENTINEL} & \
                  echo $! > /dev/shm/engram-warm-pid && \
                  echo warmed > /dev/shm/engram-warm-marker"
             ),
