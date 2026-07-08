@@ -1841,6 +1841,13 @@ pub trait MetadataStore: Send + Sync {
     /// exactly when a peer should legitimately re-claim.
     ///
     /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    ///
+    /// DEAD CODE as of ADR 0081 P1b (nothing calls this anymore — the
+    /// enable-scanner's old capture-progress consumer task, its only
+    /// caller, was deleted when capture became a heartbeat-dispatched
+    /// job; `mirror_capture_progress_to_enable_job` is its UNFENCED
+    /// replacement). Left in place through P1b/P3 to keep those commits'
+    /// footprints bounded; deleted in ADR 0081 P4.
     async fn update_enable_job_capture_progress(
         &self,
         id: uuid::Uuid,
@@ -2244,6 +2251,42 @@ pub trait MetadataStore: Send + Sync {
     /// shape). Default: empty.
     async fn cold_base_snapshot_ids(&self) -> Result<Vec<SnapshotId>, MetaError> {
         Ok(Vec::new())
+    }
+
+    /// Every cold base's `disk_manifest` + `memory_manifest`, parsed —
+    /// the chunk-GC pin-set's 7th source (`PinSet::collect`, ADR 0081
+    /// §B6): a cold base's chunks have no OTHER root (unlike the
+    /// overlay snapshot it seeds, it never gets its own `snapshots` row
+    /// pinned via `snapshot_blob_pin_set`/`enabled_images`), so without
+    /// this they'd be silently reaped out from under a live
+    /// `cold_bases` row. Default: empty (no second GC — a store without
+    /// `cold_bases` support has nothing to pin).
+    async fn cold_base_manifest_refs(
+        &self,
+    ) -> Result<Vec<crate::types::manifest::ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0081 §D: does a `cold_bases` row exist for `disk_manifest`
+    /// under a DIFFERENT `fc_snapshot_version` than `current_fc_version`?
+    /// Powers the `recaptured:fc_version_changed` reuse-outcome label —
+    /// distinguishing "this rootfs was captured before, just under an
+    /// older/newer FC build" from a genuine first-time
+    /// `recaptured:no_cold_base`. Matches on `disk_manifest` alone (not
+    /// the full content key, which already bakes in the version and so
+    /// can never itself answer "under a DIFFERENT version") — `cold_bases`
+    /// has no `resources` column to refine further, and every row in the
+    /// table is FC's by construction (VZ/Process never write one), so
+    /// this is a sound approximation for a telemetry label, not a
+    /// correctness gate. Default `false` (a store without this query
+    /// surface just reports the coarser `no_cold_base` label instead).
+    async fn cold_base_fc_version_changed(
+        &self,
+        disk_manifest: &str,
+        current_fc_version: &str,
+    ) -> Result<bool, MetaError> {
+        let _ = (disk_manifest, current_fc_version);
+        Ok(false)
     }
 
     // ---- session secrets ----

@@ -500,10 +500,11 @@ async fn advance_one(
             .map_err(classify_capture_error)?;
         match capture_row.stage {
             engram_core::types::CaptureJobStage::Done => {
-                let hit = crate::api::enabled_images::finalize_capture_job(state, &capture_row)
-                    .await
-                    .map_err(classify_capture_error)?;
-                ("recaptured:content_changed", hit)
+                let (hit, outcome) =
+                    crate::api::enabled_images::finalize_capture_job(state, &capture_row)
+                        .await
+                        .map_err(classify_capture_error)?;
+                (outcome, hit)
             }
             engram_core::types::CaptureJobStage::Failed => {
                 let retryable = capture_row.retryable.unwrap_or(false);

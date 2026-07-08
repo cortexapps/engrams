@@ -357,6 +357,7 @@ jobs:
             --test checkpoint_reconcile_live_pg \
             --test enable_jobs_live_pg \
             --test capture_jobs_live_pg \
+            --test claim_cold_base_live_pg \
             --test enable_reuse_live_pg \
             --test placement_reservation_live_pg \
             --test host_register_live_pg \
@@ -885,6 +886,7 @@ jobs:
             -p engram-host-agent \
             --test checkpoint_chain \
             --test warm_hook_capture \
+            --test cold_base_capture \
             --test migration_source \
             --test two_host_live_teleport \
             --test two_host_drain_wave \

@@ -13,9 +13,11 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::ids::{CaptureJobId, HostId, SnapshotId};
-use super::image::{ImageConfig, OciRuntimeDefaults};
+use super::image::{ImageConfig, OciRuntimeDefaults, ResourceHints};
+use super::snapshot::SnapshotMetadata;
 
 /// `capture_jobs.stage`: `assigned -> booting -> warming -> freezing ->
 /// done | failed`. The cold-base hit path skips `booting`'s cold-boot
@@ -215,6 +217,163 @@ pub struct CaptureJobSpec {
     /// synthetic `session_id` derived deterministically from `job_id` (stable
     /// across a reassign/retry of the same job).
     pub capture_egress: Option<super::egress::SessionEgressPolicy>,
+    /// ADR 0081 §B: the claim handler's cold-base reuse decision for
+    /// this attempt. ALWAYS computed coordinator-side (the claim
+    /// handler already holds `disk_manifest` + `resources` off the job
+    /// row and `fc_snapshot_version`/`backend` off the claiming host's
+    /// own `hosts` row — there is nothing left for the executor to
+    /// independently derive, so it never recomputes a content key,
+    /// only echoes the one it was given back in its result).
+    #[serde(default)]
+    pub cold_base_plan: ColdBasePlan,
+}
+
+/// ADR 0081 §B: the claim handler's cold-base decision — a tri-state
+/// (not `Option<Option<..>>`) so "no cold-base concept here" (non-FC),
+/// "FC, but nothing to reuse" (miss), and "FC, verified candidate"
+/// (hit) are three explicit, exhaustively-matched variants instead of
+/// nested optionality. `Miss`/`Hit` both carry the content key the
+/// executor must report its outcome under — computed ONCE,
+/// coordinator-side, from data the executor never sees directly
+/// (`ImageConfig::resources`), so the same content-addressing decision
+/// can never drift between the claim's lookup and the executor's report.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum ColdBasePlan {
+    /// The claiming host is not FC (or reported no `fc_snapshot_version`)
+    /// — no cold-base concept applies; the executor runs the single-
+    /// stage full path and its result carries no `cold_base`.
+    #[default]
+    NotApplicable,
+    /// FC-capable host, but no `cold_bases` row exists for this content
+    /// key (or the existing one failed the chunk-presence self-heal, or
+    /// belongs to a different `fc_snapshot_version`/backend) — the
+    /// executor boots fresh and reports its own Full capture as the new
+    /// cold base under `content_key`. `reason` is ONLY telemetry (the
+    /// `reuse_outcome` taxonomy, ADR §D) — it never changes what the
+    /// executor does.
+    Miss {
+        content_key: String,
+        reason: ColdBaseMissReason,
+    },
+    /// FC-capable host with a verified-present candidate — the executor
+    /// restores `snapshot` (chain auto-seeds off its own memory
+    /// manifest, exactly like a plain session resume) instead of
+    /// cold-booting. A backend that can't actually diff (capability
+    /// mismatch with what placement pinned) must hard-error, never
+    /// silently fall back to a fresh cold boot (ADR decision 11).
+    Hit {
+        content_key: String,
+        // `Box`ed: `SnapshotMetadata` is ~600 bytes and `NotApplicable`/
+        // `Miss` are tiny — clippy::large_enum_variant flags the
+        // resulting size skew (every `ColdBasePlan` value pays the
+        // largest variant's stack size regardless of which one it is).
+        snapshot: Box<SnapshotMetadata>,
+    },
+}
+
+/// ADR 0081 §D: WHY a claim resolved to [`ColdBasePlan::Miss`] — purely
+/// a `reuse_outcome` telemetry label the claim handler already knows
+/// (it just ran the lookup + presence check), threaded through so
+/// `finalize_capture_job` doesn't have to re-derive it from a `CaptureJobResult`
+/// that only carries the executor's OWN view (which can't distinguish
+/// these — the executor just sees "no candidate, boot fresh" either way).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColdBaseMissReason {
+    /// No `cold_bases` row exists for this exact content key, AND none
+    /// exists for this `disk_manifest` under any OTHER
+    /// `fc_snapshot_version` either — a genuine first-time capture.
+    NoCandidate,
+    /// A `cold_bases` row exists for this content key, but its chunks
+    /// failed the presence self-heal (a GC over-delete, a manual
+    /// deletion, a partial earlier upload).
+    ChunksMissing,
+    /// No row exists for this exact content key, but one DOES exist for
+    /// this `disk_manifest` under a DIFFERENT `fc_snapshot_version` —
+    /// this rootfs was captured before, just under a different FC
+    /// build.
+    FcVersionChanged,
+}
+
+/// ADR 0081 §B: the executor's result for one capture-job attempt —
+/// bincode-encoded into `capture_jobs.result_bincode` on `stage=Done`,
+/// replacing the bare `SnapshotMetadata` P1b shipped with (a mechanical,
+/// additive change: `finalize_capture_job` is this type's only decoder).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CaptureJobResult {
+    /// The artifact the enabled image / `snapshots` row must point at:
+    /// the Diff overlay for a warm image, or the single Full snapshot
+    /// for a warm-less image (byte-identical to `cold_base.snapshot` in
+    /// that case — the cold base IS the artifact, ADR §B3).
+    pub snapshot: SnapshotMetadata,
+    /// Present whenever this attempt produced OR reused a cold base —
+    /// every FC capture on a `supports_diff_checkpoints` host, warm or
+    /// warm-less. `None` on VZ/Process (single-stage, no cold-base
+    /// concept — `fc_snapshot_version` stays `None` there too).
+    #[serde(default)]
+    pub cold_base: Option<CapturedColdBase>,
+}
+
+/// One capture attempt's cold-base outcome — tells
+/// `finalize_capture_job` whether to `upsert_cold_base` (a fresh
+/// capture) or leave the existing `cold_bases` row alone (a hit simply
+/// reused it unchanged).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CapturedColdBase {
+    pub content_key: String,
+    pub snapshot: SnapshotMetadata,
+    /// `true`: this run PRODUCED the cold base (a fresh Full capture —
+    /// the miss path, or a warm-less image, whose single capture IS a
+    /// cold base). `false`: restored from an existing `cold_bases` row
+    /// (the hit path) — the row is unchanged and must not be
+    /// re-upserted.
+    pub freshly_captured: bool,
+    /// Echoed straight from the claim's [`ColdBasePlan::Miss`] (`None`
+    /// for a `Hit` — nothing to explain, and `finalize_capture_job` maps
+    /// `freshly_captured == false` straight to `reused_cold_base`
+    /// without consulting this field at all).
+    #[serde(default)]
+    pub miss_reason: Option<ColdBaseMissReason>,
+}
+
+/// ADR 0081 §B1: the cold-base content key —
+/// `sha256(disk_manifest.content_ref || canonical(resources) ||
+/// fc_snapshot_version || backend_kind)`. Env-agnostic (name/
+/// description/env/workdir never enter the key — ADR 0080's verified
+/// assumption that base snapshots don't depend on session env) and
+/// FC-`SNAPSHOT_VERSION`-keyed (closes the issue-#160 cross-version
+/// corruption class re-armed by aggressive reuse) and backend-keyed
+/// (VZ/Process never share a namespace with FC bases).
+///
+/// Canonicalization: a small `#[derive(Serialize)]` struct with a FIXED
+/// field order (not a `HashMap`) fed to `serde_json::to_vec` — `serde_json`
+/// preserves struct field declaration order, so this is deterministic
+/// across processes/versions without a custom canonical-JSON writer.
+/// `disk_manifest` is the `ManifestRef` Display form (`<uuid>@v<num>`,
+/// the same opaque text `capture_jobs.disk_manifest` already stores) —
+/// callers pass it as received, no re-parse needed.
+pub fn cold_base_content_key(
+    disk_manifest: &str,
+    resources: &ResourceHints,
+    fc_snapshot_version: Option<&str>,
+    backend_kind: &str,
+) -> String {
+    #[derive(Serialize)]
+    struct KeyInput<'a> {
+        disk_manifest: &'a str,
+        resources: &'a ResourceHints,
+        fc_snapshot_version: Option<&'a str>,
+        backend_kind: &'a str,
+    }
+    let bytes = serde_json::to_vec(&KeyInput {
+        disk_manifest,
+        resources,
+        fc_snapshot_version,
+        backend_kind,
+    })
+    .expect("KeyInput has no non-serializable fields");
+    let digest = Sha256::digest(&bytes);
+    format!("{digest:x}")
 }
 
 /// The `cold_bases` row (ADR 0081 section B): a content-keyed,
@@ -232,6 +391,13 @@ pub struct ColdBaseRow {
     pub memory_manifest: String,
     pub fc_snapshot_version: String,
     pub captured_at: DateTime<Utc>,
+    /// Migration 0097: the executor's own bincode-encoded
+    /// `SnapshotMetadata` for this cold base, verbatim — what the claim
+    /// handler hands back as [`ColdBasePlan::Hit::snapshot`] for the
+    /// executor to `restore()` directly. `disk_manifest`/`memory_manifest`
+    /// above are kept as separate text columns for cheap SQL-level
+    /// inspection/debugging; this is the source of truth for restore.
+    pub snapshot_bincode: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -299,5 +465,53 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    fn hints(mem: Option<u32>) -> ResourceHints {
+        ResourceHints {
+            suggested_memory_mib: mem,
+            suggested_vcpus: Some(2),
+            suggested_disk_gib: Some(10),
+        }
+    }
+
+    #[test]
+    fn cold_base_content_key_is_deterministic() {
+        let a = cold_base_content_key("m1@v1", &hints(Some(4096)), Some("v10.0.0"), "firecracker");
+        let b = cold_base_content_key("m1@v1", &hints(Some(4096)), Some("v10.0.0"), "firecracker");
+        assert_eq!(a, b);
+        // sha256 hex digest length.
+        assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn cold_base_content_key_is_sensitive_to_every_component() {
+        let base =
+            cold_base_content_key("m1@v1", &hints(Some(4096)), Some("v10.0.0"), "firecracker");
+        assert_ne!(
+            base,
+            cold_base_content_key("m2@v1", &hints(Some(4096)), Some("v10.0.0"), "firecracker"),
+            "disk_manifest must be part of the key"
+        );
+        assert_ne!(
+            base,
+            cold_base_content_key("m1@v1", &hints(Some(8192)), Some("v10.0.0"), "firecracker"),
+            "resources must be part of the key"
+        );
+        assert_ne!(
+            base,
+            cold_base_content_key("m1@v1", &hints(Some(4096)), Some("v9.0.0"), "firecracker"),
+            "fc_snapshot_version must be part of the key"
+        );
+        assert_ne!(
+            base,
+            cold_base_content_key("m1@v1", &hints(Some(4096)), Some("v10.0.0"), "vz"),
+            "backend_kind must be part of the key"
+        );
+        assert_ne!(
+            base,
+            cold_base_content_key("m1@v1", &hints(Some(4096)), None, "firecracker"),
+            "a missing fc_snapshot_version must not collide with a present one"
+        );
     }
 }

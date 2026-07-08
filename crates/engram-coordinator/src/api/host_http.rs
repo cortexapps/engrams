@@ -1095,11 +1095,15 @@ pub async fn claim_capture_job(
             )
         });
 
+    let cold_base_plan =
+        crate::api::enabled_images::resolve_cold_base_plan(&state, host_id, &row, &config).await;
+
     tracing::info!(
         host_id = %host_id,
         %job_id,
         epoch = req.epoch,
         image_uri = %row.image_uri,
+        cold_base_plan = ?cold_base_plan,
         "host claimed capture job",
     );
     Ok(Json(engram_core::types::capture_job::CaptureJobSpec {
@@ -1107,6 +1111,7 @@ pub async fn claim_capture_job(
         warm: config.warm,
         resolved_env,
         capture_egress,
+        cold_base_plan,
     }))
 }
 

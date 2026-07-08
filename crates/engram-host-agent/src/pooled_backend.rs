@@ -6906,15 +6906,73 @@ impl SandboxBackend for PooledBackend {
         result
     }
 
+    /// ADR 0081 §B: cold-base / warm-overlay split.
+    ///
+    /// `req.cold_base_plan` (computed entirely coordinator-side —
+    /// `ColdBasePlan`'s doc) drives the stage plan:
+    ///
+    /// - `NotApplicable` (non-FC claiming host, or an FC host with no
+    ///   `fc_snapshot_version` reported): unchanged single-stage path —
+    ///   cold-boot (or the caller never even reaches this since a
+    ///   non-diffing backend can't have been claimed a `Hit`/`Miss`; see
+    ///   the hard-error gate below), run the hook if any, ONE snapshot
+    ///   call at the end. Warm-less images take this same single path
+    ///   naturally (`warm.is_none()` just skips the hook step) — no
+    ///   special-casing needed since there's only ever one snapshot call
+    ///   in this arm.
+    /// - `Miss { content_key }`: cold-boot, and — ONLY if this is a WARM
+    ///   image (a warm-less image's single final snapshot IS the cold
+    ///   base, see above) — take an extra Full snapshot BEFORE the hook
+    ///   runs (chain auto-seeds off it, `self.snapshot`'s own
+    ///   `advance_checkpoint_state` post-capture bookkeeping — no new
+    ///   plumbing needed), then run the hook, then the final overlay
+    ///   snapshot (now a cheap Diff, chain already seeded).
+    /// - `Hit { content_key, snapshot }`: `self.restore(snapshot)`
+    ///   instead of cold-booting (chain auto-seeds sparse off the
+    ///   restored base's OWN memory manifest — the same machinery a
+    ///   plain session resume uses), run the hook, take the final
+    ///   overlay snapshot (a cheap Diff). No cold boot at all.
+    ///
+    /// Every arm ends with exactly one snapshot call whose metadata
+    /// becomes [`engram_core::types::capture_job::CaptureJobResult::
+    /// snapshot`] — the artifact the enabled image points at.
     #[tracing::instrument(name = "host.build_base_snapshot", skip_all)]
     async fn build_base_snapshot(
         &self,
-        spec: SandboxSpec,
-        warm: Option<WarmConfig>,
-        capture_env: std::collections::HashMap<String, String>,
-        capture_egress: Option<engram_core::types::egress::SessionEgressPolicy>,
+        req: engram_core::traits::sandbox::BuildBaseSnapshotRequest,
         progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
-    ) -> Result<SnapshotMetadata, SandboxError> {
+    ) -> Result<engram_core::types::capture_job::CaptureJobResult, SandboxError> {
+        use engram_core::types::capture_job::{CaptureJobResult, CapturedColdBase, ColdBasePlan};
+
+        let engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+            spec,
+            warm,
+            capture_env,
+            capture_egress,
+            cold_base_plan,
+        } = req;
+
+        // ADR 0081 decision 11: a `Hit`/`Miss` plan means placement
+        // pinned this host as FC-capable (`fc_snapshot_version` +
+        // `supports_diff_checkpoints`). If the actual backend can't
+        // diff, that's a placement bug — hard error, never a silent
+        // single-stage fallback.
+        if !matches!(cold_base_plan, ColdBasePlan::NotApplicable)
+            && !self.inner.supports_diff_checkpoints()
+        {
+            return Err(SandboxError::CaptureFailed(
+                engram_core::types::CaptureFailure {
+                    kind: engram_core::types::CaptureFailureKind::ColdBaseCapabilityMismatch,
+                    stage: Some("assigned".to_string()),
+                    tail: String::new(),
+                    message: "claim carried a cold-base plan but this backend does not support \
+                          diff memory snapshots (supports_diff_checkpoints() == false); this \
+                          is a placement bug, not a transient condition"
+                        .to_string(),
+                },
+            ));
+        }
+
         // ADR 0021 P1.5: no stub-harness attach — the harness lives
         // in the rootfs of the image being captured, so the snapshot
         // is already complete without any second virtio-blk drive.
@@ -6928,17 +6986,24 @@ impl SandboxBackend for PooledBackend {
         // plus whatever secrets the warm boot needs.
         let mut session_env = spec.env.clone();
         session_env.extend(capture_env);
+        let is_warm = warm.is_some();
 
-        // Boot the capture VM (opens the cold_boot operation scope on Linux).
+        // ---- stage 1: a LIVE VM at (or converging toward) agentd-ready
+        // — restore the cold base on a Hit (no cold boot at all), else
+        // cold-boot fresh (Miss / NotApplicable). ----
         //
-        // ADR 0081 P1b: the teardown reconcile no longer exempts capture VMs
-        // via a `base_captures` DashMap tracked here — the host-agent's
-        // capture-job executor (`capture_job.rs`) tracks `(job_id, sandbox_id)`
-        // for the whole job lifetime and the reconcile consults IT instead
-        // (`CaptureJobRegistry::is_live_sandbox`), so the exemption survives
-        // exactly as long as a live job record says it should, not as long as
-        // this one call happens to run.
-        let id = self.create(spec).await?;
+        // ADR 0081 P1b: the teardown reconcile no longer exempts capture
+        // VMs via a `base_captures` DashMap tracked here — the host-
+        // agent's capture-job executor (`capture_job.rs`) tracks
+        // `(job_id, sandbox_id)` for the whole job lifetime and the
+        // reconcile consults IT instead (`CaptureJobExecutor::
+        // is_live_sandbox`), so the exemption survives exactly as long
+        // as a live job record says it should, not as long as this one
+        // call happens to run.
+        let id = match &cold_base_plan {
+            ColdBasePlan::Hit { snapshot, .. } => self.restore((**snapshot).clone()).await?,
+            ColdBasePlan::Miss { .. } | ColdBasePlan::NotApplicable => self.create(spec).await?,
+        };
 
         // Capture-time egress (ADR 0080): register the coordinator-assembled
         // policy for the capture VM's guest IP so the `[warm]` hook can reach
@@ -6947,9 +7012,10 @@ impl SandboxBackend for PooledBackend {
         // no egress. Torn down after the destroy below, on every path.
         let capture_egress = self.register_capture_egress(id, capture_egress).await;
 
-        // Issue #539: `phase=boot` — the capture VM exists and is booting to
-        // agentd-ready. Best-effort; a slow/dropped consumer must not stall
-        // the capture.
+        // Issue #539: `phase=boot` — the capture VM exists and is
+        // booting (or, on a Hit, already live from the restore) toward
+        // agentd-ready. Best-effort; a slow/dropped consumer must not
+        // stall the capture.
         let boot_event = engram_core::types::CaptureProgress {
             phase: engram_core::types::CapturePhase::Boot,
             sandbox_id: Some(id),
@@ -6962,7 +7028,7 @@ impl SandboxBackend for PooledBackend {
 
         // Drive the capture to a snapshot, then ALWAYS tear the VM down —
         // a capture VM has no session and must not linger.
-        let captured = async {
+        let captured: Result<CaptureJobResult, SandboxError> = async {
             // Finding 1: a slow cold boot / chunk materialize has no
             // progress source of its own to renew the capture-claim lease
             // — resend the boot frame every 30s until agentd-ready (or we
@@ -6971,19 +7037,68 @@ impl SandboxBackend for PooledBackend {
             let boot_keepalive = spawn_leg_keepalive(progress.clone(), boot_event);
             // Wait for the guest to reach agentd-ready (bootstrap on
             // accept(), harness unmounted — the option-D capture point).
-            // VZ backend doesn't support this (FC-only), so ignore InvalidSpec.
+            // On a Hit restore the watch is already pre-set true (FC's
+            // restore path); on VZ this returns InvalidSpec (no
+            // readiness concept there).
             match self.inner.wait_agent_ready(id).await {
                 Ok(()) => {}
                 Err(SandboxError::InvalidSpec(_)) => {}
                 Err(e) => return Err(e),
             }
             drop(boot_keepalive);
+
+            // ADR 0081 §B3: a WARM image on a MISS needs its OWN cold
+            // base minted before the hook runs (the hook must land on
+            // top of an established base, not fold into the artifact's
+            // only capture) — take a Full snapshot now. `self.snapshot`
+            // takes Full here because no checkpoint chain exists yet for
+            // this freshly-created sandbox; its own post-capture
+            // bookkeeping (`advance_checkpoint_state`) auto-seeds the
+            // chain off the Full's memory manifest, so the LATER overlay
+            // snapshot below is automatically a cheap Diff — no new
+            // pause/resume/seed plumbing needed here.
+            //
+            // Every other combination skips this: `NotApplicable` (no
+            // cold-base concept), `Hit` (already have one — the restore
+            // above seeded the chain sparse off IT), and warm-less
+            // (its single final snapshot below IS the cold base).
+            let minted_cold_base = if is_warm && matches!(cold_base_plan, ColdBasePlan::Miss { .. })
+            {
+                #[cfg(target_os = "linux")]
+                if let Some(state) = self.nbd_sandboxes.get(&id) {
+                    state.backend.operation_scope().end();
+                }
+                let cold_base_event = engram_core::types::CaptureProgress {
+                    phase: engram_core::types::CapturePhase::Snapshot,
+                    sandbox_id: Some(id),
+                    warm_stage: None,
+                    detail: Some("cold-base capture".to_string()),
+                    output_tail: String::new(),
+                    warm_stages: Vec::new(),
+                };
+                let _ = progress.try_send(cold_base_event.clone());
+                let cold_base_keepalive = spawn_leg_keepalive(progress.clone(), cold_base_event);
+                let meta = self.snapshot(id).await.map_err(|e| {
+                    SandboxError::CaptureFailed(engram_core::types::CaptureFailure {
+                        kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
+                        stage: Some("booting".to_string()),
+                        tail: String::new(),
+                        message: format!("cold-base Full capture failed: {e}"),
+                    })
+                });
+                drop(cold_base_keepalive);
+                Some(meta?)
+            } else {
+                None
+            };
+
             // Capture-time prewarm hook (image `[warm]`): run the warm
-            // command in the live VM BEFORE the snapshot, so a process it
-            // leaves running (e.g. a `gradle --daemon`) is frozen into the
-            // base snapshot and every restored session inherits it warm.
-            // The command must start its daemon detached and exit; we run
-            // it to completion and gate the capture on a clean exit.
+            // command in the live VM BEFORE the (overlay) snapshot, so a
+            // process it leaves running (e.g. a `gradle --daemon`) is
+            // frozen into the snapshot and every restored session
+            // inherits it warm. The command must start its daemon
+            // detached and exit; we run it to completion and gate the
+            // capture on a clean exit.
             //
             // FAIL-LOUD: a non-zero exit or timeout aborts the capture
             // (and thus the enable) — we never ship a "cold" base snapshot
@@ -7006,7 +7121,10 @@ impl SandboxBackend for PooledBackend {
                     .await?;
             }
             // Close the cold-boot window (mirrors `start_agent`) before the
-            // snapshot flush opens its own `snapshot` operation scope.
+            // snapshot flush opens its own `snapshot` operation scope. A
+            // no-op if the Miss+warm arm above already ended it (or if
+            // this sandbox was restored, not cold-booted — no scope to
+            // end either way).
             #[cfg(target_os = "linux")]
             if let Some(state) = self.nbd_sandboxes.get(&id) {
                 state.backend.operation_scope().end();
@@ -7031,8 +7149,11 @@ impl SandboxBackend for PooledBackend {
             let snapshot_keepalive = spawn_leg_keepalive(progress.clone(), snapshot_event);
             // Capture: pause → flush disk → chunk memory + upload
             // state.bin/sidecar to BlobStorage. This is the portable
-            // artifact `create_session` restores from.
-            let result = self.snapshot(id).await.map_err(|e| {
+            // artifact `create_session` restores from — a Diff overlay
+            // when a chain was seeded above (warm Miss's pre-hook Full,
+            // or the Hit restore's sparse seed), a Full when neither ran
+            // (warm-less, or `NotApplicable`).
+            let final_meta = self.snapshot(id).await.map_err(|e| {
                 SandboxError::CaptureFailed(engram_core::types::CaptureFailure {
                     kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
                     stage: None,
@@ -7041,7 +7162,42 @@ impl SandboxBackend for PooledBackend {
                 })
             });
             drop(snapshot_keepalive);
-            result
+            let final_meta = final_meta?;
+
+            let cold_base = match &cold_base_plan {
+                ColdBasePlan::NotApplicable => None,
+                ColdBasePlan::Hit {
+                    content_key,
+                    snapshot,
+                } => Some(CapturedColdBase {
+                    content_key: content_key.clone(),
+                    // The (unchanged) existing row's own identity — NOT
+                    // `final_meta` (the fresh overlay this attempt just
+                    // took). `finalize_capture_job` must not re-upsert
+                    // `cold_bases` for a Hit; this field is reported for
+                    // symmetry/debuggability, not consumed as a write.
+                    snapshot: (**snapshot).clone(),
+                    freshly_captured: false,
+                    miss_reason: None,
+                }),
+                ColdBasePlan::Miss {
+                    content_key,
+                    reason,
+                } => Some(CapturedColdBase {
+                    content_key: content_key.clone(),
+                    // Warm Miss: the pre-hook Full minted above. Warm-less
+                    // Miss: no pre-hook capture ran — `final_meta` IS the
+                    // cold base (the single Full path, ADR §B3).
+                    snapshot: minted_cold_base.unwrap_or_else(|| final_meta.clone()),
+                    freshly_captured: true,
+                    miss_reason: Some(*reason),
+                }),
+            };
+
+            Ok(CaptureJobResult {
+                snapshot: final_meta,
+                cold_base,
+            })
         }
         .await;
 
@@ -8093,10 +8249,13 @@ mod tests {
 
         pooled
             .build_base_snapshot(
-                live_spec("slow-boot"),
-                None, // no [warm] hook: isolates the boot leg
-                Default::default(),
-                None,
+                engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+                    spec: live_spec("slow-boot"),
+                    warm: None,
+                    capture_env: Default::default(),
+                    capture_egress: None,
+                    cold_base_plan: engram_core::types::capture_job::ColdBasePlan::NotApplicable,
+                },
                 progress_tx,
             )
             .await
@@ -8185,10 +8344,13 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             pooled.build_base_snapshot(
-                live_spec("warm-early-kill"),
-                Some(warm),
-                Default::default(),
-                None,
+                engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+                    spec: live_spec("warm-early-kill"),
+                    warm: Some(warm),
+                    capture_env: Default::default(),
+                    capture_egress: None,
+                    cold_base_plan: engram_core::types::capture_job::ColdBasePlan::NotApplicable,
+                },
                 progress_tx,
             ),
         )
@@ -8282,10 +8444,13 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             pooled.build_base_snapshot(
-                live_spec("warm-stall"),
-                Some(warm),
-                Default::default(),
-                None,
+                engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+                    spec: live_spec("warm-stall"),
+                    warm: Some(warm),
+                    capture_env: Default::default(),
+                    capture_egress: None,
+                    cold_base_plan: engram_core::types::capture_job::ColdBasePlan::NotApplicable,
+                },
                 progress_tx,
             ),
         )
@@ -8412,10 +8577,13 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             pooled.build_base_snapshot(
-                live_spec("warm-stage-deadline"),
-                Some(warm),
-                Default::default(),
-                None,
+                engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+                    spec: live_spec("warm-stage-deadline"),
+                    warm: Some(warm),
+                    capture_env: Default::default(),
+                    capture_egress: None,
+                    cold_base_plan: engram_core::types::capture_job::ColdBasePlan::NotApplicable,
+                },
                 progress_tx,
             ),
         )
@@ -8564,10 +8732,13 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             pooled.build_base_snapshot(
-                live_spec("warm-noise"),
-                Some(warm),
-                Default::default(),
-                None,
+                engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+                    spec: live_spec("warm-noise"),
+                    warm: Some(warm),
+                    capture_env: Default::default(),
+                    capture_egress: None,
+                    cold_base_plan: engram_core::types::capture_job::ColdBasePlan::NotApplicable,
+                },
                 progress_tx,
             ),
         )
@@ -8698,10 +8869,13 @@ mod tests {
 
         pooled
             .build_base_snapshot(
-                live_spec("warm-two-stage"),
-                Some(warm),
-                Default::default(),
-                None,
+                engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+                    spec: live_spec("warm-two-stage"),
+                    warm: Some(warm),
+                    capture_env: Default::default(),
+                    capture_egress: None,
+                    cold_base_plan: engram_core::types::capture_job::ColdBasePlan::NotApplicable,
+                },
                 progress_tx,
             )
             .await
@@ -8733,6 +8907,437 @@ mod tests {
             last_warm.warm_stages[1].outcome,
             engram_core::types::WarmStageOutcome::Done
         );
+    }
+
+    /// ADR 0081 §B: `build_base_snapshot`'s cold-base/warm-overlay stage
+    /// plan. `ColdBaseMock` tracks `create`/`restore`/`snapshot` call
+    /// counts so each test asserts the EXACT stage sequence its
+    /// `ColdBasePlan` should drive, without needing to fake FC's real
+    /// `memory.diff` sparse-range format (that fidelity belongs to the
+    /// FC integration test, not this unit suite) — this mock has no
+    /// `checkpoint_dir` wired, so every `snapshot()` call routes through
+    /// `inner.snapshot()` (never `inner.snapshot_diff()`); what's under
+    /// test here is purely the STAGE SEQUENCE (create-vs-restore,
+    /// snapshot call count, the hard-error gate, and the result shape),
+    /// not the Full/Diff cost distinction itself.
+    mod cold_base_stage_plan {
+        use super::*;
+        use engram_core::traits::sandbox::BuildBaseSnapshotRequest;
+        use engram_core::types::capture_job::{ColdBaseMissReason, ColdBasePlan};
+        use engram_core::types::image::WarmConfig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct ColdBaseMock {
+            staging: PathBuf,
+            create_calls: Arc<AtomicUsize>,
+            restore_calls: Arc<AtomicUsize>,
+            snapshot_calls: Arc<AtomicUsize>,
+            destroy_calls: Arc<AtomicUsize>,
+            supports_diff: bool,
+        }
+
+        impl ColdBaseMock {
+            fn new(staging: PathBuf, supports_diff: bool) -> Self {
+                Self {
+                    staging,
+                    create_calls: Arc::new(AtomicUsize::new(0)),
+                    restore_calls: Arc::new(AtomicUsize::new(0)),
+                    snapshot_calls: Arc::new(AtomicUsize::new(0)),
+                    destroy_calls: Arc::new(AtomicUsize::new(0)),
+                    supports_diff,
+                }
+            }
+        }
+
+        #[async_trait]
+        impl SandboxBackend for ColdBaseMock {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                self.create_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(SandboxId::new())
+            }
+            async fn exec_stream(
+                &self,
+                id: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                // A trivial always-succeeds hook (mirrors `command =
+                // ["true"]` — no `::engram-warm::` progress lines, just a
+                // clean exit).
+                use engram_core::types::sandbox::ExecEvent;
+                let events = futures::stream::iter(vec![ExecEvent::Exit(Some(0))]);
+                Ok(ExecStream {
+                    sandbox_id: id,
+                    exec_id: "exec-cold-base-mock".into(),
+                    events: Box::pin(events),
+                })
+            }
+            fn supports_diff_checkpoints(&self) -> bool {
+                self.supports_diff
+            }
+            async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+                let snapshot_id = engram_core::SnapshotId::new();
+                let dest = self.staging.join(snapshot_id.to_string());
+                tokio::fs::create_dir_all(&dest).await.unwrap();
+                tokio::fs::write(dest.join("memory.bin"), vec![9u8; 4096])
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("state.bin"), b"x")
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("manifest.json"), b"{}")
+                    .await
+                    .unwrap();
+                Ok(SnapshotMetadata {
+                    id: snapshot_id,
+                    size_bytes: 4096,
+                    created_at: chrono::Utc::now(),
+                    image_version: "t:1".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                    working_set_blob_key: None,
+                    aux_bundles: vec![],
+                    paused_at: None,
+                })
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.staging.join(id.to_string())
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                self.restore_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(SandboxId::new())
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                self.destroy_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        fn warm_config() -> WarmConfig {
+            WarmConfig {
+                command: vec!["true".into()],
+                timeout_secs: Some(30),
+                workdir: None,
+                env: Vec::new(),
+                network: None,
+            }
+        }
+
+        fn fake_snapshot() -> SnapshotMetadata {
+            SnapshotMetadata {
+                id: engram_core::SnapshotId::new(),
+                size_bytes: 4096,
+                created_at: chrono::Utc::now(),
+                image_version: "cold-base:1".into(),
+                disk_manifest: None,
+                memory_manifest: None,
+                base_memory_manifest: None,
+                migration_source: None,
+                source_sandbox_id: None,
+                state_blob_key: None,
+                sidecar_blob_key: None,
+                rootfs_blob_key: None,
+                working_set_blob_key: None,
+                aux_bundles: vec![],
+                paused_at: None,
+            }
+        }
+
+        async fn pooled_over(mock: ColdBaseMock) -> Arc<PooledBackend> {
+            let tmp = tempfile::tempdir().unwrap();
+            let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+                engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+            );
+            let cs = engram_chunk_store::ChunkStore::new(blob);
+            let inner: Arc<dyn SandboxBackend> = Arc::new(mock);
+            let p = Arc::new(
+                PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized")),
+            );
+            std::mem::forget(tmp);
+            p
+        }
+
+        /// `NotApplicable` (non-FC host / warm-less image): single-stage
+        /// path — `create` once, `restore` never, exactly ONE `snapshot`
+        /// call, and the result carries no `cold_base`.
+        #[tokio::test]
+        async fn not_applicable_is_single_stage_with_no_cold_base() {
+            let staging = tempfile::tempdir().unwrap();
+            let mock = ColdBaseMock::new(staging.path().to_path_buf(), true);
+            let counters = mock.clone();
+            let pooled = pooled_over(mock).await;
+            let (progress_tx, _rx) = tokio::sync::mpsc::channel(64);
+
+            let result = pooled
+                .build_base_snapshot(
+                    BuildBaseSnapshotRequest {
+                        spec: live_spec("cb-not-applicable"),
+                        warm: None,
+                        capture_env: Default::default(),
+                        capture_egress: None,
+                        cold_base_plan: ColdBasePlan::NotApplicable,
+                    },
+                    progress_tx,
+                )
+                .await
+                .expect("single-stage capture must succeed");
+
+            assert_eq!(counters.create_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(counters.restore_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(counters.snapshot_calls.load(Ordering::SeqCst), 1);
+            assert!(result.cold_base.is_none());
+        }
+
+        /// Warm-less image on an FC host with `ColdBasePlan::Miss`: still
+        /// single-stage (ONE `snapshot` call — the single Full path IS
+        /// the cold base, ADR §B3) — but the result now carries
+        /// `cold_base` (so a LATER warm image with the same content can
+        /// reuse it), `freshly_captured: true`, with the SAME snapshot
+        /// metadata as the artifact.
+        #[tokio::test]
+        async fn warm_less_miss_is_single_stage_but_reports_cold_base_identity() {
+            let staging = tempfile::tempdir().unwrap();
+            let mock = ColdBaseMock::new(staging.path().to_path_buf(), true);
+            let counters = mock.clone();
+            let pooled = pooled_over(mock).await;
+            let (progress_tx, _rx) = tokio::sync::mpsc::channel(64);
+
+            let result = pooled
+                .build_base_snapshot(
+                    BuildBaseSnapshotRequest {
+                        spec: live_spec("cb-warm-less-miss"),
+                        warm: None,
+                        capture_env: Default::default(),
+                        capture_egress: None,
+                        cold_base_plan: ColdBasePlan::Miss {
+                            content_key: "ck-1".into(),
+                            reason: ColdBaseMissReason::NoCandidate,
+                        },
+                    },
+                    progress_tx,
+                )
+                .await
+                .expect("warm-less miss must succeed");
+
+            assert_eq!(counters.create_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(counters.restore_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                counters.snapshot_calls.load(Ordering::SeqCst),
+                1,
+                "warm-less has no hook to protect a pre-hook cold-base capture for"
+            );
+            let cb = result.cold_base.expect("must report cold-base identity");
+            assert_eq!(cb.content_key, "ck-1");
+            assert!(cb.freshly_captured);
+            assert_eq!(cb.miss_reason, Some(ColdBaseMissReason::NoCandidate));
+            assert_eq!(
+                cb.snapshot.id, result.snapshot.id,
+                "the single Full capture IS both the cold base and the artifact"
+            );
+        }
+
+        /// Warm image on a MISS: two `snapshot` calls (the pre-hook Full
+        /// cold-base capture, then the post-hook overlay) and exactly one
+        /// `create` — no cold boot avoided (there was nothing to reuse),
+        /// but the cold base is minted BEFORE the hook runs.
+        #[tokio::test]
+        async fn warm_miss_takes_a_pre_hook_snapshot_then_the_overlay() {
+            let staging = tempfile::tempdir().unwrap();
+            let mock = ColdBaseMock::new(staging.path().to_path_buf(), true);
+            let counters = mock.clone();
+            let pooled = pooled_over(mock).await;
+            let (progress_tx, _rx) = tokio::sync::mpsc::channel(64);
+
+            let result = pooled
+                .build_base_snapshot(
+                    BuildBaseSnapshotRequest {
+                        spec: live_spec("cb-warm-miss"),
+                        warm: Some(warm_config()),
+                        capture_env: Default::default(),
+                        capture_egress: None,
+                        cold_base_plan: ColdBasePlan::Miss {
+                            content_key: "ck-2".into(),
+                            reason: ColdBaseMissReason::ChunksMissing,
+                        },
+                    },
+                    progress_tx,
+                )
+                .await
+                .expect("warm miss must succeed");
+
+            assert_eq!(counters.create_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(counters.restore_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                counters.snapshot_calls.load(Ordering::SeqCst),
+                2,
+                "a WARM miss mints its own cold base before the hook, then takes the overlay"
+            );
+            let cb = result.cold_base.expect("must report the minted cold base");
+            assert!(cb.freshly_captured);
+            assert_eq!(cb.miss_reason, Some(ColdBaseMissReason::ChunksMissing));
+            assert_ne!(
+                cb.snapshot.id, result.snapshot.id,
+                "the pre-hook cold base and the post-hook overlay are DISTINCT captures"
+            );
+        }
+
+        /// A `Hit`: `restore` instead of `create` — no cold boot at all —
+        /// and exactly one `snapshot` call (the overlay). The reported
+        /// `cold_base` echoes the candidate's OWN (unchanged) identity,
+        /// not the fresh overlay, and `freshly_captured` is `false`.
+        #[tokio::test]
+        async fn hit_restores_instead_of_creating() {
+            let staging = tempfile::tempdir().unwrap();
+            let mock = ColdBaseMock::new(staging.path().to_path_buf(), true);
+            let counters = mock.clone();
+            let pooled = pooled_over(mock).await;
+            let (progress_tx, _rx) = tokio::sync::mpsc::channel(64);
+            let candidate = fake_snapshot();
+            let candidate_id = candidate.id;
+
+            let result = pooled
+                .build_base_snapshot(
+                    BuildBaseSnapshotRequest {
+                        spec: live_spec("cb-hit"),
+                        warm: Some(warm_config()),
+                        capture_env: Default::default(),
+                        capture_egress: None,
+                        cold_base_plan: ColdBasePlan::Hit {
+                            content_key: "ck-3".into(),
+                            snapshot: Box::new(candidate),
+                        },
+                    },
+                    progress_tx,
+                )
+                .await
+                .expect("hit path must succeed");
+
+            assert_eq!(
+                counters.create_calls.load(Ordering::SeqCst),
+                0,
+                "a Hit must never cold-boot"
+            );
+            assert_eq!(counters.restore_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                counters.snapshot_calls.load(Ordering::SeqCst),
+                1,
+                "only the post-hook overlay — no pre-hook capture needed, we already have one"
+            );
+            let cb = result
+                .cold_base
+                .expect("must report the cold-base identity");
+            assert!(!cb.freshly_captured);
+            assert_eq!(cb.miss_reason, None);
+            assert_eq!(
+                cb.snapshot.id, candidate_id,
+                "a Hit echoes the EXISTING candidate's identity, not a new capture"
+            );
+            assert_ne!(
+                cb.snapshot.id, result.snapshot.id,
+                "the candidate's identity is distinct from the fresh overlay artifact"
+            );
+        }
+
+        /// ADR decision 11: a `Hit`/`Miss` plan on a backend that can't
+        /// actually diff is a placement bug — hard error, no cold boot
+        /// ever attempted, never a silent single-stage fallback.
+        #[tokio::test]
+        async fn capability_mismatch_hard_errors_before_booting_anything() {
+            let staging = tempfile::tempdir().unwrap();
+            // supports_diff = false: this "FC" host has dirty-page
+            // tracking disabled (or IS non-FC) — either way it can't
+            // honor a Hit/Miss plan.
+            let mock = ColdBaseMock::new(staging.path().to_path_buf(), false);
+            let counters = mock.clone();
+            let pooled = pooled_over(mock).await;
+            let (progress_tx, _rx) = tokio::sync::mpsc::channel(64);
+
+            let err = pooled
+                .build_base_snapshot(
+                    BuildBaseSnapshotRequest {
+                        spec: live_spec("cb-mismatch"),
+                        warm: None,
+                        capture_env: Default::default(),
+                        capture_egress: None,
+                        cold_base_plan: ColdBasePlan::Miss {
+                            content_key: "ck-4".into(),
+                            reason: ColdBaseMissReason::NoCandidate,
+                        },
+                    },
+                    progress_tx,
+                )
+                .await
+                .expect_err("a capability mismatch must hard-error");
+
+            match err {
+                SandboxError::CaptureFailed(failure) => {
+                    assert_eq!(
+                        failure.kind,
+                        engram_core::types::CaptureFailureKind::ColdBaseCapabilityMismatch
+                    );
+                    assert!(!failure.kind.is_retryable());
+                }
+                other => {
+                    panic!("expected CaptureFailed(ColdBaseCapabilityMismatch), got {other:?}")
+                }
+            }
+            assert_eq!(
+                counters.create_calls.load(Ordering::SeqCst),
+                0,
+                "must fail BEFORE ever booting a VM"
+            );
+            assert_eq!(counters.restore_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(counters.destroy_calls.load(Ordering::SeqCst), 0);
+        }
+
+        /// A `Hit` combined with an actual capability mismatch is the
+        /// SAME hard error as `Miss` — the gate checks the plan variant,
+        /// not which specific variant it is.
+        #[tokio::test]
+        async fn hit_with_capability_mismatch_also_hard_errors() {
+            let staging = tempfile::tempdir().unwrap();
+            let mock = ColdBaseMock::new(staging.path().to_path_buf(), false);
+            let counters = mock.clone();
+            let pooled = pooled_over(mock).await;
+            let (progress_tx, _rx) = tokio::sync::mpsc::channel(64);
+
+            let err = pooled
+                .build_base_snapshot(
+                    BuildBaseSnapshotRequest {
+                        spec: live_spec("cb-hit-mismatch"),
+                        warm: None,
+                        capture_env: Default::default(),
+                        capture_egress: None,
+                        cold_base_plan: ColdBasePlan::Hit {
+                            content_key: "ck-5".into(),
+                            snapshot: Box::new(fake_snapshot()),
+                        },
+                    },
+                    progress_tx,
+                )
+                .await
+                .expect_err("a capability mismatch must hard-error even on a Hit");
+
+            assert!(matches!(
+                err,
+                SandboxError::CaptureFailed(f)
+                    if f.kind == engram_core::types::CaptureFailureKind::ColdBaseCapabilityMismatch
+            ));
+            assert_eq!(counters.restore_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     /// ADR 0045 C2 (E2B fold): hot chunks lead the pull set in fault

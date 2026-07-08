@@ -4416,6 +4416,9 @@ impl MetadataStore for PostgresStore {
     /// what lets the enable-scanner delete its blind capture-lease ticker
     /// (`enable_scanner.rs`): the host's >=30s keepalive comfortably beats
     /// the 300s lease.
+    ///
+    /// DEAD CODE as of ADR 0081 P1b — see the trait method's own doc.
+    /// Deleted in ADR 0081 P4.
     async fn update_enable_job_capture_progress(
         &self,
         id: Uuid,
@@ -5122,14 +5125,15 @@ impl MetadataStore for PostgresStore {
     async fn upsert_cold_base(&self, row: ColdBaseRow) -> Result<(), MetaError> {
         sqlx::query(
             r#"
-            INSERT INTO cold_bases (content_key, snapshot_id, disk_manifest, memory_manifest, fc_snapshot_version, captured_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO cold_bases (content_key, snapshot_id, disk_manifest, memory_manifest, fc_snapshot_version, captured_at, snapshot_bincode)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (content_key) DO UPDATE SET
                 snapshot_id = EXCLUDED.snapshot_id,
                 disk_manifest = EXCLUDED.disk_manifest,
                 memory_manifest = EXCLUDED.memory_manifest,
                 fc_snapshot_version = EXCLUDED.fc_snapshot_version,
-                captured_at = EXCLUDED.captured_at
+                captured_at = EXCLUDED.captured_at,
+                snapshot_bincode = EXCLUDED.snapshot_bincode
             "#,
         )
         .bind(&row.content_key)
@@ -5138,6 +5142,7 @@ impl MetadataStore for PostgresStore {
         .bind(&row.memory_manifest)
         .bind(&row.fc_snapshot_version)
         .bind(row.captured_at)
+        .bind(&row.snapshot_bincode)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -5147,7 +5152,7 @@ impl MetadataStore for PostgresStore {
     async fn get_cold_base(&self, content_key: &str) -> Result<Option<ColdBaseRow>, MetaError> {
         let row = sqlx::query(
             r#"
-            SELECT content_key, snapshot_id, disk_manifest, memory_manifest, fc_snapshot_version, captured_at
+            SELECT content_key, snapshot_id, disk_manifest, memory_manifest, fc_snapshot_version, captured_at, snapshot_bincode
               FROM cold_bases
              WHERE content_key = $1
             "#,
@@ -5165,6 +5170,54 @@ impl MetadataStore for PostgresStore {
             .await
             .map_err(db_err)?;
         Ok(rows.into_iter().map(|(id,)| SnapshotId(id)).collect())
+    }
+
+    async fn cold_base_manifest_refs(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT disk_manifest, memory_manifest FROM cold_bases")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db_err)?;
+        let mut refs = Vec::with_capacity(rows.len() * 2);
+        for (disk, mem) in rows {
+            for text in [disk, mem] {
+                match text.parse::<engram_core::types::manifest::ManifestRef>() {
+                    Ok(r) => refs.push(r),
+                    Err(e) => {
+                        tracing::warn!(
+                            manifest = %text,
+                            error = %e,
+                            "cold_base_manifest_refs: unparseable manifest ref; skipping (GC \
+                             pin-set collection continues with the rest)",
+                        );
+                    }
+                }
+            }
+        }
+        Ok(refs)
+    }
+
+    async fn cold_base_fc_version_changed(
+        &self,
+        disk_manifest: &str,
+        current_fc_version: &str,
+    ) -> Result<bool, MetaError> {
+        let (exists,): (bool,) = sqlx::query_as(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM cold_bases
+                 WHERE disk_manifest = $1 AND fc_snapshot_version <> $2
+            )
+            "#,
+        )
+        .bind(disk_manifest)
+        .bind(current_fc_version)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(exists)
     }
 
     async fn get_session_secrets(

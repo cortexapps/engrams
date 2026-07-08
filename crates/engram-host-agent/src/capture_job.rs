@@ -427,10 +427,13 @@ impl CaptureJobExecutor {
         let capture_task = tokio::spawn(async move {
             backend
                 .build_base_snapshot(
-                    job_spec.spec,
-                    job_spec.warm,
-                    job_spec.resolved_env,
-                    job_spec.capture_egress,
+                    engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+                        spec: job_spec.spec,
+                        warm: job_spec.warm,
+                        capture_env: job_spec.resolved_env,
+                        capture_egress: job_spec.capture_egress,
+                        cold_base_plan: job_spec.cold_base_plan,
+                    },
                     progress_tx,
                 )
                 .await
@@ -545,8 +548,6 @@ fn classify_sandbox_error(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use engram_core::types::egress::SessionEgressPolicy;
-    use engram_core::types::image::WarmConfig;
     use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
     use engram_core::types::snapshot::SnapshotMetadata;
     use engram_core::SandboxError;
@@ -614,12 +615,10 @@ mod tests {
         }
         async fn build_base_snapshot(
             &self,
-            _spec: SandboxSpec,
-            _warm: Option<WarmConfig>,
-            _capture_env: std::collections::HashMap<String, String>,
-            _capture_egress: Option<SessionEgressPolicy>,
+            req: engram_core::traits::sandbox::BuildBaseSnapshotRequest,
             progress: tokio::sync::mpsc::Sender<CaptureProgress>,
-        ) -> Result<SnapshotMetadata, SandboxError> {
+        ) -> Result<engram_core::types::capture_job::CaptureJobResult, SandboxError> {
+            let _ = req;
             let id = self.create(live_spec("mock")).await?;
             let _ = progress
                 .send(CaptureProgress {
@@ -635,22 +634,25 @@ mod tests {
             // live-sandbox exemption before completing.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             self.destroy(id).await?;
-            Ok(SnapshotMetadata {
-                id: engram_core::SnapshotId::new(),
-                size_bytes: 1,
-                created_at: chrono::Utc::now(),
-                image_version: "mock:1".into(),
-                disk_manifest: None,
-                memory_manifest: None,
-                base_memory_manifest: None,
-                migration_source: None,
-                source_sandbox_id: None,
-                state_blob_key: None,
-                sidecar_blob_key: None,
-                rootfs_blob_key: None,
-                working_set_blob_key: None,
-                aux_bundles: vec![],
-                paused_at: None,
+            Ok(engram_core::types::capture_job::CaptureJobResult {
+                snapshot: SnapshotMetadata {
+                    id: engram_core::SnapshotId::new(),
+                    size_bytes: 1,
+                    created_at: chrono::Utc::now(),
+                    image_version: "mock:1".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                    working_set_blob_key: None,
+                    aux_bundles: vec![],
+                    paused_at: None,
+                },
+                cold_base: None,
             })
         }
     }
@@ -661,6 +663,7 @@ mod tests {
             warm: None,
             resolved_env: Default::default(),
             capture_egress: None,
+            cold_base_plan: engram_core::types::capture_job::ColdBasePlan::NotApplicable,
         }
     }
 

@@ -440,8 +440,20 @@ fn spawn_capture_job_simulator(
                     aux_bundles: vec![],
                     paused_at: None,
                 };
+                // ADR 0081 P3: `result_bincode` now encodes a
+                // `CaptureJobResult` (artifact + optional cold-base
+                // outcome), not a bare `SnapshotMetadata`. This
+                // simulator's `capture_host` is non-FC-shaped (no
+                // `ColdBasePlan` ever resolves to `Hit`/`Miss` for it —
+                // `resolve_cold_base_plan` requires `hosts.capabilities.
+                // backend == "firecracker"`, which this fixture's `hosts`
+                // row never sets), so `cold_base` is always `None` here.
+                let result = engram_core::types::capture_job::CaptureJobResult {
+                    snapshot: snapshot_meta,
+                    cold_base: None,
+                };
                 let result_bincode =
-                    bincode::serialize(&snapshot_meta).expect("encode synthetic SnapshotMetadata");
+                    bincode::serialize(&result).expect("encode synthetic CaptureJobResult");
                 let report = CaptureJobReport {
                     job_id: assignment.job_id,
                     epoch: assignment.epoch,

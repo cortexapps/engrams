@@ -145,6 +145,13 @@ pub enum CaptureFailureKind {
     WarmExecTransport,
     /// The post-warm snapshot step (pause/flush/chunk/upload) failed.
     SnapshotFailed,
+    /// ADR 0081 decision 11: the claim carried a `ColdBasePlan::Hit` or
+    /// `Miss` (this backend/host was pinned as FC-capable), but the
+    /// executor's actual backend can't produce diff memory snapshots
+    /// (`supports_diff_checkpoints() == false`). A placement bug, not a
+    /// transient condition — never silently falls back to a full-only
+    /// capture.
+    ColdBaseCapabilityMismatch,
 }
 
 impl CaptureFailureKind {
@@ -157,12 +164,18 @@ impl CaptureFailureKind {
             Self::WarmKilled => "warm_killed",
             Self::WarmExecTransport => "warm_exec_transport",
             Self::SnapshotFailed => "snapshot_failed",
+            Self::ColdBaseCapabilityMismatch => "cold_base_capability_mismatch",
         }
     }
 
     /// Only a mid-stream transport death is eligible for the
     /// enable-scanner's attempts-budget retry; every other kind is a
     /// deterministic outcome that retrying cannot fix (bail fast).
+    /// `ColdBaseCapabilityMismatch` is a placement bug — reassigning to
+    /// a fresh host (which the retry path already does on ANY retryable
+    /// failure) would actually fix it in practice, but marking it
+    /// non-retryable makes the underlying placement bug visible instead
+    /// of quietly self-healing via reassignment every time.
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::WarmExecTransport)
     }
@@ -180,6 +193,7 @@ impl CaptureFailureKind {
             "warm_killed" => Self::WarmKilled,
             "warm_exec_transport" => Self::WarmExecTransport,
             "snapshot_failed" => Self::SnapshotFailed,
+            "cold_base_capability_mismatch" => Self::ColdBaseCapabilityMismatch,
             _ => return None,
         })
     }

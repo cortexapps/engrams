@@ -7,6 +7,7 @@ use futures::stream::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::SandboxError;
+use crate::types::capture_job::{CaptureJobResult, ColdBasePlan};
 use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::endpoints::GuestEndpoints;
@@ -16,6 +17,23 @@ use crate::types::sandbox::{
     AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
 };
 use crate::types::snapshot::SnapshotMetadata;
+
+/// ADR 0081 §B: everything [`SandboxBackend::build_base_snapshot`] needs
+/// for one capture attempt, bundled into a struct (rather than a
+/// growing positional-arg list) since P3 added the cold-base plan on
+/// top of P1b's four. Maps 1:1 onto [`crate::types::capture_job::
+/// CaptureJobSpec`].
+#[derive(Clone, Debug)]
+pub struct BuildBaseSnapshotRequest {
+    pub spec: SandboxSpec,
+    pub warm: Option<WarmConfig>,
+    pub capture_env: std::collections::HashMap<String, String>,
+    pub capture_egress: Option<SessionEgressPolicy>,
+    /// The claim handler's cold-base decision for this attempt — see
+    /// [`ColdBasePlan`]. The executor never independently recomputes a
+    /// content key; it only acts on / echoes back what it's given here.
+    pub cold_base_plan: ColdBasePlan,
+}
 
 /// Combined `AsyncRead + AsyncWrite` so trait-object types below can
 /// require both — Rust's trait-object syntax only allows one
@@ -614,14 +632,21 @@ pub trait SandboxBackend: Send + Sync {
     /// the executor drains them into a durable per-job record + the
     /// in-memory report the heartbeat loop advertises, instead of
     /// forwarding them onto a live gRPC stream.
+    ///
+    /// ADR 0081 §B (P3): `req.cold_base`, when `Some`, is a claim-time-
+    /// verified cold-base candidate — the implementation restores it
+    /// (chain auto-seeds off its own memory manifest) instead of
+    /// cold-booting, runs the warm hook, and takes a DIFF snapshot as
+    /// the overlay. A backend that received `Some` but genuinely can't
+    /// diff (an FC host with dirty-page tracking disabled, say) must
+    /// hard-error rather than silently falling back to a Full capture —
+    /// placement pinned `fc_snapshot_version`/capability precisely so
+    /// this mismatch should never reach here (ADR decision 11).
     async fn build_base_snapshot(
         &self,
-        _spec: SandboxSpec,
-        _warm: Option<WarmConfig>,
-        _capture_env: std::collections::HashMap<String, String>,
-        _capture_egress: Option<crate::types::egress::SessionEgressPolicy>,
+        _req: BuildBaseSnapshotRequest,
         _progress: tokio::sync::mpsc::Sender<crate::types::CaptureProgress>,
-    ) -> Result<SnapshotMetadata, SandboxError> {
+    ) -> Result<CaptureJobResult, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `build_base_snapshot` (needs the pooled chunk-store wrapper)".into(),
         ))

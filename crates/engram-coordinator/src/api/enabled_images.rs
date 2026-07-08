@@ -300,7 +300,7 @@ pub(crate) fn new_enable_row(image_uri: &str, config: &ImageConfig) -> EnabledIm
 /// every chunk (short-circuiting on the first miss); any miss — or any error
 /// reading a manifest/probe — is treated as "not reusable" so we fail safe
 /// toward a correct fresh capture.
-async fn reuse_candidate_chunks_present(
+pub(crate) async fn reuse_candidate_chunks_present(
     chunk_store: &engram_chunk_store::ChunkStore,
     blob: std::sync::Arc<dyn engram_core::traits::BlobStorage>,
     disk_manifest: engram_core::types::manifest::ManifestRef,
@@ -352,6 +352,48 @@ async fn reuse_candidate_chunks_present(
     true
 }
 
+/// ADR 0081 §B4: whole-artifact reuse gains the FC-version dimension —
+/// a memory-manifest-bearing candidate with NO recorded
+/// `fc_snapshot_version` can never be placement-gated at restore time
+/// (`CapabilityRequirements::fc_snapshot_version: None` is the SOFT
+/// "unconstrained" posture, ADR 0068), so silently reusing one would
+/// let a fresh session restore that snapshot on ANY host regardless of
+/// its actual FC `SNAPSHOT_VERSION` — re-arming the issue-#160
+/// cross-version corruption class this whole ADR exists to keep
+/// closed. `enabled_images` has no denormalized
+/// `base_snapshot_fc_snapshot_version` column (unlike disk/memory
+/// manifest) to check cheaply, so this reads the `snapshots` row
+/// directly. Disk-only candidates (`memory_manifest: None`, e.g. VZ)
+/// have no FC/UFFD restore risk at all — always `true`. A metadata
+/// hiccup fails safe toward recapture (`false`), matching the sibling
+/// chunk-presence self-heal's posture.
+async fn candidate_fc_version_known(
+    state: &SharedState,
+    snapshot_id: engram_core::types::SnapshotId,
+    memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+) -> bool {
+    if memory_manifest.is_none() {
+        return true;
+    }
+    match state.services.meta.get_snapshot(snapshot_id).await {
+        Ok(Some(record)) => record.fc_snapshot_version.is_some(),
+        Ok(None) => {
+            tracing::warn!(
+                %snapshot_id,
+                "reuse verify: candidate's snapshots row is gone; treating as not reusable",
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                %snapshot_id, error = %e,
+                "reuse verify: fc_snapshot_version lookup failed; treating as not reusable",
+            );
+            false
+        }
+    }
+}
+
 /// ADR 0081 P1b: whether [`try_reuse_base_snapshot`] found (and verified)
 /// an existing base snapshot equivalent to what a fresh capture would
 /// produce — the content/digest reuse fast paths lifted verbatim out of
@@ -390,9 +432,12 @@ pub(crate) async fn try_reuse_base_snapshot(
     // content/digest reuse is unsound for warm images — always re-capture.
     // (This is also what makes a warm-secret rotate actually take effect:
     // a re-enable with the same digest must not short-circuit to the stale
-    // snapshot.) ADR 0081 P3 (a later commit) replaces this boolean with
-    // the cold-base/warm-overlay split; unchanged here.
-    let reuse_ok = config.warm.is_none();
+    // snapshot.) ADR 0081 §B4: warm images no longer fall through to a
+    // fresh capture from scratch either — `ensure_capture_job`/the claim
+    // handler's `ColdBasePlan` reuses the COLD BASE (env-agnostic) and
+    // always re-runs the hook fresh. This whole-artifact path stays
+    // warm-less-only.
+    let warm_less = config.warm.is_none();
 
     // ADR 0036 P4 / ADR 0080: content-keyed reuse. A base snapshot is a
     // function of (rootfs bytes, capture-affecting resources) — the
@@ -408,7 +453,7 @@ pub(crate) async fn try_reuse_base_snapshot(
     // makes a no-op re-bake's enable near-instant — and hosts already
     // hold the reused snapshot's chunks on NVMe, so no fleet-wide
     // re-prefetch either.
-    if let Some(disk_ref) = row.disk_manifest.filter(|_| reuse_ok) {
+    if let Some(disk_ref) = row.disk_manifest.filter(|_| warm_less) {
         if let Some(existing) = state
             .services
             .meta
@@ -438,6 +483,7 @@ pub(crate) async fn try_reuse_base_snapshot(
                     memory_manifest,
                 )
                 .await
+                    && candidate_fc_version_known(state, id, memory_manifest).await
                 {
                     tracing::info!(
                         image_uri = %row.image_uri,
@@ -452,8 +498,8 @@ pub(crate) async fn try_reuse_base_snapshot(
                     image_uri = %row.image_uri,
                     reused_from = %existing.image_uri,
                     snapshot_id = %id,
-                    "content-identical base snapshot is missing chunks in BlobStorage; \
-                     re-capturing instead of reusing (self-heal)",
+                    "content-identical base snapshot is missing chunks or has no recorded \
+                     fc_snapshot_version; re-capturing instead of reusing (self-heal)",
                 );
             }
         }
@@ -468,7 +514,7 @@ pub(crate) async fn try_reuse_base_snapshot(
         .get_enabled_image(&row.image_uri)
         .await?
     {
-        if reuse_ok && existing.manifest_digest == row.manifest_digest {
+        if warm_less && existing.manifest_digest == row.manifest_digest {
             if let Some(id) = existing.base_snapshot_id {
                 let disk_manifest = existing.base_snapshot_disk_manifest.ok_or_else(|| {
                     ApiError::Internal(format!(
@@ -490,6 +536,7 @@ pub(crate) async fn try_reuse_base_snapshot(
                     memory_manifest,
                 )
                 .await
+                    && candidate_fc_version_known(state, id, memory_manifest).await
                 {
                     tracing::info!(
                         image_uri = %row.image_uri,
@@ -503,8 +550,8 @@ pub(crate) async fn try_reuse_base_snapshot(
                     image_uri = %row.image_uri,
                     digest = %row.manifest_digest,
                     snapshot_id = %id,
-                    "recorded base snapshot for this digest is missing chunks in BlobStorage; \
-                     re-capturing instead of reusing (self-heal)",
+                    "recorded base snapshot for this digest is missing chunks or has no \
+                     recorded fc_snapshot_version; re-capturing instead of reusing (self-heal)",
                 );
             }
         }
@@ -580,6 +627,147 @@ pub(crate) async fn capture_footprint_for_job_row(
     }
 }
 
+/// ADR 0081 §B: the claim handler's cold-base decision for one attempt.
+/// Computed ENTIRELY coordinator-side: the claiming host's own `hosts`
+/// row already carries `capabilities.backend` + `capabilities.
+/// fc_snapshot_version`, and `row`/`config` already carry
+/// `disk_manifest`/`resources` — there is nothing here the executor
+/// could derive independently, which is exactly why [`ColdBasePlan`]
+/// is computed once, here, and only ever echoed back.
+///
+/// Fail-safe: any metadata hiccup (host lookup / `get_cold_base` /
+/// chunk-presence probe) degrades to [`ColdBasePlan::NotApplicable`]
+/// (or the coarsest `Miss` reason) rather than failing the claim — a
+/// missed reuse opportunity costs an extra cold boot, not a broken
+/// capture.
+pub(crate) async fn resolve_cold_base_plan(
+    state: &SharedState,
+    host_id: engram_core::HostId,
+    row: &engram_core::types::capture_job::CaptureJobRow,
+    config: &ImageConfig,
+) -> engram_core::types::capture_job::ColdBasePlan {
+    use engram_core::types::capture_job::{ColdBaseMissReason, ColdBasePlan};
+
+    let hosts = match state.services.meta.list_active_hosts().await {
+        Ok(hosts) => hosts,
+        Err(e) => {
+            tracing::warn!(
+                %host_id, capture_job_id = %row.id, error = %e,
+                "resolve_cold_base_plan: list_active_hosts failed; treating as NotApplicable",
+            );
+            return ColdBasePlan::NotApplicable;
+        }
+    };
+    let Some(host) = hosts.iter().find(|h| h.id == host_id) else {
+        return ColdBasePlan::NotApplicable;
+    };
+    let backend_kind = "firecracker";
+    let Some(fc_version) = (host.capabilities.backend == backend_kind)
+        .then_some(host.capabilities.fc_snapshot_version.as_deref())
+        .flatten()
+    else {
+        // Non-FC host, or an FC host that hasn't reported a
+        // `fc_snapshot_version` yet — no cold-base concept applies.
+        return ColdBasePlan::NotApplicable;
+    };
+
+    let content_key = engram_core::types::capture_job::cold_base_content_key(
+        &row.disk_manifest,
+        &config.resources,
+        Some(fc_version),
+        backend_kind,
+    );
+
+    let candidate = match state.services.meta.get_cold_base(&content_key).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                %host_id, capture_job_id = %row.id, %content_key, error = %e,
+                "resolve_cold_base_plan: get_cold_base failed; treating as a miss",
+            );
+            None
+        }
+    };
+    let Some(candidate) = candidate else {
+        let fc_version_changed = state
+            .services
+            .meta
+            .cold_base_fc_version_changed(&row.disk_manifest, fc_version)
+            .await
+            .unwrap_or(false);
+        let reason = if fc_version_changed {
+            ColdBaseMissReason::FcVersionChanged
+        } else {
+            ColdBaseMissReason::NoCandidate
+        };
+        return ColdBasePlan::Miss {
+            content_key,
+            reason,
+        };
+    };
+
+    // Verify chunk presence before ever handing this candidate to a
+    // host (the same self-heal `try_reuse_base_snapshot` applies to
+    // whole-artifact reuse).
+    let (Ok(disk_ref), mem_ref) = (
+        candidate
+            .disk_manifest
+            .parse::<engram_core::types::manifest::ManifestRef>(),
+        candidate
+            .memory_manifest
+            .parse::<engram_core::types::manifest::ManifestRef>()
+            .ok(),
+    ) else {
+        tracing::warn!(
+            %content_key, disk_manifest = %candidate.disk_manifest,
+            "resolve_cold_base_plan: cold_bases row has an unparseable manifest ref; \
+             treating as a miss",
+        );
+        return ColdBasePlan::Miss {
+            content_key,
+            reason: ColdBaseMissReason::ChunksMissing,
+        };
+    };
+    let present = reuse_candidate_chunks_present(
+        &state.services.chunk_store,
+        state.services.blob.clone(),
+        disk_ref,
+        mem_ref,
+    )
+    .await;
+    if !present {
+        tracing::warn!(
+            %content_key, snapshot_id = %candidate.snapshot_id,
+            "resolve_cold_base_plan: cold-base candidate is missing chunks in BlobStorage; \
+             recapturing instead of reusing (self-heal)",
+        );
+        return ColdBasePlan::Miss {
+            content_key,
+            reason: ColdBaseMissReason::ChunksMissing,
+        };
+    }
+
+    match bincode::deserialize::<engram_core::types::snapshot::SnapshotMetadata>(
+        &candidate.snapshot_bincode,
+    ) {
+        Ok(snapshot) => ColdBasePlan::Hit {
+            content_key,
+            snapshot: Box::new(snapshot),
+        },
+        Err(e) => {
+            tracing::warn!(
+                %content_key, snapshot_id = %candidate.snapshot_id, error = %e,
+                "resolve_cold_base_plan: cold_bases row's snapshot_bincode failed to decode; \
+                 treating as a miss",
+            );
+            ColdBasePlan::Miss {
+                content_key,
+                reason: ColdBaseMissReason::ChunksMissing,
+            }
+        }
+    }
+}
+
 pub(crate) async fn ensure_capture_job(
     state: &SharedState,
     row: &EnabledImage,
@@ -638,10 +826,18 @@ pub(crate) async fn ensure_capture_job(
     Ok(state.services.meta.insert_capture_job(new_job).await?)
 }
 
-/// ADR 0081 P1b: consume a `stage == Done` `capture_jobs` row — decode
-/// its `result_bincode` (the executor's `SnapshotMetadata`, bincode-
-/// encoded), verify the chunked manifests are actually durable, and
-/// record the `snapshots` row. Mirrors the tail of the old
+/// ADR 0081 §D: the [`finalize_capture_job`] outcome — its
+/// `reuse_outcome` label (ADR 0081 §D's taxonomy) alongside the
+/// [`ReuseHit`] the caller upserts onto the `enabled_images` row. A
+/// plain string, not an enum: it's a one-way trip straight into
+/// `set_enable_job_reuse_outcome`'s `TEXT` column.
+pub(crate) type FinalizeOutcome = (ReuseHit, &'static str);
+
+/// ADR 0081 P1b/P3: consume a `stage == Done` `capture_jobs` row —
+/// decode its `result_bincode` (the executor's `CaptureJobResult`,
+/// bincode-encoded), verify the chunked manifests are actually durable,
+/// record the `snapshots` row, and (P3) record/skip the `cold_bases` row
+/// per the executor's `cold_base` outcome. Mirrors the tail of the old
 /// `capture_and_record_base_snapshot` exactly, except the FC
 /// snapshot-version comes straight off the job row (the host already
 /// stamped it in its terminal report) instead of a separate
@@ -649,20 +845,21 @@ pub(crate) async fn ensure_capture_job(
 pub(crate) async fn finalize_capture_job(
     state: &SharedState,
     capture_row: &engram_core::types::capture_job::CaptureJobRow,
-) -> Result<ReuseHit, ApiError> {
+) -> Result<FinalizeOutcome, ApiError> {
     let bytes = capture_row.result_bincode.as_deref().ok_or_else(|| {
         ApiError::Internal(format!(
             "capture job {} is `done` but carries no result_bincode",
             capture_row.id
         ))
     })?;
-    let meta: engram_core::types::snapshot::SnapshotMetadata = bincode::deserialize(bytes)
+    let result: engram_core::types::capture_job::CaptureJobResult = bincode::deserialize(bytes)
         .map_err(|e| {
             ApiError::Internal(format!(
                 "capture job {} result_bincode failed to decode: {e}",
                 capture_row.id
             ))
         })?;
+    let meta = result.snapshot;
 
     // A base snapshot is only useful if its chunked manifests are
     // durable in BlobStorage — verify before recording, so an
@@ -681,6 +878,76 @@ pub(crate) async fn finalize_capture_job(
             capture_row.image_uri
         )));
     }
+
+    // ADR 0081 §B6/§D: record (or skip) the cold-base row + derive the
+    // reuse_outcome label. Done BEFORE `record_snapshot` below — an
+    // upsert_cold_base failure should abort the enable the same way a
+    // recoverability failure does, rather than leave the overlay
+    // recorded with an inconsistent cold-base row.
+    use engram_core::types::capture_job::ColdBaseMissReason;
+    let reuse_outcome: &'static str = match &result.cold_base {
+        None => "recaptured:content_changed",
+        Some(cb) if !cb.freshly_captured => "reused_cold_base",
+        Some(cb) => {
+            let label = match cb.miss_reason {
+                Some(ColdBaseMissReason::NoCandidate) => "recaptured:no_cold_base",
+                Some(ColdBaseMissReason::ChunksMissing) => "recaptured:chunks_missing",
+                Some(ColdBaseMissReason::FcVersionChanged) => "recaptured:fc_version_changed",
+                // Shouldn't happen (the executor only sets `freshly_captured`
+                // from a `ColdBasePlan::Miss`, which always carries a
+                // reason) — fall back to the generic label rather than
+                // panicking on a telemetry field.
+                None => "recaptured:content_changed",
+            };
+            let disk_manifest_text = cb
+                .snapshot
+                .disk_manifest
+                .map(|r| r.to_string())
+                .ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "capture job {} produced a cold base with no disk_manifest",
+                        capture_row.id
+                    ))
+                })?;
+            let memory_manifest_text = cb
+                .snapshot
+                .memory_manifest
+                .map(|r| r.to_string())
+                .ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "capture job {} produced a cold base with no memory_manifest \
+                         (a cold base only ever exists on FC, which always chunks memory)",
+                        capture_row.id
+                    ))
+                })?;
+            let fc_snapshot_version = capture_row.fc_snapshot_version.clone().ok_or_else(|| {
+                ApiError::Internal(format!(
+                    "capture job {} produced a cold base but stamped no fc_snapshot_version",
+                    capture_row.id
+                ))
+            })?;
+            let snapshot_bincode = bincode::serialize(&cb.snapshot).map_err(|e| {
+                ApiError::Internal(format!(
+                    "capture job {}: failed to re-encode cold-base snapshot for storage: {e}",
+                    capture_row.id
+                ))
+            })?;
+            state
+                .services
+                .meta
+                .upsert_cold_base(engram_core::types::capture_job::ColdBaseRow {
+                    content_key: cb.content_key.clone(),
+                    snapshot_id: cb.snapshot.id,
+                    disk_manifest: disk_manifest_text,
+                    memory_manifest: memory_manifest_text,
+                    fc_snapshot_version,
+                    captured_at: cb.snapshot.created_at,
+                    snapshot_bincode,
+                })
+                .await?;
+            label
+        }
+    };
 
     let now = Utc::now();
     // Record the snapshot row (session_id = NULL — a template artifact,
@@ -728,7 +995,10 @@ pub(crate) async fn finalize_capture_job(
     // Memory manifest is optional (migration 0049): FC produces a chunked
     // memory snapshot, VZ cold-boots and captures disk only. Pass through
     // whatever the backend produced — `None` skips memory residency.
-    Ok((meta.id, disk_manifest, meta.memory_manifest))
+    Ok((
+        (meta.id, disk_manifest, meta.memory_manifest),
+        reuse_outcome,
+    ))
 }
 
 /// Resolve an image's warm env (`config.warm.env`, ADR 0080) into

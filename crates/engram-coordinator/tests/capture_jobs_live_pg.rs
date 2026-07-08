@@ -503,6 +503,7 @@ async fn cold_base_upsert_and_get_round_trip() {
         memory_manifest: format!("{}@v1", Uuid::new_v4()),
         fc_snapshot_version: "v6".into(),
         captured_at: Utc::now(),
+        snapshot_bincode: vec![1, 2, 3, 4],
     };
     meta.upsert_cold_base(row.clone()).await.expect("upsert");
 
@@ -515,10 +516,13 @@ async fn cold_base_upsert_and_get_round_trip() {
     assert_eq!(got.fc_snapshot_version, "v6");
     assert_eq!(got.disk_manifest, row.disk_manifest);
     assert_eq!(got.memory_manifest, row.memory_manifest);
+    assert_eq!(got.snapshot_bincode, row.snapshot_bincode);
 
     // Re-upsert at the same content key with a NEW snapshot_id (a
     // recapture landing under identical content) must overwrite, not
     // duplicate — `content_key` is the primary key.
+    let disk_manifest_text = row.disk_manifest.clone();
+    let memory_manifest_text = row.memory_manifest.clone();
     let new_snapshot_id = SnapshotId::new();
     let row2 = ColdBaseRow {
         snapshot_id: new_snapshot_id,
@@ -538,4 +542,67 @@ async fn cold_base_upsert_and_get_round_trip() {
         .await
         .expect("cold base snapshot ids");
     assert!(ids.contains(&new_snapshot_id));
+
+    // ADR 0081 §B6: the chunk-GC pin-set's 7th source — both manifest
+    // refs (disk AND memory) must be present, parsed.
+    let refs = meta
+        .cold_base_manifest_refs()
+        .await
+        .expect("cold base manifest refs");
+    let disk_ref: engram_core::types::manifest::ManifestRef =
+        disk_manifest_text.parse().expect("parse disk manifest");
+    let mem_ref: engram_core::types::manifest::ManifestRef =
+        memory_manifest_text.parse().expect("parse memory manifest");
+    assert!(refs.contains(&disk_ref), "disk manifest must be pinned");
+    assert!(refs.contains(&mem_ref), "memory manifest must be pinned");
+}
+
+/// ADR 0081 §D: `cold_base_fc_version_changed` powers the
+/// `recaptured:fc_version_changed` reuse-outcome label — it must find a
+/// row for the SAME `disk_manifest` under a DIFFERENT `fc_snapshot_version`,
+/// but not when the ONLY row is under the version being checked, and not
+/// for an unrelated `disk_manifest`.
+#[tokio::test]
+#[ignore]
+async fn cold_base_fc_version_changed_detects_a_version_drift_on_the_same_disk_manifest() {
+    let Some(meta) = connect().await else { return };
+    let disk_manifest = format!("{}@v1", Uuid::new_v4());
+    let other_disk_manifest = format!("{}@v1", Uuid::new_v4());
+
+    // No row at all yet for either disk manifest.
+    assert!(!meta
+        .cold_base_fc_version_changed(&disk_manifest, "v10")
+        .await
+        .expect("no rows yet"));
+
+    let row = ColdBaseRow {
+        content_key: format!("test-content-key-{}", Uuid::new_v4()),
+        snapshot_id: SnapshotId::new(),
+        disk_manifest: disk_manifest.clone(),
+        memory_manifest: format!("{}@v1", Uuid::new_v4()),
+        fc_snapshot_version: "v9".into(),
+        captured_at: Utc::now(),
+        snapshot_bincode: vec![1],
+    };
+    meta.upsert_cold_base(row).await.expect("upsert v9 row");
+
+    // Checking the SAME version the only row was captured under must
+    // NOT report drift (there's no OTHER version to have drifted from).
+    assert!(!meta
+        .cold_base_fc_version_changed(&disk_manifest, "v9")
+        .await
+        .expect("same version, no drift"));
+
+    // Checking a DIFFERENT version than the recorded row must report
+    // drift — this rootfs WAS captured before, just under v9.
+    assert!(meta
+        .cold_base_fc_version_changed(&disk_manifest, "v10")
+        .await
+        .expect("different version, drift detected"));
+
+    // An unrelated disk_manifest must never be affected by the v9 row.
+    assert!(!meta
+        .cold_base_fc_version_changed(&other_disk_manifest, "v10")
+        .await
+        .expect("unrelated disk manifest, no drift"));
 }
