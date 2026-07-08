@@ -99,8 +99,19 @@ data:
       # This is the SPA's own CSP only — the coord sets a stricter
       # `sandbox` CSP on each artifact response itself (proxied via the
       # /api/ location above, untouched here).
+      #
+      # `img-src` allows `data:`: the Browser tab's noVNC client (ADR 0065,
+      # BrowserPane) paints Tight-JPEG framebuffer rects via
+      # `data:image/jpeg` <img> loads — a bare `'self'` silently drops
+      # every JPEG rect (x11vnc emits them only for busy regions, so
+      # simple screens still rendered and the gap looked like a guest-side
+      # blank/black screen). data: images are same-document content — the
+      # exfil channel img-src exists to block (loads to attacker hosts)
+      # stays blocked. Bundled assets still ship as real files
+      # (web/vite.config.ts assetsInlineLimit: 0) — don't regress that to
+      # data: URIs just because the CSP now tolerates them.
       location / {
-        add_header Content-Security-Policy "default-src 'self'; img-src 'self'; media-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; media-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'" always;
         add_header X-Content-Type-Options "nosniff" always;
         try_files $uri $uri/ /index.html;
       }
