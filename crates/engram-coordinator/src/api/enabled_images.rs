@@ -595,17 +595,26 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // A warm failure is fail-loud — it surfaces here as a capture error
     // and aborts the enable.
     //
+    // The wire clone is STRIPPED to the fields the host executes
+    // (command/timeout/workdir). `env` and `network` are coordinator
+    // concerns — env is resolved into `capture_env` and network into
+    // `capture_egress` above (the wire-v13 contract: the host never
+    // interprets them) — and `env`'s `CaptureEnvValue` is an
+    // internally-tagged serde enum, which bincode cannot DECODE
+    // (`deserialize_any`): the first image with a non-empty
+    // `[[warm.env]]` failed capture host-side on exactly that (dev-brain,
+    // ADR 0080 rollout). Empty-vec/None round-trip fine.
+    //
     // Issue #539: `progress` receives live `CaptureProgress` events for
     // the call's lifetime — the caller (`enable_scanner::advance_one`)
     // drains it into a fenced `enable_jobs` write per event.
+    let wire_warm = config.warm.clone().map(|mut w| {
+        w.env = Vec::new();
+        w.network = None;
+        w
+    });
     let meta = host
-        .build_base_snapshot(
-            spec,
-            config.warm.clone(),
-            capture_env,
-            capture_egress,
-            progress,
-        )
+        .build_base_snapshot(spec, wire_warm, capture_env, capture_egress, progress)
         .await
         .map_err(|e| match e {
             engram_core::SandboxError::CaptureFailed(failure) => ApiError::CaptureFailed {
