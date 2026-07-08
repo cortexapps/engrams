@@ -43,7 +43,7 @@ use std::time::Duration;
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{AgentSpec, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection, Transport};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use parking_lot::Mutex;
 use tokio::time::sleep;
@@ -223,50 +223,18 @@ async fn ensure_harness_artifacts() -> (PathBuf, PathBuf) {
     (harness_bin, claude_bin)
 }
 
-/// Bake a debian-slim rootfs with curl + ca-certs, agentd injected,
-/// AND bake the real Claude Code harness pack directly into the
-/// rootfs at `/opt/engram/harness/` (ADR 0021 P1.5: harness lives in
-/// the rootfs now, not on a separate substrate).
+/// Bake a busybox rootfs (ADR 0080 §D docker-free bake) AND lay the real
+/// Claude Code harness pack directly into the rootfs at
+/// `/opt/engram/harness/` (ADR 0021 P1.5: harness lives in the rootfs now,
+/// not on a separate substrate).
 ///
-/// Dockerfile COPYs the prebuilt harness wrapper + claude CLI from
-/// the build context (ADR 0080: no engram.toml — the bake carries no
-/// runtime config). The egress CA reaches the guest at runtime via
+/// The `customize` closure copies the prebuilt harness wrapper + claude CLI
+/// into `/opt/engram/harness/` (ADR 0080: no engram.toml — the bake carries
+/// no runtime config). The egress CA reaches the guest at runtime via
 /// `AgentSpec.host_ca_pem`, which rides the `SpawnHarness` vsock RPC
 /// (2026-07 core-ops fold: agentd installs the CA before spawning,
 /// one first-contact call instead of two).
-async fn bake_harness_rootfs(repo: &str, harness_bin: &Path, claude_bin: &Path) -> PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let target_root = Path::new(&manifest).join("..").join("..").join("target");
-    let agent_bin = target_root
-        .join("x86_64-unknown-linux-musl")
-        .join("release")
-        .join("engram-agentd");
-    assert!(agent_bin.exists(), "musl agentd missing");
-
-    let src = tempfile::tempdir().expect("source dir");
-    // Stage the harness binaries into the Docker build context so
-    // COPY can pull them into /opt/engram/harness/. Layout mirrors
-    // the published `harness-claude` artifact: `harness` is the
-    // engram-harness-claude wrapper, `claude` is the Anthropic
-    // Claude Code CLI alongside.
-    std::fs::copy(harness_bin, src.path().join("harness")).unwrap();
-    std::fs::copy(claude_bin, src.path().join("claude")).unwrap();
-    // No in-container network — the dev-vm's Docker daemon has DNS
-    // issues during apt-get. debian-slim already has /bin/sh + the
-    // base TLS libraries; ca-certificates is wired by agentd's CA
-    // install (now part of the `SpawnHarness` handler) + the
-    // `SSL_CERT_FILE` env-var family it exports onto every harness
-    // child.
-    std::fs::write(
-        src.path().join("Dockerfile"),
-        "FROM debian:bookworm-slim\n\
-         RUN mkdir -p /workspace /opt/engram/harness\n\
-         COPY harness /opt/engram/harness/harness\n\
-         COPY claude /opt/engram/harness/claude\n\
-         RUN chmod +x /opt/engram/harness/harness /opt/engram/harness/claude\n",
-    )
-    .unwrap();
-
+async fn bake_harness_rootfs(harness_bin: &Path, claude_bin: &Path, busybox: &Path) -> PathBuf {
     let images = tempfile::tempdir().expect("images");
     let images_path = images.path().to_path_buf();
     std::mem::forget(images);
@@ -277,22 +245,37 @@ async fn bake_harness_rootfs(repo: &str, harness_bin: &Path, claude_bin: &Path) 
     std::mem::forget(chunk_root);
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
 
-    let baker = Builder::new(DockerCli::new(), chunk_store);
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: repo.into(),
-            tag: "warm-1".into(),
-            images_dir: images_path.clone(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("bake ext4");
+    // ADR 0080 §D docker-free bake: busybox stands in for debian-slim's
+    // userland (agentd rides its own bundle). Lay the real harness pack into
+    // `/opt/engram/harness/` — layout mirrors the published `harness-claude`
+    // artifact: `harness` is the engram-harness-claude wrapper, `claude` is
+    // the Anthropic Claude Code CLI alongside. ca-certificates is wired by
+    // agentd's CA install (part of the `SpawnHarness` handler) + the
+    // `SSL_CERT_FILE` env-var family it exports onto every harness child.
+    let harness_bin = harness_bin.to_path_buf();
+    let claude_bin = claude_bin.to_path_buf();
+    let outcome = common::bake_fixture_ext4(
+        &images_path.join("rootfs.ext4"),
+        &chunk_store,
+        busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        move |tree| {
+            use std::os::unix::fs::PermissionsExt;
+            let hdir = tree.join("opt/engram/harness");
+            std::fs::create_dir_all(&hdir)?;
+            for (src, name) in [(&harness_bin, "harness"), (&claude_bin, "claude")] {
+                let dst = hdir.join(name);
+                std::fs::copy(src, &dst)?;
+                std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+            }
+            Ok(())
+        },
+    )
+    .await;
 
     outcome.rootfs_path
 }
@@ -648,12 +631,15 @@ async fn e2e_harness_cold_via_pooled_backend() {
     if !require_root() {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     cleanup_host_state();
 
     let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
     let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
-    let rootfs_path =
-        bake_harness_rootfs("engram-e2e-harness-cold", &harness_bin, &claude_bin).await;
+    let rootfs_path = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -720,12 +706,15 @@ async fn e2e_harness_warm_via_pooled_backend() {
     if !require_root() {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     cleanup_host_state();
 
     let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
     let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
-    let rootfs_path =
-        bake_harness_rootfs("engram-e2e-harness-warm", &harness_bin, &claude_bin).await;
+    let rootfs_path = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
@@ -842,16 +831,19 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
     if !require_root() {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     cleanup_host_state();
 
     let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
     let (proxy_port, ca_pem, _registry) = spawn_real_proxy().await;
-    // Same rootfs as `e2e_harness_cold` — harness binary is COPY'd in
-    // at `/opt/engram/harness/harness`. If start_agent ignored the
+    // Same rootfs as `e2e_harness_cold` — the harness pack is laid into
+    // `/opt/engram/harness/harness`. If start_agent ignored the
     // empty argv and still tried to spawn, the test would surface that
     // as either a spawn failure or a sink event below.
-    let rootfs_path =
-        bake_harness_rootfs("engram-e2e-harness-devvm", &harness_bin, &claude_bin).await;
+    let rootfs_path = bake_harness_rootfs(&harness_bin, &claude_bin, &busybox).await;
 
     let work = tempfile::tempdir().expect("work");
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());

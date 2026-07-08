@@ -331,8 +331,8 @@ async fn unknown_layer_media_type_fails_loud_before_any_download() {
 // ---------------------------------------------------------------
 
 /// ADR 0036 byte-determinism hinges on SOURCE_DATE_EPOCH, honored by
-/// e2fsprogs >= 1.47.1 (the same gate the image-builder determinism
-/// test uses). Older/missing mke2fs → skip with a note, never flake.
+/// e2fsprogs >= 1.47.1 (the same >=1.47.1 e2fsprogs determinism
+/// gate). Older/missing mke2fs → skip with a note, never flake.
 fn deterministic_mke2fs_available() -> Option<String> {
     let on_path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|dir| dir.join("mke2fs").is_file()))

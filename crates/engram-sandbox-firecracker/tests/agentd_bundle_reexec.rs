@@ -37,7 +37,7 @@ use engram_core::traits::sandbox::{AgentRefresh, SandboxBackend};
 use engram_core::types::sandbox::{
     AuxRoDrive, CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec,
 };
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 
 use common::{drain, fc_preflight, require_bin};
@@ -82,9 +82,13 @@ async fn agentd_rolls_via_bundle_without_recapture() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let agent =
         Path::new(&manifest).join("../../target/x86_64-unknown-linux-musl/release/engram-agentd");
@@ -98,29 +102,24 @@ async fn agentd_rolls_via_bundle_without_recapture() {
     }
 
     // ---- 1. Bake a shim-only rootfs (NO agentd inside) ----
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
         engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
     );
-    let baker = Builder::new(DockerCli::new(), engram_chunk_store::ChunkStore::new(blob));
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "agentd-reexec-test".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("ext4 bake (shim only)");
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |_tree| Ok(()),
+    )
+    .await;
 
     // ---- 2. Stage generation v1 and boot with the SYMBOLIC slot ----
     // Rootfs outlives the original sandbox's jail (restore reopens it).

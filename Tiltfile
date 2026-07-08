@@ -456,6 +456,11 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         env['ENGRAM_NBD_DEVICES'] = nbd_csv
     if 'Darwin' in uname_str:
         env['PATH'] = '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
+        # ADR 0080 §C: the enable-time materializer packs ext4 via mke2fs.
+        # Point it at homebrew's keg-only e2fsprogs (>= 1.47.1) explicitly so
+        # resolution never depends on PATH ordering — the dev mirror of the
+        # host-agent image's ENGRAM_MKE2FS=/usr/sbin/mke2fs.
+        env['ENGRAM_MKE2FS'] = '/opt/homebrew/opt/e2fsprogs/sbin/mke2fs'
     else:
         # Linux: the host-agent runs under sudo (below), which scrubs
         # PATH to a secure default. Preserve the caller's PATH so it

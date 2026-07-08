@@ -25,10 +25,10 @@ Lanes:
                 this SHA for either downstream bake to consume.
   cli_tools     engram-cli changed — release closure of {engram-cli}.
                 Gates the OSS publish-cli-tools job, which republishes the
-                "golden" cli GHCR artifact
-                (cli-tools) that the reusable bake-dev-image workflow pulls
-                instead of recompiling. Same role publish-host-binaries plays
-                for the FC-host bakes.
+                "golden" cli GHCR artifact (cli-tools) that dogfood dev-image
+                bakes pull to drive `engram` admin commands instead of
+                recompiling. Same role publish-host-binaries plays for the
+                FC-host bakes.
   tf_or_helm    deploy/terraform/ + deploy/helm/
   dev_image     dev-engrams dogfood rebake — images OR host_binaries OR
                 host_base OR the release closure of {engram-harness-claude}
@@ -76,8 +76,8 @@ CONTAINER_BINS = {
 # harness-only change shipped nothing (the bug this gate fixes).
 SESSION_HARNESS_BINS = {"engram-harness-claude"}
 # The ops CLI. OSS publishes it once as the `cli-tools` GHCR artifact
-# (publish-cli-tools); the reusable bake-dev-image workflow pulls that instead
-# of compiling from a source checkout — exactly how the FC-host bakes consume
+# (publish-cli-tools); dogfood dev-image bakes pull that instead of compiling
+# from a source checkout — exactly how the FC-host bakes consume
 # publish-host-binaries. ADR 0080: engram-agentd LEFT this set — agentd is no
 # longer injected into any image; it ships as `bundle-agentd` (see AGENTD_BINS
 # below), so an agentd change republishes a bundle instead of re-baking every
@@ -127,6 +127,12 @@ TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
 # ADR 0027: the RO session bundles (skills / browser / …). A change here means
 # the bundle artifacts must be rebuilt + republished, and the FC-host image
 # re-baked to pull the new squashfs. Independent of the Rust/OS lanes.
+# ADR 0080 §D: the `guest-tools` bundle (the pinned static ttyd) lives entirely
+# under deploy/bundles/guest-tools/ (a pinned download in build.sh — no crate),
+# so `bundles |= guest_tools_changed` is already covered by this path rule; a
+# ttyd re-pin trips `bundles` and republishes bundle-guest-tools. (Contrast
+# agentd, a compiled crate OUTSIDE this path, which needs the explicit
+# agentd_changed closure term below.)
 BUNDLES_PATHS = ["deploy/bundles/"]
 # ADR 0027: the `dev-engrams` dogfood session image runs the REAL `just dev`
 # (whole-repo build) inside a sandbox, so it's stale on essentially any source
@@ -281,17 +287,14 @@ def main():
     # Union — gates the publish-host-binaries job so the GHCR artifact exists
     # at this SHA for whichever downstream bake (thin and/or base) fires.
     host_image = host_binaries or host_base
-    # Golden cli+agentd artifact (cli-tools). Republish whenever either binary's
-    # release closure moved, or a conservative common trigger (lockfile / root
-    # manifest / the bake workflow / this script) changed, OR the flake changed:
-    # publish-cli-tools ALSO bundles a pinned static mke2fs built via
-    # `nix build .#mke2fs-static` (ADR 0036), so flake.nix/flake.lock feed the
-    # artifact even when no Rust binary moved. Without this, an e2fsprogs re-pin
-    # leaves cli-tools carrying the stale mke2fs and the dogfood bakes don't see
-    # the fix (exactly what happened with the 1.47.3 -> 1.47.2 pin).
+    # Golden cli artifact (cli-tools = just engram-cli). Republish whenever its
+    # release closure moved or a conservative common trigger (lockfile / root
+    # manifest / the bake workflow / this script) changed. ADR 0080: cli-tools
+    # no longer bundles mke2fs (the `engram image build` bake retired with
+    # engram-image-builder; the only mke2fs left rides the host-agent image),
+    # so a flake.nix/flake.lock re-pin no longer needs to republish cli-tools.
     cli_tools = (bool(cc & cli_tools_closure)
-                 or any_path(changed, BINARY_COMMON)
-                 or any_path(changed, ["flake.nix", "flake.lock"]))
+                 or any_path(changed, BINARY_COMMON))
     tf_or_helm = any_path(changed, TF_HELM_PATHS)
     # The dogfood image builds the whole repo via `just dev`, so it's stale on
     # any source the container/host bakes consume, plus the dev-orchestration

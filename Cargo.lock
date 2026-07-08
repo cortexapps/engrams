@@ -1045,14 +1045,9 @@ dependencies = [
 name = "engram-cli"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "clap",
- "engram-chunk-store",
  "engram-core",
- "engram-image-builder",
- "engram-oci",
  "engram-protocol",
- "engram-storage-local",
  "serde",
  "serde_json",
  "tokio",
@@ -1131,7 +1126,6 @@ dependencies = [
  "engram-git-github",
  "engram-harness-proto",
  "engram-host-agent",
- "engram-image-builder",
  "engram-mount-manifest",
  "engram-oci",
  "engram-oci-auth",
@@ -1335,7 +1329,6 @@ dependencies = [
  "engram-egress-proxy",
  "engram-harness-noop",
  "engram-harness-proto",
- "engram-image-builder",
  "engram-migrate-proto",
  "engram-oci",
  "engram-protocol",
@@ -1394,36 +1387,6 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
- "workspace-hack",
-]
-
-[[package]]
-name = "engram-image-builder"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "clap",
- "engram-agentd",
- "engram-chunk-store",
- "engram-core",
- "engram-oci",
- "engram-postgres",
- "engram-rootfs-materializer",
- "engram-sandbox-firecracker",
- "engram-storage-gcs",
- "engram-storage-local",
- "futures",
- "parking_lot",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid",
  "workspace-hack",
 ]
 
@@ -1587,7 +1550,6 @@ dependencies = [
  "engram-core",
  "engram-egress-proxy",
  "engram-harness-proto",
- "engram-image-builder",
  "engram-oci",
  "engram-rootfs-materializer",
  "engram-storage-local",

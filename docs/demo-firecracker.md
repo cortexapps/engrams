@@ -63,9 +63,11 @@ Cache the FC test artifacts on the VM (kernel + ubuntu rootfs):
 
 ## Run the demo
 
-Bring the stack up and bake the image with the unified recipes — `just
-dev` auto-detects KVM and runs the FC split topology (ADR 0024); there's
-no FC-specific recipe anymore. Then exercise the VM lifecycle by hand.
+Bring the stack up and build + push the demo image with the unified
+recipes — `just dev` auto-detects KVM and runs the FC split topology
+(ADR 0024); there's no FC-specific recipe anymore, and `just bake-demo`
+is now a plain `docker build && docker push` (ADR 0080). Then exercise
+the VM lifecycle by hand.
 
 ```
 # 1. Stack up via Tilt (coord + host-agent, FC). tmux because the VM
@@ -74,8 +76,9 @@ no FC-specific recipe anymore. Then exercise the VM lifecycle by hand.
 /dev-vm ssh "tmux new-session -d -s engram \
   'cd ~/engrams && nix develop --command just dev > /tmp/engram-tilt.log 2>&1'"
 
-# 2. Bake + enable the demo image, create a session. integration-session
-#    prints the session id + ready-to-paste curls; grab SID from it.
+# 2. Build+push (ADR 0080: docker build && push) + enable the demo image,
+#    create a session. integration-session prints the session id +
+#    ready-to-paste curls; grab SID from it.
 /dev-vm run just bake-demo
 /dev-vm run just integration-session    # set SID to the printed session id
 ```
@@ -154,20 +157,21 @@ curl -s -X POST http://localhost:8090/sessions/$SID/prompt \
 
 ## Bugs the demo surfaced (all fixed in this pass)
 
-1. **`engram image build` couldn't bake an FC-usable image.** The
-   CLI didn't expose `--inject-agent`, so produced rootfs.ext4
-   files had no `engram-agentd` and the host couldn't `exec()`
-   against the VM (no vsock listener inside the guest). Added
-   the flag, plus a bake recipe (later unified as `just bake-demo`,
-   ADR 0024).
+1. **Early bakes produced FC-unusable images** (historical). The
+   old local-bake path didn't inject `engram-agentd`, so produced
+   rootfs.ext4 files had no in-guest vsock listener and the host
+   couldn't `exec()` against the VM. That whole local-bake path is
+   gone (ADR 0080): images are now plain OCI, materialized host-side
+   into chunked ext4, and `engram-agentd` rides the `bundle-agentd`
+   slot the stage-1 init execs — so a fresh image always has the agent.
 
 2. **`FirecrackerConfig::with_kernel` default boot args missed
-   `init=/sbin/engram-init`.** The image-baker writes
-   `/sbin/engram-init` to exec the agent; without the kernel arg
-   the kernel tried to boot debian's systemd (which we don't
-   ship), the VM hung in early init, and exec timed out. Boot
-   args now end with `init=/sbin/engram-init` so any
-   Engram-baked image launches the agent automatically.
+   `init=/sbin/engram-init`.** The host-side materializer injects
+   `/sbin/engram-init` (the stage-1 shim that brings up the agent);
+   without the kernel arg the kernel tried to boot debian's systemd
+   (which we don't ship), the VM hung in early init, and exec timed
+   out. The FC backend now ends boot args with `init=/sbin/engram-init`
+   so any Engram image launches the agent automatically.
 
 3. **`exec_stream` raced against guest boot.** The agent inside
    the guest takes a couple of seconds to bind on vsock 1024;
@@ -192,7 +196,8 @@ curl -s -X POST http://localhost:8090/sessions/$SID/prompt \
   (auto-augmentation in `api/sessions.rs`).
 - Snapshot size optimization: 4 GiB per snapshot is the
   default-memory ceiling. Sessions with smaller resource hints in
-  `engram.toml` would produce smaller snapshots.
+  the enable-time image-config (`[resources]`, ADR 0080) would
+  produce smaller snapshots.
 - VM-level proxy e2e test: the unit + iptables tests cover the
   proxy in isolation; a future test should exec curl from inside a
   real sandbox through the iptables REDIRECT and verify the proxy

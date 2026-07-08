@@ -39,7 +39,7 @@ pub enum RemountOutcome {
 
 /// ADR 0055: the reserved dynamic-mount slot prefix the init shim mounts skill
 /// squashfs at (`/opt/engram/dyn/<i>`; see `AuxRoDrive::slot_guest_mount` and
-/// the image-builder init script). Every per-session skill swap lands under
+/// the stage-1 init script (engram-rootfs-materializer)). Every per-session skill swap lands under
 /// this prefix, so re-mounting the prefix covers them all uniformly.
 #[cfg(target_os = "linux")]
 const DYN_MOUNT_PREFIX: &str = "/opt/engram/dyn/";

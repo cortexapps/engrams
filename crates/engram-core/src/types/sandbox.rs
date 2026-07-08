@@ -179,9 +179,9 @@ impl AuxRoDrive {
     /// ADR 0062: reserved slot index for the harness catalog. Slot 0 (`dyn_0`)
     /// carries the content-addressed catalog squashfs (every registered harness
     /// under `<name>/`); the session `exec`s `/opt/engram/dyn/0/<name>/<exec>`.
-    /// Skills assign to `dyn_2..` (slot 1 is agentd, ADR 0080). The harness is
-    /// `exec`'d, so unlike a skill its slot must be coordinator-known up front
-    /// to build `argv[0]`.
+    /// Skills assign to `dyn_3..` (slot 1 is agentd, slot 2 is guest-tools —
+    /// ADR 0080). The harness is `exec`'d, so unlike a skill its slot must be
+    /// coordinator-known up front to build `argv[0]`.
     pub const HARNESS_SLOT_INDEX: usize = 0;
 
     /// ADR 0080: reserved slot index for the agentd bundle. Slot 1 (`dyn_1`)
@@ -200,12 +200,27 @@ impl AuxRoDrive {
     /// generation this host stages.
     pub const AGENTD_STAMP_KEY: &'static str = "agentd";
 
-    /// ADR 0062/0080: skill slots start after the harness + agentd slots, so a
-    /// session may carry at most this many skills.
-    pub const MAX_SKILL_SLOTS: usize = Self::RESERVED_SLOTS - 2;
+    /// ADR 0080 §D: reserved slot index for the `guest-tools` bundle. Slot 2
+    /// (`dyn_2`) carries engrams-owned in-guest tooling that no longer bakes
+    /// into session images — today the static `ttyd` binary agentd's
+    /// `shell.rs` lazily spawns for the SHELL tab. Unlike agentd it is NOT
+    /// required to boot: capture resolves this slot to the sentinel like any
+    /// skill slot, the coordinator pins the fleet's current generation on
+    /// fresh creates (soft — a bundle-less fleet warns and falls back to an
+    /// image-baked ttyd), and agentd probes the dyn mounts for the tool at
+    /// StartShell time.
+    pub const GUEST_TOOLS_SLOT_INDEX: usize = 2;
 
-    /// ADR 0080: first reserved slot index skills may occupy (`dyn_2`).
-    pub const FIRST_SKILL_SLOT_INDEX: usize = Self::AGENTD_SLOT_INDEX + 1;
+    /// ADR 0080 §D: stamp key (in `current.json`) for the guest-tools bundle
+    /// generation this host stages.
+    pub const GUEST_TOOLS_STAMP_KEY: &'static str = "guest-tools";
+
+    /// ADR 0062/0080: skill slots start after the harness + agentd +
+    /// guest-tools slots, so a session may carry at most this many skills.
+    pub const MAX_SKILL_SLOTS: usize = Self::RESERVED_SLOTS - 3;
+
+    /// ADR 0080: first reserved slot index skills may occupy (`dyn_3`).
+    pub const FIRST_SKILL_SLOT_INDEX: usize = Self::GUEST_TOOLS_SLOT_INDEX + 1;
 
     /// Firecracker `drive_id` for reserved dynamic slot `i` (`"dyn_<i>"`).
     /// Underscore, NOT hyphen: FC rejects a `PUT /drives/<id>` whose id isn't

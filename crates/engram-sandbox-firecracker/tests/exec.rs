@@ -5,10 +5,10 @@
 //! (host → vsock UDS → guest agent) is the same wire protocol on top
 //! of the same `tokio::net::UnixStream`, so exercising the protocol
 //! over a plain UDS exercises everything except the FC vsock proxy.
-//! When the image baker can produce a rootfs with `engram-agentd`
-//! embedded (next slice), an `#[ignore]` test will run this through
-//! a real microVM. Until then, this is the highest-fidelity test we
-//! can run on either macOS or Linux.
+//! The `#[ignore]`'d `exec_real_vm` test runs this same wire protocol
+//! through a real microVM (rootfs packed by the fixture baker, agentd
+//! staged via its bundle slot); this UDS test is the highest-fidelity
+//! one that runs on either macOS or Linux without KVM.
 
 #![cfg(unix)]
 

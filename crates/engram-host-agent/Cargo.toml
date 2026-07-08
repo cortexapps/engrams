@@ -106,7 +106,6 @@ engram-sandbox-process.workspace = true
 # item d (#530) deleted `ensure_stub_harness`, the only src/ consumer
 # (Mke2fsPacker in lib.rs); every remaining use is test-fixture image
 # packing in tests/*.rs, so this only needs to build for `cargo test`.
-engram-image-builder.workspace = true
 tempfile = "3"
 # ADR 0008 Phase 5: the chunked-OCI fault integration test spins
 # up a loopback fake-registry that speaks just enough of the OCI

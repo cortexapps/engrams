@@ -217,19 +217,24 @@ impl VzBackend {
         dir.join(format!("{id}.vsock"))
     }
 
-    /// ADR 0080: resolve a symbolic agentd slot (`sha256 = None` at
-    /// `AuxRoDrive::AGENTD_SLOT_INDEX`) against this host's staged
-    /// stamp (`<bundle_dir>/current.json`, key `agentd`) — the VZ
-    /// mirror of the FC cold-boot resolution. Loud when the stamp or
-    /// the key is missing: the guest's stage-1 init execs agentd out
-    /// of this mount, so a cold boot without it can't come up. A
-    /// no-op when no symbolic agentd slot is present (resolved specs,
-    /// bundle-less test specs).
+    /// ADR 0080: resolve the symbolic stamped slots against this host's
+    /// staged stamp (`<bundle_dir>/current.json`) — the VZ mirror of the FC
+    /// cold-boot resolution. The agentd slot (`AGENTD_SLOT_INDEX`, key
+    /// `agentd`) is HARD: the guest's stage-1 init execs agentd out of that
+    /// mount, so a cold boot without it can't come up. The guest-tools slot
+    /// (`GUEST_TOOLS_SLOT_INDEX`, key `guest-tools`, ADR 0080 §D) is SOFT:
+    /// a missing key warns and the slot stays symbolic (skipped at attach;
+    /// the SHELL tab then needs an image-baked ttyd). A no-op when no
+    /// symbolic stamped slot is present (resolved specs, bundle-less test
+    /// specs).
     fn resolve_agentd_slot(&self, drives: &mut [AuxRoDrive]) -> Result<(), SandboxError> {
-        let needs = drives
+        let needs_agentd = drives
             .iter()
             .any(|d| d.sha256.is_none() && d.slot_index() == Some(AuxRoDrive::AGENTD_SLOT_INDEX));
-        if !needs {
+        let needs_guest_tools = drives.iter().any(|d| {
+            d.sha256.is_none() && d.slot_index() == Some(AuxRoDrive::GUEST_TOOLS_SLOT_INDEX)
+        });
+        if !needs_agentd && !needs_guest_tools {
             return Ok(());
         }
         let stamp_path = self.cfg.bundle_dir.join(AuxRoDrive::CURRENT_STAMP);
@@ -247,17 +252,45 @@ impl VzBackend {
                     stamp_path.display()
                 ))
             })?;
-        let sha = stamp.get(AuxRoDrive::AGENTD_STAMP_KEY).ok_or_else(|| {
-            SandboxError::InvalidSpec(format!(
-                "bundle stamp {} carries no `{}` entry — restage bundles \
-                 (`just bundles-vz`)",
-                stamp_path.display(),
-                AuxRoDrive::AGENTD_STAMP_KEY,
-            ))
-        })?;
-        for d in drives.iter_mut() {
-            if d.sha256.is_none() && d.slot_index() == Some(AuxRoDrive::AGENTD_SLOT_INDEX) {
-                d.sha256 = Some(sha.clone());
+        if needs_agentd {
+            // Hard: the guest's stage-1 init execs agentd out of this mount,
+            // so a cold boot without it can't come up.
+            let sha = stamp.get(AuxRoDrive::AGENTD_STAMP_KEY).ok_or_else(|| {
+                SandboxError::InvalidSpec(format!(
+                    "bundle stamp {} carries no `{}` entry — restage bundles \
+                     (`just bundles-vz`)",
+                    stamp_path.display(),
+                    AuxRoDrive::AGENTD_STAMP_KEY,
+                ))
+            })?;
+            for d in drives.iter_mut() {
+                if d.sha256.is_none() && d.slot_index() == Some(AuxRoDrive::AGENTD_SLOT_INDEX) {
+                    d.sha256 = Some(sha.clone());
+                }
+            }
+        }
+        if needs_guest_tools {
+            // Soft (ADR 0080 §D): guest-tools carries the SHELL-tab ttyd, not
+            // anything boot-critical. A stamp without it warns loudly and
+            // leaves the slot symbolic — VZ's attach skips unresolved slots,
+            // and agentd falls back to an image-baked ttyd at StartShell.
+            match stamp.get(AuxRoDrive::GUEST_TOOLS_STAMP_KEY) {
+                Some(sha) => {
+                    for d in drives.iter_mut() {
+                        if d.sha256.is_none()
+                            && d.slot_index() == Some(AuxRoDrive::GUEST_TOOLS_SLOT_INDEX)
+                        {
+                            d.sha256 = Some(sha.clone());
+                        }
+                    }
+                }
+                None => tracing::warn!(
+                    stamp = %stamp_path.display(),
+                    "bundle stamp carries no `{}` entry — the SHELL tab only \
+                     works if the image bakes ttyd; restage bundles \
+                     (`just bundles-vz`)",
+                    AuxRoDrive::GUEST_TOOLS_STAMP_KEY,
+                ),
             }
         }
         Ok(())

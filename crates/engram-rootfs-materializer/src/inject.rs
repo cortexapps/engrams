@@ -1,8 +1,8 @@
 //! Stage-1 init injection — the ONE engrams file written into a
 //! session rootfs (ADR 0080).
 //!
-//! Moved here from `engram-image-builder` (which re-exports these
-//! types) so both producers of a bootable rootfs — the retiring
+//! ADR 0080: this module is the single home for the stage-1 init
+//! shim, so both producers of a bootable rootfs — the retiring
 //! `docker export` bake and this crate's OCI-layer materializer —
 //! share a single shim source. The shim mounts the essentials, mounts
 //! the aux bundle slots, copies `engram-agentd` out of its reserved

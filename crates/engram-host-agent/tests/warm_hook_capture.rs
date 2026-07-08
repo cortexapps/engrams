@@ -37,7 +37,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -46,7 +46,7 @@ use futures::StreamExt;
 /// The long-lived process the warm command leaves running (a
 /// gradle-daemon stand-in). A distinctive sleep duration so nothing else
 /// in the guest collides. We track it by PID (recorded to a file), not by
-/// name — `debian:bookworm-slim` has no `procps`/`pgrep`.
+/// name — the busybox fixture rootfs (ADR 0080 §D) carries no `procps`/`pgrep`.
 const WARM_SENTINEL: &str = "sleep 2147480";
 
 #[tokio::test]
@@ -221,6 +221,8 @@ struct TestEnv {
     kernel: std::path::PathBuf,
     /// ADR 0080: the staged agentd bundle every backend/spec references.
     staged: common::StagedAgentdBundle,
+    /// ADR 0080 §D: the static busybox the docker-free bake packs.
+    busybox: std::path::PathBuf,
     work: tempfile::TempDir,
     images: tempfile::TempDir,
     chunk_store: engram_chunk_store::ChunkStore,
@@ -242,7 +244,7 @@ impl TestEnv {
             eprintln!("SKIP: /dev/kvm not present");
             return None;
         }
-        for bin in ["firecracker", "docker", "mke2fs", "mksquashfs"] {
+        for bin in ["firecracker", "mke2fs", "mksquashfs"] {
             let missing = std::env::var_os("PATH")
                 .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
                 .unwrap_or(true);
@@ -251,6 +253,10 @@ impl TestEnv {
                 return None;
             }
         }
+        let Some(busybox) = common::find_busybox() else {
+            eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+            return None;
+        };
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
         let agent = Path::new(&manifest_dir)
             .join("../../target/x86_64-unknown-linux-musl/release/engram-agentd");
@@ -275,6 +281,7 @@ impl TestEnv {
         Some(Self {
             kernel,
             staged,
+            busybox,
             work,
             images,
             chunk_store,
@@ -303,26 +310,21 @@ impl TestEnv {
         )
     }
 
-    /// Bake a minimal agentd-injected debian rootfs and return its path.
+    /// Bake a minimal agentd-injected debian rootfs and return its path
+    /// (docker-free, ADR 0080 §D).
     async fn bake(&self, name: &str) -> std::path::PathBuf {
-        let src = tempfile::tempdir().expect("source dir");
-        std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
-        let baker = Builder::new(DockerCli::new(), self.chunk_store.clone());
-        let outcome = baker
-            .build(&BuildRequest {
-                source: src.path().to_path_buf(),
-                repo: name.into(),
-                tag: "warm-1".into(),
-                images_dir: self.images.path().to_path_buf(),
-                format: Format::Ext4,
-                init_injection: Some(InitInjection {
-                    vsock_port: ENGRAM_AGENTD_PORT,
-                    transport: engram_image_builder::Transport::Vsock,
-                    init_script: None,
-                }),
-            })
-            .await
-            .expect("ext4 bake with agent injection");
+        let outcome = common::bake_fixture_ext4(
+            &self.images.path().join(format!("{name}.ext4")),
+            &self.chunk_store,
+            &self.busybox,
+            Some(InitInjection {
+                vsock_port: ENGRAM_AGENTD_PORT,
+                transport: Transport::Vsock,
+                init_script: None,
+            }),
+            |_tree| Ok(()),
+        )
+        .await;
         outcome.rootfs_path
     }
 
