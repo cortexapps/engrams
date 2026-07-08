@@ -199,12 +199,16 @@ spec:
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ .Values.otel.endpoint | quote }}
             {{- end }}
-            {{- /* ENGRAM_GUEST_OTEL_ENDPOINT (in-guest agentd export) is
-                   deliberately NOT wired here — it depends on a guest->
-                   collector firewall pinhole (net.rs) that doesn't exist
-                   yet. Out of scope for #526 (phase 2 / prototype-first,
-                   tracked as a follow-up); wiring the env without the
-                   pinhole would just be a silently-unreachable dial. */}}
+            {{- if and .Values.otel.enabled .Values.otel.guestEndpoint }}
+            # #526 phase 2: in-guest agentd OTLP export. Rides the FC
+            # kernel cmdline (`engram_otel=`) into COLD boots (capture
+            # VMs); the host-agent opens the matching guest->collector
+            # tcp pinhole in the INPUT chain (net.rs) so the dial to
+            # the slot-0 gateway (10.200.0.1) reaches the hostNetwork
+            # collector instead of the VM-pool DROP.
+            - name: ENGRAM_GUEST_OTEL_ENDPOINT
+              value: {{ .Values.otel.guestEndpoint | quote }}
+            {{- end }}
             {{- with .Values.hostAgent.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
