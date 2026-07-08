@@ -2,9 +2,13 @@ use async_trait::async_trait;
 
 use crate::error::MetaError;
 use crate::types::capability::Capability;
+use crate::types::capture_job::{
+    CaptureJobAssignment, CaptureJobReport, CaptureJobRow, CaptureJobStage, ColdBaseRow,
+    NewCaptureJob,
+};
 use crate::types::event::{ArtifactRow, PersistedEvent};
 use crate::types::host::{HostHeartbeat, HostRecord, HostStatus};
-use crate::types::ids::{HostId, SandboxId, SessionId};
+use crate::types::ids::{CaptureJobId, HostId, SandboxId, SessionId, SnapshotId};
 use crate::types::manifest::ManifestRef;
 use crate::types::registry::{
     EnableJob, EnableJobState, EnabledImage, RegistryCredential, SessionSecrets,
@@ -1993,6 +1997,187 @@ pub trait MetadataStore: Send + Sync {
     /// direction rather than laundering a stringly type). Read on every
     /// heartbeat ack; best-effort on the caller's side.
     async fn list_prestaging_refs(&self) -> Result<Vec<serde_json::Value>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    // ---- capture jobs (ADR 0081) ----
+    //
+    // Capture becomes a durable, host-executed, epoch-fenced job row
+    // dispatched/reported over the heartbeat, replacing the
+    // connection-coupled `BuildBaseSnapshot` RPC stream — a dropped
+    // stream today keeps the capture running detached host-side while
+    // the coordinator re-drives from scratch, booting a duplicate
+    // capture VM with no anti-affinity. Every write below is fenced by
+    // `(id, epoch)`, never a lease-holder identity: any coordinator
+    // replica can record a host's report. Default implementations
+    // error exactly like the enable-jobs family above (only the
+    // Postgres store — the one hosts actually dispatch against —
+    // supports jobs); the heartbeat-ack-adjacent bulk reads default to
+    // empty, matching `list_prestaging_refs`/the GC pin-set reads,
+    // since those are called unconditionally every tick regardless of
+    // whether any capture jobs exist.
+    //
+    // This commit (P1a) only adds the store surface — dormant until
+    // the executor/scanner rework (a later commit) calls it.
+
+    /// Insert a fresh `assigned`-stage job for `row.enable_job_id`, or —
+    /// when a non-terminal job for the same enable job already exists
+    /// (the `capture_jobs_active_enable` partial unique index) — return
+    /// that job instead (insert-or-get, exactly like
+    /// [`Self::create_or_get_enable_job`]). A coordinator restart or a
+    /// re-driven scanner tick must resume the existing attempt, never
+    /// duplicate a capture VM.
+    async fn insert_capture_job(&self, row: NewCaptureJob) -> Result<CaptureJobRow, MetaError> {
+        let _ = row;
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// One capture job by id.
+    async fn get_capture_job(&self, id: CaptureJobId) -> Result<Option<CaptureJobRow>, MetaError> {
+        let _ = id;
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// The active (non-terminal) capture job for an enable job, if any
+    /// — the read [`Self::insert_capture_job`]'s insert-or-get falls
+    /// back to, also useful for the claim endpoint to re-derive
+    /// dispatch state without a job id in hand.
+    async fn active_capture_job_for_enable(
+        &self,
+        enable_job_id: uuid::Uuid,
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        let _ = enable_job_id;
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// The fenced write every [`CaptureJobReport`] drives: advances
+    /// `stage`/`stage_progress`/`last_progress_at` (bumping
+    /// `stage_started_at` only when `stage` actually changes),
+    /// `COALESCE`s in `fc_snapshot_version` once known, and — when
+    /// `report.terminal` is `Some` — stamps `stage = 'done'` +
+    /// `result_bincode`, or `stage = 'failed'` + `error`/`error_stage`/
+    /// `retryable`. Fenced `WHERE id = $1 AND epoch = $2 AND stage NOT
+    /// IN ('done', 'failed')` — any replica can perform this write, no
+    /// lease-holder identity to lose. Returns whether the row was
+    /// updated: `false` means the report is fenced off (a stale epoch
+    /// from a reassigned-away attempt) or the job was already terminal
+    /// — either way the caller drops the report, it must never retry
+    /// or surface an error for it.
+    async fn record_capture_job_report(
+        &self,
+        report: &CaptureJobReport,
+    ) -> Result<bool, MetaError> {
+        let _ = report;
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Reassign a job to `new_host`: fenced
+    /// `UPDATE ... SET host_id = $new, epoch = epoch + 1, attempts =
+    /// attempts + 1, stage = 'assigned', stage_started_at = NOW(),
+    /// last_progress_at = NOW(), stage_progress = NULL WHERE id = $1
+    /// AND epoch = $2 AND stage NOT IN ('done', 'failed')` — the
+    /// per-stage deadline scan's re-pick path (a stalled `assigned`
+    /// dispatch, or an expired stage budget under the attempts
+    /// budget). `None` when the fence missed (already reassigned by a
+    /// racing scan tick, or terminal).
+    async fn reassign_capture_job(
+        &self,
+        id: CaptureJobId,
+        expected_epoch: i64,
+        new_host: HostId,
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        let _ = (id, expected_epoch, new_host);
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Every non-terminal job whose current stage has run longer than
+    /// its budget in `budgets` (the deadline scan's read: `assigned`
+    /// 60s, `booting` 300s absolute, `freezing` =
+    /// `snapshot_create_timeout(mem_mib) + 60s`, etc. — the caller
+    /// supplies the budgets since they depend on job-specific config
+    /// like `mem_mib`). Default: empty (mirrors the other
+    /// heartbeat/scanner-tick bulk reads below — a store without job
+    /// support simply never has overdue jobs).
+    async fn expire_capture_job_stages(
+        &self,
+        budgets: &[(CaptureJobStage, std::time::Duration)],
+    ) -> Result<Vec<CaptureJobRow>, MetaError> {
+        let _ = budgets;
+        Ok(Vec::new())
+    }
+
+    /// Active (non-terminal) job assignments currently on `host` — the
+    /// `HeartbeatAck.capture_assignments` source, read every heartbeat
+    /// regardless of whether any capture jobs exist fleet-wide.
+    async fn capture_assignments_for_host(
+        &self,
+        host: HostId,
+    ) -> Result<Vec<CaptureJobAssignment>, MetaError> {
+        let _ = host;
+        Ok(Vec::new())
+    }
+
+    /// The set of hosts with at least one active (non-terminal)
+    /// capture job — placement's one-capture-per-host anti-affinity
+    /// veto (`capture_jobs_active_host`).
+    async fn hosts_with_live_capture_jobs(
+        &self,
+    ) -> Result<std::collections::HashSet<HostId>, MetaError> {
+        Ok(std::collections::HashSet::new())
+    }
+
+    /// Stamp the terminal `reuse_outcome` on an enable job (ADR 0081
+    /// section D): `reused_full | reused_cold_base |
+    /// recaptured:no_cold_base | recaptured:content_changed |
+    /// recaptured:chunks_missing | recaptured:fc_version_changed`. A
+    /// plain write, not fenced by claimant — it's stamped once the job
+    /// has already reached a terminal enable-job state.
+    async fn set_enable_job_reuse_outcome(
+        &self,
+        enable_job_id: uuid::Uuid,
+        outcome: &str,
+    ) -> Result<(), MetaError> {
+        let _ = (enable_job_id, outcome);
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Insert or replace the cold base at `row.content_key` (ADR 0081
+    /// section B) — the content-keyed, boot-to-agentd-ready Full
+    /// snapshot every warm-image capture of matching content reuses
+    /// (the hook always re-runs against a fresh env on top of it).
+    async fn upsert_cold_base(&self, row: ColdBaseRow) -> Result<(), MetaError> {
+        let _ = row;
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Look up a cold base by its content key — the reuse-candidate
+    /// read the executor's miss/hit decision drives off of. Default
+    /// `None`, mirroring [`Self::find_enabled_image_by_content`]: a
+    /// store without the query surface simply never reuses.
+    async fn get_cold_base(&self, content_key: &str) -> Result<Option<ColdBaseRow>, MetaError> {
+        let _ = content_key;
+        Ok(None)
+    }
+
+    /// Every cold base's `snapshot_id` — joins the ADR 0077 GC pin-set
+    /// roots (mirrors [`Self::bundle_pin_set`]/
+    /// [`Self::snapshot_blob_pin_set`]'s always-called-unconditionally
+    /// shape). Default: empty.
+    async fn cold_base_snapshot_ids(&self) -> Result<Vec<SnapshotId>, MetaError> {
         Ok(Vec::new())
     }
 

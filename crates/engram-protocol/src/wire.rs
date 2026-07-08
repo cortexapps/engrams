@@ -92,7 +92,11 @@ use serde::{Deserialize, Serialize};
 // explicit: an enable driven by a v14 coord must never land on a v13 host
 // (which would answer `Unimplemented`), so skewed hosts drain off
 // scheduling until the MIG rolls. Lockstep coord+host roll.
-pub const WIRE_VERSION: u32 = 14;
+// v15 (ADR 0081): capture_jobs heartbeat dispatch/reporting (#546) —
+// `Heartbeat.capture_job_reports`, `HeartbeatAck.capture_assignments`/
+// `acked_capture_jobs`. BuildBaseSnapshot RPC deletion rides this bump
+// (removed in the cutover commit).
+pub const WIRE_VERSION: u32 = 15;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

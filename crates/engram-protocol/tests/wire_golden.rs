@@ -410,8 +410,14 @@ fn wire_version_pinned() {
     // coord→host; `ManifestRef` — already pinned — and
     // `OciRuntimeDefaults` host→coord), goldens ADDED for the new
     // shapes; every existing golden is byte-identical.
+    // 14 -> 15: ADR 0081 (#546) — capture_jobs heartbeat dispatch/
+    // reporting. `Heartbeat.capture_job_reports` /
+    // `HeartbeatAck.capture_assignments`/`acked_capture_jobs` ride the
+    // JSON heartbeat/ack, NOT the gRPC bincode `bytes` payloads this
+    // corpus pins — no new golden entries here. BuildBaseSnapshot RPC
+    // deletion rides this bump too (removed in the cutover commit).
     assert_eq!(
-        WIRE_VERSION, 14,
+        WIRE_VERSION, 15,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

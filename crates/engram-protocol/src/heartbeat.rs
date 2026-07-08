@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
-use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
+use engram_core::types::{CaptureJobAssignment, CaptureJobReport};
+use engram_core::{CaptureJobId, HostId, SandboxId, SessionId, SnapshotId};
 use serde::{Deserialize, Serialize};
 
 /// Serde default for `running_sandboxes_known` (issue #215): a
@@ -72,6 +73,19 @@ pub struct Heartbeat {
     /// pre-utilization host-agent interops cleanly against this coord.
     #[serde(default)]
     pub utilization: engram_core::types::host::HostUtilization,
+    /// ADR 0081 (wire v15): durable capture-job reports this host holds
+    /// — progress + (once known) the terminal outcome — for every
+    /// `capture_jobs` row it's currently executing. Re-advertised every
+    /// heartbeat until `HeartbeatAck.acked_capture_jobs` names the
+    /// terminal ones (the `CheckpointAdvert`/`acked_checkpoints` pattern
+    /// verbatim): what makes a completed-but-unacked capture become a
+    /// durable PG fact regardless of which coord replica (if any)
+    /// survives the original dispatch. `#[serde(default)]` for
+    /// mixed-version interop during the coord+host roll (clean-break
+    /// wire bump, but a straggler heartbeat during the rollout window
+    /// must still decode).
+    #[serde(default)]
+    pub capture_job_reports: Vec<CaptureJobReport>,
 }
 
 /// Issue #529: distinguishes a periodic (ADR 0028 Fix A) checkpoint
@@ -140,6 +154,22 @@ pub struct HeartbeatAck {
     /// files — the PG rows own the references now.
     #[serde(default)]
     pub acked_checkpoints: Vec<SnapshotId>,
+    /// ADR 0081 (wire v15): capture jobs this host currently owns —
+    /// `(job_id, epoch)` dispatches the coordinator's fenced writer
+    /// side wants executed. An assignment the host doesn't recognize
+    /// (a fresh claim, or a bumped epoch on one it's already running)
+    /// drives it to call the claim endpoint for the full
+    /// `CaptureJobSpec`; a LOWER epoch than one already running means
+    /// the host destroys the stale attempt first. `#[serde(default)]`
+    /// for mixed-version interop during the roll.
+    #[serde(default)]
+    pub capture_assignments: Vec<CaptureJobAssignment>,
+    /// ADR 0081: terminal `CaptureJobReport`s from this heartbeat that
+    /// the coord successfully recorded into PG. The host stops
+    /// re-advertising the matching durable record — mirrors
+    /// `acked_checkpoints`'s role for checkpoint adverts.
+    #[serde(default)]
+    pub acked_capture_jobs: Vec<CaptureJobId>,
 }
 
 /// Identity of one enabled image. Manifest digest is the sha256 of
@@ -225,6 +255,7 @@ mod tests {
             ready_images: Vec::new(),
             checkpoints: Vec::new(),
             utilization: Default::default(),
+            capture_job_reports: Vec::new(),
         }
     }
 
@@ -348,11 +379,128 @@ mod tests {
                     version: 1,
                 }),
             }],
+            capture_assignments: vec![CaptureJobAssignment {
+                job_id: CaptureJobId::new(),
+                epoch: 3,
+            }],
+            acked_capture_jobs: vec![CaptureJobId::new()],
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: HeartbeatAck = serde_json::from_str(&json).unwrap();
         assert_eq!(back.revoked_sessions, original.revoked_sessions);
         assert_eq!(back.enabled_images, original.enabled_images);
+        assert_eq!(back.capture_assignments, original.capture_assignments);
+        assert_eq!(back.acked_capture_jobs, original.acked_capture_jobs);
+    }
+
+    /// ADR 0081 (wire v15): a heartbeat carrying live capture-job
+    /// progress AND a terminal report round-trips through JSON —
+    /// exercising both `CaptureTerminalReport` variants (`Done` carries
+    /// opaque bincode bytes; `Failed` carries the error taxonomy) plus
+    /// the `stage_progress`-shaped detail/log_tail fields.
+    #[test]
+    fn capture_job_reports_round_trip_through_json() {
+        use engram_core::types::{CaptureJobProgress, CaptureJobStage, CaptureTerminalReport};
+
+        let mut h = sample();
+        h.capture_job_reports = vec![
+            CaptureJobReport {
+                job_id: CaptureJobId::new(),
+                epoch: 2,
+                stage: CaptureJobStage::Warming,
+                progress: Some(CaptureJobProgress {
+                    detail: Some("install-deps".into()),
+                    log_tail: Some("Successfully installed foo-1.2.3".into()),
+                }),
+                fc_snapshot_version: Some("v6".into()),
+                terminal: None,
+            },
+            CaptureJobReport {
+                job_id: CaptureJobId::new(),
+                epoch: 1,
+                stage: CaptureJobStage::Failed,
+                progress: None,
+                fc_snapshot_version: None,
+                terminal: Some(CaptureTerminalReport::Failed {
+                    error: "warm hook exited 1".into(),
+                    error_stage: "warming".into(),
+                    retryable: false,
+                }),
+            },
+            CaptureJobReport {
+                job_id: CaptureJobId::new(),
+                epoch: 1,
+                stage: CaptureJobStage::Done,
+                progress: None,
+                fc_snapshot_version: Some("v6".into()),
+                terminal: Some(CaptureTerminalReport::Done {
+                    result_bincode: vec![9, 8, 7, 6],
+                }),
+            },
+        ];
+        let json = serde_json::to_string(&h).unwrap();
+        let back: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.capture_job_reports.len(), 3);
+        assert_eq!(back.capture_job_reports[0].stage, CaptureJobStage::Warming);
+        assert_eq!(
+            back.capture_job_reports[0]
+                .progress
+                .as_ref()
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some("install-deps")
+        );
+        assert_eq!(
+            back.capture_job_reports[0].fc_snapshot_version.as_deref(),
+            Some("v6")
+        );
+        match &back.capture_job_reports[1].terminal {
+            Some(CaptureTerminalReport::Failed {
+                error,
+                error_stage,
+                retryable,
+            }) => {
+                assert_eq!(error, "warm hook exited 1");
+                assert_eq!(error_stage, "warming");
+                assert!(!retryable);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        match &back.capture_job_reports[2].terminal {
+            Some(CaptureTerminalReport::Done { result_bincode }) => {
+                assert_eq!(result_bincode, &vec![9, 8, 7, 6]);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// Rollout interop: a heartbeat from a pre-ADR-0081 host-agent omits
+    /// `capture_job_reports` entirely; a coord that predates this ack a
+    /// pre-ADR-0081 sends no `capture_assignments`/`acked_capture_jobs`.
+    /// Both directions must decode to empty, not fail.
+    #[test]
+    fn capture_job_fields_default_to_empty_for_mixed_version_interop() {
+        let json = r#"{
+            "host_id": "00000000-0000-0000-0000-000000000000",
+            "sent_at": "2026-06-05T00:00:00Z",
+            "capacity": {"total_mib": 1024, "used_mib": 0, "running_sandboxes": 0},
+            "running_sandboxes": [],
+            "draining": false
+        }"#;
+        let hb: Heartbeat = serde_json::from_str(json).expect("decode without capture fields");
+        assert!(hb.capture_job_reports.is_empty());
+
+        let ack_json = serde_json::json!({
+            "server_time": "2026-06-05T00:00:00Z",
+            "revoked_sessions": [],
+        });
+        let ack: HeartbeatAck =
+            serde_json::from_value(ack_json).expect("decode ack without capture fields");
+        assert!(ack.enabled_images.is_empty());
+        assert!(ack.acked_checkpoints.is_empty());
+        assert!(ack.capture_assignments.is_empty());
+        assert!(ack.acked_capture_jobs.is_empty());
     }
 
     #[test]

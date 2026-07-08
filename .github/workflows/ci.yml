@@ -356,6 +356,7 @@ jobs:
             --test eviction_live_pg \
             --test checkpoint_reconcile_live_pg \
             --test enable_jobs_live_pg \
+            --test capture_jobs_live_pg \
             --test enable_reuse_live_pg \
             --test placement_reservation_live_pg \
             --test host_register_live_pg \

@@ -5,11 +5,11 @@ use chrono::{DateTime, Utc};
 use engram_core::types::session::SessionMode;
 use engram_core::types::session_op::{OpKind, OpState, SessionOp};
 use engram_core::types::{
-    EnableJob, EnableJobState, EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus,
-    HostUtilization, PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionState,
-    SnapshotRecord,
+    CaptureJobProgress, CaptureJobRow, CaptureJobStage, ColdBaseRow, EnableJob, EnableJobState,
+    EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus, HostUtilization,
+    PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionState, SnapshotRecord,
 };
-use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId};
+use engram_core::{CaptureJobId, HostId, MetaError, SandboxId, SessionId, SnapshotId};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 use uuid::Uuid;
@@ -564,6 +564,68 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
         output_tail: row.try_get("output_tail").map_err(col_err)?,
         created_at: row.try_get("created_at").map_err(col_err)?,
         updated_at: row.try_get("updated_at").map_err(col_err)?,
+    })
+}
+
+/// ADR 0081: `capture_jobs.stage` column <-> `CaptureJobStage`.
+/// Exhaustive — an unknown string is a hard `Serialization` error
+/// rather than a silent default (which would resurrect a terminal or
+/// misclassify a live job to the deadline scan).
+pub(crate) fn parse_capture_job_stage(s: &str) -> Result<CaptureJobStage, MetaError> {
+    CaptureJobStage::parse(s)
+        .ok_or_else(|| MetaError::Serialization(format!("unknown capture job stage: {s}")))
+}
+
+/// Nullable JSONB decode for `capture_jobs.stage_progress`. `NULL`
+/// means "no progress event yet for this stage."
+fn capture_job_progress_from_row(row: &PgRow) -> Result<Option<CaptureJobProgress>, MetaError> {
+    match row
+        .try_get::<Option<serde_json::Value>, _>("stage_progress")
+        .map_err(col_err)?
+    {
+        Some(v) => serde_json::from_value(v).map_err(|e| MetaError::Serialization(e.to_string())),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn capture_job_from_row(row: &PgRow) -> Result<CaptureJobRow, MetaError> {
+    let id: Uuid = row.try_get("id").map_err(col_err)?;
+    let host_id: Uuid = row.try_get("host_id").map_err(col_err)?;
+    let stage: String = row.try_get("stage").map_err(col_err)?;
+    let attempts: i32 = row.try_get("attempts").map_err(col_err)?;
+    Ok(CaptureJobRow {
+        id: CaptureJobId(id),
+        enable_job_id: row.try_get("enable_job_id").map_err(col_err)?,
+        image_uri: row.try_get("image_uri").map_err(col_err)?,
+        disk_manifest: row.try_get("disk_manifest").map_err(col_err)?,
+        image_config: jsonb_from_row(row, "image_config")?,
+        oci_defaults: jsonb_from_row(row, "oci_defaults")?,
+        host_id: HostId(host_id),
+        epoch: row.try_get("epoch").map_err(col_err)?,
+        stage: parse_capture_job_stage(&stage)?,
+        stage_started_at: row.try_get("stage_started_at").map_err(col_err)?,
+        stage_progress: capture_job_progress_from_row(row)?,
+        last_progress_at: row.try_get("last_progress_at").map_err(col_err)?,
+        attempts: attempts.max(0) as u32,
+        retryable: row.try_get("retryable").map_err(col_err)?,
+        error: row.try_get("error").map_err(col_err)?,
+        error_stage: row.try_get("error_stage").map_err(col_err)?,
+        fc_snapshot_version: row.try_get("fc_snapshot_version").map_err(col_err)?,
+        result_bincode: row.try_get("result_bincode").map_err(col_err)?,
+        created_at: row.try_get("created_at").map_err(col_err)?,
+        updated_at: row.try_get("updated_at").map_err(col_err)?,
+    })
+}
+
+pub(crate) fn cold_base_from_row(row: &PgRow) -> Result<ColdBaseRow, MetaError> {
+    let snapshot_id: Uuid = row.try_get("snapshot_id").map_err(col_err)?;
+    Ok(ColdBaseRow {
+        content_key: row.try_get("content_key").map_err(col_err)?,
+        snapshot_id: SnapshotId(snapshot_id),
+        disk_manifest: row.try_get("disk_manifest").map_err(col_err)?,
+        memory_manifest: row.try_get("memory_manifest").map_err(col_err)?,
+        fc_snapshot_version: row.try_get("fc_snapshot_version").map_err(col_err)?,
+        captured_at: row.try_get("captured_at").map_err(col_err)?,
     })
 }
 
