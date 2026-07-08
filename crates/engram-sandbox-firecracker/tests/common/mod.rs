@@ -218,11 +218,24 @@ where
     }
 }
 
-/// Poll until `path` (a Firecracker API socket) is bound, or `timeout`
-/// elapses. Promoted from `boot.rs` so the raw-`spawn_firecracker` tests can
-/// drop their fixed post-spawn sleeps. 50ms ticks.
+/// Poll until `path` (a Firecracker API socket) is ACCEPTING connections, or
+/// `timeout` elapses. Promoted from `boot.rs` so the raw-`spawn_firecracker`
+/// tests can drop their fixed post-spawn sleeps. 50ms ticks.
+///
+/// A real `connect()`, not `path.exists()`: the socket file appears at
+/// `bind()`, before `listen()` is accepting, so an existence poll can pass in
+/// the bind→listen window and the first API request then dies with
+/// ECONNREFUSED — exactly the `put_machine_config: Connection refused` flake
+/// that hit `aux_ro_drive_content_swap_under_snapshot_is_the_incident` on the
+/// suite-startup thundering herd (CI run 28974774202). Connect-polling also
+/// keeps retrying through an FC that bound and crashed, converting a
+/// first-request panic into this helper's own bounded timeout with a
+/// caller-visible `assert!` message.
 pub async fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
-    poll_until(timeout, Duration::from_millis(50), || path.exists()).await
+    poll_until(timeout, Duration::from_millis(50), || {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    })
+    .await
 }
 
 /// Poll `path` until its contents contain ANY of `needles`, or `timeout`
