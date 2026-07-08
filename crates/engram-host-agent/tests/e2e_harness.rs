@@ -267,11 +267,17 @@ async fn bake_harness_rootfs(harness_bin: &Path, claude_bin: &Path, busybox: &Pa
             use std::os::unix::fs::PermissionsExt;
             let hdir = tree.join("opt/engram/harness");
             std::fs::create_dir_all(&hdir)?;
-            for (src, name) in [(&harness_bin, "harness"), (&claude_bin, "claude")] {
-                let dst = hdir.join(name);
-                std::fs::copy(src, &dst)?;
-                std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
-            }
+            // The harness wrapper is musl-static — a straight copy runs
+            // anywhere. The Claude CLI is a glibc-DYNAMIC binary: in the
+            // debian fixture the rootfs supplied ld-linux + libc, but the
+            // busybox tree has neither, and execve of a binary whose
+            // interpreter is missing fails ENOENT ("spawn claude failed:
+            // No such file or directory" with the file plainly present).
+            // Copy it with its ldd closure like the other host tools.
+            let dst = hdir.join("harness");
+            std::fs::copy(&harness_bin, &dst)?;
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+            common::copy_host_tool_with_closure(tree, &claude_bin, "opt/engram/harness/claude")?;
             Ok(())
         },
     )
