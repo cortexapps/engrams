@@ -120,13 +120,15 @@ if fc_colima_profile:
     # `tilt up` with a confusing "no such file" for the kernel.
     _fc_colima_check = str(local(
         'colima ssh --profile ' + fc_colima_profile +
-        ' -- test -f /opt/engram-dev/Image && echo ok || echo missing',
+        ' -- sh -lc "test -f /opt/engram-dev/Image && ' +
+        'test -x /opt/engram-dev/bin/mke2fs && echo ok || echo missing"',
         echo_off=True, quiet=True)).strip()
     if _fc_colima_check != 'ok':
         fail(
             ('ENGRAM_FC_COLIMA_PROFILE={p} is set but the Colima VM `{p}` has no ' +
-             'guest kernel at /opt/engram-dev/Image (or the profile is not ' +
-             'running). Run `just fc-colima-provision {p}` first.')
+             'guest kernel at /opt/engram-dev/Image, no mke2fs at ' +
+             '/opt/engram-dev/bin/mke2fs, or the profile is not running. Run ' +
+             '`just fc-colima-provision {p}` first.')
                 .format(p=fc_colima_profile)
         )
     # ADR 0068: the docker-compose deps (postgres/registry/fake-gcs/jaeger) MUST
@@ -365,6 +367,14 @@ if 'Darwin' in uname_str:
         '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
     )
 
+if fc_colima_profile:
+    # ADR 0068: the fc-dev VM has a ~19 GiB rootfs, smaller than the
+    # production 20 GiB disk-cache floor. Keep the coordinator's
+    # materialize/capture placement floor in lockstep with the VM-side
+    # host-agent idle-evict override below, or the VM can never be
+    # considered disk-healthy.
+    coord_env['ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES'] = '3221225472'
+
 if bin_dir:
     # CI: run the downloaded release binary, no compile.
     coord_serve_cmd = 'exec ' + bin_dir + '/engram-coordinator'
@@ -566,6 +576,10 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         env['ENGRAM_GRPC_LISTEN_ADDR'] = '0.0.0.0:' + grpc_port
         env['ENGRAM_COORDINATOR_ENDPOINT'] = 'http://192.168.5.2:8090'
         env['ENGRAM_FIRECRACKER_BIN'] = '/usr/local/bin/firecracker'
+        # ADR 0080: enable-time materialization runs inside the VM-side
+        # host-agent. Provisioning installs a stable mke2fs contract path
+        # there so sudo/PATH drift cannot drop the ext4 packer.
+        env['ENGRAM_MKE2FS'] = '/opt/engram-dev/bin/mke2fs'
         # We always cross-compile + sync engram-uffd-handler alongside
         # engram-host-agent (below), so point at it explicitly rather than
         # rely on the VM's PATH — ADR 0045's Uffd restore path becomes

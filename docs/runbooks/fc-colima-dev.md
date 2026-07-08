@@ -26,8 +26,9 @@ just fc-colima-provision            # default profile fc-dev; idempotent
 ```
 
 This creates/starts the profile (`--vm-type vz --nested-virtualization`,
-6 CPU / 8 GiB / 60 GiB), and inside it: installs packages + the upstream
-`firecracker` aarch64 binary (CI's pinned version), loads `nbd`
+6 CPU / 16 GiB / 60 GiB), and inside it: installs packages, exposes
+`/opt/engram-dev/bin/mke2fs` for enable-time materialization, installs the
+upstream `firecracker` aarch64 binary (CI's pinned version), loads `nbd`
 (`nbds_max=16`, persisted — without it base-snapshot capture at image-enable
 breaks), sets `vm.unprivileged_userfaultfd=1`, installs the loopback
 forwarders (below), and builds the aarch64 guest kernel natively in the VM
@@ -53,7 +54,9 @@ Tilt's host-agent resource then: cross-compiles `engram-host-agent` +
 `nix develop`), tar-pipes the binaries and the staged bundle dir
 (`var/shared`) onto the VM's own disk (FC serves bundle files as block-device
 backings — never off the virtiofs mount), and launches the agent in the VM
-under `sudo` with the same env contract as the Linux dev path.
+under `sudo` with the same env contract as the Linux dev path. The launch env
+sets `ENGRAM_MKE2FS=/opt/engram-dev/bin/mke2fs`; rerun
+`just fc-colima-provision` to repair an older profile that predates this path.
 
 ## How the networking works (and why nothing had to move)
 
@@ -138,8 +141,10 @@ under `sudo` with the same env contract as the Linux dev path.
 
 ## Troubleshooting
 
-- *Parse-time failure "no guest kernel at /opt/engram-dev/Image"* — run
-  `just fc-colima-provision` (VM missing, stopped, or never provisioned).
+- *Parse-time failure "no guest kernel at /opt/engram-dev/Image" or
+  "no mke2fs at /opt/engram-dev/bin/mke2fs"* — run
+  `just fc-colima-provision` (VM missing, stopped, never provisioned, or
+  provisioned before the mke2fs contract path existed).
 - *Image pull fails in the host-agent* — check the socat units:
   `colima ssh --profile fc-dev -- systemctl status engram-fwd-registry engram-fwd-gcs`
   and that the Mac-side registry answers: `curl http://localhost:5001/v2/`.

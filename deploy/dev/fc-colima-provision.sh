@@ -10,6 +10,7 @@
 # justfile `dev-fc` path depends on these exact paths):
 #   /usr/local/bin/firecracker        - upstream FC binary, version pinned below
 #   /opt/engram-dev/Image             - the aarch64 guest kernel (ADR 0025 recipe)
+#   /opt/engram-dev/bin/mke2fs        - e2fsprogs packer for enable materialize
 #   /opt/engram-dev/{bin,shared,var}  - working dirs for the host-agent
 #
 # Usage: deploy/dev/fc-colima-provision.sh [profile] [--rebuild-kernel]
@@ -138,6 +139,24 @@ else
     echo "==> all apt packages already present"
 fi
 
+# --- mke2fs: enable-time image materialization runs in the VM-side
+# host-agent, so give it a stable contract path independent of sudo's PATH.
+# The binary still comes from the VM's e2fsprogs package; /etc/mke2fs.conf and
+# the rest of the e2fsprogs chain stay package-owned.
+MKE2FS_BIN="$(command -v mke2fs || true)"
+if [ -z "$MKE2FS_BIN" ]; then
+    echo "fc-colima-provision: e2fsprogs installed but mke2fs is not on PATH" >&2
+    exit 1
+fi
+mkdir -p /opt/engram-dev/bin
+ln -sf "$MKE2FS_BIN" /opt/engram-dev/bin/mke2fs
+MKE2FS_VER="$("/opt/engram-dev/bin/mke2fs" -V 2>&1 | sed -n 's/^mke2fs \([0-9][0-9.]*\).*/\1/p' | head -1 || true)"
+if [ -n "$MKE2FS_VER" ] && [ "$(printf '%s\n%s\n' "1.47.1" "$MKE2FS_VER" | sort -V | head -1)" != "1.47.1" ]; then
+    echo "WARNING: mke2fs $MKE2FS_VER is older than 1.47.1; enable still works, but ext4 packs are not byte-stable (ADR 0036)." >&2
+fi
+echo "==> mke2fs: /opt/engram-dev/bin/mke2fs -> $MKE2FS_BIN"
+/opt/engram-dev/bin/mke2fs -V
+
 # --- firecracker binary (upstream aarch64 release, CI's pinned version) ---
 NEED_FC=1
 if [ -x /usr/local/bin/firecracker ]; then
@@ -262,6 +281,10 @@ if [ "$kernel_exists" = "yes" ]; then
     echo "    /opt/engram-dev/Image already exists; skipping build."
     echo "    Force a rebuild with: $(basename "$0") $PROFILE --rebuild-kernel"
     echo "    (or: colima ssh --profile $PROFILE -- sudo rm /opt/engram-dev/Image)"
+    if ssh_ bash -c '[ -d /opt/engram-dev/kernel-build ]'; then
+        echo "    removing stale /opt/engram-dev/kernel-build work tree"
+        ssh_ sudo rm -rf /opt/engram-dev/kernel-build
+    fi
 else
     echo "    staging deploy/kernel/ into the VM (VM-local dir, not virtiofs)"
     tar -C deploy/kernel -cf - build-fc-kernel.sh engram-docker.fragment microvm-kernel-ci-aarch64-6.1.config \
@@ -277,6 +300,8 @@ else
         install -m 0644 "$asset" /opt/engram-dev/Image
     '
     echo "    installed /opt/engram-dev/Image"
+    echo "    removing /opt/engram-dev/kernel-build work tree"
+    ssh_ sudo rm -rf /opt/engram-dev/kernel-build
 fi
 
 # --- summary ---
@@ -286,6 +311,7 @@ cat <<EOF
 
 Provisioned inside the VM:
   - packages: build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file socat iptables squashfs-tools e2fsprogs
+  - /opt/engram-dev/bin/mke2fs (stable contract path for enable-time materialize)
   - /usr/local/bin/firecracker ($FC_VERSION)
   - nbd loaded (nbds_max=16), vm.unprivileged_userfaultfd=1, /dev/kvm mode 0666 (persisted)
   - engram-dev-fwd.service (DNAT localhost:{5001,4443,4317} -> 192.168.5.2, no
