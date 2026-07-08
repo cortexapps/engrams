@@ -247,7 +247,8 @@ impl Materializer {
                         LayerCompression::Zstd => flatten::apply_layer(
                             &rootfs,
                             &mut meta,
-                            zstd::stream::read::Decoder::new(reader)?,
+                            ruzstd::decoding::StreamingDecoder::new(reader)
+                                .map_err(|e| std::io::Error::other(e.to_string()))?,
                         )?,
                         LayerCompression::None => flatten::apply_layer(&rootfs, &mut meta, reader)?,
                     }

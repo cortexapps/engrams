@@ -88,6 +88,7 @@ tower = { version = "0.5", default-features = false, features = ["buffer", "filt
 tower-http = { version = "0.6", features = ["auth", "cors", "map-response-body", "trace"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
+twox-hash = { version = "2", default-features = false, features = ["xxhash32", "xxhash64"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 winnow = { version = "1" }
 zeroize = { version = "1" }
