@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -88,6 +89,57 @@ pub struct OciClient {
     /// internal token cache (which it doesn't expose).
     head_tokens: Arc<Mutex<HashMap<(String, String), String>>>,
     auth: Arc<dyn RegistryAuthResolver>,
+    /// Per-blob transient-retry + Range-resume policy for streaming
+    /// large layer blobs to disk (see
+    /// [`OciClient::pull_docker_blob_to_file`]). Production default;
+    /// tests dial the backoff down via [`OciClient::with_blob_retry`].
+    blob_retry: BlobRetryConfig,
+}
+
+/// Transient-retry policy for streaming ONE (potentially multi-GB) blob
+/// to disk with HTTP `Range` resume — see
+/// [`OciClient::pull_docker_blob_to_file`]. A single flaky GB-layer
+/// stream (GKE Cloud NAT resets a long single-stream download mid-body:
+/// reqwest surfaces `error decoding response body`) must not fail the
+/// whole image pull, so each blob retries in place, resuming from the
+/// bytes already on disk rather than restarting the layer — let alone
+/// the image.
+#[derive(Clone, Copy, Debug)]
+pub struct BlobRetryConfig {
+    /// Max total attempts for one blob before giving up. A 401 re-auth
+    /// does NOT consume an attempt.
+    pub max_attempts: u32,
+    /// Delay before the first retry; doubled each subsequent retry
+    /// (1s, 2s, 4s, 8s, …), capped.
+    pub base_backoff: Duration,
+    /// Floor applied when the registry answers 429 — rate limiting backs
+    /// off harder than a plain transport blip.
+    pub rate_limit_backoff: Duration,
+}
+
+impl Default for BlobRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            base_backoff: Duration::from_secs(1),
+            rate_limit_backoff: Duration::from_secs(5),
+        }
+    }
+}
+
+impl BlobRetryConfig {
+    /// Backoff before the retry that follows the `attempt`-th failure
+    /// (1-based). Exponential on the base; a rate-limited (429) failure
+    /// never waits less than `rate_limit_backoff`.
+    pub(crate) fn backoff(&self, attempt: u32, rate_limited: bool) -> Duration {
+        let shift = attempt.saturating_sub(1).min(6);
+        let delay = self.base_backoff.saturating_mul(1u32 << shift);
+        if rate_limited {
+            delay.max(self.rate_limit_backoff)
+        } else {
+            delay
+        }
+    }
 }
 
 impl OciClient {
@@ -113,7 +165,22 @@ impl OciClient {
             http: reqwest::Client::new(),
             head_tokens: Arc::new(Mutex::new(HashMap::new())),
             auth,
+            blob_retry: BlobRetryConfig::default(),
         }
+    }
+
+    /// Override the per-blob transient-retry policy (default: 5 attempts,
+    /// 1s exponential backoff, 5s floor on 429). The materializer never
+    /// sets this — production runs on the default; tests dial it down so
+    /// the exhaustion path doesn't sleep for real seconds.
+    pub fn with_blob_retry(mut self, cfg: BlobRetryConfig) -> Self {
+        self.blob_retry = cfg;
+        self
+    }
+
+    /// The active per-blob retry policy (used by `docker_image.rs`).
+    pub(crate) fn blob_retry(&self) -> BlobRetryConfig {
+        self.blob_retry
     }
 
     /// The cached client whose protocol matches `reference`'s registry
