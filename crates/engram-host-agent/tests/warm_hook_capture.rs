@@ -57,9 +57,13 @@ async fn warm_hook_process_survives_base_snapshot() {
     let rootfs = env.bake("engram-warm-hook-test").await;
 
     // The warm command backgrounds a long-lived process, records its PID +
-    // a marker, and exits 0. `nohup` keeps it alive after the exec's shell
-    // exits (it's reparented to init, not killed — agentd's exec only
-    // SIGKILLs the direct child via kill_on_drop). This is the shape a real
+    // a marker, and exits 0. No `nohup`: agentd's exec has no controlling
+    // tty, so the shell's exit sends no SIGHUP — the backgrounded child
+    // just reparents to PID 1 (agentd) and lives (agentd's exec only
+    // SIGKILLs the direct child via kill_on_drop). Ubuntu's busybox-static
+    // also ships NO nohup applet, so a `nohup`-wrapped spawn dies with a
+    // swallowed "not found" and the capture silently goes warm-less —
+    // exactly what this test exists to catch. This is the shape a real
     // warm hook takes (`gradle --daemon` likewise outlives the launching
     // shell).
     let warm = WarmConfig {
@@ -67,7 +71,7 @@ async fn warm_hook_process_survives_base_snapshot() {
             "/bin/sh".into(),
             "-c".into(),
             format!(
-                "nohup {WARM_SENTINEL} </dev/null >/dev/null 2>&1 & \
+                "{WARM_SENTINEL} </dev/null >/dev/null 2>&1 & \
                  echo $! > /dev/shm/engram-warm-pid && \
                  echo warmed > /dev/shm/engram-warm-marker"
             ),
