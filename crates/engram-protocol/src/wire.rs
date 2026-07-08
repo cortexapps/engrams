@@ -82,7 +82,17 @@ use serde::{Deserialize, Serialize};
 // own `capture_egress_policy` builder (from `WarmConfig.network`) is
 // retired, and the host no longer interprets `warm.env`/`warm.network`
 // out of `warm_bincode`. Lockstep coord+host roll.
-pub const WIRE_VERSION: u32 = 13;
+// v14 (ADR 0080 Phase 3b): new server-streaming `MaterializeImage` RPC —
+// enable-time host-side materialization of a STANDARD docker/OCI image
+// (pull → flatten → pack → chunk) replacing the coordinator's
+// engram-artifact pull (`fetch_and_seal_artifact`/`materialize_disk_chunks`
+// retired). Carries bincode `Option<ResolvedRegistryAuth>` coord→host and
+// bincode `ManifestRef`/`OciRuntimeDefaults` host→coord. A proto RPC
+// ADDITION is protobuf-compatible, but the bump makes the deploy posture
+// explicit: an enable driven by a v14 coord must never land on a v13 host
+// (which would answer `Unimplemented`), so skewed hosts drain off
+// scheduling until the MIG rolls. Lockstep coord+host roll.
+pub const WIRE_VERSION: u32 = 14;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

@@ -311,6 +311,28 @@ fn struct_payloads_golden() {
     // `Vec<WarmStageRecord>` — the `CaptureProgress.warm_stages_bincode`
     // payload (issue #539). `WarmStageRecord` derives `PartialEq`.
     assert_golden("warm_stages", &warm_stages());
+
+    // ADR 0080 phase 3b (wire v14) — the MaterializeImage payloads.
+    // `Option<ResolvedRegistryAuth>` crosses coord→host in
+    // `registry_auth_bincode` (pin the `Some` shape; the empty-buffer
+    // `None` never reaches bincode). `OciRuntimeDefaults` crosses
+    // host→coord in `MaterializeImageDone.oci_defaults_bincode`
+    // (single-entry map for determinism). Neither derives `PartialEq`
+    // usefully here (ResolvedRegistryAuth has no `PartialEq`); pin bytes.
+    assert_golden_no_eq(
+        "resolved_registry_auth",
+        &Some(engram_core::types::registry::ResolvedRegistryAuth {
+            username: "robot$puller".into(),
+            password: "hunter2".into(),
+        }),
+    );
+    assert_golden_no_eq(
+        "oci_runtime_defaults",
+        &engram_core::types::image::OciRuntimeDefaults {
+            env: HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]),
+            workdir: Some("/workspace".into()),
+        },
+    );
 }
 
 #[test]
@@ -382,8 +404,14 @@ fn wire_version_pinned() {
     // WarmConfig (inside warm_bincode) gains `env`. Neither type is in
     // the golden corpus (SessionEgressPolicy itself is unchanged), so
     // bincode goldens are unchanged.
+    // 13 -> 14: ADR 0080 phase 3b — the new server-streaming
+    // `MaterializeImage` RPC (host-side materialization of standard
+    // docker images). NEW bincode payloads only (`ResolvedRegistryAuth`
+    // coord→host; `ManifestRef` — already pinned — and
+    // `OciRuntimeDefaults` host→coord), goldens ADDED for the new
+    // shapes; every existing golden is byte-identical.
     assert_eq!(
-        WIRE_VERSION, 13,
+        WIRE_VERSION, 14,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -429,6 +457,22 @@ fn regen_golden() {
         },
     );
     write("warm_stages", &warm_stages());
+    // ADR 0080 phase 3b — MaterializeImage payloads (see
+    // struct_payloads_golden for the shapes' rationale).
+    write(
+        "resolved_registry_auth",
+        &Some(engram_core::types::registry::ResolvedRegistryAuth {
+            username: "robot$puller".into(),
+            password: "hunter2".into(),
+        }),
+    );
+    write(
+        "oci_runtime_defaults",
+        &engram_core::types::image::OciRuntimeDefaults {
+            env: HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]),
+            workdir: Some("/workspace".into()),
+        },
+    );
 
     write("secret_mode_literal", &SecretMode::Literal);
     write("secret_mode_broker", &SecretMode::Broker);

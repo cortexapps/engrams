@@ -11,20 +11,23 @@
 //!    whose lease is free or expired
 //!    ([`engram_core::traits::MetadataStore::claim_enable_jobs`]).
 //! 2. Per job, run the enable pipeline from the top — every step
-//!    fast-forwards, so a job resumed after a coordinator crash
-//!    re-runs cheaply:
-//!    - [`crate::api::enabled_images::fetch_and_seal_artifact`] —
-//!      KB-sized metadata pull; builds the row from the job's
-//!      ImageConfig + the artifact's runtime_defaults (ADR 0080).
-//!    - `materializing`: [`crate::api::enabled_images::materialize_disk_chunks`]
-//!      with a shared progress counter; already-present chunks
-//!      content-address-skip (the resume high-water mark is free). A
-//!      side task checkpoints `chunks_done` to PG every couple of
-//!      seconds — that's the operator's progress bar AND the claim
-//!      renewal that stops a peer from stealing a long materialize.
+//!    fast-forwards or is cheap to re-run, so a job resumed after a
+//!    coordinator crash converges:
+//!    - `materializing` (ADR 0080 phase 3b, HOST-side):
+//!      [`crate::api::enabled_images::materialize_image_on_host`] picks
+//!      a disk-healthy host and drives the streaming `MaterializeImage`
+//!      RPC — the host pulls the STANDARD docker image, packs a
+//!      bootable ext4, and chunks it into its write-through chunk
+//!      store (→ BlobStorage). Every stage frame the host streams is
+//!      persisted onto the job row
+//!      (`update_enable_job_materialize_progress`) — the operator's
+//!      progress line AND the claim renewal that stops a peer from
+//!      stealing a long materialize. A re-run re-pulls, but chunk PUTs
+//!      content-address-dedup and the content-derived ManifestRef
+//!      reproduces, so convergence is exact.
 //!    - `capturing`: [`crate::api::enabled_images::capture_and_record_base_snapshot`]
-//!      boots the capture VM on a host (idempotent via the
-//!      digest-keyed reuse check).
+//!      boots the capture VM from the materialized manifest on a host
+//!      (idempotent via the content/digest-keyed reuse checks).
 //!    - `prestaging` (ADR 0036 amendment, issue #538, INTERIM): advertise
 //!      the freshly-captured base snapshot as a `prestage_images`
 //!      heartbeat-ack entry and wait for every eligible (`stages_images`)
@@ -52,8 +55,6 @@
 //! from the lease claim: one pod owns a job at a time; a crashed
 //! pod's claim expires and a peer re-claims, resuming idempotently.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -62,7 +63,7 @@ use engram_core::types::{EnableJob, EnableJobState};
 use engram_core::MetaError;
 
 use crate::api::enabled_images::{
-    capture_and_record_base_snapshot, fetch_and_seal_artifact, materialize_disk_chunks,
+    capture_and_record_base_snapshot, materialize_image_on_host, new_enable_row,
 };
 use crate::state::SharedState;
 
@@ -299,6 +300,24 @@ fn classify_capture_error(e: crate::error::ApiError) -> AdvanceError {
     }
 }
 
+/// ADR 0080 phase 3b: classify a host-side materialize failure.
+/// `ApiError::Unavailable` covers the host picker's `NoCapacity` plus
+/// connect-time transport/WIRE_VERSION deaths — transient, retry.
+/// `ApiError::MaterializeFailed` defers to the kind's own contract
+/// (`MaterializeFailureKind::is_retryable`): busy / disk / registry /
+/// store / mid-stream transport retry via the attempts budget (each
+/// retry re-picks a host); a too-large image or deterministic content
+/// problem bails fast on the first occurrence.
+fn classify_materialize_error(e: crate::error::ApiError) -> AdvanceError {
+    match e {
+        crate::error::ApiError::Unavailable(_) => AdvanceError::Pipeline(Box::new(e)),
+        crate::error::ApiError::MaterializeFailed { kind, .. } if kind.is_retryable() => {
+            AdvanceError::Pipeline(Box::new(e))
+        }
+        other => AdvanceError::NonRetryable(Box::new(other)),
+    }
+}
+
 /// Run the enable pipeline for one claimed job. Every step is
 /// idempotent, so this always starts from the top and fast-forwards:
 /// metadata pull is KBs, materialize skips present chunks, capture
@@ -319,83 +338,79 @@ async fn advance_one(
         "enable-scanner: driving job",
     );
 
-    // Pipeline I/O (registry/GCS/capture) is a `Pipeline` error; fenced
-    // store writes (`?` on `MetaError`) become `LeaseLost` on Conflict
-    // via `From<MetaError>` and bubble all the way out, abandoning the
-    // job without further writes.
-    // ADR 0080: the full image config rides the job (set on enable/update,
-    // inherited on refresh) — `fetch_and_seal_artifact` stamps it onto the
-    // row it builds, so capture resolves warm env/egress from it and the
-    // ready-time upsert persists it for the dashboard's edit form. Config
-    // edits therefore stay invisible to session-create until the new base
-    // snapshot actually exists.
-    let (mut row, artifacts) = fetch_and_seal_artifact(state, &image_uri, &job.image_config)
-        .await
-        .map_err(|e| AdvanceError::Pipeline(Box::new(e)))?;
+    // Pipeline I/O (registry/host RPC/capture) is a `Pipeline` error;
+    // fenced store writes (`?` on `MetaError`) become `LeaseLost` on
+    // Conflict via `From<MetaError>` and bubble all the way out,
+    // abandoning the job without further writes.
+    //
+    // ADR 0080: the full image config rides the job (set on enable/
+    // update, inherited on refresh); the ready-time upsert persists it
+    // for the dashboard's edit form, so config edits stay invisible to
+    // session-create until the new base snapshot actually exists. A
+    // config that fails validation is deterministic — bail fast (the
+    // POST-time validation makes this unreachable in practice, but a
+    // job written by an older coordinator must not loop the budget).
+    job.image_config.validate().map_err(|e| {
+        AdvanceError::NonRetryable(Box::new(crate::error::ApiError::BadRequest(format!(
+            "image config for `{image_uri}`: {e}"
+        ))))
+    })?;
+    let mut row = new_enable_row(&image_uri, &job.image_config);
 
-    // ---- materializing ----
+    // ---- materializing (host-side, ADR 0080 phase 3b) ----
     state
         .services
         .meta
         .set_enable_job_state(job_id, claimant, EnableJobState::Materializing)
         .await?;
-    // chunks_total from the bootstrap (None for harness-only images).
-    let chunks_total = artifacts
-        .disk_bootstrap_json
-        .as_deref()
-        .and_then(|b| serde_json::from_slice::<engram_chunk_store::Bootstrap>(b).ok())
-        .map(|bs| bs.entries.len() as u32);
-    let counter = Arc::new(AtomicU32::new(0));
-    state
-        .services
-        .meta
-        .update_enable_job_progress(job_id, claimant, 0, chunks_total)
-        .await?;
-
-    // Checkpoint task: persists the counter every couple of seconds.
-    // Doubles as the (now fenced) claim renewal during a long
-    // materialize. If a checkpoint hits a Conflict our lease is gone —
-    // stop ticking so we don't keep hammering a row a peer owns; the
-    // next state write in the main path surfaces the LeaseLost.
-    let ticker = {
+    // The host streams a stage frame (`pull → flatten → pack → chunk`)
+    // per transition plus a ≤30 s keepalive re-send; each persisted
+    // frame is the operator's progress line AND the fenced claim
+    // renewal (`update_enable_job_materialize_progress` bumps
+    // `claimed_at`) — renewals stop exactly when the stream dies,
+    // letting a peer legitimately re-claim. Mirrors the capture
+    // consumer below.
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::channel::<engram_core::types::MaterializeProgress>(64);
+    let progress_consumer = {
         let meta = state.services.meta.clone();
-        let counter = counter.clone();
-        let interval = cfg.progress_interval;
         let claimant = claimant.to_string();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                let done = counter.load(Ordering::Relaxed);
+            while let Some(frame) = progress_rx.recv().await {
                 match meta
-                    .update_enable_job_progress(job_id, &claimant, done, None)
+                    .update_enable_job_materialize_progress(job_id, &claimant, &frame)
                     .await
                 {
                     Ok(()) => {}
                     Err(MetaError::Conflict(msg)) => {
-                        tracing::warn!(%job_id, reason = %msg, "enable progress checkpoint lost the lease; stopping ticker");
+                        tracing::warn!(%job_id, reason = %msg, "enable materialize progress write lost the lease; abandoning to peer");
                         break;
                     }
                     Err(e) => {
-                        tracing::debug!(%job_id, error = %e, "enable progress checkpoint failed");
+                        tracing::debug!(%job_id, error = %e, "enable materialize progress write failed");
                     }
                 }
             }
         })
     };
-    let materialize_result =
-        materialize_disk_chunks(state, &image_uri, &artifacts, Some(counter.clone())).await;
-    ticker.abort();
-    row.disk_manifest = materialize_result.map_err(|e| AdvanceError::Pipeline(Box::new(e)))?;
-    // Final progress write so the bar lands on 100% even if the last
-    // ticker tick raced the abort.
-    let done = counter.load(Ordering::Relaxed);
-    state
-        .services
-        .meta
-        .update_enable_job_progress(job_id, claimant, done, None)
-        .await?;
+    let materialize_result = materialize_image_on_host(state, &image_uri, progress_tx).await;
+    // `materialize_image_on_host` returning means every `Sender` clone
+    // is dropped — awaiting the consumer guarantees the final frame is
+    // persisted before we act on the result (same ordering property as
+    // the capture consumer below).
+    let _ = progress_consumer.await;
+    let materialized = materialize_result.map_err(classify_materialize_error)?;
+    tracing::info!(
+        %job_id,
+        %image_uri,
+        disk_manifest = %materialized.disk_manifest,
+        manifest_digest = %materialized.manifest_digest,
+        ext4_size_bytes = materialized.ext4_size_bytes,
+        "enable job materialized image on host",
+    );
+    row.disk_manifest = Some(materialized.disk_manifest);
+    row.oci_defaults = materialized.oci_defaults;
+    row.manifest_digest = materialized.manifest_digest;
 
     // ---- capturing ----
     state
@@ -481,8 +496,9 @@ async fn advance_one(
         .await?;
 
     // Renew the claim lease throughout the wait, same trick as the capture
-    // ticker above (progress is static — materialize/capture are done — so
-    // re-writing the same `done` count purely renews `claimed_at`).
+    // consumer above (progress is static — materialize/capture are done —
+    // so the write is purely a `claimed_at` renewal; post-ADR-0080 the
+    // chunk counters are vestigial and stay 0).
     let prestage_ticker = {
         let meta = state.services.meta.clone();
         let interval = cfg.progress_interval;
@@ -493,7 +509,7 @@ async fn advance_one(
             loop {
                 tick.tick().await;
                 match meta
-                    .update_enable_job_progress(job_id, &claimant, done, None)
+                    .update_enable_job_progress(job_id, &claimant, 0, None)
                     .await
                 {
                     Ok(()) => {}

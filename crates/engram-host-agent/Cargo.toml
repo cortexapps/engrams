@@ -34,6 +34,9 @@ engram-storage-local.workspace = true
 engram-storage-gcs.workspace = true
 engram-egress-proxy.workspace = true
 engram-oci.workspace = true
+# ADR 0080 §C: host-side materialization of standard docker images —
+# the `MaterializeImage` RPC's engine (pull → flatten → pack → chunk).
+engram-rootfs-materializer.workspace = true
 engram-sandbox-firecracker.workspace = true
 engram-sandbox-vz.workspace = true
 engram-cloud-static.workspace = true

@@ -47,6 +47,14 @@ engram-image-builder.workspace = true
 sha2.workspace = true
 engram-egress-proxy.workspace = true
 engram-storage-local.workspace = true
+# ADR 0080 phase 3b: `materialize_boot` runs the real materializer
+# against an in-process mock docker registry (axum, loopback), then
+# boots the produced chunked ext4.
+engram-rootfs-materializer.workspace = true
+engram-oci.workspace = true
+axum.workspace = true
+tar.workspace = true
+flate2.workspace = true
 futures.workspace = true
 rcgen.workspace = true
 rustls.workspace = true

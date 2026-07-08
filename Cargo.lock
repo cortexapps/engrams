@@ -1137,6 +1137,7 @@ dependencies = [
  "engram-oci-auth",
  "engram-postgres",
  "engram-protocol",
+ "engram-rootfs-materializer",
  "engram-sandbox-process",
  "engram-secrets-dev",
  "engram-secrets-gcp",
@@ -1338,6 +1339,7 @@ dependencies = [
  "engram-migrate-proto",
  "engram-oci",
  "engram-protocol",
+ "engram-rootfs-materializer",
  "engram-sandbox-firecracker",
  "engram-sandbox-process",
  "engram-sandbox-vz",
@@ -1557,6 +1559,7 @@ dependencies = [
  "flate2",
  "http",
  "parking_lot",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha2",
@@ -1575,6 +1578,7 @@ name = "engram-sandbox-firecracker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "bytes",
  "chrono",
  "dashmap",
@@ -1584,8 +1588,11 @@ dependencies = [
  "engram-egress-proxy",
  "engram-harness-proto",
  "engram-image-builder",
+ "engram-oci",
+ "engram-rootfs-materializer",
  "engram-storage-local",
  "engram-telemetry",
+ "flate2",
  "futures",
  "futures-util",
  "libc",
@@ -1598,6 +1605,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -4522,6 +4530,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6617,6 +6634,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-core",
+ "twox-hash",
  "uuid",
  "winnow",
  "zeroize",

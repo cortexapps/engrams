@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Persistent dev session — bakes + enables + creates a session and
-# leaves it running so you can poke at it with curl, wscat, or the
-# web UI. Companion to `integration-test.sh` (which always deletes
-# at the end).
+# Persistent dev session — builds + enables the demo image (ADR 0080:
+# plain `docker build && docker push`, via integration-bake-demo.sh)
+# + creates a session and leaves it running so you can poke at it with
+# curl, wscat, or the web UI. Companion to `integration-test.sh`
+# (which always deletes at the end).
 #
 # Idempotent across iterations:
 #   • If the demo image at the current HEAD is already enabled,
-#     skip the bake/enable.
+#     skip the build/enable.
 #   • If a session from a previous run is still active, print its
 #     id and exit — don't keep stacking.
 #
@@ -48,32 +49,15 @@ already_enabled=$("$ENGRAM_CLI" --json image list 2>/dev/null \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('image_uri')=='$IMAGE_URI' for i in d.get('images',[])))" 2>/dev/null || echo False)
 
 if [ "$already_enabled" = "True" ]; then
-    echo "==> image $IMAGE_URI already enabled; skipping bake"
+    echo "==> image $IMAGE_URI already enabled; skipping build+enable"
 else
-    echo "==> baking demo image @ $SHORT"
-    cargo build --release -p engram-cli >/dev/null 2>&1
-    cargo build --release --target x86_64-unknown-linux-musl \
-        -p engram-agentd >/dev/null 2>&1
-    "$ENGRAM_CLI" image build \
-        --repo integration-test/demo \
-        --tag "warm-$SHORT" \
-        --source deploy/demo \
-        --format ext4 \
-        --images-dir ./var/integration/images \
-        --inject-init \
-        --push "$IMAGE_URI" \
-        2>&1 | tail -3
-    # Base snapshot is captured at enable time (ADR 0020), not at bake — the
-    # old --capture-canonical-* flags were removed from `engram-cli image build`.
-
-    echo "==> enable image over app-gRPC (blocks until the enable job is ready)"
-    # ADR 0051 + ADR 0036: `image enable` enables AND polls the async
-    # enable job internally, returning non-zero on job failure.
-    if ! "$ENGRAM_CLI" image enable --uri "$IMAGE_URI" --config deploy/demo/image-config.toml; then
-        echo "ERROR: enabling $IMAGE_URI failed (enable job did not reach ready)" >&2
-        exit 1
-    fi
-    echo "    enable job ready"
+    # ADR 0080 phase 3b: one build+enable choreography — docker build +
+    # push a PLAIN docker image, enable (host-side materialize +
+    # capture), and wait for digest-ready. Shared with the CI e2e lane;
+    # prints the same $IMAGE_URI computed above.
+    echo "==> build + enable demo image @ $SHORT (via integration-bake-demo.sh)"
+    IMAGE_URI=$(bash deploy/dev/integration-bake-demo.sh)
+    echo "    enabled $IMAGE_URI"
 fi
 
 # Look for an existing dev-session row (status=active, this image,

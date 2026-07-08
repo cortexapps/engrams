@@ -324,6 +324,41 @@ pub trait HostClient: Send + Sync {
         ))
     }
 
+    /// ADR 0080 §C: materialize a STANDARD docker/OCI image into a
+    /// chunked bootable ext4 on this host — pull, whiteout-aware
+    /// flatten, stage-1 init injection, deterministic mke2fs pack,
+    /// chunk into the host's chunk store (which writes through to
+    /// BlobStorage, so the returned manifest is durable and readable
+    /// coordinator-side). The enable scanner calls this on a picked
+    /// host during the `materializing` stage; sibling of
+    /// [`Self::build_base_snapshot`] (same streaming/lease shape).
+    ///
+    /// `platform_os`/`platform_arch` are OCI platform strings
+    /// (`"linux"`, `"amd64" | "arm64"`); the host validates them
+    /// against its own arch and fails loud on a mismatch.
+    /// `registry_auth` carries coordinator-resolved STATIC basic-auth
+    /// creds; `None` = anonymous or the host's ambient resolver.
+    /// `progress` receives a [`crate::types::MaterializeProgress`] per
+    /// stage transition plus a keepalive re-send at least every 30 s —
+    /// implementors send best-effort (`try_send`), a slow consumer
+    /// must never stall the materialize.
+    ///
+    /// Default errors so mocks / capability-less hosts opt out; the
+    /// local + gRPC clients delegate to the backend's
+    /// `materialize_image`.
+    async fn materialize_image(
+        &self,
+        _image_uri: &str,
+        _platform_os: &str,
+        _platform_arch: &str,
+        _registry_auth: Option<crate::types::registry::ResolvedRegistryAuth>,
+        _progress: tokio::sync::mpsc::Sender<crate::types::MaterializeProgress>,
+    ) -> Result<crate::types::MaterializedImage, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `materialize_image`".into(),
+        ))
+    }
+
     /// ADR 0020 P1: restore a per-image base snapshot for a session
     /// and inject the per-session env. Called by `create_session` on a
     /// base-snapshot hit. ADR 0021 P1.5 retired the option-D
