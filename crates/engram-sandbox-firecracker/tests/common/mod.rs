@@ -14,7 +14,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
+use engram_core::types::image::OciRuntimeDefaults;
 use engram_core::types::sandbox::ExecEvent;
+use engram_rootfs_materializer::{
+    inject_init, recommended_size, recursive_size, Ext4Packer, InitInjection, Mke2fsPacker,
+};
 use futures::StreamExt;
 
 /// Successful preflight: paths to the cached vmlinux + ext4 rootfs.
@@ -363,5 +368,177 @@ pub fn stage_agentd_bundle(bundle_dir: &Path, agentd_binary: &Path) -> StagedAge
         bundle_dir: bundle_dir.to_path_buf(),
         squashfs_sha: agentd_sha,
         binary_sha,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0080 §D: docker-free fixture rootfs bake.
+//
+// Phase 4 retired the docker-based image bake (docker build + export + mke2fs).
+// The FC integration tests only ever baked a minimal rootfs whose whole
+// userland is `/bin/sh` + coreutils (agentd is static musl, so the guest
+// needs no glibc), so we build that tree directly from a static busybox and
+// pack it with the SAME `Mke2fsPacker` + stage-1 init the enable-time
+// materializer uses. Tests that needed extra binaries (`socat`, `curl`, a
+// gcc-built probe, a COPY'd harness) lay them onto the tree in the
+// `customize` closure — [`copy_host_tool_with_closure`] copies a dynamically
+// linked host tool + its `ldd` closure so the property each test asserts is
+// unchanged. NO docker anywhere.
+// ---------------------------------------------------------------------------
+
+/// Result of [`bake_fixture_ext4`] — the retired bake's `BuildOutcome`
+/// shape the FC tests still consume (`rootfs_path` + the chunked
+/// `disk_manifest`).
+pub struct BakedFixture {
+    pub rootfs_path: PathBuf,
+    pub disk_manifest: Option<ManifestRef>,
+    pub runtime_defaults: OciRuntimeDefaults,
+}
+
+/// Static busybox from the runner — the fixture guest's whole userland. The
+/// FC CI lane apt-installs `busybox-static`; dev boxes usually have one of the
+/// standard paths (or set `BUSYBOX_STATIC`). Returns `None` (callers
+/// `SKIP:`) when absent, mirroring [`require_bin`].
+pub fn find_busybox() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("BUSYBOX_STATIC") {
+        let p = PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    ["/bin/busybox", "/usr/bin/busybox", "/sbin/busybox"]
+        .iter()
+        .map(Path::new)
+        .find(|p| p.is_file())
+        .map(Path::to_path_buf)
+}
+
+/// Lay a minimal FHS skeleton + a static busybox (with an applet symlink for
+/// EVERY applet `busybox --list` reports) into `tree`. That gives the guest
+/// `/bin/sh` (ash), the coreutils the stage-1 shim runs
+/// (mount/mkdir/cat/cp/chmod/cut/…), and the userland the exec assertions
+/// invoke (`echo`, `head`, `ip`, `ping`, `setsid`, …). Static busybox has no
+/// shared-library deps, so nothing else is required for it to run.
+pub fn busybox_rootfs(tree: &Path, busybox: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in [
+        "bin",
+        "sbin",
+        "dev",
+        "etc",
+        "opt",
+        "proc",
+        "root",
+        "run",
+        "sys",
+        "tmp",
+        "usr/bin",
+        "usr/sbin",
+        "usr/local/bin",
+        "workspace",
+    ] {
+        std::fs::create_dir_all(tree.join(dir))?;
+    }
+    let bb = tree.join("bin/busybox");
+    std::fs::copy(busybox, &bb)?;
+    std::fs::set_permissions(&bb, std::fs::Permissions::from_mode(0o755))?;
+    // Symlink every applet busybox ships to it, so `bin/<applet>` resolves.
+    let list = std::process::Command::new(busybox).arg("--list").output()?;
+    for applet in String::from_utf8_lossy(&list.stdout).split_whitespace() {
+        // Applets are bare names; skip any with a path component (defensive).
+        if applet.is_empty() || applet.contains('/') {
+            continue;
+        }
+        let link = tree.join("bin").join(applet);
+        if !link.exists() {
+            std::os::unix::fs::symlink("busybox", &link)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy a dynamically-linked host tool (`tool`, an absolute path — resolve
+/// via [`which`]) into `tree` at `guest_rel` (e.g. `usr/bin/socat`) together
+/// with every shared object `ldd` reports, preserving each `.so`'s host path
+/// inside the tree. The docker-free way to give a fixture a real `socat` /
+/// `curl` without an apt layer; the KVM CI runner + dev-vm have these on the
+/// host. Best-effort on the closure (a static tool reports none).
+pub fn copy_host_tool_with_closure(
+    tree: &Path,
+    tool: &Path,
+    guest_rel: &str,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let place = |src: &Path, rel: &str| -> std::io::Result<()> {
+        let dst = tree.join(rel.trim_start_matches('/'));
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, &dst)?;
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    };
+    place(tool, guest_rel)?;
+    // `ldd` prints lines like `libx.so => /path/libx.so (0x...)` plus the
+    // dynamic loader `/lib64/ld-linux-...`. Copy every absolute path it names
+    // to that same path inside the tree.
+    let ldd = std::process::Command::new("ldd").arg(tool).output()?;
+    for line in String::from_utf8_lossy(&ldd.stdout).lines() {
+        for token in line.split_whitespace() {
+            if token.starts_with('/') {
+                let src = Path::new(token);
+                if src.is_file() {
+                    place(src, token)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ADR 0080 §D: bake a fixture ext4 rootfs WITHOUT docker. Lays the busybox
+/// skeleton into a scratch tree, runs `customize` on it (COPY-equivalents:
+/// extra files / [`copy_host_tool_with_closure`] tools), injects the stage-1
+/// init shim (`init`), `Mke2fsPacker`-packs it into `out_ext4`, and chunks it
+/// into `chunk_store` (content-derived manifest, like the retired bake).
+/// Gate callers with `require_bin("mke2fs")` + [`find_busybox`].
+pub async fn bake_fixture_ext4(
+    out_ext4: &Path,
+    chunk_store: &ChunkStore,
+    busybox: &Path,
+    init: Option<InitInjection>,
+    customize: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> BakedFixture {
+    let tree = tempfile::tempdir().expect("fixture tree dir");
+    busybox_rootfs(tree.path(), busybox).expect("busybox skeleton");
+    customize(tree.path()).expect("fixture customize");
+    if let Some(injection) = &init {
+        inject_init(tree.path(), injection)
+            .await
+            .expect("inject stage-1 init");
+    }
+    if let Some(parent) = out_ext4.parent() {
+        std::fs::create_dir_all(parent).expect("out_ext4 parent");
+    }
+    let dir_size = recursive_size(tree.path()).await.expect("recursive_size");
+    Mke2fsPacker::default()
+        .pack(tree.path(), out_ext4, recommended_size(dir_size))
+        .await
+        .expect("mke2fs pack (is a >=1.47.1 mke2fs on PATH / ENGRAM_MKE2FS?)");
+    // Chunk the ext4 into the content-addressed store, mirroring the retired
+    // Builder's ext4 branch: content-derived ref, idempotent put.
+    let manifest = chunk_store
+        .chunk_file(out_ext4, ManifestKind::Disk, None)
+        .await
+        .expect("chunk fixture ext4");
+    let manifest_ref = manifest.content_ref();
+    if chunk_store.get_manifest(manifest_ref).await.is_err() {
+        chunk_store
+            .put_manifest(manifest_ref, &manifest)
+            .await
+            .expect("put fixture manifest");
+    }
+    BakedFixture {
+        rootfs_path: out_ext4.to_path_buf(),
+        disk_manifest: Some(manifest_ref),
+        runtime_defaults: OciRuntimeDefaults::default(),
     }
 }

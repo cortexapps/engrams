@@ -1,6 +1,6 @@
 # 0080 — Plain-Dockerfile session images: dynamic agentd, out-of-band ImageConfig, host-side materialization
 
-Status: Proposed (2026-07-07)
+Status: Accepted (2026-07-07)
 
 Builds on: ADR 0036 (per-chunk artifacts + async enable), ADR 0055
 (uniform dynamic mounts), ADR 0057 (unified session policy — the half
@@ -251,6 +251,66 @@ in the request; GCP workload identity resolved host-side
 (`engram-oci-auth`). Per-session latency: zero — materialize is
 enable/rebase-time only.
 
+**Phase 3b divergences (implementation):**
+
+- **Wire v14** — `MaterializeImage` is the exact two-task
+  server-streaming shape of `BuildBaseSnapshot` (progress frames
+  strictly precede the one terminal frame; stream-death before a
+  terminal synthesizes the retryable `transport` kind, the sibling of
+  `WarmExecTransport`). The `done` frame ALSO carries
+  `manifest_digest`: the host's `pull_docker_manifest` resolves the
+  platform manifest anyway (for the pre-pull size cap), so the digest
+  ships back instead of the coordinator making a second platform-aware
+  pull. Digest-pinning for capture is kept, but the capture VM boots
+  from the freshly materialized chunked ext4 via
+  `spec.rootfs_manifest` (the ADR 0028 Fix-B override) — there is no
+  artifact for the host's image cache to pull; the pinned URI is
+  record-keeping.
+- **Chunk-store seam** — no explicit upload step. The host's pooled
+  chunk store is `ChunkStore::new(blob)` (BlobStorage-durable) with
+  the NVMe cache as a write-through *local* tier (ADR 0078 phase 1),
+  so the materializer's `chunk_file` + `put_manifest` land durably in
+  BlobStorage as a side effect and the coordinator (and every
+  prefetching host) reads the manifest directly — the same seam the
+  snapshot path uses.
+- **Auth split, concretely** — the coordinator resolves + `CredCipher`-
+  decrypts only `Static` rows and ships user/pass (`Option<
+  ResolvedRegistryAuth>` bincode, redacted `Debug`); GcpWorkloadIdentity /
+  Anonymous / no-row ship `None`, and the host then uses its EXISTING
+  ambient resolver — the image-cache `OciClient` whose
+  `HttpAuthResolver` asks the coordinator per pull (covering GCP WI
+  centrally), falling back to anonymous on hosts without one.
+- **Platform** — the request carries `linux/<coordinator arch>`
+  (deployments are same-arch coord+hosts) and the HOST validates it
+  against its own arch, failing loud on a mismatch. A mixed-arch fleet
+  needs an arch-aware materialize/capture picker before it can work —
+  recorded as an explicit non-goal here.
+- **Disk veto placement** — the ADR 0078 tier-0 disk floor went INTO
+  `pick_capture_host` (now shared verbatim by capture and materialize)
+  as `host_disk_floor_ok`, kept in lockstep with
+  `named_host_fit_veto`'s `disk_full` arm — fixing the pre-existing
+  "capture picker ignores disk" gap for both jobs at once.
+- **Scratch location** — `<work_dir>/materialize-scratch`, a SIBLING
+  of `chunk-cache` (same volume, so the statvfs headroom check
+  measures the disk that fills) rather than inside the cache root:
+  the cache sweeper owns that directory's contents and must not race
+  a live materialize. Orphaned per-run subdirs (host-agent death
+  mid-run) are swept by a startup reconcile.
+- **Job progress mapping** — the enable job's `chunks_done/chunks_total`
+  counters are vestigial post-3b (the coordinator no longer pushes
+  chunks); stage frames render as `materialize[<stage>] <detail>` into
+  the existing `output_tail` column via a new claim-renewing
+  `update_enable_job_materialize_progress` (no schema change), and the
+  host re-sends the latest stage every 20 s as the ≤30 s keepalive.
+- **Enqueue-time validation** — a KB-sized `pull_docker_manifest`
+  probe (coordinator arch, sibling-arch fallback, either accepted)
+  replaces the artifact metadata pull; `create_or_get_enable_job` now
+  takes `manifest_digest = None` and the digest is stamped at
+  materialize time from the platform manifest actually used.
+- **3a API extension** — `Materializer::materialize` grew an optional
+  progress sender (stage transitions only; keepalive cadence is the
+  caller's) and `Materialized`/`PulledImage` gained `manifest_digest`.
+
 ### D. Purification
 
 ttyd → `guest-tools` bundle (agentd's `shell.rs` resolves it from the
@@ -261,6 +321,70 @@ as workspace requirements). `engram-image-builder`,
 `just bake-demo` are deleted; dev flow becomes
 `docker build && docker push localhost:5001/… && engram image enable
 --config …`.
+
+**Phase 4 divergences (implementation):**
+
+- **`guest-tools` slot layout** — `GUEST_TOOLS_SLOT_INDEX = 2`
+  (`dyn_2`, stamp key `guest-tools`), skills shift to `dyn_3..`
+  (`FIRST_SKILL_SLOT_INDEX = 3`, `MAX_SKILL_SLOTS = RESERVED_SLOTS - 3`).
+  Unlike agentd (§A, HARD at capture), guest-tools is SOFT everywhere:
+  the coordinator's `resolve_guest_tools_mount` pins the fleet
+  generation on fresh creates but warns + returns `None` on a
+  bundle-less fleet; VZ's `resolve_agentd_slot` resolves it if staged
+  and otherwise leaves the slot symbolic (skipped at attach); agentd's
+  `shell.rs::resolve_ttyd_bin` probes the dyn mounts for `ttyd`
+  (`ENGRAM_TTYD_BIN` → bundle mount → the legacy `/usr/local/bin/ttyd`
+  image path, with a loud warn on fallback). The `guest-tools` bundle
+  (`deploy/bundles/guest-tools/build.sh`) downloads a **pinned,
+  per-arch sha256-verified** static ttyd (tsl0922 GitHub release
+  1.7.7) and packs it reproducibly via `_pack.sh`. Detector: it lives
+  entirely under `deploy/bundles/` (a pinned download, no crate), so
+  `bundles |= guest_tools_changed` is already covered by the
+  `BUNDLES_PATHS` path rule — no closure term needed (contrast agentd,
+  a compiled crate).
+- **Fixture migration, no docker** — retiring `engram-image-builder`
+  broke every FC/host-agent integration test that baked a rootfs via
+  `Builder` + `docker build`. They now bake through a shared
+  `common::bake_fixture_ext4`: a static-busybox userland (every
+  `busybox --list` applet symlinked) + the stage-1 `inject_init` +
+  the SAME `Mke2fsPacker` the materializer uses, chunked into the test
+  chunk store. Tests that needed real tools get them WITHOUT an apt
+  layer: `copy_host_tool_with_closure` copies a host `socat`/`curl` +
+  its `ldd` closure (proxy tests), and the epoll probe is compiled
+  host-side with `cc -static` (two_host_live_teleport). Each test's
+  asserted property is unchanged; `require_bin("docker")` gates
+  dropped, a static-busybox gate added. e2e_shell now exercises the
+  `/usr/local/bin/ttyd` fallback path (the bundle-resolve path is
+  covered by the coordinator + VZ resolution above).
+- **mke2fs moves to the host-agent image** — the only mke2fs left is
+  the enable-time materializer's, which runs in the host-agent
+  container. `debian:trixie` (the runtime base) ships e2fsprogs
+  1.47.2 (matches the flake pin), so `docker/host-agent.Dockerfile`
+  keeps the apt `e2fsprogs` but adds a build-time
+  `mke2fs -V >= 1.47.1` assertion (fail loud if a base bump regresses
+  determinism) and `ENV ENGRAM_MKE2FS=/usr/sbin/mke2fs`. `cli-tools`
+  no longer bundles the static mke2fs (its `nix build .#mke2fs-static`
+  step + the detector's flake→cli_tools trigger retired). macOS/VZ dev
+  points `ENGRAM_MKE2FS` at homebrew's keg-only e2fsprogs in the
+  Tiltfile.
+- **Bake-path deletions** — `bake-dev-image.yml` (the reusable
+  external-repo bake) deleted; `ci.yml`'s `bake-demo-image` converted
+  from an `engram-cli image build --push` job to a plain
+  `docker/build-push-action` buildx build+push (the prod demo image
+  still publishes, just as a standard OCI image); `just bake` +
+  `deploy/dev/{bake-demo,integration-bake-demo}.sh` are
+  `docker build && docker push`. `deploy/demo/Dockerfile` drops the
+  ttyd multi-stage COPY and the `.bashrc` bake (both now engrams-owned
+  via the guest-tools bundle + stage-1 init).
+
+## Commit chain
+
+- P1 (dynamic agentd): #603 `3ea55caf`
+- P2a (ImageConfig + UpdateImage core/wire): #604 `a1e478e2`
+- P2b (surface: web form + orchestrator authz + e2e): #605 `9b9526e6`
+- P3a (`engram-rootfs-materializer` crate + fixture tests): #606 `286ecbf5`
+- P3b (`MaterializeImage` host RPC, wire v14 + pipeline switch): #607
+- P4 (purification + retirement, this branch): flips this ADR to Accepted.
 
 ## Alternatives rejected
 

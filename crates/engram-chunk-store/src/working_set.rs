@@ -18,7 +18,7 @@
 //! hosts don't race over a single trace file. The chunk-store API
 //! can also publish a "canonical" trace under
 //! `traces/<manifest_id>/canonical.json` for base images (captured
-//! at bake time by `engram-image-builder`).
+//! at bake time by `engram-rootfs-materializer`).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,7 @@ pub struct TraceRef {
 }
 
 impl TraceRef {
-    /// Canonical trace produced by `engram-image-builder` for a
+    /// Canonical trace produced by `engram-rootfs-materializer` for a
     /// base image. Loaded by every host on first restore of that
     /// image, before vCPUs run.
     pub fn canonical(manifest_id: Uuid) -> Self {

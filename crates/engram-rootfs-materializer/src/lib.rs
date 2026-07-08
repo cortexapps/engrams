@@ -69,6 +69,10 @@ pub struct Materialized {
     /// persisted by the enable pipeline, merged under the admin
     /// `ImageConfig` at session create.
     pub oci_defaults: OciRuntimeDefaults,
+    /// Digest (`sha256:<hex>`) of the platform-resolved docker image
+    /// manifest that was materialized — the enable row's
+    /// `manifest_digest` (keeps digest-pinning for capture).
+    pub manifest_digest: String,
     /// Size of the packed ext4 in bytes.
     pub ext4_size_bytes: u64,
 }
@@ -183,24 +187,47 @@ impl Materializer {
     /// and is scrubbed whatever the outcome; the only durable outputs
     /// are the chunks + manifest committed to `chunk_store` and the
     /// returned [`Materialized`].
+    ///
+    /// `progress` (phase 3b): best-effort stage frames (`try_send`),
+    /// one per pipeline stage transition — the `MaterializeImage` RPC
+    /// forwards them coord-ward; the keepalive cadence (≤30 s) is the
+    /// CALLER's job (it re-sends the last frame), this crate only
+    /// signals honest transitions. `None` = silent (tests, the bake).
     pub async fn materialize(
         &self,
         image_uri: &str,
         platform: Platform,
         scratch_dir: &Path,
         chunk_store: &ChunkStore,
+        progress: Option<tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>>,
     ) -> Result<Materialized, MaterializeError> {
+        use engram_core::types::{MaterializeProgress, MaterializeStage};
+        let report = |stage: MaterializeStage, detail: Option<String>| {
+            if let Some(tx) = &progress {
+                let _ = tx.try_send(MaterializeProgress { stage, detail });
+            }
+        };
+
         tokio::fs::create_dir_all(scratch_dir).await?;
         let work = scratch_dir.join(format!("materialize-{}", uuid::Uuid::new_v4().simple()));
         let _guard = ScratchGuard { dir: work.clone() };
 
         // 1. Pull.
+        report(MaterializeStage::Pull, Some(format!("{platform}")));
         let layers_dir = work.join("layers");
         let pulled = pull::pull_image(&self.oci, image_uri, platform, &layers_dir).await?;
 
         // 2. Flatten (sync tar/decompress IO — off the async runtime).
         // Each layer file is deleted as soon as it's applied, so the
         // scratch peak during the flatten is tree + ONE layer.
+        report(
+            MaterializeStage::Flatten,
+            Some(format!(
+                "{} layers, {} compressed bytes",
+                pulled.layers.len(),
+                pulled.compressed_bytes
+            )),
+        );
         let rootfs = work.join("rootfs");
         tokio::fs::create_dir_all(&rootfs).await?;
         let tree_meta = {
@@ -220,7 +247,8 @@ impl Materializer {
                         LayerCompression::Zstd => flatten::apply_layer(
                             &rootfs,
                             &mut meta,
-                            zstd::stream::read::Decoder::new(reader)?,
+                            ruzstd::decoding::StreamingDecoder::new(reader)
+                                .map_err(|e| std::io::Error::other(e.to_string()))?,
                         )?,
                         LayerCompression::None => flatten::apply_layer(&rootfs, &mut meta, reader)?,
                     }
@@ -278,6 +306,7 @@ impl Materializer {
         }
 
         // 4. Deterministic pack: clamp mtimes, then mke2fs.
+        report(MaterializeStage::Pack, None);
         {
             let rootfs_c = rootfs.clone();
             tokio::task::spawn_blocking(move || ext4::clamp_mtimes(&rootfs_c))
@@ -300,6 +329,10 @@ impl Materializer {
         // scratch peak drops to just the ext4.
         let _ = tokio::fs::remove_dir_all(&rootfs).await;
         let ext4_size_bytes = tokio::fs::metadata(&ext4_path).await?.len();
+        report(
+            MaterializeStage::Chunk,
+            Some(format!("{ext4_size_bytes} ext4 bytes")),
+        );
 
         // 5. Chunk into the content-addressed store. Identity is
         // content-derived (ADR 0036): a deterministic re-materialize
@@ -332,6 +365,7 @@ impl Materializer {
         Ok(Materialized {
             disk_manifest,
             oci_defaults: pulled.oci_defaults,
+            manifest_digest: pulled.manifest_digest,
             ext4_size_bytes,
         })
         // _guard drops here → scratch subdir scrubbed.

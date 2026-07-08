@@ -37,7 +37,7 @@
 //! - `engram-uffd-handler` — UFFD page-fault handler that resolves
 //!   guest memory faults to memory-manifest chunks (FC backend)
 //! - `engram-sandbox-vz::disk` — materialize-to-file for macOS dev
-//! - `engram-image-builder` — chunks new image bake outputs
+//! - `engram-rootfs-materializer` — chunks bake/materialize outputs
 
 pub mod bootstrap;
 pub mod cache;

@@ -1,38 +1,26 @@
 #!/usr/bin/env bash
-# `just bake-demo` — bake deploy/demo/ and push it to the LOCAL OCI
-# registry (localhost:5001, the registry `just dev` runs). ADR 0024.
-# Switch-free: detect-backend.sh + `uname` decide the arch.
+# `just bake-demo` — build deploy/demo/ as a PLAIN docker image and
+# push it to the LOCAL OCI registry (localhost:5001, the registry
+# `just dev` runs). ADR 0024; ADR 0080 phase 3b: the engram-artifact
+# bake is retired from this flow — enable-time host-side
+# materialization (MaterializeImage) turns the pushed docker image
+# into the chunked bootable ext4, so this script is now the exact
+# user contract: `docker build && docker push`.
 #
 # ADR 0062: the image carries NO harness. The built-in `claude` harness is a
 # per-session selection that rides the fleet `current_bundles` stamp (staged
-# via `just bundles-squashfs` / `bundles-vz`), not baked into the image — so
-# this script only bakes the rootfs + agentd.
+# via `just bundles-squashfs` / `bundles-vz`), not baked into the image.
+# ADR 0080: agentd is NOT in the image either — it rides the `agentd`
+# bundle; the stage-1 init shim is injected at enable-time materialize.
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-: "${ENGRAM_KEK_MASTER_KEY:?run \`just bootstrap\` first to generate a KEK}"
-
-# Detect the sandbox backend (once, reused below).
-backend="$(bash deploy/dev/detect-backend.sh)"
-
-# On macOS/VZ, check that e2fsprogs (mke2fs) is available for ext4 image building.
-# (Registry pushes require ext4 format; directory format is local-only.)
-if [ "$backend" = "vz" ]; then
-    PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
-    if ! command -v mke2fs >/dev/null 2>&1; then
-        echo "Error: mke2fs not found. VZ image builds require e2fsprogs." >&2
-        echo "" >&2
-        echo "Install it with:" >&2
-        echo "  brew install e2fsprogs" >&2
-        exit 1
-    fi
-fi
-
 REGISTRY="localhost:5001"
 
-# Dev bakes target the host's own arch (the base image is pinned via
-# --platform on arm64 below).
+# Dev builds target the host's own arch (the base image is pinned via
+# --platform on arm64 below so the guest binaries match the VZ/FC
+# guest kernel arch).
 case "$(uname -m)" in
     arm64 | aarch64) ARM=1 ;;
     x86_64 | amd64)  ARM=0 ;;
@@ -41,43 +29,25 @@ case "$(uname -m)" in
         exit 1
         ;;
 esac
-# All backends now use the vsock transport. VZ migrated off the
-# virtio-console bridge onto Apple's real VZVirtioSocketDevice in ADR
-# 0066 Phase 2 — the Kata guest kernel VZ boots ships
-# CONFIG_VIRTIO_VSOCKETS=y, so vsock works there just like it does on
-# Firecracker (and it muxes concurrent streams per port, so the port
-# relay is head-of-line-free).
-TRANSPORT=vsock
 
-# ADR 0080: agentd is NOT baked into the image — it rides the `agentd`
-# bundle (staged by `just bundles-squashfs` / `just bundles-vz`); the bake
-# injects only the stage-1 init shim.
-echo "==> build cli"
-cargo build --release -p engram-cli
-
-# Stage the image source; pin the debian base to the guest arch on
-# arm64 so the rootfs binaries match the kernel (mirrors vz-bake-demo).
+# Stage the image source; pin the base images to the guest arch on
+# arm64 (mirrors integration-bake-demo.sh).
 STAGING="./var/bake/demo"
 rm -rf "$STAGING"
 mkdir -p "$STAGING"
 cp deploy/demo/Dockerfile "$STAGING/Dockerfile"
 if [ "$ARM" = "1" ]; then
-    sed -i.bak 's|^FROM debian:|FROM --platform=linux/arm64 debian:|' "$STAGING/Dockerfile"
+    sed -i.bak 's|^FROM |FROM --platform=linux/arm64 |' "$STAGING/Dockerfile"
     rm -f "$STAGING/Dockerfile.bak"
 fi
 
-echo "==> bake demo -> $REGISTRY/demo:warm-1"
-./target/release/engram-cli image build \
-    --repo demo \
-    --tag warm-1 \
-    --source "$STAGING" \
-    --format ext4 \
-    --images-dir ./var/bake/_staging \
-    --transport "$TRANSPORT" \
-    --inject-init \
-    --push "$REGISTRY/demo"
+echo "==> docker build + push demo -> $REGISTRY/demo:warm-1"
+docker build -t "$REGISTRY/demo:warm-1" "$STAGING"
+docker push "$REGISTRY/demo:warm-1"
 
 echo ""
 echo "✓ pushed $REGISTRY/demo:warm-1"
 echo "  enable it: engram image enable --uri $REGISTRY/demo:warm-1 --config deploy/demo/image-config.toml"
+echo "  (the enable materializes on a host — the host-agent needs mke2fs on"
+echo "   PATH, or ENGRAM_MKE2FS pointing at one; macOS: brew install e2fsprogs)"
 echo "  or create a session against --image $REGISTRY/demo:warm-1"

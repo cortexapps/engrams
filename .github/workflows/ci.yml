@@ -30,14 +30,12 @@ name: CI
 #                       patch_drive_swap, option_d_warm_lease.
 #   - web:              pnpm install + oxlint + tsc + vite build +
 #                       vitest
-#   - bake-demo-image:  push-to-main only. Bakes the canonical
-#                       deploy/demo rootfs as a chunked-OCI artifact
-#                       and pushes to
-#                       `ghcr.io/cortexapps/engrams/demo:warm-<sha>`
-#                       (+ :main / :latest aliases). Relocated from
-#                       engrams-internal/bake-demo-image.yml so the
-#                       prod demo image and the test image come from
-#                       one publish path.
+#   - bake-demo-image:  push-to-main only. ADR 0080: a plain
+#                       `docker build && docker push` of deploy/demo
+#                       to `ghcr.io/cortexapps/engrams/demo:warm-<sha>`
+#                       (+ :main / :latest aliases). The coordinator
+#                       materializes the rootfs host-side at enable —
+#                       no bake CLI, no agentd/ttyd injection.
 #   - artifacts-e2e-stack: release-builds engram-coordinator +
 #                       engram-host-agent + engram-cli + musl
 #                       engram-agentd ONCE and uploads as a workflow
@@ -323,8 +321,6 @@ jobs:
 
       # Default (non-ignored) tests across the entire workspace. Mirrors
       # `just check`'s nextest pass — same speedup, same coverage. The
-      # engram-image-builder e2e bake test skips itself if `docker` is
-      # not on PATH; ubuntu-latest ships Docker, so it runs. The
       # GCS-emulator round-trip uses STORAGE_EMULATOR_HOST set above.
       #
       # `--no-fail-fast` reports every failing test instead of stopping
@@ -682,15 +678,19 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           sudo chmod 0666 /dev/userfaultfd
 
-      # `mke2fs` (e2fsprogs) is needed by the exec_real_vm test for
-      # ext4 packing. `musl-tools` is for the static agentd build that
-      # the same test bakes into the rootfs. `squashfs-tools` (mksquashfs)
-      # is for `just bundles-squashfs`, which stages the `browser` bundle
-      # the e2e_vnc test mounts (ADR 0064).
-      - name: Install build deps (musl-tools, e2fsprogs, squashfs-tools)
+      # `mke2fs` (e2fsprogs) is needed by the exec_real_vm +
+      # materialize_boot tests for ext4 packing. `musl-tools` is for the
+      # static agentd build that the same tests bake into the rootfs.
+      # `squashfs-tools` (mksquashfs) is for `just bundles-squashfs`,
+      # which stages the `browser` bundle the e2e_vnc test mounts (ADR
+      # 0064), and for the agentd-bundle staging in
+      # agentd_bundle_reexec/materialize_boot. `busybox-static` is the
+      # materialize_boot guest's entire userland (ADR 0080 phase 3b —
+      # the synthetic docker image's one real binary).
+      - name: Install build deps (musl-tools, e2fsprogs, squashfs-tools, busybox-static)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq musl-tools e2fsprogs squashfs-tools
+          sudo apt-get install -y -qq musl-tools e2fsprogs squashfs-tools busybox-static
 
       # Stock firecracker — matches the deployed fork's upstream base (v1.16.0)
       # so the existing FC suite + the stock<->fork compat test exercise the
@@ -858,6 +858,7 @@ jobs:
             --test snapshot_uffd \
             --test exec_real_vm \
             --test agentd_bundle_reexec \
+            --test materialize_boot \
             --test baked_harness_loopback \
             --test forge_loopback \
             --test upload_loopback \
@@ -1246,12 +1247,11 @@ jobs:
   # publish path. Push-to-main only (PRs don't need to push; the
   # e2e lane bakes its own image locally for test isolation).
   #
-  # ADR 0062: ONE `demo` image — the workspace rootfs (debian + git +
-  # ttyd) with NO harness baked in. The harness is a per-session
-  # selection: the built-in `claude` rides the fleet `current_bundles`
-  # stamp (staged onto hosts by node-assets from the
-  # `bake-harness-claude-artifact` job), not injected into this image.
-  # Prod points here for the default session and selects
+  # ADR 0062/0080: ONE `demo` image — the workspace rootfs (debian +
+  # git/curl/socat/iproute2) with NO harness, NO agentd, and NO ttyd
+  # baked in. The harness (`claude`), agentd, and ttyd (`guest-tools`)
+  # all ride the fleet `current_bundles` stamp, staged onto hosts by
+  # node-assets. Prod points here for the default session and selects
   # `harness = "claude"` per session.
   #
   # Publishes `ghcr.io/cortexapps/engrams/demo:warm-<sha>` (plus the
@@ -1274,62 +1274,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ''
-          target: x86_64-unknown-linux-musl
-
-      # ADR 0013: engram-protocol/build.rs needs protoc.
-      # Install protoc via apt: arduino/setup-protoc@v3 with a pinned
-      # version *still* called the GH releases API to validate and
-      # 401'd with "Bad credentials" on a not-rare-enough fraction
-      # of runs. Ubuntu 24.04's protobuf-compiler ships 3.21.12,
-      # well above tonic-build/prost-build's minimum, and `apt`
-      # never hits the GH API — deterministic, ~2s.
-      - name: Install protoc
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
-          protoc --version
-
-      - name: Install musl tooling
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
-
-      # Parallel linker for the native-gnu portion (the musl agentd
-      # build uses musl-gcc's bundled ld and is unaffected).
-      - name: Setup mold linker
-        uses: rui314/setup-mold@v1
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          # Shared with artifacts-e2e-stack: both build release host
-          # binaries (engram-cli + others) AND musl-target release
-          # agentd. The release+musl dep graph is sizeable and very
-          # stable across commits — the shared cache saves ~1-2min
-          # on whichever job runs second. Shares the key with
-          # artifacts-e2e-stack because their cargo build inputs are
-          # identical (the image source is not a compile input).
-          shared-key: release-musl-bake
-
-      - name: Build engram-cli + static-musl agentd
-        run: |
-          # Static-musl agentd is packed into `bundle-agentd` by
-          # `just bundles-squashfs` (ADR 0080 — nothing injects it into a
-          # rootfs anymore). (ADR 0015 M1 collapsed engram-bootstrap
-          # into engram-agentd, `75ba2df`.)
-          cargo build --release --target x86_64-unknown-linux-musl \
-              -p engram-agentd
-          # engram-cli runs on the host to drive the bake + push.
-          cargo build --release -p engram-cli
-
-      - name: Stage ${{ matrix.variant }} source
-        run: |
-          # ADR 0080: the image source is just the Dockerfile — runtime
-          # config is applied at enable time (image-config.toml), never baked.
-          mkdir -p var/${{ matrix.variant }}
-          cp deploy/${{ matrix.variant }}/Dockerfile  var/${{ matrix.variant }}/
-
+      # ADR 0080: a session image is a plain `docker build && docker push`
+      # of a standard OCI image — no engram-cli bake, no agentd/ttyd
+      # injection, no ext4 pack. The coordinator materializes the rootfs
+      # host-side (MaterializeImage) at enable time. So this job is now a
+      # straight buildx build+push, same shape as bake-images.yml.
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -1345,76 +1294,26 @@ jobs:
         run: |
           BASE="ghcr.io/${{ github.repository }}/$VARIANT"
           SHORT="${SHA:0:7}"
-          # `engram-cli image build --push` pushes to a single URI per
-          # call; we push once to the SHA-tagged variant and then
-          # alias :short / :latest / :main via crane.
-          echo "primary=$BASE:warm-$SHA" >> "$GITHUB_OUTPUT"
+          # buildx pushes every tag in one build — the :warm-<sha> pin plus
+          # the :warm-<short> / :main / :latest aliases prod points at.
           {
-            echo "extra_tags<<EOF"
+            echo "list<<EOF"
+            echo "$BASE:warm-$SHA"
             echo "$BASE:warm-$SHORT"
             echo "$BASE:main"
             echo "$BASE:latest"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Bake + push ${{ matrix.variant }} image
-        env:
-          # engram-cli's tracing subscriber defaults to `warn`. Bump
-          # to `info` for the image-builder crate so the bake log
-          # surfaces the chunked-rootfs push progress.
-          RUST_LOG: info,engram_image_builder=info,engram_oci=info
-          PUSH_URI: ${{ steps.tags.outputs.primary }}
-          VARIANT: ${{ matrix.variant }}
-        run: |
-          echo "Building + pushing $PUSH_URI"
-          # Binary follows the cargo package name (`engram-cli`); the
-          # `engram` you type at the shell is just clap's command-name,
-          # not the filename.
-          #
-          # ADR 0015 M5 (`18be1ad`) retired bake-time canonical
-          # memory capture along with the warm pool + `templates`
-          # table. Hot-tier startup is now driven by host prefetch
-          # of the chunked rootfs from BlobStorage on enable-image,
-          # not by a bake-time memory snapshot.
-          ./target/release/engram-cli image build \
-              --repo "${{ github.repository }}/$VARIANT" \
-              --tag "warm-${{ github.sha }}" \
-              --source "var/$VARIANT" \
-              --format ext4 \
-              --images-dir "var/engram/images-$VARIANT" \
-              --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \
-              --push "$PUSH_URI"
-          echo "Pushed: $PUSH_URI"
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Mirror primary tag to alias tags
-        env:
-          PRIMARY: ${{ steps.tags.outputs.primary }}
-          EXTRA_TAGS: ${{ steps.tags.outputs.extra_tags }}
-          # Pin crane (ADR 0021 reproducibility) instead of the moving
-          # `releases/latest/download/` redirect, which 404'd transiently
-          # while GitHub rotated the `latest` pointer mid-publish and
-          # flaked this step (one variant of the matrix failed while the
-          # other, running the same download, passed). Bump deliberately.
-          CRANE_VERSION: v0.21.7
-        run: |
-          # crane copies tags without re-uploading layers — saves
-          # bandwidth vs `docker pull && tag && push`. (The harness
-          # bake intentionally doesn't mirror to `:main` / `:latest`
-          # aliases — it sticks to the pinned `<version>-<platform>`
-          # tag per ADR 0021's reproducibility rule.)
-          # --retry-all-errors covers a transient 404/5xx on the asset
-          # CDN; --retry-delay backs off between attempts.
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
-            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
-            | sudo tar -xzf - -C /usr/local/bin crane
-          crane auth login ghcr.io \
-            -u "${{ github.actor }}" \
-            -p "${{ secrets.GITHUB_TOKEN }}"
-          while IFS= read -r tag; do
-            [ -z "$tag" ] && continue
-            echo "Mirroring $PRIMARY -> $tag"
-            crane copy "$PRIMARY" "$tag"
-          done <<< "$EXTRA_TAGS"
+      - name: Build + push ${{ matrix.variant }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/${{ matrix.variant }}/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
 
       - name: Summarize
         if: always()

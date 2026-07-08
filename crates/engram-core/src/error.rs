@@ -148,6 +148,13 @@ pub enum SandboxError {
     /// (`enable_scanner.rs`) reads `kind` to decide retryable vs.
     /// deterministic bail-fast.
     CaptureFailed(crate::types::CaptureFailure),
+    /// ADR 0080 §C: a structured `materialize_image` failure. The
+    /// `kind` drives the enable scanner's retryable-vs-bail-fast
+    /// classification exactly like `CaptureFailed` does for captures
+    /// (`MaterializeFailureKind::is_retryable`). The streaming RPC
+    /// carries it as a terminal `MaterializeImageFailed` frame so the
+    /// kind survives the wire.
+    MaterializeFailed(crate::types::MaterializeFailure),
 }
 
 impl fmt::Display for SandboxError {
@@ -174,6 +181,7 @@ impl fmt::Display for SandboxError {
             ),
             Self::Unsupported(msg) => write!(f, "host does not implement this RPC: {msg}"),
             Self::CaptureFailed(failure) => write!(f, "{failure}"),
+            Self::MaterializeFailed(failure) => write!(f, "{failure}"),
         }
     }
 }

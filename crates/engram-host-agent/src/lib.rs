@@ -45,6 +45,7 @@ pub mod idle_evictor;
 pub mod image_cache;
 pub mod image_prefetch;
 pub mod live_attach;
+pub mod materialize;
 pub mod metrics;
 pub mod orphan_reap;
 pub mod pooled_backend;
@@ -253,6 +254,16 @@ impl HostAgent {
                 }
                 if let Some((cs, dir)) = self.chunk_store.clone() {
                     p = p.with_chunk_store(cs, dir);
+                    // ADR 0080 §C: the MaterializeImage scratch root —
+                    // gated on the chunk store because a materialize
+                    // without one has nowhere durable to land. Same
+                    // volume as the chunk cache (work_dir), so the
+                    // statvfs headroom check measures the disk that
+                    // actually fills. Sweep orphans from a previous
+                    // generation that died mid-run before serving.
+                    let scratch = self.cfg.work_dir.join("materialize-scratch");
+                    crate::materialize::reconcile_scratch(&scratch);
+                    p = p.with_materialize_scratch(scratch);
                 }
                 if let Some(cache) = self.chunk_cache.clone() {
                     p = p.with_chunk_cache(cache);

@@ -51,7 +51,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::checkpoint::CheckpointRecord;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -116,7 +116,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         eprintln!("SKIP: /dev/kvm not present");
         return;
     }
-    for bin in ["firecracker", "docker", "mke2fs", "mksquashfs"] {
+    for bin in ["firecracker", "mke2fs", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)
@@ -125,6 +125,10 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
             return;
         }
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let agent = Path::new(&manifest_dir)
         .join("../../target/x86_64-unknown-linux-musl/release/engram-agentd");
@@ -137,9 +141,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         return;
     }
 
-    // ---- 1. Bake an agentd-injected rootfs ----
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
+    // ---- 1. Bake an agentd-injected rootfs (docker-free, ADR 0080 §D) ----
     let images = tempfile::tempdir().expect("images dir");
     let work = tempfile::tempdir().expect("work dir");
     let blob_root = work.path().join("blob");
@@ -148,22 +150,18 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         engram_storage_local::LocalBlobStorage::new(blob_root.clone()),
     );
     let bake_chunk_store = engram_chunk_store::ChunkStore::new(bake_blob);
-    let baker = Builder::new(DockerCli::new(), bake_chunk_store.clone());
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-evict-finalize-test".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("ext4 bake with agent injection");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &bake_chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |_tree| Ok(()),
+    )
+    .await;
 
     // ---- 2. Generation A: PooledBackend wrapping a GATED chunk store ----
     let gate = Arc::new(tokio::sync::Notify::new());

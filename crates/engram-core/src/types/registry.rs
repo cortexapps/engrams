@@ -96,6 +96,30 @@ impl RegistryAuthSpec {
     }
 }
 
+/// ADR 0080 §C: RESOLVED static basic-auth registry creds, shipped
+/// coord→host inside a `MaterializeImage` request (bincode in
+/// `registry_auth_bincode`). The coordinator decrypts a `Static` row
+/// via `CredCipher` and sends plain user/pass for the one pull; `None`
+/// on the wire means "anonymous, or resolve host-side via the host's
+/// ambient resolver" (GCP workload identity / public registries).
+/// Never persisted host-side.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ResolvedRegistryAuth {
+    pub username: String,
+    pub password: String,
+}
+
+// Manual Debug: the password is a live secret — never let a stray
+// `{:?}` (tracing, error context) leak it into logs.
+impl std::fmt::Debug for ResolvedRegistryAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedRegistryAuth")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Public-facing view: the encrypted payload + any future secret-
 /// adjacent fields are omitted so API responses can render this
 /// directly without leaking ciphertext.

@@ -24,13 +24,33 @@ FROM debian:trixie-slim
 # Runtime deps the host-agent shells out to (on the GCE/Packer hosts
 # these come from the node image; the K8s host-agent image must carry
 # them itself — ADR 0044 K1):
-#   - e2fsprogs: mke2fs, to materialize the per-sandbox ext4 rootfs
+#   - e2fsprogs: mke2fs, to materialize the per-sandbox ext4 rootfs AND
+#     (ADR 0080 §C) the enable-time image materialization. This is now
+#     the ONLY mke2fs in the pipeline (the bake path retired), so its
+#     determinism matters: ADR 0036 needs an e2fsprogs that honors
+#     SOURCE_DATE_EPOCH (>= 1.47.1) or re-materializing unchanged content
+#     stamps wall-clock times and breaks chunk dedup / base-snapshot
+#     reuse. debian:trixie ships e2fsprogs 1.47.2 (matches the flake pin),
+#     so the apt mke2fs is fine — but we ASSERT the floor below so a base
+#     bump that regresses it fails the image build loudly.
 #   - iproute2:  ip, for the tap device + guest netns
 #   - iptables:  egress NAT / firewall rules for guest networking
 # (ca-certificates: TLS to the blob backend — GCS/S3.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates e2fsprogs iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
+# ADR 0080/0036: fail the build if the base's mke2fs predates the
+# SOURCE_DATE_EPOCH support that deterministic packing relies on.
+RUN set -eux; \
+    ver="$(mke2fs -V 2>&1 | sed -n 's/^mke2fs \([0-9][0-9.]*\).*/\1/p' | head -1)"; \
+    echo "e2fsprogs mke2fs: $ver"; \
+    [ "$(printf '1.47.1\n%s\n' "$ver" | sort -V | head -1)" = "1.47.1" ] || { \
+        echo "mke2fs $ver < 1.47.1 — deterministic ext4 pack broken (ADR 0036); pin a newer base or bundle a static mke2fs" >&2; \
+        exit 1; }
+# ADR 0080: host-agent's materializer resolves mke2fs via ENGRAM_MKE2FS
+# first (engram_rootfs_materializer::ext4::resolve_mke2fs). Pin it at the
+# apt path so the resolution never depends on PATH ordering or a sibling.
+ENV ENGRAM_MKE2FS=/usr/sbin/mke2fs
 COPY --from=builder /tmp/engram-host-agent /usr/local/bin/engram-host-agent
 # ADR 0044 K2: the UFFD memory-restore handler. On the GCE/Packer hosts it
 # came from the node image; the K8s host-agent image must carry it (a PATH

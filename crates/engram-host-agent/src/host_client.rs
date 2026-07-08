@@ -267,6 +267,25 @@ impl HostClient for LocalHostClient {
             .await
     }
 
+    async fn materialize_image(
+        &self,
+        image_uri: &str,
+        platform_os: &str,
+        platform_arch: &str,
+        registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
+    ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
+        self.sandbox
+            .materialize_image(
+                image_uri,
+                platform_os,
+                platform_arch,
+                registry_auth,
+                progress,
+            )
+            .await
+    }
+
     async fn restore_base_for_session(
         &self,
         metadata: SnapshotMetadata,

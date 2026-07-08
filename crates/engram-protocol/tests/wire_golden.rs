@@ -311,6 +311,28 @@ fn struct_payloads_golden() {
     // `Vec<WarmStageRecord>` — the `CaptureProgress.warm_stages_bincode`
     // payload (issue #539). `WarmStageRecord` derives `PartialEq`.
     assert_golden("warm_stages", &warm_stages());
+
+    // ADR 0080 phase 3b (wire v14) — the MaterializeImage payloads.
+    // `Option<ResolvedRegistryAuth>` crosses coord→host in
+    // `registry_auth_bincode` (pin the `Some` shape; the empty-buffer
+    // `None` never reaches bincode). `OciRuntimeDefaults` crosses
+    // host→coord in `MaterializeImageDone.oci_defaults_bincode`
+    // (single-entry map for determinism). Neither derives `PartialEq`
+    // usefully here (ResolvedRegistryAuth has no `PartialEq`); pin bytes.
+    assert_golden_no_eq(
+        "resolved_registry_auth",
+        &Some(engram_core::types::registry::ResolvedRegistryAuth {
+            username: "robot$puller".into(),
+            password: "hunter2".into(),
+        }),
+    );
+    assert_golden_no_eq(
+        "oci_runtime_defaults",
+        &engram_core::types::image::OciRuntimeDefaults {
+            env: HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]),
+            workdir: Some("/workspace".into()),
+        },
+    );
 }
 
 #[test]
@@ -382,8 +404,14 @@ fn wire_version_pinned() {
     // WarmConfig (inside warm_bincode) gains `env`. Neither type is in
     // the golden corpus (SessionEgressPolicy itself is unchanged), so
     // bincode goldens are unchanged.
+    // 13 -> 14: ADR 0080 phase 3b — the new server-streaming
+    // `MaterializeImage` RPC (host-side materialization of standard
+    // docker images). NEW bincode payloads only (`ResolvedRegistryAuth`
+    // coord→host; `ManifestRef` — already pinned — and
+    // `OciRuntimeDefaults` host→coord), goldens ADDED for the new
+    // shapes; every existing golden is byte-identical.
     assert_eq!(
-        WIRE_VERSION, 13,
+        WIRE_VERSION, 14,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -429,6 +457,22 @@ fn regen_golden() {
         },
     );
     write("warm_stages", &warm_stages());
+    // ADR 0080 phase 3b — MaterializeImage payloads (see
+    // struct_payloads_golden for the shapes' rationale).
+    write(
+        "resolved_registry_auth",
+        &Some(engram_core::types::registry::ResolvedRegistryAuth {
+            username: "robot$puller".into(),
+            password: "hunter2".into(),
+        }),
+    );
+    write(
+        "oci_runtime_defaults",
+        &engram_core::types::image::OciRuntimeDefaults {
+            env: HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]),
+            workdir: Some("/workspace".into()),
+        },
+    );
 
     write("secret_mode_literal", &SecretMode::Literal);
     write("secret_mode_broker", &SecretMode::Broker);
@@ -457,5 +501,48 @@ fn regen_golden() {
             files_skipped_unparseable: 1,
             files_skipped_too_young: 2,
         },
+    );
+}
+
+/// ADR 0080 prod regression (dev-brain enable): `WarmConfig.env` holds
+/// `CaptureEnvValue`, an internally-tagged serde enum — bincode cannot
+/// DECODE that representation (`deserialize_any`), so a non-empty
+/// `[[warm.env]]` crossing the wire fails host-side at capture. The
+/// coordinator therefore ships a STRIPPED wire clone (env cleared,
+/// network dropped — both are coordinator concerns per the wire-v13
+/// contract). This test pins both halves: the stripped shape
+/// round-trips, and the tagged shape still fails decode — if a future
+/// serde change makes the tagged enum bincode-safe, the second assert
+/// fires and the strip (plus this test) can be retired.
+#[test]
+fn warm_config_wire_shape_round_trips_only_when_stripped() {
+    use engram_core::types::image::{CaptureEnvEntry, CaptureEnvValue, WarmConfig};
+
+    let stripped = WarmConfig {
+        command: vec!["bash".into(), "-lc".into(), "/opt/engram/warm.sh".into()],
+        timeout_secs: Some(3300),
+        workdir: Some("/workspace".into()),
+        env: Vec::new(),
+        network: None,
+    };
+    let bytes = bincode::serialize(&Some(stripped.clone())).expect("encode stripped");
+    let back: Option<WarmConfig> = bincode::deserialize(&bytes).expect("decode stripped");
+    assert_eq!(back.as_ref().map(|w| &w.command), Some(&stripped.command));
+
+    let tagged = WarmConfig {
+        env: vec![CaptureEnvEntry {
+            name: "OP_SERVICE_ACCOUNT_TOKEN".into(),
+            value: CaptureEnvValue::SecretRef {
+                secret_ref: "gcp-sm://x".into(),
+            },
+        }],
+        ..stripped
+    };
+    let bytes = bincode::serialize(&Some(tagged)).expect("tagged encode currently succeeds");
+    let res: Result<Option<WarmConfig>, _> = bincode::deserialize(&bytes);
+    assert!(
+        res.is_err(),
+        "tagged CaptureEnvValue became bincode-decodable — retire the coordinator's \
+         wire-strip in enabled_images.rs and this pin together"
     );
 }

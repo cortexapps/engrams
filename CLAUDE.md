@@ -34,11 +34,13 @@ layer: how to build, test, and the conventions we hold.
 
 ## Repo map
 
-**Rust workspace** (`crates/`, ~36 members). Key binaries:
+**Rust workspace** (`crates/`, ~35 members). Key binaries:
 `engram-coordinator`, `engram-host-agent`, `engram-host-operator` (K8s rollout, ADR
 0044), `engram-uffd-handler` (FC snapshot page-faulting, Linux-only), `engram-agentd`,
-`engram-cli` (admin CLI → coordinator app-gRPC), `engram-harness-claude`,
-`engram-image-builder`. Notable libraries: `engram-core` (shared traits:
+`engram-cli` (admin CLI → coordinator app-gRPC), `engram-harness-claude`.
+(ADR 0080 retired `engram-image-builder`: a session image is a plain `docker build
+&& docker push`, materialized host-side at enable time.) Notable libraries:
+`engram-core` (shared traits:
 `SandboxBackend`, `HarnessHub`, `BlobStorage`, `MetadataStore`, `GitForge`, …),
 `engram-protocol` (control-plane wire types), `engram-sandbox-{firecracker,vz,process}`,
 `engram-chunk-store` (content-addressed storage, ADR 0007), `engram-rootfs-materializer`

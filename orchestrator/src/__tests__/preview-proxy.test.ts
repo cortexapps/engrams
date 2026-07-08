@@ -7,6 +7,7 @@
  */
 
 import { expect, test, describe } from "bun:test";
+import { gzipSync } from "node:zlib";
 import { Hono } from "hono";
 import { create } from "@bufbuild/protobuf";
 
@@ -64,8 +65,9 @@ const asUser = (id: string, role?: string) => async () => ({ user: { id, role } 
 
 /** A PortRelay that ignores the request and replies with a canned HTTP/1.1
  * response — i.e. behaves like the guest origin for one round-trip. */
-function fakeRelayServing(responseText: string): PortRelayClient {
-  const bytes = new TextEncoder().encode(responseText);
+function fakeRelayServing(responseText: string | Uint8Array): PortRelayClient {
+  const bytes =
+    typeof responseText === "string" ? new TextEncoder().encode(responseText) : responseText;
   return {
     relay(inbound: AsyncIterable<RelayPortRequest>) {
       return (async function* () {
@@ -242,6 +244,34 @@ describe("preview proxy middleware (HTTP)", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/plain");
     expect(await res.text()).toBe("hello world");
+  });
+
+  test("strips content-encoding/content-length when fetch decompressed the body", async () => {
+    // Guest origin gzips its response (as e.g. an Express/Vite dev server does
+    // when the browser sends Accept-Encoding). Bun's fetch transparently
+    // decompresses the body; forwarding the original headers with the
+    // decompressed bytes is exactly net::ERR_CONTENT_DECODING_FAILED.
+    const body = gzipSync(Buffer.from("hello gzipped world"));
+    const head =
+      "HTTP/1.1 200 OK\r\n" +
+      "Content-Type: text/html\r\n" +
+      "Content-Encoding: gzip\r\n" +
+      `Content-Length: ${body.length}\r\n` +
+      "\r\n";
+    const canned = Buffer.concat([Buffer.from(head), body]);
+
+    const app = appWith(fakeRelayServing(new Uint8Array(canned)));
+    const res = await app.request("http://jumping-fat-kittens.lvh.me:8787/", {
+      headers: {
+        host: "jumping-fat-kittens.lvh.me:8787",
+        "accept-encoding": "gzip, deflate, br",
+      },
+    });
+    expect(res.status).toBe(200);
+    // The forwarded headers must describe the (decompressed) body we forward.
+    expect(res.headers.get("content-encoding")).toBeNull();
+    expect(res.headers.get("content-length")).not.toBe(String(body.length));
+    expect(await res.text()).toBe("hello gzipped world");
   });
 
   test("non-preview host falls through to the app", async () => {

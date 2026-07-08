@@ -39,7 +39,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_harness_proto::{read_msg, write_msg, RelayAck, RelayConnect, PROXY_PORT_VSOCK_PORT};
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -71,9 +71,18 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
+    // `ip` is a busybox applet (loopback bring-up); socat comes from the host.
+    let Some(socat) = common::which("socat") else {
+        eprintln!("SKIP: socat not on host PATH");
+        return;
+    };
 
     // ---- 0. Prebuilt musl agentd (carries the ADR 0066 port relay). ----
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
@@ -92,41 +101,31 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
     }
 
     // ---- 1. Bake a minimal image with socat (concurrent loopback servers). ----
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(
-        src.path().join("Dockerfile"),
-        // `iproute2` for `ip link set lo up` — this minimal test image's default
-        // init doesn't bring up loopback, and the relay dials `127.0.0.1` (prod
-        // guest images bring `lo` up; dev servers there bind loopback fine).
-        "FROM debian:bookworm-slim\n\
-         RUN apt-get update && apt-get install -y --no-install-recommends socat coreutils iproute2 \
-         && rm -rf /var/lib/apt/lists/*\n\
-         RUN mkdir -p /workspace\n",
-    )
-    .unwrap();
-
+    // `ip` (busybox applet) brings `lo` up — this minimal test image's default
+    // init doesn't, and the relay dials `127.0.0.1` (prod guest images bring
+    // `lo` up; dev servers there bind loopback fine). socat + its ldd closure
+    // ride in via the customize closure.
     let images = tempfile::tempdir().expect("images dir");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
     let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
         engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
     );
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let baker = Builder::new(DockerCli::new(), chunk_store);
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "proxy-port-loopback-test".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("ext4 bake with agent injection");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |tree| {
+            common::copy_host_tool_with_closure(tree, &socat, "usr/bin/socat")?;
+            Ok(())
+        },
+    )
+    .await;
 
     // ---- 2. FC backend + sandbox. ----
     let work = tempfile::tempdir().expect("work dir");

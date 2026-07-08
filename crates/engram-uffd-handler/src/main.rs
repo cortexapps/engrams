@@ -169,7 +169,7 @@ mod linux {
         pub trace_output: Option<PathBuf>,
         /// ADR 0014 M1.14: when set, bypass `pick_blob_backend`'s
         /// env-var lookup and `LocalBlobStorage::new(this)` directly.
-        /// Used by the image-builder's profile pass, where the bake
+        /// Used by the bake/materialize profile pass, where the bake
         /// already knows its chunk-store root and the UFFD handler
         /// needs to read from the same place — env-var-driven
         /// resolution would mis-locate it because the bake uses a
@@ -202,7 +202,7 @@ mod linux {
         /// writer (its singleflight / pins / budget govern) and this
         /// handler performs the readiness Hello BEFORE creating the
         /// base-shm file or binding the FC-facing UDS. When unset
-        /// (tests, image-builder profile pass), misses take the
+        /// (tests, the bake/materialize profile pass), misses take the
         /// direct-blob fallback.
         pub substrate_sock: Option<PathBuf>,
     }
@@ -476,7 +476,7 @@ mod linux {
                         // spawn in production. Run fallback-only rather
                         // than paying the per-miss retry budget against
                         // a socket that will not appear (FC test suites
-                        // and the image-builder profile pass hit this
+                        // and the bake/materialize profile pass hit this
                         // arm by design).
                         tracing::warn!(
                             error = %e,
@@ -670,7 +670,7 @@ mod linux {
         // ADR 0014 M1.14: dump the trace to a local file first, so a
         // later publish_trace failure (e.g., the bake's blob root
         // has a different layout than runtime's) doesn't lose the
-        // recorded data. The image-builder's profile pass reads
+        // recorded data. The bake/materialize profile pass reads
         // this file back to stage the trace as an OCI layer.
         if let Some(path) = args.trace_output.as_ref() {
             let bytes = serde_json::to_vec(&trace)
@@ -712,7 +712,7 @@ mod linux {
 
     /// `ENGRAM_BLOB_BACKEND` (default `local`) decides backend.
     /// Mirrors the convention every other Engram crate uses (see
-    /// `engram_image_builder::blob`, `engram_coordinator::blob`,
+    /// `engram_rootfs_materializer`, `engram_coordinator::blob`,
     /// `engram_host_agent::blob`).
     ///
     /// Local-mode blob root resolves from `ENGRAM_LOCAL_PATH/blobs`

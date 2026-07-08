@@ -4,18 +4,22 @@
 //! Stage C (and ADR 0015 M5): this is the single source of truth for
 //! "what images can a session use." ADR 0080: Postgres stores the URI
 //! plus the RPC-supplied `image_config` (name/description/env/workdir/
-//! resources/warm) and the artifact's Dockerfile-derived `oci_defaults`
-//! — the bake carries no metadata — so `POST /sessions` resolves the
-//! effective config from a Postgres row without going to the registry
-//! on the hot path. The dashboard's image picker reads from here.
+//! resources/warm) and the image's Dockerfile-derived `oci_defaults`
+//! — the image carries no engrams metadata — so `POST /sessions`
+//! resolves the effective config from a Postgres row without going to
+//! the registry on the hot path. The dashboard's image picker reads
+//! from here.
 //!
-//! ADR 0015 M5: enable is asynchronous but simple — fetch the OCI
-//! artifact metadata, validate the config, push the chunked rootfs into
-//! BlobStorage so hosts can prefetch from it, capture the base snapshot
-//! under the job's config, upsert the row. The `templates` cascade
-//! (snapshot materialization, warm-pool waiting) is gone; hosts diff
-//! `enabled_images` against their local `ready_images` set on every
-//! heartbeat and prefetch what's missing.
+//! ADR 0080 phase 3b: enable is asynchronous and the heavy lifting is
+//! HOST-side — validate the config + a KB-sized docker-manifest probe,
+//! `MaterializeImage` on a disk-healthy host (which pulls the STANDARD
+//! docker image, flattens, packs a bootable ext4, and chunks it into
+//! its write-through chunk store → BlobStorage), capture the base
+//! snapshot from the materialized manifest under the job's config,
+//! upsert the row. Old engram OCI artifacts can no longer be enabled
+//! (clean break; existing rows keep working — their chunks are already
+//! in BlobStorage). Hosts diff `enabled_images` against their local
+//! `ready_images` set on every heartbeat and prefetch what's missing.
 //!
 //! The verbs live on the app-gRPC `ImageService` (`grpc_app/image.rs`):
 //! EnableImage (config inherit-on-unset; required first enable),
@@ -26,82 +30,73 @@
 //! re-enabling clears `soft_deleted_at`).
 
 use chrono::Utc;
-use engram_core::types::image::{ImageConfig, OciRuntimeDefaults};
+use engram_core::types::image::ImageConfig;
+use engram_core::types::registry::{RegistryAuthSpec, ResolvedRegistryAuth};
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::EnabledImage;
+use engram_oci_auth::AuthStrategy;
 use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
 
-/// Pull the engram OCI artifact metadata at `image_uri` and build the
-/// `EnabledImage` row ready to upsert (ADR 0080: `config` is the
-/// RPC-supplied ImageConfig riding the enable job — the artifact carries
-/// no runtime config; only the Dockerfile-derived `runtime_defaults` in
-/// its config blob). Also returns the full `TemplateArtifacts` so the
-/// caller can push chunked-rootfs layers into BlobStorage.
-pub(crate) async fn fetch_and_seal_artifact(
-    state: &SharedState,
-    image_uri: &str,
-    config: &ImageConfig,
-) -> Result<(EnabledImage, engram_oci::TemplateArtifacts), ApiError> {
-    config
-        .validate()
-        .map_err(|e| ApiError::BadRequest(format!("image config for `{image_uri}`: {e}")))?;
-    let artifacts = state
-        .services
-        .oci
-        .pull_template_metadata(image_uri)
-        .await
-        .map_err(|e| {
-            ApiError::BadRequest(format!(
-                "registry pull for `{image_uri}` failed: {e}. \
-                 Check that the URI is correct and that a matching \
-                 registry credential exists if the registry requires auth."
-            ))
-        })?;
-
-    // ADR 0080: the artifact's config blob must carry the
-    // Dockerfile-derived `runtime_defaults`. FAIL LOUD on a pre-0080
-    // artifact (which shipped manifest.toml instead) — silently
-    // defaulting would strip the Dockerfile ENV/WORKDIR from every
-    // session of this image.
-    let oci_defaults = extract_runtime_defaults(&artifacts.config_json)
-        .map_err(|e| ApiError::BadRequest(format!("artifact config blob at `{image_uri}`: {e}")))?;
-
-    let now = Utc::now();
-    let row = EnabledImage {
-        id: Uuid::new_v4(),
-        image_uri: image_uri.to_string(),
-        image_config: config.clone(),
-        oci_defaults,
-        manifest_digest: artifacts.manifest_digest.as_str().to_string(),
-        // Stamped by the caller after `materialize_disk_chunks`
-        // returns the bake's ManifestRef (or `None` for harness-only).
-        disk_manifest: None,
-        // Stamped by the caller after `capture_and_record_base_snapshot`.
-        // The DB column is NOT NULL, so the upsert only succeeds once
-        // this is set — enforcing "enabled iff base snapshot exists".
-        base_snapshot_id: None,
-        // ADR 0021 P2: stamped by the caller from the captured snapshot's
-        // disk + memory manifests, alongside base_snapshot_id. `None` until then.
-        base_snapshot_disk_manifest: None,
-        base_snapshot_memory_manifest: None,
-        last_refreshed_at: now,
-        created_at: now,
-        updated_at: None,
-        // Newly enabled or refreshed → always live. The upsert's
-        // ON CONFLICT branch in PG flips `soft_deleted_at = NULL`
-        // explicitly, so even an existing soft-deleted row gets
-        // undeleted by re-enabling.
-        soft_deleted_at: None,
-    };
-    Ok((row, artifacts))
+/// The OCI platform-arch string of THIS coordinator process. ADR 0080
+/// phase 3b ships it in `MaterializeImage` — coordinator and hosts are
+/// same-arch per deployment (prod GCE, dev-vm, mac VZ alike), and the
+/// host validates against its own arch, so a mismatch fails loud
+/// instead of materializing the wrong platform.
+pub(crate) fn coord_platform_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        _ => "amd64",
+    }
 }
 
-/// Shared enable/update/refresh tail: validate the artifact (metadata
-/// pull, ADR 0080 runtime_defaults check) and create-or-get the enable
-/// job carrying `config`.
+/// ADR 0080 phase 3b: cheap enqueue-time validation that `image_uri`
+/// names a pullable STANDARD docker/OCI image — a KB-sized manifest
+/// probe through the coordinator's own auth resolver, so a typo'd URI
+/// or missing credential fails the POST with an actionable 400 instead
+/// of burning scanner attempts. Probes the coordinator's arch first
+/// and falls back to the sibling arch (accepting either): the
+/// authoritative platform choice happens at materialize time on the
+/// picked host, this is only "does the image exist and can we auth".
+pub(crate) async fn validate_plain_image(
+    state: &SharedState,
+    image_uri: &str,
+) -> Result<(), ApiError> {
+    let primary = coord_platform_arch();
+    let fallback = if primary == "arm64" { "amd64" } else { "arm64" };
+    let first_err = match state
+        .services
+        .oci
+        .pull_docker_manifest(image_uri, "linux", primary)
+        .await
+    {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
+    if state
+        .services
+        .oci
+        .pull_docker_manifest(image_uri, "linux", fallback)
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest(format!(
+        "registry probe for `{image_uri}` failed: {first_err}. Check that the URI names a \
+         standard docker/OCI image (engram artifacts can no longer be enabled — push with \
+         `docker build && docker push`) and that a matching registry credential exists if \
+         the registry requires auth."
+    )))
+}
+
+/// Shared enable/update/refresh tail: validate the config + the image
+/// reference (manifest probe) and create-or-get the enable job
+/// carrying `config`. The manifest digest is stamped later by the
+/// scanner from the platform manifest the host actually materializes —
+/// enqueue passes `None` rather than guessing a platform here.
 ///
 /// In-flight-config guard (check-then-act, admin-visible): re-POSTing an
 /// enable is a resume, so `create_or_get_enable_job` returns the
@@ -114,11 +109,14 @@ pub(crate) async fn enqueue_enable_job(
     image_uri: &str,
     config: &ImageConfig,
 ) -> Result<engram_core::types::EnableJob, ApiError> {
-    let (_row, artifacts) = fetch_and_seal_artifact(state, image_uri, config).await?;
+    config
+        .validate()
+        .map_err(|e| ApiError::BadRequest(format!("image config for `{image_uri}`: {e}")))?;
+    validate_plain_image(state, image_uri).await?;
     let job = state
         .services
         .meta
-        .create_or_get_enable_job(image_uri, Some(artifacts.manifest_digest.as_str()), config)
+        .create_or_get_enable_job(image_uri, None, config)
         .await?;
     if &job.image_config != config {
         return Err(ApiError::Conflict(format!(
@@ -132,89 +130,152 @@ pub(crate) async fn enqueue_enable_job(
     Ok(job)
 }
 
-/// Parse the artifact config blob's `runtime_defaults` (ADR 0080). A
-/// missing key means a pre-0080 artifact — an actionable error, not a
-/// default.
-fn extract_runtime_defaults(config_json: &[u8]) -> Result<OciRuntimeDefaults, String> {
-    let v: serde_json::Value =
-        serde_json::from_slice(config_json).map_err(|e| format!("not valid JSON: {e}"))?;
-    let field = v.get("runtime_defaults").cloned().ok_or_else(|| {
-        "missing `runtime_defaults` — this artifact predates ADR 0080; re-bake and re-push \
-         the image with a current `engram image build`"
-            .to_string()
-    })?;
-    serde_json::from_value(field).map_err(|e| format!("malformed `runtime_defaults`: {e}"))
-}
-
-/// ADR 0015 M5: push the chunked rootfs into BlobStorage at the
-/// content-addressed key for each chunk, plus the reconstructed
-/// `Manifest` at the disk `ManifestRef`. Hosts' prefetch loop reads
-/// from BlobStorage; nothing else feeds it.
-///
-/// Bundle without disk chunks (`disk_bootstrap_json` and
-/// `bundle_json` both `None`) is silently accepted — that's the
-/// harness-builder pattern (bake produced just a manifest layer).
-pub(crate) async fn materialize_disk_chunks(
+/// ADR 0080 phase 3b: resolve the STATIC registry credential for
+/// `image_uri`'s registry host, decrypted coordinator-side (CredCipher
+/// via the deployment KEK) so the host receives ready-to-use basic
+/// auth in the `MaterializeImage` request. Non-static rows
+/// (GcpWorkloadIdentity / Anonymous) and missing rows resolve to
+/// `None` — the host's ambient resolver covers those per-pull.
+pub(crate) async fn resolve_static_registry_auth(
     state: &SharedState,
     image_uri: &str,
-    artifacts: &engram_oci::TemplateArtifacts,
-    progress: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
-) -> Result<Option<engram_core::types::manifest::ManifestRef>, ApiError> {
-    let (Some(boot), Some(bundle_json)) = (
-        artifacts.disk_bootstrap_json.as_deref(),
-        artifacts.bundle_json.as_deref(),
-    ) else {
-        // Harness-only image: no chunked-disk artifact to materialize,
-        // no ManifestRef to stamp on the row. Pin-set will skip it
-        // via the partial index on `disk_manifest_id`.
+) -> Result<Option<ResolvedRegistryAuth>, ApiError> {
+    let registry = engram_oci::registry_host(image_uri)
+        .map_err(|e| ApiError::BadRequest(format!("image uri `{image_uri}`: {e}")))?;
+    let Some(row) = state
+        .services
+        .meta
+        .registry_credential_for_host(&registry)
+        .await?
+    else {
         return Ok(None);
     };
-    let bootstrap: engram_chunk_store::Bootstrap = serde_json::from_slice(boot)
-        .map_err(|e| ApiError::Internal(format!("parse disk bootstrap json: {e}")))?;
-    // ADR 0036 clean break: the materializer only speaks the
-    // per-chunk-blob shape. A v1 (monolithic chunks blob) artifact
-    // can't be enabled — its blob layer no longer has a consumer.
-    if !bootstrap.is_per_chunk() {
-        return Err(ApiError::BadRequest(format!(
-            "`{image_uri}` carries a pre-ADR-0036 monolithic chunk-blob artifact; \
-             re-bake the image with a current `engram image build` and push again"
-        )));
+    match row.auth {
+        RegistryAuthSpec::Static {
+            username,
+            wrapped_dek,
+            nonce,
+            ciphertext,
+            key_id,
+        } => {
+            let strategy = engram_oci_auth::StaticStrategy::seal_open(
+                state.services.kek.as_ref(),
+                username,
+                &wrapped_dek,
+                &nonce,
+                &ciphertext,
+                &key_id,
+            )
+            .await
+            .map_err(|e| {
+                ApiError::Internal(format!(
+                    "decrypt static registry credential for `{registry}`: {e}"
+                ))
+            })?;
+            let creds = strategy.fetch_creds().await.map_err(|e| {
+                ApiError::Internal(format!("registry credential for `{registry}`: {e}"))
+            })?;
+            Ok(Some(ResolvedRegistryAuth {
+                username: creds.username,
+                password: creds.password,
+            }))
+        }
+        RegistryAuthSpec::GcpWorkloadIdentity { .. } | RegistryAuthSpec::Anonymous => Ok(None),
     }
-    let manifest = bootstrap.to_manifest();
-    // The bake wrote bundle.json with the disk_manifest ref it used
-    // against its LOCAL chunk store. Hosts re-read that ref on
-    // prefetch to ask `chunk_store.get_manifest(ref)` — so we must
-    // materialize at the SAME ref, not a fresh one. Otherwise the
-    // host's lookup faults with `blob not found` (ADR 0015 M5
-    // integration-test regression caught by the dev-vm smoke).
-    let manifest_ref = parse_disk_manifest_ref(bundle_json).ok_or_else(|| {
-        ApiError::BadRequest(
-            "bundle.json missing or unparseable `disk_manifest` field; \
-             can't materialize chunks without knowing the canonical ref"
-                .into(),
-        )
-    })?;
-    let source = ChunkSource::Oci {
-        oci: state.services.oci.as_ref(),
-        image_uri,
-    };
-    let (wrote, deduped) = materialize_chunk_blob(
-        state.services.blob.as_ref(),
-        &state.services.chunk_store,
-        manifest_ref,
-        &bootstrap,
-        &manifest,
-        &source,
-        progress,
-    )
-    .await?;
+}
+
+/// ADR 0080 phase 3b: run the `materializing` stage on a host — pick a
+/// disk-healthy host (the capture picker's ADR 0078 disk floor),
+/// resolve static registry auth, and drive the streaming
+/// `MaterializeImage` RPC. `progress` receives the host's stage frames
+/// (the caller persists each as the job's progress line + claim
+/// renewal). Error mapping mirrors the capture RPC's: connect-time
+/// transport deaths and WIRE_VERSION skews become the retryable
+/// `Unavailable`; structured host failures keep their kind
+/// (`ApiError::MaterializeFailed`) for the scanner's classifier.
+pub(crate) async fn materialize_image_on_host(
+    state: &SharedState,
+    image_uri: &str,
+    progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
+) -> Result<engram_core::types::MaterializedImage, ApiError> {
+    let (host_id, host) =
+        crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
+            .await
+            .map_err(|e| {
+                ApiError::Unavailable(format!(
+                    "no host is available to materialize this image ({e:?}). \
+                     Register a disk-healthy host and retry the enable."
+                ))
+            })?;
+    let registry_auth = resolve_static_registry_auth(state, image_uri).await?;
+    let arch = coord_platform_arch();
     tracing::info!(
-        wrote,
-        deduped,
-        manifest = %manifest_ref,
-        "materialized disk chunks into BlobStorage",
+        %image_uri,
+        %host_id,
+        platform = %format!("linux/{arch}"),
+        static_auth = registry_auth.is_some(),
+        "materializing image on host for enable",
     );
-    Ok(Some(manifest_ref))
+    host.materialize_image(image_uri, "linux", arch, registry_auth, progress)
+        .await
+        .map_err(|e| match e {
+            engram_core::SandboxError::MaterializeFailed(failure) => ApiError::MaterializeFailed {
+                kind: failure.kind,
+                message: format!(
+                    "materialize `{image_uri}` on host {host_id} failed: {}",
+                    failure.message
+                ),
+            },
+            // Same retryable transport classes as the capture RPC
+            // (ADR 0050 C / issue #229): re-pick a host next attempt.
+            engram_core::SandboxError::Unavailable(msg) => ApiError::Unavailable(format!(
+                "materialize `{image_uri}` could not reach host {host_id}: {msg}"
+            )),
+            engram_core::SandboxError::WireSkew { host: hw, coord } => {
+                ApiError::Unavailable(format!(
+                    "materialize `{image_uri}` hit a WIRE_VERSION skew against host {host_id} \
+                     (host={hw}, coord={coord})"
+                ))
+            }
+            other => ApiError::Internal(format!(
+                "materialize `{image_uri}` on host {host_id} failed: {other}"
+            )),
+        })
+}
+
+/// Build the `EnabledImage` row skeleton for one enable job — the
+/// materialize + capture stages stamp
+/// `disk_manifest`/`oci_defaults`/`manifest_digest` and the
+/// base-snapshot refs onto it before the ready-time upsert.
+pub(crate) fn new_enable_row(image_uri: &str, config: &ImageConfig) -> EnabledImage {
+    let now = Utc::now();
+    EnabledImage {
+        id: Uuid::new_v4(),
+        image_uri: image_uri.to_string(),
+        image_config: config.clone(),
+        // Stamped from the MaterializeImage result (the Dockerfile
+        // ENV/WORKDIR out of the image config blob).
+        oci_defaults: Default::default(),
+        // Stamped from the MaterializeImage result (the digest of the
+        // platform manifest the host actually materialized).
+        manifest_digest: String::new(),
+        // Stamped from the MaterializeImage result (content-derived).
+        disk_manifest: None,
+        // Stamped after `capture_and_record_base_snapshot`. The DB
+        // column is NOT NULL, so the upsert only succeeds once this is
+        // set — enforcing "enabled iff base snapshot exists".
+        base_snapshot_id: None,
+        base_snapshot_disk_manifest: None,
+        base_snapshot_memory_manifest: None,
+        last_refreshed_at: now,
+        created_at: now,
+        updated_at: None,
+        // Newly enabled or refreshed → always live. The upsert's
+        // ON CONFLICT branch in PG flips `soft_deleted_at = NULL`
+        // explicitly, so even an existing soft-deleted row gets
+        // undeleted by re-enabling.
+        soft_deleted_at: None,
+    }
 }
 
 /// Verify a reuse-candidate base snapshot's chunks are actually present in
@@ -473,7 +534,18 @@ pub(crate) async fn capture_and_record_base_snapshot(
         allow_hosts: Vec::new(),
         allow_host_patterns: Vec::new(),
     };
-    let spec = crate::api::sessions::cold_boot_spec(&capture_uri, &config, None, capture_network);
+    // ADR 0080 phase 3b: the capture VM boots from the freshly
+    // MATERIALIZED chunked ext4 (`row.disk_manifest`, stamped by the
+    // `materializing` stage) — the explicit rootfs-manifest override,
+    // the same shape as ADR 0028's disk-only recovery. There is no
+    // engram OCI artifact for the host to pull anymore; `capture_uri`
+    // stays digest-pinned purely as record-keeping (`spec.image`).
+    let spec = crate::api::sessions::cold_boot_spec(
+        &capture_uri,
+        &config,
+        row.disk_manifest,
+        capture_network,
+    );
 
     let (host_id, host) =
         crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
@@ -523,17 +595,26 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // A warm failure is fail-loud — it surfaces here as a capture error
     // and aborts the enable.
     //
+    // The wire clone is STRIPPED to the fields the host executes
+    // (command/timeout/workdir). `env` and `network` are coordinator
+    // concerns — env is resolved into `capture_env` and network into
+    // `capture_egress` above (the wire-v13 contract: the host never
+    // interprets them) — and `env`'s `CaptureEnvValue` is an
+    // internally-tagged serde enum, which bincode cannot DECODE
+    // (`deserialize_any`): the first image with a non-empty
+    // `[[warm.env]]` failed capture host-side on exactly that (dev-brain,
+    // ADR 0080 rollout). Empty-vec/None round-trip fine.
+    //
     // Issue #539: `progress` receives live `CaptureProgress` events for
     // the call's lifetime — the caller (`enable_scanner::advance_one`)
     // drains it into a fenced `enable_jobs` write per event.
+    let wire_warm = config.warm.clone().map(|mut w| {
+        w.env = Vec::new();
+        w.network = None;
+        w
+    });
     let meta = host
-        .build_base_snapshot(
-            spec,
-            config.warm.clone(),
-            capture_env,
-            capture_egress,
-            progress,
-        )
+        .build_base_snapshot(spec, wire_warm, capture_env, capture_egress, progress)
         .await
         .map_err(|e| match e {
             engram_core::SandboxError::CaptureFailed(failure) => ApiError::CaptureFailed {
@@ -703,320 +784,21 @@ async fn resolve_capture_env(
     Ok(out)
 }
 
-/// Parse the bake's bundle.json and pull out its `disk_manifest`
-/// ref, the same key hosts ask the chunk store for at prefetch
-/// time. The bake serializes `ManifestRef` via serde so the field
-/// is a JSON object `{manifest_id, version}`. Returns `None` for
-/// missing/malformed bundles — caller surfaces as 400.
-fn parse_disk_manifest_ref(
-    bundle_json: &[u8],
-) -> Option<engram_core::types::manifest::ManifestRef> {
-    let v: serde_json::Value = serde_json::from_slice(bundle_json).ok()?;
-    let field = v.get("disk_manifest")?.clone();
-    serde_json::from_value(field).ok()
-}
-
-/// Where `materialize_chunk_blob` reads each chunk's bytes from.
-///
-/// `Map` serves chunks from memory (tests only). `Oci` pulls each
-/// chunk's own blob from the registry on demand (ADR 0036), so the
-/// coord never holds more than `CONCURRENCY` chunks at once — the bound
-/// that stops a multi-GiB image from OOM-killing the coord on enable.
-enum ChunkSource<'a> {
-    /// In-memory chunk map — only the materialize unit test constructs
-    /// this; prod always uses `Oci`.
-    #[cfg(test)]
-    Map(&'a std::collections::HashMap<engram_chunk_store::ChunkHash, bytes::Bytes>),
-    Oci {
-        oci: &'a engram_oci::OciClient,
-        image_uri: &'a str,
-    },
-}
-
-impl ChunkSource<'_> {
-    async fn fetch(
-        &self,
-        entry: &engram_chunk_store::BootstrapEntry,
-    ) -> Result<bytes::Bytes, ApiError> {
-        // `*self` copies the Copy ref-fields out (they're all `&_`), so
-        // the Oci arm gets `&str`/`&OciClient` rather than the
-        // double-refs match-ergonomics would bind on `match self`.
-        match *self {
-            #[cfg(test)]
-            ChunkSource::Map(map) => map.get(&entry.sha256).cloned().ok_or_else(|| {
-                ApiError::Internal(format!("test chunk map missing {}", entry.sha256))
-            }),
-            ChunkSource::Oci { oci, image_uri } => {
-                let digest = entry.blob_digest.as_deref().ok_or_else(|| {
-                    ApiError::Internal(format!(
-                        "bootstrap entry {} missing per-chunk blob digest (pre-ADR-0036 \
-                         artifact slipped past the is_per_chunk gate?)",
-                        entry.sha256
-                    ))
-                })?;
-                // One blob GET per chunk; a single transient registry
-                // hiccup (connection reset / partial body) shouldn't
-                // fail the whole enable. Retry with backoff — and back
-                // off much harder on 429s, which want a politer pause
-                // than connection blips (Retry-After is typically
-                // seconds-to-minutes).
-                const MAX_ATTEMPTS: u32 = 5;
-                let mut attempt = 1u32;
-                loop {
-                    match oci.pull_chunk(image_uri, digest, entry.length as u64).await {
-                        Ok(b) => break Ok(b),
-                        Err(e) if attempt < MAX_ATTEMPTS => {
-                            let rate_limited = e.to_string().contains("429");
-                            let backoff_ms =
-                                if rate_limited { 5_000 } else { 200 } * attempt as u64;
-                            tracing::warn!(
-                                chunk = %entry.sha256,
-                                attempt,
-                                rate_limited,
-                                error = %e,
-                                "chunk pull failed; retrying with backoff"
-                            );
-                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                            attempt += 1;
-                        }
-                        Err(e) => {
-                            break Err(ApiError::Internal(format!(
-                                "fetch chunk {} after {attempt} attempts: {e}",
-                                entry.sha256
-                            )))
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Push each chunk in `bootstrap` into BlobStorage at its
-/// content-addressed key, plus the reconstructed `Manifest` at
-/// `manifest_ref`. Content-addressing means chunks already present (a
-/// prior bake / re-enable / deterministic re-bake sharing chunks) are
-/// skipped — and with an `Oci` source they aren't even fetched, so a
-/// delta re-enable moves only delta bytes (ADR 0036). Bounded-parallel
-/// exists?-fetch-put keeps the wire busy without a thousand-deep
-/// sequential round-trip.
-///
-/// Returns (wrote, deduped) chunk counts.
-async fn materialize_chunk_blob(
-    blob: &dyn engram_core::traits::BlobStorage,
-    chunk_store: &engram_chunk_store::ChunkStore,
-    manifest_ref: engram_core::types::manifest::ManifestRef,
-    bootstrap: &engram_chunk_store::Bootstrap,
-    manifest: &engram_chunk_store::Manifest,
-    source: &ChunkSource<'_>,
-    progress: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
-) -> Result<(usize, usize), ApiError> {
-    use futures::stream::{FuturesUnordered, StreamExt};
-    let mut tasks = FuturesUnordered::new();
-    // Cap in-flight chunks: with an OciRange source each task holds a
-    // freshly-downloaded chunk (~chunk_size) until its put completes, so
-    // peak memory is ~CONCURRENCY × chunk_size. That bound is the whole
-    // point — it's what keeps a multi-GiB enable from OOM-killing the
-    // coord. GCS easily sustains this fan-out (5k writes/sec/bucket).
-    const CONCURRENCY: usize = 16;
-    let mut iter = bootstrap.entries.iter();
-    let mut written = 0usize;
-    let mut deduped = 0usize;
-
-    async fn process_one(
-        blob: &dyn engram_core::traits::BlobStorage,
-        source: &ChunkSource<'_>,
-        entry: engram_chunk_store::BootstrapEntry,
-    ) -> Result<bool, ApiError> {
-        let key = entry.sha256.storage_key();
-        // Content-addressed: a chunk already in BlobStorage is skipped,
-        // and (OciRange) never fetched.
-        if blob
-            .exists(&key)
-            .await
-            .map_err(|e| ApiError::Internal(format!("exists probe {}: {e}", entry.sha256)))?
-        {
-            return Ok(false);
-        }
-        let bytes = source.fetch(&entry).await?;
-        blob.put(&key, bytes)
-            .await
-            .map_err(|e| ApiError::Internal(format!("put chunk {}: {e}", entry.sha256)))?;
-        Ok(true)
-    }
-
-    for _ in 0..CONCURRENCY {
-        if let Some(entry) = iter.next() {
-            tasks.push(process_one(blob, source, entry.clone()));
-        }
-    }
-    while let Some(res) = tasks.next().await {
-        match res? {
-            true => written += 1,
-            false => deduped += 1,
-        }
-        // ADR 0036: progress counter for the enable job's
-        // chunks_done — counts every settled chunk (fetched or
-        // dedup-skipped); the scanner's checkpoint task persists it.
-        if let Some(p) = &progress {
-            p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        if let Some(entry) = iter.next() {
-            tasks.push(process_one(blob, source, entry.clone()));
-        }
-    }
-
-    // After every chunk landed, the manifest JSON itself goes in
-    // BlobStorage. host-agent's `chunk_store.get_manifest(mref)`
-    // resolves through the same backend; a manifest with missing
-    // chunks would be a footgun (faults on first read).
-    match chunk_store.get_manifest(manifest_ref).await {
-        Ok(_) => {
-            tracing::debug!(
-                manifest = %manifest_ref,
-                "manifest already present in BlobStorage; skipping put_manifest"
-            );
-        }
-        Err(_) => {
-            chunk_store
-                .put_manifest(manifest_ref, manifest)
-                .await
-                .map_err(|e| ApiError::Internal(format!("put_manifest {manifest_ref}: {e}")))?;
-        }
-    }
-
-    Ok((written, deduped))
-}
+// ADR 0080 phase 3b: `parse_disk_manifest_ref`, `ChunkSource`, and
+// `materialize_chunk_blob` — the coordinator-side engram-artifact
+// chunk push — retired. The `materializing` stage now runs HOST-side
+// via the `MaterializeImage` RPC (`materialize_image_on_host` above):
+// the host chunks the packed ext4 into its write-through chunk store,
+// so the chunks + manifest land in BlobStorage without the coordinator
+// ever holding image bytes.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engram_chunk_store::{Bootstrap, BootstrapEntry, ChunkSize, ManifestKind, ManifestRef};
+    use engram_chunk_store::{ManifestKind, ManifestRef};
     use engram_core::traits::BlobStorage;
     use engram_storage_local::LocalBlobStorage;
     use std::sync::Arc;
-
-    /// ADR 0080: the artifact config blob must carry `runtime_defaults`;
-    /// a pre-0080 artifact (or a malformed blob) fails the enable with an
-    /// actionable "re-bake" error instead of silently dropping the
-    /// Dockerfile ENV/WORKDIR.
-    #[test]
-    fn extract_runtime_defaults_requires_the_field_and_parses_it() {
-        let ok = br#"{"kind":"engram-image-v1","runtime_defaults":{"env":{"PATH":"/usr/bin"},"workdir":"/w"}}"#;
-        let d = extract_runtime_defaults(ok).expect("well-formed blob");
-        assert_eq!(d.env.get("PATH").map(String::as_str), Some("/usr/bin"));
-        assert_eq!(d.workdir.as_deref(), Some("/w"));
-
-        // Pre-0080 artifact: config blob without runtime_defaults.
-        let err = extract_runtime_defaults(br#"{"kind":"engram-image-v1"}"#).unwrap_err();
-        assert!(err.contains("re-bake"), "must be actionable: {err}");
-
-        // Not JSON at all.
-        assert!(extract_runtime_defaults(b"not-json").is_err());
-    }
-
-    /// Regression guard for the OCI → BlobStorage materializer.
-    /// Constructs a synthetic chunks-blob + bootstrap, runs the
-    /// slicing logic, and asserts:
-    ///   1. each chunk lands at its content-addressed key
-    ///   2. the manifest lands at the supplied ManifestRef
-    ///   3. a second call against the same BlobStorage dedups
-    ///      (no redundant puts on top of identical bytes)
-    #[tokio::test]
-    async fn materialize_chunk_blob_writes_chunks_and_manifest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
-        let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
-
-        let chunk_size_u32: u32 = 64;
-        let chunk_size = ChunkSize::bytes(chunk_size_u32 as u64);
-        let mut c0 = b"chunk-zero".to_vec();
-        c0.resize(chunk_size_u32 as usize, 0);
-        let mut c1 = b"chunk-one-different".to_vec();
-        c1.resize(chunk_size_u32 as usize, 0);
-        let h0 = engram_chunk_store::ChunkHash::of(&c0);
-        let h1 = engram_chunk_store::ChunkHash::of(&c1);
-        let chunk_map: std::collections::HashMap<_, _> = [
-            (h0, bytes::Bytes::from(c0.clone())),
-            (h1, bytes::Bytes::from(c1.clone())),
-        ]
-        .into_iter()
-        .collect();
-
-        // ADR 0036 per-chunk shape: each entry addresses its own
-        // blob (digest == chunk hash), blob_offset always 0.
-        let bootstrap = Bootstrap {
-            schema_version: engram_chunk_store::BOOTSTRAP_SCHEMA_VERSION,
-            kind: ManifestKind::Memory,
-            total_bytes: (c0.len() + c1.len()) as u64,
-            chunk_size,
-            entries: vec![
-                BootstrapEntry {
-                    file_offset: 0,
-                    blob_digest: Some(format!("sha256:{}", h0.to_hex())),
-                    blob_offset: 0,
-                    length: c0.len() as u32,
-                    sha256: h0,
-                },
-                BootstrapEntry {
-                    file_offset: c0.len() as u64,
-                    blob_digest: Some(format!("sha256:{}", h1.to_hex())),
-                    blob_offset: 0,
-                    length: c1.len() as u32,
-                    sha256: h1,
-                },
-            ],
-        };
-        assert!(bootstrap.is_per_chunk());
-        let manifest = bootstrap.to_manifest();
-        let manifest_ref = ManifestRef::new();
-
-        let (wrote, deduped) = materialize_chunk_blob(
-            blob.as_ref(),
-            &chunk_store,
-            manifest_ref,
-            &bootstrap,
-            &manifest,
-            &ChunkSource::Map(&chunk_map),
-            None,
-        )
-        .await
-        .expect("materialize");
-        assert_eq!(wrote, 2);
-        assert_eq!(deduped, 0);
-
-        // Chunks landed at their content-addressed keys.
-        for (h, body) in [(h0, &c0), (h1, &c1)] {
-            let got = blob.get(&h.storage_key()).await.expect("get chunk");
-            assert_eq!(got.as_ref(), body.as_slice());
-        }
-
-        // Manifest landed at the canonical ref.
-        let m = chunk_store
-            .get_manifest(manifest_ref)
-            .await
-            .expect("get_manifest");
-        assert_eq!(m.chunks.len(), 2);
-        assert_eq!(m.chunks[0].hash, h0);
-        assert_eq!(m.chunks[1].hash, h1);
-        assert_eq!(m.total_bytes, bootstrap.total_bytes);
-
-        // Second call dedups — same content, same keys, nothing
-        // re-written.
-        let (wrote2, deduped2) = materialize_chunk_blob(
-            blob.as_ref(),
-            &chunk_store,
-            manifest_ref,
-            &bootstrap,
-            &manifest,
-            &ChunkSource::Map(&chunk_map),
-            None,
-        )
-        .await
-        .expect("materialize again");
-        assert_eq!(wrote2, 0, "second materialize should dedup all chunks");
-        assert_eq!(deduped2, 2);
-    }
 
     /// Self-heal verify: a reuse candidate whose manifest chunks are all
     /// present in BlobStorage is reusable; a missing chunk (the reaped-base

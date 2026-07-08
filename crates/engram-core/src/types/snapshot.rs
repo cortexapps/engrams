@@ -121,8 +121,9 @@ pub struct SnapshotMetadata {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub id: SnapshotId,
-    /// `None` for template snapshots produced by the image-builder
-    /// at bake time (ADR 0014 M1.11): the snapshot is a template
+    /// `None` for template snapshots produced by the enable-time
+    /// materializer (engram-rootfs-materializer) at bake time (ADR
+    /// 0014 M1.11): the snapshot is a template
     /// artifact, not a session capture, so the FK to `sessions` is
     /// not meaningful. Session-bound snapshots (idle-eviction,
     /// graceful-drain, M2 background uploader) still set it. The

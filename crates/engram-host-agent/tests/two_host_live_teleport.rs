@@ -33,7 +33,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_core::types::snapshot::MigrationSourceInfo;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
@@ -155,7 +155,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some((kernel, handler, agent)) = gate() else {
+    let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
     // Low-disk hosts (the dev VM at >90% used) trip the cache's
@@ -172,25 +172,20 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
 
     // Bake once (host A's image; the chunks land in the shared store).
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
+    // Docker-free (ADR 0080 §D).
     let images = tempfile::tempdir().expect("images dir");
-    let baker = Builder::new(DockerCli::new(), chunk_store.clone());
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-two-host-teleport".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("bake");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |_tree| Ok(()),
+    )
+    .await;
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
@@ -570,7 +565,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some((kernel, handler, agent)) = gate() else {
+    let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
     std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
@@ -582,34 +577,49 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
     );
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
 
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(src.path().join("epoll_reader.c"), EPOLL_READER_C).unwrap();
-    std::fs::write(
-        src.path().join("Dockerfile"),
-        "FROM gcc:bookworm AS build\n\
-         COPY epoll_reader.c /epoll_reader.c\n\
-         RUN gcc -O2 -static -o /epoll_reader /epoll_reader.c\n\
-         FROM debian:bookworm-slim\n\
-         COPY --from=build /epoll_reader /usr/local/bin/epoll_reader\n",
-    )
-    .unwrap();
-    let images = tempfile::tempdir().expect("images dir");
-    let baker = Builder::new(DockerCli::new(), chunk_store.clone());
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-teleport-pipe".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
+    // ADR 0080 §D docker-free bake: compile the epoll probe statically on the
+    // HOST (no gcc:bookworm build stage) and lay it into the busybox rootfs.
+    // Gate on a host C compiler.
+    let cc = ["cc", "gcc"].into_iter().find_map(|bin| {
+        std::env::var_os("PATH").and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join(bin))
+                .find(|c| c.is_file())
         })
-        .await
-        .expect("bake");
+    });
+    let Some(cc) = cc else {
+        eprintln!("SKIP: no host C compiler (cc/gcc) for the static epoll probe");
+        return;
+    };
+    let scratch = tempfile::tempdir().expect("epoll build scratch");
+    let epoll_c = scratch.path().join("epoll_reader.c");
+    std::fs::write(&epoll_c, EPOLL_READER_C).unwrap();
+    let epoll_bin = scratch.path().join("epoll_reader");
+    let images = tempfile::tempdir().expect("images dir");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |tree| {
+            use std::os::unix::fs::PermissionsExt;
+            let status = std::process::Command::new(&cc)
+                .args(["-O2", "-static", "-o"])
+                .arg(&epoll_bin)
+                .arg(&epoll_c)
+                .status()?;
+            assert!(status.success(), "cc -O2 -static epoll_reader failed");
+            let dst = tree.join("usr/local/bin/epoll_reader");
+            std::fs::copy(&epoll_bin, &dst)?;
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        },
+    )
+    .await;
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
@@ -865,7 +875,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some((kernel, handler, agent)) = gate() else {
+    let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
     let _ = tracing_subscriber::fmt()
@@ -904,25 +914,20 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
     );
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
 
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
+    // Docker-free (ADR 0080 §D).
     let images = tempfile::tempdir().expect("images dir");
-    let baker = Builder::new(DockerCli::new(), chunk_store.clone());
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-teleport-nbd".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("bake");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |_tree| Ok(()),
+    )
+    .await;
     let rootfs_manifest = outcome
         .disk_manifest
         .expect("ext4 bake produces a chunked disk manifest");
@@ -1092,7 +1097,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
-    let Some((kernel, handler, agent)) = gate() else {
+    let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
     // Low-disk hosts (the dev VM at >90% used) trip the cache's
@@ -1105,25 +1110,20 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         engram_storage_local::LocalBlobStorage::new(blob_root.clone()),
     );
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
+    // Docker-free (ADR 0080 §D).
     let images = tempfile::tempdir().expect("images dir");
-    let baker = Builder::new(DockerCli::new(), chunk_store.clone());
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-kill-source-test".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: engram_image_builder::Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("bake");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |_tree| Ok(()),
+    )
+    .await;
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
@@ -1231,7 +1231,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     host_b.server.abort();
 }
 
-fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
+fn gate() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let kernel = match std::env::var("FC_TEST_KERNEL") {
         Ok(p) => PathBuf::from(p),
         Err(_) => {
@@ -1243,7 +1243,7 @@ fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
         eprintln!("SKIP: /dev/kvm not present");
         return None;
     }
-    for bin in ["firecracker", "docker", "mke2fs", "mksquashfs"] {
+    for bin in ["firecracker", "mke2fs", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)
@@ -1252,6 +1252,10 @@ fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
             return None;
         }
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return None;
+    };
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let agent = Path::new(&manifest_dir)
         .join("../../target/x86_64-unknown-linux-musl/release/engram-agentd");
@@ -1264,7 +1268,7 @@ fn gate() -> Option<(PathBuf, PathBuf, PathBuf)> {
         eprintln!("SKIP: engram-uffd-handler not built");
         return None;
     }
-    Some((kernel, handler, agent))
+    Some((kernel, handler, agent, busybox))
 }
 
 async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &str) -> String {

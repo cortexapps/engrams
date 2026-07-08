@@ -543,9 +543,11 @@ bundles-squashfs:
     stamp="{"
     sep=""
     # ADR 0055: `sentinel` rides every reserved dyn-* slot; skills/
-    # integrations-cli/browser are catalog skills swapped in per session. Files
-    # are content-keyed (<sha>.squashfs); the stamp maps logical name -> sha.
-    for name in sentinel skills integrations-cli browser; do
+    # integrations-cli/browser are catalog skills swapped in per session;
+    # guest-tools (ADR 0080 §D) carries the pinned static ttyd for the SHELL
+    # tab (reserved slot dyn_2). Files are content-keyed (<sha>.squashfs);
+    # the stamp maps logical name -> sha.
+    for name in sentinel skills integrations-cli browser guest-tools; do
         tmp="var/shared/.$name.build.squashfs"
         if ! "deploy/bundles/$name/build.sh" "$tmp"; then
             echo "$name bundle build failed; skipping (sessions degrade gracefully)" >&2
@@ -679,10 +681,14 @@ bundles-vz:
     stamp="{"
     sep=""
     # `sentinel` rides every reserved dyn slot at capture; skills/
-    # integrations-cli/browser are catalog skills swapped in per session.
+    # integrations-cli/browser are catalog skills swapped in per session;
+    # guest-tools (ADR 0080 §D) carries the pinned static ttyd for the SHELL
+    # tab (reserved slot dyn_2 — the coord resolves it per fresh create).
     # integrations-cli/browser need Docker and are best-effort
-    # (skipped on failure), exactly as `just bundles` already degrades.
-    for name in sentinel skills integrations-cli browser; do
+    # (skipped on failure), exactly as `just bundles` already degrades;
+    # guest-tools downloads the pinned ttyd release and degrades the same
+    # way offline (SHELL tab then needs an image-baked ttyd).
+    for name in sentinel skills integrations-cli browser guest-tools; do
         # Stage under the repo (absolute, $HOME-rooted), NOT `mktemp -d`: the
         # Docker-built bundles (integrations-cli/browser) bind-mount this dir into the
         # build container, and Docker Desktop on macOS does not share the
@@ -835,24 +841,22 @@ integration-evac-test:
 integration-session:
     bash deploy/dev/integration-session.sh
 
-# Bake an image from a directory containing a Dockerfile (plus an
-# optional [build]-only engram.toml — ADR 0080),
-# then push it to the local OCI registry. Auto-selects cross-compile
-# target + `--transport` flag based on host arch. Tag defaults to
-# `warm-<rfc3339>`; override with `TAG=...`.
+# ADR 0080: build a session image from a directory containing a
+# Dockerfile and push it to the local OCI registry — a PLAIN
+# `docker build && docker push` (the user contract). The coordinator
+# materializes the rootfs host-side at enable time; nothing is chunked
+# or injected locally. Tag defaults to `warm-<rfc3339>`; override TAG=...
 #
 # Usage:
 #   just bake cortex/api ./examples/api
 #   just bake cortex/api .
 #   TAG=warm-2 just bake cortex/api ./examples/api
 #
-# After this, the new image appears in the dashboard's "create
-# session" dropdown immediately (the coordinator polls
-# `image_versions` on every `/api/images` GET) and is pullable via
-# `engram session create --image localhost:5001/<repo>:<tag>`.
+# Then enable it (once, applying runtime config out-of-band):
+#   engram image enable --uri localhost:5001/<repo>:<tag> --config <toml>
+# and reference it: `engram session create --image localhost:5001/<repo>:<tag>`.
 bake repo dir='.':
     @set -e; \
-    : "${ENGRAM_KEK_MASTER_KEY:?run \`just bootstrap\` first to generate a KEK}"; \
     if [ "$(uname -s -m)" = "Darwin arm64" ]; then \
         PLATFORM=linux/arm64; \
     elif [ "$(uname -s -m)" = "Linux x86_64" ]; then \
@@ -863,26 +867,13 @@ bake repo dir='.':
         echo "unsupported host: $(uname -s -m)" >&2; exit 1; \
     fi; \
     TAG="${TAG:-warm-$(date -u +%Y%m%dT%H%M%SZ)}"; \
-    STAGING="./var/bake/{{repo}}"; \
-    rm -rf "$STAGING"; mkdir -p "$STAGING"; \
-    cp "{{dir}}/Dockerfile"  "$STAGING/Dockerfile"; \
-    if [ -f "{{dir}}/engram.toml" ]; then cp "{{dir}}/engram.toml" "$STAGING/engram.toml"; fi; \
-    if [ "$PLATFORM" = "linux/arm64" ]; then \
-        sed -i.bak 's|^FROM \([^ ]*\)$|FROM --platform=linux/arm64 \1|' "$STAGING/Dockerfile"; \
-        rm -f "$STAGING/Dockerfile.bak"; \
-    fi; \
-    PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
-    cargo run -p engram-cli -- image build \
-        --repo {{repo}} \
-        --tag $TAG \
-        --source $STAGING \
-        --format ext4 \
-        --images-dir ./var/bake/_staging \
-        --inject-init \
-        --push localhost:5001/{{repo}}; \
+    URI="localhost:5001/{{repo}}:$TAG"; \
+    docker build --platform "$PLATFORM" -t "$URI" -f "{{dir}}/Dockerfile" "{{dir}}"; \
+    docker push "$URI"; \
     echo ""; \
-    echo "✓ pushed localhost:5001/{{repo}}:$TAG"; \
-    echo "  use it: engram session create --image localhost:5001/{{repo}}:$TAG ..."
+    echo "✓ pushed $URI"; \
+    echo "  enable it: engram image enable --uri $URI --config <image-config.toml>"; \
+    echo "  then:      engram session create --image $URI ..."
 
 # ------------------------------------------------------------------
 # Apple Silicon — Virtualization.framework codesigning + VZ tests.

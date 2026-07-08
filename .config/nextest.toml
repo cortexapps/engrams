@@ -16,8 +16,8 @@
 [profile.default]
 # 3-minute hard cap per test. All non-ignored tests in the
 # workspace should complete well under this; the slowest ones
-# observed (image-builder's docker-bake test, sandbox-vz's full-
-# plumbing test) run in seconds-to-tens-of-seconds.
+# observed (sandbox-vz's full-plumbing test, the materializer's
+# mke2fs pack test) run in seconds-to-tens-of-seconds.
 slow-timeout = { period = "30s", terminate-after = 6 }
 
 # Integration tests in the new e2e_stack lane legitimately take

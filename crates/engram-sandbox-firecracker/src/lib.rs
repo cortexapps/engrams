@@ -364,8 +364,8 @@ pub struct FirecrackerConfig {
     pub uffd_cache_root: Option<PathBuf>,
     /// ADR 0075: the substrate populate socket handed to the handler
     /// as `--substrate-sock` — the single-writer host-agent's UDS.
-    /// `None` (tests, image-builder profile pass) leaves the handler
-    /// on its direct-blob fallback. Constructors derive
+    /// `None` (tests, the bake/materialize profile pass) leaves the
+    /// handler on its direct-blob fallback. Constructors derive
     /// `<work_dir>/substrate.sock` alongside `uffd_cache_root`.
     pub uffd_substrate_sock: Option<PathBuf>,
     /// ADR 0014 M1.14: bake-side override for the UFFD handler's
@@ -384,7 +384,7 @@ pub struct FirecrackerConfig {
     /// resolved at startup via [`cpu_template_from_env`]. `None`
     /// here keeps tests (which boot fresh VMs on whatever CI CPU is
     /// available) opt-out by default — only the prod call sites
-    /// in `engram-coordinator` and `engram-image-builder` set it.
+    /// in `engram-coordinator` and `engram-rootfs-materializer` set it.
     pub cpu_template: Option<String>,
     /// ADR 0035: directory where content-addressed bundle generations
     /// (`<drive_id>-<sha256>.squashfs`) and the bake-time
@@ -588,7 +588,7 @@ impl FirecrackerConfig {
             uffd_substrate_sock: None,
             uffd_blob_root: None,
             // Host-passthrough by default. Prod (`engram-coordinator`)
-            // and the bake (`engram-image-builder`) both opt in to a
+            // and the bake (`engram-rootfs-materializer`) both opt in to a
             // template via `cpu_template_from_env`. Tests stay opted
             // out so `cargo test` on heterogeneous CI runners doesn't
             // wedge if the runner CPU doesn't satisfy the template.
@@ -1952,7 +1952,8 @@ impl FirecrackerBackend {
     ) -> Result<(), SandboxError> {
         // Validate the spec carries a usable rootfs. We only accept an
         // ext4 image; a directory rootfs would need to be packed into
-        // ext4 first by the image-builder.
+        // ext4 first by the enable-time materializer
+        // (engram-rootfs-materializer).
         let rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::InvalidSpec(
                 "FirecrackerBackend.create requires rootfs_source pointing at an ext4 image".into(),

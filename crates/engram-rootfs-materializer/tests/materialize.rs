@@ -331,8 +331,8 @@ async fn unknown_layer_media_type_fails_loud_before_any_download() {
 // ---------------------------------------------------------------
 
 /// ADR 0036 byte-determinism hinges on SOURCE_DATE_EPOCH, honored by
-/// e2fsprogs >= 1.47.1 (the same gate the image-builder determinism
-/// test uses). Older/missing mke2fs → skip with a note, never flake.
+/// e2fsprogs >= 1.47.1 (the same >=1.47.1 e2fsprogs determinism
+/// gate). Older/missing mke2fs → skip with a note, never flake.
 fn deterministic_mke2fs_available() -> Option<String> {
     let on_path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|dir| dir.join("mke2fs").is_file()))
@@ -390,15 +390,39 @@ async fn materialize_is_deterministic_and_scrubs_scratch() {
     let scratch = tempfile::tempdir().unwrap();
     let m = materializer();
 
+    // Phase 3b: the RPC's progress frames — assert the honest stage
+    // sequence rides the optional sender.
+    let (ptx, mut prx) = tokio::sync::mpsc::channel(32);
     let first = m
-        .materialize(&fx.uri, Platform::LinuxArm64, scratch.path(), &chunk_store)
+        .materialize(
+            &fx.uri,
+            Platform::LinuxArm64,
+            scratch.path(),
+            &chunk_store,
+            Some(ptx),
+        )
         .await
         .expect("first materialize");
+    let mut stages = Vec::new();
+    while let Ok(p) = prx.try_recv() {
+        stages.push(p.stage);
+    }
+    use engram_core::types::MaterializeStage as S;
+    assert_eq!(
+        stages,
+        vec![S::Pull, S::Flatten, S::Pack, S::Chunk],
+        "one frame per stage transition, in pipeline order"
+    );
     assert!(
         std::fs::read_dir(scratch.path()).unwrap().next().is_none(),
         "scratch must be scrubbed after a successful run"
     );
     assert!(first.ext4_size_bytes > 0);
+    assert!(
+        first.manifest_digest.starts_with("sha256:"),
+        "the platform manifest digest must ride the result: {}",
+        first.manifest_digest
+    );
     assert_eq!(
         first
             .oci_defaults
@@ -414,7 +438,13 @@ async fn materialize_is_deterministic_and_scrubs_scratch() {
         .expect("manifest committed to the store");
 
     let second = m
-        .materialize(&fx.uri, Platform::LinuxArm64, scratch.path(), &chunk_store)
+        .materialize(
+            &fx.uri,
+            Platform::LinuxArm64,
+            scratch.path(),
+            &chunk_store,
+            None,
+        )
         .await
         .expect("second materialize");
     assert_eq!(
@@ -441,7 +471,13 @@ async fn materialize_scrubs_scratch_on_error() {
     let scratch = tempfile::tempdir().unwrap();
 
     let err = materializer()
-        .materialize(&fx.uri, Platform::LinuxArm64, scratch.path(), &chunk_store)
+        .materialize(
+            &fx.uri,
+            Platform::LinuxArm64,
+            scratch.path(),
+            &chunk_store,
+            None,
+        )
         .await
         .expect_err("must fail on the bogus mediaType");
     assert!(err.to_string().contains("vnd.fancy.layer.v9+brotli"));

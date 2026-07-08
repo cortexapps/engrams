@@ -37,7 +37,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{
     AgentSpec, CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec,
 };
-use engram_image_builder::{BuildRequest, Builder, DockerCli, Format, InitInjection, Transport};
+use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use parking_lot::Mutex;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
@@ -181,12 +181,21 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("docker") || !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
         return;
     }
     if !require_root() {
         return;
     }
+    let Some(busybox) = common::find_busybox() else {
+        eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
+        return;
+    };
+    // `ip` / `ping` are busybox applets; curl + ca-certificates come from the host.
+    let Some(curl) = common::which("curl") else {
+        eprintln!("SKIP: curl not on host PATH");
+        return;
+    };
     iptables_cleanup();
     delete_stale_taps();
 
@@ -235,42 +244,35 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     });
 
     // ---- 3. Bake a rootfs with engram-agentd + curl + /etc/hosts seed ----
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(
-        src.path().join("Dockerfile"),
-        // debian-slim has glibc + ca-certificates support. Install
-        // curl + ca-certificates so the in-VM curl validates the
-        // proxy-minted leaf via the trust bundle the init shim
-        // updates. /etc/hosts seeding has to happen at runtime —
-        // Docker mounts it read-only at build time — so we do it
-        // inside the test's exec command.
-        "FROM debian:bookworm-slim\n\
-         RUN apt-get update && apt-get install -y --no-install-recommends \
-             curl ca-certificates iproute2 iputils-ping && rm -rf /var/lib/apt/lists/*\n",
-    )
-    .unwrap();
+    // The in-VM curl validates the proxy-minted leaf via the host CA bundle
+    // copied in below (the init shim also updates trust). `ip` / `ping` are
+    // busybox applets. /etc/hosts seeding happens at runtime in the test's
+    // exec command. curl + its ldd closure ride in via the customize closure.
     let images = tempfile::tempdir().expect("images");
     let chunk_root = tempfile::tempdir().expect("chunk store root");
     let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
         engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
     );
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let baker = Builder::new(DockerCli::new(), chunk_store);
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-proxy-e2e".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            init_injection: Some(InitInjection {
-                vsock_port: ENGRAM_AGENTD_PORT,
-                transport: Transport::Vsock,
-                init_script: None,
-            }),
-        })
-        .await
-        .expect("ext4 bake");
+    let outcome = common::bake_fixture_ext4(
+        &images.path().join("rootfs.ext4"),
+        &chunk_store,
+        &busybox,
+        Some(InitInjection {
+            vsock_port: ENGRAM_AGENTD_PORT,
+            transport: Transport::Vsock,
+            init_script: None,
+        }),
+        |tree| {
+            common::copy_host_tool_with_closure(tree, &curl, "usr/bin/curl")?;
+            if let Ok(ca) = std::fs::read("/etc/ssl/certs/ca-certificates.crt") {
+                std::fs::create_dir_all(tree.join("etc/ssl/certs"))?;
+                std::fs::write(tree.join("etc/ssl/certs/ca-certificates.crt"), ca)?;
+            }
+            Ok(())
+        },
+    )
+    .await;
 
     // ADR 0021 P1.5: no substrate to build — the egress CA reaches
     // the guest via `AgentSpec.host_ca_pem`, which rides the

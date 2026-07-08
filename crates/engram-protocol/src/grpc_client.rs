@@ -37,11 +37,12 @@ use crate::grpc::{
     AnswerHarnessQuestionRequest, ApplyEgressPolicyRequest, BindHarnessSessionRequest,
     BuildBaseSnapshotRequest, CreateSandboxRequest, DequeueHarnessQueuedPromptRequest,
     EditHarnessQueuedPromptRequest, Empty, ExecStartRequest, FencedSandboxRequest, GuestIpResponse,
-    InterruptHarnessRequest, MigrationExportRef, MigrationFetchRequest, MigrationItem,
-    ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
-    ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
-    ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, StartAgentRequest, StringList, UnbindHarnessSessionRequest,
+    InterruptHarnessRequest, MaterializeImageRequest, MigrationExportRef, MigrationFetchRequest,
+    MigrationItem, ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary,
+    ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong,
+    ProxyShellText, ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest,
+    SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest, StringList,
+    UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -679,6 +680,103 @@ impl GrpcHostClient {
                 }
                 None => {
                     tracing::warn!("build_base_snapshot: empty stream frame; ignoring");
+                }
+            }
+        }
+    }
+
+    /// ADR 0080 phase 3b (wire v14): `MaterializeImage` is
+    /// server-streaming, mirroring [`Self::build_base_snapshot`] — zero
+    /// or more `progress` frames (host keepalive every <=30 s)
+    /// forwarded onto `progress`, then exactly one terminal frame
+    /// (`done` decodes to `Ok`, `failed` decodes to a structured
+    /// `SandboxError::MaterializeFailed`). A stream that ends (or
+    /// errors) before a terminal frame arrives is the retryable
+    /// `MaterializeFailureKind::Transport` — the transport sibling of
+    /// capture's `WarmExecTransport`. Connect-time failures surface
+    /// through `grpc_to_sandbox_err` (WireSkew / Unavailable), exactly
+    /// like the capture RPC, so the enable scanner's retry classifier
+    /// sees the same shapes on both verbs.
+    pub async fn materialize_image(
+        &self,
+        image_uri: &str,
+        platform_os: &str,
+        platform_arch: &str,
+        registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
+    ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
+        use engram_core::types::{
+            MaterializeFailure, MaterializeFailureKind, MaterializeProgress, MaterializeStage,
+            MaterializedImage,
+        };
+        let req = MaterializeImageRequest {
+            image_uri: image_uri.to_string(),
+            platform_os: platform_os.to_string(),
+            platform_arch: platform_arch.to_string(),
+            registry_auth_bincode: encode_bincode(&registry_auth, "Option<ResolvedRegistryAuth>")?,
+        };
+        let mut stream = self
+            .inner
+            .clone()
+            .materialize_image(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+
+        loop {
+            let frame = match stream.message().await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    return Err(SandboxError::MaterializeFailed(MaterializeFailure {
+                        kind: MaterializeFailureKind::Transport,
+                        message: "materialize_image stream closed before a terminal frame".into(),
+                    }));
+                }
+                Err(status) => {
+                    return Err(SandboxError::MaterializeFailed(MaterializeFailure {
+                        kind: MaterializeFailureKind::Transport,
+                        message: format!("materialize_image stream error: {status}"),
+                    }));
+                }
+            };
+            match frame.event {
+                Some(crate::grpc::materialize_image_event::Event::Progress(p)) => {
+                    // Unknown stage string (a newer host mid-roll) is
+                    // dropped rather than mislabeled — the frame's only
+                    // job coord-side is display + lease renewal, and
+                    // the keepalive cadence resends known stages.
+                    if let Some(stage) = MaterializeStage::parse(&p.stage) {
+                        // A slow/dropped consumer must not stall the
+                        // materialize — best-effort forward.
+                        let _ = progress.try_send(MaterializeProgress {
+                            stage,
+                            detail: p.detail,
+                        });
+                    }
+                }
+                Some(crate::grpc::materialize_image_event::Event::Done(done)) => {
+                    return Ok(MaterializedImage {
+                        disk_manifest: decode_bincode(&done.disk_manifest_bincode, "ManifestRef")?,
+                        oci_defaults: decode_bincode(
+                            &done.oci_defaults_bincode,
+                            "OciRuntimeDefaults",
+                        )?,
+                        manifest_digest: done.manifest_digest,
+                        ext4_size_bytes: done.ext4_size_bytes,
+                    });
+                }
+                Some(crate::grpc::materialize_image_event::Event::Failed(failed)) => {
+                    // Unknown kind (newer host) defaults to Internal —
+                    // bail fast; never invent retryability.
+                    let kind = MaterializeFailureKind::parse(&failed.kind)
+                        .unwrap_or(MaterializeFailureKind::Internal);
+                    return Err(SandboxError::MaterializeFailed(MaterializeFailure {
+                        kind,
+                        message: failed.message,
+                    }));
+                }
+                None => {
+                    tracing::warn!("materialize_image: empty stream frame; ignoring");
                 }
             }
         }
@@ -1522,6 +1620,25 @@ impl HostClient for GrpcHostClient {
         progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Self::build_base_snapshot(self, spec, warm, capture_env, capture_egress, progress).await
+    }
+
+    async fn materialize_image(
+        &self,
+        image_uri: &str,
+        platform_os: &str,
+        platform_arch: &str,
+        registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
+    ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
+        Self::materialize_image(
+            self,
+            image_uri,
+            platform_os,
+            platform_arch,
+            registry_auth,
+            progress,
+        )
+        .await
     }
 
     async fn restore_base_for_session(
