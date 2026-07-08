@@ -19,7 +19,11 @@ pub(crate) mod forge;
 // registry doesn't exist anymore (the harness is an image property
 // baked at image-bake time).
 mod health;
-pub(crate) mod host_http;
+// `pub`: ADR 0081 P1b live-PG tests (`enable_reuse_live_pg`,
+// `enable_jobs_live_pg`) drive `claim_capture_job` directly (in-process,
+// no HTTP) to simulate a host claiming + executing a capture job without
+// standing up a real host-agent.
+pub mod host_http;
 pub(crate) mod hosts;
 pub(crate) mod interrupt;
 pub(crate) mod prompt;
@@ -64,6 +68,10 @@ pub fn router(state: SharedState) -> Router {
         .route(
             "/hosts/:id/auth/resolve-registry",
             post(host_http::resolve_registry_auth),
+        )
+        .route(
+            "/hosts/:id/capture-jobs/:job_id/claim",
+            post(host_http::claim_capture_job),
         )
         .route(
             "/hosts/:id/sessions/:session_id/sandboxes/:sandbox_id/ownership",

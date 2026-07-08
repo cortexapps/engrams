@@ -572,12 +572,20 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
-    /// ADR 0020 P1: boot `spec` to agentd-ready with the stub harness
-    /// attached (harness unmounted — the option-D capture point), take
-    /// a portable FC snapshot (chunked memory + uploaded state/sidecar),
-    /// tear the capture VM down, and return the snapshot's metadata. The
-    /// coord calls this on a host during `POST /api/enabled-images`;
-    /// `create_session` later restores from the resulting snapshot.
+    /// ADR 0020 P1 / ADR 0081 P1b: boot `spec` to agentd-ready with the
+    /// stub harness attached (harness unmounted — the option-D capture
+    /// point), take a portable FC snapshot (chunked memory + uploaded
+    /// state/sidecar), tear the capture VM down, and return the
+    /// snapshot's metadata. `create_session` later restores from the
+    /// resulting snapshot.
+    ///
+    /// ADR 0081 P1b: the caller is now the host-agent's OWN capture-job
+    /// executor (`capture_job::CaptureJobExecutor`, driven by a durable,
+    /// heartbeat-dispatched `capture_jobs` row) rather than a coordinator
+    /// RPC handler — the deleted `BuildBaseSnapshot` RPC used to call
+    /// this same method from `grpc_server.rs`. This method's own
+    /// signature/behavior is UNCHANGED by that move; it remains the
+    /// executor's engine, called in-process.
     ///
     /// Implemented on `PooledBackend` (which owns the chunk-store +
     /// state/sidecar upload that make the snapshot portable). Default
@@ -601,9 +609,11 @@ pub trait SandboxBackend: Send + Sync {
     /// nothing: the capture stays egress-less (the proxy denies unknown
     /// guests). The backend must NOT derive egress from `warm` itself.
     ///
-    /// `progress` (issue #539) receives [`crate::types::CaptureProgress`]
-    /// events for the call's lifetime — see the matching doc on
-    /// [`crate::traits::HostClient::build_base_snapshot`].
+    /// `progress` (issue #539, ADR 0081 P1b) receives
+    /// [`crate::types::CaptureProgress`] events for the call's lifetime —
+    /// the executor drains them into a durable per-job record + the
+    /// in-memory report the heartbeat loop advertises, instead of
+    /// forwarding them onto a live gRPC stream.
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,

@@ -1,22 +1,21 @@
 //! ADR 0013 host → coord HTTP clients.
 //!
-//! Five functions that match the five new coord HTTP endpoints
-//! (`engram_coordinator::api::host_http`):
+//! Functions that match the coord's HTTP endpoints
+//! (`engram_coordinator::api::host_http`), all wired into `run()`'s
+//! heartbeat loop / event sink / eviction-pusher:
 //!
 //!   - `register` — POST /api/v1/hosts/register, once at startup
 //!   - `heartbeat` — POST /api/v1/hosts/:id/heartbeat, every 5s
 //!   - `resolve_registry_auth` — POST /api/v1/hosts/:id/auth/resolve-registry
 //!   - `harness_event` — POST /api/v1/sessions/:session_id/harness-events
 //!   - `idle_eviction_candidates` — POST /api/v1/hosts/:id/idle-eviction-candidates
+//!   - `claim_capture_job` (ADR 0081 P1b) — POST
+//!     /api/v1/hosts/:id/capture-jobs/:job_id/claim, called from the
+//!     heartbeat-ack loop for any unclaimed `capture_assignments` entry
 //!
-//! The functions exist standalone (dark) in this commit so the
-//! cutover commit can wire them into the dialer / event sink /
-//! eviction-pusher in one move. Today only `register` is called
-//! from `run()`.
-//!
-//! All five share one pooled `reqwest::Client` carried by
-//! `CoordClient`. HTTP/1.1 keep-alive is sufficient — these are
-//! low-frequency POSTs against the coord LB.
+//! All share one pooled `reqwest::Client` carried by `CoordClient`.
+//! HTTP/1.1 keep-alive is sufficient — these are low-frequency POSTs
+//! against the coord LB.
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -162,6 +161,30 @@ impl CoordClient {
             .await
             .map_err(CoordClientError::Transport)?;
         decode_json(resp, "resolve_registry_auth").await
+    }
+
+    /// POST /api/v1/hosts/:id/capture-jobs/:job_id/claim
+    ///
+    /// ADR 0081 §A: resolve the full dispatch for a `capture_assignments`
+    /// entry the heartbeat-ack loop doesn't yet have running at this
+    /// epoch. The coordinator validates `(host_id, job_id, epoch)`,
+    /// resolves warm env + egress fresh, and returns the
+    /// `CaptureJobSpec` the executor needs to actually run the capture.
+    pub async fn claim_capture_job(
+        &self,
+        host_id: HostId,
+        job_id: engram_core::types::CaptureJobId,
+        epoch: i64,
+    ) -> Result<engram_core::types::capture_job::CaptureJobSpec, CoordClientError> {
+        let url = self.endpoint(&format!("/hosts/{host_id}/capture-jobs/{job_id}/claim"));
+        let body = ClaimCaptureJobRequest { epoch };
+        let builder = self.http.post(&url);
+        let resp = self
+            .auth(builder, &body)
+            .send()
+            .await
+            .map_err(CoordClientError::Transport)?;
+        decode_json(resp, "claim_capture_job").await
     }
 
     /// POST /api/v1/sessions/:session_id/harness-events
@@ -522,6 +545,12 @@ pub struct HeartbeatRequest {
     /// ADR 0068: this tick's re-probed capability vector.
     #[serde(default)]
     pub capabilities: engram_core::types::host::HostCapabilities,
+    /// ADR 0081 P1b: un-acked `capture_jobs` progress/terminal reports —
+    /// see [`engram_protocol::heartbeat::CheckpointAdvert`]'s twin,
+    /// `capture_job::CaptureJobRecord::load_all`. Re-advertised every
+    /// heartbeat until `HeartbeatResponse.acked_capture_jobs` names them.
+    #[serde(default)]
+    pub capture_job_reports: Vec<engram_core::types::CaptureJobReport>,
 }
 
 #[derive(Deserialize)]
@@ -555,6 +584,14 @@ pub struct HeartbeatResponse {
     /// into PG. The host deletes the matching durable record files.
     #[serde(default)]
     pub acked_checkpoints: Vec<engram_core::types::SnapshotId>,
+    /// ADR 0081 P1b: `(job_id, epoch)` assignments this host should be
+    /// running (or should claim, if it isn't yet).
+    #[serde(default)]
+    pub capture_assignments: Vec<engram_core::types::CaptureJobAssignment>,
+    /// ADR 0081 P1b: terminal reports from this heartbeat that landed in
+    /// PG. The host deletes the matching durable capture-job records.
+    #[serde(default)]
+    pub acked_capture_jobs: Vec<engram_core::types::CaptureJobId>,
 }
 
 #[derive(Serialize)]
@@ -565,6 +602,11 @@ pub struct ResolveRegistryAuthRequest {
 #[derive(Deserialize)]
 pub struct ResolveRegistryAuthResponse {
     pub creds: Option<RegistryCreds>,
+}
+
+#[derive(Serialize)]
+pub struct ClaimCaptureJobRequest {
+    pub epoch: i64,
 }
 
 #[derive(Deserialize)]
@@ -711,8 +753,25 @@ mod tests {
             stages_images: false,
             capabilities: Default::default(),
             harness_attached: Vec::new(),
+            capture_job_reports: Vec::new(),
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");
+    }
+
+    /// ADR 0081 P1b: the new capture-job HTTP-mirror fields must decode
+    /// to empty/defaults for an ack from a coord that predates them
+    /// (mid-rollout interop) — `#[serde(default)]` on both sides.
+    #[test]
+    fn heartbeat_response_capture_job_fields_default_for_old_coord() {
+        let old_coord_ack = serde_json::json!({
+            "server_time": "2026-07-08T00:00:00Z",
+            "revoked_sessions": [],
+            "enabled_images": [],
+            "live_bundles": [],
+        });
+        let ack: HeartbeatResponse = serde_json::from_value(old_coord_ack).unwrap();
+        assert!(ack.capture_assignments.is_empty());
+        assert!(ack.acked_capture_jobs.is_empty());
     }
 }

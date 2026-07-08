@@ -1941,6 +1941,28 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// ADR 0081 P1b: release the claim WITHOUT touching `state`/`attempts`/
+    /// `error` — the watch-only exit for a `Capturing` job whose
+    /// `capture_jobs` row is still in flight (`assigned`/`booting`/
+    /// `warming`/`freezing`) or whose retryable failure was just
+    /// reassigned to a fresh host+epoch. Unlike letting the claim simply
+    /// age out (`claim_enable_jobs`'s `lease_secs`, 300s by default), this
+    /// makes the job IMMEDIATELY re-claimable next tick (~3s later) — the
+    /// job row's own state/progress is the durable source of truth, the
+    /// enable-job claim only dedups short scanner ops, so there's no
+    /// reason to make watch-only polling wait out a lease meant to bound
+    /// a crashed pod's ownership. Fenced by `claimant`: `Ok(false)` means
+    /// the lease had already moved (a peer's tick beat this one to it) —
+    /// harmless, the peer's next tick observes the same row.
+    async fn release_enable_job_claim(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+    ) -> Result<bool, MetaError> {
+        let _ = (id, claimant);
+        Ok(true)
+    }
+
     // ---- ADR 0036 amendment: fleet chunk prestage (issue #538) ----
     //
     // A fourth, non-terminal enable-job stage between `capturing` and
@@ -2056,6 +2078,27 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// ADR 0081 P1b: the MOST RECENT capture job for an enable job,
+    /// terminal or not — unlike [`Self::active_capture_job_for_enable`]
+    /// (which hides a row the instant it goes `done`/`failed`), this is
+    /// what the enable scanner's watch-only `Capturing` arm polls: the
+    /// tick that observes a fresh `done` (to finalize + advance to
+    /// `prestaging`) or a terminal `failed` (to reassign-under-budget or
+    /// bail non-retryable) needs to see that terminal row, not `None`.
+    /// `ORDER BY created_at DESC LIMIT 1` — an enable job has at most one
+    /// non-terminal capture job at a time (the partial unique index), but
+    /// may accumulate multiple TERMINAL rows across retries of the
+    /// enable job itself (`retry_enable_job`); the newest is authoritative.
+    async fn latest_capture_job_for_enable(
+        &self,
+        enable_job_id: uuid::Uuid,
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        let _ = enable_job_id;
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
     /// The fenced write every [`CaptureJobReport`] drives: advances
     /// `stage`/`stage_progress`/`last_progress_at` (bumping
     /// `stage_started_at` only when `stage` actually changes),
@@ -2134,6 +2177,28 @@ pub trait MetadataStore: Send + Sync {
         &self,
     ) -> Result<std::collections::HashSet<HostId>, MetaError> {
         Ok(std::collections::HashSet::new())
+    }
+
+    /// ADR 0081 P1b: mirror a [`CaptureJobReport`]'s stage/progress onto
+    /// the owning `enable_jobs` row's ADR 0079 dashboard columns
+    /// (`capture_phase`/`warm_stage`/`output_tail`) — UNFENCED (no
+    /// `claimed_by` check, no claim renewal): `capture_jobs` is now
+    /// authoritative for execution and fencing; this is cosmetic
+    /// dashboard mirroring only, driven by the heartbeat reconcile on
+    /// every report regardless of which coordinator pod (if any)
+    /// currently holds the enable job's claim. `None` leaves a column
+    /// unchanged (`COALESCE`) — a report with no rendered phase
+    /// (`assigned`/`done`/`failed`) shouldn't blank the last-known
+    /// warm-hook stage/output an operator was reading.
+    async fn mirror_capture_progress_to_enable_job(
+        &self,
+        enable_job_id: uuid::Uuid,
+        capture_phase: Option<&str>,
+        warm_stage: Option<&str>,
+        output_tail: Option<&str>,
+    ) -> Result<(), MetaError> {
+        let _ = (enable_job_id, capture_phase, warm_stage, output_tail);
+        Ok(())
     }
 
     /// Stamp the terminal `reuse_outcome` on an enable job (ADR 0081

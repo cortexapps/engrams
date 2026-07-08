@@ -4613,7 +4613,29 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         match row {
-            Some(r) => row::enable_job_from_row(&r),
+            Some(r) => {
+                // ADR 0081 P1b: a prior (failed) attempt's TERMINAL
+                // `capture_jobs` row must not survive a retry — the
+                // scanner's `latest_capture_job_for_enable` read is
+                // "newest row for this enable job, terminal or not" (so
+                // it can observe a `done`/`failed` outcome), which would
+                // otherwise keep re-surfacing the OLD exhausted failure
+                // forever and wedge the retry. Only terminal rows: a
+                // live (non-terminal) row can't coexist with `state =
+                // 'failed'` above (retry only applies once the capture
+                // pipeline itself gave up), so this is a no-op in the
+                // normal case and a safety net against any stale leftover.
+                if let Err(e) = sqlx::query(
+                    "DELETE FROM capture_jobs WHERE enable_job_id = $1 AND stage IN ('done', 'failed')",
+                )
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                {
+                    tracing::warn!(enable_job_id = %id, error = %e, "retry_enable_job: failed to clear stale terminal capture_jobs row (non-fatal; the scanner may re-observe the old outcome)");
+                }
+                row::enable_job_from_row(&r)
+            }
             None => match self.get_enable_job(id).await? {
                 Some(job) => Err(MetaError::Conflict(format!(
                     "enable job {id} is `{}`, not `failed`; only failed jobs can be retried",
@@ -4622,6 +4644,26 @@ impl MetadataStore for PostgresStore {
                 None => Err(MetaError::NotFound),
             },
         }
+    }
+
+    /// ADR 0081 P1b: release the claim without touching state/attempts —
+    /// the watch-only exit for a `Capturing` job whose `capture_jobs` row
+    /// is still in flight. See the trait doc for why this exists
+    /// alongside `claim_enable_jobs`'s lease-expiry path.
+    async fn release_enable_job_claim(&self, id: Uuid, claimant: &str) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
+             WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(id)
+        .bind(claimant)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
     }
 
     // ---- ADR 0036 amendment: fleet chunk prestage (issue #538) ----
@@ -4715,14 +4757,14 @@ impl MetadataStore for PostgresStore {
         // by the `capture_jobs_active_enable` partial unique index, so a
         // coordinator restart or a re-driven scanner tick resumes the
         // existing attempt instead of duplicating a capture VM.
-        const COLUMNS: &str = "id, enable_job_id, image_uri, disk_manifest, image_config, \
-            oci_defaults, host_id, epoch, stage, stage_started_at, stage_progress, \
+        const COLUMNS: &str = "id, enable_job_id, image_uri, manifest_digest, disk_manifest, \
+            image_config, oci_defaults, host_id, epoch, stage, stage_started_at, stage_progress, \
             last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version, \
             result_bincode, created_at, updated_at";
         let insert_sql = format!(
             r#"
-            INSERT INTO capture_jobs (id, enable_job_id, image_uri, disk_manifest, image_config, oci_defaults, host_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO capture_jobs (id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config, oci_defaults, host_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (enable_job_id) WHERE stage NOT IN ('done', 'failed')
             DO NOTHING
             RETURNING {COLUMNS}
@@ -4739,6 +4781,7 @@ impl MetadataStore for PostgresStore {
             .bind(Uuid::new_v4())
             .bind(row.enable_job_id)
             .bind(&row.image_uri)
+            .bind(&row.manifest_digest)
             .bind(&row.disk_manifest)
             .bind(sqlx::types::Json(&row.image_config))
             .bind(sqlx::types::Json(&row.oci_defaults))
@@ -4764,6 +4807,7 @@ impl MetadataStore for PostgresStore {
                     .bind(Uuid::new_v4())
                     .bind(row.enable_job_id)
                     .bind(&row.image_uri)
+                    .bind(&row.manifest_digest)
                     .bind(&row.disk_manifest)
                     .bind(sqlx::types::Json(&row.image_config))
                     .bind(sqlx::types::Json(&row.oci_defaults))
@@ -4785,10 +4829,10 @@ impl MetadataStore for PostgresStore {
     async fn get_capture_job(&self, id: CaptureJobId) -> Result<Option<CaptureJobRow>, MetaError> {
         let row = sqlx::query(
             r#"
-            SELECT id, enable_job_id, image_uri, disk_manifest, image_config, oci_defaults,
-                   host_id, epoch, stage, stage_started_at, stage_progress, last_progress_at,
-                   attempts, retryable, error, error_stage, fc_snapshot_version, result_bincode,
-                   created_at, updated_at
+            SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                   oci_defaults, host_id, epoch, stage, stage_started_at, stage_progress,
+                   last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                   result_bincode, created_at, updated_at
               FROM capture_jobs
              WHERE id = $1
             "#,
@@ -4806,12 +4850,35 @@ impl MetadataStore for PostgresStore {
     ) -> Result<Option<CaptureJobRow>, MetaError> {
         let row = sqlx::query(
             r#"
-            SELECT id, enable_job_id, image_uri, disk_manifest, image_config, oci_defaults,
-                   host_id, epoch, stage, stage_started_at, stage_progress, last_progress_at,
-                   attempts, retryable, error, error_stage, fc_snapshot_version, result_bincode,
-                   created_at, updated_at
+            SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                   oci_defaults, host_id, epoch, stage, stage_started_at, stage_progress,
+                   last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                   result_bincode, created_at, updated_at
               FROM capture_jobs
              WHERE enable_job_id = $1 AND stage NOT IN ('done', 'failed')
+            "#,
+        )
+        .bind(enable_job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::capture_job_from_row(&r)).transpose()
+    }
+
+    async fn latest_capture_job_for_enable(
+        &self,
+        enable_job_id: Uuid,
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                   oci_defaults, host_id, epoch, stage, stage_started_at, stage_progress,
+                   last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                   result_bincode, created_at, updated_at
+              FROM capture_jobs
+             WHERE enable_job_id = $1
+             ORDER BY created_at DESC
+             LIMIT 1
             "#,
         )
         .bind(enable_job_id)
@@ -4895,6 +4962,39 @@ impl MetadataStore for PostgresStore {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn mirror_capture_progress_to_enable_job(
+        &self,
+        enable_job_id: Uuid,
+        capture_phase: Option<&str>,
+        warm_stage: Option<&str>,
+        output_tail: Option<&str>,
+    ) -> Result<(), MetaError> {
+        // UNFENCED on purpose (ADR 0081 P1b): `capture_jobs` owns
+        // fencing/execution now, this is a cosmetic dashboard mirror the
+        // heartbeat reconcile drives regardless of which coordinator pod
+        // (if any) holds the enable job's claim. `COALESCE` so a report
+        // with no rendered phase (`assigned`/`done`/`failed`) doesn't
+        // blank the last-known warm-hook stage/output.
+        sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET capture_phase = COALESCE($2, capture_phase),
+                   warm_stage = COALESCE($3, warm_stage),
+                   output_tail = COALESCE($4, output_tail),
+                   updated_at = NOW()
+             WHERE id = $1
+            "#,
+        )
+        .bind(enable_job_id)
+        .bind(capture_phase)
+        .bind(warm_stage)
+        .bind(output_tail)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn reassign_capture_job(
         &self,
         id: CaptureJobId,
@@ -4913,10 +5013,10 @@ impl MetadataStore for PostgresStore {
                    stage_progress = NULL,
                    updated_at = NOW()
              WHERE id = $1 AND epoch = $2 AND stage NOT IN ('done', 'failed')
-            RETURNING id, enable_job_id, image_uri, disk_manifest, image_config, oci_defaults,
-                      host_id, epoch, stage, stage_started_at, stage_progress, last_progress_at,
-                      attempts, retryable, error, error_stage, fc_snapshot_version, result_bincode,
-                      created_at, updated_at
+            RETURNING id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                      oci_defaults, host_id, epoch, stage, stage_started_at, stage_progress,
+                      last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                      result_bincode, created_at, updated_at
             "#,
         )
         .bind(id.as_uuid())
@@ -4940,10 +5040,10 @@ impl MetadataStore for PostgresStore {
         }
         let rows = sqlx::query(
             r#"
-            SELECT id, enable_job_id, image_uri, disk_manifest, image_config, oci_defaults,
-                   host_id, epoch, stage, stage_started_at, stage_progress, last_progress_at,
-                   attempts, retryable, error, error_stage, fc_snapshot_version, result_bincode,
-                   created_at, updated_at
+            SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                   oci_defaults, host_id, epoch, stage, stage_started_at, stage_progress,
+                   last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                   result_bincode, created_at, updated_at
               FROM capture_jobs
              WHERE stage NOT IN ('done', 'failed')
             "#,

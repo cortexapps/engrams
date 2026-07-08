@@ -504,10 +504,18 @@ async fn assemble_egress_policy(
 ///
 /// The sandbox-dependent identity half is left as placeholders: the
 /// capture VM is created INSIDE the host's `build_base_snapshot`, so the
-/// host stamps `sandbox_id` + `guest_ip` at registration. The synthetic
-/// `session_id` minted here keys the host's registry entry for teardown.
+/// host stamps `sandbox_id` + `guest_ip` at registration.
+///
+/// ADR 0081 P1b: `session_id` is now the CALLER's to supply (was
+/// `SessionId::new()` — a fresh random id every call). Capture is a
+/// durable job that can be reassigned/retried under the SAME `job_id`;
+/// the claim endpoint calls this with [`synthetic_capture_session_id`]
+/// so every claim of the same job registers (and tears down) under the
+/// identical host-registry key instead of leaking one egress entry per
+/// attempt.
 pub(crate) fn assemble_capture_egress_policy(
     network: &engram_core::types::image::NetworkPolicy,
+    session_id: SessionId,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let allow_all = matches!(
         network.default,
@@ -519,7 +527,7 @@ pub(crate) fn assemble_capture_egress_policy(
         return None;
     }
     Some(engram_core::types::egress::SessionEgressPolicy {
-        session_id: SessionId::new(),
+        session_id,
         // Stamped by the host at registration (the capture VM doesn't
         // exist yet when this is assembled).
         sandbox_id: SandboxId(uuid::Uuid::nil()),
@@ -532,6 +540,22 @@ pub(crate) fn assemble_capture_egress_policy(
         observes: Vec::new(),
         secret_mode: engram_core::types::image::SecretMode::Literal,
     })
+}
+
+/// ADR 0081 P1b: deterministic synthetic `SessionId` for a capture job's
+/// egress registration, stable across every claim of the same `job_id`
+/// (a stage-deadline reassign bumps `epoch` but keeps `job_id` fixed, and
+/// a retried claim of the SAME epoch — e.g. the host retrying a failed
+/// HTTP round trip — must key identically too). Derived via truncated
+/// SHA-256 of the job id (same recipe as [`HostId::from_node_name`]), not
+/// an RFC-4122 v5 UUID — this crate has no v5 dependency and `SessionId`
+/// is opaque, so any stable derivation is equally valid.
+pub(crate) fn synthetic_capture_session_id(job_id: engram_core::types::CaptureJobId) -> SessionId {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("engram-capture-session:{job_id}").as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    SessionId(uuid::Uuid::from_bytes(bytes))
 }
 
 /// ADR 0056 (Phase 4): translate an integration policy's response-observation
@@ -743,11 +767,14 @@ mod capture_egress_tests {
     #[test]
     fn capture_egress_none_when_no_egress_granted() {
         assert!(
-            assemble_capture_egress_policy(&NetworkPolicy {
-                default: NetworkDefault::Deny,
-                allow_hosts: vec![],
-                allow_host_patterns: vec![],
-            })
+            assemble_capture_egress_policy(
+                &NetworkPolicy {
+                    default: NetworkDefault::Deny,
+                    allow_hosts: vec![],
+                    allow_host_patterns: vec![],
+                },
+                engram_core::SessionId::new(),
+            )
             .is_none(),
             "deny-default with no hosts grants nothing → no policy",
         );
@@ -758,11 +785,14 @@ mod capture_egress_tests {
     /// with placeholder identity for the host to stamp.
     #[test]
     fn capture_egress_scopes_declared_allowlist() {
-        let policy = assemble_capture_egress_policy(&NetworkPolicy {
-            default: NetworkDefault::Deny,
-            allow_hosts: vec!["accounts.google.com".into()],
-            allow_host_patterns: vec!["*.auth0.com".into()],
-        })
+        let policy = assemble_capture_egress_policy(
+            &NetworkPolicy {
+                default: NetworkDefault::Deny,
+                allow_hosts: vec!["accounts.google.com".into()],
+                allow_host_patterns: vec!["*.auth0.com".into()],
+            },
+            engram_core::SessionId::new(),
+        )
         .expect("allowlist must produce a policy");
 
         assert!(!policy.allow_all);
@@ -783,12 +813,36 @@ mod capture_egress_tests {
     /// network.
     #[test]
     fn capture_egress_allow_all_for_allow_default() {
-        let policy = assemble_capture_egress_policy(&NetworkPolicy {
-            default: NetworkDefault::Allow,
-            allow_hosts: vec![],
-            allow_host_patterns: vec![],
-        })
+        let policy = assemble_capture_egress_policy(
+            &NetworkPolicy {
+                default: NetworkDefault::Allow,
+                allow_hosts: vec![],
+                allow_host_patterns: vec![],
+            },
+            engram_core::SessionId::new(),
+        )
         .expect("allow-default must produce a policy");
         assert!(policy.allow_all, "default=allow → allow_all");
+    }
+
+    /// ADR 0081 P1b: the synthetic session id must be a pure function of
+    /// `job_id` — stable across every claim of the same job (a reassign
+    /// bumps `epoch`, not `job_id`), and distinct across different jobs
+    /// (otherwise two unrelated captures would collide on one egress
+    /// registry entry).
+    #[test]
+    fn synthetic_capture_session_id_is_deterministic_and_distinct() {
+        let job_a = engram_core::types::CaptureJobId::new();
+        let job_b = engram_core::types::CaptureJobId::new();
+        assert_eq!(
+            super::synthetic_capture_session_id(job_a),
+            super::synthetic_capture_session_id(job_a),
+            "same job_id must derive the same session_id every time",
+        );
+        assert_ne!(
+            super::synthetic_capture_session_id(job_a),
+            super::synthetic_capture_session_id(job_b),
+            "distinct job_ids must derive distinct session_ids",
+        );
     }
 }

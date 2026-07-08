@@ -26,7 +26,6 @@ use crate::error::SandboxError;
 use crate::traits::sandbox::{BrowserStart, ForgeSink, HarnessDial, HarnessSink, UploadSink};
 use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
-use crate::types::image::WarmConfig;
 use crate::types::port::PortTunnel;
 use crate::types::sandbox::{
     AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
@@ -286,43 +285,16 @@ pub trait HostClient: Send + Sync {
         fence: SessionFence,
     ) -> Result<SandboxId, SandboxError>;
 
-    /// ADR 0020 P1: boot the image to agentd-ready, snapshot it, tear
-    /// the capture VM down, and return the portable snapshot metadata.
-    /// Called by the coord during `POST /api/enabled-images` to produce
-    /// the per-image base snapshot `create_session` restores from.
-    /// Default errors so mocks / non-FC hosts opt out; the local +
-    /// gRPC clients delegate to the backend's `build_base_snapshot`.
-    ///
-    /// `warm` is the image's optional capture-time prewarm hook
-    /// ([`WarmConfig`]), threaded down to the backend. `capture_env` is the
-    /// resolved capture-time env injected into the warm hook (refs already
-    /// resolved coordinator-side). `capture_egress` (ADR 0080, wire v13) is
-    /// the coordinator-assembled egress policy the host registers for the
-    /// capture VM while the hook runs — `None` keeps the capture
-    /// egress-less.
-    ///
-    /// Issue #539: `progress` receives [`crate::types::CaptureProgress`]
-    /// events for the lifetime of the call — `phase=boot` once the capture
-    /// VM is up, `phase=warm` stage/heartbeat events while the `[warm]`
-    /// hook runs (a host keepalive at least every 30 s even if the hook is
-    /// silent-but-healthy), then `phase=snapshot` before the memory/disk
-    /// capture. A slow consumer must not block the capture — implementors
-    /// send best-effort (`try_send`). On failure the returned
-    /// `SandboxError::CaptureFailed` carries the same stage + tail the last
-    /// progress event reported, so a dropped/backed-up consumer still gets
-    /// the diagnosis on the terminal error even if it missed live updates.
-    async fn build_base_snapshot(
-        &self,
-        _spec: SandboxSpec,
-        _warm: Option<WarmConfig>,
-        _capture_env: std::collections::HashMap<String, String>,
-        _capture_egress: Option<crate::types::egress::SessionEgressPolicy>,
-        _progress: tokio::sync::mpsc::Sender<crate::types::CaptureProgress>,
-    ) -> Result<SnapshotMetadata, SandboxError> {
-        Err(SandboxError::InvalidSpec(
-            "this host doesn't support `build_base_snapshot`".into(),
-        ))
-    }
+    // ADR 0081 P1b (issue #546): `build_base_snapshot` — the
+    // connection-coupled RPC that used to boot a capture VM, run its
+    // optional `[warm]` hook, snapshot it, and stream progress back — is
+    // DELETED from this trait. Capture is now a durable,
+    // heartbeat-dispatched job (`capture_jobs`): the coordinator
+    // assigns `(job_id, epoch)` over `HeartbeatAck.capture_assignments`;
+    // the host claims the full dispatch over an authed HTTP endpoint and
+    // runs `crate::traits::sandbox::SandboxBackend::build_base_snapshot`
+    // directly (that method is UNCHANGED — only this RPC-shaped
+    // `HostClient` seam is gone). See `docs/adr/0081-capture-jobs.md`.
 
     /// ADR 0080 §C: materialize a STANDARD docker/OCI image into a
     /// chunked bootable ext4 on this host — pull, whiteout-aware
@@ -330,8 +302,7 @@ pub trait HostClient: Send + Sync {
     /// chunk into the host's chunk store (which writes through to
     /// BlobStorage, so the returned manifest is durable and readable
     /// coordinator-side). The enable scanner calls this on a picked
-    /// host during the `materializing` stage; sibling of
-    /// [`Self::build_base_snapshot`] (same streaming/lease shape).
+    /// host during the `materializing` stage.
     ///
     /// `platform_os`/`platform_arch` are OCI platform strings
     /// (`"linux"`, `"amd64" | "arm64"`); the host validates them

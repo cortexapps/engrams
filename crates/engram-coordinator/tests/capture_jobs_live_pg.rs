@@ -75,6 +75,7 @@ fn new_capture_job(enable_job_id: Uuid, host_id: HostId) -> NewCaptureJob {
     NewCaptureJob {
         enable_job_id,
         image_uri: format!("test-registry.local/capture-jobs/img/{}", Uuid::new_v4()),
+        manifest_digest: "sha256:deadbeef".to_string(),
         disk_manifest: format!("{}@v1", Uuid::new_v4()),
         image_config: test_config(),
         oci_defaults: Default::default(),

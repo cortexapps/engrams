@@ -597,6 +597,7 @@ pub(crate) fn capture_job_from_row(row: &PgRow) -> Result<CaptureJobRow, MetaErr
         id: CaptureJobId(id),
         enable_job_id: row.try_get("enable_job_id").map_err(col_err)?,
         image_uri: row.try_get("image_uri").map_err(col_err)?,
+        manifest_digest: row.try_get("manifest_digest").map_err(col_err)?,
         disk_manifest: row.try_get("disk_manifest").map_err(col_err)?,
         image_config: jsonb_from_row(row, "image_config")?,
         oci_defaults: jsonb_from_row(row, "oci_defaults")?,

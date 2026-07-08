@@ -1,13 +1,17 @@
 //! Capture-time progress + failure taxonomy for base-snapshot capture
-//! (issue #539). Crosses the coord↔host boundary as a bincode `bytes`
-//! payload inside the streaming `BuildBaseSnapshot` RPC (see
-//! `host_service.proto`'s `CaptureProgress`/`CaptureFailed` messages) and
-//! is persisted onto the `enable_jobs` row so an operator can read a
-//! `[warm]` hook's live stage + failing stage + output tail without host
-//! log access.
+//! (issue #539). ADR 0081 P1b: `CaptureProgress` no longer crosses any
+//! wire — the streaming `BuildBaseSnapshot` RPC that used to carry it is
+//! deleted. It's now a purely in-process signal: `PooledBackend::
+//! build_base_snapshot` pushes it onto an `mpsc::Sender` the host-agent's
+//! capture-job executor (`capture_job.rs`) drains, translating each event
+//! into a `CaptureJobReport` that rides the heartbeat and is persisted
+//! onto the `capture_jobs` row so an operator can read a `[warm]` hook's
+//! live stage + failing stage + output tail without host log access.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use super::ids::SandboxId;
 
 /// Which phase of `build_base_snapshot` a [`CaptureProgress`] event was
 /// emitted from.
@@ -85,6 +89,16 @@ pub enum WarmStageOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureProgress {
     pub phase: CapturePhase,
+    /// ADR 0081 P1b: the capture VM's id, once `create()` has returned.
+    /// `None` on any event emitted before the VM exists (there are none
+    /// today — the very first event, `phase == Boot`, is already built
+    /// after `create()`, so this is `Some` from the first event onward in
+    /// practice). Lets the host-agent's capture-job executor learn the
+    /// sandbox id it's driving without re-plumbing `build_base_snapshot`'s
+    /// signature — it only ever talks to the executor through this
+    /// channel and the call's final `Result`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_id: Option<SandboxId>,
     /// Current `[warm]`-hook stage name while `phase == Warm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_stage: Option<String>,

@@ -342,39 +342,33 @@ async fn reuse_candidate_chunks_present(
     true
 }
 
-/// ADR 0020 P1: capture (or reuse) the per-image base snapshot, record
-/// its `snapshots` row, and return the snapshot id. The caller stamps it
-/// onto the enabled_images row's NOT NULL `base_snapshot_id` and upserts
-/// only after this succeeds — so a capture failure aborts the whole
-/// enable and leaves zero rows (the FK makes "enabled iff base snapshot"
-/// a schema invariant).
+/// ADR 0081 P1b: whether [`try_reuse_base_snapshot`] found (and verified)
+/// an existing base snapshot equivalent to what a fresh capture would
+/// produce — the content/digest reuse fast paths lifted verbatim out of
+/// the old `capture_and_record_base_snapshot` (no host RPC, no
+/// `capture_jobs` row; cheap PG-only checks the scanner runs on every
+/// tick before it ever asks a host to do anything).
+pub(crate) type ReuseHit = (
+    engram_core::types::SnapshotId,
+    // Disk manifest of the base snapshot (always present).
+    engram_core::types::manifest::ManifestRef,
+    // Memory manifest — `None` for cold-boot backends (VZ) that capture a
+    // disk-only base snapshot; `Some` for FC's chunked memory snapshot.
+    Option<engram_core::types::manifest::ManifestRef>,
+);
+
+/// ADR 0020 P1 / ADR 0081 P1b: reuse fast path — if the image is already
+/// enabled at equivalent content (or, legacy, the same OCI digest) with a
+/// base snapshot whose chunks are still durable, return it instead of
+/// ever creating a `capture_jobs` row. `Ok(None)` means a fresh capture
+/// is required (`ensure_capture_job` is the caller's next step).
 ///
-/// Idempotent: if the image is already enabled at the same content
-/// digest with a base snapshot, reuse it — no re-boot.
-///
-/// The capture runs on a prod host (so it inherits the host CPU's
-/// CPUID baseline; pair with `ENGRAM_FC_CPU_TEMPLATE=T2CL` for fleet
-/// portability — ADR 0020). The host attaches its local stub harness,
-/// boots to agentd-ready, snapshots (chunked memory + uploaded
-/// state/sidecar), and tears the capture VM down.
-pub(crate) async fn capture_and_record_base_snapshot(
+/// Idempotent, side-effect-free (besides logging): safe to call on every
+/// scanner tick without contributing to the job's attempts budget.
+pub(crate) async fn try_reuse_base_snapshot(
     state: &SharedState,
     row: &EnabledImage,
-    // Issue #539: live `CaptureProgress` events for the whole call.
-    // Unused (no events sent) on the content/digest-reuse fast paths
-    // below — no host RPC is made there, so there's nothing to report.
-    progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
-) -> Result<
-    (
-        engram_core::types::SnapshotId,
-        // Disk manifest of the base snapshot (always present).
-        engram_core::types::manifest::ManifestRef,
-        // Memory manifest — `None` for cold-boot backends (VZ) that capture a
-        // disk-only base snapshot; `Some` for FC's chunked memory snapshot.
-        Option<engram_core::types::manifest::ManifestRef>,
-    ),
-    ApiError,
-> {
+) -> Result<Option<ReuseHit>, ApiError> {
     // The effective config (RPC-supplied config merged over the
     // Dockerfile-derived defaults) is what the capture VM boots with —
     // the warm hook needs the image's env (JAVA_HOME, PATH, …).
@@ -386,7 +380,8 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // content/digest reuse is unsound for warm images — always re-capture.
     // (This is also what makes a warm-secret rotate actually take effect:
     // a re-enable with the same digest must not short-circuit to the stale
-    // snapshot.)
+    // snapshot.) ADR 0081 P3 (a later commit) replaces this boolean with
+    // the cold-base/warm-overlay split; unchanged here.
     let reuse_ok = config.warm.is_none();
 
     // ADR 0036 P4 / ADR 0080: content-keyed reuse. A base snapshot is a
@@ -441,7 +436,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
                         snapshot_id = %id,
                         "content-identical image already captured; reusing base snapshot",
                     );
-                    return Ok((id, disk_manifest, memory_manifest));
+                    return Ok(Some((id, disk_manifest, memory_manifest)));
                 }
                 tracing::warn!(
                     image_uri = %row.image_uri,
@@ -492,7 +487,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
                         snapshot_id = %id,
                         "base snapshot already recorded for this digest; reusing",
                     );
-                    return Ok((id, disk_manifest, memory_manifest));
+                    return Ok(Some((id, disk_manifest, memory_manifest)));
                 }
                 tracing::warn!(
                     image_uri = %row.image_uri,
@@ -505,49 +500,32 @@ pub(crate) async fn capture_and_record_base_snapshot(
         }
     }
 
-    // Anonymous capture spec — no session env, no harness pack (the
-    // host substitutes its stub harness so the snapshot carries a
-    // harness drive slot for per-session swap at restore). ADR 0027
-    // bundles + ADR 0027 memory floor live inside the shared helper;
-    // capture + restore MUST agree on `mem_size_mib` (FC requires it),
-    // and ADR 0028's disk-only recovery boots the same shape.
-    //
-    // Issue #192: pin the capture's image reference to the digest we
-    // just resolved, NOT `row.image_uri`'s (possibly mutable) tag. The
-    // host's local OCI cache is keyed on this URI string; a moving tag
-    // (`:latest`) lets a tag-keyed cache hit serve a previous bake's
-    // rootfs even though the coord materialized fresh chunks — so the
-    // recorded `manifest_digest` and the captured base-snapshot bytes
-    // disagree, and the fleet silently keeps booting the old guest. A
-    // digest-pinned reference is content-addressed and immutable, so the
-    // host pulls (and caches) exactly the resolved bake.
-    let capture_uri = engram_oci::digest_pinned_uri(
-        &row.image_uri,
-        &engram_oci::Digest256(row.manifest_digest.clone()),
-    );
-    // ADR 0057: base-snapshot capture is a trusted, ephemeral build step (it may
-    // run a `[warm]` hook that needs egress), and the captured snapshot is
-    // network-agnostic — every session that later restores it gets its own
-    // policy network. So capture boots with allow-all egress.
-    let capture_network = engram_core::types::image::NetworkPolicy {
-        default: engram_core::types::image::NetworkDefault::Allow,
-        allow_hosts: Vec::new(),
-        allow_host_patterns: Vec::new(),
-    };
-    // ADR 0080 phase 3b: the capture VM boots from the freshly
-    // MATERIALIZED chunked ext4 (`row.disk_manifest`, stamped by the
-    // `materializing` stage) — the explicit rootfs-manifest override,
-    // the same shape as ADR 0028's disk-only recovery. There is no
-    // engram OCI artifact for the host to pull anymore; `capture_uri`
-    // stays digest-pinned purely as record-keeping (`spec.image`).
-    let spec = crate::api::sessions::cold_boot_spec(
-        &capture_uri,
-        &config,
-        row.disk_manifest,
-        capture_network,
-    );
+    Ok(None)
+}
 
-    let (host_id, host) =
+/// ADR 0081 P1b: ensure a `capture_jobs` row exists for this enable job
+/// and return the MOST RECENT one (terminal or not) — the scanner's
+/// entire interaction with capture dispatch. Picks a capture host (the
+/// same `pick_capture_host` the old direct-RPC path used) only when no
+/// row exists yet for this enable job; an existing row (running,
+/// reassigned, or terminal) is returned as-is — the actual `SandboxSpec`/
+/// env/egress assembly is deferred to the CLAIM endpoint
+/// (`host_http::claim_capture_job`), which resolves secrets fresh at
+/// claim time rather than once at job-creation time (ADR 0081 §A).
+pub(crate) async fn ensure_capture_job(
+    state: &SharedState,
+    row: &EnabledImage,
+    enable_job_id: Uuid,
+) -> Result<engram_core::types::capture_job::CaptureJobRow, ApiError> {
+    if let Some(existing) = state
+        .services
+        .meta
+        .latest_capture_job_for_enable(enable_job_id)
+        .await?
+    {
+        return Ok(existing);
+    }
+    let (host_id, _) =
         crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
             .await
             .map_err(|e| {
@@ -556,90 +534,58 @@ pub(crate) async fn capture_and_record_base_snapshot(
                      ({e:?}). Register a host and retry the enable."
                 ))
             })?;
-
+    let disk_manifest = row
+        .disk_manifest
+        .ok_or_else(|| {
+            ApiError::Internal(format!(
+                "enable job for `{}` reached the capturing stage without a disk_manifest \
+                 (the materializing stage should have stamped one)",
+                row.image_uri
+            ))
+        })?
+        .to_string();
     tracing::info!(
         image_uri = %row.image_uri,
         host_id = %host_id,
-        "capturing base snapshot for image enable",
+        %enable_job_id,
+        "creating capture job for image enable",
     );
-    // Resolve the capture-time env for the `[warm]` hook (`warm.env`, ADR
-    // 0080): literals pass through, secret refs resolve through the same
-    // SecretStore a session uses — FAIL-LOUD: an unresolvable ref aborts
-    // the capture here rather than baking a corrupt "warm" snapshot. The
-    // host receives only resolved values (never the refs). The values
-    // flow coord→host→capture-exec and whatever the warm processes
-    // persist lands in the base snapshot — which we treat as
-    // secret-bearing (see ADR 0007 storage model); the refs themselves
-    // never leave the DB.
-    let warm_env = config
-        .warm
-        .as_ref()
-        .map(|w| w.env.as_slice())
-        .unwrap_or(&[]);
-    let capture_env = resolve_capture_env(state, &row.image_uri, warm_env).await?;
+    let new_job = engram_core::types::capture_job::NewCaptureJob {
+        enable_job_id,
+        image_uri: row.image_uri.clone(),
+        manifest_digest: row.manifest_digest.clone(),
+        disk_manifest,
+        image_config: row.image_config.clone(),
+        oci_defaults: row.oci_defaults.clone(),
+        host_id,
+    };
+    Ok(state.services.meta.insert_capture_job(new_job).await?)
+}
 
-    // ADR 0080 (wire v13): assemble the `[warm]` hook's capture egress
-    // policy HERE (one egress builder for sessions and captures alike)
-    // and ship it ready-to-register; the host stamps the
-    // sandbox-dependent identity (sandbox_id, guest IP) at registration.
-    // `None` ⇒ the capture VM stays egress-less.
-    let capture_egress = config
-        .warm
-        .as_ref()
-        .and_then(|w| w.network.as_ref())
-        .and_then(crate::session_boot::assemble_capture_egress_policy);
-
-    // Thread the image's optional `[warm]` hook into capture: the host
-    // runs it in the live VM before the snapshot freezes, so a warmed
-    // process (e.g. a gradle daemon) is captured into the base snapshot.
-    // A warm failure is fail-loud — it surfaces here as a capture error
-    // and aborts the enable.
-    //
-    // Issue #539: `progress` receives live `CaptureProgress` events for
-    // the call's lifetime — the caller (`enable_scanner::advance_one`)
-    // drains it into a fenced `enable_jobs` write per event.
-    let meta = host
-        .build_base_snapshot(
-            spec,
-            config.warm.clone(),
-            capture_env,
-            capture_egress,
-            progress,
-        )
-        .await
-        .map_err(|e| match e {
-            engram_core::SandboxError::CaptureFailed(failure) => ApiError::CaptureFailed {
-                kind: failure.kind,
-                message: format!(
-                    "base snapshot capture for `{}` failed on host {host_id}: {failure}",
-                    row.image_uri
-                ),
-            },
-            // ADR 0050 C / issue #229: a connect-time transport death
-            // (host rolled between `pick_capture_host` and this RPC, or a
-            // mixed-version WIRE_VERSION rejection) is the SAME retryable
-            // failure class as a mid-stream `WarmExecTransport` — both
-            // just mean "didn't reach a live, matching-wire host", and
-            // `classify_capture_error` already retries `ApiError::
-            // Unavailable` via the attempts budget. Route both here
-            // instead of falling into the generic `Internal` (bail-fast)
-            // arm, or the enable wedges non-retryable on a transient roll.
-            engram_core::SandboxError::Unavailable(msg) => ApiError::Unavailable(format!(
-                "base snapshot capture for `{}` could not reach host {host_id}: {msg}",
-                row.image_uri
-            )),
-            engram_core::SandboxError::WireSkew {
-                host: host_wire,
-                coord,
-            } => ApiError::Unavailable(format!(
-                "base snapshot capture for `{}` hit a WIRE_VERSION skew against host \
-                     {host_id} (host={host_wire}, coord={coord})",
-                row.image_uri
-            )),
-            other => ApiError::Internal(format!(
-                "base snapshot capture for `{}` failed on host {host_id}: {other}",
-                row.image_uri
-            )),
+/// ADR 0081 P1b: consume a `stage == Done` `capture_jobs` row — decode
+/// its `result_bincode` (the executor's `SnapshotMetadata`, bincode-
+/// encoded), verify the chunked manifests are actually durable, and
+/// record the `snapshots` row. Mirrors the tail of the old
+/// `capture_and_record_base_snapshot` exactly, except the FC
+/// snapshot-version comes straight off the job row (the host already
+/// stamped it in its terminal report) instead of a separate
+/// `fc_snapshot_version_for_host` lookup.
+pub(crate) async fn finalize_capture_job(
+    state: &SharedState,
+    capture_row: &engram_core::types::capture_job::CaptureJobRow,
+) -> Result<ReuseHit, ApiError> {
+    let bytes = capture_row.result_bincode.as_deref().ok_or_else(|| {
+        ApiError::Internal(format!(
+            "capture job {} is `done` but carries no result_bincode",
+            capture_row.id
+        ))
+    })?;
+    let meta: engram_core::types::snapshot::SnapshotMetadata = bincode::deserialize(bytes)
+        .map_err(|e| {
+            ApiError::Internal(format!(
+                "capture job {} result_bincode failed to decode: {e}",
+                capture_row.id
+            ))
         })?;
 
     // A base snapshot is only useful if its chunked manifests are
@@ -656,22 +602,11 @@ pub(crate) async fn capture_and_record_base_snapshot(
         return Err(ApiError::Internal(format!(
             "base snapshot for `{}` was captured but its chunked manifests \
              failed HEAD-verify in BlobStorage; not enabling",
-            row.image_uri
+            capture_row.image_uri
         )));
     }
 
     let now = Utc::now();
-    // ADR 0068: stamp the capturing host's FC snapshot-version so a
-    // later restore (a fresh `create`, ADR 0020 — there is no warm pool,
-    // every create restores this base row) can eventually be paired
-    // against it at placement. Best-effort: a lookup failure degrades to
-    // NULL (today's unconstrained behavior), never fails the enable.
-    let fc_snapshot_version = state
-        .services
-        .meta
-        .fc_snapshot_version_for_host(host_id)
-        .await
-        .unwrap_or_default();
     // Record the snapshot row (session_id = NULL — a template artifact,
     // not a session capture). The caller stamps the returned id onto the
     // enabled_images row's NOT NULL base_snapshot_id and upserts it only
@@ -682,7 +617,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
         .record_snapshot(SnapshotRecord {
             id: meta.id,
             session_id: None,
-            host_id: Some(host_id),
+            host_id: Some(capture_row.host_id),
             image_version: meta.image_version.clone(),
             size_bytes: meta.size_bytes,
             created_at: meta.created_at,
@@ -694,12 +629,15 @@ pub(crate) async fn capture_and_record_base_snapshot(
             recoverable,
             // Template artifact — no session, no event log.
             events_cursor: None,
-            fc_snapshot_version,
+            // ADR 0068: stamp the capturing host's FC snapshot-version —
+            // the job row already carries it (stamped by the host in its
+            // terminal report), no separate lookup needed.
+            fc_snapshot_version: capture_row.fc_snapshot_version.clone(),
         })
         .await?;
 
     tracing::info!(
-        image_uri = %row.image_uri,
+        image_uri = %capture_row.image_uri,
         snapshot_id = %meta.id,
         size_bytes = meta.size_bytes,
         "recorded base snapshot for image",
@@ -708,7 +646,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
         ApiError::Internal(format!(
             "base snapshot for `{}` was captured without a chunked disk manifest; \
              residency requires a chunked rootfs — not enabling",
-            row.image_uri
+            capture_row.image_uri
         ))
     })?;
     // Memory manifest is optional (migration 0049): FC produces a chunked
@@ -725,10 +663,14 @@ pub(crate) async fn capture_and_record_base_snapshot(
 /// deployment `ref` (backends like GCP SM that honor explicit refs).
 ///
 /// FAIL-LOUD (ADR 0080): an unresolvable or erroring ref fails the
-/// capture with an actionable error. The pre-0080 behavior (warn + skip)
+/// claim with an actionable error. The pre-0080 behavior (warn + skip)
 /// let a missing secret silently bake a corrupt "warm" base snapshot
-/// that every session then inherited.
-async fn resolve_capture_env(
+/// that every session then inherited. ADR 0081 P1b: called from the
+/// coordinator's capture-job CLAIM handler (`host_http::
+/// claim_capture_job`) instead of from the old direct-RPC capture path
+/// — resolution now happens fresh on every claim (including a
+/// reassign), never once at job-creation time.
+pub(crate) async fn resolve_capture_env(
     state: &SharedState,
     image_uri: &str,
     warm_env: &[engram_core::types::CaptureEnvEntry],

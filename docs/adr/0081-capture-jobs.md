@@ -331,4 +331,98 @@ machinery; `MaterializeImage` (stays an RPC by decision above).
 
 ## Divergence log
 
-- (filled as phases land)
+**P1b (cutover commit — this PR's second commit, on top of the P1a
+foundation) landed**: migration 0095 verbs wired live, wire v15 heartbeat
+fields consumed on both sides, `BuildBaseSnapshot` RPC deleted end to
+end (proto/client/server/`HostClient` trait — `SandboxBackend::
+build_base_snapshot` unchanged, now called only by the host-agent's own
+executor), the `capture_job.rs` executor + durable record + live-sandbox
+registry, the claim endpoint, and the scanner's watch-only `Capturing`
+rework + stage-deadline scan.
+
+- **`capture_jobs.manifest_digest` added (migration 0096, NOT in the
+  original 0095 design)**: the P1a row carried `disk_manifest` (the
+  content-derived chunked-rootfs ref) but not the OCI `manifest_digest`.
+  Two real needs surfaced implementing P1b: (1) the claim handler needs
+  it to digest-pin `SandboxSpec.image` (issue #192 — a moving tag must
+  not let the host's local OCI cache serve a different bake than the
+  coordinator materialized); (2) the enable scanner's watch-only
+  `Capturing` re-entry (capture is now genuinely multi-tick — a capture
+  VM can run for minutes across many scanner ticks) needs to SKIP
+  re-running `materialize_image_on_host` on every tick, and without a
+  durable `manifest_digest` on the job row there was no way to
+  reconstruct the materialized state without re-pulling. Caught by the
+  `enable_reuse_live_pg` regression test asserting "materializes exactly
+  once" — it failed (materialized 3x) before this column existed.
+- **Executor design: calls `SandboxBackend::build_base_snapshot`
+  unchanged, doesn't reimplement its body.** The spec text describes
+  "moving the body... structurally intact" into `capture_job.rs`; the
+  ADR's own §11 ("the executor lives... above the `SandboxBackend`
+  seam") is the more precise statement and is what got built: the
+  executor spawns `backend.build_base_snapshot(...)` and drains its
+  existing `CaptureProgress` channel into the durable record + heartbeat
+  report, exactly the way `grpc_server.rs`'s deleted handler used to
+  drain it onto the gRPC stream. `CaptureProgress` gained one field
+  (`sandbox_id: Option<SandboxId>`, stamped on the first event) so the
+  executor learns the VM's identity without re-plumbing the trait
+  method's signature — the type no longer crosses any wire, so this was
+  a free change.
+- **`CaptureJobProgress` (the wire-facing progress shape) is lossier
+  than the old `CaptureProgress`**: it has `{detail, log_tail}`, not the
+  old `{warm_stage, warm_stages: Vec<WarmStageRecord>, output_tail}`.
+  This is the ALREADY-DECIDED P1a schema (migration 0095's
+  `stage_progress` shape), not a P1b regression — but it means the
+  `enable_jobs.warm_stage`/`warm_stages` dashboard columns only get a
+  best-effort mirror (`report.progress.detail` stands in for the
+  specific warm-hook stage name) via the new UNFENCED
+  `mirror_capture_progress_to_enable_job` verb, not the rich stage
+  history `update_enable_job_capture_progress` used to persist.
+- **`update_enable_job_capture_progress` (the old fenced,
+  claim-renewing verb) is now DEAD CODE** — nothing calls it (the
+  scanner's old consumer task, its only caller, is deleted). Left in
+  place (Postgres impl + trait method + its own live-pg test coverage)
+  rather than deleted, to keep this commit's footprint bounded; a
+  follow-up cleanup commit should remove it.
+- **`release_enable_job_claim` (new verb, not in the original design)**:
+  the watch-only `Capturing` exit needs the enable-job claim released
+  IMMEDIATELY (so the next ~3s tick re-observes the capture_jobs row),
+  not left to expire via `claim_enable_jobs`'s 300s lease — the lease
+  exists to bound a crashed pod's ownership, not to pace a healthy
+  watch loop.
+- **`latest_capture_job_for_enable` (new verb, not in the original
+  design)**: `active_capture_job_for_enable` (P1a) only returns
+  NON-terminal rows — by definition it can never observe a `done`/
+  `failed` outcome, so the scanner has no way to see a job that just
+  went terminal. This new verb (`ORDER BY created_at DESC LIMIT 1`,
+  terminal or not) is what the scanner actually polls.
+- **`retry_enable_job` now also clears a stale terminal `capture_jobs`
+  row** for the same enable job (a small addition to the existing
+  Postgres query, not a new verb) — otherwise a retried enable job would
+  see the OLD exhausted-Failed row forever via
+  `latest_capture_job_for_enable` and immediately re-fail non-retryable
+  without ever attempting a fresh capture.
+- **Claim-time secret-resolution failure**: implemented as specified —
+  a fail-loud `resolve_capture_env` error inside the claim handler
+  writes a synthetic non-retryable `Failed` terminal via
+  `record_capture_job_report` (fenced by the row's own current epoch)
+  BEFORE returning the HTTP error, so the host never receives a spec for
+  a job that's already dead coordinator-side.
+- **`reuse_outcome` values landing this commit**: only `reused_full`
+  (the existing content/digest reuse hit) and
+  `recaptured:content_changed` (any fresh capture, reuse miss). The
+  ADR's fuller taxonomy (`reused_cold_base`, `recaptured:no_cold_base`,
+  `recaptured:chunks_missing`, `recaptured:fc_version_changed`) is
+  meaningless before P3 (`cold_bases` doesn't exist as a concept in the
+  capture flow yet) — deferred to that phase as the ADR's own P3/P4
+  scoping already implies.
+- **Digest-pinning gap, now closed**: an earlier draft of this commit
+  left `spec.image` un-pinned at claim time (no `manifest_digest` on the
+  row) with a documented "harmless, record-keeping only" rationale.
+  Superseded by the migration-0096 fix above — flagging here only
+  because it's exactly the kind of divergence this log exists to catch
+  before it goes stale.
+- **NOT done this commit** (P2/P3/P4, explicitly out of scope per the
+  Phases section): footprint/anti-affinity/FC-version-pin placement,
+  the cold-base/warm-overlay split, `cold_bases` reuse, the
+  determinism test. `pick_capture_host` is called verbatim (first-fit,
+  no footprint sizing) everywhere this commit needed a host pick.

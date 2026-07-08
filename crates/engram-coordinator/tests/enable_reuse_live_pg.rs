@@ -361,40 +361,103 @@ impl HostClient for FakeCaptureHost {
         })
     }
 
-    async fn build_base_snapshot(
-        &self,
-        spec: SandboxSpec,
-        _warm: Option<engram_core::types::image::WarmConfig>,
-        _capture_env: std::collections::HashMap<String, String>,
-        _capture_egress: Option<engram_core::types::egress::SessionEgressPolicy>,
-        _progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
-    ) -> Result<SnapshotMetadata, SandboxError> {
-        self.captures.fetch_add(1, Ordering::SeqCst);
-        // ADR 0080 phase 3b: the capture boots from the freshly
-        // materialized chunked ext4 — the coordinator must thread the
-        // row's disk manifest as the explicit rootfs override.
-        assert!(
-            spec.rootfs_manifest.is_some(),
-            "capture spec must carry the materialized rootfs_manifest"
-        );
-        Ok(SnapshotMetadata {
-            id: SnapshotId::new(),
-            size_bytes: 4096,
-            created_at: Utc::now(),
-            image_version: "reuse-fixture".into(),
-            disk_manifest: Some(self.snapshot_disk_ref),
-            memory_manifest: None, // cold-boot shape (VZ-like)
-            base_memory_manifest: None,
-            migration_source: None,
-            source_sandbox_id: None,
-            state_blob_key: None,
-            sidecar_blob_key: None,
-            rootfs_blob_key: None,
-            working_set_blob_key: None,
-            aux_bundles: vec![],
-            paused_at: None,
-        })
-    }
+    // ADR 0081 P1b: `HostClient::build_base_snapshot` is deleted — capture
+    // is now a durable `capture_jobs` row dispatched over the heartbeat,
+    // not a direct RPC this fake would intercept. The test below drives a
+    // simulated host loop (`spawn_capture_job_simulator`) that polls
+    // `capture_assignments_for_host`, calls the REAL `claim_capture_job`
+    // handler in-process (exercising the actual `SandboxSpec`/env/egress
+    // assembly), and reports a synthetic `Done` terminal via
+    // `record_capture_job_report` — the moral equivalent of what this
+    // method used to do, minus an actual capture VM.
+}
+
+// ---------------------------------------------------------------
+// ADR 0081 P1b: simulated host-side capture-job executor. No real
+// host-agent process exists in this test, so instead of a fake
+// `HostClient::build_base_snapshot` (deleted) this polls
+// `capture_assignments_for_host` and, for each unseen `(job_id, epoch)`,
+// drives the REAL `claim_capture_job` handler in-process (exercising the
+// actual `SandboxSpec`/env/egress assembly the coordinator builds) and
+// reports back a synthetic `Done` terminal via `record_capture_job_report`
+// — the same store call the real heartbeat reconcile uses.
+// ---------------------------------------------------------------
+
+fn spawn_capture_job_simulator(
+    state: Arc<engram_coordinator::AppState>,
+    meta: Arc<dyn MetadataStore>,
+    host_id: HostId,
+    capture_host: Arc<FakeCaptureHost>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use engram_core::types::{CaptureJobReport, CaptureJobStage, CaptureTerminalReport};
+        use std::collections::HashMap as StdHashMap;
+        let mut seen: StdHashMap<Uuid, i64> = StdHashMap::new();
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let Ok(assignments) = meta.capture_assignments_for_host(host_id).await else {
+                continue;
+            };
+            for assignment in assignments {
+                let job_uuid = assignment.job_id.as_uuid();
+                if seen.get(&job_uuid) == Some(&assignment.epoch) {
+                    continue;
+                }
+                let claimed = engram_coordinator::api::host_http::claim_capture_job(
+                    State(state.clone()),
+                    AxPath((host_id, assignment.job_id)),
+                    axum::Json(engram_coordinator::api::host_http::ClaimCaptureJobRequest {
+                        epoch: assignment.epoch,
+                    }),
+                )
+                .await;
+                let spec = match claimed {
+                    Ok(axum::Json(spec)) => spec,
+                    Err(e) => {
+                        eprintln!("capture job simulator: claim failed: {e:?}");
+                        continue;
+                    }
+                };
+                assert!(
+                    spec.spec.rootfs_manifest.is_some(),
+                    "capture spec must carry the materialized rootfs_manifest"
+                );
+                capture_host.captures.fetch_add(1, Ordering::SeqCst);
+                let snapshot_meta = SnapshotMetadata {
+                    id: SnapshotId::new(),
+                    size_bytes: 4096,
+                    created_at: Utc::now(),
+                    image_version: "reuse-fixture".into(),
+                    disk_manifest: Some(capture_host.snapshot_disk_ref),
+                    memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                    working_set_blob_key: None,
+                    aux_bundles: vec![],
+                    paused_at: None,
+                };
+                let result_bincode =
+                    bincode::serialize(&snapshot_meta).expect("encode synthetic SnapshotMetadata");
+                let report = CaptureJobReport {
+                    job_id: assignment.job_id,
+                    epoch: assignment.epoch,
+                    stage: CaptureJobStage::Done,
+                    progress: None,
+                    fc_snapshot_version: None,
+                    terminal: Some(CaptureTerminalReport::Done { result_bincode }),
+                };
+                if let Err(e) = meta.record_capture_job_report(&report).await {
+                    eprintln!("capture job simulator: record_capture_job_report failed: {e}");
+                    continue;
+                }
+                seen.insert(job_uuid, assignment.epoch);
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------
@@ -561,6 +624,11 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
     })
     .await
     .expect("hosts row");
+
+    // ADR 0081 P1b: the simulated host-side capture-job executor (no
+    // real host-agent process in this test).
+    let _capture_sim =
+        spawn_capture_job_simulator(state.clone(), meta.clone(), host_id, capture_host.clone());
 
     // ---- run the scanner; enable tag A, then tag B ----
     let _scanner = enable_scanner::spawn(

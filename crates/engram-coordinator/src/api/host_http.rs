@@ -1,16 +1,18 @@
-//! ADR 0013 host → coord HTTP endpoints (dark in this commit).
+//! ADR 0013 host → coord HTTP endpoints.
 //!
 //! Replaces the host-initiated bits of the WS protocol with plain
-//! HTTP/JSON POSTs that any coord pod can serve. The host-agent
-//! doesn't call these yet — that wiring lands in the cutover
-//! commit. Routing is live so a `curl` against a coord pod
-//! exercises the endpoint today.
+//! HTTP/JSON POSTs that any coord pod can serve. Wired into the
+//! host-agent's real heartbeat loop / event sink / eviction-pusher
+//! (`engram-host-agent::coord_client`).
 //!
-//! Five endpoints:
+//! Endpoints:
 //!   - `POST /api/hosts/register` — once per host-agent startup
 //!   - `POST /api/hosts/:id/heartbeat` — every 5s
 //!   - `POST /api/hosts/:id/auth/resolve-registry` — host requests
 //!     OCI creds during image pull
+//!   - `POST /api/hosts/:id/capture-jobs/:job_id/claim` (ADR 0081 P1b) —
+//!     host resolves the full dispatch for a `HeartbeatAck.
+//!     capture_assignments` entry it doesn't yet own
 //!   - `POST /api/sessions/:session_id/harness-events` — host
 //!     forwards adapter events one POST at a time
 //!   - `POST /api/hosts/:id/idle-eviction-candidates` — host pushes
@@ -350,6 +352,11 @@ pub struct HeartbeatRequest {
     /// twin). Disagreement-alarm input only.
     #[serde(default)]
     pub harness_attached: Vec<SandboxId>,
+    /// ADR 0081 P1b: un-acked `capture_jobs` progress/terminal reports
+    /// from this host's durable capture-job records — the
+    /// `CheckpointAdvert`/`checkpoints` pattern verbatim, for capture.
+    #[serde(default)]
+    pub capture_job_reports: Vec<engram_core::types::CaptureJobReport>,
 }
 
 #[derive(Serialize)]
@@ -385,6 +392,16 @@ pub struct HeartbeatResponse {
     /// PG. The host deletes the matching durable record files.
     #[serde(default)]
     pub acked_checkpoints: Vec<engram_core::types::SnapshotId>,
+    /// ADR 0081 P1b: `(job_id, epoch)` assignments this host should be
+    /// running (or should claim, if it isn't yet) — read unconditionally
+    /// every tick via `capture_assignments_for_host`.
+    #[serde(default)]
+    pub capture_assignments: Vec<engram_core::types::CaptureJobAssignment>,
+    /// ADR 0081 P1b: terminal reports from this heartbeat that landed in
+    /// PG (or were already terminal at a matching epoch) — the host
+    /// deletes the matching durable capture-job records.
+    #[serde(default)]
+    pub acked_capture_jobs: Vec<engram_core::types::CaptureJobId>,
 }
 
 pub async fn heartbeat(
@@ -695,6 +712,87 @@ pub async fn heartbeat(
         );
     }
 
+    // ADR 0081 P1b: reconcile this host's un-acked capture-job reports.
+    // Each write is fenced by `(job_id, epoch)` — any coord replica can
+    // perform it, no lease-holder identity involved. A terminal report is
+    // acked when either the fenced write actually landed it, OR the row
+    // is already terminal at a MATCHING epoch (idempotent re-advertise —
+    // e.g. a prior ack this host somehow didn't observe). A terminal
+    // report whose epoch no longer matches (the job was reassigned away)
+    // is silently dropped: the host's own stale-epoch bookkeeping evicts
+    // that attempt, and a fresh report at the new epoch supersedes it.
+    let mut acked_capture_jobs = Vec::new();
+    for report in &hb.capture_job_reports {
+        let applied = match state.services.meta.record_capture_job_report(report).await {
+            Ok(applied) => applied,
+            Err(e) => {
+                tracing::warn!(
+                    host_id = %host_id,
+                    job_id = %report.job_id,
+                    error = %e,
+                    "capture job report reconcile failed; host re-advertises next heartbeat",
+                );
+                false
+            }
+        };
+        // One lookup serves both the ack-idempotency check below and the
+        // dashboard mirror's `enable_job_id`.
+        let row = state
+            .services
+            .meta
+            .get_capture_job(report.job_id)
+            .await
+            .ok()
+            .flatten();
+        if report.terminal.is_some() {
+            if applied {
+                acked_capture_jobs.push(report.job_id);
+            } else if let Some(row) = &row {
+                if row.epoch == report.epoch && row.stage.is_terminal() {
+                    acked_capture_jobs.push(report.job_id);
+                }
+            }
+        }
+        // Mirror onto the enable_jobs dashboard columns — best-effort,
+        // cosmetic only (see `mirror_capture_progress_to_enable_job`'s
+        // doc: it does NOT renew any enable-job claim).
+        if let Some(row) = &row {
+            let capture_phase = capture_job_stage_to_phase(report.stage);
+            let warm_stage = report.progress.as_ref().and_then(|p| p.detail.as_deref());
+            let output_tail = report.progress.as_ref().and_then(|p| p.log_tail.as_deref());
+            if let Err(e) = state
+                .services
+                .meta
+                .mirror_capture_progress_to_enable_job(
+                    row.enable_job_id,
+                    capture_phase.map(|p| p.as_str()),
+                    warm_stage,
+                    output_tail,
+                )
+                .await
+            {
+                tracing::debug!(
+                    host_id = %host_id,
+                    job_id = %report.job_id,
+                    error = %e,
+                    "capture job dashboard mirror failed (non-fatal)",
+                );
+            }
+        }
+    }
+    // This host's current `(job_id, epoch)` assignments — read
+    // unconditionally every tick regardless of whether any capture jobs
+    // exist fleet-wide (mirrors `list_prestaging_refs`'s posture).
+    let capture_assignments = state
+        .services
+        .meta
+        .capture_assignments_for_host(host_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::debug!(host_id = %host_id, error = %e, "capture_assignments_for_host failed");
+            Vec::new()
+        });
+
     Ok(Json(HeartbeatResponse {
         server_time: Utc::now(),
         revoked_sessions: Vec::new(),
@@ -702,7 +800,26 @@ pub async fn heartbeat(
         prestage_images,
         live_bundles,
         acked_checkpoints,
+        capture_assignments,
+        acked_capture_jobs,
     }))
+}
+
+/// ADR 0081 P1b: map a `CaptureJobStage` to the `CapturePhase` the
+/// `enable_jobs.capture_phase` dashboard column has always stored —
+/// `Booting -> Boot`, `Warming -> Warm`, `Freezing -> Snapshot`;
+/// `Assigned`/`Done`/`Failed` have no rendered phase (`None` leaves the
+/// column at its last-known value via `COALESCE`).
+fn capture_job_stage_to_phase(
+    stage: engram_core::types::CaptureJobStage,
+) -> Option<engram_core::types::CapturePhase> {
+    use engram_core::types::{CaptureJobStage, CapturePhase};
+    match stage {
+        CaptureJobStage::Booting => Some(CapturePhase::Boot),
+        CaptureJobStage::Warming => Some(CapturePhase::Warm),
+        CaptureJobStage::Freezing => Some(CapturePhase::Snapshot),
+        CaptureJobStage::Assigned | CaptureJobStage::Done | CaptureJobStage::Failed => None,
+    }
 }
 
 /// ADR 0015 M5: project enabled-image rows down to the wire
@@ -798,6 +915,159 @@ pub async fn resolve_registry_auth(
             password: c.password,
         });
     Ok(Json(ResolveRegistryAuthResponse { creds }))
+}
+
+// ---- POST /api/hosts/:id/capture-jobs/:job_id/claim ----
+
+/// ADR 0081 P1b: the epoch a host is claiming — sent so the coordinator
+/// can reject a stale claim (a host that raced a reassignment, or one
+/// replaying an old `HeartbeatAck.capture_assignments` entry) instead of
+/// silently handing out a fresh `CaptureJobSpec` for an epoch it no
+/// longer owns.
+#[derive(Deserialize)]
+pub struct ClaimCaptureJobRequest {
+    pub epoch: i64,
+}
+
+/// ADR 0081 §A: resolve the full dispatch for `(host_id, job_id, epoch)`
+/// — `SandboxSpec` (same construction `capture_and_record_base_snapshot`
+/// used to do directly), the image's optional `[warm]` hook, the
+/// capture-time env resolved FRESH against `SecretStore` (fail-loud), and
+/// the capture egress policy keyed by a synthetic session id derived
+/// deterministically from `job_id` (stable across every claim of the
+/// same job). Secrets ride only this authed response — never PG, never
+/// the heartbeat, never the durable host-side record.
+///
+/// Validates the row is actually assigned to `host_id` at `epoch` and
+/// non-terminal before doing any of that work. A resolve-env failure
+/// (missing/unresolvable secret) is NOT retried by the host — it's a
+/// deterministic misconfiguration, so THIS handler fails the job
+/// directly (non-retryable) via a synthetic terminal report through the
+/// same fenced `record_capture_job_report` path the heartbeat reconcile
+/// uses, then returns the error to the host (which never gets a spec to
+/// run, so it never starts an executor for this job/epoch).
+pub async fn claim_capture_job(
+    State(state): State<SharedState>,
+    Path((host_id, job_id)): Path<(HostId, engram_core::types::CaptureJobId)>,
+    Json(req): Json<ClaimCaptureJobRequest>,
+) -> Result<Json<engram_core::types::capture_job::CaptureJobSpec>, ApiError> {
+    let row = state
+        .services
+        .meta
+        .get_capture_job(job_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("capture job {job_id} not found")))?;
+    if row.host_id != host_id {
+        return Err(ApiError::BadRequest(format!(
+            "capture job {job_id} is assigned to host {}, not {host_id}",
+            row.host_id
+        )));
+    }
+    if row.stage.is_terminal() {
+        return Err(ApiError::Conflict(format!(
+            "capture job {job_id} is already terminal ({})",
+            row.stage
+        )));
+    }
+    if row.epoch != req.epoch {
+        return Err(ApiError::Conflict(format!(
+            "capture job {job_id} claim requested epoch {}, current epoch is {}",
+            req.epoch, row.epoch
+        )));
+    }
+
+    let config = row.image_config.merged_with(&row.oci_defaults);
+    let disk_manifest: engram_core::types::manifest::ManifestRef =
+        row.disk_manifest.parse().map_err(|e| {
+            ApiError::Internal(format!(
+                "capture job {job_id}: stored disk_manifest {:?} failed to parse: {e}",
+                row.disk_manifest
+            ))
+        })?;
+
+    // Same construction `capture_and_record_base_snapshot` used to do
+    // directly (issue #192: digest-pin `spec.image` so a moving tag can't
+    // let the host's local OCI cache serve a different bake than the one
+    // materialized; ADR 0057: capture boots with allow-all egress — a
+    // trusted, ephemeral build step).
+    let capture_uri = engram_oci::digest_pinned_uri(
+        &row.image_uri,
+        &engram_oci::Digest256(row.manifest_digest.clone()),
+    );
+    let capture_network = engram_core::types::image::NetworkPolicy {
+        default: engram_core::types::image::NetworkDefault::Allow,
+        allow_hosts: Vec::new(),
+        allow_host_patterns: Vec::new(),
+    };
+    let spec = crate::api::sessions::cold_boot_spec(
+        &capture_uri,
+        &config,
+        Some(disk_manifest),
+        capture_network,
+    );
+
+    let warm_env = config
+        .warm
+        .as_ref()
+        .map(|w| w.env.as_slice())
+        .unwrap_or(&[]);
+    let resolved_env = match crate::api::enabled_images::resolve_capture_env(
+        &state,
+        &row.image_uri,
+        warm_env,
+    )
+    .await
+    {
+        Ok(env) => env,
+        Err(e) => {
+            // Deterministic misconfiguration — fail the job directly
+            // (non-retryable) rather than hand the host a spec it
+            // can't run, and rather than let the host report a
+            // retryable transport-shaped failure for what is really
+            // an operator fix (add the secret / fix the ref).
+            let report = engram_core::types::CaptureJobReport {
+                job_id,
+                epoch: row.epoch,
+                stage: engram_core::types::CaptureJobStage::Failed,
+                progress: None,
+                fc_snapshot_version: None,
+                terminal: Some(engram_core::types::CaptureTerminalReport::Failed {
+                    error: e.to_string(),
+                    error_stage: "assigned".to_string(),
+                    retryable: false,
+                }),
+            };
+            if let Err(write_err) = state.services.meta.record_capture_job_report(&report).await {
+                tracing::warn!(%job_id, error = %write_err, "claim_capture_job: failed to record env-resolve failure");
+            }
+            return Err(e);
+        }
+    };
+
+    let capture_egress = config
+        .warm
+        .as_ref()
+        .and_then(|w| w.network.as_ref())
+        .and_then(|n| {
+            crate::session_boot::assemble_capture_egress_policy(
+                n,
+                crate::session_boot::synthetic_capture_session_id(job_id),
+            )
+        });
+
+    tracing::info!(
+        host_id = %host_id,
+        %job_id,
+        epoch = req.epoch,
+        image_uri = %row.image_uri,
+        "host claimed capture job",
+    );
+    Ok(Json(engram_core::types::capture_job::CaptureJobSpec {
+        spec,
+        warm: config.warm,
+        resolved_env,
+        capture_egress,
+    }))
 }
 
 // ---- POST /api/sessions/:session_id/harness-events ----

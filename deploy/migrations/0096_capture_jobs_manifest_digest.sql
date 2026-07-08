@@ -1,0 +1,14 @@
+-- ADR 0081 P1b: `capture_jobs` needs the OCI manifest digest alongside
+-- `disk_manifest` (the content-derived chunked-rootfs ref) so:
+--   (a) the claim handler can digest-pin `SandboxSpec.image` (issue #192 —
+--       a moving tag must not let the host's local OCI cache serve a
+--       different bake than the one the coordinator materialized), and
+--   (b) the enable scanner's watch-only `Capturing` re-entry can
+--       reconstruct the materialized row without re-running
+--       `materialize_image_on_host` on every tick of a multi-minute
+--       capture (materialize is idempotent but not free — a re-pull/
+--       re-validate every ~3s while a `[warm]` hook runs is wasteful and
+--       broke the "materializes exactly once" reuse-regression guard).
+-- `NOT NULL DEFAULT ''` mirrors `enabled_images.manifest_digest`'s shape;
+-- every row inserted from this commit forward always supplies it.
+ALTER TABLE capture_jobs ADD COLUMN manifest_digest TEXT NOT NULL DEFAULT '';

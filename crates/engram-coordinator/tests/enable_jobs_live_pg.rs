@@ -175,6 +175,7 @@ async fn progress_state_failure_and_retry_round_trip() {
         "pod-a",
         &engram_core::types::CaptureProgress {
             phase: engram_core::types::CapturePhase::Warm,
+            sandbox_id: None,
             warm_stage: Some("install-deps".to_string()),
             detail: None,
             output_tail: "some hook output".to_string(),
@@ -536,6 +537,7 @@ async fn capture_progress_is_fenced_renews_lease_and_survives_failure() {
     let stage_started = Utc::now();
     let progress = CaptureProgress {
         phase: CapturePhase::Warm,
+        sandbox_id: None,
         warm_stage: Some("uiresources-wait".into()),
         detail: Some("waiting on uiresources/brain-backend".into()),
         output_tail: "error: timed out waiting for the condition on uiresources/brain-backend"
@@ -581,6 +583,7 @@ async fn capture_progress_is_fenced_renews_lease_and_survives_failure() {
     // exactly like update_enable_job_progress.
     let peer_progress = CaptureProgress {
         phase: CapturePhase::Warm,
+        sandbox_id: None,
         warm_stage: Some("peer-stage".into()),
         detail: None,
         output_tail: "peer output".into(),

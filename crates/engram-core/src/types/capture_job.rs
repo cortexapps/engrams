@@ -143,6 +143,13 @@ pub struct CaptureJobRow {
     pub id: CaptureJobId,
     pub enable_job_id: uuid::Uuid,
     pub image_uri: String,
+    /// `sha256:...` digest of the OCI manifest the `materializing` stage
+    /// actually pulled — ADR 0081 P1b (added post-0095): lets the claim
+    /// handler digest-pin `SandboxSpec.image` (issue #192) and lets the
+    /// enable scanner reconstruct a resumed watch WITHOUT re-running
+    /// `materialize_image_on_host` on every tick of a multi-minute
+    /// capture.
+    pub manifest_digest: String,
     /// Content-derived manifest ref of the materialized rootfs (ADR
     /// 0080), rendered as text (`ManifestRef`'s canonical
     /// `<uuid>@v<num>` Display form) — opaque at this layer, parsed by
@@ -182,10 +189,32 @@ pub struct CaptureJobRow {
 pub struct NewCaptureJob {
     pub enable_job_id: uuid::Uuid,
     pub image_uri: String,
+    pub manifest_digest: String,
     pub disk_manifest: String,
     pub image_config: ImageConfig,
     pub oci_defaults: OciRuntimeDefaults,
     pub host_id: HostId,
+}
+
+/// ADR 0081 P1b: the full dispatch the claim endpoint
+/// (`POST /api/v1/hosts/:id/capture-jobs/:job_id/claim`) hands back to a
+/// host that claimed `(job_id, epoch)` off `HeartbeatAck.capture_assignments`
+/// — everything [`crate::traits::sandbox::SandboxBackend::build_base_snapshot`]
+/// needs to actually run the capture. Rides the authed host<->coord HTTP
+/// channel only; never persisted (secrets never touch `capture_jobs`,
+/// PG, or the heartbeat — the coordinator re-resolves `resolved_env`
+/// fresh on every claim, exactly like the pre-0081 RPC did per-call).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CaptureJobSpec {
+    pub spec: super::sandbox::SandboxSpec,
+    pub warm: Option<super::image::WarmConfig>,
+    /// The resolved capture-time env (secret refs already resolved
+    /// through `SecretStore`) — see `resolve_capture_env`.
+    pub resolved_env: std::collections::HashMap<String, String>,
+    /// Assembled via `session_boot::assemble_capture_egress_policy` with a
+    /// synthetic `session_id` derived deterministically from `job_id` (stable
+    /// across a reassign/retry of the same job).
+    pub capture_egress: Option<super::egress::SessionEgressPolicy>,
 }
 
 /// The `cold_bases` row (ADR 0081 section B): a content-keyed,
