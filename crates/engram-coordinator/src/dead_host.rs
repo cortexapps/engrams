@@ -33,6 +33,16 @@
 //! forever (with a `host_id` pointing at a host that won't respond);
 //! operators can still `POST /sessions/:id/migrate` by hand.
 //!
+//! **Probe strikes + rescue grace (2026-07-09 rk28 incident):** a stale
+//! row alone never kills a host — the issue-#231 liveness probe must
+//! ALSO fail `min_probe_failures` consecutive ticks, and any answered
+//! probe (a "rescue") arms a `probe_rescue_grace` window during which
+//! failures defer instead of evict. A single failed Ping in the middle
+//! of a post-roll http2 flap used to orphan live sessions twenty
+//! seconds after the same detector had proven the host alive; a
+//! genuinely dead host just pays `(min_probe_failures − 1)` extra
+//! ticks (~20 s at defaults).
+//!
 //! **ADR 0045 Phase A (retire reactive evac):** the second stage
 //! routes a recoverable session (snapshot row OR
 //! `sessions.live_disk_manifest_*`) to `HostLost → Idle` for lazy
@@ -111,6 +121,23 @@ pub struct DeadHostConfig {
     /// — comfortable margin for transient network blips, fast
     /// enough to catch real failures.
     pub stale_threshold: Duration,
+    /// Consecutive FAILED liveness probes (one per detector tick)
+    /// required before a stale-row host is actually marked dead.
+    /// A genuinely dead host fails every probe, so this only adds
+    /// `(min_probe_failures - 1) × poll_interval` (~20s at defaults)
+    /// to real detection; a host mid-flap gets the strikes forgiven
+    /// the moment one probe lands. Prod incident 2026-07-09 (rk28):
+    /// a single failed Ping during a ~2-minute post-roll http2 flap
+    /// orphaned two live sessions — twenty seconds after the SAME
+    /// detector's probe had rescued the host.
+    pub min_probe_failures: u32,
+    /// A host that ANSWERED a probe (a "rescue") this recently cannot
+    /// be marked dead by a subsequent probe failure — a host proven
+    /// alive seconds ago is overwhelmingly mid-flap, not dead. The
+    /// grace is measured from the last rescue, so a truly-dead host
+    /// still gets evicted once it expires (with `min_probe_failures`
+    /// long since accumulated).
+    pub probe_rescue_grace: Duration,
 }
 
 impl Default for DeadHostConfig {
@@ -118,7 +145,44 @@ impl Default for DeadHostConfig {
         Self {
             poll_interval: Duration::from_secs(10),
             stale_threshold: Duration::from_secs(30),
+            min_probe_failures: 3,
+            probe_rescue_grace: Duration::from_secs(120),
         }
+    }
+}
+
+/// Per-host probe history the detector keeps in memory. Per-replica
+/// (deliberately not persisted): with two replicas racing the advisory
+/// lock, each counts its own strikes, so eviction can take up to 2× the
+/// strike window — a bounded, conservative error in the safe direction
+/// (never evicts EARLIER than a single replica would).
+#[derive(Clone, Copy, Debug, Default)]
+struct ProbeMemory {
+    /// Consecutive failed probes, one per detector tick. Reset by any
+    /// answered probe.
+    consecutive_failures: u32,
+    /// When this host last answered a probe while its row was stale.
+    last_rescue: Option<std::time::Instant>,
+}
+
+/// Pure verdict for the probe-failure path: is this failure enough
+/// evidence to orphan the host's sessions? `mem` has already been
+/// updated with the current failure. Two gates, both must pass:
+/// enough consecutive strikes, and no recent rescue (a host that
+/// answered a probe `probe_rescue_grace` ago is mid-flap until proven
+/// otherwise for the grace duration).
+fn probe_failure_permits_eviction(
+    mem: &ProbeMemory,
+    now: std::time::Instant,
+    min_probe_failures: u32,
+    probe_rescue_grace: Duration,
+) -> bool {
+    if mem.consecutive_failures < min_probe_failures {
+        return false;
+    }
+    match mem.last_rescue {
+        Some(rescued_at) => now.duration_since(rescued_at) >= probe_rescue_grace,
+        None => true,
     }
 }
 
@@ -131,9 +195,14 @@ pub fn spawn(cfg: DeadHostConfig, pool: PgPool, state: SharedState) -> tokio::ta
         // Skip the immediate first tick — the coordinator just
         // started and no host has had time to be considered stale.
         tick.tick().await;
+        // Probe history across ticks (strikes + rescue grace); pruned
+        // to the current candidate set each sweep, so a host whose
+        // heartbeats recover starts its next staleness episode fresh.
+        let mut probe_memory: std::collections::HashMap<HostId, ProbeMemory> =
+            std::collections::HashMap::new();
         loop {
             tick.tick().await;
-            if let Err(e) = run_once(&cfg, &pool, &state).await {
+            if let Err(e) = run_once(&cfg, &pool, &state, &mut probe_memory).await {
                 tracing::warn!(error = %e, "dead-host detector tick failed; will retry");
             }
         }
@@ -144,12 +213,17 @@ async fn run_once(
     cfg: &DeadHostConfig,
     pool: &PgPool,
     state: &SharedState,
+    probe_memory: &mut std::collections::HashMap<HostId, ProbeMemory>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let candidates = state
         .services
         .meta
         .list_stale_hosts(cfg.stale_threshold.as_secs())
         .await?;
+    // A host that stopped being a candidate recovered (its heartbeats
+    // are landing again) — drop its strikes/rescue history.
+    let ids: std::collections::HashSet<HostId> = candidates.iter().map(|h| h.id).collect();
+    probe_memory.retain(|id, _| ids.contains(id));
     if candidates.is_empty() {
         return Ok(());
     }
@@ -159,7 +233,7 @@ async fn run_once(
     );
     for host in candidates {
         let host_addr = host.host_addr.clone();
-        if let Err(e) = evict_host(pool, state, host.id, host_addr).await {
+        if let Err(e) = evict_host(cfg, pool, state, host.id, host_addr, probe_memory).await {
             tracing::warn!(host_id = %host.id, error = %e, "evict failed; another replica may have it");
         }
     }
@@ -200,10 +274,12 @@ fn recovery_target(has_snapshot: bool, has_live_manifest: bool) -> SessionState 
 }
 
 async fn evict_host(
+    cfg: &DeadHostConfig,
     pool: &PgPool,
     state: &SharedState,
     host_id: HostId,
     host_addr: Option<String>,
+    probe_memory: &mut std::collections::HashMap<HostId, ProbeMemory>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let meta = &state.services.meta;
     let host_registry = &state.host_registry;
@@ -259,30 +335,46 @@ async fn evict_host(
     // cross-pod case: this pod never saw H register, so its registry is
     // empty for H). No `host_addr` (pre-0013 row) ⇒ unprobeable ⇒ fall
     // through to eviction, exactly as before this guard existed.
-    let probe_client: Option<Arc<dyn engram_core::traits::HostClient>> = match state
-        .services
-        .host_pool
-        .get(host_id)
-    {
-        Ok(c) => Some(Arc::new(c)),
+    // `Some(answered)` = we had something to probe with (a dial that
+    // failed to warm counts as a FAILED probe — it's unreachability
+    // evidence, same as a failed Ping); `None` = unprobeable (pre-0013
+    // row with no `host_addr`) ⇒ fall through to eviction, exactly as
+    // before this guard existed.
+    let probe_outcome: Option<bool> = match state.services.host_pool.get(host_id) {
+        Ok(c) => {
+            let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
+            Some(host_responds(&client).await)
+        }
         Err(_) => match host_addr {
             Some(addr) => match state.services.host_pool.get_or_warm(host_id, addr).await {
-                Ok(c) => Some(Arc::new(c)),
+                Ok(c) => {
+                    let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
+                    Some(host_responds(&client).await)
+                }
                 Err(e) => {
-                    tracing::debug!(host_id = %host_id, error = %e, "dead-host probe: could not warm a dial; treating as unreachable");
-                    None
+                    tracing::debug!(host_id = %host_id, error = %e, "dead-host probe: could not warm a dial; treating as a failed probe");
+                    Some(false)
                 }
             },
             None => None,
         },
     };
-    if let Some(client) = probe_client {
-        if host_responds(&client).await {
-            // ADR 0068: no behavioral change — this probe already existed
-            // (added in `7fcc4c3c`). Graphing it alongside the reconcile
-            // probe's rescue counter (`RECONCILE_PROBE_RESCUES_TOTAL`)
-            // makes both rescue paths visible together.
+    match probe_outcome {
+        Some(true) => {
+            // ADR 0068: this probe already existed (added in `7fcc4c3c`).
+            // Graphing it alongside the reconcile probe's rescue counter
+            // (`RECONCILE_PROBE_RESCUES_TOTAL`) makes both rescue paths
+            // visible together. The rescue also arms the grace window: a
+            // host proven alive NOW can't be killed by a single failed
+            // probe on the next tick (prod 2026-07-09, rk28).
             ::metrics::counter!(crate::metrics::DEAD_HOST_PROBE_RESCUES_TOTAL).increment(1);
+            probe_memory.insert(
+                host_id,
+                ProbeMemory {
+                    consecutive_failures: 0,
+                    last_rescue: Some(std::time::Instant::now()),
+                },
+            );
             tracing::warn!(
                 host_id = %host_id,
                 "stale row but live host — host answered Ping while last_heartbeat_at is stale; SKIPPING eviction. Check heartbeat persistence (coord PG pool saturation?) — see engram_heartbeat_persist_failures_total (issue #231)",
@@ -293,7 +385,41 @@ async fn evict_host(
                 .await?;
             return Ok(());
         }
+        Some(false) => {
+            // Failed probe: one strike. Evict only with enough
+            // consecutive strikes AND no recent rescue — a genuinely
+            // dead host fails every tick and pays only
+            // `(min_probe_failures - 1) × poll_interval`; a flapping
+            // host rides it out.
+            let mem = probe_memory.entry(host_id).or_default();
+            mem.consecutive_failures = mem.consecutive_failures.saturating_add(1);
+            let now = std::time::Instant::now();
+            if !probe_failure_permits_eviction(
+                mem,
+                now,
+                cfg.min_probe_failures,
+                cfg.probe_rescue_grace,
+            ) {
+                tracing::warn!(
+                    host_id = %host_id,
+                    strikes = mem.consecutive_failures,
+                    min_strikes = cfg.min_probe_failures,
+                    recently_rescued = mem
+                        .last_rescue
+                        .is_some_and(|t| now.duration_since(t) < cfg.probe_rescue_grace),
+                    "stale row + failed probe, but not enough evidence to orphan its sessions yet; deferring eviction to a later tick",
+                );
+                sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
+                    .bind(&lock_key)
+                    .execute(&mut *conn)
+                    .await?;
+                return Ok(());
+            }
+        }
+        // Unprobeable (no host_addr): legacy immediate eviction.
+        None => {}
     }
+    probe_memory.remove(&host_id);
 
     let affected = meta.mark_host_dead_and_orphan_sessions(host_id).await?;
 
@@ -553,5 +679,66 @@ mod tests {
             !host_responds(&dead).await,
             "an unreachable host must not be treated as live (eviction proceeds)",
         );
+    }
+
+    // Prod incident 2026-07-09 (rk28): during a ~2-minute post-roll
+    // http2 flap the detector's probe rescued the host four times, then
+    // a SINGLE failed Ping — twenty seconds after the last rescue —
+    // marked it dead and orphaned two live sessions. The verdict below
+    // is the gate that makes that impossible: a failed probe evicts
+    // only with `min_probe_failures` consecutive strikes AND no rescue
+    // within `probe_rescue_grace`.
+    use std::time::Instant;
+
+    const MIN: u32 = 3;
+    const GRACE: Duration = Duration::from_secs(120);
+
+    fn mem(failures: u32, rescued_ago: Option<Duration>) -> (ProbeMemory, Instant) {
+        // Anchor `now` far enough from the ProbeMemory's rescue instant
+        // that subtraction can't underflow.
+        let now = Instant::now() + GRACE * 10;
+        let m = ProbeMemory {
+            consecutive_failures: failures,
+            last_rescue: rescued_ago.map(|ago| now - ago),
+        };
+        (m, now)
+    }
+
+    #[test]
+    fn single_probe_failure_never_evicts() {
+        // The incident shape: one failed probe, host rescued 20s ago.
+        let (m, now) = mem(1, Some(Duration::from_secs(20)));
+        assert!(!probe_failure_permits_eviction(&m, now, MIN, GRACE));
+        // Even with no rescue on record, one strike isn't enough.
+        let (m, now) = mem(1, None);
+        assert!(!probe_failure_permits_eviction(&m, now, MIN, GRACE));
+    }
+
+    #[test]
+    fn consecutive_failures_without_a_rescue_evict() {
+        // The genuine dead host (kill -9): never answers, accumulates
+        // strikes across ticks, evicts at the threshold.
+        let (m, now) = mem(MIN - 1, None);
+        assert!(!probe_failure_permits_eviction(&m, now, MIN, GRACE));
+        let (m, now) = mem(MIN, None);
+        assert!(probe_failure_permits_eviction(&m, now, MIN, GRACE));
+    }
+
+    #[test]
+    fn recent_rescue_blocks_eviction_even_at_the_strike_threshold() {
+        // Enough strikes, but the host answered a probe inside the
+        // grace window — mid-flap until proven otherwise.
+        let (m, now) = mem(MIN + 2, Some(GRACE - Duration::from_secs(1)));
+        assert!(!probe_failure_permits_eviction(&m, now, MIN, GRACE));
+    }
+
+    #[test]
+    fn expired_rescue_grace_allows_eviction_with_enough_strikes() {
+        // The flap turned out to be a real death: the last rescue is
+        // beyond the grace and the strikes kept mounting — evict.
+        let (m, now) = mem(MIN, Some(GRACE));
+        assert!(probe_failure_permits_eviction(&m, now, MIN, GRACE));
+        let (m, now) = mem(MIN, Some(GRACE * 2));
+        assert!(probe_failure_permits_eviction(&m, now, MIN, GRACE));
     }
 }
