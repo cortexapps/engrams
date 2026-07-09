@@ -785,35 +785,101 @@ Recorded before this PR merges so nothing below is discovered stale.
   lands within one heartbeat of the write-through flush), but this is an
   assumption to **verify before ever tightening the GC grace**, not a
   proven invariant.
-- **(c) Post-#621 reservation re-attach (HARD requirement before merge).**
-  P2's placement is disk-footprint-only; the one-capture-per-host
-  anti-affinity bounds capture-vs-**capture** contention but NOT
-  capture-vs-**session** RAM contention — i.e. the exact 2026-07-08
-  node-OOM class (session 8a80c3fb) that ADR 0081/PR #621 closes with a
-  RAM/CPU reservation. So this PR MUST NOT merge on P2's disk-only
-  placement alone; when this branch rebases over PR #621 (which lands
-  ADR 0081's reservation on `enable_jobs`), the reservation moves onto
-  `capture_jobs`:
-  - Budgets are stamped at `insert_capture_job` time from
-    `ImageConfig::resolved_memory_mib()` / `resolved_vcpus()`.
-  - **Release is implicit**: a terminal stage drops the row out of the
-    reserved-SUM via the same `stage NOT IN ('done','failed')` filter
-    the anti-affinity/assignment reads already use — there is NO explicit
-    `clear_capture_reservation` call. #621's `clear_capture_reservation`
-    verb is **deleted** and its `enable_jobs` reservation columns retired.
-  - `reassign_capture_job` / `redrive_failed_capture_job` re-run the 2D
-    (disk + RAM/CPU) fit for the new host and move the reservation
-    atomically under the same epoch fence they already carry.
-  - The reserved-SUM readers + `queued_demand` re-point from
-    `enable_jobs.capture_host_id` to `capture_jobs.host_id`.
-  - Keep #621's `pick_materialize_host` split AND this PR's
-    `hosts_with_live_capture_jobs` delete-host guard; the merged picker
-    enforces BOTH the disk-footprint veto (this PR) and the RAM/CPU fit
-    (#621).
-- **(d) Egress rule pattern must align with PR #595 (ADR 0083).** #595
-  switched host INPUT accepts to `-I INPUT 1` (insert-at-top) plus a
-  startup purge-and-reapply, replacing append-based rules. The capture-VM
-  egress policy this PR assembles (`assemble_capture_egress_policy`) must
-  adopt the SAME insert-at-top + purge-and-reapply pattern when this
-  branch rebases over #595 — there is a known `net.rs` conflict with #595
-  to resolve at that point, not a silent divergence.
+- **(c) Post-#621 reservation re-attach — DONE in this chain.** P2's
+  placement was disk-footprint-only; the one-capture-per-host anti-affinity
+  bounded capture-vs-**capture** contention but NOT capture-vs-**session**
+  RAM contention — the exact 2026-07-08 node-OOM class (session 8a80c3fb)
+  that ADR 0081/PR #621 closes with a RAM/CPU reservation. After merging
+  `origin/main` (which landed #621's reservation on `enable_jobs`), the
+  reservation moved onto `capture_jobs` (migration 0099):
+  - **Schema:** `capture_jobs` gains `mem_budget_mib` / `cpu_budget_vcpus`
+    (`NOT NULL DEFAULT 0`) + `waiting_since`; `host_id` becomes
+    **NULLABLE** (`NULL` = WAITING for capacity). #621's `enable_jobs`
+    reservation columns (`capture_host_id` / `capture_waiting_since` /
+    `mem_budget_mib` / `cpu_budget_vcpus`) are **dropped**.
+  - **Budgets stamped at insert** from `ImageConfig::resolved_memory_mib()`
+    / `resolved_vcpus()` (the derivation #621 put on `ImageConfig` — the
+    single source sessions reserve with). `ensure_capture_job` computes
+    them; `insert_capture_job` writes them. No zero-budget row can exist
+    for a real capture.
+  - **Reserving pick is a SEPARATE verb from insert.** `insert_capture_job`
+    creates the row WAITING (`host_id NULL`, `waiting_since NOW()`);
+    `place_capture_job(id, candidates)` then runs `pick_host_2d` (the
+    shared FOR-UPDATE 2D RAM/CPU best-fit, reserved-SUM re-pointed to
+    `capture_jobs`) over `placement::capture_candidate_hosts` (the
+    disk-floor + footprint + one-capture-per-host anti-affinity +
+    optional `fc_snapshot_version`-pin filtered set). Splitting insert from
+    place keeps the 2D fit atomic with the host-row lock without threading
+    candidates through the insert-or-get. BOTH axes enforced: disk (coord
+    filter) AND RAM/CPU (PG 2D fit).
+  - **Release is implicit**: a terminal stage drops the row out of every
+    reserved-SUM via the same `stage NOT IN ('done','failed')` filter the
+    anti-affinity/assignment reads already use — there is NO explicit
+    release. #621's `reserve_capture_host` / `clear_capture_reservation`
+    verbs and the `CaptureReservation` enum are **deleted**.
+  - **Waiting semantics.** A `host_id NULL` row is not dispatchable
+    (`capture_assignments_for_host` keys on `host_id`) and counts as
+    `queued_demand` (autoscaler grows toward it). A new fleet-wide
+    `capture_job_capacity_scan` re-offers every waiting row to
+    `place_capture_job` each tick; expiry past `ENGRAM_QUEUE_TIMEOUT_SECS`
+    (default 1800 s, the session queue's knob) fails it `CapacityTimeout`
+    (non-retryable) via a synthetic terminal `CaptureJobReport` — the same
+    legible message shape #621 shipped. The wait deadline is DB-anchored on
+    `waiting_since` (COALESCE-stamped on the first miss — restart-proof;
+    the #621 fix's principle). `expire_capture_job_stages` is now
+    DISPATCHED-only (`host_id IS NOT NULL`) so a waiting row is subject to
+    the queue timeout, never the per-stage deadline (it can't burn attempts
+    while waiting).
+  - **Reassign/redrive re-reserve.** `reassign_capture_job` /
+    `redrive_failed_capture_job` re-run the 2D fit over the candidate set
+    INSIDE the same epoch-fenced write; the `host_id` old→new swap is
+    atomic with the reservation. No fitting host ⇒ the row is left WAITING
+    (`host_id NULL`), NOT failed — the `epoch + 1` bump still tears down the
+    abandoned attempt host-side (`cancel_absent`), and the row falls into
+    the waiting flow.
+  - **Reserved-SUM readers + `queued_demand`** re-point from
+    `enable_jobs.capture_host_id` to `capture_jobs.host_id`
+    (non-terminal, `host_id IS NOT NULL` for the reserved SUM; `host_id IS
+    NULL` for queued demand). The `delete_host` guard counts non-terminal
+    `capture_jobs` bound to the host. #621's `pick_materialize_host` split
+    is kept (materialize boots no VM → disk-floor-only, no reservation);
+    this PR's `hosts_with_live_capture_jobs` anti-affinity is kept
+    (excludes waiting `host_id NULL` rows).
+  - **Divergences where there was latitude:**
+    - *Waiting anchor:* a NEW `capture_jobs.waiting_since` column, NOT a
+      reuse of `stage_started_at` — `place`/`reassign` re-anchor
+      `stage_started_at`/`last_progress_at` to drive the `assigned`
+      deadline from dispatch, so it can't honestly double as the
+      first-miss queue anchor.
+    - *Reassign-no-fit:* epoch (and attempts) ALWAYS bump even with no fit
+      — the stalled dispatched attempt must be fenced/torn down regardless;
+      the row then waits (host_id NULL) rather than failing, and the
+      dispatched-only stage-deadline scan won't re-bump attempts while it
+      waits.
+    - *CapacityTimeout* is conveyed via the terminal row's `error` message
+      (there is no failure-kind column on `capture_jobs`); the
+      `CaptureFailureKind::CapacityTimeout` variant remains in the taxonomy
+      (round-trip-tested), and the coordinator-originated timeout write is
+      thin glue over the store-tested `list_waiting_capture_jobs` +
+      `record_capture_job_report`.
+  - **Tests:** `placement_reservation_live_pg`'s #621 capture tests ported
+    to the `capture_jobs` model preserving coverage — (a) mutual
+    visibility + implicit terminal release, (b) waiting → queued-demand →
+    place-on-free, (c) epoch-fenced-no-clobber + implicit release, (d)
+    replaced the budget-0 test with `insert_stamps_real_budgets_from_
+    image_config` (no zero-budget row can exist), (e) replaced the
+    reclaim-stale-host test with `reassign_moves_the_reservation_between_
+    hosts_under_the_epoch_fence`. `capture_jobs_live_pg` gains
+    `reassign_with_no_fitting_host_leaves_the_row_waiting` and
+    `waiting_capture_lists_then_places_on_a_later_tick` (the
+    waiting→reserve-on-tick + `list_waiting_capture_jobs` surface).
+- **(d) Egress rule pattern aligned with PR #595 (ADR 0083) — DONE in the
+  Step-1 merge.** The `net.rs` conflict with #595 was resolved by adopting
+  #595's `-I INPUT 1` (insert-at-top) + startup purge-and-reapply. The
+  branch's own new INPUT rule — the guest-OTLP export pinhole
+  (`engram-guest-otlp-input`, ADR 0019 / #526) — was converted from `-A
+  INPUT` to the SAME `-I INPUT 1` idiom and added to
+  `PURGEABLE_PROXY_COMMENTS`, closing the identical restart/port-change
+  latent bug for it. (The capture-VM egress policy itself rides the same
+  proxy path as sessions and assembles no host-INPUT rules of its own, so
+  there was nothing capture-specific to convert.)
