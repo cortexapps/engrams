@@ -18,14 +18,16 @@
 //! records every entry's tar-carried `(uid, gid, mode)` in a
 //! [`TreeMetadata`] sidecar and applies what it can:
 //!
-//! - **modes** (incl. setuid) — always applied (chmod on own files is
-//!   unprivileged-safe).
+//! - **modes** (incl. setuid) — recorded in the sidecar and applied to the
+//!   scratch tree where the host filesystem permits it; the materializer's
+//!   offline ext4 stamp also re-applies them for rootless local dev.
 //! - **uid/gid** — applied by [`TreeMetadata::apply_ownership`], which
 //!   the phase-3b host RPC (running as root) calls before the pack;
-//!   under an unprivileged caller (tests, dev) it stops at the first
-//!   `PermissionDenied` and the tree keeps the caller's uid — exactly
-//!   the limitation the retiring `docker export` bake had (it also ran
-//!   as the bake user).
+//!   under an unprivileged caller (local dev/tests) it stops at the first
+//!   `PermissionDenied`. The materializer then applies the same metadata
+//!   directly to the packed ext4 image with an offline `debugfs` pass, so
+//!   the guest-visible rootfs still matches the OCI ownership without
+//!   running the host agent as root.
 //! - **xattrs** — applied where the filesystem allows; refusals (e.g.
 //!   `security.*` on macOS or unprivileged Linux) are collected in
 //!   [`TreeMetadata::skipped_xattrs`], never silently dropped.
@@ -684,9 +686,10 @@ mod tests {
         assert_eq!(meta.get("bin/sh"), meta.get("bin/busybox"));
     }
 
-    /// setuid (and the full 4-digit mode) survives extraction.
+    /// setuid (and the full 4-digit mode) survives in the sidecar even on
+    /// host filesystems that strip it from the scratch tree.
     #[test]
-    fn setuid_bit_preserved() {
+    fn setuid_bit_recorded_even_if_host_strips_it() {
         let layer = LayerBuilder::new()
             .file("usr/bin/sudo", 0o4755, b"elf")
             .build();
@@ -695,7 +698,10 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o7777, 0o4755, "setuid must survive on the tree");
+        assert!(
+            matches!(mode & 0o7777, 0o4755 | 0o755),
+            "host scratch mode should either preserve setuid or strip only that bit"
+        );
         assert_eq!(meta.get("usr/bin/sudo").unwrap().mode, 0o4755);
     }
 
@@ -984,5 +990,96 @@ mod tests {
                 .expect_err("foreign chown must fail unprivileged");
             assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         }
+    }
+
+    fn e2fsprogs_pair() -> Option<(PathBuf, PathBuf)> {
+        if let Some(mke2fs) = std::env::var_os("ENGRAM_MKE2FS").map(PathBuf::from) {
+            if let Some(debugfs) = mke2fs.parent().map(|d| d.join("debugfs")) {
+                if mke2fs.is_file() && debugfs.is_file() {
+                    return Some((mke2fs, debugfs));
+                }
+            }
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let mke2fs = dir.join("mke2fs");
+                let debugfs = dir.join("debugfs");
+                if mke2fs.is_file() && debugfs.is_file() {
+                    return Some((mke2fs, debugfs));
+                }
+            }
+        }
+        let homebrew = PathBuf::from("/opt/homebrew/opt/e2fsprogs/sbin");
+        let mke2fs = homebrew.join("mke2fs");
+        let debugfs = homebrew.join("debugfs");
+        (mke2fs.is_file() && debugfs.is_file()).then_some((mke2fs, debugfs))
+    }
+
+    fn debugfs_stat(debugfs: &std::path::Path, image: &std::path::Path, path: &str) -> String {
+        let out = std::process::Command::new(debugfs)
+            .arg("-R")
+            .arg(format!("stat \"{path}\""))
+            .arg(image)
+            .output()
+            .expect("run debugfs stat");
+        assert!(
+            out.status.success(),
+            "debugfs stat failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn stamp_image_ownership_repairs_rootless_ext4_owners() {
+        use crate::ext4::Ext4Packer;
+
+        let Some((mke2fs, debugfs)) = e2fsprogs_pair() else {
+            eprintln!("SKIP: mke2fs/debugfs pair not available");
+            return;
+        };
+
+        let layer = LayerBuilder::new()
+            .dir("usr", 0o755)
+            .dir("usr/bin", 0o755)
+            .file("usr/bin/mount", 0o4755, b"fake mount")
+            .build();
+        let (root, meta) = flatten(&[layer]);
+        std::fs::create_dir_all(root.path().join("sbin")).unwrap();
+        std::fs::write(root.path().join("sbin/engram-init"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            root.path().join("sbin/engram-init"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let image_dir = tempfile::tempdir().unwrap();
+        let image = image_dir.path().join("rootfs.ext4");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let size = crate::ext4::recommended_size(
+                crate::ext4::recursive_size(root.path()).await.unwrap(),
+            );
+            crate::ext4::Mke2fsPacker::with_binary(&mke2fs)
+                .pack(root.path(), &image, size)
+                .await
+                .unwrap();
+            crate::ext4::stamp_image_ownership_with_debugfs(&image, root.path(), &meta, &debugfs)
+                .await
+                .unwrap();
+        });
+
+        let mount_stat = debugfs_stat(&debugfs, &image, "/usr/bin/mount");
+        assert!(mount_stat.contains("Type: regular"), "{mount_stat}");
+        assert!(mount_stat.contains("Mode:  04755"), "{mount_stat}");
+        assert!(mount_stat.contains("User:     0"), "{mount_stat}");
+        assert!(mount_stat.contains("Group:     0"), "{mount_stat}");
+
+        let init_stat = debugfs_stat(&debugfs, &image, "/sbin/engram-init");
+        assert!(init_stat.contains("User:     0"), "{init_stat}");
+        assert!(init_stat.contains("Group:     0"), "{init_stat}");
     }
 }

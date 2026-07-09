@@ -300,6 +300,32 @@ reap-sessions:
 bake-demo:
     bash deploy/dev/bake-demo.sh
 
+# Bake the demo image AND make it live on the running coord in one step — the
+# inner-loop cycle after editing deploy/demo/ (engram.toml vcpus/mem, or the
+# rootfs). `bake-demo` only pushes; this then registers it and BLOCKS until the
+# base-snapshot capture (the enable job) reports ready, exiting non-zero if it
+# fails. Because `warm-1` is a fixed tag, a re-bake moves it to a NEW digest: if
+# the image is already enabled we `image refresh` (re-fetch the moved tag + force
+# a re-capture), since `image enable` is idempotent on an already-enabled URI and
+# would keep serving the STALE base snapshot. Requires the stack up
+# (`just dev` / `just dev-fc`).
+bake-demo-enable:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash deploy/dev/bake-demo.sh
+    export ENGRAM_APP_GRPC_ADDR="${ENGRAM_APP_GRPC_ADDR:-http://127.0.0.1:50061}"
+    export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
+    cli=./target/release/engram-cli
+    uri=localhost:5001/demo:warm-1
+    if "$cli" --json image list \
+        | python3 -c "import sys,json; sys.exit(0 if any(i.get('image_uri')=='$uri' for i in json.load(sys.stdin).get('images',[])) else 1)"; then
+        echo "==> $uri already enabled — refreshing (re-fetch moved tag + re-capture base snapshot)"
+        "$cli" image refresh --uri "$uri" --recapture
+    else
+        echo "==> enabling $uri (captures base snapshot)"
+        "$cli" image enable --uri "$uri"
+    fi
+
 # Fetch the kernel artifact this host's backend needs (VZ → Kata arm64
 # kernel; Firecracker → FC test kernel+rootfs; process → nothing).
 pull-kernel:

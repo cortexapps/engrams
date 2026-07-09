@@ -21,7 +21,7 @@
 //! ```text
 //!   port 1024 (host → guest, agentd):  UDS at <base>_1024 ←→ connectToPort(1024)
 //!   port 1026 (guest → host, harness): VZVirtioSocketListener → harness_sink
-//!   port 1027 (guest → host, ready):   VZVirtioSocketListener → drained
+//!   port 1027 (guest → host, ready):   VZVirtioSocketListener → ready watch
 //!   port 1029 (guest → host, upload):  VZVirtioSocketListener → upload_sink
 //!   port 1030 (host → guest, relay):   connectToPort(1030) via open_guest_stream
 //! ```
@@ -40,10 +40,9 @@
 //!   `upload_pump` serialisation is retired.
 //! - **Ready (1027), guest→host:** agentd (on the vsock transport) dials
 //!   the readiness port at startup and writes one `AgentReady` frame
-//!   (fire-and-forget). We register a listener that drains and drops it,
-//!   so the guest's handshake completes on the first dial instead of
-//!   spinning ~90s. VZ keeps its existing "first read blocks until agentd
-//!   binds" readiness model; the drain just prevents the boot stall.
+//!   (fire-and-forget). We register a listener that reads the frame, flips
+//!   a per-sandbox watch, and drains the connection. `build_base_snapshot`
+//!   waits on that watch so a panicked init cannot be captured as ready.
 //! - **Relay (1030), host→guest:** served directly by the backend's
 //!   `open_guest_stream` through the shared [`VsockConnector`] — no
 //!   bridge-side listener, one fresh vsock stream per forwarded browser
@@ -72,7 +71,7 @@ use objc2_virtualization::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::vm::Sendable;
@@ -282,18 +281,19 @@ impl VsockBridge {
     /// Look up the VM's `VZVirtioSocketDevice`, bind the agentd UDS
     /// (1024) host→guest pump, and register the guest→host listeners
     /// (harness 1026 → `harness_sink`, upload 1029 → `upload_sink`, ready
-    /// 1027 → drain). The VM must already be `start()`ed — VZ socket-device
+    /// 1027 → ready watch). The VM must already be `start()`ed — VZ socket-device
     /// APIs only operate on a running machine.
     ///
-    /// Returns the bridge alongside a [`VsockConnector`] the backend keeps
-    /// for `open_guest_stream` (the port relay, 1030).
+    /// Returns the bridge, a [`VsockConnector`] the backend keeps for
+    /// `open_guest_stream` (the port relay, 1030), and a readiness watch
+    /// filled when agentd writes its `AgentReady` frame.
     pub async fn start(
         vm: Sendable<Retained<VZVirtualMachine>>,
         queue: DispatchRetained<DispatchQueue>,
         base_path: PathBuf,
         harness_sink: Option<HarnessSink>,
         upload_sink: Option<UploadSink>,
-    ) -> Result<(Self, VsockConnector), BridgeError> {
+    ) -> Result<(Self, VsockConnector, watch::Receiver<bool>), BridgeError> {
         let socket_device = lookup_socket_device(&queue, &vm)
             .await
             .ok_or(BridgeError::NoSocketDevice)?;
@@ -331,7 +331,8 @@ impl VsockBridge {
         // duplex hop, no per-connection serialisation.
         let harness_delivery: Option<ConnDelivery> = harness_sink.map(harness_delivery);
         let upload_delivery: Option<ConnDelivery> = upload_sink.map(upload_delivery);
-        let ready_delivery: Option<ConnDelivery> = Some(ready_drain_delivery());
+        let (ready_tx, ready_rx) = watch::channel(false);
+        let ready_delivery: Option<ConnDelivery> = Some(ready_drain_delivery(ready_tx));
 
         for (port, delivery) in [
             (VSOCK_PORT_HARNESS, harness_delivery),
@@ -391,6 +392,7 @@ impl VsockBridge {
                 _delegates: kept_delegates,
             },
             connector,
+            ready_rx,
         ))
     }
 
@@ -556,10 +558,10 @@ fn upload_delivery(sink: UploadSink) -> ConnDelivery {
     })
 }
 
-/// Drain the readiness handshake: agentd writes one `AgentReady` frame
-/// and half-closes. Read to EOF and drop so the guest's dial completes
-/// on the first attempt (no ~90s spin) without gating anything.
-fn ready_drain_delivery() -> ConnDelivery {
+/// Drain the readiness handshake: agentd writes one `AgentReady` frame and
+/// half-closes. Read the frame, flip the readiness watch, then read to EOF so
+/// the guest's dial completes on the first attempt (no ~90s spin).
+fn ready_drain_delivery(ready_tx: watch::Sender<bool>) -> ConnDelivery {
     Arc::new(move |fd: OwnedFd| {
         let stream = match AsyncRawFdStream::new(fd) {
             Ok(s) => s,
@@ -568,8 +570,25 @@ fn ready_drain_delivery() -> ConnDelivery {
                 return;
             }
         };
+        let ready_tx = ready_tx.clone();
         tokio::spawn(async move {
             let mut stream = stream;
+            match engram_agentd::read_msg::<_, engram_agentd::AgentReady>(&mut stream).await {
+                Ok(ready) => {
+                    tracing::info!(
+                        agent_version = %ready.agent_version,
+                        "vz agentd ready",
+                    );
+                    let _ = ready_tx.send(true);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "vz ready-port read failed; waiting for a later ready dial"
+                    );
+                    return;
+                }
+            }
             let mut sink = tokio::io::sink();
             let _ = tokio::io::copy(&mut stream, &mut sink).await;
             tracing::debug!("vz ready-port handshake drained");

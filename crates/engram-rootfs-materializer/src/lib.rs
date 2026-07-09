@@ -39,7 +39,8 @@ use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
 use engram_core::types::image::OciRuntimeDefaults;
 
 pub use ext4::{
-    clamp_mtimes, recommended_size, recursive_size, Ext4Error, Ext4Packer, Mke2fsPacker,
+    clamp_mtimes, recommended_size, recursive_size, stamp_image_ownership, Ext4Error, Ext4Packer,
+    Mke2fsPacker,
 };
 pub use flatten::{apply_layer, EntryMeta, FlattenError, SkippedXattr, TreeMetadata};
 pub use inject::{inject_init, InitInjection, Transport, DEFAULT_INIT_SHIM};
@@ -280,30 +281,32 @@ impl Materializer {
         inject::inject_init(&rootfs, &self.init).await?;
 
         // 3b. Ownership: apply the tar-recorded uid/gid to the real
-        // tree (mke2fs -d copies ownership as-is). Root (the phase-3b
-        // host RPC) applies it for real; an unprivileged caller
-        // (tests, dev) gets PermissionDenied on the first foreign
-        // chown and degrades to recorded-only — the same limitation
-        // the retiring docker-export bake had.
-        {
+        // tree when the caller can chown (rootful host-agent path).
+        // Local macOS/VZ dev intentionally stays unprivileged; there
+        // a foreign chown is refused, so we stamp the same uid/gid/mode
+        // into the ext4 inode metadata after mke2fs instead.
+        let tree_meta = Arc::new(tree_meta);
+        let ownership_applied = {
             let rootfs_c = rootfs.clone();
-            let result = tokio::task::spawn_blocking(move || tree_meta.apply_ownership(&rootfs_c))
-                .await
-                .map_err(|e| {
-                    MaterializeError::Io(std::io::Error::other(format!("chown task: {e}")))
-                })?;
+            let tree_meta_c = Arc::clone(&tree_meta);
+            let result =
+                tokio::task::spawn_blocking(move || tree_meta_c.apply_ownership(&rootfs_c))
+                    .await
+                    .map_err(|e| {
+                        MaterializeError::Io(std::io::Error::other(format!("chown task: {e}")))
+                    })?;
             match result {
-                Ok(()) => {}
+                Ok(()) => true,
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                     tracing::warn!(
-                        "unprivileged materialize: tree ownership recorded in the sidecar but \
-                         not applied (uid/gid in the packed image will be the caller's); the \
-                         host RPC runs as root and applies it for real"
+                        "unprivileged materialize: tree ownership chown refused; will stamp \
+                         uid/gid/mode into the packed ext4 image offline"
                     );
+                    false
                 }
                 Err(e) => return Err(e.into()),
             }
-        }
+        };
 
         // 4. Deterministic pack: clamp mtimes, then mke2fs.
         report(MaterializeStage::Pack, None);
@@ -325,6 +328,14 @@ impl Materializer {
             "packing flattened tree to ext4"
         );
         self.packer.pack(&rootfs, &ext4_path, fs_size).await?;
+        if !ownership_applied {
+            let stamped =
+                ext4::stamp_image_ownership(&ext4_path, &rootfs, tree_meta.as_ref()).await?;
+            tracing::warn!(
+                stamped_inodes = stamped,
+                "unprivileged materialize: stamped uid/gid/mode into ext4 image via debugfs"
+            );
+        }
         // The tree served its purpose — free it before chunking so the
         // scratch peak drops to just the ext4.
         let _ = tokio::fs::remove_dir_all(&rootfs).await;

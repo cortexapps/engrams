@@ -40,9 +40,10 @@ pub(crate) struct VmConfig {
     /// Linux kernel command line. Default points root at /dev/vda
     /// (the first virtio-block device) and routes the console to hvc0.
     pub kernel_cmdline: String,
-    /// ADR 0061: skill bundles to attach as read-only erofs virtio-blk
-    /// drives. Only entries with `sha256 = Some` attach (sentinels are
-    /// skipped); attach order is `/dev/vdb`, `/dev/vdc`, …
+    /// ADR 0061: skill/bundle slots to attach as read-only erofs virtio-blk
+    /// drives. Only entries with `sha256 = Some` attach. Each aux device is
+    /// tagged with its `drive_id` as VZ's virtio block identifier so guest init
+    /// can mount by stable `dyn_<i>` identity instead of `/dev/vd*` order.
     pub aux_ro_drives: Vec<AuxRoDrive>,
     /// Directory the erofs payloads live in (`<sha>.erofs`).
     pub bundle_dir: std::path::PathBuf,
@@ -488,15 +489,20 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
         vz_cfg.setCPUCount(cfg.vcpus as objc2_foundation::NSUInteger);
         vz_cfg.setMemorySize((cfg.memory_mib as u64) * 1024 * 1024);
 
-        // Storage devices, in attach order so `/dev/vda` is the
-        // rootfs and (when present) `/dev/vdb` is the harness
-        // substrate:
+        // Storage devices. The rootfs is first so Linux sees it as
+        // `/dev/vda` (the kernel cmdline points root there).
         //   - rootfs.ext4 — read-write, so the guest can mutate
         //     /workspace state during the session.
         //   - harness-substrate.img — read-only ext4 image of the
         //     host's `cfg.harnesses_dir`. Init shim mounts it at
         //     `/run/engram/harnesses`. Same wire as the FC backend.
-        let mut storage: Vec<Retained<VZStorageDeviceConfiguration>> = Vec::with_capacity(2);
+        let resolved_aux_count = cfg
+            .aux_ro_drives
+            .iter()
+            .filter(|drive| drive.sha256.is_some())
+            .count();
+        let mut storage: Vec<Retained<VZStorageDeviceConfiguration>> =
+            Vec::with_capacity(1 + resolved_aux_count);
 
         let rootfs_url = nsurl_for_path(&cfg.rootfs_path);
         let attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
@@ -515,13 +521,13 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
 
         // ADR 0061/0062: attach each resolved bundle as a read-only erofs
         // virtio-blk image. Order by ascending reserved slot (NOT the
-        // coordinator's slice order, which pushes the harness last) so the
-        // harness (slot 0) is attached first and the guest init shim mounts it
-        // at /opt/engram/dyn/0 — the FIXED path the coordinator `exec`s. The
-        // guest indexes dyn/<i> by attach order alone, so slice order would
-        // strand the harness at dyn/<n_skills>. See `aux_drives_in_slot_order`.
-        // The guest RO-mounts each device at /opt/engram/dyn/<i>; agentd reads
-        // its mount.json to wire skills (harness is `exec`'d, not wired).
+        // coordinator's slice order, which pushes the harness last) and set
+        // VZ's stable virtio block identifier to the slot id (`dyn_0`,
+        // `dyn_1`, ...). The guest init shim prefers that identifier over
+        // `/dev/vd*` enumeration order, which keeps VZ aligned with FC's
+        // drive-id contract even if Linux enumerates devices differently.
+        // agentd reads each mount's mount.json to wire skills (harness is
+        // `exec`'d, not wired).
         // Sentinel slots (sha = None) are skipped, so base-snapshot capture
         // (whose spec carries only `reserved_slot` placeholders) attaches
         // nothing and the base snapshot stays skill-agnostic.
@@ -549,6 +555,24 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
             let dev = VZVirtioBlockDeviceConfiguration::initWithAttachment(
                 VZVirtioBlockDeviceConfiguration::alloc(),
                 &att_super,
+            );
+            let identifier = NSString::from_str(&drive.drive_id);
+            VZVirtioBlockDeviceConfiguration::validateBlockDeviceIdentifier_error(&identifier)
+                .map_err(|err| {
+                    VzError::AttachmentFailed(format!(
+                        "invalid VZ block device identifier {} for aux drive {}: {}",
+                        drive.drive_id,
+                        drive.drive_id,
+                        ns_error_message(&err)
+                    ))
+                })?;
+            dev.setBlockDeviceIdentifier(&identifier);
+            tracing::debug!(
+                drive_id = %drive.drive_id,
+                slot = ?drive.slot_index(),
+                sha256 = %sha,
+                path = %path.display(),
+                "vz: attaching aux erofs bundle"
             );
             storage.push(Retained::cast_unchecked(dev));
         }

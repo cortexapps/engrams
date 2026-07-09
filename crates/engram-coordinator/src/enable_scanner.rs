@@ -451,7 +451,8 @@ async fn advance_one(
             }
         })
     };
-    let capture_result = capture_and_record_base_snapshot(state, &row, progress_tx).await;
+    let capture_result =
+        capture_and_record_base_snapshot(state, &row, job.force_recapture, progress_tx).await;
     // `capture_and_record_base_snapshot` returning means every `Sender`
     // clone it (or the host RPC underneath it) held has been dropped —
     // awaiting the consumer here guarantees every progress event,

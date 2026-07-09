@@ -14,6 +14,7 @@
 //! [`Ext4Packer`] is a trait so unit tests can mock it; the real
 //! binary is exercised by the packer/determinism integration tests.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -38,6 +39,9 @@ pub enum Ext4Error {
     /// mke2fs returned a non-zero exit code. The string is its
     /// captured stderr — verbose, but useful when the bake fails.
     Mke2fs(String),
+    /// debugfs failed while applying offline metadata edits. The string is
+    /// the captured diagnostic output.
+    Debugfs(String),
     /// Could not find the mke2fs binary (PATH miss or stale config).
     MissingBinary(String),
 }
@@ -47,6 +51,7 @@ impl std::fmt::Display for Ext4Error {
         match self {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Mke2fs(s) => write!(f, "mke2fs: {s}"),
+            Self::Debugfs(s) => write!(f, "debugfs: {s}"),
             Self::MissingBinary(b) => write!(f, "binary not found: {b}"),
         }
     }
@@ -115,6 +120,32 @@ fn resolve_mke2fs() -> PathBuf {
         }
     }
     PathBuf::from("mke2fs")
+}
+
+/// Resolve the companion `debugfs` binary used only by the unprivileged
+/// ownership fallback. Prefer an explicit override, then the sibling of the
+/// configured `mke2fs` (Homebrew/Nix e2fsprogs layout), then the executable
+/// sibling/PATH fallbacks used by `mke2fs`.
+fn resolve_debugfs() -> PathBuf {
+    if let Some(p) = std::env::var_os("ENGRAM_DEBUGFS") {
+        return PathBuf::from(p);
+    }
+    if let Some(p) = std::env::var_os("ENGRAM_MKE2FS") {
+        let mke2fs = PathBuf::from(p);
+        if let Some(sibling) = mke2fs.parent().map(|d| d.join("debugfs")) {
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(sibling) = exe.parent().map(|d| d.join("debugfs")) {
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("debugfs")
 }
 
 #[async_trait]
@@ -246,6 +277,194 @@ impl Mke2fsPacker {
             return Err(Ext4Error::Mke2fs(stderr));
         }
         Ok(())
+    }
+}
+
+/// Rootless repair for the `mke2fs -d` ownership/mode gap.
+///
+/// `mke2fs -d` copies uid/gid from the host tree. In local macOS/VZ dev the
+/// materializer is deliberately not root, so applying the OCI uid/gid with
+/// `chown` is refused and the packed image would otherwise contain UID 501
+/// owners for root-owned files. Some host filesystems also strip setuid/setgid
+/// bits from the scratch tree. This pass edits the ext4 inode metadata offline
+/// with `debugfs`; it does not mount the image and does not need sudo.
+pub async fn stamp_image_ownership(
+    image: &Path,
+    source_root: &Path,
+    tree_meta: &crate::flatten::TreeMetadata,
+) -> Result<usize, Ext4Error> {
+    stamp_image_ownership_with_debugfs(image, source_root, tree_meta, &resolve_debugfs()).await
+}
+
+pub(crate) async fn stamp_image_ownership_with_debugfs(
+    image: &Path,
+    source_root: &Path,
+    tree_meta: &crate::flatten::TreeMetadata,
+    debugfs: &Path,
+) -> Result<usize, Ext4Error> {
+    let stamps = collect_ownership_stamps(source_root, tree_meta)?;
+    if stamps.is_empty() {
+        return Ok(0);
+    }
+
+    let mut commands = String::new();
+    for (rel, stamp) in &stamps {
+        let path = debugfs_quote_path(rel)?;
+        commands.push_str(&format!("sif {path} uid {}\n", stamp.uid));
+        commands.push_str(&format!("sif {path} gid {}\n", stamp.gid));
+        commands.push_str(&format!("sif {path} mode 0{:o}\n", stamp.full_mode));
+    }
+
+    let mut cmd_path = image.to_path_buf();
+    cmd_path.as_mut_os_string().push(format!(
+        ".ownership-{}.debugfs",
+        uuid::Uuid::new_v4().simple()
+    ));
+    tokio::fs::write(&cmd_path, commands).await?;
+
+    let output = match tokio::process::Command::new(debugfs)
+        .arg("-w")
+        .arg("-f")
+        .arg(&cmd_path)
+        .arg(image)
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&cmd_path).await;
+            return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                Ext4Error::MissingBinary(debugfs.to_string_lossy().into_owned())
+            } else {
+                Ext4Error::Io(e)
+            });
+        }
+    };
+    let _ = tokio::fs::remove_file(&cmd_path).await;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() || debugfs_reported_errors(&stderr) {
+        return Err(Ext4Error::Debugfs(format_debugfs_failure(
+            output.status,
+            &stdout,
+            &stderr,
+        )));
+    }
+
+    Ok(stamps.len())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InodeStamp {
+    uid: u64,
+    gid: u64,
+    full_mode: u32,
+}
+
+fn collect_ownership_stamps(
+    source_root: &Path,
+    tree_meta: &crate::flatten::TreeMetadata,
+) -> Result<BTreeMap<String, InodeStamp>, Ext4Error> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mut stamps = BTreeMap::new();
+    let mut stack = vec![source_root.to_path_buf()];
+
+    while let Some(path) = stack.pop() {
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+
+        let rel = path
+            .strip_prefix(source_root)
+            .map_err(|e| Ext4Error::Debugfs(format!("path escape while stamping: {e}")))?;
+        let rel = rel
+            .to_str()
+            .ok_or_else(|| Ext4Error::Debugfs(format!("non-utf8 path: {}", rel.display())))?
+            .to_string();
+        let desired_owner = tree_meta
+            .get(&rel)
+            .map(|m| (m.uid, m.gid))
+            // Materializer-created entries (`/`, implicit parents, injected
+            // `/sbin/engram-init`) are root-owned in the rootful host-agent
+            // path, so make the rootless image match that contract.
+            .unwrap_or((0, 0));
+        let desired_mode = tree_meta
+            .get(&rel)
+            .map(|m| m.mode)
+            .unwrap_or_else(|| meta.permissions().mode() & 0o7777);
+        let Some(full_mode) = full_inode_mode(meta.file_type(), desired_mode) else {
+            continue;
+        };
+
+        let actual_owner = (meta.uid() as u64, meta.gid() as u64);
+        let actual_mode = meta.permissions().mode() & 0o7777;
+        if desired_owner != actual_owner || desired_mode != actual_mode {
+            stamps.insert(
+                rel,
+                InodeStamp {
+                    uid: desired_owner.0,
+                    gid: desired_owner.1,
+                    full_mode,
+                },
+            );
+        }
+
+        if meta.file_type().is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                stack.push(entry?.path());
+            }
+        }
+    }
+
+    Ok(stamps)
+}
+
+fn full_inode_mode(file_type: std::fs::FileType, mode: u32) -> Option<u32> {
+    if file_type.is_dir() {
+        Some(0o040000 | (mode & 0o7777))
+    } else if file_type.is_file() {
+        Some(0o100000 | (mode & 0o7777))
+    } else {
+        None
+    }
+}
+
+fn debugfs_quote_path(rel: &str) -> Result<String, Ext4Error> {
+    if rel.bytes().any(|b| matches!(b, 0 | b'\n' | b'\r')) {
+        return Err(Ext4Error::Debugfs(format!(
+            "cannot stamp path with control character: {rel:?}"
+        )));
+    }
+    let mut quoted = String::from("\"/");
+    for ch in rel.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    Ok(quoted)
+}
+
+fn debugfs_reported_errors(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with("debugfs ")
+    })
+}
+
+fn format_debugfs_failure(status: std::process::ExitStatus, stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => format!("exit status {status}"),
+        (false, true) => format!("exit status {status}; stdout: {stdout}"),
+        (true, false) => format!("exit status {status}; stderr: {stderr}"),
+        (false, false) => format!("exit status {status}; stdout: {stdout}; stderr: {stderr}"),
     }
 }
 
@@ -551,6 +770,24 @@ mod tests {
                 "recommended_size({s}) must be 4 KiB aligned for VZ"
             );
         }
+    }
+
+    #[test]
+    fn debugfs_quote_path_escapes_debugfs_syntax() {
+        assert_eq!(debugfs_quote_path("").unwrap(), "\"/\"");
+        assert_eq!(
+            debugfs_quote_path("dir/with spaces/quote\"and\\slash").unwrap(),
+            "\"/dir/with spaces/quote\\\"and\\\\slash\""
+        );
+        assert!(debugfs_quote_path("bad\npath").is_err());
+    }
+
+    #[test]
+    fn debugfs_reported_errors_ignores_banner_only() {
+        assert!(!debugfs_reported_errors("debugfs 1.47.4 (6-Mar-2025)\n"));
+        assert!(debugfs_reported_errors(
+            "debugfs 1.47.4 (6-Mar-2025)\n/missing: File not found by ext2_lookup\n"
+        ));
     }
 
     /// The determinism clamp: newer-than-epoch mtimes (freshly written

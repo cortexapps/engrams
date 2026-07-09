@@ -245,29 +245,73 @@ if [ -b /dev/vdb ]; then
     rmdir /run/engram/.ca-stage 2>/dev/null || true
 fi
 mark ca_staged
-# ADR 0055: mount each reserved dynamic-mount slot the host attached as an
-# extra read-only virtio-blk drive. Slots carry a sentinel at base-snapshot
-# capture; a per-session create patch_drives the profile-selected skills into
-# the slots' devices in the paused restore window. We mount every read-only
-# bundle device (squashfs on FC, erofs on VZ — the ext4 CA drive is never
-# matched) at a sequential /opt/engram/dyn/<i> — the index tracks the host's
-# slot order (FC preserves attach order). The mounts freeze into the base
-# snapshot's VFS; on a fresh-create restore the host has swapped some slots'
-# devices, and agentd umount/remounts /opt/engram/dyn/* at session bind so
-# each superblock re-parses its (possibly swapped) device (ADR 0035 §3).
-# agentd then reads each mount's mount.json to wire skills (sentinels are
-# skipped). Best-effort.
-i=0
-for dev in /dev/vd*; do
-    [ -b "$dev" ] || continue
-    [ "$dev" = "/dev/vda" ] && continue  # rootfs
-    mkdir -p "/opt/engram/dyn/$i" 2>/dev/null || true
-    if mount -t squashfs -o ro "$dev" "/opt/engram/dyn/$i" 2>/dev/null || \
-       mount -t erofs -o ro "$dev" "/opt/engram/dyn/$i" 2>/dev/null; then
-        i=$((i + 1))
-    else
-        rmdir "/opt/engram/dyn/$i" 2>/dev/null || true  # not a bundle device (e.g. CA ext4)
+# ADR 0055: mount each dynamic-mount slot the host attached as an extra
+# read-only virtio-blk drive. VZ tags aux disks with the stable virtio block
+# identifier (`dyn_<i>`), exposed by Linux at `/sys/block/vd*/serial`; prefer
+# that over `/dev/vd*` enumeration order. FC/backcompat keeps the fallback
+# compact order. Only read-only bundle formats are attempted (squashfs on FC,
+# erofs on VZ), so the ext4 CA drive is never matched.
+mount_dyn_bundle() {
+    dev="$1"
+    slot="$2"
+    mnt="/opt/engram/dyn/$slot"
+    mkdir -p "$mnt" 2>/dev/null || true
+    if mount -t squashfs -o ro "$dev" "$mnt" 2>/dev/null || \
+       mount -t erofs -o ro "$dev" "$mnt" 2>/dev/null; then
+        return 0
     fi
+    rmdir "$mnt" 2>/dev/null || true
+    return 1
+}
+
+mounted_dyn_devs=""
+mounted_any_dyn=0
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    # VZ path: mount by the stable block identifier, not by device name order.
+    for sysdev in /sys/block/vd*; do
+        [ -d "$sysdev" ] || continue
+        base="${sysdev##*/}"
+        dev="/dev/$base"
+        [ -b "$dev" ] || continue
+        [ "$dev" = "/dev/vda" ] && continue  # rootfs
+        ident="$(cat "$sysdev/serial" 2>/dev/null || cat "$sysdev/device/serial" 2>/dev/null || true)"
+        case "$ident" in
+            dyn_[0-9]|dyn_[0-9][0-9])
+                slot="${ident#dyn_}"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        case " $mounted_dyn_devs " in
+            *" $dev "*) continue ;;
+        esac
+        if mount_dyn_bundle "$dev" "$slot"; then
+            mounted_dyn_devs="$mounted_dyn_devs $dev"
+            mounted_any_dyn=1
+        fi
+    done
+
+    # FC/backcompat path: compact remaining untagged devices by enumeration.
+    i=0
+    for dev in /dev/vd*; do
+        [ -b "$dev" ] || continue
+        [ "$dev" = "/dev/vda" ] && continue  # rootfs
+        case " $mounted_dyn_devs " in
+            *" $dev "*) continue ;;
+        esac
+        while [ -d "/opt/engram/dyn/$i" ]; do
+            i=$((i + 1))
+        done
+        if mount_dyn_bundle "$dev" "$i"; then
+            mounted_dyn_devs="$mounted_dyn_devs $dev"
+            mounted_any_dyn=1
+            i=$((i + 1))
+        fi
+    done
+
+    [ "$mounted_any_dyn" = "1" ] && break
+    sleep 0.05
 done
 mark bundles_mounted
 export ENGRAM_TRANSPORT=__TRANSPORT__
@@ -430,12 +474,26 @@ mod tests {
         );
     }
 
-    /// ADR 0061: the dyn-mount loop must try squashfs first (FC path) then
-    /// erofs (VZ's Kata kernel has no CONFIG_SQUASHFS). The ext4 CA drive
-    /// must never be matched because only read-only bundle formats are
+    /// ADR 0061/0080: the dyn-mount path must prefer VZ's stable virtio
+    /// block identifier (`/sys/block/vd*/serial == dyn_<i>`) and still fall
+    /// back to FC's enumeration order. It must try squashfs first (FC path)
+    /// then erofs (VZ's Kata kernel has no CONFIG_SQUASHFS). The ext4 CA
+    /// drive must never be matched because only read-only bundle formats are
     /// attempted.
     #[test]
-    fn init_shim_dyn_mount_tries_squashfs_then_erofs() {
+    fn init_shim_dyn_mount_prefers_ids_and_tries_squashfs_then_erofs() {
+        assert!(
+            DEFAULT_INIT_SHIM.contains("/sys/block/vd*"),
+            "VZ dyn-mount path must inspect virtio block sysfs entries",
+        );
+        assert!(
+            DEFAULT_INIT_SHIM.contains("cat \"$sysdev/serial\""),
+            "VZ dyn-mount path must read the block device identifier",
+        );
+        assert!(
+            DEFAULT_INIT_SHIM.contains("dyn_[0-9]|dyn_[0-9][0-9]"),
+            "VZ dyn-mount path must recognize stable dyn_<slot> identifiers",
+        );
         assert!(
             DEFAULT_INIT_SHIM.contains("mount -t squashfs -o ro"),
             "dyn-mount loop must try squashfs first (FC path)",
@@ -444,15 +502,15 @@ mod tests {
             DEFAULT_INIT_SHIM.contains("mount -t erofs -o ro"),
             "dyn-mount loop must try erofs as fallback (VZ / Kata path)",
         );
-        // The dyn-mount loop iterates /dev/vd* and skips /dev/vda (rootfs).
-        // It must only attempt read-only bundle formats (squashfs, erofs), never
+        // The dyn-mount path scans /dev/vd* and skips /dev/vda (rootfs). It
+        // must only attempt read-only bundle formats (squashfs, erofs), never
         // ext4 — otherwise the CA ext4 drive on /dev/vdb would be double-mounted.
-        // We verify the dyn-mount loop section (between "for dev in /dev/vd*" and
+        // We verify the dyn-mount section (between "mount_dyn_bundle()" and
         // "mark bundles_mounted") contains no "mount -t ext4" invocation.
         let shim = DEFAULT_INIT_SHIM;
         let loop_start = shim
-            .find("for dev in /dev/vd*")
-            .expect("dyn-mount loop must be present");
+            .find("mount_dyn_bundle()")
+            .expect("dyn-mount helper must be present");
         let loop_end = shim
             .find("mark bundles_mounted")
             .expect("bundles_mounted mark must be present");

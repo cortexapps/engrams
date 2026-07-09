@@ -399,6 +399,12 @@ pub struct EnableJob {
     /// stage resolves `warm.env` refs and assembles the `warm.network`
     /// egress policy from it.
     pub image_config: crate::types::image::ImageConfig,
+    /// Operator-requested bypass of base-snapshot reuse. Used by
+    /// `RefreshImage(force_recapture = true)` when a breaking runtime/tooling
+    /// change needs a new base snapshot even if the rootfs content and
+    /// resources match an existing enabled image.
+    #[serde(default)]
+    pub force_recapture: bool,
     /// ADR 0036 amendment (issue #538): per-host prestage outcome map,
     /// written once at the end of the `Prestaging` stage —
     /// `{"<host-uuid>": {"outcome": "staged"|"timed_out"|"unschedulable",

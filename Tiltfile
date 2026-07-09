@@ -251,6 +251,11 @@ bin_dir = env_or('ENGRAM_INTEG_BIN_DIR', '')
 # to ship spans elsewhere (or to '' to disable export entirely).
 otel_endpoint = env_or('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4317')
 
+# Local dev hosts can have much smaller work dirs than production. Keep the
+# coordinator's materialize/capture placement floor and the host-agent's
+# idle-evict floor aligned, while still allowing .env/process overrides.
+dev_disk_floor_bytes = env_or('ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES', '3221225472')
+
 coord_env = {
     'DATABASE_URL': 'postgres://engram:engram@localhost:5435/engram',
     'ENGRAM_BIND_ADDR': '127.0.0.1:8090',
@@ -277,6 +282,7 @@ coord_env = {
     'ENGRAM_BLOB_BACKEND': 'gcs' if dev_split else env_or('ENGRAM_BLOB_BACKEND', 'local'),
     'ENGRAM_GCS_BUCKET': env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test'),
     'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
+    'ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES': dev_disk_floor_bytes,
     'OTEL_EXPORTER_OTLP_ENDPOINT': otel_endpoint,
     'RUST_LOG': 'info,engram=debug',
 }
@@ -386,7 +392,7 @@ else:
 if sandbox_backend == 'firecracker':
     print('engram dev: NBD devices discovered = %r (two_hosts=%s)' % (_nbd, two_hosts))
 
-def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress_proxy_port):
+def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress_proxy_port, egress_dns_port):
     env = {
         # `kernel_key` is only non-None for vz/firecracker, both of
         # which force `dev_split`, so this always lands on the
@@ -402,6 +408,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # back to the Linux fleet path /var/lib/engram/shared (absent on
         # macOS) and every skill-enabled create 400s.
         'ENGRAM_BUNDLE_DIR': _bundle_dir,
+        'ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES': dev_disk_floor_bytes,
         # ADR 0039: the Tilt dev/e2e stack doesn't bake engram-uffd-handler
         # (prod's FC-host image does), and the host-agent runs under sudo
         # with a scrubbed PATH so it couldn't spawn a co-located one anyway.
@@ -440,6 +447,13 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # iptables REDIRECTs its VMs there) so a co-located second host
         # in the two-host stack doesn't collide on the bind.
         'ENGRAM_EGRESS_PROXY_PORT': egress_proxy_port,
+        # DNS-filter proxy port. Like the proxy/gRPC/metrics ports, it must be
+        # distinct per host-agent on the SHARED netns of the two-host e2e stack
+        # (host-agent-b gets dns_base+1 below) — else the second host-agent
+        # fails closed on `Address already in use` (ADR 0075). The host-agent
+        # wires this same value into the FC iptables `:53 -> dns` REDIRECT, so
+        # the two can't drift.
+        'ENGRAM_EGRESS_DNS_PORT': egress_dns_port,
         'ENGRAM_HOST_METRICS_ADDR': '0.0.0.0:' + metrics_port,
         # ADR 0019: same OTLP target as the coord, so the host-side
         # restore/boot spans land in the same Jaeger trace.
@@ -535,13 +549,24 @@ if dev_split:
         labels=['setup'])
 
 _proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT', '0'))
+# DNS-filter proxy base port. Always a real port (unlike the proxy port, which
+# has a 0-footgun default): the DNS listener always binds. host-agent-b takes
+# _dns_base + 1 so the two hosts don't collide on the shared netns. Keep the
+# Linux/FC default at 5353 for parity with the binary default, but avoid it for
+# Mac-local VZ dev because mDNS/Chrome commonly owns UDP 5353 on Darwin.
+_dns_base_default = '5353'
+if uname_str.startswith('Darwin'):
+    _dns_base_default = '5453'
+_dns_base = int(env_or('ENGRAM_EGRESS_DNS_PORT', _dns_base_default))
 if dev_split:
-    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base))
+    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base), str(_dns_base))
     if two_hosts:
-        # Distinct proxy port for the second host-agent; 0 (disabled)
-        # stays 0 so the dev default is unchanged.
+        # Distinct proxy + DNS ports for the second host-agent (they share the
+        # netns). Proxy: 0 (disabled) stays 0 so the dev default is unchanged.
+        # DNS: always +1 (the DNS listener always binds), else host-agent-b
+        # fails closed on `Address already in use` (ADR 0075).
         _proxy_b = str(_proxy_base + 1) if _proxy_base > 0 else '0'
-        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b)
+        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b, str(_dns_base + 1))
 
 # ----------------------------------------------------------------
 # Orchestrator (Bun/Hono, ADR 0051) — the web's BFF.

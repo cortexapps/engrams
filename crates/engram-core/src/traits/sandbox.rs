@@ -494,12 +494,11 @@ pub trait SandboxBackend: Send + Sync {
     /// bootstrap/agentd reached `accept()`. This is the same wait
     /// [`Self::start_agent`] does before spawning a harness, exposed
     /// standalone so the base-snapshot capture can reach a quiescent
-    /// guest *without* binding a session harness. Default errors —
-    /// only the FC backend (which owns the per-sandbox `agent_ready`
-    /// watch) implements it.
+    /// guest *without* binding a session harness. Default errors; VM
+    /// backends that own a per-sandbox readiness signal override it.
     async fn wait_agent_ready(&self, _id: SandboxId) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
-            "this backend doesn't support `wait_agent_ready` (FC-only)".into(),
+            "this backend doesn't support `wait_agent_ready`".into(),
         ))
     }
 

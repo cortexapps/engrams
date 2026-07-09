@@ -556,6 +556,7 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
         attempts: attempts.max(0) as u32,
         error: row.try_get("error").map_err(col_err)?,
         image_config: jsonb_from_row(row, "image_config")?,
+        force_recapture: row.try_get("force_recapture").map_err(col_err)?,
         prestage_hosts,
         capture_phase: capture_phase_from_row(row)?,
         warm_stage: row.try_get("warm_stage").map_err(col_err)?,

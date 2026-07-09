@@ -6982,7 +6982,9 @@ impl SandboxBackend for PooledBackend {
             let boot_keepalive = spawn_leg_keepalive(progress.clone(), boot_event);
             // Wait for the guest to reach agentd-ready (bootstrap on
             // accept(), harness unmounted — the option-D capture point).
-            // VZ backend doesn't support this (FC-only), so ignore InvalidSpec.
+            // VM backends (FC/VZ) provide this readiness signal. Process/mocks
+            // may still return InvalidSpec, which means there is no VM boot
+            // readiness concept to gate on.
             match self.inner.wait_agent_ready(id).await {
                 Ok(()) => {}
                 Err(SandboxError::InvalidSpec(_)) => {}

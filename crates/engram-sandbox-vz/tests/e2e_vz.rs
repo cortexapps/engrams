@@ -136,6 +136,49 @@ fn skill_erofs_preflight() -> Option<(PathBuf, String)> {
     Some((dir, sha))
 }
 
+fn bundle_dir_preflight() -> Option<(PathBuf, HashMap<String, String>)> {
+    let dir = std::env::var("ENGRAM_VZ_BUNDLE_DIR")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("ENGRAM_VZ_SKILL_EROFS")
+                .ok()
+                .and_then(|p| PathBuf::from(p).parent().map(Path::to_path_buf))
+        })
+        .unwrap_or_else(|| PathBuf::from("var/shared"));
+    let current = dir.join("current.json");
+    if !current.exists() {
+        eprintln!(
+            "SKIP: VZ bundle stamp not found at {} (run `just bundles-vz` or set ENGRAM_VZ_BUNDLE_DIR)",
+            current.display()
+        );
+        return None;
+    }
+    let bytes = std::fs::read(&current).ok()?;
+    let stamp: HashMap<String, String> = match serde_json::from_slice(&bytes) {
+        Ok(stamp) => stamp,
+        Err(e) => {
+            eprintln!("SKIP: cannot parse {}: {e}", current.display());
+            return None;
+        }
+    };
+    for key in [
+        engram_core::types::sandbox::AuxRoDrive::SENTINEL_STAMP_KEY,
+        engram_core::types::sandbox::AuxRoDrive::AGENTD_STAMP_KEY,
+    ] {
+        let Some(sha) = stamp.get(key) else {
+            eprintln!("SKIP: {} carries no {key:?} entry", current.display());
+            return None;
+        };
+        let path = dir.join(format!("{sha}.erofs"));
+        if !path.exists() {
+            eprintln!("SKIP: stamped bundle {key:?} missing at {}", path.display());
+            return None;
+        }
+    }
+    Some((dir, stamp))
+}
+
 fn spec_with_skill(rootfs: &Path, sha: &str) -> SandboxSpec {
     let mut s = spec(rootfs);
     s.aux_ro_drives = vec![engram_core::types::sandbox::AuxRoDrive {
@@ -144,6 +187,40 @@ fn spec_with_skill(rootfs: &Path, sha: &str) -> SandboxSpec {
         fs_type: "erofs".into(),
         sha256: Some(sha.to_string()),
     }];
+    s
+}
+
+fn spec_with_reserved_slots(
+    rootfs: &Path,
+    stamp: &HashMap<String, String>,
+    slots: usize,
+) -> SandboxSpec {
+    use engram_core::types::sandbox::AuxRoDrive;
+
+    let sentinel = stamp
+        .get(AuxRoDrive::SENTINEL_STAMP_KEY)
+        .expect("preflight requires sentinel");
+    let agentd = stamp
+        .get(AuxRoDrive::AGENTD_STAMP_KEY)
+        .expect("preflight requires agentd");
+    let guest_tools = stamp.get(AuxRoDrive::GUEST_TOOLS_STAMP_KEY);
+
+    let mut s = spec(rootfs);
+    s.aux_ro_drives = (0..slots)
+        .map(|i| {
+            let sha = if i == AuxRoDrive::AGENTD_SLOT_INDEX {
+                agentd
+            } else if i == AuxRoDrive::GUEST_TOOLS_SLOT_INDEX {
+                guest_tools.unwrap_or(sentinel)
+            } else {
+                sentinel
+            };
+            AuxRoDrive {
+                sha256: Some(sha.clone()),
+                ..AuxRoDrive::reserved_slot(i)
+            }
+        })
+        .collect();
     s
 }
 
@@ -271,20 +348,91 @@ async fn e2e_vz_skill_erofs_attaches() {
         .expect("create");
     await_agent(&backend, id).await;
 
-    // The erofs skill is attached as /dev/vdb (first aux drive after the
-    // /dev/vda rootfs). RO-mount it and read the bundle's mount.json to
-    // prove the attach + the kernel's erofs driver work end to end. This
-    // does not rely on the init-shim auto-mount (Part 3 / a re-bake).
+    // The erofs skill is tagged with VZ's stable block identifier `dyn_0`.
+    // Find the device by `/sys/block/vd*/serial` instead of assuming Linux
+    // names it `/dev/vdb`, then RO-mount it and read the bundle's mount.json.
     let (out, code) = exec(
         &backend,
         id,
-        "mkdir -p /mnt/e && mount -t erofs -o ro /dev/vdb /mnt/e && cat /mnt/e/mount.json",
+        "dev=''; \
+         for sys in /sys/block/vd*; do \
+           [ -d \"$sys\" ] || continue; \
+           [ \"$(cat \"$sys/serial\" 2>/dev/null || cat \"$sys/device/serial\" 2>/dev/null || true)\" = dyn_0 ] || continue; \
+           dev=\"/dev/${sys##*/}\"; break; \
+         done; \
+         [ -n \"$dev\" ] || { echo missing-dyn-0; exit 10; }; \
+         mkdir -p /mnt/e && mount -t erofs -o ro \"$dev\" /mnt/e && cat /mnt/e/mount.json",
     )
     .await;
-    assert_eq!(code, Some(0), "mount erofs /dev/vdb failed; out={out}");
+    assert_eq!(code, Some(0), "mount erofs dyn_0 failed; out={out}");
     assert!(
         out.contains('{'),
         "mount.json not readable from erofs; out={out}"
+    );
+
+    backend.destroy(id).await.expect("destroy");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires macOS + codesigned binary + VZ kernel + ENGRAM_VZ_ROOTFS + ENGRAM_VZ_BUNDLE_DIR/current.json"]
+async fn e2e_vz_twelve_aux_slots_have_stable_block_ids() {
+    let env = match vz_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let (bundle_dir, stamp) = match bundle_dir_preflight() {
+        Some(x) => x,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let blob = Arc::new(engram_storage_local::LocalBlobStorage::new(
+        work.path().join("blob"),
+    ));
+    let cs = engram_chunk_store::ChunkStore::new(blob);
+    let backend = VzBackend::new(
+        work.path().join("sb"),
+        VzConfig::with_kernel(env.kernel.clone()).with_bundle_dir(bundle_dir),
+    )
+    .expect("VzBackend::new")
+    .with_chunk_store(cs);
+
+    let id = backend
+        .create(spec_with_reserved_slots(
+            &env.rootfs,
+            &stamp,
+            engram_core::types::sandbox::AuxRoDrive::RESERVED_SLOTS,
+        ))
+        .await
+        .expect("create with 12 aux slots");
+    await_agent(&backend, id).await;
+
+    let (out, code) = exec(
+        &backend,
+        id,
+        "set -eu; \
+         for i in 0 1 2 3 4 5 6 7 8 9 10 11; do \
+           dev=''; \
+           for sys in /sys/block/vd*; do \
+             [ -d \"$sys\" ] || continue; \
+             [ \"$(cat \"$sys/serial\" 2>/dev/null || cat \"$sys/device/serial\" 2>/dev/null || true)\" = \"dyn_$i\" ] || continue; \
+             dev=\"/dev/${sys##*/}\"; break; \
+           done; \
+           [ -n \"$dev\" ] || { echo \"missing dyn_$i\"; exit 20; }; \
+           mkdir -p \"/opt/engram/dyn/$i\"; \
+           if ! grep -q \" /opt/engram/dyn/$i \" /proc/mounts; then \
+             mount -t erofs -o ro \"$dev\" \"/opt/engram/dyn/$i\" || \
+             mount -t squashfs -o ro \"$dev\" \"/opt/engram/dyn/$i\"; \
+           fi; \
+           ls \"/opt/engram/dyn/$i\" >/dev/null; \
+           echo \"dyn_$i=$dev\"; \
+         done; \
+         echo VZ_SLOT_PROBE_OK",
+    )
+    .await;
+    assert_eq!(code, Some(0), "12-slot VZ probe failed; out={out}");
+    assert!(
+        out.contains("VZ_SLOT_PROBE_OK"),
+        "12-slot VZ probe did not complete; out={out}"
     );
 
     backend.destroy(id).await.expect("destroy");

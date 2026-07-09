@@ -99,6 +99,10 @@ struct VzSandboxState {
     /// `open_guest_stream` (ADR 0066 port relay, guest vsock 1030) — one
     /// fresh vsock stream per forwarded browser connection.
     connector: VsockConnector,
+    /// Flipped when agentd dials the VZ ready port (1027) after binding its
+    /// RPC listener. Base-snapshot capture waits on this so a boot that
+    /// panicked in engram-init cannot be snapshotted as ready.
+    agent_ready: tokio::sync::watch::Receiver<bool>,
     /// `<short-socket-dir>/<sandbox_id>.vsock` — base path (see
     /// `engram_core::socket`; kept short, not under `work_dir`, so the
     /// per-port `_<port>` UDS bind paths stay within SUN_LEN even when
@@ -411,7 +415,7 @@ impl VzBackend {
 
         let harness_sink = self.harness_sink.lock().clone();
         let upload_sink = self.upload_sink.lock().clone();
-        let (bridge, connector) = VsockBridge::start(
+        let (bridge, connector, agent_ready) = VsockBridge::start(
             vm.raw_clone(),
             vm.queue_clone(),
             vsock_uds_path.clone(),
@@ -428,6 +432,7 @@ impl VzBackend {
                 vm,
                 bridge: parking_lot::Mutex::new(Some(bridge)),
                 connector,
+                agent_ready,
                 vsock_uds_path,
                 rootfs_path,
                 guest_endpoints: Mutex::new(None),
@@ -634,7 +639,7 @@ impl SandboxBackend for VzBackend {
         // the port relay (guest vsock 1030) via `open_guest_stream`.
         let harness_sink = self.harness_sink.lock().clone();
         let upload_sink = self.upload_sink.lock().clone();
-        let (bridge, connector) = VsockBridge::start(
+        let (bridge, connector, agent_ready) = VsockBridge::start(
             vm.raw_clone(),
             vm.queue_clone(),
             vsock_uds_path.clone(),
@@ -659,6 +664,7 @@ impl SandboxBackend for VzBackend {
                 vm,
                 bridge: parking_lot::Mutex::new(Some(bridge)),
                 connector,
+                agent_ready,
                 vsock_uds_path,
                 rootfs_path,
                 guest_endpoints: Mutex::new(None),
@@ -740,6 +746,36 @@ impl SandboxBackend for VzBackend {
                 format!("SpawnHarness: unexpected response: {other:?}").into(),
             )),
         }
+    }
+
+    #[tracing::instrument(name = "vz.wait_agent_ready", skip_all, fields(sandbox_id = %id))]
+    async fn wait_agent_ready(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let mut agent_ready = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.agent_ready.clone()
+        };
+        let wait_deadline = Duration::from_secs(180);
+        if !*agent_ready.borrow() {
+            tracing::Instrument::instrument(
+                tokio::time::timeout(wait_deadline, agent_ready.wait_for(|v| *v)),
+                tracing::info_span!("vz.await_agent_ready", phase = "agent_handshake"),
+            )
+            .await
+            .map_err(|_| {
+                SandboxError::Vm(
+                    format!(
+                        "agentd did not dial ready port within {}s — guest never bound \
+                         ENGRAM_AGENTD_PORT (kernel panic? engram-init hang?)",
+                        wait_deadline.as_secs()
+                    )
+                    .into(),
+                )
+            })?
+            .map_err(|e| {
+                SandboxError::Vm(format!("agent_ready watch closed unexpectedly: {e}").into())
+            })?;
+        }
+        Ok(())
     }
 
     fn set_harness_sink(&self, sink: HarnessSink) {
