@@ -3,8 +3,9 @@
 //! `capture_job::CaptureJobRecord` (ADR 0084 §A).
 //!
 //! The contract both rely on:
-//!   - **persist** = write to a `.json.partial` temp, fsync, rename —
-//!     the rename publishes complete bytes or nothing;
+//!   - **persist** = write to a `.json.partial` temp, fsync, rename, then
+//!     fsync the parent dir — the rename publishes complete bytes or
+//!     nothing, and the dir fsync makes the rename itself crash-durable;
 //!   - **load_all** = torn-write-tolerant: unreadable/unparseable files
 //!     are skipped with a warn, never an error — a torn write must not
 //!     wedge the heartbeat loop that re-advertises these records;
@@ -41,6 +42,12 @@ pub async fn persist<T: Serialize>(
     let f = tokio::fs::OpenOptions::new().read(true).open(&tmp).await?;
     f.sync_all().await?;
     tokio::fs::rename(&tmp, &dest).await?;
+    // fsync the PARENT DIRECTORY so the rename itself is durable — without
+    // this, a crash after `rename` returns can still lose the directory
+    // entry (the file's data is synced, but the dir's updated block that
+    // points at it may sit only in the page cache). Opening a directory
+    // read-only for `fsync` is valid on Linux and macOS.
+    tokio::fs::File::open(dir).await?.sync_all().await?;
     Ok(())
 }
 
