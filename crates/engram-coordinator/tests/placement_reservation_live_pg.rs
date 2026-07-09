@@ -413,3 +413,216 @@ async fn ram_ledger_util_columns_round_trip_through_real_pg() {
         "base_shm_pending_mib has no PG column and must NOT survive a round-trip"
     );
 }
+
+// ---------------------------------------------------------------------
+// ADR 0081 — capture placement rides the session scheduler
+// ---------------------------------------------------------------------
+
+/// Create + claim an enable job whose config budgets are
+/// (`mem_mib`, `vcpus`), returning it with the claim held by `claimant`.
+/// Unique `image_uri` per call: the partial unique index allows one
+/// non-terminal job per uri, and the shared test DB runs suites
+/// concurrently.
+async fn seed_claimed_job(
+    meta: &Arc<dyn MetadataStore>,
+    claimant: &str,
+    mem_mib: u32,
+    vcpus: u32,
+) -> engram_core::types::EnableJob {
+    let mut config = engram_core::types::image::ImageConfig {
+        name: "capture-reservation-test".into(),
+        ..Default::default()
+    };
+    config.resources.suggested_memory_mib = Some(mem_mib);
+    config.resources.suggested_vcpus = Some(vcpus);
+    let uri = format!("localhost:5001/capture-reservation:{}", SessionId::new());
+    let job = meta
+        .create_or_get_enable_job(&uri, None, &config)
+        .await
+        .expect("create enable job");
+    // Claim broadly; our fresh job is unclaimed so it's in the batch.
+    // (Other suites' jobs may be claimed too — fenced writes only touch
+    // OUR job id, so that's harmless.)
+    meta.claim_enable_jobs(claimant, 300, 64)
+        .await
+        .expect("claim enable jobs");
+    meta.get_enable_job(job.id)
+        .await
+        .expect("get job")
+        .expect("job present")
+}
+
+/// The core ADR 0081 property, both directions: a reserved capture is
+/// visible to session placement, and releasing it frees the host.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn capture_reservation_is_visible_to_session_placement() {
+    let Some(meta) = connect().await else {
+        return;
+    };
+    let tag = SessionId::new();
+    let host = seed_host(&meta, &format!("cap-a-{tag}"), 16_384).await;
+    let claimant = format!("t-{tag}");
+
+    let job = seed_claimed_job(&meta, &claimant, 12_288, 2).await;
+    // The budgets were stamped at creation from the image config — the
+    // same derivation sessions reserve with.
+    assert_eq!(job.mem_budget_mib, 12_288);
+    assert_eq!(job.cpu_budget_vcpus, 2);
+
+    let picked = meta
+        .reserve_capture_host(job.id, &claimant, &[host], job.mem_budget_mib, 2)
+        .await
+        .expect("reserve capture host");
+    assert_eq!(picked, Some(host), "empty host must fit the capture");
+
+    // A 8 GiB session no longer fits next to the 12 GiB capture VM on a
+    // 16 GiB host — the incident shape (capture invisible to session
+    // placement) must queue instead.
+    let queued = reserve(&meta, SessionId::new(), 8_192, 2, &[host], 0).await;
+    assert_eq!(
+        queued, None,
+        "session placement must see the capture reservation"
+    );
+
+    // Release → the same session-sized reserve now lands.
+    meta.clear_capture_reservation(job.id, &claimant)
+        .await
+        .expect("clear capture reservation");
+    let placed = reserve(&meta, SessionId::new(), 8_192, 2, &[host], 0).await;
+    assert_eq!(placed, Some(host), "released capture frees the host");
+
+    let row = meta
+        .get_enable_job(job.id)
+        .await
+        .expect("get job")
+        .expect("job present");
+    assert_eq!(row.capture_host_id, None);
+    assert_eq!(row.capture_waiting_since, None);
+}
+
+/// The reverse direction + the queue semantics: a session reservation
+/// blocks the capture; the waiting capture stamps
+/// `capture_waiting_since` (kept across re-tries — the timeout clock
+/// measures from the FIRST miss), counts as queued demand for the
+/// autoscaler, and places once capacity frees.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn waiting_capture_counts_as_queued_demand_and_places_when_freed() {
+    let Some(meta) = connect().await else {
+        return;
+    };
+    let tag = SessionId::new();
+    let host = seed_host(&meta, &format!("cap-b-{tag}"), 16_384).await;
+    let claimant = format!("t-{tag}");
+
+    // Fill the host with a session first.
+    let session = SessionId::new();
+    let placed = reserve(&meta, session, 12_288, 2, &[host], 0).await;
+    assert_eq!(placed, Some(host));
+
+    // A 7777-MiB capture can't fit → waiting, wait clock stamped.
+    let job = seed_claimed_job(&meta, &claimant, 7_777, 2).await;
+    let picked = meta
+        .reserve_capture_host(job.id, &claimant, &[host], 7_777, 2)
+        .await
+        .expect("reserve capture host");
+    assert_eq!(picked, None, "capture must see the session reservation");
+    let row = meta
+        .get_enable_job(job.id)
+        .await
+        .expect("get job")
+        .expect("job present");
+    assert_eq!(row.capture_host_id, None);
+    let first_miss = row.capture_waiting_since.expect("wait clock stamped");
+
+    // While waiting, the capture IS queue demand (other suites only ever
+    // ADD their own demand rows, so the fleet total is >= our budget).
+    let demand = meta.queued_demand().await.expect("queued demand");
+    assert!(
+        demand.mem_mib >= 7_777,
+        "waiting capture must count as queued demand (got {} MiB)",
+        demand.mem_mib
+    );
+
+    // A re-try while still full keeps the ORIGINAL wait mark (COALESCE).
+    let again = meta
+        .reserve_capture_host(job.id, &claimant, &[host], 7_777, 2)
+        .await
+        .expect("re-reserve");
+    assert_eq!(again, None);
+    let row = meta
+        .get_enable_job(job.id)
+        .await
+        .expect("get job")
+        .expect("job present");
+    assert_eq!(
+        row.capture_waiting_since,
+        Some(first_miss),
+        "the timeout clock measures from the FIRST miss"
+    );
+
+    // Free the session's reservation → the capture lands and the wait
+    // clock clears.
+    meta.delete_pending_session(session)
+        .await
+        .expect("delete pending session");
+    let picked = meta
+        .reserve_capture_host(job.id, &claimant, &[host], 7_777, 2)
+        .await
+        .expect("reserve after free");
+    assert_eq!(picked, Some(host));
+    let row = meta
+        .get_enable_job(job.id)
+        .await
+        .expect("get job")
+        .expect("job present");
+    assert_eq!(row.capture_host_id, Some(host));
+    assert_eq!(row.capture_waiting_since, None);
+}
+
+/// Fencing + the failure path: a stale claimant can't reserve, and
+/// `record_enable_job_failure` (which releases the claim) also releases
+/// the capture reservation in the same write.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn capture_reservation_is_fenced_and_released_on_failure() {
+    let Some(meta) = connect().await else {
+        return;
+    };
+    let tag = SessionId::new();
+    let host = seed_host(&meta, &format!("cap-c-{tag}"), 16_384).await;
+    let claimant = format!("t-{tag}");
+
+    let job = seed_claimed_job(&meta, &claimant, 4_096, 2).await;
+    let err = meta
+        .reserve_capture_host(job.id, "someone-else", &[host], 4_096, 2)
+        .await
+        .expect_err("stale claimant must not reserve");
+    assert!(
+        matches!(err, engram_core::MetaError::Conflict(_)),
+        "fence miss must be a Conflict, got {err:?}"
+    );
+
+    let picked = meta
+        .reserve_capture_host(job.id, &claimant, &[host], 4_096, 2)
+        .await
+        .expect("reserve with the real claimant");
+    assert_eq!(picked, Some(host));
+
+    // The failure record releases claim AND reservation in ONE write.
+    meta.record_enable_job_failure(job.id, &claimant, "test failure", 5, false)
+        .await
+        .expect("record failure");
+    let row = meta
+        .get_enable_job(job.id)
+        .await
+        .expect("get job")
+        .expect("job present");
+    assert_eq!(row.capture_host_id, None);
+    assert_eq!(row.capture_waiting_since, None);
+
+    // The host is free again for a full-size session.
+    let placed = reserve(&meta, SessionId::new(), 16_000, 2, &[host], 0).await;
+    assert_eq!(placed, Some(host));
+}

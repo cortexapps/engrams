@@ -11,35 +11,11 @@ use tracing::Instrument;
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
 
-/// Default sandbox sizing for sessions created without explicit limits.
-/// Phase 1 numbers — will move to per-repo `engram.toml` config later.
-pub(crate) const DEFAULT_VCPUS: u32 = 2;
-pub(crate) const DEFAULT_MEMORY_MIB: u32 = 4096;
+/// Default disk sizing for sessions created without an explicit limit.
+/// (RAM/vCPU defaults live with their derivation on `ImageConfig` —
+/// `resolved_memory_mib`/`resolved_vcpus` in engram-core — since ADR 0081
+/// placement reserves them for sessions and captures alike.)
 pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
-
-/// Resolved guest memory (MiB) for an image: its `suggested_memory_mib` (or
-/// the default). The single source of truth shared by base-snapshot capture
-/// (`enabled_images`) and session restore — FC requires the restore
-/// `mem_size_mib` to equal the snapshot's, so they MUST compute it
-/// identically. ADR 0055: the base snapshot is sized once per image and is
-/// skill-agnostic (skills bind via `patch_drive`, never resize memory), so
-/// memory-heavy tooling (e.g. browser) is an image-sizing concern —
-/// declare `suggested_memory_mib` on the image, not a per-session skill.
-pub(crate) fn resolved_memory_mib(config: &ImageConfig) -> u32 {
-    config
-        .resources
-        .suggested_memory_mib
-        .unwrap_or(DEFAULT_MEMORY_MIB)
-}
-
-/// ADR 0048: resolved guest vCPU count for an image. Enable-time
-/// validation (`enabled_images::validate_manifest`) guarantees the
-/// declaration is present for enabled images; `DEFAULT_VCPUS` is the
-/// defensive fallback for the test / non-enabled paths, mirroring
-/// `resolved_memory_mib`. This is the budget placement reserves.
-pub(crate) fn resolved_vcpus(config: &ImageConfig) -> u32 {
-    config.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS)
-}
 
 /// The system's cold-boot `SandboxSpec` shape — a fresh kernel boot
 /// (not a snapshot restore) with manifest-derived resources, env, and
@@ -64,8 +40,8 @@ pub(crate) fn cold_boot_spec(
 ) -> engram_core::types::sandbox::SandboxSpec {
     use engram_core::types::sandbox::{AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 
-    let vcpus = resolved_vcpus(config);
-    let memory_mib = resolved_memory_mib(config);
+    let vcpus = config.resolved_vcpus();
+    let memory_mib = config.resolved_memory_mib();
     let disk_gib = config
         .resources
         .suggested_disk_gib
@@ -2015,10 +1991,13 @@ mod tests {
             m
         };
         // Unset → default.
-        assert_eq!(resolved_memory_mib(&mk(None)), DEFAULT_MEMORY_MIB);
+        assert_eq!(
+            mk(None).resolved_memory_mib(),
+            engram_core::types::image::DEFAULT_MEMORY_MIB
+        );
         // Set → honored verbatim, both below and above the default.
-        assert_eq!(resolved_memory_mib(&mk(Some(256))), 256);
-        assert_eq!(resolved_memory_mib(&mk(Some(8192))), 8192);
+        assert_eq!(mk(Some(256)).resolved_memory_mib(), 256);
+        assert_eq!(mk(Some(8192)).resolved_memory_mib(), 8192);
     }
 
     /// ADR 0057: broker substitution authenticates only because the placeholder

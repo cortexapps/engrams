@@ -1927,6 +1927,57 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// ADR 0081: atomically pick + reserve a capture host for job `id`
+    /// from `candidates` (the caller's ranked schedulable list), using
+    /// the SAME `FOR UPDATE` 2D best-fit transaction as
+    /// [`Self::reserve_and_persist_create`] — candidate host rows locked
+    /// in PK order, reserved = Σ budgets over memory-reserving sessions
+    /// UNION capturing enable jobs, so concurrent placers (sessions and
+    /// captures, any replica) serialize and see each other.
+    ///
+    /// On a fit: stamps `capture_host_id` (clearing
+    /// `capture_waiting_since`) and returns the host. On none: leaves
+    /// `capture_host_id` NULL, stamps `capture_waiting_since` iff not
+    /// already set (first miss starts the wait clock), and returns
+    /// `None` — the job is *waiting for capacity*, counted by
+    /// [`Self::queued_demand`] so the autoscaler grows the pool for it.
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    /// Returns [`MetaError::Conflict`] when the lease has moved on.
+    async fn reserve_capture_host(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        candidates: &[crate::HostId],
+        mem_budget_mib: i64,
+        cpu_budget_vcpus: i64,
+    ) -> Result<Option<crate::HostId>, MetaError> {
+        let _ = (id, claimant, candidates, mem_budget_mib, cpu_budget_vcpus);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// ADR 0081: release job `id`'s capture reservation
+    /// (`capture_host_id`/`capture_waiting_since` → NULL). Called when
+    /// the capture step returns, success or failure — the failure path
+    /// is belt-and-suspenders: [`Self::record_enable_job_failure`] also
+    /// clears both (it releases the claim, so a separate fenced clear
+    /// afterwards would fence-miss).
+    ///
+    /// Fenced by `claimant`; returns [`MetaError::Conflict`] when the
+    /// lease has moved on.
+    async fn clear_capture_reservation(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
     /// Admin retry: `failed → pending`, resetting attempts/error/
     /// claim. Errors `NotFound` for unknown ids; `Conflict` when the
     /// job isn't in `failed`.

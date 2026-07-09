@@ -780,16 +780,16 @@ pub async fn pick_specific_host(
     Ok((host_id, backend))
 }
 
-/// ADR 0020 P1: any schedulable host for a base-snapshot capture or an
-/// ADR 0080 image materialize — NOT gated on image readiness or RAM/CPU
-/// capacity (the capture host lazy-materializes the rootfs from
-/// BlobStorage), but it IS gated on the ADR 0078 tier-0 disk floor:
-/// both jobs write image-sized data under the host's work dir, so a
+/// ADR 0080 phase 3b: a host for the MATERIALIZE stage (docker pull +
+/// ext4 pack + chunk) — no VM boots, so NOT gated on image readiness or
+/// RAM/CPU capacity, but it IS gated on the ADR 0078 tier-0 disk floor:
+/// materialize writes image-sized data under the host's work dir, so a
 /// host already below the chunk-cache floor (about to disk-evict its
-/// cache) must never be handed more disk work. Fixed here for both
-/// consumers (the old capture picker ignored disk entirely — the
-/// `capture-host picker ignores disk` incident class).
-pub async fn pick_capture_host(
+/// cache) must never be handed more disk work (the `capture-host picker
+/// ignores disk` incident class). The CAPTURE stage no longer picks
+/// here — ADR 0081 reserves its host through the session scheduler
+/// ([`capture_candidates`] + `MetadataStore::reserve_capture_host`).
+pub async fn pick_materialize_host(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
@@ -801,14 +801,7 @@ pub async fn pick_capture_host(
     let ttl = placement_ttl();
     let id = hosts
         .iter()
-        .find(|h| {
-            host_is_schedulable(h, now, ttl)
-                // ADR 0068: base gate only — see `pick_specific_host`.
-                && host_meets_capabilities(h, &CapabilityRequirements::default()).is_ok()
-                // ADR 0078 tier-0 disk veto (same floor + same
-                // unmeasured-is-soft posture as `named_host_fit_veto`).
-                && host_disk_floor_ok(h)
-        })
+        .find(|h| capture_host_eligible(h, now, ttl))
         .map(|h| h.id)
         .ok_or(PickError::NoCapacity)?;
     let backend = registry
@@ -816,6 +809,38 @@ pub async fn pick_capture_host(
         .await
         .map_err(|e| PickError::HostUnreachable(id, e.to_string()))?;
     Ok((id, backend))
+}
+
+/// Shared eligibility for the enable pipeline's host-side stages:
+/// schedulable, base-capable (ADR 0068 — see `pick_specific_host`), and
+/// above the ADR 0078 tier-0 disk floor (same unmeasured-is-soft
+/// posture as `named_host_fit_veto`).
+fn capture_host_eligible(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> bool {
+    host_is_schedulable(h, now, ttl)
+        && host_meets_capabilities(h, &CapabilityRequirements::default()).is_ok()
+        && host_disk_floor_ok(h)
+}
+
+/// ADR 0081: the ranked candidate set for capture-host RESERVATION —
+/// every eligible host in row order. Deliberately capacity-blind: the
+/// RAM/CPU fit happens atomically inside
+/// `MetadataStore::reserve_capture_host` (the shared FOR-UPDATE 2D
+/// pick), the same split `rank_hosts` / `reserve_and_persist_create`
+/// have on the session path. An empty vec means the fleet has no
+/// eligible host at all (also `NoCapacity` to the caller's wait loop —
+/// e.g. mid-roll every host is briefly wire-skewed).
+pub async fn capture_candidates(meta: &dyn MetadataStore) -> Result<Vec<HostId>, PickError> {
+    let hosts = meta
+        .list_active_hosts()
+        .await
+        .map_err(|e| PickError::Internal(format!("list_active_hosts: {e}")))?;
+    let now = Utc::now();
+    let ttl = placement_ttl();
+    Ok(hosts
+        .iter()
+        .filter(|h| capture_host_eligible(h, now, ttl))
+        .map(|h| h.id)
+        .collect())
 }
 
 /// ADR 0078's tier-0 disk floor as a standalone predicate: free

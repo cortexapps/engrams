@@ -199,12 +199,12 @@ pub(crate) async fn materialize_image_on_host(
     progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
 ) -> Result<engram_core::types::MaterializedImage, ApiError> {
     let (host_id, host) =
-        crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
+        crate::placement::pick_materialize_host(state.services.meta.as_ref(), &state.host_registry)
             .await
             .map_err(|e| {
                 ApiError::Unavailable(format!(
                     "no host is available to materialize this image ({e:?}). \
-                     Register a disk-healthy host and retry the enable."
+             Register a disk-healthy host and retry the enable."
                 ))
             })?;
     let registry_auth = resolve_static_registry_auth(state, image_uri).await?;
@@ -360,6 +360,14 @@ async fn reuse_candidate_chunks_present(
 pub(crate) async fn capture_and_record_base_snapshot(
     state: &SharedState,
     row: &EnabledImage,
+    // ADR 0081: the enable job whose capture this is — carries the
+    // placement budgets and the id the host reservation is stamped
+    // onto — plus the scanner's claimant (every reservation write is
+    // lease-fenced) and how long to wait for capacity before failing
+    // (the session queue timeout).
+    job: &engram_core::types::EnableJob,
+    claimant: &str,
+    capacity_wait: std::time::Duration,
     // Issue #539: live `CaptureProgress` events for the whole call.
     // Unused (no events sent) on the content/digest-reuse fast paths
     // below — no host RPC is made there, so there's nothing to report.
@@ -547,20 +555,88 @@ pub(crate) async fn capture_and_record_base_snapshot(
         capture_network,
     );
 
-    let (host_id, host) =
-        crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
+    // ADR 0081: the capture VM is a session-sized tenant — reserve its
+    // host through the SAME atomic 2D fit sessions place with, so a
+    // capture can never land RAM it doesn't have (the n05d node-OOM
+    // incident: a 24 GiB capture VM next to a 24 GiB session on a
+    // 64 GiB node). No fit right now is NOT a failure: the waiting job
+    // counts as queued demand (`queued_demand`), the K4 autoscaler
+    // grows the pool toward it, and we re-try the reserve until it
+    // lands or the queue timeout expires — the same posture a queued
+    // session gets. The budgets ride the job row (stamped at creation);
+    // the config fallback covers jobs enqueued before migration 0095,
+    // whose columns default to 0 (which would reserve nothing —
+    // exactly the incident class this exists to close).
+    let mem_budget_mib = if job.mem_budget_mib > 0 {
+        job.mem_budget_mib
+    } else {
+        config.resolved_memory_mib() as i64
+    };
+    let cpu_budget_vcpus = if job.cpu_budget_vcpus > 0 {
+        job.cpu_budget_vcpus as i64
+    } else {
+        config.resolved_vcpus() as i64
+    };
+    const CAPACITY_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + capacity_wait;
+    let host_id = loop {
+        let candidates = crate::placement::capture_candidates(state.services.meta.as_ref())
             .await
-            .map_err(|e| {
-                ApiError::Unavailable(format!(
-                    "no host is available to capture this image's base snapshot \
-                     ({e:?}). Register a host and retry the enable."
-                ))
-            })?;
+            .map_err(|e| ApiError::Internal(format!("list capture candidates: {e:?}")))?;
+        let picked = state
+            .services
+            .meta
+            .reserve_capture_host(
+                job.id,
+                claimant,
+                &candidates,
+                mem_budget_mib,
+                cpu_budget_vcpus,
+            )
+            .await?;
+        match picked {
+            Some(h) => break h,
+            None if tokio::time::Instant::now() >= deadline => {
+                return Err(ApiError::CaptureFailed {
+                    kind: engram_core::types::CaptureFailureKind::CapacityTimeout,
+                    message: format!(
+                        "no host fit the capture VM for `{}` ({mem_budget_mib} MiB / \
+                         {cpu_budget_vcpus} vCPUs) within {}s — the fleet is at capacity \
+                         and the autoscaler didn't grow it (maxHosts? cloud quota?). \
+                         Free capacity (or raise the node-pool ceiling) and retry the job.",
+                        row.image_uri,
+                        capacity_wait.as_secs(),
+                    ),
+                });
+            }
+            None => {
+                tracing::info!(
+                    image_uri = %row.image_uri,
+                    mem_budget_mib,
+                    cpu_budget_vcpus,
+                    "capture waiting for capacity (counted as queued demand; \
+                     the autoscaler scales toward it)",
+                );
+                tokio::time::sleep(CAPACITY_POLL).await;
+            }
+        }
+    };
+    let host = state
+        .host_registry
+        .backend_for(host_id)
+        .await
+        .map_err(|e| {
+            ApiError::Unavailable(format!(
+                "reserved capture host {host_id} is unreachable: {e}"
+            ))
+        })?;
 
     tracing::info!(
         image_uri = %row.image_uri,
         host_id = %host_id,
-        "capturing base snapshot for image enable",
+        mem_budget_mib,
+        cpu_budget_vcpus,
+        "capturing base snapshot for image enable (host reserved, ADR 0081)",
     );
     // Resolve the capture-time env for the `[warm]` hook (`warm.env`, ADR
     // 0080): literals pass through, secret refs resolve through the same
