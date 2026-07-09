@@ -63,13 +63,30 @@ Captures become first-class tenants of the session scheduler:
    it does for a session. A capture that waits longer than the queue
    timeout (`ENGRAM_QUEUE_TIMEOUT_SECS`, default 30 min — the same
    backstop sessions get for maxHosts/quota/stockout) fails the job
-   with a legible error.
+   with a legible error. The wait deadline is measured from the
+   **DB-persisted `capture_waiting_since`** (the first miss), not a
+   wall-clock instant captured at the top of the wait loop:
+   `reserve_capture_host` returns the COALESCE-stamped anchor in its
+   no-fit arm and the scanner compares `now − anchor` against the
+   timeout the same way the queue scanner times a session out. A
+   process-local deadline would reset on every pod restart / lease
+   re-claim, so under coordinator churn the 30-min backstop would
+   never fire.
 
 4. **Release on capture exit.** `capture_host_id` (and
    `capture_waiting_since`) clear when the capture step returns —
    success or failure — and on any terminal job state. A crashed pod's
-   stale reservation lives only until the lease expires and a peer
-   re-claims (the re-run re-reserves from scratch).
+   stale `capture_host_id` is cleared the instant a peer re-claims the
+   expired lease: `claim_enable_jobs` nulls it in the claim's `SET`
+   clause, so the re-run's `reserve_capture_host` re-reserves from
+   scratch instead of counting the job's OWN phantom reservation
+   against the only viable host (a self-block, on a tight fleet, that
+   would otherwise never fit its own budget → `CapacityTimeout`; and
+   `queued_demand` excludes a host-reserved job, so the autoscaler
+   wouldn't rescue it either). `capture_waiting_since` deliberately
+   **survives** the reclaim — it is the first-miss wait anchor the
+   timeout measures from (§3), cleared only when the capture actually
+   fits, is explicitly released, fails, or is retried.
 
 5. **The n≤1 posture is lifted.** With reservations, concurrent
    captures (of different images — the per-image in-flight dedupe in
@@ -107,9 +124,11 @@ stays disk-gated.
   claim and loops `reserve → sleep 5s` in-process (each reserve write
   renews the lease, so a long wait doesn't get stolen), and `run_once`
   drives claimed jobs concurrently (a `JoinSet`) so a waiting capture
-  parks one task, not the pod's whole sweep. The concurrent drive is
-  also the actual lift of the old one-enable-at-a-time-per-pod
-  serialization — the serial loop, not any explicit gate, was the n≤1.
+  parks its own task without starving the *other* jobs in the same
+  claim batch (the whole tick still joins before it returns — see the
+  `run_once`-join note below). The concurrent drive is also the actual
+  lift of the old one-enable-at-a-time-per-pod serialization — the
+  serial loop, not any explicit gate, was the n≤1.
 - **`CapacityTimeout` is a `CaptureFailureKind`.** Instead of a new
   `ApiError` variant or string matching, the wait-deadline failure
   rides the existing issue-#539 structured taxonomy
@@ -128,10 +147,38 @@ stays disk-gated.
   the proto `EnableJob` doesn't surface them (a waiting job is legible
   via the coord's waiting log and the `capacity_timeout` failure kind).
   Revisit if the dashboard wants a "waiting for capacity" badge.
-- Pre-0095 in-flight jobs have budget columns `DEFAULT 0`; the capture
-  step falls back to config-derived budgets when it sees 0, so a
-  mid-rollout job can't reserve nothing (the incident class itself).
+- **Pre-0095 fallback budgets are PERSISTED, not just used for the
+  pick.** In-flight jobs migrated onto 0-default budget columns would
+  reserve *nothing* — a budget-0 `capture_host_id` folds 0 into every
+  other placer's reserved-SUM (the exact 2026-07-08 OOM), and a
+  budget-0 waiting job folds 0 into `queued_demand` so the autoscaler
+  never grows for it. The capture step resolves the config-derived
+  budget for a 0 row, and `reserve_capture_host` STAMPS it onto
+  `mem_budget_mib` / `cpu_budget_vcpus` in **both** its branches (fit
+  AND no-fit, fenced by claimant) — so the moment the capture step
+  touches a mid-rollout job the row carries a real budget that every
+  reserved-SUM reader and `queued_demand` see, not just the in-process
+  pick. The derivation stays in one place (the caller resolves; the SQL
+  persists).
+- **`run_once` joins its whole `JoinSet` before returning**, so a
+  capacity-waiting capture parks one of the pod's `claim_limit` (default
+  2) claim slots and delays *that pod's* next sweep until the capture
+  places or times out. Bounded by `claim_limit` and mitigated by
+  multiple replicas + the claim's `FOR UPDATE SKIP LOCKED` (peers keep
+  sweeping the rest of the fleet's jobs); acceptable for now. The proper
+  fix — decoupling the wait from a claim slot — rides the capture-jobs
+  redesign (issue #546).
+- **A lease-loss re-claim can briefly double-run a capture.** If a pod
+  loses its lease while its capture RPC is still executing host-side, a
+  peer re-claims and can start a second capture before the first
+  notices. The reservation bookkeeping here is correct on both sides
+  (each re-reserves from scratch after the claim-time clear), but the
+  duplicate host-side execution is a pre-existing enable-pipeline
+  hazard that the capture-jobs redesign (issue #546) owns; ADR 0081
+  does not close it.
 
-Validated by `placement_reservation_live_pg` (3 new tests: mutual
+Validated by `placement_reservation_live_pg` (5 new tests: mutual
 visibility both directions, wait-clock + queued-demand semantics,
-fencing + failure-path release) — in CI's live-PG lane.
+fencing + failure-path release, pre-0095 fallback-budget persistence +
+session-visibility, and reclaim-clears-stale-host-but-keeps-wait-anchor)
+— in CI's live-PG lane.

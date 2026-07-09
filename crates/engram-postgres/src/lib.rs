@@ -10,7 +10,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::{
-    CreateDisposition, DisableEnabledImageOutcome, MetadataStore, SessionCreateWriteSet,
+    CaptureReservation, CreateDisposition, DisableEnabledImageOutcome, MetadataStore,
+    SessionCreateWriteSet,
 };
 use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp};
 use engram_core::types::{
@@ -4360,10 +4361,27 @@ impl MetadataStore for PostgresStore {
         // jobs whose lease is free or expired. The inner SELECT ...
         // FOR UPDATE SKIP LOCKED keeps two pods' simultaneous sweeps
         // from blocking on each other — each claims a disjoint set.
+        //
+        // ADR 0081 (fix): clear `capture_host_id` on (re-)claim. If a pod
+        // reserved a host then crashed/lost its lease, the stale
+        // `capture_host_id` is a phantom reservation of the job's OWN
+        // budget. When the re-claiming pod re-runs `reserve_capture_host`,
+        // `pick_host_2d`'s reserved-SUM has no self-exclusion, so on a
+        // tight fleet the job counts its own phantom against the only
+        // viable host and can NEVER fit itself → 30-min `CapacityTimeout`
+        // (non-retryable), while `queued_demand` excludes it
+        // (`capture_host_id IS NOT NULL`) so the autoscaler won't help.
+        // Clearing it here makes the re-run re-reserve from scratch.
+        // `capture_waiting_since` is deliberately NOT cleared: it's the
+        // first-miss wait anchor and must survive re-claim (it's cleared
+        // only by `reserve_capture_host`'s fit branch,
+        // `clear_capture_reservation`, `record_enable_job_failure`, and
+        // `retry_enable_job`).
         let rows = sqlx::query(
             r#"
             UPDATE enable_jobs
-               SET claimed_by = $1, claimed_at = NOW(), updated_at = NOW()
+               SET claimed_by = $1, claimed_at = NOW(), updated_at = NOW(),
+                   capture_host_id = NULL
              WHERE id IN (
                    SELECT id FROM enable_jobs
                     WHERE state NOT IN ('ready', 'failed')
@@ -4609,7 +4627,7 @@ impl MetadataStore for PostgresStore {
         candidates: &[HostId],
         mem_budget_mib: i64,
         cpu_budget_vcpus: i64,
-    ) -> Result<Option<HostId>, MetaError> {
+    ) -> Result<CaptureReservation, MetaError> {
         let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         // The SAME FOR UPDATE 2D pick as session placement (ADR 0081) —
@@ -4618,50 +4636,88 @@ impl MetadataStore for PostgresStore {
         // placers (sessions and captures alike) serialize. No affinity
         // tier: a capture has no snapshot locality to prefer.
         let picked = pick_host_2d(&mut tx, &cand, 0, mem_budget_mib, cpu_budget_vcpus).await?;
-        let n = match picked {
+        // ADR 0081 (fix): persist the RESOLVED budgets in BOTH branches.
+        // A pre-0095 row carries `0` budgets and the caller resolves them
+        // from the image config — but a resolution that never lands in the
+        // row is invisible to every OTHER placer's reserved-SUM
+        // (`pick_host_2d`, `per_host_reserved`, `fleet_free_mib`) and to
+        // `queued_demand`. Stamping the budget here (fenced by claimant,
+        // atomic with the pick) closes that hole once: a fit stamps a real
+        // reservation, a miss stamps real queued demand.
+        let cpu_budget_vcpus_i32 = cpu_budget_vcpus as i32;
+        let reservation = match picked {
             // Fit → stamp the reservation (visible to every reserved-SUM
-            // reader from commit) and stop the wait clock.
-            Some(host) => sqlx::query(
-                r#"
-                UPDATE enable_jobs
-                   SET capture_host_id = $3,
-                       capture_waiting_since = NULL,
-                       claimed_at = NOW(),
-                       updated_at = NOW()
-                 WHERE id = $1 AND claimed_by = $2
-                "#,
-            )
-            .bind(id)
-            .bind(claimant)
-            .bind(host),
+            // reader from commit) and stop the wait clock (a job that
+            // waited then fit must stop counting as waiting demand).
+            Some(host) => {
+                let n = sqlx::query(
+                    r#"
+                    UPDATE enable_jobs
+                       SET capture_host_id = $3,
+                           capture_waiting_since = NULL,
+                           mem_budget_mib = $4,
+                           cpu_budget_vcpus = $5,
+                           claimed_at = NOW(),
+                           updated_at = NOW()
+                     WHERE id = $1 AND claimed_by = $2
+                    "#,
+                )
+                .bind(id)
+                .bind(claimant)
+                .bind(host)
+                .bind(mem_budget_mib)
+                .bind(cpu_budget_vcpus_i32)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+                if n == 0 {
+                    tx.rollback().await.map_err(db_err)?;
+                    return Err(self.enable_job_fence_miss(id, claimant).await);
+                }
+                CaptureReservation::Reserved(HostId(host))
+            }
             // No fit → the job is waiting for capacity: start the wait
             // clock iff this is the first miss (COALESCE keeps the
             // original mark across re-tries so the queue timeout is
             // measured from the FIRST miss), and count as queued demand
-            // (`queued_demand`) so the autoscaler grows the pool.
-            None => sqlx::query(
-                r#"
-                UPDATE enable_jobs
-                   SET capture_waiting_since = COALESCE(capture_waiting_since, NOW()),
-                       claimed_at = NOW(),
-                       updated_at = NOW()
-                 WHERE id = $1 AND claimed_by = $2
-                "#,
-            )
-            .bind(id)
-            .bind(claimant),
-        }
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        if n == 0 {
-            // Lease moved on — abandon without reserving.
-            tx.rollback().await.map_err(db_err)?;
-            return Err(self.enable_job_fence_miss(id, claimant).await);
-        }
+            // (`queued_demand`) so the autoscaler grows the pool. RETURN
+            // the (post-COALESCE, non-NULL) mark: it's the DB anchor the
+            // scanner's wait deadline measures from — a wall-clock deadline
+            // resets on every pod restart / re-claim and the 30-min
+            // backstop would never fire under coordinator churn.
+            None => {
+                let row: Option<(DateTime<Utc>,)> = sqlx::query_as(
+                    r#"
+                    UPDATE enable_jobs
+                       SET capture_waiting_since = COALESCE(capture_waiting_since, NOW()),
+                           mem_budget_mib = $3,
+                           cpu_budget_vcpus = $4,
+                           claimed_at = NOW(),
+                           updated_at = NOW()
+                     WHERE id = $1 AND claimed_by = $2
+                    RETURNING capture_waiting_since
+                    "#,
+                )
+                .bind(id)
+                .bind(claimant)
+                .bind(mem_budget_mib)
+                .bind(cpu_budget_vcpus_i32)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                match row {
+                    Some((since,)) => CaptureReservation::Waiting { since },
+                    None => {
+                        // Lease moved on — abandon without reserving.
+                        tx.rollback().await.map_err(db_err)?;
+                        return Err(self.enable_job_fence_miss(id, claimant).await);
+                    }
+                }
+            }
+        };
         tx.commit().await.map_err(db_err)?;
-        Ok(picked.map(HostId))
+        Ok(reservation)
     }
 
     async fn clear_capture_reservation(&self, id: Uuid, claimant: &str) -> Result<(), MetaError> {

@@ -76,6 +76,23 @@ pub enum CreateDisposition {
     Queued,
 }
 
+/// ADR 0081: outcome of [`MetadataStore::reserve_capture_host`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureReservation {
+    /// A candidate host fit both budgets; `capture_host_id` is stamped
+    /// (and `capture_waiting_since` cleared) for the duration of the
+    /// capture step.
+    Reserved(HostId),
+    /// No candidate fit; the job is *waiting for capacity*. Carries the
+    /// (COALESCE-stamped) first-miss timestamp — the DB anchor the enable
+    /// scanner's wait deadline measures from, so a pod restart / re-claim
+    /// can't reset the queue timeout (the wall clock resets on every
+    /// process restart; `capture_waiting_since` survives in Postgres).
+    Waiting {
+        since: chrono::DateTime<chrono::Utc>,
+    },
+}
+
 /// ADR 0073 phase 4: one idle-scan candidate row (Active + bound).
 #[derive(Clone, Debug)]
 pub struct IdleScanCandidate {
@@ -1935,12 +1952,23 @@ pub trait MetadataStore: Send + Sync {
     /// UNION capturing enable jobs, so concurrent placers (sessions and
     /// captures, any replica) serialize and see each other.
     ///
-    /// On a fit: stamps `capture_host_id` (clearing
-    /// `capture_waiting_since`) and returns the host. On none: leaves
-    /// `capture_host_id` NULL, stamps `capture_waiting_since` iff not
-    /// already set (first miss starts the wait clock), and returns
-    /// `None` — the job is *waiting for capacity*, counted by
-    /// [`Self::queued_demand`] so the autoscaler grows the pool for it.
+    /// Persists the resolved `mem_budget_mib` / `cpu_budget_vcpus` on the
+    /// job row in BOTH branches (fit and no-fit): a pre-0095 job carries
+    /// `0` budgets, and the caller resolves them from the image config —
+    /// but that resolution is worthless if it never lands in the row that
+    /// every *other* placer's reserved-SUM reads. Without this a 24 GiB
+    /// capture would count as 0 MiB reserved (the 2026-07-08 OOM class),
+    /// and a budget-0 waiting job would fold 0 into [`Self::queued_demand`]
+    /// so the autoscaler never grows for it.
+    ///
+    /// On a fit: returns [`CaptureReservation::Reserved`] — stamps
+    /// `capture_host_id` and clears `capture_waiting_since` (a job that
+    /// waited then fit stops counting as waiting). On none: returns
+    /// [`CaptureReservation::Waiting`] carrying the (COALESCE-stamped)
+    /// first-miss timestamp — the job is *waiting for capacity*, counted
+    /// by [`Self::queued_demand`] so the autoscaler grows the pool, and
+    /// the returned timestamp is the DB anchor the enable scanner's wait
+    /// deadline measures from (so a pod restart can't reset the timeout).
     ///
     /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
     /// Returns [`MetaError::Conflict`] when the lease has moved on.
@@ -1951,7 +1979,7 @@ pub trait MetadataStore: Send + Sync {
         candidates: &[crate::HostId],
         mem_budget_mib: i64,
         cpu_budget_vcpus: i64,
-    ) -> Result<Option<crate::HostId>, MetaError> {
+    ) -> Result<CaptureReservation, MetaError> {
         let _ = (id, claimant, candidates, mem_budget_mib, cpu_budget_vcpus);
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),

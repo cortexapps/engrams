@@ -578,12 +578,21 @@ pub(crate) async fn capture_and_record_base_snapshot(
         config.resolved_vcpus() as i64
     };
     const CAPACITY_POLL: std::time::Duration = std::time::Duration::from_secs(5);
-    let deadline = tokio::time::Instant::now() + capacity_wait;
+    // ADR 0081 (fix): the wait deadline is anchored to the DB-persisted
+    // `capture_waiting_since` (the first miss), NOT a `tokio::Instant`
+    // computed at call entry. A wall-clock deadline resets on every pod
+    // restart / lease re-claim, so under coordinator churn the 30-min
+    // backstop would never fire and a genuinely-stuck capture would spin
+    // forever. `reserve_capture_host` returns the COALESCE-stamped anchor
+    // in its `Waiting` arm; we compare against it the same way the queue
+    // scanner times out a session (chrono `signed_duration_since` on the
+    // PG timestamp — modest clock skew is acceptable).
+    let capacity_wait_secs = capacity_wait.as_secs() as i64;
     let host_id = loop {
         let candidates = crate::placement::capture_candidates(state.services.meta.as_ref())
             .await
             .map_err(|e| ApiError::Internal(format!("list capture candidates: {e:?}")))?;
-        let picked = state
+        let reservation = state
             .services
             .meta
             .reserve_capture_host(
@@ -594,26 +603,31 @@ pub(crate) async fn capture_and_record_base_snapshot(
                 cpu_budget_vcpus,
             )
             .await?;
-        match picked {
-            Some(h) => break h,
-            None if tokio::time::Instant::now() >= deadline => {
-                return Err(ApiError::CaptureFailed {
-                    kind: engram_core::types::CaptureFailureKind::CapacityTimeout,
-                    message: format!(
-                        "no host fit the capture VM for `{}` ({mem_budget_mib} MiB / \
-                         {cpu_budget_vcpus} vCPUs) within {}s — the fleet is at capacity \
-                         and the autoscaler didn't grow it (maxHosts? cloud quota?). \
-                         Free capacity (or raise the node-pool ceiling) and retry the job.",
-                        row.image_uri,
-                        capacity_wait.as_secs(),
-                    ),
-                });
-            }
-            None => {
+        match reservation {
+            engram_core::traits::CaptureReservation::Reserved(h) => break h,
+            engram_core::traits::CaptureReservation::Waiting { since } => {
+                let waited_secs = chrono::Utc::now()
+                    .signed_duration_since(since)
+                    .num_seconds()
+                    .max(0);
+                if waited_secs >= capacity_wait_secs {
+                    return Err(ApiError::CaptureFailed {
+                        kind: engram_core::types::CaptureFailureKind::CapacityTimeout,
+                        message: format!(
+                            "no host fit the capture VM for `{}` ({mem_budget_mib} MiB / \
+                             {cpu_budget_vcpus} vCPUs) within {waited_secs}s (limit {}s, \
+                             measured from the first miss) — the fleet is at capacity and \
+                             the autoscaler didn't grow it (maxHosts? cloud quota?). Free \
+                             capacity (or raise the node-pool ceiling) and retry the job.",
+                            row.image_uri, capacity_wait_secs,
+                        ),
+                    });
+                }
                 tracing::info!(
                     image_uri = %row.image_uri,
                     mem_budget_mib,
                     cpu_budget_vcpus,
+                    waited_secs,
                     "capture waiting for capacity (counted as queued demand; \
                      the autoscaler scales toward it)",
                 );
