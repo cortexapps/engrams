@@ -1,6 +1,6 @@
 import { useParams } from "@tanstack/react-router";
 import { Fragment, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
-import { Activity, Globe, SquareTerminal } from "lucide-react";
+import { Activity, Code2, Globe, SquareTerminal } from "lucide-react";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
@@ -44,7 +44,7 @@ function readPanePref(): WorkPanePref {
     if (!raw) return DEFAULT_PANE_PREF;
     const p = JSON.parse(raw) as Partial<WorkPanePref>;
     return {
-      tab: p.tab === "browser" || p.tab === "diagnostics" ? p.tab : "shell",
+      tab: p.tab === "browser" || p.tab === "ide" || p.tab === "diagnostics" ? p.tab : "shell",
       // Clamp within [pane minSize, 100 − transcript minSize] so a restored
       // width never collides with either panel's floor (react-resizable-panels
       // would otherwise clamp it and warn).
@@ -106,6 +106,9 @@ export function SessionDetail() {
   // present iff the session's profile selected the `browser` skill bundle. We
   // read that straight off the profile snapshot the masthead already shows.
   const browserEnabled = (profile?.skills ?? []).includes("browser");
+  // The in-guest IDE (code-server, ADR 0081) is the same shape of optional
+  // capability, gated on the `ide` skill.
+  const ideEnabled = (profile?.skills ?? []).includes("ide");
 
   const isMobile = useIsMobile();
   const prefRef = useRef<WorkPanePref>(readPanePref());
@@ -120,12 +123,15 @@ export function SessionDetail() {
   const transcriptRef = useRef<ImperativePanelHandle>(null);
   const paneSizeRef = useRef(prefRef.current.size);
 
-  // Fall back to the shell view if the browser capability disappears (an admin
-  // drops the skill and useTasks refetches) while the browser view is active,
+  // Fall back to the shell view if the browser/IDE capability disappears (an
+  // admin drops the skill and useTasks refetches) while that view is active,
   // so we never point at an absent tab.
   useEffect(() => {
     if (paneTab === "browser" && !browserEnabled) setPaneTab("shell");
   }, [paneTab, browserEnabled]);
+  useEffect(() => {
+    if (paneTab === "ide" && !ideEnabled) setPaneTab("shell");
+  }, [paneTab, ideEnabled]);
 
   // Persist the last-viewed tab (width is persisted from onLayout). Open-state
   // is intentionally not stored — the pane always starts collapsed.
@@ -170,8 +176,7 @@ export function SessionDetail() {
     if (!browserEnabled || autoOpenedBrowserRef.current) return;
     const agentBootedBrowser = events.some(
       (ie) =>
-        ie.event.type === "exec_started" &&
-        ie.event.command.join(" ").includes("playwright-cli"),
+        ie.event.type === "exec_started" && ie.event.command.join(" ").includes("playwright-cli"),
     );
     if (agentBootedBrowser) {
       autoOpenedBrowserRef.current = true;
@@ -210,16 +215,12 @@ export function SessionDetail() {
     id: PaneTabId;
     label: string;
     icon: ComponentType<{ className?: string }>;
-  }[] = browserEnabled
-    ? [
-        { id: "shell", label: "Shell", icon: SquareTerminal },
-        { id: "browser", label: "Browser", icon: Globe },
-        { id: "diagnostics", label: "Diagnostics", icon: Activity },
-      ]
-    : [
-        { id: "shell", label: "Shell", icon: SquareTerminal },
-        { id: "diagnostics", label: "Diagnostics", icon: Activity },
-      ];
+  }[] = [
+    { id: "shell", label: "Shell", icon: SquareTerminal },
+    ...(browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
+    ...(ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
+    { id: "diagnostics", label: "Diagnostics", icon: Activity },
+  ];
 
   // The transcript column: its own masthead (task id + vitals) over the thread.
   // The work pane sits beside it at full height, so the masthead lives here
@@ -267,6 +268,7 @@ export function SessionDetail() {
                 tab={paneTab}
                 onTabChange={setPaneTab}
                 browserEnabled={browserEnabled}
+                ideEnabled={ideEnabled}
                 onCollapse={collapsePane}
                 variant="overlay"
               />
@@ -328,6 +330,7 @@ export function SessionDetail() {
                 tab={paneTab}
                 onTabChange={setPaneTab}
                 browserEnabled={browserEnabled}
+                ideEnabled={ideEnabled}
                 onCollapse={collapsePane}
                 variant="panel"
                 expanded={expanded}
