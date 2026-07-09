@@ -315,13 +315,10 @@ const enableImageSchema = z
     allowHostsText: z.string(),
     allowPatternsText: z.string(),
   })
-  .refine(
-    (v) => v.warmCommand.trim() !== "" || v.captureEnv.every((r) => r.name.trim() === ""),
-    {
-      message: "warm env needs a warm command — everything warm rides the [warm] block",
-      path: ["warmCommand"],
-    },
-  );
+  .refine((v) => v.warmCommand.trim() !== "" || v.captureEnv.every((r) => r.name.trim() === ""), {
+    message: "warm env needs a warm command — everything warm rides the [warm] block",
+    path: ["warmCommand"],
+  });
 type EnableImageValues = z.infer<typeof enableImageSchema>;
 
 // Pre-fill the full-config form from the enabled row (edit mode) or with
