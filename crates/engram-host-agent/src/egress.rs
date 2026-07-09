@@ -14,8 +14,9 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use engram_egress_proxy::{CaSource, CertMint, Proxy, ProxyConfig, Registry};
+use engram_egress_proxy::{CaSource, CertMint, Listeners, Proxy, ProxyConfig, Registry};
 
 /// Per-host egress-proxy handle. Holds the registry (mutated as
 /// sessions come and go on this host), the CA cert PEM (handed to
@@ -56,16 +57,30 @@ impl std::fmt::Display for EgressError {
 impl std::error::Error for EgressError {}
 
 impl HostEgress {
-    /// Load the CA via the supplied source, build the proxy, and
-    /// spawn its listener.
+    /// Load the CA via the supplied source, build the proxy, **bind its
+    /// listeners synchronously**, then spawn the accept loop.
     ///
-    /// Best-effort: callers can recover from `EgressError::Bind` by
-    /// running with egress disabled; the host-agent still serves
-    /// sessions, but no egress filtering or broker-mode
-    /// substitution. Operators see a warn-level log.
+    /// Fail-closed on a bind failure. Egress is mandatory (issue #240):
+    /// the caller (`main.rs`) aborts host-agent startup on
+    /// `EgressError::Bind`, because a host that keeps running with a
+    /// live iptables `:443 -> proxy` REDIRECT but no listener sends
+    /// every guest a RST — the guest's TLS client reports
+    /// `ConnectionRefused` — silently breaking every session on the
+    /// host. Binding here (rather than inside the accept-loop task)
+    /// is what turns that failure into a value the caller can act on;
+    /// the earlier design spawned the bind inside a detached task, so
+    /// `spawn` returned `Ok` before the bind was even attempted and a
+    /// failure only surfaced as a log line from the dying task.
+    /// `dns_bind_addr`: where the filtering DNS proxy binds (both UDP
+    /// and TCP). Production passes the port the iptables `:53 -> dns`
+    /// REDIRECT targets; it must match or the guest can't resolve.
+    /// `None` disables the DNS listener entirely — used by tests that
+    /// exercise only the egress registry and would otherwise collide on
+    /// the fixed DNS port when the suite runs in parallel.
     pub async fn spawn(
         ca_source: Arc<dyn CaSource>,
         bind_addr: SocketAddr,
+        dns_bind_addr: Option<SocketAddr>,
         observe_sink: Option<engram_egress_proxy::ObserveSink>,
     ) -> Result<Self, EgressError> {
         let ca = ca_source.load().await.map_err(EgressError::Ca)?;
@@ -82,12 +97,18 @@ impl HostEgress {
         let mint = Arc::new(CertMint::new(Arc::new(ca)));
 
         let mut proxy_cfg = ProxyConfig::new(bind_addr, registry.clone(), mint);
+        proxy_cfg.dns_bind_addr = dns_bind_addr;
         proxy_cfg.observe_sink = observe_sink;
         let proxy = Proxy::new(proxy_cfg);
+
+        let listeners = bind_with_retry(&proxy).await.map_err(EgressError::Bind)?;
         let task = tokio::spawn(async move {
-            if let Err(e) = proxy.run().await {
-                tracing::error!(error = %e, "egress proxy listener exited");
-            }
+            proxy.serve(listeners).await;
+            // `serve` loops forever on accept; if it ever returns, the
+            // proxy is down while iptables still REDIRECTs to it —
+            // log loudly so operators aren't left diagnosing silent
+            // per-session `ConnectionRefused`.
+            tracing::error!("egress proxy serve loop exited unexpectedly");
         });
         tracing::info!(addr = %bind_addr, "host-agent egress proxy spawned");
 
@@ -97,6 +118,38 @@ impl HostEgress {
             _proxy_task: task,
         })
     }
+}
+
+/// Bind the proxy listeners, retrying briefly to ride over a transient
+/// port race — e.g. a host-agent restart racing the previous instance's
+/// socket teardown, which is exactly how the proxy came up dead on the
+/// fc-colima dev rig (both ports were free moments later). A bind that
+/// still fails after the retry budget is fatal: `spawn` returns
+/// `EgressError::Bind` and `main.rs` aborts (fail-closed). Under a
+/// supervisor (K8s, or a Tilt retrigger) a permanent conflict then
+/// crashloops loudly instead of serving broken sessions.
+async fn bind_with_retry(proxy: &Proxy) -> Result<Listeners, std::io::Error> {
+    const ATTEMPTS: u32 = 5;
+    const BACKOFF: Duration = Duration::from_millis(500);
+    let mut last_err = None;
+    for attempt in 1..=ATTEMPTS {
+        match proxy.bind().await {
+            Ok(bound) => return Ok(bound),
+            Err(e) => {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = ATTEMPTS,
+                    error = %e,
+                    "egress proxy bind failed; retrying",
+                );
+                last_err = Some(e);
+                if attempt < ATTEMPTS {
+                    tokio::time::sleep(BACKOFF).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once, so last_err is set on failure"))
 }
 
 /// ADR 0059: build the proxy's optional GraphQL matcher from the wire fields.

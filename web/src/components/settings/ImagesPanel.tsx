@@ -315,13 +315,10 @@ const enableImageSchema = z
     allowHostsText: z.string(),
     allowPatternsText: z.string(),
   })
-  .refine(
-    (v) => v.warmCommand.trim() !== "" || v.captureEnv.every((r) => r.name.trim() === ""),
-    {
-      message: "warm env needs a warm command — everything warm rides the [warm] block",
-      path: ["warmCommand"],
-    },
-  );
+  .refine((v) => v.warmCommand.trim() !== "" || v.captureEnv.every((r) => r.name.trim() === ""), {
+    message: "warm env needs a warm command — everything warm rides the [warm] block",
+    path: ["warmCommand"],
+  });
 type EnableImageValues = z.infer<typeof enableImageSchema>;
 
 // Pre-fill the full-config form from the enabled row (edit mode) or with
@@ -761,9 +758,9 @@ function EnableImageDialog({
                 </Button>
               </div>
               <FieldDescription>
-                Non-secret env applied to every sandbox of this image — merged over the
-                Dockerfile's <code className="font-mono">ENV</code>, under session env (ADR 0080).
-                Applies immediately on save, no recapture.
+                Non-secret env applied to every sandbox of this image — merged over the Dockerfile's{" "}
+                <code className="font-mono">ENV</code>, under session env (ADR 0080). Applies
+                immediately on save, no recapture.
               </FieldDescription>
               {envArray.fields.length === 0 ? (
                 <p className="text-xs text-muted-foreground">No image env vars.</p>
@@ -871,8 +868,8 @@ function EnableImageDialog({
               <div>
                 <FieldLabel>Warm capture hook</FieldLabel>
                 <FieldDescription>
-                  Runs inside the capture VM at base-snapshot capture. Everything in this section
-                  is capture-affecting — editing it recaptures the base snapshot (minutes; sessions
+                  Runs inside the capture VM at base-snapshot capture. Everything in this section is
+                  capture-affecting — editing it recaptures the base snapshot (minutes; sessions
                   keep working against the old snapshot until the new one is ready).
                 </FieldDescription>
               </div>
@@ -1003,9 +1000,9 @@ function EnableImageDialog({
                     )}
                   />
                   <FieldDescription>
-                    Egress policy for the capture VM while the warm hook runs (ADR 0080; same
-                    shape as a profile's allow-list). No network — or deny with an empty
-                    allow-list — is an egress-less capture.
+                    Egress policy for the capture VM while the warm hook runs (ADR 0080; same shape
+                    as a profile's allow-list). No network — or deny with an empty allow-list — is
+                    an egress-less capture.
                   </FieldDescription>
                   {netDefaultLive === "deny" && (
                     <div className="grid gap-3 sm:grid-cols-2">
@@ -1060,9 +1057,9 @@ function EnableImageDialog({
               </p>
               <p className="font-mono text-xs text-muted-foreground">{pendingRecapture.reason}</p>
               <p className="text-xs text-muted-foreground">
-                Applying it will recapture the base snapshot — that takes minutes, and sessions
-                keep working against the old snapshot until the new one is ready. Progress shows
-                in the jobs list above.
+                Applying it will recapture the base snapshot — that takes minutes, and sessions keep
+                working against the old snapshot until the new one is ready. Progress shows in the
+                jobs list above.
               </p>
               <div className="flex justify-end gap-2">
                 <Button

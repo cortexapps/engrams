@@ -563,6 +563,13 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
         warm_stage_started_at: row.try_get("warm_stage_started_at").map_err(col_err)?,
         warm_stages: warm_stages_from_row(row)?,
         output_tail: row.try_get("output_tail").map_err(col_err)?,
+        mem_budget_mib: row.try_get("mem_budget_mib").map_err(col_err)?,
+        cpu_budget_vcpus: row.try_get("cpu_budget_vcpus").map_err(col_err)?,
+        capture_host_id: row
+            .try_get::<Option<uuid::Uuid>, _>("capture_host_id")
+            .map_err(col_err)?
+            .map(engram_core::HostId),
+        capture_waiting_since: row.try_get("capture_waiting_since").map_err(col_err)?,
         created_at: row.try_get("created_at").map_err(col_err)?,
         updated_at: row.try_get("updated_at").map_err(col_err)?,
     })

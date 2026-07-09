@@ -1,7 +1,7 @@
 //! Pack a flattened rootfs tar into an ext4 disk image, ready for
 //! `FirecrackerBackend` to attach as a root drive.
 //!
-//! ADR 0082: the host scratch tree stores contents only. We first emit
+//! ADR 0084: the host scratch tree stores contents only. We first emit
 //! one deterministic tar whose headers carry the OCI uid/gid/mode/mtime
 //! and xattr metadata, then the default [`Mke2fsPacker`] shells out to
 //! `mke2fs -t ext4 -F -d <tar>`. Metadata flows as tar data, never

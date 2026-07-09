@@ -368,7 +368,7 @@ fn e2fsprogs_pair() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
 }
 
 /// ADR 0036 byte-determinism hinges on SOURCE_DATE_EPOCH, honored by
-/// e2fsprogs >= 1.47.1, and ADR 0082 additionally requires libarchive
+/// e2fsprogs >= 1.47.1, and ADR 0084 additionally requires libarchive
 /// tar input support. Older/missing/non-libarchive mke2fs → skip with
 /// a note, never flake.
 fn deterministic_mke2fs_available() -> Option<(std::path::PathBuf, String)> {

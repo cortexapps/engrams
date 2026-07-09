@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     # ADR 0036: byte-deterministic ext4 packs need e2fsprogs >= 1.47.1 for
-    # SOURCE_DATE_EPOCH. ADR 0082 also needs libarchive-enabled `mke2fs -d
+    # SOURCE_DATE_EPOCH. ADR 0084 also needs libarchive-enabled `mke2fs -d
     # <tarball>` so tar headers, not host inodes, carry uid/gid/mode. Keep the
     # nixpkgs rev pinned at e2fsprogs EXACTLY 1.47.2: it has SOURCE_DATE_EPOCH
     # and avoids the 1.47.3 `mke2fs -d` >2 GiB regression. The override below
@@ -25,7 +25,7 @@
           overlays = [ rust-overlay.overlays.default ];
         };
 
-        # ADR 0036/0082: e2fsprogs 1.47.2 (pinned via nixpkgs-e2fsprogs) with
+        # ADR 0036/0084: e2fsprogs 1.47.2 (pinned via nixpkgs-e2fsprogs) with
         # libarchive tar-input support. Current nixpkgs wires this by adding
         # libarchive and `--with-libarchive=direct`; use the same mechanism here
         # so `mke2fs` links through the nix closure instead of relying on dlopen
@@ -72,7 +72,7 @@
                                     # but harmless on macOS)
             nodejs_22               # web SPA dev server (`just web` -> vite)
             pnpm                    # workspace package manager for web/
-            # ADR 0036/0082: pinned e2fsprogs 1.47.2 with SOURCE_DATE_EPOCH and
+            # ADR 0036/0084: pinned e2fsprogs 1.47.2 with SOURCE_DATE_EPOCH and
             # libarchive-enabled tar-input `mke2fs -d` support. The let-binding
             # shadows `pkgs.e2fsprogs` so dev and CI use the same toolchain.
             e2fsprogs
@@ -207,7 +207,7 @@
           '';
         };
 
-        # ADR 0036/0082: buildable dynamic mke2fs output for `nix develop`, CI's
+        # ADR 0036/0084: buildable dynamic mke2fs output for `nix develop`, CI's
         # setup-reproducible-mke2fs action, and image materialization. `.bin` is
         # e2fsprogs' bin output and inherits the libarchive override above.
         packages = {

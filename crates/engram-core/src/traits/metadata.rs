@@ -76,6 +76,23 @@ pub enum CreateDisposition {
     Queued,
 }
 
+/// ADR 0081: outcome of [`MetadataStore::reserve_capture_host`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureReservation {
+    /// A candidate host fit both budgets; `capture_host_id` is stamped
+    /// (and `capture_waiting_since` cleared) for the duration of the
+    /// capture step.
+    Reserved(HostId),
+    /// No candidate fit; the job is *waiting for capacity*. Carries the
+    /// (COALESCE-stamped) first-miss timestamp — the DB anchor the enable
+    /// scanner's wait deadline measures from, so a pod restart / re-claim
+    /// can't reset the queue timeout (the wall clock resets on every
+    /// process restart; `capture_waiting_since` survives in Postgres).
+    Waiting {
+        since: chrono::DateTime<chrono::Utc>,
+    },
+}
+
 /// ADR 0073 phase 4: one idle-scan candidate row (Active + bound).
 #[derive(Clone, Debug)]
 pub struct IdleScanCandidate {
@@ -1937,6 +1954,68 @@ pub trait MetadataStore: Send + Sync {
         force_terminal: bool,
     ) -> Result<(u32, EnableJobState), MetaError> {
         let _ = (id, claimant, error, max_attempts, force_terminal);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// ADR 0081: atomically pick + reserve a capture host for job `id`
+    /// from `candidates` (the caller's ranked schedulable list), using
+    /// the SAME `FOR UPDATE` 2D best-fit transaction as
+    /// [`Self::reserve_and_persist_create`] — candidate host rows locked
+    /// in PK order, reserved = Σ budgets over memory-reserving sessions
+    /// UNION capturing enable jobs, so concurrent placers (sessions and
+    /// captures, any replica) serialize and see each other.
+    ///
+    /// Persists the resolved `mem_budget_mib` / `cpu_budget_vcpus` on the
+    /// job row in BOTH branches (fit and no-fit): a pre-0095 job carries
+    /// `0` budgets, and the caller resolves them from the image config —
+    /// but that resolution is worthless if it never lands in the row that
+    /// every *other* placer's reserved-SUM reads. Without this a 24 GiB
+    /// capture would count as 0 MiB reserved (the 2026-07-08 OOM class),
+    /// and a budget-0 waiting job would fold 0 into [`Self::queued_demand`]
+    /// so the autoscaler never grows for it.
+    ///
+    /// On a fit: returns [`CaptureReservation::Reserved`] — stamps
+    /// `capture_host_id` and clears `capture_waiting_since` (a job that
+    /// waited then fit stops counting as waiting). On none: returns
+    /// [`CaptureReservation::Waiting`] carrying the (COALESCE-stamped)
+    /// first-miss timestamp — the job is *waiting for capacity*, counted
+    /// by [`Self::queued_demand`] so the autoscaler grows the pool, and
+    /// the returned timestamp is the DB anchor the enable scanner's wait
+    /// deadline measures from (so a pod restart can't reset the timeout).
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    /// Returns [`MetaError::Conflict`] when the lease has moved on.
+    async fn reserve_capture_host(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        candidates: &[crate::HostId],
+        mem_budget_mib: i64,
+        cpu_budget_vcpus: i64,
+    ) -> Result<CaptureReservation, MetaError> {
+        let _ = (id, claimant, candidates, mem_budget_mib, cpu_budget_vcpus);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// ADR 0081: release job `id`'s capture reservation
+    /// (`capture_host_id`/`capture_waiting_since` → NULL). Called when
+    /// the capture step returns, success or failure — the failure path
+    /// is belt-and-suspenders: [`Self::record_enable_job_failure`] also
+    /// clears both (it releases the claim, so a separate fenced clear
+    /// afterwards would fence-miss).
+    ///
+    /// Fenced by `claimant`; returns [`MetaError::Conflict`] when the
+    /// lease has moved on.
+    async fn clear_capture_reservation(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant);
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))

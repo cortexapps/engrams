@@ -1,4 +1,4 @@
-# 0082 — Tar-input materialization: metadata flows tar → ext4 as data, never through host inodes
+# 0084 — Tar-input materialization: metadata flows tar → ext4 as data, never through host inodes
 
 Status: Accepted (2026-07-09)
 

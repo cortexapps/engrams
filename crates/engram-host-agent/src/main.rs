@@ -122,6 +122,17 @@ struct Cli {
     #[arg(long, env = "ENGRAM_EGRESS_PROXY_PORT", default_value_t = 8443)]
     egress_proxy_port: u16,
 
+    /// UDP+TCP port the filtering DNS proxy binds. iptables REDIRECTs
+    /// guest `{udp,tcp}/53` here, so this MUST match the value baked
+    /// into the FC iptables rules — both are wired from this one flag.
+    /// Defaults to 5353 (avoids the systemd-resolved bind on
+    /// 127.0.0.53:53). Like `--egress-proxy-port`, this exists to avoid
+    /// a bind collision — notably when TWO host-agents share a netns
+    /// (the `ENGRAM_INTEG_TWO_HOSTS` e2e stack): each needs a distinct
+    /// DNS port or the second fails closed on `Address already in use`.
+    #[arg(long, env = "ENGRAM_EGRESS_DNS_PORT", default_value_t = 5353)]
+    egress_dns_port: u16,
+
     /// Where the host-agent loads the deployment-wide egress-proxy
     /// CA from. Production uses `gcp-secret-manager` with Workload
     /// Identity; dev uses `local-disk` (auto-generates on first boot).
@@ -333,10 +344,11 @@ async fn main() -> Result<(), HostAgentError> {
             // plumb the matching TCP/443 port into the FC config so
             // iptables installs the REDIRECT rule (and the matching
             // default-deny on FORWARD + udp/tcp 53 DNS REDIRECT).
-            // `egress_dns_port` stays at the default 5353 — operators
-            // don't need to override unless something else on the host
-            // already binds that port. There is no unfiltered path.
+            // The DNS-redirect port is wired from the same `--egress-dns-port`
+            // flag the proxy binds (below), so the iptables `:53 -> dns` REDIRECT
+            // and the proxy's DNS listener can never drift. Defaults to 5353.
             fc_cfg.egress_proxy_port = Some(cli.egress_proxy_port);
+            fc_cfg.egress_dns_port = Some(cli.egress_dns_port);
             // ADR 0014 follow-up: pin CPUID to a Cascade Lake baseline
             // so warm snapshots stay portable across the bake-host CPU
             // (AMD on Blacksmith runners) vs the prod-host CPU (Intel
@@ -618,6 +630,19 @@ async fn build_host_egress(
     observe_sink: Option<engram_egress_proxy::ObserveSink>,
 ) -> Result<engram_host_agent::egress::HostEgress, String> {
     use std::sync::Arc;
+    // Port 0 would bind an ephemeral port while the iptables REDIRECT
+    // still targets the literal configured value — the host boots green
+    // and every guest gets ConnectionRefused, the exact split-brain the
+    // fail-closed bind (ADR 0083) exists to kill. There is no `0 = off`
+    // sentinel (egress is mandatory, issue #240), so reject it here.
+    if cli.egress_proxy_port == 0 || cli.egress_dns_port == 0 {
+        return Err(format!(
+            "egress ports must be non-zero (got proxy={}, dns={}): the iptables \
+             REDIRECT targets the configured port, so an ephemeral (0) bind \
+             leaves :443/:53 redirected at a dead port",
+            cli.egress_proxy_port, cli.egress_dns_port,
+        ));
+    }
     let source: Arc<dyn engram_egress_proxy::CaSource> = match cli.ca_source {
         CaSourceChoice::Env => Arc::new(engram_egress_proxy::EnvCaSource::new(
             cli.ca_cert_var.clone(),
@@ -646,7 +671,14 @@ async fn build_host_egress(
     let bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_proxy_port)
         .parse()
         .map_err(|e| format!("parse bind addr: {e}"))?;
-    engram_host_agent::egress::HostEgress::spawn(source, bind, observe_sink)
+    // The DNS proxy binds the port the FC iptables `:53 -> dns` REDIRECT
+    // targets; both come from `--egress-dns-port` (default 5353) so they
+    // can't drift. Configurable so two host-agents sharing a netns (the
+    // e2e two-host stack) don't collide on it.
+    let dns_bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_dns_port)
+        .parse()
+        .map_err(|e| format!("parse dns bind addr: {e}"))?;
+    engram_host_agent::egress::HostEgress::spawn(source, bind, Some(dns_bind), observe_sink)
         .await
         .map_err(|e| e.to_string())
 }

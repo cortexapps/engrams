@@ -21,6 +21,7 @@
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+
 COORD="http://127.0.0.1:8090"
 HARNESS="${HARNESS:-none}"
 PROMPT="${PROMPT:-}"

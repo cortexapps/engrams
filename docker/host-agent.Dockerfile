@@ -33,7 +33,7 @@ FROM debian:trixie-slim
 #     reuse. debian:trixie ships e2fsprogs 1.47.2 (matches the flake pin),
 #     so the apt mke2fs is fine — but we ASSERT the floor below so a base
 #     bump that regresses it fails the image build loudly.
-#   - libarchive13t64: ADR 0082 tar-input materialization; trixie's mke2fs
+#   - libarchive13t64: ADR 0084 tar-input materialization; trixie's mke2fs
 #     dlopens libarchive for `-d <tarball>` support.
 #   - iproute2:  ip, for the tap device + guest netns
 #   - iptables:  egress NAT / firewall rules for guest networking
@@ -41,7 +41,7 @@ FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates e2fsprogs libarchive13t64 iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
-# ADR 0080/0036/0082: fail the build if the base's mke2fs predates
+# ADR 0080/0036/0084: fail the build if the base's mke2fs predates
 # SOURCE_DATE_EPOCH support or regresses tar-input libarchive support.
 RUN set -eux; \
     ver="$(mke2fs -V 2>&1 | sed -n 's/^mke2fs \([0-9][0-9.]*\).*/\1/p' | head -1)"; \
@@ -60,11 +60,11 @@ RUN set -eux; \
     stat_out="$(debugfs -R "stat /bin/setuid-probe" "$scratch/rootfs.ext4" 2>/dev/null)"; \
     printf '%s\n' "$stat_out"; \
     printf '%s\n' "$stat_out" | grep -Eq 'User:[[:space:]]+0[[:space:]]+Group:[[:space:]]+0' || { \
-        echo "mke2fs tar input failed to preserve uid/gid 0 from the tar header (ADR 0082)" >&2; \
+        echo "mke2fs tar input failed to preserve uid/gid 0 from the tar header (ADR 0084)" >&2; \
         exit 1; \
     }; \
     printf '%s\n' "$stat_out" | grep -Eq 'Mode:[[:space:]]+04755' || { \
-        echo "mke2fs tar input failed to preserve mode 04755 from the tar header (ADR 0082)" >&2; \
+        echo "mke2fs tar input failed to preserve mode 04755 from the tar header (ADR 0084)" >&2; \
         exit 1; \
     }
 # ADR 0080: host-agent's materializer resolves mke2fs via ENGRAM_MKE2FS

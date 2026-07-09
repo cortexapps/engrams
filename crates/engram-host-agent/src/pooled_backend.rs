@@ -10764,9 +10764,12 @@ mod tests {
                 engram_egress_proxy::LocalDiskCaSource::new(dir.path().join("egress-ca")),
             );
             // Port 0 ⇒ OS-assigned ephemeral port (no fixed-port
-            // collisions when the suite runs in parallel).
+            // collisions when the suite runs in parallel). DNS proxy
+            // disabled (`None`): these tests exercise only the egress
+            // registry, and a fixed DNS port would collide across the
+            // parallel suite now that a bind failure is fatal (ADR 0083).
             let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let egress = HostEgress::spawn(source, bind, None)
+            let egress = HostEgress::spawn(source, bind, None, None)
                 .await
                 .expect("spawn egress");
             (egress, dir)
