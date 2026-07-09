@@ -162,6 +162,52 @@ plain iframe.
   rebake for the new wire verbs (ADR 0080 fleet-stamp delivery); coordinator /
   host-agent / orchestrator / web roll normally.
 
+## As-built notes (P2–P5)
+
+Divergences from the sections above, recorded as implemented:
+
+- **`start_ide` returns a bare port, not a struct.** `BrowserStart` exists only
+  to carry the issue-#569 CDP warning; the IDE has no secondary probe, so the
+  chain mirrors `start_shell`'s shape instead.
+- **Workdir source.** `shell.rs` never sets a cwd (ttyd inherits agentd's).
+  The only real in-guest source of the session workdir is the reserved
+  `ENGRAM_HARNESS_CWD` key on the SpawnHarness frame, so `HarnessSupervisor`
+  now records it and `start_ide` exports it as `ENGRAM_IDE_WORKDIR`; the
+  launcher falls back to `$HOME` when absent (workdir-less images).
+- **agentd wire enum indices 13/14** (StartIde/StopIde, IdeReady/IdeStopped);
+  golden tests also pinned the previously-unpinned index 12
+  (`RefreshAgent`/`AgentRefreshed`) since the new indices are defined
+  relative to it.
+- **Orchestrator WS ordering.** The guard runs pre-upgrade, but `ensureIde`
+  runs *post*-upgrade (inside the upgrade callback): an auto-resume can take
+  seconds, and holding a raw un-upgraded socket that long risks client
+  timeouts. Failure closes 1011. Same pattern as vnc.ts's ensureBrowser.
+- **`server.ts` upgrade hooks generalized** from a single `previewUpgrade`
+  slot to an ordered `UpgradeHook[]` (clean break); preview stays first
+  because it is Host-keyed and must win even for ide-shaped paths on a
+  preview origin.
+- **Policy map.** `SessionService.EnsureIde` needed an entry in the
+  orchestrator's fail-closed RPC policy map (same owner-scoped `shell` action
+  as `EnsureBrowser`) — P1 alone left the passthrough conformance test red.
+- **`proxyHttp` gained an optional `targetPath` param** (prefix-stripped IDE
+  path) instead of a copy; `bridgeClientToGuest` was exported unchanged;
+  `guard.ts` mechanics were extracted to a headers-level
+  `authorizeSessionAccess` so the WS upgrade hook can auth without a Hono
+  context. Preview behavior unchanged.
+- **Bundle build gates on ELF magic**: VS Code's bundled js-debug extension
+  ships win32 PE `.node` files that broke the ldd/patchelf walk under
+  `set -e`. The collector now skips non-ELF files explicitly.
+- **`docker/node-assets-fetch.sh`** (the FC-host bake's bundle staging) also
+  needed the `ide` entry + `current.json` stamp key — without it prod hosts
+  would never stage the bundle.
+- **No agent-driven auto-open for the IDE tab** (the browser auto-opens on
+  `playwright-cli` activity): the IDE is a human-only surface with no agent
+  signal to key off.
+- Bundle pins **code-server 4.127.0** (sha256-pinned per-arch, verified);
+  live-smoked on a glibc-skewed container (build = bookworm 2.36, run =
+  ubuntu 22.04 / 2.35): ensure/healthz/idempotent re-ensure/respawn/killpg
+  all proven.
+
 ## Phases
 
 1. **P1 wire contracts** — proto RPCs (`EnsureIde`, `StartIde`/`StopIde`,
