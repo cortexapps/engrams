@@ -143,6 +143,10 @@ mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run 2>/dev/null || true
 # recorded"). Restore the convention so any uid can use /tmp. (ADR 0027 e2e.)
 mkdir -p /tmp 2>/dev/null || true
 chmod 1777 /tmp 2>/dev/null || true
+# 2026-07-09: silent early-mount failures cost hours; name the first broken layer.
+if [ ! -r /proc/uptime ]; then
+    echo "engram-init: FATAL-ish: /proc mount failed — early mounts are broken (image metadata? kernel config?); expect cascade failures" >&2
+fi
 mark fs_mounts_done
 # DNS for userspace. The kernel handled IP+routes via `ip=dhcp` (see
 # vz-backend kernel cmdline); IP_PNP doesn't write resolv.conf, so
@@ -265,53 +269,45 @@ mount_dyn_bundle() {
 }
 
 mounted_dyn_devs=""
-mounted_any_dyn=0
-for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    # VZ path: mount by the stable block identifier, not by device name order.
-    for sysdev in /sys/block/vd*; do
-        [ -d "$sysdev" ] || continue
-        base="${sysdev##*/}"
-        dev="/dev/$base"
-        [ -b "$dev" ] || continue
-        [ "$dev" = "/dev/vda" ] && continue  # rootfs
-        ident="$(cat "$sysdev/serial" 2>/dev/null || cat "$sysdev/device/serial" 2>/dev/null || true)"
-        case "$ident" in
-            dyn_[0-9]|dyn_[0-9][0-9])
-                slot="${ident#dyn_}"
-                ;;
-            *)
-                continue
-                ;;
-        esac
-        case " $mounted_dyn_devs " in
-            *" $dev "*) continue ;;
-        esac
-        if mount_dyn_bundle "$dev" "$slot"; then
-            mounted_dyn_devs="$mounted_dyn_devs $dev"
-            mounted_any_dyn=1
-        fi
-    done
+# VZ path: mount by the stable block identifier, not by device name order.
+for sysdev in /sys/block/vd*; do
+    [ -d "$sysdev" ] || continue
+    base="${sysdev##*/}"
+    dev="/dev/$base"
+    [ -b "$dev" ] || continue
+    [ "$dev" = "/dev/vda" ] && continue  # rootfs
+    ident="$(cat "$sysdev/serial" 2>/dev/null || cat "$sysdev/device/serial" 2>/dev/null || true)"
+    case "$ident" in
+        dyn_[0-9]|dyn_[0-9][0-9])
+            slot="${ident#dyn_}"
+            ;;
+        *)
+            continue
+            ;;
+    esac
+    case " $mounted_dyn_devs " in
+        *" $dev "*) continue ;;
+    esac
+    if mount_dyn_bundle "$dev" "$slot"; then
+        mounted_dyn_devs="$mounted_dyn_devs $dev"
+    fi
+done
 
-    # FC/backcompat path: compact remaining untagged devices by enumeration.
-    i=0
-    for dev in /dev/vd*; do
-        [ -b "$dev" ] || continue
-        [ "$dev" = "/dev/vda" ] && continue  # rootfs
-        case " $mounted_dyn_devs " in
-            *" $dev "*) continue ;;
-        esac
-        while [ -d "/opt/engram/dyn/$i" ]; do
-            i=$((i + 1))
-        done
-        if mount_dyn_bundle "$dev" "$i"; then
-            mounted_dyn_devs="$mounted_dyn_devs $dev"
-            mounted_any_dyn=1
-            i=$((i + 1))
-        fi
+# FC/backcompat path: compact remaining untagged devices by enumeration.
+i=0
+for dev in /dev/vd*; do
+    [ -b "$dev" ] || continue
+    [ "$dev" = "/dev/vda" ] && continue  # rootfs
+    case " $mounted_dyn_devs " in
+        *" $dev "*) continue ;;
+    esac
+    while [ -d "/opt/engram/dyn/$i" ]; do
+        i=$((i + 1))
     done
-
-    [ "$mounted_any_dyn" = "1" ] && break
-    sleep 0.05
+    if mount_dyn_bundle "$dev" "$i"; then
+        mounted_dyn_devs="$mounted_dyn_devs $dev"
+        i=$((i + 1))
+    fi
 done
 mark bundles_mounted
 export ENGRAM_TRANSPORT=__TRANSPORT__
@@ -501,6 +497,18 @@ mod tests {
         assert!(
             DEFAULT_INIT_SHIM.contains("mount -t erofs -o ro"),
             "dyn-mount loop must try erofs as fallback (VZ / Kata path)",
+        );
+        assert!(
+            DEFAULT_INIT_SHIM.contains(
+                "echo \"engram-init: FATAL-ish: /proc mount failed — early mounts are broken (image metadata? kernel config?); expect cascade failures\" >&2"
+            ),
+            "init shim must diagnose broken early mounts before the silent cascade",
+        );
+        assert!(
+            !DEFAULT_INIT_SHIM.contains("mounted_any_dyn")
+                && !DEFAULT_INIT_SHIM.contains("sleep 0.05")
+                && !DEFAULT_INIT_SHIM.contains("for attempt in"),
+            "dyn-mount path must be single-pass, not retry-based",
         );
         // The dyn-mount path scans /dev/vd* and skips /dev/vda (rootfs). It
         // must only attempt read-only bundle formats (squashfs, erofs), never
