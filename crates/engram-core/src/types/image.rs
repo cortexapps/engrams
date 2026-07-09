@@ -220,7 +220,40 @@ impl OciRuntimeDefaults {
     }
 }
 
+/// Fallback guest vCPU count for configs missing the declaration
+/// (test / non-enabled paths — enable-time validation requires it).
+pub const DEFAULT_VCPUS: u32 = 2;
+/// Fallback guest memory for configs missing `suggested_memory_mib`.
+pub const DEFAULT_MEMORY_MIB: u32 = 4096;
+
 impl ImageConfig {
+    /// Resolved guest memory (MiB) for an image: its
+    /// `suggested_memory_mib` (or the default). The single source of
+    /// truth shared by base-snapshot capture (`enabled_images`), session
+    /// restore, AND placement reservation (sessions and captures alike,
+    /// ADR 0046/0081) — FC requires the restore `mem_size_mib` to equal
+    /// the snapshot's, so they MUST compute it identically. ADR 0055:
+    /// the base snapshot is sized once per image and is skill-agnostic
+    /// (skills bind via `patch_drive`, never resize memory), so
+    /// memory-heavy tooling (e.g. browser) is an image-sizing concern —
+    /// declare `suggested_memory_mib` on the image, not a per-session
+    /// skill.
+    pub fn resolved_memory_mib(&self) -> u32 {
+        self.resources
+            .suggested_memory_mib
+            .unwrap_or(DEFAULT_MEMORY_MIB)
+    }
+
+    /// ADR 0048: resolved guest vCPU count for an image. Enable-time
+    /// validation ([`ImageConfig::validate`]) guarantees the declaration
+    /// is present for enabled images; [`DEFAULT_VCPUS`] is the defensive
+    /// fallback for the test / non-enabled paths, mirroring
+    /// [`ImageConfig::resolved_memory_mib`]. This is the budget
+    /// placement reserves.
+    pub fn resolved_vcpus(&self) -> u32 {
+        self.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS)
+    }
+
     /// The effective per-image config: this admin-authored config with
     /// the image's Dockerfile-derived [`OciRuntimeDefaults`] folded in
     /// as **defaults** — the admin config always wins:

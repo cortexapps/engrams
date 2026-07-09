@@ -12,5 +12,7 @@ description = "Canonical workspace image: debian:bookworm-slim + git + ttyd. ADR
 
 # ADR 0048: an enabled image must declare its vCPU count — placement
 # reserves it against the host's CPU budget so packing has a CPU bound.
+# 4 (not 2): the claude CLI needs the headroom to start (fc-colima dev,
+# commit 1aad03b0) — carried over from the now-retired demo engram.toml.
 [resources]
-suggested_vcpus = 2
+suggested_vcpus = 4

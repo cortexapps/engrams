@@ -195,10 +195,11 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
     proxy_cfg.resolver = resolver;
     proxy_cfg.dns_bind_addr = None; // we don't exercise DNS in this test
     let proxy = engram_egress_proxy::Proxy::new(proxy_cfg);
+    // Bind synchronously (ADR 0083) — listener up before serve spawns.
+    let listeners = proxy.bind().await.expect("egress proxy bind");
     tokio::spawn(async move {
-        let _ = proxy.run().await;
+        proxy.serve(listeners).await;
     });
-    tokio::time::sleep(Duration::from_millis(150)).await; // give the listener time to bind
 
     // ---- 2. Install the host iptables ruleset (Fix 1 lives here) ----
     host_startup(Some(proxy_port), None)

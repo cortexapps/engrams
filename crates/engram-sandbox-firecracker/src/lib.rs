@@ -5557,7 +5557,7 @@ impl FirecrackerBackend {
                 })
             });
         let mut redacted_spec = live.state.spec.clone();
-        for (_k, v) in redacted_spec.env.iter_mut() {
+        for v in redacted_spec.env.values_mut() {
             *v = "<redacted>".into();
         }
         let source_rootfs_canonical = live
@@ -5734,7 +5734,7 @@ impl FirecrackerBackend {
         // stay for diagnostic value (operators can see "this snapshot
         // had ANTHROPIC_API_KEY set" without the secret itself).
         let mut redacted_spec = spec.clone();
-        for (_k, v) in redacted_spec.env.iter_mut() {
+        for v in redacted_spec.env.values_mut() {
             *v = "<redacted>".into();
         }
         let manifest = FcSnapshotManifest {

@@ -115,8 +115,8 @@ impl BootBundleCache {
                      {base_snapshot_id} but its row is gone"
                 ))
             })?;
-        let memory_mib = crate::api::sessions::resolved_memory_mib(&config);
-        let cpu_budget_vcpus = crate::api::sessions::resolved_vcpus(&config);
+        let memory_mib = config.resolved_memory_mib();
+        let cpu_budget_vcpus = config.resolved_vcpus();
         let bundle = Arc::new(BootBundle {
             enabled,
             config,

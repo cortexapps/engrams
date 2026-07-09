@@ -176,6 +176,60 @@ migrate-orchestrator:
         ORCHESTRATOR_DATABASE_URL=postgres://engram:engram@localhost:5435/engram_orchestrator \
         bunx drizzle-kit migrate
 
+# Provision an orchestrator login (ADR 0051 better-auth). Prompts for
+# email / admin? / password, then creates the user through the running
+# orchestrator's sign-up endpoint (so the password is hashed exactly like
+# a real sign-up) and, if you asked for admin, promotes the role via SQL.
+# Assumes the stack is already up (`just dev`) — it talks to the live
+# orchestrator on :8787 and the postgres container. Idempotent: an
+# already-existing email is tolerated and (if admin) still gets promoted.
+orchestrator-user:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ORIGIN="http://localhost:5173"
+    PORT="${ORCHESTRATOR_PORT:-8787}"
+    URL="http://127.0.0.1:${PORT}/api/auth/sign-up/email"
+
+    read -rp "Email: " EMAIL
+    [[ -n "$EMAIL" ]] || { echo "email is required" >&2; exit 1; }
+    read -rp "Admin? [y/N]: " ADMIN_ANS
+    read -rsp "Password (min 8 chars): " PASSWORD; echo
+    [[ ${#PASSWORD} -ge 8 ]] || { echo "password must be at least 8 characters" >&2; exit 1; }
+    NAME="${EMAIL%@*}"
+
+    echo "→ creating ${EMAIL} via ${URL}"
+    # Password goes through jq's env (not argv) and reaches curl over stdin,
+    # so it never lands in a process arg list.
+    BODY="$(PW="$PASSWORD" jq -n --arg e "$EMAIL" --arg n "$NAME" \
+        '{email:$e, password:env.PW, name:$n}')"
+    CODE="$(printf '%s' "$BODY" | curl -sS -o /tmp/orchestrator-user.out -w '%{http_code}' \
+        -X POST "$URL" -H 'content-type: application/json' -H "origin: ${ORIGIN}" --data @-)"
+
+    if [[ "$CODE" == "200" ]]; then
+        echo "✓ user created"
+    elif grep -qi 'already' /tmp/orchestrator-user.out; then
+        echo "• user already exists — continuing"
+    else
+        echo "✗ sign-up failed (HTTP ${CODE}):" >&2
+        cat /tmp/orchestrator-user.out >&2; echo >&2
+        echo "  (is the orchestrator running? \`just dev\`)" >&2
+        exit 1
+    fi
+    rm -f /tmp/orchestrator-user.out
+
+    if [[ "$ADMIN_ANS" =~ ^[Yy] ]]; then
+        EMAIL_SQL="${EMAIL//\'/\'\'}"
+        echo "→ promoting ${EMAIL} to admin"
+        docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
+            psql -U engram -d engram_orchestrator \
+            -c "UPDATE \"user\" SET role='admin' WHERE email='${EMAIL_SQL}'"
+        echo "✓ role set to admin — sign out and back in to pick it up"
+    fi
+
+    docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
+        psql -U engram -d engram_orchestrator \
+        -c "SELECT email, coalesce(role,'user') AS role FROM \"user\" WHERE email='${EMAIL//\'/\'\'}'"
+
 # Drop the dev DB volume (destructive). Use when migrations diverge.
 db-reset:
     docker compose -f deploy/docker-compose.dev.yml down -v
@@ -207,6 +261,48 @@ dev:
 dev-down:
     tilt down
 
+# ADR 0082: like `just dev`, but the host-agent (+ its Firecracker stack)
+# runs INSIDE a dedicated Colima VM instead of as a Mac-local process —
+# the only way to exercise the FC-only surfaces (NBD, UFFD, netns egress,
+# squashfs patch-drives) on Apple Silicon. Coordinator/orchestrator/web/
+# compose stay on the Mac exactly as in plain `just dev`; only the
+# Tiltfile's host-agent resource moves. The env var is the real switch —
+# the Tiltfile reads ENGRAM_FC_COLIMA_PROFILE directly — this recipe is
+# sugar so you don't have to remember its name. First-time setup:
+# `just fc-colima-provision [profile]`.
+dev-fc profile='fc-dev' mac_docker_context='colima':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # ADR 0082: only the host-agent + FC stack run in the Colima VM (as a raw
+    # `colima ssh` process, NOT a container); the docker-compose deps stay on the
+    # Mac. `colima start` persistently repoints the docker CLI at the VM daemon
+    # (writes currentContext=colima-<profile> to ~/.docker/config.json), so a
+    # plain `tilt up` makes Tilt's docker_compose() deploy the deps INTO the VM —
+    # where the VM's localhost→Mac DNAT (engram-dev-fwd) routes registry/GCS
+    # traffic away from them and the Mac-side stack can't reach them. Pin
+    # DOCKER_HOST to the Mac docker for the tilt process ONLY (no global-context
+    # mutation — other shells keep whatever colima set). Mac context defaults to
+    # `colima` (the default-profile daemon, per ADR 0082 "default Colima docker
+    # daemon untouched"); for Docker Desktop: `just dev-fc {{profile}} desktop-linux`.
+    mac_host="$(docker context inspect '{{mac_docker_context}}' 2>/dev/null \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["Endpoints"]["docker"]["Host"])' 2>/dev/null || true)"
+    if [ -z "$mac_host" ]; then
+        echo "dev-fc: docker context '{{mac_docker_context}}' not found or has no docker endpoint. Available:" >&2
+        docker context ls >&2
+        echo "Pass one explicitly, e.g.: just dev-fc {{profile}} desktop-linux" >&2
+        exit 1
+    fi
+    echo "dev-fc: compose deps -> Mac docker '{{mac_docker_context}}' ($mac_host); host-agent -> colima VM '{{profile}}'"
+    ENGRAM_FC_COLIMA_PROFILE={{profile}} DOCKER_HOST="$mac_host" tilt up
+
+# ADR 0082: create/update the named Colima VM (aarch64 Ubuntu, nested
+# virt, /dev/kvm, Firecracker + the aarch64 guest kernel, NBD/UFFD host
+# prep, the localhost→Mac DNAT unit engram-dev-fwd) — everything `dev-fc` needs
+# before its first run. Idempotent; safe to re-run after a Colima
+# upgrade or a provisioning-script change.
+fc-colima-provision profile='fc-dev':
+    bash deploy/dev/fc-colima-provision.sh {{profile}}
+
 # Reclaim all dev sandbox disk — the dev analog of the production lifecycle
 # GC. Two stages:
 #
@@ -222,18 +318,36 @@ dev-down:
 #      `<sandbox>.rootfs.ext4` (+ its vsock sockets) NOT owned by a session
 #      that is still live — the live set is re-read AFTER stage 1, so a
 #      session created concurrently is never swept.
+#   3. Prune stale RO skill bundles in var/shared: any `<sha>.{erofs,squashfs}`
+#      NOT referenced by the live `current.json` stamp. Old generations pile up
+#      on every re-bundle, and a VZ→FC backend switch strands the ENTIRE .erofs
+#      set (VZ stages erofs; FC stages squashfs and can't mount erofs) — that
+#      alone was ~9 GiB. When ENGRAM_FC_COLIMA_PROFILE is set (ADR 0082) the
+#      same prune runs inside the VM's /opt/engram-dev/shared, where the synced
+#      bundles actually consume the small VM disk.
+#   4. (ADR 0082, fc-colima only) Sweep orphaned base-snapshot dirs in the VM:
+#      /opt/engram-dev/var/sandboxes/snapshots/<id> with no live coordinator DB
+#      row. The snapshot GC works off DB rows, so a dir left by a hard DB delete
+#      or a FAILED capture is never reclaimed — and each holds a GiB-sized
+#      memory dump that fills the small VM disk. Live ids come from Postgres.
 #
-# Checkpoints (snapshots) are reclaimed by the coordinator's snapshot/chunk
-# GC once their owning sessions are gone; the warm-pool base snapshot an
-# enabled image clones from is preserved (re-captured on image re-enable).
+# Checkpoints (snapshots) are otherwise reclaimed by the coordinator's
+# snapshot/chunk GC once their owning sessions are gone; the warm-pool base
+# snapshot an enabled image clones from is preserved (re-captured on re-enable).
 #
 # Use it to reclaim disk or get a clean slate before a re-bake. Talks to the
 # coordinator app-gRPC via ENGRAM_APP_GRPC_ADDR / ENGRAM_APP_GRPC_TOKEN (dev
 # defaults below); the stack must be up.
-reap-sessions:
+reap-sessions profile='' mac_docker_context='colima':
     #!/usr/bin/env bash
     set -euo pipefail
     export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
+    # fc-colima profile for the VM-side stages (3 bundles, 4 snapshots). The
+    # `{{profile}}` param wins; else fall back to ENGRAM_FC_COLIMA_PROFILE. Unlike
+    # `just dev-fc`, a bare `just reap-sessions` has NO env var set (dev-fc sets it
+    # inline for tilt only), so the VM stages used to silently skip — pass the
+    # profile explicitly: `just reap-sessions fc-dev`.
+    fc_profile="{{profile}}"; [ -z "$fc_profile" ] && fc_profile="${ENGRAM_FC_COLIMA_PROFILE:-}"
     sandboxes_dir="${ENGRAM_HOST_SANDBOX_DIR:-var/host-sandboxes}"
     # Disk usage of the sandbox dir in KiB (0 if it doesn't exist yet). `du -k`
     # is portable across macOS/Linux and reports actual allocated blocks, so
@@ -283,6 +397,73 @@ reap-sessions:
         swept=$((swept+1))
     done
     echo "swept $swept orphaned sandbox rootfs file(s)."
+    # 3. Prune stale RO skill bundles (var/shared): <sha>.{erofs,squashfs} not
+    #    referenced by current.json. Keeps the download cache (.cache) and the
+    #    hidden .*.build.* / .*.stage temp entries (dotfiles don't match the
+    #    non-dot globs below). No current.json -> nothing is "live", so skip
+    #    rather than nuke the lot.
+    prune_bundles() {  # prune_bundles <dir>   (runs on the Mac; var/shared)
+        local d="$1" keep sha f pruned=0
+        [ -f "$d/current.json" ] || { echo "  ($d: no current.json — skip)"; return 0; }
+        keep="$(grep -oE '[0-9a-f]{64}' "$d/current.json" | sort -u)"
+        shopt -s nullglob
+        for f in "$d"/*.erofs "$d"/*.squashfs; do
+            sha="$(basename "$f")"; sha="${sha%.*}"
+            printf '%s\n' "$keep" | grep -qx "$sha" && continue
+            rm -f "$f"; pruned=$((pruned+1))
+        done
+        echo "  pruned $pruned stale bundle(s) from $d"
+    }
+    echo "==> pruning stale skill bundles (var/shared)"
+    before_shared_kb="$(dir_kb var/shared)"
+    prune_bundles var/shared
+    after_shared_kb="$(dir_kb var/shared)"
+    shared_freed=$(( before_shared_kb > after_shared_kb ? before_shared_kb - after_shared_kb : 0 ))
+    [ "$shared_freed" -gt 0 ] && echo "  reclaimed $(human_kb "$shared_freed") from var/shared."
+    # ADR 0082: the synced bundles live on the small fc-colima VM disk — prune
+    # the VM's /opt/engram-dev/shared the same way. The prune runs from a
+    # helper piped to `sudo bash -s` over stdin (NOT a heredoc: an unindented
+    # heredoc terminator would break `just`'s recipe indentation, and colima
+    # ssh doesn't run remote args through a shell anyway).
+    if [ -n "$fc_profile" ] && command -v colima >/dev/null 2>&1; then
+        echo "==> pruning stale bundles inside the fc-colima VM ($fc_profile)"
+        colima ssh --profile "$fc_profile" -- sudo bash -s < deploy/dev/reap-vm-bundles.sh
+        # 4. Sweep orphaned base-snapshot dirs in the VM: the coordinator's
+        #    snapshot GC works off DB rows, so a snapshot dir left by a hard DB
+        #    delete or a failed capture is never reclaimed — and each carries a
+        #    GiB-sized memory dump that fills the small VM disk. Gather the live
+        #    snapshot-id set from Postgres (via the always-up dev container) and
+        #    pass it (space-joined) to the VM sweeper; anything else is orphaned.
+        echo "==> sweeping orphaned base-snapshot dirs in the VM"
+        # The compose deps (Postgres) live on the MAC docker daemon, but
+        # `colima start --profile <p>` persistently repoints the docker CLI at
+        # the VM daemon (currentContext=colima-<p>). So a bare `docker compose
+        # exec postgres` here hits the VM — which has no Postgres — the query
+        # fails, and (guarded in reap-vm-snapshots.sh) the sweep is refused
+        # rather than nuking every base snapshot. Pin the Mac docker context
+        # like `dev-fc` does. Default `colima`; for Docker Desktop:
+        # `just reap-sessions {{profile}} desktop-linux`.
+        mac_host="$(docker context inspect '{{mac_docker_context}}' 2>/dev/null \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["Endpoints"]["docker"]["Host"])' 2>/dev/null || true)"
+        if [ -z "$mac_host" ]; then
+            echo "    docker context '{{mac_docker_context}}' not found or has no endpoint. Available:" >&2
+            docker context ls >&2
+            echo "    Pass the Mac context, e.g.: just reap-sessions $fc_profile desktop-linux" >&2
+            exit 1
+        fi
+        # No `2>/dev/null` on the query: a failure must be VISIBLE (paired with
+        # the empty-set guard in the sweeper) — a silently-swallowed error used
+        # to abort with a cryptic exit code, or worse, feed an empty live set.
+        live_snaps="$(DOCKER_HOST="$mac_host" docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
+            psql -U engram -d engram -tAc \
+            "select id::text from snapshots union select base_snapshot_id::text from enabled_images where base_snapshot_id is not null" \
+            | tr '\n' ' ' | tr -s ' ')"
+        colima ssh --profile "$fc_profile" -- sudo bash -s -- "$live_snaps" < deploy/dev/reap-vm-snapshots.sh
+    elif command -v colima >/dev/null 2>&1; then
+        echo "==> SKIPPING fc-colima VM stages (bundles + orphaned snapshots) — no profile."
+        echo "    The VM holds the GiB-sized base-snapshot dumps; pass the profile to sweep them:"
+        echo "      just reap-sessions fc-dev"
+    fi
     after_kb="$(dir_kb "$sandboxes_dir")"; after_kb="${after_kb:-0}"
     reclaimed_kb=$(( before_kb > after_kb ? before_kb - after_kb : 0 ))
     if [ "$reclaimed_kb" -gt 0 ]; then
@@ -292,13 +473,41 @@ reap-sessions:
     fi
     echo "reap-sessions: done. Checkpoints GC in the background once their sessions are gone."
 
-# Build the Claude harness from source, publish it to the local OCI
-# registry, and bake deploy/demo-claude/ against it — pushing the image
-# to localhost:5001 (the registry `just dev` runs). Arch + transport are
-# detected; no per-backend recipe. Requires `just bootstrap` (KEK) and a
-# running local registry (it's up under `just dev`, or `just registry-up`).
+# Bake the canonical `demo` image (deploy/demo/) and push it to the local OCI
+# registry as demo:warm-1 (localhost:5001, the registry `just dev` runs). Arch +
+# transport are detected; no per-backend recipe. ADR 0062: the image carries NO
+# harness — the built-in `claude` harness is a per-session selection staged on
+# the fleet, not baked in. Requires `just bootstrap` (KEK) and a running local
+# registry (it's up under `just dev`, or `just registry-up`). This only PUSHES;
+# use `just bake-demo-enable` to also make it live on the coord.
 bake-demo:
     bash deploy/dev/bake-demo.sh
+
+# Bake the demo image AND make it live on the running coord in one step — the
+# inner-loop cycle after editing deploy/demo/ (engram.toml vcpus/mem, or the
+# rootfs). `bake-demo` only pushes; this then registers it and BLOCKS until the
+# base-snapshot capture (the enable job) reports ready, exiting non-zero if it
+# fails. Because `warm-1` is a fixed tag, a re-bake moves it to a NEW digest: if
+# the image is already enabled we `image refresh` (re-fetch the moved tag + force
+# a re-capture), since `image enable` is idempotent on an already-enabled URI and
+# would keep serving the STALE base snapshot. Requires the stack up
+# (`just dev` / `just dev-fc`).
+bake-demo-enable:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash deploy/dev/bake-demo.sh
+    export ENGRAM_APP_GRPC_ADDR="${ENGRAM_APP_GRPC_ADDR:-http://127.0.0.1:50061}"
+    export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
+    cli=./target/release/engram-cli
+    uri=localhost:5001/demo:warm-1
+    if "$cli" --json image list \
+        | python3 -c "import sys,json; sys.exit(0 if any(i.get('image_uri')=='$uri' for i in json.load(sys.stdin).get('images',[])) else 1)"; then
+        echo "==> $uri already enabled — refreshing (re-fetch moved tag + re-capture base snapshot)"
+        "$cli" image refresh --uri "$uri"
+    else
+        echo "==> enabling $uri (captures base snapshot)"
+        "$cli" image enable --uri "$uri"
+    fi
 
 # Fetch the kernel artifact this host's backend needs (VZ → Kata arm64
 # kernel; Firecracker → FC test kernel+rootfs; process → nothing).
@@ -324,9 +533,12 @@ bundles:
 # (<sha256>.squashfs + current.json stamp) under var/shared/, the
 # dev mirror of the FC-host image's /var/lib/engram/shared. Run the
 # host-agent with ENGRAM_BUNDLE_DIR=$PWD/var/shared so FC dev sessions
-# resolve/capture against it. Linux-only (mksquashfs; FC is Linux-only
-# anyway). Re-run after editing a skill — the stamp repoints and new
-# sessions pick the fresh generation up via the §3 swap.
+# resolve/capture against it. Needs mksquashfs: on Linux that's
+# `apt install squashfs-tools`; on macOS (ADR 0082's fc-colima dev mode —
+# FC itself still only ever boots inside the Colima VM) run this from
+# `nix develop`, which provides mksquashfs on darwin too. Re-run after
+# editing a skill — the stamp repoints and new sessions pick the fresh
+# generation up via the §3 swap.
 bundles-squashfs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -350,20 +562,67 @@ bundles-squashfs:
         stamp="$stamp$sep\"$name\": \"$sha\""
         sep=", "
     done
-    # ADR 0062: the built-in `claude` harness rides the stamp like a skill, but
-    # unlike the committed/container-built bundles above its tree (the
-    # engram-harness-claude entry binary + the bundled `claude` CLI) is BUILT, not
-    # assembled here — so it's staged from a pre-built tree dir handed in via
-    # ENGRAM_HARNESS_CLAUDE_TREE (the e2e sets this to the downloaded harness-claude
-    # artifact). Skipped when unset, so a no-harness dev stack still boots; a local
-    # `just dev` that wants the built-in claude points this at a staged tree.
-    if [ -n "${ENGRAM_HARNESS_CLAUDE_TREE:-}" ]; then
+    # ADR 0062: the built-in `claude` harness rides the stamp like a skill (key
+    # `harness-claude`, mounted on dyn_0). Its tree — the engram-harness-claude
+    # entry binary + the pinned `claude` CLI + the committed harness.toml — is
+    # the ONE bundle not assembled by a per-bundle build.sh: CI hands it in
+    # pre-built via ENGRAM_HARNESS_CLAUDE_TREE (bake-harness-claude-artifact). A
+    # local dev stack has no such artifact, so when unset we build the tree HERE
+    # (mirroring bake-demo's cross-compile + the bundles-vz path), then pack it
+    # via harness-claude/build.sh. Without this the fleet stamp never carries
+    # `harness-claude` and `POST /sessions` 400s with "built-in harness `claude`
+    # squashfs (`harness-claude`) is not staged on any host yet". Requires the
+    # nix cross toolchain on PATH (this recipe runs under `nix develop`).
+    harness_tree="${ENGRAM_HARNESS_CLAUDE_TREE:-}"
+    if [ -z "$harness_tree" ]; then
+        # PINNED — keep in lockstep with ci.yml's bake-harness-claude-artifact
+        # and bundles-vz: 2.1.185 is the newest CLI that still offers
+        # AskUserQuestion headlessly (cortexapps/engrams#431); bump deliberately
+        # and re-verify AUQ.
+        CLAUDE_VERSION=2.1.185
+        case "$(uname -m)" in
+            arm64 | aarch64) htarget=aarch64-unknown-linux-musl; carch=linux-arm64 ;;
+            x86_64 | amd64)  htarget=x86_64-unknown-linux-musl;   carch=linux-x64  ;;
+            *) echo "harness-claude: unsupported arch $(uname -m); skipping" >&2; htarget="" ;;
+        esac
+        if [ -n "$htarget" ]; then
+            # Best-effort: a cross-build/download failure warns and skips so the
+            # stack still comes up (without the built-in claude).
+            tree="$PWD/var/shared/.harness-claude.stage"
+            cache="var/shared/.cache/claude-$CLAUDE_VERSION-$carch"
+            ok=1
+            cargo build --release --target "$htarget" -p engram-harness-claude || ok=0
+            if [ "$ok" = 1 ] && [ ! -x "$cache" ]; then
+                mkdir -p "$(dirname "$cache")"
+                curl -fsSL --retry 3 \
+                    "https://downloads.claude.ai/claude-code-releases/$CLAUDE_VERSION/$carch/claude" \
+                    -o "$cache" && chmod +x "$cache" || ok=0
+            fi
+            if [ "$ok" = 1 ]; then
+                rm -rf "$tree"; mkdir -p "$tree"
+                cp -p "target/$htarget/release/engram-harness-claude" "$tree/harness"
+                cp -p "$cache" "$tree/claude"
+                cp -p deploy/harness-claude/harness.toml "$tree/harness.toml"
+                harness_tree="$tree"
+            else
+                echo "harness-claude local build failed; skipping (dev stack boots without the built-in claude)" >&2
+            fi
+        fi
+    fi
+    if [ -n "$harness_tree" ]; then
+        [ -x "$harness_tree/harness" ] || {
+            echo "harness tree $harness_tree is missing an executable 'harness' entry binary" >&2
+            exit 1
+        }
         tmp="var/shared/.harness-claude.build.squashfs"
-        deploy/bundles/harness-claude/build.sh "$ENGRAM_HARNESS_CLAUDE_TREE" "$tmp"
+        deploy/bundles/harness-claude/build.sh "$harness_tree" "$tmp"
         sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
         mv "$tmp" "var/shared/$sha.squashfs"
         stamp="$stamp$sep\"harness-claude\": \"$sha\""
         sep=", "
+        # Drop the locally-built stage tree (keep the download cache); an
+        # externally-provided ENGRAM_HARNESS_CLAUDE_TREE is left untouched.
+        [ "$harness_tree" = "$PWD/var/shared/.harness-claude.stage" ] && rm -rf "$harness_tree"
     fi
     # ADR 0080: the agentd bundle (reserved slot dyn_1) — MANDATORY, not
     # best-effort: without it no guest can boot (the stage-1 init execs
@@ -605,6 +864,8 @@ bake repo dir='.':
         PLATFORM=linux/arm64; \
     elif [ "$(uname -s -m)" = "Linux x86_64" ]; then \
         PLATFORM=linux/amd64; \
+    elif [ "$(uname -s -m)" = "Linux aarch64" ]; then \
+        PLATFORM=linux/arm64; \
     else \
         echo "unsupported host: $(uname -s -m)" >&2; exit 1; \
     fi; \
