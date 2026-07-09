@@ -819,7 +819,7 @@ pub async fn pick_capture_host(
 }
 
 /// ADR 0078's tier-0 disk floor as a standalone predicate: free
-/// work_dir space at or above [`engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB`].
+/// work_dir space at or above the host disk-cache floor.
 /// Unmeasured (`disk_total_mib == 0`) is soft — no veto, the same
 /// posture as unmeasured RAM (brand-new / dev hosts). Kept in lockstep
 /// with the disk arm of [`named_host_fit_veto`].
@@ -831,7 +831,15 @@ fn host_disk_floor_ok(h: &HostRecord) -> bool {
         .utilization
         .disk_total_mib
         .saturating_sub(h.utilization.disk_used_mib);
-    free_disk_mib >= engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB
+    free_disk_mib >= host_disk_cache_floor_mib()
+}
+
+fn host_disk_cache_floor_mib() -> u64 {
+    std::env::var("ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(engram_core::types::host::HOST_DISK_CACHE_FLOOR_BYTES)
+        / (1024 * 1024)
 }
 
 /// Pick a host for `ctx`, then `restore` from `metadata` on it. (The
