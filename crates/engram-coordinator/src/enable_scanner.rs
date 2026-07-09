@@ -27,7 +27,16 @@
 //!      reproduces, so convergence is exact.
 //!    - `capturing`: [`crate::api::enabled_images::capture_and_record_base_snapshot`]
 //!      boots the capture VM from the materialized manifest on a host
-//!      (idempotent via the content/digest-keyed reuse checks).
+//!      (idempotent via the content/digest-keyed reuse checks). ADR
+//!      0081: the host is RESERVED through the session scheduler's
+//!      atomic 2D fit (`reserve_capture_host`) — a no-fit fleet parks
+//!      the step in an in-process wait (the job counts as queued demand,
+//!      so the autoscaler grows toward it; the claim renews on every
+//!      re-try) rather than burning an attempt, and only a
+//!      `capture_capacity_wait` expiry fails the job
+//!      (`CapacityTimeout`, non-retryable — operator action).
+//!      Claimed jobs are driven CONCURRENTLY (the reservation is what
+//!      makes that safe), so a wait parks one task, not the sweep.
 //!    - `prestaging` (ADR 0036 amendment, issue #538, INTERIM): advertise
 //!      the freshly-captured base snapshot as a `prestage_images`
 //!      heartbeat-ack entry and wait for every eligible (`stages_images`)
@@ -97,6 +106,13 @@ pub struct EnableScannerConfig {
     /// — dev-brain-sized images pull ~33 GB through a 16-permit semaphore;
     /// see `engram_enable_prestage_seconds` before retuning).
     pub prestage_timeout: Duration,
+    /// ADR 0081: how long the capture step waits for a host to fit its
+    /// RAM/CPU budgets before failing the job (`CapacityTimeout`).
+    /// `ENGRAM_QUEUE_TIMEOUT_SECS` — deliberately the SAME knob and
+    /// default (1800 s) as the session queue's give-up backstop: while
+    /// waiting, the capture IS queue demand (the autoscaler grows toward
+    /// it), so it deserves the same maxHosts/quota/stockout backstop.
+    pub capture_capacity_wait: Duration,
 }
 
 /// Every field here is a pure constant — no I/O. Env resolution
@@ -116,11 +132,13 @@ impl Default for EnableScannerConfig {
             max_attempts: 5,
             progress_interval: Duration::from_secs(2),
             prestage_timeout: DEFAULT_PRESTAGE_TIMEOUT,
+            capture_capacity_wait: DEFAULT_CAPTURE_CAPACITY_WAIT,
         }
     }
 }
 
 const DEFAULT_PRESTAGE_TIMEOUT: Duration = Duration::from_secs(1200);
+const DEFAULT_CAPTURE_CAPACITY_WAIT: Duration = Duration::from_secs(1800);
 
 impl EnableScannerConfig {
     /// Resolves `ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS` on top of the pure
@@ -145,6 +163,25 @@ impl EnableScannerConfig {
                     error = %e,
                     default_secs = DEFAULT_PRESTAGE_TIMEOUT.as_secs(),
                     "ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS is not a valid u64; using the default"
+                ),
+            }
+        }
+        // ADR 0081: the SAME knob as the session queue's give-up backstop
+        // (`queue_scanner::QueueScannerConfig::timeout`) — a waiting
+        // capture is queue demand.
+        if let Ok(raw) = std::env::var("ENGRAM_QUEUE_TIMEOUT_SECS") {
+            match raw.parse::<u64>() {
+                Ok(secs) if secs > 0 => cfg.capture_capacity_wait = Duration::from_secs(secs),
+                Ok(_) => tracing::warn!(
+                    raw = %raw,
+                    default_secs = DEFAULT_CAPTURE_CAPACITY_WAIT.as_secs(),
+                    "ENGRAM_QUEUE_TIMEOUT_SECS must be > 0; using the default"
+                ),
+                Err(e) => tracing::warn!(
+                    raw = %raw,
+                    error = %e,
+                    default_secs = DEFAULT_CAPTURE_CAPACITY_WAIT.as_secs(),
+                    "ENGRAM_QUEUE_TIMEOUT_SECS is not a valid u64; using the default"
                 ),
             }
         }
@@ -189,67 +226,85 @@ pub(crate) async fn run_once(
         return Ok(());
     }
     tracing::debug!(count = jobs.len(), "enable-scanner claimed jobs");
+    // ADR 0081: drive the claimed jobs CONCURRENTLY. The old serial loop
+    // was a de-facto one-enable-at-a-time-per-pod gate (a `[warm]`
+    // capture holds its slot for tens of minutes); with captures now
+    // reserving RAM/CPU like sessions, concurrent enables are safe by
+    // construction, so the only bound is `claim_limit`. Each task owns
+    // its job end-to-end, including the failure record — one wedged job
+    // must not stall the others.
+    let mut tasks = tokio::task::JoinSet::new();
     for job in jobs {
-        let job_id = job.id;
-        match advance_one(cfg, state, &claimant, job).await {
-            Ok(()) => {}
-            Err(AdvanceError::LeaseLost(msg)) => {
-                // #232: our lease expired and a peer re-claimed the job
-                // mid-flight. Abandon immediately — every state write is
-                // fenced, so we hold no authority over the row anymore.
-                // Recording a failure here would clear the new
-                // claimant's lease and stamp `error` on a job it is
-                // actively completing. Do nothing; the peer drives it.
-                tracing::warn!(%job_id, reason = %msg, "enable job lease lost; abandoning to peer");
-            }
-            Err(e @ (AdvanceError::Pipeline(_) | AdvanceError::NonRetryable(_))) => {
-                // Per-job failure: ONE atomic, fenced write bumps attempts,
-                // stores the error, releases the claim, AND flips to `failed`
-                // if the budget is spent (transient) or the failure is
-                // non-retryable (deterministic — bail fast). Keep sweeping;
-                // one wedged job must not stall the queue. A Conflict means
-                // the lease went away between the failure and now, so we drop.
-                let force_terminal = matches!(e, AdvanceError::NonRetryable(_));
-                let msg = match &e {
-                    AdvanceError::Pipeline(inner) | AdvanceError::NonRetryable(inner) => {
-                        inner.to_string()
-                    }
-                    AdvanceError::LeaseLost(_) => unreachable!("guarded by the outer pattern"),
-                };
-                tracing::warn!(%job_id, error = %msg, non_retryable = force_terminal, "enable job pipeline failed");
-                match state
-                    .services
-                    .meta
-                    .record_enable_job_failure(
-                        job_id,
-                        &claimant,
-                        &msg,
-                        cfg.max_attempts,
-                        force_terminal,
-                    )
-                    .await
-                {
-                    Ok((attempts, EnableJobState::Failed)) => {
-                        tracing::warn!(
-                            %job_id,
-                            attempts,
-                            max_attempts = cfg.max_attempts,
-                            non_retryable = force_terminal,
-                            "enable job marked failed",
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(MetaError::Conflict(msg)) => {
-                        tracing::warn!(%job_id, reason = %msg, "enable job lease lost while recording failure; abandoning to peer");
-                    }
-                    Err(e2) => {
-                        tracing::warn!(%job_id, error = %e2, "failed to record enable job failure");
-                    }
+        let cfg = cfg.clone();
+        let state = state.clone();
+        let claimant = claimant.clone();
+        tasks.spawn(async move {
+            drive_job(&cfg, &state, &claimant, job).await;
+        });
+    }
+    while let Some(res) = tasks.join_next().await {
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "enable-scanner job task panicked");
+        }
+    }
+    Ok(())
+}
+
+/// Drive one claimed job through the pipeline and record its outcome —
+/// the per-job body the (now concurrent) sweep spawns.
+async fn drive_job(cfg: &EnableScannerConfig, state: &SharedState, claimant: &str, job: EnableJob) {
+    let job_id = job.id;
+    match advance_one(cfg, state, claimant, job).await {
+        Ok(()) => {}
+        Err(AdvanceError::LeaseLost(msg)) => {
+            // #232: our lease expired and a peer re-claimed the job
+            // mid-flight. Abandon immediately — every state write is
+            // fenced, so we hold no authority over the row anymore.
+            // Recording a failure here would clear the new
+            // claimant's lease and stamp `error` on a job it is
+            // actively completing. Do nothing; the peer drives it.
+            tracing::warn!(%job_id, reason = %msg, "enable job lease lost; abandoning to peer");
+        }
+        Err(e @ (AdvanceError::Pipeline(_) | AdvanceError::NonRetryable(_))) => {
+            // Per-job failure: ONE atomic, fenced write bumps attempts,
+            // stores the error, releases the claim, AND flips to `failed`
+            // if the budget is spent (transient) or the failure is
+            // non-retryable (deterministic — bail fast). Keep sweeping;
+            // one wedged job must not stall the queue. A Conflict means
+            // the lease went away between the failure and now, so we drop.
+            let force_terminal = matches!(e, AdvanceError::NonRetryable(_));
+            let msg = match &e {
+                AdvanceError::Pipeline(inner) | AdvanceError::NonRetryable(inner) => {
+                    inner.to_string()
+                }
+                AdvanceError::LeaseLost(_) => unreachable!("guarded by the outer pattern"),
+            };
+            tracing::warn!(%job_id, error = %msg, non_retryable = force_terminal, "enable job pipeline failed");
+            match state
+                .services
+                .meta
+                .record_enable_job_failure(job_id, claimant, &msg, cfg.max_attempts, force_terminal)
+                .await
+            {
+                Ok((attempts, EnableJobState::Failed)) => {
+                    tracing::warn!(
+                        %job_id,
+                        attempts,
+                        max_attempts = cfg.max_attempts,
+                        non_retryable = force_terminal,
+                        "enable job marked failed",
+                    );
+                }
+                Ok(_) => {}
+                Err(MetaError::Conflict(msg)) => {
+                    tracing::warn!(%job_id, reason = %msg, "enable job lease lost while recording failure; abandoning to peer");
+                }
+                Err(e2) => {
+                    tracing::warn!(%job_id, error = %e2, "failed to record enable job failure");
                 }
             }
         }
     }
-    Ok(())
 }
 
 /// Outcome of [`advance_one`] when it doesn't complete the pipeline.
@@ -451,7 +506,15 @@ async fn advance_one(
             }
         })
     };
-    let capture_result = capture_and_record_base_snapshot(state, &row, progress_tx).await;
+    let capture_result = capture_and_record_base_snapshot(
+        state,
+        &row,
+        &job,
+        claimant,
+        cfg.capture_capacity_wait,
+        progress_tx,
+    )
+    .await;
     // `capture_and_record_base_snapshot` returning means every `Sender`
     // clone it (or the host RPC underneath it) held has been dropped —
     // awaiting the consumer here guarantees every progress event,
@@ -462,6 +525,20 @@ async fn advance_one(
     // touches these columns itself — it relies on this write having
     // already landed.
     let _ = progress_consumer.await;
+    // ADR 0081: the capture VM is gone either way (snapshotted, failed,
+    // or never reached) — release its host reservation before acting on
+    // the result. Best-effort on the FAILURE path (`record_enable_job_
+    // failure` also clears both columns in its own claim-releasing
+    // write); a Conflict means the lease moved on, which the fenced
+    // writes below will surface as `LeaseLost` themselves.
+    if let Err(e) = state
+        .services
+        .meta
+        .clear_capture_reservation(job_id, claimant)
+        .await
+    {
+        tracing::debug!(%job_id, error = %e, "capture reservation clear deferred to the failure/terminal write");
+    }
     let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
         capture_result.map_err(classify_capture_error)?;
     row.base_snapshot_id = Some(base_snapshot_id);
