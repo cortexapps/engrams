@@ -29,6 +29,14 @@ self-locate their runtime from `$0`, never a fixed mount path.
   SAME Chrome via the `playwright-cli` CLI (bash, no MCP server) — one shared
   browser. Selected by name `browser`. (Subsumes the retired headless-only
   `playwright` bundle.)
+- **`ide/`** (ADR 0081) — the opt-in in-guest IDE: the pinned code-server
+  standalone release (VS Code web) + the `engram-ide` launcher agentd drives
+  lazily (StartIde → `engram-ide --ensure`). The bundled Node is glibc-dynamic,
+  so build.sh gives it the same patchelf self-contained treatment as `browser/`
+  (**not** usable on musl/alpine bases). Binds loopback `:13337` only — reached
+  over the ADR 0066 vsock relay through the session-scoped orchestrator proxy.
+  A trusted first-party surface like the shell: full session env, no uid drop
+  (unlike `browser/`). Selected by name `ide`.
 - **`sentinel/`** — ADR 0055: the tiny placeholder every reserved dynamic-mount
   slot (`dyn-0..dyn-{RESERVED_SLOTS-1}`) carries at base-snapshot capture, since
   Firecracker needs all drives present at `load_snapshot`. A per-session create
@@ -43,6 +51,7 @@ self-locate their runtime from `$0`, never a fixed mount path.
 deploy/bundles/sentinel/build.sh    out/sentinel.squashfs      # MANDATORY (capture)
 deploy/bundles/skills/build.sh      out/skills.squashfs
 deploy/bundles/browser/build.sh     out/browser.squashfs       # needs Docker
+deploy/bundles/ide/build.sh         out/ide.squashfs           # needs Docker
 
 # content-addressed staging + current.json stamp for a dev FC host:  `just bundles-squashfs`
 # unpacked trees for local dev (ProcessBackend):  use `just bundles`
