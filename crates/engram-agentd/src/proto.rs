@@ -314,6 +314,32 @@ pub enum WireRequest {
     /// captured agentd (warn, never a failed create) — by design.
     /// Appended last: see the APPEND-ONLY note above.
     RefreshAgent,
+    /// ADR 0081: ensure the in-guest IDE (code-server) is running and
+    /// serving HTTP on `port` (defaults to
+    /// [`crate::ide::DEFAULT_IDE_PORT`], 13337). Lazy + idempotent,
+    /// exactly like [`Self::StartBrowser`]: on first call the agent
+    /// spawns the `engram-ide` launcher (shipped + PATH-symlinked by
+    /// the `ide` bundle); on later calls it re-probes and respawns only
+    /// if the stack went away. The agent only replies once code-server
+    /// answers an HTTP probe on `127.0.0.1:{port}/healthz`, so the
+    /// host's relay dial finds a server actually *serving* right after
+    /// this returns.
+    ///
+    /// Replies [`WireResponse::IdeReady`] on success, or
+    /// [`WireResponse::Error`] if the spawn or the probe fails (no
+    /// launcher on PATH — the profile didn't select the `ide` bundle —
+    /// code-server never bound, etc.).
+    /// Appended last: see the APPEND-ONLY note above.
+    StartIde {
+        /// Optional port override. `None` → 13337.
+        port: Option<u16>,
+    },
+    /// ADR 0081: tear down the IDE: the agent `killpg`s the launcher's
+    /// process group so code-server and its helpers all reap together.
+    /// Idempotent — a no-op when nothing is running. Replies
+    /// [`WireResponse::IdeStopped`].
+    /// Appended last: see the APPEND-ONLY note above.
+    StopIde,
 }
 
 /// Body of [`WireRequest::SpawnHarness`]. ADR 0021 P1.4 dropped the
@@ -444,6 +470,21 @@ pub enum WireResponse {
         restarting: bool,
         sha256: Option<String>,
     },
+    /// Reply to [`WireRequest::StartIde`]. code-server is alive AND an
+    /// HTTP `/healthz` probe to `127.0.0.1:port` from inside the VM
+    /// answered — when the host relays to this same port immediately
+    /// afterward, it should find a server. `spawned` is true if this
+    /// call started code-server, false if it was already running and
+    /// only re-probed.
+    /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
+    IdeReady {
+        port: u16,
+        spawned: bool,
+    },
+    /// Reply to [`WireRequest::StopIde`] — the IDE has been torn down
+    /// (or there was nothing running).
+    /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
+    IdeStopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -20,6 +20,7 @@ pub mod clock;
 pub mod forge;
 pub mod handler;
 pub mod harness_supervisor;
+pub mod ide;
 pub mod port_relay;
 pub mod proto;
 pub mod reaper;

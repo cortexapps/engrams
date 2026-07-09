@@ -232,6 +232,44 @@ where
             write_msg(&mut writer, &resp).await?;
             return Ok(());
         }
+        WireRequest::StartIde { port } => {
+            let port = port.unwrap_or(crate::ide::DEFAULT_IDE_PORT);
+            // ADR 0081: the IDE is a trusted first-party surface over the
+            // user's own workspace — unlike the browser it inherits the FULL
+            // durable session env (mirrors the StartShell arm above), so its
+            // integrated terminal behaves identically to the Shell tab. The
+            // workdir agentd recorded from the SpawnHarness frame rides
+            // along so code-server opens on the workspace.
+            let resp = match crate::ide::start_ide(
+                port,
+                supervisor.session_env(),
+                supervisor.session_workdir(),
+            )
+            .await
+            {
+                Ok(outcome) => WireResponse::IdeReady {
+                    port: outcome.port,
+                    spawned: outcome.spawned,
+                },
+                Err(e) => WireResponse::Error {
+                    kind: format!("{:?}", e.kind()),
+                    message: format!("start_ide: {e}"),
+                },
+            };
+            write_msg(&mut writer, &resp).await?;
+            return Ok(());
+        }
+        WireRequest::StopIde => {
+            let resp = match crate::ide::stop_ide().await {
+                Ok(()) => WireResponse::IdeStopped,
+                Err(e) => WireResponse::Error {
+                    kind: format!("{:?}", e.kind()),
+                    message: format!("stop_ide: {e}"),
+                },
+            };
+            write_msg(&mut writer, &resp).await?;
+            return Ok(());
+        }
         WireRequest::RefreshAgent => {
             // ADR 0080: fresh-create restore, pre-bind. The host may have
             // patch_drive'd the agentd slot (and others) in the paused
