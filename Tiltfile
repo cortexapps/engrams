@@ -137,8 +137,9 @@ if fc_colima_profile:
     # `colima start` persistently repoints the docker CLI at the VM daemon (writes
     # currentContext=colima-<profile> to ~/.docker/config.json), so a bare
     # `tilt up` would make docker_compose() deploy the deps INTO the VM — where
-    # they collide with the in-VM socat forwarders on :5001/:4443 and strand the
-    # coordinator's DB. `just dev-fc` pins DOCKER_HOST to the Mac docker; this
+    # the VM's localhost→Mac DNAT (engram-dev-fwd) routes registry/GCS traffic
+    # AWAY from them and the Mac-side coordinator can't see the DB. `just
+    # dev-fc` pins DOCKER_HOST to the Mac docker; this
     # guard fails fast if that DIDN'T happen (e.g. a direct `tilt up` under the
     # stolen context) rather than silently misplacing the deps.
     _docker_host = os.environ.get('DOCKER_HOST', '')

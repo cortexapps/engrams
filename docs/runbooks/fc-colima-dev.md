@@ -66,11 +66,13 @@ sets `ENGRAM_MKE2FS=/opt/engram-dev/bin/mke2fs`; rerun
   advertises `http://127.0.0.1:9101` and the coordinator can't tell it moved.
 - **VM → Mac** (register/heartbeat, OCI pulls, GCS chunks): Lima guests reach
   Mac-loopback services via the host gateway `192.168.5.2`. The coordinator
-  endpoint is simply `http://192.168.5.2:8090`. The registry and fake-gcs
-  instead get socat units in the VM (`engram-fwd-registry`: localhost:5001 →
-  gateway:5001; `engram-fwd-gcs`: localhost:4443 → gateway:4443) so that
-  `localhost:5001/...` image refs and `engram-oci`'s loopback-only plaintext
-  HTTP allowance keep working unmodified.
+  endpoint is simply `http://192.168.5.2:8090`. The registry, fake-gcs, and
+  jaeger instead get an OUTPUT DNAT in the VM (`engram-dev-fwd.service`:
+  localhost:{5001,4443,4317} → gateway, via `route_localnet` + MASQUERADE) so
+  that `localhost:5001/...` image refs and `engram-oci`'s loopback-only
+  plaintext HTTP allowance keep working unmodified. Deliberately NOT loopback
+  listeners (the original socat design): Lima auto-forwards guest loopback
+  listeners onto the Mac, where they'd shadow the real deps.
 
 ## Gotchas
 
@@ -145,8 +147,9 @@ sets `ENGRAM_MKE2FS=/opt/engram-dev/bin/mke2fs`; rerun
   "no mke2fs at /opt/engram-dev/bin/mke2fs"* — run
   `just fc-colima-provision` (VM missing, stopped, never provisioned, or
   provisioned before the mke2fs contract path existed).
-- *Image pull fails in the host-agent* — check the socat units:
-  `colima ssh --profile fc-dev -- systemctl status engram-fwd-registry engram-fwd-gcs`
+- *Image pull fails in the host-agent* — check the DNAT forwarder:
+  `colima ssh --profile fc-dev -- systemctl status engram-dev-fwd` (and its
+  rules: `colima ssh --profile fc-dev -- sudo iptables -t nat -S OUTPUT`),
   and that the Mac-side registry answers: `curl http://localhost:5001/v2/`.
 - *Base-snapshot capture fails at image-enable* — check NBD in the VM:
   `colima ssh --profile fc-dev -- ls /dev/nbd0` (provision persists the

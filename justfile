@@ -278,7 +278,8 @@ dev-fc profile='fc-dev' mac_docker_context='colima':
     # Mac. `colima start` persistently repoints the docker CLI at the VM daemon
     # (writes currentContext=colima-<profile> to ~/.docker/config.json), so a
     # plain `tilt up` makes Tilt's docker_compose() deploy the deps INTO the VM —
-    # where they collide with the in-VM socat forwarders on :5001/:4443. Pin
+    # where the VM's localhost→Mac DNAT (engram-dev-fwd) routes registry/GCS
+    # traffic away from them and the Mac-side stack can't reach them. Pin
     # DOCKER_HOST to the Mac docker for the tilt process ONLY (no global-context
     # mutation — other shells keep whatever colima set). Mac context defaults to
     # `colima` (the default-profile daemon, per ADR 0082 "default Colima docker
@@ -296,7 +297,7 @@ dev-fc profile='fc-dev' mac_docker_context='colima':
 
 # ADR 0082: create/update the named Colima VM (aarch64 Ubuntu, nested
 # virt, /dev/kvm, Firecracker + the aarch64 guest kernel, NBD/UFFD host
-# prep, the loopback-forwarding socat units) — everything `dev-fc` needs
+# prep, the localhost→Mac DNAT unit engram-dev-fwd) — everything `dev-fc` needs
 # before its first run. Idempotent; safe to re-run after a Colima
 # upgrade or a provisioning-script change.
 fc-colima-provision profile='fc-dev':

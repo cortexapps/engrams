@@ -62,7 +62,7 @@ Provisioning is one idempotent command: `just fc-colima-provision [profile]` →
 
 - creates/starts the profile (`--vm-type vz --nested-virtualization`, M3+ gate),
   **capturing and restoring the docker CLI context** (`colima start` steals it);
-- installs VM packages (kernel build deps, iptables, socat, squashfs-tools),
+- installs VM packages (kernel build deps, iptables, squashfs-tools),
   the upstream `firecracker` aarch64 release binary (same version CI pins);
 - applies host prep mirroring CI/node-prep: `modprobe nbd nbds_max=…`
   (without it, base-snapshot capture at image-enable 500s — the ADR 0024
@@ -131,9 +131,10 @@ When `ENGRAM_FC_COLIMA_PROFILE` is set, the Tiltfile:
 - VZ remains the zero-setup default; this mode is opt-in and additive. The
   two backends keep independent base snapshots per image (snapshot manifests
   are backend-specific by design), so switching modes re-captures.
-- New moving parts owned by the provision script: the socat units, the Lima
-  auto-forward assumption, and sysctl/modprobe state — all pinned in one
-  idempotent script rather than scattered shell history.
+- New moving parts owned by the provision script: the `engram-dev-fwd` DNAT
+  unit (P3 replaced the original socat units), the Lima auto-forward
+  assumption, and sysctl/modprobe state — all pinned in one idempotent script
+  rather than scattered shell history.
 
 ## Phase log
 

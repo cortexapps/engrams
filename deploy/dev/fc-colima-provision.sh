@@ -125,7 +125,7 @@ FC_VERSION="$1"
 VM_USER="$2"
 
 # --- apt packages ---
-PKGS="build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file socat iptables squashfs-tools e2fsprogs"
+PKGS="build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools e2fsprogs"
 MISSING=""
 for p in $PKGS; do
     dpkg -s "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"
@@ -310,7 +310,7 @@ cat <<EOF
 ==> fc-colima-provision done for profile '$PROFILE'
 
 Provisioned inside the VM:
-  - packages: build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file socat iptables squashfs-tools e2fsprogs
+  - packages: build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools e2fsprogs
   - /opt/engram-dev/bin/mke2fs (stable contract path for enable-time materialize)
   - /usr/local/bin/firecracker ($FC_VERSION)
   - nbd loaded (nbds_max=16), vm.unprivileged_userfaultfd=1, /dev/kvm mode 0666 (persisted)
