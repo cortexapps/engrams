@@ -90,4 +90,10 @@ it absorbs the transient race *and* surfaces the permanent conflict.
   `5353` bind into a real collision when multiple proxies stand up in one process (the test
   suite); the port is now the caller's decision — prod passes the port the iptables
   `:53 -> dns` REDIRECT targets, tests pass `None` to skip the DNS listener.
+- Port `0` is rejected at startup for both `--egress-proxy-port` and
+  `--egress-dns-port`: a `0` *bind* succeeds (ephemeral port) while the iptables
+  REDIRECT still targets literal `0`, so the host would boot green with every
+  guest getting `ConnectionRefused` — a split-brain the bind-failure guard alone
+  cannot catch. There was already no `0 = off` sentinel (egress is mandatory);
+  now it's enforced.
 - No image re-bake, schema change, or guest change — host-agent binary only.

@@ -630,6 +630,19 @@ async fn build_host_egress(
     observe_sink: Option<engram_egress_proxy::ObserveSink>,
 ) -> Result<engram_host_agent::egress::HostEgress, String> {
     use std::sync::Arc;
+    // Port 0 would bind an ephemeral port while the iptables REDIRECT
+    // still targets the literal configured value — the host boots green
+    // and every guest gets ConnectionRefused, the exact split-brain the
+    // fail-closed bind (ADR 0083) exists to kill. There is no `0 = off`
+    // sentinel (egress is mandatory, issue #240), so reject it here.
+    if cli.egress_proxy_port == 0 || cli.egress_dns_port == 0 {
+        return Err(format!(
+            "egress ports must be non-zero (got proxy={}, dns={}): the iptables \
+             REDIRECT targets the configured port, so an ephemeral (0) bind \
+             leaves :443/:53 redirected at a dead port",
+            cli.egress_proxy_port, cli.egress_dns_port,
+        ));
+    }
     let source: Arc<dyn engram_egress_proxy::CaSource> = match cli.ca_source {
         CaSourceChoice::Env => Arc::new(engram_egress_proxy::EnvCaSource::new(
             cli.ca_cert_var.clone(),
