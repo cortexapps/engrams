@@ -1,6 +1,14 @@
 # 0082 — Tar-input materialization: metadata flows tar → ext4 as data, never through host inodes
 
-Status: Proposed
+Status: Accepted (2026-07-09)
+
+Commit chain: `eec1e087` (tar-input pack + toolchain), `59be62bb`
+(guest-init retry-loop revert + loud /proc diagnostic), `58bb23d4`
+(materialize disk-floor restore that unblocked the live validation).
+Live-validated on macOS/VZ: enable → tar materialize → base-snapshot
+capture → guest boot to `agentd_staged`, with the previously-panicking
+`/usr/bin/mount` inode landing `04755` uid 0 in the enable-produced
+image.
 
 Builds on: ADR 0080 (host-side materialization — the pipeline this
 fixes), ADR 0036 (byte-deterministic ext4 packs — the pin this
