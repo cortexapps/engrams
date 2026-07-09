@@ -80,23 +80,6 @@ pub enum CreateDisposition {
     Queued,
 }
 
-/// ADR 0081: outcome of [`MetadataStore::reserve_capture_host`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CaptureReservation {
-    /// A candidate host fit both budgets; `capture_host_id` is stamped
-    /// (and `capture_waiting_since` cleared) for the duration of the
-    /// capture step.
-    Reserved(HostId),
-    /// No candidate fit; the job is *waiting for capacity*. Carries the
-    /// (COALESCE-stamped) first-miss timestamp — the DB anchor the enable
-    /// scanner's wait deadline measures from, so a pod restart / re-claim
-    /// can't reset the queue timeout (the wall clock resets on every
-    /// process restart; `capture_waiting_since` survives in Postgres).
-    Waiting {
-        since: chrono::DateTime<chrono::Utc>,
-    },
-}
-
 /// ADR 0073 phase 4: one idle-scan candidate row (Active + bound).
 #[derive(Clone, Debug)]
 pub struct IdleScanCandidate {
@@ -1928,68 +1911,6 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// ADR 0081: atomically pick + reserve a capture host for job `id`
-    /// from `candidates` (the caller's ranked schedulable list), using
-    /// the SAME `FOR UPDATE` 2D best-fit transaction as
-    /// [`Self::reserve_and_persist_create`] — candidate host rows locked
-    /// in PK order, reserved = Σ budgets over memory-reserving sessions
-    /// UNION capturing enable jobs, so concurrent placers (sessions and
-    /// captures, any replica) serialize and see each other.
-    ///
-    /// Persists the resolved `mem_budget_mib` / `cpu_budget_vcpus` on the
-    /// job row in BOTH branches (fit and no-fit): a pre-0095 job carries
-    /// `0` budgets, and the caller resolves them from the image config —
-    /// but that resolution is worthless if it never lands in the row that
-    /// every *other* placer's reserved-SUM reads. Without this a 24 GiB
-    /// capture would count as 0 MiB reserved (the 2026-07-08 OOM class),
-    /// and a budget-0 waiting job would fold 0 into [`Self::queued_demand`]
-    /// so the autoscaler never grows for it.
-    ///
-    /// On a fit: returns [`CaptureReservation::Reserved`] — stamps
-    /// `capture_host_id` and clears `capture_waiting_since` (a job that
-    /// waited then fit stops counting as waiting). On none: returns
-    /// [`CaptureReservation::Waiting`] carrying the (COALESCE-stamped)
-    /// first-miss timestamp — the job is *waiting for capacity*, counted
-    /// by [`Self::queued_demand`] so the autoscaler grows the pool, and
-    /// the returned timestamp is the DB anchor the enable scanner's wait
-    /// deadline measures from (so a pod restart can't reset the timeout).
-    ///
-    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
-    /// Returns [`MetaError::Conflict`] when the lease has moved on.
-    async fn reserve_capture_host(
-        &self,
-        id: uuid::Uuid,
-        claimant: &str,
-        candidates: &[crate::HostId],
-        mem_budget_mib: i64,
-        cpu_budget_vcpus: i64,
-    ) -> Result<CaptureReservation, MetaError> {
-        let _ = (id, claimant, candidates, mem_budget_mib, cpu_budget_vcpus);
-        Err(MetaError::Migration(
-            "enable jobs unsupported by this store".into(),
-        ))
-    }
-
-    /// ADR 0081: release job `id`'s capture reservation
-    /// (`capture_host_id`/`capture_waiting_since` → NULL). Called when
-    /// the capture step returns, success or failure — the failure path
-    /// is belt-and-suspenders: [`Self::record_enable_job_failure`] also
-    /// clears both (it releases the claim, so a separate fenced clear
-    /// afterwards would fence-miss).
-    ///
-    /// Fenced by `claimant`; returns [`MetaError::Conflict`] when the
-    /// lease has moved on.
-    async fn clear_capture_reservation(
-        &self,
-        id: uuid::Uuid,
-        claimant: &str,
-    ) -> Result<(), MetaError> {
-        let _ = (id, claimant);
-        Err(MetaError::Migration(
-            "enable jobs unsupported by this store".into(),
-        ))
-    }
-
     /// Admin retry: `failed → pending`, resetting attempts/error/
     /// claim. Errors `NotFound` for unknown ids; `Conflict` when the
     /// job isn't in `failed`.
@@ -2168,22 +2089,46 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// Reassign a job to `new_host`: fenced
-    /// `UPDATE ... SET host_id = $new, epoch = epoch + 1, attempts =
-    /// attempts + 1, stage = 'assigned', stage_started_at = NOW(),
-    /// last_progress_at = NOW(), stage_progress = NULL WHERE id = $1
-    /// AND epoch = $2 AND stage NOT IN ('done', 'failed')` — the
-    /// per-stage deadline scan's re-pick path (a stalled `assigned`
-    /// dispatch, or an expired stage budget under the attempts
-    /// budget). `None` when the fence missed (already reassigned by a
-    /// racing scan tick, or terminal).
+    /// ADR 0084 (c): the reserving pick for a WAITING job (`host_id
+    /// NULL`) — its fresh-insert placement and its every-tick re-attempt.
+    /// Runs the SAME `FOR UPDATE` 2D best-fit as session placement
+    /// (`pick_host_2d`, reserved-SUM now reading `capture_jobs`) over
+    /// `candidates` (the coordinator's disk-footprint + anti-affinity +
+    /// fc-version-filtered set) using the row's OWN stamped budgets. On a
+    /// fit: binds `host_id` and clears `waiting_since` (dispatchable from
+    /// the next heartbeat). On no fit: leaves the row waiting, stamping
+    /// `waiting_since` on the first miss (`COALESCE` — restart-proof queue
+    /// anchor). Idempotent + atomic: locks the job row `FOR UPDATE`, so a
+    /// row already bound returns unchanged (no double-reserve). `None`
+    /// when the job is gone or already terminal.
+    async fn place_capture_job(
+        &self,
+        id: CaptureJobId,
+        candidates: &[HostId],
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        let _ = (id, candidates);
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Reassign a stalled DISPATCHED job (its `assigned`/stage deadline
+    /// missed): fenced, epoch-bumped, re-running the reserving 2D fit over
+    /// `candidates` in the SAME transaction so the host old→new swap is
+    /// atomic with the reservation. On a fit: `host_id = $new`; on no fit:
+    /// `host_id = NULL` (the row falls into the waiting flow rather than
+    /// failing outright). Always `epoch = epoch + 1` (fences/tears down
+    /// the abandoned attempt via host-side `cancel_absent`) and `attempts
+    /// = attempts + 1` (a real re-attempt). Fenced `WHERE id = $1 AND
+    /// epoch = $2 AND stage NOT IN ('done', 'failed')`; `None` when the
+    /// fence missed (already reassigned, or terminal).
     async fn reassign_capture_job(
         &self,
         id: CaptureJobId,
         expected_epoch: i64,
-        new_host: HostId,
+        candidates: &[HostId],
     ) -> Result<Option<CaptureJobRow>, MetaError> {
-        let _ = (id, expected_epoch, new_host);
+        let _ = (id, expected_epoch, candidates);
         Err(MetaError::Migration(
             "capture jobs unsupported by this store".into(),
         ))
@@ -2224,28 +2169,38 @@ pub trait MetadataStore: Send + Sync {
         &self,
         id: CaptureJobId,
         expected_epoch: i64,
-        new_host: HostId,
+        candidates: &[HostId],
         max_attempts: u32,
     ) -> Result<Option<CaptureJobRow>, MetaError> {
-        let _ = (id, expected_epoch, new_host, max_attempts);
+        let _ = (id, expected_epoch, candidates, max_attempts);
         Err(MetaError::Migration(
             "capture jobs unsupported by this store".into(),
         ))
     }
 
-    /// Every non-terminal job whose current stage has run longer than
-    /// its budget in `budgets` (the deadline scan's read: `assigned`
-    /// 60s, `booting` 300s absolute, `freezing` =
-    /// `snapshot_create_timeout(mem_mib) + 60s`, etc. — the caller
-    /// supplies the budgets since they depend on job-specific config
-    /// like `mem_mib`). Default: empty (mirrors the other
-    /// heartbeat/scanner-tick bulk reads below — a store without job
-    /// support simply never has overdue jobs).
+    /// Every DISPATCHED (`host_id IS NOT NULL`) non-terminal job whose
+    /// current stage has run longer than its budget in `budgets` (the
+    /// deadline scan's read: `assigned` 60s, `booting` 300s absolute,
+    /// `freezing` = `snapshot_create_timeout(mem_mib) + 60s`, etc. — the
+    /// caller supplies the budgets since they depend on job-specific
+    /// config like `mem_mib`). Deliberately EXCLUDES waiting jobs
+    /// (`host_id IS NULL`): a waiting job has no stage deadline, only the
+    /// queue timeout ([`Self::list_waiting_capture_jobs`]). Default:
+    /// empty (a store without job support never has overdue jobs).
     async fn expire_capture_job_stages(
         &self,
         budgets: &[(CaptureJobStage, std::time::Duration)],
     ) -> Result<Vec<CaptureJobRow>, MetaError> {
         let _ = budgets;
+        Ok(Vec::new())
+    }
+
+    /// Every WAITING (`host_id IS NULL`) non-terminal capture job — the
+    /// queue-timeout scan's read. Each is re-offered to
+    /// [`Self::place_capture_job`] every tick; one whose `waiting_since`
+    /// is older than the queue timeout is failed with `CapacityTimeout`.
+    /// Default: empty.
+    async fn list_waiting_capture_jobs(&self) -> Result<Vec<CaptureJobRow>, MetaError> {
         Ok(Vec::new())
     }
 

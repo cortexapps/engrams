@@ -25,18 +25,22 @@
 //!      stealing a long materialize. A re-run re-pulls, but chunk PUTs
 //!      content-address-dedup and the content-derived ManifestRef
 //!      reproduces, so convergence is exact.
-//!    - `capturing`: [`crate::api::enabled_images::capture_and_record_base_snapshot`]
-//!      boots the capture VM from the materialized manifest on a host
-//!      (idempotent via the content/digest-keyed reuse checks). ADR
-//!      0081: the host is RESERVED through the session scheduler's
-//!      atomic 2D fit (`reserve_capture_host`) — a no-fit fleet parks
-//!      the step in an in-process wait (the job counts as queued demand,
-//!      so the autoscaler grows toward it; the claim renews on every
-//!      re-try) rather than burning an attempt, and only a
-//!      `capture_capacity_wait` expiry fails the job
-//!      (`CapacityTimeout`, non-retryable — operator action).
-//!      Claimed jobs are driven CONCURRENTLY (the reservation is what
-//!      makes that safe), so a wait parks one task, not the sweep.
+//!    - `capturing`: [`crate::api::enabled_images::ensure_capture_job`]
+//!      inserts a durable `capture_jobs` row (idempotent via the
+//!      content/digest-keyed reuse checks + the active-per-enable unique
+//!      index); the host runs the VM off the heartbeat. ADR 0084 (c): the
+//!      host is RESERVED through the session scheduler's atomic 2D fit
+//!      (`place_capture_job` → `pick_host_2d` over
+//!      `capture_candidate_hosts`) with the reservation living ON the
+//!      `capture_jobs` row (released implicitly on a terminal stage). A
+//!      no-fit fleet parks the row WAITING (`host_id NULL`), counted as
+//!      queued demand so the autoscaler grows toward it;
+//!      `capture_job_capacity_scan` re-offers it each tick and only a
+//!      `capture_capacity_wait` (`ENGRAM_QUEUE_TIMEOUT_SECS`) expiry fails
+//!      it (`CapacityTimeout`, non-retryable — operator action). The
+//!      `capturing` enable-job leg is WATCH-ONLY: it releases its claim
+//!      and returns `InFlight`, so the serial sweep never stalls behind a
+//!      long capture.
 //!    - `prestaging` (ADR 0036 amendment, issue #538, INTERIM): advertise
 //!      the freshly-captured base snapshot as a `prestage_images`
 //!      heartbeat-ack entry and wait for every eligible (`stages_images`)
@@ -223,6 +227,10 @@ pub(crate) async fn run_once(
     // THIS pod: any coordinator replica may reassign or fail a
     // stage-overdue row.
     capture_job_deadline_scan(cfg, state).await;
+    // ADR 0084 (c): drive WAITING captures — re-attempt the reserving pick
+    // and time out past the queue deadline. Fleet-wide, like the deadline
+    // scan; any replica may place or fail a waiting row.
+    capture_job_capacity_scan(cfg, state).await;
 
     let jobs = state
         .services
@@ -574,59 +582,60 @@ async fn advance_one(
                         &capture_row,
                     )
                     .await;
-                    match crate::placement::pick_capture_host(
+                    // ADR 0084 (c): compute the disk-eligible candidate set;
+                    // `redrive_failed_capture_job` runs the atomic 2D
+                    // RAM/CPU fit over it inside the epoch fence. No fitting
+                    // host ⇒ the row is re-driven WAITING (host_id NULL) and
+                    // the capacity scan drives it — NOT an outright fail.
+                    let candidates = match crate::placement::capture_candidate_hosts(
                         state.services.meta.as_ref(),
-                        &state.host_registry,
                         footprint,
                         None,
                     )
                     .await
                     {
-                        Ok((new_host, _)) => {
-                            match state
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(%job_id, capture_job_id = %capture_row.id, error = ?e, "enable-scanner: could not list capture candidates to re-drive; will retry next tick");
+                            let _ = state
                                 .services
                                 .meta
-                                .redrive_failed_capture_job(
-                                    capture_row.id,
-                                    capture_row.epoch,
-                                    new_host,
-                                    cfg.max_attempts,
-                                )
-                                .await
-                            {
-                                Ok(Some(redriven)) => {
-                                    tracing::info!(%job_id, capture_job_id = %capture_row.id, epoch = redriven.epoch, attempts = redriven.attempts, %new_host, "enable-scanner: re-drove retryable-terminal capture job onto a fresh host");
-                                    let _ = state
-                                        .services
-                                        .meta
-                                        .release_enable_job_claim(job_id, claimant)
-                                        .await;
-                                    return Err(AdvanceError::InFlight);
-                                }
-                                Ok(None) => {
-                                    // ANOMALY, never a silent no-op: we
-                                    // read a failed+retryable row under
-                                    // budget, yet the fenced re-drive
-                                    // matched 0 rows — a racing coordinator
-                                    // replica moved the epoch, or the row is
-                                    // no longer retryable. Warn and fall
-                                    // through to fail the enable job below
-                                    // rather than loop.
-                                    tracing::warn!(%job_id, capture_job_id = %capture_row.id, epoch = capture_row.epoch, attempts = capture_row.attempts, "enable-scanner: redrive of a retryable-terminal capture job matched 0 rows; failing the enable job");
-                                }
-                                Err(e) => {
-                                    tracing::warn!(%job_id, capture_job_id = %capture_row.id, error = %e, "enable-scanner: failed to re-drive retryable capture job; will retry next tick");
-                                    let _ = state
-                                        .services
-                                        .meta
-                                        .release_enable_job_claim(job_id, claimant)
-                                        .await;
-                                    return Err(AdvanceError::InFlight);
-                                }
-                            }
+                                .release_enable_job_claim(job_id, claimant)
+                                .await;
+                            return Err(AdvanceError::InFlight);
+                        }
+                    };
+                    match state
+                        .services
+                        .meta
+                        .redrive_failed_capture_job(
+                            capture_row.id,
+                            capture_row.epoch,
+                            &candidates,
+                            cfg.max_attempts,
+                        )
+                        .await
+                    {
+                        Ok(Some(redriven)) => {
+                            tracing::info!(%job_id, capture_job_id = %capture_row.id, epoch = redriven.epoch, attempts = redriven.attempts, host = ?redriven.host_id, "enable-scanner: re-drove retryable-terminal capture job (WAITING if no host fit)");
+                            let _ = state
+                                .services
+                                .meta
+                                .release_enable_job_claim(job_id, claimant)
+                                .await;
+                            return Err(AdvanceError::InFlight);
+                        }
+                        Ok(None) => {
+                            // ANOMALY, never a silent no-op: we read a
+                            // failed+retryable row under budget, yet the
+                            // fenced re-drive matched 0 rows — a racing
+                            // coordinator replica moved the epoch, or the row
+                            // is no longer retryable. Warn and fall through
+                            // to fail the enable job below rather than loop.
+                            tracing::warn!(%job_id, capture_job_id = %capture_row.id, epoch = capture_row.epoch, attempts = capture_row.attempts, "enable-scanner: redrive of a retryable-terminal capture job matched 0 rows; failing the enable job");
                         }
                         Err(e) => {
-                            tracing::warn!(%job_id, capture_job_id = %capture_row.id, error = ?e, "enable-scanner: no host available to re-drive a retryable capture job; will retry next tick");
+                            tracing::warn!(%job_id, capture_job_id = %capture_row.id, error = %e, "enable-scanner: failed to re-drive retryable capture job; will retry next tick");
                             let _ = state
                                 .services
                                 .meta
@@ -646,7 +655,7 @@ async fn advance_one(
                 return Err(AdvanceError::NonRetryable(Box::new(
                     crate::error::ApiError::Internal(format!(
                         "base snapshot capture for `{image_uri}` failed on host \
-                         {}: {msg}",
+                         {:?}: {msg}",
                         capture_row.host_id
                     )),
                 )));
@@ -954,39 +963,42 @@ async fn capture_job_deadline_scan(cfg: &EnableScannerConfig, state: &SharedStat
         if row.attempts < cfg.max_attempts {
             let footprint =
                 crate::api::enabled_images::capture_footprint_for_job_row(state, &row).await;
-            match crate::placement::pick_capture_host(
+            // ADR 0084 (c): the disk-eligible candidate set;
+            // `reassign_capture_job` runs the atomic 2D RAM/CPU fit over it
+            // inside the epoch fence. No fitting host ⇒ the row is
+            // reassigned WAITING (host_id NULL) — the epoch bump still tears
+            // down the stalled attempt host-side, and the capacity scan
+            // drives it from there. `row` came from
+            // `expire_capture_job_stages` (dispatched, non-terminal), so
+            // `reassign_capture_job`'s `stage NOT IN ('done','failed')`
+            // fence is correct; a `None` means the fence missed (a racing
+            // scan already reassigned it, or a report drove it terminal) —
+            // benign, but never silently ignored.
+            let candidates = match crate::placement::capture_candidate_hosts(
                 state.services.meta.as_ref(),
-                &state.host_registry,
                 footprint,
                 None,
             )
             .await
             {
-                Ok((new_host, _)) => {
-                    // `row` came from `expire_capture_job_stages`, which
-                    // only returns NON-terminal rows, so `reassign_capture_job`
-                    // (fenced `stage NOT IN ('done','failed')`) is correct
-                    // here. A `None` still means the fence missed (a racing
-                    // scan tick already reassigned it, or a report drove it
-                    // terminal between the read and this write) — benign,
-                    // but never silently ignored.
-                    match state
-                        .services
-                        .meta
-                        .reassign_capture_job(row.id, row.epoch, new_host)
-                        .await
-                    {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            tracing::warn!(capture_job_id = %row.id, epoch = row.epoch, "capture-job deadline scan: reassign matched 0 rows (raced a concurrent scan or a terminal report); skipping");
-                        }
-                        Err(e) => {
-                            tracing::warn!(capture_job_id = %row.id, error = %e, "capture-job deadline scan: reassign failed");
-                        }
-                    }
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(capture_job_id = %row.id, error = ?e, "capture-job deadline scan: could not list candidates to reassign; will retry next tick");
+                    continue;
+                }
+            };
+            match state
+                .services
+                .meta
+                .reassign_capture_job(row.id, row.epoch, &candidates)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::warn!(capture_job_id = %row.id, epoch = row.epoch, "capture-job deadline scan: reassign matched 0 rows (raced a concurrent scan or a terminal report); skipping");
                 }
                 Err(e) => {
-                    tracing::warn!(capture_job_id = %row.id, error = ?e, "capture-job deadline scan: no host available to reassign; will retry next tick");
+                    tracing::warn!(capture_job_id = %row.id, error = %e, "capture-job deadline scan: reassign failed");
                 }
             }
         } else {
@@ -1007,6 +1019,108 @@ async fn capture_job_deadline_scan(cfg: &EnableScannerConfig, state: &SharedStat
             };
             if let Err(e) = state.services.meta.record_capture_job_report(&report).await {
                 tracing::warn!(capture_job_id = %row.id, error = %e, "capture-job deadline scan: fenced-fail write failed");
+            }
+        }
+    }
+}
+
+/// ADR 0084 (c): the WAITING-capture scan — the queue-timeout half of the
+/// capture placement reservation re-attach. Every `capture_jobs` row with
+/// no host bound yet (`host_id IS NULL`) is re-offered to the reserving 2D
+/// pick (`place_capture_job`); one whose DB-anchored `waiting_since` is
+/// older than the queue timeout ([`EnableScannerConfig::
+/// capture_capacity_wait`], `ENGRAM_QUEUE_TIMEOUT_SECS`, default 1800 s) is
+/// failed with a `CapacityTimeout`-shaped terminal report (non-retryable,
+/// the same legible message #621 shipped). Fleet-wide, any-replica — the
+/// row's own epoch fencing is the safety net; and DB-anchored so a pod
+/// restart / re-claim can't reset the deadline.
+async fn capture_job_capacity_scan(cfg: &EnableScannerConfig, state: &SharedState) {
+    use engram_core::types::{CaptureJobStage, CaptureTerminalReport};
+
+    let waiting = match state.services.meta.list_waiting_capture_jobs().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "capture-job capacity scan: list_waiting_capture_jobs failed");
+            return;
+        }
+    };
+    let now = Utc::now();
+    for row in waiting {
+        // Timeout FIRST (anchored on the DB-persisted `waiting_since`, not a
+        // wall clock computed at process start — restart-proof).
+        let waited = row
+            .waiting_since
+            .map(|s| now.signed_duration_since(s))
+            .unwrap_or_else(chrono::Duration::zero);
+        let expired = waited
+            .to_std()
+            .map(|w| w >= cfg.capture_capacity_wait)
+            .unwrap_or(false);
+        if expired {
+            let waited_secs = waited.num_seconds().max(0);
+            tracing::warn!(
+                capture_job_id = %row.id,
+                enable_job_id = %row.enable_job_id,
+                mem_budget_mib = row.mem_budget_mib,
+                cpu_budget_vcpus = row.cpu_budget_vcpus,
+                waited_secs,
+                "capture job waited past the queue timeout with no fitting host; failing CapacityTimeout",
+            );
+            let report = engram_core::types::CaptureJobReport {
+                job_id: row.id,
+                epoch: row.epoch,
+                stage: CaptureJobStage::Failed,
+                progress: None,
+                fc_snapshot_version: row.fc_snapshot_version.clone(),
+                terminal: Some(CaptureTerminalReport::Failed {
+                    error: format!(
+                        "no host fit the capture VM for `{}` ({} MiB / {} vCPUs) within {}s \
+                         (limit {}s, measured from the first miss) — the fleet is at capacity and \
+                         the autoscaler didn't grow it (maxHosts? cloud quota?). Free capacity \
+                         (or raise the node-pool ceiling) and retry the job.",
+                        row.image_uri,
+                        row.mem_budget_mib,
+                        row.cpu_budget_vcpus,
+                        waited_secs,
+                        cfg.capture_capacity_wait.as_secs(),
+                    ),
+                    error_stage: CaptureJobStage::Assigned.as_str().to_string(),
+                    retryable: false,
+                }),
+            };
+            if let Err(e) = state.services.meta.record_capture_job_report(&report).await {
+                tracing::warn!(capture_job_id = %row.id, error = %e, "capture-job capacity scan: fenced-fail write failed");
+            }
+            continue;
+        }
+        // Not timed out — re-attempt the reserving pick.
+        let footprint =
+            crate::api::enabled_images::capture_footprint_for_job_row(state, &row).await;
+        let candidates = match crate::placement::capture_candidate_hosts(
+            state.services.meta.as_ref(),
+            footprint,
+            None,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(capture_job_id = %row.id, error = ?e, "capture-job capacity scan: could not list candidates; will retry next tick");
+                continue;
+            }
+        };
+        match state
+            .services
+            .meta
+            .place_capture_job(row.id, &candidates)
+            .await
+        {
+            Ok(Some(placed)) if placed.host_id.is_some() => {
+                tracing::info!(capture_job_id = %row.id, host = ?placed.host_id, "capture-job capacity scan: placed a waiting capture (capacity freed)");
+            }
+            Ok(_) => {} // still waiting — try again next tick
+            Err(e) => {
+                tracing::warn!(capture_job_id = %row.id, error = %e, "capture-job capacity scan: place failed");
             }
         }
     }

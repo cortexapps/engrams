@@ -424,27 +424,10 @@ pub struct EnableJob {
     /// the diagnostic that used to require host-log access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tail: Option<String>,
-    /// ADR 0081: the capture VM's placement budgets, stamped at job
-    /// creation from the image config (`resolved_memory_mib` /
-    /// `resolved_vcpus` — the same derivation session placement
-    /// reserves with).
-    #[serde(default)]
-    pub mem_budget_mib: i64,
-    #[serde(default)]
-    pub cpu_budget_vcpus: i32,
-    /// ADR 0081: the atomically-reserved capture host, set by
-    /// `reserve_capture_host` for the duration of the capture step and
-    /// `NULL` outside it. While set, the job's budgets count in every
-    /// reserved-SUM the placers read (sessions and captures are
-    /// mutually visible).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capture_host_id: Option<crate::HostId>,
-    /// ADR 0081: first moment the capture found no host that fits
-    /// (`NULL` once placed). Waiting captures count as queued demand
-    /// for the node-pool autoscaler; past the queue timeout the job
-    /// fails legibly instead of waiting forever.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capture_waiting_since: Option<DateTime<Utc>>,
+    // ADR 0084 (c): the capture placement reservation moved OFF this row
+    // and ONTO `capture_jobs` (budgets + host_id + waiting_since live
+    // there now, released implicitly on a terminal stage). The #621
+    // `enable_jobs` reservation columns are retired (migration 0099).
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

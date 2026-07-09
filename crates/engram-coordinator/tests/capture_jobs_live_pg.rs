@@ -1,16 +1,14 @@
 //! Live-Postgres tests for the ADR 0084 `capture_jobs`/`cold_bases`
 //! `MetadataStore` surface: insert-or-get dedup (one active job per
-//! enable job), the epoch-fenced report write (stale-epoch rejection,
-//! terminal Done/Failed landing, post-terminal immutability),
-//! reassignment (epoch/attempts bump + stage reset), the per-stage
-//! deadline scan, the heartbeat-ack-adjacent bulk reads
+//! enable job), the ADR 0084 (c) WAITING-insert + reserving `place`
+//! (host_id NULL until an atomic 2D fit binds it), the epoch-fenced
+//! report write (stale-epoch rejection, terminal Done/Failed landing,
+//! post-terminal immutability), the reserving reassignment/redrive
+//! (epoch/attempts bump + host old→new swap under the fence, no-fit ⇒
+//! WAITING), the per-stage deadline scan (dispatched-only), the
+//! heartbeat-ack-adjacent bulk reads
 //! (`capture_assignments_for_host`/`hosts_with_live_capture_jobs`), and
 //! the `cold_bases` reuse-lookup round trip.
-//!
-//! This is P1a (dormant): nothing in production calls these verbs yet
-//! (the executor/scanner rework lands in a later commit) — this suite
-//! exercises the fenced store surface itself, exactly like
-//! `enable_jobs_live_pg.rs` does for the sibling `enable_jobs` verbs.
 //!
 //! `#[ignore]`'d by default; requires Postgres reachable at
 //! `ENGRAM_TEST_DATABASE_URL`. Run:
@@ -26,6 +24,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
+use engram_core::types::host::{
+    HostCapacity, HostHeartbeat, HostMetadata, HostRecord, HostStatus, HostUtilization,
+};
 use engram_core::types::{
     CaptureJobProgress, CaptureJobReport, CaptureJobRow, CaptureJobStage, CaptureTerminalReport,
     ColdBaseRow, NewCaptureJob,
@@ -71,7 +72,9 @@ async fn seed_enable_job(meta: &Arc<dyn MetadataStore>, tag: &str) -> Uuid {
         .id
 }
 
-fn new_capture_job(enable_job_id: Uuid, host_id: HostId) -> NewCaptureJob {
+/// ADR 0084 (c): a fresh capture job is inserted WAITING (host_id NULL)
+/// with its placement budgets stamped — no host is chosen at insert time.
+fn new_capture_job(enable_job_id: Uuid) -> NewCaptureJob {
     NewCaptureJob {
         enable_job_id,
         image_uri: format!("test-registry.local/capture-jobs/img/{}", Uuid::new_v4()),
@@ -79,8 +82,93 @@ fn new_capture_job(enable_job_id: Uuid, host_id: HostId) -> NewCaptureJob {
         disk_manifest: format!("{}@v1", Uuid::new_v4()),
         image_config: test_config(),
         oci_defaults: Default::default(),
-        host_id,
+        mem_budget_mib: 2_048,
+        cpu_budget_vcpus: 2,
     }
+}
+
+fn zero_capacity() -> HostCapacity {
+    HostCapacity {
+        total_gb: 0,
+        used_gb: 0,
+        total_mib: 0,
+        used_mib: 0,
+        running_sandboxes: 0,
+    }
+}
+
+/// Seed a `ready` host with `allocatable_mib` headroom (and a total vCPU
+/// count) so the reserving 2D pick (`place_capture_job` /
+/// `reassign_capture_job` / `redrive_failed_capture_job` → `pick_host_2d`)
+/// can actually fit a capture onto it.
+async fn seed_host(
+    meta: &Arc<dyn MetadataStore>,
+    allocatable_mib: u64,
+    total_vcpus: u32,
+) -> HostId {
+    let id = HostId::new();
+    let hostname = format!("cap-host-{id}");
+    meta.upsert_host(HostRecord {
+        id,
+        hostname: hostname.clone(),
+        cloud_metadata: HostMetadata::default(),
+        capacity: zero_capacity(),
+        utilization: HostUtilization::default(),
+        status: HostStatus::Ready,
+        last_heartbeat_at: Utc::now(),
+        host_addr: Some(format!("http://{hostname}:9101")),
+        ready_images: Vec::new(),
+        current_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus,
+        wire_version: 0,
+        stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
+    })
+    .await
+    .expect("upsert host");
+    meta.touch_host_heartbeat(
+        id,
+        HostHeartbeat {
+            status: HostStatus::Ready,
+            capacity: zero_capacity(),
+            utilization: HostUtilization {
+                allocatable_mib,
+                ..HostUtilization::default()
+            },
+            ready_images: Vec::new(),
+            current_bundles: Vec::new(),
+            total_vcpus,
+            wire_version: engram_protocol::WIRE_VERSION,
+            stages_images: false,
+            capabilities: engram_core::types::host::HostCapabilities::default(),
+        },
+    )
+    .await
+    .expect("heartbeat host");
+    id
+}
+
+/// Insert a fresh job then place it onto `host` via the reserving pick —
+/// the "dispatched capture" the lifecycle tests below drive. Asserts it
+/// actually bound (the host must have headroom).
+async fn insert_placed(
+    meta: &Arc<dyn MetadataStore>,
+    enable_job_id: Uuid,
+    host: HostId,
+) -> CaptureJobRow {
+    let job = meta
+        .insert_capture_job(new_capture_job(enable_job_id))
+        .await
+        .expect("insert capture job");
+    assert_eq!(job.host_id, None, "a fresh capture job inserts WAITING");
+    let placed = meta
+        .place_capture_job(job.id, &[host])
+        .await
+        .expect("place capture job")
+        .expect("row present");
+    assert_eq!(placed.host_id, Some(host), "place must bind the host");
+    placed
 }
 
 #[tokio::test]
@@ -88,10 +176,9 @@ fn new_capture_job(enable_job_id: Uuid, host_id: HostId) -> NewCaptureJob {
 async fn insert_capture_job_dedups_active_jobs_per_enable_job() {
     let Some(meta) = connect().await else { return };
     let enable_job_id = seed_enable_job(&meta, "dedup").await;
-    let host = HostId::new();
 
     let a = meta
-        .insert_capture_job(new_capture_job(enable_job_id, host))
+        .insert_capture_job(new_capture_job(enable_job_id))
         .await
         .expect("insert a");
     assert_eq!(a.stage, CaptureJobStage::Assigned);
@@ -102,7 +189,7 @@ async fn insert_capture_job_dedups_active_jobs_per_enable_job() {
     // Re-insert while the job is still active (e.g. a re-driven scanner
     // tick) → same job, never duplicated.
     let b = meta
-        .insert_capture_job(new_capture_job(enable_job_id, host))
+        .insert_capture_job(new_capture_job(enable_job_id))
         .await
         .expect("insert b");
     assert_eq!(b.id, a.id, "active job must be returned, not duplicated");
@@ -125,7 +212,7 @@ async fn insert_capture_job_dedups_active_jobs_per_enable_job() {
         .expect("terminal report"));
 
     let c = meta
-        .insert_capture_job(new_capture_job(enable_job_id, host))
+        .insert_capture_job(new_capture_job(enable_job_id))
         .await
         .expect("insert c after terminal");
     assert_ne!(c.id, a.id, "a terminal job must not block a fresh capture");
@@ -136,9 +223,8 @@ async fn insert_capture_job_dedups_active_jobs_per_enable_job() {
 async fn record_capture_job_report_is_fenced_by_epoch() {
     let Some(meta) = connect().await else { return };
     let enable_job_id = seed_enable_job(&meta, "fenced").await;
-    let host = HostId::new();
     let job = meta
-        .insert_capture_job(new_capture_job(enable_job_id, host))
+        .insert_capture_job(new_capture_job(enable_job_id))
         .await
         .expect("insert");
 
@@ -197,12 +283,11 @@ async fn record_capture_job_report_is_fenced_by_epoch() {
 #[ignore]
 async fn terminal_reports_land_once_and_become_immutable() {
     let Some(meta) = connect().await else { return };
-    let host = HostId::new();
 
     // --- Done path ---
     let enable_job_done = seed_enable_job(&meta, "terminal-done").await;
     let job = meta
-        .insert_capture_job(new_capture_job(enable_job_done, host))
+        .insert_capture_job(new_capture_job(enable_job_done))
         .await
         .expect("insert done job");
     let done_report = CaptureJobReport {
@@ -235,7 +320,7 @@ async fn terminal_reports_land_once_and_become_immutable() {
     // --- Failed path ---
     let enable_job_failed = seed_enable_job(&meta, "terminal-failed").await;
     let job2 = meta
-        .insert_capture_job(new_capture_job(enable_job_failed, host))
+        .insert_capture_job(new_capture_job(enable_job_failed))
         .await
         .expect("insert failed job");
     let failed_report = CaptureJobReport {
@@ -275,12 +360,10 @@ async fn terminal_reports_land_once_and_become_immutable() {
 async fn reassign_bumps_epoch_and_attempts_and_resets_stage() {
     let Some(meta) = connect().await else { return };
     let enable_job_id = seed_enable_job(&meta, "reassign").await;
-    let host_a = HostId::new();
-    let host_b = HostId::new();
-    let job = meta
-        .insert_capture_job(new_capture_job(enable_job_id, host_a))
-        .await
-        .expect("insert");
+    let host_a = seed_host(&meta, 65_536, 64).await;
+    let host_b = seed_host(&meta, 65_536, 64).await;
+    // Dispatched on host_a via the reserving pick.
+    let job = insert_placed(&meta, enable_job_id, host_a).await;
 
     // Advance it partway so the reassign's stage/progress reset is
     // actually observable (not vacuously true from a fresh row).
@@ -300,14 +383,20 @@ async fn reassign_bumps_epoch_and_attempts_and_resets_stage() {
         .await
         .expect("progress"));
 
+    // ADR 0084 (c): reassign re-runs the reserving 2D fit over the
+    // candidate set — host_b fits, so the reservation moves atomically.
     let reassigned = meta
-        .reassign_capture_job(job.id, job.epoch, host_b)
+        .reassign_capture_job(job.id, job.epoch, &[host_b])
         .await
         .expect("reassign call")
         .expect("reassign lands");
     assert_eq!(reassigned.epoch, job.epoch + 1);
     assert_eq!(reassigned.attempts, job.attempts + 1);
-    assert_eq!(reassigned.host_id, host_b);
+    assert_eq!(reassigned.host_id, Some(host_b));
+    assert!(
+        reassigned.waiting_since.is_none(),
+        "a placed reassign clears the wait clock"
+    );
     assert_eq!(reassigned.stage, CaptureJobStage::Assigned);
     assert!(
         reassigned.stage_progress.is_none(),
@@ -316,10 +405,113 @@ async fn reassign_bumps_epoch_and_attempts_and_resets_stage() {
 
     // A reassign against the now-STALE original epoch must miss.
     let stale = meta
-        .reassign_capture_job(job.id, job.epoch, host_a)
+        .reassign_capture_job(job.id, job.epoch, &[host_a])
         .await
         .expect("stale reassign call");
     assert!(stale.is_none(), "a stale-epoch reassign must not land");
+}
+
+/// ADR 0084 (c): a reassign that finds NO fitting host leaves the row
+/// WAITING (host_id NULL) rather than failing outright — the epoch still
+/// bumps (tearing down the stalled attempt host-side) and the row falls
+/// into the queue-timeout flow.
+#[tokio::test]
+#[ignore]
+async fn reassign_with_no_fitting_host_leaves_the_row_waiting() {
+    let Some(meta) = connect().await else { return };
+    let enable_job_id = seed_enable_job(&meta, "reassign-nofit").await;
+    let host_a = seed_host(&meta, 65_536, 64).await;
+    let job = insert_placed(&meta, enable_job_id, host_a).await;
+
+    // Reassign with an EMPTY candidate set: `pick_host_2d` finds nothing.
+    let reassigned = meta
+        .reassign_capture_job(job.id, job.epoch, &[])
+        .await
+        .expect("reassign call")
+        .expect("row still present (fenced write landed)");
+    assert_eq!(
+        reassigned.epoch,
+        job.epoch + 1,
+        "epoch bumps even with no fit"
+    );
+    assert_eq!(reassigned.host_id, None, "no fit ⇒ WAITING (host_id NULL)");
+    assert!(
+        reassigned.waiting_since.is_some(),
+        "a no-fit reassign stamps the wait anchor",
+    );
+}
+
+/// ADR 0084 (c): the WAITING flow at the store surface — an insert with no
+/// fitting host stays WAITING (host_id NULL, wait anchor stamped), is
+/// listed by `list_waiting_capture_jobs` (the queue-timeout scan's read),
+/// and `place_capture_job` BINDS it on a later tick once a host fits,
+/// clearing the anchor and dropping it out of the waiting list.
+#[tokio::test]
+#[ignore]
+async fn waiting_capture_lists_then_places_on_a_later_tick() {
+    let Some(meta) = connect().await else { return };
+    let enable_job_id = seed_enable_job(&meta, "waiting-reserve-on-tick").await;
+
+    // Insert then place with NO candidate → WAITING.
+    let job = meta
+        .insert_capture_job(new_capture_job(enable_job_id))
+        .await
+        .expect("insert");
+    let waiting = meta
+        .place_capture_job(job.id, &[])
+        .await
+        .expect("place with no candidate")
+        .expect("row present");
+    assert_eq!(waiting.host_id, None, "no fit ⇒ WAITING");
+    let anchor = waiting
+        .waiting_since
+        .expect("wait anchor stamped on first miss");
+
+    // The queue-timeout scan's read sees it.
+    let listed = meta
+        .list_waiting_capture_jobs()
+        .await
+        .expect("list waiting");
+    assert!(
+        listed.iter().any(|j| j.id == job.id && j.host_id.is_none()),
+        "the waiting job must appear in list_waiting_capture_jobs",
+    );
+
+    // A re-tick with STILL no host keeps the ORIGINAL anchor (COALESCE —
+    // the queue timeout measures from the FIRST miss).
+    let still = meta
+        .place_capture_job(job.id, &[])
+        .await
+        .expect("re-place")
+        .expect("row present");
+    assert_eq!(
+        still.waiting_since,
+        Some(anchor),
+        "the wait anchor survives re-ticks",
+    );
+
+    // Capacity appears → the next tick BINDS it and clears the anchor.
+    let host = seed_host(&meta, 65_536, 64).await;
+    let placed = meta
+        .place_capture_job(job.id, &[host])
+        .await
+        .expect("place with a fitting host")
+        .expect("row present");
+    assert_eq!(placed.host_id, Some(host), "a fitting host binds the row");
+    assert!(
+        placed.waiting_since.is_none(),
+        "binding clears the wait anchor"
+    );
+
+    // …and it's no longer a waiting row.
+    let listed = meta
+        .list_waiting_capture_jobs()
+        .await
+        .expect("list waiting after place");
+    assert!(
+        !listed.iter().any(|j| j.id == job.id),
+        "a placed job must drop out of the waiting list",
+    );
 }
 
 /// Drive `job` to a TERMINAL `failed`/`retryable=true` row with the
@@ -355,18 +547,15 @@ async fn fail_retryable(meta: &Arc<dyn MetadataStore>, job: &CaptureJobRow) {
 async fn redrive_revives_a_retryable_terminal_row_under_budget() {
     let Some(meta) = connect().await else { return };
     let enable_job_id = seed_enable_job(&meta, "redrive").await;
-    let host_a = HostId::new();
-    let host_b = HostId::new();
-    let job = meta
-        .insert_capture_job(new_capture_job(enable_job_id, host_a))
-        .await
-        .expect("insert");
+    let host_a = seed_host(&meta, 65_536, 64).await;
+    let host_b = seed_host(&meta, 65_536, 64).await;
+    let job = insert_placed(&meta, enable_job_id, host_a).await;
     fail_retryable(&meta, &job).await;
 
     // The bug being fixed: `reassign_capture_job` is fenced off a terminal
     // row and matches nothing (the silent no-op that used to loop forever).
     let reassigned = meta
-        .reassign_capture_job(job.id, job.epoch, host_b)
+        .reassign_capture_job(job.id, job.epoch, &[host_b])
         .await
         .expect("reassign call");
     assert!(
@@ -374,15 +563,16 @@ async fn redrive_revives_a_retryable_terminal_row_under_budget() {
         "reassign_capture_job must NOT touch a terminal failed row (this is the no-op the fix routes around)"
     );
 
-    // The fix: `redrive_failed_capture_job` under budget revives the row.
+    // The fix: `redrive_failed_capture_job` under budget revives the row,
+    // re-running the reserving 2D fit for the new host (ADR 0084 (c)).
     let redriven = meta
-        .redrive_failed_capture_job(job.id, job.epoch, host_b, 5)
+        .redrive_failed_capture_job(job.id, job.epoch, &[host_b], 5)
         .await
         .expect("redrive call")
         .expect("redrive lands under budget");
     assert_eq!(redriven.epoch, job.epoch + 1, "epoch must bump");
     assert_eq!(redriven.attempts, job.attempts + 1, "attempts must bump");
-    assert_eq!(redriven.host_id, host_b, "new host must be stamped");
+    assert_eq!(redriven.host_id, Some(host_b), "new host must be stamped");
     assert_eq!(redriven.stage, CaptureJobStage::Assigned, "stage resets");
     assert!(redriven.stage_progress.is_none());
     assert!(
@@ -397,14 +587,14 @@ async fn redrive_revives_a_retryable_terminal_row_under_budget() {
     // The row is now `assigned` at a NEW epoch — a re-drive against the
     // OLD epoch, and any re-drive of a now-non-`failed` row, must miss.
     assert!(
-        meta.redrive_failed_capture_job(job.id, job.epoch, host_a, 5)
+        meta.redrive_failed_capture_job(job.id, job.epoch, &[host_a], 5)
             .await
             .expect("stale-epoch redrive call")
             .is_none(),
         "a stale-epoch redrive must not land",
     );
     assert!(
-        meta.redrive_failed_capture_job(job.id, redriven.epoch, host_a, 5)
+        meta.redrive_failed_capture_job(job.id, redriven.epoch, &[host_a], 5)
             .await
             .expect("non-failed redrive call")
             .is_none(),
@@ -421,19 +611,16 @@ async fn redrive_revives_a_retryable_terminal_row_under_budget() {
 async fn redrive_refused_when_attempts_at_budget() {
     let Some(meta) = connect().await else { return };
     let enable_job_id = seed_enable_job(&meta, "redrive-budget").await;
-    let host_a = HostId::new();
-    let host_b = HostId::new();
-    let job = meta
-        .insert_capture_job(new_capture_job(enable_job_id, host_a))
-        .await
-        .expect("insert");
+    let host_a = seed_host(&meta, 65_536, 64).await;
+    let job = insert_placed(&meta, enable_job_id, host_a).await;
     // A fresh row is at attempts = 1. Fail it retryable, then re-drive
     // with a budget of exactly 1: `attempts < 1` is false, so the fence
-    // matches nothing.
+    // matches nothing (candidates are irrelevant — the budget fence fails
+    // before any placement is attempted).
     fail_retryable(&meta, &job).await;
     assert_eq!(job.attempts, 1);
     let refused = meta
-        .redrive_failed_capture_job(job.id, job.epoch, host_b, 1)
+        .redrive_failed_capture_job(job.id, job.epoch, &[], 1)
         .await
         .expect("at-budget redrive call");
     assert!(
@@ -453,18 +640,14 @@ async fn redrive_refused_when_attempts_at_budget() {
 #[ignore]
 async fn expire_capture_job_stages_picks_up_only_over_budget_rows() {
     let Some(meta) = connect().await else { return };
-    let host = HostId::new();
+    // ADR 0084 (c): `expire_capture_job_stages` is DISPATCHED-only
+    // (host_id NOT NULL), so both jobs must be placed on a real host.
+    let host = seed_host(&meta, 65_536, 64).await;
     let enable_job_assigned = seed_enable_job(&meta, "expire-assigned").await;
     let enable_job_booting = seed_enable_job(&meta, "expire-booting").await;
 
-    let assigned_job = meta
-        .insert_capture_job(new_capture_job(enable_job_assigned, host))
-        .await
-        .expect("insert assigned");
-    let booting_job = meta
-        .insert_capture_job(new_capture_job(enable_job_booting, host))
-        .await
-        .expect("insert booting");
+    let assigned_job = insert_placed(&meta, enable_job_assigned, host).await;
+    let booting_job = insert_placed(&meta, enable_job_booting, host).await;
     // Move the second job to `booting` so it's a DIFFERENT stage than
     // the first (which stays `assigned`).
     let advance = CaptureJobReport {
@@ -511,25 +694,16 @@ async fn expire_capture_job_stages_picks_up_only_over_budget_rows() {
 #[ignore]
 async fn capture_assignments_for_host_lists_only_active_rows_for_that_host() {
     let Some(meta) = connect().await else { return };
-    let host = HostId::new();
-    let other_host = HostId::new();
+    let host = seed_host(&meta, 65_536, 64).await;
+    let other_host = seed_host(&meta, 65_536, 64).await;
 
     let enable_job_active = seed_enable_job(&meta, "assignments-active").await;
     let enable_job_done = seed_enable_job(&meta, "assignments-done").await;
     let enable_job_other = seed_enable_job(&meta, "assignments-other-host").await;
 
-    let active = meta
-        .insert_capture_job(new_capture_job(enable_job_active, host))
-        .await
-        .expect("insert active");
-    let done = meta
-        .insert_capture_job(new_capture_job(enable_job_done, host))
-        .await
-        .expect("insert done");
-    let other = meta
-        .insert_capture_job(new_capture_job(enable_job_other, other_host))
-        .await
-        .expect("insert other-host");
+    let active = insert_placed(&meta, enable_job_active, host).await;
+    let done = insert_placed(&meta, enable_job_done, host).await;
+    let other = insert_placed(&meta, enable_job_other, other_host).await;
 
     let done_report = CaptureJobReport {
         job_id: done.id,
@@ -570,19 +744,14 @@ async fn capture_assignments_for_host_lists_only_active_rows_for_that_host() {
 #[ignore]
 async fn hosts_with_live_capture_jobs_reports_active_hosts_only() {
     let Some(meta) = connect().await else { return };
-    let live_host = HostId::new();
-    let done_host = HostId::new();
+    let live_host = seed_host(&meta, 65_536, 64).await;
+    let done_host = seed_host(&meta, 65_536, 64).await;
 
     let enable_job_live = seed_enable_job(&meta, "live-host").await;
     let enable_job_done = seed_enable_job(&meta, "done-host").await;
 
-    meta.insert_capture_job(new_capture_job(enable_job_live, live_host))
-        .await
-        .expect("insert live");
-    let done_job = meta
-        .insert_capture_job(new_capture_job(enable_job_done, done_host))
-        .await
-        .expect("insert done");
+    insert_placed(&meta, enable_job_live, live_host).await;
+    let done_job = insert_placed(&meta, enable_job_done, done_host).await;
     let done_report = CaptureJobReport {
         job_id: done_job.id,
         epoch: done_job.epoch,

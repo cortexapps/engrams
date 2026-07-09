@@ -202,7 +202,7 @@ pub(crate) async fn materialize_image_on_host(
     // flattens + packs + chunks the rootfs — so it carries no capture
     // footprint, RAM reservation, or anti-affinity. `pick_materialize_host`
     // is the ADR 0078 disk-floor-only picker; the CAPTURE stage uses the
-    // reserving `pick_capture_host` instead.
+    // reserving `place_capture_job` path instead.
     let (host_id, host) =
         crate::placement::pick_materialize_host(state.services.meta.as_ref(), &state.host_registry)
             .await
@@ -557,8 +557,9 @@ pub(crate) async fn try_reuse_base_snapshot(
 
 /// ADR 0084 P1b: ensure a `capture_jobs` row exists for this enable job
 /// and return the MOST RECENT one (terminal or not) — the scanner's
-/// entire interaction with capture dispatch. Picks a capture host (the
-/// same `pick_capture_host` the old direct-RPC path used) only when no
+/// entire interaction with capture dispatch. Inserts a WAITING row then
+/// runs the reserving pick (`place_capture_job` over
+/// `capture_candidate_hosts`) only when no
 /// row exists yet for this enable job; an existing row (running,
 /// reassigned, or terminal) is returned as-is — the actual `SandboxSpec`/
 /// env/egress assembly is deferred to the CLAIM endpoint
@@ -787,30 +788,15 @@ pub(crate) async fn ensure_capture_job(
     })?;
     let disk_manifest = disk_manifest_ref.to_string();
     let config = row.effective_config();
-    let footprint = capture_footprint_for(state, disk_manifest_ref, &config).await;
-    let (host_id, _) = crate::placement::pick_capture_host(
-        state.services.meta.as_ref(),
-        &state.host_registry,
-        footprint,
-        // ADR 0084 §B5's fc_snapshot_version pin is threaded in once a
-        // cold-base candidate is looked up (P3) — this call site has no
-        // candidate to pin to yet at job-CREATION time (the claim
-        // handler resolves the candidate fresh per attempt).
-        None,
-    )
-    .await
-    .map_err(|e| {
-        ApiError::Unavailable(format!(
-            "no host is available to capture this image's base snapshot \
-             ({e:?}). Register a host and retry the enable."
-        ))
-    })?;
     tracing::info!(
         image_uri = %row.image_uri,
-        host_id = %host_id,
         %enable_job_id,
         "creating capture job for image enable",
     );
+    // ADR 0084 (c): insert the row WAITING (host_id NULL) with its
+    // placement budgets stamped from the image config — the single source
+    // session placement reserves with, so a capture is exactly as visible
+    // to the fleet as a session of this image.
     let new_job = engram_core::types::capture_job::NewCaptureJob {
         enable_job_id,
         image_uri: row.image_uri.clone(),
@@ -818,9 +804,33 @@ pub(crate) async fn ensure_capture_job(
         disk_manifest,
         image_config: row.image_config.clone(),
         oci_defaults: row.oci_defaults.clone(),
-        host_id,
+        mem_budget_mib: config.resolved_memory_mib() as i64,
+        cpu_budget_vcpus: config.resolved_vcpus() as i32,
     };
-    Ok(state.services.meta.insert_capture_job(new_job).await?)
+    let inserted = state.services.meta.insert_capture_job(new_job).await?;
+    // Immediately attempt the reserving 2D pick so a fresh job dispatches
+    // THIS tick rather than idling a full scan interval. No fit ⇒ the row
+    // stays WAITING and the capacity scan (`capture_job_capacity_scan`)
+    // re-offers it every tick, failing it with `CapacityTimeout` past the
+    // queue deadline. `fc_snapshot_version` pin: `None` at job-creation
+    // time (the claim handler resolves the cold-base candidate fresh per
+    // attempt — ADR 0084 §B5 "known gap").
+    let footprint = capture_footprint_for(state, disk_manifest_ref, &config).await;
+    let candidates =
+        crate::placement::capture_candidate_hosts(state.services.meta.as_ref(), footprint, None)
+            .await
+            .map_err(|e| {
+                ApiError::Internal(format!(
+                    "capture candidate hosts for `{}`: {e:?}",
+                    row.image_uri
+                ))
+            })?;
+    let placed = state
+        .services
+        .meta
+        .place_capture_job(inserted.id, &candidates)
+        .await?;
+    Ok(placed.unwrap_or(inserted))
 }
 
 /// ADR 0084 §D: the [`finalize_capture_job`] outcome — its
@@ -957,7 +967,9 @@ pub(crate) async fn finalize_capture_job(
         .record_snapshot(SnapshotRecord {
             id: meta.id,
             session_id: None,
-            host_id: Some(capture_row.host_id),
+            // A `done` capture was necessarily dispatched, so `host_id` is
+            // `Some`; `SnapshotRecord.host_id` is itself `Option`.
+            host_id: capture_row.host_id,
             image_version: meta.image_version.clone(),
             size_bytes: meta.size_bytes,
             created_at: meta.created_at,

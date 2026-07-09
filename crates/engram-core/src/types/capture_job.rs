@@ -161,7 +161,25 @@ pub struct CaptureJobRow {
     /// time and never persisted to this row).
     pub image_config: ImageConfig,
     pub oci_defaults: OciRuntimeDefaults,
-    pub host_id: HostId,
+    /// The reserved capture host — `None` while WAITING for capacity (no
+    /// host fit yet). A `None` host_id is not dispatchable (heartbeat
+    /// dispatch keys on host_id) and counts as queued demand; the scanner
+    /// re-attempts the reserving pick every tick until it places or the
+    /// queue timeout expires (ADR 0084 (c) reservation re-attach).
+    pub host_id: Option<HostId>,
+    /// Placement reservation (ADR 0081 → ADR 0084 (c)): the capture VM's
+    /// RAM/CPU budgets, stamped at insert from `ImageConfig::
+    /// resolved_memory_mib` / `resolved_vcpus`. Every reserved-SUM reader
+    /// (session placement, per_host_reserved, fleet_free_mib) sums a
+    /// non-terminal `capture_jobs` row with a bound `host_id` by these;
+    /// release is IMPLICIT — a terminal `stage` drops the row out of the
+    /// SUM (no explicit clear).
+    pub mem_budget_mib: i64,
+    pub cpu_budget_vcpus: i32,
+    /// First moment this job found no fitting host (COALESCE-stamped,
+    /// restart-proof); the DB anchor the coordinator measures the queue
+    /// timeout from. `None` once placed.
+    pub waiting_since: Option<DateTime<Utc>>,
     /// Fencing token; bumped on every reassignment.
     pub epoch: i64,
     pub stage: CaptureJobStage,
@@ -184,8 +202,12 @@ pub struct CaptureJobRow {
 
 /// The write-set for [`crate::traits::MetadataStore::insert_capture_job`]
 /// — everything needed to create a fresh, `assigned`-stage row. The id,
-/// epoch (starts at 1), stage, and timestamps are struck by the store;
-/// callers only supply what the job captures and where it's placed.
+/// epoch (starts at 1), stage, and timestamps are struck by the store.
+/// A fresh row is inserted WAITING (`host_id NULL`, `waiting_since NOW()`)
+/// with its placement budgets stamped; the reserving pick
+/// (`place_capture_job`) binds a host in a separate atomic step (ADR 0084
+/// (c) — no host is chosen at insert time, so the 2D RAM/CPU fit stays
+/// atomic with the host-row lock).
 #[derive(Clone, Debug)]
 pub struct NewCaptureJob {
     pub enable_job_id: uuid::Uuid,
@@ -194,7 +216,12 @@ pub struct NewCaptureJob {
     pub disk_manifest: String,
     pub image_config: ImageConfig,
     pub oci_defaults: OciRuntimeDefaults,
-    pub host_id: HostId,
+    /// Reservation budgets, derived from `image_config` via
+    /// `ImageConfig::resolved_memory_mib` / `resolved_vcpus` (the single
+    /// source sessions reserve with). Stamped at insert so no zero-budget
+    /// row can ever exist for a real capture.
+    pub mem_budget_mib: i64,
+    pub cpu_budget_vcpus: i32,
 }
 
 /// ADR 0084 P1b: the full dispatch the claim endpoint

@@ -997,9 +997,12 @@ pub async fn claim_capture_job(
         .get_capture_job(job_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("capture job {job_id} not found")))?;
-    if row.host_id != host_id {
+    // ADR 0084 (c): `host_id` is `None` while WAITING for capacity — a
+    // waiting job is never dispatched to any host, so a claim for one is a
+    // stale/forged request. Only a job bound to exactly this host claims.
+    if row.host_id != Some(host_id) {
         return Err(ApiError::BadRequest(format!(
-            "capture job {job_id} is assigned to host {}, not {host_id}",
+            "capture job {job_id} is assigned to host {:?}, not {host_id}",
             row.host_id
         )));
     }
@@ -1500,7 +1503,10 @@ mod tests {
                 disk_manifest: "manifest".into(),
                 image_config: Default::default(),
                 oci_defaults: Default::default(),
-                host_id: HostId::new(),
+                host_id: Some(HostId::new()),
+                mem_budget_mib: 2_048,
+                cpu_budget_vcpus: 2,
+                waiting_since: None,
                 epoch,
                 stage,
                 stage_started_at: now,

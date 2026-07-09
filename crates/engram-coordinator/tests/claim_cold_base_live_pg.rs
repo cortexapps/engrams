@@ -151,17 +151,26 @@ async fn seed_capture_job(
         .await
         .expect("seed enable job")
         .id;
-    meta.insert_capture_job(NewCaptureJob {
-        enable_job_id,
-        image_uri: uri,
-        manifest_digest: "sha256:deadbeef".to_string(),
-        disk_manifest: disk_manifest.to_string(),
-        image_config: test_config(),
-        oci_defaults: Default::default(),
-        host_id,
-    })
-    .await
-    .expect("insert capture job")
+    let job = meta
+        .insert_capture_job(NewCaptureJob {
+            enable_job_id,
+            image_uri: uri,
+            manifest_digest: "sha256:deadbeef".to_string(),
+            disk_manifest: disk_manifest.to_string(),
+            image_config: test_config(),
+            oci_defaults: Default::default(),
+            mem_budget_mib: 2_048,
+            cpu_budget_vcpus: 2,
+        })
+        .await
+        .expect("insert capture job");
+    // ADR 0084 (c): a fresh job inserts WAITING; bind it to `host_id` via
+    // the reserving pick so the claim handler (which checks the job is
+    // assigned to the claiming host) accepts it.
+    meta.place_capture_job(job.id, &[host_id])
+        .await
+        .expect("place capture job")
+        .expect("row present")
 }
 
 async fn claim(
