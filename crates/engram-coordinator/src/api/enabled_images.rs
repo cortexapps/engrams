@@ -198,25 +198,20 @@ pub(crate) async fn materialize_image_on_host(
     image_uri: &str,
     progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
 ) -> Result<engram_core::types::MaterializedImage, ApiError> {
-    // ADR 0084 §C: materialize is what PRODUCES the disk manifest a real
-    // size could be read from — there is no size signal to read yet at
-    // this point (the OCI manifest's compressed layer sizes are a poor
-    // proxy for the flattened+packed ext4 output, so we deliberately
-    // don't guess from them). Floor-only sizing: the ADR 0078 disk floor
-    // + anti-affinity still apply, just no footprint headroom veto.
-    let (host_id, host) = crate::placement::pick_capture_host(
-        state.services.meta.as_ref(),
-        &state.host_registry,
-        crate::placement::CaptureFootprint::floor_only(),
-        None,
-    )
-    .await
-    .map_err(|e| {
-        ApiError::Unavailable(format!(
-            "no host is available to materialize this image ({e:?}). \
-             Register a disk-healthy host and retry the enable."
-        ))
-    })?;
+    // ADR 0084 / ADR 0081: materialize boots no VM — it just pulls +
+    // flattens + packs + chunks the rootfs — so it carries no capture
+    // footprint, RAM reservation, or anti-affinity. `pick_materialize_host`
+    // is the ADR 0078 disk-floor-only picker; the CAPTURE stage uses the
+    // reserving `pick_capture_host` instead.
+    let (host_id, host) =
+        crate::placement::pick_materialize_host(state.services.meta.as_ref(), &state.host_registry)
+            .await
+            .map_err(|e| {
+                ApiError::Unavailable(format!(
+                    "no host is available to materialize this image ({e:?}). \
+                     Register a disk-healthy host and retry the enable."
+                ))
+            })?;
     let registry_auth = resolve_static_registry_auth(state, image_uri).await?;
     let arch = coord_platform_arch();
     tracing::info!(
@@ -583,7 +578,7 @@ pub(crate) async fn capture_footprint_for(
     disk_manifest: engram_core::types::manifest::ManifestRef,
     config: &ImageConfig,
 ) -> crate::placement::CaptureFootprint {
-    let mem_mib = crate::api::sessions::resolved_memory_mib(config) as u64;
+    let mem_mib = config.resolved_memory_mib() as u64;
     match state.services.chunk_store.get_manifest(disk_manifest).await {
         Ok(manifest) => {
             let image_size_mib = (manifest.total_bytes / (1024 * 1024)).max(1);

@@ -10,7 +10,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::{
-    CreateDisposition, DisableEnabledImageOutcome, MetadataStore, SessionCreateWriteSet,
+    CaptureReservation, CreateDisposition, DisableEnabledImageOutcome, MetadataStore,
+    SessionCreateWriteSet,
 };
 use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp};
 use engram_core::types::{
@@ -426,6 +427,125 @@ fn best_fit_measured(
     best.map(|(_, h)| h)
 }
 
+/// ADR 0046/0048/0081: the shared `FOR UPDATE` 2D pick every reserving
+/// placer runs — session create (`reserve_and_persist_create`), the
+/// queue scanner (`place_queued_session`), and capture reservation
+/// (`reserve_capture_host`). Locks the candidate host rows in PK order
+/// so all placers (any replica) serialize on the overlap without
+/// deadlock, builds the fit map from host-measured `allocatable_mib`
+/// (0 = unmeasured → soft) + the vCPU budget, subtracts the reserved
+/// SUM — memory-reserving sessions UNION capturing enable jobs (ADR
+/// 0081: sessions and captures are mutually visible) — and best-fit
+/// chooses via [`choose_placement_host`].
+///
+/// `Ok(None)` = nothing fits (or no candidates); the caller decides
+/// queue-vs-reject and owns the commit/rollback — the lock is held for
+/// the REST of the caller's transaction.
+async fn pick_host_2d(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cand: &[uuid::Uuid],
+    affinity_len: usize,
+    budget_mib: i64,
+    budget_vcpus: i64,
+) -> Result<Option<uuid::Uuid>, MetaError> {
+    if cand.is_empty() {
+        return Ok(None);
+    }
+    let host_rows = sqlx::query(
+        r#"
+        SELECT id, allocatable_mib, total_vcpus
+        FROM hosts
+        WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
+        -- ORDER BY id BEFORE `FOR UPDATE`: every placer (any replica)
+        -- locks the overlapping host rows in the SAME (PK) order, so a
+        -- burst can't lock {A,B} vs {B,A} and deadlock. The LockRows
+        -- executor node sits atop the sort, so rows are locked in id
+        -- order. (Load test: `deadlock detected` under concurrent
+        -- creates before this.)
+        ORDER BY id
+        FOR UPDATE
+        "#,
+    )
+    .bind(cand)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    // ADR 0046/0048: build the 2D fit map. allocatable_mib is the
+    // host-measured RAM headroom (nets out daemon/OS/chunk-cache/mlock
+    // baseline; 0 = unmeasured). The CPU budget is total_vcpus ×
+    // overcommit (0 = host hasn't reported its core count → no CPU gate).
+    let mut fit: std::collections::HashMap<uuid::Uuid, HostFit> =
+        std::collections::HashMap::with_capacity(host_rows.len());
+    for r in &host_rows {
+        let hid: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
+        let alloc_mib: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
+        let total_vcpus: i32 = sqlx::Row::try_get(r, "total_vcpus").map_err(db_err)?;
+        fit.insert(
+            hid,
+            HostFit {
+                alloc_mib,
+                reserved_mib: 0,
+                cpu_budget: engram_core::types::host::host_cpu_budget(total_vcpus.max(0) as u32),
+                reserved_vcpus: 0,
+            },
+        );
+    }
+    // Reserved within the txn — sees the committed reservations of
+    // placers that locked these hosts before us. The sessions branch is
+    // the SQL twin of `SessionState::host_memory_reserving_states()`;
+    // the enable_jobs branch is ADR 0081's capture-VM reservation.
+    let res_rows = sqlx::query(
+        r#"
+        SELECT host_id,
+               COALESCE(SUM(mem), 0)::BIGINT AS reserved_mib,
+               COALESCE(SUM(cpu), 0)::BIGINT AS reserved_vcpus
+        FROM (
+            SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
+            FROM sessions
+            WHERE host_id = ANY($1)
+              AND status IN ('pending','created','active',
+                             'evacuating','evicting')
+              -- A `pending` row older than 10 min is a crash-orphaned
+              -- reservation (a boot never takes that long); don't let it
+              -- leak into the reserved figure and false-reject the host.
+              -- ADR 0048: gate on last_active_at, not created_at — a
+              -- session can sit `queued` for many minutes before
+              -- `place_queued_session` flips it to `pending` (bumping
+              -- last_active_at), and an old created_at would make that
+              -- fresh reservation look crash-orphaned and leak
+              -- (overcommit). reserve_and_persist_create sets both to NOW().
+              AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
+            UNION ALL
+            SELECT capture_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+            FROM enable_jobs
+            WHERE capture_host_id = ANY($1)
+              AND state NOT IN ('ready','failed')
+        ) reserved
+        GROUP BY host_id
+        "#,
+    )
+    .bind(cand)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    for r in &res_rows {
+        let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
+        let mem: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
+        let cpu: i64 = sqlx::Row::try_get(r, "reserved_vcpus").map_err(db_err)?;
+        if let Some(f) = fit.get_mut(&h) {
+            f.reserved_mib = mem;
+            f.reserved_vcpus = cpu;
+        }
+    }
+    Ok(choose_placement_host(
+        cand,
+        affinity_len,
+        &fit,
+        budget_mib,
+        budget_vcpus,
+    ))
+}
+
 // Kept beside `choose_placement_host` (the fn it exercises) rather than at the
 // file end — the `MetadataStore` impl follows.
 #[allow(clippy::items_after_test_module)]
@@ -819,112 +939,26 @@ impl MetadataStore for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
 
         // -------- pick a host (ADR 0046/0048 best-fit 2D), if any candidate --------
-        // Issue #535 (b): this is `reserve_placement`'s FOR-UPDATE pick, kept
-        // verbatim — extended below so the SAME transaction also writes the
-        // satellites instead of stopping at the bare row insert.
+        // Issue #535 (b): `pick_host_2d` is `reserve_placement`'s FOR-UPDATE
+        // pick (now shared with `place_queued_session` and ADR 0081's
+        // `reserve_capture_host`) — extended below so the SAME transaction
+        // also writes the satellites instead of stopping at the bare row
+        // insert. The candidate host-row locks are held for the REST of the
+        // transaction, not just the pick + insert — `tx.commit()` is at the
+        // bottom of this function, after the sealed-secrets insert, the
+        // per-capability insert loop, and the integration-policy upsert all
+        // run on the same `tx`. A many-capability create serializes
+        // concurrent placers on that whole multi-round-trip critical
+        // section, not a sub-ms window.
         let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
-        let picked: Option<uuid::Uuid> = if cand.is_empty() {
-            None
-        } else {
-            // Lock the candidate host rows so concurrent placers (any coord
-            // replica) serialize on the overlap — a burst can't read the same
-            // pre-insert reserved figure and stack onto one host. Issue #535
-            // (b): unlike the old `reserve_placement`, this lock is now held
-            // for the REST of the transaction, not just the pick + insert —
-            // `tx.commit()` is at the bottom of this function, after the
-            // sealed-secrets insert, the per-capability insert loop, and the
-            // integration-policy upsert all run on the same `tx`. A
-            // many-capability create serializes concurrent placers on that
-            // whole multi-round-trip critical section, not a sub-ms window.
-            let host_rows = sqlx::query(
-                r#"
-                SELECT id, allocatable_mib, total_vcpus
-                FROM hosts
-                WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
-                -- ORDER BY id BEFORE `FOR UPDATE`: every placer (any replica,
-                -- both this and `place_queued_session`) locks the overlapping
-                -- host rows in the SAME (PK) order, so a burst can't lock
-                -- {A,B} vs {B,A} and deadlock. The LockRows executor node sits
-                -- atop the sort, so rows are locked in id order. (Load test:
-                -- `deadlock detected` under concurrent creates before this.)
-                ORDER BY id
-                FOR UPDATE
-                "#,
-            )
-            .bind(&cand)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            // ADR 0046/0048: build the 2D fit map. allocatable_mib is the
-            // host-measured RAM headroom (nets out daemon/OS/chunk-cache/mlock
-            // baseline; 0 = unmeasured). The CPU budget is total_vcpus ×
-            // overcommit (0 = host hasn't reported its core count → no CPU gate).
-            let mut fit: std::collections::HashMap<uuid::Uuid, HostFit> =
-                std::collections::HashMap::with_capacity(host_rows.len());
-            for r in &host_rows {
-                let id: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
-                let alloc_mib: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
-                let total_vcpus: i32 = sqlx::Row::try_get(r, "total_vcpus").map_err(db_err)?;
-                fit.insert(
-                    id,
-                    HostFit {
-                        alloc_mib,
-                        reserved_mib: 0,
-                        cpu_budget: engram_core::types::host::host_cpu_budget(
-                            total_vcpus.max(0) as u32
-                        ),
-                        reserved_vcpus: 0,
-                    },
-                );
-            }
-            // Reserved within the txn — sees the committed `pending` rows of
-            // placers that locked these hosts before us. Status list is the
-            // SQL twin of `SessionState::host_memory_reserving_states()`.
-            let res_rows = sqlx::query(
-                r#"
-                SELECT host_id,
-                       COALESCE(SUM(mem_budget_mib), 0)::BIGINT AS reserved_mib,
-                       COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT AS reserved_vcpus
-                FROM sessions
-                WHERE host_id = ANY($1)
-                  AND status IN ('pending','created','active',
-                                 'evacuating','evicting')
-                  -- A `pending` row older than 10 min is a crash-orphaned
-                  -- reservation (a boot never takes that long); don't let it
-                  -- leak into the reserved figure and false-reject the host.
-                  -- ADR 0048: gate on last_active_at, not created_at — a
-                  -- session can sit `queued` for many minutes before
-                  -- `place_queued_session` flips it to `pending` (bumping
-                  -- last_active_at), and an old created_at would make that
-                  -- fresh reservation look crash-orphaned and leak
-                  -- (overcommit). This call sets both to NOW().
-                  AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
-                GROUP BY host_id
-                "#,
-            )
-            .bind(&cand)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            for r in &res_rows {
-                let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
-                let mem: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
-                let cpu: i64 = sqlx::Row::try_get(r, "reserved_vcpus").map_err(db_err)?;
-                if let Some(f) = fit.get_mut(&h) {
-                    f.reserved_mib = mem;
-                    f.reserved_vcpus = cpu;
-                }
-            }
-            // Best-fit, 2D, affinity-prefix-first among the ranked candidates
-            // — see `choose_placement_host` (unit-tested).
-            choose_placement_host(
-                &cand,
-                affinity_len,
-                &fit,
-                ws.mem_budget_mib,
-                ws.cpu_budget_vcpus as i64,
-            )
-        };
+        let picked: Option<uuid::Uuid> = pick_host_2d(
+            &mut tx,
+            &cand,
+            affinity_len,
+            ws.mem_budget_mib,
+            ws.cpu_budget_vcpus as i64,
+        )
+        .await?;
 
         let now = Utc::now();
         let disposition = match picked {
@@ -1415,75 +1449,17 @@ impl MetadataStore for PostgresStore {
         }
         let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        // Same FOR UPDATE serialization + 2D fit as `reserve_placement`.
-        let host_rows = sqlx::query(
-            r#"
-            SELECT id, allocatable_mib, total_vcpus
-            FROM hosts
-            WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
-            -- ORDER BY id BEFORE `FOR UPDATE`: every placer (any replica, both
-            -- this and `place_queued_session`) locks the overlapping host rows
-            -- in the SAME (PK) order, so a burst can't lock {A,B} vs {B,A} and
-            -- deadlock. The LockRows executor node sits atop the sort, so rows
-            -- are locked in id order. (Load test: `deadlock detected` under
-            -- concurrent creates before this.)
-            ORDER BY id
-            FOR UPDATE
-            "#,
-        )
-        .bind(&cand)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        let mut fit: std::collections::HashMap<uuid::Uuid, HostFit> =
-            std::collections::HashMap::with_capacity(host_rows.len());
-        for r in &host_rows {
-            let hid: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
-            let alloc_mib: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
-            let total_vcpus: i32 = sqlx::Row::try_get(r, "total_vcpus").map_err(db_err)?;
-            fit.insert(
-                hid,
-                HostFit {
-                    alloc_mib,
-                    reserved_mib: 0,
-                    cpu_budget: engram_core::types::host::host_cpu_budget(total_vcpus.max(0) as u32),
-                    reserved_vcpus: 0,
-                },
-            );
-        }
-        let res_rows = sqlx::query(
-            r#"
-            SELECT host_id,
-                   COALESCE(SUM(mem_budget_mib), 0)::BIGINT AS reserved_mib,
-                   COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT AS reserved_vcpus
-            FROM sessions
-            WHERE host_id = ANY($1)
-              AND status IN ('pending','created','active',
-                             'evacuating','evicting')
-              AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
-            GROUP BY host_id
-            "#,
-        )
-        .bind(&cand)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        for r in &res_rows {
-            let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
-            let mem: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
-            let cpu: i64 = sqlx::Row::try_get(r, "reserved_vcpus").map_err(db_err)?;
-            if let Some(f) = fit.get_mut(&h) {
-                f.reserved_mib = mem;
-                f.reserved_vcpus = cpu;
-            }
-        }
-        let Some(picked) = choose_placement_host(
+        // Same FOR UPDATE serialization + 2D fit as every reserving placer
+        // (shared `pick_host_2d`, ADR 0046/0048/0081).
+        let Some(picked) = pick_host_2d(
+            &mut tx,
             &cand,
             affinity_len,
-            &fit,
             mem_budget_mib,
             cpu_budget_vcpus as i64,
-        ) else {
+        )
+        .await?
+        else {
             tx.rollback().await.map_err(db_err)?;
             return Ok(None);
         };
@@ -1515,12 +1491,26 @@ impl MetadataStore for PostgresStore {
     // retry, and the op reclaim sweep owns coord-died-mid-boot recovery.
 
     async fn queued_demand(&self) -> Result<engram_core::types::session::QueuedDemand, MetaError> {
+        // ADR 0081: waiting captures (`capture_waiting_since` set, no
+        // host reserved) fold into the queued-session demand — the K4
+        // autoscaler scales up for a capture exactly as for a session,
+        // and its scale-down hard gate (`queued_sessions == 0`) holds
+        // the fleet while one waits.
         let row: (i64, i64, i64) = sqlx::query_as(
             r#"
             SELECT COUNT(*)::BIGINT,
-                   COALESCE(SUM(mem_budget_mib), 0)::BIGINT,
-                   COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT
-            FROM sessions WHERE status = 'queued'
+                   COALESCE(SUM(mem), 0)::BIGINT,
+                   COALESCE(SUM(cpu), 0)::BIGINT
+            FROM (
+                SELECT mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
+                FROM sessions WHERE status = 'queued'
+                UNION ALL
+                SELECT mem_budget_mib, cpu_budget_vcpus::BIGINT
+                FROM enable_jobs
+                WHERE capture_waiting_since IS NOT NULL
+                  AND capture_host_id IS NULL
+                  AND state NOT IN ('ready','failed')
+            ) demand
             "#,
         )
         .fetch_one(&self.pool)
@@ -1539,24 +1529,33 @@ impl MetadataStore for PostgresStore {
         std::collections::HashMap<HostId, engram_core::types::host::ReservedBudget>,
         MetaError,
     > {
-        // Same predicate as `reserve_placement` / `fleet_free_mib` — the
+        // Same predicate as `pick_host_2d` / `fleet_free_mib` — the
         // memory-reserving states, with crash-orphaned `pending` rows
-        // excluded — but summing BOTH budget dimensions (ADR 0048).
+        // excluded, UNION the capturing enable jobs (ADR 0081) — summing
+        // BOTH budget dimensions (ADR 0048).
         let rows: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(
             r#"
             SELECT host_id,
-                   COALESCE(SUM(mem_budget_mib), 0)::BIGINT,
-                   COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT
-            FROM sessions
-            WHERE host_id IS NOT NULL
-              AND status IN ('pending','created','active',
-                             'evacuating','evicting')
-              -- ADR 0048: gate on last_active_at, not created_at — a session
-              -- can sit `queued` for many minutes before `place_queued_session`
-              -- flips it to `pending` (bumping last_active_at), and an old
-              -- created_at would make that fresh reservation look crash-orphaned
-              -- and leak (overcommit). reserve_placement sets both to NOW().
-              AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
+                   COALESCE(SUM(mem), 0)::BIGINT,
+                   COALESCE(SUM(cpu), 0)::BIGINT
+            FROM (
+                SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
+                FROM sessions
+                WHERE host_id IS NOT NULL
+                  AND status IN ('pending','created','active',
+                                 'evacuating','evicting')
+                  -- ADR 0048: gate on last_active_at, not created_at — a session
+                  -- can sit `queued` for many minutes before `place_queued_session`
+                  -- flips it to `pending` (bumping last_active_at), and an old
+                  -- created_at would make that fresh reservation look crash-orphaned
+                  -- and leak (overcommit). reserve_and_persist_create sets both to NOW().
+                  AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
+                UNION ALL
+                SELECT capture_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+                FROM enable_jobs
+                WHERE capture_host_id IS NOT NULL
+                  AND state NOT IN ('ready','failed')
+            ) reserved
             GROUP BY host_id
             "#,
         )
@@ -1620,17 +1619,26 @@ impl MetadataStore for PostgresStore {
             SELECT COALESCE(SUM(GREATEST(0, h.allocatable_mib - COALESCE(r.reserved, 0))), 0)::BIGINT
             FROM hosts h
             LEFT JOIN (
-                SELECT host_id, SUM(mem_budget_mib) AS reserved
-                FROM sessions
-                WHERE host_id IS NOT NULL
-                  AND status IN ('pending','created','active',
-                                 'evacuating','evicting')
-                  -- ADR 0048: gate on last_active_at, not created_at — a session
-              -- can sit `queued` for many minutes before `place_queued_session`
-              -- flips it to `pending` (bumping last_active_at), and an old
-              -- created_at would make that fresh reservation look crash-orphaned
-              -- and leak (overcommit). reserve_placement sets both to NOW().
-              AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
+                SELECT host_id, SUM(mem) AS reserved
+                FROM (
+                    SELECT host_id, mem_budget_mib AS mem
+                    FROM sessions
+                    WHERE host_id IS NOT NULL
+                      AND status IN ('pending','created','active',
+                                     'evacuating','evicting')
+                      -- ADR 0048: gate on last_active_at, not created_at — a session
+                      -- can sit `queued` for many minutes before `place_queued_session`
+                      -- flips it to `pending` (bumping last_active_at), and an old
+                      -- created_at would make that fresh reservation look crash-orphaned
+                      -- and leak (overcommit). reserve_and_persist_create sets both to NOW().
+                      AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
+                    UNION ALL
+                    -- ADR 0081: a capturing enable job's VM reserves like a session.
+                    SELECT capture_host_id, mem_budget_mib
+                    FROM enable_jobs
+                    WHERE capture_host_id IS NOT NULL
+                      AND state NOT IN ('ready','failed')
+                ) reserved
                 GROUP BY host_id
             ) r ON r.host_id = h.id
             WHERE h.status IN ('ready','draining') AND NOT h.cordoned
@@ -1852,13 +1860,18 @@ impl MetadataStore for PostgresStore {
         use engram_core::types::session::DeleteHostOutcome;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         // Refuse while any session is still bound — deleting the row out
-        // from under a live session would orphan its routing.
+        // from under a live session would orphan its routing. ADR 0081:
+        // an in-flight base-snapshot capture binds the host the same way
+        // (its VM is running there); count it in the same guard.
         let bound: i64 = sqlx::query_scalar(
             r#"
-            SELECT COUNT(*)::BIGINT FROM sessions
-            WHERE host_id = $1
-              AND status IN ('pending','created','active',
-                             'evacuating','evicting')
+            SELECT (SELECT COUNT(*) FROM sessions
+                     WHERE host_id = $1
+                       AND status IN ('pending','created','active',
+                                      'evacuating','evicting'))::BIGINT
+                 + (SELECT COUNT(*) FROM enable_jobs
+                     WHERE capture_host_id = $1
+                       AND state NOT IN ('ready','failed'))::BIGINT
             "#,
         )
         .bind(id.as_uuid())
@@ -4247,17 +4260,23 @@ impl MetadataStore for PostgresStore {
         // stored) and stamps it onto the enabled_images row at ready.
         let inserted = sqlx::query(
             r#"
-            INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config,
+                                     mem_budget_mib, cpu_budget_vcpus)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
             DO NOTHING
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
             "#,
         )
         .bind(Uuid::new_v4())
         .bind(image_uri)
         .bind(manifest_digest)
         .bind(sqlx::types::Json(image_config))
+        // ADR 0081: the capture VM's placement budgets — the same
+        // derivation session placement reserves with, so a capture is
+        // exactly as visible as a session of this image.
+        .bind(image_config.resolved_memory_mib() as i64)
+        .bind(image_config.resolved_vcpus() as i32)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4266,7 +4285,7 @@ impl MetadataStore for PostgresStore {
         }
         let existing = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
               FROM enable_jobs
              WHERE image_uri = $1 AND state NOT IN ('ready', 'failed')
             "#,
@@ -4286,7 +4305,7 @@ impl MetadataStore for PostgresStore {
                     VALUES ($1, $2, $3, $4)
                     ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
                     DO NOTHING
-                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
                     "#,
                 )
                 .bind(Uuid::new_v4())
@@ -4308,7 +4327,7 @@ impl MetadataStore for PostgresStore {
 
     async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
         let row = sqlx::query(
-            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
+            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -4320,7 +4339,7 @@ impl MetadataStore for PostgresStore {
     async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
               FROM enable_jobs
              ORDER BY created_at DESC
              LIMIT $1
@@ -4343,10 +4362,27 @@ impl MetadataStore for PostgresStore {
         // jobs whose lease is free or expired. The inner SELECT ...
         // FOR UPDATE SKIP LOCKED keeps two pods' simultaneous sweeps
         // from blocking on each other — each claims a disjoint set.
+        //
+        // ADR 0081 (fix): clear `capture_host_id` on (re-)claim. If a pod
+        // reserved a host then crashed/lost its lease, the stale
+        // `capture_host_id` is a phantom reservation of the job's OWN
+        // budget. When the re-claiming pod re-runs `reserve_capture_host`,
+        // `pick_host_2d`'s reserved-SUM has no self-exclusion, so on a
+        // tight fleet the job counts its own phantom against the only
+        // viable host and can NEVER fit itself → 30-min `CapacityTimeout`
+        // (non-retryable), while `queued_demand` excludes it
+        // (`capture_host_id IS NOT NULL`) so the autoscaler won't help.
+        // Clearing it here makes the re-run re-reserve from scratch.
+        // `capture_waiting_since` is deliberately NOT cleared: it's the
+        // first-miss wait anchor and must survive re-claim (it's cleared
+        // only by `reserve_capture_host`'s fit branch,
+        // `clear_capture_reservation`, `record_enable_job_failure`, and
+        // `retry_enable_job`).
         let rows = sqlx::query(
             r#"
             UPDATE enable_jobs
-               SET claimed_by = $1, claimed_at = NOW(), updated_at = NOW()
+               SET claimed_by = $1, claimed_at = NOW(), updated_at = NOW(),
+                   capture_host_id = NULL
              WHERE id IN (
                    SELECT id FROM enable_jobs
                     WHERE state NOT IN ('ready', 'failed')
@@ -4355,7 +4391,7 @@ impl MetadataStore for PostgresStore {
                     LIMIT $3
                       FOR UPDATE SKIP LOCKED
              )
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
             "#,
         )
         .bind(claimant)
@@ -4509,6 +4545,11 @@ impl MetadataStore for PostgresStore {
                            END,
                    claimed_by = NULL,
                    claimed_at = NULL,
+                   -- ADR 0081: this write releases the claim, so a separate
+                   -- fenced `clear_capture_reservation` afterwards would
+                   -- fence-miss — release the capture reservation here too.
+                   capture_host_id = NULL,
+                   capture_waiting_since = NULL,
                    updated_at = NOW()
              WHERE id = $1 AND claimed_by = $2
             RETURNING attempts, state
@@ -4531,6 +4572,129 @@ impl MetadataStore for PostgresStore {
         }
     }
 
+    async fn reserve_capture_host(
+        &self,
+        id: Uuid,
+        claimant: &str,
+        candidates: &[HostId],
+        mem_budget_mib: i64,
+        cpu_budget_vcpus: i64,
+    ) -> Result<CaptureReservation, MetaError> {
+        let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // The SAME FOR UPDATE 2D pick as session placement (ADR 0081) —
+        // candidate host rows stay locked until the commit below, so the
+        // reservation write is atomic with the pick and concurrent
+        // placers (sessions and captures alike) serialize. No affinity
+        // tier: a capture has no snapshot locality to prefer.
+        let picked = pick_host_2d(&mut tx, &cand, 0, mem_budget_mib, cpu_budget_vcpus).await?;
+        // ADR 0081 (fix): persist the RESOLVED budgets in BOTH branches.
+        // A pre-0095 row carries `0` budgets and the caller resolves them
+        // from the image config — but a resolution that never lands in the
+        // row is invisible to every OTHER placer's reserved-SUM
+        // (`pick_host_2d`, `per_host_reserved`, `fleet_free_mib`) and to
+        // `queued_demand`. Stamping the budget here (fenced by claimant,
+        // atomic with the pick) closes that hole once: a fit stamps a real
+        // reservation, a miss stamps real queued demand.
+        let cpu_budget_vcpus_i32 = cpu_budget_vcpus as i32;
+        let reservation = match picked {
+            // Fit → stamp the reservation (visible to every reserved-SUM
+            // reader from commit) and stop the wait clock (a job that
+            // waited then fit must stop counting as waiting demand).
+            Some(host) => {
+                let n = sqlx::query(
+                    r#"
+                    UPDATE enable_jobs
+                       SET capture_host_id = $3,
+                           capture_waiting_since = NULL,
+                           mem_budget_mib = $4,
+                           cpu_budget_vcpus = $5,
+                           claimed_at = NOW(),
+                           updated_at = NOW()
+                     WHERE id = $1 AND claimed_by = $2
+                    "#,
+                )
+                .bind(id)
+                .bind(claimant)
+                .bind(host)
+                .bind(mem_budget_mib)
+                .bind(cpu_budget_vcpus_i32)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+                if n == 0 {
+                    tx.rollback().await.map_err(db_err)?;
+                    return Err(self.enable_job_fence_miss(id, claimant).await);
+                }
+                CaptureReservation::Reserved(HostId(host))
+            }
+            // No fit → the job is waiting for capacity: start the wait
+            // clock iff this is the first miss (COALESCE keeps the
+            // original mark across re-tries so the queue timeout is
+            // measured from the FIRST miss), and count as queued demand
+            // (`queued_demand`) so the autoscaler grows the pool. RETURN
+            // the (post-COALESCE, non-NULL) mark: it's the DB anchor the
+            // scanner's wait deadline measures from — a wall-clock deadline
+            // resets on every pod restart / re-claim and the 30-min
+            // backstop would never fire under coordinator churn.
+            None => {
+                let row: Option<(DateTime<Utc>,)> = sqlx::query_as(
+                    r#"
+                    UPDATE enable_jobs
+                       SET capture_waiting_since = COALESCE(capture_waiting_since, NOW()),
+                           mem_budget_mib = $3,
+                           cpu_budget_vcpus = $4,
+                           claimed_at = NOW(),
+                           updated_at = NOW()
+                     WHERE id = $1 AND claimed_by = $2
+                    RETURNING capture_waiting_since
+                    "#,
+                )
+                .bind(id)
+                .bind(claimant)
+                .bind(mem_budget_mib)
+                .bind(cpu_budget_vcpus_i32)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                match row {
+                    Some((since,)) => CaptureReservation::Waiting { since },
+                    None => {
+                        // Lease moved on — abandon without reserving.
+                        tx.rollback().await.map_err(db_err)?;
+                        return Err(self.enable_job_fence_miss(id, claimant).await);
+                    }
+                }
+            }
+        };
+        tx.commit().await.map_err(db_err)?;
+        Ok(reservation)
+    }
+
+    async fn clear_capture_reservation(&self, id: Uuid, claimant: &str) -> Result<(), MetaError> {
+        let n = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET capture_host_id = NULL,
+                   capture_waiting_since = NULL,
+                   claimed_at = NOW(),
+                   updated_at = NOW()
+             WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(id)
+        .bind(claimant)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n == 0 {
+            return Err(self.enable_job_fence_miss(id, claimant).await);
+        }
+        Ok(())
+    }
+
     async fn retry_enable_job(&self, id: Uuid) -> Result<EnableJob, MetaError> {
         // Issue #539 (migration 0079): also reset the capture-progress
         // columns a prior (failed) capture attempt left behind. Without
@@ -4549,6 +4713,8 @@ impl MetadataStore for PostgresStore {
                    capture_phase = NULL, warm_stage = NULL,
                    warm_stage_started_at = NULL, warm_stages = NULL,
                    output_tail = NULL,
+                   -- ADR 0081: a fresh run re-reserves from scratch.
+                   capture_host_id = NULL, capture_waiting_since = NULL,
                    -- Also reset the chunk-progress counters (same class as
                    -- the warm/capture columns above): the UI renders these
                    -- as live progress too, and the progress checkpoint
@@ -4556,7 +4722,7 @@ impl MetadataStore for PostgresStore {
                    -- read as live until the retry's first chunk event.
                    chunks_done = 0, chunks_total = NULL
              WHERE id = $1 AND state = 'failed'
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
             "#,
         )
         .bind(id)

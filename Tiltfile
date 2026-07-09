@@ -75,6 +75,20 @@ def env_or(key, default):
     return env_file.get(key) or os.environ.get(key) or default
 
 # ----------------------------------------------------------------
+# ADR 0082: Firecracker dev via a dedicated Colima VM.
+#
+# When set, the host-agent (+ its FC stack) runs INSIDE the named Colima
+# VM instead of as a Mac-local process — the only way to exercise the
+# FC-only surfaces (NBD, UFFD, netns egress, squashfs patch-drives) on
+# Apple Silicon, where /dev/kvm only exists inside a nested-virt guest.
+# Coordinator/orchestrator/web/compose are untouched either way; only the
+# backend probe and the host-agent resource below change shape. `just
+# dev-fc` sets this; plain `just dev` / `tilt up` never does, so behavior
+# with it unset is byte-for-byte what it was before this ADR.
+# ----------------------------------------------------------------
+fc_colima_profile = env_or('ENGRAM_FC_COLIMA_PROFILE', '')
+
+# ----------------------------------------------------------------
 # Backend + topology — one probe, no arch ladder (ADR 0024).
 #
 # `detect-backend.sh` is the single host-capability source of truth
@@ -91,9 +105,61 @@ def env_or(key, default):
 # ----------------------------------------------------------------
 
 uname_str = str(local('uname -s -m', echo_off=True, quiet=True)).strip()
-sandbox_backend = str(
-    local('bash deploy/dev/detect-backend.sh', echo_off=True, quiet=True)
-).strip()
+
+# ADR 0082: the fc-colima bundles + host-agent build steps run under a real
+# `nix develop` (for mksquashfs + the aarch64 musl cross-toolchain). The loop
+# that a per-build `nix develop` used to feed is handled by the bundles
+# resource's TRIGGER_MODE_MANUAL (see below), not by avoiding nix.
+_nix = '$(command -v nix || echo /nix/var/nix/profiles/default/bin/nix)'
+
+if fc_colima_profile:
+    # The VM's /dev/kvm is invisible to a probe run on the Mac — force the
+    # backend instead of asking detect-backend.sh, and fail fast (at parse
+    # time, before any resource starts) if the VM hasn't been provisioned
+    # or isn't running, rather than let the host-agent die deep into
+    # `tilt up` with a confusing "no such file" for the kernel.
+    _fc_colima_check = str(local(
+        'colima ssh --profile ' + fc_colima_profile +
+        ' -- sh -lc "test -f /opt/engram-dev/Image && ' +
+        'test -x /opt/engram-dev/bin/mke2fs && echo ok || echo missing"',
+        echo_off=True, quiet=True)).strip()
+    if _fc_colima_check != 'ok':
+        fail(
+            ('ENGRAM_FC_COLIMA_PROFILE={p} is set but the Colima VM `{p}` has no ' +
+             'guest kernel at /opt/engram-dev/Image, no mke2fs at ' +
+             '/opt/engram-dev/bin/mke2fs, or the profile is not running. Run ' +
+             '`just fc-colima-provision {p}` first.')
+                .format(p=fc_colima_profile)
+        )
+    # ADR 0082: the docker-compose deps (postgres/registry/fake-gcs/jaeger) MUST
+    # run on the Mac's docker, never inside the fc-dev VM — only the host-agent (a
+    # `colima ssh` PROCESS, not a container) + its FC stack belong there. But
+    # `colima start` persistently repoints the docker CLI at the VM daemon (writes
+    # currentContext=colima-<profile> to ~/.docker/config.json), so a bare
+    # `tilt up` would make docker_compose() deploy the deps INTO the VM — where
+    # the VM's localhost→Mac DNAT (engram-dev-fwd) routes registry/GCS traffic
+    # AWAY from them and the Mac-side coordinator can't see the DB. `just
+    # dev-fc` pins DOCKER_HOST to the Mac docker; this
+    # guard fails fast if that DIDN'T happen (e.g. a direct `tilt up` under the
+    # stolen context) rather than silently misplacing the deps.
+    _docker_host = os.environ.get('DOCKER_HOST', '')
+    if not _docker_host:
+        _docker_host = str(local(
+            'docker context inspect --format "{{.Endpoints.docker.Host}}" 2>/dev/null || true',
+            echo_off=True, quiet=True)).strip()
+    if ('/' + fc_colima_profile + '/docker.sock') in _docker_host:
+        fail(
+            ("docker is pointed at the fc-dev VM daemon ({h}), so the compose " +
+             "deps would deploy INTO the VM instead of the Mac (ADR 0082). Start " +
+             "with `just dev-fc {p}` — it pins DOCKER_HOST to your Mac docker — or " +
+             "run `docker context use colima` before `tilt up`.")
+                .format(h=_docker_host, p=fc_colima_profile)
+        )
+    sandbox_backend = 'firecracker'
+else:
+    sandbox_backend = str(
+        local('bash deploy/dev/detect-backend.sh', echo_off=True, quiet=True)
+    ).strip()
 
 # Split (prod-shape) for the real-virt backends; in-process for `process`.
 dev_split = sandbox_backend != 'process'
@@ -116,13 +182,19 @@ elif sandbox_backend == 'firecracker':
     kernel_pull_hint = '`just pull-kernel` to populate the cache'
 
 if kernel_key:
-    kernel_path = env_or(kernel_key, kernel_default)
-    if not os.path.exists(kernel_path):
-        fail(
-            'kernel artifact not found at {path}. Run {hint}, ' +
-            'or set {key} in .env to a vmlinux path you already have.'
-                .format(path=kernel_path, hint=kernel_pull_hint, key=kernel_key)
-        )
+    if fc_colima_profile:
+        # Lives inside the VM, not on the Mac — the fail-fast check above
+        # already confirmed it's there at exactly this path (the ADR 0082
+        # provisioning contract), so there's nothing to stat locally.
+        kernel_path = '/opt/engram-dev/Image'
+    else:
+        kernel_path = env_or(kernel_key, kernel_default)
+        if not os.path.exists(kernel_path):
+            fail(
+                ('kernel artifact not found at {path}. Run {hint}, ' +
+                 'or set {key} in .env to a vmlinux path you already have.')
+                    .format(path=kernel_path, hint=kernel_pull_hint, key=kernel_key)
+            )
 
 # ----------------------------------------------------------------
 # GCS emulator: reuse an external one if it's already up.
@@ -296,6 +368,17 @@ if 'Darwin' in uname_str:
         '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
     )
 
+if fc_colima_profile:
+    # ADR 0082: the fc-dev VM has a ~19 GiB rootfs, smaller than the
+    # production 20 GiB disk-cache floor. Lower BOTH coordinator-side
+    # floors — placement (or the VM is never disk-eligible for a
+    # session) and the idle detector's — in lockstep with the VM-side
+    # host-agent idle-evict override below. The two are separate env
+    # vars on purpose: prod must be able to tune idle eviction without
+    # silently loosening placement's disk gate.
+    coord_env['ENGRAM_PLACEMENT_DISK_FLOOR_BYTES'] = '3221225472'
+    coord_env['ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES'] = '3221225472'
+
 if bin_dir:
     # CI: run the downloaded release binary, no compile.
     coord_serve_cmd = 'exec ' + bin_dir + '/engram-coordinator'
@@ -359,9 +442,16 @@ local_resource('coordinator',
 # to relocate onto. From the operator's side it's still just `just dev`
 # (or `tilt up`); the env flag adds host-agent-b.
 two_hosts = env_or('ENGRAM_INTEG_TWO_HOSTS', '') in ('1', 'true', 'yes')
+if two_hosts and fc_colima_profile:
+    # ADR 0082 wires exactly one VM-hosted host-agent; a second one would
+    # need its own gRPC/metrics ports forwarded out of the SAME VM plus a
+    # disjoint NBD/sandbox-dir split inside it, neither of which exists
+    # yet. Fail fast instead of silently only starting host-agent.
+    fail('ENGRAM_INTEG_TWO_HOSTS is not supported together with ' +
+         'ENGRAM_FC_COLIMA_PROFILE yet.')
 
 def _discover_nbd():
-    # FC serves the chunked rootfs over /dev/nbdN. The host-agent only
+    # (ADR 0024) FC serves the chunked rootfs over /dev/nbdN. The host-agent only
     # takes the chunked-NBD path (which produces the chunked disk +
     # memory manifests that `POST /api/enabled-images` REQUIRES — it
     # 500s on a base snapshot built via the materialize-to-file
@@ -370,6 +460,19 @@ def _discover_nbd():
     # VZ/macOS don't use NBD.
     if sandbox_backend != 'firecracker':
         return []
+    if fc_colima_profile:
+        # Devices are in the VM. `colima ssh -- ls /dev/nbd*` does NOT work:
+        # colima ssh runs no remote shell, so the glob passes literally,
+        # matches nothing, and ENGRAM_NBD_DEVICES ends up unset — which
+        # silently drops the host-agent onto the materialize-to-file path,
+        # producing base snapshots with no chunked manifest that then fail to
+        # restore ("read fc manifest.json … No such file"). List /dev (a lone
+        # command) and filter for nbdN on the Mac side.
+        listing = str(local(
+            "colima ssh --profile " + fc_colima_profile + " -- ls -1 /dev",
+            echo_off=True, quiet=True)).strip()
+        return ['/dev/' + d.strip() for d in listing.split('\n')
+                if d.strip().startswith('nbd') and d.strip()[3:].isdigit()]
     listing = str(local("ls -1 /dev/nbd* 2>/dev/null || true",
                         echo_off=True, quiet=True)).strip()
     return [d for d in listing.split('\n') if d]
@@ -386,7 +489,7 @@ else:
 if sandbox_backend == 'firecracker':
     print('engram dev: NBD devices discovered = %r (two_hosts=%s)' % (_nbd, two_hosts))
 
-def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress_proxy_port):
+def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress_proxy_port, egress_dns_port):
     env = {
         # `kernel_key` is only non-None for vz/firecracker, both of
         # which force `dev_split`, so this always lands on the
@@ -433,13 +536,23 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         'ENGRAM_BLOB_BACKEND': 'gcs',
         'ENGRAM_GCS_BUCKET': env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test'),
         'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
-        # Egress proxy off in dev — set ENGRAM_EGRESS_PROXY_PORT to
-        # enable. CI sets it (Blacksmith doesn't NAT FC TAP traffic, so
-        # guests route via the proxy); local dev relies on host masquerade.
-        # Per-host port (each host-agent binds its own 0.0.0.0:<port> +
-        # iptables REDIRECTs its VMs there) so a co-located second host
-        # in the two-host stack doesn't collide on the bind.
+        # Egress proxy port. The proxy is MANDATORY (issue #240) — the only
+        # path a guest reaches the network (SNI allow-list + DNS filter);
+        # there's no "off" (0 is a footgun: a dead :443->0 redirect while the
+        # proxy binds a random port). Per-host fixed port (each host-agent
+        # binds 0.0.0.0:<port> + iptables REDIRECTs its VMs there). The fc path
+        # defaults this to 8443 (see _proxy_base below) so claude sessions can
+        # reach api.anthropic.com; a session still needs api.anthropic.com in
+        # its policy network.allow_hosts + ANTHROPIC_API_KEY for the call to
+        # succeed (ADR 0006/0057).
         'ENGRAM_EGRESS_PROXY_PORT': egress_proxy_port,
+        # DNS-filter proxy port. Like the proxy/gRPC/metrics ports, it must be
+        # distinct per host-agent on the SHARED netns of the two-host e2e stack
+        # (host-agent-b gets dns_base+1 below) — else the second host-agent
+        # fails closed on `0.0.0.0:5353 Address already in use` (ADR 0083). The
+        # host-agent wires this same value into the FC iptables `:53 -> dns`
+        # REDIRECT, so the two can't drift.
+        'ENGRAM_EGRESS_DNS_PORT': egress_dns_port,
         'ENGRAM_HOST_METRICS_ADDR': '0.0.0.0:' + metrics_port,
         # ADR 0019: same OTLP target as the coord, so the host-side
         # restore/boot spans land in the same Jaeger trace.
@@ -454,7 +567,46 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
 
     if nbd_csv:
         env['ENGRAM_NBD_DEVICES'] = nbd_csv
-    if 'Darwin' in uname_str:
+
+    if fc_colima_profile:
+        # ADR 0082: this resource's whole execution model moves into the
+        # VM — addresses, PATH, and the build/sync/serve steps below all
+        # target it, not the Mac. Only the two addresses below actually
+        # need to change: Mac->VM (gRPC) and VM->Mac (coordinator) keep
+        # their loopback semantics via Lima's auto-forward + the gateway,
+        # per the ADR's networking section.
+        env['ENGRAM_SANDBOX_WORK_DIR'] = '/opt/engram-dev/var/sandboxes'
+        env['ENGRAM_BUNDLE_DIR'] = '/opt/engram-dev/shared'
+        env['ENGRAM_GRPC_LISTEN_ADDR'] = '0.0.0.0:' + grpc_port
+        env['ENGRAM_COORDINATOR_ENDPOINT'] = 'http://192.168.5.2:8090'
+        env['ENGRAM_FIRECRACKER_BIN'] = '/usr/local/bin/firecracker'
+        # ADR 0080: enable-time materialization runs inside the VM-side
+        # host-agent. Provisioning installs a stable mke2fs contract path
+        # there so sudo/PATH drift cannot drop the ext4 packer.
+        env['ENGRAM_MKE2FS'] = '/opt/engram-dev/bin/mke2fs'
+        # We always cross-compile + sync engram-uffd-handler alongside
+        # engram-host-agent (below), so point at it explicitly rather than
+        # rely on the VM's PATH — ADR 0045's Uffd restore path becomes
+        # exercisable here for the first time (still opt-in via
+        # ENGRAM_FC_RESTORE_MODE=uffd; the dev default stays `file`).
+        env['ENGRAM_FC_UFFD_HANDLER_BIN'] = '/opt/engram-dev/bin/engram-uffd-handler'
+        # The idle-evict disk-pressure floor defaults to 20 GiB — LARGER than
+        # the fc-dev VM's ~19 GiB rootfs, so free disk can never exceed it and
+        # idle eviction would be permanently paused ("disk pressure (free <
+        # floor)"), never reclaiming space on a small dev VM. Drop it to 3 GiB
+        # so eviction actually runs and keeps the VM from filling.
+        env['ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES'] = '3221225472'
+        # No KEK / egress-CA material crosses the VM boundary: the
+        # host-agent never reads ENGRAM_KEK_MASTER_KEY (coordinator/
+        # orchestrator only — grep confirms no reference in
+        # crates/engram-host-agent), and its egress CA `--ca-source`
+        # defaults to `local-disk`, which self-generates a CA under
+        # `<work_dir>/egress-ca` on first boot (see `build_host_egress` in
+        # crates/engram-host-agent/src/main.rs) — nothing to sync there
+        # either. The egress proxy also stays off by default in dev
+        # (ENGRAM_EGRESS_PROXY_PORT unset -> binds :0), same as today.
+        env['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    elif 'Darwin' in uname_str:
         env['PATH'] = '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
         # ADR 0080 §C: the enable-time materializer packs ext4 via mke2fs.
         # Point it at homebrew's keg-only e2fsprogs (>= 1.47.1) explicitly so
@@ -467,35 +619,133 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # still finds firecracker / ip / iptables / mke2fs.
         env['PATH'] = os.environ.get('PATH', '')
 
-    # How to produce + launch the binary:
-    #   • bin_dir set (CI): exec the prebuilt release binary, no compile.
-    #   • else: cargo build, then launch the debug binary.
-    if bin_dir:
-        ha_bin = bin_dir + '/engram-host-agent'
-        build_prefix = ''
+    if fc_colima_profile:
+        # Cross-compile on the Mac (native cargo can't target the VM's
+        # aarch64-linux triple any other way here), then push the two
+        # binaries + the staged bundle dir onto the VM's OWN disk over
+        # `colima ssh` — FC serves bundle files as block-device backings,
+        # which must never be read off the virtiofs mount. There's no
+        # `colima cp`, so tar-over-ssh does both syncs (mirrors how the
+        # `bundles` resource below already stages var/shared on the Mac
+        # side first).
+        target = 'aarch64-unknown-linux-musl'
+        # Tilt's serve process runs with a reduced PATH that (unlike the
+        # parse-time local() context and an interactive shell) does NOT
+        # include Homebrew's bin dir, so a bare `colima` fails with
+        # "command not found". Resolve it to an absolute path once at the
+        # front of the serve_cmd and reference "$_colima" everywhere — the
+        # var propagates across the &&/| stages since they share one shell.
+        colima = '"$_colima"'
+        # Cross-compile under a real `nix develop` shell: cc-rs building ring's
+        # C code needs the exact per-target CC/CFLAGS `nix develop` sets up (a
+        # sourced env snapshot got the wrong musl-gcc and leaked Apple clang
+        # flags like `-arch arm64` into the aarch64 build). host-agent rebuilds
+        # rarely (only on a .rs change or a current.json repoint), so the
+        # per-build flake eval is a non-issue.
+        build_cmd = (
+            _nix + ' develop -c cargo build --release --target ' + target +
+            ' -p engram-host-agent -p engram-uffd-handler'
+        )
+        # NOTE on remote-command quoting: `colima ssh -- <args>` does NOT run
+        # the joined args through a remote shell, so `&&`/`||`/`|` in a single
+        # remote arg are taken literally ("command not found"). Keep each
+        # remote command a single program (no shell operators), or wrap it in
+        # an explicit `bash -c '...'` (see prekill below). The mkdir uses the
+        # OUTER Mac shell's `&&` (fine); the remote `tar xf` is a lone command.
+        # No remote chmod needed — tar preserves the source's +x bit.
+        # Keep macOS tar cruft out of the stream: COPYFILE_DISABLE=1 drops the
+        # ._* AppleDouble companion files, and --no-xattrs drops the
+        # com.apple.* xattrs that macOS bsdtar otherwise embeds as PAX headers
+        # (LIBARCHIVE.xattr.*), which the VM's GNU tar spams "Ignoring unknown
+        # extended header keyword" over on extract. Neither is wanted in-guest.
+        sync_bin_cmd = (
+            colima + ' ssh --profile ' + fc_colima_profile +
+            ' -- mkdir -p /opt/engram-dev/bin /opt/engram-dev/var/sandboxes && ' +
+            'COPYFILE_DISABLE=1 tar --no-xattrs -cf - -C target/' + target + '/release ' +
+            'engram-host-agent engram-uffd-handler | ' +
+            colima + ' ssh --profile ' + fc_colima_profile +
+            ' -- tar xf - -C /opt/engram-dev/bin'
+        )
+        # Sync ONLY current.json + the squashfs it references — NOT all of
+        # var/shared. That dir also accumulates stale generations and (from
+        # VZ `just dev` runs) large .erofs bundles the FC guest can't even
+        # mount; `tar -C var/shared .` copied all of it (~9 GiB of erofs) into
+        # the VM and filled its disk. Derive the file list from current.json's
+        # shas at runtime. (/opt/engram-dev/shared is pre-created by
+        # fc-colima-provision.sh, so the remote side is a lone `tar xf`.)
+        sync_bundle_cmd = (
+            'COPYFILE_DISABLE=1 tar --no-xattrs -cf - -C ' + _bundle_dir +
+            " current.json $(grep -oE '[0-9a-f]{64}' " + _bundle_dir +
+            "/current.json | sed 's/$/.squashfs/') | " +
+            colima + ' ssh --profile ' + fc_colima_profile +
+            ' -- tar xf - -C /opt/engram-dev/shared'
+        )
+        # Restart semantics: verified live that `colima ssh`'s multiplexed
+        # ControlMaster transport does NOT propagate SIGTERM/SIGHUP to the
+        # remote process when Tilt kills this local serve_cmd — killing
+        # the local `colima ssh` wrapper (even as a whole process group)
+        # leaves the remote engram-host-agent running. colima ssh exposes
+        # no `-t`/pty flag to fix this from here, so the pre-kill below is
+        # the actual mechanism, not just a backstop: every (re)start kills
+        # any prior instance before launching a new one. One consequence:
+        # `tilt down` (or Tilt exiting) does NOT stop the remote
+        # host-agent or its live microVMs — they keep running in the VM
+        # until the next `tilt up` / `dev-fc`, or a manual
+        # `colima ssh --profile <p> -- sudo pkill -f engram-host-agent`.
+        # Keep the REMOTE side a lone command (`sudo -n pkill -f <bin>`, no
+        # operators/quotes — `bash -c '...'` quoting doesn't survive colima ssh
+        # reliably) and put the `|| true` on the Mac side, in a subshell so it
+        # only swallows pkill's "no match" exit (not the &&-chained syncs).
+        prekill_cmd = (
+            '( ' + colima + ' ssh --profile ' + fc_colima_profile +
+            ' -- sudo -n pkill -f /opt/engram-dev/bin/engram-host-agent || true )'
+        )
+        env_kv = ' '.join([k + '=' + v for k, v in env.items()])
+        serve_cmd = (
+            # Tilt's serve process has a reduced PATH without Homebrew's bin
+            # dir. `colima` itself shells out to `limactl` (both in
+            # /opt/homebrew/bin), so an absolute `colima` path isn't enough —
+            # put Homebrew on PATH so colima finds lima. Safe for the
+            # `nix develop -c` cross-build below: nix prepends its own toolchain
+            # ahead of this (matches the spike env that built the binaries).
+            'export PATH="/opt/homebrew/bin:$PATH" && ' +
+            '_colima="$(command -v colima || echo /opt/homebrew/bin/colima)" && ' +
+            build_cmd + ' && ' + sync_bin_cmd + ' && ' + sync_bundle_cmd +
+            ' && ' + prekill_cmd + ' && ' +
+            'exec ' + colima + ' ssh --profile ' + fc_colima_profile +
+            ' -- sudo -n env ' + env_kv +
+            ' /opt/engram-dev/bin/engram-host-agent'
+        )
     else:
-        ha_bin = './target/debug/engram-host-agent'
-        build_prefix = 'cargo build -p engram-host-agent && '
+        # How to produce + launch the binary:
+        #   • bin_dir set (CI): exec the prebuilt release binary, no compile.
+        #   • else: cargo build, then launch the debug binary.
+        if bin_dir:
+            ha_bin = bin_dir + '/engram-host-agent'
+            build_prefix = ''
+        else:
+            ha_bin = './target/debug/engram-host-agent'
+            build_prefix = 'cargo build -p engram-host-agent && '
 
-    if needs_codesign:
-        # VZ (macOS): the binary needs the virtualization entitlement;
-        # codesign after build, before exec. No sudo on macOS.
-        serve_cmd = (
-            build_prefix +
-            'bash crates/engram-sandbox-vz/scripts/codesign.sh debug && ' +
-            'exec ' + ha_bin
-        )
-    else:
-        # Firecracker (Linux): the host-agent creates per-VM TAPs
-        # (CAP_NET_ADMIN), so it runs under passwordless sudo. sudo
-        # scrubs the environment, so preserve exactly the keys Tilt
-        # injected (--preserve-env). Needs a NOPASSWD sudoers entry on
-        # the box (the dev-vm skill's bootstrap-remote installs one).
-        preserve = ','.join(env.keys())
-        serve_cmd = (
-            build_prefix +
-            'exec sudo -n --preserve-env=' + preserve + ' ' + ha_bin
-        )
+        if needs_codesign:
+            # VZ (macOS): the binary needs the virtualization entitlement;
+            # codesign after build, before exec. No sudo on macOS.
+            serve_cmd = (
+                build_prefix +
+                'bash crates/engram-sandbox-vz/scripts/codesign.sh debug && ' +
+                'exec ' + ha_bin
+            )
+        else:
+            # Firecracker (Linux): the host-agent creates per-VM TAPs
+            # (CAP_NET_ADMIN), so it runs under passwordless sudo. sudo
+            # scrubs the environment, so preserve exactly the keys Tilt
+            # injected (--preserve-env). Needs a NOPASSWD sudoers entry on
+            # the box (the dev-vm skill's bootstrap-remote installs one).
+            preserve = ','.join(env.keys())
+            serve_cmd = (
+                build_prefix +
+                'exec sudo -n --preserve-env=' + preserve + ' ' + ha_bin
+            )
 
     local_resource(name,
         serve_cmd=serve_cmd,
@@ -529,19 +779,107 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
 _bundle_dir = os.path.abspath('var/shared')
 if dev_split:
     _bundles_recipe = 'bundles-vz' if sandbox_backend == 'vz' else 'bundles-squashfs'
+    _bundles_cmd = 'just ' + _bundles_recipe
+    # On the fc-colima path this resource auto-retriggered forever. The build
+    # is content-deterministic and never modifies deploy/bundles (verified:
+    # content + mtime unchanged across builds), but the Docker-built bundles
+    # under colima's file-sharing bump the *ctime* of the whole deploy/bundles
+    # tree as a side effect, and Tilt's deps watcher fires on ctime -> rebuild
+    # -> ctime sweep -> loop. (VZ dev never hit it — no fc-dev colima VM /
+    # docker-bundle churn in that path.) The build's output is deterministic,
+    # so losing auto-rebuild costs nothing: build once at startup, and after an
+    # intentional skill edit re-trigger `bundles` from the Tilt UI. Keep AUTO
+    # off the fc path so plain `just dev` (VZ) still auto-rebuilds on edits.
+    _bundles_trigger = TRIGGER_MODE_AUTO
+    if fc_colima_profile and 'Darwin' in uname_str:
+        # Run under a real `nix develop`: bundles-squashfs needs mksquashfs AND
+        # (to build the harness-claude bundle locally, ADR 0062) the aarch64
+        # musl cross-toolchain with the exact per-target CC/CFLAGS — the sourced
+        # print-dev-env snapshot got the cc-rs cross-build wrong. `nix develop`
+        # keeps the inherited PATH, so prepend Homebrew's bin so the Docker-built
+        # bundles find docker/colima. TRIGGER_MODE_MANUAL (below) is what stops
+        # the rebuild loop, so paying the per-build flake eval once is fine.
+        _bundles_cmd = ('export PATH="/opt/homebrew/bin:$PATH" && ' + _nix +
+                        ' develop -c ' + _bundles_cmd)
+        # The loop: the Docker-built bundles under colima's file-sharing bump
+        # the *ctime* of the whole deploy/bundles tree, and Tilt's deps watcher
+        # fires on ctime -> rebuild -> ctime sweep -> forever. (VZ never hit it —
+        # no fc-dev colima VM / docker-bundle churn.) The build output is
+        # deterministic, so MANUAL costs nothing: build once at startup, and
+        # re-trigger `bundles` from the Tilt UI after an intentional skill edit.
+        _bundles_trigger = TRIGGER_MODE_MANUAL
     local_resource('bundles',
-        cmd='just ' + _bundles_recipe,
+        cmd=_bundles_cmd,
         deps=['deploy/bundles'],
+        trigger_mode=_bundles_trigger,
         labels=['setup'])
 
-_proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT', '0'))
+# The egress proxy is MANDATORY (issue #240): it's the only path a guest
+# reaches the network, and `0` is NOT an "off" sentinel — host_startup still
+# installs a `:443 -> port 0` REDIRECT (dead) while the proxy binds a random
+# ephemeral port, so guest HTTPS (e.g. a claude session's api.anthropic.com
+# call) silently hangs. On the fc path default it to a real fixed port (8443,
+# the host-agent's own CLI default) so egress actually works; other dev
+# backends keep the historical 0 unless overridden. (The proxy is fail-closed
+# on a bind collision — 8443 is verified free in the fc-dev VM.)
+_proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT',
+                         '8443' if fc_colima_profile else '0'))
+# DNS-filter proxy base port. Always a real port (unlike the proxy port, which
+# has a 0-footgun default): the DNS listener always binds. host-agent-b takes
+# _dns_base + 1 so the two hosts don't collide on the shared netns.
+_dns_base = int(env_or('ENGRAM_EGRESS_DNS_PORT', '5353'))
 if dev_split:
-    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base))
+    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base), str(_dns_base))
+    if fc_colima_profile:
+        # ADR 0082: the coordinator dials the host-agent's advertised
+        # 127.0.0.1:9101 (and scrapes metrics on :9100) — reachable only via a
+        # guest->Mac forward. Lima's auto-forward is edge-triggered and proved
+        # unreliable across host-agent/VM restarts (the port silently stops
+        # forwarding -> "no host could restore … tcp connect error"). Hold the
+        # forward DETERMINISTICALLY ourselves with `ssh -L` over colima's own
+        # ssh (regenerate ssh-config each start — the VM's ssh port changes on
+        # restart; ServerAliveInterval drops the tunnel when the VM dies so
+        # Tilt restarts + reconnects). This is what makes coord->host stable.
+        local_resource('fc-grpc-forward',
+            serve_cmd=(
+                'export PATH="/opt/homebrew/bin:$PATH" && ' +
+                'cfg="$(mktemp)" && colima ssh-config ' + fc_colima_profile +
+                ' > "$cfg" && ' +
+                # Drop any forwards a prior colima mux master still holds on
+                # 9101/9100 (see ControlPath=none note below). `-O cancel`
+                # removes just those forwards WITHOUT killing the master, so the
+                # host-agent's own colima-ssh session riding that master stays
+                # up. No-op once nothing forwards over the shared master.
+                '( ssh -F "$cfg" -O cancel ' +
+                '-L 127.0.0.1:9101:127.0.0.1:9101 ' +
+                '-L 127.0.0.1:9100:127.0.0.1:9100 ' +
+                'colima-' + fc_colima_profile + ' 2>/dev/null || true ) && ' +
+                'exec ssh -F "$cfg" -N ' +
+                # colima's ssh-config sets `ControlMaster auto` + `ControlPersist
+                # yes`. Left as-is, our `-N` forward would set up the shared
+                # master, then ControlPersist DAEMONIZES it into the background
+                # and the foreground ssh returns 0 immediately — Tilt sees the
+                # serve_cmd "exit 0", flags the resource dead, and the retry
+                # then trips ExitOnForwardFailure (the backgrounded master still
+                # owns the ports). Force a dedicated, non-multiplexed connection
+                # so `-N` blocks HERE in the foreground where Tilt supervises it
+                # and it dies cleanly on kill (verified: default cfg → exit 0;
+                # ControlPath=none → blocks). Must be BEFORE the -L flags.
+                '-o ControlMaster=no -o ControlPath=none ' +
+                '-o ExitOnForwardFailure=yes -o ServerAliveInterval=5 ' +
+                '-o ServerAliveCountMax=3 ' +
+                '-L 127.0.0.1:9101:127.0.0.1:9101 ' +
+                '-L 127.0.0.1:9100:127.0.0.1:9100 ' +
+                'colima-' + fc_colima_profile),
+            resource_deps=['host-agent'],
+            labels=['setup'])
     if two_hosts:
-        # Distinct proxy port for the second host-agent; 0 (disabled)
-        # stays 0 so the dev default is unchanged.
+        # Distinct proxy + DNS ports for the second host-agent (they share the
+        # netns). Proxy: 0 (disabled) stays 0 so the dev default is unchanged.
+        # DNS: always +1 (the DNS listener always binds), else host-agent-b
+        # fails closed on `0.0.0.0:5353 Address already in use` (ADR 0083).
         _proxy_b = str(_proxy_base + 1) if _proxy_base > 0 else '0'
-        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b)
+        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b, str(_dns_base + 1))
 
 # ----------------------------------------------------------------
 # Orchestrator (Bun/Hono, ADR 0051) — the web's BFF.

@@ -29,8 +29,8 @@ pub use integration::{
     MintFieldSchema, MintKindDescriptor, ResolvedFields, ScopedCredential,
 };
 pub use metadata::{
-    CreateDisposition, DisableEnabledImageOutcome, GcCandidateRow, MetadataStore,
-    SessionCreateWriteSet, SnapshotTotals, UpdateOutcome,
+    CaptureReservation, CreateDisposition, DisableEnabledImageOutcome, GcCandidateRow,
+    MetadataStore, SessionCreateWriteSet, SnapshotTotals, UpdateOutcome,
 };
 pub use sandbox::{
     AgentRefresh, BrowserStart, ForgeSink, HarnessByteStream, HarnessDial, HarnessSink,

@@ -106,62 +106,73 @@ impl Proxy {
         }
     }
 
-    /// Run forever. Returns only on listener bind failure.
-    pub async fn run(self) -> Result<(), std::io::Error> {
-        let listener = TcpListener::bind(self.cfg.bind_addr).await?;
-        tracing::info!(addr = %self.cfg.bind_addr, "engram-egress-proxy listening");
-        let registry = self.cfg.registry.clone();
-        let resolver = self.cfg.resolver.clone();
-        let server_cfg = self.server_cfg.clone();
-        let client_cfg = self.client_cfg.clone();
-        let observe_sink = self.cfg.observe_sink.clone();
+    /// Bind the 443 listener and (when configured) the DNS sockets,
+    /// returning just the sockets for [`serve`](Self::serve) to run.
+    ///
+    /// Bind is split from serve so a bind failure is a value the caller
+    /// can act on. Egress is mandatory (issue #240): a host-agent that
+    /// keeps running with a live iptables `:443 -> proxy` REDIRECT but
+    /// no listener sends every guest a RST (the guest's TLS client
+    /// reports `ConnectionRefused`), silently breaking every session on
+    /// the host. A DNS bind failure is just as fatal — the guest's
+    /// `:53 -> dns` REDIRECT is live too, so a dead DNS socket breaks
+    /// resolution the same way.
+    pub async fn bind(&self) -> Result<Listeners, std::io::Error> {
+        let tcp = TcpListener::bind(self.cfg.bind_addr).await?;
+        let dns = if let Some(dns_addr) = self.cfg.dns_bind_addr {
+            let udp = UdpSocket::bind(dns_addr).await.inspect_err(|e| {
+                tracing::error!(addr = %dns_addr, error = %e, "DNS/udp bind failed");
+            })?;
+            let dns_tcp = TcpListener::bind(dns_addr).await.inspect_err(|e| {
+                tracing::error!(addr = %dns_addr, error = %e, "DNS/tcp bind failed");
+            })?;
+            Some((Arc::new(udp), dns_tcp))
+        } else {
+            None
+        };
+        Ok(Listeners { tcp, dns })
+    }
 
-        // Spawn the filtering DNS proxy. Bound on udp/53 + tcp/53
-        // (via the same dns_bind_addr); iptables REDIRECTs guest
-        // DNS traffic here regardless of the upstream IP they pick.
-        if let Some(dns_addr) = self.cfg.dns_bind_addr {
-            let udp_sock = match UdpSocket::bind(dns_addr).await {
-                Ok(s) => Arc::new(s),
-                Err(e) => {
-                    tracing::error!(addr = %dns_addr, error = %e, "DNS/udp bind failed");
-                    return Err(e);
-                }
-            };
-            let tcp_listener = match TcpListener::bind(dns_addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(addr = %dns_addr, error = %e, "DNS/tcp bind failed");
-                    return Err(e);
-                }
-            };
+    /// Run the accept loop forever on already-bound listeners. The DNS
+    /// serve loops are spawned as child tasks. Returns only if the
+    /// accept loop itself terminates (it shouldn't — accept errors are
+    /// logged and retried).
+    pub async fn serve(self, listeners: Listeners) {
+        let Listeners { tcp, dns } = listeners;
+        tracing::info!(addr = ?tcp.local_addr().ok(), "engram-egress-proxy listening");
+
+        // The filtering DNS proxy: serve loops for the already-bound
+        // udp/53 + tcp/53 sockets. iptables REDIRECTs guest DNS traffic
+        // here regardless of the upstream IP they pick.
+        if let Some((udp, dns_tcp)) = dns {
             let upstream = self.cfg.dns_upstream;
-            let registry_for_udp = registry.clone();
+            let registry_for_udp = self.cfg.registry.clone();
             tokio::spawn(async move {
-                if let Err(e) = dns::serve_udp(udp_sock, registry_for_udp, upstream).await {
+                if let Err(e) = dns::serve_udp(udp, registry_for_udp, upstream).await {
                     tracing::error!(error = %e, "DNS/udp serve loop ended");
                 }
             });
-            let registry_for_tcp = registry.clone();
+            let registry_for_tcp = self.cfg.registry.clone();
             tokio::spawn(async move {
-                if let Err(e) = dns::serve_tcp(tcp_listener, registry_for_tcp, upstream).await {
+                if let Err(e) = dns::serve_tcp(dns_tcp, registry_for_tcp, upstream).await {
                     tracing::error!(error = %e, "DNS/tcp serve loop ended");
                 }
             });
         }
 
         loop {
-            let (stream, peer) = match listener.accept().await {
+            let (stream, peer) = match tcp.accept().await {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(error = %e, "accept failed");
                     continue;
                 }
             };
-            let registry = registry.clone();
-            let resolver = resolver.clone();
-            let server_cfg = server_cfg.clone();
-            let client_cfg = client_cfg.clone();
-            let observe_sink = observe_sink.clone();
+            let registry = self.cfg.registry.clone();
+            let resolver = self.cfg.resolver.clone();
+            let server_cfg = self.server_cfg.clone();
+            let client_cfg = self.client_cfg.clone();
+            let observe_sink = self.cfg.observe_sink.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle(
                     stream,
@@ -178,6 +189,22 @@ impl Proxy {
                 }
             });
         }
+    }
+}
+
+/// The bound listeners handed from [`Proxy::bind`] to [`Proxy::serve`]:
+/// the 443 TCP listener and, when the DNS filter is enabled, its
+/// UDP+TCP sockets. An opaque token — all proxy state stays on `Proxy`.
+pub struct Listeners {
+    tcp: TcpListener,
+    dns: Option<(Arc<UdpSocket>, TcpListener)>,
+}
+
+impl Listeners {
+    /// The address the 443 listener actually bound (useful when the
+    /// config asked for an ephemeral port).
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.tcp.local_addr()
     }
 }
 

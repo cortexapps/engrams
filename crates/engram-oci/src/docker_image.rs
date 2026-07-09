@@ -14,7 +14,13 @@
 
 use std::path::Path;
 
+use futures::TryStreamExt;
+use oci_client::client::BlobResponse;
+use oci_client::errors::OciDistributionError;
 use oci_client::manifest::{OciDescriptor, OciManifest};
+use oci_client::{Client, Reference, RegistryOperation};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use crate::{pull_layer_to_vec, Digest256, OciClient, OciError};
 
@@ -158,54 +164,190 @@ impl OciClient {
         pull_layer_to_vec(client, &reference, &blob.to_descriptor()).await
     }
 
-    /// Stream a (potentially large) layer blob straight to `dest` —
-    /// bounded memory regardless of layer size, digest-verified before
-    /// returning. One re-auth + retry on 401: the bearer token minted
-    /// at the manifest pull expires mid-run for big multi-layer images
-    /// (GHCR tokens live ~5 min).
+    /// Stream a (potentially multi-GB) layer blob straight to `dest` —
+    /// bounded memory regardless of layer size, whole-file digest-verified
+    /// before returning.
+    ///
+    /// **Transient-resilient (the `dev-brain` incident).** A ~60 GiB
+    /// image's fat layers are long single-stream downloads; through GKE
+    /// Cloud NAT they hit idle/receive resets mid-body (reqwest:
+    /// `error decoding response body`). Rather than fail the layer — and
+    /// with it the whole image pull, which the enable scanner scrubs and
+    /// restarts from zero — this **keeps the bytes already written and
+    /// resumes** with `Range: bytes=<offset>-` (a 206 appends; a registry
+    /// that ignores `Range` and 200s restarts the layer from zero so we
+    /// never double a prefix), up to [`BlobRetryConfig::max_attempts`]
+    /// with exponential backoff (429 backs off harder). One re-auth on
+    /// 401 (GHCR bearer tokens live ~5 min) doesn't consume an attempt.
+    ///
+    /// [`BlobRetryConfig`]: crate::BlobRetryConfig
     pub async fn pull_docker_blob_to_file(
         &self,
         uri: &str,
         blob: &DockerBlobRef,
         dest: &Path,
     ) -> Result<(), OciError> {
-        let reference: oci_client::Reference = uri
+        let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
         let client = self.client_for(&reference);
         let desc = blob.to_descriptor();
+        self.stream_blob_resumable(client, &reference, &desc, &blob.digest, dest)
+            .await
+    }
 
+    /// Stream `desc` to `dest`, retrying transient failures in place with
+    /// HTTP `Range` resume. `digest` is the expected `sha256:<hex>` of the
+    /// WHOLE blob; the assembled file is verified against it after the
+    /// last byte lands (a running hash over the bytes actually written —
+    /// covering the full assembly across all ranges, never per-range).
+    async fn stream_blob_resumable(
+        &self,
+        client: &Client,
+        reference: &Reference,
+        desc: &OciDescriptor,
+        digest: &str,
+        dest: &Path,
+    ) -> Result<(), OciError> {
+        let cfg = self.blob_retry();
         let mut file = tokio::fs::File::create(dest).await.map_err(OciError::Io)?;
-        match client.pull_blob(&reference, &desc, &mut file).await {
-            Ok(()) => {}
-            Err(oci_client::errors::OciDistributionError::UnauthorizedError { .. }) => {
-                let auth = self.auth_for(&reference).await?;
-                client
-                    .auth(&reference, &auth, oci_client::RegistryOperation::Pull)
-                    .await
-                    .map_err(|e| OciError::Distribution(format!("re-auth (pull): {e}")))?;
-                // Recreate: the failed attempt may have written bytes.
-                file = tokio::fs::File::create(dest).await.map_err(OciError::Io)?;
-                client
-                    .pull_blob(&reference, &desc, &mut file)
-                    .await
-                    .map_err(|e| {
-                        OciError::Distribution(format!(
-                            "pull layer {} (re-authed): {e}",
-                            blob.digest
-                        ))
-                    })?;
+        let mut hasher = Sha256::new();
+        let mut offset: u64 = 0;
+        let mut attempt: u32 = 0;
+        let mut reauthed = false;
+
+        loop {
+            // offset == 0 → `Range: bytes=0-`; a range-honoring registry
+            // 206s, one that can't 200s the whole body. offset > 0 is a
+            // resume.
+            let started = client
+                .pull_blob_stream_partial(reference, desc, offset, None)
+                .await;
+
+            let mut stream = match started {
+                // 206: the registry honored the range — append at `offset`.
+                Ok(BlobResponse::Partial(s)) => s,
+                // 200: the registry ignored `Range` and is resending from
+                // byte 0. Restart the file (truncate) + hasher so a resume
+                // never appends a duplicate prefix.
+                Ok(BlobResponse::Full(s)) => {
+                    if offset != 0 {
+                        file = tokio::fs::File::create(dest).await.map_err(OciError::Io)?;
+                        hasher = Sha256::new();
+                        offset = 0;
+                    }
+                    s
+                }
+                // Token expired mid-run — re-auth ONCE (free of the retry
+                // budget) and retry the request.
+                Err(e) if is_unauthorized(&e) && !reauthed => {
+                    reauthed = true;
+                    let auth = self.auth_for(reference).await?;
+                    client
+                        .auth(reference, &auth, RegistryOperation::Pull)
+                        .await
+                        .map_err(|e| OciError::Distribution(format!("re-auth (pull): {e}")))?;
+                    continue;
+                }
+                Err(e) => {
+                    attempt += 1;
+                    if request_retryable(&e) && attempt < cfg.max_attempts {
+                        tokio::time::sleep(cfg.backoff(attempt, is_rate_limited(&e))).await;
+                        continue;
+                    }
+                    return Err(OciError::Distribution(format!(
+                        "pull layer {digest} to {}: {e} (after {attempt} attempt(s))",
+                        dest.display()
+                    )));
+                }
+            };
+
+            // Drain the body, appending to the file. A mid-stream reset
+            // (the prod `error decoding response body`) leaves what we've
+            // written in place; the next attempt resumes from `offset`.
+            let mut stream_err = None;
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(chunk)) => {
+                        hasher.update(&chunk);
+                        file.write_all(&chunk).await.map_err(OciError::Io)?;
+                        offset += chunk.len() as u64;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        stream_err = Some(e);
+                        break;
+                    }
+                }
             }
-            Err(e) => {
+
+            if let Some(e) = stream_err {
+                attempt += 1;
+                if attempt < cfg.max_attempts {
+                    file.flush().await.map_err(OciError::Io)?;
+                    tokio::time::sleep(cfg.backoff(attempt, false)).await;
+                    continue;
+                }
                 return Err(OciError::Distribution(format!(
-                    "pull layer {} to {}: {e}",
-                    blob.digest,
+                    "pull layer {digest} to {}: mid-stream error at offset {offset} \
+                     (after {attempt} attempt(s)): {e}",
                     dest.display()
                 )));
             }
+
+            // Whole body received: verify the assembled file. The running
+            // hash covers exactly the bytes on disk (updated as each range
+            // appended), so this is the same whole-blob guarantee as a
+            // single-shot verified pull.
+            file.flush().await.map_err(OciError::Io)?;
+            let actual = format!("sha256:{:x}", hasher.finalize_reset());
+            if actual == digest {
+                return Ok(());
+            }
+            // Assembly doesn't match the manifest digest (a corrupt range
+            // or a truncated resume the server never flagged). Restart from
+            // scratch, bounded by the same attempt budget.
+            attempt += 1;
+            if attempt < cfg.max_attempts {
+                file = tokio::fs::File::create(dest).await.map_err(OciError::Io)?;
+                offset = 0;
+                tokio::time::sleep(cfg.backoff(attempt, false)).await;
+                continue;
+            }
+            return Err(OciError::Distribution(format!(
+                "pull layer {digest} to {}: digest mismatch after assembly \
+                 (got {actual}, after {attempt} attempt(s))",
+                dest.display()
+            )));
         }
-        use tokio::io::AsyncWriteExt;
-        file.flush().await.map_err(OciError::Io)?;
-        Ok(())
+    }
+}
+
+/// A 401: the bearer token expired mid-run. `pull_blob_stream_partial`
+/// surfaces it as `ServerError { code: 401 }`; other paths as the typed
+/// `UnauthorizedError`.
+fn is_unauthorized(e: &OciDistributionError) -> bool {
+    matches!(
+        e,
+        OciDistributionError::UnauthorizedError { .. }
+            | OciDistributionError::ServerError { code: 401, .. }
+    )
+}
+
+/// A 429: the registry is rate-limiting. Retryable, but backs off harder.
+fn is_rate_limited(e: &OciDistributionError) -> bool {
+    matches!(e, OciDistributionError::ServerError { code: 429, .. })
+}
+
+/// A request-level failure worth retrying: a registry 5xx / 429, or any
+/// reqwest transport error (connect / timeout / mid-body reset). A
+/// definitive 4xx other than 429 is NOT retried — retrying can't fix it.
+fn request_retryable(e: &OciDistributionError) -> bool {
+    match e {
+        OciDistributionError::ServerError { code, .. } => {
+            *code == 429 || (500..=599).contains(code)
+        }
+        OciDistributionError::RequestError(_) => true,
+        _ => false,
     }
 }

@@ -73,13 +73,16 @@ export default defineConfig({
   plugins: [react(), tailwindcss(), ghosttyWasmPlugin()],
   resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
   build: {
-    // The prod dashboard CSP is `img-src 'self'` (no `data:`) —
-    // deploy/helm/engram/templates/web-configmap.yaml (ADR 0026). Vite's default
-    // inlines assets <4 KB as `data:` URIs, which that CSP then blocks: an <img>
-    // logo (the bundled connector marks) fails to load and ProviderTile silently
-    // falls back to its monogram. Same class of bug as the ghostty WASM data: URI
-    // above. Emit every asset as a real same-origin file so `img-src 'self'`
-    // covers it. (A few extra tiny requests; negligible under HTTP/2.)
+    // Emit every asset as a real same-origin file rather than letting Vite's
+    // default inline <4 KB assets as `data:` URIs. The prod dashboard CSP
+    // (deploy/helm/engram/templates/web-configmap.yaml, ADR 0026) historically
+    // blocked `data:` images outright, which made inlined <img> logos (the
+    // bundled connector marks) silently fall back to ProviderTile monograms —
+    // same class of bug as the ghostty WASM data: URI above. The CSP now
+    // allows `img-src data:` (noVNC's Tight-JPEG rects require it), but real
+    // files remain the right call: same-origin URLs stay cacheable and keep
+    // the bundle small, and script/wasm data: URIs are still CSP-blocked.
+    // (A few extra tiny requests; negligible under HTTP/2.)
     assetsInlineLimit: 0,
   },
   server: {

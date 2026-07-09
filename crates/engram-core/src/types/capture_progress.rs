@@ -152,6 +152,13 @@ pub enum CaptureFailureKind {
     /// transient condition — never silently falls back to a full-only
     /// capture.
     ColdBaseCapabilityMismatch,
+    /// ADR 0081 (coordinator-emitted; a host never sends this): no host
+    /// fit the capture VM's RAM/CPU budgets within the queue timeout —
+    /// the fleet is at capacity and the autoscaler didn't (or couldn't:
+    /// maxHosts, cloud quota/stockout) grow it. Not retryable via the
+    /// attempts budget — another 30-minute wait won't help; the operator
+    /// frees capacity (or raises maxHosts) and `RetryEnableJob`s.
+    CapacityTimeout,
 }
 
 impl CaptureFailureKind {
@@ -165,6 +172,7 @@ impl CaptureFailureKind {
             Self::WarmExecTransport => "warm_exec_transport",
             Self::SnapshotFailed => "snapshot_failed",
             Self::ColdBaseCapabilityMismatch => "cold_base_capability_mismatch",
+            Self::CapacityTimeout => "capacity_timeout",
         }
     }
 
@@ -194,6 +202,7 @@ impl CaptureFailureKind {
             "warm_exec_transport" => Self::WarmExecTransport,
             "snapshot_failed" => Self::SnapshotFailed,
             "cold_base_capability_mismatch" => Self::ColdBaseCapabilityMismatch,
+            "capacity_timeout" => Self::CapacityTimeout,
             _ => return None,
         })
     }

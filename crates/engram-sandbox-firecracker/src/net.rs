@@ -350,25 +350,42 @@ pub fn host_startup_lines(
          -m comment --comment engram-host-input-established",
     ));
     if let Some(port) = proxy_port {
+        // `-I INPUT 1` (insert-at-top), NOT `-A` (append): these
+        // ACCEPTs MUST sit before the `engram-host-input` blanket DROP,
+        // and `-A` only lands them there when the DROP isn't present
+        // yet. Across a host-agent restart the DROP already exists, so
+        // an appended ACCEPT falls AFTER it and every REDIRECTed proxy
+        // packet is silently dropped (session stuck at run_started —
+        // observed on the fc-colima dev rig when the proxy port changed
+        // 0→8443 between runs). Inserting at the top is order-
+        // independent of history and can't open an isolation gap
+        // (adding a pool-scoped ACCEPT above the DROP only ever narrows
+        // what the DROP catches). `purge_engram_proxy_rules` clears any
+        // prior copy first so these re-insert cleanly every startup.
         out.push(format!(
-            "-A INPUT -s {pool} -p tcp --dport {port} -j ACCEPT \
+            "-I INPUT 1 -s {pool} -p tcp --dport {port} -j ACCEPT \
              -m comment --comment engram-proxy-input",
         ));
         out.push(format!(
-            "-A INPUT -s {pool} -p udp --dport {dns_port} -j ACCEPT \
+            "-I INPUT 1 -s {pool} -p udp --dport {dns_port} -j ACCEPT \
              -m comment --comment engram-proxy-dns-input",
         ));
         out.push(format!(
-            "-A INPUT -s {pool} -p tcp --dport {dns_port} -j ACCEPT \
+            "-I INPUT 1 -s {pool} -p tcp --dport {dns_port} -j ACCEPT \
              -m comment --comment engram-proxy-dns-input",
         ));
     }
     if let Some(port) = guest_otel_port {
         // In-guest OTLP export pinhole (see the doc comment). Must
-        // precede the blanket DROP below — `host_startup` applies
-        // lines in order with `-A`.
+        // precede the blanket DROP below. `-I INPUT 1` (insert-at-top),
+        // NOT `-A` (append), for the SAME reason as the proxy pinholes
+        // above (ADR 0083 / #595): across a host-agent restart the DROP
+        // already exists, so an appended ACCEPT falls AFTER it and the
+        // guest's collector dial is silently dropped once the otel port
+        // changes under a config roll. `purge_engram_proxy_rules` clears
+        // any prior copy first so this re-inserts cleanly every startup.
         out.push(format!(
-            "-A INPUT -s {pool} -p tcp --dport {port} -j ACCEPT \
+            "-I INPUT 1 -s {pool} -p tcp --dport {port} -j ACCEPT \
              -m comment --comment engram-guest-otlp-input",
         ));
     }
@@ -607,6 +624,23 @@ pub async fn host_startup(
             ));
         }
     }
+    // Clear any prior engram proxy/dns/redirect/otlp rules before
+    // re-applying. The `-C`-then-insert loop below is history-BLIND: if a
+    // previous host_startup ran with a different `proxy_port`/`dns_port`/
+    // `guest_otel_port` (a config change, or the dev-only
+    // `ENGRAM_EGRESS_PROXY_PORT=0` footgun), its rules linger. Concrete
+    // failures that caused, both silently wedging egress with a guest
+    // stuck at run_started:
+    //   1. A stale nat `REDIRECT … redir ports <old>` sits BEFORE the new
+    //      one; iptables is first-match, so :443 is redirected to a dead
+    //      port and the proxy never sees the connection.
+    //   2. The new INPUT `--dport <new> ACCEPT` is appended AFTER the
+    //      already-present blanket DROP and never fires.
+    // Purging these comment classes first (they are always safe to
+    // remove — an absent ACCEPT/REDIRECT can only tighten policy, and we
+    // never touch the FORWARD egress-deny) makes host_startup declarative:
+    // the final ruleset depends only on the current args, not on history.
+    purge_engram_proxy_rules().await;
     for line in host_startup_lines(proxy_port, dns_port, guest_otel_port) {
         // Idempotency check: replace the leading `-A`/`-I` with `-C`
         // (or skip altogether for non-rule meta commands like
@@ -644,12 +678,61 @@ pub fn otel_endpoint_port(endpoint: &str) -> Option<u16> {
     }
 }
 
+/// The engram-owned rule comments that `purge_engram_proxy_rules`
+/// deletes-and-reapplies each startup. All are ACCEPTs (INPUT) or
+/// REDIRECTs (nat PREROUTING) — never a DROP — so removing them can
+/// only tighten policy, never open an egress path. `engram-guest-otlp-input`
+/// (ADR 0084 (d) alignment) joins the set: it too is an insert-at-top
+/// INPUT ACCEPT whose port can change under a config roll, so it needs
+/// the same purge-and-reapply as the proxy/dns pinholes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PURGEABLE_PROXY_COMMENTS: &[&str] = &[
+    "engram-proxy-input",
+    "engram-proxy-dns-input",
+    "engram-proxy-redirect",
+    "engram-dns-redirect",
+    "engram-guest-otlp-input",
+];
+
+/// Delete every engram proxy/dns/redirect/otlp rule so `host_startup` can
+/// re-apply them fresh (see the call site for why the plain `-C`/`-A`
+/// idempotency isn't enough). Enumerates the live ruleset with
+/// `iptables -S` and issues the `-D` twin of each matching line — this
+/// catches rules carrying a STALE port (which a spec-based delete of the
+/// current-args rule would miss). Best-effort: a delete that races
+/// another writer just no-ops; we never fail startup on it.
+#[cfg(target_os = "linux")]
+async fn purge_engram_proxy_rules() {
+    for (table, chain) in [("filter", "INPUT"), ("nat", "PREROUTING")] {
+        let listing = match tokio::process::Command::new("iptables")
+            .args(["-t", table, "-S", chain])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => continue,
+        };
+        for line in listing.lines() {
+            if !PURGEABLE_PROXY_COMMENTS.iter().any(|c| line.contains(c)) {
+                continue;
+            }
+            // `-S` prints rules as `-A <chain> …`; the `-D <chain> …`
+            // twin deletes exactly that rule (stale port and all).
+            let del = line.replacen("-A ", "-D ", 1);
+            let mut argv = vec!["-t", table];
+            argv.extend(del.split_whitespace());
+            let _ = run_cmd("iptables", &argv).await;
+        }
+    }
+}
+
 /// Convert an `-I/-A`-style line into its `-C` (check) twin. We do
 /// the swap textually to avoid duplicating the rule construction.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn check_form(line: &str) -> String {
     line.replacen("-I FORWARD 1", "-C FORWARD", 1)
         .replacen("-A FORWARD", "-C FORWARD", 1)
+        .replacen("-I INPUT 1", "-C INPUT", 1)
         .replacen("-A INPUT", "-C INPUT", 1)
         .replacen("-t nat -A PREROUTING", "-t nat -C PREROUTING", 1)
         .replacen("-t nat -A POSTROUTING", "-t nat -C POSTROUTING", 1)
@@ -1734,6 +1817,40 @@ mod tests {
         assert!(!lines.contains("engram-dns-redirect"));
         // But it DOES close egress with the default-deny.
         assert!(lines.contains("engram-default-deny"));
+    }
+
+    #[test]
+    fn proxy_input_accepts_insert_at_top_not_append() {
+        // Regression: the proxy/DNS INPUT ACCEPTs must be emitted as
+        // `-I INPUT 1` (insert-at-top), not `-A INPUT` (append). With
+        // `-A`, a host-agent restart whose proxy port CHANGED (e.g. the
+        // fc-colima dev rig going 0→8443) appends the new ACCEPT AFTER
+        // the already-present blanket DROP, so every REDIRECTed proxy
+        // packet is dropped and the session hangs at run_started.
+        // Insert-at-top is order-independent of history.
+        for line in host_startup_lines(Some(8443), Some(5353), None) {
+            if line.contains("engram-proxy-input") || line.contains("engram-proxy-dns-input") {
+                assert!(
+                    line.starts_with("-I INPUT 1 "),
+                    "proxy/DNS INPUT ACCEPT must insert-at-top, got: {line}",
+                );
+            }
+        }
+        // The blanket DROP still appends (always last).
+        assert!(host_startup_lines(Some(8443), Some(5353), None)
+            .iter()
+            .any(|l| l.starts_with("-A INPUT") && l.ends_with("engram-host-input")));
+    }
+
+    #[test]
+    fn check_form_maps_insert_at_top_input_to_check() {
+        // The idempotency pre-check must recognise `-I INPUT 1` (else it
+        // would try to `-C` a literal `-I INPUT 1 …` string, mis-detect
+        // "not present", and re-insert a duplicate every startup).
+        let inserted = "-I INPUT 1 -s 10.200.0.0/16 -p tcp --dport 8443 -j ACCEPT \
+             -m comment --comment engram-proxy-input";
+        assert!(check_form(inserted).starts_with("-C INPUT "));
+        assert!(!check_form(inserted).contains("-I INPUT 1"));
     }
 
     #[test]

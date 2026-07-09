@@ -32,7 +32,7 @@ pub mod sni;
 pub mod substitute;
 pub mod violation;
 
-pub use proxy::{Proxy, ProxyConfig};
+pub use proxy::{Listeners, Proxy, ProxyConfig};
 pub use resolver::{
     default_resolver, ResolveError, StaticResolver, SystemResolver, UpstreamResolver,
 };
