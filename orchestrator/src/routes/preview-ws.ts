@@ -65,6 +65,12 @@ function previewWsCloseFor(err: unknown): [number, string] {
   return [1011, "preview upstream error"];
 }
 
+function rawDataToBufferSource(data: RawData): BufferSource {
+  if (data instanceof ArrayBuffer) return data;
+  if (Array.isArray(data)) return Buffer.concat(data) as unknown as BufferSource;
+  return data as unknown as BufferSource;
+}
+
 /** Build the `server.on("upgrade")` hook. Returns `true` if it handled the
  * request (a preview host), `false` to let the normal (shell) path run. */
 export function makePreviewUpgradeHandler(
@@ -149,7 +155,7 @@ function bridgeClientToGuest(
   subprotocols: string[],
 ): void {
   const abort = new AbortController();
-  const pending: Array<string | Buffer> = [];
+  const pending: Array<string | BufferSource> = [];
   let guestWs: WebSocket | null = null;
   let guestOpen = false;
 
@@ -158,7 +164,7 @@ function bridgeClientToGuest(
   // exists, and the client can send the instant it opens — before the guest-side
   // socket (set up async below) is ready. Buffer until the guest is OPEN.
   clientWs.on("message", (data: RawData, isBinary: boolean) => {
-    const msg = isBinary ? (data as Buffer) : data.toString();
+    const msg = isBinary ? rawDataToBufferSource(data) : data.toString();
     if (guestOpen && guestWs) guestWs.send(msg);
     else pending.push(msg);
   });
