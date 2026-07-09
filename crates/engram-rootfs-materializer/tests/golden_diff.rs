@@ -17,18 +17,15 @@
 //! What it does:
 //! 1. `pull_image` + `flatten::apply_layer` (the exact per-layer
 //!    decompressor match from `Materializer::materialize`) into a kept
-//!    scratch tree — the pipeline STOPPED after flatten, which is the
-//!    stage that golden-diffs against `docker export`.
-//! 2. Attempts `TreeMetadata::apply_ownership` (real `lchown`): as
-//!    root it must succeed; unprivileged it must degrade to
-//!    PermissionDenied (both outcomes reported).
-//! 3. Reads the `docker export` tar IN-PROCESS (no extraction — so
-//!    device nodes and foreign uid/gids are compared faithfully even
-//!    when running unprivileged) and diffs:
+//!    scratch tree, then `ext4::emit_tar`.
+//! 2. Reads the `docker export` tar and emitted materializer tar
+//!    IN-PROCESS (no extraction — so device nodes, xattrs, and foreign
+//!    uid/gids are compared faithfully even when running unprivileged)
+//!    and diffs:
 //!    file list + entry types, modes (incl. setuid/setgid/sticky),
 //!    symlink targets, hardlink groupings, per-file sha256, uid/gid
-//!    (export-tar header vs the TreeMetadata sidecar, always; vs the
-//!    on-disk tree too when ownership was applied), and xattrs.
+//!    (export-tar header vs the TreeMetadata sidecar and emitted tar),
+//!    and xattrs.
 //!
 //! Known-acceptable deltas (reported, not failed):
 //! - `/.dockerenv` — docker adds it at create time.
@@ -38,8 +35,7 @@
 //! - `/proc`, `/sys` — empty mount-point dirs.
 //! - `/etc/{hostname,hosts,resolv.conf,mtab}` — docker mutates or
 //!   creates these at container-create time.
-//! - mtimes — not compared (the pack stage clamps them separately).
-//! - xattrs the unprivileged flatten recorded in `skipped_xattrs`.
+//! - mtimes — not compared (the tar emit clamps them separately).
 //!
 //! Anything else is a REAL diff: printed verbatim, and the test fails.
 
@@ -48,7 +44,7 @@ use std::path::{Component, Path, PathBuf};
 
 use engram_oci::{AnonymousResolver, OciClient};
 use engram_rootfs_materializer::{
-    apply_layer, pull_image, LayerCompression, Platform, TreeMetadata,
+    apply_layer, emit_tar, pull_image, LayerCompression, Platform, TreeMetadata,
 };
 use sha2::Digest as _;
 
@@ -239,96 +235,6 @@ fn read_export_tar(path: &Path) -> BTreeMap<String, Entry> {
 }
 
 // ---------------------------------------------------------------
-// Side B: the flattened tree on disk.
-// ---------------------------------------------------------------
-
-fn read_tree(root: &Path) -> BTreeMap<String, Entry> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-    let mut out = BTreeMap::new();
-    let mut by_inode: HashMap<(u64, u64), BTreeSet<String>> = HashMap::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for entry in std::fs::read_dir(&d).expect("read_dir") {
-            let entry = entry.expect("dir entry");
-            let p = entry.path();
-            let rel = p
-                .strip_prefix(root)
-                .unwrap()
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-            let meta = std::fs::symlink_metadata(&p).expect("lstat");
-            let ft = meta.file_type();
-            let mode = meta.permissions().mode() & 0o7777;
-            let (kind, sha256, link) = if ft.is_dir() {
-                stack.push(p.clone());
-                (Kind::Dir, None, None)
-            } else if ft.is_symlink() {
-                let t = std::fs::read_link(&p).expect("readlink");
-                (Kind::Symlink, None, Some(t.to_string_lossy().into_owned()))
-            } else if ft.is_file() {
-                let mut f = std::fs::File::open(&p).expect("open");
-                let mut hasher = sha2::Sha256::new();
-                std::io::copy(&mut f, &mut hasher).expect("hash");
-                if meta.nlink() > 1 {
-                    by_inode
-                        .entry((meta.dev(), meta.ino()))
-                        .or_default()
-                        .insert(rel.clone());
-                }
-                (Kind::File, Some(format!("{:x}", hasher.finalize())), None)
-            } else if ft.is_char_device() {
-                (Kind::Char(0, 0), None, None)
-            } else if ft.is_block_device() {
-                (Kind::Block(0, 0), None, None)
-            } else if ft.is_fifo() {
-                (Kind::Fifo, None, None)
-            } else {
-                continue;
-            };
-            let mut xattrs = BTreeMap::new();
-            if !ft.is_symlink() {
-                if let Ok(names) = xattr::list(&p) {
-                    for name in names {
-                        let n = name.to_string_lossy().into_owned();
-                        if let Ok(Some(v)) = xattr::get(&p, &name) {
-                            xattrs.insert(n, v);
-                        }
-                    }
-                }
-            }
-            out.insert(
-                rel,
-                Entry {
-                    kind,
-                    mode,
-                    uid: meta.uid() as u64,
-                    gid: meta.gid() as u64,
-                    size: meta.len(),
-                    sha256,
-                    link,
-                    hardlink_rep: None,
-                    xattrs,
-                },
-            );
-        }
-    }
-    for set in by_inode.values() {
-        if set.len() < 2 {
-            continue; // nlink>1 but the sibling is outside the tree? shouldn't happen
-        }
-        let rep = set.iter().next().unwrap().clone();
-        for p in set {
-            if let Some(e) = out.get_mut(p) {
-                e.hardlink_rep = Some(rep.clone());
-            }
-        }
-    }
-    out
-}
-
-// ---------------------------------------------------------------
 // Classification of known-acceptable delta paths.
 // ---------------------------------------------------------------
 
@@ -446,61 +352,35 @@ async fn golden_diff_flatten_vs_docker_export() {
 
     eprintln!("\n=== GOLDEN DIFF REPORT: {uri} ===");
     eprintln!(
-        "flatten: {} sidecar entries, {} skipped specials, {} skipped xattrs",
+        "flatten: {} sidecar entries, {} skipped specials",
         tree_meta.len(),
-        tree_meta.skipped_specials.len(),
-        tree_meta.skipped_xattrs.len()
+        tree_meta.skipped_specials.len()
     );
-    eprintln!("-- flatten skipped_specials (device nodes / fifos; mknod needs root):");
-    for p in &tree_meta.skipped_specials {
-        eprintln!("   {p}");
-    }
-    eprintln!("-- flatten skipped_xattrs:");
-    for x in &tree_meta.skipped_xattrs {
-        eprintln!("   {} xattr {}: {}", x.path, x.name, x.error);
+    eprintln!("-- flatten skipped_specials (recorded for tar emit):");
+    for s in &tree_meta.skipped_specials {
+        eprintln!("   {} {:?}", s.path, s.kind);
     }
 
-    // --- 2. the real lchown path ---
-    let ownership_applied = match tree_meta.apply_ownership(&rootfs) {
-        Ok(()) => {
-            eprintln!("-- ownership: APPLIED to the tree (running privileged)");
-            true
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!(
-                "-- ownership: recorded-only (unprivileged; lchown refused: {e}); \
-                 on-disk uid/gid NOT compared — sidecar-vs-export-tar comparison below \
-                 covers ownership"
-            );
-            false
-        }
-        Err(e) => panic!("apply_ownership failed with a non-permission error: {e}"),
-    };
-    if env("ENGRAM_GOLDEN_DIFF_REQUIRE_OWNERSHIP").is_some() {
-        assert!(
-            ownership_applied,
-            "ENGRAM_GOLDEN_DIFF_REQUIRE_OWNERSHIP set but apply_ownership degraded — \
-             run this as root"
-        );
-    }
+    let emitted_tar = scratch.path().join("rootfs.tar");
+    emit_tar(&rootfs, &tree_meta, &emitted_tar).expect("emit materializer tar");
 
-    // --- 3. read both sides ---
+    // --- 2. read both sides ---
     let export = read_export_tar(&export_tar);
-    let tree = read_tree(&rootfs);
+    let emitted = read_export_tar(&emitted_tar);
     eprintln!(
-        "export tar: {} entries; flatten tree: {} entries",
+        "export tar: {} entries; emitted tar: {} entries",
         export.len(),
-        tree.len()
+        emitted.len()
     );
 
     let mut real: Vec<String> = Vec::new();
     let mut acceptable: Vec<String> = Vec::new();
     let mut dev_inventory_export: Vec<String> = Vec::new();
 
-    // --- 4a. export-side walk ---
+    // --- 3a. export-side walk ---
     for (path, exp) in &export {
         let class = classify(path);
-        let got = tree.get(path);
+        let got = emitted.get(path);
         match class {
             Class::DockerEnv => {
                 acceptable.push(format!("[docker-added] {path}"));
@@ -515,9 +395,9 @@ async fn golden_diff_flatten_vs_docker_export() {
                     exp.uid,
                     exp.gid,
                     if got.is_some() {
-                        "(present in flatten)"
+                        "(present in emitted tar)"
                     } else {
-                        "(absent in flatten)"
+                        "(absent in emitted tar)"
                     }
                 ));
                 continue;
@@ -535,7 +415,7 @@ async fn golden_diff_flatten_vs_docker_export() {
                 };
                 if !same {
                     acceptable.push(format!(
-                        "[mutable-etc] {path}: export={} sha={:?} vs flatten={}",
+                        "[mutable-etc] {path}: export={} sha={:?} vs emitted={}",
                         kind_str(&exp.kind),
                         exp.sha256.as_deref().map(|s| &s[..12]),
                         got.map(|t| format!(
@@ -551,18 +431,18 @@ async fn golden_diff_flatten_vs_docker_export() {
             Class::Compare => {}
         }
 
-        // Device nodes / fifos outside /dev: the flatten skips them by
-        // design and records them — acceptable IF recorded.
-        if matches!(exp.kind, Kind::Char(..) | Kind::Block(..) | Kind::Fifo) {
-            if tree_meta.skipped_specials.contains(path) {
-                acceptable.push(format!(
-                    "[special-skipped] {} {} (recorded in skipped_specials)",
+        // Device nodes / fifos outside /dev: if the host tree could not
+        // hold them, emit_tar should recreate them from the sidecar.
+        if matches!(exp.kind, Kind::Char(..) | Kind::Block(..) | Kind::Fifo) && got.is_none() {
+            if tree_meta.skipped_specials.iter().any(|s| s.path == *path) {
+                real.push(format!(
+                    "SPECIAL {} {} recorded in skipped_specials but absent from emitted tar",
                     kind_str(&exp.kind),
                     path
                 ));
             } else {
                 real.push(format!(
-                    "SPECIAL {} {} in export but neither in tree nor skipped_specials",
+                    "SPECIAL {} {} in export but neither in emitted tar nor skipped_specials",
                     kind_str(&exp.kind),
                     path
                 ));
@@ -572,7 +452,7 @@ async fn golden_diff_flatten_vs_docker_export() {
 
         let Some(t) = got else {
             real.push(format!(
-                "MISSING in flatten: {} {} (mode={:o} size={})",
+                "MISSING in emitted tar: {} {} (mode={:o} size={})",
                 kind_str(&exp.kind),
                 path,
                 exp.mode,
@@ -583,7 +463,7 @@ async fn golden_diff_flatten_vs_docker_export() {
 
         if t.kind != exp.kind {
             real.push(format!(
-                "KIND {path}: export={} flatten={}",
+                "KIND {path}: export={} emitted={}",
                 kind_str(&exp.kind),
                 kind_str(&t.kind)
             ));
@@ -592,105 +472,96 @@ async fn golden_diff_flatten_vs_docker_export() {
         // Mode: symlink modes are meaningless on Linux (always 0777).
         if exp.kind != Kind::Symlink && t.mode != exp.mode {
             real.push(format!(
-                "MODE {path}: export={:o} flatten={:o}",
+                "MODE {path}: export={:o} emitted={:o}",
                 exp.mode, t.mode
             ));
         }
         if t.sha256 != exp.sha256 {
             real.push(format!(
-                "CONTENT {path}: export sha256={:?} size={} / flatten sha256={:?} size={}",
+                "CONTENT {path}: export sha256={:?} size={} / emitted sha256={:?} size={}",
                 exp.sha256, exp.size, t.sha256, t.size
             ));
         }
         if t.link != exp.link {
             real.push(format!(
-                "SYMLINK TARGET {path}: export={:?} flatten={:?}",
+                "SYMLINK TARGET {path}: export={:?} emitted={:?}",
                 exp.link, t.link
             ));
         }
 
-        // uid/gid: export-tar header vs the sidecar record (always),
-        // and vs the on-disk tree when ownership was applied.
-        match tree_meta.get(path) {
-            Some(m) => {
-                if (m.uid, m.gid) != (exp.uid, exp.gid) {
-                    real.push(format!(
-                        "SIDECAR OWNERSHIP {path}: export uid={} gid={} / sidecar uid={} gid={}",
-                        exp.uid, exp.gid, m.uid, m.gid
-                    ));
-                }
-                if m.mode != exp.mode && exp.kind != Kind::Symlink {
-                    real.push(format!(
-                        "SIDECAR MODE {path}: export={:o} sidecar={:o}",
-                        exp.mode, m.mode
-                    ));
-                }
+        // uid/gid: export-tar header vs the sidecar record and emitted
+        // tar header.
+        if let Some(m) = tree_meta.get(path) {
+            if (m.uid, m.gid) != (exp.uid, exp.gid) {
+                real.push(format!(
+                    "SIDECAR OWNERSHIP {path}: export uid={} gid={} / sidecar uid={} gid={}",
+                    exp.uid, exp.gid, m.uid, m.gid
+                ));
             }
-            None => real.push(format!(
-                "SIDECAR MISSING record for {path} (present in export + tree)"
-            )),
+            if m.mode != exp.mode && exp.kind != Kind::Symlink {
+                real.push(format!(
+                    "SIDECAR MODE {path}: export={:o} sidecar={:o}",
+                    exp.mode, m.mode
+                ));
+            }
         }
-        if ownership_applied && (t.uid, t.gid) != (exp.uid, exp.gid) {
+        if (t.uid, t.gid) != (exp.uid, exp.gid) {
             real.push(format!(
-                "TREE OWNERSHIP {path}: export uid={} gid={} / tree uid={} gid={}",
+                "EMITTED OWNERSHIP {path}: export uid={} gid={} / emitted uid={} gid={}",
                 exp.uid, exp.gid, t.uid, t.gid
             ));
         }
 
-        // xattrs: every export-tar xattr must be on the tree, unless
-        // the flatten recorded the refusal.
+        // xattrs: every export-tar xattr must be in the sidecar and
+        // emitted tar.
         for (name, value) in &exp.xattrs {
             match t.xattrs.get(name) {
                 Some(v) if v == value => {}
                 other => {
-                    let skipped = tree_meta
-                        .skipped_xattrs
-                        .iter()
-                        .any(|s| &s.path == path && &s.name == name);
                     let msg = format!(
-                        "XATTR {path} {name}: export {}B, flatten {}",
+                        "XATTR {path} {name}: export {}B, emitted {}",
                         value.len(),
                         match other {
                             Some(v) => format!("{}B (different value)", v.len()),
                             None => "absent".into(),
                         }
                     );
-                    if skipped {
-                        acceptable.push(format!("[xattr-skipped] {msg}"));
-                    } else {
-                        real.push(msg);
-                    }
+                    real.push(msg);
                 }
+            }
+            match tree_meta.get(path).and_then(|m| m.xattrs.get(name)) {
+                Some(v) if v == value => {}
+                _ => real.push(format!("SIDECAR XATTR {path} {name}: missing or different")),
             }
         }
     }
 
-    // --- 4b. flatten-only paths ---
-    for (path, t) in &tree {
+    // --- 3b. emitted-only paths ---
+    for (path, t) in &emitted {
         if export.contains_key(path) {
             continue;
         }
         match classify(path) {
             Class::Dev => {
-                acceptable.push(format!("[dev] flatten-only: {} {path}", kind_str(&t.kind)))
+                acceptable.push(format!("[dev] emitted-only: {} {path}", kind_str(&t.kind)))
             }
             Class::ProcSys => {
-                acceptable.push(format!("[proc-sys] flatten-only: {path}"));
+                acceptable.push(format!("[proc-sys] emitted-only: {path}"));
             }
             Class::MutableEtc => acceptable.push(format!(
-                "[mutable-etc] flatten-only: {path} (docker replaced it in the export)"
+                "[mutable-etc] emitted-only: {path} (docker replaced it in the export)"
             )),
             _ => real.push(format!(
-                "EXTRA in flatten (not in export): {} {path} mode={:o}",
+                "EXTRA in emitted tar (not in export): {} {path} mode={:o}",
                 kind_str(&t.kind),
                 t.mode
             )),
         }
     }
 
-    // --- 4c. hardlink groupings ---
+    // --- 3c. hardlink groupings ---
     // For every export hardlink group, the same set of paths must share
-    // one inode in the flatten tree, and vice versa.
+    // one inode in the emitted tar, and vice versa.
     let group_of = |m: &BTreeMap<String, Entry>| -> HashMap<String, BTreeSet<String>> {
         let mut g: HashMap<String, BTreeSet<String>> = HashMap::new();
         for (p, e) in m {
@@ -701,7 +572,7 @@ async fn golden_diff_flatten_vs_docker_export() {
         g
     };
     let eg = group_of(&export);
-    let tg = group_of(&tree);
+    let tg = group_of(&emitted);
     let egroups: BTreeSet<BTreeSet<String>> = eg.into_values().collect();
     let tgroups: BTreeSet<BTreeSet<String>> = tg
         .into_values()
@@ -724,16 +595,16 @@ async fn golden_diff_flatten_vs_docker_export() {
         .collect();
     for g in egroups.difference(&tgroups) {
         real.push(format!(
-            "HARDLINK GROUP in export but not identically in flatten: {g:?}"
+            "HARDLINK GROUP in export but not identically in emitted tar: {g:?}"
         ));
     }
     for g in tgroups.difference(&egroups) {
         real.push(format!(
-            "HARDLINK GROUP in flatten but not identically in export: {g:?}"
+            "HARDLINK GROUP in emitted tar but not identically in export: {g:?}"
         ));
     }
 
-    // --- 5. report ---
+    // --- 4. report ---
     eprintln!(
         "\n-- device/special inventory from the export tar ({}):",
         dev_inventory_export.len()
@@ -753,7 +624,7 @@ async fn golden_diff_flatten_vs_docker_export() {
 
     assert!(
         real.is_empty(),
-        "{} REAL diffs between the flatten and docker export for {uri} (see report above)",
+        "{} REAL diffs between the emitted tar and docker export for {uri} (see report above)",
         real.len()
     );
 }

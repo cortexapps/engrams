@@ -11,29 +11,13 @@
 //! - Hardlinks become real hardlinks; symlinks stay symlinks.
 //! - Modes — including setuid/setgid/sticky — are applied to the tree.
 //!
-//! ## Ownership: the unprivileged seam
+//! ## Metadata: the unprivileged seam
 //!
-//! `mke2fs -d` copies the tree's ownership **as-is** into the ext4
-//! image, and an unprivileged process cannot `chown`. So the flatten
-//! records every entry's tar-carried `(uid, gid, mode)` in a
-//! [`TreeMetadata`] sidecar and applies what it can:
-//!
-//! - **modes** (incl. setuid) — recorded in the sidecar and applied to the
-//!   scratch tree where the host filesystem permits it; the materializer's
-//!   offline ext4 stamp also re-applies them for rootless local dev.
-//! - **uid/gid** — applied by [`TreeMetadata::apply_ownership`], which
-//!   the phase-3b host RPC (running as root) calls before the pack;
-//!   under an unprivileged caller (local dev/tests) it stops at the first
-//!   `PermissionDenied`. The materializer then applies the same metadata
-//!   directly to the packed ext4 image with an offline `debugfs` pass, so
-//!   the guest-visible rootfs still matches the OCI ownership without
-//!   running the host agent as root.
-//! - **xattrs** — applied where the filesystem allows; refusals (e.g.
-//!   `security.*` on macOS or unprivileged Linux) are collected in
-//!   [`TreeMetadata::skipped_xattrs`], never silently dropped.
-//! - **device nodes / fifos** — mknod is root-only; recorded in
-//!   [`TreeMetadata::skipped_specials`] (rare in session images; the
-//!   guest's devtmpfs provides /dev at boot).
+//! The host tree stores file contents only. Every tar-carried metadata
+//! field that cannot safely flow through unprivileged host inodes
+//! (uid/gid, full mode bits, xattrs, and skipped special-file records)
+//! is retained in [`TreeMetadata`] so the pack stage can emit a tarball
+//! whose headers are the metadata authority.
 //!
 //! ## Path safety
 //!
@@ -51,31 +35,77 @@ use std::io::Read;
 use std::path::{Component, Path};
 
 /// Tar-carried identity of one flattened entry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntryMeta {
     pub uid: u64,
     pub gid: u64,
     /// Permission bits incl. setuid/setgid/sticky (`mode & 0o7777`).
     pub mode: u32,
+    /// PAX-carried extended attributes (`SCHILY.xattr.*`), keyed by raw
+    /// xattr name without the prefix.
+    pub xattrs: BTreeMap<String, Vec<u8>>,
 }
 
-/// An xattr the filesystem refused (collected, never silently lost).
-#[derive(Clone, Debug)]
-pub struct SkippedXattr {
+impl EntryMeta {
+    pub fn new(uid: u64, gid: u64, mode: u32) -> Self {
+        Self {
+            uid,
+            gid,
+            mode,
+            xattrs: BTreeMap::new(),
+        }
+    }
+}
+
+/// Special-file type that cannot be materialized on the host tree
+/// without root, but can be represented in the emitted tar.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SkippedSpecialKind {
+    Fifo,
+    Char { major: u32, minor: u32 },
+    Block { major: u32, minor: u32 },
+}
+
+/// A special file omitted from the host tree and retained for tar emit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkippedSpecial {
     pub path: String,
-    pub name: String,
-    pub error: String,
+    pub kind: SkippedSpecialKind,
+    pub mtime: u64,
 }
 
-/// Sidecar metadata for a flattened tree — the ownership/xattr record
-/// that survives running unprivileged (see the module docs).
+impl PartialEq<str> for SkippedSpecial {
+    fn eq(&self, other: &str) -> bool {
+        self.path == other
+    }
+}
+
+impl PartialEq<String> for SkippedSpecial {
+    fn eq(&self, other: &String) -> bool {
+        &self.path == other
+    }
+}
+
+impl PartialEq<SkippedSpecial> for str {
+    fn eq(&self, other: &SkippedSpecial) -> bool {
+        self == other.path
+    }
+}
+
+impl PartialEq<SkippedSpecial> for String {
+    fn eq(&self, other: &SkippedSpecial) -> bool {
+        self == &other.path
+    }
+}
+
+/// Sidecar metadata for a flattened tree — the record that survives
+/// running unprivileged (see the module docs).
 #[derive(Debug, Default)]
 pub struct TreeMetadata {
     entries: BTreeMap<String, EntryMeta>,
-    pub skipped_xattrs: Vec<SkippedXattr>,
     /// Device nodes / fifos the unprivileged flatten couldn't create
     /// (tar paths).
-    pub skipped_specials: Vec<String>,
+    pub skipped_specials: Vec<SkippedSpecial>,
 }
 
 impl TreeMetadata {
@@ -96,7 +126,7 @@ impl TreeMetadata {
         self.entries.iter()
     }
 
-    fn insert(&mut self, rel: String, meta: EntryMeta) {
+    pub(crate) fn insert(&mut self, rel: String, meta: EntryMeta) {
         self.entries.insert(rel, meta);
     }
 
@@ -105,32 +135,6 @@ impl TreeMetadata {
         let prefix = format!("{rel}/");
         self.entries
             .retain(|k, _| k != rel && !k.starts_with(&prefix));
-    }
-
-    /// Apply the recorded uid/gid (and re-assert the mode — `chown`
-    /// strips setuid/setgid bits) onto the real tree. Root-only in
-    /// practice: the phase-3b host RPC calls this before the ext4
-    /// pack so `mke2fs -d` copies true ownership into the image.
-    ///
-    /// Returns `PermissionDenied` from the first refused chown —
-    /// callers running unprivileged treat that as "recorded, not
-    /// applied" (the documented dev/test limitation); any other error
-    /// is real and propagates.
-    pub fn apply_ownership(&self, root: &Path) -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        for (rel, meta) in &self.entries {
-            let p = root.join(rel);
-            let Ok(fs_meta) = std::fs::symlink_metadata(&p) else {
-                continue; // replaced/removed by a later layer's whiteout
-            };
-            std::os::unix::fs::lchown(&p, Some(meta.uid as u32), Some(meta.gid as u32))?;
-            // chown clears setuid/setgid on regular files — re-apply the
-            // recorded mode (symlinks carry no meaningful mode).
-            if !fs_meta.file_type().is_symlink() {
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(meta.mode))?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -233,23 +237,34 @@ pub fn apply_layer<R: Read>(
         }
 
         // --- real entries ---
-        let header = entry.header();
-        let mode = header
+        let entry_type = entry.header().entry_type();
+        let mode = entry
+            .header()
             .mode()
             .map_err(|e| FlattenError::Malformed(format!("{rel}: mode: {e}")))?
             & 0o7777;
-        let uid = header
+        let uid = entry
+            .header()
             .uid()
             .map_err(|e| FlattenError::Malformed(format!("{rel}: uid: {e}")))?;
-        let gid = header
+        let gid = entry
+            .header()
             .gid()
             .map_err(|e| FlattenError::Malformed(format!("{rel}: gid: {e}")))?;
-        let mtime = header.mtime().unwrap_or(0);
-        let entry_meta = EntryMeta { uid, gid, mode };
+        let mtime = entry.header().mtime().unwrap_or(0);
+        let dev_major = entry.header().device_major().ok().flatten().unwrap_or(0);
+        let dev_minor = entry.header().device_minor().ok().flatten().unwrap_or(0);
+        let xattrs = collect_xattrs(&mut entry)?;
+        let entry_meta = EntryMeta {
+            uid,
+            gid,
+            mode,
+            xattrs,
+        };
         let dst = root.join(&rel);
 
         use tar::EntryType;
-        match header.entry_type() {
+        match entry_type {
             EntryType::Directory => {
                 // Replacing a non-dir with a dir drops the old entry;
                 // an existing dir is merged (metadata refreshed).
@@ -260,7 +275,6 @@ pub fn apply_layer<R: Read>(
                 }
                 std::fs::create_dir_all(&dst)?;
                 set_mode(&dst, mode)?;
-                apply_xattrs(&mut entry, &dst, &rel, meta)?;
                 meta.insert(rel.clone(), entry_meta);
                 created_this_layer.insert(rel);
             }
@@ -277,7 +291,6 @@ pub fn apply_layer<R: Read>(
                 // than the epoch.
                 let ft = filetime::FileTime::from_unix_time(mtime as i64, 0);
                 filetime::set_file_times(&dst, ft, ft)?;
-                apply_xattrs(&mut entry, &dst, &rel, meta)?;
                 meta.insert(rel.clone(), entry_meta);
                 created_this_layer.insert(rel);
             }
@@ -325,14 +338,31 @@ pub fn apply_layer<R: Read>(
                 std::fs::hard_link(&target_abs, &dst)?;
                 // A hardlink shares the target's inode — record the
                 // target's identity so the sidecar stays consistent.
-                let linked_meta = meta.get(&target_rel).copied().unwrap_or(entry_meta);
+                let linked_meta = meta.get(&target_rel).cloned().unwrap_or(entry_meta);
                 meta.insert(rel.clone(), linked_meta);
                 created_this_layer.insert(rel);
             }
             EntryType::Fifo | EntryType::Char | EntryType::Block => {
                 // mknod is root-only; record and continue (module docs).
-                tracing::warn!(path = %rel, kind = ?header.entry_type(), "skipping special file (mknod requires root)");
-                meta.skipped_specials.push(rel.clone());
+                tracing::warn!(path = %rel, kind = ?entry_type, "skipping special file (mknod requires root)");
+                ensure_parent(&dst)?;
+                let kind = match entry_type {
+                    EntryType::Fifo => SkippedSpecialKind::Fifo,
+                    EntryType::Char => SkippedSpecialKind::Char {
+                        major: dev_major,
+                        minor: dev_minor,
+                    },
+                    EntryType::Block => SkippedSpecialKind::Block {
+                        major: dev_major,
+                        minor: dev_minor,
+                    },
+                    _ => unreachable!(),
+                };
+                meta.skipped_specials.push(SkippedSpecial {
+                    path: rel.clone(),
+                    kind,
+                    mtime,
+                });
                 meta.insert(rel, entry_meta);
             }
             // PAX/GNU metadata records are consumed by the tar crate
@@ -493,37 +523,23 @@ fn opaque_dir(
     Ok(())
 }
 
-/// Apply the entry's PAX-carried xattrs (`SCHILY.xattr.*`) to the
-/// extracted file/dir; refusals are collected on `meta` (module docs).
-/// Symlink entries never reach here — `xattr::set` follows links.
-fn apply_xattrs<R: Read>(
+/// Collect the entry's PAX-carried xattrs (`SCHILY.xattr.*`) into
+/// the sidecar. The host tree intentionally does not receive xattrs.
+fn collect_xattrs<R: Read>(
     entry: &mut tar::Entry<'_, R>,
-    dst: &Path,
-    rel: &str,
-    meta: &mut TreeMetadata,
-) -> Result<(), FlattenError> {
+) -> Result<BTreeMap<String, Vec<u8>>, FlattenError> {
     let Some(exts) = entry.pax_extensions()? else {
-        return Ok(());
+        return Ok(BTreeMap::new());
     };
-    // Collect first: applying while iterating would borrow `entry` twice.
-    let mut xattrs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut xattrs = BTreeMap::new();
     for ext in exts {
         let ext = ext?;
         let Ok(key) = ext.key() else { continue };
         if let Some(name) = key.strip_prefix("SCHILY.xattr.") {
-            xattrs.push((name.to_string(), ext.value_bytes().to_vec()));
+            xattrs.insert(name.to_string(), ext.value_bytes().to_vec());
         }
     }
-    for (name, value) in xattrs {
-        if let Err(e) = xattr::set(dst, &name, &value) {
-            meta.skipped_xattrs.push(SkippedXattr {
-                path: rel.to_string(),
-                name,
-                error: e.to_string(),
-            });
-        }
-    }
-    Ok(())
+    Ok(xattrs)
 }
 
 #[cfg(test)]
@@ -705,9 +721,7 @@ mod tests {
         assert_eq!(meta.get("usr/bin/sudo").unwrap().mode, 0o4755);
     }
 
-    /// uid/gid land in the sidecar even though the unprivileged
-    /// flatten can't chown the real tree (the ownership seam 3b
-    /// applies as root).
+    /// uid/gid land in the sidecar without requiring host chown.
     #[test]
     fn uid_gid_recorded_in_sidecar() {
         let layer = LayerBuilder::new()
@@ -716,20 +730,12 @@ mod tests {
             .build();
         let (_root, meta) = flatten(&[layer]);
         assert_eq!(
-            meta.get("home/dev/.bashrc"),
-            Some(&EntryMeta {
-                uid: 1000,
-                gid: 1000,
-                mode: 0o644
-            })
+            meta.get("home/dev/.bashrc").map(|m| (m.uid, m.gid, m.mode)),
+            Some((1000, 1000, 0o644))
         );
         assert_eq!(
-            meta.get("etc/shadow"),
-            Some(&EntryMeta {
-                uid: 0,
-                gid: 42,
-                mode: 0o600
-            })
+            meta.get("etc/shadow").map(|m| (m.uid, m.gid, m.mode)),
+            Some((0, 42, 0o600))
         );
     }
 
@@ -946,140 +952,8 @@ mod tests {
 
         let (root, meta) = flatten(&[layer]);
         assert!(!root.path().join("run/queue.pipe").exists());
-        assert_eq!(meta.skipped_specials, vec!["run/queue.pipe".to_string()]);
-    }
-
-    /// apply_ownership under an unprivileged caller: refused chowns
-    /// surface as PermissionDenied (the caller downgrades to
-    /// "recorded, not applied"); a root caller would get real
-    /// ownership. Self-chown (our own uid/gid) is the allowed case and
-    /// must succeed.
-    #[test]
-    fn apply_ownership_self_is_ok_foreign_is_permission_denied() {
-        let layer = LayerBuilder::new().file("f", 0o600, b"x").build();
-        let (root, mut meta) = flatten(&[layer]);
-
-        // Rewrite the record to OUR uid/gid — chown to self is allowed
-        // unprivileged, so this must succeed and re-assert the mode.
-        let m = std::fs::metadata(root.path().join("f")).unwrap();
-        let (my_uid, my_gid) = (m.uid() as u64, m.gid() as u64);
-        meta.entries.insert(
-            "f".into(),
-            EntryMeta {
-                uid: my_uid,
-                gid: my_gid,
-                mode: 0o600,
-            },
-        );
-        meta.apply_ownership(root.path())
-            .expect("self-chown is fine");
-
-        if my_uid != 0 {
-            // A foreign uid must refuse with PermissionDenied (the
-            // documented unprivileged limitation, downgraded by callers).
-            meta.entries.insert(
-                "f".into(),
-                EntryMeta {
-                    uid: 0,
-                    gid: 0,
-                    mode: 0o600,
-                },
-            );
-            let err = meta
-                .apply_ownership(root.path())
-                .expect_err("foreign chown must fail unprivileged");
-            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-        }
-    }
-
-    fn e2fsprogs_pair() -> Option<(PathBuf, PathBuf)> {
-        if let Some(mke2fs) = std::env::var_os("ENGRAM_MKE2FS").map(PathBuf::from) {
-            if let Some(debugfs) = mke2fs.parent().map(|d| d.join("debugfs")) {
-                if mke2fs.is_file() && debugfs.is_file() {
-                    return Some((mke2fs, debugfs));
-                }
-            }
-        }
-        if let Some(path) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&path) {
-                let mke2fs = dir.join("mke2fs");
-                let debugfs = dir.join("debugfs");
-                if mke2fs.is_file() && debugfs.is_file() {
-                    return Some((mke2fs, debugfs));
-                }
-            }
-        }
-        let homebrew = PathBuf::from("/opt/homebrew/opt/e2fsprogs/sbin");
-        let mke2fs = homebrew.join("mke2fs");
-        let debugfs = homebrew.join("debugfs");
-        (mke2fs.is_file() && debugfs.is_file()).then_some((mke2fs, debugfs))
-    }
-
-    fn debugfs_stat(debugfs: &std::path::Path, image: &std::path::Path, path: &str) -> String {
-        let out = std::process::Command::new(debugfs)
-            .arg("-R")
-            .arg(format!("stat \"{path}\""))
-            .arg(image)
-            .output()
-            .expect("run debugfs stat");
-        assert!(
-            out.status.success(),
-            "debugfs stat failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    }
-
-    #[test]
-    fn stamp_image_ownership_repairs_rootless_ext4_owners() {
-        use crate::ext4::Ext4Packer;
-
-        let Some((mke2fs, debugfs)) = e2fsprogs_pair() else {
-            eprintln!("SKIP: mke2fs/debugfs pair not available");
-            return;
-        };
-
-        let layer = LayerBuilder::new()
-            .dir("usr", 0o755)
-            .dir("usr/bin", 0o755)
-            .file("usr/bin/mount", 0o4755, b"fake mount")
-            .build();
-        let (root, meta) = flatten(&[layer]);
-        std::fs::create_dir_all(root.path().join("sbin")).unwrap();
-        std::fs::write(root.path().join("sbin/engram-init"), b"#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(
-            root.path().join("sbin/engram-init"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-
-        let image_dir = tempfile::tempdir().unwrap();
-        let image = image_dir.path().join("rootfs.ext4");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let size = crate::ext4::recommended_size(
-                crate::ext4::recursive_size(root.path()).await.unwrap(),
-            );
-            crate::ext4::Mke2fsPacker::with_binary(&mke2fs)
-                .pack(root.path(), &image, size)
-                .await
-                .unwrap();
-            crate::ext4::stamp_image_ownership_with_debugfs(&image, root.path(), &meta, &debugfs)
-                .await
-                .unwrap();
-        });
-
-        let mount_stat = debugfs_stat(&debugfs, &image, "/usr/bin/mount");
-        assert!(mount_stat.contains("Type: regular"), "{mount_stat}");
-        assert!(mount_stat.contains("Mode:  04755"), "{mount_stat}");
-        assert!(mount_stat.contains("User:     0"), "{mount_stat}");
-        assert!(mount_stat.contains("Group:     0"), "{mount_stat}");
-
-        let init_stat = debugfs_stat(&debugfs, &image, "/sbin/engram-init");
-        assert!(init_stat.contains("User:     0"), "{init_stat}");
-        assert!(init_stat.contains("Group:     0"), "{init_stat}");
+        assert_eq!(meta.skipped_specials.len(), 1);
+        assert_eq!(meta.skipped_specials[0].path, "run/queue.pipe");
+        assert_eq!(meta.skipped_specials[0].kind, SkippedSpecialKind::Fifo);
     }
 }

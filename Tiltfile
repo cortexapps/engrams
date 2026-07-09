@@ -293,15 +293,6 @@ coord_env = {
 if sandbox_backend == 'process':
     coord_env['ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND'] = '1'
 
-# `mke2fs` is keg-only under homebrew/e2fsprogs, so it isn't on the
-# default PATH on Apple Silicon. The host-agent's harness substrate
-# builder shells out to it, so the coordinator process needs it
-# resolvable. Mirror what `just bake` does and prepend the keg path.
-if 'Darwin' in uname_str:
-    coord_env['PATH'] = (
-        '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
-    )
-
 if bin_dir:
     # CI: run the downloaded release binary, no compile.
     coord_serve_cmd = 'exec ' + bin_dir + '/engram-coordinator'
@@ -465,17 +456,17 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
     # would clobber the host-agent's PATH-lookup default.
     if env_or('ENGRAM_FC_UFFD_HANDLER_BIN', ''):
         env['ENGRAM_FC_UFFD_HANDLER_BIN'] = env_or('ENGRAM_FC_UFFD_HANDLER_BIN', '')
+    # ADR 0082: materialization needs a libarchive-enabled (tar-input)
+    # mke2fs. Normally that's the flake's e2fsprogs on PATH (launch tilt
+    # from `nix develop`); an .env/process override pins one explicitly —
+    # e.g. a running tilt whose shell predates the flake bump. Conditional
+    # for the same clobber reason as above.
+    if env_or('ENGRAM_MKE2FS', ''):
+        env['ENGRAM_MKE2FS'] = env_or('ENGRAM_MKE2FS', '')
 
     if nbd_csv:
         env['ENGRAM_NBD_DEVICES'] = nbd_csv
-    if 'Darwin' in uname_str:
-        env['PATH'] = '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
-        # ADR 0080 §C: the enable-time materializer packs ext4 via mke2fs.
-        # Point it at homebrew's keg-only e2fsprogs (>= 1.47.1) explicitly so
-        # resolution never depends on PATH ordering — the dev mirror of the
-        # host-agent image's ENGRAM_MKE2FS=/usr/sbin/mke2fs.
-        env['ENGRAM_MKE2FS'] = '/opt/homebrew/opt/e2fsprogs/sbin/mke2fs'
-    else:
+    if 'Darwin' not in uname_str:
         # Linux: the host-agent runs under sudo (below), which scrubs
         # PATH to a secure default. Preserve the caller's PATH so it
         # still finds firecracker / ip / iptables / mke2fs.

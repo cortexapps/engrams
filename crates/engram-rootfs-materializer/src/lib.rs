@@ -8,12 +8,12 @@
 //!    as [`OciRuntimeDefaults`], stream layer blobs to scratch. Fails
 //!    loud on unknown layer mediaTypes before downloading bytes.
 //! 2. [`flatten`] — whiteout-aware layer application into one tree
-//!    (`.wh.`, opaque dirs, hardlinks, symlinks, setuid, xattrs, the
-//!    unprivileged-ownership sidecar, zip-slip rejection).
+//!    (`.wh.`, opaque dirs, hardlinks, symlinks, setuid, metadata
+//!    sidecar, zip-slip rejection).
 //! 3. [`inject`] — write the stage-1 init shim (the ONE engrams file
 //!    in the rootfs).
-//! 4. [`ext4`] — deterministic mke2fs pack (fixed UUID/hash-seed +
-//!    `SOURCE_DATE_EPOCH` + a tree-side mtime clamp).
+//! 4. [`ext4`] — deterministic tar emit plus mke2fs pack (fixed
+//!    UUID/hash-seed + `SOURCE_DATE_EPOCH`).
 //! 5. chunk — `chunk_file` into the content-addressed store; the
 //!    manifest ref is **content-derived** ([`Manifest::content_ref`]),
 //!    so re-materializing unchanged content reproduces the same ref
@@ -38,11 +38,10 @@ use std::sync::Arc;
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
 use engram_core::types::image::OciRuntimeDefaults;
 
-pub use ext4::{
-    clamp_mtimes, recommended_size, recursive_size, stamp_image_ownership, Ext4Error, Ext4Packer,
-    Mke2fsPacker,
+pub use ext4::{emit_tar, recommended_size, recursive_size, Ext4Error, Ext4Packer, Mke2fsPacker};
+pub use flatten::{
+    apply_layer, EntryMeta, FlattenError, SkippedSpecial, SkippedSpecialKind, TreeMetadata,
 };
-pub use flatten::{apply_layer, EntryMeta, FlattenError, SkippedXattr, TreeMetadata};
 pub use inject::{inject_init, InitInjection, Transport, DEFAULT_INIT_SHIM};
 pub use pull::{
     layer_compression, pull_image, LayerCompression, Platform, PullError, PulledImage, PulledLayer,
@@ -154,6 +153,42 @@ impl Drop for ScratchGuard {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct DroppedXattrs {
+    affected_entries: usize,
+    examples: Vec<String>,
+}
+
+fn mke2fs_accepts_tar_xattr(name: &str) -> bool {
+    matches!(name, "security.capability" | "gnu.translator")
+}
+
+fn mke2fs_dropped_xattrs(tree_meta: &TreeMetadata) -> DroppedXattrs {
+    let mut affected_entries = 0;
+    let mut examples = Vec::new();
+
+    for (path, meta) in tree_meta.iter() {
+        let mut entry_has_dropped_xattr = false;
+        for xattr_name in meta.xattrs.keys() {
+            if mke2fs_accepts_tar_xattr(xattr_name) {
+                continue;
+            }
+            entry_has_dropped_xattr = true;
+            if examples.len() < 3 {
+                examples.push(format!("{path}:{xattr_name}"));
+            }
+        }
+        if entry_has_dropped_xattr {
+            affected_entries += 1;
+        }
+    }
+
+    DroppedXattrs {
+        affected_entries,
+        examples,
+    }
+}
+
 /// The materializer: OCI client (auth resolved by the caller's
 /// [`engram_oci::RegistryAuthResolver`]) + an ext4 packer + the init
 /// injection to stamp into every produced rootfs.
@@ -262,83 +297,50 @@ impl Materializer {
                 MaterializeError::Io(std::io::Error::other(format!("flatten task: {e}")))
             })??
         };
-        if !tree_meta.skipped_xattrs.is_empty() {
-            tracing::warn!(
-                count = tree_meta.skipped_xattrs.len(),
-                first = ?tree_meta.skipped_xattrs.first(),
-                "some layer xattrs could not be applied to the tree"
-            );
-        }
         if !tree_meta.skipped_specials.is_empty() {
             tracing::warn!(
                 paths = ?tree_meta.skipped_specials,
-                "special files (dev nodes/fifos) skipped — mknod requires root; the guest's \
-                 devtmpfs provides /dev at boot"
+                "special files recorded in sidecar for tar emit"
+            );
+        }
+        let dropped_xattrs = mke2fs_dropped_xattrs(&tree_meta);
+        if dropped_xattrs.affected_entries != 0 {
+            tracing::warn!(
+                affected_entries = dropped_xattrs.affected_entries,
+                examples = ?dropped_xattrs.examples,
+                "mke2fs tar input will drop non-whitelisted xattrs"
             );
         }
 
         // 3. Inject the stage-1 init shim.
         inject::inject_init(&rootfs, &self.init).await?;
 
-        // 3b. Ownership: apply the tar-recorded uid/gid to the real
-        // tree when the caller can chown (rootful host-agent path).
-        // Local macOS/VZ dev intentionally stays unprivileged; there
-        // a foreign chown is refused, so we stamp the same uid/gid/mode
-        // into the ext4 inode metadata after mke2fs instead.
-        let tree_meta = Arc::new(tree_meta);
-        let ownership_applied = {
-            let rootfs_c = rootfs.clone();
-            let tree_meta_c = Arc::clone(&tree_meta);
-            let result =
-                tokio::task::spawn_blocking(move || tree_meta_c.apply_ownership(&rootfs_c))
-                    .await
-                    .map_err(|e| {
-                        MaterializeError::Io(std::io::Error::other(format!("chown task: {e}")))
-                    })?;
-            match result {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    tracing::warn!(
-                        "unprivileged materialize: tree ownership chown refused; will stamp \
-                         uid/gid/mode into the packed ext4 image offline"
-                    );
-                    false
-                }
-                Err(e) => return Err(e.into()),
-            }
-        };
-
-        // 4. Deterministic pack: clamp mtimes, then mke2fs.
+        // 4. Deterministic pack: emit metadata-authoritative tar, delete
+        // the host-content tree, then mke2fs -d <tar>.
         report(MaterializeStage::Pack, None);
-        {
-            let rootfs_c = rootfs.clone();
-            tokio::task::spawn_blocking(move || ext4::clamp_mtimes(&rootfs_c))
-                .await
-                .map_err(|e| {
-                    MaterializeError::Io(std::io::Error::other(format!("clamp task: {e}")))
-                })??;
-        }
         let dir_size = ext4::recursive_size(&rootfs).await?;
         let ext4_path = work.join("rootfs.ext4");
+        let tar_path = work.join("rootfs.tar");
         let fs_size = ext4::recommended_size(dir_size);
         tracing::info!(
             image = %image_uri,
             dir_size_bytes = dir_size,
             ext4_size_bytes = fs_size,
-            "packing flattened tree to ext4"
+            "emitting flattened tree tar and packing to ext4"
         );
-        self.packer.pack(&rootfs, &ext4_path, fs_size).await?;
-        if !ownership_applied {
-            let stamped =
-                ext4::stamp_image_ownership(&ext4_path, &rootfs, tree_meta.as_ref()).await?;
-            tracing::warn!(
-                stamped_inodes = stamped,
-                "unprivileged materialize: stamped uid/gid/mode into ext4 image via debugfs"
-            );
+        {
+            let rootfs_c = rootfs.clone();
+            let tar_path_c = tar_path.clone();
+            tokio::task::spawn_blocking(move || ext4::emit_tar(&rootfs_c, &tree_meta, &tar_path_c))
+                .await
+                .map_err(|e| {
+                    MaterializeError::Io(std::io::Error::other(format!("tar emit task: {e}")))
+                })??;
         }
-        // The tree served its purpose — free it before chunking so the
-        // scratch peak drops to just the ext4.
+        // The tree served its purpose — free it before mke2fs so the
+        // scratch peak is tree+tar, then tar+ext4.
         let _ = tokio::fs::remove_dir_all(&rootfs).await;
+        self.packer.pack(&tar_path, &ext4_path, fs_size).await?;
         let ext4_size_bytes = tokio::fs::metadata(&ext4_path).await?.len();
         report(
             MaterializeStage::Chunk,
@@ -393,5 +395,51 @@ mod tests {
         assert_eq!(estimated_peak_scratch_bytes(0), 0);
         // No overflow on adversarial input.
         assert!(estimated_peak_scratch_bytes(u64::MAX) > 0);
+    }
+
+    #[test]
+    fn mke2fs_dropped_xattrs_reports_only_non_whitelisted_and_truncates_examples() {
+        fn entry_with_xattrs(names: &[&str]) -> EntryMeta {
+            let mut entry = EntryMeta::new(0, 0, 0o644);
+            for name in names {
+                entry.xattrs.insert((*name).to_string(), Vec::new());
+            }
+            entry
+        }
+
+        let mut meta = TreeMetadata::default();
+        meta.insert(
+            "bin/ok".to_string(),
+            entry_with_xattrs(&["gnu.translator", "security.capability"]),
+        );
+        assert_eq!(
+            mke2fs_dropped_xattrs(&meta),
+            DroppedXattrs {
+                affected_entries: 0,
+                examples: Vec::new(),
+            },
+        );
+
+        meta.insert(
+            "bin/mixed".to_string(),
+            entry_with_xattrs(&["security.capability", "security.selinux", "user.mime_type"]),
+        );
+        meta.insert(
+            "etc/a".to_string(),
+            entry_with_xattrs(&["trusted.overlay.opaque"]),
+        );
+        meta.insert("etc/b".to_string(), entry_with_xattrs(&["user.comment"]));
+        meta.insert("etc/c".to_string(), entry_with_xattrs(&["user.extra"]));
+
+        let dropped = mke2fs_dropped_xattrs(&meta);
+        assert_eq!(dropped.affected_entries, 4);
+        assert_eq!(
+            dropped.examples,
+            vec![
+                "bin/mixed:security.selinux",
+                "bin/mixed:user.mime_type",
+                "etc/a:trusted.overlay.opaque",
+            ],
+        );
     }
 }

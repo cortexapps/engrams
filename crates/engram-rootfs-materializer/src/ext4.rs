@@ -1,11 +1,11 @@
-//! Pack a directory tree into an ext4 disk image, ready for
+//! Pack a flattened rootfs tar into an ext4 disk image, ready for
 //! `FirecrackerBackend` to attach as a root drive.
 //!
-//! The default [`Mke2fsPacker`] shells out to `mke2fs -t ext4 -F -d`,
-//! which (since e2fsprogs 1.43) populates the freshly-formatted
-//! filesystem from a source directory in one shot — no loopback
-//! mount, no root needed. This is the same flow Firecracker's CI uses
-//! to bake their published `ubuntu-*.ext4` artifacts.
+//! ADR 0082: the host scratch tree stores contents only. We first emit
+//! one deterministic tar whose headers carry the OCI uid/gid/mode/mtime
+//! and xattr metadata, then the default [`Mke2fsPacker`] shells out to
+//! `mke2fs -t ext4 -F -d <tar>`. Metadata flows as tar data, never
+//! through host inode ownership.
 //!
 //! ADR 0080: this module is the single home for tree → ext4 packing,
 //! whether the tree came from `docker export` (the retiring bake) or
@@ -14,20 +14,25 @@
 //! [`Ext4Packer`] is a trait so unit tests can mock it; the real
 //! binary is exercised by the packer/determinism integration tests.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::BufReader;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+
+use crate::flatten::{SkippedSpecialKind, TreeMetadata};
 
 #[async_trait]
 pub trait Ext4Packer: Send + Sync {
     /// Create `dst_image` (overwriting any existing file) of size
     /// `size_bytes`, format it as ext4, and copy the contents of
-    /// `src_dir` into the new filesystem. The image is left ready for
+    /// `src_tar` into the new filesystem. The image is left ready for
     /// Firecracker to attach as a block device.
     async fn pack(
         &self,
-        src_dir: &Path,
+        src_tar: &Path,
         dst_image: &Path,
         size_bytes: u64,
     ) -> Result<(), Ext4Error>;
@@ -39,9 +44,6 @@ pub enum Ext4Error {
     /// mke2fs returned a non-zero exit code. The string is its
     /// captured stderr — verbose, but useful when the bake fails.
     Mke2fs(String),
-    /// debugfs failed while applying offline metadata edits. The string is
-    /// the captured diagnostic output.
-    Debugfs(String),
     /// Could not find the mke2fs binary (PATH miss or stale config).
     MissingBinary(String),
 }
@@ -51,7 +53,6 @@ impl std::fmt::Display for Ext4Error {
         match self {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Mke2fs(s) => write!(f, "mke2fs: {s}"),
-            Self::Debugfs(s) => write!(f, "debugfs: {s}"),
             Self::MissingBinary(b) => write!(f, "binary not found: {b}"),
         }
     }
@@ -122,37 +123,11 @@ fn resolve_mke2fs() -> PathBuf {
     PathBuf::from("mke2fs")
 }
 
-/// Resolve the companion `debugfs` binary used only by the unprivileged
-/// ownership fallback. Prefer an explicit override, then the sibling of the
-/// configured `mke2fs` (Homebrew/Nix e2fsprogs layout), then the executable
-/// sibling/PATH fallbacks used by `mke2fs`.
-fn resolve_debugfs() -> PathBuf {
-    if let Some(p) = std::env::var_os("ENGRAM_DEBUGFS") {
-        return PathBuf::from(p);
-    }
-    if let Some(p) = std::env::var_os("ENGRAM_MKE2FS") {
-        let mke2fs = PathBuf::from(p);
-        if let Some(sibling) = mke2fs.parent().map(|d| d.join("debugfs")) {
-            if sibling.is_file() {
-                return sibling;
-            }
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(sibling) = exe.parent().map(|d| d.join("debugfs")) {
-            if sibling.is_file() {
-                return sibling;
-            }
-        }
-    }
-    PathBuf::from("debugfs")
-}
-
 #[async_trait]
 impl Ext4Packer for Mke2fsPacker {
     async fn pack(
         &self,
-        src_dir: &Path,
+        src_tar: &Path,
         dst_image: &Path,
         size_bytes: u64,
     ) -> Result<(), Ext4Error> {
@@ -178,7 +153,7 @@ impl Ext4Packer for Mke2fsPacker {
         //    of the tmp file on any failure path; ignore cleanup errors
         //    since the original mke2fs error is what the caller cares
         //    about.
-        let result = self.run_mke2fs(src_dir, &tmp).await;
+        let result = self.run_mke2fs(src_tar, &tmp).await;
         if let Err(e) = result {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
@@ -210,9 +185,9 @@ const DETERMINISTIC_HASH_SEED: &str = "00000000-5eed-4a11-8036-000000000036";
 /// and (a) stamps superblock mkfs/write times from it instead of the
 /// wall clock, and (b) clamps inode timestamps newer than it — which
 /// covers files injected at materialize time (the init shim, whiteout
-/// side effects). [`clamp_mtimes`] performs the same clamp in the tree
-/// itself as belt-and-braces (the reproducible-bundle lesson: one path
-/// skipping the clamp produced sha mismatches).
+/// side effects). [`emit_tar`] performs the same clamp in the emitted
+/// tar itself as belt-and-braces (the reproducible-bundle lesson: one
+/// path skipping the clamp produced sha mismatches).
 /// Verified empirically: same tree packed twice (and two
 /// separately-created identical trees) → byte-identical images.
 pub const DETERMINISTIC_EPOCH_SECS: u64 = 1_704_067_200;
@@ -222,7 +197,7 @@ impl Mke2fsPacker {
     /// Inner mke2fs invocation, factored out so the caller can wrap
     /// the failure path in tmp-file cleanup without duplicating
     /// argument construction.
-    async fn run_mke2fs(&self, src_dir: &Path, dst_image: &Path) -> Result<(), Ext4Error> {
+    async fn run_mke2fs(&self, src_tar: &Path, dst_image: &Path) -> Result<(), Ext4Error> {
         // Provision the inode table from the actual entry count, not
         // mke2fs's default (size / 16 KiB). A tree of many tiny files —
         // node_modules, gradle/pnpm caches — exhausts the default inode
@@ -239,7 +214,7 @@ impl Mke2fsPacker {
             .await
             .map(|m| m.len())
             .unwrap_or(0);
-        let num_inodes = inode_count_for(count_entries(src_dir).await, fs_size_bytes);
+        let num_inodes = inode_count_for(count_tar_entries(src_tar).await, fs_size_bytes);
         let output = tokio::process::Command::new(&self.bin)
             .arg("-t")
             .arg("ext4")
@@ -257,7 +232,7 @@ impl Mke2fsPacker {
             .arg(num_inodes.to_string())
             .env("SOURCE_DATE_EPOCH", DETERMINISTIC_EPOCH)
             .arg("-d")
-            .arg(src_dir)
+            .arg(src_tar)
             .arg(dst_image)
             .output()
             .await
@@ -280,191 +255,207 @@ impl Mke2fsPacker {
     }
 }
 
-/// Rootless repair for the `mke2fs -d` ownership/mode gap.
-///
-/// `mke2fs -d` copies uid/gid from the host tree. In local macOS/VZ dev the
-/// materializer is deliberately not root, so applying the OCI uid/gid with
-/// `chown` is refused and the packed image would otherwise contain UID 501
-/// owners for root-owned files. Some host filesystems also strip setuid/setgid
-/// bits from the scratch tree. This pass edits the ext4 inode metadata offline
-/// with `debugfs`; it does not mount the image and does not need sudo.
-pub async fn stamp_image_ownership(
-    image: &Path,
-    source_root: &Path,
-    tree_meta: &crate::flatten::TreeMetadata,
-) -> Result<usize, Ext4Error> {
-    stamp_image_ownership_with_debugfs(image, source_root, tree_meta, &resolve_debugfs()).await
+enum EmitSource {
+    Host(PathBuf),
+    Special {
+        kind: SkippedSpecialKind,
+        mtime: u64,
+    },
 }
 
-pub(crate) async fn stamp_image_ownership_with_debugfs(
-    image: &Path,
-    source_root: &Path,
-    tree_meta: &crate::flatten::TreeMetadata,
-    debugfs: &Path,
-) -> Result<usize, Ext4Error> {
-    let stamps = collect_ownership_stamps(source_root, tree_meta)?;
-    if stamps.is_empty() {
-        return Ok(0);
-    }
+/// Emit a deterministic rootfs tar from the host-content tree plus the
+/// OCI metadata sidecar. Blocking — call from `spawn_blocking` in async
+/// materialization code.
+pub fn emit_tar(root: &Path, tree_meta: &TreeMetadata, dst_tar: &Path) -> Result<(), Ext4Error> {
+    let file = File::create(dst_tar)?;
+    let mut builder = tar::Builder::new(file);
+    let entries = collect_emit_entries(root, tree_meta)?;
+    let mut first_by_inode: HashMap<(u64, u64), String> = HashMap::new();
 
-    let mut commands = String::new();
-    for (rel, stamp) in &stamps {
-        let path = debugfs_quote_path(rel)?;
-        commands.push_str(&format!("sif {path} uid {}\n", stamp.uid));
-        commands.push_str(&format!("sif {path} gid {}\n", stamp.gid));
-        commands.push_str(&format!("sif {path} mode 0{:o}\n", stamp.full_mode));
-    }
+    for (rel, source) in entries {
+        let tar_path = tar_path_for_rel(&rel);
+        match source {
+            EmitSource::Host(path) => {
+                let fs_meta = std::fs::symlink_metadata(&path)?;
+                let file_type = fs_meta.file_type();
+                let (uid, gid, mode, xattrs) = tar_meta(&rel, Some(&fs_meta), tree_meta);
+                let mtime = clamped_fs_mtime(&fs_meta);
 
-    let mut cmd_path = image.to_path_buf();
-    cmd_path.as_mut_os_string().push(format!(
-        ".ownership-{}.debugfs",
-        uuid::Uuid::new_v4().simple()
-    ));
-    tokio::fs::write(&cmd_path, commands).await?;
-
-    let output = match tokio::process::Command::new(debugfs)
-        .arg("-w")
-        .arg("-f")
-        .arg(&cmd_path)
-        .arg(image)
-        .output()
-        .await
-    {
-        Ok(output) => output,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&cmd_path).await;
-            return Err(if e.kind() == std::io::ErrorKind::NotFound {
-                Ext4Error::MissingBinary(debugfs.to_string_lossy().into_owned())
-            } else {
-                Ext4Error::Io(e)
-            });
-        }
-    };
-    let _ = tokio::fs::remove_file(&cmd_path).await;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    if !output.status.success() || debugfs_reported_errors(&stderr) {
-        return Err(Ext4Error::Debugfs(format_debugfs_failure(
-            output.status,
-            &stdout,
-            &stderr,
-        )));
-    }
-
-    Ok(stamps.len())
-}
-
-#[derive(Clone, Copy, Debug)]
-struct InodeStamp {
-    uid: u64,
-    gid: u64,
-    full_mode: u32,
-}
-
-fn collect_ownership_stamps(
-    source_root: &Path,
-    tree_meta: &crate::flatten::TreeMetadata,
-) -> Result<BTreeMap<String, InodeStamp>, Ext4Error> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let mut stamps = BTreeMap::new();
-    let mut stack = vec![source_root.to_path_buf()];
-
-    while let Some(path) = stack.pop() {
-        let meta = std::fs::symlink_metadata(&path)?;
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-
-        let rel = path
-            .strip_prefix(source_root)
-            .map_err(|e| Ext4Error::Debugfs(format!("path escape while stamping: {e}")))?;
-        let rel = rel
-            .to_str()
-            .ok_or_else(|| Ext4Error::Debugfs(format!("non-utf8 path: {}", rel.display())))?
-            .to_string();
-        let desired_owner = tree_meta
-            .get(&rel)
-            .map(|m| (m.uid, m.gid))
-            // Materializer-created entries (`/`, implicit parents, injected
-            // `/sbin/engram-init`) are root-owned in the rootful host-agent
-            // path, so make the rootless image match that contract.
-            .unwrap_or((0, 0));
-        let desired_mode = tree_meta
-            .get(&rel)
-            .map(|m| m.mode)
-            .unwrap_or_else(|| meta.permissions().mode() & 0o7777);
-        let Some(full_mode) = full_inode_mode(meta.file_type(), desired_mode) else {
-            continue;
-        };
-
-        let actual_owner = (meta.uid() as u64, meta.gid() as u64);
-        let actual_mode = meta.permissions().mode() & 0o7777;
-        if desired_owner != actual_owner || desired_mode != actual_mode {
-            stamps.insert(
-                rel,
-                InodeStamp {
-                    uid: desired_owner.0,
-                    gid: desired_owner.1,
-                    full_mode,
-                },
-            );
-        }
-
-        if meta.file_type().is_dir() {
-            for entry in std::fs::read_dir(&path)? {
-                stack.push(entry?.path());
+                if file_type.is_dir() {
+                    append_pax_xattrs(&mut builder, &xattrs)?;
+                    let mut header =
+                        tar_header(tar::EntryType::Directory, 0, mode, uid, gid, mtime);
+                    builder.append_data(&mut header, &tar_path, std::io::empty())?;
+                } else if file_type.is_symlink() {
+                    append_pax_xattrs(&mut builder, &xattrs)?;
+                    let mut header = tar_header(tar::EntryType::Symlink, 0, mode, uid, gid, mtime);
+                    let target = std::fs::read_link(&path)?;
+                    builder.append_link(&mut header, &tar_path, &target)?;
+                } else if file_type.is_file() {
+                    if fs_meta.nlink() > 1 {
+                        let key = (fs_meta.dev(), fs_meta.ino());
+                        if let Some(first) = first_by_inode.get(&key) {
+                            let mut header =
+                                tar_header(tar::EntryType::Link, 0, mode, uid, gid, mtime);
+                            builder.append_link(&mut header, &tar_path, first)?;
+                            continue;
+                        }
+                        first_by_inode.insert(key, rel.clone());
+                    }
+                    append_pax_xattrs(&mut builder, &xattrs)?;
+                    let mut header = tar_header(
+                        tar::EntryType::Regular,
+                        fs_meta.len(),
+                        mode,
+                        uid,
+                        gid,
+                        mtime,
+                    );
+                    let file = File::open(&path)?;
+                    builder.append_data(&mut header, &tar_path, BufReader::new(file))?;
+                } else if file_type.is_fifo() {
+                    append_pax_xattrs(&mut builder, &xattrs)?;
+                    let mut header = tar_header(tar::EntryType::Fifo, 0, mode, uid, gid, mtime);
+                    builder.append_data(&mut header, &tar_path, std::io::empty())?;
+                }
+            }
+            EmitSource::Special { kind, mtime } => {
+                let (uid, gid, mode, xattrs) = tar_meta(&rel, None, tree_meta);
+                append_pax_xattrs(&mut builder, &xattrs)?;
+                let mtime = mtime.min(DETERMINISTIC_EPOCH_SECS);
+                let entry_type = match kind {
+                    SkippedSpecialKind::Fifo => tar::EntryType::Fifo,
+                    SkippedSpecialKind::Char { .. } => tar::EntryType::Char,
+                    SkippedSpecialKind::Block { .. } => tar::EntryType::Block,
+                };
+                let mut header = tar_header(entry_type, 0, mode, uid, gid, mtime);
+                match kind {
+                    SkippedSpecialKind::Fifo => {}
+                    SkippedSpecialKind::Char { major, minor }
+                    | SkippedSpecialKind::Block { major, minor } => {
+                        header.set_device_major(major)?;
+                        header.set_device_minor(minor)?;
+                    }
+                }
+                builder.append_data(&mut header, &tar_path, std::io::empty())?;
             }
         }
     }
 
-    Ok(stamps)
+    builder.finish()?;
+    Ok(())
 }
 
-fn full_inode_mode(file_type: std::fs::FileType, mode: u32) -> Option<u32> {
-    if file_type.is_dir() {
-        Some(0o040000 | (mode & 0o7777))
-    } else if file_type.is_file() {
-        Some(0o100000 | (mode & 0o7777))
-    } else {
-        None
-    }
-}
+fn collect_emit_entries(
+    root: &Path,
+    tree_meta: &TreeMetadata,
+) -> Result<BTreeMap<String, EmitSource>, Ext4Error> {
+    let mut out = BTreeMap::new();
+    out.insert(String::new(), EmitSource::Host(root.to_path_buf()));
 
-fn debugfs_quote_path(rel: &str) -> Result<String, Ext4Error> {
-    if rel.bytes().any(|b| matches!(b, 0 | b'\n' | b'\r')) {
-        return Err(Ext4Error::Debugfs(format!(
-            "cannot stamp path with control character: {rel:?}"
-        )));
-    }
-    let mut quoted = String::from("\"/");
-    for ch in rel.chars() {
-        match ch {
-            '\\' => quoted.push_str("\\\\"),
-            '"' => quoted.push_str("\\\""),
-            _ => quoted.push(ch),
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut children = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            children.push(entry?.path());
+        }
+        children.sort();
+
+        for path in children {
+            let fs_meta = std::fs::symlink_metadata(&path)?;
+            let rel = rel_string(root, &path)?;
+            if fs_meta.file_type().is_dir() {
+                stack.push(path.clone());
+            }
+            out.insert(rel, EmitSource::Host(path));
         }
     }
-    quoted.push('"');
-    Ok(quoted)
+
+    for special in &tree_meta.skipped_specials {
+        out.insert(
+            special.path.clone(),
+            EmitSource::Special {
+                kind: special.kind.clone(),
+                mtime: special.mtime,
+            },
+        );
+    }
+
+    Ok(out)
 }
 
-fn debugfs_reported_errors(stderr: &str) -> bool {
-    stderr.lines().any(|line| {
-        let line = line.trim();
-        !line.is_empty() && !line.starts_with("debugfs ")
-    })
+fn rel_string(root: &Path, path: &Path) -> Result<String, Ext4Error> {
+    let rel = path.strip_prefix(root).map_err(|e| {
+        Ext4Error::Io(std::io::Error::other(format!(
+            "path escape while emitting tar: {e}"
+        )))
+    })?;
+    Ok(rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/"))
 }
 
-fn format_debugfs_failure(status: std::process::ExitStatus, stdout: &str, stderr: &str) -> String {
-    let stdout = stdout.trim();
-    let stderr = stderr.trim();
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => format!("exit status {status}"),
-        (false, true) => format!("exit status {status}; stdout: {stdout}"),
-        (true, false) => format!("exit status {status}; stderr: {stderr}"),
-        (false, false) => format!("exit status {status}; stdout: {stdout}; stderr: {stderr}"),
+fn tar_path_for_rel(rel: &str) -> PathBuf {
+    if rel.is_empty() {
+        PathBuf::from(".")
+    } else {
+        PathBuf::from(rel)
+    }
+}
+
+fn tar_meta(
+    rel: &str,
+    fs_meta: Option<&std::fs::Metadata>,
+    tree_meta: &TreeMetadata,
+) -> (u64, u64, u32, BTreeMap<String, Vec<u8>>) {
+    if let Some(meta) = tree_meta.get(rel) {
+        return (meta.uid, meta.gid, meta.mode, meta.xattrs.clone());
+    }
+    let mode = fs_meta
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(0o644);
+    (0, 0, mode, BTreeMap::new())
+}
+
+fn tar_header(
+    entry_type: tar::EntryType,
+    size: u64,
+    mode: u32,
+    uid: u64,
+    gid: u64,
+    mtime: u64,
+) -> tar::Header {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(entry_type);
+    header.set_size(size);
+    header.set_mode(mode);
+    header.set_uid(uid);
+    header.set_gid(gid);
+    header.set_mtime(mtime);
+    header
+}
+
+fn append_pax_xattrs<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    xattrs: &BTreeMap<String, Vec<u8>>,
+) -> std::io::Result<()> {
+    if xattrs.is_empty() {
+        return Ok(());
+    }
+    let pax: Vec<(String, &[u8])> = xattrs
+        .iter()
+        .map(|(name, value)| (format!("SCHILY.xattr.{name}"), value.as_slice()))
+        .collect();
+    builder.append_pax_extensions(pax.iter().map(|(key, value)| (key.as_str(), *value)))
+}
+
+fn clamped_fs_mtime(meta: &std::fs::Metadata) -> u64 {
+    if meta.mtime() < 0 {
+        0
+    } else {
+        (meta.mtime() as u64).min(DETERMINISTIC_EPOCH_SECS)
     }
 }
 
@@ -510,31 +501,34 @@ pub fn recommended_size(dir_size_bytes: u64) -> u64 {
     raw.saturating_add(align - 1) & !(align - 1)
 }
 
-/// Count filesystem entries (regular files, dirs, symlinks — one inode
-/// each) under `dir`. Does NOT follow symlinks: `mke2fs -d` replicates a
-/// symlink as a symlink (one inode), and not following also avoids walking
-/// symlink farms (pnpm `node_modules`) or cycles. Used to size the inode
-/// table via [`recommended_inodes`].
-async fn count_entries(dir: &Path) -> u64 {
-    let mut n = 0u64;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let mut rd = match tokio::fs::read_dir(&d).await {
-            Ok(r) => r,
-            Err(_) => continue,
+/// Count tar payload entries (regular files, dirs, symlinks, special
+/// files — one inode each). PAX/GNU metadata records are not rootfs
+/// entries and do not need inodes.
+async fn count_tar_entries(tar_path: &Path) -> u64 {
+    let tar_path = tar_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> u64 {
+        let Ok(file) = File::open(tar_path) else {
+            return 0;
         };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            n = n.saturating_add(1);
-            // `file_type()` reflects the entry itself (readdir d_type),
-            // NOT the symlink target — so we only descend into real dirs.
-            if let Ok(ft) = entry.file_type().await {
-                if ft.is_dir() {
-                    stack.push(entry.path());
-                }
+        let mut archive = tar::Archive::new(BufReader::new(file));
+        let Ok(entries) = archive.entries() else {
+            return 0;
+        };
+
+        let mut n = 0u64;
+        for entry in entries.flatten() {
+            match entry.header().entry_type() {
+                tar::EntryType::XHeader
+                | tar::EntryType::XGlobalHeader
+                | tar::EntryType::GNULongName
+                | tar::EntryType::GNULongLink => {}
+                _ => n = n.saturating_add(1),
             }
         }
-    }
-    n
+        n
+    })
+    .await
+    .unwrap_or(0)
 }
 
 /// Inodes to provision for a tree of `entry_count` entries. mke2fs's
@@ -590,7 +584,7 @@ pub fn inode_count_for(entry_count: u64, fs_size_bytes: u64) -> u64 {
 /// Counting is per-entry, so a hardlink (pnpm's content-addressed store links
 /// into `node_modules`) is counted once per link — an overcount, but in the
 /// safe direction (a slightly larger fs is fine; a too-small one is fatal).
-/// Not following symlinks matches `count_entries` and `mke2fs -d`, which
+/// Not following symlinks matches tar emission and `mke2fs -d <tar>`, which
 /// replicates a symlink as a symlink: we count the link inode's own blocks and
 /// reach a target only if it lives in the real tree. `symlink_metadata`
 /// (lstat) also can't error on broken symlinks, unlike `metadata`.
@@ -618,43 +612,6 @@ pub async fn recursive_size(dir: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
-}
-
-/// Clamp every mtime under `root` (files, dirs, symlinks) to
-/// [`DETERMINISTIC_EPOCH_SECS`] — anything newer is set to the epoch;
-/// older (tar-carried, already deterministic) timestamps are left
-/// alone. Belt-and-braces for the pack's `SOURCE_DATE_EPOCH` clamp:
-/// e2fsprogs < 1.47.1 silently ignores the env var, and the
-/// reproducible-bundle incident taught us that any single path
-/// skipping the clamp shows up later as a sha-mismatch head-scratcher.
-/// Run right before [`Ext4Packer::pack`]. Blocking — call from
-/// `spawn_blocking`.
-pub fn clamp_mtimes(root: &Path) -> std::io::Result<()> {
-    let clamp = filetime::FileTime::from_unix_time(DETERMINISTIC_EPOCH_SECS as i64, 0);
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        // Clamp the directory itself AFTER queueing (children writes
-        // won't touch it again — we only read below this point).
-        for entry in std::fs::read_dir(&d)? {
-            let entry = entry?;
-            let p = entry.path();
-            let meta = std::fs::symlink_metadata(&p)?;
-            if meta.is_dir() {
-                stack.push(p.clone());
-            }
-            let mtime = filetime::FileTime::from_last_modification_time(&meta);
-            if mtime > clamp {
-                // lutimes: never follow symlinks (the target may not
-                // even exist inside the tree).
-                filetime::set_symlink_file_times(&p, clamp, clamp)?;
-            }
-        }
-        let meta = std::fs::symlink_metadata(&d)?;
-        if filetime::FileTime::from_last_modification_time(&meta) > clamp {
-            filetime::set_symlink_file_times(&d, clamp, clamp)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -773,50 +730,130 @@ mod tests {
     }
 
     #[test]
-    fn debugfs_quote_path_escapes_debugfs_syntax() {
-        assert_eq!(debugfs_quote_path("").unwrap(), "\"/\"");
-        assert_eq!(
-            debugfs_quote_path("dir/with spaces/quote\"and\\slash").unwrap(),
-            "\"/dir/with spaces/quote\\\"and\\\\slash\""
-        );
-        assert!(debugfs_quote_path("bad\npath").is_err());
-    }
+    fn emit_tar_records_sidecar_metadata_xattrs_and_hardlinks() {
+        use crate::flatten::{EntryMeta, TreeMetadata};
 
-    #[test]
-    fn debugfs_reported_errors_ignores_banner_only() {
-        assert!(!debugfs_reported_errors("debugfs 1.47.4 (6-Mar-2025)\n"));
-        assert!(debugfs_reported_errors(
-            "debugfs 1.47.4 (6-Mar-2025)\n/missing: File not found by ext2_lookup\n"
-        ));
-    }
-
-    /// The determinism clamp: newer-than-epoch mtimes (freshly written
-    /// files) snap to the epoch; older, tar-carried mtimes survive.
-    /// Symlinks are clamped via lutimes (never following the target).
-    #[test]
-    fn clamp_mtimes_clamps_new_and_keeps_old() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::create_dir(root.join("sub")).unwrap();
-        std::fs::write(root.join("sub/fresh"), b"now").unwrap(); // wall clock, > epoch
-        std::fs::write(root.join("old"), b"then").unwrap();
+        std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+        std::fs::write(root.join("usr/bin/mount"), b"mount").unwrap();
+        std::fs::hard_link(root.join("usr/bin/mount"), root.join("usr/bin/mount.link")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+
         let old = filetime::FileTime::from_unix_time(1_000_000, 0); // 1970s
-        filetime::set_file_mtime(root.join("old"), old).unwrap();
-        std::os::unix::fs::symlink("missing-target", root.join("dangling")).unwrap();
+        filetime::set_file_mtime(root.join("usr/bin/mount"), old).unwrap();
+        filetime::set_file_mtime(root.join("usr/bin/mount.link"), old).unwrap();
 
-        clamp_mtimes(root).unwrap();
+        let mut meta = TreeMetadata::default();
+        let mut file_meta = EntryMeta::new(0, 0, 0o4755);
+        file_meta
+            .xattrs
+            .insert("security.capability".into(), b"cap".to_vec());
+        meta.insert("usr/bin/mount".into(), file_meta.clone());
+        meta.insert("usr/bin/mount.link".into(), file_meta);
+        meta.insert("bin".into(), EntryMeta::new(0, 0, 0o777));
 
-        let mt = |p: &str| {
-            let m = std::fs::symlink_metadata(root.join(p)).unwrap();
-            filetime::FileTime::from_last_modification_time(&m).unix_seconds()
-        };
-        assert_eq!(mt("sub/fresh"), DETERMINISTIC_EPOCH_SECS as i64);
-        assert_eq!(mt("sub"), DETERMINISTIC_EPOCH_SECS as i64);
-        assert_eq!(mt("old"), 1_000_000, "pre-epoch mtimes are preserved");
+        let out = tempfile::tempdir().unwrap();
+        let tar_a = out.path().join("rootfs-a.tar");
+        let tar_b = out.path().join("rootfs-b.tar");
+        emit_tar(root, &meta, &tar_a).unwrap();
+        emit_tar(root, &meta, &tar_b).unwrap();
         assert_eq!(
-            mt("dangling"),
-            DETERMINISTIC_EPOCH_SECS as i64,
-            "symlink itself is clamped without following its target"
+            std::fs::read(&tar_a).unwrap(),
+            std::fs::read(&tar_b).unwrap(),
+            "two emits of the same tree must be byte-identical"
+        );
+
+        let mut archive = tar::Archive::new(std::fs::File::open(tar_a).unwrap());
+        let mut seen = BTreeMap::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let h = entry.header().clone();
+            let mut xattrs = BTreeMap::new();
+            if let Some(exts) = entry.pax_extensions().unwrap() {
+                for ext in exts {
+                    let ext = ext.unwrap();
+                    let key = ext.key().unwrap();
+                    if let Some(name) = key.strip_prefix("SCHILY.xattr.") {
+                        xattrs.insert(name.to_string(), ext.value_bytes().to_vec());
+                    }
+                }
+            }
+            let link = h
+                .link_name()
+                .unwrap()
+                .map(|p| p.to_string_lossy().into_owned());
+            seen.insert(
+                path,
+                (
+                    h.entry_type(),
+                    h.uid().unwrap(),
+                    h.gid().unwrap(),
+                    h.mode().unwrap() & 0o7777,
+                    h.mtime().unwrap(),
+                    link,
+                    xattrs,
+                ),
+            );
+        }
+
+        let root_entry = seen.get(".").expect("root entry");
+        assert_eq!(root_entry.0, tar::EntryType::Directory);
+        assert_eq!((root_entry.1, root_entry.2), (0, 0));
+
+        let mount = seen.get("usr/bin/mount").expect("mount entry");
+        assert_eq!(mount.0, tar::EntryType::Regular);
+        assert_eq!((mount.1, mount.2, mount.3), (0, 0, 0o4755));
+        assert_eq!(mount.4, 1_000_000, "old mtimes survive the clamp");
+        assert_eq!(
+            mount.6.get("security.capability").map(Vec::as_slice),
+            Some(&b"cap"[..])
+        );
+
+        let link = seen.get("usr/bin/mount.link").expect("hardlink entry");
+        assert_eq!(link.0, tar::EntryType::Link);
+        assert_eq!(link.5.as_deref(), Some("usr/bin/mount"));
+
+        let symlink = seen.get("bin").expect("symlink entry");
+        assert_eq!(symlink.0, tar::EntryType::Symlink);
+        assert_eq!(symlink.5.as_deref(), Some("usr/bin"));
+    }
+
+    #[test]
+    fn emit_tar_clamps_new_mtimes_without_mutating_tree() {
+        use crate::flatten::TreeMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("fresh"), b"now").unwrap();
+        let before = std::fs::symlink_metadata(root.join("fresh"))
+            .unwrap()
+            .mtime();
+        assert!(
+            before >= DETERMINISTIC_EPOCH_SECS as i64,
+            "fixture needs a post-epoch mtime"
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        let tar_path = out.path().join("rootfs.tar");
+        emit_tar(root, &TreeMetadata::default(), &tar_path).unwrap();
+        let after = std::fs::symlink_metadata(root.join("fresh"))
+            .unwrap()
+            .mtime();
+        assert_eq!(after, before, "emit must not mutate host-tree mtimes");
+
+        let mut archive = tar::Archive::new(std::fs::File::open(tar_path).unwrap());
+        let fresh = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap())
+            .find(|e| e.path().unwrap().to_string_lossy() == "fresh")
+            .expect("fresh tar entry");
+        assert_eq!(
+            fresh.header().mtime().unwrap(),
+            DETERMINISTIC_EPOCH_SECS,
+            "new mtimes are clamped in tar headers"
         );
     }
 }

@@ -21,7 +21,8 @@ use axum::Router;
 use bytes::Bytes;
 use engram_oci::{AnonymousResolver, OciClient};
 use engram_rootfs_materializer::{
-    pull_image, InitInjection, LayerCompression, Materializer, Platform, Transport,
+    apply_layer, emit_tar, pull_image, recommended_size, recursive_size, Ext4Packer, InitInjection,
+    LayerCompression, Materializer, Mke2fsPacker, Platform, Transport, TreeMetadata,
 };
 use parking_lot::Mutex;
 use sha2::Digest as _;
@@ -330,17 +331,49 @@ async fn unknown_layer_media_type_fails_loud_before_any_download() {
 // Full pipeline: determinism + scratch discipline (needs mke2fs).
 // ---------------------------------------------------------------
 
+const SCRATCHPAD_MKE2FS: &str = "/private/tmp/claude-501/-Users-ganeshdatta-Documents-engrams/8c393984-8b5a-4ad7-9428-47048ade71fd/scratchpad/mke2fs-libarchive/bin/mke2fs";
+
+fn find_on_path(bin: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|dir| dir.join(bin))
+        .find(|p| p.is_file())
+}
+
+fn e2fsprogs_pair() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let scratchpad = std::path::PathBuf::from(SCRATCHPAD_MKE2FS);
+    let mke2fs = if scratchpad.is_file() {
+        scratchpad
+    } else if let Some(p) = std::env::var_os("ENGRAM_MKE2FS").map(std::path::PathBuf::from) {
+        p
+    } else {
+        find_on_path("mke2fs")?
+    };
+
+    let debugfs = if let Some(p) = std::env::var_os("ENGRAM_DEBUGFS").map(std::path::PathBuf::from)
+    {
+        p
+    } else if let Some(sibling) = mke2fs.parent().map(|d| d.join("debugfs")) {
+        if sibling.is_file() {
+            sibling
+        } else {
+            find_on_path("debugfs")?
+        }
+    } else {
+        find_on_path("debugfs")?
+    };
+
+    (mke2fs.is_file() && debugfs.is_file()).then_some((mke2fs, debugfs))
+}
+
 /// ADR 0036 byte-determinism hinges on SOURCE_DATE_EPOCH, honored by
-/// e2fsprogs >= 1.47.1 (the same >=1.47.1 e2fsprogs determinism
-/// gate). Older/missing mke2fs → skip with a note, never flake.
-fn deterministic_mke2fs_available() -> Option<String> {
-    let on_path = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|dir| dir.join("mke2fs").is_file()))
-        .unwrap_or(false);
-    if !on_path {
-        return None;
-    }
-    let out = std::process::Command::new("mke2fs")
+/// e2fsprogs >= 1.47.1, and ADR 0082 additionally requires libarchive
+/// tar input support. Older/missing/non-libarchive mke2fs → skip with
+/// a note, never flake.
+fn deterministic_mke2fs_available() -> Option<(std::path::PathBuf, String)> {
+    let (mke2fs, _debugfs) = e2fsprogs_pair()?;
+    let out = std::process::Command::new(&mke2fs)
         .arg("-V")
         .output()
         .ok()?;
@@ -353,18 +386,208 @@ fn deterministic_mke2fs_available() -> Option<String> {
         let c: u32 = it.next()?.parse().ok()?;
         Some((a, b, c))
     });
-    matches!(ver, Some(v) if v >= (1, 47, 1)).then_some(text)
+    if !matches!(ver, Some(v) if v >= (1, 47, 1)) {
+        return None;
+    }
+    mke2fs_accepts_tar(&mke2fs).ok()?;
+    Some((mke2fs, text))
 }
 
-fn materializer() -> Materializer {
-    Materializer::new(
+fn materializer(mke2fs: impl Into<std::path::PathBuf>) -> Materializer {
+    Materializer::with_packer(
         oci_client(),
         InitInjection {
             vsock_port: 1024,
             transport: Transport::Vsock,
             init_script: None,
         },
+        Arc::new(Mke2fsPacker::with_binary(mke2fs)),
     )
+}
+
+fn mke2fs_accepts_tar(mke2fs: &std::path::Path) -> Result<(), String> {
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let tar_path = dir.path().join("smoke.tar");
+    {
+        let file = std::fs::File::create(&tar_path).map_err(|e| e.to_string())?;
+        let mut tar = tar::Builder::new(file);
+        let mut h = tar::Header::new_gnu();
+        h.set_mode(0o644);
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_size(2);
+        h.set_mtime(946_684_800);
+        h.set_entry_type(tar::EntryType::Regular);
+        tar.append_data(&mut h, "ok", &b"ok"[..])
+            .map_err(|e| e.to_string())?;
+        tar.finish().map_err(|e| e.to_string())?;
+    }
+    let image = dir.path().join("smoke.ext4");
+    let f = std::fs::File::create(&image).map_err(|e| e.to_string())?;
+    f.set_len(16 * 1024 * 1024).map_err(|e| e.to_string())?;
+    drop(f);
+
+    let out = std::process::Command::new(mke2fs)
+        .arg("-t")
+        .arg("ext4")
+        .arg("-F")
+        .arg("-q")
+        .arg("-d")
+        .arg(&tar_path)
+        .arg(&image)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+fn debugfs_cmd(debugfs: &std::path::Path, image: &std::path::Path, cmd: &str) -> String {
+    let out = std::process::Command::new(debugfs)
+        .arg("-R")
+        .arg(cmd)
+        .arg(image)
+        .output()
+        .expect("run debugfs");
+    assert!(
+        out.status.success(),
+        "debugfs {cmd:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn debugfs_inode(stat: &str) -> u64 {
+    stat.split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|w| (w[0] == "Inode:").then(|| w[1].parse().ok()).flatten())
+        .unwrap_or_else(|| panic!("debugfs stat missing inode: {stat}"))
+}
+
+fn metadata_layer() -> Vec<u8> {
+    let mut tar = tar::Builder::new(Vec::new());
+    let mut file = tar::Header::new_gnu();
+    file.set_mode(0o4755);
+    file.set_uid(0);
+    file.set_gid(0);
+    file.set_size(10);
+    file.set_mtime(946_684_800);
+    file.set_entry_type(tar::EntryType::Regular);
+    let cap = [
+        0x01, 0x00, 0x00, 0x02, // revision 2 + effective flag
+        0x00, 0x00, 0x20, 0x00, // permitted: cap_sys_admin
+        0x00, 0x00, 0x00, 0x00, // inheritable
+        0x00, 0x00, 0x00, 0x00, // permitted high
+        0x00, 0x00, 0x00, 0x00, // inheritable high
+    ];
+    tar.append_pax_extensions([
+        ("SCHILY.xattr.security.capability", &cap[..]),
+        ("SCHILY.xattr.user.test", &b"dropped-by-mke2fs"[..]),
+    ])
+    .unwrap();
+    tar.append_data(&mut file, "usr/bin/mount", &b"fake mount"[..])
+        .unwrap();
+
+    let mut hardlink = tar::Header::new_gnu();
+    hardlink.set_mode(0o4755);
+    hardlink.set_uid(0);
+    hardlink.set_gid(0);
+    hardlink.set_size(0);
+    hardlink.set_mtime(946_684_800);
+    hardlink.set_entry_type(tar::EntryType::Link);
+    tar.append_link(&mut hardlink, "usr/bin/mount.link", "usr/bin/mount")
+        .unwrap();
+
+    let mut symlink = tar::Header::new_gnu();
+    symlink.set_mode(0o777);
+    symlink.set_uid(0);
+    symlink.set_gid(0);
+    symlink.set_size(0);
+    symlink.set_mtime(946_684_800);
+    symlink.set_entry_type(tar::EntryType::Symlink);
+    tar.append_link(&mut symlink, "etc/mtab", "../proc/self/mounts")
+        .unwrap();
+
+    let mut fifo = tar::Header::new_gnu();
+    fifo.set_mode(0o644);
+    fifo.set_uid(0);
+    fifo.set_gid(0);
+    fifo.set_size(0);
+    fifo.set_mtime(946_684_800);
+    fifo.set_entry_type(tar::EntryType::Fifo);
+    tar.append_data(&mut fifo, "run/queue.pipe", std::io::empty())
+        .unwrap();
+
+    tar.finish().unwrap();
+    tar.into_inner().unwrap()
+}
+
+#[tokio::test]
+async fn real_mke2fs_tar_input_preserves_materialized_metadata() {
+    let Some((mke2fs, debugfs)) = e2fsprogs_pair() else {
+        eprintln!("SKIP: mke2fs/debugfs pair not available");
+        return;
+    };
+    if let Err(e) = mke2fs_accepts_tar(&mke2fs) {
+        eprintln!(
+            "SKIP: mke2fs does not support tar input (likely built without libarchive): {}",
+            e.trim()
+        );
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let mut meta = TreeMetadata::default();
+    apply_layer(root.path(), &mut meta, metadata_layer().as_slice()).unwrap();
+
+    let image_dir = tempfile::tempdir().unwrap();
+    let size = recommended_size(recursive_size(root.path()).await.unwrap());
+    let tar_path = image_dir.path().join("rootfs.tar");
+    emit_tar(root.path(), &meta, &tar_path).unwrap();
+    let image = image_dir.path().join("rootfs.ext4");
+    Mke2fsPacker::with_binary(&mke2fs)
+        .pack(&tar_path, &image, size)
+        .await
+        .unwrap();
+
+    let mount_stat = debugfs_cmd(&debugfs, &image, "stat /usr/bin/mount");
+    assert!(mount_stat.contains("Type: regular"), "{mount_stat}");
+    assert!(mount_stat.contains("Mode:  04755"), "{mount_stat}");
+    assert!(mount_stat.contains("User:     0"), "{mount_stat}");
+    assert!(mount_stat.contains("Group:     0"), "{mount_stat}");
+
+    let link_stat = debugfs_cmd(&debugfs, &image, "stat /usr/bin/mount.link");
+    assert_eq!(
+        debugfs_inode(&mount_stat),
+        debugfs_inode(&link_stat),
+        "hardlink entries must share an ext4 inode"
+    );
+
+    let symlink_stat = debugfs_cmd(&debugfs, &image, "stat /etc/mtab");
+    assert!(symlink_stat.contains("Type: symlink"), "{symlink_stat}");
+    assert!(
+        symlink_stat.contains("../proc/self/mounts"),
+        "{symlink_stat}"
+    );
+
+    let fifo_stat = debugfs_cmd(&debugfs, &image, "stat /run/queue.pipe");
+    assert!(
+        fifo_stat.to_ascii_lowercase().contains("type: fifo"),
+        "{fifo_stat}"
+    );
+
+    let xattrs = debugfs_cmd(&debugfs, &image, "ea_list /usr/bin/mount");
+    assert!(
+        xattrs.contains("security.capability"),
+        "security.capability should round-trip through mke2fs/libarchive: {xattrs}"
+    );
+    assert!(
+        !xattrs.contains("user.test"),
+        "mke2fs/libarchive 1.47.2 drops user.* xattrs; test pins that behavior: {xattrs}"
+    );
 }
 
 /// The keystone: two FULL runs (pull → flatten → inject → pack →
@@ -373,10 +596,10 @@ fn materializer() -> Materializer {
 /// every run scrubs its scratch, success or not.
 #[tokio::test]
 async fn materialize_is_deterministic_and_scrubs_scratch() {
-    let Some(ver) = deterministic_mke2fs_available() else {
+    let Some((mke2fs, ver)) = deterministic_mke2fs_available() else {
         eprintln!(
-            "mke2fs missing or < 1.47.1 (no SOURCE_DATE_EPOCH); skipping determinism test \
-             (use the flake-pinned mke2fs: `nix develop`)"
+            "mke2fs missing, < 1.47.1, or lacks tar input support; skipping determinism test \
+             (use the libarchive-enabled flake-pinned mke2fs)"
         );
         return;
     };
@@ -388,7 +611,7 @@ async fn materialize_is_deterministic_and_scrubs_scratch() {
         engram_storage_local::LocalBlobStorage::new(store_dir.path().to_path_buf()),
     ));
     let scratch = tempfile::tempdir().unwrap();
-    let m = materializer();
+    let m = materializer(mke2fs);
 
     // Phase 3b: the RPC's progress frames — assert the honest stage
     // sequence rides the optional sender.
@@ -470,7 +693,7 @@ async fn materialize_scrubs_scratch_on_error() {
     ));
     let scratch = tempfile::tempdir().unwrap();
 
-    let err = materializer()
+    let err = materializer("mke2fs")
         .materialize(
             &fx.uri,
             Platform::LinuxArm64,

@@ -33,20 +33,40 @@ FROM debian:trixie-slim
 #     reuse. debian:trixie ships e2fsprogs 1.47.2 (matches the flake pin),
 #     so the apt mke2fs is fine — but we ASSERT the floor below so a base
 #     bump that regresses it fails the image build loudly.
+#   - libarchive13t64: ADR 0082 tar-input materialization; trixie's mke2fs
+#     dlopens libarchive for `-d <tarball>` support.
 #   - iproute2:  ip, for the tap device + guest netns
 #   - iptables:  egress NAT / firewall rules for guest networking
 # (ca-certificates: TLS to the blob backend — GCS/S3.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates e2fsprogs iproute2 iptables \
+    ca-certificates e2fsprogs libarchive13t64 iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
-# ADR 0080/0036: fail the build if the base's mke2fs predates the
-# SOURCE_DATE_EPOCH support that deterministic packing relies on.
+# ADR 0080/0036/0082: fail the build if the base's mke2fs predates
+# SOURCE_DATE_EPOCH support or regresses tar-input libarchive support.
 RUN set -eux; \
     ver="$(mke2fs -V 2>&1 | sed -n 's/^mke2fs \([0-9][0-9.]*\).*/\1/p' | head -1)"; \
     echo "e2fsprogs mke2fs: $ver"; \
     [ "$(printf '1.47.1\n%s\n' "$ver" | sort -V | head -1)" = "1.47.1" ] || { \
         echo "mke2fs $ver < 1.47.1 — deterministic ext4 pack broken (ADR 0036); pin a newer base or bundle a static mke2fs" >&2; \
-        exit 1; }
+        exit 1; \
+    }; \
+    scratch="$(mktemp -d)"; \
+    trap 'rm -rf "$scratch"' EXIT; \
+    mkdir -p "$scratch/root/bin"; \
+    printf 'setuid smoke\n' > "$scratch/root/bin/setuid-probe"; \
+    tar --numeric-owner --owner=0 --group=0 --mode=0755 --no-recursion -cf "$scratch/input.tar" -C "$scratch/root" . ./bin; \
+    tar --numeric-owner --owner=0 --group=0 --mode=04755 -rf "$scratch/input.tar" -C "$scratch/root" ./bin/setuid-probe; \
+    mke2fs -q -F -t ext4 -d "$scratch/input.tar" "$scratch/rootfs.ext4" 4m; \
+    stat_out="$(debugfs -R "stat /bin/setuid-probe" "$scratch/rootfs.ext4" 2>/dev/null)"; \
+    printf '%s\n' "$stat_out"; \
+    printf '%s\n' "$stat_out" | grep -Eq 'User:[[:space:]]+0[[:space:]]+Group:[[:space:]]+0' || { \
+        echo "mke2fs tar input failed to preserve uid/gid 0 from the tar header (ADR 0082)" >&2; \
+        exit 1; \
+    }; \
+    printf '%s\n' "$stat_out" | grep -Eq 'Mode:[[:space:]]+04755' || { \
+        echo "mke2fs tar input failed to preserve mode 04755 from the tar header (ADR 0082)" >&2; \
+        exit 1; \
+    }
 # ADR 0080: host-agent's materializer resolves mke2fs via ENGRAM_MKE2FS
 # first (engram_rootfs_materializer::ext4::resolve_mke2fs). Pin it at the
 # apt path so the resolution never depends on PATH ordering or a sibling.
