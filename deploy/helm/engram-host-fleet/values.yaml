@@ -234,11 +234,17 @@ otel:
       limits:
         cpu: 200m
         memory: 192Mi
-  # NOTE: no `guestEndpoint` field here (yet). In-guest agentd export
-  # (ENGRAM_GUEST_OTEL_ENDPOINT -> the FC kernel cmdline's `engram_otel=`)
-  # depends on a guest->collector firewall pinhole that doesn't exist yet
-  # — deliberately deferred out of #526's scope (prototype-first). Add
-  # this field in that follow-up, not here.
+  # In-guest agentd OTLP export (#526 phase 2). When non-empty (and
+  # `otel.enabled`), sets ENGRAM_GUEST_OTEL_ENDPOINT on the host-agent:
+  # the endpoint rides the FC kernel cmdline (`engram_otel=`) into the
+  # guest on COLD boots (capture VMs — restores reuse the snapshot's
+  # embedded cmdline), and the host-agent opens a matching tcp pinhole
+  # in the host INPUT chain so the guest's dial survives the VM-pool
+  # DROP. The guest-reachable collector address is the VM's default
+  # gateway — the slot-0 TAP at 10.200.0.1 — and the otelcol sidecar
+  # binds 0.0.0.0 under hostNetwork, so the canonical value is
+  # "http://10.200.0.1:4317". Empty (default) = no env, no pinhole.
+  guestEndpoint: ""
 
 # Metrics scraping. Mirrors the engram chart's `metrics.podMonitoring`:
 # on GKE, Google Managed Prometheus scrapes via a `PodMonitoring` CRD
