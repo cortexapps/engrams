@@ -35,15 +35,35 @@ setsid bash -c "exec tilt up --stream >'$LOG' 2>&1" &
 disown 2>/dev/null || true
 echo "==> tilt up started (log: $LOG)"
 
-# Wait for the coordinator HTTP API.
+# On failure, a blind `tail` of the interleaved stream log is useless:
+# the bundle bake's apt output (thousands of lines) drowns the streams
+# that explain the failure. Dump the load-bearing resources' streams
+# individually (tilt truncates long resource names with `…`, hence the
+# prefix matches), then a short raw tail for anything unanticipated.
+dump_diagnostics() {
+    for r in coordina postgres registry jaeger seed-buck fake-gcs host-agent; do
+        echo "--- tilt.log stream: ${r}* (last 40 lines) ---" >&2
+        { grep -F "$r" "$LOG" || true; } | tail -40 >&2
+    done
+    echo "--- tilt.log raw tail (last 60 lines) ---" >&2
+    tail -60 "$LOG" >&2 || true
+}
+
+# Wait for the coordinator HTTP API. The coord resource dep-chains on
+# postgres/registry/jaeger/seed-buckets — on a cold-cache runner those
+# are all docker pulls, racing the bundle bake's chromium download from
+# the (throttled) snapshot.debian.org pin for the same NIC. 180s was not
+# enough on slow runners (2026-07-09: jaeger still mid-pull at the
+# timeout, coord never even started); 600s buys the worst cold case
+# without slowing green runs (the loop exits the second /healthz serves).
 echo "==> waiting for coord /healthz"
-for _ in $(seq 1 180); do
+for _ in $(seq 1 600); do
     curl -fsS http://127.0.0.1:8090/healthz >/dev/null 2>&1 && break
     sleep 1
 done
 if ! curl -fsS http://127.0.0.1:8090/healthz >/dev/null 2>&1; then
     echo "ERROR: coord never came up" >&2
-    tail -80 "$LOG" >&2 || true
+    dump_diagnostics
     exit 1
 fi
 echo "    coord up"
@@ -77,8 +97,11 @@ host_count() {
         | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ' || true
 }
 
+# 600s for the same cold-runner reason as the coord wait above — and
+# more so: host-agent additionally dep-chains on the `bundles` bake,
+# whose chromium install rides the throttled snapshot.debian.org pin.
 echo "==> waiting for host registration (want >= $want_hosts)"
-for _ in $(seq 1 180); do
+for _ in $(seq 1 600); do
     n=$(host_count)
     [ "${n:-0}" -ge "$want_hosts" ] && break
     sleep 1
@@ -86,7 +109,7 @@ done
 n=$(host_count)
 if [ "${n:-0}" -lt "$want_hosts" ]; then
     echo "ERROR: expected >= $want_hosts host-agent(s), got ${n:-0}" >&2
-    tail -80 "$LOG" >&2 || true
+    dump_diagnostics
     exit 1
 fi
 echo "    $n host(s) registered; prod-shape stack ready"
