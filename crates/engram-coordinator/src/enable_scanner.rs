@@ -509,10 +509,22 @@ async fn advance_one(
             engram_core::types::CaptureJobStage::Failed => {
                 let retryable = capture_row.retryable.unwrap_or(false);
                 if retryable && capture_row.attempts < cfg.max_attempts {
-                    // Reassign under budget: pick a fresh host, bump the
-                    // job's epoch, and go back to watching — this does
-                    // NOT touch the enable job's own attempts counter,
-                    // that budget belongs to the capture_jobs row.
+                    // Re-drive under budget: pick a fresh host, then
+                    // atomically re-drive the TERMINAL `failed` row back to
+                    // `assigned` (epoch++/attempts++) and go back to
+                    // watching — this does NOT touch the enable job's own
+                    // attempts counter, that budget belongs to the
+                    // capture_jobs row.
+                    //
+                    // NOTE (issue #546 blocker): a plain
+                    // `reassign_capture_job` is fenced `stage NOT IN
+                    // ('done','failed')` and would match 0 rows on a
+                    // terminal row — a silent no-op that leaves the row
+                    // `failed` while we return `InFlight`, so the next tick
+                    // re-reads the SAME terminal row (attempts never
+                    // bumped) and loops forever, never reaching
+                    // `ready`/`failed`. `redrive_failed_capture_job`
+                    // targets the terminal row specifically.
                     let footprint = crate::api::enabled_images::capture_footprint_for_job_row(
                         state,
                         &capture_row,
@@ -527,26 +539,62 @@ async fn advance_one(
                     .await
                     {
                         Ok((new_host, _)) => {
-                            if let Err(e) = state
+                            match state
                                 .services
                                 .meta
-                                .reassign_capture_job(capture_row.id, capture_row.epoch, new_host)
+                                .redrive_failed_capture_job(
+                                    capture_row.id,
+                                    capture_row.epoch,
+                                    new_host,
+                                    cfg.max_attempts,
+                                )
                                 .await
                             {
-                                tracing::warn!(%job_id, capture_job_id = %capture_row.id, error = %e, "enable-scanner: failed to reassign retryable capture job");
+                                Ok(Some(redriven)) => {
+                                    tracing::info!(%job_id, capture_job_id = %capture_row.id, epoch = redriven.epoch, attempts = redriven.attempts, %new_host, "enable-scanner: re-drove retryable-terminal capture job onto a fresh host");
+                                    let _ = state
+                                        .services
+                                        .meta
+                                        .release_enable_job_claim(job_id, claimant)
+                                        .await;
+                                    return Err(AdvanceError::InFlight);
+                                }
+                                Ok(None) => {
+                                    // ANOMALY, never a silent no-op: we
+                                    // read a failed+retryable row under
+                                    // budget, yet the fenced re-drive
+                                    // matched 0 rows — a racing coordinator
+                                    // replica moved the epoch, or the row is
+                                    // no longer retryable. Warn and fall
+                                    // through to fail the enable job below
+                                    // rather than loop.
+                                    tracing::warn!(%job_id, capture_job_id = %capture_row.id, epoch = capture_row.epoch, attempts = capture_row.attempts, "enable-scanner: redrive of a retryable-terminal capture job matched 0 rows; failing the enable job");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%job_id, capture_job_id = %capture_row.id, error = %e, "enable-scanner: failed to re-drive retryable capture job; will retry next tick");
+                                    let _ = state
+                                        .services
+                                        .meta
+                                        .release_enable_job_claim(job_id, claimant)
+                                        .await;
+                                    return Err(AdvanceError::InFlight);
+                                }
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(%job_id, capture_job_id = %capture_row.id, error = ?e, "enable-scanner: no host available to reassign a retryable capture job; will retry next tick");
+                            tracing::warn!(%job_id, capture_job_id = %capture_row.id, error = ?e, "enable-scanner: no host available to re-drive a retryable capture job; will retry next tick");
+                            let _ = state
+                                .services
+                                .meta
+                                .release_enable_job_claim(job_id, claimant)
+                                .await;
+                            return Err(AdvanceError::InFlight);
                         }
                     }
-                    let _ = state
-                        .services
-                        .meta
-                        .release_enable_job_claim(job_id, claimant)
-                        .await;
-                    return Err(AdvanceError::InFlight);
                 }
+                // Not retryable, attempts exhausted, or a redrive anomaly
+                // (warned above): fail the enable job with the terminal
+                // row's own failure kind.
                 let msg = capture_row
                     .error
                     .clone()
@@ -871,13 +919,26 @@ async fn capture_job_deadline_scan(cfg: &EnableScannerConfig, state: &SharedStat
             .await
             {
                 Ok((new_host, _)) => {
-                    if let Err(e) = state
+                    // `row` came from `expire_capture_job_stages`, which
+                    // only returns NON-terminal rows, so `reassign_capture_job`
+                    // (fenced `stage NOT IN ('done','failed')`) is correct
+                    // here. A `None` still means the fence missed (a racing
+                    // scan tick already reassigned it, or a report drove it
+                    // terminal between the read and this write) — benign,
+                    // but never silently ignored.
+                    match state
                         .services
                         .meta
                         .reassign_capture_job(row.id, row.epoch, new_host)
                         .await
                     {
-                        tracing::warn!(capture_job_id = %row.id, error = %e, "capture-job deadline scan: reassign failed");
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            tracing::warn!(capture_job_id = %row.id, epoch = row.epoch, "capture-job deadline scan: reassign matched 0 rows (raced a concurrent scan or a terminal report); skipping");
+                        }
+                        Err(e) => {
+                            tracing::warn!(capture_job_id = %row.id, error = %e, "capture-job deadline scan: reassign failed");
+                        }
                     }
                 }
                 Err(e) => {

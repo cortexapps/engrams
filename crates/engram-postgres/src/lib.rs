@@ -4958,6 +4958,55 @@ impl MetadataStore for PostgresStore {
         row.map(|r| row::capture_job_from_row(&r)).transpose()
     }
 
+    async fn redrive_failed_capture_job(
+        &self,
+        id: CaptureJobId,
+        expected_epoch: i64,
+        new_host: HostId,
+        max_attempts: u32,
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        // Unlike `reassign_capture_job` (fenced `stage NOT IN
+        // ('done','failed')`), this deliberately targets a TERMINAL
+        // `failed` row and re-drives it — the automatic path's equivalent
+        // of `retry_enable_job`'s DELETE-the-terminal-row escape. The
+        // `attempts < $4` clause makes the budget atomic (an exhausted job
+        // returns 0 rows → `None`); the `epoch + 1` bump keeps any stale
+        // report from the abandoned attempt fenced out of
+        // `record_capture_job_report`. Per-attempt fields are cleared and
+        // timestamps reset to mirror a fresh `insert_capture_job` row.
+        let row = sqlx::query(
+            r#"
+            UPDATE capture_jobs
+               SET host_id = $3,
+                   epoch = epoch + 1,
+                   attempts = attempts + 1,
+                   stage = 'assigned',
+                   stage_started_at = NOW(),
+                   last_progress_at = NOW(),
+                   stage_progress = NULL,
+                   error = NULL,
+                   error_stage = NULL,
+                   retryable = NULL,
+                   result_bincode = NULL,
+                   fc_snapshot_version = NULL,
+                   updated_at = NOW()
+             WHERE id = $1 AND epoch = $2 AND stage = 'failed' AND retryable AND attempts < $4
+            RETURNING id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                      oci_defaults, host_id, epoch, stage, stage_started_at, stage_progress,
+                      last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                      result_bincode, created_at, updated_at
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(expected_epoch)
+        .bind(new_host.as_uuid())
+        .bind(i64::from(max_attempts))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::capture_job_from_row(&r)).transpose()
+    }
+
     async fn expire_capture_job_stages(
         &self,
         budgets: &[(engram_core::types::CaptureJobStage, std::time::Duration)],

@@ -27,8 +27,8 @@ use std::time::Duration;
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::{
-    CaptureJobProgress, CaptureJobReport, CaptureJobStage, CaptureTerminalReport, ColdBaseRow,
-    NewCaptureJob,
+    CaptureJobProgress, CaptureJobReport, CaptureJobRow, CaptureJobStage, CaptureTerminalReport,
+    ColdBaseRow, NewCaptureJob,
 };
 use engram_core::{HostId, SnapshotId};
 use uuid::Uuid;
@@ -320,6 +320,133 @@ async fn reassign_bumps_epoch_and_attempts_and_resets_stage() {
         .await
         .expect("stale reassign call");
     assert!(stale.is_none(), "a stale-epoch reassign must not land");
+}
+
+/// Drive `job` to a TERMINAL `failed`/`retryable=true` row with the
+/// per-attempt fields populated (so a subsequent re-drive's clears are
+/// observable, not vacuously true).
+async fn fail_retryable(meta: &Arc<dyn MetadataStore>, job: &CaptureJobRow) {
+    let report = CaptureJobReport {
+        job_id: job.id,
+        epoch: job.epoch,
+        stage: CaptureJobStage::Failed,
+        progress: None,
+        fc_snapshot_version: Some("v7".into()),
+        terminal: Some(CaptureTerminalReport::Failed {
+            error: "stream died mid-capture".into(),
+            error_stage: "warming".into(),
+            retryable: true,
+        }),
+    };
+    assert!(meta
+        .record_capture_job_report(&report)
+        .await
+        .expect("fail-retryable report"));
+}
+
+/// Issue #546 blocker: `reassign_capture_job` is fenced `stage NOT IN
+/// ('done','failed')` and so silently no-ops on a TERMINAL row — the
+/// enable scanner's terminal-retryable arm needs `redrive_failed_capture_job`
+/// to actually revive the row. Under budget it must produce a fresh
+/// `assigned` attempt (epoch+1/attempts+1, new host, per-attempt fields
+/// cleared); `reassign_capture_job` on the same terminal row must NOT.
+#[tokio::test]
+#[ignore]
+async fn redrive_revives_a_retryable_terminal_row_under_budget() {
+    let Some(meta) = connect().await else { return };
+    let enable_job_id = seed_enable_job(&meta, "redrive").await;
+    let host_a = HostId::new();
+    let host_b = HostId::new();
+    let job = meta
+        .insert_capture_job(new_capture_job(enable_job_id, host_a))
+        .await
+        .expect("insert");
+    fail_retryable(&meta, &job).await;
+
+    // The bug being fixed: `reassign_capture_job` is fenced off a terminal
+    // row and matches nothing (the silent no-op that used to loop forever).
+    let reassigned = meta
+        .reassign_capture_job(job.id, job.epoch, host_b)
+        .await
+        .expect("reassign call");
+    assert!(
+        reassigned.is_none(),
+        "reassign_capture_job must NOT touch a terminal failed row (this is the no-op the fix routes around)"
+    );
+
+    // The fix: `redrive_failed_capture_job` under budget revives the row.
+    let redriven = meta
+        .redrive_failed_capture_job(job.id, job.epoch, host_b, 5)
+        .await
+        .expect("redrive call")
+        .expect("redrive lands under budget");
+    assert_eq!(redriven.epoch, job.epoch + 1, "epoch must bump");
+    assert_eq!(redriven.attempts, job.attempts + 1, "attempts must bump");
+    assert_eq!(redriven.host_id, host_b, "new host must be stamped");
+    assert_eq!(redriven.stage, CaptureJobStage::Assigned, "stage resets");
+    assert!(redriven.stage_progress.is_none());
+    assert!(
+        redriven.error.is_none()
+            && redriven.error_stage.is_none()
+            && redriven.retryable.is_none()
+            && redriven.result_bincode.is_none()
+            && redriven.fc_snapshot_version.is_none(),
+        "per-attempt fields must be cleared, mirroring a fresh insert",
+    );
+
+    // The row is now `assigned` at a NEW epoch — a re-drive against the
+    // OLD epoch, and any re-drive of a now-non-`failed` row, must miss.
+    assert!(
+        meta.redrive_failed_capture_job(job.id, job.epoch, host_a, 5)
+            .await
+            .expect("stale-epoch redrive call")
+            .is_none(),
+        "a stale-epoch redrive must not land",
+    );
+    assert!(
+        meta.redrive_failed_capture_job(job.id, redriven.epoch, host_a, 5)
+            .await
+            .expect("non-failed redrive call")
+            .is_none(),
+        "a re-drive of a non-`failed` row must miss",
+    );
+}
+
+/// The attempts budget is atomic in the verb: a retryable-terminal row
+/// whose `attempts` has reached the budget refuses the re-drive (0 rows →
+/// `None`), leaving the row `failed` so the enable scanner fails the
+/// enable job with the terminal row's own failure kind.
+#[tokio::test]
+#[ignore]
+async fn redrive_refused_when_attempts_at_budget() {
+    let Some(meta) = connect().await else { return };
+    let enable_job_id = seed_enable_job(&meta, "redrive-budget").await;
+    let host_a = HostId::new();
+    let host_b = HostId::new();
+    let job = meta
+        .insert_capture_job(new_capture_job(enable_job_id, host_a))
+        .await
+        .expect("insert");
+    // A fresh row is at attempts = 1. Fail it retryable, then re-drive
+    // with a budget of exactly 1: `attempts < 1` is false, so the fence
+    // matches nothing.
+    fail_retryable(&meta, &job).await;
+    assert_eq!(job.attempts, 1);
+    let refused = meta
+        .redrive_failed_capture_job(job.id, job.epoch, host_b, 1)
+        .await
+        .expect("at-budget redrive call");
+    assert!(
+        refused.is_none(),
+        "a re-drive at the attempts budget must be refused",
+    );
+
+    // The row stays terminal `failed` (unchanged) — the enable scanner's
+    // fail path can now surface it as a terminal enable-job failure.
+    let got = meta.get_capture_job(job.id).await.unwrap().unwrap();
+    assert_eq!(got.stage, CaptureJobStage::Failed);
+    assert_eq!(got.attempts, 1, "a refused re-drive must not bump attempts");
+    assert_eq!(got.error.as_deref(), Some("stream died mid-capture"));
 }
 
 #[tokio::test]

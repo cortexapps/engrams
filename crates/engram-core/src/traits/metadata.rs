@@ -2110,6 +2110,50 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// Re-drive a RETRYABLE TERMINAL (`failed`) job back onto a fresh
+    /// host under the attempts budget — the automatic counterpart of the
+    /// operator's `retry_enable_job` escape. [`Self::reassign_capture_job`]
+    /// is fenced `stage NOT IN ('done', 'failed')`, so it can never move
+    /// a row that already reached `failed`: the enable scanner's
+    /// terminal-retryable arm would call it, match 0 rows, and silently
+    /// loop on the same terminal row forever (the enable job never reaches
+    /// `ready`/`failed`). This verb closes that hole with a fence that
+    /// deliberately targets a terminal row: `UPDATE ... SET host_id =
+    /// $new, epoch = epoch + 1, attempts = attempts + 1, stage =
+    /// 'assigned', <reset per-attempt fields> WHERE id = $1 AND epoch =
+    /// $2 AND stage = 'failed' AND retryable AND attempts < $4`.
+    ///
+    /// The `attempts < $max_attempts` clause makes the budget atomic: a
+    /// row that has exhausted its attempts returns `None` (0 rows), and
+    /// the caller fails the enable job with the terminal row's own failure
+    /// kind, exactly as the non-retryable path does. The `epoch + 1` bump
+    /// preserves the terminal-report-immutability property: any stale
+    /// report from the just-abandoned attempt is fenced off by epoch, so
+    /// [`Self::record_capture_job_report`] stays fenced on `(id, epoch)`
+    /// and never needs weakening. Per-attempt fields
+    /// (`error`/`error_stage`/`retryable`/`result_bincode`/
+    /// `fc_snapshot_version`) are cleared and the stage/progress
+    /// timestamps reset, mirroring what a fresh
+    /// [`Self::insert_capture_job`] initializes.
+    ///
+    /// `None` when the fence missed: attempts exhausted, a racing
+    /// coordinator replica already re-drove it (epoch moved), or the row
+    /// is no longer a retryable `failed` — never silently ignore it, the
+    /// caller must decide (fail the enable job, or observe the fresh
+    /// attempt) rather than loop.
+    async fn redrive_failed_capture_job(
+        &self,
+        id: CaptureJobId,
+        expected_epoch: i64,
+        new_host: HostId,
+        max_attempts: u32,
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        let _ = (id, expected_epoch, new_host, max_attempts);
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
     /// Every non-terminal job whose current stage has run longer than
     /// its budget in `budgets` (the deadline scan's read: `assigned`
     /// 60s, `booting` 300s absolute, `freezing` =
