@@ -1,6 +1,8 @@
 # 0082 — Local Firecracker dev on Apple Silicon via a dedicated Colima VM
 
-Status: Proposed
+Status: Accepted (2026-07-09) — implemented on PR #595 (`fc-colima-dev`); the
+phase log below records the P0–P3 divergences. Sibling decision: ADR 0083
+(fail-closed egress-proxy bind), found via this rig and landed in the same PR.
 
 ## Context
 
