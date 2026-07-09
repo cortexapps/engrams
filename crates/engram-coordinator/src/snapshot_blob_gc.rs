@@ -73,7 +73,7 @@ pub async fn run_one_snapshot_blob_sweep(
         let gen_before = meta.chunk_generation().await?;
         let mut pins: HashSet<SnapshotId> =
             meta.snapshot_blob_pin_set().await?.into_iter().collect();
-        // ADR 0081 §B6: a cold base's own Full snapshot has no
+        // ADR 0084 §B6: a cold base's own Full snapshot has no
         // `snapshots` row (only the warm overlay it seeds gets one) —
         // its state.bin/sidecar blobs would otherwise look unpinned to
         // this sweep.
@@ -142,7 +142,7 @@ pub async fn run_one_snapshot_blob_sweep(
         // unpinned candidate has its blobs deleted.
         let mut pins: HashSet<SnapshotId> =
             meta.snapshot_blob_pin_set().await?.into_iter().collect();
-        // ADR 0081 §B6: a cold base's own Full snapshot has no
+        // ADR 0084 §B6: a cold base's own Full snapshot has no
         // `snapshots` row (only the warm overlay it seeds gets one) —
         // its state.bin/sidecar blobs would otherwise look unpinned to
         // this sweep.

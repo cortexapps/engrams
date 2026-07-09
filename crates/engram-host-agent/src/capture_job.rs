@@ -1,4 +1,4 @@
-//! ADR 0081 P1b: capture as a durable, heartbeat-dispatched host-owned
+//! ADR 0084 P1b: capture as a durable, heartbeat-dispatched host-owned
 //! job.
 //!
 //! Base-snapshot capture used to run inside a streaming `BuildBaseSnapshot`
@@ -151,7 +151,7 @@ pub struct CaptureJobExecutor {
     /// change without a host-agent restart); `None` on VZ/Process
     /// hosts. Stamped on every report this executor emits: the
     /// coordinator's finalize REQUIRES it whenever a capture produced a
-    /// cold base (the content key's version dimension — ADR 0081 §B),
+    /// cold base (the content key's version dimension — ADR 0084 §B),
     /// and the host that actually ran the VMM is the authority for it,
     /// not the heartbeat-lagged `hosts.capabilities` row.
     fc_snapshot_version: Option<String>,
@@ -272,9 +272,9 @@ impl CaptureJobExecutor {
     /// unless this exact epoch is already running. A LOWER epoch than
     /// what's running is implicitly "no" too (the assignment is stale —
     /// the coordinator hasn't caught up to a reassignment this host
-    /// already knows about), matching ADR 0081's "ignore a
+    /// already knows about), matching ADR 0084's "ignore a
     /// lower-than-running epoch" rule without a separate branch.
-    /// Convergence cancel (ADR 0081 §A): destroy the VM of any
+    /// Convergence cancel (ADR 0084 §A): destroy the VM of any
     /// still-running attempt whose `job_id` is entirely absent from the
     /// coordinator's AUTHORITATIVE assignment list for this host — it was
     /// reassigned to another host or terminally superseded, so its writes

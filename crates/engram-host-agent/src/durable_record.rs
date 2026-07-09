@@ -1,6 +1,6 @@
 //! One-file-per-record durable JSON persistence — the shared engine
 //! under `checkpoint::CheckpointRecord` (ADR 0028 Fix A) and
-//! `capture_job::CaptureJobRecord` (ADR 0081 §A).
+//! `capture_job::CaptureJobRecord` (ADR 0084 §A).
 //!
 //! The contract both rely on:
 //!   - **persist** = write to a `.json.partial` temp, fsync, rename —

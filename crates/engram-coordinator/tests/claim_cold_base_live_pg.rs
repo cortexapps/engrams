@@ -1,4 +1,4 @@
-//! ADR 0081 §B/§D: `claim_capture_job`'s cold-base plan resolution
+//! ADR 0084 §B/§D: `claim_capture_job`'s cold-base plan resolution
 //! (`resolve_cold_base_plan`, `pub(crate)` — reached only through the
 //! `pub` axum handler, called in-process exactly like
 //! `enable_reuse_live_pg.rs`'s capture-job simulator does).

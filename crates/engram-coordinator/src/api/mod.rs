@@ -19,7 +19,7 @@ pub(crate) mod forge;
 // registry doesn't exist anymore (the harness is an image property
 // baked at image-bake time).
 mod health;
-// `pub`: ADR 0081 P1b live-PG tests (`enable_reuse_live_pg`,
+// `pub`: ADR 0084 P1b live-PG tests (`enable_reuse_live_pg`,
 // `enable_jobs_live_pg`) drive `claim_capture_job` directly (in-process,
 // no HTTP) to simulate a host claiming + executing a capture job without
 // standing up a real host-agent.

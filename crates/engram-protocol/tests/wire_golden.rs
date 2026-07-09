@@ -249,7 +249,7 @@ fn cow_state() -> CowState {
 
 /// Issue #539 (historical): `Vec<WarmStageRecord>` used to cross the
 /// coord<->host wire as the `CaptureProgress.warm_stages_bincode`
-/// payload; ADR 0081 P1b deleted that RPC (and P4 deleted the
+/// payload; ADR 0084 P1b deleted that RPC (and P4 deleted the
 /// now-dead-code metadata verb, `update_enable_job_capture_progress`,
 /// that used to write it), so this is now purely a JSON-in-JSONB
 /// stability guard (`enable_jobs.warm_stages`) — kept pinned here
@@ -415,7 +415,7 @@ fn wire_version_pinned() {
     // coord→host; `ManifestRef` — already pinned — and
     // `OciRuntimeDefaults` host→coord), goldens ADDED for the new
     // shapes; every existing golden is byte-identical.
-    // 14 -> 15: ADR 0081 (#546) — capture_jobs heartbeat dispatch/
+    // 14 -> 15: ADR 0084 (#546) — capture_jobs heartbeat dispatch/
     // reporting. `Heartbeat.capture_job_reports` /
     // `HeartbeatAck.capture_assignments`/`acked_capture_jobs` ride the
     // JSON heartbeat/ack, NOT the gRPC bincode `bytes` payloads this

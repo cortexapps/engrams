@@ -361,7 +361,7 @@ impl HostClient for FakeCaptureHost {
         })
     }
 
-    // ADR 0081 P1b: `HostClient::build_base_snapshot` is deleted — capture
+    // ADR 0084 P1b: `HostClient::build_base_snapshot` is deleted — capture
     // is now a durable `capture_jobs` row dispatched over the heartbeat,
     // not a direct RPC this fake would intercept. The test below drives a
     // simulated host loop (`spawn_capture_job_simulator`) that polls
@@ -373,7 +373,7 @@ impl HostClient for FakeCaptureHost {
 }
 
 // ---------------------------------------------------------------
-// ADR 0081 P1b: simulated host-side capture-job executor. No real
+// ADR 0084 P1b: simulated host-side capture-job executor. No real
 // host-agent process exists in this test, so instead of a fake
 // `HostClient::build_base_snapshot` (deleted) this polls
 // `capture_assignments_for_host` and, for each unseen `(job_id, epoch)`,
@@ -440,7 +440,7 @@ fn spawn_capture_job_simulator(
                     aux_bundles: vec![],
                     paused_at: None,
                 };
-                // ADR 0081 P3: `result_bincode` now encodes a
+                // ADR 0084 P3: `result_bincode` now encodes a
                 // `CaptureJobResult` (artifact + optional cold-base
                 // outcome), not a bare `SnapshotMetadata`. This
                 // simulator's `capture_host` is non-FC-shaped (no
@@ -637,7 +637,7 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
     .await
     .expect("hosts row");
 
-    // ADR 0081 P1b: the simulated host-side capture-job executor (no
+    // ADR 0084 P1b: the simulated host-side capture-job executor (no
     // real host-agent process in this test).
     let _capture_sim =
         spawn_capture_job_simulator(state.clone(), meta.clone(), host_id, capture_host.clone());

@@ -9,7 +9,7 @@
 //!   - `resolve_registry_auth` — POST /api/v1/hosts/:id/auth/resolve-registry
 //!   - `harness_event` — POST /api/v1/sessions/:session_id/harness-events
 //!   - `idle_eviction_candidates` — POST /api/v1/hosts/:id/idle-eviction-candidates
-//!   - `claim_capture_job` (ADR 0081 P1b) — POST
+//!   - `claim_capture_job` (ADR 0084 P1b) — POST
 //!     /api/v1/hosts/:id/capture-jobs/:job_id/claim, called from the
 //!     heartbeat-ack loop for any unclaimed `capture_assignments` entry
 //!
@@ -165,7 +165,7 @@ impl CoordClient {
 
     /// POST /api/v1/hosts/:id/capture-jobs/:job_id/claim
     ///
-    /// ADR 0081 §A: resolve the full dispatch for a `capture_assignments`
+    /// ADR 0084 §A: resolve the full dispatch for a `capture_assignments`
     /// entry the heartbeat-ack loop doesn't yet have running at this
     /// epoch. The coordinator validates `(host_id, job_id, epoch)`,
     /// resolves warm env + egress fresh, and returns the
@@ -545,7 +545,7 @@ pub struct HeartbeatRequest {
     /// ADR 0068: this tick's re-probed capability vector.
     #[serde(default)]
     pub capabilities: engram_core::types::host::HostCapabilities,
-    /// ADR 0081 P1b: un-acked `capture_jobs` progress/terminal reports —
+    /// ADR 0084 P1b: un-acked `capture_jobs` progress/terminal reports —
     /// see [`engram_protocol::heartbeat::CheckpointAdvert`]'s twin,
     /// `capture_job::CaptureJobRecord::load_all`. Re-advertised every
     /// heartbeat until `HeartbeatResponse.acked_capture_jobs` names them.
@@ -584,7 +584,7 @@ pub struct HeartbeatResponse {
     /// into PG. The host deletes the matching durable record files.
     #[serde(default)]
     pub acked_checkpoints: Vec<engram_core::types::SnapshotId>,
-    /// ADR 0081 P1b: `(job_id, epoch)` assignments this host should be
+    /// ADR 0084 P1b: `(job_id, epoch)` assignments this host should be
     /// running (or should claim, if it isn't yet). `None` = the coord's
     /// read failed (unknown — take no action); `Some` is authoritative,
     /// including `Some(vec![])`: a still-running local attempt absent
@@ -593,7 +593,7 @@ pub struct HeartbeatResponse {
     /// capacity).
     #[serde(default)]
     pub capture_assignments: Option<Vec<engram_core::types::CaptureJobAssignment>>,
-    /// ADR 0081 P1b: terminal reports from this heartbeat that landed in
+    /// ADR 0084 P1b: terminal reports from this heartbeat that landed in
     /// PG. The host deletes the matching durable capture-job records.
     #[serde(default)]
     pub acked_capture_jobs: Vec<engram_core::types::CaptureJobId>,
@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");
     }
 
-    /// ADR 0081 P1b: the new capture-job HTTP-mirror fields must decode
+    /// ADR 0084 P1b: the new capture-job HTTP-mirror fields must decode
     /// to empty/defaults for an ack from a coord that predates them
     /// (mid-rollout interop) — `#[serde(default)]` on both sides.
     #[test]

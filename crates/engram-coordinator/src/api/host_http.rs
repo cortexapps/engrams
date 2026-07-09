@@ -10,7 +10,7 @@
 //!   - `POST /api/hosts/:id/heartbeat` — every 5s
 //!   - `POST /api/hosts/:id/auth/resolve-registry` — host requests
 //!     OCI creds during image pull
-//!   - `POST /api/hosts/:id/capture-jobs/:job_id/claim` (ADR 0081 P1b) —
+//!   - `POST /api/hosts/:id/capture-jobs/:job_id/claim` (ADR 0084 P1b) —
 //!     host resolves the full dispatch for a `HeartbeatAck.
 //!     capture_assignments` entry it doesn't yet own
 //!   - `POST /api/sessions/:session_id/harness-events` — host
@@ -352,7 +352,7 @@ pub struct HeartbeatRequest {
     /// twin). Disagreement-alarm input only.
     #[serde(default)]
     pub harness_attached: Vec<SandboxId>,
-    /// ADR 0081 P1b: un-acked `capture_jobs` progress/terminal reports
+    /// ADR 0084 P1b: un-acked `capture_jobs` progress/terminal reports
     /// from this host's durable capture-job records — the
     /// `CheckpointAdvert`/`checkpoints` pattern verbatim, for capture.
     #[serde(default)]
@@ -392,7 +392,7 @@ pub struct HeartbeatResponse {
     /// PG. The host deletes the matching durable record files.
     #[serde(default)]
     pub acked_checkpoints: Vec<engram_core::types::SnapshotId>,
-    /// ADR 0081 P1b: `(job_id, epoch)` assignments this host should be
+    /// ADR 0084 P1b: `(job_id, epoch)` assignments this host should be
     /// running (or should claim, if it isn't yet) — read unconditionally
     /// every tick via `capture_assignments_for_host`. `None` means the
     /// read FAILED (unknown, do nothing); `Some(vec![])` means the
@@ -403,7 +403,7 @@ pub struct HeartbeatResponse {
     /// captures fleet-wide.
     #[serde(default)]
     pub capture_assignments: Option<Vec<engram_core::types::CaptureJobAssignment>>,
-    /// ADR 0081 P1b: terminal reports from this heartbeat that landed in
+    /// ADR 0084 P1b: terminal reports from this heartbeat that landed in
     /// PG (or were already terminal at a matching epoch) — the host
     /// deletes the matching durable capture-job records.
     #[serde(default)]
@@ -718,7 +718,7 @@ pub async fn heartbeat(
         );
     }
 
-    // ADR 0081 P1b: reconcile this host's un-acked capture-job reports.
+    // ADR 0084 P1b: reconcile this host's un-acked capture-job reports.
     // Each write is fenced by `(job_id, epoch)` — any coord replica can
     // perform it, no lease-holder identity involved. A terminal report is
     // acked when either the fenced write actually landed it, OR the row
@@ -811,12 +811,12 @@ pub async fn heartbeat(
     }))
 }
 
-/// ADR 0081 P1b: map a `CaptureJobStage` to the `CapturePhase` the
+/// ADR 0084 P1b: map a `CaptureJobStage` to the `CapturePhase` the
 /// `enable_jobs.capture_phase` dashboard column has always stored —
 /// `Booting -> Boot`, `Warming -> Warm`, `Freezing -> Snapshot`;
 /// `Assigned`/`Done`/`Failed` have no rendered phase (`None` leaves the
 /// column at its last-known value via `COALESCE`).
-/// ADR 0081 §A: may a host's TERMINAL capture-job report be acked (so the
+/// ADR 0084 §A: may a host's TERMINAL capture-job report be acked (so the
 /// host deletes its durable record and stops re-advertising)?
 ///
 /// The rule: ack iff the report either landed (`applied`) or can NEVER
@@ -959,7 +959,7 @@ pub async fn resolve_registry_auth(
 
 // ---- POST /api/hosts/:id/capture-jobs/:job_id/claim ----
 
-/// ADR 0081 P1b: the epoch a host is claiming — sent so the coordinator
+/// ADR 0084 P1b: the epoch a host is claiming — sent so the coordinator
 /// can reject a stale claim (a host that raced a reassignment, or one
 /// replaying an old `HeartbeatAck.capture_assignments` entry) instead of
 /// silently handing out a fresh `CaptureJobSpec` for an epoch it no
@@ -969,7 +969,7 @@ pub struct ClaimCaptureJobRequest {
     pub epoch: i64,
 }
 
-/// ADR 0081 §A: resolve the full dispatch for `(host_id, job_id, epoch)`
+/// ADR 0084 §A: resolve the full dispatch for `(host_id, job_id, epoch)`
 /// — `SandboxSpec` (same construction `capture_and_record_base_snapshot`
 /// used to do directly), the image's optional `[warm]` hook, the
 /// capture-time env resolved FRESH against `SecretStore` (fail-loud), and
@@ -1480,7 +1480,7 @@ mod tests {
         );
     }
 
-    /// ADR 0081 §A: the terminal-report ack rule. The two failure modes
+    /// ADR 0084 §A: the terminal-report ack rule. The two failure modes
     /// this pins: (a) a superseded-epoch terminal MUST ack, or the old
     /// host re-advertises its fenced-off record every heartbeat forever;
     /// (b) a PG lookup error must NEVER ack, or a blip deletes the only

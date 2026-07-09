@@ -90,7 +90,7 @@ service HostService {
   rpc PauseSandbox(FencedSandboxRequest) returns (Empty);
   rpc ResumeSandbox(FencedSandboxRequest) returns (Empty);
 
-  // ADR 0081 P1b (issue #546): `BuildBaseSnapshot` — boot the image to
+  // ADR 0084 P1b (issue #546): `BuildBaseSnapshot` — boot the image to
   // agentd-ready, run the optional `[warm]` hook, take a portable FC
   // snapshot, tear the capture VM down — is DELETED. Capture is now a
   // durable, heartbeat-dispatched job row (`capture_jobs`): the
@@ -98,7 +98,7 @@ service HostService {
   // capture_assignments`, the host claims the full dispatch over
   // `POST /api/hosts/:id/capture-jobs/:job_id/claim`, and reports
   // progress/terminal outcome via `Heartbeat.capture_job_reports`. See
-  // `docs/adr/0081-capture-jobs.md`. The underlying engine
+  // `docs/adr/0084-capture-jobs.md`. The underlying engine
   // (`SandboxBackend::build_base_snapshot`) is unchanged — only this
   // RPC's connection-coupled streaming shape is gone.
 
@@ -467,7 +467,7 @@ message RestoreRequest {
   bytes session_id = 2;      // 16-byte session UUID; ignored when fencing_epoch == 0
   uint64 fencing_epoch = 3;  // 0 = unfenced interim caller
 }
-// ADR 0081 P1b: `BuildBaseSnapshotRequest`/`BuildBaseSnapshotResponse`/
+// ADR 0084 P1b: `BuildBaseSnapshotRequest`/`BuildBaseSnapshotResponse`/
 // `BuildBaseSnapshotEvent`/`CaptureProgress`/`CaptureFailed` — the
 // `BuildBaseSnapshot` RPC's request/response/stream messages — are
 // DELETED along with the rpc itself (see the comment above `service

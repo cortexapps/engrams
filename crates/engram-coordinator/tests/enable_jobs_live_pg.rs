@@ -163,7 +163,7 @@ async fn progress_state_failure_and_retry_round_trip() {
         .await
         .expect("claim");
 
-    // ADR 0081 P4: `update_enable_job_capture_progress` (the fenced,
+    // ADR 0084 P4: `update_enable_job_capture_progress` (the fenced,
     // claim-renewing verb `CaptureProgress`-shaped events used to ride)
     // was deleted as dead code — nothing has called it since the P1b
     // cutover to heartbeat-dispatched capture jobs. Stamp the same

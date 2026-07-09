@@ -1,4 +1,4 @@
--- ADR 0081 phase 1: capture becomes a durable, host-executed,
+-- ADR 0084 phase 1: capture becomes a durable, host-executed,
 -- epoch-fenced job row dispatched/reported over the heartbeat,
 -- replacing the connection-coupled `BuildBaseSnapshot` RPC stream (a
 -- dropped stream today keeps running detached host-side while the
@@ -56,18 +56,18 @@ CREATE TABLE capture_jobs (
 CREATE UNIQUE INDEX capture_jobs_active_enable ON capture_jobs (enable_job_id)
     WHERE stage NOT IN ('done', 'failed');
 
--- One-capture-per-host anti-affinity (ADR 0081 section C) + the
+-- One-capture-per-host anti-affinity (ADR 0084 section C) + the
 -- `capture_assignments_for_host` heartbeat-ack read.
 CREATE INDEX capture_jobs_active_host ON capture_jobs (host_id)
     WHERE stage NOT IN ('done', 'failed');
 
--- ADR 0081 section D: reuse telemetry stamped on every terminal
+-- ADR 0084 section D: reuse telemetry stamped on every terminal
 -- enable — `reused_full | reused_cold_base | recaptured:no_cold_base |
 -- recaptured:content_changed | recaptured:chunks_missing |
 -- recaptured:fc_version_changed`.
 ALTER TABLE enable_jobs ADD COLUMN reuse_outcome TEXT;
 
--- ADR 0081 section B: the cold-base / warm-overlay split. Content key
+-- ADR 0084 section B: the cold-base / warm-overlay split. Content key
 -- is env-agnostic — `sha256(disk_manifest.content_ref ||
 -- canonical(image_config.resources) || fc_snapshot_version ||
 -- backend_kind)` — computed by the executor, not by SQL.

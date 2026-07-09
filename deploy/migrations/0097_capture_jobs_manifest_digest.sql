@@ -1,4 +1,4 @@
--- ADR 0081 P1b: `capture_jobs` needs the OCI manifest digest alongside
+-- ADR 0084 P1b: `capture_jobs` needs the OCI manifest digest alongside
 -- `disk_manifest` (the content-derived chunked-rootfs ref) so:
 --   (a) the claim handler can digest-pin `SandboxSpec.image` (issue #192 —
 --       a moving tag must not let the host's local OCI cache serve a

@@ -506,7 +506,7 @@ async fn assemble_egress_policy(
 /// capture VM is created INSIDE the host's `build_base_snapshot`, so the
 /// host stamps `sandbox_id` + `guest_ip` at registration.
 ///
-/// ADR 0081 P1b: `session_id` is now the CALLER's to supply (was
+/// ADR 0084 P1b: `session_id` is now the CALLER's to supply (was
 /// `SessionId::new()` — a fresh random id every call). Capture is a
 /// durable job that can be reassigned/retried under the SAME `job_id`;
 /// the claim endpoint calls this with [`synthetic_capture_session_id`]
@@ -542,7 +542,7 @@ pub(crate) fn assemble_capture_egress_policy(
     })
 }
 
-/// ADR 0081 P1b: deterministic synthetic `SessionId` for a capture job's
+/// ADR 0084 P1b: deterministic synthetic `SessionId` for a capture job's
 /// egress registration, stable across every claim of the same `job_id`
 /// (a stage-deadline reassign bumps `epoch` but keeps `job_id` fixed, and
 /// a retried claim of the SAME epoch — e.g. the host retrying a failed
@@ -825,7 +825,7 @@ mod capture_egress_tests {
         assert!(policy.allow_all, "default=allow → allow_all");
     }
 
-    /// ADR 0081 P1b: the synthetic session id must be a pure function of
+    /// ADR 0084 P1b: the synthetic session id must be a pure function of
     /// `job_id` — stable across every claim of the same job (a reassign
     /// bumps `epoch`, not `job_id`), and distinct across different jobs
     /// (otherwise two unrelated captures would collide on one egress

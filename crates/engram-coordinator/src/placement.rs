@@ -167,7 +167,7 @@ pub fn host_meets_capabilities(
     Ok(())
 }
 
-/// ADR 0081 §C: how much host disk a capture/materialize job needs —
+/// ADR 0084 §C: how much host disk a capture/materialize job needs —
 /// threaded into [`pick_capture_host`] so placement can veto a host that
 /// technically clears the ADR 0078 disk FLOOR but doesn't have headroom
 /// for the job's own write volume (the old picker only checked the
@@ -829,11 +829,11 @@ pub async fn pick_specific_host(
     Ok((host_id, backend))
 }
 
-/// ADR 0081 §C: the free work_dir disk (MiB) `pick_capture_host` ranks
+/// ADR 0084 §C: the free work_dir disk (MiB) `pick_capture_host` ranks
 /// hosts by — `None` for an unmeasured host (dev/brand-new; the same
 /// soft posture `host_disk_floor_ok` gives it: it neither vetoes NOR
 /// ranks above a measured host, so a fleet of unmeasured hosts falls
-/// back to row order, matching pre-ADR-0081 first-fit behavior).
+/// back to row order, matching pre-ADR-0084 first-fit behavior).
 fn free_disk_mib(h: &HostRecord) -> Option<u64> {
     if h.utilization.disk_total_mib == 0 {
         return None;
@@ -845,14 +845,14 @@ fn free_disk_mib(h: &HostRecord) -> Option<u64> {
     )
 }
 
-/// ADR 0081 §C: the pure filter+rank core of [`pick_capture_host`] —
+/// ADR 0084 §C: the pure filter+rank core of [`pick_capture_host`] —
 /// unit-tested directly against a `&[HostRecord]` fixture, no I/O.
 ///
 /// Filters: schedulable ∧ the base capability gate (+ `fc_snapshot_version`
 /// pin when `required_fc_version` names one) ∧ the ADR 0078 disk floor ∧
 /// `need.disk_mib` headroom (an unmeasured host is soft here too — same
 /// posture as the floor) ∧ NOT already running a live capture job
-/// (`live_capture_hosts` — one-capture-per-host anti-affinity, ADR 0081
+/// (`live_capture_hosts` — one-capture-per-host anti-affinity, ADR 0084
 /// §C). Ranking: MAX free disk among survivors (replacing the old
 /// first-fit) — row order breaks ties among unmeasured/equal hosts.
 pub fn pick_capture_host_from(
@@ -894,13 +894,13 @@ pub fn pick_capture_host_from(
     best.map(|(_, id)| id).ok_or(PickError::NoCapacity)
 }
 
-/// ADR 0020 P1 / ADR 0081 §C: any schedulable host for a base-snapshot
+/// ADR 0020 P1 / ADR 0084 §C: any schedulable host for a base-snapshot
 /// capture or an ADR 0080 image materialize — NOT gated on image
 /// readiness or RAM/CPU capacity (the capture host lazy-materializes
 /// the rootfs from BlobStorage), but IS gated on the ADR 0078 tier-0
 /// disk floor PLUS the job's own [`CaptureFootprint`] headroom, an
 /// optional `fc_snapshot_version` pin (set when a cold-base candidate
-/// exists — ADR 0081 §B5), and one-capture-per-host anti-affinity
+/// exists — ADR 0084 §B5), and one-capture-per-host anti-affinity
 /// (`hosts_with_live_capture_jobs`). Ranked by max free disk, not
 /// first-fit — packs capture jobs onto the roomiest host instead of
 /// whichever host happens to sort first. `NoCapacity` stays retryable

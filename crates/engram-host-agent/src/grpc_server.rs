@@ -1553,7 +1553,7 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         // all, not something this handler itself would ever return).
         // Map defensively in case a future refactor surfaces it here.
         SandboxError::Unsupported(_) => Status::unimplemented(err.to_string()),
-        // ADR 0081 P1b: the `BuildBaseSnapshot` RPC that used to
+        // ADR 0084 P1b: the `BuildBaseSnapshot` RPC that used to
         // pattern-match this variant and emit a structured `CaptureFailed`
         // stream frame (so the kind/stage/tail survived the wire) is
         // deleted — capture failures now travel as a `CaptureTerminalReport`

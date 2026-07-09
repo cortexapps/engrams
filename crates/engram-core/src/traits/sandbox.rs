@@ -18,7 +18,7 @@ use crate::types::sandbox::{
 };
 use crate::types::snapshot::SnapshotMetadata;
 
-/// ADR 0081 §B: everything [`SandboxBackend::build_base_snapshot`] needs
+/// ADR 0084 §B: everything [`SandboxBackend::build_base_snapshot`] needs
 /// for one capture attempt, bundled into a struct (rather than a
 /// growing positional-arg list) since P3 added the cold-base plan on
 /// top of P1b's four. Maps 1:1 onto [`crate::types::capture_job::
@@ -590,14 +590,14 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
-    /// ADR 0020 P1 / ADR 0081 P1b: boot `spec` to agentd-ready with the
+    /// ADR 0020 P1 / ADR 0084 P1b: boot `spec` to agentd-ready with the
     /// stub harness attached (harness unmounted — the option-D capture
     /// point), take a portable FC snapshot (chunked memory + uploaded
     /// state/sidecar), tear the capture VM down, and return the
     /// snapshot's metadata. `create_session` later restores from the
     /// resulting snapshot.
     ///
-    /// ADR 0081 P1b: the caller is now the host-agent's OWN capture-job
+    /// ADR 0084 P1b: the caller is now the host-agent's OWN capture-job
     /// executor (`capture_job::CaptureJobExecutor`, driven by a durable,
     /// heartbeat-dispatched `capture_jobs` row) rather than a coordinator
     /// RPC handler — the deleted `BuildBaseSnapshot` RPC used to call
@@ -627,13 +627,13 @@ pub trait SandboxBackend: Send + Sync {
     /// nothing: the capture stays egress-less (the proxy denies unknown
     /// guests). The backend must NOT derive egress from `warm` itself.
     ///
-    /// `progress` (issue #539, ADR 0081 P1b) receives
+    /// `progress` (issue #539, ADR 0084 P1b) receives
     /// [`crate::types::CaptureProgress`] events for the call's lifetime —
     /// the executor drains them into a durable per-job record + the
     /// in-memory report the heartbeat loop advertises, instead of
     /// forwarding them onto a live gRPC stream.
     ///
-    /// ADR 0081 §B (P3): `req.cold_base_plan` is the claim-time-resolved
+    /// ADR 0084 §B (P3): `req.cold_base_plan` is the claim-time-resolved
     /// tri-state — `NotApplicable` (no cold-base concept: warm-less or
     /// non-FC), `Miss` (mint a cold base before the hook), or `Hit`
     /// (a verified candidate) — the implementation restores a `Hit`

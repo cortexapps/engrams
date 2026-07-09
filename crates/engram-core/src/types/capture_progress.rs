@@ -1,5 +1,5 @@
 //! Capture-time progress + failure taxonomy for base-snapshot capture
-//! (issue #539). ADR 0081 P1b: `CaptureProgress` no longer crosses any
+//! (issue #539). ADR 0084 P1b: `CaptureProgress` no longer crosses any
 //! wire — the streaming `BuildBaseSnapshot` RPC that used to carry it is
 //! deleted. It's now a purely in-process signal: `PooledBackend::
 //! build_base_snapshot` pushes it onto an `mpsc::Sender` the host-agent's
@@ -89,7 +89,7 @@ pub enum WarmStageOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureProgress {
     pub phase: CapturePhase,
-    /// ADR 0081 P1b: the capture VM's id, once `create()` has returned.
+    /// ADR 0084 P1b: the capture VM's id, once `create()` has returned.
     /// `None` on any event emitted before the VM exists (there are none
     /// today — the very first event, `phase == Boot`, is already built
     /// after `create()`, so this is `Some` from the first event onward in
@@ -145,7 +145,7 @@ pub enum CaptureFailureKind {
     WarmExecTransport,
     /// The post-warm snapshot step (pause/flush/chunk/upload) failed.
     SnapshotFailed,
-    /// ADR 0081 decision 11: the claim carried a `ColdBasePlan::Hit` or
+    /// ADR 0084 decision 11: the claim carried a `ColdBasePlan::Hit` or
     /// `Miss` (this backend/host was pinned as FC-capable), but the
     /// executor's actual backend can't produce diff memory snapshots
     /// (`supports_diff_checkpoints() == false`). A placement bug, not a

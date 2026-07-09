@@ -43,7 +43,7 @@ pub fn build_heartbeat(
         // utilization; the HTTP heartbeat loop in `lib.rs` is the
         // real producer.
         utilization: Default::default(),
-        // ADR 0081 (wire v15): no capture-job executor exists yet
+        // ADR 0084 (wire v15): no capture-job executor exists yet
         // (dormant P1a) — always empty until a later commit wires the
         // durable-record source.
         capture_job_reports: Vec::new(),

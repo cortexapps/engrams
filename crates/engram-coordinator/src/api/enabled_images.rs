@@ -198,7 +198,7 @@ pub(crate) async fn materialize_image_on_host(
     image_uri: &str,
     progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
 ) -> Result<engram_core::types::MaterializedImage, ApiError> {
-    // ADR 0081 §C: materialize is what PRODUCES the disk manifest a real
+    // ADR 0084 §C: materialize is what PRODUCES the disk manifest a real
     // size could be read from — there is no size signal to read yet at
     // this point (the OCI manifest's compressed layer sizes are a poor
     // proxy for the flattened+packed ext4 output, so we deliberately
@@ -352,7 +352,7 @@ pub(crate) async fn reuse_candidate_chunks_present(
     true
 }
 
-/// ADR 0081 §B4: whole-artifact reuse gains the FC-version dimension —
+/// ADR 0084 §B4: whole-artifact reuse gains the FC-version dimension —
 /// a memory-manifest-bearing candidate with NO recorded
 /// `fc_snapshot_version` can never be placement-gated at restore time
 /// (`CapabilityRequirements::fc_snapshot_version: None` is the SOFT
@@ -394,7 +394,7 @@ async fn candidate_fc_version_known(
     }
 }
 
-/// ADR 0081 P1b: whether [`try_reuse_base_snapshot`] found (and verified)
+/// ADR 0084 P1b: whether [`try_reuse_base_snapshot`] found (and verified)
 /// an existing base snapshot equivalent to what a fresh capture would
 /// produce — the content/digest reuse fast paths lifted verbatim out of
 /// the old `capture_and_record_base_snapshot` (no host RPC, no
@@ -409,7 +409,7 @@ pub(crate) type ReuseHit = (
     Option<engram_core::types::manifest::ManifestRef>,
 );
 
-/// ADR 0020 P1 / ADR 0081 P1b: reuse fast path — if the image is already
+/// ADR 0020 P1 / ADR 0084 P1b: reuse fast path — if the image is already
 /// enabled at equivalent content (or, legacy, the same OCI digest) with a
 /// base snapshot whose chunks are still durable, return it instead of
 /// ever creating a `capture_jobs` row. `Ok(None)` means a fresh capture
@@ -432,7 +432,7 @@ pub(crate) async fn try_reuse_base_snapshot(
     // content/digest reuse is unsound for warm images — always re-capture.
     // (This is also what makes a warm-secret rotate actually take effect:
     // a re-enable with the same digest must not short-circuit to the stale
-    // snapshot.) ADR 0081 §B4: warm images no longer fall through to a
+    // snapshot.) ADR 0084 §B4: warm images no longer fall through to a
     // fresh capture from scratch either — `ensure_capture_job`/the claim
     // handler's `ColdBasePlan` reuses the COLD BASE (env-agnostic) and
     // always re-runs the hook fresh. This whole-artifact path stays
@@ -560,7 +560,7 @@ pub(crate) async fn try_reuse_base_snapshot(
     Ok(None)
 }
 
-/// ADR 0081 P1b: ensure a `capture_jobs` row exists for this enable job
+/// ADR 0084 P1b: ensure a `capture_jobs` row exists for this enable job
 /// and return the MOST RECENT one (terminal or not) — the scanner's
 /// entire interaction with capture dispatch. Picks a capture host (the
 /// same `pick_capture_host` the old direct-RPC path used) only when no
@@ -568,9 +568,9 @@ pub(crate) async fn try_reuse_base_snapshot(
 /// reassigned, or terminal) is returned as-is — the actual `SandboxSpec`/
 /// env/egress assembly is deferred to the CLAIM endpoint
 /// (`host_http::claim_capture_job`), which resolves secrets fresh at
-/// claim time rather than once at job-creation time (ADR 0081 §A).
+/// claim time rather than once at job-creation time (ADR 0084 §A).
 ///
-/// ADR 0081 §C: the placement pick uses the honest
+/// ADR 0084 §C: the placement pick uses the honest
 /// [`crate::placement::CaptureFootprint`] inputs for a capture job —
 /// `mem_mib` from the image's declared/default resources,
 /// `image_size_mib` read off the ALREADY-materialized disk
@@ -629,7 +629,7 @@ pub(crate) async fn capture_footprint_for_job_row(
     }
 }
 
-/// ADR 0081 §B: the claim handler's cold-base decision for one attempt.
+/// ADR 0084 §B: the claim handler's cold-base decision for one attempt.
 /// Computed ENTIRELY coordinator-side: the claiming host's own `hosts`
 /// row already carries `capabilities.backend` + `capabilities.
 /// fc_snapshot_version`, and `row`/`config` already carry
@@ -797,7 +797,7 @@ pub(crate) async fn ensure_capture_job(
         state.services.meta.as_ref(),
         &state.host_registry,
         footprint,
-        // ADR 0081 §B5's fc_snapshot_version pin is threaded in once a
+        // ADR 0084 §B5's fc_snapshot_version pin is threaded in once a
         // cold-base candidate is looked up (P3) — this call site has no
         // candidate to pin to yet at job-CREATION time (the claim
         // handler resolves the candidate fresh per attempt).
@@ -828,14 +828,14 @@ pub(crate) async fn ensure_capture_job(
     Ok(state.services.meta.insert_capture_job(new_job).await?)
 }
 
-/// ADR 0081 §D: the [`finalize_capture_job`] outcome — its
-/// `reuse_outcome` label (ADR 0081 §D's taxonomy) alongside the
+/// ADR 0084 §D: the [`finalize_capture_job`] outcome — its
+/// `reuse_outcome` label (ADR 0084 §D's taxonomy) alongside the
 /// [`ReuseHit`] the caller upserts onto the `enabled_images` row. A
 /// plain string, not an enum: it's a one-way trip straight into
 /// `set_enable_job_reuse_outcome`'s `TEXT` column.
 pub(crate) type FinalizeOutcome = (ReuseHit, &'static str);
 
-/// ADR 0081 P1b/P3: consume a `stage == Done` `capture_jobs` row —
+/// ADR 0084 P1b/P3: consume a `stage == Done` `capture_jobs` row —
 /// decode its `result_bincode` (the executor's `CaptureJobResult`,
 /// bincode-encoded), verify the chunked manifests are actually durable,
 /// record the `snapshots` row, and (P3) record/skip the `cold_bases` row
@@ -881,7 +881,7 @@ pub(crate) async fn finalize_capture_job(
         )));
     }
 
-    // ADR 0081 §B6/§D: record (or skip) the cold-base row + derive the
+    // ADR 0084 §B6/§D: record (or skip) the cold-base row + derive the
     // reuse_outcome label. Done BEFORE `record_snapshot` below — an
     // upsert_cold_base failure should abort the enable the same way a
     // recoverability failure does, rather than leave the overlay
@@ -1013,7 +1013,7 @@ pub(crate) async fn finalize_capture_job(
 /// FAIL-LOUD (ADR 0080): an unresolvable or erroring ref fails the
 /// claim with an actionable error. The pre-0080 behavior (warn + skip)
 /// let a missing secret silently bake a corrupt "warm" base snapshot
-/// that every session then inherited. ADR 0081 P1b: called from the
+/// that every session then inherited. ADR 0084 P1b: called from the
 /// coordinator's capture-job CLAIM handler (`host_http::
 /// claim_capture_job`) instead of from the old direct-RPC capture path
 /// — resolution now happens fresh on every claim (including a

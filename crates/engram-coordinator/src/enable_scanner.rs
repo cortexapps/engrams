@@ -179,7 +179,7 @@ pub(crate) async fn run_once(
     // observability — claim correctness comes from the atomic UPDATE.
     let claimant = std::env::var("HOSTNAME").unwrap_or_else(|_| "coord".into());
 
-    // ADR 0081 P1b: the capture-job stage-deadline scan — fleet-wide, not
+    // ADR 0084 P1b: the capture-job stage-deadline scan — fleet-wide, not
     // per-enable-job-claim (a `capture_jobs` row's own epoch fencing is
     // its safety net, not this scanner's lease). Runs every tick
     // regardless of whether any enable job is currently claimable by
@@ -210,7 +210,7 @@ pub(crate) async fn run_once(
                 tracing::warn!(%job_id, reason = %msg, "enable job lease lost; abandoning to peer");
             }
             Err(AdvanceError::InFlight) => {
-                // ADR 0081 P1b: the job's capture_jobs row is still
+                // ADR 0084 P1b: the job's capture_jobs row is still
                 // running (or was just reassigned) — `advance_one`
                 // already released the claim. Nothing to log at
                 // warn-level; this is the expected steady state of a
@@ -285,7 +285,7 @@ enum AdvanceError {
     /// `max_attempts` times for nothing. The operator can `RetryEnableJob`
     /// after fixing the image.
     NonRetryable(Box<dyn std::error::Error + Send + Sync>),
-    /// ADR 0081 P1b: the job's `capture_jobs` row is still in flight
+    /// ADR 0084 P1b: the job's `capture_jobs` row is still in flight
     /// (`assigned`/`booting`/`warming`/`freezing`), or was just reassigned
     /// under budget after a retryable failure. Distinct from `LeaseLost`
     /// (which means a PEER now owns the job) — here THIS pod is doing
@@ -311,7 +311,7 @@ impl From<MetaError> for AdvanceError {
 /// (host picking, PG reads/writes, result decode/verify). `Unavailable`
 /// (the capture-host picker's `NoCapacity`) is transient, retry.
 ///
-/// ADR 0081 P1b: the ACTUAL capture failure classification (was this
+/// ADR 0084 P1b: the ACTUAL capture failure classification (was this
 /// `[warm]` hook exit / stall / transport death retryable?) no longer
 /// happens here — it's the job row's own `retryable` column, written by
 /// the host's terminal report and consumed directly in `advance_one`'s
@@ -387,7 +387,7 @@ async fn advance_one(
 
     // ---- materializing (host-side, ADR 0080 phase 3b) ----
     //
-    // ADR 0081 P1b: SKIP re-materializing when a `capture_jobs` row
+    // ADR 0084 P1b: SKIP re-materializing when a `capture_jobs` row
     // already exists for this enable job — its own durable
     // `disk_manifest`/`image_config`/`oci_defaults`/`manifest_digest`
     // ARE the materialize result, so a watch-only re-entry (this same
@@ -464,7 +464,7 @@ async fn advance_one(
         row.manifest_digest = materialized.manifest_digest;
     }
 
-    // ---- capturing (ADR 0081 P1b: durable, heartbeat-dispatched job) ----
+    // ---- capturing (ADR 0084 P1b: durable, heartbeat-dispatched job) ----
     state
         .services
         .meta
@@ -791,7 +791,7 @@ async fn advance_one(
     Ok(())
 }
 
-/// ADR 0081 P1b (§A "per-stage progress deadlines"): expire any
+/// ADR 0084 P1b (§A "per-stage progress deadlines"): expire any
 /// `capture_jobs` row that's overrun its current stage's budget —
 /// `assigned` 60s, `booting` 300s absolute, `freezing` a generous static
 /// 600s for P1 (`snapshot_create_timeout` is host-side; TODO tie this to

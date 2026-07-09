@@ -73,7 +73,7 @@ pub struct Heartbeat {
     /// pre-utilization host-agent interops cleanly against this coord.
     #[serde(default)]
     pub utilization: engram_core::types::host::HostUtilization,
-    /// ADR 0081 (wire v15): durable capture-job reports this host holds
+    /// ADR 0084 (wire v15): durable capture-job reports this host holds
     /// — progress + (once known) the terminal outcome — for every
     /// `capture_jobs` row it's currently executing. Re-advertised every
     /// heartbeat until `HeartbeatAck.acked_capture_jobs` names the
@@ -154,7 +154,7 @@ pub struct HeartbeatAck {
     /// files — the PG rows own the references now.
     #[serde(default)]
     pub acked_checkpoints: Vec<SnapshotId>,
-    /// ADR 0081 (wire v15): capture jobs this host currently owns —
+    /// ADR 0084 (wire v15): capture jobs this host currently owns —
     /// `(job_id, epoch)` dispatches the coordinator's fenced writer
     /// side wants executed. An assignment the host doesn't recognize
     /// (a fresh claim, or a bumped epoch on one it's already running)
@@ -172,7 +172,7 @@ pub struct HeartbeatAck {
     /// interop during the roll.
     #[serde(default)]
     pub capture_assignments: Option<Vec<CaptureJobAssignment>>,
-    /// ADR 0081: terminal `CaptureJobReport`s from this heartbeat that
+    /// ADR 0084: terminal `CaptureJobReport`s from this heartbeat that
     /// the coord successfully recorded into PG. The host stops
     /// re-advertising the matching durable record — mirrors
     /// `acked_checkpoints`'s role for checkpoint adverts.
@@ -401,7 +401,7 @@ mod tests {
         assert_eq!(back.acked_capture_jobs, original.acked_capture_jobs);
     }
 
-    /// ADR 0081 (wire v15): a heartbeat carrying live capture-job
+    /// ADR 0084 (wire v15): a heartbeat carrying live capture-job
     /// progress AND a terminal report round-trips through JSON —
     /// exercising both `CaptureTerminalReport` variants (`Done` carries
     /// opaque bincode bytes; `Failed` carries the error taxonomy) plus
@@ -483,9 +483,9 @@ mod tests {
         }
     }
 
-    /// Rollout interop: a heartbeat from a pre-ADR-0081 host-agent omits
+    /// Rollout interop: a heartbeat from a pre-ADR-0084 host-agent omits
     /// `capture_job_reports` entirely; a coord that predates this ack a
-    /// pre-ADR-0081 sends no `capture_assignments`/`acked_capture_jobs`.
+    /// pre-ADR-0084 sends no `capture_assignments`/`acked_capture_jobs`.
     /// Both directions must decode to empty, not fail.
     #[test]
     fn capture_job_fields_default_to_empty_for_mixed_version_interop() {

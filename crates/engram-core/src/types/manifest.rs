@@ -65,7 +65,7 @@ impl fmt::Display for ManifestRef {
     }
 }
 
-/// ADR 0081: `capture_jobs.disk_manifest` stores the canonical Display
+/// ADR 0084: `capture_jobs.disk_manifest` stores the canonical Display
 /// form (`<uuid>@v<num>`) as plain text (opaque at the row layer — see
 /// `types::capture_job::CaptureJobRow`); the claim handler parses it back
 /// into a real `ManifestRef` to build the capture VM's `SandboxSpec`.

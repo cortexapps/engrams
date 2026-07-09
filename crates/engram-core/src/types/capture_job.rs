@@ -1,4 +1,4 @@
-//! ADR 0081: capture as a durable, host-executed, epoch-fenced job row
+//! ADR 0084: capture as a durable, host-executed, epoch-fenced job row
 //! (`capture_jobs`), dispatched and reported over the heartbeat instead
 //! of a connection-coupled RPC stream. A dropped `BuildBaseSnapshot`
 //! stream today keeps running detached host-side while the coordinator
@@ -137,7 +137,7 @@ pub struct CaptureJobAssignment {
     pub epoch: i64,
 }
 
-/// The `capture_jobs` row in full — mirrors migration `0095_capture_jobs.sql`
+/// The `capture_jobs` row in full — mirrors migration `0096_capture_jobs.sql`
 /// column-for-column.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureJobRow {
@@ -145,7 +145,7 @@ pub struct CaptureJobRow {
     pub enable_job_id: uuid::Uuid,
     pub image_uri: String,
     /// `sha256:...` digest of the OCI manifest the `materializing` stage
-    /// actually pulled — ADR 0081 P1b (added post-0095): lets the claim
+    /// actually pulled — ADR 0084 P1b (added post-0096): lets the claim
     /// handler digest-pin `SandboxSpec.image` (issue #192) and lets the
     /// enable scanner reconstruct a resumed watch WITHOUT re-running
     /// `materialize_image_on_host` on every tick of a multi-minute
@@ -197,14 +197,14 @@ pub struct NewCaptureJob {
     pub host_id: HostId,
 }
 
-/// ADR 0081 P1b: the full dispatch the claim endpoint
+/// ADR 0084 P1b: the full dispatch the claim endpoint
 /// (`POST /api/v1/hosts/:id/capture-jobs/:job_id/claim`) hands back to a
 /// host that claimed `(job_id, epoch)` off `HeartbeatAck.capture_assignments`
 /// — everything [`crate::traits::sandbox::SandboxBackend::build_base_snapshot`]
 /// needs to actually run the capture. Rides the authed host<->coord HTTP
 /// channel only; never persisted (secrets never touch `capture_jobs`,
 /// PG, or the heartbeat — the coordinator re-resolves `resolved_env`
-/// fresh on every claim, exactly like the pre-0081 RPC did per-call).
+/// fresh on every claim, exactly like the pre-0084 RPC did per-call).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureJobSpec {
     pub spec: super::sandbox::SandboxSpec,
@@ -216,7 +216,7 @@ pub struct CaptureJobSpec {
     /// synthetic `session_id` derived deterministically from `job_id` (stable
     /// across a reassign/retry of the same job).
     pub capture_egress: Option<super::egress::SessionEgressPolicy>,
-    /// ADR 0081 §B: the claim handler's cold-base reuse decision for
+    /// ADR 0084 §B: the claim handler's cold-base reuse decision for
     /// this attempt. ALWAYS computed coordinator-side (the claim
     /// handler already holds `disk_manifest` + `resources` off the job
     /// row and `fc_snapshot_version`/`backend` off the claiming host's
@@ -227,7 +227,7 @@ pub struct CaptureJobSpec {
     pub cold_base_plan: ColdBasePlan,
 }
 
-/// ADR 0081 §B: the claim handler's cold-base decision — a tri-state
+/// ADR 0084 §B: the claim handler's cold-base decision — a tri-state
 /// (not `Option<Option<..>>`) so "no cold-base concept here" (non-FC),
 /// "FC, but nothing to reuse" (miss), and "FC, verified candidate"
 /// (hit) are three explicit, exhaustively-matched variants instead of
@@ -270,7 +270,7 @@ pub enum ColdBasePlan {
     },
 }
 
-/// ADR 0081 §D: WHY a claim resolved to [`ColdBasePlan::Miss`] — purely
+/// ADR 0084 §D: WHY a claim resolved to [`ColdBasePlan::Miss`] — purely
 /// a `reuse_outcome` telemetry label the claim handler already knows
 /// (it just ran the lookup + presence check), threaded through so
 /// `finalize_capture_job` doesn't have to re-derive it from a `CaptureJobResult`
@@ -294,7 +294,7 @@ pub enum ColdBaseMissReason {
     FcVersionChanged,
 }
 
-/// ADR 0081 §B: the executor's result for one capture-job attempt —
+/// ADR 0084 §B: the executor's result for one capture-job attempt —
 /// bincode-encoded into `capture_jobs.result_bincode` on `stage=Done`,
 /// replacing the bare `SnapshotMetadata` P1b shipped with (a mechanical,
 /// additive change: `finalize_capture_job` is this type's only decoder).
@@ -335,7 +335,7 @@ pub struct CapturedColdBase {
     pub miss_reason: Option<ColdBaseMissReason>,
 }
 
-/// ADR 0081 §B1: the cold-base content key —
+/// ADR 0084 §B1: the cold-base content key —
 /// `sha256(disk_manifest.content_ref || canonical(resources) ||
 /// fc_snapshot_version || backend_kind)`. Env-agnostic (name/
 /// description/env/workdir never enter the key — ADR 0080's verified
@@ -375,7 +375,7 @@ pub fn cold_base_content_key(
     format!("{digest:x}")
 }
 
-/// The `cold_bases` row (ADR 0081 section B): a content-keyed,
+/// The `cold_bases` row (ADR 0084 section B): a content-keyed,
 /// boot-to-agentd-ready Full snapshot, reusable across every warm
 /// image whose cold-base content key matches (env-agnostic — the
 /// warm hook always re-runs against a fresh env on top of it).
@@ -390,7 +390,7 @@ pub struct ColdBaseRow {
     pub memory_manifest: String,
     pub fc_snapshot_version: String,
     pub captured_at: DateTime<Utc>,
-    /// Migration 0097: the executor's own bincode-encoded
+    /// Migration 0098: the executor's own bincode-encoded
     /// `SnapshotMetadata` for this cold base, verbatim — what the claim
     /// handler hands back as [`ColdBasePlan::Hit::snapshot`] for the
     /// executor to `restore()` directly. `disk_manifest`/`memory_manifest`

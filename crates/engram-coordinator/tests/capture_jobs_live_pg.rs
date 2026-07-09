@@ -1,4 +1,4 @@
-//! Live-Postgres tests for the ADR 0081 `capture_jobs`/`cold_bases`
+//! Live-Postgres tests for the ADR 0084 `capture_jobs`/`cold_bases`
 //! `MetadataStore` surface: insert-or-get dedup (one active job per
 //! enable job), the epoch-fenced report write (stale-epoch rejection,
 //! terminal Done/Failed landing, post-terminal immutability),
@@ -543,7 +543,7 @@ async fn cold_base_upsert_and_get_round_trip() {
         .expect("cold base snapshot ids");
     assert!(ids.contains(&new_snapshot_id));
 
-    // ADR 0081 §B6: the chunk-GC pin-set's 7th source — both manifest
+    // ADR 0084 §B6: the chunk-GC pin-set's 7th source — both manifest
     // refs (disk AND memory) must be present, parsed.
     let refs = meta
         .cold_base_manifest_refs()
@@ -557,7 +557,7 @@ async fn cold_base_upsert_and_get_round_trip() {
     assert!(refs.contains(&mem_ref), "memory manifest must be pinned");
 }
 
-/// ADR 0081 §D: `cold_base_fc_version_changed` powers the
+/// ADR 0084 §D: `cold_base_fc_version_changed` powers the
 /// `recaptured:fc_version_changed` reuse-outcome label — it must find a
 /// row for the SAME `disk_manifest` under a DIFFERENT `fc_snapshot_version`,
 /// but not when the ONLY row is under the version being checked, and not

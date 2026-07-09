@@ -4408,12 +4408,12 @@ impl MetadataStore for PostgresStore {
     /// there is no coordinator chunk counter anymore, so the honest
     /// operator surface is a rendered progress line in `output_tail`
     /// (the same column the capture phase's hook output rides). Fenced
-    /// + claim-renewing exactly like the ADR 0081 P1b
+    /// + claim-renewing exactly like the ADR 0084 P1b
     /// `mirror_capture_progress_to_enable_job` (UNFENCED, unlike this
     /// verb — see its own doc) does for the capture phase; the fenced,
     /// claim-renewing capture-progress verb this comment used to point
     /// at (`update_enable_job_capture_progress`) was DELETED as dead
-    /// code in ADR 0081 P4.
+    /// code in ADR 0084 P4.
     async fn update_enable_job_materialize_progress(
         &self,
         id: Uuid,
@@ -4565,7 +4565,7 @@ impl MetadataStore for PostgresStore {
         .map_err(db_err)?;
         match row {
             Some(r) => {
-                // ADR 0081 P1b: a prior (failed) attempt's TERMINAL
+                // ADR 0084 P1b: a prior (failed) attempt's TERMINAL
                 // `capture_jobs` row must not survive a retry — the
                 // scanner's `latest_capture_job_for_enable` read is
                 // "newest row for this enable job, terminal or not" (so
@@ -4597,7 +4597,7 @@ impl MetadataStore for PostgresStore {
         }
     }
 
-    /// ADR 0081 P1b: release the claim without touching state/attempts —
+    /// ADR 0084 P1b: release the claim without touching state/attempts —
     /// the watch-only exit for a `Capturing` job whose `capture_jobs` row
     /// is still in flight. See the trait doc for why this exists
     /// alongside `claim_enable_jobs`'s lease-expiry path.
@@ -4701,7 +4701,7 @@ impl MetadataStore for PostgresStore {
         Ok(rows.into_iter().map(|(v,)| v).collect())
     }
 
-    // ---- capture jobs (ADR 0081) ----
+    // ---- capture jobs (ADR 0084) ----
 
     async fn insert_capture_job(&self, row: NewCaptureJob) -> Result<CaptureJobRow, MetaError> {
         // Insert-or-get, exactly like `create_or_get_enable_job`: guarded
@@ -4823,7 +4823,7 @@ impl MetadataStore for PostgresStore {
         report: &CaptureJobReport,
     ) -> Result<bool, MetaError> {
         // ONE fenced write any replica can perform — no lease-holder
-        // identity to lose (ADR 0081). `stage_started_at` only advances
+        // identity to lose (ADR 0084). `stage_started_at` only advances
         // when the stage actually changed; `stage_progress` is a direct
         // SET (a fresh report replaces the prior progress snapshot
         // wholesale, matching the streaming protocol's "full frame, not a
@@ -4899,7 +4899,7 @@ impl MetadataStore for PostgresStore {
         warm_stage: Option<&str>,
         output_tail: Option<&str>,
     ) -> Result<(), MetaError> {
-        // UNFENCED on purpose (ADR 0081 P1b): `capture_jobs` owns
+        // UNFENCED on purpose (ADR 0084 P1b): `capture_jobs` owns
         // fencing/execution now, this is a cosmetic dashboard mirror the
         // heartbeat reconcile drives regardless of which coordinator pod
         // (if any) holds the enable job's claim. `COALESCE` so a report

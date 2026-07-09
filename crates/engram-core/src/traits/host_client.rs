@@ -285,7 +285,7 @@ pub trait HostClient: Send + Sync {
         fence: SessionFence,
     ) -> Result<SandboxId, SandboxError>;
 
-    // ADR 0081 P1b (issue #546): `build_base_snapshot` — the
+    // ADR 0084 P1b (issue #546): `build_base_snapshot` — the
     // connection-coupled RPC that used to boot a capture VM, run its
     // optional `[warm]` hook, snapshot it, and stream progress back — is
     // DELETED from this trait. Capture is now a durable,
@@ -294,7 +294,7 @@ pub trait HostClient: Send + Sync {
     // the host claims the full dispatch over an authed HTTP endpoint and
     // runs `crate::traits::sandbox::SandboxBackend::build_base_snapshot`
     // directly (that method is UNCHANGED — only this RPC-shaped
-    // `HostClient` seam is gone). See `docs/adr/0081-capture-jobs.md`.
+    // `HostClient` seam is gone). See `docs/adr/0084-capture-jobs.md`.
 
     /// ADR 0080 §C: materialize a STANDARD docker/OCI image into a
     /// chunked bootable ext4 on this host — pull, whiteout-aware

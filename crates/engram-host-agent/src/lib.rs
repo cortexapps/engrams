@@ -313,7 +313,7 @@ impl HostAgent {
                 arc.set_self_ref(&arc);
                 arc
             };
-            // ADR 0081 P1b: the capture-job executor + durable-record
+            // ADR 0084 P1b: the capture-job executor + durable-record
             // registry. `pooled` (a `SandboxBackend`) is the executor's
             // engine, unchanged — still `PooledBackend::
             // build_base_snapshot` under the hood; this layer adds
@@ -326,7 +326,7 @@ impl HostAgent {
             // The FC snapshot-format version stamp (probed once — the
             // binary can't change under a running host-agent; None on
             // VZ/Process). The coordinator's finalize requires it on any
-            // capture that produced a cold base (ADR 0081 §B content
+            // capture that produced a cold base (ADR 0084 §B content
             // key), and the host that runs the VMM is its authority.
             let fc_snapshot_version = capabilities::fc_snapshot_version(
                 self.fc_for_reattach
@@ -482,7 +482,7 @@ impl HostAgent {
                                 strikes.remove(&sandbox_id);
                                 continue;
                             }
-                            // ADR 0081 P1b: base-snapshot capture VMs are host-local
+                            // ADR 0084 P1b: base-snapshot capture VMs are host-local
                             // + transient and NEVER session-owned by design;
                             // reaping one as an "orphan" kills an in-flight capture
                             // (a slow `[warm]` hook runs past the strike debounce).
@@ -1310,7 +1310,7 @@ impl HostAgent {
                     // its first call) — this IS the retry for whatever
                     // the old blocking gRPC gate used to loop on.
                     let capabilities = capabilities::probe_all(&probe_inputs_for_heartbeat).await;
-                    // ADR 0081 P1b: re-advertise every un-acked capture-job
+                    // ADR 0084 P1b: re-advertise every un-acked capture-job
                     // report (running progress + un-acked terminal outcomes)
                     // until the coord's ack names it — the
                     // `checkpoints`/`acked_checkpoints` pattern verbatim.
@@ -1402,7 +1402,7 @@ impl HostAgent {
                                     .await;
                                 }
                             }
-                            // ADR 0081 P1b: the coord recorded these
+                            // ADR 0084 P1b: the coord recorded these
                             // terminal capture-job reports into PG — drop
                             // the in-memory report + the durable record
                             // file (the PG row owns the reference now).

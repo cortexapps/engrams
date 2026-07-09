@@ -92,7 +92,7 @@ use serde::{Deserialize, Serialize};
 // explicit: an enable driven by a v14 coord must never land on a v13 host
 // (which would answer `Unimplemented`), so skewed hosts drain off
 // scheduling until the MIG rolls. Lockstep coord+host roll.
-// v15 (ADR 0081): capture_jobs heartbeat dispatch/reporting (#546) —
+// v15 (ADR 0084): capture_jobs heartbeat dispatch/reporting (#546) —
 // `Heartbeat.capture_job_reports`, `HeartbeatAck.capture_assignments`/
 // `acked_capture_jobs`. BuildBaseSnapshot RPC deletion rides this bump
 // (removed in the cutover commit).

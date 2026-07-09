@@ -1,4 +1,4 @@
-//! ADR 0081 §B (P3): cold-base / warm-overlay capture against a REAL
+//! ADR 0084 §B (P3): cold-base / warm-overlay capture against a REAL
 //! Firecracker microVM.
 //!
 //! One test, sized to the property it proves (repo convention: prove

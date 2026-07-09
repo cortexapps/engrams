@@ -567,7 +567,7 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
     })
 }
 
-/// ADR 0081: `capture_jobs.stage` column <-> `CaptureJobStage`.
+/// ADR 0084: `capture_jobs.stage` column <-> `CaptureJobStage`.
 /// Exhaustive — an unknown string is a hard `Serialization` error
 /// rather than a silent default (which would resurrect a terminal or
 /// misclassify a live job to the deadline scan).
@@ -620,9 +620,9 @@ pub(crate) fn capture_job_from_row(row: &PgRow) -> Result<CaptureJobRow, MetaErr
 
 pub(crate) fn cold_base_from_row(row: &PgRow) -> Result<ColdBaseRow, MetaError> {
     let snapshot_id: Uuid = row.try_get("snapshot_id").map_err(col_err)?;
-    // Migration 0097: nullable for schema-evolution safety, but every
+    // Migration 0098: nullable for schema-evolution safety, but every
     // row `upsert_cold_base` writes always sets it — a NULL here means
-    // a row written before 0097 landed (impossible in practice: the
+    // a row written before 0098 landed (impossible in practice: the
     // table was dormant until this same change started writing it) or
     // a hand-edited row. Either way, treat it as unusable rather than
     // handing the executor a `Vec::new()` it would fail to bincode-
@@ -630,7 +630,7 @@ pub(crate) fn cold_base_from_row(row: &PgRow) -> Result<ColdBaseRow, MetaError> 
     let snapshot_bincode: Option<Vec<u8>> = row.try_get("snapshot_bincode").map_err(col_err)?;
     let snapshot_bincode = snapshot_bincode.ok_or_else(|| {
         MetaError::Serialization(format!(
-            "cold_bases row {snapshot_id} has no snapshot_bincode (pre-migration-0097 row?)"
+            "cold_bases row {snapshot_id} has no snapshot_bincode (pre-migration-0098 row?)"
         ))
     })?;
     Ok(ColdBaseRow {

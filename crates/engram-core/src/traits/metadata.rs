@@ -1833,11 +1833,11 @@ pub trait MetadataStore: Send + Sync {
 
     /// ADR 0080 phase 3b: persist one `MaterializeProgress` frame from
     /// the streaming `MaterializeImage` RPC onto the job row — the
-    /// `materializing`-stage counterpart of the ADR 0081 P1b
+    /// `materializing`-stage counterpart of the ADR 0084 P1b
     /// `mirror_capture_progress_to_enable_job` (the capture-phase
     /// verb's fenced, claim-renewing predecessor,
     /// `update_enable_job_capture_progress`, was DELETED as dead code in
-    /// ADR 0081 P4 — its only caller, the enable-scanner's old capture-
+    /// ADR 0084 P4 — its only caller, the enable-scanner's old capture-
     /// progress consumer task, was removed in P1b when capture became a
     /// heartbeat-dispatched job). Renders the frame into
     /// `output_tail` (`materialize[<stage>] <detail>` — the job's
@@ -1921,7 +1921,7 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// ADR 0081 P1b: release the claim WITHOUT touching `state`/`attempts`/
+    /// ADR 0084 P1b: release the claim WITHOUT touching `state`/`attempts`/
     /// `error` — the watch-only exit for a `Capturing` job whose
     /// `capture_jobs` row is still in flight (`assigned`/`booting`/
     /// `warming`/`freezing`) or whose retryable failure was just
@@ -2002,7 +2002,7 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    // ---- capture jobs (ADR 0081) ----
+    // ---- capture jobs (ADR 0084) ----
     //
     // Capture becomes a durable, host-executed, epoch-fenced job row
     // dispatched/reported over the heartbeat, replacing the
@@ -2044,7 +2044,7 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// ADR 0081 P1b: the MOST RECENT capture job for an enable job,
+    /// ADR 0084 P1b: the MOST RECENT capture job for an enable job,
     /// terminal or not — deliberately NOT filtered to non-terminal rows
     /// (a filtered read would hide a row the instant it goes
     /// `done`/`failed`); this is
@@ -2146,7 +2146,7 @@ pub trait MetadataStore: Send + Sync {
         Ok(std::collections::HashSet::new())
     }
 
-    /// ADR 0081 P1b: mirror a [`CaptureJobReport`]'s stage/progress onto
+    /// ADR 0084 P1b: mirror a [`CaptureJobReport`]'s stage/progress onto
     /// the owning `enable_jobs` row's ADR 0079 dashboard columns
     /// (`capture_phase`/`warm_stage`/`output_tail`) — UNFENCED (no
     /// `claimed_by` check, no claim renewal): `capture_jobs` is now
@@ -2168,7 +2168,7 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
-    /// Stamp the terminal `reuse_outcome` on an enable job (ADR 0081
+    /// Stamp the terminal `reuse_outcome` on an enable job (ADR 0084
     /// section D): `reused_full | reused_cold_base |
     /// recaptured:no_cold_base | recaptured:content_changed |
     /// recaptured:chunks_missing | recaptured:fc_version_changed`. A
@@ -2185,7 +2185,7 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// Insert or replace the cold base at `row.content_key` (ADR 0081
+    /// Insert or replace the cold base at `row.content_key` (ADR 0084
     /// section B) — the content-keyed, boot-to-agentd-ready Full
     /// snapshot every warm-image capture of matching content reuses
     /// (the hook always re-runs against a fresh env on top of it).
@@ -2214,7 +2214,7 @@ pub trait MetadataStore: Send + Sync {
     }
 
     /// Every cold base's `disk_manifest` + `memory_manifest`, parsed —
-    /// the chunk-GC pin-set's 7th source (`PinSet::collect`, ADR 0081
+    /// the chunk-GC pin-set's 7th source (`PinSet::collect`, ADR 0084
     /// §B6): a cold base's chunks have no OTHER root (unlike the
     /// overlay snapshot it seeds, it never gets its own `snapshots` row
     /// pinned via `snapshot_blob_pin_set`/`enabled_images`), so without
@@ -2227,7 +2227,7 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// ADR 0081 §D: does a `cold_bases` row exist for `disk_manifest`
+    /// ADR 0084 §D: does a `cold_bases` row exist for `disk_manifest`
     /// under a DIFFERENT `fc_snapshot_version` than `current_fc_version`?
     /// Powers the `recaptured:fc_version_changed` reuse-outcome label —
     /// distinguishing "this rootfs was captured before, just under an

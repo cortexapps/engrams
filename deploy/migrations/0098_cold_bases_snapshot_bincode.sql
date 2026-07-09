@@ -1,5 +1,5 @@
--- ADR 0081 phase 3: cold_bases needs a full, restorable SnapshotMetadata,
--- not just the (disk_manifest, memory_manifest) text pair migration 0095
+-- ADR 0084 phase 3: cold_bases needs a full, restorable SnapshotMetadata,
+-- not just the (disk_manifest, memory_manifest) text pair migration 0096
 -- shipped. Restoring a cold base means calling
 -- `SandboxBackend::restore(SnapshotMetadata)` — a real struct carrying
 -- `state_blob_key`/`sidecar_blob_key`/`image_version`/`size_bytes`/etc,

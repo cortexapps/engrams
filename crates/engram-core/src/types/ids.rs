@@ -65,7 +65,7 @@ id_newtype!(SnapshotId);
 id_newtype!(MessageId);
 id_newtype!(ToolCallId);
 id_newtype!(AgentCommitId);
-// ADR 0081: identifies one durable, host-executed capture job row
+// ADR 0084: identifies one durable, host-executed capture job row
 // (`capture_jobs.id`).
 id_newtype!(CaptureJobId);
 

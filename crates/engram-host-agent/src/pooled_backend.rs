@@ -6906,7 +6906,7 @@ impl SandboxBackend for PooledBackend {
         result
     }
 
-    /// ADR 0081 §B: cold-base / warm-overlay split.
+    /// ADR 0084 §B: cold-base / warm-overlay split.
     ///
     /// `req.cold_base_plan` (computed entirely coordinator-side —
     /// `ColdBasePlan`'s doc) drives the stage plan:
@@ -6952,7 +6952,7 @@ impl SandboxBackend for PooledBackend {
             cold_base_plan,
         } = req;
 
-        // ADR 0081 decision 11: a `Hit`/`Miss` plan means placement
+        // ADR 0084 decision 11: a `Hit`/`Miss` plan means placement
         // pinned this host as FC-capable (`fc_snapshot_version` +
         // `supports_diff_checkpoints`). If the actual backend can't
         // diff, that's a placement bug — hard error, never a silent
@@ -6992,7 +6992,7 @@ impl SandboxBackend for PooledBackend {
         // — restore the cold base on a Hit (no cold boot at all), else
         // cold-boot fresh (Miss / NotApplicable). ----
         //
-        // ADR 0081 P1b: the teardown reconcile no longer exempts capture
+        // ADR 0084 P1b: the teardown reconcile no longer exempts capture
         // VMs via a `base_captures` DashMap tracked here — the host-
         // agent's capture-job executor (`capture_job.rs`) tracks
         // `(job_id, sandbox_id)` for the whole job lifetime and the
@@ -7065,7 +7065,7 @@ impl SandboxBackend for PooledBackend {
             }
             drop(boot_keepalive);
 
-            // ADR 0081 §B3: a WARM image on a MISS needs its OWN cold
+            // ADR 0084 §B3: a WARM image on a MISS needs its OWN cold
             // base minted before the hook runs (the hook must land on
             // top of an established base, not fold into the artifact's
             // only capture) — take a Full snapshot now. `self.snapshot`
@@ -8927,7 +8927,7 @@ mod tests {
         );
     }
 
-    /// ADR 0081 §B: `build_base_snapshot`'s cold-base/warm-overlay stage
+    /// ADR 0084 §B: `build_base_snapshot`'s cold-base/warm-overlay stage
     /// plan. `ColdBaseMock` tracks `create`/`restore`/`snapshot` call
     /// counts so each test asserts the EXACT stage sequence its
     /// `ColdBasePlan` should drive, without needing to fake FC's real

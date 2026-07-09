@@ -1,4 +1,4 @@
-# 0081 — Capture as a durable host-owned job: `capture_jobs`, cold-base/warm-overlay split, footprint placement
+# 0084 — Capture as a durable host-owned job: `capture_jobs`, cold-base/warm-overlay split, footprint placement
 
 Status: Accepted (2026-07-08) — P1-P4 all landed in this PR's commit chain (see the Divergence log)
 
@@ -80,7 +80,7 @@ deadlines bound progress, never totality.*
 
 ### A. The job model
 
-Migration `0095_capture_jobs.sql`:
+Migration `0096_capture_jobs.sql`:
 
 ```sql
 CREATE TABLE capture_jobs (
@@ -332,7 +332,7 @@ machinery; `MaterializeImage` (stays an RPC by decision above).
 ## Divergence log
 
 **P1b (cutover commit — this PR's second commit, on top of the P1a
-foundation) landed**: migration 0095 verbs wired live, wire v15 heartbeat
+foundation) landed**: migration 0096 verbs wired live, wire v15 heartbeat
 fields consumed on both sides, `BuildBaseSnapshot` RPC deleted end to
 end (proto/client/server/`HostClient` trait — `SandboxBackend::
 build_base_snapshot` unchanged, now called only by the host-agent's own
@@ -340,8 +340,8 @@ executor), the `capture_job.rs` executor + durable record + live-sandbox
 registry, the claim endpoint, and the scanner's watch-only `Capturing`
 rework + stage-deadline scan.
 
-- **`capture_jobs.manifest_digest` added (migration 0096, NOT in the
-  original 0095 design)**: the P1a row carried `disk_manifest` (the
+- **`capture_jobs.manifest_digest` added (migration 0097, NOT in the
+  original 0096 design)**: the P1a row carried `disk_manifest` (the
   content-derived chunked-rootfs ref) but not the OCI `manifest_digest`.
   Two real needs surfaced implementing P1b: (1) the claim handler needs
   it to digest-pin `SandboxSpec.image` (issue #192 — a moving tag must
@@ -370,7 +370,7 @@ rework + stage-deadline scan.
 - **`CaptureJobProgress` (the wire-facing progress shape) is lossier
   than the old `CaptureProgress`**: it has `{detail, log_tail}`, not the
   old `{warm_stage, warm_stages: Vec<WarmStageRecord>, output_tail}`.
-  This is the ALREADY-DECIDED P1a schema (migration 0095's
+  This is the ALREADY-DECIDED P1a schema (migration 0096's
   `stage_progress` shape), not a P1b regression — but it means the
   `enable_jobs.warm_stage`/`warm_stages` dashboard columns only get a
   best-effort mirror (`report.progress.detail` stands in for the
@@ -418,7 +418,7 @@ rework + stage-deadline scan.
 - **Digest-pinning gap, now closed**: an earlier draft of this commit
   left `spec.image` un-pinned at claim time (no `manifest_digest` on the
   row) with a documented "harmless, record-keeping only" rationale.
-  Superseded by the migration-0096 fix above — flagging here only
+  Superseded by the migration-0097 fix above — flagging here only
   because it's exactly the kind of divergence this log exists to catch
   before it goes stale.
 - **NOT done this commit** (P2/P3/P4, explicitly out of scope per the
@@ -498,7 +498,7 @@ coordinator-side, in the claim handler's new `resolve_cold_base_plan`),
 `finalize_capture_job` recording `cold_bases` + the full
 `reuse_outcome` taxonomy.
 
-- **Migration 0096 → 0097, not a 0095 edit**: the P1a `cold_bases`
+- **Migration 0097 → 0098, not a 0096 edit**: the P1a `cold_bases`
   schema (`content_key, snapshot_id, disk_manifest, memory_manifest,
   fc_snapshot_version, captured_at`) has no way to reconstruct a full,
   restorable `SnapshotMetadata` — several of that struct's fields
@@ -506,9 +506,9 @@ coordinator-side, in the claim handler's new `resolve_cold_base_plan`),
   `snapshot_id` alone by convention, but others (`aux_bundles`,
   `paused_at`, `image_version`, `size_bytes`) are not, and
   reconstructing a lossy approximation risked a restore silently
-  missing a real field a future capture starts using. Migration 0097
+  missing a real field a future capture starts using. Migration 0098
   adds `cold_bases.snapshot_bincode` (nullable, since the table was
-  still dormant when 0097 landed — no backfill needed) storing the
+  still dormant when 0098 landed — no backfill needed) storing the
   executor's own bincode-encoded `SnapshotMetadata` verbatim; the
   claim handler decodes it straight into `ColdBasePlan::Hit`.
 - **`ColdBasePlan` is a tri-state enum, not the ADR text's
