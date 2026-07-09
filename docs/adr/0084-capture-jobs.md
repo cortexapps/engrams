@@ -754,3 +754,66 @@ verb's own doc for why fencing/lease-renewal no longer apply once
   failure). The Hit arm now replaces the sparse seed with a FORKED
   one — the same each-consumer-owns-a-fresh-lineage rule
   session-create off a shared base template already documents.
+
+## Known gaps + forward plan
+
+Recorded before this PR merges so nothing below is discovered stale.
+
+- **(a) Cold-base content key omits kernel + bundle identity.** The key
+  is `sha256(disk_manifest ‖ resources ‖ fc_snapshot_version ‖
+  backend_kind)`. Two capture inputs it does NOT cover: the **guest
+  kernel** (ADR 0025 — the vendored `vmlinux` lives OUTSIDE the rootfs,
+  so it is not in `disk_manifest`) and the **dynamic agentd/aux bundle
+  set** (ADR 0080/0027 — a separate squashfs, again not in
+  `disk_manifest`). Consequence: a kernel roll or an agentd/bundle roll
+  with an unchanged rootfs reuses a cold base captured under the OLD
+  kernel/bundle until the rootfs itself changes. This is **staleness,
+  not corruption** — the restored base still boots, it just isn't the
+  freshest kernel/agentd. The `fc_snapshot_version` term already guards
+  the one cross-version case that IS corruption (issue #160). Fix:
+  fold a kernel identifier (the `pull-kernel` content hash) and the
+  bundle-set stamp into the content key. Deferred to a follow-up —
+  flagged rather than left silent because a kernel roll is exactly the
+  event that would otherwise surface as "the new kernel didn't take."
+- **(b) Cold-base pin window vs GC grace.** A cold base's disk/memory
+  chunks are written during `freezing` but only become pinned once
+  `finalize_capture_job` upserts the `cold_bases` row (the §B6 pin-set
+  source). Between those two points the chunks are unrooted. Correctness
+  depends on the chunk-GC candidate-table grace exceeding the maximum
+  latency from "chunks written" to "Done report applied + finalize
+  upsert" — believed true today (the grace is generous and a Done report
+  lands within one heartbeat of the write-through flush), but this is an
+  assumption to **verify before ever tightening the GC grace**, not a
+  proven invariant.
+- **(c) Post-#621 reservation re-attach (HARD requirement before merge).**
+  P2's placement is disk-footprint-only; the one-capture-per-host
+  anti-affinity bounds capture-vs-**capture** contention but NOT
+  capture-vs-**session** RAM contention — i.e. the exact 2026-07-08
+  node-OOM class (session 8a80c3fb) that ADR 0081/PR #621 closes with a
+  RAM/CPU reservation. So this PR MUST NOT merge on P2's disk-only
+  placement alone; when this branch rebases over PR #621 (which lands
+  ADR 0081's reservation on `enable_jobs`), the reservation moves onto
+  `capture_jobs`:
+  - Budgets are stamped at `insert_capture_job` time from
+    `ImageConfig::resolved_memory_mib()` / `resolved_vcpus()`.
+  - **Release is implicit**: a terminal stage drops the row out of the
+    reserved-SUM via the same `stage NOT IN ('done','failed')` filter
+    the anti-affinity/assignment reads already use — there is NO explicit
+    `clear_capture_reservation` call. #621's `clear_capture_reservation`
+    verb is **deleted** and its `enable_jobs` reservation columns retired.
+  - `reassign_capture_job` / `redrive_failed_capture_job` re-run the 2D
+    (disk + RAM/CPU) fit for the new host and move the reservation
+    atomically under the same epoch fence they already carry.
+  - The reserved-SUM readers + `queued_demand` re-point from
+    `enable_jobs.capture_host_id` to `capture_jobs.host_id`.
+  - Keep #621's `pick_materialize_host` split AND this PR's
+    `hosts_with_live_capture_jobs` delete-host guard; the merged picker
+    enforces BOTH the disk-footprint veto (this PR) and the RAM/CPU fit
+    (#621).
+- **(d) Egress rule pattern must align with PR #595 (ADR 0083).** #595
+  switched host INPUT accepts to `-I INPUT 1` (insert-at-top) plus a
+  startup purge-and-reapply, replacing append-based rules. The capture-VM
+  egress policy this PR assembles (`assemble_capture_egress_policy`) must
+  adopt the SAME insert-at-top + purge-and-reapply pattern when this
+  branch rebases over #595 — there is a known `net.rs` conflict with #595
+  to resolve at that point, not a silent divergence.
