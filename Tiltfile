@@ -326,7 +326,11 @@ otel_endpoint = env_or('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4317')
 # Local dev hosts can have much smaller work dirs than production. Keep the
 # coordinator's materialize/capture placement floor and the host-agent's
 # idle-evict floor aligned, while still allowing .env/process overrides.
+# Placement gets its own knob upstream (deliberately decoupled from idle
+# eviction, see host_disk_cache_floor_mib) — in dev BOTH must drop to 3 GiB
+# or a laptop with <20 GiB free vetoes every materialize with NoCapacity.
 dev_disk_floor_bytes = env_or('ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES', '3221225472')
+dev_placement_floor_bytes = env_or('ENGRAM_PLACEMENT_DISK_FLOOR_BYTES', '3221225472')
 
 coord_env = {
     'DATABASE_URL': 'postgres://engram:engram@localhost:5435/engram',
@@ -355,6 +359,7 @@ coord_env = {
     'ENGRAM_GCS_BUCKET': env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test'),
     'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
     'ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES': dev_disk_floor_bytes,
+    'ENGRAM_PLACEMENT_DISK_FLOOR_BYTES': dev_placement_floor_bytes,
     'OTEL_EXPORTER_OTLP_ENDPOINT': otel_endpoint,
     'RUST_LOG': 'info,engram=debug',
 }
@@ -822,15 +827,14 @@ if dev_split:
         labels=['setup'])
 
 # The egress proxy is MANDATORY (issue #240): it's the only path a guest
-# reaches the network, and `0` is NOT an "off" sentinel — host_startup still
-# installs a `:443 -> port 0` REDIRECT (dead) while the proxy binds a random
-# ephemeral port, so guest HTTPS (e.g. a claude session's api.anthropic.com
-# call) silently hangs. On the fc path default it to a real fixed port (8443,
-# the host-agent's own CLI default) so egress actually works; other dev
-# backends keep the historical 0 unless overridden. (The proxy is fail-closed
-# on a bind collision — 8443 is verified free in the fc-dev VM.)
-_proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT',
-                         '8443' if fc_colima_profile else '0'))
+# reaches the network, and `0` is NOT an "off" sentinel — the host-agent
+# now REFUSES to boot on port 0 (ADR 0083 fail-closed: the iptables
+# REDIRECT targets the configured literal, so an ephemeral bind leaves
+# :443/:53 redirected at a dead port). Default every dev backend to a real
+# fixed port (8443, the host-agent's own CLI default; verified free in the
+# fc-dev VM, and merely an idle listener on macOS/VZ where no REDIRECT
+# exists). host-agent-b takes +1 below.
+_proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT', '8443'))
 # DNS-filter proxy base port. Always a real port (unlike the proxy port, which
 # has a 0-footgun default): the DNS listener always binds. host-agent-b takes
 # _dns_base + 1 so the two hosts don't collide on the shared netns. Keep the
