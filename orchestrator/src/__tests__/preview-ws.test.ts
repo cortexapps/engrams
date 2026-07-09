@@ -107,12 +107,14 @@ describe("preview WS passthrough", () => {
       app,
       () => {},
       nodeWs,
-      makePreviewUpgradeHandler({
-        store: fakeStore(exposure),
-        portRelay: fakeRelayToPort(guestPort),
-        getSession: authedOwner,
-        previewBaseDomain: "lvh.me:8787",
-      }),
+      [
+        makePreviewUpgradeHandler({
+          store: fakeStore(exposure),
+          portRelay: fakeRelayToPort(guestPort),
+          getSession: authedOwner,
+          previewBaseDomain: "lvh.me:8787",
+        }),
+      ],
     );
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     const serverPort = (server.address() as net.AddressInfo).port;
@@ -146,12 +148,14 @@ describe("preview WS passthrough", () => {
       app,
       () => {},
       nodeWs,
-      makePreviewUpgradeHandler({
-        store: fakeStore(exposure),
-        portRelay: fakeRelayToPort(0), // never dialed — auth fails first
-        getSession: async () => null,
-        previewBaseDomain: "lvh.me:8787",
-      }),
+      [
+        makePreviewUpgradeHandler({
+          store: fakeStore(exposure),
+          portRelay: fakeRelayToPort(0), // never dialed — auth fails first
+          getSession: async () => null,
+          previewBaseDomain: "lvh.me:8787",
+        }),
+      ],
     );
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     const serverPort = (server.address() as net.AddressInfo).port;

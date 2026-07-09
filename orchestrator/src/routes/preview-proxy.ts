@@ -246,12 +246,21 @@ type FetchInit = RequestInit & { duplex?: "half" };
  * local port. This keeps web types end to end (no node↔web stream casts) and
  * uses only Bun-supported APIs; the extra localhost hop is within the v1
  * latency envelope (ADR 0064 "Latency").
+ *
+ * `targetPath` overrides the pathname+search sent to the guest (defaults to
+ * the incoming request's own `url.pathname + url.search`). ADR 0081's IDE
+ * proxy (`routes/ide.ts`) uses this to strip the `/api/v1/sessions/:id/ide`
+ * route prefix before forwarding to code-server, which expects root-relative
+ * paths — everything else about the mechanics (loopback hop, header
+ * forwarding, content-encoding/length strip, streaming body) is unchanged and
+ * shared verbatim.
  */
-function proxyHttp(
+export function proxyHttp(
   relay: PortRelayClient,
   sessionId: string,
   port: number,
   c: Context,
+  targetPath?: string,
 ): Promise<Response> {
   const signal = c.req.raw.signal;
 
@@ -282,7 +291,10 @@ function proxyHttp(
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
       const localPort = addr && typeof addr === "object" ? addr.port : 0;
-      const url = new URL(c.req.url);
+      const path = targetPath ?? (() => {
+        const url = new URL(c.req.url);
+        return url.pathname + url.search;
+      })();
       // Rewrite Host so guest apps that self-reference localhost keep working.
       const headers = new Headers(c.req.raw.headers);
       headers.set("host", `localhost:${port}`);
@@ -296,7 +308,7 @@ function proxyHttp(
       };
       if (c.req.raw.body) init.duplex = "half";
 
-      fetch(`http://127.0.0.1:${localPort}${url.pathname}${url.search}`, init)
+      fetch(`http://127.0.0.1:${localPort}${path}`, init)
         .then((upstream) => {
           // WHATWG fetch transparently DECOMPRESSES a Content-Encoding'd
           // upstream body but leaves the original entity headers in place, so

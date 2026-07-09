@@ -139,8 +139,13 @@ export function makePreviewUpgradeHandler(
  * listener that raw-pipes a real local socket into the `PortRelay` tunnel, then
  * open a native `WebSocket` to that local port. The guest dev server handshakes
  * + frames over the tunnel; we forward messages + close in both directions.
+ *
+ * Exported so ADR 0081's IDE proxy (`routes/ide.ts`) reuses these mechanics
+ * verbatim for code-server's own-handshake WS traffic, keyed by session path
+ * instead of a preview slug/token — `url` there already carries the
+ * route-prefix-stripped path code-server expects.
  */
-function bridgeClientToGuest(
+export function bridgeClientToGuest(
   clientWs: WsConn,
   relay: PortRelayClient,
   sessionId: string,

@@ -123,6 +123,15 @@ export const POLICY: Record<string, PolicyEntry> = {
     subject: "Session",
     sessionIdField: "sessionId",
   },
+  // ADR 0081: bring up the in-guest IDE (code-server) — same owner-or-admin
+  // interactive-access bar as EnsureBrowser/Exec. The IDE tab itself goes
+  // through routes/ide.ts (which calls this server-side), but the passthrough
+  // exposes it with the same gate.
+  "SessionService.EnsureIde": {
+    action: "shell",
+    subject: "Session",
+    sessionIdField: "sessionId",
+  },
   // Admin-only SessionService methods
   "SessionService.Snapshot": { action: "manage", subject: "all" },
   "SessionService.EvictLocal": { action: "manage", subject: "all" },

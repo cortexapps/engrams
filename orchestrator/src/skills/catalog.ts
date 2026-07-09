@@ -35,6 +35,14 @@ export const BUILTIN_SKILLS: { name: string; label: string; description: string 
     description:
       "One shared Chromium the human drives over VNC (BROWSER tab) and the agent drives programmatically — same browser, so the human watches the agent live. Use an image sized for a browser (≥1 GiB).",
   },
+  {
+    // ADR 0081: the in-guest IDE bundle (code-server), a human surface served
+    // in the IDE tab via the session-scoped proxy (routes/ide.ts).
+    name: "ide",
+    label: "IDE",
+    description:
+      "VS Code in the session (code-server): browse and edit the workspace, with an integrated terminal.",
+  },
 ];
 
 export const BUILTIN_NAMES = new Set(BUILTIN_SKILLS.map((s) => s.name));

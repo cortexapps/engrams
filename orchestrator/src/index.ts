@@ -21,6 +21,7 @@ import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
 import { makeVncRoute } from "./routes/vnc.ts";
+import { makeIdeRoute, makeIdeUpgradeHandler } from "./routes/ide.ts";
 import { makePreviewProxyMiddleware } from "./routes/preview-proxy.ts";
 import { makePreviewUpgradeHandler } from "./routes/preview-ws.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
@@ -106,6 +107,13 @@ const { app: vncApp, injectUpgrade: injectVncUpgrade } = makeVncRoute();
 injectVncUpgrade(upgradeWebSocket);
 app.route("/", vncApp);
 
+// ADR 0081: in-guest IDE (code-server) HTTP proxy. Session-scoped + guarded;
+// the WS half is the upgrade hook passed to buildServer below. Mounted after
+// shell/vnc (paths are disjoint; the preview middleware above is Host-keyed
+// and passes non-preview hosts straight through).
+const { app: ideApp } = makeIdeRoute();
+app.route("/", ideApp);
+
 // Default 404 for unmatched Hono paths.
 app.notFound((c) => c.json({ error: "not found" }, 404));
 
@@ -151,8 +159,10 @@ const server = buildServer(
   // injectWebSocket is included for completeness but the custom upgrade handler
   // is used instead of calling nodeWs.injectWebSocket(server).
   { upgradeWebSocket, wss, injectWebSocket },
-  // ADR 0064 P2b-ws: preview WS-upgrade hook — checked before the shell path.
-  makePreviewUpgradeHandler(),
+  // Raw WS-upgrade hooks, tried in order before the shell/vnc path: the
+  // preview proxy first (Host-keyed — a preview host is a different origin,
+  // so it wins outright), then the IDE proxy (path-keyed, ADR 0081).
+  [makePreviewUpgradeHandler(), makeIdeUpgradeHandler()],
 );
 
 // ADR 0060: inject the SlackThreadWorkflow's seams (the Slack provider
