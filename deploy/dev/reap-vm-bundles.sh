@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prune stale RO skill bundles inside the fc-colima VM (ADR 0068), mirroring
+# Prune stale RO skill bundles inside the fc-colima VM (ADR 0082), mirroring
 # `just reap-sessions`'s var/shared prune. Runs IN the VM — piped to
 # `sudo bash -s` over `colima ssh` (stdin, so colima ssh's non-shell arg
 # handling can't mangle it). Removes any <sha>.{erofs,squashfs} in

@@ -1,6 +1,6 @@
 # Runbook: `just dev-fc` — the Firecracker backend on a Mac via Colima
 
-ADR 0068. Runs the real Firecracker backend in the local dev stack on Apple
+ADR 0082. Runs the real Firecracker backend in the local dev stack on Apple
 Silicon: the host-agent (+ FC, NBD, UFFD, netns egress, squashfs bundles) runs
 inside a dedicated Colima VM with a nested-virt `/dev/kvm`, while the
 coordinator, orchestrator, web, and docker-compose deps stay on the Mac

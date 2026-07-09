@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # `just fc-colima-provision [profile]` — provision a dedicated Colima VM as
-# an aarch64 Firecracker dev host (ADR 0068). Idempotent: safe to re-run
+# an aarch64 Firecracker dev host (ADR 0082). Idempotent: safe to re-run
 # against an already-provisioned (or partially-provisioned) profile. Only
 # the host-agent + its FC stack run in this VM; the coordinator,
 # orchestrator, web, and docker-compose deps stay on the Mac (`just dev-fc`
@@ -19,7 +19,7 @@
 #                     /opt/engram-dev/Image already exists
 #
 # Requires macOS on Apple Silicon + nested virtualization (Apple M3 or
-# later, macOS 15+) to get a real /dev/kvm inside the VM — see ADR 0068.
+# later, macOS 15+) to get a real /dev/kvm inside the VM — see ADR 0082.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -55,7 +55,7 @@ echo "      the /dev/kvm check below rather than silently degrading to no" >&2
 echo "      isolation." >&2
 
 # Firecracker version: read CI's pin so the aarch64 dev rig and the x86_64
-# CI lane run the same FC release train (ADR 0068). Falls back to a
+# CI lane run the same FC release train (ADR 0082). Falls back to a
 # hardcoded value if ci.yml's format ever changes underneath this grep —
 # keep that fallback in sync with the "Install firecracker" step there.
 FC_VERSION="$(grep -oE 'FC_VER: v[0-9.]+' .github/workflows/ci.yml | head -1 | awk '{print $2}')"
@@ -201,7 +201,7 @@ udevadm trigger --name-match=kvm 2>/dev/null || true
 # --- loopback forwarders: preserve the Mac dev stack's loopback literalism
 # (localhost:5001 image refs, STORAGE_EMULATOR_HOST=http://localhost:4443,
 # OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317) unmodified inside the VM by
-# routing them to the Lima host gateway (ADR 0068 "Networking" — VM -> Mac). The
+# routing them to the Lima host gateway (ADR 0082 "Networking" — VM -> Mac). The
 # host-agent env uses these localhost:PORT values as-is.
 #
 # We DNAT the loopback destination to the gateway rather than run a socat

@@ -1,4 +1,4 @@
-# 0068 — Local Firecracker dev on Apple Silicon via a dedicated Colima VM
+# 0082 — Local Firecracker dev on Apple Silicon via a dedicated Colima VM
 
 Status: Proposed
 

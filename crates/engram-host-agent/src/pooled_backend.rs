@@ -10765,7 +10765,7 @@ mod tests {
             // collisions when the suite runs in parallel). DNS proxy
             // disabled (`None`): these tests exercise only the egress
             // registry, and a fixed DNS port would collide across the
-            // parallel suite now that a bind failure is fatal (ADR 0075).
+            // parallel suite now that a bind failure is fatal (ADR 0083).
             let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
             let egress = HostEgress::spawn(source, bind, None, None)
                 .await

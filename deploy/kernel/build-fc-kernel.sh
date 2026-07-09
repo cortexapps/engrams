@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the engram Firecracker guest kernel (ADR 0025; ARCH support ADR 0068).
+# Build the engram Firecracker guest kernel (ADR 0025; ARCH support ADR 0082).
 #
 # = Firecracker's stock microvm guest config (FC-bootable: virtio-mmio +
 #   vsock + ip_pnp) + deploy/kernel/engram-docker.fragment (the netfilter
@@ -8,7 +8,7 @@
 #   dockerd/compose inside a sandbox; this rebuild restores them.
 #
 # ARCH=x86_64 (default, unchanged): output $OUT/vmlinux-engram-${LINUX_VERSION}-${KERNEL_REV}
-# ARCH=arm64 (ADR 0068, the Colima aarch64 dev rig): output
+# ARCH=arm64 (ADR 0082, the Colima aarch64 dev rig): output
 #   $OUT/Image-engram-${LINUX_VERSION}-${KERNEL_REV} — aarch64 Firecracker
 #   boots a bare `Image`, not `vmlinux`.
 # Published as a GitHub release asset by .github/workflows/build-fc-kernel.yml;
@@ -30,7 +30,7 @@ LINUX_VERSION="${LINUX_VERSION:-6.1.102}"
 KERNEL_REV="${KERNEL_REV:-1}"                    # engram build revision; bump on fragment/base change
 
 # ARCH selects the kernel build target: x86_64 (default, byte-for-byte
-# unchanged behavior for existing callers/CI) or arm64 (ADR 0068).
+# unchanged behavior for existing callers/CI) or arm64 (ADR 0082).
 ARCH="${ARCH:-x86_64}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FRAGMENT="${SCRIPT_DIR}/engram-docker.fragment"

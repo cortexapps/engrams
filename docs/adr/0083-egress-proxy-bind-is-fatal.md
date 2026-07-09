@@ -1,4 +1,4 @@
-# ADR 0075: egress-proxy bind failure is fatal (fail-closed startup)
+# ADR 0083: egress-proxy bind failure is fatal (fail-closed startup)
 
 **Status:** Accepted (2026-07-07). The per-host egress proxy (ADR 0006) is the **only**
 path a guest reaches the network: iptables on the FC host installs a `:443 -> proxy` (and

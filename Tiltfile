@@ -75,7 +75,7 @@ def env_or(key, default):
     return env_file.get(key) or os.environ.get(key) or default
 
 # ----------------------------------------------------------------
-# ADR 0068: Firecracker dev via a dedicated Colima VM.
+# ADR 0082: Firecracker dev via a dedicated Colima VM.
 #
 # When set, the host-agent (+ its FC stack) runs INSIDE the named Colima
 # VM instead of as a Mac-local process — the only way to exercise the
@@ -106,7 +106,7 @@ fc_colima_profile = env_or('ENGRAM_FC_COLIMA_PROFILE', '')
 
 uname_str = str(local('uname -s -m', echo_off=True, quiet=True)).strip()
 
-# ADR 0068: the fc-colima bundles + host-agent build steps run under a real
+# ADR 0082: the fc-colima bundles + host-agent build steps run under a real
 # `nix develop` (for mksquashfs + the aarch64 musl cross-toolchain). The loop
 # that a per-build `nix develop` used to feed is handled by the bundles
 # resource's TRIGGER_MODE_MANUAL (see below), not by avoiding nix.
@@ -131,7 +131,7 @@ if fc_colima_profile:
              '`just fc-colima-provision {p}` first.')
                 .format(p=fc_colima_profile)
         )
-    # ADR 0068: the docker-compose deps (postgres/registry/fake-gcs/jaeger) MUST
+    # ADR 0082: the docker-compose deps (postgres/registry/fake-gcs/jaeger) MUST
     # run on the Mac's docker, never inside the fc-dev VM — only the host-agent (a
     # `colima ssh` PROCESS, not a container) + its FC stack belong there. But
     # `colima start` persistently repoints the docker CLI at the VM daemon (writes
@@ -149,7 +149,7 @@ if fc_colima_profile:
     if ('/' + fc_colima_profile + '/docker.sock') in _docker_host:
         fail(
             ("docker is pointed at the fc-dev VM daemon ({h}), so the compose " +
-             "deps would deploy INTO the VM instead of the Mac (ADR 0068). Start " +
+             "deps would deploy INTO the VM instead of the Mac (ADR 0082). Start " +
              "with `just dev-fc {p}` — it pins DOCKER_HOST to your Mac docker — or " +
              "run `docker context use colima` before `tilt up`.")
                 .format(h=_docker_host, p=fc_colima_profile)
@@ -183,7 +183,7 @@ elif sandbox_backend == 'firecracker':
 if kernel_key:
     if fc_colima_profile:
         # Lives inside the VM, not on the Mac — the fail-fast check above
-        # already confirmed it's there at exactly this path (the ADR 0068
+        # already confirmed it's there at exactly this path (the ADR 0082
         # provisioning contract), so there's nothing to stat locally.
         kernel_path = '/opt/engram-dev/Image'
     else:
@@ -368,7 +368,7 @@ if 'Darwin' in uname_str:
     )
 
 if fc_colima_profile:
-    # ADR 0068: the fc-dev VM has a ~19 GiB rootfs, smaller than the
+    # ADR 0082: the fc-dev VM has a ~19 GiB rootfs, smaller than the
     # production 20 GiB disk-cache floor. Keep the coordinator's
     # materialize/capture placement floor in lockstep with the VM-side
     # host-agent idle-evict override below, or the VM can never be
@@ -439,7 +439,7 @@ local_resource('coordinator',
 # (or `tilt up`); the env flag adds host-agent-b.
 two_hosts = env_or('ENGRAM_INTEG_TWO_HOSTS', '') in ('1', 'true', 'yes')
 if two_hosts and fc_colima_profile:
-    # ADR 0068 wires exactly one VM-hosted host-agent; a second one would
+    # ADR 0082 wires exactly one VM-hosted host-agent; a second one would
     # need its own gRPC/metrics ports forwarded out of the SAME VM plus a
     # disjoint NBD/sandbox-dir split inside it, neither of which exists
     # yet. Fail fast instead of silently only starting host-agent.
@@ -545,7 +545,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # DNS-filter proxy port. Like the proxy/gRPC/metrics ports, it must be
         # distinct per host-agent on the SHARED netns of the two-host e2e stack
         # (host-agent-b gets dns_base+1 below) — else the second host-agent
-        # fails closed on `0.0.0.0:5353 Address already in use` (ADR 0075). The
+        # fails closed on `0.0.0.0:5353 Address already in use` (ADR 0083). The
         # host-agent wires this same value into the FC iptables `:53 -> dns`
         # REDIRECT, so the two can't drift.
         'ENGRAM_EGRESS_DNS_PORT': egress_dns_port,
@@ -565,7 +565,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         env['ENGRAM_NBD_DEVICES'] = nbd_csv
 
     if fc_colima_profile:
-        # ADR 0068: this resource's whole execution model moves into the
+        # ADR 0082: this resource's whole execution model moves into the
         # VM — addresses, PATH, and the build/sync/serve steps below all
         # target it, not the Mac. Only the two addresses below actually
         # need to change: Mac->VM (gRPC) and VM->Mac (coordinator) keep
@@ -827,7 +827,7 @@ _dns_base = int(env_or('ENGRAM_EGRESS_DNS_PORT', '5353'))
 if dev_split:
     host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base), str(_dns_base))
     if fc_colima_profile:
-        # ADR 0068: the coordinator dials the host-agent's advertised
+        # ADR 0082: the coordinator dials the host-agent's advertised
         # 127.0.0.1:9101 (and scrapes metrics on :9100) — reachable only via a
         # guest->Mac forward. Lima's auto-forward is edge-triggered and proved
         # unreliable across host-agent/VM restarts (the port silently stops
@@ -873,7 +873,7 @@ if dev_split:
         # Distinct proxy + DNS ports for the second host-agent (they share the
         # netns). Proxy: 0 (disabled) stays 0 so the dev default is unchanged.
         # DNS: always +1 (the DNS listener always binds), else host-agent-b
-        # fails closed on `0.0.0.0:5353 Address already in use` (ADR 0075).
+        # fails closed on `0.0.0.0:5353 Address already in use` (ADR 0083).
         _proxy_b = str(_proxy_base + 1) if _proxy_base > 0 else '0'
         host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b, str(_dns_base + 1))
 

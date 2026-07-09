@@ -321,7 +321,7 @@ async fn spawn_real_proxy() -> (u16, String, Arc<engram_egress_proxy::Registry>)
     // never actually exercise the real-upstream path; that's the
     // whole point of these tests.
     let proxy = engram_egress_proxy::Proxy::new(proxy_cfg);
-    // Bind synchronously (fail-closed, ADR 0075) so a port collision
+    // Bind synchronously (fail-closed, ADR 0083) so a port collision
     // surfaces here rather than inside the detached serve task; then
     // spawn the accept loop.
     let listeners = proxy.bind().await.expect("egress proxy bind");

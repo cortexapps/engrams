@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sweep orphaned base-snapshot dirs in the fc-colima VM (ADR 0068). Dirs under
+# Sweep orphaned base-snapshot dirs in the fc-colima VM (ADR 0082). Dirs under
 # /opt/engram-dev/var/sandboxes/snapshots/ whose id has no live coordinator DB
 # row are dead weight: the coordinator's snapshot GC works off DB rows, so a
 # snapshot dir left by a hard DB delete or a failed capture is never reclaimed,

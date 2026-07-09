@@ -261,7 +261,7 @@ dev:
 dev-down:
     tilt down
 
-# ADR 0068: like `just dev`, but the host-agent (+ its Firecracker stack)
+# ADR 0082: like `just dev`, but the host-agent (+ its Firecracker stack)
 # runs INSIDE a dedicated Colima VM instead of as a Mac-local process —
 # the only way to exercise the FC-only surfaces (NBD, UFFD, netns egress,
 # squashfs patch-drives) on Apple Silicon. Coordinator/orchestrator/web/
@@ -273,7 +273,7 @@ dev-down:
 dev-fc profile='fc-dev' mac_docker_context='colima':
     #!/usr/bin/env bash
     set -euo pipefail
-    # ADR 0068: only the host-agent + FC stack run in the Colima VM (as a raw
+    # ADR 0082: only the host-agent + FC stack run in the Colima VM (as a raw
     # `colima ssh` process, NOT a container); the docker-compose deps stay on the
     # Mac. `colima start` persistently repoints the docker CLI at the VM daemon
     # (writes currentContext=colima-<profile> to ~/.docker/config.json), so a
@@ -281,7 +281,7 @@ dev-fc profile='fc-dev' mac_docker_context='colima':
     # where they collide with the in-VM socat forwarders on :5001/:4443. Pin
     # DOCKER_HOST to the Mac docker for the tilt process ONLY (no global-context
     # mutation — other shells keep whatever colima set). Mac context defaults to
-    # `colima` (the default-profile daemon, per ADR 0068 "default Colima docker
+    # `colima` (the default-profile daemon, per ADR 0082 "default Colima docker
     # daemon untouched"); for Docker Desktop: `just dev-fc {{profile}} desktop-linux`.
     mac_host="$(docker context inspect '{{mac_docker_context}}' 2>/dev/null \
         | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["Endpoints"]["docker"]["Host"])' 2>/dev/null || true)"
@@ -294,7 +294,7 @@ dev-fc profile='fc-dev' mac_docker_context='colima':
     echo "dev-fc: compose deps -> Mac docker '{{mac_docker_context}}' ($mac_host); host-agent -> colima VM '{{profile}}'"
     ENGRAM_FC_COLIMA_PROFILE={{profile}} DOCKER_HOST="$mac_host" tilt up
 
-# ADR 0068: create/update the named Colima VM (aarch64 Ubuntu, nested
+# ADR 0082: create/update the named Colima VM (aarch64 Ubuntu, nested
 # virt, /dev/kvm, Firecracker + the aarch64 guest kernel, NBD/UFFD host
 # prep, the loopback-forwarding socat units) — everything `dev-fc` needs
 # before its first run. Idempotent; safe to re-run after a Colima
@@ -321,10 +321,10 @@ fc-colima-provision profile='fc-dev':
 #      NOT referenced by the live `current.json` stamp. Old generations pile up
 #      on every re-bundle, and a VZ→FC backend switch strands the ENTIRE .erofs
 #      set (VZ stages erofs; FC stages squashfs and can't mount erofs) — that
-#      alone was ~9 GiB. When ENGRAM_FC_COLIMA_PROFILE is set (ADR 0068) the
+#      alone was ~9 GiB. When ENGRAM_FC_COLIMA_PROFILE is set (ADR 0082) the
 #      same prune runs inside the VM's /opt/engram-dev/shared, where the synced
 #      bundles actually consume the small VM disk.
-#   4. (ADR 0068, fc-colima only) Sweep orphaned base-snapshot dirs in the VM:
+#   4. (ADR 0082, fc-colima only) Sweep orphaned base-snapshot dirs in the VM:
 #      /opt/engram-dev/var/sandboxes/snapshots/<id> with no live coordinator DB
 #      row. The snapshot GC works off DB rows, so a dir left by a hard DB delete
 #      or a FAILED capture is never reclaimed — and each holds a GiB-sized
@@ -419,7 +419,7 @@ reap-sessions profile='' mac_docker_context='colima':
     after_shared_kb="$(dir_kb var/shared)"
     shared_freed=$(( before_shared_kb > after_shared_kb ? before_shared_kb - after_shared_kb : 0 ))
     [ "$shared_freed" -gt 0 ] && echo "  reclaimed $(human_kb "$shared_freed") from var/shared."
-    # ADR 0068: the synced bundles live on the small fc-colima VM disk — prune
+    # ADR 0082: the synced bundles live on the small fc-colima VM disk — prune
     # the VM's /opt/engram-dev/shared the same way. The prune runs from a
     # helper piped to `sudo bash -s` over stdin (NOT a heredoc: an unindented
     # heredoc terminator would break `just`'s recipe indentation, and colima
@@ -531,7 +531,7 @@ bundles:
 # dev mirror of the FC-host image's /var/lib/engram/shared. Run the
 # host-agent with ENGRAM_BUNDLE_DIR=$PWD/var/shared so FC dev sessions
 # resolve/capture against it. Needs mksquashfs: on Linux that's
-# `apt install squashfs-tools`; on macOS (ADR 0068's fc-colima dev mode —
+# `apt install squashfs-tools`; on macOS (ADR 0082's fc-colima dev mode —
 # FC itself still only ever boots inside the Colima VM) run this from
 # `nix develop`, which provides mksquashfs on darwin too. Re-run after
 # editing a skill — the stamp repoints and new sessions pick the fresh
