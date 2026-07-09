@@ -35,6 +35,18 @@
       "grants": ["metadata:read"],
       "match": { "method": "GET", "path": "/orgs/*/repos*" }
     },
+    {
+      "grants": ["metadata:read"],
+      "match": { "method": "GET", "path": "/repos/*" }
+    },
+    {
+      "grants": ["metadata:read"],
+      "match": { "method": "GET", "path": "/user" }
+    },
+    {
+      "grants": ["metadata:read"],
+      "match": { "method": "GET", "path": "/rate_limit" }
+    },
 
     {
       "grants": ["contents:read"],

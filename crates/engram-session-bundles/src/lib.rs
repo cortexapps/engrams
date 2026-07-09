@@ -58,6 +58,7 @@ struct Layout {
     claude_skills: PathBuf, // /root/.claude/skills -> agents_skills
     usr_local_bin: PathBuf, // /usr/local/bin (on PATH)
     etc_gitconfig: PathBuf, // /etc/gitconfig
+    run_agentd: PathBuf,    // /run/engram/engram-agentd (the exec'd tmpfs copy)
 }
 
 impl Layout {
@@ -68,6 +69,7 @@ impl Layout {
             claude_skills: root.join("root/.claude/skills"),
             usr_local_bin: root.join("usr/local/bin"),
             etc_gitconfig: root.join("etc/gitconfig"),
+            run_agentd: root.join("run/engram/engram-agentd"),
         }
     }
 }
@@ -79,6 +81,25 @@ impl Layout {
 pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> ActivationReport {
     let mut report = ActivationReport::default();
     let layout = Layout::under(root);
+
+    // ADR 0080 moved agentd out of the baked rootfs: stage-1 init copies it
+    // out of its bundle slot to tmpfs (`/run/engram/engram-agentd`) and execs
+    // the copy as PID 1 — so nothing puts `engram-agentd` on PATH any more,
+    // which broke every wrapper that resolves it there (the skills bundle's
+    // `git-askpass` / `engram-share` both `exec engram-agentd <subcommand>`).
+    // Restore the contract by linking the tmpfs copy onto /usr/local/bin.
+    // Gated on the copy existing: the dev ProcessBackend runs agentd as a
+    // plain host process with no /run/engram staging, and must never touch
+    // the machine's real /usr/local/bin. Before the bundle scan on purpose —
+    // agentd belongs on PATH even for a plain image with no skills mounted.
+    if layout.run_agentd.exists() {
+        let link = layout.usr_local_bin.join("engram-agentd");
+        if let Err(e) = ensure_symlink(&layout.run_agentd, &link) {
+            report
+                .warnings
+                .push(format!("link engram-agentd onto PATH: {e}"));
+        }
+    }
 
     // Collect the mounted skill bundles from the reserved slots, skipping
     // sentinels (reserved-but-unused) and unmounted/empty slots.
@@ -516,6 +537,60 @@ mod tests {
             .warnings
             .iter()
             .all(|w| !w.contains("engram-browser")));
+    }
+
+    /// Stage the ADR 0080 tmpfs agentd copy (`/run/engram/engram-agentd`)
+    /// the stage-1 init leaves behind in a real guest.
+    fn stage_run_agentd(root: &Path) {
+        let run = root.join("run/engram");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("engram-agentd"), b"\x7fELF").unwrap();
+    }
+
+    #[test]
+    fn agentd_tmpfs_copy_is_linked_onto_path() {
+        // ADR 0080 regression: `git-askpass`/`engram-share` exec
+        // `engram-agentd` via PATH, but the binary now lives only at the
+        // tmpfs copy init exec'd. activate() must restore the PATH contract.
+        let dir = tempfile::tempdir().unwrap();
+        stage_run_agentd(dir.path());
+        stage_skills_slot(dir.path(), 0);
+        activate(dir.path(), &env(&[]));
+        let l = Layout::under(dir.path());
+        let link = l.usr_local_bin.join("engram-agentd");
+        assert!(link.is_symlink(), "engram-agentd must be on PATH");
+        assert_eq!(std::fs::read_link(&link).unwrap(), l.run_agentd);
+    }
+
+    #[test]
+    fn agentd_path_link_lands_even_with_no_skill_bundles() {
+        // A plain image with every slot sentinel still needs agentd on PATH
+        // (e.g. a later-mounted bundle's wrapper, or a raw `engram-agentd`
+        // invocation from an exec) — the link must precede the
+        // no-bundles early return.
+        let dir = tempfile::tempdir().unwrap();
+        stage_run_agentd(dir.path());
+        stage_sentinel_slot(dir.path(), 0);
+        let report = activate(dir.path(), &env(&[]));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no skill bundles")));
+        let l = Layout::under(dir.path());
+        assert!(l.usr_local_bin.join("engram-agentd").is_symlink());
+    }
+
+    #[test]
+    fn no_agentd_staging_means_no_path_link_and_no_warning() {
+        // Dev ProcessBackend: agentd runs as a host process, /run/engram is
+        // never staged — activate() must not create the link (it would point
+        // at nothing) and must not warn (this is the normal dev shape).
+        let dir = tempfile::tempdir().unwrap();
+        stage_skills_slot(dir.path(), 0);
+        let report = activate(dir.path(), &env(&[]));
+        let l = Layout::under(dir.path());
+        assert!(!l.usr_local_bin.join("engram-agentd").exists());
+        assert!(report.warnings.iter().all(|w| !w.contains("engram-agentd")));
     }
 
     #[test]
