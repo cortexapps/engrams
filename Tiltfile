@@ -369,10 +369,13 @@ if 'Darwin' in uname_str:
 
 if fc_colima_profile:
     # ADR 0082: the fc-dev VM has a ~19 GiB rootfs, smaller than the
-    # production 20 GiB disk-cache floor. Keep the coordinator's
-    # materialize/capture placement floor in lockstep with the VM-side
-    # host-agent idle-evict override below, or the VM can never be
-    # considered disk-healthy.
+    # production 20 GiB disk-cache floor. Lower BOTH coordinator-side
+    # floors — placement (or the VM is never disk-eligible for a
+    # session) and the idle detector's — in lockstep with the VM-side
+    # host-agent idle-evict override below. The two are separate env
+    # vars on purpose: prod must be able to tune idle eviction without
+    # silently loosening placement's disk gate.
+    coord_env['ENGRAM_PLACEMENT_DISK_FLOOR_BYTES'] = '3221225472'
     coord_env['ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES'] = '3221225472'
 
 if bin_dir:
