@@ -832,6 +832,16 @@ impl HostClient for HostRegistry {
         backend.stop_browser(sandbox_id).await
     }
 
+    async fn start_ide(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.start_ide(sandbox_id).await
+    }
+
+    async fn stop_ide(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.stop_ide(sandbox_id).await
+    }
+
     async fn proxy_shell(
         &self,
         sandbox_id: SandboxId,

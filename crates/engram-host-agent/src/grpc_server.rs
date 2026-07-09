@@ -29,7 +29,7 @@ use engram_protocol::grpc::{
     BuildBaseSnapshotResponse, CaptureFailed, CaptureProgress, CowStateAllResponse,
     CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
     DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
-    ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse,
+    ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse, IdePortResponse,
     InterruptHarnessRequest, ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent,
     MaterializeImageFailed, MaterializeImageRequest, MaterializeProgress, MigrationCaptureResponse,
     MigrationExportRef, MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse,
@@ -1104,6 +1104,23 @@ impl HostService for HostServiceImpl {
             .stop_browser(id)
             .await
             .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn start_ide(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<IdePortResponse>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        let port = self.inner.start_ide(id).await.map_err(sandbox_to_status)?;
+        Ok(Response::new(IdePortResponse {
+            port: u32::from(port),
+        }))
+    }
+
+    async fn stop_ide(&self, req: Request<SandboxIdMessage>) -> Result<Response<Empty>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        self.inner.stop_ide(id).await.map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
     }
 

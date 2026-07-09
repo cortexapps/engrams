@@ -429,6 +429,40 @@ impl app::session_service_server::SessionService for AppSessionService {
         }))
     }
 
+    /// ADR 0081: ensure the ephemeral in-guest IDE (code-server) is up and
+    /// return its loopback HTTP port. The orchestrator's `/ide` proxy calls
+    /// this before opening a PortRelay tunnel to the guest's `:13337`
+    /// (ADR 0066). Idempotent — `start_ide` re-probes an already-running
+    /// server. Mirrors [`Self::ensure_browser`].
+    async fn ensure_ide(
+        &self,
+        req: Request<app::EnsureIdeRequest>,
+    ) -> Result<Response<app::EnsureIdeResponse>, Status> {
+        self.auth.check(&req)?;
+        let id = parse_session_id(&req.get_ref().session_id)?;
+        // Auto-resume Idle, then resolve the live sandbox (PG authority, ADR 0047).
+        crate::api::snapshot::ensure_active(&self.state, id)
+            .await
+            .map_err(into_status)?;
+        let sandbox_id = self.state.resolve_sandbox(id).await.ok_or_else(|| {
+            into_status(crate::error::ApiError::Conflict(
+                "session has no live sandbox after auto-resume; \
+                 try `engram session resume <id>` and retry"
+                    .into(),
+            ))
+        })?;
+        let port = self
+            .state
+            .services
+            .host
+            .start_ide(sandbox_id)
+            .await
+            .map_err(|e| Status::unavailable(format!("start_ide: {e}")))?;
+        Ok(Response::new(app::EnsureIdeResponse {
+            port: u32::from(port),
+        }))
+    }
+
     async fn resume(
         &self,
         req: Request<app::ResumeRequest>,

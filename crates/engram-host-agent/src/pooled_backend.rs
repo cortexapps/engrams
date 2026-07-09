@@ -7311,6 +7311,19 @@ impl SandboxBackend for PooledBackend {
         self.inner.stop_browser(id).await
     }
 
+    /// ADR 0081: forward to inner, exactly as `start_browser` does — without
+    /// this the trait default (`Ok(13337)`) would run and the FC/VZ backend's
+    /// actual vsock StartIde RPC to in-VM agentd would never fire, so the
+    /// orchestrator would relay to a port nothing started.
+    async fn start_ide(&self, id: SandboxId) -> Result<u16, SandboxError> {
+        self.inner.start_ide(id).await
+    }
+
+    /// ADR 0081: forward to inner (the trait default is a no-op).
+    async fn stop_ide(&self, id: SandboxId) -> Result<(), SandboxError> {
+        self.inner.stop_ide(id).await
+    }
+
     /// ADR 0016 Phase A: COW diagnostic. Reads from the NBD-backed
     /// disk state (`nbd_sandboxes`) + the per-host `chunk_cache`
     /// for base-chunk locality + the in-memory `last_snapshot_unix_ms`
@@ -10510,12 +10523,15 @@ mod tests {
             start_shell_calls: Mutex<Vec<SandboxId>>,
             start_browser_calls: Mutex<Vec<SandboxId>>,
             stop_browser_calls: Mutex<Vec<SandboxId>>,
+            start_ide_calls: Mutex<Vec<SandboxId>>,
+            stop_ide_calls: Mutex<Vec<SandboxId>>,
             guest_endpoints_calls: Mutex<Vec<SandboxId>>,
             /// Non-default response values so we can verify the
             /// forward returned the inner's value, not the trait
             /// default.
             shell_port: u16,
             browser_port: u16,
+            ide_port: u16,
             guest_endpoints_value: Option<GuestEndpoints>,
         }
         impl SpyInner {
@@ -10524,6 +10540,8 @@ mod tests {
                     start_shell_calls: Mutex::new(Vec::new()),
                     start_browser_calls: Mutex::new(Vec::new()),
                     stop_browser_calls: Mutex::new(Vec::new()),
+                    start_ide_calls: Mutex::new(Vec::new()),
+                    stop_ide_calls: Mutex::new(Vec::new()),
                     guest_endpoints_calls: Mutex::new(Vec::new()),
                     // Pick non-default values so a "trait default ran
                     // instead of our override" failure shows up as a
@@ -10532,6 +10550,9 @@ mod tests {
                     // Non-default browser port (the trait default is 5900);
                     // a fall-through would return 5900 with a zero counter.
                     browser_port: 45900,
+                    // Non-default ide port (the trait default is 13337);
+                    // a fall-through would return 13337 with a zero counter.
+                    ide_port: 43337,
                     guest_endpoints_value: Some(GuestEndpoints {
                         egress_identity: "10.200.0.42".parse().unwrap(),
                         dial_ip: "10.200.0.2".parse().unwrap(),
@@ -10584,6 +10605,14 @@ mod tests {
             }
             async fn stop_browser(&self, id: SandboxId) -> Result<(), SandboxError> {
                 self.stop_browser_calls.lock().push(id);
+                Ok(())
+            }
+            async fn start_ide(&self, id: SandboxId) -> Result<u16, SandboxError> {
+                self.start_ide_calls.lock().push(id);
+                Ok(self.ide_port)
+            }
+            async fn stop_ide(&self, id: SandboxId) -> Result<(), SandboxError> {
+                self.stop_ide_calls.lock().push(id);
                 Ok(())
             }
             async fn guest_endpoints(&self, id: SandboxId) -> Option<GuestEndpoints> {
@@ -10673,6 +10702,54 @@ mod tests {
                 calls,
                 vec![id],
                 "PooledBackend.stop_browser must forward to inner; got {} calls",
+                calls.len(),
+            );
+        }
+
+        /// ADR 0081 regression guard: PooledBackend.start_ide MUST forward
+        /// to its inner backend. The trait default returns Ok(13337)
+        /// WITHOUT touching the inner, so a deleted/regressed delegate
+        /// would hand the orchestrator a port nothing started — the same
+        /// failure class as start_shell/start_browser above.
+        #[tokio::test]
+        async fn pooled_backend_forwards_start_ide_to_inner() {
+            let inner = Arc::new(SpyInner::new());
+            let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
+            let id = SandboxId::new();
+            let port = pooled.start_ide(id).await.unwrap();
+
+            let calls = inner.start_ide_calls.lock().clone();
+            assert_eq!(
+                calls,
+                vec![id],
+                "PooledBackend.start_ide must forward to inner; got {} calls",
+                calls.len(),
+            );
+            // The returned port is the inner's value, NOT the trait
+            // default (13337). A fall-through would return 13337 and leave
+            // the inner's counter at 0.
+            assert_eq!(
+                port, inner.ide_port,
+                "must return inner's port (proves the forward, not the 13337 default)",
+            );
+        }
+
+        /// ADR 0081 regression guard: PooledBackend.stop_ide MUST forward
+        /// to its inner backend. The trait default is a no-op, so a deleted
+        /// delegate would silently never tear down the in-guest code-server
+        /// while reporting success — and the inner's counter would stay at 0.
+        #[tokio::test]
+        async fn pooled_backend_forwards_stop_ide_to_inner() {
+            let inner = Arc::new(SpyInner::new());
+            let pooled = PooledBackend::new(inner.clone() as Arc<dyn SandboxBackend>);
+            let id = SandboxId::new();
+            pooled.stop_ide(id).await.unwrap();
+
+            let calls = inner.stop_ide_calls.lock().clone();
+            assert_eq!(
+                calls,
+                vec![id],
+                "PooledBackend.stop_ide must forward to inner; got {} calls",
                 calls.len(),
             );
         }

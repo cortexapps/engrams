@@ -903,6 +903,22 @@ pub trait SandboxBackend: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0081: ensure the in-guest IDE (code-server) is running and
+    /// answering on its loopback HTTP port, returning that port. FC/VZ
+    /// override to send `StartIde` over the agentd channel; the dev
+    /// ProcessBackend has no real guest and inherits this default (the
+    /// feature is gated to FC/VZ profiles). Unlike `start_browser` there
+    /// is no diagnostic warning to carry, so the return is the bare port
+    /// (mirrors [`Self::start_shell`]).
+    async fn start_ide(&self, _id: SandboxId) -> Result<u16, SandboxError> {
+        Ok(13337)
+    }
+
+    /// ADR 0081: tear down the in-guest IDE. Default no-op.
+    async fn stop_ide(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot.
     /// `None` for backends without an NBD-chunked disk view
     /// (Process, VZ-without-NBD, FC before its NBD attach lands) —
