@@ -235,7 +235,12 @@ export type SessionEvent =
       // host failure (the card's historical meaning).
       cause?: "planned_relocation" | "host_failure_recovery";
       at: string;
-    };
+    }
+  // Session titles: the harness proposed an LLM-generated title. Not rendered
+  // in the transcript — it drives the session's display title (materialized on
+  // the task via the coordinator + the 1s ListTasks poll). Typed here so the
+  // frame is a known kind, not an untyped passthrough.
+  | { type: "title_suggested"; title: string; at: string };
 
 export type SessionEventKind = SessionEvent["type"];
 

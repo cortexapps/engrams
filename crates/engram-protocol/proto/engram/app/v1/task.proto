@@ -24,6 +24,13 @@ service TaskService {
   // session teardown inherits DeleteSession's racy-idempotent
   // semantics.
   rpc DeleteTask(DeleteTaskRequest) returns (DeleteTaskResponse);
+  // Rename (or reset) a task's title. Requires ability "update" on the
+  // task — the owner or an admin. A present `title` sets the user's
+  // STICKY custom title (harness suggestions no longer override it); an
+  // absent `title` clears it (reset), so the effective title falls back
+  // to the most-recent harness suggestion, then the truncated-prompt
+  // default.
+  rpc UpdateTask(UpdateTaskRequest) returns (UpdateTaskResponse);
 }
 
 message CreateTaskRequest {
@@ -68,6 +75,10 @@ message Task {
   repeated TaskSessionRef sessions = 7;
   // ISO-8601.
   string created_at = 8;
+  // True when `title` is the user's sticky custom title (they renamed it);
+  // false when it is auto (harness suggestion or truncated prompt). Lets the
+  // UI offer a "reset to auto" affordance. Derived: custom_title != null.
+  bool title_is_custom = 9;
 }
 
 message TaskSessionRef {
@@ -121,3 +132,13 @@ message DeleteTaskRequest {
 }
 
 message DeleteTaskResponse {}
+
+message UpdateTaskRequest {
+  string task_id = 1;
+  // Present ⇒ set the sticky custom title. Absent ⇒ clear it (reset to auto).
+  optional string title = 2;
+}
+
+message UpdateTaskResponse {
+  Task task = 1;
+}

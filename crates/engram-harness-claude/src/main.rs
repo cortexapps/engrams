@@ -75,6 +75,10 @@ mod adapter {
     pub const MAX_ARGS_SUMMARY_BYTES: usize = 1024;
     pub const MAX_RESULT_SUMMARY_BYTES: usize = 4096;
     pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
+    /// Cap for a harness-suggested session title. Titles are a short line;
+    /// this only bounds a pathological one. Truncated code-point-safely by
+    /// `truncate_str`.
+    pub const MAX_TITLE_BYTES: usize = 512;
     /// Phase 1c: per-chunk cap for live `AgentMessageChunk` token deltas.
     /// The underlying SSE `text_delta`s are token-batched (tens of bytes
     /// typically), so this only bounds a pathological delta. Kept well
@@ -1756,12 +1760,14 @@ mod adapter {
                             } else {
                                 // A line outside any turn (e.g. claude's
                                 // init banner before the first prompt):
-                                // parse only for the session-id capture
-                                // side effect; emit nothing. No turn ⇒ no
-                                // chunks to stream, so the message-id sink is
-                                // a throwaway.
+                                // parse mainly for the session-id capture
+                                // side effect. No turn ⇒ no chunks to stream,
+                                // so the message-id sink is a throwaway. A
+                                // `TitleSuggested` can legitimately arrive
+                                // between turns, though — forward those (they
+                                // carry no run_id) rather than drop them.
                                 let mut sink = 0u32;
-                                let _ = translate_jsonl(
+                                if let Some(translated) = translate_jsonl(
                                     &line,
                                     "",
                                     &mut sink,
@@ -1770,7 +1776,13 @@ mod adapter {
                                     &mut HashMap::new(),
                                     &mut HashSet::new(),
                                     &mut Vec::new(),
-                                );
+                                ) {
+                                    for ev in translated {
+                                        if matches!(ev, HarnessEvent::TitleSuggested { .. }) {
+                                            emit(evt_tx, ev).await;
+                                        }
+                                    }
+                                }
                             }
                         }
                         Ok(None) => break, // stdout EOF: claude is exiting
@@ -2787,6 +2799,20 @@ mod adapter {
             "result" => {
                 // The session loop closes the turn on this line via
                 // `detect_result_marker`; nothing to translate here.
+            }
+            "ai-title" => {
+                // Claude Code emits `{"type":"ai-title","aiTitle":"…",…}` with an
+                // LLM-generated short title for the session. Surface it as a
+                // first-class harness event; the coordinator records the latest
+                // one and the orchestrator uses it as the session's display title.
+                if let Some(title) = v.get("aiTitle").and_then(|s| s.as_str()) {
+                    let title = title.trim();
+                    if !title.is_empty() {
+                        out.push(HarnessEvent::TitleSuggested {
+                            title: truncate_str(title, MAX_TITLE_BYTES),
+                        });
+                    }
+                }
             }
             _ => {}
         }
@@ -4302,6 +4328,47 @@ mod tests {
             }
             other => panic!("expected AgentMessage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ai_title_line_becomes_title_suggested() {
+        // Claude Code's `ai-title` line surfaces as a `TitleSuggested` event.
+        // It carries no run_id, so the empty run_id here (the out-of-turn call
+        // shape) is fine.
+        let line = r#"{"type":"ai-title","aiTitle":"Fix the flaky test","sessionId":"abc-123"}"#;
+        let mut tc = 0u32;
+        let mut fc = HashMap::new();
+        let evs = translate_jsonl(
+            line,
+            "",
+            &mut tc,
+            50,
+            &mut None,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            HarnessEvent::TitleSuggested { title } => assert_eq!(title, "Fix the flaky test"),
+            other => panic!("expected TitleSuggested, got {other:?}"),
+        }
+
+        // A blank title is dropped (no phantom empty-title event).
+        let blank = r#"{"type":"ai-title","aiTitle":"   ","sessionId":"abc-123"}"#;
+        let evs = translate_jsonl(
+            blank,
+            "",
+            &mut tc,
+            50,
+            &mut None,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(evs.is_empty(), "blank ai-title emits nothing");
     }
 
     #[test]

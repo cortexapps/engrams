@@ -2527,6 +2527,7 @@ mod evicting_gate_tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         }
     }
 
@@ -2887,6 +2888,7 @@ mod evicting_gate_tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         let (state, mini, _local) = crate::state::tests::build_state_for_session(session);
 
@@ -2975,6 +2977,7 @@ mod resume_queue_fence_tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         }
     }
 

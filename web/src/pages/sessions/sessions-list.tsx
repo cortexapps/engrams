@@ -1,9 +1,18 @@
-import type { ComponentPropsWithoutRef, ReactNode, Ref, RefObject } from "react";
+import {
+  useState,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+  type Ref,
+  type RefObject,
+} from "react";
 import { Link } from "@tanstack/react-router";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { Pencil } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatusGlyph } from "../../components/Glyph";
+import { TitleEditForm } from "./TitleEditForm";
 import type { SessionListItem } from "../../lib/types";
 import { relativeTime, shortId, statusLabel } from "./session-format";
 import { ProfileChip } from "../../components/profiles/ProfileChip";
@@ -12,8 +21,8 @@ import { useNow } from "../../hooks/useNow";
 // The sessions list reads as a workspace switcher, not a data grid: a flat list
 // of rich rows in the server's most-recently-active-first order,
 // each row a single focusable link into that workspace. A status telltale (the glyph)
-// leads, the session id carries identity — the slot a human-readable name will
-// take over later — and the image/status/age trail as quiet metadata.
+// leads, the title carries identity (short id when unnamed), and the
+// image/status/age trail as quiet metadata.
 
 export function SessionsList({
   sessions,
@@ -154,13 +163,45 @@ export function SessionRow({
   showOwner: boolean;
   now?: number;
 } & ComponentPropsWithoutRef<"li"> & { ref?: Ref<HTMLLIElement> }) {
+  const [editing, setEditing] = useState(false);
+  // A real task row (not a synthetic unattributed-* admin row) can be renamed.
+  // The server is authoritative (owner or admin); the list only surfaces rows
+  // the caller may see, so showing the control whenever there's a task is safe.
+  const canEdit = s.taskId != null;
+
+  if (editing && s.taskId) {
+    return (
+      // Keep the virtualization contract (ref + absolute positioning + the
+      // virtualizer's transform in rowProps) — dropping it would paint the
+      // edit form at the list's top-left; measureElement absorbs the form's
+      // different height.
+      <li
+        ref={ref}
+        {...rowProps}
+        data-testid="session-row"
+        data-session-id={s.id}
+        className={`absolute left-0 top-0 w-full px-3 py-2 ${rowProps.className ?? ""}`}
+      >
+        <TitleEditForm
+          taskId={s.taskId}
+          initial={s.title ?? ""}
+          isCustom={s.titleIsCustom}
+          onDone={() => setEditing(false)}
+        />
+      </li>
+    );
+  }
+
   return (
+    // `group` reveals the rename affordance on hover; the li is already
+    // absolutely positioned by the virtualizer, which also makes it the
+    // containing block for the Pencil (no `relative` needed).
     <li
       ref={ref}
       {...rowProps}
       data-testid="session-row"
       data-session-id={s.id}
-      className={`absolute left-0 top-0 w-full ${rowProps.className ?? ""}`}
+      className={`group absolute left-0 top-0 w-full ${rowProps.className ?? ""}`}
     >
       <Link
         to="/sessions/$id"
@@ -171,10 +212,14 @@ export function SessionRow({
         <span className="inline-flex w-3 shrink-0 justify-center text-[0.7rem] leading-none">
           <StatusGlyph status={s.status} />
         </span>
-        {/* Identity: the id carries the row (a human-readable name lands here
-            later); the image trails as the recessive "what kind" descriptor. */}
+        {/* Identity: the title carries the row (falling back to the short id
+            when unnamed); the image trails as the recessive "what kind" descriptor. */}
         <span className="flex min-w-0 flex-1 items-baseline gap-2.5">
-          <span className="shrink-0 font-mono text-sm font-medium">{shortId(s.id)}</span>
+          {s.title ? (
+            <span className="min-w-0 truncate text-sm font-medium">{s.title}</span>
+          ) : (
+            <span className="shrink-0 font-mono text-sm font-medium">{shortId(s.id)}</span>
+          )}
           <ProfileChip profile={s.profile} fallbackImage={s.image} className="text-xs" />
         </span>
         {showOwner && (
@@ -200,6 +245,21 @@ export function SessionRow({
           {relativeTime(s.last_active_at, now)}
         </span>
       </Link>
+      {/* Rename affordance — a sibling of the Link (never nested in an anchor),
+          revealed on row hover / keyboard focus. */}
+      {canEdit && (
+        <Button
+          type="button"
+          size="icon-xs"
+          variant="ghost"
+          onClick={() => setEditing(true)}
+          aria-label="Rename session"
+          title="Rename"
+          className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
+        >
+          <Pencil />
+        </Button>
+      )}
     </li>
   );
 }

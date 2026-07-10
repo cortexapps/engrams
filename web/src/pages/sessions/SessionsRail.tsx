@@ -146,8 +146,13 @@ export function SessionsRail() {
                               <StatusGlyph status={r.status} />
                             </span>
                             <span className="flex min-w-0 flex-1 flex-col">
-                              <span className="truncate font-mono text-[0.8rem] leading-tight">
-                                {shortId(r.id)}
+                              <span
+                                className={cn(
+                                  "truncate text-[0.8rem] leading-tight",
+                                  r.title ? "font-medium" : "font-mono",
+                                )}
+                              >
+                                {r.title ?? shortId(r.id)}
                               </span>
                               <ProfileChip
                                 profile={r.profile}

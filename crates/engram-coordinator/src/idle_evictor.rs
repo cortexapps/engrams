@@ -1340,6 +1340,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
@@ -1394,6 +1395,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
@@ -1549,6 +1551,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta, _stashed) = d5_state(session, sandbox_root.path());
@@ -1622,6 +1625,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -1824,6 +1828,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -2050,6 +2055,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -2272,6 +2278,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -2388,6 +2395,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta) = build_state_and_meta(session, sandbox_root.path());
@@ -2596,6 +2604,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -2713,6 +2722,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2740,6 +2750,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         }
     }
 

@@ -42,6 +42,7 @@ pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session 
         live_disk_manifest: _, // Internal coord state (ADR 0016 Phase B); not on the wire shape.
         park_rung: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
         parked_at: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
+        suggested_title,
     } = s;
     app::Session {
         id: id.to_string(),
@@ -53,6 +54,7 @@ pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session 
         // ISO-8601, matching the JSON wire (chrono's Serialize is RFC3339).
         created_at: created_at.to_rfc3339(),
         last_active_at: last_active_at.to_rfc3339(),
+        suggested_title: suggested_title.clone(),
     }
 }
 
@@ -881,6 +883,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         }
     }
 

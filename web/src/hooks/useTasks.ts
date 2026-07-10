@@ -1,6 +1,15 @@
-import { useInfiniteQuery, useQuery } from "@connectrpc/connect-query";
-import { keepPreviousData, useQuery as useTanstackQuery } from "@tanstack/react-query";
-import { listTasks } from "../gen/engram/app/v1/task-TaskService_connectquery";
+import {
+  createConnectQueryKey,
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+} from "@connectrpc/connect-query";
+import {
+  keepPreviousData,
+  useQuery as useTanstackQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { listTasks, updateTask } from "../gen/engram/app/v1/task-TaskService_connectquery";
 import type { SessionListItem } from "../lib/types";
 import type { Task } from "../gen/engram/app/v1/task_pb";
 import { authClient } from "../lib/auth-client";
@@ -56,8 +65,14 @@ export function taskToSessionListItem(task: Task): SessionListItem {
   // Unattributed rows: id starts with 'unattributed-'; the session id is the
   // stable identifier. Fall back to task.id when there's no session ref yet.
   const id = ref?.sessionId ?? task.id;
+  // Synthetic admin rows (`unattributed-<sessionId>`) have no real task row —
+  // taskId null so the UI hides the rename control (UpdateTask would 404).
+  const taskId = task.id.startsWith("unattributed-") ? null : task.id;
   return {
     id,
+    taskId,
+    title: task.title ?? null,
+    titleIsCustom: task.titleIsCustom,
     // Session proto fields are strings (proto3 generated TS), matching SessionState/SessionMode.
     status: (sess?.status ?? "pending") as SessionListItem["status"],
     image: sess?.image ?? "",
@@ -96,6 +111,25 @@ export function useTasks(params?: TaskListParams) {
     refetchInterval: (query) => pollIntervalFor(query.state.data?.tasks),
     refetchOnWindowFocus: true,
     placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * Rename (or reset) a task's title. Pass `{ taskId, title }` to set a sticky
+ * custom title, or `{ taskId }` (title omitted) to reset to the auto title.
+ * Invalidates the task list so every surface re-renders with the new title.
+ */
+export function useUpdateTask() {
+  const qc = useQueryClient();
+  return useMutation(updateTask, {
+    // cardinality undefined → the whole ListTasks key family, finite AND
+    // infinite: the list surfaces paginate with useInfiniteQuery (ADR 0087),
+    // and a finite-only invalidation would leave their titles stale until the
+    // next ambient poll.
+    onSuccess: () =>
+      qc.invalidateQueries({
+        queryKey: createConnectQueryKey({ schema: listTasks, cardinality: undefined }),
+      }),
   });
 }
 

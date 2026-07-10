@@ -13,6 +13,7 @@ import { expect, test, describe } from "bun:test";
 import {
   compileSessionCreateInput,
   createTaskWithSession,
+  truncatePrompt,
   type SessionCompileDeps,
   type CreateTaskDeps,
   type TaskSessionsClient,
@@ -81,6 +82,39 @@ const deps = (token: string | null = null, images = [{ id: "img-1", imageUri: "u
   connectors: { list: async () => [] },
   harnessCatalog: fakeHarnessCatalog(),
   resolveUserToken: async () => token,
+});
+
+describe("truncatePrompt — default title from the prompt", () => {
+  test("short prompt is used verbatim", () => {
+    expect(truncatePrompt("Fix the bug")).toBe("Fix the bug");
+  });
+
+  test("collapses whitespace/newlines and trims", () => {
+    expect(truncatePrompt("  Fix   the\n\tbug  ")).toBe("Fix the bug");
+  });
+
+  test("clips a long prompt to ~80 code points with an ellipsis", () => {
+    const long = "a".repeat(200);
+    const out = truncatePrompt(long)!;
+    expect(out.endsWith("…")).toBe(true);
+    expect([...out].length).toBe(81); // 80 chars + ellipsis
+  });
+
+  test("does not split a multi-byte glyph at the boundary", () => {
+    // 81 emoji: clipping at 80 code points must not produce a lone surrogate.
+    const emoji = "😀".repeat(81);
+    const out = truncatePrompt(emoji)!;
+    expect(out.endsWith("…")).toBe(true);
+    // Every code point before the ellipsis is a whole emoji.
+    expect([...out.slice(0, -1)].every((c) => c === "😀")).toBe(true);
+  });
+
+  test("empty / whitespace-only / null → null (no default)", () => {
+    expect(truncatePrompt("")).toBe(null);
+    expect(truncatePrompt("   \n  ")).toBe(null);
+    expect(truncatePrompt(undefined)).toBe(null);
+    expect(truncatePrompt(null)).toBe(null);
+  });
 });
 
 describe("compileSessionCreateInput", () => {

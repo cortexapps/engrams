@@ -627,6 +627,20 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// Session titles: record the latest harness-suggested (LLM-generated)
+    /// title on the session row. Idempotent; called from the harness event
+    /// sink the moment a `TitleSuggested` event arrives, so the orchestrator
+    /// can surface it as the session's display title without walking the log.
+    /// A self-descriptive operational fact — never user attribution.
+    async fn set_session_suggested_title(
+        &self,
+        id: SessionId,
+        title: &str,
+    ) -> Result<(), MetaError> {
+        let _ = (id, title);
+        Ok(())
+    }
+
     /// ADR 0079 (review finding #6): the FENCED park-rung write for
     /// op-path callers (rung-2 park bookkeeping + its compensations, the
     /// idle-evict park clear). Appends `AND current_epoch = $e`; `Ok(false)`

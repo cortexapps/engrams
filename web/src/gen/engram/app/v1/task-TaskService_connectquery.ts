@@ -34,3 +34,15 @@ export const getTask = TaskService.method.getTask;
  * @generated from rpc engram.app.v1.TaskService.DeleteTask
  */
 export const deleteTask = TaskService.method.deleteTask;
+
+/**
+ * Rename (or reset) a task's title. Requires ability "update" on the
+ * task — the owner or an admin. A present `title` sets the user's
+ * STICKY custom title (harness suggestions no longer override it); an
+ * absent `title` clears it (reset), so the effective title falls back
+ * to the most-recent harness suggestion, then the truncated-prompt
+ * default.
+ *
+ * @generated from rpc engram.app.v1.TaskService.UpdateTask
+ */
+export const updateTask = TaskService.method.updateTask;
