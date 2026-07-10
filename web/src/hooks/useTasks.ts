@@ -172,8 +172,18 @@ export function useTasksInfiniteAsSessionList(
         const rowsSoFar = allPages.reduce((count, page) => count + page.tasks.length, 0);
         return rowsSoFar < lastPage.totalCount ? allPages.length + 1 : undefined;
       },
-      refetchInterval: (currentQuery) =>
-        pollIntervalFor(currentQuery.state.data?.pages.flatMap((page) => page.tasks)),
+      // An interval refetch re-requests EVERY loaded page (that full-chain
+      // snapshot is load-bearing: it heals the transient row-drop/dup seams
+      // offset pages tear under live reordering). Scaling the interval by the
+      // loaded depth keeps total request volume constant no matter how deep a
+      // viewer has scrolled — the common case (one page, watching a task
+      // boot) keeps the fast cadence.
+      refetchInterval: (currentQuery) => {
+        const pages = currentQuery.state.data?.pages;
+        return (
+          pollIntervalFor(pages?.flatMap((page) => page.tasks)) * Math.max(1, pages?.length ?? 1)
+        );
+      },
       refetchOnWindowFocus: true,
       placeholderData: keepPreviousData,
     },
