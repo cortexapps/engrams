@@ -12,8 +12,8 @@ import "engram/app/v1/profile.proto";
 // it is excluded from the Rust build.
 service TaskService {
   rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
-  // No filter fields: the server scopes the list by the CALLER's
-  // ability, never by a client-supplied filter.
+  // Filters narrow inside the caller's ability, never widen it. An empty
+  // request is the legacy ability-scoped, unpaginated behavior.
   rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
   rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
   // BLAST RADIUS (plan Task 19): requires ability "delete" on the
@@ -83,10 +83,29 @@ message TaskSessionRef {
   optional ProfileSnapshot profile = 4;
 }
 
-message ListTasksRequest {}
+message ListTasksRequest {
+  // "" = legacy ability default (member → own, admin → all + unattributed);
+  // "mine" = strictly the caller's own tasks (admins included);
+  // "all"  = fleet-wide + unattributed, admin-only (PermissionDenied otherwise).
+  string scope = 1;
+  // Case-insensitive substring over task title, task id, and session ids.
+  string search = 2;
+  // Owner filter: entries are better-auth user ids or the sentinel "system"
+  // for unattributed rows. OR within the field; empty = no owner filter.
+  repeated string created_by_user_ids = 3;
+  // Live session-state filter (e.g. "active", "idle", "dead"). A task matches
+  // when its DISPLAY state — primary session's live status, or "pending" when
+  // no live session is known — is in the set. Empty = no filter.
+  repeated string states = 4;
+  // 1-based page over the filtered, most-recently-active-first ordering.
+  // page_size 0 = unpaginated (legacy callers); clamped to 200 otherwise.
+  int32 page = 5;
+  int32 page_size = 6;
+}
 
 message ListTasksResponse {
   repeated Task tasks = 1;
+  int32 total_count = 2; // matches BEFORE pagination
 }
 
 message GetTaskRequest {

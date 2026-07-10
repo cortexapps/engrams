@@ -15,6 +15,11 @@
  *   (unrecognised / blank)
  *     → keep task's own persisted status ("open" at create, unchanged)
  *
+ * List semantics (ADR 0087):
+ *   Scope and owner filters run in SQL; live display-state filtering, search,
+ *   recent-activity ordering, and pagination run after the control-plane join.
+ *   Filters narrow inside the caller's ability; they never widen it.
+ *
  * Unattributed sessions (anti-attribution / synthetic admin rows):
  *   Control-plane sessions with NO task_session row in the orchestrator DB are
  *   surfaced as synthetic admin-only Task rows in ListTasks. Their id follows
@@ -43,7 +48,7 @@
 import { ConnectError, Code } from "@connectrpc/connect";
 import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
 import { subject } from "@casl/ability";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, type SQL } from "drizzle-orm";
 
 import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Task, TaskSessionRef } from "../gen/engram/app/v1/task_pb.ts";
@@ -450,15 +455,54 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
     // -------------------------------------------------------------------------
     // ListTasks
     // -------------------------------------------------------------------------
-    async listTasks(_req, ctx) {
+    async listTasks(req, ctx) {
       const user = await requireUser(ctx, getSession);
       const ability = abilityFor(user);
       const isAdmin = user.role === "admin";
       const db = getDbFn();
 
-      // Fetch all task rows + their session refs in one shot.
-      const taskRows = await db.select().from(taskTable);
-      const sessionRefRows = await db.select().from(taskSessionTable);
+      if (req.scope !== "" && req.scope !== "mine" && req.scope !== "all") {
+        throw new ConnectError("invalid scope", Code.InvalidArgument);
+      }
+      if (req.scope === "all" && !isAdmin) {
+        throw new ConnectError("forbidden", Code.PermissionDenied);
+      }
+
+      const mineOnly = req.scope === "mine" || (req.scope === "" && !isAdmin);
+      const taskConditions: SQL[] = [];
+      if (mineOnly) {
+        taskConditions.push(eq(taskTable.createdByUserId, user.id));
+      }
+      const owners = req.createdByUserIds;
+      if (owners.length > 0) {
+        const ownerConds: SQL[] = [];
+        const ownerIds = owners.filter((owner) => owner !== "system");
+        if (ownerIds.length > 0) {
+          ownerConds.push(inArray(taskTable.createdByUserId, ownerIds));
+        }
+        if (owners.includes("system")) {
+          ownerConds.push(isNull(taskTable.createdByUserId));
+        }
+        const ownerCondition = or(...ownerConds);
+        if (ownerCondition) {
+          taskConditions.push(ownerCondition);
+        }
+      }
+
+      const taskQuery = db.select().from(taskTable);
+      const taskRows = taskConditions.length > 0
+        ? await taskQuery.where(and(...taskConditions))
+        : await taskQuery;
+
+      const taskIds = taskRows.map((row) => row.id);
+      const sessionRefRows = mineOnly
+        ? taskIds.length > 0
+          ? await db
+              .select()
+              .from(taskSessionTable)
+              .where(inArray(taskSessionTable.taskId, taskIds))
+          : []
+        : await db.select().from(taskSessionTable);
 
       // Group session refs by taskId.
       const refsByTaskId = new Map<
@@ -495,7 +539,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         sessionMap.set(sess.id, sess);
       }
 
-      // Filter task rows by ability (member sees own; admin sees all).
+      // Filter task rows by ability (belt-and-braces under SQL scoping).
       const visibleTasks: Task[] = [];
       for (const row of taskRows) {
         if (
@@ -510,8 +554,9 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         visibleTasks.push(buildTask(row, refs, sessionMap, profileMap));
       }
 
-      // For admins: surface unattributed sessions as synthetic rows.
-      if (isAdmin) {
+      // Fleet-wide views surface unattributed sessions unless the owner filter
+      // excludes system-owned rows.
+      if (!mineOnly && (owners.length === 0 || owners.includes("system"))) {
         for (const sess of allSessions) {
           if (!knownSessionIds.has(sess.id)) {
             visibleTasks.push(buildUnattributedTask(sess));
@@ -519,7 +564,43 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         }
       }
 
-      return { tasks: visibleTasks };
+      let filteredTasks = visibleTasks;
+
+      if (req.states.length > 0) {
+        const states = new Set(req.states);
+        filteredTasks = filteredTasks.filter((task) => {
+          const displayState = task.sessions[0]?.session?.status ?? "pending";
+          return states.has(displayState);
+        });
+      }
+
+      const q = req.search.trim().toLowerCase();
+      if (q !== "") {
+        filteredTasks = filteredTasks.filter((task) =>
+          (task.title ?? "").toLowerCase().includes(q) ||
+          task.id.toLowerCase().includes(q) ||
+          task.sessions.some((ref) => ref.sessionId.toLowerCase().includes(q))
+        );
+      }
+
+      filteredTasks.sort((a, b) => {
+        const aActiveAt = a.sessions[0]?.session?.lastActiveAt ?? a.createdAt;
+        const bActiveAt = b.sessions[0]?.session?.lastActiveAt ?? b.createdAt;
+        return Date.parse(bActiveAt) - Date.parse(aActiveAt);
+      });
+
+      const totalCount = filteredTasks.length;
+      if (req.pageSize <= 0) {
+        return { tasks: filteredTasks, totalCount };
+      }
+
+      const pageSize = Math.min(req.pageSize, 200);
+      const page = Math.max(1, req.page || 1);
+      const offset = (page - 1) * pageSize;
+      return {
+        tasks: filteredTasks.slice(offset, offset + pageSize),
+        totalCount,
+      };
     },
 
     // -------------------------------------------------------------------------

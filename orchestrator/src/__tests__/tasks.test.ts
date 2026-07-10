@@ -43,7 +43,8 @@ import {
   taskSession as taskSessionTable,
   profile as profileTable,
 } from "../db/schema.ts";
-import { eq } from "drizzle-orm";
+import { eq, type SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 
 // ---------------------------------------------------------------------------
 // DB gate (same pattern as db.test.ts)
@@ -327,7 +328,12 @@ function makeGetSession(
  * createTask runs to completion. Drizzle's chainable builder is stubbed as a
  * thenable: each builder method returns the same object, awaited as an array.
  */
-function okDb(taskId = "fake-task"): Db {
+interface ListDbFixture {
+  tasks: Array<typeof taskTable.$inferSelect>;
+  sessionRefs: Array<typeof taskSessionTable.$inferSelect>;
+}
+
+function okDb(taskId = "fake-task", listFixture?: ListDbFixture): Db {
   const taskRow = {
     id: taskId,
     type: "chat",
@@ -339,16 +345,73 @@ function okDb(taskId = "fake-task"): Db {
     createdAt: new Date(),
     updatedAt: new Date(),
   };
+  const dialect = new PgDialect();
   // First select() (task table) returns [taskRow]; subsequent selects
   // (task_session) return []. A counter flips after the first resolve.
   let selectCount = 0;
   const makeSelectChain = () => {
-    const rows = selectCount++ === 0 ? [taskRow] : [];
+    const defaultRows = selectCount++ === 0 ? [taskRow] : [];
+    let selectedTable: unknown;
+    let condition: SQL | undefined;
+    const resolveFixtureRows = (): unknown[] => {
+      if (!listFixture) return defaultRows;
+
+      if (selectedTable === taskTable) {
+        let rows = listFixture.tasks;
+        if (!condition) return rows;
+        const query = dialect.sqlToQuery(condition);
+        const ownerIds = query.params.filter((param): param is string => typeof param === "string");
+        const hasNullOwner = query.sql.includes("created_by_user_id") && query.sql.includes("is null");
+        const hasOwnerOr = query.sql.includes(" or ");
+        const hasOwnerAnd = query.sql.includes(" and ");
+
+        if (hasOwnerAnd && ownerIds.length > 0) {
+          const [scopeOwnerId, ...filterOwnerIds] = ownerIds;
+          rows = rows.filter((row) => row.createdByUserId === scopeOwnerId);
+          if (filterOwnerIds.length > 0 || hasNullOwner) {
+            rows = rows.filter(
+              (row) =>
+                (row.createdByUserId != null && filterOwnerIds.includes(row.createdByUserId)) ||
+                (hasNullOwner && row.createdByUserId === null),
+            );
+          }
+        } else if (hasOwnerOr || ownerIds.length > 1) {
+          rows = rows.filter(
+            (row) =>
+              (row.createdByUserId != null && ownerIds.includes(row.createdByUserId)) ||
+              (hasNullOwner && row.createdByUserId === null),
+          );
+        } else if (hasNullOwner) {
+          rows = rows.filter((row) => row.createdByUserId === null);
+        } else if (ownerIds.length === 1) {
+          rows = rows.filter((row) => row.createdByUserId === ownerIds[0]);
+        }
+        return rows;
+      }
+
+      if (selectedTable === taskSessionTable) {
+        if (!condition) return listFixture.sessionRefs;
+        const taskIds = new Set(
+          dialect
+            .sqlToQuery(condition)
+            .params.filter((param): param is string => typeof param === "string"),
+        );
+        return listFixture.sessionRefs.filter((row) => taskIds.has(row.taskId));
+      }
+
+      throw new Error("unexpected table in fake task DB select");
+    };
     const chain: Record<string, unknown> = {
-      from: () => chain,
-      where: () => chain,
+      from: (table: unknown) => {
+        selectedTable = table;
+        return chain;
+      },
+      where: (where: SQL | undefined) => {
+        condition = where;
+        return chain;
+      },
       limit: () => chain,
-      then: (resolve: (v: unknown) => unknown) => resolve(rows),
+      then: (resolve: (v: unknown) => unknown) => resolve(resolveFixtureRows()),
     };
     return chain;
   };
@@ -476,7 +539,255 @@ describe("TaskService — unauthenticated", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2. Only "chat" type accepted
+// 2. ListTasks filters, scope, ordering, and pagination (ADR 0087)
+// ---------------------------------------------------------------------------
+
+function listTaskRow(
+  id: string,
+  createdByUserId: string | null,
+  createdAt: string,
+  title: string | null = null,
+): typeof taskTable.$inferSelect {
+  const at = new Date(createdAt);
+  return {
+    id,
+    type: "chat",
+    title,
+    status: "open",
+    createdByUserId,
+    source: {},
+    workflowRunId: null,
+    createdAt: at,
+    updatedAt: at,
+  };
+}
+
+function listSessionRef(
+  taskId: string,
+  sessionId: string,
+): typeof taskSessionTable.$inferSelect {
+  return {
+    taskId,
+    sessionId,
+    role: "primary",
+    profileId: null,
+    createdAt: new Date("2026-01-01T00:00:00.000Z"),
+  };
+}
+
+function liveSession(
+  id: string,
+  status: string,
+  lastActiveAt: string,
+): FakeSession {
+  return {
+    id,
+    status,
+    image: "registry/test:latest",
+    mode: "agent",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    lastActiveAt,
+  };
+}
+
+const LIST_ADMIN_ACTIVE = "list-admin-active";
+const LIST_ADMIN_PENDING = "list-admin-pending";
+const LIST_MEMBER_TITLE = "list-member-title";
+const LIST_MEMBER_ID = "list-task-id-HaYsTaCk";
+const LIST_SYSTEM = "list-system-task";
+const LIST_ORPHAN_SESSION = "list-orphan-session";
+
+const listFixture: ListDbFixture = {
+  tasks: [
+    listTaskRow(LIST_ADMIN_ACTIVE, ADMIN_ID, "2026-01-01T00:00:00.000Z"),
+    listTaskRow(LIST_ADMIN_PENDING, ADMIN_ID, "2026-04-01T00:00:00.000Z"),
+    listTaskRow(LIST_MEMBER_TITLE, MEMBER_A, "2026-01-01T00:00:00.000Z", "TiTle-NeEdLe review"),
+    listTaskRow(LIST_MEMBER_ID, MEMBER_B, "2026-01-01T00:00:00.000Z"),
+    listTaskRow(LIST_SYSTEM, null, "2026-01-01T00:00:00.000Z"),
+  ],
+  sessionRefs: [
+    listSessionRef(LIST_ADMIN_ACTIVE, "list-admin-live"),
+    listSessionRef(LIST_MEMBER_TITLE, "list-member-title-session"),
+    listSessionRef(LIST_MEMBER_ID, "list-member-id-session"),
+    listSessionRef(LIST_SYSTEM, "list-session-WiRe-KeY"),
+  ],
+};
+
+const listLiveSessions: FakeSession[] = [
+  liveSession("list-admin-live", "active", "2026-05-01T00:00:00.000Z"),
+  liveSession("list-member-title-session", "idle", "2026-03-01T00:00:00.000Z"),
+  liveSession("list-member-id-session", "dead", "2026-02-01T00:00:00.000Z"),
+  liveSession("list-session-WiRe-KeY", "active", "2026-01-01T00:00:00.000Z"),
+  liveSession(LIST_ORPHAN_SESSION, "active", "2026-06-01T00:00:00.000Z"),
+];
+
+function makeListClient(
+  userId: string,
+  role: "user" | "admin",
+  fixture: ListDbFixture = listFixture,
+  sessions: FakeSession[] = listLiveSessions,
+): ReturnType<typeof makeClient> {
+  const transport = createRouterTransport((router) => {
+    registerTasks(router, {
+      getSession: makeGetSession(userId, role),
+      sessions: makeFakeSessions({ existing: sessions }),
+      profiles: makeFakeProfiles(),
+      images: fakeImages(),
+      db: okDb("unused-list-task", fixture),
+    });
+  });
+  return createClient(TaskService, transport);
+}
+
+describe("TaskService — ListTasks ADR 0087", () => {
+  test("member empty scope sees only own tasks", async () => {
+    const resp = await makeListClient(MEMBER_A, "user").listTasks({});
+    expect(resp.tasks.map((task) => task.id)).toEqual([LIST_MEMBER_TITLE]);
+    expect(resp.totalCount).toBe(1);
+  });
+
+  test("member all scope is PermissionDenied and invalid scope is InvalidArgument", async () => {
+    const client = makeListClient(MEMBER_A, "user");
+    await expectConnectError(client.listTasks({ scope: "all" }), Code.PermissionDenied);
+    await expectConnectError(client.listTasks({ scope: "everyone" }), Code.InvalidArgument);
+  });
+
+  test("admin mine scope returns only own tasks and no unattributed rows", async () => {
+    const resp = await makeListClient(ADMIN_ID, "admin").listTasks({ scope: "mine" });
+    expect(resp.tasks.map((task) => task.id)).toEqual([
+      LIST_ADMIN_ACTIVE,
+      LIST_ADMIN_PENDING,
+    ]);
+    expect(resp.tasks.some((task) => task.id.startsWith("unattributed-"))).toBe(false);
+    expect(resp.totalCount).toBe(2);
+  });
+
+  test("admin empty and all scopes include every task plus unattributed rows", async () => {
+    const client = makeListClient(ADMIN_ID, "admin");
+    for (const scope of ["", "all"]) {
+      const resp = await client.listTasks({ scope });
+      expect(resp.tasks).toHaveLength(6);
+      expect(resp.tasks.map((task) => task.id)).toContain(
+        `unattributed-${LIST_ORPHAN_SESSION}`,
+      );
+      expect(resp.totalCount).toBe(6);
+    }
+  });
+
+  test("search matches title, task id, and session id case-insensitively", async () => {
+    const client = makeListClient(ADMIN_ID, "admin");
+    const cases = [
+      ["title-needle", LIST_MEMBER_TITLE],
+      ["HAYSTACK", LIST_MEMBER_ID],
+      ["wire-key", LIST_SYSTEM],
+    ];
+    for (const [search, expectedId] of cases) {
+      const resp = await client.listTasks({ scope: "all", search });
+      expect(resp.tasks.map((task) => task.id)).toEqual([expectedId]);
+      expect(resp.totalCount).toBe(1);
+    }
+  });
+
+  test("states match live primary status and pending fallback", async () => {
+    const client = makeListClient(ADMIN_ID, "admin");
+    const active = await client.listTasks({ scope: "mine", states: ["active"] });
+    expect(active.tasks.map((task) => task.id)).toEqual([LIST_ADMIN_ACTIVE]);
+    expect(active.totalCount).toBe(1);
+
+    const pending = await client.listTasks({ scope: "mine", states: ["pending"] });
+    expect(pending.tasks.map((task) => task.id)).toEqual([LIST_ADMIN_PENDING]);
+    expect(pending.totalCount).toBe(1);
+  });
+
+  test("owner filters select a concrete user or system-owned and unattributed rows", async () => {
+    const client = makeListClient(ADMIN_ID, "admin");
+    const member = await client.listTasks({
+      scope: "all",
+      createdByUserIds: [MEMBER_A],
+    });
+    expect(member.tasks.map((task) => task.id)).toEqual([LIST_MEMBER_TITLE]);
+    expect(member.totalCount).toBe(1);
+
+    const system = await client.listTasks({
+      scope: "all",
+      createdByUserIds: ["system"],
+    });
+    expect(system.tasks.map((task) => task.id)).toEqual([
+      `unattributed-${LIST_ORPHAN_SESSION}`,
+      LIST_SYSTEM,
+    ]);
+    expect(system.totalCount).toBe(2);
+
+    const memberAndSystem = await client.listTasks({
+      scope: "all",
+      createdByUserIds: [MEMBER_A, "system"],
+    });
+    expect(memberAndSystem.tasks.map((task) => task.id)).toEqual([
+      `unattributed-${LIST_ORPHAN_SESSION}`,
+      LIST_MEMBER_TITLE,
+      LIST_SYSTEM,
+    ]);
+    expect(memberAndSystem.totalCount).toBe(3);
+
+    const twoUsers = await client.listTasks({
+      scope: "all",
+      createdByUserIds: [MEMBER_A, ADMIN_ID],
+    });
+    expect(twoUsers.tasks.map((task) => task.id)).toEqual([
+      LIST_ADMIN_ACTIVE,
+      LIST_ADMIN_PENDING,
+      LIST_MEMBER_TITLE,
+    ]);
+    expect(twoUsers.tasks.some((task) => task.id.startsWith("unattributed-"))).toBe(false);
+    expect(twoUsers.totalCount).toBe(3);
+  });
+
+  test("orders by session lastActiveAt with createdAt fallback", async () => {
+    const resp = await makeListClient(ADMIN_ID, "admin").listTasks({ scope: "all" });
+    expect(resp.tasks.map((task) => task.id)).toEqual([
+      `unattributed-${LIST_ORPHAN_SESSION}`,
+      LIST_ADMIN_ACTIVE,
+      LIST_ADMIN_PENDING,
+      LIST_MEMBER_TITLE,
+      LIST_MEMBER_ID,
+      LIST_SYSTEM,
+    ]);
+  });
+
+  test("paginates after sorting, keeps pre-slice count, clamps to 200, and supports legacy zero", async () => {
+    const tasks = Array.from({ length: 205 }, (_, index) =>
+      listTaskRow(
+        `page-task-${index.toString().padStart(3, "0")}`,
+        ADMIN_ID,
+        new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+      )
+    );
+    const client = makeListClient(
+      ADMIN_ID,
+      "admin",
+      { tasks, sessionRefs: [] },
+      [],
+    );
+    const first = await client.listTasks({ scope: "all", page: 1, pageSize: 2 });
+    expect(first.tasks.map((task) => task.id)).toEqual(["page-task-204", "page-task-203"]);
+    expect(first.totalCount).toBe(205);
+
+    const second = await client.listTasks({ scope: "all", page: 2, pageSize: 2 });
+    expect(second.tasks.map((task) => task.id)).toEqual(["page-task-202", "page-task-201"]);
+    expect(second.totalCount).toBe(205);
+
+    const clamped = await client.listTasks({ scope: "all", pageSize: 500 });
+    expect(clamped.tasks).toHaveLength(200);
+    expect(clamped.totalCount).toBe(205);
+
+    const legacy = await client.listTasks({ scope: "all", pageSize: 0 });
+    expect(legacy.tasks).toHaveLength(205);
+    expect(legacy.totalCount).toBe(205);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3. Only "chat" type accepted
 // ---------------------------------------------------------------------------
 
 describe("TaskService — type validation", () => {
