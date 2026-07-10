@@ -12,8 +12,8 @@
  *      headers/trailers back to the caller.
  *
  * GetSession signature of better-auth is injectable for tests
- * (`getSession?: GetSession`). When omitted, the real auth.api.getSession
- * from better-auth is used.
+ * (`getSession?: GetSession`). When omitted, getSessionFromHeaders resolves
+ * the real better-auth session (cookie or API key, ADR 0086).
  *
  * Excluded from this layer (served elsewhere):
  *   - StreamEvents / GetArtifact → Hono routes (Task 20)
@@ -28,7 +28,7 @@ import { subject } from "@casl/ability";
 import { POLICY, policyKey } from "../authz/policy-map.ts";
 import { abilityFor } from "../authz/ability.ts";
 import { resolveSessionOwner } from "../authz/resolve.ts";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,8 +44,8 @@ export interface PassthroughSpec {
 }
 
 /**
- * Injected getSession implementation. The default is better-auth's
- * auth.api.getSession; tests inject a stub.
+ * Injected getSession implementation. The default is getSessionFromHeaders
+ * (auth/session.ts); tests inject a stub.
  */
 export type GetSession = (
   headers: Headers,
@@ -97,8 +97,8 @@ function copyHeaders(src: Headers | undefined, dst: Headers): void {
 
 /**
  * Build a Web-standard Headers object from a HandlerContext's requestHeader.
- * better-auth.api.getSession accepts HeadersInit; the context provides a
- * Headers instance already.
+ * getSessionFromHeaders takes a Headers instance; the context provides one
+ * already.
  */
 function headersOf(ctx: HandlerContext): Headers {
   return ctx.requestHeader;
@@ -154,8 +154,7 @@ export function registerPassthrough(
 ): void {
   const resolveSession: GetSession =
     getSession ??
-    ((headers) =>
-      auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
+    getSessionFromHeaders;
 
   const ownerResolver: ResolveOwner = resolveOwner ?? resolveSessionOwner;
 

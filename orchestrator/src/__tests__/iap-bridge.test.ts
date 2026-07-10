@@ -149,6 +149,8 @@ function makeReqRes(options: {
   iapJwt?: string;
   cookie?: string;
   url?: string;
+  apiKey?: string;
+  authorization?: string;
 }): {
   req: IncomingMessage;
   res: ServerResponse & { _status?: number; _headers?: Record<string, string>; _body?: string };
@@ -158,6 +160,8 @@ function makeReqRes(options: {
   const headers: Record<string, string> = {};
   if (options.iapJwt) headers["x-goog-iap-jwt-assertion"] = options.iapJwt;
   if (options.cookie) headers["cookie"] = options.cookie;
+  if (options.apiKey) headers["x-api-key"] = options.apiKey;
+  if (options.authorization) headers["authorization"] = options.authorization;
 
   // Minimal IncomingMessage stand-in. Defaults to a NON-exempt path so the
   // bridge actually runs — /healthz is short-circuited (see the exemption
@@ -295,6 +299,44 @@ describe("IAP bridge — missing/invalid assertion → 401", () => {
     const jwt = await signIapJwt(TEST_EMAIL, { expiredAgo: true });
     let nextCalled = false;
     const { req, res, statusCode } = makeReqRes({ iapJwt: jwt });
+    await iapBridge(req, res, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(false);
+    expect(statusCode()).toBe(401);
+  });
+
+  // ADR 0086: API-keyed programmatic requests skip the IAP wall (a pure
+  // ROUTING bypass — the key is validated at the auth seams, which fail
+  // closed). No assertion + a key header → next(), no 401, no cookie minted.
+  test("x-api-key present → next() with no assertion (no 401, no cookie)", async () => {
+    let nextCalled = false;
+    const { req, res, statusCode, getSetCookie } = makeReqRes({ apiKey: "engk_whatever" });
+    await iapBridge(req, res, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(true);
+    expect(statusCode()).toBe(200);
+    expect(getSetCookie()).toBeUndefined();
+  });
+
+  test("Authorization: Bearer engk_… → next() with no assertion", async () => {
+    let nextCalled = false;
+    const { req, res } = makeReqRes({ authorization: "Bearer engk_something" });
+    await iapBridge(req, res, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(true);
+  });
+
+  // A junk key still passes the BRIDGE (presence is the routing signal) — the
+  // seams reject it. But a non-engk_ bearer is NOT an API key: fail closed.
+  test("Authorization: Bearer without the engk_ prefix does NOT bypass → 401", async () => {
+    let nextCalled = false;
+    const { req, res, statusCode } = makeReqRes({ authorization: "Bearer some-oauth-token" });
     await iapBridge(req, res, () => {
       nextCalled = true;
     });

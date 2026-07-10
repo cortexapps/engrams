@@ -16,7 +16,7 @@ import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
 
 import { IntegrationService } from "../gen/engram/app/v1/integration_pb.ts";
 import type { MintKind } from "../gen/engram/app/v1/mint_pb.ts";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import { getDb } from "../db/client.ts";
 import { makeConnectorStore, type ConnectorStore } from "../db/connectors.ts";
 import { makeConnectorLogoStore, type ConnectorLogoStore } from "../db/connector-logos.ts";
@@ -140,7 +140,7 @@ function statusOf(c: Connector, names: Set<string>, requiredByKind: Map<string, 
 export function registerIntegration(router: ConnectRouter, deps?: IntegrationDeps): void {
   const getSession: GetSession =
     deps?.getSession ??
-    ((headers) => auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
+    getSessionFromHeaders;
   const connectors: ConnectorStore = deps?.connectors ?? makeConnectorStore(getDb());
   const connectorLogos: ConnectorLogoStore = deps?.connectorLogos ?? makeConnectorLogoStore(getDb());
   const orgSecret: OrgSecretAccess = deps?.orgSecret ?? (defaultOrgSecret as unknown as OrgSecretAccess);

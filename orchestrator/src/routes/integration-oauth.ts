@@ -13,7 +13,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import { abilityFor } from "../authz/ability.ts";
 import { config } from "../config.ts";
 import { loadRegistry } from "../connectors/registry.ts";
@@ -57,7 +57,7 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
   const randomState = deps?.randomState ?? (() => crypto.randomUUID());
   const getSession: GetSession =
     deps?.getSession ??
-    ((headers) => auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
+    getSessionFromHeaders;
 
   // In-memory CSRF state (single-instance). The callback also re-checks the admin
   // session cookie, so this guards against cross-site request forgery, not auth.

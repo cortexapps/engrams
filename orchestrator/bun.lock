@@ -5,6 +5,7 @@
     "": {
       "name": "engrams-orchestrator",
       "dependencies": {
+        "@better-auth/api-key": "1.6.16",
         "@bufbuild/protobuf": "^2.12.0",
         "@casl/ability": "^7.0.0",
         "@connectrpc/connect": "^2.1.1",
@@ -34,6 +35,8 @@
     },
   },
   "packages": {
+    "@better-auth/api-key": ["@better-auth/api-key@1.6.16", "", { "dependencies": { "zod": "^4.3.6" }, "peerDependencies": { "@better-auth/core": "^1.6.16", "@better-auth/utils": "0.4.1", "better-auth": "^1.6.16", "better-call": "1.3.6" } }, "sha512-3iEn1tcVsT9inPTrjinyciA8TT1cpls/uDd/7cQCN6hN4xy6l4VO11pnoMcetstdq6jOayWgyrDT6cPCl/hafA=="],
+
     "@better-auth/core": ["@better-auth/core@1.6.16", "", { "dependencies": { "@opentelemetry/semantic-conventions": "^1.39.0", "@standard-schema/spec": "^1.1.0", "zod": "^4.3.6" }, "peerDependencies": { "@better-auth/utils": "0.4.1", "@better-fetch/fetch": "1.2.2", "@cloudflare/workers-types": ">=4", "@opentelemetry/api": "^1.9.0", "better-call": "1.3.6", "jose": "^6.1.0", "kysely": "^0.28.5 || ^0.29.0", "nanostores": "^1.0.1" }, "optionalPeers": ["@cloudflare/workers-types", "@opentelemetry/api"] }, "sha512-a0+ZNaaYYxOdFXFXmOE36TgtYN8QDzSYDozaAH0zsiWB0oyljsENyCxHJSekysISftb0rFpVXNdw525aEAOa6w=="],
 
     "@better-auth/drizzle-adapter": ["@better-auth/drizzle-adapter@1.6.16", "", { "peerDependencies": { "@better-auth/core": "^1.6.16", "@better-auth/utils": "0.4.1", "drizzle-orm": "^0.45.2" }, "optionalPeers": ["drizzle-orm"] }, "sha512-AZjswadpR7zlQduj3fRSsu1R5ldQRR9AeFqoxXRI4colrQhevOVY+tJr8RTJv9Nh18e9FMYDXUju2GX+QWHDzg=="],

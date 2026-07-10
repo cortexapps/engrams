@@ -14,7 +14,7 @@
 
 import { Hono } from "hono";
 
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import { makeConnectorLogoStore, type ConnectorLogoStore } from "../db/connector-logos.ts";
 
 export type GetSession = (headers: Headers) => Promise<{ user: unknown } | null>;
@@ -32,7 +32,7 @@ export function makeConnectorLogoRoute(deps?: ConnectorLogoRouteDeps): Hono {
   const getStore = (): ConnectorLogoStore => (store ??= makeConnectorLogoStore());
   const getSession: GetSession =
     deps?.getSession ??
-    ((headers) => auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
+    getSessionFromHeaders;
 
   app.get("/api/v1/integrations/:provider/logo", async (c) => {
     const session = await getSession(c.req.raw.headers);

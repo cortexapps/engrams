@@ -20,7 +20,7 @@ import { ProfileService } from "../gen/engram/app/v1/profile_pb.ts";
 import type { Profile } from "../gen/engram/app/v1/profile_pb.ts";
 
 import { abilityFor } from "../authz/ability.ts";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import { getDb } from "../db/client.ts";
 import { makeProfileStore, type ProfileRow, type ProfileStore } from "../db/profiles.ts";
 import {
@@ -199,7 +199,7 @@ function assertSecretsValid(secrets: ProfileSecret[]): void {
 export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): void {
   const getSession: GetSession =
     deps?.getSession ??
-    ((headers) => auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
+    getSessionFromHeaders;
   const store: ProfileStore = deps?.store ?? makeProfileStore(getDb());
   const images: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
   const harnessCatalog: HarnessCatalogClient =

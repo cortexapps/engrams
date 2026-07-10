@@ -50,7 +50,7 @@ import type { Task, TaskSessionRef } from "../gen/engram/app/v1/task_pb.ts";
 import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 
 import { abilityFor } from "../authz/ability.ts";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import {
@@ -364,8 +364,7 @@ async function loadTask(
 export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
   const getSession: GetSession =
     deps?.getSession ??
-    ((headers) =>
-      auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
+    getSessionFromHeaders;
 
   const sessionsClient: SessionsClient = deps?.sessions ?? (defaultSessions as unknown as SessionsClient);
   const getDbFn = (): Db => deps?.db ?? getDb();

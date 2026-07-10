@@ -31,6 +31,7 @@ import { registerProfiles } from "./rpc/profiles.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
 import { registerOrgSecret } from "./rpc/org-secret.ts";
 import { registerMint } from "./rpc/mint.ts";
+import { registerApiKeys } from "./rpc/api-key.ts";
 import { registerIntegration } from "./rpc/integration.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
@@ -141,6 +142,11 @@ const server = buildServer(
     // Native MintService (ADR 0057 C3): admin-gated proxy over the coordinator's
     // read-only mint-kind registry (Plane-A form metadata). Before passthrough.
     registerMint(router);
+
+    // Native ApiKeyService (ADR 0086): admin-gated global API keys over the
+    // orchestrator's own DB + the better-auth api-key plugin. Before
+    // passthrough. The plugin's own HTTP endpoints are 404'd in better-auth.ts.
+    registerApiKeys(router);
 
     // Native IntegrationService (ADR 0057 C3): admin-gated connector catalog CRUD
     // (Plane B) over the orchestrator's own DB; built-ins are read-only seeds.

@@ -30,7 +30,7 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import type { GetSession } from "./guard.ts";
 
 // ---------------------------------------------------------------------------
@@ -77,10 +77,7 @@ export function makeMeRoute(deps?: MeDeps): Hono {
 
   const resolveSession: GetSession =
     deps?.getSession ??
-    ((headers) =>
-      auth.api.getSession({
-        headers,
-      } as Parameters<typeof auth.api.getSession>[0]));
+    getSessionFromHeaders;
 
   /** Resolve the authenticated user or throw 401. */
   async function requireUser(headers: Headers): Promise<{ id: string; role: string }> {

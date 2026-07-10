@@ -369,8 +369,8 @@ export function makePreviewProxyMiddleware(deps?: PreviewProxyDeps): MiddlewareH
   const resolveSession: GetSession =
     deps?.getSession ??
     (async (headers) => {
-      const { auth } = await import("../auth/better-auth.ts");
-      return auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]);
+      const { getSessionFromHeaders } = await import("../auth/session.ts");
+      return getSessionFromHeaders(headers);
     });
 
   return async (c, next) => {

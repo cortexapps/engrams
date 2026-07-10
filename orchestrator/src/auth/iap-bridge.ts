@@ -109,6 +109,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import { auth } from "./better-auth.ts";
 import { config } from "../config.ts";
+import { extractApiKey } from "./api-key-header.ts";
 
 // ---------------------------------------------------------------------------
 // Public (unauthenticated) paths
@@ -377,21 +378,25 @@ function injectRequestSessionCookie(req: IncomingMessage, name: string, signedVa
  * Verify the existing session cookie and return the user's email if valid.
  * Returns undefined if the cookie is absent, invalid, or session not found.
  */
+/** Convert IncomingMessage headers to a Fetch Headers object. */
+function headersOf(req: IncomingMessage): Headers {
+  const headers = new Headers();
+  for (const [key, val] of Object.entries(req.headers)) {
+    if (!val) continue;
+    if (Array.isArray(val)) {
+      for (const v of val) headers.append(key, v);
+    } else {
+      headers.set(key, val);
+    }
+  }
+  return headers;
+}
+
 async function verifyExistingSession(
   req: IncomingMessage,
 ): Promise<{ email: string } | undefined> {
   try {
-    // Convert IncomingMessage headers to a Fetch Headers object for better-auth.
-    const headers = new Headers();
-    for (const [key, val] of Object.entries(req.headers)) {
-      if (!val) continue;
-      if (Array.isArray(val)) {
-        for (const v of val) headers.append(key, v);
-      } else {
-        headers.set(key, val);
-      }
-    }
-
+    const headers = headersOf(req);
     const session = await auth.api.getSession({ headers } as Parameters<
       typeof auth.api.getSession
     >[0]);
@@ -440,6 +445,21 @@ export async function iapBridge(
 
   // INERT PATH: IAP_AUDIENCES empty → bridge is fully off.
   if (config.iapAudiences.length === 0) {
+    next();
+    return;
+  }
+
+  // API-KEY BYPASS (ADR 0086): a programmatic request carrying an API key
+  // (x-api-key or `Authorization: Bearer engk_…`) skips the IAP wall — IAP can
+  // only attest humans, and the fail-closed 401 below would otherwise block
+  // every keyed caller. This is a pure ROUTING bypass: nothing is minted or
+  // granted here. getSession at the auth seams validates the key (the apiKey
+  // plugin's mock-session hook); a junk key sails past the bridge and still
+  // fails closed at every seam with its normal Unauthenticated/401. Checked
+  // BEFORE verifyExistingSession: the mock session it would resolve carries a
+  // @service.local email that can never match an IAP assertion, and the
+  // user-switch logic below would 401 the request.
+  if (extractApiKey(headersOf(req))) {
     next();
     return;
   }
