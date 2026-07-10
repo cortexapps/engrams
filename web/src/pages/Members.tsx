@@ -42,10 +42,17 @@ function baUserToAdminUser(u: BaUser): AdminUser {
   };
 }
 
+// API-key service accounts (ADR 0086, `apikey+<uuid>@service.local`) are
+// machine identities managed on /settings/api-keys — not people. Hide them
+// from the Members roster and its counts.
+function isServiceAccount(u: BaUser): boolean {
+  return u.email.startsWith("apikey+") && u.email.endsWith("@service.local");
+}
+
 async function fetchAdminUsers(): Promise<AdminUser[]> {
   const result = await authClient.admin.listUsers({ query: { limit: 100 } });
   const users = (result.data as { users?: BaUser[] } | null)?.users ?? [];
-  return users.map(baUserToAdminUser);
+  return users.filter((u) => !isServiceAccount(u)).map(baUserToAdminUser);
 }
 
 export function Members() {
