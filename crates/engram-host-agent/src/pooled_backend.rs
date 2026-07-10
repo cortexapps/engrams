@@ -906,6 +906,51 @@ impl PooledBackend {
         );
     }
 
+    /// Run `sync` in the guest — the base-capture quiesce (see the call
+    /// site in `build_base_snapshot`). Bounded: sync of a warm image's
+    /// dirty set is seconds; 120 s covers a slow chunked-NBD writeback
+    /// without letting a wedged guest hang the capture forever.
+    async fn sync_guest_fs(&self, id: SandboxId) -> Result<(), SandboxError> {
+        use engram_core::types::sandbox::ExecEvent;
+        use futures::StreamExt;
+
+        // Via `sh -c` so PATH/applet resolution finds sync on both
+        // full images and the busybox test fixtures (no bare /bin/sync
+        // there).
+        let req = ExecRequest {
+            command: vec!["/bin/sh".into(), "-c".into(), "sync".into()],
+            stdin: None,
+            env: std::collections::HashMap::new(),
+            workdir: None,
+            timeout: Some(std::time::Duration::from_secs(120)),
+        };
+        let started = std::time::Instant::now();
+        let stream = self
+            .exec_stream(id, req)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("pre-capture guest sync exec: {e}")))?;
+        let mut events = stream.events;
+        while let Some(ev) = events.next().await {
+            if let ExecEvent::Exit(status) = ev {
+                return if status == Some(0) {
+                    tracing::info!(
+                        sandbox_id = %id,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "pre-capture guest sync complete",
+                    );
+                    Ok(())
+                } else {
+                    Err(SandboxError::Snapshot(format!(
+                        "pre-capture guest sync exited {status:?}"
+                    )))
+                };
+            }
+        }
+        Err(SandboxError::Snapshot(
+            "pre-capture guest sync: exec stream ended without an exit status".into(),
+        ))
+    }
+
     /// Run an image's capture-time `[warm]` hook ([`WarmConfig`]) in the
     /// live capture VM, just before the base snapshot is frozen. The warm
     /// command starts a long-lived process detached (e.g. `gradle
@@ -7252,6 +7297,22 @@ impl SandboxBackend for PooledBackend {
                 warm_tail = self
                     .run_warm_hook(id, warm, &session_env, &progress)
                     .await?;
+                // Incident 2026-07-10 mitigation: flush the guest's dirty
+                // page cache to the (durably captured) disk BEFORE the
+                // final snapshot. The memory image is REQUIRED to carry
+                // dirty page cache faithfully — the fidelity gate
+                // (`unsynced_warm_writes_survive_uffd_restore_and_cache_drop`)
+                // asserts it does — but a base snapshot fans out to every
+                // session of an image, so its DISK must not depend on
+                // that: with the sync, the captured disk stands alone
+                // (fsck-able, drop_caches-recoverable) even if a
+                // memory-fidelity regression slips through. Warm captures
+                // only: the hook is the sole producer of meaningful
+                // unsynced state at capture (docker layers, PG pages, git
+                // metadata — a warm-less capture's dirty window is bare
+                // boot state). Fail-loud like the hook itself: a guest
+                // that cannot sync is a guest we must not ship as a base.
+                self.sync_guest_fs(id).await?;
             }
             // Close the cold-boot window (mirrors `start_agent`) before the
             // snapshot flush opens its own `snapshot` operation scope. A
