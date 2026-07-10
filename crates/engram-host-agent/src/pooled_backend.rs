@@ -2097,7 +2097,24 @@ impl PooledBackend {
             "outcome" => if create_res.is_ok() { "success" } else { "error" },
         )
         .record(create_start.elapsed().as_secs_f64());
-        let metadata = create_res?;
+        let metadata = match create_res {
+            Ok(m) => m,
+            Err(e) => {
+                // A failed Diff create may still have consumed the dirty
+                // bitmap (FC reads+resets it before/while writing the
+                // file; mid-write failure semantics are undefined).
+                // Conservative: poison. Worst case is one unnecessary
+                // Full; the alternative is silent memory corruption.
+                if chain_prev.is_some() {
+                    poison_checkpoint_chain_after_failed_diff(
+                        &self.checkpoint_chains,
+                        id,
+                        "fc snapshot_diff create",
+                    );
+                }
+                return Err(e);
+            }
+        };
         let dest = self.inner.snapshot_path_for(metadata.id);
         // `create_res` was Ok ⟹ `inner.snapshot`/`snapshot_diff` brought
         // the guest back running. The guard rides into `SnapshotCapture`
@@ -4357,6 +4374,35 @@ pub(crate) struct SnapshotCapture {
     unwind: CaptureUnwind,
 }
 
+/// Incident 2026-07-10: FC's `PUT /snapshot/create` (Diff) consumes —
+/// and resets — the KVM dirty-page bitmap the moment it runs. If
+/// anything after that point fails (the create itself mid-write, the
+/// sparse re-chunk, the eviction finalize-record persist), the consumed
+/// dirty set is GONE: the chain's manifest never advanced, so a
+/// subsequent Diff against the stale chain entry would silently exclude
+/// every page the failed capture consumed — and a guest restored from
+/// that chain reads pre-capture bytes at those pages (memory
+/// corruption). Drop the chain entry instead: the next capture finds no
+/// chain and takes a FULL snapshot — slower, correct. (The eviction
+/// flavor is immune only AFTER its finalize record is durable; before
+/// that instant it has the same hole, hence the `snapshot_begin` call
+/// sites.)
+fn poison_checkpoint_chain_after_failed_diff(
+    chains: &DashMap<SandboxId, crate::checkpoint::CheckpointChain>,
+    id: SandboxId,
+    failed_step: &str,
+) {
+    if chains.remove(&id).is_some() {
+        metrics::counter!(crate::metrics::CHECKPOINT_CHAIN_POISONED_TOTAL).increment(1);
+        tracing::warn!(
+            sandbox_id = %id,
+            failed_step,
+            "diff capture failed after FC consumed the dirty bitmap; \
+             checkpoint chain dropped — next capture will be a FULL snapshot",
+        );
+    }
+}
+
 /// ADR 0045 D5: see [`PooledBackend::finisher`]. Owns Arc-clones of the
 /// fields the snapshot post phase + chain bookkeeping touch, so the phase
 /// can run detached from the originating RPC.
@@ -4635,6 +4681,18 @@ impl SnapshotFinisher {
                 Ok(m)
             }
             Err(e) => {
+                // The FC Diff already ran (capture_phase succeeded), so
+                // the dirty bitmap is consumed and the memory.diff we're
+                // about to delete is its only record — a later Diff off
+                // the unadvanced chain would silently miss these pages.
+                // Poison the chain so the next capture is a Full.
+                if chain_prev.is_some() {
+                    poison_checkpoint_chain_after_failed_diff(
+                        &self.checkpoint_chains,
+                        id,
+                        "snapshot post-processing",
+                    );
+                }
                 // ADR 0014 cleanup hygiene: rm -rf the FC-written
                 // snapshot dir before propagating. Idle-evict retry
                 // (every ~30s) without this leaks 4 GiB per try and
@@ -5488,6 +5546,17 @@ impl SandboxBackend for PooledBackend {
                     // the multi-GiB local staging dir on every retry.
                     unwind.defuse();
                     drop(unwind);
+                    // The Diff already consumed the dirty bitmap and the
+                    // dir removal below deletes memory.diff — poison the
+                    // chain so the retry captures Full (see
+                    // `poison_checkpoint_chain_after_failed_diff`).
+                    if chain_prev.is_some() {
+                        poison_checkpoint_chain_after_failed_diff(
+                            &self.checkpoint_chains,
+                            id,
+                            "eviction disk-pending persist",
+                        );
+                    }
                     match tokio::fs::remove_dir_all(&dest).await {
                         Ok(_) => {}
                         Err(rm_err) => tracing::warn!(
@@ -5539,6 +5608,13 @@ impl SandboxBackend for PooledBackend {
             // Gated above; unreachable in practice (checkpoint_dir just
             // got checked), but never destroy a fresh capture on a
             // defensive None — clean up and fail loudly instead.
+            if record.chain_prev_ref.is_some() {
+                poison_checkpoint_chain_after_failed_diff(
+                    &self.checkpoint_chains,
+                    id,
+                    "eviction finalizer unavailable",
+                );
+            }
             let _ = tokio::fs::remove_dir_all(&dest).await;
             return Err(SandboxError::InvalidSpec(
                 "checkpoint_dir disappeared between the gate check and record construction".into(),
@@ -5551,6 +5627,15 @@ impl SandboxBackend for PooledBackend {
             // retries ~30s apart, each attempt minting a fresh snapshot_id
             // + `dest`; without this cleanup that's an unbounded disk-fill
             // class on a host whose finalize_dir write path is unhealthy.
+            // The removal deletes memory.diff, whose dirty set the Diff
+            // already consumed — poison the chain so the retry is a Full.
+            if record.chain_prev_ref.is_some() {
+                poison_checkpoint_chain_after_failed_diff(
+                    &self.checkpoint_chains,
+                    id,
+                    "eviction finalize-record persist",
+                );
+            }
             let _ = tokio::fs::remove_dir_all(&dest).await;
             return Err(SandboxError::Snapshot(format!(
                 "persist eviction finalize record: {e}"
