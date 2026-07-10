@@ -80,6 +80,12 @@ plain iframe.
   workspace, equivalent to the shell: it gets the **full session env** and
   runs as the same user the shell runs as, so its integrated terminal behaves
   identically to the Shell tab.
+- `config/machine-settings.json` — bundle-owned VS Code **machine-scope**
+  settings (`chat.disableAIFeatures: true` — no Copilot/AI chat in the
+  in-session IDE; the agent is the AI surface). The RO mount can't be
+  code-server's live config home, so the launcher seeds it into
+  `<user-data-dir>/Machine/settings.json` on every bring-up: the bundle stays
+  authoritative for the machine layer, user settings are never touched.
 - Wired into the `bundles`, `bundles-squashfs`, and `bundles-vz` justfile
   loops and the bundle README, distribution unchanged (content-addressed
   fleet stamp, ADR 0027/0035/0055).

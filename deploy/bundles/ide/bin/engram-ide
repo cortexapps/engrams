@@ -126,6 +126,17 @@ fi
 # to $HOME for a bare dev invocation.
 WORKDIR="${ENGRAM_IDE_WORKDIR:-${HOME:-/root}}"
 
+# Seed the bundle's machine-level settings (config/machine-settings.json —
+# e.g. chat.disableAIFeatures, no Copilot in the in-session IDE) into
+# code-server's user-data dir. Machine scope is the admin-managed layer above
+# user settings, and the RO bundle mount can't be its live home, so copy on
+# every bring-up: the bundle stays authoritative for this layer across bundle
+# updates, while User/ settings (the layer the Settings UI edits) are never
+# touched. Path per code-server: <user-data-dir>/Machine/settings.json.
+DATA_DIR="${XDG_DATA_HOME:-${HOME:-/root}/.local/share}/code-server"
+mkdir -p "$DATA_DIR/Machine"
+cp "$here/config/machine-settings.json" "$DATA_DIR/Machine/settings.json"
+
 cleanup() {
     # Disarm first: `kill 0` signals the WHOLE process group — including this
     # shell — so without clearing the traps the delivered TERM/INT re-enters

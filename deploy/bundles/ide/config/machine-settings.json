@@ -1,0 +1,11 @@
+// Machine-level VS Code settings seeded by bin/engram-ide into
+// <user-data-dir>/Machine/settings.json on every bring-up (VS Code parses
+// settings files as JSONC, so this comment is fine). Machine scope is the
+// admin-managed layer above user settings — the right home for policy the
+// bundle owns. The bundle mount is read-only, so this is a seed copy, not a
+// live file.
+{
+  // No Copilot / AI chat in the in-session IDE: the agent IS the AI surface
+  // here, and code-server has no GitHub auth to back Copilot anyway.
+  "chat.disableAIFeatures": true
+}

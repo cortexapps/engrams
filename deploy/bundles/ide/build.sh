@@ -208,6 +208,10 @@ build_tree() {
     docker cp "$cname:/out/." "$dest/"
     docker rm -f "$cname" >/dev/null 2>&1 || true
     cp "$here/mount.json" "$dest/"
+    # Machine-level VS Code settings the launcher seeds into the user-data dir
+    # at bring-up (the RO mount can't be code-server's live config home).
+    mkdir -p "$dest/config"
+    cp "$here/config/machine-settings.json" "$dest/config/"
     # Fail loud if the tree never reached the host — assert the launcher AND
     # the patched node landed so a broken build errors here instead of
     # shipping a silently empty bundle that still packs + stamps.
