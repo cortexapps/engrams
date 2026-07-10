@@ -9,7 +9,14 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 
 export function printJson(value: unknown): void {
-  console.log(JSON.stringify(value, null, 2));
+  // protobuf-es maps 64-bit proto fields to bigint, which JSON.stringify
+  // rejects outright ("cannot serialize BigInt") — and a single stray field
+  // (e.g. HostView.capacity_total_mib) would crash the whole verb. Convert
+  // at the one output edge; every value here is a size/count far below
+  // 2^53, so Number is lossless in practice.
+  console.log(
+    JSON.stringify(value, (_k, v: unknown) => (typeof v === "bigint" ? Number(v) : v), 2),
+  );
 }
 
 export function fail(message: string): never {
