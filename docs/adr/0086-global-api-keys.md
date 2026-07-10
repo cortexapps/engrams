@@ -1,6 +1,6 @@
 # 0086 — Global API keys: admin-minted programmatic credentials riding the existing session seams
 
-Status: Proposed (2026-07-09)
+Status: Accepted (2026-07-09)
 
 Builds on: ADR 0051 (the TypeScript orchestration tier — better-auth cookie
 sessions, CASL authorization, the two-plane auth split this ADR extends), ADR
@@ -166,8 +166,23 @@ clean-break refactor; injectable test seams unchanged.
 
 ## Commit chain
 
-- P1 (orchestrator): _pending_
-- P2 (web): _pending — flips this ADR to Accepted_
+- P1 (orchestrator): #631 `ac083f6a`
+- P2 (web): #632 `6fad3988` — flips this ADR to Accepted
+
+### Phase divergences (implementation)
+
+- **P1**: verification against the installed dist confirmed every planned
+  plugin behavior, plus one nuance the plan missed: the plugin treats a call
+  as a *client* request when `ctx.request` **or `ctx.headers`** is present —
+  the server-side `createApiKey({body: {userId}})` call must pass no headers
+  or it is rejected. `lastRequest` IS stamped with rate limiting disabled
+  (the "Last used" column works). Masked preview length raised to 11
+  (`startingCharactersConfig`) — the default 6 was swallowed by the 5-char
+  `engk_` prefix.
+- **P2**: the create form needs `noValidate` — the date input's `min`
+  (picker affordance) otherwise triggers NATIVE constraint validation, which
+  silently blocks submit on a past date before react-hook-form runs; zod
+  owns validation so the error is styled and testable.
 
 ## Rollout
 
