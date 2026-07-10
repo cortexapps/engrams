@@ -1,6 +1,20 @@
 # 0087 — Task-list filters: server-side scope, search, and pagination for ListTasks
 
-Status: Proposed
+Status: Accepted
+
+Commit chain: cf65dd78 (ADR) → b9b32b32 (ListTasks filters + pagination) →
+df74b6ff (web surfaces + composite FilterBar) → 93b7cba0 (rev 3: search into
+the Drizzle where-clause) → fd1a7e35 (rev 4: infinite scroll, clamp 200→1000)
+→ 54c2d936 (rev 5: pinned list chrome + virtualized rows).
+
+As-built divergences from the original proposal: search moved from in-memory
+into SQL once it was clear only the synthetic unattributed rows genuinely need
+a post-join match (rev 3); the owner filter became `repeated` so the composite
+filter bar needs no single-select special case (rev 2); every click-to-page
+affordance (rail show-more, Prev/Next pagers) was replaced by sentinel-driven
+infinite scroll over a growing page_size (rev 4); the list pages pin their
+heading/toolbar and virtualize rows (rev 5), which retires the "pager UI"
+described below wherever the two conflict.
 
 ## Context
 
@@ -47,7 +61,9 @@ message ListTasksRequest {
   // no live session is known — is in the set. Empty = no filter.
   repeated string states = 4;
   // 1-based page over the filtered, most-recently-active-first ordering.
-  // page_size 0 = unpaginated (legacy callers); clamped to 200 otherwise.
+  // page_size 0 = unpaginated (legacy callers); clamped to 1000 otherwise
+  // (raised from 200 in rev 4: the web paginates by a growing page_size,
+  // and a low clamp would silently stall its infinite scroll).
   int32 page = 5;
   int32 page_size = 6;
 }
@@ -92,11 +108,14 @@ scoping.
 ### Web surfaces
 
 - **Sessions rail** = *all my tasks*: `scope=mine`, a search box, initial page
-  of 25 with a show-more that grows `page_size`. Rail filter state (search +
-  visible count) lives in a small shared store so the ⌥-jump keymap and the
-  command menu — which read the same `useRailSessions` rows — stay in lockstep
-  with what the rail displays. The footer "My tasks" link is retired (the rail
-  *is* my tasks); the total badge comes from `total_count`.
+  of 25 growing by infinite scroll (rev 4: a shared `useLoadMoreSentinel`
+  IntersectionObserver hook replaces every click-to-page affordance; each
+  surface keeps ONE 1s-polled query whose `page_size` grows — deliberately not
+  `useInfiniteQuery` page-appends, which would refetch every loaded page per
+  poll tick). Rail filter state (search + visible count) lives in a small
+  shared store so the ⌥-jump keymap and the command menu — which read the same
+  `useRailSessions` rows — stay in lockstep with what the rail displays. The
+  footer "My tasks" link is retired (the rail *is* my tasks).
 - **`/sessions/list` (My tasks)** stays as the full-page/mobile rendering of
   the same searchable list (the rail is desktop-only), with a pager. The
   Live/Archived/All tabs are retired — recency sort + search + the admin state
@@ -108,8 +127,10 @@ scoping.
   is generic and controlled (`fields` config + `value`/`onChange`); the page
   supplies the owner and session-state fields. Semantics: OR within a field,
   AND across fields — which is why the owner filter is `repeated` on the wire
-  rather than a single id. Page size 50 with a pager. All filters are request
-  params — the server does the work; the page renders what it's given.
+  rather than a single id. Rows load by infinite scroll (50-per-step growing
+  `page_size`) under a pinned heading + toolbar — only the virtualized list
+  scrolls (rev 5, `@tanstack/react-virtual`). All filters are request params —
+  the server does the work; the page renders what it's given.
 - The start screen's recent-tasks preview switches to `scope=mine` (an admin's
   "recent" should be their own work).
 
