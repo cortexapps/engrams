@@ -108,7 +108,7 @@ export function StartScreen() {
   const { data: images } = useEnabledImages(true);
   const { data: harnesses } = useHarnessCatalog(true);
   const { data: harnessEnvVars } = useHarnessEnv(true);
-  const { data: taskList } = useTasksAsSessionList();
+  const { data: taskList } = useTasksAsSessionList({ scope: "mine", pageSize: 25 });
   const createTaskMutation = useMutation(createTask);
 
   const profiles = profilesData?.profiles ?? [];

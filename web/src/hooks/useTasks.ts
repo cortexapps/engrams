@@ -5,6 +5,15 @@ import type { SessionListItem } from "../lib/types";
 import type { Task } from "../gen/engram/app/v1/task_pb";
 import { authClient } from "../lib/auth-client";
 
+export interface TaskListParams {
+  scope?: "" | "mine" | "all";
+  search?: string;
+  states?: string[];
+  createdByUserIds?: string[];
+  page?: number;
+  pageSize?: number;
+}
+
 /** ADR 0051 Task 23: map a Task proto to the SessionListItem shape the list
  * components consume. A chat task has sessions[0] as its primary session.
  * `data-session-id` and navigation still point at the SESSION id — the detail
@@ -50,21 +59,17 @@ export function taskToSessionListItem(task: Task): SessionListItem {
 }
 
 /** ADR 0051 Task 23: replaces useSessions for list surfaces.
- * ListTasks is server-scoped by the CASL ability — admin sees all, member
- * sees own. No scope param needed (the server handles it).
+ * ListTasks defaults to the legacy CASL-ability scope, while explicit params
+ * narrow personal/admin surfaces and enable server-side filtering/pagination.
  *
  * Options are behaviorally equivalent to the former useSessions options
  * (refetchOnWindowFocus and staleTime come from TanStack defaults, not explicit
  * carry-over — 1s live-poll and placeholderData are the meaningful deltas). */
-export function useTasks() {
-  return useQuery(
-    listTasks,
-    {},
-    {
-      refetchInterval: 1_000,
-      placeholderData: (prev) => prev,
-    },
-  );
+export function useTasks(params?: TaskListParams) {
+  return useQuery(listTasks, params ?? {}, {
+    refetchInterval: 1_000,
+    placeholderData: (prev) => prev,
+  });
 }
 
 /** Admin-only: fetch a stable id→{name,email} map from better-auth's admin
@@ -115,14 +120,16 @@ function enrichWithOwners(
 }
 
 /** Convert the ListTasksResponse tasks array to SessionListItem[]. */
-export function useTasksAsSessionList(): {
+export function useTasksAsSessionList(params?: TaskListParams): {
   data: SessionListItem[] | undefined;
+  totalCount: number | undefined;
   isPending: boolean;
   error: unknown;
 } {
-  const { data, isPending, error } = useTasks();
+  const { data, isPending, error } = useTasks(params);
   return {
     data: data?.tasks.map(taskToSessionListItem),
+    totalCount: data?.totalCount,
     isPending,
     error,
   };
@@ -130,16 +137,18 @@ export function useTasksAsSessionList(): {
 
 /** Admin variant: same as useTasksAsSessionList but enriches owner fields
  * from the better-auth admin user list. Used exclusively by AllSessions. */
-export function useTasksAsSessionListWithOwners(): {
+export function useTasksAsSessionListWithOwners(params?: TaskListParams): {
   data: SessionListItem[] | undefined;
+  totalCount: number | undefined;
   isPending: boolean;
   error: unknown;
 } {
-  const { data, isPending, error } = useTasks();
+  const { data, isPending, error } = useTasks(params);
   const { data: usersMap } = useAdminUsersMap(true);
   const raw = data?.tasks.map(taskToSessionListItem);
   return {
     data: raw ? enrichWithOwners(raw, usersMap) : undefined,
+    totalCount: data?.totalCount,
     isPending,
     error,
   };

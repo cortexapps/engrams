@@ -1,8 +1,9 @@
 import { useRouterState } from "@tanstack/react-router";
+import { useDebouncedValue } from "../../hooks/useDebouncedValue";
 import { useSession } from "../../hooks/useSessions";
 import { useTasksAsSessionList } from "../../hooks/useTasks";
 import type { Session, SessionListItem, SessionState, ProfileSnapshotView } from "../../lib/types";
-import { compareSessions } from "./session-format";
+import { useRailStore } from "./rail-store";
 
 // The ordered, capped, open-session-pinned list that backs BOTH the sessions
 // rail and the keyboard jump layer (⌥1–9 / ⌥[ ⌥]). Lifting it here is what
@@ -13,14 +14,8 @@ import { compareSessions } from "./session-format";
 // ADR 0051 Task 28: migrated from useSessions (REST /api/v1/sessions) to
 // useTasksAsSessionList (connect-query ListTasks → orchestrator native
 // TaskService). The REST surface is no longer reachable from the browser after
-// the vite proxy flips all /api to the orchestrator. One deliberate scope
-// change: ListTasks has no scope param, so an ADMIN's rail now previews ALL
-// tasks (incl. unattributed rows) like the list page, where the old
-// useSessions("mine") was own-only even for admins. Members are unaffected
-// (server-side CASL scoping). Otherwise behaviour is unchanged:
-// member sees own tasks, admin sees all (CASL gate on the server).
-
-export const RAIL_CAP = 10;
+// the vite proxy flips all /api to the orchestrator. The explicit `mine` scope
+// preserves the old own-only rail for members and admins alike.
 
 /** One rail row. Normalises the list shape (`last_active_at`) and the single
  * session shape (`created_at`, used to pin an open session outside the recent
@@ -47,27 +42,24 @@ const fromSession = (s: Session): RailRow => ({
   profile: null,
 });
 
-// Most-recently-active first (status-agnostic); the stable sort keeps rows that
-// share a timestamp from jittering under the 1s refetch. The full sessions list
-// (SessionsList) shares this exact comparator, so the rail reads as a capped
-// preview of the same order.
-function sortForRail(rows: SessionListItem[]): SessionListItem[] {
-  return [...rows].sort(compareSessions);
-}
-
 export interface RailSessions {
   /** The rendered/jumpable rows, in display order. */
   rows: RailRow[];
   /** The currently-open session id, if the route is a session detail. */
   openId: string | undefined;
-  /** True total of "my" sessions (the rail caps the visible rows at RAIL_CAP). */
+  /** True total of "my" sessions before pagination. */
   total: number;
+  /** Whether another page-size step is available. */
+  hasMore: boolean;
   isPending: boolean;
   error: unknown;
 }
 
 export function useRailSessions(): RailSessions {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const search = useRailStore((s) => s.search);
+  const limit = useRailStore((s) => s.limit);
+  const debounced = useDebouncedValue(search);
 
   // `/sessions/<id>` → the open session; `/sessions/all` (fleet list) and
   // `/sessions/list` (my-tasks table) are section pages, not a detail — treating
@@ -76,9 +68,14 @@ export function useRailSessions(): RailSessions {
   const openId = seg && seg !== "all" && seg !== "list" ? seg : undefined;
 
   // ADR 0051 Task 28: use TaskService-backed list instead of REST /sessions.
-  const { data, isPending, error } = useTasksAsSessionList();
+  const { data, totalCount, isPending, error } = useTasksAsSessionList({
+    scope: "mine",
+    search: debounced,
+    page: 1,
+    pageSize: limit,
+  });
   const all = data ?? [];
-  const recent = sortForRail(all).slice(0, RAIL_CAP);
+  const recent = all.slice(0, limit);
 
   // The open session always needs a row, even if it's older than the recent
   // window or (for an admin) isn't one of mine. Shares the query cache with
@@ -91,5 +88,6 @@ export function useRailSessions(): RailSessions {
     else if (openSession.data) rows.unshift(fromSession(openSession.data));
   }
 
-  return { rows, openId, total: all.length, isPending, error };
+  const total = totalCount ?? 0;
+  return { rows, openId, total, hasMore: total > rows.length, isPending, error };
 }

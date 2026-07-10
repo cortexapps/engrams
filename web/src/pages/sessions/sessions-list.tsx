@@ -1,29 +1,17 @@
-import { useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StatusGlyph } from "../../components/Glyph";
 import type { SessionListItem } from "../../lib/types";
-import {
-  compareSessions,
-  lifecycleOf,
-  matchesFilter,
-  relativeTime,
-  shortId,
-  statusLabel,
-  type StatusFilter,
-} from "./session-format";
+import { relativeTime, shortId, statusLabel } from "./session-format";
 import { ProfileChip } from "../../components/profiles/ProfileChip";
 
 // The sessions list reads as a workspace switcher, not a data grid: a flat list
-// of rich rows ordered most-recently-active first (the same order as the rail),
+// of rich rows in the server's most-recently-active-first order,
 // each row a single focusable link into that workspace. A status telltale (the glyph)
 // leads, the session id carries identity — the slot a human-readable name will
-// take over later — and the image/status/age trail as quiet metadata. Live /
-// Archived / All tabs keep terminal history out of the default working set.
-
-const FILTERS: StatusFilter[] = ["live", "archived", "all"];
+// take over later — and the image/status/age trail as quiet metadata.
 
 export function SessionsList({
   sessions,
@@ -45,8 +33,6 @@ export function SessionsList({
    * background refetch keeps the last-good list visible (calm under live state). */
   error?: unknown;
 }) {
-  const [filter, setFilter] = useState<StatusFilter>("live");
-
   // The query keeps `placeholderData: prev`, so once we've loaded, `isPending`
   // is false and stale rows stay on screen through refetches. These two guards
   // therefore only fire on the genuine first load.
@@ -73,66 +59,28 @@ export function SessionsList({
     );
   }
 
-  const live = sessions.filter((s) => lifecycleOf(s.status) !== "ARCHIVED").length;
-
-  return (
-    <Tabs value={filter} onValueChange={(v) => setFilter(v as StatusFilter)}>
-      <TabsList>
-        <TabsTrigger value="live">
-          Live
-          <Count n={live} />
-        </TabsTrigger>
-        <TabsTrigger value="archived">
-          Archived
-          <Count n={sessions.length - live} />
-        </TabsTrigger>
-        <TabsTrigger value="all">
-          All
-          <Count n={sessions.length} />
-        </TabsTrigger>
-      </TabsList>
-      {FILTERS.map((f) => (
-        <TabsContent key={f} value={f}>
-          <SessionRows sessions={sessions} filter={f} showOwner={showOwner} />
-        </TabsContent>
-      ))}
-    </Tabs>
-  );
+  return <SessionRows sessions={sessions} showOwner={showOwner} />;
 }
 
-function SessionRows({
+export function SessionRows({
   sessions,
-  filter,
   showOwner,
 }: {
   sessions: SessionListItem[];
-  filter: StatusFilter;
   showOwner: boolean;
 }) {
-  const rows = sessions.filter((s) => matchesFilter(s.status, filter)).sort(compareSessions);
-  if (rows.length === 0) {
-    return (
-      <p className="py-10 text-center text-sm text-muted-foreground">
-        {filter === "archived" ? "No archived tasks." : "No live tasks."}
-      </p>
-    );
-  }
   return (
     <ul className="divide-y divide-border overflow-hidden rounded-lg border">
-      {rows.map((s) => (
+      {sessions.map((s) => (
         <SessionRow key={s.id} s={s} showOwner={showOwner} />
       ))}
     </ul>
   );
 }
 
-function Count({ n }: { n: number }) {
-  return <span className="ml-1.5 font-mono text-xs tabular-nums opacity-60">{n}</span>;
-}
-
 // First-load placeholder: the row silhouette, not a spinner, so the list keeps
 // its shape while the fetch resolves (mirrors the rail's skeleton behaviour).
-function SkeletonRows() {
+export function SkeletonRows() {
   return (
     <div role="status" aria-label="Loading tasks">
       <ul className="divide-y divide-border overflow-hidden rounded-lg border">
@@ -162,7 +110,7 @@ function ownerLabel(s: SessionListItem): string | null {
   return s.owner_email;
 }
 
-function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }) {
+export function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }) {
   return (
     <li data-testid="session-row" data-session-id={s.id}>
       <Link
