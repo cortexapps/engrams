@@ -226,6 +226,9 @@ message RefreshImageRequest {
   // Must already be enabled — refresh refuses to enable a new URI so
   // the auditable enable path can't be bypassed.
   string image_uri = 1;
+  // Force the async refresh job to recapture a new base snapshot instead
+  // of reusing an existing content-identical snapshot.
+  bool force_recapture = 2;
 }
 
 // Refresh runs the identical async pipeline as enable (the upsert

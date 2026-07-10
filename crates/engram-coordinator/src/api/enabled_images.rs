@@ -108,6 +108,7 @@ pub(crate) async fn enqueue_enable_job(
     state: &SharedState,
     image_uri: &str,
     config: &ImageConfig,
+    force_recapture: bool,
 ) -> Result<engram_core::types::EnableJob, ApiError> {
     config
         .validate()
@@ -116,7 +117,7 @@ pub(crate) async fn enqueue_enable_job(
     let job = state
         .services
         .meta
-        .create_or_get_enable_job(image_uri, None, config)
+        .create_or_get_enable_job_with_options(image_uri, None, config, force_recapture)
         .await?;
     if &job.image_config != config {
         return Err(ApiError::Conflict(format!(
@@ -127,7 +128,20 @@ pub(crate) async fn enqueue_enable_job(
             job.state.as_str(),
         )));
     }
+    if job.force_recapture != force_recapture {
+        return Err(ApiError::Conflict(format!(
+            "an enable job for `{image_uri}` is already in flight (id {}, state {}) with a \
+             different recapture setting; wait for it to finish (or retry it to terminal), \
+             then re-send this request",
+            job.id,
+            job.state.as_str(),
+        )));
+    }
     Ok(job)
+}
+
+fn base_snapshot_reuse_ok(config: &ImageConfig, force_recapture: bool) -> bool {
+    config.warm.is_none() && !force_recapture
 }
 
 /// ADR 0080 phase 3b: resolve the STATIC registry credential for
@@ -362,7 +376,8 @@ pub(crate) async fn capture_and_record_base_snapshot(
     row: &EnabledImage,
     // ADR 0081: the enable job whose capture this is — carries the
     // placement budgets and the id the host reservation is stamped
-    // onto — plus the scanner's claimant (every reservation write is
+    // onto (and the `force_recapture` flag that disables snapshot
+    // reuse) — plus the scanner's claimant (every reservation write is
     // lease-fenced) and how long to wait for capacity before failing
     // (the session queue timeout).
     job: &engram_core::types::EnableJob,
@@ -395,7 +410,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // (This is also what makes a warm-secret rotate actually take effect:
     // a re-enable with the same digest must not short-circuit to the stale
     // snapshot.)
-    let reuse_ok = config.warm.is_none();
+    let reuse_ok = base_snapshot_reuse_ok(&config, job.force_recapture);
 
     // ADR 0036 P4 / ADR 0080: content-keyed reuse. A base snapshot is a
     // function of (rootfs bytes, capture-affecting resources) — the
@@ -889,6 +904,28 @@ mod tests {
     use engram_core::traits::BlobStorage;
     use engram_storage_local::LocalBlobStorage;
     use std::sync::Arc;
+
+    #[test]
+    fn force_recapture_disables_base_snapshot_reuse() {
+        let plain: ImageConfig =
+            toml::from_str("name = \"plain\"\n[resources]\nsuggested_vcpus = 2\n").unwrap();
+        assert!(base_snapshot_reuse_ok(&plain, false));
+        assert!(!base_snapshot_reuse_ok(&plain, true));
+
+        let warm: ImageConfig = toml::from_str(
+            r#"
+            name = "warm"
+
+            [resources]
+            suggested_vcpus = 2
+
+            [warm]
+            command = ["true"]
+            "#,
+        )
+        .unwrap();
+        assert!(!base_snapshot_reuse_ok(&warm, false));
+    }
 
     /// Self-heal verify: a reuse candidate whose manifest chunks are all
     /// present in BlobStorage is reusable; a missing chunk (the reaped-base

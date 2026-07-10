@@ -503,7 +503,7 @@ bake-demo-enable:
     if "$cli" --json image list \
         | python3 -c "import sys,json; sys.exit(0 if any(i.get('image_uri')=='$uri' for i in json.load(sys.stdin).get('images',[])) else 1)"; then
         echo "==> $uri already enabled — refreshing (re-fetch moved tag + re-capture base snapshot)"
-        "$cli" image refresh --uri "$uri"
+        "$cli" image refresh --uri "$uri" --recapture
     else
         echo "==> enabling $uri (captures base snapshot)"
         "$cli" image enable --uri "$uri"
