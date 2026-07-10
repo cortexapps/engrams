@@ -119,6 +119,13 @@ done
 n=$(host_count)
 if [ "${n:-0}" -lt "$want_hosts" ]; then
     echo "ERROR: expected >= $want_hosts host-agent(s), got ${n:-0}" >&2
+    # The poll swallows the CLI's stderr (transient warm-up noise); on
+    # timeout, show ONE full attempt so the failure mode is visible.
+    echo "--- one un-silenced \`engrams --json hosts list\` attempt ---" >&2
+    { engrams --json hosts list || true; } >&2
+    echo "--- orchestrator /healthz + bun --version ---" >&2
+    { curl -sS "${ENGRAMS_URL}/healthz" || true; } >&2
+    { bun --version || true; } >&2
     dump_diagnostics
     exit 1
 fi
