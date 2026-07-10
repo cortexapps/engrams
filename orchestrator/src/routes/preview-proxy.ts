@@ -248,7 +248,7 @@ type FetchInit = RequestInit & { duplex?: "half" };
  * latency envelope (ADR 0064 "Latency").
  *
  * `targetPath` overrides the pathname+search sent to the guest (defaults to
- * the incoming request's own `url.pathname + url.search`). ADR 0081's IDE
+ * the incoming request's own `url.pathname + url.search`). ADR 0085's IDE
  * proxy (`routes/ide.ts`) uses this to strip the `/api/v1/sessions/:id/ide`
  * route prefix before forwarding to code-server, which expects root-relative
  * paths — everything else about the mechanics (loopback hop, header

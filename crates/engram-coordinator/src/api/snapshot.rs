@@ -274,7 +274,7 @@ pub(crate) async fn snapshot_core(
                 // frozen into a snapshot (Chrome RAM + dead sockets on resume). Reap it
                 // best-effort before the capture; the next EnsureBrowser re-lazy-starts it.
                 let _ = st.services.host.stop_browser(sandbox_id).await;
-                // ADR 0081: same for the IDE — a snapshotted code-server's listeners
+                // ADR 0085: same for the IDE — a snapshotted code-server's listeners
                 // resurrect wedged after restore (issue #567's lesson). Reap it
                 // best-effort; the next EnsureIde re-lazy-starts it.
                 let _ = st.services.host.stop_ide(sandbox_id).await;

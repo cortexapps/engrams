@@ -107,7 +107,7 @@ const { app: vncApp, injectUpgrade: injectVncUpgrade } = makeVncRoute();
 injectVncUpgrade(upgradeWebSocket);
 app.route("/", vncApp);
 
-// ADR 0081: in-guest IDE (code-server) HTTP proxy. Session-scoped + guarded;
+// ADR 0085: in-guest IDE (code-server) HTTP proxy. Session-scoped + guarded;
 // the WS half is the upgrade hook passed to buildServer below. Mounted after
 // shell/vnc (paths are disjoint; the preview middleware above is Host-keyed
 // and passes non-preview hosts straight through).
@@ -161,7 +161,7 @@ const server = buildServer(
   { upgradeWebSocket, wss, injectWebSocket },
   // Raw WS-upgrade hooks, tried in order before the shell/vnc path: the
   // preview proxy first (Host-keyed — a preview host is a different origin,
-  // so it wins outright), then the IDE proxy (path-keyed, ADR 0081).
+  // so it wins outright), then the IDE proxy (path-keyed, ADR 0085).
   [makePreviewUpgradeHandler(), makeIdeUpgradeHandler()],
 );
 

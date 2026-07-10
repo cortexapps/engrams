@@ -54,7 +54,7 @@ export type RouteRegistrar = (router: ConnectRouter) => void;
  * to the next hook. Handled here (not via the Hono app) because these proxies
  * need the raw socket, not a parsed request. Today's hooks: the preview proxy
  * (ADR 0064 P2b-ws, keyed on the `<slug>.<previewBaseDomain>` Host header) and
- * the IDE proxy (ADR 0081, keyed on the `/api/v1/sessions/:id/ide/*` path). */
+ * the IDE proxy (ADR 0085, keyed on the `/api/v1/sessions/:id/ide/*` path). */
 export type UpgradeHook = (
   req: IncomingMessage,
   socket: Socket,

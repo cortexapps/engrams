@@ -1,11 +1,11 @@
 /**
- * In-guest IDE proxy (ADR 0081 P4) — session-scoped HTTP + WebSocket.
+ * In-guest IDE proxy (ADR 0085 P4) — session-scoped HTTP + WebSocket.
  *
  * ALL /api/v1/sessions/:id/ide/*  (+ a redirect for the bare `/ide`)
  *
  * code-server (VS Code in the guest) serves plain HTTP assets AND speaks its
  * own WebSocket protocol on the same loopback port. This route fills the
- * missing proxy quadrant (ADR 0081 "Context"): session-path + better-auth
+ * missing proxy quadrant (ADR 0085 "Context"): session-path + better-auth
  * guard × full HTTP+WS passthrough.
  *
  *   - Auth: the same better-auth + CASL gate as /shell and /vnc, re-run on

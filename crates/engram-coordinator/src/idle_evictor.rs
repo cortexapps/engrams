@@ -422,7 +422,7 @@ pub(crate) async fn run_evict_pipeline(
         // snapshot so a live Chrome is never frozen into it (re-lazy-started on
         // the next EnsureBrowser after resume). Best-effort; never blocks eviction.
         let _ = state.services.host.stop_browser(sandbox_id).await;
-        // ADR 0081: same for the IDE — a live code-server's listeners would
+        // ADR 0085: same for the IDE — a live code-server's listeners would
         // resurrect wedged after restore (issue #567's lesson); the next
         // EnsureIde re-lazy-starts it. Best-effort; never blocks eviction.
         let _ = state.services.host.stop_ide(sandbox_id).await;

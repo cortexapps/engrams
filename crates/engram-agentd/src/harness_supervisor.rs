@@ -81,7 +81,7 @@ pub struct HarnessSupervisor {
     /// The session working directory, recorded from the reserved
     /// `HARNESS_CWD_ENV` key on each `SpawnHarness` frame (same lifecycle
     /// as `session_env`, including the empty-argv readiness probe). The
-    /// IDE (`StartIde`, ADR 0081) reads it back via
+    /// IDE (`StartIde`, ADR 0085) reads it back via
     /// [`Self::session_workdir`] so code-server opens on the workspace,
     /// not agentd's cwd (`/`). `None` when the frame carried no cwd
     /// (dev_vm / workdir-less images).
@@ -142,7 +142,7 @@ impl HarnessSupervisor {
         // dev_vm sessions deliver it on an empty-argv probe and never spawn
         // a harness, but their exec/shell processes still inherit it.
         *self.session_env.write().expect("session_env lock poisoned") = req.session_env.clone();
-        // ADR 0081: record the session workdir alongside — the IDE
+        // ADR 0085: record the session workdir alongside — the IDE
         // (`StartIde`) opens code-server on it, and like the env it must
         // land even on the readiness probe (dev_vm spawns no harness).
         *self

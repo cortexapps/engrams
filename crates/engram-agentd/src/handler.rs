@@ -234,7 +234,7 @@ where
         }
         WireRequest::StartIde { port } => {
             let port = port.unwrap_or(crate::ide::DEFAULT_IDE_PORT);
-            // ADR 0081: the IDE is a trusted first-party surface over the
+            // ADR 0085: the IDE is a trusted first-party surface over the
             // user's own workspace — unlike the browser it inherits the FULL
             // durable session env (mirrors the StartShell arm above), so its
             // integrated terminal behaves identically to the Shell tab. The

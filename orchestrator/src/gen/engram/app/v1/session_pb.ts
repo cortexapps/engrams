@@ -2051,7 +2051,7 @@ export const SessionService: GenService<{
     output: typeof EnsureBrowserResponseSchema;
   },
   /**
-   * ADR 0081: bring up the ephemeral in-guest IDE (code-server) for a
+   * ADR 0085: bring up the ephemeral in-guest IDE (code-server) for a
    * session and return its loopback HTTP port. The orchestrator calls this
    * before proxying the IDE tab's HTTP/WS traffic over a PortRelay tunnel
    * (ADR 0066), exactly as EnsureBrowser does for VNC.

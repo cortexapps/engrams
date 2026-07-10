@@ -1110,7 +1110,7 @@ impl SandboxBackend for VzBackend {
         Ok(())
     }
 
-    /// ADR 0081: ask agentd to ensure the in-guest IDE (code-server) is
+    /// ADR 0085: ask agentd to ensure the in-guest IDE (code-server) is
     /// running and answering `/healthz` on its loopback HTTP port. Mirrors
     /// [`Self::start_browser`]: the coordinator's `ensure_ide` calls this
     /// just before the orchestrator relays to the guest's port, so the
@@ -1156,7 +1156,7 @@ impl SandboxBackend for VzBackend {
         }
     }
 
-    /// ADR 0081: tear down the in-guest IDE. Idempotent — a no-op when the
+    /// ADR 0085: tear down the in-guest IDE. Idempotent — a no-op when the
     /// sandbox is gone or nothing is running.
     async fn stop_ide(&self, id: SandboxId) -> Result<(), SandboxError> {
         let vsock_uds_path = {

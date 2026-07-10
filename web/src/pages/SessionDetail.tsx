@@ -106,7 +106,7 @@ export function SessionDetail() {
   // present iff the session's profile selected the `browser` skill bundle. We
   // read that straight off the profile snapshot the masthead already shows.
   const browserEnabled = (profile?.skills ?? []).includes("browser");
-  // The in-guest IDE (code-server, ADR 0081) is the same shape of optional
+  // The in-guest IDE (code-server, ADR 0085) is the same shape of optional
   // capability, gated on the `ide` skill.
   const ideEnabled = (profile?.skills ?? []).includes("ide");
 

@@ -182,7 +182,7 @@ fn wire_request_golden_and_variant_indices() {
     assert_variant_index(&start_browser, 10, "WireRequest::StartBrowser");
     assert_variant_index(&WireRequest::StopBrowser, 11, "WireRequest::StopBrowser");
     assert_variant_index(&WireRequest::RefreshAgent, 12, "WireRequest::RefreshAgent");
-    // ADR 0081: appended after RefreshAgent.
+    // ADR 0085: appended after RefreshAgent.
     assert_variant_index(&start_ide, 13, "WireRequest::StartIde");
     assert_variant_index(&WireRequest::StopIde, 14, "WireRequest::StopIde");
 }
@@ -278,7 +278,7 @@ fn wire_response_golden_and_variant_indices() {
         12,
         "WireResponse::AgentRefreshed",
     );
-    // ADR 0081: appended after AgentRefreshed.
+    // ADR 0085: appended after AgentRefreshed.
     assert_variant_index(&ide_ready, 13, "WireResponse::IdeReady");
     assert_variant_index(&WireResponse::IdeStopped, 14, "WireResponse::IdeStopped");
 }

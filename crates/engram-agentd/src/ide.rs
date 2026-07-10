@@ -1,4 +1,4 @@
-//! In-guest IDE (code-server) lifecycle (ADR 0081).
+//! In-guest IDE (code-server) lifecycle (ADR 0085).
 //!
 //! Mirrors [`crate::browser`]'s hardened shape — probe-first fast path,
 //! force-stop a wedged pidfile stack before re-ensure (issue #567), spawn
@@ -36,7 +36,7 @@ use tokio::time::{sleep, timeout};
 /// dev-server ports so it doesn't collide with user workloads.
 pub const DEFAULT_IDE_PORT: u16 = 13337;
 
-/// Launcher symlinked onto PATH by the `ide` bundle (ADR 0081). Other
+/// Launcher symlinked onto PATH by the `ide` bundle (ADR 0085). Other
 /// images that bake the launcher into a different prefix can override the
 /// resolved path via `ENGRAM_IDE_BIN` in the agent environment.
 const DEFAULT_IDE_LAUNCHER: &str = "engram-ide";
@@ -93,7 +93,7 @@ pub struct IdeOutcome {
 /// `session_env` is the durable session environment (image `[env]` +
 /// secrets + session id) the host carried in on `SpawnHarness`, handed to
 /// the launcher **wholesale** — the IDE is a trusted first-party surface
-/// like the shell (ADR 0081), not allowlist-scrubbed like the browser.
+/// like the shell (ADR 0085), not allowlist-scrubbed like the browser.
 /// `workdir` is the session working directory (the harness cwd agentd
 /// recorded from the `SpawnHarness` frame), exported as
 /// `ENGRAM_IDE_WORKDIR` so the launcher opens code-server on the
@@ -570,7 +570,7 @@ sys.exit(0)
         assert_eq!(
             seen.get("FAKE_SESSION_SECRET").map(String::as_str),
             Some("hunter2"),
-            "full session env passthrough (ADR 0081): no allowlist scrub"
+            "full session env passthrough (ADR 0085): no allowlist scrub"
         );
 
         let again = again.unwrap().expect("re-probe should succeed");

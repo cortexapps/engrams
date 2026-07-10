@@ -314,7 +314,7 @@ pub enum WireRequest {
     /// captured agentd (warn, never a failed create) — by design.
     /// Appended last: see the APPEND-ONLY note above.
     RefreshAgent,
-    /// ADR 0081: ensure the in-guest IDE (code-server) is running and
+    /// ADR 0085: ensure the in-guest IDE (code-server) is running and
     /// serving HTTP on `port` (defaults to
     /// [`crate::ide::DEFAULT_IDE_PORT`], 13337). Lazy + idempotent,
     /// exactly like [`Self::StartBrowser`]: on first call the agent
@@ -334,7 +334,7 @@ pub enum WireRequest {
         /// Optional port override. `None` → 13337.
         port: Option<u16>,
     },
-    /// ADR 0081: tear down the IDE: the agent `killpg`s the launcher's
+    /// ADR 0085: tear down the IDE: the agent `killpg`s the launcher's
     /// process group so code-server and its helpers all reap together.
     /// Idempotent — a no-op when nothing is running. Replies
     /// [`WireResponse::IdeStopped`].

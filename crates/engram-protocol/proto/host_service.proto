@@ -163,7 +163,7 @@ service HostService {
   rpc StartBrowser(SandboxIdMessage) returns (BrowserPortResponse);
   rpc StopBrowser(SandboxIdMessage) returns (Empty);
 
-  // ADR 0081: bring up / tear down the ephemeral in-guest IDE (code-server).
+  // ADR 0085: bring up / tear down the ephemeral in-guest IDE (code-server).
   // StartIde is idempotent and returns the loopback HTTP port; the
   // coordinator's EnsureIde calls it, and the snapshot / idle-evict path
   // calls StopIde alongside StopBrowser so a live code-server is never

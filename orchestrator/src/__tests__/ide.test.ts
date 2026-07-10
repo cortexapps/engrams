@@ -1,5 +1,5 @@
 /**
- * In-guest IDE proxy (ADR 0081 P4) — HTTP + WS on the Bun runtime.
+ * In-guest IDE proxy (ADR 0085 P4) — HTTP + WS on the Bun runtime.
  *
  * Mirrors preview-{proxy,ws}.test.ts: only the coordinator PortRelay is faked
  * (a TCP bridge to a real in-process "guest" server standing in for

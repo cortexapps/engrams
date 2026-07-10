@@ -7473,7 +7473,7 @@ impl SandboxBackend for PooledBackend {
         self.inner.stop_browser(id).await
     }
 
-    /// ADR 0081: forward to inner, exactly as `start_browser` does — without
+    /// ADR 0085: forward to inner, exactly as `start_browser` does — without
     /// this the trait default (`Ok(13337)`) would run and the FC/VZ backend's
     /// actual vsock StartIde RPC to in-VM agentd would never fire, so the
     /// orchestrator would relay to a port nothing started.
@@ -7481,7 +7481,7 @@ impl SandboxBackend for PooledBackend {
         self.inner.start_ide(id).await
     }
 
-    /// ADR 0081: forward to inner (the trait default is a no-op).
+    /// ADR 0085: forward to inner (the trait default is a no-op).
     async fn stop_ide(&self, id: SandboxId) -> Result<(), SandboxError> {
         self.inner.stop_ide(id).await
     }
@@ -11189,7 +11189,7 @@ mod tests {
             );
         }
 
-        /// ADR 0081 regression guard: PooledBackend.start_ide MUST forward
+        /// ADR 0085 regression guard: PooledBackend.start_ide MUST forward
         /// to its inner backend. The trait default returns Ok(13337)
         /// WITHOUT touching the inner, so a deleted/regressed delegate
         /// would hand the orchestrator a port nothing started — the same
@@ -11217,7 +11217,7 @@ mod tests {
             );
         }
 
-        /// ADR 0081 regression guard: PooledBackend.stop_ide MUST forward
+        /// ADR 0085 regression guard: PooledBackend.stop_ide MUST forward
         /// to its inner backend. The trait default is a no-op, so a deleted
         /// delegate would silently never tear down the in-guest code-server
         /// while reporting success — and the inner's counter would stay at 0.

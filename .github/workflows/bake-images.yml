@@ -679,7 +679,7 @@ jobs:
           # + openbox + node + playwright-cli, pointed at that Chrome over CDP),
           # then squashfs. Subsumes the retired headless `playwright` bundle.
           deploy/bundles/browser/build.sh dist/browser.squashfs
-          # ide (ADR 0081): glibc Docker build (the pinned code-server
+          # ide (ADR 0085): glibc Docker build (the pinned code-server
           # standalone release, its bundled node patchelf'd self-contained
           # like browser), then squashfs.
           deploy/bundles/ide/build.sh dist/ide.squashfs

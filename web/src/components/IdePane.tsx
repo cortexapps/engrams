@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { API_BASE } from "../lib/base";
 import { PaneStatus } from "./PaneStatus";
 
-// In-browser IDE tab (ADR 0081). Unlike the Shell/Browser panes there is no
+// In-browser IDE tab (ADR 0085). Unlike the Shell/Browser panes there is no
 // client library and no socket for this component to own directly — the
 // orchestrator's `/api/v1/sessions/:id/ide/*` proxy serves code-server's own
 // web app (HTTP + its own WS handshake) same-origin, so the whole client is
@@ -29,7 +29,7 @@ const HEALTH_BACKOFF_INITIAL_MS = 500;
 const HEALTH_BACKOFF_MAX_MS = 5_000;
 // Past this many failed probes we stop polling silently and surface a
 // Reconnect affordance — a wedged launcher (e.g. the `ide` skill missing from
-// the baked image, ADR 0081 §Consequences) should say so rather than spin
+// the baked image, ADR 0085 §Consequences) should say so rather than spin
 // forever.
 const HEALTH_MAX_ATTEMPTS = 12;
 

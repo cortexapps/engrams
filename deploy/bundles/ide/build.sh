@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ADR 0081: build the opt-in `ide` RO bundle — the pinned code-server
+# ADR 0085: build the opt-in `ide` RO bundle — the pinned code-server
 # standalone release (VS Code web) + the engram-ide launcher agentd drives.
 #
 # The release tarball is PINNED — version + per-arch sha256 — from coder's

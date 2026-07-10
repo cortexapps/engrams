@@ -940,7 +940,7 @@ pub trait SandboxBackend: Send + Sync {
         Ok(())
     }
 
-    /// ADR 0081: ensure the in-guest IDE (code-server) is running and
+    /// ADR 0085: ensure the in-guest IDE (code-server) is running and
     /// answering on its loopback HTTP port, returning that port. FC/VZ
     /// override to send `StartIde` over the agentd channel; the dev
     /// ProcessBackend has no real guest and inherits this default (the
@@ -951,7 +951,7 @@ pub trait SandboxBackend: Send + Sync {
         Ok(13337)
     }
 
-    /// ADR 0081: tear down the in-guest IDE. Default no-op.
+    /// ADR 0085: tear down the in-guest IDE. Default no-op.
     async fn stop_ide(&self, _id: SandboxId) -> Result<(), SandboxError> {
         Ok(())
     }

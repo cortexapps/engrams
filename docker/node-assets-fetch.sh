@@ -111,7 +111,7 @@ integrations_cli_sha="$(stage_bundle integrations-cli)"
 # playwright-cli driving it over CDP), opt-in per session. Subsumes the retired
 # `playwright` bundle.
 browser_sha="$(stage_bundle browser)"
-# ADR 0081: the in-guest IDE (code-server), opt-in per session — agentd spawns
+# ADR 0085: the in-guest IDE (code-server), opt-in per session — agentd spawns
 # it lazily for the dashboard IDE tab.
 ide_sha="$(stage_bundle ide)"
 # ADR 0062: the built-in `claude` harness rides the stamp like a skill — the coord

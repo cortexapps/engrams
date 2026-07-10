@@ -1,5 +1,5 @@
 #!/bin/sh
-# ADR 0081 ide bundle launcher. Self-contained, glibc-linked; runs on any
+# ADR 0085 ide bundle launcher. Self-contained, glibc-linked; runs on any
 # glibc base — issue #569: NOT via LD_LIBRARY_PATH (the kernel always execs
 # the loader baked into each binary's PT_INTERP, so that only steers a loader
 # that is already running the base image's own), but because build.sh
@@ -13,7 +13,7 @@
 # opening the session workdir (ENGRAM_IDE_WORKDIR, set by agentd). Loopback
 # ONLY — reachability is the ADR 0066 vsock relay (agentd dials 127.0.0.1
 # in-guest and splices), so the IDE never listens on the guest network; the
-# only route to it is the auth-gated orchestrator proxy (ADR 0081 §4).
+# only route to it is the auth-gated orchestrator proxy (ADR 0085 §4).
 #
 # Unlike the browser (untrusted page rendering -> env allowlist + uid drop,
 # ADR 0065 §7), the IDE is a trusted first-party surface over the user's own
@@ -47,7 +47,7 @@ if [ "$(readlink -- "$BUNDLE_LINK" 2>/dev/null)" != "$here" ]; then
     }
 fi
 
-# --- Lazy, idempotent bring-up + agentd "registration" (ADR 0081) ------------
+# --- Lazy, idempotent bring-up + agentd "registration" (ADR 0085) ------------
 # agentd StartIde runs `engram-ide --ensure`. `--ensure` is idempotent —
 # code-server already answering /healthz means it is up — and flock-guarded so
 # concurrent ensures can't double-spawn. The daemon runs DETACHED in its own
@@ -153,7 +153,7 @@ trap cleanup TERM INT EXIT
 # just report not-ready; the next Ensure would race a half-dead pidfile). The
 # 1s pause keeps a hard launch failure from hot-looping. --auth none is safe
 # because the only route here is the better-auth-guarded orchestrator proxy
-# over the vsock relay (ADR 0081); telemetry/update-check/workspace-trust are
+# over the vsock relay (ADR 0085); telemetry/update-check/workspace-trust are
 # off — this is a headless, ephemeral, single-user server.
 launch=0
 while :; do

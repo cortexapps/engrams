@@ -43,7 +43,7 @@ export const BUILTIN_SKILLS: { name: string; label: string; description: string 
       "One shared Chromium the human drives over VNC (BROWSER tab) and the agent drives programmatically — same browser, so the human watches the agent live. Use an image sized for a browser (≥1 GiB).",
   },
   {
-    // ADR 0081: code-server as a trusted, human-only IDE surface over the
+    // ADR 0085: code-server as a trusted, human-only IDE surface over the
     // session workspace (mirror of the orchestrator's BUILTIN_SKILLS — keep
     // the two in sync).
     name: "ide",

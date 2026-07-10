@@ -1,4 +1,4 @@
-# ADR 0081: pinned version for the opt-in `ide` RO bundle. It ships the
+# ADR 0085: pinned version for the opt-in `ide` RO bundle. It ships the
 # code-server standalone release (VS Code served as a web app: one Node server,
 # plain HTTP + its own WebSocket protocol on the same port) plus the
 # engram-ide launcher agentd drives (StartIde -> `engram-ide --ensure`).
@@ -7,7 +7,7 @@
 # version (keep in lockstep with build.sh) + the bundle name the coordinator
 # resolves (a profile selects "ide").
 name = "ide"
-description = "In-guest IDE: code-server (VS Code web) opened on the session workspace, loopback-bound and reached over the ADR 0066 vsock relay through the session-scoped orchestrator proxy (ADR 0081)."
+description = "In-guest IDE: code-server (VS Code web) opened on the session workspace, loopback-bound and reached over the ADR 0066 vsock relay through the session-scoped orchestrator proxy (ADR 0085)."
 
 # Keep in lockstep with build.sh (which also pins the per-arch tarball sha256s).
 code_server_version = "4.127.0"

@@ -529,7 +529,7 @@ pub trait HostClient: Send + Sync {
         Ok(())
     }
 
-    /// ADR 0081: bring up the ephemeral in-guest IDE (code-server) and
+    /// ADR 0085: bring up the ephemeral in-guest IDE (code-server) and
     /// return its loopback HTTP port. The coordinator calls this before
     /// opening a relay tunnel to code-server :13337 (ADR 0066); the IDE is
     /// reached over the vsock port relay, not a direct dial. Default
@@ -539,7 +539,7 @@ pub trait HostClient: Send + Sync {
         Err(SandboxError::NotFound)
     }
 
-    /// ADR 0081: tear down the in-guest IDE. Called at the snapshot /
+    /// ADR 0085: tear down the in-guest IDE. Called at the snapshot /
     /// idle-eviction boundary (code-server is ephemeral and never
     /// snapshotted — its listeners would resurrect wedged after restore,
     /// issue #567's lesson), NOT on viewer disconnect. Default no-op; only

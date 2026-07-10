@@ -29,7 +29,7 @@ self-locate their runtime from `$0`, never a fixed mount path.
   SAME Chrome via the `playwright-cli` CLI (bash, no MCP server) — one shared
   browser. Selected by name `browser`. (Subsumes the retired headless-only
   `playwright` bundle.)
-- **`ide/`** (ADR 0081) — the opt-in in-guest IDE: the pinned code-server
+- **`ide/`** (ADR 0085) — the opt-in in-guest IDE: the pinned code-server
   standalone release (VS Code web) + the `engram-ide` launcher agentd drives
   lazily (StartIde → `engram-ide --ensure`). The bundled Node is glibc-dynamic,
   so build.sh gives it the same patchelf self-contained treatment as `browser/`
