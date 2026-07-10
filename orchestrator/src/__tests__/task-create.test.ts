@@ -153,6 +153,26 @@ describe("compileSessionCreateInput", () => {
     });
   });
 
+  test("a chat task from a SERVICE-ACCOUNT principal rides org_env (the CI smoke regression)", async () => {
+    // A `ci-<repo>` API key creates type:"chat" tasks (the only accepted
+    // type), but the service account has no per-user harness token — the
+    // programmatic flag must force the org-credential path or the harness
+    // boots credential-less ("not logged in", session 47723225).
+    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
+      type: "chat",
+      programmatic: true,
+    });
+    expect(inp.harnessEnv?.[USER_ENV]).toBeUndefined();
+    const policy = JSON.parse(inp.integrationPolicyJson!) as {
+      secrets?: Array<{ secret_ref: string; env_var: string; mode: string }>;
+    };
+    expect((policy.secrets ?? []).find((s) => s.env_var === ORG_ENV)).toMatchObject({
+      secret_ref: ORG_ENV,
+      env_var: ORG_ENV,
+      mode: "literal",
+    });
+  });
+
   test("passes the prompt through when set", async () => {
     const inp = await compileSessionCreateInput(profile(), deps(), { prompt: "do the thing" });
     expect(inp.prompt).toBe("do the thing");

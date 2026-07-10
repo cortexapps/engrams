@@ -51,6 +51,7 @@ import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 
 import { abilityFor } from "../authz/ability.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { isServiceAccountEmail } from "./api-key.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import {
@@ -151,12 +152,20 @@ function headersOf(ctx: HandlerContext): Headers {
 async function requireUser(
   ctx: HandlerContext,
   getSession: GetSession,
-): Promise<{ id: string; role: string }> {
+): Promise<{ id: string; role: string; serviceAccount: boolean }> {
   const session = await getSession(headersOf(ctx));
   if (!session) {
     throw new ConnectError("unauthenticated", Code.Unauthenticated);
   }
-  return { id: session.user.id, role: session.user.role ?? "user" };
+  return {
+    id: session.user.id,
+    role: session.user.role ?? "user",
+    // A global API key resolves to its service-account owner (ADR 0086) —
+    // a PROGRAMMATIC principal: it has no per-user harness token, so task
+    // compilation must take the org-credential path even for "chat" tasks
+    // (the CI create-session smoke failed "not logged in" without this).
+    serviceAccount: isServiceAccountEmail(session.user.email ?? ""),
+  };
 }
 
 /**
@@ -421,6 +430,10 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         {
           type: "chat",
           ownerUserId: user.id,
+          // A service-account creator (API key, e.g. CI) has no per-user
+          // harness token — compile the org-credential path (ADR 0063 B4)
+          // even though the task type is "chat".
+          ownerIsServiceAccount: user.serviceAccount,
           profileId: req.profileId,
           title: req.title ?? null,
           ...(req.prompt != null ? { prompt: req.prompt } : {}),

@@ -151,6 +151,17 @@ function SkeletonRows() {
   );
 }
 
+/** Owner column label. Service-account owners (ADR 0086 API keys, email
+ *  `apikey+…@service.local`) display their user NAME — which IS the key's
+ *  name (e.g. `ci-engineering-blog`) — instead of the synthetic email. */
+function ownerLabel(s: SessionListItem): string | null {
+  const email = s.owner_email ?? "";
+  if (email.startsWith("apikey+") && email.endsWith("@service.local")) {
+    return s.owner_name || email;
+  }
+  return s.owner_email;
+}
+
 function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }) {
   return (
     <li data-testid="session-row" data-session-id={s.id}>
@@ -181,7 +192,7 @@ function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }
                   </AvatarFallback>
                 </Avatar>
                 <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-                  {s.owner_email}
+                  {ownerLabel(s)}
                 </span>
               </>
             )}
