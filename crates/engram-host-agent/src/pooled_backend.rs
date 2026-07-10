@@ -772,6 +772,62 @@ fn spawn_leg_keepalive(
 }
 
 impl PooledBackend {
+    /// ADR 0019 / telemetry restoration (#526): read the uffd-handler's
+    /// per-jail prefault-effectiveness snapshot and emit the
+    /// `engram_resume_prefault_*` counters. Detached into a bounded,
+    /// backgrounded poll (spawned, non-blocking — restore must never wait
+    /// on it): `prefault_from_trace` runs on the handler's dedicated
+    /// background thread and only writes the file at the END of that
+    /// fetch, so a synchronous read raced the write and chronically
+    /// misclassified healthy replayed resumes as `stats_missing`. A file
+    /// that still isn't there after `PREFAULT_STATS_POLL_TIMEOUT` really
+    /// does mean the handler died or the wiring didn't fire — the alarm
+    /// the counter exists for. Outcome lands as attributes on a dedicated
+    /// `resume.prefault_stats` span carrying `sandbox_id` — detached work
+    /// gets its own span, correlated by attribute.
+    fn spawn_prefault_stats_probe(&self, id: SandboxId) {
+        let Some(stats_path) = self.prefault_stats_path(id) else {
+            return;
+        };
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                let stats_bytes = read_prefault_stats_with_retry(&stats_path).await;
+                let outcome = classify_prefault_outcome(stats_bytes.as_deref());
+                let span = tracing::Span::current();
+                span.record("outcome", outcome.label());
+                if let PrefaultOutcome::Replayed { installed, skipped } = outcome {
+                    span.record("installed", installed as u64);
+                    span.record("skipped", skipped as u64);
+                }
+                // The peer-fill snapshot (post-copy migration destinations
+                // only) — span attributes only, not a counter; only
+                // recorded when nonzero so the common non-peer resume
+                // doesn't carry four always-0 fields.
+                if let Some(peer) = parse_peer_fill_snapshot(stats_bytes.as_deref())
+                    .filter(PeerFillSnapshot::is_nonzero)
+                {
+                    span.record("peer_pulled", peer.peer_pulled);
+                    span.record("peer_alt_sourced", peer.peer_alt_sourced);
+                    span.record("peer_zero_chunks", peer.peer_zero_chunks);
+                    span.record("peer_live_faults", peer.peer_live_faults);
+                }
+                tracing::info!(outcome = outcome.label(), "resume prefault effectiveness");
+                emit_prefault_metrics(outcome);
+            },
+            tracing::info_span!(
+                "resume.prefault_stats",
+                sandbox_id = %id,
+                outcome = tracing::field::Empty,
+                installed = tracing::field::Empty,
+                skipped = tracing::field::Empty,
+                peer_pulled = tracing::field::Empty,
+                peer_alt_sourced = tracing::field::Empty,
+                peer_zero_chunks = tracing::field::Empty,
+                peer_live_faults = tracing::field::Empty,
+            ),
+        ));
+    }
+
     /// Capture-time egress (ADR 0080, wire v13): the capture VM gets a tap +
     /// guest IP like any sandbox, but no egress policy is registered for it,
     /// so the proxy denies its traffic as `UnknownGuest`. When the coordinator
@@ -1117,6 +1173,17 @@ impl PooledBackend {
         &self,
         metadata: SnapshotMetadata,
         fresh: bool,
+        // ADR 0077 phase 2: fork the disk manifest identity at NBD attach.
+        // True whenever this restore attaches a SHARED disk manifest (a
+        // fresh create off a base snapshot, or a capture VM restoring a
+        // shared cold base) — each consumer's flush chain must own a
+        // private lineage, exactly like the cold-create path
+        // (`try_spawn_nbd` fork=true). False for resume/rehydrate/
+        // migration, which re-attach the session's OWN already-forked id
+        // and must tick it, not fork again. Distinct from `fresh`: a
+        // Hit-capture restore is fork=true but fresh=false (it keeps the
+        // snapshot's pinned mounts and resume memory semantics).
+        fork_disk_at_attach: bool,
         // ADR 0055: per-session skills to patch into reserved slots (fresh only;
         // ignored on resume, which keeps the snapshot's pinned mounts).
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
@@ -1268,10 +1335,15 @@ impl PooledBackend {
         // canonical-rootfs symlinks.
         #[cfg(target_os = "linux")]
         let pending_nbd_state = tracing::Instrument::instrument(
-            self.prepare_resume_nbd_attach(&metadata, &src),
+            self.prepare_resume_nbd_attach(&metadata, &src, fork_disk_at_attach),
             tracing::info_span!("restore.prepare_nbd"),
         )
         .await?;
+        // Non-Linux has no NBD data plane — the fork decision has no seam
+        // to apply to (the materialize-to-file fallback below has no
+        // manifest chain).
+        #[cfg(not(target_os = "linux"))]
+        let _ = fork_disk_at_attach;
         // ADR 0045 C2: a staged post-copy destination arms its fetch
         // poller HERE — the earliest point the NBD handle exists. The
         // attach above used the presetup's published disk ref; the
@@ -6692,7 +6764,12 @@ impl SandboxBackend for PooledBackend {
         let row_template = migration.as_ref().map(|_| metadata.clone());
         // Resume keeps the snapshot's pinned mounts — no per-session selection.
         let id = self
-            .restore_with(metadata, /*fresh=*/ false, Vec::new())
+            .restore_with(
+                metadata,
+                /*fresh=*/ false,
+                /*fork_disk_at_attach=*/ false,
+                Vec::new(),
+            )
             .await?;
         match migration {
             Some(mig) if mig.post_copy => {
@@ -6717,73 +6794,7 @@ impl SandboxBackend for PooledBackend {
                 }
             }
         }
-        // ADR 0019 / telemetry restoration (#526): read the uffd-handler's
-        // per-jail prefault-effectiveness snapshot and emit the
-        // `engram_resume_prefault_*` counters.
-        //
-        // Review finding 1: this used to read `stats_path` synchronously
-        // the instant `restore_with` returned — i.e. the instant FC resumes
-        // vCPUs. But `prefault_from_trace` runs on the handler's dedicated
-        // background thread (ADR 0043 P1, deliberately off the resume
-        // critical path) and only writes the file at the END of that fetch
-        // (seconds; longer on the migration-dest path). Reading immediately
-        // raced the write and chronically misclassified healthy replayed
-        // resumes as `stats_missing`.
-        //
-        // Fix: detach the read into a bounded, backgrounded poll (spawned,
-        // non-blocking — `restore()` must never wait on it, the same
-        // guardrail that put the fetch on a background thread in the first
-        // place) that retries until the file shows up or a generous timeout
-        // elapses. A file that still isn't there after
-        // `PREFAULT_STATS_POLL_TIMEOUT` really does mean the handler died
-        // or the wiring didn't fire — the alarm the counter exists for.
-        //
-        // Finding 5: record the outcome as attributes on a dedicated
-        // `resume.prefault_stats` span (not the RPC's `host.restore` span)
-        // carrying `sandbox_id` for correlation — same "detached work gets
-        // its own span, correlated by attribute, not a fake/held-open
-        // parent" shape this PR already uses for scanner-driven pipelines
-        // and for `restore.prefetch_memory_bg` just above.
-        if let Some(stats_path) = self.prefault_stats_path(id) {
-            tokio::spawn(tracing::Instrument::instrument(
-                async move {
-                    let stats_bytes = read_prefault_stats_with_retry(&stats_path).await;
-                    let outcome = classify_prefault_outcome(stats_bytes.as_deref());
-                    let span = tracing::Span::current();
-                    span.record("outcome", outcome.label());
-                    if let PrefaultOutcome::Replayed { installed, skipped } = outcome {
-                        span.record("installed", installed as u64);
-                        span.record("skipped", skipped as u64);
-                    }
-                    // Finding 6: the peer-fill snapshot (post-copy
-                    // migration destinations only) — span attributes
-                    // only, not a counter; only recorded when nonzero so
-                    // the common non-peer resume doesn't carry four
-                    // always-0 fields.
-                    if let Some(peer) = parse_peer_fill_snapshot(stats_bytes.as_deref())
-                        .filter(PeerFillSnapshot::is_nonzero)
-                    {
-                        span.record("peer_pulled", peer.peer_pulled);
-                        span.record("peer_alt_sourced", peer.peer_alt_sourced);
-                        span.record("peer_zero_chunks", peer.peer_zero_chunks);
-                        span.record("peer_live_faults", peer.peer_live_faults);
-                    }
-                    tracing::info!(outcome = outcome.label(), "resume prefault effectiveness");
-                    emit_prefault_metrics(outcome);
-                },
-                tracing::info_span!(
-                    "resume.prefault_stats",
-                    sandbox_id = %id,
-                    outcome = tracing::field::Empty,
-                    installed = tracing::field::Empty,
-                    skipped = tracing::field::Empty,
-                    peer_pulled = tracing::field::Empty,
-                    peer_alt_sourced = tracing::field::Empty,
-                    peer_zero_chunks = tracing::field::Empty,
-                    peer_live_faults = tracing::field::Empty,
-                ),
-            ));
-        }
+        self.spawn_prefault_stats_probe(id);
         Ok(id)
     }
 
@@ -6802,7 +6813,12 @@ impl SandboxBackend for PooledBackend {
         // fresh lineage (see seed_checkpoint_chain_forked).
         let memory_ref = metadata.memory_manifest;
         let id = self
-            .restore_with(metadata, /*fresh=*/ true, selected_mounts)
+            .restore_with(
+                metadata,
+                /*fresh=*/ true,
+                /*fork_disk_at_attach=*/ true,
+                selected_mounts,
+            )
             .await?;
         if let Some(memory_ref) = memory_ref {
             self.seed_checkpoint_chain_forked(id, memory_ref).await;
@@ -7003,21 +7019,35 @@ impl SandboxBackend for PooledBackend {
         let id = match &cold_base_plan {
             ColdBasePlan::Hit { snapshot, .. } => {
                 let memory_ref = snapshot.memory_manifest;
-                let id = self.restore((**snapshot).clone()).await?;
-                // `restore()` seeded the checkpoint chain SPARSE — at the
-                // cold base's OWN manifest lineage. Correct for a session
-                // resuming its own snapshot; WRONG here: the cold base is
-                // shared across every capture that hits it, and the first
-                // capture's overlay already published `base_id@v2`, so a
-                // second hit's diff would collide ("version conflict:
-                // attempted v2, latest is v2" — the exact FC-lane CI
-                // failure this fixes). Same rule as session-create off a
-                // shared base template: each consumer's chain must own a
-                // FRESH lineage. Replace the sparse seed with a forked one.
+                // The cold base is SHARED across every capture that hits
+                // it, so BOTH lineages must fork a private chain (same
+                // rule as session-create off a shared base template):
+                //
+                // - memory: seed FORKED, not sparse — the first capture's
+                //   overlay already published `base_id@v2`, so a second
+                //   hit's diff would collide ("version conflict: attempted
+                //   v2, latest is v2" — the exact FC-lane CI failure the
+                //   forked seed fixed).
+                // - disk: `fork_disk_at_attach=true` — the warm hook's
+                //   writes flush through the NBD chain, and an unforked
+                //   attach would tick (and race) the cold base's shared
+                //   disk manifest chain exactly the same way.
+                //
+                // `fresh=false`: this is a resume of the cold base's
+                // pinned device model, not a session fresh-create — no
+                // per-session mount swap, resume memory semantics.
+                let id = self
+                    .restore_with(
+                        (**snapshot).clone(),
+                        /*fresh=*/ false,
+                        /*fork_disk_at_attach=*/ true,
+                        Vec::new(),
+                    )
+                    .await?;
                 if let Some(memory_ref) = memory_ref {
-                    self.checkpoint_chains.remove(&id);
                     self.seed_checkpoint_chain_forked(id, memory_ref).await;
                 }
+                self.spawn_prefault_stats_probe(id);
                 id
             }
             ColdBasePlan::Miss { .. } | ColdBasePlan::NotApplicable => self.create(spec).await?,
@@ -7302,7 +7332,12 @@ impl SandboxBackend for PooledBackend {
         //    current generation so new sessions run the latest skills.
         let memory_ref = metadata.memory_manifest;
         let id = self
-            .restore_with(metadata, /*fresh=*/ true, selected_mounts)
+            .restore_with(
+                metadata,
+                /*fresh=*/ true,
+                /*fork_disk_at_attach=*/ true,
+                selected_mounts,
+            )
             .await?;
         // ADR 0045 seed-at-create: the session's RAM == the base
         // manifest at this instant (see `restore_fresh`); seed the
@@ -7788,6 +7823,7 @@ impl PooledBackend {
         &self,
         metadata: &SnapshotMetadata,
         src: &std::path::Path,
+        fork_at_attach: bool,
     ) -> Result<Option<crate::disk_daemon::NbdSandboxState>, SandboxError> {
         let (pool, chunk_store, chunk_cache) = match (
             self.nbd_pool.as_ref(),
@@ -7846,16 +7882,20 @@ impl PooledBackend {
             );
             return Ok(Some(state));
         }
+        // Fork vs tick is the CALLER's call (see `restore_with`'s
+        // `fork_disk_at_attach`): a resume re-attaches the session's OWN
+        // already-forked manifest id (tick), while a fresh create off a
+        // base snapshot — or a capture VM restoring a shared cold base —
+        // attaches a SHARED manifest and must fork a private lineage.
+        // Hardcoding `false` here was the incident-2026-07-10 bug: every
+        // base-restored session published onto the shared base chain.
         let state = crate::disk_daemon::attach_manifest(
             disk_ref,
             chunk_cache.clone(),
             store_arc,
             pool,
             self.flush_config.dirty_threshold_bytes,
-            // Resume attaches the session's OWN already-forked manifest id
-            // (from its prior snapshot) — tick, don't fork.
-            /*fork_at_attach=*/
-            false,
+            fork_at_attach,
         )
         .await
         .map_err(|e| SandboxError::Vm(format!("nbd attach_manifest (resume): {e}").into()))?;

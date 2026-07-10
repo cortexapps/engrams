@@ -587,3 +587,98 @@ async fn high_offset_write_reads_back_through_the_device() {
     drop(f);
     drop(state);
 }
+
+/// Incident 2026-07-10 regression gate: `attach_manifest(fork=true)` —
+/// the fresh-restore-from-a-SHARED-base attach — must mint a PRIVATE
+/// manifest identity on its first flush instead of ticking the shared
+/// base chain. `prepare_resume_nbd_attach` used to hardcode
+/// `fork_at_attach=false`, so every session restored from a base
+/// snapshot (and every Hit-capture VM) published onto ONE shared chain:
+/// seven concurrent dev-brain VMs interleaved versions on `e038298c…`
+/// up to v1800+, making capture/restore version pins ambiguous. The
+/// backend-level fork semantics have unit tests; this guards the seam
+/// that actually failed — the flag reaching the attach helper.
+#[tokio::test]
+#[ignore = "requires modprobe nbd + writeable /dev/nbd0"]
+async fn forked_attach_first_flush_mints_private_id_and_leaves_base_chain_untouched() {
+    let nbd_path = PathBuf::from(
+        std::env::var("ENGRAM_TEST_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()),
+    );
+    if !nbd_path.exists() {
+        eprintln!("SKIP: {} not present", nbd_path.display());
+        return;
+    }
+    let work = tempfile::tempdir().expect("work");
+    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.path().join("blob")));
+    let store = ChunkStore::new(blob);
+    let mut cache_cfg = ChunkCacheConfig::new(work.path().join("cache"));
+    cache_cfg.budget_bytes = 256 * 1024 * 1024;
+    let cache = ChunkCache::new(cache_cfg);
+
+    // A tiny 2-chunk "base" manifest standing in for a shared base
+    // snapshot's disk lineage.
+    const CHUNK: u64 = 4096;
+    let mut chunks = Vec::new();
+    for i in 0..2u64 {
+        let body = vec![(i as u8) + 1; CHUNK as usize];
+        let hash = store.put_chunk(&body).await.expect("put chunk");
+        chunks.push(engram_chunk_store::manifest::ChunkRef {
+            offset: i * CHUNK,
+            hash,
+        });
+    }
+    let manifest = engram_chunk_store::Manifest {
+        schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+        kind: ManifestKind::Disk,
+        chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(CHUNK),
+        total_bytes: CHUNK * 2,
+        chunks,
+        parent: None,
+        working_set_trace: None,
+        annotations: serde_json::Value::Null,
+    };
+    let base_ref = ManifestRef::new();
+    store
+        .put_manifest(base_ref, &manifest)
+        .await
+        .expect("put base manifest");
+
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path]).expect("pool");
+    let store = Arc::new(store);
+    let state = attach_manifest(
+        base_ref,
+        cache,
+        store.clone(),
+        &pool,
+        u64::MAX,
+        /*fork=*/ true,
+    )
+    .await
+    .expect("forked attach");
+
+    // Dirty one chunk through the backend and flush — the FIRST publish
+    // of a forked attach adopts a private id at v1.
+    state
+        .backend
+        .write(0, &[0xAB; 64])
+        .await
+        .expect("dirty write");
+    let outcome = state.backend.flush().await.expect("flush");
+    assert_ne!(
+        outcome.manifest_ref.manifest_id, base_ref.manifest_id,
+        "first flush of a forked attach must mint a PRIVATE manifest id, \
+         not tick the shared base chain",
+    );
+    assert_eq!(
+        outcome.manifest_ref.version, 1,
+        "the private lineage starts at v1",
+    );
+    // The shared base chain must be untouched: its next version must
+    // not exist in the store.
+    let base_next = store.get_manifest(base_ref.next_version()).await;
+    assert!(
+        base_next.is_err(),
+        "the shared base chain must NOT have been ticked by a forked attach",
+    );
+    drop(state);
+}
