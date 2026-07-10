@@ -37,7 +37,8 @@ layer: how to build, test, and the conventions we hold.
 **Rust workspace** (`crates/`, ~35 members). Key binaries:
 `engram-coordinator`, `engram-host-agent`, `engram-host-operator` (K8s rollout, ADR
 0044), `engram-uffd-handler` (FC snapshot page-faulting, Linux-only), `engram-agentd`,
-`engram-cli` (admin CLI → coordinator app-gRPC), `engram-harness-claude`.
+`engram-harness-claude`. (The product CLI is `cli/` — Bun/TS `engrams`,
+orchestrator-native; the Rust `engram-cli` crate is retired.)
 (ADR 0080 retired `engram-image-builder`: a session image is a plain `docker build
 && docker push`, materialized host-side at enable time.) Notable libraries:
 `engram-core` (shared traits:
@@ -47,7 +48,10 @@ layer: how to build, test, and the conventions we hold.
 (standard OCI image → flattened ext4 rootfs + chunks, ADR 0080), `engram-postgres`,
 `engram-crypto`, `engram-egress-proxy`, `engram-transport`, `engram-telemetry`.
 
-**Other top-level:** `orchestrator/` (Bun), `web/` (pnpm), `deploy/` (helm,
+**Other top-level:** `orchestrator/` (Bun), `web/` (pnpm), `cli/` (Bun — the
+`engrams` product CLI; talks to the orchestrator, never the coordinator;
+`engrams auth login` or ENGRAMS_API_KEY, dev scripts read var/dev-api-key),
+`deploy/` (helm,
 migrations, packer, dev/, otel, bundles, kernel), `docker/` (per-image Dockerfiles),
 `docs/` (`adr/`, `runbooks/`, `history.md`, `known-issues.md`), `third_party/firecracker`
 (vendored fork), `.github/workflows/`.

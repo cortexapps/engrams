@@ -363,6 +363,37 @@ export const apikey = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Device-authorization grants — better-auth device-authorization plugin table
+// (the `engrams auth login` rail). Field set mirrors the plugin's `deviceCode`
+// model exactly (the drizzle adapter maps by TS property name; the exported
+// const name MUST be `deviceCode` — that's the model-name lookup key). Rows
+// are short-lived (10-minute expiry) and terminal-state rows are deleted by
+// the plugin on the token poll that consumes them.
+// ---------------------------------------------------------------------------
+
+export const deviceCode = pgTable(
+  "device_code",
+  {
+    id: text("id").primaryKey(),
+    deviceCode: text("device_code").notNull(),
+    userCode: text("user_code").notNull(),
+    // Set at approve time (the approving better-auth user).
+    userId: text("user_id"),
+    expiresAt: timestamp("expires_at").notNull(),
+    // pending | approved | denied.
+    status: text("status").notNull(),
+    lastPolledAt: timestamp("last_polled_at"),
+    pollingInterval: integer("polling_interval"),
+    clientId: text("client_id"),
+    scope: text("scope"),
+  },
+  (t) => [
+    index("device_code_device_code_idx").on(t.deviceCode), // token-poll lookup
+    index("device_code_user_code_idx").on(t.userCode), // approve/verify lookup
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // User session secrets — KEK-envelope sealed at rest (ADR 0051 Drip A)
 //
 // A generic, env-var-name-keyed per-user secret store. The orchestrator OWNS

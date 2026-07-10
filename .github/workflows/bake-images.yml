@@ -426,18 +426,16 @@ jobs:
             firecracker:application/octet-stream
           echo "Published forked firecracker -> $REPO:$FC_SHA"
 
-  # Compile the ops CLI ONCE — the exact, CI-tested binary — and publish it to
-  # GHCR as an OCI artifact keyed by SHA. Dogfood dev-image bakes (and any
-  # consuming repo) pull this to drive `engram` admin commands instead of
-  # compiling from a private source checkout — exactly how the FC-host bakes
-  # consume publish-host-binaries, and for the same reason: the bake that
-  # ships is the bake CI tested, and the consuming workflow needs no Rust
-  # toolchain. ADR 0080: engram-agentd LEFT this artifact (it ships as
-  # `bundle-agentd`), and the local `image build` bake + its bundled mke2fs
-  # retired too — cli-tools is now JUST the ops CLI (session / image enable /
-  # registry). engram-cli is the runner-native gnu build — it only ever runs
-  # on the ubuntu bake runner, so gnu is correct and dodges a musl reqwest/TLS
-  # rebuild.
+  # Compile the product CLI ONCE — the exact, CI-tested binary — and publish
+  # it to GHCR as an OCI artifact keyed by SHA. Consuming repos (the
+  # engrams-internal engram-cli action, engineering-blog scripts) pull this to
+  # drive `engrams` commands instead of compiling from a source checkout —
+  # exactly how the FC-host bakes consume publish-host-binaries. The CLI is
+  # Bun/TS (cli/ — the orchestrator-native rewrite retired the Rust
+  # engram-cli crate); `bun build --compile` emits self-contained binaries,
+  # cross-compiled per target from the one runner. The artifact carries
+  # `engrams` (runner-native linux x64 — what Actions consumers exec) plus
+  # `engrams-{linux-arm64,darwin-arm64}` for other hosts.
   publish-cli-tools:
     needs: detect
     if: needs.detect.outputs.cli_tools == 'true' || github.event_name == 'workflow_dispatch'
@@ -451,33 +449,25 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Set up Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      # engram-protocol/build.rs (transitively, via engram-cli) invokes
-      # protoc. Pin an exact tag — the action's default semver range hits the
-      # GitHub releases API, which flakes on the shared Blacksmith IP pool.
-      - uses: arduino/setup-protoc@v3
+      - uses: oven-sh/setup-bun@v2
         with:
-          version: "25.9"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          bun-version: latest
 
-      - name: Cache cargo build state
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build engram-cli (gnu)
+      - name: Build engrams (bun compile, per-target)
+        working-directory: cli
         run: |
-          # engram-cli drives the bake on the host runner; the runner-native gnu
-          # build is correct and avoids the musl reqwest/TLS rebuild.
-          cargo build --release -p engram-cli
-          mkdir -p dist
-          cp target/release/engram-cli dist/
-          file dist/engram-cli
+          bun install --frozen-lockfile
+          bun run typecheck
+          mkdir -p ../dist
+          bun build --compile --minify --target=bun-linux-x64 \
+            --outfile ../dist/engrams src/main.ts
+          bun build --compile --minify --target=bun-linux-arm64 \
+            --outfile ../dist/engrams-linux-arm64 src/main.ts
+          bun build --compile --minify --target=bun-darwin-arm64 \
+            --outfile ../dist/engrams-darwin-arm64 src/main.ts
+          file ../dist/engrams*
+          ../dist/engrams --version
 
-      # ADR 0080: cli-tools no longer bundles mke2fs. The local `image build`
-      # bake it fed is retired; the only mke2fs left is the enable-time
-      # materializer, which runs in the host-agent image
-      # (docker/host-agent.Dockerfile pins e2fsprogs >= 1.47.1 there).
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -495,11 +485,13 @@ jobs:
           set -euo pipefail
           REPO="ghcr.io/${{ github.repository }}/cli-tools"
           SHORT="${SHA:0:7}"
-          # `oras pull <repo>/cli-tools:<ref>` drops engram-cli into cwd
+          # `oras pull <repo>/cli-tools:<ref>` drops the binaries into cwd
           # (consumers chmod +x — oras doesn't preserve the bit).
           oras push "$REPO:$SHA" \
             --artifact-type application/vnd.engrams.cli-tools.v1 \
-            engram-cli:application/octet-stream
+            engrams:application/octet-stream \
+            engrams-linux-arm64:application/octet-stream \
+            engrams-darwin-arm64:application/octet-stream
           oras tag "$REPO:$SHA" "$SHORT"
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
             oras tag "$REPO:$SHA" "main"

@@ -215,7 +215,6 @@ crates/
   engram-coordinator                # binary: HTTP API + scheduler + GC scheduler
   engram-host-agent                 # binary: per-host daemon (chunked-OCI, NBD, reaper)
   engram-rootfs-materializer        # OCI image → whiteout-flattened ext4 + chunks (host-side)
-  engram-cli                        # binary: ops/admin tool
   engram-agentd                     # binary: in-guest exec daemon + harness supervisor
   engram-uffd-handler               # binary: userfaultfd page-fault handler
   engram-sandbox-firecracker        # SandboxBackend: FC microVMs (Linux production)

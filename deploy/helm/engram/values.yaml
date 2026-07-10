@@ -78,9 +78,9 @@ auth:
   existingSecret: ""
   secretKey: ENGRAM_AUTH_TOKENS
 
-# Coordinator app-gRPC surface (ADR 0051). The orchestrator (cross-pod) and
-# engram-cli (via kubectl port-forward) reach the coordinator over this gRPC
-# port. The deployment binds it on 0.0.0.0 (the coord default is loopback) and
+# Coordinator app-gRPC surface (ADR 0051). The orchestrator (cross-pod) —
+# the ONLY client since the `engrams` CLI moved to the orchestrator's
+# Connect surface — reaches the coordinator over this gRPC port. The deployment binds it on 0.0.0.0 (the coord default is loopback) and
 # the Service exposes a named `app-grpc` port. The surface is bearer-gated
 # (ENGRAM_APP_GRPC_TOKENS — fail-closed when empty) and must stay network-private
 # (ClusterIP / port-forward only; never internet-reachable).

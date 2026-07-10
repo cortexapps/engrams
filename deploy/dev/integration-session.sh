@@ -17,7 +17,7 @@
 #   PROMPT='hi' HARNESS=claude bash deploy/dev/integration-session.sh
 #
 # Cleanup: `just dev-down` reaps the session along with everything
-# else; or `engram-cli session delete $SID` directly.
+# else; or `engrams session delete $SID` directly.
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -26,14 +26,11 @@ COORD="http://127.0.0.1:8090"
 HARNESS="${HARNESS:-none}"
 PROMPT="${PROMPT:-}"
 
-# ADR 0051 Drip E: the coordinator's web-facing REST surface is gone —
-# enable/list images, list sessions, create + delete sessions all go
-# over the coord's app-gRPC via engram-cli. Endpoint + bearer default
-# to the Tiltfile's coord app-gRPC. (The `/healthz` check below is a
-# KEPT REST route, left as-is.)
-ENGRAM_CLI="${ENGRAM_INTEG_BIN_DIR:-./target/release}/engram-cli"
-export ENGRAM_APP_GRPC_ADDR="${ENGRAM_APP_GRPC_ADDR:-http://127.0.0.1:50061}"
-export ENGRAM_APP_GRPC_TOKENS="${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}"
+# Image + session verbs go through the `engrams` CLI → the orchestrator's
+# Connect surface (the coordinator app-gRPC is internal). Endpoint + admin
+# key default to the `just dev` stack (Tilt seeds var/dev-api-key). (The
+# coord `/healthz` check below is a KEPT internal REST route, left as-is.)
+source deploy/dev/engrams-cli.sh
 
 if ! curl -fsS "$COORD/healthz" >/dev/null 2>&1; then
     echo "ERROR: coord not reachable at $COORD" >&2
@@ -46,7 +43,7 @@ LOCAL_REGISTRY="localhost:5001"
 IMAGE_URI="$LOCAL_REGISTRY/integration-test/demo:warm-$SHORT"
 
 # Already enabled?
-already_enabled=$("$ENGRAM_CLI" --json image list 2>/dev/null \
+already_enabled=$(engrams --json image list 2>/dev/null \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('image_uri')=='$IMAGE_URI' for i in d.get('images',[])))" 2>/dev/null || echo False)
 
 if [ "$already_enabled" = "True" ]; then
@@ -66,7 +63,7 @@ fi
 # row doesn't carry a label field, so we filter by image+status and
 # pick the most recent. Best-effort: stale rows from prior runs are
 # possible if `just dev-down` didn't reap.
-existing_sid=$("$ENGRAM_CLI" --json session list 2>/dev/null \
+existing_sid=$(engrams --json session list 2>/dev/null \
     | python3 -c "
 import sys, json
 try:
@@ -100,7 +97,7 @@ else
     if [ -n "$PROMPT" ]; then
         CREATE_ARGS+=(--prompt "$PROMPT")
     fi
-    SID=$("$ENGRAM_CLI" "${CREATE_ARGS[@]}")
+    SID=$(engrams "${CREATE_ARGS[@]}")
     echo "    session_id=$SID"
 fi
 
@@ -108,13 +105,13 @@ echo ""
 echo "✓ session $SID is live — iterate:"
 echo ""
 echo "  # exec a one-shot command"
-echo "  $ENGRAM_CLI session exec $SID 'ls /'"
+echo "  engrams session exec $SID 'ls /'"
 echo ""
 echo "  # open the shell (browser, after port-forwarding)"
 echo "  open http://localhost:5173/sessions/$SID"
 echo ""
 echo "  # raw events"
-echo "  $ENGRAM_CLI session logs $SID"
+echo "  engrams session logs $SID"
 echo ""
 echo "  # tear down"
-echo "  $ENGRAM_CLI session delete $SID"
+echo "  engrams session delete $SID"

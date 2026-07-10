@@ -341,7 +341,12 @@ fc-colima-provision profile='fc-dev':
 reap-sessions profile='' mac_docker_context='colima':
     #!/usr/bin/env bash
     set -euo pipefail
-    export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
+    # The `engrams` CLI drives the orchestrator (the coordinator is internal);
+    # `just dev` seeds the admin credential into var/dev-api-key (Tilt's
+    # dev-api-key resource).
+    export ENGRAMS_URL="${ENGRAMS_URL:-http://localhost:8787}"
+    export ENGRAMS_API_KEY="${ENGRAMS_API_KEY:-$(cat var/dev-api-key 2>/dev/null || true)}"
+    [ -n "$ENGRAMS_API_KEY" ] || { echo "no ENGRAMS_API_KEY and no var/dev-api-key — is the stack up (just dev)?" >&2; exit 1; }
     # fc-colima profile for the VM-side stages (3 bundles, 4 snapshots). The
     # `{{profile}}` param wins; else fall back to ENGRAM_FC_COLIMA_PROFILE. Unlike
     # `just dev-fc`, a bare `just reap-sessions` has NO env var set (dev-fc sets it
@@ -367,26 +372,24 @@ reap-sessions profile='' mac_docker_context='colima':
         }'
     }
     echo "==> starting reaper"
-    echo "==> building engram-cli"
-    cargo build --quiet -p engram-cli
-    cli="$(cargo metadata --format-version=1 --no-deps \
-        | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])')/debug/engram-cli"
+    (cd cli && bun install --silent)
+    cli() { bun cli/src/main.ts "$@"; }
     before_kb="$(dir_kb "$sandboxes_dir")"; before_kb="${before_kb:-0}"
     # 1. Reap every live session via the production DeleteSession path.
-    echo "==> loading sessions from the coordinator"
-    ids="$("$cli" --json session list \
+    echo "==> loading sessions from the orchestrator"
+    ids="$(cli --json session list \
         | python3 -c 'import sys,json;print("\n".join(s["id"] for s in json.load(sys.stdin)["sessions"]))')"
     total=0; for id in $ids; do total=$((total+1)); done
     echo "found $total live session(s)"
     count=0
     for id in $ids; do
         printf '==> reaping %s ... ' "$id"
-        if "$cli" session delete "$id" >/dev/null 2>&1; then echo deleted; count=$((count+1)); else echo "(skipped)"; fi
+        if cli session delete "$id" >/dev/null 2>&1; then echo deleted; count=$((count+1)); else echo "(skipped)"; fi
     done
     echo "reaped $count live session(s)."
     # 2. Sweep orphaned rootfs files no still-live session owns.
     echo "==> sweeping orphaned sandbox rootfs files"
-    live=" $("$cli" --json session list \
+    live=" $(cli --json session list \
         | python3 -c 'import sys,json;print(" ".join(s["sandbox_id"] for s in json.load(sys.stdin)["sessions"] if s.get("sandbox_id")))') "
     shopt -s nullglob
     swept=0
@@ -492,25 +495,27 @@ reap-sessions profile='' mac_docker_context='colima':
 # Blob generations are pinned by snapshots: run `just reap-sessions` FIRST if
 # old sessions still reference the generations you want gone. Local staged-
 # file pruning (var/shared on the Mac, /opt/engram-dev/shared in the fc VM)
-# also lives in reap-sessions. The stack must be up (coordinator app-gRPC).
+# also lives in reap-sessions. The stack must be up — the `engrams` CLI
+# drives the orchestrator (:8787), which forwards FleetService (admin-gated).
 #
 # Deregister dead host rows + GC stale bundle/snapshot/chunk blobs (grace 0).
 reap-bundles:
     #!/usr/bin/env bash
     set -euo pipefail
-    export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
-    cargo build --quiet -p engram-cli
-    cli="$(cargo metadata --format-version=1 --no-deps \
-        | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])')/debug/engram-cli"
+    export ENGRAMS_URL="${ENGRAMS_URL:-http://localhost:8787}"
+    export ENGRAMS_API_KEY="${ENGRAMS_API_KEY:-$(cat var/dev-api-key 2>/dev/null || true)}"
+    [ -n "$ENGRAMS_API_KEY" ] || { echo "no ENGRAMS_API_KEY and no var/dev-api-key — is the stack up (just dev)?" >&2; exit 1; }
+    (cd cli && bun install --silent)
+    cli() { bun cli/src/main.ts "$@"; }
     echo "==> deregistering dead host rows"
-    dead="$("$cli" --json host list \
+    dead="$(cli --json host list \
         | python3 -c 'import sys,json;print("\n".join(h["id"] for h in json.load(sys.stdin)["hosts"] if h["status"]=="dead"))')"
     if [ -z "$dead" ]; then
         echo "  (no dead hosts)"
     else
         for id in $dead; do
             printf '  deleting dead host %s ... ' "$id"
-            if "$cli" host delete "$id" >/dev/null 2>&1; then
+            if cli host delete "$id" >/dev/null 2>&1; then
                 echo deleted
             else
                 echo "SKIPPED (sessions still bound? reap those first: just reap-sessions)"
@@ -518,7 +523,7 @@ reap-bundles:
         done
     fi
     echo "==> GC sweeps (apply, grace 0)"
-    "$cli" admin gc --apply --grace-secs 0
+    cli admin gc --apply --grace-secs 0
     echo "reap-bundles: done."
 
 # Params forward to reap-sessions (fc-colima profile + Mac docker context for
@@ -552,17 +557,21 @@ bake-demo-enable:
     #!/usr/bin/env bash
     set -euo pipefail
     bash deploy/dev/bake-demo.sh
-    export ENGRAM_APP_GRPC_ADDR="${ENGRAM_APP_GRPC_ADDR:-http://127.0.0.1:50061}"
-    export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
-    cli=./target/release/engram-cli
+    # The `engrams` CLI drives the orchestrator; `just dev` seeds the admin
+    # credential (Tilt's dev-api-key resource → var/dev-api-key).
+    export ENGRAMS_URL="${ENGRAMS_URL:-http://localhost:8787}"
+    export ENGRAMS_API_KEY="${ENGRAMS_API_KEY:-$(cat var/dev-api-key 2>/dev/null || true)}"
+    [ -n "$ENGRAMS_API_KEY" ] || { echo "no ENGRAMS_API_KEY and no var/dev-api-key — is the stack up (just dev)?" >&2; exit 1; }
+    (cd cli && bun install --silent)
+    cli() { bun cli/src/main.ts "$@"; }
     uri=localhost:5001/demo:warm-1
-    if "$cli" --json image list \
+    if cli --json image list \
         | python3 -c "import sys,json; sys.exit(0 if any(i.get('image_uri')=='$uri' for i in json.load(sys.stdin).get('images',[])) else 1)"; then
         echo "==> $uri already enabled — refreshing (re-fetch moved tag + re-capture base snapshot)"
-        "$cli" image refresh --uri "$uri" --recapture
+        cli image refresh --uri "$uri" --recapture
     else
         echo "==> enabling $uri (captures base snapshot)"
-        "$cli" image enable --uri "$uri"
+        cli image enable --uri "$uri"
     fi
 
 # Fetch the kernel artifact this host's backend needs (VZ → Kata arm64

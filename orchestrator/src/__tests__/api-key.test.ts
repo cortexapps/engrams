@@ -35,8 +35,12 @@ import { checkDb } from "../db/client.ts";
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
 const dbReachable = DB_URL ? await checkDb() : false;
 
-function makeGetSession(userId: string | null, role: "user" | "admin" = "user"): GetSession {
-  return async () => (userId ? { user: { id: userId, role } } : null);
+function makeGetSession(
+  userId: string | null,
+  role: "user" | "admin" = "user",
+  email = "human@example.com",
+): GetSession {
+  return async () => (userId ? { user: { id: userId, role, email } } : null);
 }
 
 async function spawn(deps?: ApiKeyDeps, mountAuth = false) {
@@ -92,18 +96,26 @@ async function expectErr(p: Promise<unknown>, code: Code) {
 interface Recorded {
   createdUsers: Array<{ name: string; role: string }>;
   deletedUsers: string[];
+  deletedKeyRows: string[];
   minted: Array<{ userId: string; name: string; expiresIn?: number }>;
   swept: number;
 }
 
 function fakeBackend(opts?: { mintFails?: boolean }): { backend: ApiKeyBackend; rec: Recorded } {
-  const rec: Recorded = { createdUsers: [], deletedUsers: [], minted: [], swept: 0 };
+  const rec: Recorded = {
+    createdUsers: [],
+    deletedUsers: [],
+    deletedKeyRows: [],
+    minted: [],
+    swept: 0,
+  };
   let nextUser = 0;
   const keys = new Map<string, { referenceId: string; email: string }>();
   const backend: ApiKeyBackend = {
     async createServiceUser(input) {
       rec.createdUsers.push(input);
-      return { id: `svc-${nextUser++}` };
+      const id = `svc-${nextUser++}`;
+      return { id, email: `apikey+${id}@service.local` };
     },
     async deleteUser(userId) {
       rec.deletedUsers.push(userId);
@@ -115,7 +127,11 @@ function fakeBackend(opts?: { mintFails?: boolean }): { backend: ApiKeyBackend; 
       const id = `key-${rec.minted.length}`;
       keys.set(id, {
         referenceId: input.userId,
-        email: `apikey+${input.userId}@service.local`,
+        // Mirror production ownership: svc-* users are service accounts,
+        // anything else is a human owner (CLI keys).
+        email: input.userId.startsWith("svc-")
+          ? `apikey+${input.userId}@service.local`
+          : "human@example.com",
       });
       return {
         id,
@@ -136,10 +152,15 @@ function fakeBackend(opts?: { mintFails?: boolean }): { backend: ApiKeyBackend; 
         createdAt: new Date("2026-07-09T00:00:00Z"),
         expiresAt: null,
         lastRequest: null,
+        ownerEmail: k.email,
       }));
     },
     async findKey(id) {
       return keys.get(id) ?? null;
+    },
+    async deleteKeyRow(id) {
+      rec.deletedKeyRows.push(id);
+      keys.delete(id);
     },
     async sweepOrphanServiceUsers() {
       rec.swept++;
@@ -274,8 +295,8 @@ describe("ApiKeyService (native, stubbed backend)", () => {
     }
   });
 
-  test("revoke refuses a key owned by a human user", async () => {
-    const { backend } = fakeBackend();
+  test("admin revoke of a human-owned CLI key deletes the key row, never the user", async () => {
+    const { backend, rec } = fakeBackend();
     const human: ApiKeyBackend = {
       ...backend,
       async findKey() {
@@ -284,7 +305,9 @@ describe("ApiKeyService (native, stubbed backend)", () => {
     };
     const s = await spawn({ getSession: makeGetSession("a", "admin"), backend: human });
     try {
-      await expectErr(s.client.revokeApiKey({ id: "k" }), Code.FailedPrecondition);
+      expect((await s.client.revokeApiKey({ id: "k" })).revoked).toBe(true);
+      expect(rec.deletedKeyRows).toEqual(["k"]);
+      expect(rec.deletedUsers).toHaveLength(0);
     } finally {
       await s.close();
     }
@@ -295,6 +318,99 @@ describe("ApiKeyService (native, stubbed backend)", () => {
     expect(isServiceAccountEmail("alice@example.com")).toBe(false);
     expect(isServiceAccountEmail("apikey+abc@example.com")).toBe(false);
     expect(isServiceAccountEmail("bob+apikey@service.local")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLI keys (CreateCliKey / RevokeCliKey) — stubbed backend
+// ---------------------------------------------------------------------------
+
+describe("ApiKeyService CLI keys (stubbed backend)", () => {
+  test("anon → Unauthenticated", async () => {
+    const s = await spawn({ getSession: makeGetSession(null), backend: fakeBackend().backend });
+    try {
+      await expectErr(s.client.createCliKey({ name: "cli" }), Code.Unauthenticated);
+      await expectErr(s.client.revokeCliKey({ id: "x" }), Code.Unauthenticated);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("service-account session → PermissionDenied (no key laundering)", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("svc-9", "admin", "apikey+svc-9@service.local"),
+      backend: fakeBackend().backend,
+    });
+    try {
+      await expectErr(s.client.createCliKey({ name: "cli" }), Code.PermissionDenied);
+      await expectErr(s.client.revokeCliKey({ id: "x" }), Code.PermissionDenied);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("member mints a key owned by THEMSELVES; empty name defaults to cli", async () => {
+    const { backend, rec } = fakeBackend();
+    const s = await spawn({ getSession: makeGetSession("u-alice"), backend });
+    try {
+      const r = await s.client.createCliKey({ name: "  " });
+      expect(rec.createdUsers).toHaveLength(0); // no service account involved
+      expect(rec.minted).toEqual([{ userId: "u-alice", name: "cli", expiresIn: undefined }]);
+      expect(rec.minted[0]!.expiresIn).toBeUndefined(); // non-expiring
+      expect(r.key).toBe("engk_plaintext-once");
+      expect(r.meta?.name).toBe("cli");
+      expect(r.meta?.role).toBe("user"); // the caller's role, not an assigned one
+      expect(r.meta?.expiresAt).toBe("");
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("whoAmI reflects the resolved principal; anon is Unauthenticated", async () => {
+    const anon = await spawn({ getSession: makeGetSession(null), backend: fakeBackend().backend });
+    const human = await spawn({
+      getSession: makeGetSession("u-1", "admin", "alice@example.com"),
+      backend: fakeBackend().backend,
+    });
+    const svc = await spawn({
+      getSession: makeGetSession("svc-1", "admin", "apikey+svc-1@service.local"),
+      backend: fakeBackend().backend,
+    });
+    try {
+      await expectErr(anon.client.whoAmI({}), Code.Unauthenticated);
+      const me = await human.client.whoAmI({});
+      expect(me.email).toBe("alice@example.com");
+      expect(me.role).toBe("admin");
+      expect(me.serviceAccount).toBe(false);
+      // A global key resolves to its service account — visible as such.
+      expect((await svc.client.whoAmI({})).serviceAccount).toBe(true);
+    } finally {
+      await anon.close();
+      await human.close();
+      await svc.close();
+    }
+  });
+
+  test("revokeCliKey: own key revokes the ROW only; foreign/absent read as false", async () => {
+    const { backend, rec } = fakeBackend();
+    const alice = await spawn({ getSession: makeGetSession("u-alice"), backend });
+    const mallory = await spawn({ getSession: makeGetSession("u-mallory"), backend });
+    try {
+      const r = await alice.client.createCliKey({ name: "cli:laptop" });
+      const id = r.meta!.id;
+      // Someone else's key reads exactly like an absent one (anti-enumeration).
+      expect((await mallory.client.revokeCliKey({ id })).revoked).toBe(false);
+      expect(rec.deletedKeyRows).toHaveLength(0);
+      // The owner revokes: key row deleted, the human user untouched.
+      expect((await alice.client.revokeCliKey({ id })).revoked).toBe(true);
+      expect(rec.deletedKeyRows).toEqual([id]);
+      expect(rec.deletedUsers).toHaveLength(0);
+      // Idempotent on retry.
+      expect((await alice.client.revokeCliKey({ id })).revoked).toBe(false);
+    } finally {
+      await alice.close();
+      await mallory.close();
+    }
   });
 });
 
@@ -436,6 +552,130 @@ describe("ApiKeyService (live DB + real plugin)", () => {
         const list = await fetch(`${s.url}/api/auth/api-key/list`, { headers: { cookie } });
         expect(list.status).toBe(404);
       } finally {
+        await s.close();
+      }
+    },
+  );
+
+  test.skipIf(!dbReachable)(
+    "device flow e2e: code → approve → token → CreateCliKey → keyed request as the human",
+    async () => {
+      const { getDb } = await import("../db/client.ts");
+      const { deviceCode, user } = await import("../db/schema.ts");
+      const { getSessionFromHeaders } = await import("../auth/session.ts");
+      const db = getDb();
+
+      const s = await spawn(undefined, /* mountAuth */ true);
+      const email = `device-${Date.now()}@example.com`;
+      let humanId: string | undefined;
+      let mintedUserCode: string | undefined;
+      try {
+        // --- the CLI leg: request a device code ---
+        const codeRes = await fetch(`${s.url}/api/auth/device/code`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ client_id: "engrams-cli" }),
+        });
+        expect(codeRes.ok).toBe(true);
+        const grant = (await codeRes.json()) as {
+          device_code: string;
+          user_code: string;
+          verification_uri: string;
+        };
+        expect(grant.user_code.length).toBeGreaterThan(0);
+        mintedUserCode = grant.user_code;
+        // The URI the CLI opens is the SPA page, not the plugin's JSON route.
+        expect(grant.verification_uri.endsWith("/device")).toBe(true);
+
+        // An unknown client_id is rejected outright.
+        const badClient = await fetch(`${s.url}/api/auth/device/code`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ client_id: "not-the-cli" }),
+        });
+        expect(badClient.status).toBe(400);
+
+        // --- poll before approval → authorization_pending ---
+        const tokenBody = JSON.stringify({
+          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+          device_code: grant.device_code,
+          client_id: "engrams-cli",
+        });
+        const pending = await fetch(`${s.url}/api/auth/device/token`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: tokenBody,
+        });
+        expect(pending.status).toBe(400);
+        expect(((await pending.json()) as { error: string }).error).toBe("authorization_pending");
+
+        // --- the browser leg: sign up + approve the user_code ---
+        const signup = await fetch(`${s.url}/api/auth/sign-up/email`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ email, password: "hunter2hunter2", name: "Device User" }),
+        });
+        expect(signup.ok).toBe(true);
+        humanId = ((await signup.json()) as { user: { id: string } }).user.id;
+        const cookie = signup.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+        // The verify GET CLAIMS the grant for this session (stamps userId on
+        // the row) — approve rejects an unclaimed code. The SPA's /device
+        // page does the same status fetch before rendering Approve/Deny.
+        const claim = await fetch(
+          `${s.url}/api/auth/device?user_code=${encodeURIComponent(grant.user_code)}`,
+          { headers: { cookie } },
+        );
+        expect(claim.ok).toBe(true);
+        expect(((await claim.json()) as { status: string }).status).toBe("pending");
+        const approve = await fetch(`${s.url}/api/auth/device/approve`, {
+          method: "POST",
+          headers: { "content-type": "application/json", cookie },
+          body: JSON.stringify({ userCode: grant.user_code }),
+        });
+        expect(approve.ok).toBe(true);
+
+        // --- poll again → the short-lived session token. Backdate the
+        // slow-down stamp first so the test doesn't sleep out the 5s interval.
+        await db
+          .update(deviceCode)
+          .set({ lastPolledAt: new Date(Date.now() - 60_000) })
+          .where(eq(deviceCode.userCode, grant.user_code));
+        const tokenRes = await fetch(`${s.url}/api/auth/device/token`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: tokenBody,
+        });
+        expect(tokenRes.ok).toBe(true);
+        const { access_token } = (await tokenRes.json()) as { access_token: string };
+
+        // --- the exchange: mint the durable CLI key with the bearer session ---
+        const minted = await s
+          .keyedClient({ authorization: `Bearer ${access_token}` })
+          .createCliKey({ name: "cli:e2e" });
+        expect(minted.key.startsWith("engk_")).toBe(true);
+
+        // --- the CLI key resolves to the HUMAN user at the seams ---
+        const viaKey = await getSessionFromHeaders(new Headers({ "x-api-key": minted.key }));
+        expect(viaKey?.user.id).toBe(humanId);
+        expect(viaKey?.user.email).toBe(email);
+
+        // --- logout path: the key revokes itself; second call idempotent ---
+        const keyed = s.keyedClient({ "x-api-key": minted.key });
+        expect((await keyed.revokeCliKey({ id: minted.meta!.id })).revoked).toBe(true);
+        expect(await getSessionFromHeaders(new Headers({ "x-api-key": minted.key }))).toBeNull();
+        // The human survives their key's revocation.
+        const alive = await db.select({ id: user.id }).from(user).where(eq(user.id, humanId));
+        expect(alive).toHaveLength(1);
+      } finally {
+        if (humanId) {
+          await db.delete(user).where(eq(user.id, humanId)).catch(() => {});
+        }
+        if (mintedUserCode) {
+          await db
+            .delete(deviceCode)
+            .where(eq(deviceCode.userCode, mintedUserCode))
+            .catch(() => {});
+        }
         await s.close();
       }
     },

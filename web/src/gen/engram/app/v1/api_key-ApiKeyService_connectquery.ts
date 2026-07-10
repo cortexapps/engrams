@@ -5,7 +5,8 @@
 import { ApiKeyService } from "./api_key_pb";
 
 /**
- * Mint a key. Returns metadata plus the one-time plaintext key.
+ * Mint a global service-account key. Admin-only. Returns metadata plus the
+ * one-time plaintext key.
  *
  * @generated from rpc engram.app.v1.ApiKeyService.CreateApiKey
  */
@@ -13,15 +14,48 @@ export const createApiKey = ApiKeyService.method.createApiKey;
 
 /**
  * List all keys (metadata only — masked preview, never hash or plaintext).
+ * Admin-only.
  *
  * @generated from rpc engram.app.v1.ApiKeyService.ListApiKeys
  */
 export const listApiKeys = ApiKeyService.method.listApiKeys;
 
 /**
- * Revoke a key: deletes its service-account user (the key row cascades).
- * Idempotent (revoking an absent key yields `revoked = false`, not an error).
+ * Revoke any key. For a service-account key this deletes its owning service
+ * user (the key row cascades); for a user-owned CLI key only the key row is
+ * deleted. Admin-only. Idempotent (revoking an absent key yields
+ * `revoked = false`, not an error).
  *
  * @generated from rpc engram.app.v1.ApiKeyService.RevokeApiKey
  */
 export const revokeApiKey = ApiKeyService.method.revokeApiKey;
+
+/**
+ * Mint a CLI key owned by the CALLER (the `engrams auth login` exchange:
+ * the CLI authenticates this call with the short-lived device-flow session
+ * and stores the returned key). Any authenticated HUMAN user; requests
+ * authenticated by a service-account key are rejected (no key laundering).
+ *
+ * @generated from rpc engram.app.v1.ApiKeyService.CreateCliKey
+ */
+export const createCliKey = ApiKeyService.method.createCliKey;
+
+/**
+ * Revoke a key the CALLER owns (the `engrams auth logout` path). A key
+ * owned by someone else reads as absent (`revoked = false`) —
+ * anti-enumeration. Idempotent.
+ *
+ * @generated from rpc engram.app.v1.ApiKeyService.RevokeCliKey
+ */
+export const revokeCliKey = ApiKeyService.method.revokeCliKey;
+
+/**
+ * Who is the caller? Any authenticated principal (cookie, device-session
+ * bearer, or API key). The CLI's `auth status`/login confirmation use this
+ * instead of better-auth's GET /api/auth/get-session because in prod that
+ * HTTP route stays behind IAP (it is the SPA's session-bootstrap), while
+ * /rpc/* is reachable by keyed callers.
+ *
+ * @generated from rpc engram.app.v1.ApiKeyService.WhoAmI
+ */
+export const whoAmI = ApiKeyService.method.whoAmI;

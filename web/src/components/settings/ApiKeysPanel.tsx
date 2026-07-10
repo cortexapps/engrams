@@ -48,12 +48,13 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-// Global API keys (ADR 0086) — admin-minted programmatic credentials. A key
-// carries its own role ('admin' | 'user') and authenticates requests via
-// `x-api-key: engk_…` or `Authorization: Bearer engk_…`. The plaintext is
-// shown exactly once at creation (only its hash is stored); the list shows a
-// masked preview. Revoking deletes the key's service account — it stops
-// authenticating immediately.
+// API keys (ADR 0086) — programmatic credentials, authenticated via
+// `x-api-key: engk_…` or `Authorization: Bearer engk_…`. Two shapes share the
+// list: GLOBAL keys (admin-minted here, owned by a service account whose role
+// is the key's authorization level) and CLI keys (self-minted by
+// `engrams auth login`, owned by the user — they act as that user). The
+// plaintext is shown exactly once at creation (only its hash is stored); the
+// list shows a masked preview. Revoking stops a key immediately.
 export function ApiKeysPanel() {
   const { data, isLoading, error } = useApiKeys();
   const rows = data?.keys ?? [];
@@ -81,6 +82,7 @@ export function ApiKeysPanel() {
           <TableHeader>
             <TableRow>
               <TableHead>Name</TableHead>
+              <TableHead>Owner</TableHead>
               <TableHead>Role</TableHead>
               <TableHead>Key</TableHead>
               <TableHead>Expires</TableHead>
@@ -99,11 +101,20 @@ export function ApiKeysPanel() {
   );
 }
 
+/** A service-account owner (apikey+…@service.local) marks an admin-minted
+ *  global key; anything else is a user-owned CLI key acting as that user. */
+function isServiceOwner(email: string): boolean {
+  return email.startsWith("apikey+") && email.endsWith("@service.local");
+}
+
 function KeyRow({ row }: { row: ApiKeyMeta }) {
   const revoke = useRevokeApiKey();
   return (
     <TableRow>
       <TableCell className="text-sm">{row.name}</TableCell>
+      <TableCell className="text-xs text-muted-foreground">
+        {isServiceOwner(row.ownerEmail) ? <Badge variant="outline">global</Badge> : row.ownerEmail}
+      </TableCell>
       <TableCell>
         <Badge variant={row.role === "admin" ? "default" : "secondary"}>{row.role}</Badge>
       </TableCell>

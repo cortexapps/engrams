@@ -14,7 +14,12 @@
  *     dedicated service-account user carrying the key's role. Keyed requests
  *     resolve to a mock session at getSession; the plugin's own HTTP
  *     endpoints are 404'd (hooks.before) — management is the admin-gated
- *     ApiKeyService only.
+ *     ApiKeyService only. CLI keys (user-owned, self-minted at
+ *     `engrams auth login`) share the table + seams — see rpc/api-key.ts.
+ *   - device-authorization + bearer plugins: the `engrams auth login` rail.
+ *     Device flow (RFC 8628) hands the CLI a short-lived session token; the
+ *     bearer plugin lets that token authenticate the ONE CreateCliKey
+ *     exchange that mints the durable user-owned API key.
  *   - drizzle adapter: writes to the same engram_orchestrator postgres
  *     database via the lazy getDb() singleton. We pass a Proxy that defers
  *     the getDb() call until the first property access so this module can
@@ -34,6 +39,8 @@ import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { admin } from "better-auth/plugins/admin";
+import { bearer } from "better-auth/plugins/bearer";
+import { deviceAuthorization } from "better-auth/plugins/device-authorization";
 import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import { apiKey } from "@better-auth/api-key";
 import { getDb } from "../db/client.ts";
@@ -44,6 +51,10 @@ import {
   promotedRoleOnLogin,
 } from "./admin-allowlist.ts";
 import { API_KEY_PREFIX, extractApiKey } from "./api-key-header.ts";
+
+/** The one OAuth client_id the device-authorization flow accepts (the
+ *  `engrams` CLI). Exported for tests; the CLI hardcodes the same string. */
+export const DEVICE_CLIENT_ID = "engrams-cli";
 
 // Bootstrap-admin allowlist (restores the old `auth.bootstrapAdmins` Helm
 // value via ORCHESTRATOR_ADMIN_EMAILS). When empty, both hooks below are
@@ -179,6 +190,34 @@ export const auth = betterAuth({
   plugins: [
     admin(), // role field ('admin'|'user'), setRole/ban/list APIs → Members UI
     ...oidcPlugins, // env-driven OIDC provider (genericOAuth) when configured
+    // The `engrams auth login` rail (RFC 8628 device flow): the CLI POSTs
+    // /api/auth/device/code, the user approves on the SPA's /device page
+    // (cookie-authed), and the CLI's /api/auth/device/token poll returns a
+    // short-lived session token it immediately exchanges for a durable
+    // user-owned key via ApiKeyService.CreateCliKey. The IAP bridge exempts
+    // exactly the two CLI-facing endpoints (code/token); approve/deny ride
+    // the browser session like any auth route.
+    deviceAuthorization({
+      expiresIn: "10m", // the login window; RFC-typical, well under the 30m default
+      interval: "5s",
+      // The SPA page, not the plugin's JSON GET /api/auth/device endpoint —
+      // this string is what the CLI shows and opens in the browser.
+      verificationUri: config.deviceVerificationUrl,
+      // One known client. Anything else is a confused or hostile caller.
+      validateClient: (clientId) => clientId === DEVICE_CLIENT_ID,
+      // The plugin's options zod (v4 z.custom) rejects an ABSENT schema key
+      // ("expected nonoptional"); an empty object means "stock model/field
+      // names" — which is exactly what db/schema.ts's deviceCode table mirrors.
+      schema: {},
+    }),
+    // Resolves `Authorization: Bearer <session token>` into a session — the
+    // ONE hop of the login exchange where the CLI holds a device-flow session
+    // token but no cookie jar and no API key yet. Tokens are HMAC-verified
+    // against the better-auth secret (an unsigned token is signed server-side
+    // before verification), so a junk bearer stays anonymous. engk_ bearers
+    // are consumed by the apiKey plugin instead (prefix-disjoint by design —
+    // see extractApiKey).
+    bearer(),
     // ADR 0086: global API keys. Each key's referenceId points at a dedicated
     // service-account user (apikey+<uuid>@service.local) whose `role` is the
     // key's authorization level; enableSessionForAPIKeys turns a valid keyed

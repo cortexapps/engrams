@@ -332,17 +332,48 @@ describe("IAP bridge — missing/invalid assertion → 401", () => {
     expect(nextCalled).toBe(true);
   });
 
-  // A junk key still passes the BRIDGE (presence is the routing signal) — the
-  // seams reject it. But a non-engk_ bearer is NOT an API key: fail closed.
-  test("Authorization: Bearer without the engk_ prefix does NOT bypass → 401", async () => {
+  // A non-engk_ bearer ALSO routes past the wall — that's the CLI login
+  // exchange (`Bearer <device session token>`, CreateCliKey). Presence is
+  // only the routing signal: the bearer plugin HMAC-verifies the token at
+  // the seams, so junk stays anonymous and fails closed there.
+  test("Authorization: Bearer without the engk_ prefix → next() (seams validate)", async () => {
     let nextCalled = false;
-    const { req, res, statusCode } = makeReqRes({ authorization: "Bearer some-oauth-token" });
+    const { req, res, statusCode, getSetCookie } = makeReqRes({
+      authorization: "Bearer some-session-token",
+    });
     await iapBridge(req, res, () => {
       nextCalled = true;
     });
 
-    expect(nextCalled).toBe(false);
-    expect(statusCode()).toBe(401);
+    expect(nextCalled).toBe(true);
+    expect(statusCode()).toBe(200);
+    expect(getSetCookie()).toBeUndefined();
+  });
+
+  // The device-authorization CLI endpoints (`engrams auth login`) are the
+  // anonymous login rail: the CLI has no identity yet when it requests a code
+  // and polls for the token. Both are inert without a browser-side approval,
+  // which DOES ride the normal IAP + cookie path.
+  test("device code/token endpoints bypass the bridge; approve does not", async () => {
+    for (const url of ["/api/auth/device/code", "/api/auth/device/token"]) {
+      let nextCalled = false;
+      const { req, res, statusCode } = makeReqRes({ url });
+      await iapBridge(req, res, () => {
+        nextCalled = true;
+      });
+      expect(nextCalled).toBe(true);
+      expect(statusCode()).toBe(200);
+    }
+    // The browser-side legs stay behind IAP.
+    for (const url of ["/api/auth/device", "/api/auth/device/approve", "/api/auth/device/deny"]) {
+      let nextCalled = false;
+      const { req, res, statusCode } = makeReqRes({ url });
+      await iapBridge(req, res, () => {
+        nextCalled = true;
+      });
+      expect(nextCalled).toBe(false);
+      expect(statusCode()).toBe(401);
+    }
   });
 
   // Health-check exemption: kubelet probes / GCP LB health checks bypass IAP

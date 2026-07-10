@@ -1,0 +1,26 @@
+{
+  "name": "engrams-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The engrams product CLI. Talks to the orchestrator's Connect RPC surface (never the coordinator).",
+  "type": "module",
+  "bin": {
+    "engrams": "src/main.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build --compile --minify --outfile dist/engrams src/main.ts"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.12.0",
+    "@connectrpc/connect": "^2.1.1",
+    "@connectrpc/connect-node": "^2.1.1",
+    "commander": "^14.0.2",
+    "smol-toml": "^1.4.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^7.0.2"
+  }
+}

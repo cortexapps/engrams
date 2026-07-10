@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/api_key.proto.
  */
 export const file_engram_app_v1_api_key: GenFile = /*@__PURE__*/
-  fileDesc("ChtlbmdyYW0vYXBwL3YxL2FwaV9rZXkucHJvdG8SDWVuZ3JhbS5hcHAudjEigQEKCkFwaUtleU1ldGESCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIMCgRyb2xlGAMgASgJEg0KBXN0YXJ0GAQgASgJEhIKCmNyZWF0ZWRfYXQYBSABKAkSEgoKZXhwaXJlc19hdBgGIAEoCRIUCgxsYXN0X3VzZWRfYXQYByABKAkiRQoTQ3JlYXRlQXBpS2V5UmVxdWVzdBIMCgRuYW1lGAEgASgJEgwKBHJvbGUYAiABKAkSEgoKZXhwaXJlc19hdBgDIAEoCSJMChRDcmVhdGVBcGlLZXlSZXNwb25zZRInCgRtZXRhGAEgASgLMhkuZW5ncmFtLmFwcC52MS5BcGlLZXlNZXRhEgsKA2tleRgCIAEoCSIUChJMaXN0QXBpS2V5c1JlcXVlc3QiPgoTTGlzdEFwaUtleXNSZXNwb25zZRInCgRrZXlzGAEgAygLMhkuZW5ncmFtLmFwcC52MS5BcGlLZXlNZXRhIiEKE1Jldm9rZUFwaUtleVJlcXVlc3QSCgoCaWQYASABKAkiJwoUUmV2b2tlQXBpS2V5UmVzcG9uc2USDwoHcmV2b2tlZBgBIAEoCDKXAgoNQXBpS2V5U2VydmljZRJXCgxDcmVhdGVBcGlLZXkSIi5lbmdyYW0uYXBwLnYxLkNyZWF0ZUFwaUtleVJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLkNyZWF0ZUFwaUtleVJlc3BvbnNlElQKC0xpc3RBcGlLZXlzEiEuZW5ncmFtLmFwcC52MS5MaXN0QXBpS2V5c1JlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLkxpc3RBcGlLZXlzUmVzcG9uc2USVwoMUmV2b2tlQXBpS2V5EiIuZW5ncmFtLmFwcC52MS5SZXZva2VBcGlLZXlSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5SZXZva2VBcGlLZXlSZXNwb25zZWIGcHJvdG8z");
+  fileDesc("ChtlbmdyYW0vYXBwL3YxL2FwaV9rZXkucHJvdG8SDWVuZ3JhbS5hcHAudjEilgEKCkFwaUtleU1ldGESCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIMCgRyb2xlGAMgASgJEg0KBXN0YXJ0GAQgASgJEhIKCmNyZWF0ZWRfYXQYBSABKAkSEgoKZXhwaXJlc19hdBgGIAEoCRIUCgxsYXN0X3VzZWRfYXQYByABKAkSEwoLb3duZXJfZW1haWwYCCABKAkiRQoTQ3JlYXRlQXBpS2V5UmVxdWVzdBIMCgRuYW1lGAEgASgJEgwKBHJvbGUYAiABKAkSEgoKZXhwaXJlc19hdBgDIAEoCSJMChRDcmVhdGVBcGlLZXlSZXNwb25zZRInCgRtZXRhGAEgASgLMhkuZW5ncmFtLmFwcC52MS5BcGlLZXlNZXRhEgsKA2tleRgCIAEoCSIUChJMaXN0QXBpS2V5c1JlcXVlc3QiPgoTTGlzdEFwaUtleXNSZXNwb25zZRInCgRrZXlzGAEgAygLMhkuZW5ncmFtLmFwcC52MS5BcGlLZXlNZXRhIiEKE1Jldm9rZUFwaUtleVJlcXVlc3QSCgoCaWQYASABKAkiJwoUUmV2b2tlQXBpS2V5UmVzcG9uc2USDwoHcmV2b2tlZBgBIAEoCCIjChNDcmVhdGVDbGlLZXlSZXF1ZXN0EgwKBG5hbWUYASABKAkiTAoUQ3JlYXRlQ2xpS2V5UmVzcG9uc2USJwoEbWV0YRgBIAEoCzIZLmVuZ3JhbS5hcHAudjEuQXBpS2V5TWV0YRILCgNrZXkYAiABKAkiIQoTUmV2b2tlQ2xpS2V5UmVxdWVzdBIKCgJpZBgBIAEoCSInChRSZXZva2VDbGlLZXlSZXNwb25zZRIPCgdyZXZva2VkGAEgASgIIg8KDVdob0FtSVJlcXVlc3QiZQoOV2hvQW1JUmVzcG9uc2USDwoHdXNlcl9pZBgBIAEoCRINCgVlbWFpbBgCIAEoCRIMCgRuYW1lGAMgASgJEgwKBHJvbGUYBCABKAkSFwoPc2VydmljZV9hY2NvdW50GAUgASgIMpAECg1BcGlLZXlTZXJ2aWNlElcKDENyZWF0ZUFwaUtleRIiLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQXBpS2V5UmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQXBpS2V5UmVzcG9uc2USVAoLTGlzdEFwaUtleXMSIS5lbmdyYW0uYXBwLnYxLkxpc3RBcGlLZXlzUmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuTGlzdEFwaUtleXNSZXNwb25zZRJXCgxSZXZva2VBcGlLZXkSIi5lbmdyYW0uYXBwLnYxLlJldm9rZUFwaUtleVJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLlJldm9rZUFwaUtleVJlc3BvbnNlElcKDENyZWF0ZUNsaUtleRIiLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQ2xpS2V5UmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQ2xpS2V5UmVzcG9uc2USVwoMUmV2b2tlQ2xpS2V5EiIuZW5ncmFtLmFwcC52MS5SZXZva2VDbGlLZXlSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5SZXZva2VDbGlLZXlSZXNwb25zZRJFCgZXaG9BbUkSHC5lbmdyYW0uYXBwLnYxLldob0FtSVJlcXVlc3QaHS5lbmdyYW0uYXBwLnYxLldob0FtSVJlc3BvbnNlYgZwcm90bzM");
 
 /**
  * Key metadata — everything EXCEPT the secret material.
@@ -66,6 +66,14 @@ export type ApiKeyMeta = Message<"engram.app.v1.ApiKeyMeta"> & {
    * @generated from field: string last_used_at = 7;
    */
   lastUsedAt: string;
+
+  /**
+   * Owner email. A service-account owner (apikey+…@service.local) marks a
+   * global key; a human email marks a user-owned CLI key.
+   *
+   * @generated from field: string owner_email = 8;
+   */
+  ownerEmail: string;
 };
 
 /**
@@ -198,19 +206,158 @@ export const RevokeApiKeyResponseSchema: GenMessage<RevokeApiKeyResponse> = /*@_
   messageDesc(file_engram_app_v1_api_key, 6);
 
 /**
- * ADR 0086: admin-managed global API keys. Orchestrator-NATIVE (never proxied
- * to the coordinator). Each key is owned by a dedicated service-account user
- * (apikey+<uuid>@service.local) whose `role` ('admin'|'user') is the key's
- * authorization level; a request bearing the key resolves to that identity at
- * the existing auth seams. ALL RPCs are admin-only. The key material is
- * SHA-256-hashed at rest; the plaintext is returned exactly once, from
- * CreateApiKey, and is never retrievable again.
+ * @generated from message engram.app.v1.CreateCliKeyRequest
+ */
+export type CreateCliKeyRequest = Message<"engram.app.v1.CreateCliKeyRequest"> & {
+  /**
+   * Display name, e.g. "cli:nikhils-macbook". Defaults to "cli" when empty.
+   *
+   * @generated from field: string name = 1;
+   */
+  name: string;
+};
+
+/**
+ * Describes the message engram.app.v1.CreateCliKeyRequest.
+ * Use `create(CreateCliKeyRequestSchema)` to create a new message.
+ */
+export const CreateCliKeyRequestSchema: GenMessage<CreateCliKeyRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_api_key, 7);
+
+/**
+ * @generated from message engram.app.v1.CreateCliKeyResponse
+ */
+export type CreateCliKeyResponse = Message<"engram.app.v1.CreateCliKeyResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.ApiKeyMeta meta = 1;
+   */
+  meta?: ApiKeyMeta;
+
+  /**
+   * The full plaintext key (engk_…). Shown ONCE; only its hash is stored.
+   *
+   * @generated from field: string key = 2;
+   */
+  key: string;
+};
+
+/**
+ * Describes the message engram.app.v1.CreateCliKeyResponse.
+ * Use `create(CreateCliKeyResponseSchema)` to create a new message.
+ */
+export const CreateCliKeyResponseSchema: GenMessage<CreateCliKeyResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_api_key, 8);
+
+/**
+ * @generated from message engram.app.v1.RevokeCliKeyRequest
+ */
+export type RevokeCliKeyRequest = Message<"engram.app.v1.RevokeCliKeyRequest"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+};
+
+/**
+ * Describes the message engram.app.v1.RevokeCliKeyRequest.
+ * Use `create(RevokeCliKeyRequestSchema)` to create a new message.
+ */
+export const RevokeCliKeyRequestSchema: GenMessage<RevokeCliKeyRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_api_key, 9);
+
+/**
+ * @generated from message engram.app.v1.RevokeCliKeyResponse
+ */
+export type RevokeCliKeyResponse = Message<"engram.app.v1.RevokeCliKeyResponse"> & {
+  /**
+   * Whether a key was revoked (idempotent; an unowned/unknown id is `false`).
+   *
+   * @generated from field: bool revoked = 1;
+   */
+  revoked: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.RevokeCliKeyResponse.
+ * Use `create(RevokeCliKeyResponseSchema)` to create a new message.
+ */
+export const RevokeCliKeyResponseSchema: GenMessage<RevokeCliKeyResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_api_key, 10);
+
+/**
+ * @generated from message engram.app.v1.WhoAmIRequest
+ */
+export type WhoAmIRequest = Message<"engram.app.v1.WhoAmIRequest"> & {
+};
+
+/**
+ * Describes the message engram.app.v1.WhoAmIRequest.
+ * Use `create(WhoAmIRequestSchema)` to create a new message.
+ */
+export const WhoAmIRequestSchema: GenMessage<WhoAmIRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_api_key, 11);
+
+/**
+ * @generated from message engram.app.v1.WhoAmIResponse
+ */
+export type WhoAmIResponse = Message<"engram.app.v1.WhoAmIResponse"> & {
+  /**
+   * @generated from field: string user_id = 1;
+   */
+  userId: string;
+
+  /**
+   * @generated from field: string email = 2;
+   */
+  email: string;
+
+  /**
+   * @generated from field: string name = 3;
+   */
+  name: string;
+
+  /**
+   * "admin" | "user".
+   *
+   * @generated from field: string role = 4;
+   */
+  role: string;
+
+  /**
+   * True when the caller is a service-account principal (a global key).
+   *
+   * @generated from field: bool service_account = 5;
+   */
+  serviceAccount: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.WhoAmIResponse.
+ * Use `create(WhoAmIResponseSchema)` to create a new message.
+ */
+export const WhoAmIResponseSchema: GenMessage<WhoAmIResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_api_key, 12);
+
+/**
+ * ADR 0086: global API keys. Orchestrator-NATIVE (never proxied to the
+ * coordinator). Two key ownership shapes share the table and the auth seams:
+ *
+ *   - Global (service-account) keys: admin-minted via CreateApiKey; each is
+ *     owned by a dedicated service-account user (apikey+<uuid>@service.local)
+ *     whose `role` ('admin'|'user') is the key's authorization level.
+ *   - CLI (user-owned) keys: self-minted via CreateCliKey during
+ *     `engrams auth login`; owned by the CALLING user, so a request bearing
+ *     the key resolves to that user with their own role/ownership.
+ *
+ * The key material is SHA-256-hashed at rest; the plaintext is returned
+ * exactly once, from Create*, and is never retrievable again.
  *
  * @generated from service engram.app.v1.ApiKeyService
  */
 export const ApiKeyService: GenService<{
   /**
-   * Mint a key. Returns metadata plus the one-time plaintext key.
+   * Mint a global service-account key. Admin-only. Returns metadata plus the
+   * one-time plaintext key.
    *
    * @generated from rpc engram.app.v1.ApiKeyService.CreateApiKey
    */
@@ -221,6 +368,7 @@ export const ApiKeyService: GenService<{
   },
   /**
    * List all keys (metadata only — masked preview, never hash or plaintext).
+   * Admin-only.
    *
    * @generated from rpc engram.app.v1.ApiKeyService.ListApiKeys
    */
@@ -230,8 +378,10 @@ export const ApiKeyService: GenService<{
     output: typeof ListApiKeysResponseSchema;
   },
   /**
-   * Revoke a key: deletes its service-account user (the key row cascades).
-   * Idempotent (revoking an absent key yields `revoked = false`, not an error).
+   * Revoke any key. For a service-account key this deletes its owning service
+   * user (the key row cascades); for a user-owned CLI key only the key row is
+   * deleted. Admin-only. Idempotent (revoking an absent key yields
+   * `revoked = false`, not an error).
    *
    * @generated from rpc engram.app.v1.ApiKeyService.RevokeApiKey
    */
@@ -239,6 +389,45 @@ export const ApiKeyService: GenService<{
     methodKind: "unary";
     input: typeof RevokeApiKeyRequestSchema;
     output: typeof RevokeApiKeyResponseSchema;
+  },
+  /**
+   * Mint a CLI key owned by the CALLER (the `engrams auth login` exchange:
+   * the CLI authenticates this call with the short-lived device-flow session
+   * and stores the returned key). Any authenticated HUMAN user; requests
+   * authenticated by a service-account key are rejected (no key laundering).
+   *
+   * @generated from rpc engram.app.v1.ApiKeyService.CreateCliKey
+   */
+  createCliKey: {
+    methodKind: "unary";
+    input: typeof CreateCliKeyRequestSchema;
+    output: typeof CreateCliKeyResponseSchema;
+  },
+  /**
+   * Revoke a key the CALLER owns (the `engrams auth logout` path). A key
+   * owned by someone else reads as absent (`revoked = false`) —
+   * anti-enumeration. Idempotent.
+   *
+   * @generated from rpc engram.app.v1.ApiKeyService.RevokeCliKey
+   */
+  revokeCliKey: {
+    methodKind: "unary";
+    input: typeof RevokeCliKeyRequestSchema;
+    output: typeof RevokeCliKeyResponseSchema;
+  },
+  /**
+   * Who is the caller? Any authenticated principal (cookie, device-session
+   * bearer, or API key). The CLI's `auth status`/login confirmation use this
+   * instead of better-auth's GET /api/auth/get-session because in prod that
+   * HTTP route stays behind IAP (it is the SPA's session-bootstrap), while
+   * /rpc/* is reachable by keyed callers.
+   *
+   * @generated from rpc engram.app.v1.ApiKeyService.WhoAmI
+   */
+  whoAmI: {
+    methodKind: "unary";
+    input: typeof WhoAmIRequestSchema;
+    output: typeof WhoAmIResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_api_key, 0);

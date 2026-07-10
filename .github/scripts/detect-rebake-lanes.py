@@ -23,12 +23,12 @@ Lanes:
   host_image    host_binaries OR host_base. The union gates the OSS
                 publish-host-binaries job — the GHCR artifact must exist at
                 this SHA for either downstream bake to consume.
-  cli_tools     engram-cli changed — release closure of {engram-cli}.
-                Gates the OSS publish-cli-tools job, which republishes the
-                "golden" cli GHCR artifact (cli-tools) that dogfood dev-image
-                bakes pull to drive `engram` admin commands instead of
-                recompiling. Same role publish-host-binaries plays for the
-                FC-host bakes.
+  cli_tools     the `engrams` CLI changed — cli/ sources or the protos it
+                codegens from (no cargo closure: the CLI is Bun/TS since the
+                orchestrator-native rewrite). Gates the OSS publish-cli-tools
+                job, which republishes the "golden" cli GHCR artifact
+                (cli-tools) that CI consumers pull instead of recompiling.
+                Same role publish-host-binaries plays for the FC-host bakes.
   tf_or_helm    deploy/terraform/ + deploy/helm/
   dev_image     dev-engrams dogfood rebake — images OR host_binaries OR
                 host_base OR the release closure of {engram-harness-claude}
@@ -75,14 +75,13 @@ CONTAINER_BINS = {
 # NEITHER the container nor the host closure, so without this lane a
 # harness-only change shipped nothing (the bug this gate fixes).
 SESSION_HARNESS_BINS = {"engram-harness-claude"}
-# The ops CLI. OSS publishes it once as the `cli-tools` GHCR artifact
-# (publish-cli-tools); dogfood dev-image bakes pull that instead of compiling
-# from a source checkout — exactly how the FC-host bakes consume
-# publish-host-binaries. ADR 0080: engram-agentd LEFT this set — agentd is no
-# longer injected into any image; it ships as `bundle-agentd` (see AGENTD_BINS
-# below), so an agentd change republishes a bundle instead of re-baking every
-# session image (the dev-brain wedge this ADR kills).
-CLI_TOOLS_BINS = {"engram-cli"}
+# The product CLI (`engrams`, cli/ — Bun/TS, orchestrator-native; the Rust
+# engram-cli crate is retired). No cargo closure: its inputs are its own
+# sources + the generated proto bindings. OSS publishes it once as the
+# `cli-tools` GHCR artifact (publish-cli-tools); CI consumers pull that
+# instead of recompiling — exactly how the FC-host bakes consume
+# publish-host-binaries.
+CLI_PATHS = ["cli/"]
 # ADR 0080: the in-guest agent, exec'd out of its reserved bundle slot by the
 # stage-1 init. A change to it (or its release closure) must republish
 # `bundle-agentd` via publish-bundles — the identical coupling (and failure
@@ -90,14 +89,14 @@ CLI_TOOLS_BINS = {"engram-cli"}
 # fresh create runs yesterday's agentd.
 AGENTD_BINS = {"engram-agentd"}
 # The binaries the `test-e2e-stack` lane builds + boots: coord + host-agent
-# (the stack), cli (drives enable/registry), agentd (staged into the host
-# bundle stamp; ADR 0080), and harness-claude (likewise; ADR 0062). A
-# change anywhere in their release closure means the e2e lane could behave
+# (the stack), agentd (staged into the host bundle stamp; ADR 0080), and
+# harness-claude (likewise; ADR 0062). The `engrams` CLI (which drives
+# enable/registry in that lane) is not a crate — it rides E2E_PATHS via
+# `cli/`. A change anywhere in this closure means the e2e lane could behave
 # differently, so run it. Gates the (expensive, non-required) e2e lane.
 E2E_BINS = {
     "engram-coordinator",
     "engram-host-agent",
-    "engram-cli",
     "engram-agentd",
     "engram-harness-claude",
 }
@@ -139,7 +138,7 @@ BUNDLES_PATHS = ["deploy/bundles/"]
 # change. We trip its rebake on the union of what it builds — the container +
 # host source closures (computed below) plus the dev-orchestration inputs
 # here. Doc/TF-only pushes don't rebake it.
-DEV_IMAGE_PATHS = ["justfile", "flake.nix", "flake.lock", "Tiltfile", "deploy/dev/"]
+DEV_IMAGE_PATHS = ["justfile", "flake.nix", "flake.lock", "Tiltfile", "deploy/dev/", "cli/"]
 # ADR 0045 Phase B: the vendored Firecracker fork (a submodule + the `.gitmodules`
 # gitlink). Bumping the submodule pointer (the daily auto-rebase, or a manual
 # port) changes the FC *binary* the node-assets image stages, so it must rebuild
@@ -156,6 +155,8 @@ E2E_PATHS = [
     "Tiltfile",
     "deploy/demo/",
     "deploy/bundles/",
+    "cli/",  # the `engrams` CLI drives enable/registry/session in the lane
+    "orchestrator/",  # the product tier the stack (and the CLI) runs through
     ".github/workflows/ci.yml",
     ".github/scripts/detect-rebake-lanes.py",
 ]
@@ -274,7 +275,6 @@ def main():
     cont = release_closure(meta, CONTAINER_BINS)
     harness = release_closure(meta, SESSION_HARNESS_BINS)
     agentd_closure = release_closure(meta, AGENTD_BINS)
-    cli_tools_closure = release_closure(meta, CLI_TOOLS_BINS)
     e2e_closure = release_closure(meta, E2E_BINS)
 
     # ADR 0045 Phase B: a Firecracker-fork bump (submodule pointer) restages the
@@ -287,14 +287,13 @@ def main():
     # Union — gates the publish-host-binaries job so the GHCR artifact exists
     # at this SHA for whichever downstream bake (thin and/or base) fires.
     host_image = host_binaries or host_base
-    # Golden cli artifact (cli-tools = just engram-cli). Republish whenever its
-    # release closure moved or a conservative common trigger (lockfile / root
-    # manifest / the bake workflow / this script) changed. ADR 0080: cli-tools
-    # no longer bundles mke2fs (the `engram image build` bake retired with
-    # engram-image-builder; the only mke2fs left rides the host-agent image),
-    # so a flake.nix/flake.lock re-pin no longer needs to republish cli-tools.
-    cli_tools = (bool(cc & cli_tools_closure)
-                 or any_path(changed, BINARY_COMMON))
+    # Golden cli artifact (cli-tools = the Bun-compiled `engrams` binary).
+    # Republish whenever cli/ sources moved, the protos it codegens from
+    # changed, or the bake workflow / this script changed. No cargo terms:
+    # the orchestrator-native rewrite took the CLI out of the Rust workspace.
+    cli_tools = (any_path(changed, CLI_PATHS)
+                 or any_path(changed, PROTO_PATHS)
+                 or any_path(changed, BAKE_ALL_PATHS))
     tf_or_helm = any_path(changed, TF_HELM_PATHS)
     # The dogfood image builds the whole repo via `just dev`, so it's stale on
     # any source the container/host bakes consume, plus the dev-orchestration
@@ -348,9 +347,10 @@ def main():
     # tripping FC on a bundle-payload edit was a needless ~KVM lane. The
     # e2e-STACK lane still gates on `e2e`, so bundle staging is validated there.
     test_fc = ci_self or bool(cc & e2e_closure) or fc_fork
-    # web / orchestrator: their own sources or the protos they codegen from.
+    # web / orchestrator / cli: their own sources or the protos they codegen from.
     test_web = ci_self or proto or any_path(changed, WEB_PATHS)
     test_orchestrator = ci_self or proto or any_path(changed, ORCH_PATHS)
+    test_cli = ci_self or proto or any_path(changed, CLI_PATHS)
     # buf only lints/breaking-checks/codegen-drifts the protos.
     test_buf = ci_self or proto
 
@@ -386,7 +386,7 @@ def main():
           file=sys.stderr)
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
-          f"test_buf={test_buf} ci_self={ci_self} proto={proto}",
+          f"test_cli={test_cli} test_buf={test_buf} ci_self={ci_self} proto={proto}",
           file=sys.stderr)
     print(f"-> images_matrix={images_matrix}", file=sys.stderr)
 
@@ -412,6 +412,7 @@ def main():
             f.write(f"test_fc={b(test_fc)}\n")
             f.write(f"test_web={b(test_web)}\n")
             f.write(f"test_orchestrator={b(test_orchestrator)}\n")
+            f.write(f"test_cli={b(test_cli)}\n")
             f.write(f"test_buf={b(test_buf)}\n")
             # Per-image bake matrix (JSON array → fromJSON in bake-images.yml).
             f.write(f"images_matrix={json.dumps(images_matrix)}\n")
