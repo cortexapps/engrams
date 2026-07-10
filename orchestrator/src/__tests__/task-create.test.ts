@@ -211,6 +211,23 @@ describe("compileSessionCreateInput", () => {
     );
     expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
   });
+
+  // ADR 0031 §7: git commit attribution.
+  test("owner identity stamps ENGRAM_USER_NAME/EMAIL for the guest gitconfig", async () => {
+    const inp = await compileSessionCreateInput(profile(), deps(), {
+      owner: { name: "Ada Lovelace", email: "ada@example.com" },
+    });
+    expect(inp.harnessEnv).toMatchObject({
+      ENGRAM_USER_NAME: "Ada Lovelace",
+      ENGRAM_USER_EMAIL: "ada@example.com",
+    });
+  });
+
+  test("no owner → no attribution env", async () => {
+    const inp = await compileSessionCreateInput(profile(), deps());
+    expect(inp.harnessEnv?.ENGRAM_USER_EMAIL).toBeUndefined();
+    expect(inp.harnessEnv?.ENGRAM_USER_NAME).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -287,7 +304,12 @@ function recordingDb(records: Record<string, unknown>[], throwOnTx = false): Db 
 const createDeps = (
   sessions: TaskSessionsClient,
   db: Db,
-  opts: { active?: boolean; profileOver?: Partial<ProfileRow>; portExposures?: PortExposureStore } = {},
+  opts: {
+    active?: boolean;
+    profileOver?: Partial<ProfileRow>;
+    portExposures?: PortExposureStore;
+    users?: CreateTaskDeps["users"];
+  } = {},
 ): CreateTaskDeps => ({
   profiles: fakeProfiles(opts.active ?? true, opts.profileOver ?? {}),
   images: { listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }) } as unknown as ImagesClient,
@@ -296,6 +318,9 @@ const createDeps = (
   sessions,
   secrets: { get: async () => null },
   db,
+  // Default to "unknown user" so tests exercising other seams don't hit the
+  // real Drizzle fallback against the fake Db.
+  users: opts.users ?? { getIdentity: async () => null },
   ...(opts.portExposures ? { portExposures: opts.portExposures } : {}),
 });
 
@@ -393,6 +418,51 @@ describe("createTaskWithSession", () => {
       { type: "chat", ownerUserId: "u", profileId: "p1" },
     );
     expect(ports.calls).toHaveLength(0);
+  });
+
+  // ADR 0031 §7: the owner's identity threads into the session's harness env
+  // for git commit attribution — except for service accounts, whose synthetic
+  // email is not a valid commit author.
+  test("threads the owner's identity into the session create for git attribution", async () => {
+    const sessions = fakeSessions();
+    await createTaskWithSession(
+      createDeps(sessions, recordingDb([]), {
+        users: { getIdentity: async (id) => (id === "user-1" ? { name: "Ada", email: "ada@example.com" } : null) },
+      }),
+      { type: "chat", ownerUserId: "user-1", profileId: "p1" },
+    );
+    expect((sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv).toMatchObject({
+      ENGRAM_USER_NAME: "Ada",
+      ENGRAM_USER_EMAIL: "ada@example.com",
+    });
+  });
+
+  test("a service-account owner (API-key create) gets no git attribution", async () => {
+    const sessions = fakeSessions();
+    await createTaskWithSession(
+      createDeps(sessions, recordingDb([]), {
+        users: {
+          getIdentity: async () => ({ name: "svc", email: "apikey+abc@service.local" }),
+        },
+      }),
+      { type: "chat", ownerUserId: "svc-1", profileId: "p1" },
+    );
+    const env = (sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv;
+    expect(env?.ENGRAM_USER_EMAIL).toBeUndefined();
+    expect(env?.ENGRAM_USER_NAME).toBeUndefined();
+  });
+
+  test("an identity-lookup failure is best-effort: the task still creates, unattributed", async () => {
+    const sessions = fakeSessions();
+    const out = await createTaskWithSession(
+      createDeps(sessions, recordingDb([]), {
+        users: { getIdentity: async () => { throw new Error("identity boom"); } },
+      }),
+      { type: "chat", ownerUserId: "user-1", profileId: "p1" },
+    );
+    expect(out.sessionId).toBe("sess-1");
+    const env = (sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv;
+    expect(env?.ENGRAM_USER_EMAIL).toBeUndefined();
   });
 
   test("a port-exposure failure does NOT fail the task (best-effort) and later ports still mint", async () => {

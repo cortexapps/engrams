@@ -355,11 +355,32 @@ pub(crate) async fn resolve_session_env(
     }
 
     // ADR 0051: the coordinator no longer resolves human identity. Per-user git
-    // attribution and the auto-injected Claude token came from `state.auth`,
-    // which is removed — the orchestrator owns identity and supplies any such
-    // env via the SecretService-injected `identity_env` at create time.
+    // attribution (`ENGRAM_USER_EMAIL`/`ENGRAM_USER_NAME`) rides the
+    // orchestrator-resolved `identity_env` at create time, sealed into
+    // `session_secrets` and replayed by the overrides fold above. The app
+    // committer identity is deployment config, so it's re-stamped from
+    // `state.cfg` on every launch instead of being sealed.
+    stamp_committer_env(&state.cfg, &mut env);
 
     (bundle, env)
+}
+
+/// Stamp the deployment's app committer identity (`--git-committer-email`)
+/// into a session launch env as git's native `GIT_COMMITTER_*` overrides:
+/// every in-session commit is *committed* by the engrams app identity, while
+/// authorship stays with the gitconfig `[user]` block (the human initiator
+/// when known — ADR 0031 §7 — else this same identity via the in-guest
+/// fallback in `engram-session-bundles`). `or_insert` so an image- or
+/// caller-supplied value wins over the deployment default. No-op when the
+/// deployment doesn't configure a committer email.
+fn stamp_committer_env(cfg: &crate::config::CoordinatorConfig, env: &mut HashMap<String, String>) {
+    let Some(email) = cfg.git_committer_email.as_ref() else {
+        return;
+    };
+    env.entry("GIT_COMMITTER_EMAIL".into())
+        .or_insert_with(|| email.clone());
+    env.entry("GIT_COMMITTER_NAME".into())
+        .or_insert_with(|| cfg.git_committer_name.clone());
 }
 
 /// ADR 0016 §A.1.7: rebuild the post-resume [`SessionEgressPolicy`]
@@ -1335,6 +1356,12 @@ async fn prepare_inner(
         deferred_map.insert(k, v);
     }
 
+    // App committer identity (deployment config): stamped after every other
+    // layer with `or_insert`, so anything explicit above wins. Resume takes
+    // the same stamp via `resolve_session_env` — deliberately NOT sealed
+    // into `session_secrets` (config is durable and hot-swappable).
+    stamp_committer_env(&state.cfg, &mut session_env);
+
     let deferred_session_secrets: Option<HashMap<String, String>> = if deferred_map.is_empty() {
         None
     } else {
@@ -1998,6 +2025,43 @@ mod tests {
         // Set → honored verbatim, both below and above the default.
         assert_eq!(mk(Some(256)).resolved_memory_mib(), 256);
         assert_eq!(mk(Some(8192)).resolved_memory_mib(), 8192);
+    }
+
+    /// The app committer stamp: applied only when configured, both keys as a
+    /// pair, and `or_insert` semantics so an explicit env value (image
+    /// manifest / caller override) beats the deployment default.
+    #[test]
+    fn stamp_committer_env_pairs_and_defers_to_explicit_values() {
+        let mut cfg = crate::config::CoordinatorConfig::default();
+        let mut env = HashMap::new();
+
+        // Unconfigured → untouched.
+        stamp_committer_env(&cfg, &mut env);
+        assert!(env.is_empty());
+
+        // Configured → both keys stamped as a pair.
+        cfg.git_committer_email = Some("1+engrams[bot]@users.noreply.github.com".into());
+        stamp_committer_env(&cfg, &mut env);
+        assert_eq!(
+            env.get("GIT_COMMITTER_EMAIL").map(String::as_str),
+            Some("1+engrams[bot]@users.noreply.github.com")
+        );
+        assert_eq!(
+            env.get("GIT_COMMITTER_NAME").map(String::as_str),
+            Some("engrams")
+        );
+
+        // An explicit value survives the stamp (or_insert).
+        let mut env = HashMap::from([("GIT_COMMITTER_EMAIL".to_string(), "own@x".to_string())]);
+        stamp_committer_env(&cfg, &mut env);
+        assert_eq!(
+            env.get("GIT_COMMITTER_EMAIL").map(String::as_str),
+            Some("own@x")
+        );
+        assert_eq!(
+            env.get("GIT_COMMITTER_NAME").map(String::as_str),
+            Some("engrams")
+        );
     }
 
     /// ADR 0057: broker substitution authenticates only because the placeholder

@@ -162,6 +162,18 @@ struct Cli {
     /// manager). Takes precedence over `--github-app-private-key-path`.
     #[arg(long, env = "ENGRAM_GITHUB_APP_PRIVATE_KEY")]
     github_app_private_key: Option<String>,
+
+    /// App committer email stamped on every in-session commit (git's
+    /// `GIT_COMMITTER_EMAIL` in the session env + the in-guest gitconfig
+    /// `[user]` fallback). Rides next to the GitHub App config — for GitHub
+    /// use `<APP_ID>+<APP_SLUG>[bot]@users.noreply.github.com`. Unset =
+    /// no stamping (guest commits fall back to the image's git identity).
+    #[arg(long, env = "ENGRAM_GIT_COMMITTER_EMAIL")]
+    git_committer_email: Option<String>,
+
+    /// Display name paired with `--git-committer-email`.
+    #[arg(long, env = "ENGRAM_GIT_COMMITTER_NAME", default_value = "engrams")]
+    git_committer_name: String,
     // ADR 0051: the ADR 0031 human-authentication flags (--auth-mode,
     // --oidc-*, --forward-auth-*, --bootstrap-admins, --dev-default-email,
     // --cookie-secure) are removed. The orchestrator owns human auth; the
@@ -312,6 +324,10 @@ async fn main() -> Result<(), CoordinatorError> {
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect(),
+        // Treat a set-but-empty env var as unset (same reasoning as the
+        // token lists above) — an empty committer email must not stamp.
+        git_committer_email: cli.git_committer_email.clone().filter(|e| !e.is_empty()),
+        git_committer_name: cli.git_committer_name.clone(),
     };
 
     let pg = PostgresStore::connect(&cfg.database_url)

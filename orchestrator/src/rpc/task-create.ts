@@ -12,8 +12,9 @@
  * a session is NEVER created outside the task model.
  *
  * `compileSessionCreateInput` is the intricate inner step — image resolution,
- * harness env (user token + CLI dummy env + profile env + trigger extras),
- * skills union, and the compiled per-session integration policy.
+ * harness env (user token + CLI dummy env + profile env + git attribution +
+ * trigger extras), skills union, and the compiled per-session integration
+ * policy.
  */
 
 import { ConnectError, Code } from "@connectrpc/connect";
@@ -21,6 +22,8 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import { log as rootLog } from "../log.ts";
 import type { ProfileRow, ProfileStore } from "../db/profiles.ts";
+import { makeUserIdentityStore, type UserIdentityStore } from "../db/users.ts";
+import { isServiceAccountEmail } from "./api-key.ts";
 import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
 import type { ImagesClient } from "./profiles.ts";
 import { evictOwnerCacheEntry } from "../authz/resolve.ts";
@@ -104,6 +107,11 @@ export interface SessionCompileOpts {
   /** Extra harness env merged LAST (highest precedence) — e.g. the trigger's
    *  ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060). */
   extraHarnessEnv?: Record<string, string>;
+  /** The initiating human's identity for git commit attribution (ADR 0031 §7),
+   *  stamped as ENGRAM_USER_NAME/ENGRAM_USER_EMAIL — the guest writes them into
+   *  /etc/gitconfig's [user] block so in-session commits are authored by the
+   *  human who started the session. Omit for service-account owners. */
+  owner?: { name: string; email: string };
 }
 
 /** The deployment's fallback harness when neither the session nor the profile
@@ -143,7 +151,8 @@ export async function compileSessionCreateInput(
   const isHuman = (opts.type ?? "chat") === "chat" && !opts.programmatic;
 
   // Harness env, lowest → highest precedence: user token < CLI dummy env <
-  // profile env_vars < model env < effort env < trigger extras. NEVER log values.
+  // profile env_vars < model env < effort env < git attribution < trigger
+  // extras. NEVER log values.
   const harness: Record<string, string> = {};
   // The human credential env-var name is the selected harness's declared
   // `user_env` (ADR 0063 — no longer the hardcoded CLAUDE_CODE_OAUTH_TOKEN).
@@ -173,6 +182,13 @@ export async function compileSessionCreateInput(
     const effortEnv = descriptor.effort.find((e) => e.id === effortId)?.env ?? {};
     for (const [k, v] of Object.entries(modelEnv)) harness[k] = v;
     for (const [k, v] of Object.entries(effortEnv)) harness[k] = v;
+  }
+  // ADR 0031 §7: git commit attribution — the initiating human authors the
+  // in-session commits (the guest turns these into /etc/gitconfig's [user]
+  // block). Orchestrator-authoritative, so it beats profile env_vars.
+  if (opts.owner) {
+    harness.ENGRAM_USER_NAME = opts.owner.name;
+    harness.ENGRAM_USER_EMAIL = opts.owner.email;
   }
   for (const [k, v] of Object.entries(opts.extraHarnessEnv ?? {})) harness[k] = v;
   const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
@@ -242,6 +258,9 @@ export interface CreateTaskDeps {
   /** ADR 0064: port-exposure store for auto-minting `profile.portExposures`.
    *  Defaults to a Drizzle store over `db` when omitted. */
   portExposures?: PortExposureStore;
+  /** ADR 0031 §7: owner identity lookup for git commit attribution.
+   *  Defaults to a Drizzle store over `db` when omitted. */
+  users?: UserIdentityStore;
 }
 
 export interface CreateTaskParams {
@@ -291,6 +310,24 @@ export async function createTaskWithSession(
     throw new ConnectError("profile not found or archived", Code.NotFound);
   }
 
+  // ADR 0031 §7: resolve the owner's identity for git commit attribution.
+  // Service-account owners (API-key creates) are skipped — their synthetic
+  // `apikey+…@service.local` email is not a valid commit author (GitHub
+  // rejects it on squash-merge). Best-effort: a lookup failure boots the
+  // session unattributed rather than failing the create.
+  let owner: { name: string; email: string } | undefined;
+  try {
+    const identity = await (deps.users ?? makeUserIdentityStore(deps.db)).getIdentity(
+      params.ownerUserId,
+    );
+    if (identity && !isServiceAccountEmail(identity.email)) owner = identity;
+  } catch (err) {
+    log.warn(
+      { userId: params.ownerUserId, err },
+      "task-create: owner identity lookup failed — booting without git attribution",
+    );
+  }
+
   const sessionInput = await compileSessionCreateInput(
     profile,
     {
@@ -307,6 +344,7 @@ export async function createTaskWithSession(
       ...(params.model != null ? { model: params.model } : {}),
       ...(params.effort != null ? { effort: params.effort } : {}),
       ...(params.extraHarnessEnv ? { extraHarnessEnv: params.extraHarnessEnv } : {}),
+      ...(owner ? { owner } : {}),
     },
   );
 

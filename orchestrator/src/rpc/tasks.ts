@@ -62,6 +62,7 @@ import {
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
+import type { UserIdentityStore } from "../db/users.ts";
 import type { ImagesClient } from "./profiles.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
 import {
@@ -133,6 +134,8 @@ export interface TaskDeps {
   connectors?: CustomConnectorSource;
   /** Port-exposure store (ADR 0064) — auto-mints profile.portExposures at create. */
   portExposures?: PortExposureStore;
+  /** Owner identity lookup for git commit attribution (ADR 0031 §7). */
+  users?: UserIdentityStore;
   db?: Db;
 }
 
@@ -425,6 +428,9 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           sessions: sessionsClient,
           secrets: resolveSecrets(),
           portExposures: resolvePortExposures(),
+          // Omitted deps.users falls through to the primitive's Drizzle
+          // default over `db` (rpc/task-create.ts).
+          ...(deps?.users ? { users: deps.users } : {}),
           db: getDbFn(),
         },
         {

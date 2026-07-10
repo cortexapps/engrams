@@ -375,8 +375,14 @@ async function spawnServer(deps: TaskDeps): Promise<TestServer> {
   app.notFound((c) => c.json({ error: "not found" }, 404));
 
   // Default the harness catalog to a hermetic fake so create-path tests don't
-  // fall through to the real control-plane client (a test may override it).
-  const fullDeps: TaskDeps = { harnessCatalog: fakeHarnessCatalog(), ...deps };
+  // fall through to the real control-plane client, and the identity store to
+  // "unknown user" so the ADR 0031 attribution lookup doesn't consume the
+  // fake DB's select counter (a test may override either).
+  const fullDeps: TaskDeps = {
+    harnessCatalog: fakeHarnessCatalog(),
+    users: { getIdentity: async () => null },
+    ...deps,
+  };
   const srv = buildServer(app, (router) => {
     registerTasks(router, fullDeps);
   });
