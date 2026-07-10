@@ -194,6 +194,7 @@ impl MetadataStore for MockMetadataStore {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         self.sessions.lock().insert(id, session);
         Ok(id)
@@ -239,6 +240,7 @@ impl MetadataStore for MockMetadataStore {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         self.sessions.lock().insert(ws.session_id, session);
         Ok(match host_id {

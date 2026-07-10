@@ -275,6 +275,13 @@ fn ev_file_changed_write() -> HarnessEvent {
     }
 }
 
+/// A harness-suggested title — pins `TitleSuggested` (index 14).
+fn ev_title_suggested() -> HarnessEvent {
+    HarnessEvent::TitleSuggested {
+        title: "Fix the flaky test".into(),
+    }
+}
+
 fn cmd_checkpoint() -> HarnessCommand {
     HarnessCommand::Checkpoint {
         reason: CheckpointReason::Idle,
@@ -331,6 +338,7 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_question_answered", &ev_question_answered());
     assert_golden("event_file_changed_edit", &ev_file_changed_edit());
     assert_golden("event_file_changed_write", &ev_file_changed_write());
+    assert_golden("event_title_suggested", &ev_title_suggested());
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -363,6 +371,8 @@ fn harness_event_golden_and_variant_indices() {
     // Both `op` arms are the same enum variant, so both pin index 13.
     assert_variant_index(&ev_file_changed_edit(), 13, "HarnessEvent::FileChanged");
     assert_variant_index(&ev_file_changed_write(), 13, "HarnessEvent::FileChanged");
+    // Session titles — APPENDED after FileChanged (14).
+    assert_variant_index(&ev_title_suggested(), 14, "HarnessEvent::TitleSuggested");
 }
 
 #[test]
@@ -552,6 +562,7 @@ fn regen_golden() {
     write("event_question_answered", &ev_question_answered());
     write("event_file_changed_edit", &ev_file_changed_edit());
     write("event_file_changed_write", &ev_file_changed_write());
+    write("event_title_suggested", &ev_title_suggested());
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);

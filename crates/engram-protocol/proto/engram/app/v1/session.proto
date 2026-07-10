@@ -119,6 +119,12 @@ message Session {
   string mode = 6;
   string created_at = 7;
   string last_active_at = 8;
+  // The latest harness-suggested (LLM-generated) title for this session, if
+  // any. Written in real time by the coordinator's event sink when a
+  // TitleSuggested harness event arrives. A self-descriptive operational fact
+  // (never user attribution/preference); the orchestrator reads it to build a
+  // task's display title. Unset until the harness emits one.
+  optional string suggested_title = 9;
 }
 
 message CreateSessionRequest {

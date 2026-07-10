@@ -49,6 +49,7 @@ import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Task, TaskSessionRef } from "../gen/engram/app/v1/task_pb.ts";
 import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 
+import { log as rootLog } from "../log.ts";
 import { abilityFor } from "../authz/ability.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import { isServiceAccountEmail } from "./api-key.ts";
@@ -59,6 +60,8 @@ import {
   images as defaultImages,
   harnessCatalog as defaultHarnessCatalog,
 } from "../control-plane/client.ts";
+
+const log = rootLog.child({ component: "task" });
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
@@ -203,15 +206,51 @@ function sessionStatusToTaskStatus(sessionStatus: string): string | null {
   }
 }
 
+/** Max length (code points) of a user-set sticky custom title. */
+const CUSTOM_TITLE_MAX_CHARS = 200;
+
+/** The task-title columns the effective-title derivation reads. */
+export interface TitleRow {
+  title: string | null;
+  suggestedTitle: string | null;
+  customTitle: string | null;
+}
+
+/**
+ * The effective display title, in precedence order:
+ *   1. `custom_title` — the user's sticky rename (harness suggestions never
+ *      override it);
+ *   2. the freshest harness suggestion — the LIVE session value if the session
+ *      is still up, else the persisted `suggested_title` snapshot (so an old
+ *      chat keeps its nice title after its session is GC'd);
+ *   3. `title` — the truncated-prompt default.
+ * `null` when nothing is set (a brand-new task with no prompt).
+ */
+export function effectiveTitle(
+  row: TitleRow,
+  liveSuggested: string | null | undefined,
+): string | null {
+  return row.customTitle ?? liveSuggested ?? row.suggestedTitle ?? row.title ?? null;
+}
+
 /**
  * Build a proto Task from a DB row + a map of sessionId → live Session.
  * The sessionMap may be empty (no upstream session found → session field unset).
+ *
+ * `snapshots` (optional): the opportunistic-snapshot sink. When the primary
+ * session's LIVE `suggested_title` differs from the persisted snapshot, we push
+ * `{taskId, suggestedTitle}` so the caller can fire-and-forget the write —
+ * keeping the snapshot fresh (and durable past session GC) off the read path
+ * the orchestrator already performs. Only pushed on an actual change, so steady
+ * state produces no writes.
  */
 function buildTask(
   row: {
     id: string;
     type: string;
     title: string | null;
+    suggestedTitle: string | null;
+    customTitle: string | null;
     status: string;
     createdByUserId: string | null;
     source: unknown;
@@ -220,17 +259,31 @@ function buildTask(
   sessionRefs: Array<{ sessionId: string; role: string | null; profileId: string | null }>,
   sessionMap: Map<string, Session>,
   profileMap: Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string; skills: string[] }>,
+  snapshots?: Array<{ taskId: string; suggestedTitle: string }>,
 ): Task {
-  // Derive status from the primary session's live state (if available).
+  // Derive status + the live harness title from the primary session (if available).
   let status = row.status;
   const primaryRef = sessionRefs.find((r) => r.role === "primary") ?? sessionRefs[0];
-  if (primaryRef) {
-    const liveSession = sessionMap.get(primaryRef.sessionId);
-    if (liveSession) {
-      const mapped = sessionStatusToTaskStatus(liveSession.status);
-      if (mapped !== null) status = mapped;
-    }
+  const primarySession = primaryRef ? sessionMap.get(primaryRef.sessionId) : undefined;
+  if (primarySession) {
+    const mapped = sessionStatusToTaskStatus(primarySession.status);
+    if (mapped !== null) status = mapped;
   }
+  const liveSuggested = primarySession?.suggestedTitle;
+
+  // Opportunistic snapshot: the coordinator holds the freshest harness title on
+  // the live session; mirror it onto the task row (only when it actually
+  // changed) so it survives the session's eventual GC.
+  if (
+    snapshots != null &&
+    liveSuggested != null &&
+    liveSuggested !== "" &&
+    liveSuggested !== row.suggestedTitle
+  ) {
+    snapshots.push({ taskId: row.id, suggestedTitle: liveSuggested });
+  }
+
+  const title = effectiveTitle(row, liveSuggested);
 
   const sessions: TaskSessionRef[] = sessionRefs.map((ref) => {
     const liveSession = sessionMap.get(ref.sessionId);
@@ -246,13 +299,33 @@ function buildTask(
   return {
     id: row.id,
     type: row.type,
-    ...(row.title != null ? { title: row.title } : {}),
+    ...(title != null ? { title } : {}),
+    titleIsCustom: row.customTitle != null,
     status,
     ...(row.createdByUserId != null ? { createdByUserId: row.createdByUserId } : {}),
     sourceJson: JSON.stringify(row.source ?? {}),
     sessions,
     createdAt: row.createdAt.toISOString(),
   } as Task;
+}
+
+/**
+ * Fire-and-forget the opportunistic `suggested_title` snapshot writes buildTask
+ * collected. Best-effort: a failure only means the display title lags the live
+ * session; never blocks or fails the read.
+ */
+function persistTitleSnapshots(
+  db: Db,
+  updates: Array<{ taskId: string; suggestedTitle: string }>,
+): void {
+  if (updates.length === 0) return;
+  void Promise.all(
+    updates.map((u) =>
+      db.update(taskTable).set({ suggestedTitle: u.suggestedTitle }).where(eq(taskTable.id, u.taskId)),
+    ),
+  ).catch((err) => {
+    log.warn({ err }, "task-title snapshot write failed (continuing)");
+  });
 }
 
 /**
@@ -361,7 +434,10 @@ async function loadTask(
   }
 
   const profileMap = await buildProfileMap(sessionRefRows, profiles, imagesClient);
-  return buildTask(taskRow, sessionRefRows, sessionMap, profileMap);
+  const snapshots: Array<{ taskId: string; suggestedTitle: string }> = [];
+  const task = buildTask(taskRow, sessionRefRows, sessionMap, profileMap, snapshots);
+  persistTitleSnapshots(db_, snapshots);
+  return task;
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +579,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
 
       // Filter task rows by ability (member sees own; admin sees all).
       const visibleTasks: Task[] = [];
+      const snapshots: Array<{ taskId: string; suggestedTitle: string }> = [];
       for (const row of taskRows) {
         if (
           !ability.can(
@@ -513,8 +590,11 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           continue;
         }
         const refs = refsByTaskId.get(row.id) ?? [];
-        visibleTasks.push(buildTask(row, refs, sessionMap, profileMap));
+        visibleTasks.push(buildTask(row, refs, sessionMap, profileMap, snapshots));
       }
+      // Fire-and-forget the freshest harness titles onto the task rows (only
+      // the ones that changed) so the list keeps them past session GC.
+      persistTitleSnapshots(db, snapshots);
 
       // For admins: surface unattributed sessions as synthetic rows.
       if (isAdmin) {
@@ -616,6 +696,75 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       await db.delete(taskTable).where(eq(taskTable.id, req.taskId));
 
       return {};
+    },
+
+    // -------------------------------------------------------------------------
+    // UpdateTask — rename (present title) or reset-to-auto (absent title).
+    // -------------------------------------------------------------------------
+    async updateTask(req, ctx) {
+      const user = await requireUser(ctx, getSession);
+      const ability = abilityFor(user);
+      const db = getDbFn();
+
+      // Fetch task row.
+      const taskRows = await db
+        .select()
+        .from(taskTable)
+        .where(eq(taskTable.id, req.taskId))
+        .limit(1);
+
+      if (taskRows.length === 0) {
+        // Not found — return NotFound (no enumeration leak).
+        throw new ConnectError("not found", Code.NotFound);
+      }
+      const taskRow = taskRows[0]!;
+
+      // Owner or admin only. Anti-enumeration: a task owned by someone else
+      // returns NotFound, not PermissionDenied. Renaming is a `manage` verb —
+      // granted on owned Tasks and, via `manage:all`, to admins (the `Actions`
+      // union has no distinct "update"; `manage` is the capability owners hold).
+      if (
+        !ability.can(
+          "manage",
+          subject("Task", { createdByUserId: taskRow.createdByUserId }),
+        )
+      ) {
+        throw new ConnectError("not found", Code.NotFound);
+      }
+
+      // Present `title` ⇒ set the STICKY custom title (harness suggestions no
+      // longer override it). Absent ⇒ clear it (reset), so the effective title
+      // falls back to the freshest harness suggestion, then the truncated
+      // prompt. A blank/whitespace title is rejected — clearing is done by
+      // omitting the field, never by sending "".
+      let customTitle: string | null;
+      if (req.title !== undefined) {
+        const trimmed = req.title.trim();
+        if (trimmed === "") {
+          throw new ConnectError(
+            "title must not be blank — omit it to reset to the auto title",
+            Code.InvalidArgument,
+          );
+        }
+        if ([...trimmed].length > CUSTOM_TITLE_MAX_CHARS) {
+          throw new ConnectError(
+            `title must be at most ${CUSTOM_TITLE_MAX_CHARS} characters`,
+            Code.InvalidArgument,
+          );
+        }
+        customTitle = trimmed;
+      } else {
+        customTitle = null;
+      }
+
+      // `task.updatedAt` has no `$onUpdate`, so bump it explicitly.
+      await db
+        .update(taskTable)
+        .set({ customTitle, updatedAt: new Date() })
+        .where(eq(taskTable.id, req.taskId));
+
+      const loaded = await loadTask(req.taskId, db, sessionsClient, profiles, imagesClient);
+      return { task: loaded };
     },
   });
 }

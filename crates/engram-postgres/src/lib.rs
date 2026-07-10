@@ -1601,7 +1601,7 @@ impl MetadataStore for PostgresStore {
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
-                   park_rung, parked_at
+                   park_rung, parked_at, suggested_title
             FROM sessions WHERE id = $1
             "#,
         )
@@ -1671,7 +1671,8 @@ impl MetadataStore for PostgresStore {
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
-                   live_disk_manifest_id, live_disk_manifest_version
+                   live_disk_manifest_id, live_disk_manifest_version,
+                   suggested_title
             FROM sessions
             WHERE status IN ('pending','created','active',
                              'idle','evacuating','evicting')
@@ -2148,6 +2149,20 @@ impl MetadataStore for PostgresStore {
             .bind(id.as_uuid())
             .bind(rung)
             .bind(parked_at)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn set_session_suggested_title(
+        &self,
+        id: SessionId,
+        title: &str,
+    ) -> Result<(), MetaError> {
+        sqlx::query("UPDATE sessions SET suggested_title = $2 WHERE id = $1")
+            .bind(id.as_uuid())
+            .bind(title)
             .execute(&self.pool)
             .await
             .map_err(db_err)?;

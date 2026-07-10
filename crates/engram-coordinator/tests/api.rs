@@ -92,6 +92,7 @@ impl MetadataStore for MockMetadataStore {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         self.sessions.lock().insert(id, session);
         Ok(id)
@@ -137,6 +138,7 @@ impl MetadataStore for MockMetadataStore {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         self.sessions.lock().insert(ws.session_id, session);
         Ok(match host_id {
@@ -1145,6 +1147,7 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
                 live_disk_manifest: None,
                 park_rung: 0,
                 parked_at: None,
+                suggested_title: None,
             },
         );
     }
@@ -1239,6 +1242,7 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
                 live_disk_manifest: None,
                 park_rung: 0,
                 parked_at: None,
+                suggested_title: None,
             },
         );
     }

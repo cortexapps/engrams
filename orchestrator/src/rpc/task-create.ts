@@ -39,6 +39,25 @@ import {
 
 const log = rootLog.child({ component: "task" });
 
+/** Max length (in code points) of the truncated-prompt default title. */
+const DEFAULT_TITLE_MAX_CHARS = 80;
+
+/**
+ * Derive a session's initial (default) title from the user's prompt: collapse
+ * whitespace/newlines to single spaces, trim, and clip to
+ * `DEFAULT_TITLE_MAX_CHARS` code points with an ellipsis. Code-point-aware
+ * (`[...s]`) so a multi-byte glyph / emoji is never split mid-surrogate.
+ * Returns `null` for an empty/whitespace-only prompt (no default).
+ */
+export function truncatePrompt(prompt: string | undefined | null): string | null {
+  if (prompt == null) return null;
+  const collapsed = prompt.replace(/\s+/g, " ").trim();
+  if (collapsed === "") return null;
+  const chars = [...collapsed];
+  if (chars.length <= DEFAULT_TITLE_MAX_CHARS) return collapsed;
+  return `${chars.slice(0, DEFAULT_TITLE_MAX_CHARS).join("").trimEnd()}…`;
+}
+
 /** Drizzle DB handle the task-persist transaction runs on. */
 export type Db = NodePgDatabase<typeof schema>;
 
@@ -356,7 +375,12 @@ export async function createTaskWithSession(
       await tx.insert(taskTable).values({
         id: taskId,
         type: params.type,
-        title: params.title ?? null,
+        // Initial (default) title = the truncated prompt. A harness AI title
+        // later overrides it (via task.suggested_title + the buildTask
+        // derivation) unless the user sets a sticky custom title. A caller-
+        // supplied `params.title` still wins when present (e.g. a trigger that
+        // names the task explicitly).
+        title: params.title ?? truncatePrompt(params.prompt),
         status: "open",
         createdByUserId: params.ownerUserId,
         source: params.source ?? {},

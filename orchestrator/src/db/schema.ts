@@ -43,7 +43,15 @@ const bytea = customType<{ data: Buffer }>({
 export const task = pgTable("task", {
   id: text("id").primaryKey(), // nanoid/uuid
   type: text("type").notNull(), // 'chat' (UI) | 'slack_thread' (ADR 0060 trigger)
+  // Session titles. The effective display title is DERIVED (buildTask):
+  //   custom_title ?? liveSuggested(session) ?? suggested_title ?? title
+  // `title` is the truncated-prompt DEFAULT set at create; `suggested_title`
+  // snapshots the coordinator's live harness suggestion so it survives session
+  // GC; `custom_title` is the user's STICKY rename (harness suggestions never
+  // override it) — null once reset.
   title: text("title"),
+  suggestedTitle: text("suggested_title"),
+  customTitle: text("custom_title"),
   status: text("status").notNull().default("open"), // open|working|awaiting_review|done|failed
   createdByUserId: text("created_by_user_id"), // better-auth user id; null = automation (future)
   source: jsonb("source"), // type-specific trigger ref

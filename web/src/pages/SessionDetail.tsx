@@ -1,12 +1,13 @@
 import { useParams } from "@tanstack/react-router";
 import { Fragment, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
-import { Activity, Code2, Globe, SquareTerminal } from "lucide-react";
+import { Activity, Code2, Globe, Pencil, SquareTerminal } from "lucide-react";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { StatusGlyph } from "../components/Glyph";
 import { SessionThread } from "../components/session-thread/SessionThread";
 import { PageHeading } from "../components/page-heading";
+import { TitleEditForm } from "./sessions/TitleEditForm";
 import { WorkPane, type PaneTabId } from "../components/WorkPane";
 import { statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
@@ -81,6 +82,13 @@ export function SessionDetail() {
   const { id } = useParams({ from: "/_app/sessions/$id" });
   const { data: session } = useSession(id);
   const { data: tasksData } = useTasks();
+  // The task owning this session — for the masthead title + rename control.
+  const task = tasksData?.tasks.find((t) => t.sessions.some((r) => r.sessionId === id));
+  // Synthetic `unattributed-*` admin rows have no real task and can't be renamed.
+  const taskId = task && !task.id.startsWith("unattributed-") ? task.id : null;
+  const taskTitle = task?.title ?? null;
+  const titleIsCustom = task?.titleIsCustom ?? false;
+  const [editingTitle, setEditingTitle] = useState(false);
   const profileSnap =
     tasksData?.tasks.flatMap((t) => t.sessions).find((r) => r.sessionId === id)?.profile ?? null;
   // Normalize the embedded snapshot to the UI view once. Point-in-time by
@@ -230,8 +238,38 @@ export function SessionDetail() {
       <div className="shrink-0 px-6 pt-6 pb-4">
         <PageHeading
           eyebrow="task"
-          title={id}
-          titleVariant="mono"
+          title={
+            editingTitle && taskId ? (
+              <TitleEditForm
+                taskId={taskId}
+                initial={taskTitle ?? ""}
+                isCustom={titleIsCustom}
+                onDone={() => setEditingTitle(false)}
+                inputClassName="h-9 text-lg"
+                className="max-w-xl"
+              />
+            ) : (
+              <span className="group/title inline-flex max-w-full items-center gap-2">
+                <span className="truncate">{taskTitle ?? id}</span>
+                {taskId && (
+                  <Button
+                    type="button"
+                    size="icon-xs"
+                    variant="ghost"
+                    onClick={() => setEditingTitle(true)}
+                    aria-label="Rename session"
+                    title="Rename"
+                    className="shrink-0 opacity-0 transition-opacity group-hover/title:opacity-100 focus-visible:opacity-100"
+                  >
+                    <Pencil />
+                  </Button>
+                )}
+              </span>
+            )
+          }
+          // A named session reads as prose; the raw-id fallback stays in the
+          // lab-readout mono voice.
+          titleVariant={taskTitle ? "display" : "mono"}
           showRule={false}
           actions={
             // Desktop reopens the pane via the edge rail; phones have no rail,

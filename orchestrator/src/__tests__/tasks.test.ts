@@ -25,7 +25,7 @@ import { Hono } from "hono";
 import type { AddressInfo } from "node:net";
 
 import { buildServer } from "../server.ts";
-import { registerTasks, buildProfileMap } from "../rpc/tasks.ts";
+import { registerTasks, buildProfileMap, effectiveTitle } from "../rpc/tasks.ts";
 import type { TaskDeps, SessionsClient, Db, GetSession, ImagesClient } from "../rpc/tasks.ts";
 import type { HarnessCatalogClient } from "../rpc/task-create.ts";
 import type { UserSecretStore } from "../db/user-secrets.ts";
@@ -73,6 +73,7 @@ interface FakeSession {
   lastActiveAt: string;
   hostId?: string;
   sandboxId?: string;
+  suggestedTitle?: string;
 }
 
 /**
@@ -264,6 +265,43 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
 // so a thrown listEnabledImages must not take down the whole read — the
 // snapshot is still returned, only imageUri falls back to "".
 // ---------------------------------------------------------------------------
+
+describe("effectiveTitle — display-title precedence", () => {
+  const base = { title: "truncated prompt", suggestedTitle: null, customTitle: null };
+
+  test("custom (sticky) title wins over everything", () => {
+    expect(
+      effectiveTitle({ ...base, suggestedTitle: "snap", customTitle: "My name" }, "live"),
+    ).toBe("My name");
+  });
+
+  test("live harness suggestion beats the persisted snapshot and the default", () => {
+    expect(effectiveTitle({ ...base, suggestedTitle: "snap" }, "live")).toBe("live");
+  });
+
+  test("falls back to the snapshot when the session is gone (no live value)", () => {
+    expect(effectiveTitle({ ...base, suggestedTitle: "snap" }, undefined)).toBe("snap");
+  });
+
+  test("reset (no custom) with a suggestion → the suggestion, not the default", () => {
+    // The 'unset a sticky title' case: customTitle cleared, a harness
+    // suggestion exists → the effective title is the suggestion.
+    expect(effectiveTitle({ ...base, suggestedTitle: "snap", customTitle: null }, "live")).toBe(
+      "live",
+    );
+  });
+
+  test("falls back to the truncated-prompt default when nothing else is set", () => {
+    expect(effectiveTitle(base, undefined)).toBe("truncated prompt");
+    expect(effectiveTitle(base, null)).toBe("truncated prompt");
+  });
+
+  test("null when nothing at all is set", () => {
+    expect(effectiveTitle({ title: null, suggestedTitle: null, customTitle: null }, null)).toBe(
+      null,
+    );
+  });
+});
 
 describe("buildProfileMap — image catalog resilience", () => {
   test("falls back to empty imageUri when the image catalog is unavailable", async () => {
@@ -817,6 +855,150 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     const resp = await client.listTasks({});
     const found = resp.tasks.find((t) => t.id === createdTaskId);
     expect(found).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// UpdateTask — rename (sticky) / reset-to-auto / authz matrix (DB-gated)
+// ---------------------------------------------------------------------------
+
+describe("TaskService — rename (UpdateTask)", () => {
+  const RENAME_PROFILE = "rename-profile";
+  const sessionId = `rename-sess-${Date.now()}`;
+  const db = dbReachable ? getDb() : null;
+  // The live session object the fake returns — mutate `.suggestedTitle` to
+  // simulate a harness AI-title landing.
+  const liveSession: FakeSession = {
+    id: sessionId,
+    status: "active",
+    image: "registry/img:latest",
+    mode: "agent",
+    createdAt: new Date().toISOString(),
+    lastActiveAt: new Date().toISOString(),
+  };
+  let fakeSessions: ReturnType<typeof makeFakeSessions>;
+  let srvA: TestServer;
+  let clientA: ReturnType<typeof makeClient>;
+  let taskId: string;
+
+  beforeAll(async () => {
+    if (!dbReachable) return;
+    await db!.insert(profileTable).values({
+      id: RENAME_PROFILE,
+      name: "Rename",
+      description: "",
+      icon: "Bot",
+      imageId: "img-1",
+      harness: "claude",
+      includeUserTokens: false,
+      envVars: {},
+    });
+    fakeSessions = makeFakeSessions({ created: [liveSession], existing: [] });
+    srvA = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      secrets: makeFakeTokens(),
+      profiles: makeProfileStore(db!),
+      images: fakeImages(),
+      db: db!,
+    });
+    clientA = makeClient(srvA.serverUrl);
+    // The fake createSession returns the queued session; the live map now holds
+    // `liveSession` (same object), so mutating it below is visible to getSession.
+    const resp = await clientA.createTask({
+      type: "chat",
+      profileId: RENAME_PROFILE,
+      prompt: "Please investigate the flaky test in the CI pipeline and fix it thoroughly",
+    });
+    taskId = resp.task!.id;
+  });
+
+  afterAll(async () => {
+    if (!dbReachable) return;
+    if (taskId) await db!.delete(taskTable).where(eq(taskTable.id, taskId)).catch(() => {});
+    await db!.delete(profileTable).where(eq(profileTable.id, RENAME_PROFILE)).catch(() => {});
+    await srvA?.close();
+  });
+
+  test.skipIf(!dbReachable)("initial title is the truncated prompt; not custom", async () => {
+    const resp = await clientA.getTask({ taskId });
+    expect(resp.task!.title).toBe(
+      "Please investigate the flaky test in the CI pipeline and fix it thoroughly",
+    );
+    expect(resp.task!.titleIsCustom).toBe(false);
+  });
+
+  test.skipIf(!dbReachable)("a harness suggestion overrides the default (not custom)", async () => {
+    liveSession.suggestedTitle = "Fix flaky CI test";
+    const resp = await clientA.getTask({ taskId });
+    expect(resp.task!.title).toBe("Fix flaky CI test");
+    expect(resp.task!.titleIsCustom).toBe(false);
+  });
+
+  test.skipIf(!dbReachable)("owner rename sets a STICKY custom title", async () => {
+    const resp = await clientA.updateTask({ taskId, title: "  My renamed chat  " });
+    expect(resp.task!.title).toBe("My renamed chat"); // trimmed
+    expect(resp.task!.titleIsCustom).toBe(true);
+  });
+
+  test.skipIf(!dbReachable)("a later harness suggestion does NOT override the sticky title", async () => {
+    liveSession.suggestedTitle = "A newer AI title";
+    const resp = await clientA.getTask({ taskId });
+    expect(resp.task!.title).toBe("My renamed chat");
+    expect(resp.task!.titleIsCustom).toBe(true);
+  });
+
+  test.skipIf(!dbReachable)("reset (omit title) falls back to the latest harness suggestion", async () => {
+    const resp = await clientA.updateTask({ taskId }); // no title → clear custom
+    expect(resp.task!.title).toBe("A newer AI title");
+    expect(resp.task!.titleIsCustom).toBe(false);
+  });
+
+  test.skipIf(!dbReachable)("blank title → InvalidArgument", async () => {
+    await expect(clientA.updateTask({ taskId, title: "   " })).rejects.toThrow(
+      /at least|blank|InvalidArgument|invalid_argument/i,
+    );
+  });
+
+  test.skipIf(!dbReachable)("a non-owner member gets NotFound (anti-enumeration)", async () => {
+    const srvB = await spawnServer({
+      getSession: makeGetSession(MEMBER_B),
+      sessions: fakeSessions,
+      secrets: makeFakeTokens(),
+      profiles: makeProfileStore(db!),
+      images: fakeImages(),
+      db: db!,
+    });
+    try {
+      const clientB = makeClient(srvB.serverUrl);
+      await expect(clientB.updateTask({ taskId, title: "hijack" })).rejects.toThrow(
+        /not found|not_found/i,
+      );
+      // The title is untouched.
+      const resp = await clientA.getTask({ taskId });
+      expect(resp.task!.title).not.toBe("hijack");
+    } finally {
+      await srvB.close();
+    }
+  });
+
+  test.skipIf(!dbReachable)("an admin can rename any user's task", async () => {
+    const srvAdmin = await spawnServer({
+      getSession: makeGetSession(ADMIN_ID, "admin"),
+      sessions: fakeSessions,
+      secrets: makeFakeTokens(),
+      profiles: makeProfileStore(db!),
+      images: fakeImages(),
+      db: db!,
+    });
+    try {
+      const clientAdmin = makeClient(srvAdmin.serverUrl);
+      const resp = await clientAdmin.updateTask({ taskId, title: "Admin renamed this" });
+      expect(resp.task!.title).toBe("Admin renamed this");
+      expect(resp.task!.titleIsCustom).toBe(true);
+    } finally {
+      await srvAdmin.close();
+    }
   });
 });
 

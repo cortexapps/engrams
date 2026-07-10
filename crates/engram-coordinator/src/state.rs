@@ -220,6 +220,15 @@ pub enum SessionEvent {
         change: FileChange,
         at: DateTime<Utc>,
     },
+    /// Session titles: the harness proposed a short LLM-generated title for the
+    /// session (Claude Code's `ai-title`). Persisted to the log for history AND
+    /// materialized onto `sessions.suggested_title` by the event sink, so the
+    /// orchestrator can surface it as a task's display title. Opaque JSONB like
+    /// the other passthrough events — no `session_events` migration.
+    HarnessTitleSuggested {
+        title: String,
+        at: DateTime<Utc>,
+    },
     /// ADR 0056: a third-party integration surfaced a typed asset/action
     /// into the session. Subsumes the retired `PullRequestOpened` — an
     /// opened PR is now `provider: "forge"`, `asset_kind: "pull_request"`.
@@ -372,6 +381,7 @@ impl SessionEvent {
             Self::HarnessUserQuestion { .. } => "user_question",
             Self::HarnessQuestionAnswered { .. } => "question_answered",
             Self::HarnessFileChanged { .. } => "file_changed",
+            Self::HarnessTitleSuggested { .. } => "title_suggested",
             Self::IntegrationAsset { .. } => "integration_asset",
             Self::FileShared { .. } => "file_shared",
             Self::RecoveredFromCheckpoint { .. } => "recovered_from_checkpoint",
@@ -496,6 +506,7 @@ impl SessionEvent {
                 change,
                 at,
             },
+            HarnessEvent::TitleSuggested { title } => Self::HarnessTitleSuggested { title, at },
         }
     }
 }
@@ -1067,6 +1078,19 @@ fn harness_event_sink(
             // after the append. Unknown / already-acked ids are no-ops.
             let ack_id = outbox_ack_id(&session_event);
 
+            // Session titles: a harness-suggested title is materialized onto
+            // `sessions.suggested_title` (in real time, at ingestion) so the
+            // orchestrator can read it as the session's display title without
+            // walking the log. Captured before `session_event` moves into the
+            // published frame; the write happens after `publish` (below) so it
+            // never sits in front of the live SSE frame.
+            let suggested_title =
+                if let SessionEvent::HarnessTitleSuggested { title, .. } = &session_event {
+                    Some(title.clone())
+                } else {
+                    None
+                };
+
             // Drop a back-to-back duplicate `harness_idle`. The
             // upstream TTL bookkeeping in HarnessHub::reader_loop
             // already saw the event, so suppressing it here only
@@ -1148,6 +1172,20 @@ fn harness_event_sink(
                                 error = %e,
                                 "outbox ack from harness event failed",
                             ),
+                        }
+                    }
+
+                    // Session titles: materialize the latest harness-suggested
+                    // title onto the session row (idempotent). Best-effort — a
+                    // failure only means the display title lags the log; the
+                    // event itself is already durably appended above.
+                    if let Some(title) = &suggested_title {
+                        if let Err(e) = meta.set_session_suggested_title(session_id, title).await {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                error = %e,
+                                "set_session_suggested_title failed",
+                            );
                         }
                     }
 
@@ -1261,6 +1299,33 @@ pub(crate) mod tests {
             other => panic!("expected HarnessRunInterrupted, got {other:?}"),
         }
         assert_eq!(ev.kind(), "run_interrupted");
+    }
+
+    #[test]
+    fn title_suggested_maps_from_harness_with_stable_kind_and_round_trips() {
+        // Session titles: the harness TitleSuggested event maps to the coord
+        // SessionEvent under the stable `title_suggested` kind and round-trips
+        // through serde (the JSON form the log + orchestrator ingest see).
+        let ev = SessionEvent::from_harness(
+            HarnessEvent::TitleSuggested {
+                title: "Fix the flaky test".into(),
+            },
+            chrono::Utc::now(),
+        );
+        match &ev {
+            SessionEvent::HarnessTitleSuggested { title, .. } => {
+                assert_eq!(title, "Fix the flaky test")
+            }
+            other => panic!("expected HarnessTitleSuggested, got {other:?}"),
+        }
+        // The `kind` column (what SSE + the orchestrator ingest key on) is the
+        // stable short name; the payload's serde `type` tag follows the
+        // enum-variant convention (`harness_*`), like every other harness event.
+        assert_eq!(ev.kind(), "title_suggested");
+
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(json["type"], "harness_title_suggested");
+        assert_eq!(json["title"], "Fix the flaky test");
     }
 
     /// Issue #527 Phase 1: `PromptReceived` is coordinator-native (never
@@ -2531,6 +2596,7 @@ pub(crate) mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
@@ -2598,6 +2664,7 @@ pub(crate) mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
@@ -2644,6 +2711,7 @@ pub(crate) mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         (session_id, Arc::new(MiniMeta::new(session)))
     }
@@ -2671,6 +2739,7 @@ pub(crate) mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         let sid = session.id;
         let mini = Arc::new(MiniMeta::new(session));
