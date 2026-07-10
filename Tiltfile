@@ -540,7 +540,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # path a guest reaches the network (SNI allow-list + DNS filter);
         # there's no "off" (0 is a footgun: a dead :443->0 redirect while the
         # proxy binds a random port). Per-host fixed port (each host-agent
-        # binds 0.0.0.0:<port> + iptables REDIRECTs its VMs there). The fc path
+        # binds 0.0.0.0:<port> + iptables REDIRECTs its VMs there). The FC path
         # defaults this to 8443 (see _proxy_base below) so claude sessions can
         # reach api.anthropic.com; a session still needs api.anthropic.com in
         # its policy network.allow_hosts + ANTHROPIC_API_KEY for the call to
@@ -549,7 +549,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # DNS-filter proxy port. Like the proxy/gRPC/metrics ports, it must be
         # distinct per host-agent on the SHARED netns of the two-host e2e stack
         # (host-agent-b gets dns_base+1 below) — else the second host-agent
-        # fails closed on `0.0.0.0:5353 Address already in use` (ADR 0083). The
+        # fails closed on `Address already in use` (ADR 0083). The
         # host-agent wires this same value into the FC iptables `:53 -> dns`
         # REDIRECT, so the two can't drift.
         'ENGRAM_EGRESS_DNS_PORT': egress_dns_port,
@@ -603,8 +603,8 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # defaults to `local-disk`, which self-generates a CA under
         # `<work_dir>/egress-ca` on first boot (see `build_host_egress` in
         # crates/engram-host-agent/src/main.rs) — nothing to sync there
-        # either. The egress proxy also stays off by default in dev
-        # (ENGRAM_EGRESS_PROXY_PORT unset -> binds :0), same as today.
+        # either. The mandatory egress proxy uses the FC fixed ports selected
+        # below; local-disk CA generation stays entirely inside the VM.
         env['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
     elif 'Darwin' in uname_str:
         env['PATH'] = '/opt/homebrew/opt/e2fsprogs/sbin:' + os.environ.get('PATH', '')
@@ -818,16 +818,22 @@ if dev_split:
 # reaches the network, and `0` is NOT an "off" sentinel — host_startup still
 # installs a `:443 -> port 0` REDIRECT (dead) while the proxy binds a random
 # ephemeral port, so guest HTTPS (e.g. a claude session's api.anthropic.com
-# call) silently hangs. On the fc path default it to a real fixed port (8443,
-# the host-agent's own CLI default) so egress actually works; other dev
-# backends keep the historical 0 unless overridden. (The proxy is fail-closed
-# on a bind collision — 8443 is verified free in the fc-dev VM.)
-_proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT',
-                         '8443' if fc_colima_profile else '0'))
-# DNS-filter proxy base port. Always a real port (unlike the proxy port, which
-# has a 0-footgun default): the DNS listener always binds. host-agent-b takes
-# _dns_base + 1 so the two hosts don't collide on the shared netns.
-_dns_base = int(env_or('ENGRAM_EGRESS_DNS_PORT', '5353'))
+# call) silently hangs. Every dev backend gets real fixed ports. FC keeps the
+# binary defaults because iptables redirects its guests there. Local VZ uses a
+# separate pair: Colima's SSH forwarding can retain the FC ports on the Mac,
+# and UDP 5353 is the system mDNS port. Explicit env overrides still win.
+_proxy_default = '8443' if sandbox_backend == 'firecracker' else '18443'
+_dns_default = '5353' if sandbox_backend == 'firecracker' else '15353'
+_proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT', _proxy_default))
+_dns_base = int(env_or('ENGRAM_EGRESS_DNS_PORT', _dns_default))
+# host-agent-b takes the next proxy and DNS ports so the two hosts don't
+# collide on the shared netns.
+if _proxy_base < 1 or _proxy_base > 65535:
+    fail('ENGRAM_EGRESS_PROXY_PORT must be between 1 and 65535 (egress is mandatory)')
+if _dns_base < 1 or _dns_base > 65535:
+    fail('ENGRAM_EGRESS_DNS_PORT must be between 1 and 65535 (egress is mandatory)')
+if two_hosts and (_proxy_base == 65535 or _dns_base == 65535):
+    fail('two-host mode needs room for the second host egress ports (base must be <= 65534)')
 if dev_split:
     host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base), str(_dns_base))
     if fc_colima_profile:
@@ -875,10 +881,9 @@ if dev_split:
             labels=['setup'])
     if two_hosts:
         # Distinct proxy + DNS ports for the second host-agent (they share the
-        # netns). Proxy: 0 (disabled) stays 0 so the dev default is unchanged.
-        # DNS: always +1 (the DNS listener always binds), else host-agent-b
-        # fails closed on `0.0.0.0:5353 Address already in use` (ADR 0083).
-        _proxy_b = str(_proxy_base + 1) if _proxy_base > 0 else '0'
+        # netns), else host-agent-b fails closed on Address already in use
+        # (ADR 0083).
+        _proxy_b = str(_proxy_base + 1)
         host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b, str(_dns_base + 1))
 
 # ----------------------------------------------------------------

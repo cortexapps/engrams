@@ -117,6 +117,13 @@ forge:
     privateKey:
       existingSecret: ""
       secretKey: github-app-private-key
+  # App committer identity stamped on every in-session commit (the session
+  # initiator stays the author; this identity is the committer, and the
+  # author fallback for programmatic sessions). For a GitHub App:
+  # "<APP_ID>+<APP_SLUG>[bot]@users.noreply.github.com". Empty email = off.
+  committer:
+    email: ""
+    name: "engrams"
 
 # Cloud-agnostic identity. Production overlays bind to a
 # cloud-specific SA via annotations (GKE Workload Identity, EKS IRSA).

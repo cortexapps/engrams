@@ -739,6 +739,36 @@ impl ChunkCache {
                     hash,
                     armed: true,
                 };
+                // Double-checked hit: leadership was won on the state of the
+                // inflight MAP, but this call's fast-path disk check ran
+                // before the lock — a prior leader may have persisted and
+                // drained in between (its persist happens before its slot
+                // removal, below, so slot-gone implies file-present). Serve
+                // from disk instead of paying a duplicate remote fetch —
+                // without this, a stale-miss caller that wins leadership
+                // re-fetches a chunk that is already on NVMe (the
+                // `concurrent_clients_collapse_to_one_fetch` flake).
+                if let Some(bytes) = read_if_present(&path).await? {
+                    let waiters = {
+                        let mut inflight = self.inner.inflight.lock();
+                        inflight.remove(&hash).unwrap_or_default()
+                    };
+                    guard.armed = false;
+                    for waiter in waiters {
+                        let _ = waiter.send(Ok(bytes.clone()));
+                    }
+                    metrics::counter!(
+                        "engram_chunk_cache_hits_total",
+                        "tier" => "nvme",
+                    )
+                    .increment(1);
+                    metrics::counter!(
+                        "engram_chunk_cache_bytes_total",
+                        "tier" => "nvme",
+                    )
+                    .increment(bytes.len() as u64);
+                    return Ok(bytes);
+                }
                 let fetch = fetch.take().expect("leader runs the fetch once");
                 // ADR 0039 #16: thrash signal. If we're about to pay a remote
                 // round-trip for a hash we recently evicted, the cache is too
@@ -786,14 +816,16 @@ impl ChunkCache {
                     }
                     Err(e) => Err(e),
                 };
-                // Persist + drain waiters under a single lock acquisition,
-                // then DISARM: the slot is gone, so the guard must not remove
-                // a fresh slot a later leader may have created.
-                let waiters = {
-                    let mut inflight = self.inner.inflight.lock();
-                    inflight.remove(&hash).unwrap_or_default()
-                };
-                guard.armed = false;
+                // Persist BEFORE releasing the slot. The ordering is the
+                // singleflight's collapse invariant: a fresh caller can only
+                // become the next leader after this slot is removed, so
+                // slot-gone must imply file-present — otherwise every caller
+                // arriving in the remove→persist window (fast-path miss, then
+                // an empty inflight entry) re-fetches a chunk that is already
+                // in flight to disk. The leader's double-checked read above
+                // relies on the same invariant. Cancellation mid-persist is
+                // covered by the still-armed guard (slot removed on drop;
+                // waiters wake with RecvError and retry).
                 if let Ok(bytes) = result.as_ref() {
                     // write_local failure is non-fatal I/O (ENOSPC, perms): the
                     // fetched bytes still return to the caller, but the chunk
@@ -848,6 +880,13 @@ impl ChunkCache {
                         .increment(bytes.len() as u64);
                     }
                 }
+                // Drain waiters + DISARM: the slot is gone, so the guard must
+                // not remove a fresh slot a later leader may have created.
+                let waiters = {
+                    let mut inflight = self.inner.inflight.lock();
+                    inflight.remove(&hash).unwrap_or_default()
+                };
+                guard.armed = false;
                 // Notify waiters. Send-failure (their rx dropped)
                 // is benign.
                 for waiter in waiters {

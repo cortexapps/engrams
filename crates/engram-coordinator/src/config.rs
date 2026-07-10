@@ -48,6 +48,18 @@ pub struct CoordinatorConfig {
     /// this surface fails closed — no configured tokens, every call
     /// answers `unauthenticated` (boot is unaffected).
     pub app_grpc_tokens: Vec<String>,
+    /// App committer identity stamped into every session's launch env as
+    /// git's native `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` overrides —
+    /// in-session commits are *committed* by the deployment's app identity
+    /// (authorship stays with the gitconfig `[user]` block: the human
+    /// initiator when known, else this same identity via the in-guest
+    /// fallback, never git's guessed `root@<host>`). For a GitHub App the
+    /// convention is `<APP_ID>+<APP_SLUG>[bot]@users.noreply.github.com`;
+    /// other forges have their own shapes, hence plain config. `None` =
+    /// don't stamp (today's env untouched).
+    pub git_committer_email: Option<String>,
+    /// Display name paired with `git_committer_email` (ignored without it).
+    pub git_committer_name: String,
 }
 
 impl Default for CoordinatorConfig {
@@ -73,6 +85,8 @@ impl Default for CoordinatorConfig {
             // Empty = fail closed (every app-gRPC call rejected), NOT
             // auth-off. Populated from `ENGRAM_APP_GRPC_TOKENS`.
             app_grpc_tokens: Vec::new(),
+            git_committer_email: None,
+            git_committer_name: "engrams".into(),
         }
     }
 }

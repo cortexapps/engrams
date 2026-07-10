@@ -24,14 +24,20 @@ export function fail(message: string): never {
   process.exit(1);
 }
 
-/** Render an RPC/transport failure and exit — the one error edge for verbs. */
-export function failWith(err: unknown): never {
+/** One-line rendering of an RPC/transport failure (no exit) — for verbs
+ *  that run several independent RPCs and must report each outcome. */
+export function errorMessage(err: unknown): string {
   if (err instanceof ConnectError) {
     // rawMessage strips the "[code] " prefix Connect prepends to message;
     // Code[…] renders the enum's name (e.g. "Unauthenticated"), not its number.
-    fail(`${Code[err.code] ?? err.code}: ${err.rawMessage}`);
+    return `${Code[err.code] ?? err.code}: ${err.rawMessage}`;
   }
-  fail(err instanceof Error ? err.message : String(err));
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Render an RPC/transport failure and exit — the one error edge for verbs. */
+export function failWith(err: unknown): never {
+  fail(errorMessage(err));
 }
 
 export function truncate(s: string, max: number): string {

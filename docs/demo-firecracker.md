@@ -253,12 +253,10 @@ proxy as the *only* egress path:
 - DROP VM→RFC1918 / link-local / loopback
 - DROP VM→host-INPUT (with explicit ACCEPTs first for the proxy's
   TCP/443 listener and its DNS port — see `engram-sandbox-firecracker::net::host_startup_lines`)
-- REDIRECT VM→tcp/443 → proxy (when `--egress-proxy-port` set)
+- REDIRECT VM→tcp/443 → the mandatory proxy listener
 - REDIRECT VM→udp/53, tcp/53 → proxy DNS port (default 5353)
-- DROP everything else (proxy is the only egress when enabled)
+- DROP everything else (the proxy is the only egress)
 - MASQUERADE on POSTROUTING for return traffic
-- (No-proxy mode keeps the legacy `ACCEPT VM→1.1.1.1:53` rules so
-  DNS still works when the operator opts out of filtering.)
 
 CA delivery: per-host CA persisted to
 `<work_dir>/egress-proxy/ca.{pem,key}`; the harness substrate

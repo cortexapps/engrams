@@ -315,6 +315,13 @@ hostCmd
     return host.drain(clients(), id);
   });
 hostCmd
+  .command("delete <id>")
+  .description("deregister a host row (refused while sessions are bound — drain / reap first)")
+  .action((id: string) => {
+    const { clients } = ctx();
+    return host.remove(clients(), id);
+  });
+hostCmd
   .command("uncordon <id>")
   .description("clear an admin cordon; host returns to ready")
   .action((id: string) => {
@@ -395,6 +402,16 @@ adminCmd
   .action((id: string) => {
     const { clients, json } = ctx();
     return admin.evictIdle(clients(), id, json);
+  });
+adminCmd
+  .command("gc")
+  .description("blob GC sweeps (bundle/snapshot-blob/chunk); dry-run unless --apply")
+  .option("--apply", "mark candidates + delete promoted blobs (default: report only)")
+  .option("--grace-secs <n>", "override the candidate grace window in seconds (0 = delete same sweep)")
+  .action((opts: { apply?: boolean; graceSecs?: string }) => {
+    const { clients, json } = ctx();
+    const grace = opts.graceSecs !== undefined ? BigInt(opts.graceSecs) : undefined;
+    return admin.gc(clients(), Boolean(opts.apply), grace, json);
   });
 
 program.parseAsync().catch((e: unknown) => {

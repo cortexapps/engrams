@@ -54,8 +54,8 @@ loopback. Cross-machine alternatives all hurt:
 
 **The egress proxy runs on each FC host-agent.** Specifically:
 
-- Each `engram-host-agent` instance spawns a `HostEgress` at boot
-  (when `--egress-proxy-port > 0`). The proxy binds the host's
+- Each `engram-host-agent` instance spawns a `HostEgress` at boot.
+  The proxy binds the host's
   loopback; iptables REDIRECT is local; no cross-machine traffic
   enters the request path.
 
