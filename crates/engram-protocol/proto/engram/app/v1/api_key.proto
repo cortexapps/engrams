@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// ADR 0086: admin-managed global API keys. Orchestrator-NATIVE (never proxied
+// to the coordinator). Each key is owned by a dedicated service-account user
+// (apikey+<uuid>@service.local) whose `role` ('admin'|'user') is the key's
+// authorization level; a request bearing the key resolves to that identity at
+// the existing auth seams. ALL RPCs are admin-only. The key material is
+// SHA-256-hashed at rest; the plaintext is returned exactly once, from
+// CreateApiKey, and is never retrievable again.
+service ApiKeyService {
+  // Mint a key. Returns metadata plus the one-time plaintext key.
+  rpc CreateApiKey(CreateApiKeyRequest) returns (CreateApiKeyResponse);
+  // List all keys (metadata only — masked preview, never hash or plaintext).
+  rpc ListApiKeys(ListApiKeysRequest) returns (ListApiKeysResponse);
+  // Revoke a key: deletes its service-account user (the key row cascades).
+  // Idempotent (revoking an absent key yields `revoked = false`, not an error).
+  rpc RevokeApiKey(RevokeApiKeyRequest) returns (RevokeApiKeyResponse);
+}
+
+// Key metadata — everything EXCEPT the secret material.
+message ApiKeyMeta {
+  // The apikey row id (revocation handle).
+  string id = 1;
+  // Human-assigned name, e.g. "ci-bot".
+  string name = 2;
+  // The key's authorization level: "admin" | "user".
+  string role = 3;
+  // Masked preview (prefix + first characters), e.g. "engk_a1b2c3".
+  string start = 4;
+  // ISO-8601.
+  string created_at = 5;
+  // ISO-8601; empty = never expires.
+  string expires_at = 6;
+  // ISO-8601; empty = never used.
+  string last_used_at = 7;
+}
+
+message CreateApiKeyRequest {
+  string name = 1;
+  // "admin" | "user" — validated server-side.
+  string role = 2;
+  // ISO-8601 date/time; empty = never expires. Must be ≥ 1 day out (the
+  // plugin's expiration floor — revoke covers "kill it now").
+  string expires_at = 3;
+}
+
+message CreateApiKeyResponse {
+  ApiKeyMeta meta = 1;
+  // The full plaintext key (engk_…). Shown ONCE; only its hash is stored.
+  string key = 2;
+}
+
+message ListApiKeysRequest {}
+
+message ListApiKeysResponse {
+  repeated ApiKeyMeta keys = 1;
+}
+
+message RevokeApiKeyRequest {
+  string id = 1;
+}
+
+message RevokeApiKeyResponse {
+  // Whether a key was revoked (idempotent).
+  bool revoked = 1;
+}

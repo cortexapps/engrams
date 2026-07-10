@@ -11,7 +11,7 @@
 
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import { abilityFor } from "../authz/ability.ts";
 import { runIntegrationOp, type RunOpDeps } from "../integrations/run-op.ts";
 
@@ -19,9 +19,7 @@ export function makeIntegrationOpRoute(deps?: RunOpDeps): Hono {
   const app = new Hono();
 
   async function requireAdmin(headers: Headers): Promise<void> {
-    const session = await auth.api.getSession({
-      headers,
-    } as Parameters<typeof auth.api.getSession>[0]);
+    const session = await getSessionFromHeaders(headers);
     if (!session) throw new HTTPException(401, { message: "unauthenticated" });
     const ability = abilityFor({ id: session.user.id, role: session.user.role ?? "user" });
     if (!ability.can("manage", "all")) throw new HTTPException(403, { message: "admin required" });

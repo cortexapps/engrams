@@ -10,6 +10,11 @@
  *     ban / list APIs used by the Members UI (Task 25). We read 'user' as
  *     "member". There is no JWT plugin and no JWKS — nothing downstream
  *     consumes user identity anymore (ADR §5).
+ *   - api-key plugin (ADR 0086): global programmatic keys, each owned by a
+ *     dedicated service-account user carrying the key's role. Keyed requests
+ *     resolve to a mock session at getSession; the plugin's own HTTP
+ *     endpoints are 404'd (hooks.before) — management is the admin-gated
+ *     ApiKeyService only.
  *   - drizzle adapter: writes to the same engram_orchestrator postgres
  *     database via the lazy getDb() singleton. We pass a Proxy that defers
  *     the getDb() call until the first property access so this module can
@@ -27,8 +32,10 @@
 
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { APIError, createAuthMiddleware } from "better-auth/api";
 import { admin } from "better-auth/plugins/admin";
 import { genericOAuth } from "better-auth/plugins/generic-oauth";
+import { apiKey } from "@better-auth/api-key";
 import { getDb } from "../db/client.ts";
 import { config } from "../config.ts";
 import {
@@ -36,6 +43,7 @@ import {
   isBootstrapAdmin,
   promotedRoleOnLogin,
 } from "./admin-allowlist.ts";
+import { API_KEY_PREFIX, extractApiKey } from "./api-key-header.ts";
 
 // Bootstrap-admin allowlist (restores the old `auth.bootstrapAdmins` Helm
 // value via ORCHESTRATOR_ADMIN_EMAILS). When empty, both hooks below are
@@ -154,8 +162,46 @@ export const auth = betterAuth({
   // Bootstrap-admin promotion (ORCHESTRATOR_ADMIN_EMAILS). Undefined → omitted
   // entirely when the allowlist is empty (inert dev/local default).
   ...(databaseHooks ? { databaseHooks } : {}),
+  hooks: {
+    // ADR 0086: the api-key plugin has NO role gate on its HTTP endpoints —
+    // any logged-in user could mint themselves a key via
+    // POST /api/auth/api-key/create. Kill ALL HTTP access to the plugin's
+    // routes; key management flows only through the admin-gated ApiKeyService
+    // (src/rpc/api-key.ts). `ctx.request` is set for HTTP requests only, so
+    // server-side auth.api.createApiKey (no request) still works — the same
+    // discriminator the plugin itself uses to gate body.userId.
+    before: createAuthMiddleware(async (ctx) => {
+      if (ctx.request && ctx.path.startsWith("/api-key")) {
+        throw new APIError("NOT_FOUND");
+      }
+    }),
+  },
   plugins: [
     admin(), // role field ('admin'|'user'), setRole/ban/list APIs → Members UI
     ...oidcPlugins, // env-driven OIDC provider (genericOAuth) when configured
+    // ADR 0086: global API keys. Each key's referenceId points at a dedicated
+    // service-account user (apikey+<uuid>@service.local) whose `role` is the
+    // key's authorization level; enableSessionForAPIKeys turns a valid keyed
+    // request into a mock session for that user at getSession, so every
+    // existing seam (CASL, policy map, ownership) works unchanged. Invalid /
+    // expired / disabled keys THROW from getSession — src/auth/session.ts
+    // catches to null so the seams fail closed with their normal 401s.
+    apiKey({
+      defaultPrefix: API_KEY_PREFIX,
+      // x-api-key or `Authorization: Bearer engk_…` — shared with the IAP
+      // bridge bypass so key detection can never skew between the two.
+      customAPIKeyGetter: (ctx) => (ctx.headers ? extractApiKey(ctx.headers) : null),
+      enableSessionForAPIKeys: true,
+      // Masked preview stored as `start`: default 6 chars would be swallowed
+      // by the 5-char prefix — 11 shows engk_ + 6 chars of entropy in the UI.
+      startingCharactersConfig: { shouldStore: true, charactersLength: 11 },
+      // Per-key rate limiting is ON by default (~10 req/day) — that would
+      // break programmatic callers, and the orchestrator has no per-key QoS
+      // requirement. (lastRequest is still stamped for the "Last used" UI.)
+      rateLimit: { enabled: false },
+      // Days. Floor is the plugin's own minimum (1 day); revoke covers
+      // "kill it now". 3650 ≈ effectively non-expiring for named CI keys.
+      keyExpiration: { minExpiresIn: 1, maxExpiresIn: 3650 },
+    }),
   ],
 });

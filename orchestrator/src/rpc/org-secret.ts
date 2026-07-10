@@ -16,7 +16,7 @@ import { ConnectError, Code } from "@connectrpc/connect";
 import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
 
 import { OrgSecretService } from "../gen/engram/app/v1/org_secret_pb.ts";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import { orgSecret as defaultOrgSecret } from "../control-plane/client.ts";
 
 export type GetSession = (
@@ -54,7 +54,7 @@ async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promis
 export function registerOrgSecret(router: ConnectRouter, deps?: OrgSecretDeps): void {
   const getSession: GetSession =
     deps?.getSession ??
-    ((headers) => auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
+    getSessionFromHeaders;
   const client: OrgSecretClient =
     deps?.orgSecret ?? (defaultOrgSecret as unknown as OrgSecretClient);
 

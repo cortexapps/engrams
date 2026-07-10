@@ -14,7 +14,7 @@ import { ConnectError, Code } from "@connectrpc/connect";
 import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
 
 import { MintService, type MintKind } from "../gen/engram/app/v1/mint_pb.ts";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import { mint as defaultMint } from "../control-plane/client.ts";
 
 export type GetSession = (
@@ -42,7 +42,7 @@ async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promis
 export function registerMint(router: ConnectRouter, deps?: MintDeps): void {
   const getSession: GetSession =
     deps?.getSession ??
-    ((headers) => auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
+    getSessionFromHeaders;
   const client: MintClient = deps?.mint ?? (defaultMint as unknown as MintClient);
 
   router.service(MintService, {

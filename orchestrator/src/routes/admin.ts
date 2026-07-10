@@ -35,7 +35,7 @@
 
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import { abilityFor } from "../authz/ability.ts";
 import { config } from "../config.ts";
 
@@ -48,9 +48,7 @@ export function makeAdminRoute(
 
   /** Require admin; throws HTTPException(401/403) otherwise. */
   async function requireAdmin(headers: Headers): Promise<void> {
-    const session = await auth.api.getSession({
-      headers,
-    } as Parameters<typeof auth.api.getSession>[0]);
+    const session = await getSessionFromHeaders(headers);
     if (!session) {
       throw new HTTPException(401, { message: "unauthenticated" });
     }

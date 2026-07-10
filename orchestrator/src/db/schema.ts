@@ -317,6 +317,52 @@ export const verification = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Global API keys — @better-auth/api-key plugin table (ADR 0086)
+//
+// Field set mirrors the plugin's `apikey` model exactly (the drizzle adapter
+// maps by TS property name). `key` is the SHA-256 hash — plaintext is returned
+// once at creation and never stored. `referenceId` points at the key's
+// dedicated service-account user (`apikey+<uuid>@service.local`), whose `role`
+// is the key's authorization level; deleting that user cascades the key row
+// (revocation). Admin-only management via ApiKeyService (src/rpc/api-key.ts);
+// the plugin's own HTTP endpoints are 404'd in better-auth.ts.
+// ---------------------------------------------------------------------------
+
+export const apikey = pgTable(
+  "apikey",
+  {
+    id: text("id").primaryKey(),
+    configId: text("config_id").notNull().default("default"),
+    name: text("name"),
+    start: text("start"), // masked preview (first chars of the plaintext key)
+    prefix: text("prefix"),
+    key: text("key").notNull(), // SHA-256 hash of the full key
+    referenceId: text("reference_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    refillInterval: integer("refill_interval"),
+    refillAmount: integer("refill_amount"),
+    lastRefillAt: timestamp("last_refill_at"),
+    enabled: boolean("enabled").default(true),
+    rateLimitEnabled: boolean("rate_limit_enabled").default(false),
+    rateLimitTimeWindow: integer("rate_limit_time_window"),
+    rateLimitMax: integer("rate_limit_max"),
+    requestCount: integer("request_count").default(0),
+    remaining: integer("remaining"),
+    lastRequest: timestamp("last_request"),
+    expiresAt: timestamp("expires_at"), // null = no expiry; expired rows are auto-deleted at verify
+    createdAt: timestamp("created_at").notNull(),
+    updatedAt: timestamp("updated_at").notNull(),
+    permissions: text("permissions"),
+    metadata: text("metadata"),
+  },
+  (t) => [
+    index("apikey_reference_id_idx").on(t.referenceId),
+    index("apikey_key_idx").on(t.key), // verify path looks up by hash
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // User session secrets — KEK-envelope sealed at rest (ADR 0051 Drip A)
 //
 // A generic, env-var-name-keyed per-user secret store. The orchestrator OWNS

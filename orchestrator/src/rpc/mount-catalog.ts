@@ -16,7 +16,7 @@ import { ConnectError, Code } from "@connectrpc/connect";
 import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
 
 import { MountCatalogService } from "../gen/engram/app/v1/mount_catalog_pb.ts";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import { mountCatalog as defaultMountCatalog } from "../control-plane/client.ts";
 import type { MountCatalogClient } from "../skills/catalog.ts";
 
@@ -49,7 +49,7 @@ function requireAdmin(user: { role: string }): void {
 export function registerMountCatalog(router: ConnectRouter, deps?: MountCatalogDeps): void {
   const getSession: GetSession =
     deps?.getSession ??
-    ((headers) => auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
+    getSessionFromHeaders;
   const catalog: MountCatalogClient =
     deps?.mountCatalog ?? (defaultMountCatalog as unknown as MountCatalogClient);
 

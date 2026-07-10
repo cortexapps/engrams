@@ -21,7 +21,7 @@ import { HTTPException } from "hono/http-exception";
 import { subject } from "@casl/ability";
 import { abilityFor } from "../authz/ability.ts";
 import { resolveSessionOwner } from "../authz/resolve.ts";
-import { auth } from "../auth/better-auth.ts";
+import { getSessionFromHeaders } from "../auth/session.ts";
 import type { Actions } from "../authz/ability.ts";
 
 // ---------------------------------------------------------------------------
@@ -100,12 +100,7 @@ function resolveDefaults(
   getSession?: GetSession,
   resolveOwner?: ResolveOwner,
 ): { resolveSession: GetSession; ownerResolver: ResolveOwner } {
-  const resolveSession: GetSession =
-    getSession ??
-    ((headers) =>
-      auth.api.getSession({
-        headers,
-      } as Parameters<typeof auth.api.getSession>[0]));
+  const resolveSession: GetSession = getSession ?? getSessionFromHeaders;
   const ownerResolver: ResolveOwner = resolveOwner ?? resolveSessionOwner;
   return { resolveSession, ownerResolver };
 }
