@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 import { Activity, UserRound, X } from "lucide-react";
 import { StatusGlyph } from "../../components/Glyph";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
-import { useAdminUsersMap, useTasksInfiniteAsSessionListWithOwners } from "../../hooks/useTasks";
+import { useAdminUsersMap, useTasksInfiniteAsSessionList } from "../../hooks/useTasks";
 import type { SessionState } from "../../lib/types";
 import { PageHeading } from "../../components/page-heading";
 import { Button } from "@/components/ui/button";
@@ -65,7 +65,7 @@ export function AllSessions() {
     fetchNextPage,
     isPending,
     error,
-  } = useTasksInfiniteAsSessionListWithOwners(
+  } = useTasksInfiniteAsSessionList(
     {
       scope: "all",
       search: debouncedSearch,

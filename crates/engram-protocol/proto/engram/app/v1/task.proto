@@ -4,6 +4,7 @@ package engram.app.v1;
 
 import "engram/app/v1/session.proto";
 import "engram/app/v1/profile.proto";
+import "engram/app/v1/user.proto";
 
 // The application aggregate root (ADR 0051 §3, rev 2026-06-10).
 // ORCHESTRATOR-NATIVE: the
@@ -67,8 +68,9 @@ message Task {
   optional string title = 3;
   // "open" | "working" | "awaiting_review" | "done" | "failed".
   string status = 4;
-  // better-auth user id of the creator; unset for system-triggered
-  // tasks. Attribution lives HERE, not on the control-plane Session.
+  // Raw attribution fact matching the task.created_by_user_id DB column;
+  // unset for system-triggered tasks. Attribution lives HERE, not on the
+  // control-plane Session.
   optional string created_by_user_id = 5;
   // Type-specific trigger ref (jsonb passthrough).
   string source_json = 6;
@@ -79,6 +81,10 @@ message Task {
   // false when it is auto (harness suggestion or truncated prompt). Lets the
   // UI offer a "reset to auto" affordance. Derived: custom_title != null.
   bool title_is_custom = 9;
+  // Best-effort directory resolution of created_by_user_id, performed
+  // server-side. Unset for unattributed/automation rows (no creator) or when
+  // the corresponding better-auth user row is gone.
+  optional User created_by = 10;
 }
 
 message TaskSessionRef {

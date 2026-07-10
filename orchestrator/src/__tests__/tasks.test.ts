@@ -29,6 +29,7 @@ import { registerTasks, buildProfileMap, searchPattern, effectiveTitle } from ".
 import type { TaskDeps, SessionsClient, Db, GetSession, ImagesClient } from "../rpc/tasks.ts";
 import type { HarnessCatalogClient } from "../rpc/task-create.ts";
 import type { UserSecretStore } from "../db/user-secrets.ts";
+import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 import type { ProfileRow, ProfileStore, ProfileInput } from "../db/profiles.ts";
 
 // The claude harness's declared `auth.user_env` (see fakeHarnessCatalog); the
@@ -60,6 +61,24 @@ const dbReachable = DB_URL ? await checkDb() : false;
 const MEMBER_A = "member-a-tasks-test";
 const MEMBER_B = "member-b-tasks-test";
 const ADMIN_ID  = "admin-tasks-test";
+
+function makeFakeUsers(
+  seed: Record<string, UserIdentity> = {},
+): UserIdentityStore {
+  return {
+    async getIdentity(userId) {
+      return seed[userId] ?? null;
+    },
+    async getIdentities(userIds) {
+      return new Map(
+        userIds.flatMap((id) => {
+          const identity = seed[id];
+          return identity ? [[id, identity] as const] : [];
+        }),
+      );
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Fake upstream session state
@@ -502,7 +521,7 @@ async function spawnServer(deps: TaskDeps): Promise<TestServer> {
   // fake DB's select counter (a test may override either).
   const fullDeps: TaskDeps = {
     harnessCatalog: fakeHarnessCatalog(),
-    users: { getIdentity: async () => null },
+    users: makeFakeUsers(),
     ...deps,
   };
   const srv = buildServer(app, (router) => {
@@ -666,6 +685,11 @@ const LIST_MEMBER_ID = "list-task-id-HaYsTaCk";
 const LIST_SYSTEM = "list-system-task";
 const LIST_ORPHAN_SESSION = "list-orphan-session";
 
+const listUsers = makeFakeUsers({
+  [ADMIN_ID]: { name: "Admin Operator", email: "admin@example.com" },
+  [MEMBER_A]: { name: "Member A", email: "member-a@example.com" },
+});
+
 const listFixture: ListDbFixture = {
   tasks: [
     listTaskRow(LIST_ADMIN_ACTIVE, ADMIN_ID, "2026-01-01T00:00:00.000Z"),
@@ -702,6 +726,7 @@ function makeListClient(
       sessions: makeFakeSessions({ existing: sessions }),
       profiles: makeFakeProfiles(),
       images: fakeImages(),
+      users: listUsers,
       db: okDb("unused-list-task", fixture),
     });
   });
@@ -745,6 +770,28 @@ describe("TaskService — ListTasks ADR 0087", () => {
       );
       expect(resp.totalCount).toBe(6);
     }
+  });
+
+  test("joins known owners and preserves raw attribution when the user row is gone", async () => {
+    const resp = await makeListClient(ADMIN_ID, "admin").listTasks({ scope: "all" });
+    const owned = resp.tasks.find((task) => task.id === LIST_MEMBER_TITLE);
+    expect(owned?.createdBy).toMatchObject({
+      id: MEMBER_A,
+      name: "Member A",
+      email: "member-a@example.com",
+    });
+
+    const system = resp.tasks.find((task) => task.id === LIST_SYSTEM);
+    expect(system?.createdByUserId).toBeUndefined();
+    expect(system?.createdBy).toBeUndefined();
+    const synthetic = resp.tasks.find(
+      (task) => task.id === `unattributed-${LIST_ORPHAN_SESSION}`,
+    );
+    expect(synthetic?.createdBy).toBeUndefined();
+
+    const deletedOwner = resp.tasks.find((task) => task.id === LIST_MEMBER_ID);
+    expect(deletedOwner?.createdByUserId).toBe(MEMBER_B);
+    expect(deletedOwner?.createdBy).toBeUndefined();
   });
 
   test("search matches title, task id, and session id case-insensitively", async () => {

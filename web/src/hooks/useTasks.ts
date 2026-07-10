@@ -55,9 +55,8 @@ export function pollIntervalFor(tasks: readonly Task[] | undefined): number {
  * `data-session-id` and navigation still point at the SESSION id — the detail
  * page is unchanged until Task 24.
  *
- * `createdByUserId` is preserved in `user_id` so the AllSessions owner-enrichment
- * pass can look it up in the admin user map. owner_email/owner_name start null
- * and are filled by `enrichWithOwners` after the admin user list resolves. */
+ * `createdByUserId` is preserved in `user_id` for filtering and authorization;
+ * owner labels ride the Task row from the server-side identity join. */
 export function taskToSessionListItem(task: Task): SessionListItem {
   const ref = task.sessions[0];
   const sess = ref?.session;
@@ -77,16 +76,16 @@ export function taskToSessionListItem(task: Task): SessionListItem {
     status: (sess?.status ?? "pending") as SessionListItem["status"],
     image: sess?.image ?? "",
     mode: (sess?.mode ?? "agent") as SessionListItem["mode"],
-    // Carry createdByUserId through as user_id so owner-enrichment can look it
-    // up in the admin user map. Null for unattributed/synthetic rows.
+    // Carry the raw attribution fact through for list consumers. Null for
+    // unattributed/synthetic rows.
     user_id: task.createdByUserId ?? null,
     host_id: sess?.hostId ?? null,
     sandbox_id: sess?.sandboxId ?? null,
     created_at: sess?.createdAt ?? task.createdAt,
     last_active_at: sess?.lastActiveAt ?? task.createdAt,
-    owner_email: null,
-    owner_name: null,
-    owner_kind: null,
+    owner_email: task.createdBy?.email ?? null,
+    owner_name: task.createdBy?.name ?? null,
+    owner_kind: task.createdByUserId == null ? "system" : null,
     profile: snap
       ? {
           id: snap.id,
@@ -134,20 +133,31 @@ export function useUpdateTask() {
 }
 
 /** Admin-only: fetch a stable id→{name,email} map from better-auth's admin
- * user list for owner-label enrichment on AllSessions. Fetches once with a
+ * user list for the AllSessions owner-filter options. Fetches once with a
  * 60s stale window (admin list doesn't change frequently).
  *
- * Passes limit: 100 — sufficient for typical deployments; expand or paginate
- * if the fleet grows beyond a few dozen operators. */
+ * Pages through the WHOLE directory: a single capped fetch left any owner
+ * past the first page unmapped — dev/e2e databases accumulate hundreds of
+ * users, and real owners sorted after them rendered as "?". */
 async function fetchAdminUsersMap(): Promise<Map<string, { name: string; email: string }>> {
-  // authClient.admin.listUsers returns { data: { users, total, ... } | null, error }
-  const result = await authClient.admin.listUsers({ query: { limit: 100 } });
-  const users =
-    (result.data as { users?: Array<{ id: string; name: string; email: string }> } | null)?.users ??
-    [];
   const map = new Map<string, { name: string; email: string }>();
-  for (const u of users) {
-    map.set(u.id, { name: u.name, email: u.email });
+  const PAGE = 100;
+  let offset = 0;
+  for (;;) {
+    // authClient.admin.listUsers returns { data: { users, total, ... } | null, error }
+    const result = await authClient.admin.listUsers({ query: { limit: PAGE, offset } });
+    const data = result.data as {
+      users?: Array<{ id: string; name: string; email: string }>;
+      total?: number;
+    } | null;
+    const users = data?.users ?? [];
+    for (const u of users) {
+      map.set(u.id, { name: u.name, email: u.email });
+    }
+    offset += users.length;
+    // Terminates even if the server ignores `offset` (users.length stalls the
+    // running offset at total) or omits `total` (falls back to one page).
+    if (users.length === 0 || offset >= (data?.total ?? offset)) break;
   }
   return map;
 }
@@ -160,23 +170,8 @@ export function useAdminUsersMap(isAdmin: boolean) {
     queryFn: fetchAdminUsersMap,
     enabled: isAdmin,
     staleTime: 60_000,
-    // Keep the previous map on screen while refetching — avoids a "?" flash.
+    // Keep filter options stable while the directory refetches.
     placeholderData: (prev) => prev,
-  });
-}
-
-/** Enrich a SessionListItem[] with owner_name/owner_email from the admin user
- * map. Rows with no user_id (unattributed/synthetic) keep null — "?" is honest. */
-function enrichWithOwners(
-  items: SessionListItem[],
-  usersMap: Map<string, { name: string; email: string }> | undefined,
-): SessionListItem[] {
-  if (!usersMap) return items;
-  return items.map((item) => {
-    if (!item.user_id) return item;
-    const u = usersMap.get(item.user_id);
-    if (!u) return item;
-    return { ...item, owner_name: u.name || null, owner_email: u.email };
   });
 }
 
@@ -246,20 +241,6 @@ export function useTasksInfiniteAsSessionList(
   };
 }
 
-/** Admin variant of the infinite task list with owner labels resolved from the
- * better-auth admin user map. */
-export function useTasksInfiniteAsSessionListWithOwners(
-  params: Omit<TaskListParams, "page" | "pageSize">,
-  pageSize: number,
-): InfiniteSessionListResult {
-  const result = useTasksInfiniteAsSessionList(params, pageSize);
-  const { data: usersMap } = useAdminUsersMap(true);
-  return {
-    ...result,
-    data: result.data ? enrichWithOwners(result.data, usersMap) : undefined,
-  };
-}
-
 /** Convert the ListTasksResponse tasks array to SessionListItem[]. */
 export function useTasksAsSessionList(params?: TaskListParams): {
   data: SessionListItem[] | undefined;
@@ -270,25 +251,6 @@ export function useTasksAsSessionList(params?: TaskListParams): {
   const { data, isPending, error } = useTasks(params);
   return {
     data: data?.tasks.map(taskToSessionListItem),
-    totalCount: data?.totalCount,
-    isPending,
-    error,
-  };
-}
-
-/** Admin variant: same as useTasksAsSessionList but enriches owner fields
- * from the better-auth admin user list. Used exclusively by AllSessions. */
-export function useTasksAsSessionListWithOwners(params?: TaskListParams): {
-  data: SessionListItem[] | undefined;
-  totalCount: number | undefined;
-  isPending: boolean;
-  error: unknown;
-} {
-  const { data, isPending, error } = useTasks(params);
-  const { data: usersMap } = useAdminUsersMap(true);
-  const raw = data?.tasks.map(taskToSessionListItem);
-  return {
-    data: raw ? enrichWithOwners(raw, usersMap) : undefined,
     totalCount: data?.totalCount,
     isPending,
     error,

@@ -72,7 +72,11 @@ const log = rootLog.child({ component: "task" });
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
-import type { UserIdentityStore } from "../db/users.ts";
+import {
+  makeUserIdentityStore,
+  type UserIdentity,
+  type UserIdentityStore,
+} from "../db/users.ts";
 import type { ImagesClient } from "./profiles.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
 import {
@@ -144,7 +148,7 @@ export interface TaskDeps {
   connectors?: CustomConnectorSource;
   /** Port-exposure store (ADR 0064) — auto-mints profile.portExposures at create. */
   portExposures?: PortExposureStore;
-  /** Owner identity lookup for git commit attribution (ADR 0031 §7). */
+  /** Owner identity lookup for git attribution and task read enrichment. */
   users?: UserIdentityStore;
   db?: Db;
 }
@@ -248,6 +252,7 @@ export function effectiveTitle(
 /**
  * Build a proto Task from a DB row + a map of sessionId → live Session.
  * The sessionMap may be empty (no upstream session found → session field unset).
+ * The identityMap is a best-effort directory join keyed by createdByUserId.
  *
  * `snapshots` (optional): the opportunistic-snapshot sink. When the primary
  * session's LIVE `suggested_title` differs from the persisted snapshot, we push
@@ -271,6 +276,7 @@ function buildTask(
   sessionRefs: Array<{ sessionId: string; role: string | null; profileId: string | null }>,
   sessionMap: Map<string, Session>,
   profileMap: Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string; skills: string[] }>,
+  identityMap: Map<string, UserIdentity>,
   snapshots?: Array<{ taskId: string; suggestedTitle: string }>,
 ): Task {
   // Derive status + the live harness title from the primary session (if available).
@@ -296,6 +302,9 @@ function buildTask(
   }
 
   const title = effectiveTitle(row, liveSuggested);
+  const creator = row.createdByUserId != null
+    ? identityMap.get(row.createdByUserId)
+    : undefined;
 
   const sessions: TaskSessionRef[] = sessionRefs.map((ref) => {
     const liveSession = sessionMap.get(ref.sessionId);
@@ -315,6 +324,15 @@ function buildTask(
     titleIsCustom: row.customTitle != null,
     status,
     ...(row.createdByUserId != null ? { createdByUserId: row.createdByUserId } : {}),
+    ...(row.createdByUserId != null && creator != null
+      ? {
+          createdBy: {
+            id: row.createdByUserId,
+            name: creator.name,
+            email: creator.email,
+          },
+        }
+      : {}),
     sourceJson: JSON.stringify(row.source ?? {}),
     sessions,
     createdAt: row.createdAt.toISOString(),
@@ -411,6 +429,7 @@ async function loadTask(
   sessionsClient: SessionsClient,
   profiles: ProfileStore,
   imagesClient: ImagesClient,
+  users: UserIdentityStore,
 ): Promise<Task> {
   const db_ = db;
 
@@ -445,9 +464,19 @@ async function loadTask(
     }
   }
 
-  const profileMap = await buildProfileMap(sessionRefRows, profiles, imagesClient);
+  const [profileMap, identityMap] = await Promise.all([
+    buildProfileMap(sessionRefRows, profiles, imagesClient),
+    users.getIdentities(taskRow.createdByUserId != null ? [taskRow.createdByUserId] : []),
+  ]);
   const snapshots: Array<{ taskId: string; suggestedTitle: string }> = [];
-  const task = buildTask(taskRow, sessionRefRows, sessionMap, profileMap, snapshots);
+  const task = buildTask(
+    taskRow,
+    sessionRefRows,
+    sessionMap,
+    profileMap,
+    identityMap,
+    snapshots,
+  );
   persistTitleSnapshots(db_, snapshots);
   return task;
 }
@@ -477,6 +506,10 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
   // so registering without a DB (the auth/validation tests) doesn't throw.
   const resolvePortExposures = (): PortExposureStore =>
     deps?.portExposures ?? makePortExposureStore(getDbFn());
+  // Lazy like the other DB-backed stores: registration itself must not require
+  // a configured database.
+  const resolveUsers = (): UserIdentityStore =>
+    deps?.users ?? makeUserIdentityStore(getDbFn());
   const imagesClient: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
   const harnessCatalogClient: HarnessCatalogClient =
     deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
@@ -516,9 +549,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           sessions: sessionsClient,
           secrets: resolveSecrets(),
           portExposures: resolvePortExposures(),
-          // Omitted deps.users falls through to the primitive's Drizzle
-          // default over `db` (rpc/task-create.ts).
-          ...(deps?.users ? { users: deps.users } : {}),
+          users: resolveUsers(),
           db: getDbFn(),
         },
         {
@@ -537,7 +568,14 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         },
       );
 
-      const loaded = await loadTask(taskId, getDbFn(), sessionsClient, profiles, imagesClient);
+      const loaded = await loadTask(
+        taskId,
+        getDbFn(),
+        sessionsClient,
+        profiles,
+        imagesClient,
+        resolveUsers(),
+      );
       return { task: loaded };
     },
 
@@ -612,6 +650,14 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const taskRows = taskConditions.length > 0
         ? await taskQuery.where(and(...taskConditions))
         : await taskQuery;
+      const creatorIds = [
+        ...new Set(
+          taskRows
+            .map((row) => row.createdByUserId)
+            .filter((id): id is string => id != null),
+        ),
+      ];
+      const identityMap = await resolveUsers().getIdentities(creatorIds);
 
       const taskIds = taskRows.map((row) => row.id);
       const sessionRefRows = mineOnly
@@ -671,7 +717,9 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           continue;
         }
         const refs = refsByTaskId.get(row.id) ?? [];
-        visibleTasks.push(buildTask(row, refs, sessionMap, profileMap, snapshots));
+        visibleTasks.push(
+          buildTask(row, refs, sessionMap, profileMap, identityMap, snapshots),
+        );
       }
       // Fire-and-forget the freshest harness titles onto the task rows (only
       // the ones that changed) so the list keeps them past session GC.
@@ -754,7 +802,14 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         throw new ConnectError("not found", Code.NotFound);
       }
 
-      const loaded = await loadTask(req.taskId, db, sessionsClient, profiles, imagesClient);
+      const loaded = await loadTask(
+        req.taskId,
+        db,
+        sessionsClient,
+        profiles,
+        imagesClient,
+        resolveUsers(),
+      );
       return { task: loaded };
     },
 
@@ -878,7 +933,14 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         .set({ customTitle, updatedAt: new Date() })
         .where(eq(taskTable.id, req.taskId));
 
-      const loaded = await loadTask(req.taskId, db, sessionsClient, profiles, imagesClient);
+      const loaded = await loadTask(
+        req.taskId,
+        db,
+        sessionsClient,
+        profiles,
+        imagesClient,
+        resolveUsers(),
+      );
       return { task: loaded };
     },
   });

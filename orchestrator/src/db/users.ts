@@ -1,14 +1,12 @@
 /**
  * Read-only user identity lookups against the better-auth `user` table.
  *
- * ADR 0031 §7 (git commit attribution): the create-task path stamps the
- * owner's name/email into the session env (`ENGRAM_USER_NAME` /
- * `ENGRAM_USER_EMAIL`) so in-guest commits are authored by the human who
- * started the session. This store is that lookup's seam — injectable so
- * task-create stays unit-testable with fakes (rpc/task-create.ts).
+ * ADR 0031 §7 uses the single-id lookup for create-path git attribution.
+ * TaskService reads use the batch lookup to embed best-effort owner identity
+ * snapshots. The store stays injectable so both paths are unit-testable.
  */
 
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import * as schema from "./schema.ts";
@@ -19,10 +17,12 @@ export interface UserIdentity {
   email: string;
 }
 
-/** The seam TaskService's create path depends on (and tests fake). */
+/** The identity seam TaskService depends on (and tests fake). */
 export interface UserIdentityStore {
   /** The user's display name + email, or null for an unknown id. */
   getIdentity(userId: string): Promise<UserIdentity | null>;
+  /** Known display identities keyed by user id. */
+  getIdentities(userIds: string[]): Promise<Map<string, UserIdentity>>;
 }
 
 export function makeUserIdentityStore(db: NodePgDatabase<typeof schema>): UserIdentityStore {
@@ -34,6 +34,14 @@ export function makeUserIdentityStore(db: NodePgDatabase<typeof schema>): UserId
         .where(eq(user.id, userId))
         .limit(1);
       return rows[0] ?? null;
+    },
+    async getIdentities(userIds) {
+      if (userIds.length === 0) return new Map();
+      const rows = await db
+        .select({ id: user.id, name: user.name, email: user.email })
+        .from(user)
+        .where(inArray(user.id, userIds));
+      return new Map(rows.map(({ id, name, email }) => [id, { name, email }]));
     },
   };
 }
