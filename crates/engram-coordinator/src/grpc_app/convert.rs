@@ -726,15 +726,8 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         // amendment landed after issue #539's 11-14 allocation).
         warm_stages: _,
         output_tail,
-        // ADR 0081: placement-reservation bookkeeping (the capture VM's
-        // budgets, the reserved host, the capacity-wait mark) — internal
-        // scheduler state, not surfaced on the job's API response. A
-        // capacity-waiting job is legible to the operator through its
-        // `capacity_timeout` failure kind and the coord's waiting log.
-        mem_budget_mib: _,
-        cpu_budget_vcpus: _,
-        capture_host_id: _,
-        capture_waiting_since: _,
+        // ADR 0084 (c): the capture placement reservation moved onto
+        // `capture_jobs` (no longer bookkept on this enable-job row).
         created_at,
         updated_at,
     } = j;

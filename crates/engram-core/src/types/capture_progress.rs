@@ -1,13 +1,17 @@
 //! Capture-time progress + failure taxonomy for base-snapshot capture
-//! (issue #539). Crosses the coord↔host boundary as a bincode `bytes`
-//! payload inside the streaming `BuildBaseSnapshot` RPC (see
-//! `host_service.proto`'s `CaptureProgress`/`CaptureFailed` messages) and
-//! is persisted onto the `enable_jobs` row so an operator can read a
-//! `[warm]` hook's live stage + failing stage + output tail without host
-//! log access.
+//! (issue #539). ADR 0084 P1b: `CaptureProgress` no longer crosses any
+//! wire — the streaming `BuildBaseSnapshot` RPC that used to carry it is
+//! deleted. It's now a purely in-process signal: `PooledBackend::
+//! build_base_snapshot` pushes it onto an `mpsc::Sender` the host-agent's
+//! capture-job executor (`capture_job.rs`) drains, translating each event
+//! into a `CaptureJobReport` that rides the heartbeat and is persisted
+//! onto the `capture_jobs` row so an operator can read a `[warm]` hook's
+//! live stage + failing stage + output tail without host log access.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use super::ids::SandboxId;
 
 /// Which phase of `build_base_snapshot` a [`CaptureProgress`] event was
 /// emitted from.
@@ -85,6 +89,16 @@ pub enum WarmStageOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureProgress {
     pub phase: CapturePhase,
+    /// ADR 0084 P1b: the capture VM's id, once `create()` has returned.
+    /// `None` on any event emitted before the VM exists (there are none
+    /// today — the very first event, `phase == Boot`, is already built
+    /// after `create()`, so this is `Some` from the first event onward in
+    /// practice). Lets the host-agent's capture-job executor learn the
+    /// sandbox id it's driving without re-plumbing `build_base_snapshot`'s
+    /// signature — it only ever talks to the executor through this
+    /// channel and the call's final `Result`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_id: Option<SandboxId>,
     /// Current `[warm]`-hook stage name while `phase == Warm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_stage: Option<String>,
@@ -131,6 +145,13 @@ pub enum CaptureFailureKind {
     WarmExecTransport,
     /// The post-warm snapshot step (pause/flush/chunk/upload) failed.
     SnapshotFailed,
+    /// ADR 0084 decision 11: the claim carried a `ColdBasePlan::Hit` or
+    /// `Miss` (this backend/host was pinned as FC-capable), but the
+    /// executor's actual backend can't produce diff memory snapshots
+    /// (`supports_diff_checkpoints() == false`). A placement bug, not a
+    /// transient condition — never silently falls back to a full-only
+    /// capture.
+    ColdBaseCapabilityMismatch,
     /// ADR 0081 (coordinator-emitted; a host never sends this): no host
     /// fit the capture VM's RAM/CPU budgets within the queue timeout —
     /// the fleet is at capacity and the autoscaler didn't (or couldn't:
@@ -150,6 +171,7 @@ impl CaptureFailureKind {
             Self::WarmKilled => "warm_killed",
             Self::WarmExecTransport => "warm_exec_transport",
             Self::SnapshotFailed => "snapshot_failed",
+            Self::ColdBaseCapabilityMismatch => "cold_base_capability_mismatch",
             Self::CapacityTimeout => "capacity_timeout",
         }
     }
@@ -157,6 +179,11 @@ impl CaptureFailureKind {
     /// Only a mid-stream transport death is eligible for the
     /// enable-scanner's attempts-budget retry; every other kind is a
     /// deterministic outcome that retrying cannot fix (bail fast).
+    /// `ColdBaseCapabilityMismatch` is a placement bug — reassigning to
+    /// a fresh host (which the retry path already does on ANY retryable
+    /// failure) would actually fix it in practice, but marking it
+    /// non-retryable makes the underlying placement bug visible instead
+    /// of quietly self-healing via reassignment every time.
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::WarmExecTransport)
     }
@@ -174,6 +201,7 @@ impl CaptureFailureKind {
             "warm_killed" => Self::WarmKilled,
             "warm_exec_transport" => Self::WarmExecTransport,
             "snapshot_failed" => Self::SnapshotFailed,
+            "cold_base_capability_mismatch" => Self::ColdBaseCapabilityMismatch,
             "capacity_timeout" => Self::CapacityTimeout,
             _ => return None,
         })

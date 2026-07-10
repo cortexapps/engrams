@@ -2,9 +2,13 @@ use async_trait::async_trait;
 
 use crate::error::MetaError;
 use crate::types::capability::Capability;
+use crate::types::capture_job::{
+    CaptureJobAssignment, CaptureJobReport, CaptureJobRow, CaptureJobStage, ColdBaseRow,
+    NewCaptureJob,
+};
 use crate::types::event::{ArtifactRow, PersistedEvent};
 use crate::types::host::{HostHeartbeat, HostRecord, HostStatus};
-use crate::types::ids::{HostId, SandboxId, SessionId};
+use crate::types::ids::{CaptureJobId, HostId, SandboxId, SessionId, SnapshotId};
 use crate::types::manifest::ManifestRef;
 use crate::types::registry::{
     EnableJob, EnableJobState, EnabledImage, RegistryCredential, SessionSecrets,
@@ -74,23 +78,6 @@ pub enum CreateDisposition {
     /// No candidate fit; the row is `queued` for the scanner, carrying the
     /// identical satellites its later re-prepare will find.
     Queued,
-}
-
-/// ADR 0081: outcome of [`MetadataStore::reserve_capture_host`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CaptureReservation {
-    /// A candidate host fit both budgets; `capture_host_id` is stamped
-    /// (and `capture_waiting_since` cleared) for the duration of the
-    /// capture step.
-    Reserved(HostId),
-    /// No candidate fit; the job is *waiting for capacity*. Carries the
-    /// (COALESCE-stamped) first-miss timestamp — the DB anchor the enable
-    /// scanner's wait deadline measures from, so a pod restart / re-claim
-    /// can't reset the queue timeout (the wall clock resets on every
-    /// process restart; `capture_waiting_since` survives in Postgres).
-    Waiting {
-        since: chrono::DateTime<chrono::Utc>,
-    },
 }
 
 /// ADR 0073 phase 4: one idle-scan candidate row (Active + bound).
@@ -1859,35 +1846,15 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// Issue #539: persist one `CaptureProgress` event from the streaming
-    /// `BuildBaseSnapshot` RPC onto the job row — the live capture-phase
-    /// counterpart to [`Self::update_enable_job_progress`] (which only
-    /// covers the materialize step). ALSO renews the claim
-    /// (`claimed_at = NOW()`), which is what lets `enable_scanner` delete
-    /// its blind capture-lease-renewal ticker: the host's >=30s keepalive
-    /// is well under the 300s lease, and a transport death stops renewals
-    /// exactly when a peer should legitimately re-claim.
-    ///
-    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
-    async fn update_enable_job_capture_progress(
-        &self,
-        id: uuid::Uuid,
-        claimant: &str,
-        progress: &crate::types::CaptureProgress,
-    ) -> Result<(), MetaError> {
-        let _ = (id, claimant, progress);
-        Err(MetaError::Migration(
-            "enable jobs unsupported by this store".into(),
-        ))
-    }
-
     /// ADR 0080 phase 3b: persist one `MaterializeProgress` frame from
     /// the streaming `MaterializeImage` RPC onto the job row — the
-    /// `materializing`-stage counterpart of
-    /// [`Self::update_enable_job_capture_progress`], now that the
-    /// stage runs host-side (the coordinator-side chunk push and its
-    /// `chunks_done/chunks_total` counters are retired; those columns
-    /// stay NULL for post-3b jobs). Renders the frame into
+    /// `materializing`-stage counterpart of the ADR 0084 P1b
+    /// `mirror_capture_progress_to_enable_job` (the capture-phase
+    /// verb's fenced, claim-renewing predecessor,
+    /// `update_enable_job_capture_progress`, was DELETED as dead code in
+    /// ADR 0084 P4 — its only caller, the enable-scanner's old capture-
+    /// progress consumer task, was removed in P1b when capture became a
+    /// heartbeat-dispatched job). Renders the frame into
     /// `output_tail` (`materialize[<stage>] <detail>` — the job's
     /// operator-facing progress line) and ALSO renews the claim
     /// (`claimed_at = NOW()`), so the host's ≤30 s keepalive carries
@@ -1959,68 +1926,6 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// ADR 0081: atomically pick + reserve a capture host for job `id`
-    /// from `candidates` (the caller's ranked schedulable list), using
-    /// the SAME `FOR UPDATE` 2D best-fit transaction as
-    /// [`Self::reserve_and_persist_create`] — candidate host rows locked
-    /// in PK order, reserved = Σ budgets over memory-reserving sessions
-    /// UNION capturing enable jobs, so concurrent placers (sessions and
-    /// captures, any replica) serialize and see each other.
-    ///
-    /// Persists the resolved `mem_budget_mib` / `cpu_budget_vcpus` on the
-    /// job row in BOTH branches (fit and no-fit): a pre-0095 job carries
-    /// `0` budgets, and the caller resolves them from the image config —
-    /// but that resolution is worthless if it never lands in the row that
-    /// every *other* placer's reserved-SUM reads. Without this a 24 GiB
-    /// capture would count as 0 MiB reserved (the 2026-07-08 OOM class),
-    /// and a budget-0 waiting job would fold 0 into [`Self::queued_demand`]
-    /// so the autoscaler never grows for it.
-    ///
-    /// On a fit: returns [`CaptureReservation::Reserved`] — stamps
-    /// `capture_host_id` and clears `capture_waiting_since` (a job that
-    /// waited then fit stops counting as waiting). On none: returns
-    /// [`CaptureReservation::Waiting`] carrying the (COALESCE-stamped)
-    /// first-miss timestamp — the job is *waiting for capacity*, counted
-    /// by [`Self::queued_demand`] so the autoscaler grows the pool, and
-    /// the returned timestamp is the DB anchor the enable scanner's wait
-    /// deadline measures from (so a pod restart can't reset the timeout).
-    ///
-    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
-    /// Returns [`MetaError::Conflict`] when the lease has moved on.
-    async fn reserve_capture_host(
-        &self,
-        id: uuid::Uuid,
-        claimant: &str,
-        candidates: &[crate::HostId],
-        mem_budget_mib: i64,
-        cpu_budget_vcpus: i64,
-    ) -> Result<CaptureReservation, MetaError> {
-        let _ = (id, claimant, candidates, mem_budget_mib, cpu_budget_vcpus);
-        Err(MetaError::Migration(
-            "enable jobs unsupported by this store".into(),
-        ))
-    }
-
-    /// ADR 0081: release job `id`'s capture reservation
-    /// (`capture_host_id`/`capture_waiting_since` → NULL). Called when
-    /// the capture step returns, success or failure — the failure path
-    /// is belt-and-suspenders: [`Self::record_enable_job_failure`] also
-    /// clears both (it releases the claim, so a separate fenced clear
-    /// afterwards would fence-miss).
-    ///
-    /// Fenced by `claimant`; returns [`MetaError::Conflict`] when the
-    /// lease has moved on.
-    async fn clear_capture_reservation(
-        &self,
-        id: uuid::Uuid,
-        claimant: &str,
-    ) -> Result<(), MetaError> {
-        let _ = (id, claimant);
-        Err(MetaError::Migration(
-            "enable jobs unsupported by this store".into(),
-        ))
-    }
-
     /// Admin retry: `failed → pending`, resetting attempts/error/
     /// claim. Errors `NotFound` for unknown ids; `Conflict` when the
     /// job isn't in `failed`.
@@ -2029,6 +1934,28 @@ pub trait MetadataStore: Send + Sync {
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))
+    }
+
+    /// ADR 0084 P1b: release the claim WITHOUT touching `state`/`attempts`/
+    /// `error` — the watch-only exit for a `Capturing` job whose
+    /// `capture_jobs` row is still in flight (`assigned`/`booting`/
+    /// `warming`/`freezing`) or whose retryable failure was just
+    /// reassigned to a fresh host+epoch. Unlike letting the claim simply
+    /// age out (`claim_enable_jobs`'s `lease_secs`, 300s by default), this
+    /// makes the job IMMEDIATELY re-claimable next tick (~3s later) — the
+    /// job row's own state/progress is the durable source of truth, the
+    /// enable-job claim only dedups short scanner ops, so there's no
+    /// reason to make watch-only polling wait out a lease meant to bound
+    /// a crashed pod's ownership. Fenced by `claimant`: `Ok(false)` means
+    /// the lease had already moved (a peer's tick beat this one to it) —
+    /// harmless, the peer's next tick observes the same row.
+    async fn release_enable_job_claim(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+    ) -> Result<bool, MetaError> {
+        let _ = (id, claimant);
+        Ok(true)
     }
 
     // ---- ADR 0036 amendment: fleet chunk prestage (issue #538) ----
@@ -2088,6 +2015,331 @@ pub trait MetadataStore: Send + Sync {
     /// heartbeat ack; best-effort on the caller's side.
     async fn list_prestaging_refs(&self) -> Result<Vec<serde_json::Value>, MetaError> {
         Ok(Vec::new())
+    }
+
+    // ---- capture jobs (ADR 0084) ----
+    //
+    // Capture becomes a durable, host-executed, epoch-fenced job row
+    // dispatched/reported over the heartbeat, replacing the
+    // connection-coupled `BuildBaseSnapshot` RPC stream — a dropped
+    // stream today keeps the capture running detached host-side while
+    // the coordinator re-drives from scratch, booting a duplicate
+    // capture VM with no anti-affinity. Every write below is fenced by
+    // `(id, epoch)`, never a lease-holder identity: any coordinator
+    // replica can record a host's report. Default implementations
+    // error exactly like the enable-jobs family above (only the
+    // Postgres store — the one hosts actually dispatch against —
+    // supports jobs); the heartbeat-ack-adjacent bulk reads default to
+    // empty, matching `list_prestaging_refs`/the GC pin-set reads,
+    // since those are called unconditionally every tick regardless of
+    // whether any capture jobs exist.
+    //
+    // This commit (P1a) only adds the store surface — dormant until
+    // the executor/scanner rework (a later commit) calls it.
+
+    /// Insert a fresh `assigned`-stage job for `row.enable_job_id`, or —
+    /// when a non-terminal job for the same enable job already exists
+    /// (the `capture_jobs_active_enable` partial unique index) — return
+    /// that job instead (insert-or-get, exactly like
+    /// [`Self::create_or_get_enable_job`]). A coordinator restart or a
+    /// re-driven scanner tick must resume the existing attempt, never
+    /// duplicate a capture VM.
+    async fn insert_capture_job(&self, row: NewCaptureJob) -> Result<CaptureJobRow, MetaError> {
+        let _ = row;
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// One capture job by id.
+    async fn get_capture_job(&self, id: CaptureJobId) -> Result<Option<CaptureJobRow>, MetaError> {
+        let _ = id;
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// ADR 0084 P1b: the MOST RECENT capture job for an enable job,
+    /// terminal or not — deliberately NOT filtered to non-terminal rows
+    /// (a filtered read would hide a row the instant it goes
+    /// `done`/`failed`); this is
+    /// what the enable scanner's watch-only `Capturing` arm polls: the
+    /// tick that observes a fresh `done` (to finalize + advance to
+    /// `prestaging`) or a terminal `failed` (to reassign-under-budget or
+    /// bail non-retryable) needs to see that terminal row, not `None`.
+    /// `ORDER BY created_at DESC LIMIT 1` — an enable job has at most one
+    /// non-terminal capture job at a time (the partial unique index), but
+    /// may accumulate multiple TERMINAL rows across retries of the
+    /// enable job itself (`retry_enable_job`); the newest is authoritative.
+    async fn latest_capture_job_for_enable(
+        &self,
+        enable_job_id: uuid::Uuid,
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        let _ = enable_job_id;
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// The fenced write every [`CaptureJobReport`] drives: advances
+    /// `stage`/`stage_progress`/`last_progress_at` (bumping
+    /// `stage_started_at` only when `stage` actually changes),
+    /// `COALESCE`s in `fc_snapshot_version` once known, and — when
+    /// `report.terminal` is `Some` — stamps `stage = 'done'` +
+    /// `result_bincode`, or `stage = 'failed'` + `error`/`error_stage`/
+    /// `retryable`. Fenced `WHERE id = $1 AND epoch = $2 AND stage NOT
+    /// IN ('done', 'failed')` — any replica can perform this write, no
+    /// lease-holder identity to lose. Returns whether the row was
+    /// updated: `false` means the report is fenced off (a stale epoch
+    /// from a reassigned-away attempt) or the job was already terminal
+    /// — either way the caller drops the report, it must never retry
+    /// or surface an error for it.
+    async fn record_capture_job_report(
+        &self,
+        report: &CaptureJobReport,
+    ) -> Result<bool, MetaError> {
+        let _ = report;
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// ADR 0084 (c): the reserving pick for a WAITING job (`host_id
+    /// NULL`) — its fresh-insert placement and its every-tick re-attempt.
+    /// Runs the SAME `FOR UPDATE` 2D best-fit as session placement
+    /// (`pick_host_2d`, reserved-SUM now reading `capture_jobs`) over
+    /// `candidates` (the coordinator's disk-footprint + anti-affinity +
+    /// fc-version-filtered set) using the row's OWN stamped budgets. On a
+    /// fit: binds `host_id` and clears `waiting_since` (dispatchable from
+    /// the next heartbeat). On no fit: leaves the row waiting, stamping
+    /// `waiting_since` on the first miss (`COALESCE` — restart-proof queue
+    /// anchor). Idempotent + atomic: locks the job row `FOR UPDATE`, so a
+    /// row already bound returns unchanged (no double-reserve). `None`
+    /// when the job is gone or already terminal.
+    async fn place_capture_job(
+        &self,
+        id: CaptureJobId,
+        candidates: &[HostId],
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        let _ = (id, candidates);
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Reassign a stalled DISPATCHED job (its `assigned`/stage deadline
+    /// missed): fenced, epoch-bumped, re-running the reserving 2D fit over
+    /// `candidates` in the SAME transaction so the host old→new swap is
+    /// atomic with the reservation. On a fit: `host_id = $new`; on no fit:
+    /// `host_id = NULL` (the row falls into the waiting flow rather than
+    /// failing outright). Always `epoch = epoch + 1` (fences/tears down
+    /// the abandoned attempt via host-side `cancel_absent`) and `attempts
+    /// = attempts + 1` (a real re-attempt). Fenced `WHERE id = $1 AND
+    /// epoch = $2 AND stage NOT IN ('done', 'failed')`; `None` when the
+    /// fence missed (already reassigned, or terminal).
+    async fn reassign_capture_job(
+        &self,
+        id: CaptureJobId,
+        expected_epoch: i64,
+        candidates: &[HostId],
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        let _ = (id, expected_epoch, candidates);
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Re-drive a RETRYABLE TERMINAL (`failed`) job back onto a fresh
+    /// host under the attempts budget — the automatic counterpart of the
+    /// operator's `retry_enable_job` escape. [`Self::reassign_capture_job`]
+    /// is fenced `stage NOT IN ('done', 'failed')`, so it can never move
+    /// a row that already reached `failed`: the enable scanner's
+    /// terminal-retryable arm would call it, match 0 rows, and silently
+    /// loop on the same terminal row forever (the enable job never reaches
+    /// `ready`/`failed`). This verb closes that hole with a fence that
+    /// deliberately targets a terminal row: `UPDATE ... SET host_id =
+    /// $new, epoch = epoch + 1, attempts = attempts + 1, stage =
+    /// 'assigned', <reset per-attempt fields> WHERE id = $1 AND epoch =
+    /// $2 AND stage = 'failed' AND retryable AND attempts < $4`.
+    ///
+    /// The `attempts < $max_attempts` clause makes the budget atomic: a
+    /// row that has exhausted its attempts returns `None` (0 rows), and
+    /// the caller fails the enable job with the terminal row's own failure
+    /// kind, exactly as the non-retryable path does. The `epoch + 1` bump
+    /// preserves the terminal-report-immutability property: any stale
+    /// report from the just-abandoned attempt is fenced off by epoch, so
+    /// [`Self::record_capture_job_report`] stays fenced on `(id, epoch)`
+    /// and never needs weakening. Per-attempt fields
+    /// (`error`/`error_stage`/`retryable`/`result_bincode`/
+    /// `fc_snapshot_version`) are cleared and the stage/progress
+    /// timestamps reset, mirroring what a fresh
+    /// [`Self::insert_capture_job`] initializes.
+    ///
+    /// `None` when the fence missed: attempts exhausted, a racing
+    /// coordinator replica already re-drove it (epoch moved), or the row
+    /// is no longer a retryable `failed` — never silently ignore it, the
+    /// caller must decide (fail the enable job, or observe the fresh
+    /// attempt) rather than loop.
+    async fn redrive_failed_capture_job(
+        &self,
+        id: CaptureJobId,
+        expected_epoch: i64,
+        candidates: &[HostId],
+        max_attempts: u32,
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        let _ = (id, expected_epoch, candidates, max_attempts);
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Every DISPATCHED (`host_id IS NOT NULL`) non-terminal job whose
+    /// current stage has run longer than its budget in `budgets` (the
+    /// deadline scan's read: `assigned` 60s, `booting` 300s absolute,
+    /// `freezing` = `snapshot_create_timeout(mem_mib) + 60s`, etc. — the
+    /// caller supplies the budgets since they depend on job-specific
+    /// config like `mem_mib`). Deliberately EXCLUDES waiting jobs
+    /// (`host_id IS NULL`): a waiting job has no stage deadline, only the
+    /// queue timeout ([`Self::list_waiting_capture_jobs`]). Default:
+    /// empty (a store without job support never has overdue jobs).
+    async fn expire_capture_job_stages(
+        &self,
+        budgets: &[(CaptureJobStage, std::time::Duration)],
+    ) -> Result<Vec<CaptureJobRow>, MetaError> {
+        let _ = budgets;
+        Ok(Vec::new())
+    }
+
+    /// Every WAITING (`host_id IS NULL`) non-terminal capture job — the
+    /// queue-timeout scan's read. Each is re-offered to
+    /// [`Self::place_capture_job`] every tick; one whose `waiting_since`
+    /// is older than the queue timeout is failed with `CapacityTimeout`.
+    /// Default: empty.
+    async fn list_waiting_capture_jobs(&self) -> Result<Vec<CaptureJobRow>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Active (non-terminal) job assignments currently on `host` — the
+    /// `HeartbeatAck.capture_assignments` source, read every heartbeat
+    /// regardless of whether any capture jobs exist fleet-wide.
+    async fn capture_assignments_for_host(
+        &self,
+        host: HostId,
+    ) -> Result<Vec<CaptureJobAssignment>, MetaError> {
+        let _ = host;
+        Ok(Vec::new())
+    }
+
+    /// The set of hosts with at least one active (non-terminal)
+    /// capture job — placement's one-capture-per-host anti-affinity
+    /// veto (`capture_jobs_active_host`).
+    async fn hosts_with_live_capture_jobs(
+        &self,
+    ) -> Result<std::collections::HashSet<HostId>, MetaError> {
+        Ok(std::collections::HashSet::new())
+    }
+
+    /// ADR 0084 P1b: mirror a [`CaptureJobReport`]'s stage/progress onto
+    /// the owning `enable_jobs` row's ADR 0079 dashboard columns
+    /// (`capture_phase`/`warm_stage`/`output_tail`) — UNFENCED (no
+    /// `claimed_by` check, no claim renewal): `capture_jobs` is now
+    /// authoritative for execution and fencing; this is cosmetic
+    /// dashboard mirroring only, driven by the heartbeat reconcile on
+    /// every report regardless of which coordinator pod (if any)
+    /// currently holds the enable job's claim. `None` leaves a column
+    /// unchanged (`COALESCE`) — a report with no rendered phase
+    /// (`assigned`/`done`/`failed`) shouldn't blank the last-known
+    /// warm-hook stage/output an operator was reading.
+    async fn mirror_capture_progress_to_enable_job(
+        &self,
+        enable_job_id: uuid::Uuid,
+        capture_phase: Option<&str>,
+        warm_stage: Option<&str>,
+        output_tail: Option<&str>,
+    ) -> Result<(), MetaError> {
+        let _ = (enable_job_id, capture_phase, warm_stage, output_tail);
+        Ok(())
+    }
+
+    /// Stamp the terminal `reuse_outcome` on an enable job (ADR 0084
+    /// section D): `reused_full | reused_cold_base |
+    /// recaptured:no_cold_base | recaptured:content_changed |
+    /// recaptured:chunks_missing | recaptured:fc_version_changed`. A
+    /// plain write, not fenced by claimant — it's stamped once the job
+    /// has already reached a terminal enable-job state.
+    async fn set_enable_job_reuse_outcome(
+        &self,
+        enable_job_id: uuid::Uuid,
+        outcome: &str,
+    ) -> Result<(), MetaError> {
+        let _ = (enable_job_id, outcome);
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Insert or replace the cold base at `row.content_key` (ADR 0084
+    /// section B) — the content-keyed, boot-to-agentd-ready Full
+    /// snapshot every warm-image capture of matching content reuses
+    /// (the hook always re-runs against a fresh env on top of it).
+    async fn upsert_cold_base(&self, row: ColdBaseRow) -> Result<(), MetaError> {
+        let _ = row;
+        Err(MetaError::Migration(
+            "capture jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Look up a cold base by its content key — the reuse-candidate
+    /// read the executor's miss/hit decision drives off of. Default
+    /// `None`, mirroring [`Self::find_enabled_image_by_content`]: a
+    /// store without the query surface simply never reuses.
+    async fn get_cold_base(&self, content_key: &str) -> Result<Option<ColdBaseRow>, MetaError> {
+        let _ = content_key;
+        Ok(None)
+    }
+
+    /// Every cold base's `snapshot_id` — joins the ADR 0077 GC pin-set
+    /// roots (mirrors [`Self::bundle_pin_set`]/
+    /// [`Self::snapshot_blob_pin_set`]'s always-called-unconditionally
+    /// shape). Default: empty.
+    async fn cold_base_snapshot_ids(&self) -> Result<Vec<SnapshotId>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Every cold base's `disk_manifest` + `memory_manifest`, parsed —
+    /// the chunk-GC pin-set's 7th source (`PinSet::collect`, ADR 0084
+    /// §B6): a cold base's chunks have no OTHER root (unlike the
+    /// overlay snapshot it seeds, it never gets its own `snapshots` row
+    /// pinned via `snapshot_blob_pin_set`/`enabled_images`), so without
+    /// this they'd be silently reaped out from under a live
+    /// `cold_bases` row. Default: empty (no second GC — a store without
+    /// `cold_bases` support has nothing to pin).
+    async fn cold_base_manifest_refs(
+        &self,
+    ) -> Result<Vec<crate::types::manifest::ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0084 §D: does a `cold_bases` row exist for `disk_manifest`
+    /// under a DIFFERENT `fc_snapshot_version` than `current_fc_version`?
+    /// Powers the `recaptured:fc_version_changed` reuse-outcome label —
+    /// distinguishing "this rootfs was captured before, just under an
+    /// older/newer FC build" from a genuine first-time
+    /// `recaptured:no_cold_base`. Matches on `disk_manifest` alone (not
+    /// the full content key, which already bakes in the version and so
+    /// can never itself answer "under a DIFFERENT version") — `cold_bases`
+    /// has no `resources` column to refine further, and every row in the
+    /// table is FC's by construction (VZ/Process never write one), so
+    /// this is a sound approximation for a telemetry label, not a
+    /// correctness gate. Default `false` (a store without this query
+    /// surface just reports the coarser `no_cold_base` label instead).
+    async fn cold_base_fc_version_changed(
+        &self,
+        disk_manifest: &str,
+        current_fc_version: &str,
+    ) -> Result<bool, MetaError> {
+        let _ = (disk_manifest, current_fc_version);
+        Ok(false)
     }
 
     // ---- session secrets ----

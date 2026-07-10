@@ -247,13 +247,18 @@ fn cow_state() -> CowState {
     }
 }
 
-/// Issue #539: `Vec<WarmStageRecord>` crosses the coord<->host wire as
-/// the `CaptureProgress.warm_stages_bincode` payload
-/// (`engram-protocol/src/grpc_client.rs`'s `decode_bincode::<Vec<
-/// WarmStageRecord>>`). Two entries: one CLOSED (`ended_at` present,
-/// the `#[serde(skip_serializing_if)]` bincode-irrelevant but exercised
-/// anyway) and one still OPEN (`ended_at: None`) — the shape a failed
-/// or in-flight capture's stage history actually takes.
+/// Issue #539 (historical): `Vec<WarmStageRecord>` used to cross the
+/// coord<->host wire as the `CaptureProgress.warm_stages_bincode`
+/// payload; ADR 0084 P1b deleted that RPC (and P4 deleted the
+/// now-dead-code metadata verb, `update_enable_job_capture_progress`,
+/// that used to write it), so this is now purely a JSON-in-JSONB
+/// stability guard (`enable_jobs.warm_stages`) — kept pinned here
+/// anyway since bincode encoding is a strictly harder guarantee than
+/// JSON and this corpus already had the fixture. Two entries: one
+/// CLOSED (`ended_at`
+/// present, the `#[serde(skip_serializing_if)]` bincode-irrelevant but
+/// exercised anyway) and one still OPEN (`ended_at: None`) — the shape a
+/// failed or in-flight capture's stage history actually takes.
 fn warm_stages() -> Vec<WarmStageRecord> {
     vec![
         WarmStageRecord {
@@ -410,8 +415,14 @@ fn wire_version_pinned() {
     // coord→host; `ManifestRef` — already pinned — and
     // `OciRuntimeDefaults` host→coord), goldens ADDED for the new
     // shapes; every existing golden is byte-identical.
+    // 14 -> 15: ADR 0084 (#546) — capture_jobs heartbeat dispatch/
+    // reporting. `Heartbeat.capture_job_reports` /
+    // `HeartbeatAck.capture_assignments`/`acked_capture_jobs` ride the
+    // JSON heartbeat/ack, NOT the gRPC bincode `bytes` payloads this
+    // corpus pins — no new golden entries here. BuildBaseSnapshot RPC
+    // deletion rides this bump too (removed in the cutover commit).
     assert_eq!(
-        WIRE_VERSION, 14,
+        WIRE_VERSION, 15,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

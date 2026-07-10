@@ -64,3 +64,50 @@ impl fmt::Display for ManifestRef {
         write!(f, "{}@v{}", self.manifest_id, self.version)
     }
 }
+
+/// ADR 0084: `capture_jobs.disk_manifest` stores the canonical Display
+/// form (`<uuid>@v<num>`) as plain text (opaque at the row layer — see
+/// `types::capture_job::CaptureJobRow`); the claim handler parses it back
+/// into a real `ManifestRef` to build the capture VM's `SandboxSpec`.
+impl std::str::FromStr for ManifestRef {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (id_part, ver_part) = s
+            .split_once("@v")
+            .ok_or_else(|| format!("ManifestRef::from_str: missing '@v' separator in {s:?}"))?;
+        let manifest_id = Uuid::parse_str(id_part)
+            .map_err(|e| format!("ManifestRef::from_str: bad uuid {id_part:?}: {e}"))?;
+        let version = ver_part
+            .parse::<u64>()
+            .map_err(|e| format!("ManifestRef::from_str: bad version {ver_part:?}: {e}"))?;
+        Ok(Self {
+            manifest_id,
+            version,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_ref_display_from_str_round_trips() {
+        let r = ManifestRef {
+            manifest_id: Uuid::new_v4(),
+            version: 7,
+        };
+        let s = r.to_string();
+        let back: ManifestRef = s.parse().expect("round-trip parse");
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn manifest_ref_from_str_rejects_garbage() {
+        assert!("not-a-manifest-ref".parse::<ManifestRef>().is_err());
+        assert!(format!("{}@vNaN", Uuid::new_v4())
+            .parse::<ManifestRef>()
+            .is_err());
+    }
+}

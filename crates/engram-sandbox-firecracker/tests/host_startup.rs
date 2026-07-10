@@ -89,8 +89,12 @@ async fn host_startup_no_proxy_is_idempotent_and_lacks_redirect() {
     }
     cleanup();
 
-    host_startup(None, None).await.expect("first host_startup");
-    host_startup(None, None).await.expect("second host_startup");
+    host_startup(None, None, None)
+        .await
+        .expect("first host_startup");
+    host_startup(None, None, None)
+        .await
+        .expect("second host_startup");
 
     let dump = iptables_save();
     // Hard-isolation rules present.
@@ -137,7 +141,9 @@ async fn host_startup_with_proxy_adds_redirect_and_default_deny() {
     }
     cleanup();
 
-    host_startup(Some(9443), None).await.expect("host_startup");
+    host_startup(Some(9443), None, None)
+        .await
+        .expect("host_startup");
 
     let dump = iptables_save();
     assert!(dump.contains("engram-proxy-redirect"));
@@ -180,7 +186,7 @@ async fn host_startup_installs_established_accept_before_host_input_drop() {
     }
     cleanup();
 
-    host_startup(Some(9443), Some(5353))
+    host_startup(Some(9443), Some(5353), None)
         .await
         .expect("host_startup");
 
@@ -223,6 +229,71 @@ async fn host_startup_installs_established_accept_before_host_input_drop() {
     cleanup();
 }
 
+/// ADR 0019 / #526 phase 2: the guest→collector OTLP pinhole actually
+/// installs (live-iptables counterpart to the
+/// `host_startup_guest_otlp_pinhole_is_scoped_and_precedes_drop` unit
+/// test in src/net.rs). Deliberately minimal per the repo CI-time rule:
+/// installs the ruleset once with an otel port and asserts presence,
+/// scope, and ordering — no guest OTLP round trip (the collector-side
+/// half is deploy-layer, not net.rs's property).
+#[tokio::test]
+#[ignore = "requires Linux + root (CAP_NET_ADMIN); run with sudo on the dev VM"]
+async fn host_startup_installs_guest_otlp_pinhole_before_host_input_drop() {
+    if !require_root() {
+        return;
+    }
+    cleanup();
+
+    host_startup(Some(9443), Some(5353), Some(4317))
+        .await
+        .expect("host_startup");
+
+    let dump = iptables_save();
+    let otlp_line = dump
+        .lines()
+        .find(|l| l.contains("engram-guest-otlp-input"))
+        .expect("guest-otlp ACCEPT rule must be present after host_startup");
+    assert!(
+        otlp_line.contains("ACCEPT")
+            && otlp_line.contains("--dport 4317")
+            && otlp_line.contains("10.200.0.0/16"),
+        "pinhole must ACCEPT exactly tcp/4317 from the VM pool; got: {otlp_line}"
+    );
+
+    let otlp_idx = dump
+        .lines()
+        .position(|l| l.contains("engram-guest-otlp-input"))
+        .expect("otlp line position");
+    let drop_idx = dump
+        .lines()
+        .position(|l| {
+            (l.contains("comment engram-host-input ") || l.ends_with("comment engram-host-input"))
+                && l.contains("DROP")
+        })
+        .expect("host-input DROP line position");
+    assert!(
+        otlp_idx < drop_idx,
+        "guest-otlp ACCEPT must precede engram-host-input DROP in \
+         iptables-save; ACCEPT idx={otlp_idx}, DROP idx={drop_idx}",
+    );
+
+    // Idempotency: re-applying must not double the pinhole.
+    host_startup(Some(9443), Some(5353), Some(4317))
+        .await
+        .expect("second host_startup");
+    let dump2 = iptables_save();
+    assert_eq!(
+        dump2
+            .lines()
+            .filter(|l| l.contains("engram-guest-otlp-input"))
+            .count(),
+        1,
+        "re-applying host_startup must not duplicate the otlp pinhole",
+    );
+
+    cleanup();
+}
+
 /// Regression for the prod 2026-05-20 blackhole: post-M1.16 the per-VM
 /// netns moves the TAP off host root, so REDIRECT must match
 /// `vh-engr-+` (the host-side veth end) to catch warm-restored VM
@@ -255,7 +326,7 @@ async fn host_startup_redirects_warm_path_via_vh_engr() {
     // came from our REDIRECT, not some other process.
     let proxy_port: u16 = 28443;
 
-    host_startup(Some(proxy_port), Some(5353))
+    host_startup(Some(proxy_port), Some(5353), None)
         .await
         .expect("host_startup");
 

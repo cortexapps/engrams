@@ -167,6 +167,55 @@ pub fn host_meets_capabilities(
     Ok(())
 }
 
+/// ADR 0084 §C: how much host disk a capture/materialize job needs —
+/// threaded into [`capture_candidate_hosts`] so placement can veto a host that
+/// technically clears the ADR 0078 disk FLOOR but doesn't have headroom
+/// for the job's own write volume (the old picker only checked the
+/// floor, never the job's size).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureFootprint {
+    pub disk_mib: u64,
+}
+
+impl CaptureFootprint {
+    /// A base-snapshot capture writes: the materialized rootfs (already
+    /// on disk from the `materializing` stage, ≈1×image) PLUS the
+    /// capture VM's own COW/scratch overlay of that rootfs (another
+    /// ≈1×image) PLUS the memory dump (`mem_mib`, chunked+uploaded
+    /// before the scratch is freed) PLUS a fixed slack for the host's
+    /// other bookkeeping (state.bin/sidecar, temp chunk-store staging).
+    pub fn for_capture(image_size_mib: u64, mem_mib: u64) -> Self {
+        Self {
+            disk_mib: 2 * image_size_mib + mem_mib + 4096,
+        }
+    }
+
+    /// A materialize pulls the OCI layers, flattens them, and packs a
+    /// bootable ext4 — roughly 2.5x the final image size once you
+    /// count the flattened-layer scratch tree alongside the packed
+    /// ext4 output, plus a fixed slack for the OCI pull cache.
+    pub fn for_materialize(image_size_mib: u64) -> Self {
+        Self {
+            disk_mib: (image_size_mib as f64 * 2.5).ceil() as u64 + 1024,
+        }
+    }
+
+    /// Floor-only sizing: imposes NO footprint veto beyond the ADR 0078
+    /// disk floor `host_disk_floor_ok` already checks. Used ONLY when
+    /// the job's image size is genuinely unknown at pick time — today
+    /// that's every `materialize_image_on_host` call, because
+    /// materialize is what PRODUCES the disk manifest a size could be
+    /// read from; there is no size signal to read yet (the OCI
+    /// manifest's compressed layer sizes are a poor proxy for the
+    /// flattened+packed ext4 output, so we deliberately don't guess
+    /// from them). LOUD by design: every call site that reaches for
+    /// this must justify why in a comment, not use it as a silent
+    /// default.
+    pub const fn floor_only() -> Self {
+        Self { disk_mib: 0 }
+    }
+}
+
 /// Why a pick couldn't place a session.
 #[derive(Clone, Debug)]
 pub enum PickError {
@@ -780,15 +829,116 @@ pub async fn pick_specific_host(
     Ok((host_id, backend))
 }
 
+/// ADR 0084 §C: the free work_dir disk (MiB) `capture_candidate_hosts` ranks
+/// hosts by — `None` for an unmeasured host (dev/brand-new; the same
+/// soft posture `host_disk_floor_ok` gives it: it neither vetoes NOR
+/// ranks above a measured host, so a fleet of unmeasured hosts falls
+/// back to row order, matching pre-ADR-0084 first-fit behavior).
+fn free_disk_mib(h: &HostRecord) -> Option<u64> {
+    if h.utilization.disk_total_mib == 0 {
+        return None;
+    }
+    Some(
+        h.utilization
+            .disk_total_mib
+            .saturating_sub(h.utilization.disk_used_mib),
+    )
+}
+
+/// ADR 0084 §C: the pure filter+rank core of [`capture_candidate_hosts`] —
+/// unit-tested directly against a `&[HostRecord]` fixture, no I/O.
+///
+/// Filters: schedulable ∧ the base capability gate (+ `fc_snapshot_version`
+/// pin when `required_fc_version` names one) ∧ the ADR 0078 disk floor ∧
+/// `need.disk_mib` headroom (an unmeasured host is soft here too — same
+/// posture as the floor) ∧ NOT already running a live capture job
+/// (`live_capture_hosts` — one-capture-per-host anti-affinity, ADR 0084
+/// §C). Ranking: MAX free disk among survivors (replacing the old
+/// first-fit) — row order breaks ties among unmeasured/equal hosts.
+pub fn capture_candidate_hosts_from(
+    hosts: &[HostRecord],
+    live_capture_hosts: &std::collections::HashSet<HostId>,
+    need: CaptureFootprint,
+    required_fc_version: Option<&str>,
+    now: DateTime<Utc>,
+    ttl: Duration,
+) -> Vec<HostId> {
+    let caps = CapabilityRequirements {
+        needs_uffd_substrate: false,
+        fc_snapshot_version: required_fc_version.map(str::to_string),
+    };
+    let mut survivors: Vec<(u64, HostId)> = Vec::new();
+    for h in hosts {
+        if !host_is_schedulable(h, now, ttl) {
+            continue;
+        }
+        if host_meets_capabilities(h, &caps).is_err() {
+            continue;
+        }
+        if !host_disk_floor_ok(h) {
+            continue;
+        }
+        if live_capture_hosts.contains(&h.id) {
+            continue;
+        }
+        let free = free_disk_mib(h);
+        if free.is_some_and(|free| free < need.disk_mib) {
+            continue;
+        }
+        survivors.push((free.unwrap_or(0), h.id));
+    }
+    // Roomiest disk first — the candidate ORDER the atomic 2D RAM/CPU fit
+    // (`pick_host_2d`) inherits, so a RAM-tie breaks toward the host with
+    // the most disk headroom (replaces the P2 first-fit/max-free-disk
+    // single-pick; the RAM/CPU dimension is now enforced in PG).
+    survivors.sort_by_key(|(free, _)| std::cmp::Reverse(*free));
+    survivors.into_iter().map(|(_, id)| id).collect()
+}
+
+/// ADR 0084 §C + (c): the CANDIDATE SET for a base-snapshot capture's
+/// RESERVING pick — every host passing the ADR 0078 tier-0 disk floor,
+/// the job's own [`CaptureFootprint`] disk headroom, one-capture-per-host
+/// anti-affinity (`hosts_with_live_capture_jobs`), and an optional
+/// `fc_snapshot_version` pin (ADR 0084 §B5), ordered roomiest-disk-first.
+/// Deliberately RAM/CPU-BLIND here: the 2D fit + reservation happen
+/// atomically in PG (`place_capture_job` / `reassign_capture_job` /
+/// `redrive_failed_capture_job` → `pick_host_2d`), the same split
+/// `capture_candidates`/`reserve_capture_host` had before this row moved
+/// onto `capture_jobs`. An empty vec means no host is even disk-eligible
+/// (the caller leaves the job WAITING, not failed).
+pub async fn capture_candidate_hosts(
+    meta: &dyn MetadataStore,
+    need: CaptureFootprint,
+    required_fc_version: Option<&str>,
+) -> Result<Vec<HostId>, PickError> {
+    let hosts = meta
+        .list_active_hosts()
+        .await
+        .map_err(|e| PickError::Internal(format!("list_active_hosts: {e}")))?;
+    let live_capture_hosts = meta
+        .hosts_with_live_capture_jobs()
+        .await
+        .map_err(|e| PickError::Internal(format!("hosts_with_live_capture_jobs: {e}")))?;
+    Ok(capture_candidate_hosts_from(
+        &hosts,
+        &live_capture_hosts,
+        need,
+        required_fc_version,
+        Utc::now(),
+        placement_ttl(),
+    ))
+}
+
 /// ADR 0080 phase 3b: a host for the MATERIALIZE stage (docker pull +
 /// ext4 pack + chunk) — no VM boots, so NOT gated on image readiness or
 /// RAM/CPU capacity, but it IS gated on the ADR 0078 tier-0 disk floor:
 /// materialize writes image-sized data under the host's work dir, so a
 /// host already below the chunk-cache floor (about to disk-evict its
 /// cache) must never be handed more disk work (the `capture-host picker
-/// ignores disk` incident class). The CAPTURE stage no longer picks
-/// here — ADR 0081 reserves its host through the session scheduler
-/// ([`capture_candidates`] + `MetadataStore::reserve_capture_host`).
+/// ignores disk` incident class). Distinct from [`capture_candidate_hosts`]:
+/// materialize boots no VM, so it carries no [`CaptureFootprint`] /
+/// anti-affinity / RAM reservation — those belong only to the capture
+/// stage (ADR 0084 §C + the ADR 0081 reservation re-attach).
 pub async fn pick_materialize_host(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,
@@ -819,28 +969,6 @@ fn capture_host_eligible(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> b
     host_is_schedulable(h, now, ttl)
         && host_meets_capabilities(h, &CapabilityRequirements::default()).is_ok()
         && host_disk_floor_ok(h)
-}
-
-/// ADR 0081: the ranked candidate set for capture-host RESERVATION —
-/// every eligible host in row order. Deliberately capacity-blind: the
-/// RAM/CPU fit happens atomically inside
-/// `MetadataStore::reserve_capture_host` (the shared FOR-UPDATE 2D
-/// pick), the same split `rank_hosts` / `reserve_and_persist_create`
-/// have on the session path. An empty vec means the fleet has no
-/// eligible host at all (also `NoCapacity` to the caller's wait loop —
-/// e.g. mid-roll every host is briefly wire-skewed).
-pub async fn capture_candidates(meta: &dyn MetadataStore) -> Result<Vec<HostId>, PickError> {
-    let hosts = meta
-        .list_active_hosts()
-        .await
-        .map_err(|e| PickError::Internal(format!("list_active_hosts: {e}")))?;
-    let now = Utc::now();
-    let ttl = placement_ttl();
-    Ok(hosts
-        .iter()
-        .filter(|h| capture_host_eligible(h, now, ttl))
-        .map(|h| h.id)
-        .collect())
 }
 
 /// ADR 0078's tier-0 disk floor as a standalone predicate: free
@@ -1658,5 +1786,177 @@ mod tests {
         cordoned.cordoned = true;
         assert!(!host_is_schedulable(&cordoned, Utc::now(), TTL));
         assert!(host_is_schedulable(&host(2), Utc::now(), TTL));
+    }
+
+    mod capture_placement {
+        use super::*;
+
+        fn live() -> std::collections::HashSet<HostId> {
+            std::collections::HashSet::new()
+        }
+
+        #[test]
+        fn footprint_math_matches_the_documented_formula() {
+            // 2×image + mem + 4096 slack.
+            let f = CaptureFootprint::for_capture(1000, 2048);
+            assert_eq!(f.disk_mib, 2 * 1000 + 2048 + 4096);
+            // ceil(2.5×image) + 1024.
+            let f = CaptureFootprint::for_materialize(1001);
+            assert_eq!(f.disk_mib, 2503 + 1024);
+            assert_eq!(CaptureFootprint::floor_only().disk_mib, 0);
+        }
+
+        #[test]
+        fn footprint_veto_excludes_a_host_without_headroom() {
+            let mut roomy = host(1);
+            roomy.utilization.disk_total_mib = 200_000;
+            roomy.utilization.disk_used_mib = 100_000; // 100,000 free
+            let mut tight = host(2);
+            tight.utilization.disk_total_mib = 200_000;
+            tight.utilization.disk_used_mib = 190_000; // 10,000 free
+            let need = CaptureFootprint { disk_mib: 50_000 };
+            let cands =
+                capture_candidate_hosts_from(&[roomy, tight], &live(), need, None, Utc::now(), TTL);
+            assert_eq!(
+                cands,
+                vec![hid(1)],
+                "the tight host lacks footprint headroom"
+            );
+        }
+
+        #[test]
+        fn footprint_veto_is_soft_for_unmeasured_hosts() {
+            // Unmeasured (disk_total_mib == 0) never gets vetoed by
+            // footprint, same posture as the disk floor.
+            let unmeasured = host(1);
+            let need = CaptureFootprint {
+                disk_mib: 1_000_000,
+            };
+            let cands =
+                capture_candidate_hosts_from(&[unmeasured], &live(), need, None, Utc::now(), TTL);
+            assert_eq!(cands, vec![hid(1)]);
+        }
+
+        #[test]
+        fn disk_floor_still_applies_under_the_capture_picker() {
+            let mut pressured = host(1);
+            pressured.utilization.disk_total_mib = 200_000;
+            pressured.utilization.disk_used_mib =
+                200_000 - (engram_core::types::host::HOST_DISK_CACHE_FLOOR_MIB - 1);
+            let cands = capture_candidate_hosts_from(
+                &[pressured],
+                &live(),
+                CaptureFootprint::floor_only(),
+                None,
+                Utc::now(),
+                TTL,
+            );
+            assert!(cands.is_empty(), "a disk-pressured host is not a candidate");
+        }
+
+        #[test]
+        fn anti_affinity_excludes_a_host_already_running_a_capture_job() {
+            let free1 = host(1);
+            let free2 = host(2);
+            let mut busy: std::collections::HashSet<HostId> = std::collections::HashSet::new();
+            busy.insert(hid(1));
+            let cands = capture_candidate_hosts_from(
+                &[free1, free2],
+                &busy,
+                CaptureFootprint::floor_only(),
+                None,
+                Utc::now(),
+                TTL,
+            );
+            assert_eq!(
+                cands,
+                vec![hid(2)],
+                "host 1 already runs a live capture job"
+            );
+        }
+
+        #[test]
+        fn anti_affinity_alone_can_exhaust_the_fleet() {
+            let mut busy: std::collections::HashSet<HostId> = std::collections::HashSet::new();
+            busy.insert(hid(1));
+            let cands = capture_candidate_hosts_from(
+                &[host(1)],
+                &busy,
+                CaptureFootprint::floor_only(),
+                None,
+                Utc::now(),
+                TTL,
+            );
+            assert!(cands.is_empty());
+        }
+
+        #[test]
+        fn fc_snapshot_version_pin_excludes_a_mismatched_host() {
+            let mut wrong = host(1);
+            wrong.capabilities = engram_core::types::host::HostCapabilities {
+                schema: 1,
+                backend: "firecracker".into(),
+                grpc_self_connect: engram_core::types::host::CapStatus::Ok(None),
+                base_shm_tmpfs: engram_core::types::host::CapStatus::Ok(None),
+                uffd_minor_shmem: engram_core::types::host::CapStatus::Ok(None),
+                nbd: engram_core::types::host::CapStatus::Ok(None),
+                bundle_stamp: engram_core::types::host::CapStatus::Ok(None),
+                fc_snapshot_version: Some("v9.0.0".into()),
+                wire_version: 7,
+            };
+            let mut right = wrong.clone();
+            right.id = hid(2);
+            right.capabilities.fc_snapshot_version = Some("v10.0.0".into());
+            let cands = capture_candidate_hosts_from(
+                &[wrong, right],
+                &live(),
+                CaptureFootprint::floor_only(),
+                Some("v10.0.0"),
+                Utc::now(),
+                TTL,
+            );
+            assert_eq!(cands, vec![hid(2)]);
+        }
+
+        #[test]
+        fn max_free_disk_ranking_orders_candidates_roomiest_first() {
+            // Row order would put host 1 first; the ranking must put host 2
+            // (more free disk) first so the 2D fit inherits that order.
+            let mut small = host(1);
+            small.utilization.disk_total_mib = 400_000;
+            small.utilization.disk_used_mib = 300_000; // 100,000 free
+            let mut roomy = host(2);
+            roomy.utilization.disk_total_mib = 400_000;
+            roomy.utilization.disk_used_mib = 100_000; // 300,000 free
+            let cands = capture_candidate_hosts_from(
+                &[small, roomy],
+                &live(),
+                CaptureFootprint::floor_only(),
+                None,
+                Utc::now(),
+                TTL,
+            );
+            assert_eq!(
+                cands.first(),
+                Some(&hid(2)),
+                "must rank by max free disk, not row order"
+            );
+            assert!(cands.contains(&hid(1)), "both hosts are still candidates");
+        }
+
+        #[test]
+        fn ties_among_equal_or_unmeasured_hosts_break_by_row_order() {
+            let h1 = host(1);
+            let h2 = host(2);
+            let cands = capture_candidate_hosts_from(
+                &[h1, h2],
+                &live(),
+                CaptureFootprint::floor_only(),
+                None,
+                Utc::now(),
+                TTL,
+            );
+            assert_eq!(cands, vec![hid(1), hid(2)]);
+        }
     }
 }

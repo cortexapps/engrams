@@ -65,6 +65,9 @@ id_newtype!(SnapshotId);
 id_newtype!(MessageId);
 id_newtype!(ToolCallId);
 id_newtype!(AgentCommitId);
+// ADR 0084: identifies one durable, host-executed capture job row
+// (`capture_jobs.id`).
+id_newtype!(CaptureJobId);
 
 impl HostId {
     /// Deterministic `HostId` derived from a Kubernetes node name (ADR 0044

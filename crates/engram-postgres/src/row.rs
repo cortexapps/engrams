@@ -5,11 +5,11 @@ use chrono::{DateTime, Utc};
 use engram_core::types::session::SessionMode;
 use engram_core::types::session_op::{OpKind, OpState, SessionOp};
 use engram_core::types::{
-    EnableJob, EnableJobState, EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus,
-    HostUtilization, PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionState,
-    SnapshotRecord,
+    CaptureJobProgress, CaptureJobRow, CaptureJobStage, ColdBaseRow, EnableJob, EnableJobState,
+    EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus, HostUtilization,
+    PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionState, SnapshotRecord,
 };
-use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId};
+use engram_core::{CaptureJobId, HostId, MetaError, SandboxId, SessionId, SnapshotId};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 use uuid::Uuid;
@@ -563,15 +563,89 @@ pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
         warm_stage_started_at: row.try_get("warm_stage_started_at").map_err(col_err)?,
         warm_stages: warm_stages_from_row(row)?,
         output_tail: row.try_get("output_tail").map_err(col_err)?,
-        mem_budget_mib: row.try_get("mem_budget_mib").map_err(col_err)?,
-        cpu_budget_vcpus: row.try_get("cpu_budget_vcpus").map_err(col_err)?,
-        capture_host_id: row
-            .try_get::<Option<uuid::Uuid>, _>("capture_host_id")
-            .map_err(col_err)?
-            .map(engram_core::HostId),
-        capture_waiting_since: row.try_get("capture_waiting_since").map_err(col_err)?,
         created_at: row.try_get("created_at").map_err(col_err)?,
         updated_at: row.try_get("updated_at").map_err(col_err)?,
+    })
+}
+
+/// ADR 0084: `capture_jobs.stage` column <-> `CaptureJobStage`.
+/// Exhaustive — an unknown string is a hard `Serialization` error
+/// rather than a silent default (which would resurrect a terminal or
+/// misclassify a live job to the deadline scan).
+pub(crate) fn parse_capture_job_stage(s: &str) -> Result<CaptureJobStage, MetaError> {
+    CaptureJobStage::parse(s)
+        .ok_or_else(|| MetaError::Serialization(format!("unknown capture job stage: {s}")))
+}
+
+/// Nullable JSONB decode for `capture_jobs.stage_progress`. `NULL`
+/// means "no progress event yet for this stage."
+fn capture_job_progress_from_row(row: &PgRow) -> Result<Option<CaptureJobProgress>, MetaError> {
+    match row
+        .try_get::<Option<serde_json::Value>, _>("stage_progress")
+        .map_err(col_err)?
+    {
+        Some(v) => serde_json::from_value(v).map_err(|e| MetaError::Serialization(e.to_string())),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn capture_job_from_row(row: &PgRow) -> Result<CaptureJobRow, MetaError> {
+    let id: Uuid = row.try_get("id").map_err(col_err)?;
+    // Nullable since migration 0099: NULL == waiting for capacity.
+    let host_id: Option<Uuid> = row.try_get("host_id").map_err(col_err)?;
+    let stage: String = row.try_get("stage").map_err(col_err)?;
+    let attempts: i32 = row.try_get("attempts").map_err(col_err)?;
+    Ok(CaptureJobRow {
+        id: CaptureJobId(id),
+        enable_job_id: row.try_get("enable_job_id").map_err(col_err)?,
+        image_uri: row.try_get("image_uri").map_err(col_err)?,
+        manifest_digest: row.try_get("manifest_digest").map_err(col_err)?,
+        disk_manifest: row.try_get("disk_manifest").map_err(col_err)?,
+        image_config: jsonb_from_row(row, "image_config")?,
+        oci_defaults: jsonb_from_row(row, "oci_defaults")?,
+        host_id: host_id.map(HostId),
+        mem_budget_mib: row.try_get("mem_budget_mib").map_err(col_err)?,
+        cpu_budget_vcpus: row.try_get("cpu_budget_vcpus").map_err(col_err)?,
+        waiting_since: row.try_get("waiting_since").map_err(col_err)?,
+        epoch: row.try_get("epoch").map_err(col_err)?,
+        stage: parse_capture_job_stage(&stage)?,
+        stage_started_at: row.try_get("stage_started_at").map_err(col_err)?,
+        stage_progress: capture_job_progress_from_row(row)?,
+        last_progress_at: row.try_get("last_progress_at").map_err(col_err)?,
+        attempts: attempts.max(0) as u32,
+        retryable: row.try_get("retryable").map_err(col_err)?,
+        error: row.try_get("error").map_err(col_err)?,
+        error_stage: row.try_get("error_stage").map_err(col_err)?,
+        fc_snapshot_version: row.try_get("fc_snapshot_version").map_err(col_err)?,
+        result_bincode: row.try_get("result_bincode").map_err(col_err)?,
+        created_at: row.try_get("created_at").map_err(col_err)?,
+        updated_at: row.try_get("updated_at").map_err(col_err)?,
+    })
+}
+
+pub(crate) fn cold_base_from_row(row: &PgRow) -> Result<ColdBaseRow, MetaError> {
+    let snapshot_id: Uuid = row.try_get("snapshot_id").map_err(col_err)?;
+    // Migration 0098: nullable for schema-evolution safety, but every
+    // row `upsert_cold_base` writes always sets it — a NULL here means
+    // a row written before 0098 landed (impossible in practice: the
+    // table was dormant until this same change started writing it) or
+    // a hand-edited row. Either way, treat it as unusable rather than
+    // handing the executor a `Vec::new()` it would fail to bincode-
+    // decode with a confusing error.
+    let snapshot_bincode: Option<Vec<u8>> = row.try_get("snapshot_bincode").map_err(col_err)?;
+    let snapshot_bincode = snapshot_bincode.ok_or_else(|| {
+        MetaError::Serialization(format!(
+            "cold_bases row {snapshot_id} has no snapshot_bincode (pre-migration-0098 row?)"
+        ))
+    })?;
+    Ok(ColdBaseRow {
+        content_key: row.try_get("content_key").map_err(col_err)?,
+        snapshot_id: SnapshotId(snapshot_id),
+        disk_manifest: row.try_get("disk_manifest").map_err(col_err)?,
+        memory_manifest: row.try_get("memory_manifest").map_err(col_err)?,
+        fc_snapshot_version: row.try_get("fc_snapshot_version").map_err(col_err)?,
+        captured_at: row.try_get("captured_at").map_err(col_err)?,
+        snapshot_bincode,
     })
 }
 

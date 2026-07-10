@@ -10,16 +10,16 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::{
-    CaptureReservation, CreateDisposition, DisableEnabledImageOutcome, MetadataStore,
-    SessionCreateWriteSet,
+    CreateDisposition, DisableEnabledImageOutcome, MetadataStore, SessionCreateWriteSet,
 };
 use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp};
 use engram_core::types::{
-    ArtifactRow, Capability, EnableJob, EnableJobState, EnabledImage, HostRecord, HostStatus,
-    PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState,
-    SnapshotRecord,
+    ArtifactRow, Capability, CaptureJobAssignment, CaptureJobReport, CaptureJobRow,
+    CaptureTerminalReport, ColdBaseRow, EnableJob, EnableJobState, EnabledImage, HostRecord,
+    HostStatus, NewCaptureJob, PersistedEvent, RegistryCredential, Session, SessionSecrets,
+    SessionSpec, SessionState, SnapshotRecord,
 };
-use engram_core::{HostId, MetaError, SandboxId, SessionId};
+use engram_core::{CaptureJobId, HostId, MetaError, SandboxId, SessionId, SnapshotId};
 use row::col_err;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
@@ -429,7 +429,7 @@ fn best_fit_measured(
 /// ADR 0046/0048/0081: the shared `FOR UPDATE` 2D pick every reserving
 /// placer runs — session create (`reserve_and_persist_create`), the
 /// queue scanner (`place_queued_session`), and capture reservation
-/// (`reserve_capture_host`). Locks the candidate host rows in PK order
+/// (`place_capture_job` / `reassign_capture_job`). Locks the candidate host rows in PK order
 /// so all placers (any replica) serialize on the overlap without
 /// deadlock, builds the fit map from host-measured `allocatable_mib`
 /// (0 = unmeasured → soft) + the vCPU budget, subtracts the reserved
@@ -515,10 +515,15 @@ async fn pick_host_2d(
               -- (overcommit). reserve_and_persist_create sets both to NOW().
               AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
             UNION ALL
-            SELECT capture_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
-            FROM enable_jobs
-            WHERE capture_host_id = ANY($1)
-              AND state NOT IN ('ready','failed')
+            -- ADR 0084 (c): a capture VM reserves like a session. The
+            -- reservation lives on `capture_jobs` now (moved off
+            -- `enable_jobs`); a non-terminal row with a bound host_id
+            -- holds its budget. Release is implicit — a terminal stage
+            -- drops out of this SUM.
+            SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+            FROM capture_jobs
+            WHERE host_id = ANY($1)
+              AND stage NOT IN ('done','failed')
         ) reserved
         GROUP BY host_id
         "#,
@@ -939,8 +944,8 @@ impl MetadataStore for PostgresStore {
 
         // -------- pick a host (ADR 0046/0048 best-fit 2D), if any candidate --------
         // Issue #535 (b): `pick_host_2d` is `reserve_placement`'s FOR-UPDATE
-        // pick (now shared with `place_queued_session` and ADR 0081's
-        // `reserve_capture_host`) — extended below so the SAME transaction
+        // pick (now shared with `place_queued_session` and ADR 0084's
+        // `place_capture_job` / `reassign_capture_job`) — extended below so the SAME transaction
         // also writes the satellites instead of stopping at the bare row
         // insert. The candidate host-row locks are held for the REST of the
         // transaction, not just the pick + insert — `tx.commit()` is at the
@@ -1490,11 +1495,11 @@ impl MetadataStore for PostgresStore {
     // retry, and the op reclaim sweep owns coord-died-mid-boot recovery.
 
     async fn queued_demand(&self) -> Result<engram_core::types::session::QueuedDemand, MetaError> {
-        // ADR 0081: waiting captures (`capture_waiting_since` set, no
-        // host reserved) fold into the queued-session demand — the K4
-        // autoscaler scales up for a capture exactly as for a session,
-        // and its scale-down hard gate (`queued_sessions == 0`) holds
-        // the fleet while one waits.
+        // ADR 0084 (c): waiting captures (`capture_jobs` rows with no host
+        // bound yet — `host_id IS NULL`, non-terminal) fold into the
+        // queued-session demand — the K4 autoscaler scales up for a
+        // capture exactly as for a session, and its scale-down hard gate
+        // (`queued_sessions == 0`) holds the fleet while one waits.
         let row: (i64, i64, i64) = sqlx::query_as(
             r#"
             SELECT COUNT(*)::BIGINT,
@@ -1505,10 +1510,9 @@ impl MetadataStore for PostgresStore {
                 FROM sessions WHERE status = 'queued'
                 UNION ALL
                 SELECT mem_budget_mib, cpu_budget_vcpus::BIGINT
-                FROM enable_jobs
-                WHERE capture_waiting_since IS NOT NULL
-                  AND capture_host_id IS NULL
-                  AND state NOT IN ('ready','failed')
+                FROM capture_jobs
+                WHERE host_id IS NULL
+                  AND stage NOT IN ('done','failed')
             ) demand
             "#,
         )
@@ -1550,10 +1554,11 @@ impl MetadataStore for PostgresStore {
                   -- and leak (overcommit). reserve_and_persist_create sets both to NOW().
                   AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
                 UNION ALL
-                SELECT capture_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
-                FROM enable_jobs
-                WHERE capture_host_id IS NOT NULL
-                  AND state NOT IN ('ready','failed')
+                -- ADR 0084 (c): capturing VMs reserve on `capture_jobs`.
+                SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+                FROM capture_jobs
+                WHERE host_id IS NOT NULL
+                  AND stage NOT IN ('done','failed')
             ) reserved
             GROUP BY host_id
             "#,
@@ -1632,11 +1637,11 @@ impl MetadataStore for PostgresStore {
                       -- and leak (overcommit). reserve_and_persist_create sets both to NOW().
                       AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
                     UNION ALL
-                    -- ADR 0081: a capturing enable job's VM reserves like a session.
-                    SELECT capture_host_id, mem_budget_mib
-                    FROM enable_jobs
-                    WHERE capture_host_id IS NOT NULL
-                      AND state NOT IN ('ready','failed')
+                    -- ADR 0084 (c): a capturing VM reserves like a session.
+                    SELECT host_id, mem_budget_mib
+                    FROM capture_jobs
+                    WHERE host_id IS NOT NULL
+                      AND stage NOT IN ('done','failed')
                 ) reserved
                 GROUP BY host_id
             ) r ON r.host_id = h.id
@@ -1859,18 +1864,19 @@ impl MetadataStore for PostgresStore {
         use engram_core::types::session::DeleteHostOutcome;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         // Refuse while any session is still bound — deleting the row out
-        // from under a live session would orphan its routing. ADR 0081:
+        // from under a live session would orphan its routing. ADR 0084 (c):
         // an in-flight base-snapshot capture binds the host the same way
-        // (its VM is running there); count it in the same guard.
+        // (its VM is running there); count non-terminal `capture_jobs`
+        // rows bound to this host in the same guard.
         let bound: i64 = sqlx::query_scalar(
             r#"
             SELECT (SELECT COUNT(*) FROM sessions
                      WHERE host_id = $1
                        AND status IN ('pending','created','active',
                                       'evacuating','evicting'))::BIGINT
-                 + (SELECT COUNT(*) FROM enable_jobs
-                     WHERE capture_host_id = $1
-                       AND state NOT IN ('ready','failed'))::BIGINT
+                 + (SELECT COUNT(*) FROM capture_jobs
+                     WHERE host_id = $1
+                       AND stage NOT IN ('done','failed'))::BIGINT
             "#,
         )
         .bind(id.as_uuid())
@@ -4271,11 +4277,11 @@ impl MetadataStore for PostgresStore {
         let inserted = sqlx::query(
             r#"
             INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config,
-                                     force_recapture, mem_budget_mib, cpu_budget_vcpus)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                     force_recapture)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
             DO NOTHING
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(Uuid::new_v4())
@@ -4283,11 +4289,10 @@ impl MetadataStore for PostgresStore {
         .bind(manifest_digest)
         .bind(sqlx::types::Json(image_config))
         .bind(force_recapture)
-        // ADR 0081: the capture VM's placement budgets — the same
-        // derivation session placement reserves with, so a capture is
-        // exactly as visible as a session of this image.
-        .bind(image_config.resolved_memory_mib() as i64)
-        .bind(image_config.resolved_vcpus() as i32)
+        // ADR 0084 (c): the capture placement reservation lives on
+        // `capture_jobs` now — its budgets are stamped there at
+        // `insert_capture_job` time (from the same `ImageConfig`
+        // derivation), not on this enable-job row.
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4296,7 +4301,7 @@ impl MetadataStore for PostgresStore {
         }
         let existing = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              WHERE image_uri = $1 AND state NOT IN ('ready', 'failed')
             "#,
@@ -4313,11 +4318,11 @@ impl MetadataStore for PostgresStore {
                 let row = sqlx::query(
                     r#"
                     INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config,
-                                             force_recapture, mem_budget_mib, cpu_budget_vcpus)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                             force_recapture)
+                    VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
                     DO NOTHING
-                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
+                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
                     "#,
                 )
                 .bind(Uuid::new_v4())
@@ -4325,8 +4330,6 @@ impl MetadataStore for PostgresStore {
                 .bind(manifest_digest)
                 .bind(sqlx::types::Json(image_config))
                 .bind(force_recapture)
-                .bind(image_config.resolved_memory_mib() as i64)
-                .bind(image_config.resolved_vcpus() as i32)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(db_err)?
@@ -4342,7 +4345,7 @@ impl MetadataStore for PostgresStore {
 
     async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
         let row = sqlx::query(
-            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
+            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -4354,7 +4357,7 @@ impl MetadataStore for PostgresStore {
     async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              ORDER BY created_at DESC
              LIMIT $1
@@ -4378,26 +4381,14 @@ impl MetadataStore for PostgresStore {
         // FOR UPDATE SKIP LOCKED keeps two pods' simultaneous sweeps
         // from blocking on each other — each claims a disjoint set.
         //
-        // ADR 0081 (fix): clear `capture_host_id` on (re-)claim. If a pod
-        // reserved a host then crashed/lost its lease, the stale
-        // `capture_host_id` is a phantom reservation of the job's OWN
-        // budget. When the re-claiming pod re-runs `reserve_capture_host`,
-        // `pick_host_2d`'s reserved-SUM has no self-exclusion, so on a
-        // tight fleet the job counts its own phantom against the only
-        // viable host and can NEVER fit itself → 30-min `CapacityTimeout`
-        // (non-retryable), while `queued_demand` excludes it
-        // (`capture_host_id IS NOT NULL`) so the autoscaler won't help.
-        // Clearing it here makes the re-run re-reserve from scratch.
-        // `capture_waiting_since` is deliberately NOT cleared: it's the
-        // first-miss wait anchor and must survive re-claim (it's cleared
-        // only by `reserve_capture_host`'s fit branch,
-        // `clear_capture_reservation`, `record_enable_job_failure`, and
-        // `retry_enable_job`).
+        // ADR 0084 (c): no capture reservation to clear here anymore — the
+        // reservation moved onto `capture_jobs` (released implicitly on a
+        // terminal stage), so a lost enable-job lease no longer strands a
+        // phantom capture reservation on this row.
         let rows = sqlx::query(
             r#"
             UPDATE enable_jobs
-               SET claimed_by = $1, claimed_at = NOW(), updated_at = NOW(),
-                   capture_host_id = NULL
+               SET claimed_by = $1, claimed_at = NOW(), updated_at = NOW()
              WHERE id IN (
                    SELECT id FROM enable_jobs
                     WHERE state NOT IN ('ready', 'failed')
@@ -4406,7 +4397,7 @@ impl MetadataStore for PostgresStore {
                     LIMIT $3
                       FOR UPDATE SKIP LOCKED
              )
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(claimant)
@@ -4454,66 +4445,17 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    /// Issue #539: persist one `CaptureProgress` event onto the job row.
-    /// `warm_stage_started_at` is derived from `progress.warm_stages`' still-
-    /// open entry (the caller — `PooledBackend::run_warm_hook`/
-    /// `build_base_snapshot` via the coordinator's stream consumer — always
-    /// sends the full stage history, not a diff), not re-derived in SQL, so
-    /// a stage-name-unchanged heartbeat doesn't need a `DISTINCT FROM`
-    /// dance to avoid resetting it.
-    ///
-    /// Fenced by `claimed_by` exactly like [`Self::update_enable_job_progress`]
-    /// — see #232. Also renews the claim (`claimed_at = NOW()`), which is
-    /// what lets the enable-scanner delete its blind capture-lease ticker
-    /// (`enable_scanner.rs`): the host's >=30s keepalive comfortably beats
-    /// the 300s lease.
-    async fn update_enable_job_capture_progress(
-        &self,
-        id: Uuid,
-        claimant: &str,
-        progress: &engram_core::types::CaptureProgress,
-    ) -> Result<(), MetaError> {
-        let warm_stage_started_at = progress
-            .warm_stages
-            .iter()
-            .find(|s| s.ended_at.is_none())
-            .map(|s| s.started_at);
-        let res = sqlx::query(
-            r#"
-            UPDATE enable_jobs
-               SET capture_phase = $3,
-                   warm_stage = $4,
-                   warm_stage_started_at = $5,
-                   warm_stages = $6,
-                   output_tail = $7,
-                   claimed_at = NOW(),
-                   updated_at = NOW()
-             WHERE id = $1 AND claimed_by = $2
-            "#,
-        )
-        .bind(id)
-        .bind(claimant)
-        .bind(progress.phase.as_str())
-        .bind(progress.warm_stage.as_deref())
-        .bind(warm_stage_started_at)
-        .bind(sqlx::types::Json(&progress.warm_stages))
-        .bind(&progress.output_tail)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        if res.rows_affected() == 0 {
-            return Err(self.enable_job_fence_miss(id, claimant).await);
-        }
-        Ok(())
-    }
-
     /// ADR 0080 phase 3b: persist one `MaterializeProgress` frame onto
     /// the job row. Post-3b the `materializing` stage runs HOST-side —
     /// there is no coordinator chunk counter anymore, so the honest
     /// operator surface is a rendered progress line in `output_tail`
     /// (the same column the capture phase's hook output rides). Fenced
-    /// + claim-renewing exactly like
-    /// [`Self::update_enable_job_capture_progress`].
+    /// + claim-renewing exactly like the ADR 0084 P1b
+    /// `mirror_capture_progress_to_enable_job` (UNFENCED, unlike this
+    /// verb — see its own doc) does for the capture phase; the fenced,
+    /// claim-renewing capture-progress verb this comment used to point
+    /// at (`update_enable_job_capture_progress`) was DELETED as dead
+    /// code in ADR 0084 P4.
     async fn update_enable_job_materialize_progress(
         &self,
         id: Uuid,
@@ -4609,11 +4551,9 @@ impl MetadataStore for PostgresStore {
                            END,
                    claimed_by = NULL,
                    claimed_at = NULL,
-                   -- ADR 0081: this write releases the claim, so a separate
-                   -- fenced `clear_capture_reservation` afterwards would
-                   -- fence-miss — release the capture reservation here too.
-                   capture_host_id = NULL,
-                   capture_waiting_since = NULL,
+                   -- ADR 0084 (c): no capture reservation to release here —
+                   -- it lives on `capture_jobs` and drops out of every
+                   -- reserved-SUM implicitly once that row goes terminal.
                    updated_at = NOW()
              WHERE id = $1 AND claimed_by = $2
             RETURNING attempts, state
@@ -4636,129 +4576,6 @@ impl MetadataStore for PostgresStore {
         }
     }
 
-    async fn reserve_capture_host(
-        &self,
-        id: Uuid,
-        claimant: &str,
-        candidates: &[HostId],
-        mem_budget_mib: i64,
-        cpu_budget_vcpus: i64,
-    ) -> Result<CaptureReservation, MetaError> {
-        let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
-        // The SAME FOR UPDATE 2D pick as session placement (ADR 0081) —
-        // candidate host rows stay locked until the commit below, so the
-        // reservation write is atomic with the pick and concurrent
-        // placers (sessions and captures alike) serialize. No affinity
-        // tier: a capture has no snapshot locality to prefer.
-        let picked = pick_host_2d(&mut tx, &cand, 0, mem_budget_mib, cpu_budget_vcpus).await?;
-        // ADR 0081 (fix): persist the RESOLVED budgets in BOTH branches.
-        // A pre-0095 row carries `0` budgets and the caller resolves them
-        // from the image config — but a resolution that never lands in the
-        // row is invisible to every OTHER placer's reserved-SUM
-        // (`pick_host_2d`, `per_host_reserved`, `fleet_free_mib`) and to
-        // `queued_demand`. Stamping the budget here (fenced by claimant,
-        // atomic with the pick) closes that hole once: a fit stamps a real
-        // reservation, a miss stamps real queued demand.
-        let cpu_budget_vcpus_i32 = cpu_budget_vcpus as i32;
-        let reservation = match picked {
-            // Fit → stamp the reservation (visible to every reserved-SUM
-            // reader from commit) and stop the wait clock (a job that
-            // waited then fit must stop counting as waiting demand).
-            Some(host) => {
-                let n = sqlx::query(
-                    r#"
-                    UPDATE enable_jobs
-                       SET capture_host_id = $3,
-                           capture_waiting_since = NULL,
-                           mem_budget_mib = $4,
-                           cpu_budget_vcpus = $5,
-                           claimed_at = NOW(),
-                           updated_at = NOW()
-                     WHERE id = $1 AND claimed_by = $2
-                    "#,
-                )
-                .bind(id)
-                .bind(claimant)
-                .bind(host)
-                .bind(mem_budget_mib)
-                .bind(cpu_budget_vcpus_i32)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?
-                .rows_affected();
-                if n == 0 {
-                    tx.rollback().await.map_err(db_err)?;
-                    return Err(self.enable_job_fence_miss(id, claimant).await);
-                }
-                CaptureReservation::Reserved(HostId(host))
-            }
-            // No fit → the job is waiting for capacity: start the wait
-            // clock iff this is the first miss (COALESCE keeps the
-            // original mark across re-tries so the queue timeout is
-            // measured from the FIRST miss), and count as queued demand
-            // (`queued_demand`) so the autoscaler grows the pool. RETURN
-            // the (post-COALESCE, non-NULL) mark: it's the DB anchor the
-            // scanner's wait deadline measures from — a wall-clock deadline
-            // resets on every pod restart / re-claim and the 30-min
-            // backstop would never fire under coordinator churn.
-            None => {
-                let row: Option<(DateTime<Utc>,)> = sqlx::query_as(
-                    r#"
-                    UPDATE enable_jobs
-                       SET capture_waiting_since = COALESCE(capture_waiting_since, NOW()),
-                           mem_budget_mib = $3,
-                           cpu_budget_vcpus = $4,
-                           claimed_at = NOW(),
-                           updated_at = NOW()
-                     WHERE id = $1 AND claimed_by = $2
-                    RETURNING capture_waiting_since
-                    "#,
-                )
-                .bind(id)
-                .bind(claimant)
-                .bind(mem_budget_mib)
-                .bind(cpu_budget_vcpus_i32)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?;
-                match row {
-                    Some((since,)) => CaptureReservation::Waiting { since },
-                    None => {
-                        // Lease moved on — abandon without reserving.
-                        tx.rollback().await.map_err(db_err)?;
-                        return Err(self.enable_job_fence_miss(id, claimant).await);
-                    }
-                }
-            }
-        };
-        tx.commit().await.map_err(db_err)?;
-        Ok(reservation)
-    }
-
-    async fn clear_capture_reservation(&self, id: Uuid, claimant: &str) -> Result<(), MetaError> {
-        let n = sqlx::query(
-            r#"
-            UPDATE enable_jobs
-               SET capture_host_id = NULL,
-                   capture_waiting_since = NULL,
-                   claimed_at = NOW(),
-                   updated_at = NOW()
-             WHERE id = $1 AND claimed_by = $2
-            "#,
-        )
-        .bind(id)
-        .bind(claimant)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        if n == 0 {
-            return Err(self.enable_job_fence_miss(id, claimant).await);
-        }
-        Ok(())
-    }
-
     async fn retry_enable_job(&self, id: Uuid) -> Result<EnableJob, MetaError> {
         // Issue #539 (migration 0079): also reset the capture-progress
         // columns a prior (failed) capture attempt left behind. Without
@@ -4777,8 +4594,10 @@ impl MetadataStore for PostgresStore {
                    capture_phase = NULL, warm_stage = NULL,
                    warm_stage_started_at = NULL, warm_stages = NULL,
                    output_tail = NULL,
-                   -- ADR 0081: a fresh run re-reserves from scratch.
-                   capture_host_id = NULL, capture_waiting_since = NULL,
+                   -- ADR 0084 (c): no capture reservation on this row
+                   -- anymore; the retry's fresh `capture_jobs` row
+                   -- re-reserves from scratch (and the DELETE below clears
+                   -- the old terminal capture row).
                    -- Also reset the chunk-progress counters (same class as
                    -- the warm/capture columns above): the UI renders these
                    -- as live progress too, and the progress checkpoint
@@ -4786,7 +4605,7 @@ impl MetadataStore for PostgresStore {
                    -- read as live until the retry's first chunk event.
                    chunks_done = 0, chunks_total = NULL
              WHERE id = $1 AND state = 'failed'
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, mem_budget_mib, cpu_budget_vcpus, capture_host_id, capture_waiting_since, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -4794,7 +4613,29 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         match row {
-            Some(r) => row::enable_job_from_row(&r),
+            Some(r) => {
+                // ADR 0084 P1b: a prior (failed) attempt's TERMINAL
+                // `capture_jobs` row must not survive a retry — the
+                // scanner's `latest_capture_job_for_enable` read is
+                // "newest row for this enable job, terminal or not" (so
+                // it can observe a `done`/`failed` outcome), which would
+                // otherwise keep re-surfacing the OLD exhausted failure
+                // forever and wedge the retry. Only terminal rows: a
+                // live (non-terminal) row can't coexist with `state =
+                // 'failed'` above (retry only applies once the capture
+                // pipeline itself gave up), so this is a no-op in the
+                // normal case and a safety net against any stale leftover.
+                if let Err(e) = sqlx::query(
+                    "DELETE FROM capture_jobs WHERE enable_job_id = $1 AND stage IN ('done', 'failed')",
+                )
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                {
+                    tracing::warn!(enable_job_id = %id, error = %e, "retry_enable_job: failed to clear stale terminal capture_jobs row (non-fatal; the scanner may re-observe the old outcome)");
+                }
+                row::enable_job_from_row(&r)
+            }
             None => match self.get_enable_job(id).await? {
                 Some(job) => Err(MetaError::Conflict(format!(
                     "enable job {id} is `{}`, not `failed`; only failed jobs can be retried",
@@ -4803,6 +4644,26 @@ impl MetadataStore for PostgresStore {
                 None => Err(MetaError::NotFound),
             },
         }
+    }
+
+    /// ADR 0084 P1b: release the claim without touching state/attempts —
+    /// the watch-only exit for a `Capturing` job whose `capture_jobs` row
+    /// is still in flight. See the trait doc for why this exists
+    /// alongside `claim_enable_jobs`'s lease-expiry path.
+    async fn release_enable_job_claim(&self, id: Uuid, claimant: &str) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
+             WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(id)
+        .bind(claimant)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
     }
 
     // ---- ADR 0036 amendment: fleet chunk prestage (issue #538) ----
@@ -4887,6 +4748,647 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         Ok(rows.into_iter().map(|(v,)| v).collect())
+    }
+
+    // ---- capture jobs (ADR 0084) ----
+
+    async fn insert_capture_job(&self, row: NewCaptureJob) -> Result<CaptureJobRow, MetaError> {
+        // Insert-or-get, exactly like `create_or_get_enable_job`: guarded
+        // by the `capture_jobs_active_enable` partial unique index, so a
+        // coordinator restart or a re-driven scanner tick resumes the
+        // existing attempt instead of duplicating a capture VM.
+        //
+        // ADR 0084 (c): a fresh row is inserted WAITING — `host_id NULL`,
+        // `waiting_since NOW()` — with its placement budgets stamped from
+        // the image config (no zero-budget row can ever exist). No host is
+        // chosen here: `place_capture_job` runs the atomic 2D fit as a
+        // separate step (keeping the pick atomic with the host-row lock).
+        const COLUMNS: &str = "id, enable_job_id, image_uri, manifest_digest, disk_manifest, \
+            image_config, oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress, \
+            last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version, \
+            result_bincode, created_at, updated_at";
+        let insert_sql = format!(
+            r#"
+            INSERT INTO capture_jobs (id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config, oci_defaults, mem_budget_mib, cpu_budget_vcpus, waiting_since)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+            ON CONFLICT (enable_job_id) WHERE stage NOT IN ('done', 'failed')
+            DO NOTHING
+            RETURNING {COLUMNS}
+            "#
+        );
+        let select_sql = format!(
+            r#"
+            SELECT {COLUMNS}
+              FROM capture_jobs
+             WHERE enable_job_id = $1 AND stage NOT IN ('done', 'failed')
+            "#
+        );
+        let inserted = sqlx::query(&insert_sql)
+            .bind(Uuid::new_v4())
+            .bind(row.enable_job_id)
+            .bind(&row.image_uri)
+            .bind(&row.manifest_digest)
+            .bind(&row.disk_manifest)
+            .bind(sqlx::types::Json(&row.image_config))
+            .bind(sqlx::types::Json(&row.oci_defaults))
+            .bind(row.mem_budget_mib)
+            .bind(row.cpu_budget_vcpus)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        if let Some(r) = inserted {
+            return row::capture_job_from_row(&r);
+        }
+        let existing = sqlx::query(&select_sql)
+            .bind(row.enable_job_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        match existing {
+            Some(r) => row::capture_job_from_row(&r),
+            // Raced with the active job reaching a terminal state between
+            // INSERT and SELECT — retry the insert once, mirroring
+            // `create_or_get_enable_job`.
+            None => {
+                let r = sqlx::query(&insert_sql)
+                    .bind(Uuid::new_v4())
+                    .bind(row.enable_job_id)
+                    .bind(&row.image_uri)
+                    .bind(&row.manifest_digest)
+                    .bind(&row.disk_manifest)
+                    .bind(sqlx::types::Json(&row.image_config))
+                    .bind(sqlx::types::Json(&row.oci_defaults))
+                    .bind(row.mem_budget_mib)
+                    .bind(row.cpu_budget_vcpus)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(db_err)?
+                    .ok_or_else(|| {
+                        MetaError::Conflict(format!(
+                            "capture job for enable job {} raced two creates; retry",
+                            row.enable_job_id
+                        ))
+                    })?;
+                row::capture_job_from_row(&r)
+            }
+        }
+    }
+
+    async fn get_capture_job(&self, id: CaptureJobId) -> Result<Option<CaptureJobRow>, MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                   oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
+                   last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                   result_bincode, created_at, updated_at
+              FROM capture_jobs
+             WHERE id = $1
+            "#,
+        )
+        .bind(id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::capture_job_from_row(&r)).transpose()
+    }
+
+    async fn latest_capture_job_for_enable(
+        &self,
+        enable_job_id: Uuid,
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                   oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
+                   last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                   result_bincode, created_at, updated_at
+              FROM capture_jobs
+             WHERE enable_job_id = $1
+             ORDER BY created_at DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(enable_job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::capture_job_from_row(&r)).transpose()
+    }
+
+    async fn record_capture_job_report(
+        &self,
+        report: &CaptureJobReport,
+    ) -> Result<bool, MetaError> {
+        // ONE fenced write any replica can perform — no lease-holder
+        // identity to lose (ADR 0084). `stage_started_at` only advances
+        // when the stage actually changed; `stage_progress` is a direct
+        // SET (a fresh report replaces the prior progress snapshot
+        // wholesale, matching the streaming protocol's "full frame, not a
+        // diff" shape); the terminal fields COALESCE so a terminal
+        // report's re-advertisement (before the coord acks it) doesn't
+        // need to resend them to stay a no-op — though in practice the
+        // WHERE clause already fences off any write once `stage` is
+        // `done`/`failed`.
+        let stage_progress = report
+            .progress
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let (stage, retryable, error, error_stage, result_bincode): (
+            &str,
+            Option<bool>,
+            Option<&str>,
+            Option<&str>,
+            Option<&[u8]>,
+        ) = match &report.terminal {
+            Some(CaptureTerminalReport::Done { result_bincode }) => {
+                ("done", None, None, None, Some(result_bincode.as_slice()))
+            }
+            Some(CaptureTerminalReport::Failed {
+                error,
+                error_stage,
+                retryable,
+            }) => (
+                "failed",
+                Some(*retryable),
+                Some(error.as_str()),
+                Some(error_stage.as_str()),
+                None,
+            ),
+            None => (report.stage.as_str(), None, None, None, None),
+        };
+        let res = sqlx::query(
+            r#"
+            UPDATE capture_jobs
+               SET stage = $3,
+                   stage_progress = $4,
+                   stage_started_at = CASE WHEN stage <> $3 THEN NOW() ELSE stage_started_at END,
+                   last_progress_at = NOW(),
+                   fc_snapshot_version = COALESCE($5, fc_snapshot_version),
+                   retryable = COALESCE($6, retryable),
+                   error = COALESCE($7, error),
+                   error_stage = COALESCE($8, error_stage),
+                   result_bincode = COALESCE($9, result_bincode),
+                   updated_at = NOW()
+             WHERE id = $1 AND epoch = $2 AND stage NOT IN ('done', 'failed')
+            "#,
+        )
+        .bind(report.job_id.as_uuid())
+        .bind(report.epoch)
+        .bind(stage)
+        .bind(stage_progress)
+        .bind(report.fc_snapshot_version.as_deref())
+        .bind(retryable)
+        .bind(error)
+        .bind(error_stage)
+        .bind(result_bincode)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn mirror_capture_progress_to_enable_job(
+        &self,
+        enable_job_id: Uuid,
+        capture_phase: Option<&str>,
+        warm_stage: Option<&str>,
+        output_tail: Option<&str>,
+    ) -> Result<(), MetaError> {
+        // UNFENCED on purpose (ADR 0084 P1b): `capture_jobs` owns
+        // fencing/execution now, this is a cosmetic dashboard mirror the
+        // heartbeat reconcile drives regardless of which coordinator pod
+        // (if any) holds the enable job's claim. `COALESCE` so a report
+        // with no rendered phase (`assigned`/`done`/`failed`) doesn't
+        // blank the last-known warm-hook stage/output.
+        sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET capture_phase = COALESCE($2, capture_phase),
+                   warm_stage = COALESCE($3, warm_stage),
+                   output_tail = COALESCE($4, output_tail),
+                   updated_at = NOW()
+             WHERE id = $1
+            "#,
+        )
+        .bind(enable_job_id)
+        .bind(capture_phase)
+        .bind(warm_stage)
+        .bind(output_tail)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn place_capture_job(
+        &self,
+        id: CaptureJobId,
+        candidates: &[HostId],
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        // ADR 0084 (c): the reserving pick for a WAITING row. Lock the job
+        // row FOR UPDATE (serializes concurrent placers of the same job),
+        // then run the atomic 2D RAM/CPU best-fit over `candidates` using
+        // the row's OWN stamped budgets, holding the host-row locks
+        // `pick_host_2d` takes until commit. Only host_id-NULL rows are
+        // placeable; a row already bound is returned unchanged (no
+        // double-reserve).
+        let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let cur: Option<(Option<uuid::Uuid>, i64, i32)> = sqlx::query_as(
+            r#"SELECT host_id, mem_budget_mib, cpu_budget_vcpus
+                 FROM capture_jobs
+                WHERE id = $1 AND stage NOT IN ('done', 'failed')
+                FOR UPDATE"#,
+        )
+        .bind(id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let Some((host_id, mem, cpu)) = cur else {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(None); // gone or already terminal
+        };
+        if host_id.is_some() {
+            // Already placed (a racing placer won) — return unchanged.
+            tx.rollback().await.map_err(db_err)?;
+            return self.get_capture_job(id).await;
+        }
+        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64).await?;
+        // Fit → bind host_id, clear the wait clock, re-anchor the
+        // `assigned` deadline from dispatch. No fit → leave waiting,
+        // stamping `waiting_since` on the first miss (COALESCE).
+        let row = sqlx::query(
+            r#"
+            UPDATE capture_jobs
+               SET host_id = $2,
+                   waiting_since = CASE WHEN $2 IS NULL THEN COALESCE(waiting_since, NOW()) ELSE NULL END,
+                   stage_started_at = CASE WHEN $2 IS NULL THEN stage_started_at ELSE NOW() END,
+                   last_progress_at = CASE WHEN $2 IS NULL THEN last_progress_at ELSE NOW() END,
+                   updated_at = NOW()
+             WHERE id = $1 AND host_id IS NULL AND stage NOT IN ('done', 'failed')
+            RETURNING id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                      oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
+                      last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                      result_bincode, created_at, updated_at
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(picked)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        row.map(|r| row::capture_job_from_row(&r)).transpose()
+    }
+
+    async fn reassign_capture_job(
+        &self,
+        id: CaptureJobId,
+        expected_epoch: i64,
+        candidates: &[HostId],
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        // ADR 0084 (c): re-run the reserving 2D fit for the new host INSIDE
+        // the same epoch-fenced write, so the host old→new swap is atomic
+        // with the reservation. No fit ⇒ `host_id = NULL` (the row falls
+        // into the waiting flow rather than failing). The `epoch + 1` bump
+        // fences/tears down the abandoned attempt (host-side
+        // `cancel_absent`); `attempts + 1` counts the real re-attempt.
+        let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let budgets: Option<(i64, i32)> = sqlx::query_as(
+            r#"SELECT mem_budget_mib, cpu_budget_vcpus
+                 FROM capture_jobs
+                WHERE id = $1 AND epoch = $2 AND stage NOT IN ('done', 'failed')
+                FOR UPDATE"#,
+        )
+        .bind(id.as_uuid())
+        .bind(expected_epoch)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let Some((mem, cpu)) = budgets else {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(None); // fence missed (already reassigned, or terminal)
+        };
+        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64).await?;
+        let row = sqlx::query(
+            r#"
+            UPDATE capture_jobs
+               SET host_id = $3,
+                   waiting_since = CASE WHEN $3 IS NULL THEN COALESCE(waiting_since, NOW()) ELSE NULL END,
+                   epoch = epoch + 1,
+                   attempts = attempts + 1,
+                   stage = 'assigned',
+                   stage_started_at = NOW(),
+                   last_progress_at = NOW(),
+                   stage_progress = NULL,
+                   updated_at = NOW()
+             WHERE id = $1 AND epoch = $2 AND stage NOT IN ('done', 'failed')
+            RETURNING id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                      oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
+                      last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                      result_bincode, created_at, updated_at
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(expected_epoch)
+        .bind(picked)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        row.map(|r| row::capture_job_from_row(&r)).transpose()
+    }
+
+    async fn redrive_failed_capture_job(
+        &self,
+        id: CaptureJobId,
+        expected_epoch: i64,
+        candidates: &[HostId],
+        max_attempts: u32,
+    ) -> Result<Option<CaptureJobRow>, MetaError> {
+        // Unlike `reassign_capture_job` (fenced `stage NOT IN
+        // ('done','failed')`), this deliberately targets a TERMINAL
+        // `failed` row and re-drives it — the automatic path's equivalent
+        // of `retry_enable_job`'s DELETE-the-terminal-row escape. The
+        // `attempts < $max` clause makes the budget atomic (an exhausted
+        // job returns 0 rows → `None`); the `epoch + 1` bump keeps any
+        // stale report from the abandoned attempt fenced out of
+        // `record_capture_job_report`. Re-runs the reserving 2D fit for the
+        // new host in the same fenced transaction (ADR 0084 (c)); no fit ⇒
+        // `host_id = NULL` (waiting). Per-attempt fields are cleared and
+        // timestamps reset to mirror a fresh `insert_capture_job` row.
+        let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let budgets: Option<(i64, i32)> = sqlx::query_as(
+            r#"SELECT mem_budget_mib, cpu_budget_vcpus
+                 FROM capture_jobs
+                WHERE id = $1 AND epoch = $2 AND stage = 'failed' AND retryable AND attempts < $3
+                FOR UPDATE"#,
+        )
+        .bind(id.as_uuid())
+        .bind(expected_epoch)
+        .bind(i64::from(max_attempts))
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let Some((mem, cpu)) = budgets else {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(None); // exhausted, raced, or no longer retryable-failed
+        };
+        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64).await?;
+        let row = sqlx::query(
+            r#"
+            UPDATE capture_jobs
+               SET host_id = $3,
+                   waiting_since = CASE WHEN $3 IS NULL THEN COALESCE(waiting_since, NOW()) ELSE NULL END,
+                   epoch = epoch + 1,
+                   attempts = attempts + 1,
+                   stage = 'assigned',
+                   stage_started_at = NOW(),
+                   last_progress_at = NOW(),
+                   stage_progress = NULL,
+                   error = NULL,
+                   error_stage = NULL,
+                   retryable = NULL,
+                   result_bincode = NULL,
+                   fc_snapshot_version = NULL,
+                   updated_at = NOW()
+             WHERE id = $1 AND epoch = $2 AND stage = 'failed' AND retryable AND attempts < $4
+            RETURNING id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                      oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
+                      last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                      result_bincode, created_at, updated_at
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(expected_epoch)
+        .bind(picked)
+        .bind(i64::from(max_attempts))
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        row.map(|r| row::capture_job_from_row(&r)).transpose()
+    }
+
+    async fn expire_capture_job_stages(
+        &self,
+        budgets: &[(engram_core::types::CaptureJobStage, std::time::Duration)],
+    ) -> Result<Vec<CaptureJobRow>, MetaError> {
+        // Volumes are tiny (at most one active job per host, gated by
+        // anti-affinity) — fetch the non-terminal candidate set and
+        // filter in Rust rather than compose a per-stage CASE in SQL.
+        // ADR 0084 (c): DISPATCHED rows only (`host_id IS NOT NULL`) — a
+        // waiting row has no stage deadline, only the queue timeout
+        // (`list_waiting_capture_jobs`).
+        if budgets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                   oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
+                   last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                   result_bincode, created_at, updated_at
+              FROM capture_jobs
+             WHERE stage NOT IN ('done', 'failed') AND host_id IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let now = Utc::now();
+        let mut out = Vec::new();
+        for r in &rows {
+            let job = row::capture_job_from_row(r)?;
+            let Some((_, budget)) = budgets.iter().find(|(stage, _)| *stage == job.stage) else {
+                continue;
+            };
+            let age = now.signed_duration_since(job.last_progress_at);
+            let over_budget = age.to_std().map(|age| age > *budget).unwrap_or(false);
+            if over_budget {
+                out.push(job);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_waiting_capture_jobs(&self) -> Result<Vec<CaptureJobRow>, MetaError> {
+        // ADR 0084 (c): every WAITING (host_id NULL) non-terminal capture
+        // job — the queue-timeout scan's read. Each is re-offered to
+        // `place_capture_job` every tick; one whose `waiting_since` is
+        // older than the queue timeout is failed with `CapacityTimeout`.
+        let rows = sqlx::query(
+            r#"
+            SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
+                   oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
+                   last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
+                   result_bincode, created_at, updated_at
+              FROM capture_jobs
+             WHERE stage NOT IN ('done', 'failed') AND host_id IS NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::capture_job_from_row).collect()
+    }
+
+    async fn capture_assignments_for_host(
+        &self,
+        host: HostId,
+    ) -> Result<Vec<CaptureJobAssignment>, MetaError> {
+        let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+            r#"
+            SELECT id, epoch FROM capture_jobs
+             WHERE host_id = $1 AND stage NOT IN ('done', 'failed')
+            "#,
+        )
+        .bind(host.as_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, epoch)| CaptureJobAssignment {
+                job_id: CaptureJobId(id),
+                epoch,
+            })
+            .collect())
+    }
+
+    async fn hosts_with_live_capture_jobs(
+        &self,
+    ) -> Result<std::collections::HashSet<HostId>, MetaError> {
+        // ADR 0084 (c): a WAITING job (`host_id NULL`) binds no host, so
+        // it can't be in the anti-affinity set — exclude NULLs (and keep
+        // the decode as a plain `Uuid`).
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            r#"SELECT DISTINCT host_id FROM capture_jobs
+                WHERE stage NOT IN ('done', 'failed') AND host_id IS NOT NULL"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|(id,)| HostId(id)).collect())
+    }
+
+    async fn set_enable_job_reuse_outcome(
+        &self,
+        enable_job_id: Uuid,
+        outcome: &str,
+    ) -> Result<(), MetaError> {
+        // A plain write, not fenced by claimant — stamped once the job
+        // has already reached a terminal enable-job state, so there's no
+        // in-flight lease left to race against.
+        sqlx::query("UPDATE enable_jobs SET reuse_outcome = $2, updated_at = NOW() WHERE id = $1")
+            .bind(enable_job_id)
+            .bind(outcome)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn upsert_cold_base(&self, row: ColdBaseRow) -> Result<(), MetaError> {
+        sqlx::query(
+            r#"
+            INSERT INTO cold_bases (content_key, snapshot_id, disk_manifest, memory_manifest, fc_snapshot_version, captured_at, snapshot_bincode)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (content_key) DO UPDATE SET
+                snapshot_id = EXCLUDED.snapshot_id,
+                disk_manifest = EXCLUDED.disk_manifest,
+                memory_manifest = EXCLUDED.memory_manifest,
+                fc_snapshot_version = EXCLUDED.fc_snapshot_version,
+                captured_at = EXCLUDED.captured_at,
+                snapshot_bincode = EXCLUDED.snapshot_bincode
+            "#,
+        )
+        .bind(&row.content_key)
+        .bind(row.snapshot_id.as_uuid())
+        .bind(&row.disk_manifest)
+        .bind(&row.memory_manifest)
+        .bind(&row.fc_snapshot_version)
+        .bind(row.captured_at)
+        .bind(&row.snapshot_bincode)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_cold_base(&self, content_key: &str) -> Result<Option<ColdBaseRow>, MetaError> {
+        let row = sqlx::query(
+            r#"
+            SELECT content_key, snapshot_id, disk_manifest, memory_manifest, fc_snapshot_version, captured_at, snapshot_bincode
+              FROM cold_bases
+             WHERE content_key = $1
+            "#,
+        )
+        .bind(content_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::cold_base_from_row(&r)).transpose()
+    }
+
+    async fn cold_base_snapshot_ids(&self) -> Result<Vec<SnapshotId>, MetaError> {
+        let rows: Vec<(Uuid,)> = sqlx::query_as("SELECT snapshot_id FROM cold_bases")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(|(id,)| SnapshotId(id)).collect())
+    }
+
+    async fn cold_base_manifest_refs(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT disk_manifest, memory_manifest FROM cold_bases")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db_err)?;
+        let mut refs = Vec::with_capacity(rows.len() * 2);
+        for (disk, mem) in rows {
+            for text in [disk, mem] {
+                match text.parse::<engram_core::types::manifest::ManifestRef>() {
+                    Ok(r) => refs.push(r),
+                    Err(e) => {
+                        tracing::warn!(
+                            manifest = %text,
+                            error = %e,
+                            "cold_base_manifest_refs: unparseable manifest ref; skipping (GC \
+                             pin-set collection continues with the rest)",
+                        );
+                    }
+                }
+            }
+        }
+        Ok(refs)
+    }
+
+    async fn cold_base_fc_version_changed(
+        &self,
+        disk_manifest: &str,
+        current_fc_version: &str,
+    ) -> Result<bool, MetaError> {
+        let (exists,): (bool,) = sqlx::query_as(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM cold_bases
+                 WHERE disk_manifest = $1 AND fc_snapshot_version <> $2
+            )
+            "#,
+        )
+        .bind(disk_manifest)
+        .bind(current_fc_version)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(exists)
     }
 
     async fn get_session_secrets(

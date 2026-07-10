@@ -281,7 +281,26 @@ pub fn tap_name_for(sandbox_id: SandboxId) -> String {
 /// 5353 if the caller passes `None` while proxy mode is on —
 /// matching the default in `engram-egress-proxy::ProxyConfig::new`
 /// (chosen to avoid the systemd-resolved bind on 127.0.0.53:53).
-pub fn host_startup_lines(proxy_port: Option<u16>, dns_port: Option<u16>) -> Vec<String> {
+///
+/// `guest_otel_port`: ADR 0019 / #526 phase 2 (in-guest OTLP export).
+/// When the host is configured with a guest-reachable collector
+/// endpoint (`ENGRAM_GUEST_OTEL_ENDPOINT` → `engram_otel=` on the
+/// cold-boot kernel cmdline), the guest dials its default gateway —
+/// the slot-0 TAP at 10.200.0.1, a host-local IP — on this port, and
+/// the packet hits the host INPUT chain where the blanket
+/// `-s {pool} -j DROP` would eat it. This opens a tcp pinhole for
+/// exactly that port, from the pool only, ordered BEFORE the drop.
+/// The otelcol sidecar binds 0.0.0.0 under hostNetwork, so local
+/// delivery on the gateway IP reaches it. Forged/spammy spans from an
+/// untrusted guest are an accepted risk, handled collector-side
+/// (memory_limiter + the receiver comment in
+/// `deploy/otel/collector-gcp.yaml`) — same posture as the proxy DNS
+/// pinhole above it. `None` (the default) renders no rule.
+pub fn host_startup_lines(
+    proxy_port: Option<u16>,
+    dns_port: Option<u16>,
+    guest_otel_port: Option<u16>,
+) -> Vec<String> {
     let dns_port = dns_port.unwrap_or(DEFAULT_DNS_PORT);
     let pool = ENGRAM_POOL_CIDR;
     let mut out = Vec::new();
@@ -354,6 +373,20 @@ pub fn host_startup_lines(proxy_port: Option<u16>, dns_port: Option<u16>) -> Vec
         out.push(format!(
             "-I INPUT 1 -s {pool} -p tcp --dport {dns_port} -j ACCEPT \
              -m comment --comment engram-proxy-dns-input",
+        ));
+    }
+    if let Some(port) = guest_otel_port {
+        // In-guest OTLP export pinhole (see the doc comment). Must
+        // precede the blanket DROP below. `-I INPUT 1` (insert-at-top),
+        // NOT `-A` (append), for the SAME reason as the proxy pinholes
+        // above (ADR 0083 / #595): across a host-agent restart the DROP
+        // already exists, so an appended ACCEPT falls AFTER it and the
+        // guest's collector dial is silently dropped once the otel port
+        // changes under a config roll. `purge_engram_proxy_rules` clears
+        // any prior copy first so this re-inserts cleanly every startup.
+        out.push(format!(
+            "-I INPUT 1 -s {pool} -p tcp --dport {port} -j ACCEPT \
+             -m comment --comment engram-guest-otlp-input",
         ));
     }
     out.push(format!(
@@ -565,7 +598,11 @@ async fn run_iptables(line: &str) -> Result<(), NetError> {
 /// `--comment` tag and we check-then-insert so a coord restart
 /// doesn't double up.
 #[cfg(target_os = "linux")]
-pub async fn host_startup(proxy_port: Option<u16>, dns_port: Option<u16>) -> Result<(), NetError> {
+pub async fn host_startup(
+    proxy_port: Option<u16>,
+    dns_port: Option<u16>,
+    guest_otel_port: Option<u16>,
+) -> Result<(), NetError> {
     if let Err(e) = tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await {
         return Err(NetError::Spawn(
             "write /proc/sys/net/ipv4/ip_forward".into(),
@@ -587,23 +624,24 @@ pub async fn host_startup(proxy_port: Option<u16>, dns_port: Option<u16>) -> Res
             ));
         }
     }
-    // Clear any prior engram proxy/dns/redirect rules before re-applying.
-    // The `-C`-then-insert loop below is history-BLIND: if a previous
-    // host_startup ran with a different `proxy_port`/`dns_port` (a config
-    // change, or the dev-only `ENGRAM_EGRESS_PROXY_PORT=0` footgun), its
-    // rules linger. Two concrete failures that caused, both silently
-    // wedging egress with a guest stuck at run_started:
+    // Clear any prior engram proxy/dns/redirect/otlp rules before
+    // re-applying. The `-C`-then-insert loop below is history-BLIND: if a
+    // previous host_startup ran with a different `proxy_port`/`dns_port`/
+    // `guest_otel_port` (a config change, or the dev-only
+    // `ENGRAM_EGRESS_PROXY_PORT=0` footgun), its rules linger. Concrete
+    // failures that caused, both silently wedging egress with a guest
+    // stuck at run_started:
     //   1. A stale nat `REDIRECT … redir ports <old>` sits BEFORE the new
     //      one; iptables is first-match, so :443 is redirected to a dead
     //      port and the proxy never sees the connection.
     //   2. The new INPUT `--dport <new> ACCEPT` is appended AFTER the
     //      already-present blanket DROP and never fires.
-    // Purging these four comment classes first (they are always safe to
+    // Purging these comment classes first (they are always safe to
     // remove — an absent ACCEPT/REDIRECT can only tighten policy, and we
     // never touch the FORWARD egress-deny) makes host_startup declarative:
     // the final ruleset depends only on the current args, not on history.
     purge_engram_proxy_rules().await;
-    for line in host_startup_lines(proxy_port, dns_port) {
+    for line in host_startup_lines(proxy_port, dns_port, guest_otel_port) {
         // Idempotency check: replace the leading `-A`/`-I` with `-C`
         // (or skip altogether for non-rule meta commands like
         // create-chain — none of our lines do that today). Order:
@@ -620,19 +658,43 @@ pub async fn host_startup(proxy_port: Option<u16>, dns_port: Option<u16>) -> Res
     Ok(())
 }
 
+/// Extract the TCP port a guest must be let through to for the
+/// configured `ENGRAM_GUEST_OTEL_ENDPOINT`, for the INPUT pinhole in
+/// [`host_startup_lines`]. Accepts the `http://host:port` shapes the
+/// OTLP SDKs accept; an endpoint with no explicit port defaults to
+/// 4317 (OTLP/gRPC). Returns `None` only for a malformed port —
+/// the caller then installs no pinhole and the guest dial fails
+/// closed (DROP), never open.
+pub fn otel_endpoint_port(endpoint: &str) -> Option<u16> {
+    const OTLP_GRPC_DEFAULT_PORT: u16 = 4317;
+    let rest = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    // Strip any path component before looking for the port.
+    let authority = rest.split('/').next().unwrap_or(rest);
+    match authority.rsplit_once(':') {
+        Some((_, port)) => port.parse().ok(),
+        None => Some(OTLP_GRPC_DEFAULT_PORT),
+    }
+}
+
 /// The engram-owned rule comments that `purge_engram_proxy_rules`
 /// deletes-and-reapplies each startup. All are ACCEPTs (INPUT) or
 /// REDIRECTs (nat PREROUTING) — never a DROP — so removing them can
-/// only tighten policy, never open an egress path.
+/// only tighten policy, never open an egress path. `engram-guest-otlp-input`
+/// (ADR 0084 (d) alignment) joins the set: it too is an insert-at-top
+/// INPUT ACCEPT whose port can change under a config roll, so it needs
+/// the same purge-and-reapply as the proxy/dns pinholes.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PURGEABLE_PROXY_COMMENTS: &[&str] = &[
     "engram-proxy-input",
     "engram-proxy-dns-input",
     "engram-proxy-redirect",
     "engram-dns-redirect",
+    "engram-guest-otlp-input",
 ];
 
-/// Delete every engram proxy/dns/redirect rule so `host_startup` can
+/// Delete every engram proxy/dns/redirect/otlp rule so `host_startup` can
 /// re-apply them fresh (see the call site for why the plain `-C`/`-A`
 /// idempotency isn't enough). Enumerates the live ruleset with
 /// `iptables -S` and issues the `-D` twin of each matching line — this
@@ -1307,6 +1369,7 @@ pub async fn reattach_netns_name(_netns_name: &str, _fc_pid: u32) -> Result<(), 
 pub async fn host_startup(
     _proxy_port: Option<u16>,
     _dns_port: Option<u16>,
+    _guest_otel_port: Option<u16>,
 ) -> Result<(), NetError> {
     Err(NetError::Spawn(
         "host_startup".into(),
@@ -1647,7 +1710,7 @@ mod tests {
         // must never leave a guest with an unfiltered route. It keeps
         // the hard-isolation drops AND applies the final FORWARD
         // default-deny with NO public-resolver ACCEPT.
-        let lines = host_startup_lines(None, None).join("\n");
+        let lines = host_startup_lines(None, None, None).join("\n");
         // Inter-VM block.
         assert!(lines.contains("-s 10.200.0.0/16 -d 10.200.0.0/16 -j DROP"));
         // Host-LAN drops.
@@ -1668,7 +1731,7 @@ mod tests {
 
     #[test]
     fn host_startup_with_proxy_redirects_443_and_default_denies() {
-        let lines = host_startup_lines(Some(9443), None).join("\n");
+        let lines = host_startup_lines(Some(9443), None, None).join("\n");
         // Both cold-path (tap-engr-+, TAP in root netns) and warm-
         // path (vh-engr-+, host-side veth into per-VM netns) need a
         // REDIRECT rule. Pre-fix only the cold-path rule existed and
@@ -1687,7 +1750,7 @@ mod tests {
         // resolver; instead, REDIRECT every guest DNS query to the
         // local filtering proxy regardless of which upstream IP
         // they chose.
-        let lines = host_startup_lines(Some(9443), Some(5353));
+        let lines = host_startup_lines(Some(9443), Some(5353), None);
         let joined = lines.join("\n");
         // No more blanket ACCEPT for VM→1.1.1.1:53 in proxy mode.
         assert!(
@@ -1730,7 +1793,7 @@ mod tests {
         // None dns_port falls through to DEFAULT_DNS_PORT so the
         // operator only needs to override when something else on the
         // host already binds 5353.
-        let lines = host_startup_lines(Some(9443), None).join("\n");
+        let lines = host_startup_lines(Some(9443), None, None).join("\n");
         assert!(lines.contains("--to-port 5353"));
         assert!(lines.contains("--dport 5353 -j ACCEPT"));
     }
@@ -1744,7 +1807,7 @@ mod tests {
         // channel. With egress now mandatory, this lane drops the
         // hatch entirely. Before the fix this assertion fails (the
         // rule was present); after, it passes.
-        let lines = host_startup_lines(None, None).join("\n");
+        let lines = host_startup_lines(None, None, None).join("\n");
         assert!(
             !lines.contains("--dport 53 -d 1.1.1.1"),
             "no-proxy lane must not ACCEPT VM->1.1.1.1:53 (DNS-exfil hatch); \
@@ -1765,7 +1828,7 @@ mod tests {
         // the already-present blanket DROP, so every REDIRECTed proxy
         // packet is dropped and the session hangs at run_started.
         // Insert-at-top is order-independent of history.
-        for line in host_startup_lines(Some(8443), Some(5353)) {
+        for line in host_startup_lines(Some(8443), Some(5353), None) {
             if line.contains("engram-proxy-input") || line.contains("engram-proxy-dns-input") {
                 assert!(
                     line.starts_with("-I INPUT 1 "),
@@ -1774,7 +1837,7 @@ mod tests {
             }
         }
         // The blanket DROP still appends (always last).
-        assert!(host_startup_lines(Some(8443), Some(5353))
+        assert!(host_startup_lines(Some(8443), Some(5353), None)
             .iter()
             .any(|l| l.starts_with("-A INPUT") && l.ends_with("engram-host-input")));
     }
@@ -1796,7 +1859,7 @@ mod tests {
         // blanket VM-INPUT drop catches the REDIRECTed proxy
         // traffic too. The two sit consecutively in the output;
         // assert ACCEPT line index < DROP line index.
-        let lines = host_startup_lines(Some(9443), None);
+        let lines = host_startup_lines(Some(9443), None, None);
         let accept_idx = lines.iter().position(|l| l.contains("engram-proxy-input"));
         let drop_idx = lines.iter().position(|l| {
             l.contains("comment engram-host-input ") || l.ends_with("comment engram-host-input")
@@ -1814,7 +1877,7 @@ mod tests {
     /// This test pins the rule's presence and ordering.
     #[test]
     fn host_startup_accepts_established_input_before_drop() {
-        let lines = host_startup_lines(Some(9443), Some(5353));
+        let lines = host_startup_lines(Some(9443), Some(5353), None);
         let est_idx = lines
             .iter()
             .position(|l| l.contains("engram-host-input-established"))
@@ -1840,13 +1903,65 @@ mod tests {
         );
         // Also assert the rule is present in no-proxy mode (which
         // operators use when egress filtering is disabled).
-        let nolines = host_startup_lines(None, None);
+        let nolines = host_startup_lines(None, None, None);
         assert!(
             nolines
                 .iter()
                 .any(|l| l.contains("engram-host-input-established")),
             "ESTABLISHED ACCEPT must be present in both proxy and no-proxy modes"
         );
+    }
+
+    /// ADR 0019 / #526 phase 2: the guest→collector OTLP pinhole.
+    /// Present + pool-scoped + tcp-only + ordered before the blanket
+    /// host-INPUT DROP when configured; entirely absent when not.
+    #[test]
+    fn host_startup_guest_otlp_pinhole_is_scoped_and_precedes_drop() {
+        let lines = host_startup_lines(Some(9443), Some(5353), Some(4317));
+        let otlp_idx = lines
+            .iter()
+            .position(|l| l.contains("engram-guest-otlp-input"))
+            .expect("guest-otlp ACCEPT must be present when a port is configured");
+        let drop_idx = lines
+            .iter()
+            .position(|l| {
+                l.contains("comment engram-host-input ") || l.ends_with("comment engram-host-input")
+            })
+            .expect("host-input DROP must be present");
+        assert!(
+            otlp_idx < drop_idx,
+            "guest-otlp ACCEPT must precede the engram-host-input DROP or the \
+             guest's collector dial is eaten before local delivery",
+        );
+        let rule = &lines[otlp_idx];
+        assert!(
+            rule.contains("-s 10.200.0.0/16") && rule.contains("-p tcp --dport 4317"),
+            "pinhole must be pool-scoped and exactly one tcp port, got: {rule}",
+        );
+        // Unconfigured (the default, and every deployment that hasn't
+        // opted into in-guest export): no pinhole at all.
+        let nolines = host_startup_lines(Some(9443), Some(5353), None).join("\n");
+        assert!(
+            !nolines.contains("engram-guest-otlp-input"),
+            "no guest-otlp ACCEPT may render without a configured endpoint",
+        );
+    }
+
+    /// `otel_endpoint_port` accepts the endpoint shapes the OTLP SDKs
+    /// accept and fails CLOSED (None → no pinhole) on garbage.
+    #[test]
+    fn otel_endpoint_port_parses_sdk_shapes_and_fails_closed() {
+        assert_eq!(otel_endpoint_port("http://10.200.0.1:4317"), Some(4317));
+        assert_eq!(
+            otel_endpoint_port("http://10.200.0.1:4318/v1/traces"),
+            Some(4318)
+        );
+        assert_eq!(otel_endpoint_port("10.200.0.1:4317"), Some(4317));
+        // No explicit port → the OTLP/gRPC default.
+        assert_eq!(otel_endpoint_port("http://10.200.0.1"), Some(4317));
+        // Malformed port → None → the caller installs no pinhole.
+        assert_eq!(otel_endpoint_port("http://10.200.0.1:port"), None);
+        assert_eq!(otel_endpoint_port("http://10.200.0.1:99999"), None);
     }
 
     #[test]

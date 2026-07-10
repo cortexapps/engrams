@@ -90,23 +90,17 @@ service HostService {
   rpc PauseSandbox(FencedSandboxRequest) returns (Empty);
   rpc ResumeSandbox(FencedSandboxRequest) returns (Empty);
 
-  // ADR 0020 P1: boot the image to agentd-ready with a stub harness,
-  // take a portable FC snapshot (chunked memory + uploaded
-  // state/sidecar), tear the capture VM down, and return the
-  // snapshot's metadata. The coord calls this during
-  // POST /api/enabled-images to produce the per-image base snapshot
-  // that CreateSession later restores from.
-  //
-  // Issue #539 (wire v8): server-streaming, not unary. A `[warm]` hook
-  // can run for 10-33 minutes with only ONE opaque global timeout as a
-  // diagnostic; the host now emits `CaptureProgress` at least every 30 s
-  // (phase + current warm stage + output tail) so a live capture is
-  // observable, and a terminal `CaptureFailed` carries the failing
-  // stage + last 16 KiB of hook output instead of "(see host logs for
-  // stderr)". This RPC's streaming shape is a deliberate bridge —
-  // epic-capture-jobs (#546) deletes it once capture moves to a durable
-  // host-owned job row; only the progress *sink* changes.
-  rpc BuildBaseSnapshot(BuildBaseSnapshotRequest) returns (stream BuildBaseSnapshotEvent);
+  // ADR 0084 P1b (issue #546): `BuildBaseSnapshot` — boot the image to
+  // agentd-ready, run the optional `[warm]` hook, take a portable FC
+  // snapshot, tear the capture VM down — is DELETED. Capture is now a
+  // durable, heartbeat-dispatched job row (`capture_jobs`): the
+  // coordinator assigns `(job_id, epoch)` via `HeartbeatAck.
+  // capture_assignments`, the host claims the full dispatch over
+  // `POST /api/hosts/:id/capture-jobs/:job_id/claim`, and reports
+  // progress/terminal outcome via `Heartbeat.capture_job_reports`. See
+  // `docs/adr/0084-capture-jobs.md`. The underlying engine
+  // (`SandboxBackend::build_base_snapshot`) is unchanged — only this
+  // RPC's connection-coupled streaming shape is gone.
 
   // ADR 0080 §C (wire v14): materialize a STANDARD docker/OCI image into
   // a chunked bootable ext4 on this host — pull, whiteout-aware flatten,
@@ -473,78 +467,14 @@ message RestoreRequest {
   bytes session_id = 2;      // 16-byte session UUID; ignored when fencing_epoch == 0
   uint64 fencing_epoch = 3;  // 0 = unfenced interim caller
 }
-message BuildBaseSnapshotRequest {
-  // bincode-encoded `engram_core::types::sandbox::SandboxSpec` — the
-  // image to boot + capture. ADR 0021 P1.5: the image's `[harness]`
-  // block now lives in the rootfs, so the snapshot captures it
-  // directly — no separate stub-harness drive to swap.
-  bytes spec_bincode = 1;
-  // bincode-encoded `Option<engram_core::types::image::WarmConfig>` — the
-  // image's optional capture-time `[warm]` hook. When `Some`, the host
-  // runs it in the live VM (via exec) after agentd-ready and before the
-  // snapshot freezes, so a long-lived process it spawns (e.g. a gradle
-  // daemon) is captured into the base snapshot. A warm failure is
-  // fail-loud — it aborts the capture. Wire v13 (ADR 0080): the host
-  // executes only `command`/`timeout_secs`/`workdir` from this; the
-  // hook's env arrives resolved in `capture_env_bincode` and its egress
-  // arrives assembled in `capture_egress_bincode` — the host never
-  // interprets `warm.env` / `warm.network` itself.
-  bytes warm_bincode = 2;
-  // bincode-encoded `HashMap<String, String>` — the RESOLVED capture-time
-  // env injected into the `[warm]` hook's exec (the coordinator resolved any
-  // secret refs against the SecretStore before this call; the host never
-  // sees the refs). Merged over the config `[env]`. Empty map for an image
-  // with no warm env or no warm hook. Wire v6.
-  bytes capture_env_bincode = 3;
-  // bincode-encoded `Option<engram_core::types::egress::SessionEgressPolicy>`
-  // — the egress policy to register for the capture VM's guest IP while the
-  // `[warm]` hook runs, ASSEMBLED COORDINATOR-SIDE (wire v13, ADR 0080: one
-  // egress-policy builder; the host's own capture builder retired). `None`
-  // ⇒ register nothing: the capture VM stays egress-less (the proxy denies
-  // unknown guests). Ignored when `warm_bincode` is `None`.
-  bytes capture_egress_bincode = 4;
-}
-message BuildBaseSnapshotResponse {
-  // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.
-  bytes metadata_bincode = 1;
-}
-
-// Issue #539: one frame of the `BuildBaseSnapshot` server-streaming
-// response. Zero or more `progress` frames (at least every 30 s, a host
-// keepalive), followed by exactly one terminal frame (`done` or
-// `failed`), then the stream closes.
-message BuildBaseSnapshotEvent {
-  oneof event {
-    CaptureProgress progress = 1;
-    BuildBaseSnapshotResponse done = 2;
-    CaptureFailed failed = 3;
-  }
-}
-
-message CaptureProgress {
-  // "boot" | "warm" | "snapshot" — see
-  // `engram_core::types::capture_progress::CapturePhase`.
-  string phase = 1;
-  // Current `[warm]`-hook stage name while `phase == "warm"`.
-  optional string warm_stage = 2;
-  // Last `msg=`/heartbeat free text, or a synthesized keepalive note.
-  optional string detail = 3;
-  // Rolling last 16 KiB of the hook's combined stdout+stderr
-  // (UTF-8-lossy). Full replacement each event, not a diff.
-  string output_tail = 4;
-  // bincode-encoded `Vec<engram_core::types::capture_progress::WarmStageRecord>`
-  // — the stage history so far, including the still-open current stage.
-  bytes warm_stages_bincode = 5;
-}
-
-message CaptureFailed {
-  string message = 1;
-  // `engram_core::types::capture_progress::CaptureFailureKind`, snake_case
-  // (e.g. "warm_stall", "warm_exec_transport").
-  string kind = 2;
-  optional string warm_stage = 3;
-  string output_tail = 4;
-}
+// ADR 0084 P1b: `BuildBaseSnapshotRequest`/`BuildBaseSnapshotResponse`/
+// `BuildBaseSnapshotEvent`/`CaptureProgress`/`CaptureFailed` — the
+// `BuildBaseSnapshot` RPC's request/response/stream messages — are
+// DELETED along with the rpc itself (see the comment above `service
+// HostService`). The Rust `CaptureProgress`/`CaptureFailure` types
+// (`engram_core::types::capture_progress`) survive as a purely
+// in-process shape (host-agent's capture-job executor's internal
+// progress channel) — they just no longer cross this wire.
 
 // ADR 0080 §C (wire v14) — see the MaterializeImage rpc comment.
 message MaterializeImageRequest {

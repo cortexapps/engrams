@@ -202,7 +202,7 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
     });
 
     // ---- 2. Install the host iptables ruleset (Fix 1 lives here) ----
-    host_startup(Some(proxy_port), None)
+    host_startup(Some(proxy_port), None, None)
         .await
         .expect("host_startup");
 

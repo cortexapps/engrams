@@ -25,18 +25,22 @@
 //!      stealing a long materialize. A re-run re-pulls, but chunk PUTs
 //!      content-address-dedup and the content-derived ManifestRef
 //!      reproduces, so convergence is exact.
-//!    - `capturing`: [`crate::api::enabled_images::capture_and_record_base_snapshot`]
-//!      boots the capture VM from the materialized manifest on a host
-//!      (idempotent via the content/digest-keyed reuse checks). ADR
-//!      0081: the host is RESERVED through the session scheduler's
-//!      atomic 2D fit (`reserve_capture_host`) — a no-fit fleet parks
-//!      the step in an in-process wait (the job counts as queued demand,
-//!      so the autoscaler grows toward it; the claim renews on every
-//!      re-try) rather than burning an attempt, and only a
-//!      `capture_capacity_wait` expiry fails the job
-//!      (`CapacityTimeout`, non-retryable — operator action).
-//!      Claimed jobs are driven CONCURRENTLY (the reservation is what
-//!      makes that safe), so a wait parks one task, not the sweep.
+//!    - `capturing`: [`crate::api::enabled_images::ensure_capture_job`]
+//!      inserts a durable `capture_jobs` row (idempotent via the
+//!      content/digest-keyed reuse checks + the active-per-enable unique
+//!      index); the host runs the VM off the heartbeat. ADR 0084 (c): the
+//!      host is RESERVED through the session scheduler's atomic 2D fit
+//!      (`place_capture_job` → `pick_host_2d` over
+//!      `capture_candidate_hosts`) with the reservation living ON the
+//!      `capture_jobs` row (released implicitly on a terminal stage). A
+//!      no-fit fleet parks the row WAITING (`host_id NULL`), counted as
+//!      queued demand so the autoscaler grows toward it;
+//!      `capture_job_capacity_scan` re-offers it each tick and only a
+//!      `capture_capacity_wait` (`ENGRAM_QUEUE_TIMEOUT_SECS`) expiry fails
+//!      it (`CapacityTimeout`, non-retryable — operator action). The
+//!      `capturing` enable-job leg is WATCH-ONLY: it releases its claim
+//!      and returns `InFlight`, so the serial sweep never stalls behind a
+//!      long capture.
 //!    - `prestaging` (ADR 0036 amendment, issue #538, INTERIM): advertise
 //!      the freshly-captured base snapshot as a `prestage_images`
 //!      heartbeat-ack entry and wait for every eligible (`stages_images`)
@@ -71,9 +75,7 @@ use engram_core::types::host::HostRecord;
 use engram_core::types::{EnableJob, EnableJobState};
 use engram_core::MetaError;
 
-use crate::api::enabled_images::{
-    capture_and_record_base_snapshot, materialize_image_on_host, new_enable_row,
-};
+use crate::api::enabled_images::{materialize_image_on_host, new_enable_row};
 use crate::state::SharedState;
 
 #[derive(Clone, Debug)]
@@ -217,6 +219,19 @@ pub(crate) async fn run_once(
     // prod (HOSTNAME), the machine hostname in dev. Purely
     // observability — claim correctness comes from the atomic UPDATE.
     let claimant = std::env::var("HOSTNAME").unwrap_or_else(|_| "coord".into());
+
+    // ADR 0084 P1b: the capture-job stage-deadline scan — fleet-wide, not
+    // per-enable-job-claim (a `capture_jobs` row's own epoch fencing is
+    // its safety net, not this scanner's lease). Runs every tick
+    // regardless of whether any enable job is currently claimable by
+    // THIS pod: any coordinator replica may reassign or fail a
+    // stage-overdue row.
+    capture_job_deadline_scan(cfg, state).await;
+    // ADR 0084 (c): drive WAITING captures — re-attempt the reserving pick
+    // and time out past the queue deadline. Fleet-wide, like the deadline
+    // scan; any replica may place or fail a waiting row.
+    capture_job_capacity_scan(cfg, state).await;
+
     let jobs = state
         .services
         .meta
@@ -226,85 +241,84 @@ pub(crate) async fn run_once(
         return Ok(());
     }
     tracing::debug!(count = jobs.len(), "enable-scanner claimed jobs");
-    // ADR 0081: drive the claimed jobs CONCURRENTLY. The old serial loop
-    // was a de-facto one-enable-at-a-time-per-pod gate (a `[warm]`
-    // capture holds its slot for tens of minutes); with captures now
-    // reserving RAM/CPU like sessions, concurrent enables are safe by
-    // construction, so the only bound is `claim_limit`. Each task owns
-    // its job end-to-end, including the failure record — one wedged job
-    // must not stall the others.
-    let mut tasks = tokio::task::JoinSet::new();
+    // ADR 0084: drive the claimed jobs SERIALLY. #621 made this sweep
+    // concurrent because a `[warm]` capture used to hold its claim slot
+    // for tens of minutes; under this branch a capturing enable job is
+    // WATCH-ONLY — `advance_one` releases the claim and returns
+    // `InFlight` immediately (the `capture_jobs` row owns execution), so
+    // the serial loop never stalls behind a long capture. No JoinSet
+    // needed; the head-of-line problem the concurrency addressed is gone.
     for job in jobs {
-        let cfg = cfg.clone();
-        let state = state.clone();
-        let claimant = claimant.clone();
-        tasks.spawn(async move {
-            drive_job(&cfg, &state, &claimant, job).await;
-        });
-    }
-    while let Some(res) = tasks.join_next().await {
-        if let Err(e) = res {
-            tracing::warn!(error = %e, "enable-scanner job task panicked");
-        }
-    }
-    Ok(())
-}
-
-/// Drive one claimed job through the pipeline and record its outcome —
-/// the per-job body the (now concurrent) sweep spawns.
-async fn drive_job(cfg: &EnableScannerConfig, state: &SharedState, claimant: &str, job: EnableJob) {
-    let job_id = job.id;
-    match advance_one(cfg, state, claimant, job).await {
-        Ok(()) => {}
-        Err(AdvanceError::LeaseLost(msg)) => {
-            // #232: our lease expired and a peer re-claimed the job
-            // mid-flight. Abandon immediately — every state write is
-            // fenced, so we hold no authority over the row anymore.
-            // Recording a failure here would clear the new
-            // claimant's lease and stamp `error` on a job it is
-            // actively completing. Do nothing; the peer drives it.
-            tracing::warn!(%job_id, reason = %msg, "enable job lease lost; abandoning to peer");
-        }
-        Err(e @ (AdvanceError::Pipeline(_) | AdvanceError::NonRetryable(_))) => {
-            // Per-job failure: ONE atomic, fenced write bumps attempts,
-            // stores the error, releases the claim, AND flips to `failed`
-            // if the budget is spent (transient) or the failure is
-            // non-retryable (deterministic — bail fast). Keep sweeping;
-            // one wedged job must not stall the queue. A Conflict means
-            // the lease went away between the failure and now, so we drop.
-            let force_terminal = matches!(e, AdvanceError::NonRetryable(_));
-            let msg = match &e {
-                AdvanceError::Pipeline(inner) | AdvanceError::NonRetryable(inner) => {
-                    inner.to_string()
-                }
-                AdvanceError::LeaseLost(_) => unreachable!("guarded by the outer pattern"),
-            };
-            tracing::warn!(%job_id, error = %msg, non_retryable = force_terminal, "enable job pipeline failed");
-            match state
-                .services
-                .meta
-                .record_enable_job_failure(job_id, claimant, &msg, cfg.max_attempts, force_terminal)
-                .await
-            {
-                Ok((attempts, EnableJobState::Failed)) => {
-                    tracing::warn!(
-                        %job_id,
-                        attempts,
-                        max_attempts = cfg.max_attempts,
-                        non_retryable = force_terminal,
-                        "enable job marked failed",
-                    );
-                }
-                Ok(_) => {}
-                Err(MetaError::Conflict(msg)) => {
-                    tracing::warn!(%job_id, reason = %msg, "enable job lease lost while recording failure; abandoning to peer");
-                }
-                Err(e2) => {
-                    tracing::warn!(%job_id, error = %e2, "failed to record enable job failure");
+        let job_id = job.id;
+        match advance_one(cfg, state, &claimant, job).await {
+            Ok(()) => {}
+            Err(AdvanceError::LeaseLost(msg)) => {
+                // #232: our lease expired and a peer re-claimed the job
+                // mid-flight. Abandon immediately — every state write is
+                // fenced, so we hold no authority over the row anymore.
+                // Recording a failure here would clear the new
+                // claimant's lease and stamp `error` on a job it is
+                // actively completing. Do nothing; the peer drives it.
+                tracing::warn!(%job_id, reason = %msg, "enable job lease lost; abandoning to peer");
+            }
+            Err(AdvanceError::InFlight) => {
+                // ADR 0084 P1b: the job's capture_jobs row is still
+                // running (or was just reassigned) — `advance_one`
+                // already released the claim. Nothing to log at
+                // warn-level; this is the expected steady state of a
+                // capture in flight.
+                tracing::debug!(%job_id, "enable job capture in flight; watch-only this tick");
+            }
+            Err(e @ (AdvanceError::Pipeline(_) | AdvanceError::NonRetryable(_))) => {
+                // Per-job failure: ONE atomic, fenced write bumps attempts,
+                // stores the error, releases the claim, AND flips to `failed`
+                // if the budget is spent (transient) or the failure is
+                // non-retryable (deterministic — bail fast). Keep sweeping;
+                // one wedged job must not stall the queue. A Conflict means
+                // the lease went away between the failure and now, so we drop.
+                let force_terminal = matches!(e, AdvanceError::NonRetryable(_));
+                let msg = match &e {
+                    AdvanceError::Pipeline(inner) | AdvanceError::NonRetryable(inner) => {
+                        inner.to_string()
+                    }
+                    AdvanceError::LeaseLost(_) | AdvanceError::InFlight => {
+                        unreachable!("guarded by the outer pattern")
+                    }
+                };
+                tracing::warn!(%job_id, error = %msg, non_retryable = force_terminal, "enable job pipeline failed");
+                match state
+                    .services
+                    .meta
+                    .record_enable_job_failure(
+                        job_id,
+                        &claimant,
+                        &msg,
+                        cfg.max_attempts,
+                        force_terminal,
+                    )
+                    .await
+                {
+                    Ok((attempts, EnableJobState::Failed)) => {
+                        tracing::warn!(
+                            %job_id,
+                            attempts,
+                            max_attempts = cfg.max_attempts,
+                            non_retryable = force_terminal,
+                            "enable job marked failed",
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(MetaError::Conflict(msg)) => {
+                        tracing::warn!(%job_id, reason = %msg, "enable job lease lost while recording failure; abandoning to peer");
+                    }
+                    Err(e2) => {
+                        tracing::warn!(%job_id, error = %e2, "failed to record enable job failure");
+                    }
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Outcome of [`advance_one`] when it doesn't complete the pipeline.
@@ -323,6 +337,16 @@ enum AdvanceError {
     /// `max_attempts` times for nothing. The operator can `RetryEnableJob`
     /// after fixing the image.
     NonRetryable(Box<dyn std::error::Error + Send + Sync>),
+    /// ADR 0084 P1b: the job's `capture_jobs` row is still in flight
+    /// (`assigned`/`booting`/`warming`/`freezing`), or was just reassigned
+    /// under budget after a retryable failure. Distinct from `LeaseLost`
+    /// (which means a PEER now owns the job) — here THIS pod is doing
+    /// exactly the right thing by doing nothing: the row's own state is
+    /// authoritative, and `advance_one` already released the enable-job
+    /// claim so the next tick (~3s) re-observes it. No error, no attempts
+    /// bump, no log-level warning — this is the steady state of a capture
+    /// in flight, not an anomaly.
+    InFlight,
 }
 
 impl From<MetaError> for AdvanceError {
@@ -334,23 +358,24 @@ impl From<MetaError> for AdvanceError {
     }
 }
 
-/// Classify a base-snapshot capture failure. `ApiError::Unavailable` is the
-/// capture-host picker's `NoCapacity` — transient, retry.
+/// Classify a capture-*dispatch* failure — everything up to and around
+/// `ensure_capture_job`/`try_reuse_base_snapshot`/`finalize_capture_job`
+/// (host picking, PG reads/writes, result decode/verify). `Unavailable`
+/// (the capture-host picker's `NoCapacity`) is transient, retry.
 ///
-/// Issue #539: `ApiError::CaptureFailed` carries a `CaptureFailureKind` —
-/// only `WarmExecTransport` (the exec stream died mid-run, e.g. a vsock/
-/// gRPC connection loss) is retryable via the attempts budget; every other
-/// kind (`WarmExitNonZero`/`WarmStall`/`WarmStageDeadline`/
-/// `WarmGlobalTimeout`/`SnapshotFailed`) is a deterministic outcome that
-/// retrying can't fix — bail fast on the first occurrence, same as the old
-/// blanket `ApiError::Internal` treatment (a `[warm]` hook non-zero exit,
-/// a snapshot that failed HEAD-verify, …).
+/// ADR 0084 P1b: the ACTUAL capture failure classification (was this
+/// `[warm]` hook exit / stall / transport death retryable?) no longer
+/// happens here — it's the job row's own `retryable` column, written by
+/// the host's terminal report and consumed directly in `advance_one`'s
+/// `CaptureJobStage::Failed` arm. `ApiError::CaptureFailed` is never
+/// constructed by anything this classifier sees anymore (the old direct
+/// RPC call that produced it is deleted); everything reaching here that
+/// isn't `Unavailable` is a coordinator-side/PG failure, which is
+/// deterministic enough to bail fast on rather than burn the attempts
+/// budget re-hitting the same bug.
 fn classify_capture_error(e: crate::error::ApiError) -> AdvanceError {
     match e {
         crate::error::ApiError::Unavailable(_) => AdvanceError::Pipeline(Box::new(e)),
-        crate::error::ApiError::CaptureFailed { kind, .. } if kind.is_retryable() => {
-            AdvanceError::Pipeline(Box::new(e))
-        }
         other => AdvanceError::NonRetryable(Box::new(other)),
     }
 }
@@ -413,134 +438,250 @@ async fn advance_one(
     let mut row = new_enable_row(&image_uri, &job.image_config);
 
     // ---- materializing (host-side, ADR 0080 phase 3b) ----
-    state
+    //
+    // ADR 0084 P1b: SKIP re-materializing when a `capture_jobs` row
+    // already exists for this enable job — its own durable
+    // `disk_manifest`/`image_config`/`oci_defaults`/`manifest_digest`
+    // ARE the materialize result, so a watch-only re-entry (this same
+    // enable job re-claimed on the NEXT tick while its capture is still
+    // in flight — `Capturing` no longer completes within one
+    // `advance_one` call the way the old synchronous RPC did) doesn't
+    // re-pull/re-validate the image from the registry every ~3s for the
+    // whole duration of a multi-minute capture. Only a job that has
+    // never reached `ensure_capture_job` yet (this row's first tick, or
+    // a resume from a genuine coordinator crash before that point) pays
+    // for a fresh materialize.
+    let existing_capture_job = state
         .services
         .meta
-        .set_enable_job_state(job_id, claimant, EnableJobState::Materializing)
+        .latest_capture_job_for_enable(job_id)
         .await?;
-    // The host streams a stage frame (`pull → flatten → pack → chunk`)
-    // per transition plus a ≤30 s keepalive re-send; each persisted
-    // frame is the operator's progress line AND the fenced claim
-    // renewal (`update_enable_job_materialize_progress` bumps
-    // `claimed_at`) — renewals stop exactly when the stream dies,
-    // letting a peer legitimately re-claim. Mirrors the capture
-    // consumer below.
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::channel::<engram_core::types::MaterializeProgress>(64);
-    let progress_consumer = {
-        let meta = state.services.meta.clone();
-        let claimant = claimant.to_string();
-        tokio::spawn(async move {
-            while let Some(frame) = progress_rx.recv().await {
-                match meta
-                    .update_enable_job_materialize_progress(job_id, &claimant, &frame)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(MetaError::Conflict(msg)) => {
-                        tracing::warn!(%job_id, reason = %msg, "enable materialize progress write lost the lease; abandoning to peer");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::debug!(%job_id, error = %e, "enable materialize progress write failed");
+    if let Some(cj) = &existing_capture_job {
+        row.disk_manifest = cj.disk_manifest.parse().ok();
+        row.oci_defaults = cj.oci_defaults.clone();
+        row.manifest_digest = cj.manifest_digest.clone();
+    } else {
+        state
+            .services
+            .meta
+            .set_enable_job_state(job_id, claimant, EnableJobState::Materializing)
+            .await?;
+        // The host streams a stage frame (`pull → flatten → pack → chunk`)
+        // per transition plus a ≤30 s keepalive re-send; each persisted
+        // frame is the operator's progress line AND the fenced claim
+        // renewal (`update_enable_job_materialize_progress` bumps
+        // `claimed_at`) — renewals stop exactly when the stream dies,
+        // letting a peer legitimately re-claim. Mirrors the capture
+        // consumer below.
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::channel::<engram_core::types::MaterializeProgress>(64);
+        let progress_consumer = {
+            let meta = state.services.meta.clone();
+            let claimant = claimant.to_string();
+            tokio::spawn(async move {
+                while let Some(frame) = progress_rx.recv().await {
+                    match meta
+                        .update_enable_job_materialize_progress(job_id, &claimant, &frame)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(MetaError::Conflict(msg)) => {
+                            tracing::warn!(%job_id, reason = %msg, "enable materialize progress write lost the lease; abandoning to peer");
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::debug!(%job_id, error = %e, "enable materialize progress write failed");
+                        }
                     }
                 }
-            }
-        })
-    };
-    let materialize_result = materialize_image_on_host(state, &image_uri, progress_tx).await;
-    // `materialize_image_on_host` returning means every `Sender` clone
-    // is dropped — awaiting the consumer guarantees the final frame is
-    // persisted before we act on the result (same ordering property as
-    // the capture consumer below).
-    let _ = progress_consumer.await;
-    let materialized = materialize_result.map_err(classify_materialize_error)?;
-    tracing::info!(
-        %job_id,
-        %image_uri,
-        disk_manifest = %materialized.disk_manifest,
-        manifest_digest = %materialized.manifest_digest,
-        ext4_size_bytes = materialized.ext4_size_bytes,
-        "enable job materialized image on host",
-    );
-    row.disk_manifest = Some(materialized.disk_manifest);
-    row.oci_defaults = materialized.oci_defaults;
-    row.manifest_digest = materialized.manifest_digest;
+            })
+        };
+        let materialize_result = materialize_image_on_host(state, &image_uri, progress_tx).await;
+        // `materialize_image_on_host` returning means every `Sender` clone
+        // is dropped — awaiting the consumer guarantees the final frame is
+        // persisted before we act on the result (same ordering property as
+        // the capture consumer below).
+        let _ = progress_consumer.await;
+        let materialized = materialize_result.map_err(classify_materialize_error)?;
+        tracing::info!(
+            %job_id,
+            %image_uri,
+            disk_manifest = %materialized.disk_manifest,
+            manifest_digest = %materialized.manifest_digest,
+            ext4_size_bytes = materialized.ext4_size_bytes,
+            "enable job materialized image on host",
+        );
+        row.disk_manifest = Some(materialized.disk_manifest);
+        row.oci_defaults = materialized.oci_defaults;
+        row.manifest_digest = materialized.manifest_digest;
+    }
 
-    // ---- capturing ----
+    // ---- capturing (ADR 0084 P1b: durable, heartbeat-dispatched job) ----
     state
         .services
         .meta
         .set_enable_job_state(job_id, claimant, EnableJobState::Capturing)
         .await?;
-    // Issue #539: `build_base_snapshot` now streams `CaptureProgress` at
-    // least every 30s (host keepalive) for the whole capture, so THIS
-    // replaces the old blind lease-renewal ticker (deleted — it used to
-    // re-write the static `done` count purely to keep the claim alive):
-    // every progress write doubles as the renewal
-    // (`update_enable_job_capture_progress` bumps `claimed_at`), so a
-    // `[warm]`-hook capture that runs tens of minutes past `lease_secs`
-    // still holds its claim — and renewals stop exactly when the stream
-    // dies (a transport failure), letting a peer legitimately re-claim
-    // instead of racing a still-healthy owner.
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::channel::<engram_core::types::CaptureProgress>(64);
-    let progress_consumer = {
-        let meta = state.services.meta.clone();
-        let claimant = claimant.to_string();
-        tokio::spawn(async move {
-            while let Some(event) = progress_rx.recv().await {
-                match meta
-                    .update_enable_job_capture_progress(job_id, &claimant, &event)
+    // The content/digest reuse fast paths are unchanged (cheap, PG-only,
+    // no host RPC) — a hit skips `capture_jobs` entirely. Only checked
+    // when NO `capture_jobs` row exists yet for this enable job: once one
+    // exists, this enable job already committed to a fresh capture on an
+    // earlier tick (the reuse check found nothing then), and re-running
+    // it on every watch-only re-entry would be wasted PG/BlobStorage I/O
+    // for an answer that can't change mid-capture.
+    let reuse_hit = if existing_capture_job.is_none() {
+        crate::api::enabled_images::try_reuse_base_snapshot(state, &row, job.force_recapture)
+            .await
+            .map_err(classify_capture_error)?
+    } else {
+        None
+    };
+    let (
+        reuse_outcome,
+        (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest),
+    ) = if let Some(hit) = reuse_hit {
+        ("reused_full", hit)
+    } else {
+        // No reuse: ensure a `capture_jobs` row exists (insert-or-get —
+        // idempotent across ticks/restarts) and read its current state.
+        // Dispatch/execution happen entirely off this call: the row rides
+        // the heartbeat to whichever host owns it, and THIS tick just
+        // observes where things stand.
+        let capture_row = crate::api::enabled_images::ensure_capture_job(state, &row, job_id)
+            .await
+            .map_err(classify_capture_error)?;
+        match capture_row.stage {
+            engram_core::types::CaptureJobStage::Done => {
+                let (hit, outcome) =
+                    crate::api::enabled_images::finalize_capture_job(state, &capture_row)
+                        .await
+                        .map_err(classify_capture_error)?;
+                (outcome, hit)
+            }
+            engram_core::types::CaptureJobStage::Failed => {
+                let retryable = capture_row.retryable.unwrap_or(false);
+                if retryable && capture_row.attempts < cfg.max_attempts {
+                    // Re-drive under budget: pick a fresh host, then
+                    // atomically re-drive the TERMINAL `failed` row back to
+                    // `assigned` (epoch++/attempts++) and go back to
+                    // watching — this does NOT touch the enable job's own
+                    // attempts counter, that budget belongs to the
+                    // capture_jobs row.
+                    //
+                    // NOTE (issue #546 blocker): a plain
+                    // `reassign_capture_job` is fenced `stage NOT IN
+                    // ('done','failed')` and would match 0 rows on a
+                    // terminal row — a silent no-op that leaves the row
+                    // `failed` while we return `InFlight`, so the next tick
+                    // re-reads the SAME terminal row (attempts never
+                    // bumped) and loops forever, never reaching
+                    // `ready`/`failed`. `redrive_failed_capture_job`
+                    // targets the terminal row specifically.
+                    let footprint = crate::api::enabled_images::capture_footprint_for_job_row(
+                        state,
+                        &capture_row,
+                    )
+                    .await;
+                    // ADR 0084 (c): compute the disk-eligible candidate set;
+                    // `redrive_failed_capture_job` runs the atomic 2D
+                    // RAM/CPU fit over it inside the epoch fence. No fitting
+                    // host ⇒ the row is re-driven WAITING (host_id NULL) and
+                    // the capacity scan drives it — NOT an outright fail.
+                    let candidates = match crate::placement::capture_candidate_hosts(
+                        state.services.meta.as_ref(),
+                        footprint,
+                        None,
+                    )
                     .await
-                {
-                    Ok(()) => {}
-                    Err(MetaError::Conflict(msg)) => {
-                        tracing::warn!(%job_id, reason = %msg, "enable capture progress write lost the lease; abandoning to peer");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::debug!(%job_id, error = %e, "enable capture progress write failed");
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(%job_id, capture_job_id = %capture_row.id, error = ?e, "enable-scanner: could not list capture candidates to re-drive; will retry next tick");
+                            let _ = state
+                                .services
+                                .meta
+                                .release_enable_job_claim(job_id, claimant)
+                                .await;
+                            return Err(AdvanceError::InFlight);
+                        }
+                    };
+                    match state
+                        .services
+                        .meta
+                        .redrive_failed_capture_job(
+                            capture_row.id,
+                            capture_row.epoch,
+                            &candidates,
+                            cfg.max_attempts,
+                        )
+                        .await
+                    {
+                        Ok(Some(redriven)) => {
+                            tracing::info!(%job_id, capture_job_id = %capture_row.id, epoch = redriven.epoch, attempts = redriven.attempts, host = ?redriven.host_id, "enable-scanner: re-drove retryable-terminal capture job (WAITING if no host fit)");
+                            let _ = state
+                                .services
+                                .meta
+                                .release_enable_job_claim(job_id, claimant)
+                                .await;
+                            return Err(AdvanceError::InFlight);
+                        }
+                        Ok(None) => {
+                            // ANOMALY, never a silent no-op: we read a
+                            // failed+retryable row under budget, yet the
+                            // fenced re-drive matched 0 rows — a racing
+                            // coordinator replica moved the epoch, or the row
+                            // is no longer retryable. Warn and fall through
+                            // to fail the enable job below rather than loop.
+                            tracing::warn!(%job_id, capture_job_id = %capture_row.id, epoch = capture_row.epoch, attempts = capture_row.attempts, "enable-scanner: redrive of a retryable-terminal capture job matched 0 rows; failing the enable job");
+                        }
+                        Err(e) => {
+                            tracing::warn!(%job_id, capture_job_id = %capture_row.id, error = %e, "enable-scanner: failed to re-drive retryable capture job; will retry next tick");
+                            let _ = state
+                                .services
+                                .meta
+                                .release_enable_job_claim(job_id, claimant)
+                                .await;
+                            return Err(AdvanceError::InFlight);
+                        }
                     }
                 }
+                // Not retryable, attempts exhausted, or a redrive anomaly
+                // (warned above): fail the enable job with the terminal
+                // row's own failure kind.
+                let msg = capture_row
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "base-snapshot capture failed".to_string());
+                return Err(AdvanceError::NonRetryable(Box::new(
+                    crate::error::ApiError::Internal(format!(
+                        "base snapshot capture for `{image_uri}` failed on host \
+                         {:?}: {msg}",
+                        capture_row.host_id
+                    )),
+                )));
             }
-        })
+            // assigned | booting | warming | freezing: still in flight.
+            // Watch-only — release the claim so the row is immediately
+            // re-claimable next tick (~3s) instead of waiting out the
+            // full lease, and return without recording any failure.
+            _ => {
+                let _ = state
+                    .services
+                    .meta
+                    .release_enable_job_claim(job_id, claimant)
+                    .await;
+                return Err(AdvanceError::InFlight);
+            }
+        }
     };
-    let capture_result = capture_and_record_base_snapshot(
-        state,
-        &row,
-        &job,
-        claimant,
-        cfg.capture_capacity_wait,
-        progress_tx,
-    )
-    .await;
-    // `capture_and_record_base_snapshot` returning means every `Sender`
-    // clone it (or the host RPC underneath it) held has been dropped —
-    // awaiting the consumer here guarantees every progress event,
-    // INCLUDING the very last one written right before a failure, is
-    // persisted before we act on `capture_result`. This is load-bearing
-    // for the "failing stage + tail survive a WarmExecTransport kill"
-    // acceptance criterion: `record_enable_job_failure` (below) never
-    // touches these columns itself — it relies on this write having
-    // already landed.
-    let _ = progress_consumer.await;
-    // ADR 0081: the capture VM is gone either way (snapshotted, failed,
-    // or never reached) — release its host reservation before acting on
-    // the result. Best-effort on the FAILURE path (`record_enable_job_
-    // failure` also clears both columns in its own claim-releasing
-    // write); a Conflict means the lease moved on, which the fenced
-    // writes below will surface as `LeaseLost` themselves.
     if let Err(e) = state
         .services
         .meta
-        .clear_capture_reservation(job_id, claimant)
+        .set_enable_job_reuse_outcome(job_id, reuse_outcome)
         .await
     {
-        tracing::debug!(%job_id, error = %e, "capture reservation clear deferred to the failure/terminal write");
+        tracing::warn!(%job_id, error = %e, "enable-scanner: failed to stamp reuse_outcome (non-fatal)");
     }
-    let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
-        capture_result.map_err(classify_capture_error)?;
     row.base_snapshot_id = Some(base_snapshot_id);
     row.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
     // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
@@ -751,6 +892,240 @@ async fn advance_one(
     Ok(())
 }
 
+/// ADR 0084 P1b (§A "per-stage progress deadlines"): expire any
+/// `capture_jobs` row that's overrun its current stage's budget —
+/// `assigned` 60s, `booting` 300s absolute, `freezing` a generous static
+/// 600s for P1 (`snapshot_create_timeout` is host-side; TODO tie this to
+/// `mem_mib` once P2 placement threads footprint through here),
+/// `warming` = the row's own `image_config.warm.timeout_secs` (default
+/// [`engram_core::types::image::WarmConfig::DEFAULT_TIMEOUT_SECS`]) + 60s
+/// — a PER-JOB budget the shared `expire_capture_job_stages` verb can't
+/// express directly (it applies one flat duration per stage across every
+/// row), so `Warming` is queried with a 0s floor (== "every row currently
+/// warming, regardless of age") and filtered here against each row's own
+/// budget using its `stage_started_at`.
+///
+/// An expired row under its attempts budget is reassigned (fresh host,
+/// `epoch += 1`, `attempts += 1` — done atomically by
+/// `reassign_capture_job`); one that's exhausted the budget is failed
+/// directly via a synthetic terminal [`CaptureJobReport`] fed through the
+/// same fenced `record_capture_job_report` the heartbeat reconcile uses —
+/// this scanner IS a coordinator replica, so there's no separate verb
+/// needed for a coordinator-originated terminal write.
+async fn capture_job_deadline_scan(cfg: &EnableScannerConfig, state: &SharedState) {
+    use engram_core::types::{CaptureJobStage, CaptureTerminalReport};
+
+    let budgets = [
+        (CaptureJobStage::Assigned, Duration::from_secs(60)),
+        (CaptureJobStage::Booting, Duration::from_secs(300)),
+        // Per-job budget applied below via `stage_started_at`; 0s here
+        // just makes every currently-`warming` row a candidate.
+        (CaptureJobStage::Warming, Duration::from_secs(0)),
+        (CaptureJobStage::Freezing, Duration::from_secs(600)),
+    ];
+    let candidates = match state
+        .services
+        .meta
+        .expire_capture_job_stages(&budgets)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "capture-job deadline scan: expire_capture_job_stages failed");
+            return;
+        }
+    };
+    let now = Utc::now();
+    for row in candidates {
+        if row.stage == CaptureJobStage::Warming {
+            let warm_budget = row
+                .image_config
+                .warm
+                .as_ref()
+                .map(|w| w.timeout())
+                .unwrap_or_else(|| {
+                    Duration::from_secs(engram_core::types::image::WarmConfig::DEFAULT_TIMEOUT_SECS)
+                })
+                + Duration::from_secs(60);
+            let age = now.signed_duration_since(row.stage_started_at);
+            let over_budget = age.to_std().map(|age| age > warm_budget).unwrap_or(false);
+            if !over_budget {
+                continue;
+            }
+        }
+        tracing::warn!(
+            capture_job_id = %row.id,
+            enable_job_id = %row.enable_job_id,
+            stage = row.stage.as_str(),
+            attempts = row.attempts,
+            "capture job exceeded its stage deadline",
+        );
+        if row.attempts < cfg.max_attempts {
+            let footprint =
+                crate::api::enabled_images::capture_footprint_for_job_row(state, &row).await;
+            // ADR 0084 (c): the disk-eligible candidate set;
+            // `reassign_capture_job` runs the atomic 2D RAM/CPU fit over it
+            // inside the epoch fence. No fitting host ⇒ the row is
+            // reassigned WAITING (host_id NULL) — the epoch bump still tears
+            // down the stalled attempt host-side, and the capacity scan
+            // drives it from there. `row` came from
+            // `expire_capture_job_stages` (dispatched, non-terminal), so
+            // `reassign_capture_job`'s `stage NOT IN ('done','failed')`
+            // fence is correct; a `None` means the fence missed (a racing
+            // scan already reassigned it, or a report drove it terminal) —
+            // benign, but never silently ignored.
+            let candidates = match crate::placement::capture_candidate_hosts(
+                state.services.meta.as_ref(),
+                footprint,
+                None,
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(capture_job_id = %row.id, error = ?e, "capture-job deadline scan: could not list candidates to reassign; will retry next tick");
+                    continue;
+                }
+            };
+            match state
+                .services
+                .meta
+                .reassign_capture_job(row.id, row.epoch, &candidates)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::warn!(capture_job_id = %row.id, epoch = row.epoch, "capture-job deadline scan: reassign matched 0 rows (raced a concurrent scan or a terminal report); skipping");
+                }
+                Err(e) => {
+                    tracing::warn!(capture_job_id = %row.id, error = %e, "capture-job deadline scan: reassign failed");
+                }
+            }
+        } else {
+            let report = engram_core::types::CaptureJobReport {
+                job_id: row.id,
+                epoch: row.epoch,
+                stage: CaptureJobStage::Failed,
+                progress: None,
+                fc_snapshot_version: row.fc_snapshot_version.clone(),
+                terminal: Some(CaptureTerminalReport::Failed {
+                    error: format!(
+                        "capture job exceeded its `{}` stage deadline after {} attempt(s)",
+                        row.stage, row.attempts
+                    ),
+                    error_stage: row.stage.as_str().to_string(),
+                    retryable: false,
+                }),
+            };
+            if let Err(e) = state.services.meta.record_capture_job_report(&report).await {
+                tracing::warn!(capture_job_id = %row.id, error = %e, "capture-job deadline scan: fenced-fail write failed");
+            }
+        }
+    }
+}
+
+/// ADR 0084 (c): the WAITING-capture scan — the queue-timeout half of the
+/// capture placement reservation re-attach. Every `capture_jobs` row with
+/// no host bound yet (`host_id IS NULL`) is re-offered to the reserving 2D
+/// pick (`place_capture_job`); one whose DB-anchored `waiting_since` is
+/// older than the queue timeout ([`EnableScannerConfig::
+/// capture_capacity_wait`], `ENGRAM_QUEUE_TIMEOUT_SECS`, default 1800 s) is
+/// failed with a `CapacityTimeout`-shaped terminal report (non-retryable,
+/// the same legible message #621 shipped). Fleet-wide, any-replica — the
+/// row's own epoch fencing is the safety net; and DB-anchored so a pod
+/// restart / re-claim can't reset the deadline.
+async fn capture_job_capacity_scan(cfg: &EnableScannerConfig, state: &SharedState) {
+    use engram_core::types::{CaptureJobStage, CaptureTerminalReport};
+
+    let waiting = match state.services.meta.list_waiting_capture_jobs().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "capture-job capacity scan: list_waiting_capture_jobs failed");
+            return;
+        }
+    };
+    let now = Utc::now();
+    for row in waiting {
+        // Timeout FIRST (anchored on the DB-persisted `waiting_since`, not a
+        // wall clock computed at process start — restart-proof).
+        let waited = row
+            .waiting_since
+            .map(|s| now.signed_duration_since(s))
+            .unwrap_or_else(chrono::Duration::zero);
+        let expired = waited
+            .to_std()
+            .map(|w| w >= cfg.capture_capacity_wait)
+            .unwrap_or(false);
+        if expired {
+            let waited_secs = waited.num_seconds().max(0);
+            tracing::warn!(
+                capture_job_id = %row.id,
+                enable_job_id = %row.enable_job_id,
+                mem_budget_mib = row.mem_budget_mib,
+                cpu_budget_vcpus = row.cpu_budget_vcpus,
+                waited_secs,
+                "capture job waited past the queue timeout with no fitting host; failing CapacityTimeout",
+            );
+            let report = engram_core::types::CaptureJobReport {
+                job_id: row.id,
+                epoch: row.epoch,
+                stage: CaptureJobStage::Failed,
+                progress: None,
+                fc_snapshot_version: row.fc_snapshot_version.clone(),
+                terminal: Some(CaptureTerminalReport::Failed {
+                    error: format!(
+                        "no host fit the capture VM for `{}` ({} MiB / {} vCPUs) within {}s \
+                         (limit {}s, measured from the first miss) — the fleet is at capacity and \
+                         the autoscaler didn't grow it (maxHosts? cloud quota?). Free capacity \
+                         (or raise the node-pool ceiling) and retry the job.",
+                        row.image_uri,
+                        row.mem_budget_mib,
+                        row.cpu_budget_vcpus,
+                        waited_secs,
+                        cfg.capture_capacity_wait.as_secs(),
+                    ),
+                    error_stage: CaptureJobStage::Assigned.as_str().to_string(),
+                    retryable: false,
+                }),
+            };
+            if let Err(e) = state.services.meta.record_capture_job_report(&report).await {
+                tracing::warn!(capture_job_id = %row.id, error = %e, "capture-job capacity scan: fenced-fail write failed");
+            }
+            continue;
+        }
+        // Not timed out — re-attempt the reserving pick.
+        let footprint =
+            crate::api::enabled_images::capture_footprint_for_job_row(state, &row).await;
+        let candidates = match crate::placement::capture_candidate_hosts(
+            state.services.meta.as_ref(),
+            footprint,
+            None,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(capture_job_id = %row.id, error = ?e, "capture-job capacity scan: could not list candidates; will retry next tick");
+                continue;
+            }
+        };
+        match state
+            .services
+            .meta
+            .place_capture_job(row.id, &candidates)
+            .await
+        {
+            Ok(Some(placed)) if placed.host_id.is_some() => {
+                tracing::info!(capture_job_id = %row.id, host = ?placed.host_id, "capture-job capacity scan: placed a waiting capture (capacity freed)");
+            }
+            Ok(_) => {} // still waiting — try again next tick
+            Err(e) => {
+                tracing::warn!(capture_job_id = %row.id, error = %e, "capture-job capacity scan: place failed");
+            }
+        }
+    }
+}
+
 /// ADR 0036 amendment (issue #538): outcome of one `prestaging`-stage poll —
 /// pure decision over a hosts snapshot, unit-tested without I/O. Eligible =
 /// [`crate::placement::host_is_schedulable`] ∧ `stages_images`; staged =
@@ -881,7 +1256,7 @@ mod tests {
     fn lease_conflict_maps_to_lease_lost_not_pipeline() {
         match AdvanceError::from(MetaError::Conflict("lease lost: held by pod-b".into())) {
             AdvanceError::LeaseLost(msg) => assert!(msg.contains("pod-b")),
-            AdvanceError::Pipeline(_) | AdvanceError::NonRetryable(_) => {
+            AdvanceError::Pipeline(_) | AdvanceError::NonRetryable(_) | AdvanceError::InFlight => {
                 panic!("a lost-lease Conflict must NOT enter the failure-budget path")
             }
         }
@@ -896,7 +1271,9 @@ mod tests {
         ] {
             match AdvanceError::from(e) {
                 AdvanceError::Pipeline(_) => {}
-                AdvanceError::LeaseLost(_) | AdvanceError::NonRetryable(_) => {
+                AdvanceError::LeaseLost(_)
+                | AdvanceError::NonRetryable(_)
+                | AdvanceError::InFlight => {
                     panic!("only a Conflict should abandon; other errors retry via the budget")
                 }
             }
