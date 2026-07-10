@@ -59,6 +59,17 @@ use tokio::sync::{watch, Semaphore};
 /// base chunk both pin it and one disable leaves it pinned for the other.
 type PinnedManifests = Arc<Mutex<HashMap<ManifestDigest, Vec<ChunkHash>>>>;
 
+/// ADR 0045 addendum (2026-07-10): per-enabled-image record of the
+/// substrate base shm file THIS host's readiness claim rests on. An image lands here when its prefetch found the base file present
+/// (pre-warmed by us, or surviving a pod roll on the node tmpfs) — and the
+/// reconcile recheck then treats the file's disappearance exactly like an
+/// evicted base chunk: flip to not-ready and re-prefetch (which re-warms
+/// the file, since it's now absent). Images whose pre-warm was skipped
+/// (tmpfs headroom) or failed are deliberately NOT tracked: for them the
+/// handler's lazy path is the contract, and gating readiness on a file
+/// we chose not to write would wedge the image unready forever.
+type TrackedBaseShm = Arc<Mutex<HashMap<ManifestDigest, PathBuf>>>;
+
 /// ADR 0022 Option A: resolves a base snapshot's id to its on-disk
 /// snapshot dir (`<work_dir>/snapshots/<id>`). Supplied by the
 /// host-agent as `pooled.snapshot_path_for` so the residency-materialized
@@ -260,6 +271,12 @@ pub fn spawn_supervisor(
     // heartbeat tick's `allocatable_mib` reflects it — instead of minutes
     // later when the multi-GiB write finishes.
     ram_ledger: Arc<crate::ram_ledger::RamLedger>,
+    // ADR 0045 addendum (2026-07-10): the base-shm sweeper's enabled-image
+    // keep-set. Published (whole-set replace) from every heartbeat-ack
+    // reconcile so the GC can never sweep an enabled image's base file;
+    // left untouched on the pre-ack initial tick so the sweeper keeps
+    // deferring deletes until the enabled view is authoritative.
+    protected: Arc<crate::base_shm_gc::ProtectedPaths>,
 ) -> (
     watch::Sender<Vec<EnabledImageRef>>,
     tokio::task::JoinHandle<()>,
@@ -283,8 +300,17 @@ pub fn spawn_supervisor(
         // across ticks; shared into the per-image prefetch tasks (which
         // pin) and read by reconcile's disable loop (which unpins).
         let pinned_manifests: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
+        // ADR 0045 addendum: digest → the base shm file readiness rests on.
+        let tracked_base_shm: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
+        // The watch channel's initial value is an empty Vec, NOT a
+        // heartbeat ack — only iterations after the first `changed()`
+        // carry an authoritative enabled set the GC may act on.
+        let mut saw_ack = false;
         loop {
             let enabled = rx.borrow_and_update().clone();
+            if saw_ack {
+                protected.replace(enabled_base_shm_paths(&enabled));
+            }
             reconcile(
                 &enabled,
                 readiness.clone(),
@@ -295,6 +321,7 @@ pub fn spawn_supervisor(
                 &mut memfiles,
                 pinned_manifests.clone(),
                 ram_ledger.clone(),
+                tracked_base_shm.clone(),
             )
             .await;
 
@@ -308,12 +335,27 @@ pub fn spawn_supervisor(
                         tracing::debug!("image prefetch: enabled_images sender dropped; supervisor exiting");
                         break;
                     }
+                    saw_ack = true;
                 }
                 _ = tokio::time::sleep(RECHECK_INTERVAL) => {}
             }
         }
     });
     (tx, handle)
+}
+
+/// The substrate base-file paths the enabled set claims — the base-shm
+/// sweeper's keep-set. Empty when the substrate is off (no base dir) or
+/// no enabled image carries a memory manifest.
+fn enabled_base_shm_paths(enabled: &[EnabledImageRef]) -> HashSet<PathBuf> {
+    let Some(base_dir) = engram_sandbox_firecracker::uffd_base_dir_from_env() else {
+        return HashSet::new();
+    };
+    enabled
+        .iter()
+        .filter_map(|img| img.base_snapshot_memory_manifest.as_ref())
+        .map(|mref| engram_sandbox_firecracker::uffd_base_path_in(&base_dir, mref))
+        .collect()
 }
 
 /// One reconciliation pass: compute the ready/enabled delta, drop
@@ -330,6 +372,7 @@ async fn reconcile(
     memfiles: &mut HashMap<ManifestDigest, MemfileState>,
     pinned_manifests: PinnedManifests,
     ram_ledger: Arc<crate::ram_ledger::RamLedger>,
+    tracked_base_shm: TrackedBaseShm,
 ) {
     let current = readiness.snapshot();
     let current: HashSet<ManifestDigest> = current.into_iter().collect();
@@ -381,6 +424,11 @@ async fn reconcile(
                 }
             });
         }
+        // The base shm file itself is left for the sweeper: dropping the
+        // digest here removes it from the tracked set, and the supervisor's
+        // next keep-set publish drops its path — after which the normal
+        // mtime + open-FD sweep rules reclaim it.
+        tracked_base_shm.lock().remove(digest);
         tracing::info!(
             digest = digest.as_str(),
             "image disabled; removed from ready set",
@@ -411,14 +459,32 @@ async fn reconcile(
                     .map(|hashes| hashes.iter().all(|h| chunk_cache.contains_on_disk(*h)))
                     .unwrap_or(false)
             };
-            if still_warm {
+            // ADR 0045 addendum: the same honesty for the substrate base shm
+            // file — if readiness rests on it (tracked) and it's gone (a
+            // sweep, a tmpfs remount, an operator rm), this host would serve
+            // the next session's entire resume storm through lazy population.
+            // Treat exactly like an evicted chunk: not-ready + re-prefetch
+            // (the file is absent, so the pre-warm arm re-creates it).
+            let base_shm_intact = tracked_base_shm
+                .lock()
+                .get(&image.manifest_digest)
+                .is_none_or(|p| p.exists());
+            if still_warm && base_shm_intact {
                 continue;
             }
-            tracing::warn!(
-                image_uri = %image.image_uri,
-                digest = image.manifest_digest.as_str(),
-                "ready image's base chunks no longer resolvable locally; flipping to not-ready for re-prefetch",
-            );
+            if base_shm_intact {
+                tracing::warn!(
+                    image_uri = %image.image_uri,
+                    digest = image.manifest_digest.as_str(),
+                    "ready image's base chunks no longer resolvable locally; flipping to not-ready for re-prefetch",
+                );
+            } else {
+                tracing::warn!(
+                    image_uri = %image.image_uri,
+                    digest = image.manifest_digest.as_str(),
+                    "ready image's base shm file vanished; flipping to not-ready to re-warm it",
+                );
+            }
             readiness.mark_unready(&image.manifest_digest);
             // fall through to re-prefetch (prefetch_one re-warms the chunks;
             // the pin set is already recorded so it skips re-pinning).
@@ -447,6 +513,7 @@ async fn reconcile(
         let semaphore = semaphore.clone();
         let pinned_manifests = pinned_manifests.clone();
         let ram_ledger = ram_ledger.clone();
+        let tracked_base_shm = tracked_base_shm.clone();
         tokio::spawn(async move {
             match prefetch_one(
                 &image,
@@ -472,6 +539,22 @@ async fn reconcile(
                         guard.insert(image.manifest_digest.clone(), warmed.hashes);
                     }
                     drop(guard);
+                    // Record (or clear) the base shm file this readiness
+                    // claim rests on. Overwrite semantics matter: a
+                    // pre-warm that fit last round but was headroom-skipped
+                    // this round must DROP the stale tracking entry, or the
+                    // recheck would flip the image unready forever over a
+                    // file nothing is going to write.
+                    match warmed.base_shm {
+                        Some(path) => {
+                            tracked_base_shm
+                                .lock()
+                                .insert(image.manifest_digest.clone(), path);
+                        }
+                        None => {
+                            tracked_base_shm.lock().remove(&image.manifest_digest);
+                        }
+                    }
                     readiness.mark_ready(image.manifest_digest.clone());
                     tracing::info!(
                         image_uri = %image.image_uri,
@@ -558,6 +641,13 @@ async fn reconcile(
 struct WarmedManifest {
     chunk_count: usize,
     hashes: Vec<ChunkHash>,
+    /// ADR 0045 addendum: the substrate base shm file this image's
+    /// readiness rests on — present when the pre-warm arm left the file
+    /// in place (freshly written, or already there from a prior pod's
+    /// life). `None` when the substrate is off, the image is disk-only,
+    /// or the pre-warm was headroom-skipped / failed (lazy-path images
+    /// must not gate readiness on a file nothing will write).
+    base_shm: Option<PathBuf>,
 }
 
 /// Warm an enabled image's base-snapshot working set on local NVMe so the
@@ -644,6 +734,10 @@ async fn prefetch_one(
     let mut total =
         prefetch_manifest_chunks(disk_manifest, chunk_store, chunk_cache, semaphore).await?;
 
+    // ADR 0045 addendum: the base shm file readiness will rest on, if any
+    // (see `WarmedManifest::base_shm`).
+    let mut base_shm: Option<PathBuf> = None;
+
     // (2) ADR 0021 P2 (memory residency) — the base snapshot's memory image.
     // The UFFD handler pages these chunks in when the guest resumes; warming
     // them on NVMe retires the cold per-restore memory prefetch that was
@@ -680,7 +774,12 @@ async fn prefetch_one(
         // readiness; the lazy path is the backstop.
         if let Some(base_dir) = engram_sandbox_firecracker::uffd_base_dir_from_env() {
             let base_path = engram_sandbox_firecracker::uffd_base_path_in(&base_dir, &memory_ref);
-            if tokio::fs::metadata(&base_path).await.is_err() {
+            if tokio::fs::metadata(&base_path).await.is_ok() {
+                // Already present — pre-warmed by a prior tick, or a pod
+                // roll's node-tmpfs survivor. Readiness rests on it: track
+                // it so the recheck notices if it later vanishes.
+                base_shm = Some(base_path.clone());
+            } else {
                 // Issue #540: the non-hole byte total this write is about
                 // to land — the same figure `prewarm_base_shm` will
                 // actually pwrite (elided ranges stay holes, never
@@ -723,6 +822,7 @@ async fn prefetch_one(
                     ram_ledger.settle_pending(&memory_ref);
                     match prewarm_result {
                         Ok(written) => {
+                            base_shm = Some(base_path.clone());
                             tracing::info!(
                                 image_uri = %image.image_uri,
                                 path = %base_path.display(),
@@ -774,6 +874,7 @@ async fn prefetch_one(
     Ok(WarmedManifest {
         chunk_count: total,
         hashes: pin_hashes,
+        base_shm,
     })
 }
 
@@ -1184,6 +1285,10 @@ mod tests {
         let got: HashSet<ChunkHash> = warmed.hashes.iter().copied().collect();
         assert_eq!(got.len(), warmed.hashes.len(), "pin batch must be deduped");
         assert_eq!(got, expected, "pin batch = union of disk + memory hashes");
+        assert!(
+            warmed.base_shm.is_none(),
+            "substrate off (no ENGRAM_FC_UFFD_BASE_DIR) ⇒ readiness rests on no base file",
+        );
     }
 
     #[tokio::test]
@@ -1197,6 +1302,7 @@ mod tests {
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
+        let tracked: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
         let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
 
         let base_id = SnapshotId::new();
@@ -1225,6 +1331,7 @@ mod tests {
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
+            tracked.clone(),
         )
         .await;
         for _ in 0..200 {
@@ -1255,6 +1362,7 @@ mod tests {
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
+            tracked.clone(),
         )
         .await;
         assert!(!readiness.contains(&img.manifest_digest), "now unready");
@@ -1273,6 +1381,7 @@ mod tests {
         let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
+        let tracked: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
         let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
         let base_id = SnapshotId::new();
         let img = image_ref(base_id, disk_ref, Some(mem_ref));
@@ -1288,6 +1397,7 @@ mod tests {
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
+            tracked.clone(),
         )
         .await;
         for _ in 0..200 {
@@ -1326,12 +1436,177 @@ mod tests {
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
+            tracked.clone(),
         )
         .await;
         assert!(
             !readiness.contains(&img.manifest_digest),
             "a ready image with an evicted base chunk must flip to not-ready",
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_flips_ready_to_unready_when_tracked_base_shm_vanishes() {
+        // ADR 0045 addendum: readiness resting on a substrate base shm file
+        // must notice the file vanishing (a sweep, a tmpfs remount, an
+        // operator rm) exactly like an evicted chunk — flip to not-ready so
+        // the scheduler stops sending sessions that would pay full lazy
+        // population.
+        let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
+        let readiness = ImageReadiness::new();
+        let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
+        let tracked: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
+        let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
+        let base_id = SnapshotId::new();
+        let img = image_ref(base_id, disk_ref, Some(mem_ref));
+
+        // Enable + wait for ready (substrate env is unset here, so the
+        // prefetch itself tracks nothing — the base file is injected below,
+        // standing in for what the pre-warm arm records in production).
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+        )
+        .await;
+        for _ in 0..200 {
+            if readiness.contains(&img.manifest_digest) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(readiness.contains(&img.manifest_digest), "ready");
+
+        // Track a base shm file that exists: readiness must hold.
+        let base_file = dir.path().join("mem-manifest-v1.base");
+        std::fs::write(&base_file, b"resident").unwrap();
+        tracked
+            .lock()
+            .insert(img.manifest_digest.clone(), base_file.clone());
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+        )
+        .await;
+        assert!(
+            readiness.contains(&img.manifest_digest),
+            "an intact tracked base file must not disturb readiness",
+        );
+
+        // The file vanishes → the next reconcile flips the image unready.
+        // A zero-permit semaphore parks the fall-through re-prefetch so the
+        // flip is observable (in production the re-prefetch re-warms the
+        // file and readiness returns on its own).
+        std::fs::remove_file(&base_file).unwrap();
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            Arc::new(Semaphore::new(0)),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+        )
+        .await;
+        assert!(
+            !readiness.contains(&img.manifest_digest),
+            "a ready image whose tracked base shm file vanished must flip to not-ready",
+        );
+    }
+    /// ADR 0045 addendum: with the substrate on, `prefetch_one` reports the
+    /// base shm file readiness rests on — for a fresh pre-warm AND for a
+    /// file already present (a pod roll's node-tmpfs survivor) — and
+    /// re-creates it after a deletion (the recheck's re-prefetch heal).
+    ///
+    /// The base dir must be a tmpfs on Linux (`prefetch_one`'s
+    /// substrate-ordering probe), so it lives under /dev/shm there. Env
+    /// mutation is safe: nextest runs each test in its own process.
+    #[tokio::test]
+    async fn prefetch_one_tracks_and_reheals_the_base_shm_file() {
+        #[cfg(target_os = "linux")]
+        let base_dir = tempfile::Builder::new()
+            .prefix("engram-prewarm-test-")
+            .tempdir_in("/dev/shm")
+            .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let base_dir = tempfile::tempdir().unwrap();
+        // SAFETY: nextest process-per-test; no concurrent env readers.
+        unsafe { std::env::set_var("ENGRAM_FC_UFFD_BASE_DIR", base_dir.path()) };
+
+        let (store, cache, _dir, disk_ref, mem_ref, mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
+        let img = image_ref(SnapshotId::new(), disk_ref, Some(mem_ref));
+
+        let expected_path =
+            engram_sandbox_firecracker::uffd_base_path_in(base_dir.path(), &mem_ref);
+
+        // The sweeper keep-set derivation names the same path (the single
+        // naming authority is `uffd_base_path_in`; drift here would let
+        // the GC sweep what readiness tracks).
+        assert_eq!(
+            enabled_base_shm_paths(std::slice::from_ref(&img)),
+            [expected_path.clone()].into_iter().collect::<HashSet<_>>(),
+        );
+
+        // Fresh pre-warm: file written + reported.
+        let warmed = prefetch_one(&img, &store, &cache, &sem, None, &ledger)
+            .await
+            .unwrap();
+        assert_eq!(warmed.base_shm.as_deref(), Some(expected_path.as_path()));
+        assert_eq!(
+            std::fs::read(&expected_path).unwrap(),
+            mem_bytes,
+            "pre-warm materializes the full memory image",
+        );
+
+        // Already present (the roll-survivor shape): reported, not rewritten.
+        let mtime = std::fs::metadata(&expected_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let warmed = prefetch_one(&img, &store, &cache, &sem, None, &ledger)
+            .await
+            .unwrap();
+        assert_eq!(warmed.base_shm.as_deref(), Some(expected_path.as_path()));
+        assert_eq!(
+            std::fs::metadata(&expected_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            mtime,
+            "an existing base file is adopted, not rewritten",
+        );
+
+        // Deleted out from under readiness (a sweep): re-prefetch re-warms.
+        std::fs::remove_file(&expected_path).unwrap();
+        let warmed = prefetch_one(&img, &store, &cache, &sem, None, &ledger)
+            .await
+            .unwrap();
+        assert_eq!(warmed.base_shm.as_deref(), Some(expected_path.as_path()));
+        assert_eq!(std::fs::read(&expected_path).unwrap(), mem_bytes);
+
+        unsafe { std::env::remove_var("ENGRAM_FC_UFFD_BASE_DIR") };
     }
 }
 

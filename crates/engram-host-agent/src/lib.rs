@@ -104,6 +104,12 @@ pub struct HostAgent {
     /// as `--publish-trace-host`. `None` generates a fresh id at
     /// run time (the pre-Phase-5 default).
     pub host_id: Option<engram_core::HostId>,
+    /// ADR 0045 addendum (2026-07-10): the base-shm sweeper's
+    /// enabled-image keep-set, shared with `base_shm_gc::spawn`
+    /// (main.rs owns the sweeper; the image-prefetch supervisor
+    /// spawned in `run` publishes into it). Always present; inert
+    /// unless a sweeper holds the same handle.
+    pub base_shm_protected: Arc<base_shm_gc::ProtectedPaths>,
 }
 
 impl HostAgent {
@@ -123,7 +129,17 @@ impl HostAgent {
             nbd_pool: None,
             host_id: None,
             fc_for_reattach: None,
+            base_shm_protected: base_shm_gc::ProtectedPaths::new(),
         }
+    }
+
+    /// ADR 0045 addendum (2026-07-10): share the base-shm sweeper's
+    /// enabled-image keep-set so the image-prefetch supervisor
+    /// (spawned in `run`) publishes into the SAME registry the
+    /// sweeper consults.
+    pub fn with_base_shm_protected(mut self, protected: Arc<base_shm_gc::ProtectedPaths>) -> Self {
+        self.base_shm_protected = protected;
+        self
     }
 
     /// ADR 0009 §6: register the concrete FC backend for the
@@ -1094,6 +1110,7 @@ impl HostAgent {
                         readiness.clone(),
                         base_memfile_dir,
                         ram_ledger.clone(),
+                        self.base_shm_protected.clone(),
                     );
                     Some(tx)
                 }

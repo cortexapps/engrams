@@ -282,6 +282,12 @@ async fn main() -> Result<(), HostAgentError> {
     let node_name = std::env::var("NODE_NAME").ok().filter(|s| !s.is_empty());
     let host_id = resolve_host_id(&cli.work_dir, node_name.as_deref());
 
+    // ADR 0045 addendum (2026-07-10): the base-shm sweeper's enabled-image
+    // keep-set. One instance shared between the sweeper (FC arm below) and
+    // the image-prefetch supervisor (via the HostAgent builder), so the
+    // sweep can never delete an enabled image's pre-warmed base file.
+    let base_shm_protected = engram_host_agent::base_shm_gc::ProtectedPaths::new();
+
     // ADR 0007: blob backend + chunk store. Created before the backend
     // match so the inner VZ backend can be wired with its own chunk
     // store (snapshots chunk the rootfs clone and report the manifest
@@ -397,8 +403,12 @@ async fn main() -> Result<(), HostAgentError> {
             fc_cfg.uffd_base_dir = engram_sandbox_firecracker::uffd_base_dir_from_env();
             // ADR 0045 D4: GC unreferenced base shm files (disabled
             // images, pre-D4 session-keyed leftovers). Live files are
-            // protected by the handlers' open fds; see base_shm_gc.
-            let _base_shm_gc = engram_host_agent::base_shm_gc::spawn(fc_cfg.uffd_base_dir.clone());
+            // protected by the handlers' open fds; enabled images' files
+            // by the shared keep-set (ADR 0045 addendum); see base_shm_gc.
+            let _base_shm_gc = engram_host_agent::base_shm_gc::spawn(
+                fc_cfg.uffd_base_dir.clone(),
+                base_shm_protected.clone(),
+            );
             let fc = Arc::new(engram_sandbox_firecracker::FirecrackerBackend::new(
                 cli.work_dir.clone(),
                 fc_cfg,
@@ -559,7 +569,8 @@ async fn main() -> Result<(), HostAgentError> {
         .with_chunk_store(chunk_store, materialize_dir)
         .with_chunk_cache(chunk_cache)
         .with_image_cache(image_cache)
-        .with_host_id(host_id);
+        .with_host_id(host_id)
+        .with_base_shm_protected(base_shm_protected);
     if let Some(fc) = fc_for_reattach {
         agent = agent.with_fc_reattach(fc);
     }
