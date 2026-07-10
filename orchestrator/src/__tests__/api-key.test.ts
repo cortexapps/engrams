@@ -366,6 +366,31 @@ describe("ApiKeyService CLI keys (stubbed backend)", () => {
     }
   });
 
+  test("whoAmI reflects the resolved principal; anon is Unauthenticated", async () => {
+    const anon = await spawn({ getSession: makeGetSession(null), backend: fakeBackend().backend });
+    const human = await spawn({
+      getSession: makeGetSession("u-1", "admin", "alice@example.com"),
+      backend: fakeBackend().backend,
+    });
+    const svc = await spawn({
+      getSession: makeGetSession("svc-1", "admin", "apikey+svc-1@service.local"),
+      backend: fakeBackend().backend,
+    });
+    try {
+      await expectErr(anon.client.whoAmI({}), Code.Unauthenticated);
+      const me = await human.client.whoAmI({});
+      expect(me.email).toBe("alice@example.com");
+      expect(me.role).toBe("admin");
+      expect(me.serviceAccount).toBe(false);
+      // A global key resolves to its service account — visible as such.
+      expect((await svc.client.whoAmI({})).serviceAccount).toBe(true);
+    } finally {
+      await anon.close();
+      await human.close();
+      await svc.close();
+    }
+  });
+
   test("revokeCliKey: own key revokes the ROW only; foreign/absent read as false", async () => {
     const { backend, rec } = fakeBackend();
     const alice = await spawn({ getSession: makeGetSession("u-alice"), backend });

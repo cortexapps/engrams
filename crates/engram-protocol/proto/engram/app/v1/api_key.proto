@@ -35,6 +35,12 @@ service ApiKeyService {
   // owned by someone else reads as absent (`revoked = false`) —
   // anti-enumeration. Idempotent.
   rpc RevokeCliKey(RevokeCliKeyRequest) returns (RevokeCliKeyResponse);
+  // Who is the caller? Any authenticated principal (cookie, device-session
+  // bearer, or API key). The CLI's `auth status`/login confirmation use this
+  // instead of better-auth's GET /api/auth/get-session because in prod that
+  // HTTP route stays behind IAP (it is the SPA's session-bootstrap), while
+  // /rpc/* is reachable by keyed callers.
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
 }
 
 // Key metadata — everything EXCEPT the secret material.
@@ -106,4 +112,16 @@ message RevokeCliKeyRequest {
 message RevokeCliKeyResponse {
   // Whether a key was revoked (idempotent; an unowned/unknown id is `false`).
   bool revoked = 1;
+}
+
+message WhoAmIRequest {}
+
+message WhoAmIResponse {
+  string user_id = 1;
+  string email = 2;
+  string name = 3;
+  // "admin" | "user".
+  string role = 4;
+  // True when the caller is a service-account principal (a global key).
+  bool service_account = 5;
 }

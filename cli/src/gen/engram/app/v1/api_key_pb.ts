@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/api_key.proto.
  */
 export const file_engram_app_v1_api_key: GenFile = /*@__PURE__*/
-  fileDesc("ChtlbmdyYW0vYXBwL3YxL2FwaV9rZXkucHJvdG8SDWVuZ3JhbS5hcHAudjEilgEKCkFwaUtleU1ldGESCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIMCgRyb2xlGAMgASgJEg0KBXN0YXJ0GAQgASgJEhIKCmNyZWF0ZWRfYXQYBSABKAkSEgoKZXhwaXJlc19hdBgGIAEoCRIUCgxsYXN0X3VzZWRfYXQYByABKAkSEwoLb3duZXJfZW1haWwYCCABKAkiRQoTQ3JlYXRlQXBpS2V5UmVxdWVzdBIMCgRuYW1lGAEgASgJEgwKBHJvbGUYAiABKAkSEgoKZXhwaXJlc19hdBgDIAEoCSJMChRDcmVhdGVBcGlLZXlSZXNwb25zZRInCgRtZXRhGAEgASgLMhkuZW5ncmFtLmFwcC52MS5BcGlLZXlNZXRhEgsKA2tleRgCIAEoCSIUChJMaXN0QXBpS2V5c1JlcXVlc3QiPgoTTGlzdEFwaUtleXNSZXNwb25zZRInCgRrZXlzGAEgAygLMhkuZW5ncmFtLmFwcC52MS5BcGlLZXlNZXRhIiEKE1Jldm9rZUFwaUtleVJlcXVlc3QSCgoCaWQYASABKAkiJwoUUmV2b2tlQXBpS2V5UmVzcG9uc2USDwoHcmV2b2tlZBgBIAEoCCIjChNDcmVhdGVDbGlLZXlSZXF1ZXN0EgwKBG5hbWUYASABKAkiTAoUQ3JlYXRlQ2xpS2V5UmVzcG9uc2USJwoEbWV0YRgBIAEoCzIZLmVuZ3JhbS5hcHAudjEuQXBpS2V5TWV0YRILCgNrZXkYAiABKAkiIQoTUmV2b2tlQ2xpS2V5UmVxdWVzdBIKCgJpZBgBIAEoCSInChRSZXZva2VDbGlLZXlSZXNwb25zZRIPCgdyZXZva2VkGAEgASgIMskDCg1BcGlLZXlTZXJ2aWNlElcKDENyZWF0ZUFwaUtleRIiLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQXBpS2V5UmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQXBpS2V5UmVzcG9uc2USVAoLTGlzdEFwaUtleXMSIS5lbmdyYW0uYXBwLnYxLkxpc3RBcGlLZXlzUmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuTGlzdEFwaUtleXNSZXNwb25zZRJXCgxSZXZva2VBcGlLZXkSIi5lbmdyYW0uYXBwLnYxLlJldm9rZUFwaUtleVJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLlJldm9rZUFwaUtleVJlc3BvbnNlElcKDENyZWF0ZUNsaUtleRIiLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQ2xpS2V5UmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQ2xpS2V5UmVzcG9uc2USVwoMUmV2b2tlQ2xpS2V5EiIuZW5ncmFtLmFwcC52MS5SZXZva2VDbGlLZXlSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5SZXZva2VDbGlLZXlSZXNwb25zZWIGcHJvdG8z");
+  fileDesc("ChtlbmdyYW0vYXBwL3YxL2FwaV9rZXkucHJvdG8SDWVuZ3JhbS5hcHAudjEilgEKCkFwaUtleU1ldGESCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIMCgRyb2xlGAMgASgJEg0KBXN0YXJ0GAQgASgJEhIKCmNyZWF0ZWRfYXQYBSABKAkSEgoKZXhwaXJlc19hdBgGIAEoCRIUCgxsYXN0X3VzZWRfYXQYByABKAkSEwoLb3duZXJfZW1haWwYCCABKAkiRQoTQ3JlYXRlQXBpS2V5UmVxdWVzdBIMCgRuYW1lGAEgASgJEgwKBHJvbGUYAiABKAkSEgoKZXhwaXJlc19hdBgDIAEoCSJMChRDcmVhdGVBcGlLZXlSZXNwb25zZRInCgRtZXRhGAEgASgLMhkuZW5ncmFtLmFwcC52MS5BcGlLZXlNZXRhEgsKA2tleRgCIAEoCSIUChJMaXN0QXBpS2V5c1JlcXVlc3QiPgoTTGlzdEFwaUtleXNSZXNwb25zZRInCgRrZXlzGAEgAygLMhkuZW5ncmFtLmFwcC52MS5BcGlLZXlNZXRhIiEKE1Jldm9rZUFwaUtleVJlcXVlc3QSCgoCaWQYASABKAkiJwoUUmV2b2tlQXBpS2V5UmVzcG9uc2USDwoHcmV2b2tlZBgBIAEoCCIjChNDcmVhdGVDbGlLZXlSZXF1ZXN0EgwKBG5hbWUYASABKAkiTAoUQ3JlYXRlQ2xpS2V5UmVzcG9uc2USJwoEbWV0YRgBIAEoCzIZLmVuZ3JhbS5hcHAudjEuQXBpS2V5TWV0YRILCgNrZXkYAiABKAkiIQoTUmV2b2tlQ2xpS2V5UmVxdWVzdBIKCgJpZBgBIAEoCSInChRSZXZva2VDbGlLZXlSZXNwb25zZRIPCgdyZXZva2VkGAEgASgIIg8KDVdob0FtSVJlcXVlc3QiZQoOV2hvQW1JUmVzcG9uc2USDwoHdXNlcl9pZBgBIAEoCRINCgVlbWFpbBgCIAEoCRIMCgRuYW1lGAMgASgJEgwKBHJvbGUYBCABKAkSFwoPc2VydmljZV9hY2NvdW50GAUgASgIMpAECg1BcGlLZXlTZXJ2aWNlElcKDENyZWF0ZUFwaUtleRIiLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQXBpS2V5UmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQXBpS2V5UmVzcG9uc2USVAoLTGlzdEFwaUtleXMSIS5lbmdyYW0uYXBwLnYxLkxpc3RBcGlLZXlzUmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuTGlzdEFwaUtleXNSZXNwb25zZRJXCgxSZXZva2VBcGlLZXkSIi5lbmdyYW0uYXBwLnYxLlJldm9rZUFwaUtleVJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLlJldm9rZUFwaUtleVJlc3BvbnNlElcKDENyZWF0ZUNsaUtleRIiLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQ2xpS2V5UmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQ2xpS2V5UmVzcG9uc2USVwoMUmV2b2tlQ2xpS2V5EiIuZW5ncmFtLmFwcC52MS5SZXZva2VDbGlLZXlSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5SZXZva2VDbGlLZXlSZXNwb25zZRJFCgZXaG9BbUkSHC5lbmdyYW0uYXBwLnYxLldob0FtSVJlcXVlc3QaHS5lbmdyYW0uYXBwLnYxLldob0FtSVJlc3BvbnNlYgZwcm90bzM");
 
 /**
  * Key metadata — everything EXCEPT the secret material.
@@ -285,6 +285,60 @@ export const RevokeCliKeyResponseSchema: GenMessage<RevokeCliKeyResponse> = /*@_
   messageDesc(file_engram_app_v1_api_key, 10);
 
 /**
+ * @generated from message engram.app.v1.WhoAmIRequest
+ */
+export type WhoAmIRequest = Message<"engram.app.v1.WhoAmIRequest"> & {
+};
+
+/**
+ * Describes the message engram.app.v1.WhoAmIRequest.
+ * Use `create(WhoAmIRequestSchema)` to create a new message.
+ */
+export const WhoAmIRequestSchema: GenMessage<WhoAmIRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_api_key, 11);
+
+/**
+ * @generated from message engram.app.v1.WhoAmIResponse
+ */
+export type WhoAmIResponse = Message<"engram.app.v1.WhoAmIResponse"> & {
+  /**
+   * @generated from field: string user_id = 1;
+   */
+  userId: string;
+
+  /**
+   * @generated from field: string email = 2;
+   */
+  email: string;
+
+  /**
+   * @generated from field: string name = 3;
+   */
+  name: string;
+
+  /**
+   * "admin" | "user".
+   *
+   * @generated from field: string role = 4;
+   */
+  role: string;
+
+  /**
+   * True when the caller is a service-account principal (a global key).
+   *
+   * @generated from field: bool service_account = 5;
+   */
+  serviceAccount: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.WhoAmIResponse.
+ * Use `create(WhoAmIResponseSchema)` to create a new message.
+ */
+export const WhoAmIResponseSchema: GenMessage<WhoAmIResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_api_key, 12);
+
+/**
  * ADR 0086: global API keys. Orchestrator-NATIVE (never proxied to the
  * coordinator). Two key ownership shapes share the table and the auth seams:
  *
@@ -360,6 +414,20 @@ export const ApiKeyService: GenService<{
     methodKind: "unary";
     input: typeof RevokeCliKeyRequestSchema;
     output: typeof RevokeCliKeyResponseSchema;
+  },
+  /**
+   * Who is the caller? Any authenticated principal (cookie, device-session
+   * bearer, or API key). The CLI's `auth status`/login confirmation use this
+   * instead of better-auth's GET /api/auth/get-session because in prod that
+   * HTTP route stays behind IAP (it is the SPA's session-bootstrap), while
+   * /rpc/* is reachable by keyed callers.
+   *
+   * @generated from rpc engram.app.v1.ApiKeyService.WhoAmI
+   */
+  whoAmI: {
+    methodKind: "unary";
+    input: typeof WhoAmIRequestSchema;
+    output: typeof WhoAmIResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_api_key, 0);

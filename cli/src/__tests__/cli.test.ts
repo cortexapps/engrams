@@ -184,6 +184,13 @@ function stubRoutes(router: ConnectRouter): void {
       key: "engk_minted-plaintext",
     }),
     revokeCliKey: () => ({ revoked: true }),
+    whoAmI: () => ({
+      userId: "u-alice",
+      email: "alice@example.com",
+      name: "Alice",
+      role: "user",
+      serviceAccount: false,
+    }),
   });
 }
 
