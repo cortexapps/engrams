@@ -19,12 +19,10 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 INTEG_DIR="./var/integration"
 
-# ADR 0051: session create/delete go over the coord's app-gRPC via
-# engram-cli (the REST surface is gone). Endpoint + bearer default to the
-# `just dev` stack; integration-bake-demo.sh (steps 1-3) builds the cli.
-ENGRAM_CLI="${ENGRAM_INTEG_BIN_DIR:-./target/release}/engram-cli"
-export ENGRAM_APP_GRPC_ADDR="${ENGRAM_APP_GRPC_ADDR:-http://127.0.0.1:50061}"
-export ENGRAM_APP_GRPC_TOKENS="${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}"
+# Session create/delete go through the `engrams` CLI → the orchestrator's
+# Connect surface (the coordinator app-gRPC is internal). Endpoint + admin
+# key default to the `just dev` stack (Tilt seeds var/dev-api-key).
+source deploy/dev/engrams-cli.sh
 
 dump_logs() {
     echo ""
@@ -45,7 +43,7 @@ echo "==> step 4/5: session create (cold-create with chunks already local)"
 # --dev-vm == the old harness {kind:none}: create + boot, leave the baked
 # harness undriven. Prints the session_id on stdout.
 T0=$(date +%s.%N)
-SESS_ID=$("$ENGRAM_CLI" session create --image "$IMAGE_URI" --dev-vm)
+SESS_ID=$(engrams session create --image "$IMAGE_URI" --dev-vm)
 T1=$(date +%s.%N)
 SESS_ELAPSED=$(echo "$T1 - $T0" | bc)
 echo "    session create elapsed: ${SESS_ELAPSED}s"
@@ -53,7 +51,7 @@ echo "    session_id: $SESS_ID"
 
 echo ""
 echo "==> step 5/5: cleanup — session delete $SESS_ID"
-"$ENGRAM_CLI" session delete "$SESS_ID" >/dev/null || true
+engrams session delete "$SESS_ID" >/dev/null || true
 echo "    session deleted"
 
 trap - ERR

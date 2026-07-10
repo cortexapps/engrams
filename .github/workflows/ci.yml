@@ -30,6 +30,9 @@ name: CI
 #                       patch_drive_swap, option_d_warm_lease.
 #   - web:              pnpm install + oxlint + tsc + vite build +
 #                       vitest
+#   - cli:              the `engrams` product CLI (cli/, Bun):
+#                       typecheck + stub-orchestrator tests + a
+#                       compiled-binary smoke
 #   - bake-demo-image:  push-to-main only. ADR 0080: a plain
 #                       `docker build && docker push` of deploy/demo
 #                       to `ghcr.io/cortexapps/engrams/demo:warm-<sha>`
@@ -37,11 +40,12 @@ name: CI
 #                       materializes the rootfs host-side at enable —
 #                       no bake CLI, no agentd/ttyd injection.
 #   - artifacts-e2e-stack: release-builds engram-coordinator +
-#                       engram-host-agent + engram-cli + musl
-#                       engram-agentd ONCE and uploads as a workflow
-#                       artifact. Consumed by `test-e2e-stack` so
-#                       the e2e lane doesn't pay the compile cost
-#                       again.
+#                       engram-host-agent + musl engram-agentd ONCE
+#                       and uploads as a workflow artifact. Consumed
+#                       by `test-e2e-stack` so the e2e lane doesn't
+#                       pay the compile cost again. (The `engrams`
+#                       CLI is Bun — the e2e job runs it from cli/
+#                       source.)
 #   - test-e2e-stack:   true end-to-end against the prod-shape
 #                       stack: real coord HTTP API + real gRPC + real
 #                       host-agent + real Firecracker + real chunked
@@ -133,6 +137,7 @@ jobs:
       test_fc: ${{ steps.lanes.outputs.test_fc }}
       test_web: ${{ steps.lanes.outputs.test_web }}
       test_orchestrator: ${{ steps.lanes.outputs.test_orchestrator }}
+      test_cli: ${{ steps.lanes.outputs.test_cli }}
       test_buf: ${{ steps.lanes.outputs.test_buf }}
     steps:
       - uses: actions/checkout@v6
@@ -541,6 +546,33 @@ jobs:
         run: bun run migrate
       - name: bun test
         run: bun test
+
+  # The `engrams` product CLI (cli/, Bun + TS, orchestrator-native).
+  # Typecheck + the stub-orchestrator test suite (spawns the real entrypoint
+  # against an in-process Connect server — no external services needed).
+  cli:
+    name: cli (bun)
+    needs: detect
+    if: needs.detect.outputs.test_cli == 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: bun install
+        run: bun install --frozen-lockfile
+      - name: bun typecheck
+        run: bun run typecheck
+      - name: bun test
+        run: bun test
+      - name: compiled binary smoke
+        run: |
+          bun run build
+          ./dist/engrams --version
 
   # ADR 0051 §7: buf owns crates/engram-protocol/proto. Lint GATES style —
   # legacy host_service.proto carries scoped exceptions in buf.yaml;
@@ -1389,7 +1421,6 @@ jobs:
           cargo build --release \
               -p engram-coordinator \
               -p engram-host-agent \
-              -p engram-cli \
               -p engram-publish-builtin-harness
 
       - name: Build musl agentd (release)
@@ -1404,7 +1435,6 @@ jobs:
           path: |
             target/release/engram-coordinator
             target/release/engram-host-agent
-            target/release/engram-cli
             target/release/engram-publish-builtin-harness
             target/x86_64-unknown-linux-musl/release/engram-agentd
           retention-days: 1
@@ -1518,7 +1548,7 @@ jobs:
     timeout-minutes: 30
     # `contents: read` for the checkout; `packages: read` because the
     # host-agent (via coord's HttpAuthResolver, ADR 0013) reads sealed
-    # creds from PG seeded by `engram-cli registry add` below — that
+    # creds from PG seeded by `engrams registry add` below — that
     # path still uses GHCR for the demo image's chunked OCI layers if
     # the integration test expands. The *baker* never pulls from GHCR
     # in this lane: the harness artifact comes from a workflow-artifact
@@ -1610,11 +1640,10 @@ jobs:
       # 26344875066: rust-cache's restore prunes "stale" entries from
       # target/<profile>/ when the lockfile hash changes (Cargo.lock
       # touched by a workspace dep add in ADR 0016 Phase A). The
-      # download placed engram-coordinator/host-agent/cli at
+      # download placed engram-coordinator/host-agent at
       # target/release/, the cache restore wiped them, and
       # the Tiltfile's prebuilt-binary branch had nothing to exec for
-      # coord + host-agent, and engram-cli was missing — which broke the
-      # next step's `./target/release/engram-cli registry add`. Moving
+      # coord + host-agent. Moving
       # the download below all rust-cache operations
       # makes the order unambiguous: nothing can prune what hasn't
       # been written yet.
@@ -1633,9 +1662,9 @@ jobs:
 
       - name: Mark e2e binaries executable
         run: |
-          chmod +x target/release/engram-{coordinator,host-agent,cli,publish-builtin-harness}
+          chmod +x target/release/engram-{coordinator,host-agent,publish-builtin-harness}
           chmod +x target/x86_64-unknown-linux-musl/release/engram-agentd
-          ls -l target/release/engram-{coordinator,host-agent,cli,publish-builtin-harness} \
+          ls -l target/release/engram-{coordinator,host-agent,publish-builtin-harness} \
                 target/x86_64-unknown-linux-musl/release/engram-agentd
 
       # `tilt up` (via tilt-up-ci.sh) boots: postgres + fake-gcs +
@@ -1651,6 +1680,12 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/tilt-dev/tilt/master/scripts/install.sh \
             | sudo bash
           tilt version
+
+      # The orchestrator (a core stack member — the Tiltfile boots it even
+      # under ENGRAM_SKIP_WEB=1) and the `engrams` CLI both run on bun.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       # ADR 0027 → 0035 → 0055 → 0062: the e2e host-agent reads its RO bundles
       # from var/shared (Tiltfile sets ENGRAM_BUNDLE_DIR there), CONTENT-ADDRESSED
@@ -1722,23 +1757,19 @@ jobs:
       # ADR 0013: host-agent doesn't read docker config; it asks
       # the coord per-pull, and the coord reads sealed credentials
       # from the `registry_credentials` PG table populated via
-      # `engram-cli registry add`. Seed ghcr.io with the GITHUB_TOKEN
-      # this job was issued (the `permissions: packages: read` block
-      # at the top of this job is what makes it pullable). Pipe via
-      # --password-stdin so the token never lands in argv / ps.
-      #
-      # ADR 0051 Drip E: the CLI now drives the coord over app-gRPC (the
-      # REST surface is gone). ENGRAM_APP_GRPC_ADDR / ENGRAM_APP_GRPC_TOKENS
-      # match the Tiltfile's coord_env (same endpoint + bearer the e2e tests
-      # use, 127.0.0.1:50061 + dev-app-grpc-token); the CLI normalizes the
-      # scheme-less addr and sends the first token as the bearer.
+      # `engrams registry add` (→ the orchestrator's ImageService
+      # passthrough). Seed ghcr.io with the GITHUB_TOKEN this job was
+      # issued (the `permissions: packages: read` block at the top of
+      # this job is what makes it pullable). Pipe via --password-stdin
+      # so the token never lands in argv / ps. Endpoint + admin key
+      # come from the shared helper (tilt-up-ci.sh already waited for
+      # the seeded var/dev-api-key).
       - name: Seed GHCR credential in coord PG
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ENGRAM_APP_GRPC_ADDR: http://127.0.0.1:50061
-          ENGRAM_APP_GRPC_TOKENS: dev-app-grpc-token
         run: |
-          printf '%s' "$GHCR_TOKEN" | ./target/release/engram-cli \
+          source deploy/dev/engrams-cli.sh
+          printf '%s' "$GHCR_TOKEN" | engrams \
               registry add \
               --host ghcr.io \
               --username "${{ github.actor }}" \
@@ -1905,6 +1936,7 @@ jobs:
       - cross-musl-linux
       - web
       - orchestrator
+      - cli
       - buf
       - test-firecracker
       - vz

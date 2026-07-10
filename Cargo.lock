@@ -1042,23 +1042,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "engram-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "engram-core",
- "engram-protocol",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "workspace-hack",
-]
-
-[[package]]
 name = "engram-cloud-gcp"
 version = "0.1.0"
 dependencies = [

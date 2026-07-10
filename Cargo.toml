@@ -9,7 +9,6 @@ members = [
     "crates/engram-chunk-store",
     "crates/engram-rootfs-materializer",
     "crates/engram-publish-builtin-harness",
-    "crates/engram-cli",
     "crates/engram-agentd",
     "crates/engram-uffd-handler",
     "crates/engram-telemetry",

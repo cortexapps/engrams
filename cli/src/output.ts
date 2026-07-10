@@ -6,7 +6,7 @@
  *   - errors go to stderr prefixed `engrams:` and exit 1
  */
 
-import { ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError } from "@connectrpc/connect";
 
 export function printJson(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
@@ -20,8 +20,9 @@ export function fail(message: string): never {
 /** Render an RPC/transport failure and exit — the one error edge for verbs. */
 export function failWith(err: unknown): never {
   if (err instanceof ConnectError) {
-    // rawMessage strips the "[code] " prefix Connect prepends to message.
-    fail(`${ConnectError.from(err).code}: ${err.rawMessage}`);
+    // rawMessage strips the "[code] " prefix Connect prepends to message;
+    // Code[…] renders the enum's name (e.g. "Unauthenticated"), not its number.
+    fail(`${Code[err.code] ?? err.code}: ${err.rawMessage}`);
   }
   fail(err instanceof Error ? err.message : String(err));
 }

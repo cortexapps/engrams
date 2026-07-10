@@ -141,7 +141,7 @@ Snapshot store has **two tiers** (ADR 0005). **Hot tier** lives on each host's l
 - **`engram-agentd`**: in-VM exec daemon + harness supervisor (PID 1 after the init shim). Length-prefixed bincode over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `StartShell`, `Ping`, `Shutdown`, `SpawnHarness`. First-frame token handshake (server side) gates non-trivial verbs. Owns the harness child process; each `SpawnHarness` kills the previous child and exec's a fresh one — clean re-spawn point on resume. On startup, dials the host's per-sandbox ready UDS so the host can block on `accept()` rather than poll for "is the in-VM listener bound."
 - **`engram-transport`**: backend-agnostic transport trait. `VsockTransport` (FC) and `ConsoleTransport` (VZ); chosen at runtime via `ENGRAM_TRANSPORT` set by the stage-1 init shim (injected by the materializer, ADR 0080).
 - **`engram-rootfs-materializer`**: host-side OCI→rootfs materializer (ADR 0080). Pulls a standard OCI/Docker image, whiteout-aware-flattens the layers, injects the stage-1 `/sbin/engram-init` shim (the only engrams-owned file baked in), packs a deterministic ext4 via `mke2fs`, and chunks it into `BlobStorage`. Driven by the `MaterializeImage` host RPC at enable/rebase time — agentd, the harness, and ttyd are *not* injected; they ride host-staged bundle slots.
-- **`engram-cli`**: ops/admin tool. `engram session {list,get,delete,logs,prompt,log,diff,fork,checkpoint}`, `engram host {list,get,drain}`, `engram image {list,enable,update,disable,refresh}`.
+- **`engrams` CLI** (`cli/`, Bun/TS — not a crate): the product CLI. Talks to the ORCHESTRATOR's Connect surface (`engrams task|session|image|registry|host|profile|apikey|admin …`); auth via `engrams auth login` (device flow → user-owned API key) or `ENGRAMS_API_KEY`. The coordinator app-gRPC is internal (orchestrator-only).
 
 ---
 
@@ -610,7 +610,6 @@ engram/
     ├── engram-coordinator/            # binary: HTTP service + scheduler + idle evictor
     ├── engram-host-agent/             # binary: per-host daemon
     ├── engram-rootfs-materializer/    # host-side OCI image → flattened ext4 + chunks (ADR 0080)
-    ├── engram-cli/                    # binary: ops/admin
     ├── engram-agentd/                 # binary + library: in-guest exec daemon + harness supervisor (transport-agnostic)
     ├── engram-uffd-handler/           # binary + library: userfaultfd page-fault handler
     ├── engram-transport/              # transport abstraction (vsock for FC / virtio-console for VZ)

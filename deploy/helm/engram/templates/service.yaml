@@ -15,8 +15,8 @@ spec:
       port: {{ .Values.service.port }}
       targetPort: http
       protocol: TCP
-    # ADR 0051: app-gRPC — reached by the orchestrator (in-cluster) and by
-    # engram-cli (kubectl port-forward, by this port name). Network-private.
+    # ADR 0051: app-gRPC — reached by the orchestrator (in-cluster) only
+    # (kubectl port-forward remains a debug path). Network-private.
     - name: app-grpc
       port: {{ .Values.appGrpc.port }}
       targetPort: app-grpc

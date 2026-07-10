@@ -930,35 +930,55 @@ orchestrator_env = {
 
 skip_web = env_or('ENGRAM_SKIP_WEB', '') in ('1', 'true', 'yes')
 
-if not skip_web:
-    # createdb returns nonzero if the DB already exists (initdb made it on a
-    # fresh volume); swallow that and let drizzle-kit migrate carry the schema.
-    local_resource('orchestrator-migrate',
-        cmd=(
-            'cd orchestrator && bun install --silent && ' +
-            '(PGPASSWORD=engram createdb -h localhost -p 5435 -U engram ' +
-            'engram_orchestrator 2>/dev/null || true) && ' +
-            'ORCHESTRATOR_DATABASE_URL=' + orchestrator_db_url + ' ' +
-            'bunx drizzle-kit migrate'
-        ),
-        resource_deps=['postgres'],
-        labels=['setup'])
+# The orchestrator is a CORE stack member (not web-gated): it is the product
+# API tier the `engrams` CLI drives, so every dev/CI flow — including the
+# ENGRAM_SKIP_WEB=1 e2e/integration stacks — needs it up. Only the vite SPA
+# stays behind skip_web.
 
-    local_resource('orchestrator',
-        serve_cmd='cd orchestrator && bun install --silent && bun run start',
-        serve_env=orchestrator_env,
-        resource_deps=['postgres', 'orchestrator-migrate', 'coordinator'],
-        readiness_probe=probe(
-            period_secs=30,
-            timeout_secs=2,
-            tcp_socket=tcp_socket_action(port=8787),
-        ),
-        links=[
-            link('http://127.0.0.1:8787/healthz', 'healthz'),
-        ],
-        labels=['app'],
-        trigger_mode=TRIGGER_MODE_MANUAL,
-        auto_init=True)
+# createdb returns nonzero if the DB already exists (initdb made it on a
+# fresh volume); swallow that and let drizzle-kit migrate carry the schema.
+local_resource('orchestrator-migrate',
+    cmd=(
+        'cd orchestrator && bun install --silent && ' +
+        '(PGPASSWORD=engram createdb -h localhost -p 5435 -U engram ' +
+        'engram_orchestrator 2>/dev/null || true) && ' +
+        'ORCHESTRATOR_DATABASE_URL=' + orchestrator_db_url + ' ' +
+        'bunx drizzle-kit migrate'
+    ),
+    resource_deps=['postgres'],
+    labels=['setup'])
+
+local_resource('orchestrator',
+    serve_cmd='cd orchestrator && bun install --silent && bun run start',
+    serve_env=orchestrator_env,
+    resource_deps=['postgres', 'orchestrator-migrate', 'coordinator'],
+    readiness_probe=probe(
+        period_secs=30,
+        timeout_secs=2,
+        tcp_socket=tcp_socket_action(port=8787),
+    ),
+    links=[
+        link('http://127.0.0.1:8787/healthz', 'healthz'),
+    ],
+    labels=['app'],
+    trigger_mode=TRIGGER_MODE_MANUAL,
+    auto_init=True)
+
+# Seed the headless dev credential the `engrams` CLI (justfile recipes,
+# deploy/dev scripts, CI) authenticates with: an admin service-account API
+# key whose plaintext lands in var/dev-api-key (gitignored, 0600).
+# Idempotent — re-mints only when the file is missing or the key row is gone.
+local_resource('dev-api-key',
+    cmd=(
+        'cd orchestrator && ' +
+        'ORCHESTRATOR_DATABASE_URL=' + orchestrator_db_url + ' ' +
+        'BETTER_AUTH_SECRET="' + orchestrator_env['BETTER_AUTH_SECRET'] + '" ' +
+        'CONTROL_PLANE_BEARER="' + orchestrator_env['CONTROL_PLANE_BEARER'] + '" ' +
+        'ENGRAM_KEK_MASTER_KEY="' + orchestrator_env['ENGRAM_KEK_MASTER_KEY'] + '" ' +
+        'bun scripts/seed-dev-key.ts ../var/dev-api-key'
+    ),
+    resource_deps=['orchestrator-migrate'],
+    labels=['setup'])
 
 # ----------------------------------------------------------------
 # Web SPA (vite dev server).
