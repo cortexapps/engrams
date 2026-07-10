@@ -952,9 +952,31 @@ impl FirecrackerBackend {
         if self.config.net_pool.is_none() {
             return Ok(());
         }
-        net::host_startup(self.config.egress_proxy_port, self.config.egress_dns_port)
-            .await
-            .map_err(SandboxError::from)
+        // ADR 0019 / #526 phase 2: when in-guest OTLP export is
+        // configured, pinhole the collector port so the guest's dial
+        // to its gateway survives the host-INPUT DROP. A malformed
+        // endpoint yields no pinhole (fail closed) — the guest export
+        // just stays dark, same as unconfigured.
+        let guest_otel_port = self
+            .config
+            .guest_otel_endpoint
+            .as_deref()
+            .and_then(net::otel_endpoint_port);
+        if self.config.guest_otel_endpoint.is_some() && guest_otel_port.is_none() {
+            tracing::warn!(
+                endpoint = self.config.guest_otel_endpoint.as_deref(),
+                "ENGRAM_GUEST_OTEL_ENDPOINT has an unparseable port; \
+                 installing no guest->collector pinhole (guest OTLP export \
+                 will fail closed at the host INPUT chain)"
+            );
+        }
+        net::host_startup(
+            self.config.egress_proxy_port,
+            self.config.egress_dns_port,
+            guest_otel_port,
+        )
+        .await
+        .map_err(SandboxError::from)
     }
 
     pub fn work_dir(&self) -> &Path {

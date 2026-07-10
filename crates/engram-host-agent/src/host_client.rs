@@ -25,7 +25,6 @@ use engram_core::error::SandboxError;
 use engram_core::traits::{HarnessDial, HarnessSink, HostClient, SandboxBackend, SessionFence};
 use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
-use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::types::{SandboxId, SessionId};
@@ -252,19 +251,6 @@ impl HostClient for LocalHostClient {
         _fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
         self.sandbox.restore(metadata).await
-    }
-
-    async fn build_base_snapshot(
-        &self,
-        spec: SandboxSpec,
-        warm: Option<WarmConfig>,
-        capture_env: std::collections::HashMap<String, String>,
-        capture_egress: Option<SessionEgressPolicy>,
-        progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
-    ) -> Result<SnapshotMetadata, SandboxError> {
-        self.sandbox
-            .build_base_snapshot(spec, warm, capture_env, capture_egress, progress)
-            .await
     }
 
     async fn materialize_image(

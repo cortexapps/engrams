@@ -1,6 +1,11 @@
 # 0075 — Substrate single-writer: one chunk-cache owner per host
 
-Status: Proposed (2026-07-06)
+Status: Accepted (2026-07-08)
+
+Commit chain: Phases 1+2 landed together in #583 (`43c87b96`), review
+fix folded in. ADR 0076 (`engram-substrated`) deliberately REMAINS
+Proposed/gated per its own text — accepting this ADR does not start
+the daemon work.
 
 Issue: #547 (2026-07 core-ops overhaul, Tier 2). Depends on #528 (the
 disk budget this makes enforceable). Companion: ADR 0076 (the
@@ -83,4 +88,34 @@ helpers are `cfg(target_os = "linux")`.
 
 ## Divergence log
 
-- (filled as phases land)
+- **One PR, not two.** Phases 1 and 2 landed together in #583
+  (`43c87b96`) — the reader/writer split, `engram-substrate-proto`,
+  the populate server, the handler's 3-step read path, and the
+  readiness handshake are one coherent cutover; splitting them would
+  have shipped a window where the handler compiles read-only but has
+  no populate path.
+- **Session-chunk pinning is per-connection, not sandbox-lifetime
+  `pin_all`.** The sketch had the host-agent pinning the session's
+  divergent manifest chunks for the sandbox lifetime via
+  `pin_all`/`unpin_all` in the restore path. What shipped is better
+  self-healing: the substrate server pins the `Hello` manifest's
+  chunks for the CONNECTION lifetime (`conn_pins`, unpinned on every
+  disconnect path), and the client replays `Hello` on every fresh
+  dial (`with_conn`) — not just at startup — because the server's pin
+  set and proto check are per-connection state, and the designed-for
+  reconnect (a rolled host-agent's successor, holding an empty pin
+  set) is exactly when silently skipping the replay would leave the
+  handler unpinned for the rest of the sandbox's life. Pin release
+  needs no destroy-path bookkeeping: the disconnect is the unpin.
+- **ADR 0080 (landed after, 2026-07-07) added a writer-side caller,
+  not a writer.** The enable-time rootfs materializer
+  (`MaterializeImage`) chunks through the host-agent's ONE in-process
+  `ChunkStore`/`ChunkCache`, so the single-writer invariant holds by
+  construction. Out-of-scope note so nobody assumes otherwise: the
+  materializer's scratch-headroom guard
+  (`materialize.rs::estimated_peak_scratch_bytes` vs raw `statvfs`)
+  measures the same volume as the cache but is deliberately NOT
+  integrated with the cache's pin/evict bookkeeping — materialize
+  scratch pressure is invisible to the cache evictor, bounded instead
+  by the ≤1-concurrent-materialize cap + the pre-pull size cap +
+  scrub-on-exit.

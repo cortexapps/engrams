@@ -19,6 +19,11 @@
 //! 6. `enabled_images.base_snapshot_disk_manifest_*` (ADR 0022) —
 //!    the disk companion to #5: the rootfs a base `session.create`
 //!    restores from, also recoverable-flag-independent.
+//! 7. `cold_bases.{disk,memory}_manifest` (ADR 0084 §B6) — a cold
+//!    base's chunks have NO other root: it never gets its own
+//!    `snapshots` row (only the warm overlay it seeds does), so
+//!    without this a live `cold_bases` row's chunks would be reaped
+//!    right out from under it.
 //!
 //! Sources 5 & 6 frequently dedup against #3/#4 (the base snapshot is
 //! usually still `recoverable`); their distinct value is keeping the
@@ -212,6 +217,11 @@ async fn collect_manifest_refs(meta: &dyn MetadataStore) -> Result<HashSet<Manif
         .list_enabled_image_base_snapshot_disk_manifests()
         .await?
     {
+        refs.insert(r);
+    }
+    // ADR 0084 §B6: source #7 — cold bases have no root of their own
+    // besides this (no `snapshots` row); never a second GC.
+    for r in meta.cold_base_manifest_refs().await? {
         refs.insert(r);
     }
     Ok(refs)

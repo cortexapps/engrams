@@ -25,19 +25,18 @@ use engram_protocol::grpc::proxy_port_message::Body as ProxyPortBody;
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
     AnswerHarnessQuestionRequest, ApplyEgressPolicyRequest, BindHarnessSessionRequest,
-    BrowserPortResponse, BuildBaseSnapshotEvent, BuildBaseSnapshotRequest,
-    BuildBaseSnapshotResponse, CaptureFailed, CaptureProgress, CowStateAllResponse,
-    CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
-    DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
-    ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse, IdePortResponse,
-    InterruptHarnessRequest, ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent,
-    MaterializeImageFailed, MaterializeImageRequest, MaterializeProgress, MigrationCaptureResponse,
-    MigrationExportRef, MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse,
-    PostCopyCaptureResponse, ProbeSandboxResponse, ProxyPortData, ProxyPortMessage,
-    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing, ProxyShellPong,
-    ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SnapshotBeginResponse, SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    BrowserPortResponse, CowStateAllResponse, CowStateResponse, CreateSandboxRequest,
+    CreateSandboxResponse, DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse,
+    EditHarnessQueuedPromptRequest, Empty, ExecExit, ExecFrame, ExecStartRequest,
+    FencedSandboxRequest, GuestIpResponse, IdePortResponse, InterruptHarnessRequest,
+    ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent, MaterializeImageFailed,
+    MaterializeImageRequest, MaterializeProgress, MigrationCaptureResponse, MigrationExportRef,
+    MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse, PostCopyCaptureResponse,
+    ProbeSandboxResponse, ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose,
+    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -187,8 +186,6 @@ impl HostService for HostServiceImpl {
         Pin<Box<dyn Stream<Item = Result<ProxyShellMessage, Status>> + Send + 'static>>;
     type ProxyPortStream =
         Pin<Box<dyn Stream<Item = Result<ProxyPortMessage, Status>> + Send + 'static>>;
-    type BuildBaseSnapshotStream =
-        Pin<Box<dyn Stream<Item = Result<BuildBaseSnapshotEvent, Status>> + Send + 'static>>;
     type MaterializeImageStream =
         Pin<Box<dyn Stream<Item = Result<MaterializeImageEvent, Status>> + Send + 'static>>;
 
@@ -624,135 +621,6 @@ impl HostService for HostServiceImpl {
         }
         .instrument(span)
         .await
-    }
-
-    /// Issue #539 (wire v8): server-streaming. A dedicated task drives the
-    /// backend call while THIS task drains its `CaptureProgress` channel
-    /// and forwards each event onto the outer gRPC stream; only once that
-    /// channel closes (the backend call has returned — params, including
-    /// the `Sender`, drop at the end of its async fn body, strictly before
-    /// the awaiting `JoinHandle` resolves) do we await the backend result
-    /// and emit exactly one terminal `done`/`failed` frame. This ordering
-    /// is load-bearing: it guarantees every progress frame reaches the
-    /// stream before the terminal one, never interleaved unpredictably
-    /// across two independent producers.
-    async fn build_base_snapshot(
-        &self,
-        req: Request<BuildBaseSnapshotRequest>,
-    ) -> Result<Response<Self::BuildBaseSnapshotStream>, Status> {
-        let span = tracing::info_span!("host.build_base_snapshot");
-        link_remote_parent(&span, &req);
-        check_wire_version(&req)?;
-        let inner = req.into_inner();
-        let spec = decode_bincode(&inner.spec_bincode, "SandboxSpec")?;
-        // `warm_bincode` is the optional `[warm]` hook. A populated
-        // buffer is `Option<WarmConfig>` (a `None` still encodes to a
-        // 1-byte discriminant); a genuinely empty buffer (an unset
-        // proto field) is treated as `None`.
-        let warm = if inner.warm_bincode.is_empty() {
-            None
-        } else {
-            decode_bincode(&inner.warm_bincode, "Option<WarmConfig>")?
-        };
-        // Resolved capture-time env for the `[warm]` hook (wire v6). An
-        // empty buffer (older caller / no capture_env) decodes to an
-        // empty map.
-        let capture_env = if inner.capture_env_bincode.is_empty() {
-            std::collections::HashMap::new()
-        } else {
-            decode_bincode(&inner.capture_env_bincode, "capture_env")?
-        };
-        // Coordinator-assembled capture egress (wire v13, ADR 0080). An
-        // empty buffer decodes to `None` — an egress-less capture.
-        let capture_egress = if inner.capture_egress_bincode.is_empty() {
-            None
-        } else {
-            decode_bincode(&inner.capture_egress_bincode, "Option<SessionEgressPolicy>")?
-        };
-
-        // Issue #563 review correction: 64 was tight enough that a slow
-        // consumer (or a burst of keepalive + per-line progress events
-        // around a stage transition) could fill it and silently drop the
-        // one event that mattered — the terminal failure's stage + output
-        // tail (see `pooled_backend::run_warm_hook`'s `violation_failure`).
-        // 256 sits comfortably above the realistic event count for one
-        // capture (a handful of phase transitions + one keepalive tick per
-        // ~30s over a multi-minute hook, drained continuously by the loop
-        // below) without meaningfully growing worst-case memory.
-        let (progress_tx, mut progress_rx) =
-            mpsc::channel::<engram_core::types::CaptureProgress>(256);
-        let (tx, rx) = mpsc::channel::<Result<BuildBaseSnapshotEvent, Status>>(16);
-
-        let backend = self.inner.clone();
-        let backend_task = tokio::spawn(
-            async move {
-                backend
-                    .build_base_snapshot(spec, warm, capture_env, capture_egress, progress_tx)
-                    .await
-            }
-            .instrument(span.clone()),
-        );
-
-        tokio::spawn(
-            async move {
-                while let Some(p) = progress_rx.recv().await {
-                    let warm_stages_bincode = bincode::serialize(&p.warm_stages)
-                        .inspect_err(|e| {
-                            tracing::warn!(error = %e, "failed to bincode-encode warm_stages; dropping from this progress frame");
-                        })
-                        .unwrap_or_default();
-                    let event = BuildBaseSnapshotEvent {
-                        event: Some(engram_protocol::grpc::build_base_snapshot_event::Event::Progress(
-                            CaptureProgress {
-                                phase: p.phase.as_str().to_string(),
-                                warm_stage: p.warm_stage,
-                                detail: p.detail,
-                                output_tail: p.output_tail,
-                                warm_stages_bincode,
-                            },
-                        )),
-                    };
-                    if tx.send(Ok(event)).await.is_err() {
-                        // Client dropped the stream. Keep draining
-                        // progress_rx (cheap) so the backend task's sends
-                        // never block on a channel nobody reads, but stop
-                        // forwarding onto the dead outer stream.
-                        while progress_rx.recv().await.is_some() {}
-                        return;
-                    }
-                }
-                let terminal = match backend_task.await {
-                    Ok(Ok(metadata)) => encode_bincode(&metadata, "SnapshotMetadata").map(|bytes| {
-                        BuildBaseSnapshotEvent {
-                            event: Some(engram_protocol::grpc::build_base_snapshot_event::Event::Done(
-                                BuildBaseSnapshotResponse { metadata_bincode: bytes },
-                            )),
-                        }
-                    }),
-                    Ok(Err(SandboxError::CaptureFailed(failure))) => Ok(BuildBaseSnapshotEvent {
-                        event: Some(engram_protocol::grpc::build_base_snapshot_event::Event::Failed(
-                            CaptureFailed {
-                                message: failure.message,
-                                kind: failure.kind.as_str().to_string(),
-                                warm_stage: failure.stage,
-                                output_tail: failure.tail,
-                            },
-                        )),
-                    }),
-                    Ok(Err(other)) => Err(sandbox_to_status(other)),
-                    Err(join_err) => Err(Status::internal(format!(
-                        "build_base_snapshot backend task panicked: {join_err}"
-                    ))),
-                };
-                let _ = tx.send(terminal).await;
-            }
-            .instrument(span),
-        );
-
-        let out_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Response::new(
-            Box::pin(out_stream) as Self::BuildBaseSnapshotStream
-        ))
     }
 
     /// ADR 0080 §C (wire v14): server-streaming, the exact two-task
@@ -1702,12 +1570,13 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         // all, not something this handler itself would ever return).
         // Map defensively in case a future refactor surfaces it here.
         SandboxError::Unsupported(_) => Status::unimplemented(err.to_string()),
-        // Issue #539: the streaming `build_base_snapshot` handler pattern-
-        // matches this variant itself and emits a structured `CaptureFailed`
-        // stream frame instead of a gRPC error status (so the kind/stage/
-        // tail survive). This arm only fires if some future caller routes
-        // a `CaptureFailed` through a non-streaming RPC — fall back to a
-        // plain internal status rather than losing the error.
+        // ADR 0084 P1b: the `BuildBaseSnapshot` RPC that used to
+        // pattern-match this variant and emit a structured `CaptureFailed`
+        // stream frame (so the kind/stage/tail survived the wire) is
+        // deleted — capture failures now travel as a `CaptureTerminalReport`
+        // on the heartbeat, never through this gRPC error-mapping path.
+        // Kept as a defensive fallback in case any other caller ever
+        // surfaces this variant through a non-streaming RPC.
         SandboxError::CaptureFailed(failure) => Status::internal(failure.to_string()),
         // ADR 0080: the streaming `materialize_image` handler emits a
         // structured `MaterializeImageFailed` frame for this variant

@@ -86,12 +86,15 @@ async fn warm_hook_process_survives_base_snapshot() {
     };
 
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
-    let meta = pooled
+    let result = pooled
         .build_base_snapshot(
-            env.spec(&rootfs),
-            Some(warm),
-            Default::default(),
-            None,
+            engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+                spec: env.spec(&rootfs),
+                warm: Some(warm),
+                capture_env: Default::default(),
+                capture_egress: None,
+                cold_base_plan: engram_core::types::capture_job::ColdBasePlan::NotApplicable,
+            },
             progress_tx,
         )
         .await
@@ -100,7 +103,7 @@ async fn warm_hook_process_survives_base_snapshot() {
     // Restore a fresh session from the captured base snapshot and confirm
     // the warmed process came back live (the snapshot froze it running).
     let restored = pooled
-        .restore_fresh(meta, Vec::new())
+        .restore_fresh(result.snapshot, Vec::new())
         .await
         .expect("restore from warm base snapshot");
 
@@ -168,15 +171,24 @@ async fn warm_hook_sees_manifest_env() {
         .insert("ENGRAM_WARM_ENV_PROBE".into(), "present".into());
 
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
-    let meta = pooled
-        .build_base_snapshot(spec, Some(warm), Default::default(), None, progress_tx)
+    let result = pooled
+        .build_base_snapshot(
+            engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+                spec,
+                warm: Some(warm),
+                capture_env: Default::default(),
+                capture_egress: None,
+                cold_base_plan: engram_core::types::capture_job::ColdBasePlan::NotApplicable,
+            },
+            progress_tx,
+        )
         .await
         .expect("warm hook must see the manifest [env]; capture should succeed");
 
     // Confirm the value the hook observed was the manifest one (not a stray
     // default), surviving into a restored session.
     let restored = pooled
-        .restore_fresh(meta, Vec::new())
+        .restore_fresh(result.snapshot, Vec::new())
         .await
         .expect("restore");
     let seen = exec(&pooled, restored, "cat /dev/shm/engram-warm-env").await;
@@ -207,10 +219,13 @@ async fn warm_hook_nonzero_exit_fails_capture() {
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
     let err = pooled
         .build_base_snapshot(
-            env.spec(&rootfs),
-            Some(warm),
-            Default::default(),
-            None,
+            engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+                spec: env.spec(&rootfs),
+                warm: Some(warm),
+                capture_env: Default::default(),
+                capture_egress: None,
+                cold_base_plan: engram_core::types::capture_job::ColdBasePlan::NotApplicable,
+            },
             progress_tx,
         )
         .await

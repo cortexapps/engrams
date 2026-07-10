@@ -71,7 +71,13 @@ pub async fn run_one_snapshot_blob_sweep(
     // -------- barrier-bounded classification --------
     loop {
         let gen_before = meta.chunk_generation().await?;
-        let pins: HashSet<SnapshotId> = meta.snapshot_blob_pin_set().await?.into_iter().collect();
+        let mut pins: HashSet<SnapshotId> =
+            meta.snapshot_blob_pin_set().await?.into_iter().collect();
+        // ADR 0084 §B6: a cold base's own Full snapshot has no
+        // `snapshots` row (only the warm overlay it seeds gets one) —
+        // its state.bin/sidecar blobs would otherwise look unpinned to
+        // this sweep.
+        pins.extend(meta.cold_base_snapshot_ids().await?);
         let keys = blob
             .list_prefix(SNAPSHOT_PREFIX)
             .await
@@ -134,7 +140,13 @@ pub async fn run_one_snapshot_blob_sweep(
         // module doc). A candidate whose row has since landed is dropped
         // from the candidate table (its blob stays, pinned); a still-
         // unpinned candidate has its blobs deleted.
-        let pins: HashSet<SnapshotId> = meta.snapshot_blob_pin_set().await?.into_iter().collect();
+        let mut pins: HashSet<SnapshotId> =
+            meta.snapshot_blob_pin_set().await?.into_iter().collect();
+        // ADR 0084 §B6: a cold base's own Full snapshot has no
+        // `snapshots` row (only the warm overlay it seeds gets one) —
+        // its state.bin/sidecar blobs would otherwise look unpinned to
+        // this sweep.
+        pins.extend(meta.cold_base_snapshot_ids().await?);
         let mut resolved: Vec<SnapshotId> = Vec::with_capacity(expired.len());
         for id in expired {
             if pins.contains(&id) {
