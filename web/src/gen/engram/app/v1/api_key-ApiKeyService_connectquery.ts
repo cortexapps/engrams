@@ -48,3 +48,14 @@ export const createCliKey = ApiKeyService.method.createCliKey;
  * @generated from rpc engram.app.v1.ApiKeyService.RevokeCliKey
  */
 export const revokeCliKey = ApiKeyService.method.revokeCliKey;
+
+/**
+ * Who is the caller? Any authenticated principal (cookie, device-session
+ * bearer, or API key). The CLI's `auth status`/login confirmation use this
+ * instead of better-auth's GET /api/auth/get-session because in prod that
+ * HTTP route stays behind IAP (it is the SPA's session-bootstrap), while
+ * /rpc/* is reachable by keyed callers.
+ *
+ * @generated from rpc engram.app.v1.ApiKeyService.WhoAmI
+ */
+export const whoAmI = ApiKeyService.method.whoAmI;

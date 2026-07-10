@@ -11,16 +11,16 @@
 #   - the stack is up via `just dev` (PG, registry, fake-gcs, coord,
 #     host-agent are all up).
 #   - docker (for `docker build && docker push`).
-#   - host-target engram-cli at ./target/release/engram-cli (for
-#     `image enable` + the readiness polls).
-#   (the script will cargo-build engram-cli if missing.)
+#   - the `engrams` CLI (for `image enable` + the readiness polls):
+#     a compiled binary via ENGRAMS_BIN, else run from cli/ source
+#     with bun (see deploy/dev/engrams-cli.sh).
 #
 # Side effects:
 #   - Pushes a standard docker image to localhost:5001 under
 #     integration-test/demo:warm-<short-sha>.
-#   - Enables the image on the local coord over app-gRPC
-#     (`engram-cli image enable`) — the coordinator drives the
-#     host-side MaterializeImage + base-snapshot capture.
+#   - Enables the image via `engrams image enable` (orchestrator →
+#     coordinator) — the coordinator drives the host-side
+#     MaterializeImage + base-snapshot capture.
 #
 # On stdout, prints (and only prints) the final IMAGE_URI of the
 # enabled image on success, so callers can:
@@ -39,17 +39,13 @@ cd "$(git rev-parse --show-toplevel)"
 COORD="${COORD:-http://127.0.0.1:8090}"
 READY_DEADLINE_SECS="${READY_DEADLINE_SECS:-240}"
 
-# ADR 0051 Drip E: the coordinator's web-facing REST surface (POST
-# /api/v1/enabled-images, GET /api/v1/enable-jobs/:id, GET
-# /api/v1/enabled-images, GET /api/v1/hosts) is gone — enable + read
-# enabled images + read host digest-readiness over the coord's
-# app-gRPC via engram-cli. Endpoint + bearer default to the Tiltfile's
-# coord app-gRPC; the workflow may override via
-# ENGRAM_APP_GRPC_ADDR/TOKENS. (The `/healthz` check below is a KEPT
-# REST route, left as-is.)
-ENGRAM_CLI="${ENGRAM_INTEG_BIN_DIR:-./target/release}/engram-cli"
-export ENGRAM_APP_GRPC_ADDR="${ENGRAM_APP_GRPC_ADDR:-http://127.0.0.1:50061}"
-export ENGRAM_APP_GRPC_TOKENS="${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}"
+# Enable + read enabled images + read host digest-readiness all go
+# through the `engrams` CLI → the orchestrator's Connect surface (the
+# coordinator app-gRPC is internal). Endpoint + admin key default to
+# the `just dev` stack (Tilt seeds var/dev-api-key); CI overrides via
+# ENGRAMS_BIN/ENGRAMS_URL/ENGRAMS_API_KEY. (The coord `/healthz` check
+# below is a KEPT internal REST route, left as-is.)
+source deploy/dev/engrams-cli.sh
 
 AUTH_HEADER=()
 if [ -n "${ENGRAM_TOKEN:-}" ]; then
@@ -76,14 +72,6 @@ IMAGE_URI="$LOCAL_REGISTRY/integration-test/demo:warm-$SHORT"
 
 log "==> step 1/3: docker build + push demo image"
 log "    target: $IMAGE_URI"
-
-# Re-build only if the binary is missing; the CI lane downloads
-# release artifacts produced by an upstream job, and we want to
-# respect those rather than re-compile.
-if [ ! -x ./target/release/engram-cli ]; then
-    log "    building engram-cli (host) — not present in target/release"
-    cargo build --release -p engram-cli >&2
-fi
 
 # ADR 0080 phase 3b: a PLAIN `docker build && docker push` — the exact
 # user contract the materializer consumes. Keep bake-demo.sh's arm64
@@ -120,7 +108,7 @@ log "==> step 2/3: enable image over app-gRPC (blocks until the enable job is re
 # collapses the old "POST /enabled-images then poll /enable-jobs/:id"
 # into one command. `set -e` aborts on a non-zero exit.
 T0=$(date +%s.%N)
-if ! "$ENGRAM_CLI" image enable --uri "$IMAGE_URI" --config deploy/demo/image-config.toml >&2; then
+if ! engrams image enable --uri "$IMAGE_URI" --config deploy/demo/image-config.toml >&2; then
     log "ERROR: enabling $IMAGE_URI failed (enable job did not reach ready)"
     exit 1
 fi
@@ -134,17 +122,17 @@ log "==> step 3/3: poll hosts until this image's digest is ready"
 # image's manifest_digest (each bake produces a unique one) to
 # appear in some host's ready_image_digests, not just for the
 # count to be >= 1 — a prior run's image may already be ready.
-EXPECTED_DIGEST=$("$ENGRAM_CLI" --json image list \
+EXPECTED_DIGEST=$(engrams --json image list \
     | python3 -c "import sys,json; rows = json.load(sys.stdin).get('images', []); print(next((r['manifest_digest'] for r in rows if r['image_uri']=='$IMAGE_URI'), ''))")
 if [ -z "$EXPECTED_DIGEST" ]; then
-    log "ERROR: couldn't read manifest_digest from 'engram-cli image list'"
+    log "ERROR: couldn't read manifest_digest from 'engrams image list'"
     exit 1
 fi
 log "    waiting for digest: $EXPECTED_DIGEST"
 DEADLINE=$(( $(date +%s) + READY_DEADLINE_SECS ))
 T0=$(date +%s.%N)
 while :; do
-    READY=$("$ENGRAM_CLI" --json hosts list \
+    READY=$(engrams --json hosts list \
         | python3 -c "import sys,json; rows = json.load(sys.stdin).get('hosts', []); digests = {d for r in rows for d in r.get('ready_image_digests', [])}; print('yes' if '$EXPECTED_DIGEST' in digests else 'no')")
     if [ "$READY" = "yes" ]; then
         T1=$(date +%s.%N)

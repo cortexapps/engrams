@@ -41,7 +41,7 @@ echo "==> tilt up started (log: $LOG)"
 # individually (tilt truncates long resource names with `…`, hence the
 # prefix matches), then a short raw tail for anything unanticipated.
 dump_diagnostics() {
-    for r in coordina postgres registry jaeger seed-buck fake-gcs host-agent; do
+    for r in coordina postgres registry jaeger seed-buck fake-gcs host-agent orchestr dev-api-k; do
         echo "--- tilt.log stream: ${r}* (last 40 lines) ---" >&2
         { grep -F "$r" "$LOG" || true; } | tail -40 >&2
     done
@@ -81,19 +81,29 @@ case "${ENGRAM_INTEG_TWO_HOSTS:-}" in
     1 | true | yes) want_hosts=2 ;;
     *) want_hosts=1 ;;
 esac
-# ADR 0051: the web-facing REST `/api/v1/hosts` list is gone — query host
-# registration over the coordinator's app-gRPC via engram-cli (the surface the
-# whole stack uses now). Endpoint + bearer default to the Tiltfile's coord
-# app-gRPC; the workflow may override via ENGRAM_APP_GRPC_ADDR/TOKENS.
-ENGRAM_CLI="${ENGRAM_INTEG_BIN_DIR:-./target/release}/engram-cli"
-export ENGRAM_APP_GRPC_ADDR="${ENGRAM_APP_GRPC_ADDR:-http://127.0.0.1:50061}"
-export ENGRAM_APP_GRPC_TOKENS="${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}"
+# Host registration is queried via the `engrams` CLI → the orchestrator's
+# FleetService passthrough (the coordinator app-gRPC is internal now). The
+# orchestrator + its seeded admin key (Tilt's dev-api-key resource →
+# var/dev-api-key) are core stack members even under ENGRAM_SKIP_WEB=1, but
+# they come up asynchronously with the coord — wait for the credential file
+# before sourcing the CLI helper (which fails hard without it).
+echo "==> waiting for the orchestrator dev credential (var/dev-api-key)"
+for _ in $(seq 1 600); do
+    [ -s var/dev-api-key ] && break
+    sleep 1
+done
+if [ ! -s var/dev-api-key ] && [ -z "${ENGRAMS_API_KEY:-}" ]; then
+    echo "ERROR: var/dev-api-key never appeared (orchestrator/dev-api-key resource failed?)" >&2
+    dump_diagnostics
+    exit 1
+fi
+source deploy/dev/engrams-cli.sh
 host_count() {
     # `--json hosts list` => {"hosts":[{"hostname":...},...]}; count via the
     # same `"hostname"` marker the old REST poll used. Trailing `|| true` so a
-    # transient gRPC error (app-gRPC still warming) yields 0, not a `set -e`
+    # transient RPC error (orchestrator still warming) yields 0, not a `set -e`
     # abort under pipefail.
-    "$ENGRAM_CLI" --json hosts list 2>/dev/null \
+    engrams --json hosts list 2>/dev/null \
         | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ' || true
 }
 
@@ -109,6 +119,13 @@ done
 n=$(host_count)
 if [ "${n:-0}" -lt "$want_hosts" ]; then
     echo "ERROR: expected >= $want_hosts host-agent(s), got ${n:-0}" >&2
+    # The poll swallows the CLI's stderr (transient warm-up noise); on
+    # timeout, show ONE full attempt so the failure mode is visible.
+    echo "--- one un-silenced \`engrams --json hosts list\` attempt ---" >&2
+    { engrams --json hosts list || true; } >&2
+    echo "--- orchestrator /healthz + bun --version ---" >&2
+    { curl -sS "${ENGRAMS_URL}/healthz" || true; } >&2
+    { bun --version || true; } >&2
     dump_diagnostics
     exit 1
 fi

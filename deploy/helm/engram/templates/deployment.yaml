@@ -108,7 +108,7 @@ spec:
             - name: metrics
               containerPort: 9090
               protocol: TCP
-            # ADR 0051: app-gRPC surface (orchestrator + engram-cli).
+            # ADR 0051: app-gRPC surface (orchestrator-only).
             - name: app-grpc
               containerPort: {{ .Values.appGrpc.port }}
               protocol: TCP
@@ -129,8 +129,8 @@ spec:
                   key: {{ .Values.auth.secretKey }}
             {{- end }}
             {{- /* ADR 0051: bind app-gRPC on all interfaces (coord default is
-                   loopback) so the orchestrator (cross-pod) + engram-cli
-                   (port-forward) reach it via the Service. Bearer-gated by
+                   loopback) so the orchestrator (cross-pod) reaches it via
+                   the Service. Bearer-gated by
                    ENGRAM_APP_GRPC_TOKENS, defaulting to the same Secret as the
                    REST auth tokens so the two stay in sync (override via
                    appGrpc.tokensSecret). Empty tokens => fail closed. */}}

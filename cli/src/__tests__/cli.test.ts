@@ -17,6 +17,7 @@ import { connectNodeAdapter } from "@connectrpc/connect-node";
 import type { ConnectRouter } from "@connectrpc/connect";
 
 import { SessionService } from "../gen/engram/app/v1/session_pb.ts";
+import { FleetService } from "../gen/engram/app/v1/fleet_pb.ts";
 import { ProfileService } from "../gen/engram/app/v1/profile_pb.ts";
 import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import { ApiKeyService } from "../gen/engram/app/v1/api_key_pb.ts";
@@ -148,6 +149,24 @@ function stubRoutes(router: ConnectRouter): void {
       yield { event: { case: "exit" as const, value: { exitStatus: 3 } } };
     },
   });
+  router.service(FleetService, {
+    // uint64 capacities arrive as BIGINT on the wire — the field class that
+    // crashed `--json hosts list` in the e2e gate (JSON.stringify rejects
+    // BigInt). This stub pins the bigint-safe output edge.
+    listHosts: () => ({
+      hosts: [
+        {
+          id: "host-1",
+          hostname: "stub-host",
+          status: "ready",
+          capacityTotalMib: 16384n,
+          capacityUsedMib: 512n,
+          runningSandboxes: 2,
+          lastHeartbeatAt: "2026-07-10T00:00:00Z",
+        },
+      ],
+    }),
+  });
   router.service(ProfileService, {
     listProfiles: () => ({
       profiles: [
@@ -184,6 +203,13 @@ function stubRoutes(router: ConnectRouter): void {
       key: "engk_minted-plaintext",
     }),
     revokeCliKey: () => ({ revoked: true }),
+    whoAmI: () => ({
+      userId: "u-alice",
+      email: "alice@example.com",
+      name: "Alice",
+      role: "user",
+      serviceAccount: false,
+    }),
   });
 }
 
@@ -288,6 +314,19 @@ describe("engrams (binary vs stub orchestrator)", () => {
     expect(body.sessions[0]!["sandbox_id"]).toBe("sb-1");
     const rpc = seen.find((s) => s.path.includes("ListSessions"));
     expect(rpc?.apiKey).toBe("engk_test-key");
+  });
+
+  test("hosts list serializes bigint capacities in BOTH output modes", async () => {
+    // Regression: HostView's uint64 fields arrive as bigint; --json must not
+    // crash on JSON.stringify and the table must render them.
+    const j = await runCli(["--json", "hosts", "list"]);
+    expect(j.code).toBe(0);
+    const body = JSON.parse(j.stdout) as { hosts: Array<Record<string, unknown>> };
+    expect(body.hosts[0]!["capacity_total_mib"]).toBe(16384);
+    expect(body.hosts[0]!["hostname"]).toBe("stub-host");
+    const t = await runCli(["hosts", "list"]);
+    expect(t.code).toBe(0);
+    expect(t.stdout).toContain("16384");
   });
 
   test("no credential → exit 1 with the auth login pointer", async () => {

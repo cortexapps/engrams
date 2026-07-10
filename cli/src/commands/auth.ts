@@ -17,7 +17,7 @@ import { spawn } from "node:child_process";
 import { hostname } from "node:os";
 import { createInterface } from "node:readline/promises";
 
-import { authHeaders, clientsWith } from "../client.ts";
+import { clientsWith } from "../client.ts";
 import {
   DEVICE_CLIENT_ID,
   deleteCredential,
@@ -128,20 +128,20 @@ export async function login(host: string): Promise<void> {
 
 interface Me {
   email?: string;
-  name?: string;
   role?: string;
 }
 
-/** Resolve the identity a key acts as via better-auth's get-session. */
+/** Resolve the identity a key acts as via ApiKeyService.WhoAmI. An RPC, not
+ *  better-auth's GET /api/auth/get-session: in prod that HTTP route stays
+ *  behind IAP (it's the SPA's session bootstrap), while /rpc/* is routed for
+ *  keyed callers. */
 async function whoami(host: string, apiKey: string): Promise<Me | null> {
-  const res = await fetch(`${host}/api/auth/get-session`, {
-    headers: authHeaders({ apiKey }),
-  });
-  if (!res.ok) return null;
-  const body = (await res.json()) as {
-    user?: { email?: string; name?: string; role?: string };
-  } | null;
-  return body?.user ?? null;
+  try {
+    const me = await clientsWith(host, { apiKey }).apiKey.whoAmI({});
+    return { email: me.email, role: me.role };
+  } catch {
+    return null;
+  }
 }
 
 export async function logout(host: string): Promise<void> {

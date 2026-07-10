@@ -42,7 +42,9 @@ import { apikey, user } from "../db/schema.ts";
 
 export type GetSession = (
   headers: Headers,
-) => Promise<{ user: { id: string; role?: string | null; email?: string | null } } | null>;
+) => Promise<{
+  user: { id: string; role?: string | null; email?: string | null; name?: string | null };
+} | null>;
 
 /** The two roles a key can carry — exactly the admin plugin's user roles. */
 const ROLES = new Set(["admin", "user"]);
@@ -354,6 +356,21 @@ export function registerApiKeys(router: ConnectRouter, deps?: ApiKeyDeps): void 
       if (!found || found.referenceId !== caller.id) return { revoked: false };
       await backend().deleteKeyRow(req.id); // never the user — the owner is a human
       return { revoked: true };
+    },
+
+    async whoAmI(_req, ctx) {
+      // Any authenticated principal — service accounts included (an admin CI
+      // key legitimately asks "who am I acting as").
+      const session = await getSession(ctx.requestHeader);
+      if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
+      const email = session.user.email ?? "";
+      return {
+        userId: session.user.id,
+        email,
+        name: session.user.name ?? "",
+        role: session.user.role ?? "user",
+        serviceAccount: isServiceAccountEmail(email),
+      };
     },
   });
 }
