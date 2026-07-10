@@ -4257,6 +4257,17 @@ impl MetadataStore for PostgresStore {
         manifest_digest: Option<&str>,
         image_config: &engram_core::types::image::ImageConfig,
     ) -> Result<EnableJob, MetaError> {
+        self.create_or_get_enable_job_with_options(image_uri, manifest_digest, image_config, false)
+            .await
+    }
+
+    async fn create_or_get_enable_job_with_options(
+        &self,
+        image_uri: &str,
+        manifest_digest: Option<&str>,
+        image_config: &engram_core::types::image::ImageConfig,
+        force_recapture: bool,
+    ) -> Result<EnableJob, MetaError> {
         // INSERT guarded by the partial unique index (one non-terminal
         // job per image_uri); on conflict fall through to SELECTing
         // the in-flight job. Re-POST = resume, never duplicate work.
@@ -4265,17 +4276,19 @@ impl MetadataStore for PostgresStore {
         // stored) and stamps it onto the enabled_images row at ready.
         let inserted = sqlx::query(
             r#"
-            INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config,
+                                     force_recapture)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
             DO NOTHING
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(Uuid::new_v4())
         .bind(image_uri)
         .bind(manifest_digest)
         .bind(sqlx::types::Json(image_config))
+        .bind(force_recapture)
         // ADR 0084 (c): the capture placement reservation lives on
         // `capture_jobs` now — its budgets are stamped there at
         // `insert_capture_job` time (from the same `ImageConfig`
@@ -4288,7 +4301,7 @@ impl MetadataStore for PostgresStore {
         }
         let existing = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              WHERE image_uri = $1 AND state NOT IN ('ready', 'failed')
             "#,
@@ -4304,17 +4317,19 @@ impl MetadataStore for PostgresStore {
             None => {
                 let row = sqlx::query(
                     r#"
-                    INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config)
-                    VALUES ($1, $2, $3, $4)
+                    INSERT INTO enable_jobs (id, image_uri, manifest_digest, image_config,
+                                             force_recapture)
+                    VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
                     DO NOTHING
-                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
                     "#,
                 )
                 .bind(Uuid::new_v4())
                 .bind(image_uri)
                 .bind(manifest_digest)
                 .bind(sqlx::types::Json(image_config))
+                .bind(force_recapture)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(db_err)?
@@ -4330,7 +4345,7 @@ impl MetadataStore for PostgresStore {
 
     async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
         let row = sqlx::query(
-            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
+            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -4342,7 +4357,7 @@ impl MetadataStore for PostgresStore {
     async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              ORDER BY created_at DESC
              LIMIT $1
@@ -4382,7 +4397,7 @@ impl MetadataStore for PostgresStore {
                     LIMIT $3
                       FOR UPDATE SKIP LOCKED
              )
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(claimant)
@@ -4590,7 +4605,7 @@ impl MetadataStore for PostgresStore {
                    -- read as live until the retry's first chunk event.
                    chunks_done = 0, chunks_total = NULL
              WHERE id = $1 AND state = 'failed'
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(id)

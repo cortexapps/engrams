@@ -108,6 +108,7 @@ pub(crate) async fn enqueue_enable_job(
     state: &SharedState,
     image_uri: &str,
     config: &ImageConfig,
+    force_recapture: bool,
 ) -> Result<engram_core::types::EnableJob, ApiError> {
     config
         .validate()
@@ -116,7 +117,7 @@ pub(crate) async fn enqueue_enable_job(
     let job = state
         .services
         .meta
-        .create_or_get_enable_job(image_uri, None, config)
+        .create_or_get_enable_job_with_options(image_uri, None, config, force_recapture)
         .await?;
     if &job.image_config != config {
         return Err(ApiError::Conflict(format!(
@@ -127,7 +128,20 @@ pub(crate) async fn enqueue_enable_job(
             job.state.as_str(),
         )));
     }
+    if job.force_recapture != force_recapture {
+        return Err(ApiError::Conflict(format!(
+            "an enable job for `{image_uri}` is already in flight (id {}, state {}) with a \
+             different recapture setting; wait for it to finish (or retry it to terminal), \
+             then re-send this request",
+            job.id,
+            job.state.as_str(),
+        )));
+    }
     Ok(job)
+}
+
+fn base_snapshot_reuse_ok(config: &ImageConfig, force_recapture: bool) -> bool {
+    config.warm.is_none() && !force_recapture
 }
 
 /// ADR 0080 phase 3b: resolve the STATIC registry credential for
@@ -415,6 +429,11 @@ pub(crate) type ReuseHit = (
 pub(crate) async fn try_reuse_base_snapshot(
     state: &SharedState,
     row: &EnabledImage,
+    // `RefreshImage(force_recapture = true)`: the operator wants a fresh
+    // capture even if an equivalent artifact exists — disables both reuse
+    // fast paths below (the claim handler's `ColdBasePlan` honors the same
+    // flag, so a forced enable never short-circuits anywhere).
+    force_recapture: bool,
 ) -> Result<Option<ReuseHit>, ApiError> {
     // The effective config (RPC-supplied config merged over the
     // Dockerfile-derived defaults) is what the capture VM boots with —
@@ -431,8 +450,8 @@ pub(crate) async fn try_reuse_base_snapshot(
     // fresh capture from scratch either — `ensure_capture_job`/the claim
     // handler's `ColdBasePlan` reuses the COLD BASE (env-agnostic) and
     // always re-runs the hook fresh. This whole-artifact path stays
-    // warm-less-only.
-    let warm_less = config.warm.is_none();
+    // warm-less-only (and `force_recapture` disables it outright).
+    let reuse_ok = base_snapshot_reuse_ok(&config, force_recapture);
 
     // ADR 0036 P4 / ADR 0080: content-keyed reuse. A base snapshot is a
     // function of (rootfs bytes, capture-affecting resources) — the
@@ -448,7 +467,7 @@ pub(crate) async fn try_reuse_base_snapshot(
     // makes a no-op re-bake's enable near-instant — and hosts already
     // hold the reused snapshot's chunks on NVMe, so no fleet-wide
     // re-prefetch either.
-    if let Some(disk_ref) = row.disk_manifest.filter(|_| warm_less) {
+    if let Some(disk_ref) = row.disk_manifest.filter(|_| reuse_ok) {
         if let Some(existing) = state
             .services
             .meta
@@ -509,7 +528,7 @@ pub(crate) async fn try_reuse_base_snapshot(
         .get_enabled_image(&row.image_uri)
         .await?
     {
-        if warm_less && existing.manifest_digest == row.manifest_digest {
+        if reuse_ok && existing.manifest_digest == row.manifest_digest {
             if let Some(id) = existing.base_snapshot_id {
                 let disk_manifest = existing.base_snapshot_disk_manifest.ok_or_else(|| {
                     ApiError::Internal(format!(
@@ -675,6 +694,38 @@ pub(crate) async fn resolve_cold_base_plan(
         Some(fc_version),
         backend_kind,
     );
+
+    // `RefreshImage(force_recapture = true)`: an operator forcing a fresh
+    // capture must not get the old cold base restored back at them —
+    // that's the exact artifact they're trying to flush (e.g. after a
+    // capture-affecting change the content key can't see). Resolve as a
+    // Miss so the executor cold-boots from scratch AND records the fresh
+    // result under this content_key. `NoCandidate` rather than a new
+    // variant: `ColdBaseMissReason` is telemetry-only, and it rides the
+    // claim response JSON to the host — a variant an old host-agent can't
+    // deserialize would break claims during a coord-first roll.
+    let forced = match state.services.meta.get_enable_job(row.enable_job_id).await {
+        Ok(job) => job.map(|j| j.force_recapture).unwrap_or(false),
+        Err(e) => {
+            tracing::warn!(
+                %host_id, capture_job_id = %row.id, error = %e,
+                "resolve_cold_base_plan: enable-job lookup for force_recapture failed; \
+                 assuming not forced",
+            );
+            false
+        }
+    };
+    if forced {
+        tracing::info!(
+            %host_id, capture_job_id = %row.id, %content_key,
+            "resolve_cold_base_plan: force_recapture set on the enable job; \
+             skipping cold-base reuse",
+        );
+        return ColdBasePlan::Miss {
+            content_key,
+            reason: ColdBaseMissReason::NoCandidate,
+        };
+    }
 
     let candidate = match state.services.meta.get_cold_base(&content_key).await {
         Ok(c) => c,
@@ -1087,6 +1138,28 @@ mod tests {
     use engram_core::traits::BlobStorage;
     use engram_storage_local::LocalBlobStorage;
     use std::sync::Arc;
+
+    #[test]
+    fn force_recapture_disables_base_snapshot_reuse() {
+        let plain: ImageConfig =
+            toml::from_str("name = \"plain\"\n[resources]\nsuggested_vcpus = 2\n").unwrap();
+        assert!(base_snapshot_reuse_ok(&plain, false));
+        assert!(!base_snapshot_reuse_ok(&plain, true));
+
+        let warm: ImageConfig = toml::from_str(
+            r#"
+            name = "warm"
+
+            [resources]
+            suggested_vcpus = 2
+
+            [warm]
+            command = ["true"]
+            "#,
+        )
+        .unwrap();
+        assert!(!base_snapshot_reuse_ok(&warm, false));
+    }
 
     /// Self-heal verify: a reuse candidate whose manifest chunks are all
     /// present in BlobStorage is reusable; a missing chunk (the reaped-base

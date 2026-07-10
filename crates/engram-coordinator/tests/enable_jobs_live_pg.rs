@@ -100,6 +100,39 @@ async fn create_or_get_dedups_active_jobs_per_uri() {
 
 #[tokio::test]
 #[ignore]
+async fn create_or_get_enable_job_persists_force_recapture() {
+    let Some(meta) = connect().await else { return };
+    let uri = unique_uri("force-recapture");
+
+    let created = meta
+        .create_or_get_enable_job_with_options(&uri, None, &test_config(), true)
+        .await
+        .expect("create force-recapture job");
+    assert!(
+        created.force_recapture,
+        "new job must persist the force_recapture option"
+    );
+
+    let fetched = meta
+        .get_enable_job(created.id)
+        .await
+        .expect("get")
+        .expect("job exists");
+    assert!(fetched.force_recapture, "get must round-trip the flag");
+
+    let claimed = meta
+        .claim_enable_jobs("pod-force", 300, 50)
+        .await
+        .expect("claim");
+    let claimed = claimed
+        .into_iter()
+        .find(|j| j.id == created.id)
+        .expect("force-recapture job should be claimed");
+    assert!(claimed.force_recapture, "claim must round-trip the flag");
+}
+
+#[tokio::test]
+#[ignore]
 async fn claim_is_exclusive_until_lease_expires() {
     let Some(meta) = connect().await else { return };
     let uri = unique_uri("claim");

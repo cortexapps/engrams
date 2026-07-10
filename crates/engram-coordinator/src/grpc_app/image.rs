@@ -21,12 +21,13 @@ fn enqueue(
     state: &SharedState,
     image_uri: &str,
     config: &engram_core::types::image::ImageConfig,
+    force_recapture: bool,
 ) -> impl std::future::Future<Output = Result<engram_core::types::EnableJob, Status>> {
     let state = state.clone();
     let image_uri = image_uri.to_string();
     let config = config.clone();
     async move {
-        crate::api::enabled_images::enqueue_enable_job(&state, &image_uri, &config)
+        crate::api::enabled_images::enqueue_enable_job(&state, &image_uri, &config, force_recapture)
             .await
             .map_err(into_status)
     }
@@ -91,7 +92,7 @@ impl app::image_service_server::ImageService for AppImageService {
         config
             .validate()
             .map_err(|e| Status::invalid_argument(format!("image config: {e}")))?;
-        let job = enqueue(&self.state, &image_uri, &config).await?;
+        let job = enqueue(&self.state, &image_uri, &config, false).await?;
         Ok(Response::new(app::EnableImageResponse {
             job: Some(convert::enable_job_to_proto(&job)),
         }))
@@ -157,7 +158,7 @@ impl app::image_service_server::ImageService for AppImageService {
                 recapture_fields.join(" and "),
             )));
         }
-        let job = enqueue(&self.state, &image_uri, &config).await?;
+        let job = enqueue(&self.state, &image_uri, &config, false).await?;
         Ok(Response::new(app::UpdateImageResponse {
             job: Some(convert::enable_job_to_proto(&job)),
         }))
@@ -217,7 +218,8 @@ impl app::image_service_server::ImageService for AppImageService {
         req: Request<app::RefreshImageRequest>,
     ) -> Result<Response<app::RefreshImageResponse>, Status> {
         self.auth.check(&req)?;
-        let image_uri = req.into_inner().image_uri;
+        let req = req.into_inner();
+        let image_uri = req.image_uri;
         if image_uri.trim().is_empty() {
             return Err(Status::invalid_argument("image_uri must not be empty"));
         }
@@ -236,7 +238,13 @@ impl app::image_service_server::ImageService for AppImageService {
         };
         // Refresh carries the existing config forward (no field to set on
         // the refresh request), so a re-pull of the same tag doesn't wipe it.
-        let job = enqueue(&self.state, &image_uri, &existing.image_config).await?;
+        let job = enqueue(
+            &self.state,
+            &image_uri,
+            &existing.image_config,
+            req.force_recapture,
+        )
+        .await?;
         Ok(Response::new(app::RefreshImageResponse {
             job: Some(convert::enable_job_to_proto(&job)),
         }))

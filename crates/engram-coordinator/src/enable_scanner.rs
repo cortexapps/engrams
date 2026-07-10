@@ -530,7 +530,7 @@ async fn advance_one(
     // it on every watch-only re-entry would be wasted PG/BlobStorage I/O
     // for an answer that can't change mid-capture.
     let reuse_hit = if existing_capture_job.is_none() {
-        crate::api::enabled_images::try_reuse_base_snapshot(state, &row)
+        crate::api::enabled_images::try_reuse_base_snapshot(state, &row, job.force_recapture)
             .await
             .map_err(classify_capture_error)?
     } else {

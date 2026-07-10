@@ -306,6 +306,23 @@ enum ImageCmd {
     Refresh {
         #[arg(long)]
         uri: String,
+        /// Force a new base-snapshot capture instead of reusing an existing
+        /// content-identical snapshot.
+        #[arg(long)]
+        recapture: bool,
+    },
+    /// List recent image enable / refresh jobs.
+    Jobs,
+    /// Print one image enable / refresh job.
+    Job { id: String },
+    /// Poll one image enable / refresh job until it reaches ready/failed.
+    PollJob { id: String },
+    /// Re-queue a failed image enable / refresh job.
+    RetryJob {
+        id: String,
+        /// Don't poll the retried job to completion.
+        #[arg(long)]
+        no_wait: bool,
     },
 }
 
@@ -502,7 +519,15 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
                 no_wait,
             } => image_update(&mut c, uri, config, *allow_recapture, cli.json, *no_wait).await,
             ImageCmd::Disable { uri } => image_disable(&mut c, uri).await,
-            ImageCmd::Refresh { uri } => image_refresh(&mut c, uri, cli.json).await,
+            ImageCmd::Refresh { uri, recapture } => {
+                image_refresh(&mut c, uri, *recapture, cli.json).await
+            }
+            ImageCmd::Jobs => image_jobs(&mut c, cli.json).await,
+            ImageCmd::Job { id } => image_job(&mut c, id, cli.json).await,
+            ImageCmd::PollJob { id } => poll_enable_job(&mut c, id, cli.json).await,
+            ImageCmd::RetryJob { id, no_wait } => {
+                image_retry_job(&mut c, id, cli.json, *no_wait).await
+            }
         },
         Cmd::Host { cmd } => match cmd {
             HostCmd::List => host_list(&mut c, cli.json).await,
@@ -1332,8 +1357,8 @@ async fn image_enable(
             );
         } else {
             println!(
-                "enable job {} accepted; poll with `engram image ...` or GetEnableJob",
-                job.id
+                "enable job {} accepted; poll with `engram image poll-job {}`",
+                job.id, job.id
             );
         }
         return Ok(());
@@ -1400,6 +1425,10 @@ fn enable_job_to_json(job: &app::EnableJob) -> Value {
         "error": job.error,
         "created_at": job.created_at,
         "updated_at": job.updated_at,
+        "capture_phase": job.capture_phase,
+        "warm_stage": job.warm_stage,
+        "warm_stage_started_at": job.warm_stage_started_at,
+        "output_tail": job.output_tail,
         // ADR 0036 amendment (issue #538): per-host prestage outcome map.
         // Wire-encoded as a JSON string; parse it back to a nested object
         // for `--json` output rather than double-encoding. Malformed
@@ -1408,6 +1437,152 @@ fn enable_job_to_json(job: &app::EnableJob) -> Value {
         "prestage_hosts": serde_json::from_str::<Value>(&job.prestage_hosts)
             .unwrap_or_else(|_| serde_json::json!({})),
     })
+}
+
+fn enable_job_progress(job: &app::EnableJob) -> String {
+    if let Some(total) = job.chunks_total {
+        if total > 0 {
+            return format!("{}/{total} chunks", job.chunks_done);
+        }
+    }
+    [job.capture_phase.as_deref(), job.warm_stage.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+fn print_enable_job(job: &app::EnableJob) {
+    println!("id              : {}", job.id);
+    println!("state           : {}", job.state);
+    println!("image_uri       : {}", job.image_uri);
+    if let Some(digest) = &job.manifest_digest {
+        println!("manifest_digest : {digest}");
+    }
+    let progress = enable_job_progress(job);
+    if !progress.is_empty() {
+        println!("progress        : {progress}");
+    }
+    println!("attempts        : {}", job.attempts);
+    if let Some(err) = &job.error {
+        println!("error           : {err}");
+    }
+    if let Some(phase) = &job.capture_phase {
+        println!("capture_phase   : {phase}");
+    }
+    if let Some(stage) = &job.warm_stage {
+        println!("warm_stage      : {stage}");
+    }
+    if let Some(started_at) = &job.warm_stage_started_at {
+        println!("warm_started_at : {started_at}");
+    }
+    println!("created_at      : {}", job.created_at);
+    println!("updated_at      : {}", job.updated_at);
+    if job.prestage_hosts != "{}" && !job.prestage_hosts.is_empty() {
+        println!("prestage_hosts  : {}", job.prestage_hosts);
+    }
+    if let Some(output_tail) = &job.output_tail {
+        if !output_tail.is_empty() {
+            println!();
+            println!("output_tail:");
+            println!("{output_tail}");
+        }
+    }
+}
+
+async fn image_jobs(c: &mut Clients, json: bool) -> Result<(), CliError> {
+    let resp = c
+        .image
+        .list_enable_jobs(app::ListEnableJobsRequest {})
+        .await?
+        .into_inner();
+    if json {
+        let jobs: Vec<Value> = resp.jobs.iter().map(enable_job_to_json).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "jobs": jobs }))?
+        );
+        return Ok(());
+    }
+    if resp.jobs.is_empty() {
+        println!("(no recent enable jobs)");
+        return Ok(());
+    }
+    println!(
+        "{:<36}  {:<13}  {:<8}  {:<22}  URI",
+        "ID", "STATE", "ATTEMPTS", "DETAIL"
+    );
+    for job in &resp.jobs {
+        let detail = if job.state == "failed" {
+            job.error.as_deref().unwrap_or("failed").to_string()
+        } else {
+            enable_job_progress(job)
+        };
+        println!(
+            "{:<36}  {:<13}  {:<8}  {:<22}  {}",
+            job.id,
+            job.state,
+            job.attempts,
+            truncate(&detail, 22),
+            truncate(&job.image_uri, 64),
+        );
+    }
+    Ok(())
+}
+
+async fn image_job(c: &mut Clients, id: &str, json: bool) -> Result<(), CliError> {
+    let resp = c
+        .image
+        .get_enable_job(app::GetEnableJobRequest {
+            job_id: id.to_string(),
+        })
+        .await?
+        .into_inner();
+    let job = resp
+        .job
+        .ok_or_else(|| CliError::Other("get-enable-job response carried no job".into()))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&enable_job_to_json(&job))?
+        );
+    } else {
+        print_enable_job(&job);
+    }
+    Ok(())
+}
+
+async fn image_retry_job(
+    c: &mut Clients,
+    id: &str,
+    json: bool,
+    no_wait: bool,
+) -> Result<(), CliError> {
+    let resp = c
+        .image
+        .retry_enable_job(app::RetryEnableJobRequest {
+            job_id: id.to_string(),
+        })
+        .await?
+        .into_inner();
+    let job = resp
+        .job
+        .ok_or_else(|| CliError::Other("retry-enable-job response carried no job".into()))?;
+    if no_wait {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&enable_job_to_json(&job))?
+            );
+        } else {
+            println!(
+                "enable job {} requeued; poll with `engram image poll-job {}`",
+                job.id, job.id
+            );
+        }
+        return Ok(());
+    }
+    poll_enable_job(c, &job.id, json).await
 }
 
 /// Poll an enable job until `ready`/`failed`, rendering progress.
@@ -1450,7 +1625,7 @@ async fn poll_enable_job(c: &mut Clients, job_id: &str, json: bool) -> Result<()
                 let err = job.error.as_deref().unwrap_or("unknown error");
                 return Err(CliError::Other(format!(
                     "enable job {job_id} failed: {err} \
-                     (retry via ImageService.RetryEnableJob)"
+                     (retry with `engram image retry-job {job_id}` after fixing the cause)"
                 )));
             }
             state => {
@@ -1476,11 +1651,17 @@ async fn image_disable(c: &mut Clients, uri: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn image_refresh(c: &mut Clients, uri: &str, json: bool) -> Result<(), CliError> {
+async fn image_refresh(
+    c: &mut Clients,
+    uri: &str,
+    recapture: bool,
+    json: bool,
+) -> Result<(), CliError> {
     let resp = c
         .image
         .refresh_image(app::RefreshImageRequest {
             image_uri: uri.to_string(),
+            force_recapture: recapture,
         })
         .await?
         .into_inner();

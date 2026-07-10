@@ -712,6 +712,8 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         // surfaced on the job's API response — the operator sees it on
         // EnabledImageSummary.config.
         image_config: _,
+        // Internal scanner hint; the RPC response does not need it today.
+        force_recapture: _,
         prestage_hosts,
         capture_phase,
         warm_stage,

@@ -1774,6 +1774,21 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// Same as [`Self::create_or_get_enable_job`], with the async job marked
+    /// to bypass base-snapshot reuse and force a fresh capture. Stores that
+    /// have not added the column fall back to the normal enqueue path.
+    async fn create_or_get_enable_job_with_options(
+        &self,
+        image_uri: &str,
+        manifest_digest: Option<&str>,
+        image_config: &crate::types::image::ImageConfig,
+        force_recapture: bool,
+    ) -> Result<EnableJob, MetaError> {
+        let _ = force_recapture;
+        self.create_or_get_enable_job(image_uri, manifest_digest, image_config)
+            .await
+    }
+
     async fn get_enable_job(&self, id: uuid::Uuid) -> Result<Option<EnableJob>, MetaError> {
         let _ = id;
         Err(MetaError::Migration(
