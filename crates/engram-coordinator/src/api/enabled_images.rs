@@ -198,13 +198,18 @@ pub(crate) async fn materialize_image_on_host(
     image_uri: &str,
     progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
 ) -> Result<engram_core::types::MaterializedImage, ApiError> {
+    // ADR 0084 / ADR 0081: materialize boots no VM — it just pulls +
+    // flattens + packs + chunks the rootfs — so it carries no capture
+    // footprint, RAM reservation, or anti-affinity. `pick_materialize_host`
+    // is the ADR 0078 disk-floor-only picker; the CAPTURE stage uses the
+    // reserving `place_capture_job` path instead.
     let (host_id, host) =
         crate::placement::pick_materialize_host(state.services.meta.as_ref(), &state.host_registry)
             .await
             .map_err(|e| {
                 ApiError::Unavailable(format!(
                     "no host is available to materialize this image ({e:?}). \
-             Register a disk-healthy host and retry the enable."
+                     Register a disk-healthy host and retry the enable."
                 ))
             })?;
     let registry_auth = resolve_static_registry_auth(state, image_uri).await?;
@@ -290,7 +295,7 @@ pub(crate) fn new_enable_row(image_uri: &str, config: &ImageConfig) -> EnabledIm
 /// every chunk (short-circuiting on the first miss); any miss — or any error
 /// reading a manifest/probe — is treated as "not reusable" so we fail safe
 /// toward a correct fresh capture.
-async fn reuse_candidate_chunks_present(
+pub(crate) async fn reuse_candidate_chunks_present(
     chunk_store: &engram_chunk_store::ChunkStore,
     blob: std::sync::Arc<dyn engram_core::traits::BlobStorage>,
     disk_manifest: engram_core::types::manifest::ManifestRef,
@@ -342,47 +347,75 @@ async fn reuse_candidate_chunks_present(
     true
 }
 
-/// ADR 0020 P1: capture (or reuse) the per-image base snapshot, record
-/// its `snapshots` row, and return the snapshot id. The caller stamps it
-/// onto the enabled_images row's NOT NULL `base_snapshot_id` and upserts
-/// only after this succeeds — so a capture failure aborts the whole
-/// enable and leaves zero rows (the FK makes "enabled iff base snapshot"
-/// a schema invariant).
+/// ADR 0084 §B4: whole-artifact reuse gains the FC-version dimension —
+/// a memory-manifest-bearing candidate with NO recorded
+/// `fc_snapshot_version` can never be placement-gated at restore time
+/// (`CapabilityRequirements::fc_snapshot_version: None` is the SOFT
+/// "unconstrained" posture, ADR 0068), so silently reusing one would
+/// let a fresh session restore that snapshot on ANY host regardless of
+/// its actual FC `SNAPSHOT_VERSION` — re-arming the issue-#160
+/// cross-version corruption class this whole ADR exists to keep
+/// closed. `enabled_images` has no denormalized
+/// `base_snapshot_fc_snapshot_version` column (unlike disk/memory
+/// manifest) to check cheaply, so this reads the `snapshots` row
+/// directly. Disk-only candidates (`memory_manifest: None`, e.g. VZ)
+/// have no FC/UFFD restore risk at all — always `true`. A metadata
+/// hiccup fails safe toward recapture (`false`), matching the sibling
+/// chunk-presence self-heal's posture.
+async fn candidate_fc_version_known(
+    state: &SharedState,
+    snapshot_id: engram_core::types::SnapshotId,
+    memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+) -> bool {
+    if memory_manifest.is_none() {
+        return true;
+    }
+    match state.services.meta.get_snapshot(snapshot_id).await {
+        Ok(Some(record)) => record.fc_snapshot_version.is_some(),
+        Ok(None) => {
+            tracing::warn!(
+                %snapshot_id,
+                "reuse verify: candidate's snapshots row is gone; treating as not reusable",
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                %snapshot_id, error = %e,
+                "reuse verify: fc_snapshot_version lookup failed; treating as not reusable",
+            );
+            false
+        }
+    }
+}
+
+/// ADR 0084 P1b: whether [`try_reuse_base_snapshot`] found (and verified)
+/// an existing base snapshot equivalent to what a fresh capture would
+/// produce — the content/digest reuse fast paths lifted verbatim out of
+/// the old `capture_and_record_base_snapshot` (no host RPC, no
+/// `capture_jobs` row; cheap PG-only checks the scanner runs on every
+/// tick before it ever asks a host to do anything).
+pub(crate) type ReuseHit = (
+    engram_core::types::SnapshotId,
+    // Disk manifest of the base snapshot (always present).
+    engram_core::types::manifest::ManifestRef,
+    // Memory manifest — `None` for cold-boot backends (VZ) that capture a
+    // disk-only base snapshot; `Some` for FC's chunked memory snapshot.
+    Option<engram_core::types::manifest::ManifestRef>,
+);
+
+/// ADR 0020 P1 / ADR 0084 P1b: reuse fast path — if the image is already
+/// enabled at equivalent content (or, legacy, the same OCI digest) with a
+/// base snapshot whose chunks are still durable, return it instead of
+/// ever creating a `capture_jobs` row. `Ok(None)` means a fresh capture
+/// is required (`ensure_capture_job` is the caller's next step).
 ///
-/// Idempotent: if the image is already enabled at the same content
-/// digest with a base snapshot, reuse it — no re-boot.
-///
-/// The capture runs on a prod host (so it inherits the host CPU's
-/// CPUID baseline; pair with `ENGRAM_FC_CPU_TEMPLATE=T2CL` for fleet
-/// portability — ADR 0020). The host attaches its local stub harness,
-/// boots to agentd-ready, snapshots (chunked memory + uploaded
-/// state/sidecar), and tears the capture VM down.
-pub(crate) async fn capture_and_record_base_snapshot(
+/// Idempotent, side-effect-free (besides logging): safe to call on every
+/// scanner tick without contributing to the job's attempts budget.
+pub(crate) async fn try_reuse_base_snapshot(
     state: &SharedState,
     row: &EnabledImage,
-    // ADR 0081: the enable job whose capture this is — carries the
-    // placement budgets and the id the host reservation is stamped
-    // onto — plus the scanner's claimant (every reservation write is
-    // lease-fenced) and how long to wait for capacity before failing
-    // (the session queue timeout).
-    job: &engram_core::types::EnableJob,
-    claimant: &str,
-    capacity_wait: std::time::Duration,
-    // Issue #539: live `CaptureProgress` events for the whole call.
-    // Unused (no events sent) on the content/digest-reuse fast paths
-    // below — no host RPC is made there, so there's nothing to report.
-    progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
-) -> Result<
-    (
-        engram_core::types::SnapshotId,
-        // Disk manifest of the base snapshot (always present).
-        engram_core::types::manifest::ManifestRef,
-        // Memory manifest — `None` for cold-boot backends (VZ) that capture a
-        // disk-only base snapshot; `Some` for FC's chunked memory snapshot.
-        Option<engram_core::types::manifest::ManifestRef>,
-    ),
-    ApiError,
-> {
+) -> Result<Option<ReuseHit>, ApiError> {
     // The effective config (RPC-supplied config merged over the
     // Dockerfile-derived defaults) is what the capture VM boots with —
     // the warm hook needs the image's env (JAVA_HOME, PATH, …).
@@ -394,8 +427,12 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // content/digest reuse is unsound for warm images — always re-capture.
     // (This is also what makes a warm-secret rotate actually take effect:
     // a re-enable with the same digest must not short-circuit to the stale
-    // snapshot.)
-    let reuse_ok = config.warm.is_none();
+    // snapshot.) ADR 0084 §B4: warm images no longer fall through to a
+    // fresh capture from scratch either — `ensure_capture_job`/the claim
+    // handler's `ColdBasePlan` reuses the COLD BASE (env-agnostic) and
+    // always re-runs the hook fresh. This whole-artifact path stays
+    // warm-less-only.
+    let warm_less = config.warm.is_none();
 
     // ADR 0036 P4 / ADR 0080: content-keyed reuse. A base snapshot is a
     // function of (rootfs bytes, capture-affecting resources) — the
@@ -411,7 +448,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // makes a no-op re-bake's enable near-instant — and hosts already
     // hold the reused snapshot's chunks on NVMe, so no fleet-wide
     // re-prefetch either.
-    if let Some(disk_ref) = row.disk_manifest.filter(|_| reuse_ok) {
+    if let Some(disk_ref) = row.disk_manifest.filter(|_| warm_less) {
         if let Some(existing) = state
             .services
             .meta
@@ -441,6 +478,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
                     memory_manifest,
                 )
                 .await
+                    && candidate_fc_version_known(state, id, memory_manifest).await
                 {
                     tracing::info!(
                         image_uri = %row.image_uri,
@@ -449,14 +487,14 @@ pub(crate) async fn capture_and_record_base_snapshot(
                         snapshot_id = %id,
                         "content-identical image already captured; reusing base snapshot",
                     );
-                    return Ok((id, disk_manifest, memory_manifest));
+                    return Ok(Some((id, disk_manifest, memory_manifest)));
                 }
                 tracing::warn!(
                     image_uri = %row.image_uri,
                     reused_from = %existing.image_uri,
                     snapshot_id = %id,
-                    "content-identical base snapshot is missing chunks in BlobStorage; \
-                     re-capturing instead of reusing (self-heal)",
+                    "content-identical base snapshot is missing chunks or has no recorded \
+                     fc_snapshot_version; re-capturing instead of reusing (self-heal)",
                 );
             }
         }
@@ -471,7 +509,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
         .get_enabled_image(&row.image_uri)
         .await?
     {
-        if reuse_ok && existing.manifest_digest == row.manifest_digest {
+        if warm_less && existing.manifest_digest == row.manifest_digest {
             if let Some(id) = existing.base_snapshot_id {
                 let disk_manifest = existing.base_snapshot_disk_manifest.ok_or_else(|| {
                     ApiError::Internal(format!(
@@ -493,6 +531,7 @@ pub(crate) async fn capture_and_record_base_snapshot(
                     memory_manifest,
                 )
                 .await
+                    && candidate_fc_version_known(state, id, memory_manifest).await
                 {
                     tracing::info!(
                         image_uri = %row.image_uri,
@@ -500,246 +539,334 @@ pub(crate) async fn capture_and_record_base_snapshot(
                         snapshot_id = %id,
                         "base snapshot already recorded for this digest; reusing",
                     );
-                    return Ok((id, disk_manifest, memory_manifest));
+                    return Ok(Some((id, disk_manifest, memory_manifest)));
                 }
                 tracing::warn!(
                     image_uri = %row.image_uri,
                     digest = %row.manifest_digest,
                     snapshot_id = %id,
-                    "recorded base snapshot for this digest is missing chunks in BlobStorage; \
-                     re-capturing instead of reusing (self-heal)",
+                    "recorded base snapshot for this digest is missing chunks or has no \
+                     recorded fc_snapshot_version; re-capturing instead of reusing (self-heal)",
                 );
             }
         }
     }
 
-    // Anonymous capture spec — no session env, no harness pack (the
-    // host substitutes its stub harness so the snapshot carries a
-    // harness drive slot for per-session swap at restore). ADR 0027
-    // bundles + ADR 0027 memory floor live inside the shared helper;
-    // capture + restore MUST agree on `mem_size_mib` (FC requires it),
-    // and ADR 0028's disk-only recovery boots the same shape.
-    //
-    // Issue #192: pin the capture's image reference to the digest we
-    // just resolved, NOT `row.image_uri`'s (possibly mutable) tag. The
-    // host's local OCI cache is keyed on this URI string; a moving tag
-    // (`:latest`) lets a tag-keyed cache hit serve a previous bake's
-    // rootfs even though the coord materialized fresh chunks — so the
-    // recorded `manifest_digest` and the captured base-snapshot bytes
-    // disagree, and the fleet silently keeps booting the old guest. A
-    // digest-pinned reference is content-addressed and immutable, so the
-    // host pulls (and caches) exactly the resolved bake.
-    let capture_uri = engram_oci::digest_pinned_uri(
-        &row.image_uri,
-        &engram_oci::Digest256(row.manifest_digest.clone()),
-    );
-    // ADR 0057: base-snapshot capture is a trusted, ephemeral build step (it may
-    // run a `[warm]` hook that needs egress), and the captured snapshot is
-    // network-agnostic — every session that later restores it gets its own
-    // policy network. So capture boots with allow-all egress.
-    let capture_network = engram_core::types::image::NetworkPolicy {
-        default: engram_core::types::image::NetworkDefault::Allow,
-        allow_hosts: Vec::new(),
-        allow_host_patterns: Vec::new(),
-    };
-    // ADR 0080 phase 3b: the capture VM boots from the freshly
-    // MATERIALIZED chunked ext4 (`row.disk_manifest`, stamped by the
-    // `materializing` stage) — the explicit rootfs-manifest override,
-    // the same shape as ADR 0028's disk-only recovery. There is no
-    // engram OCI artifact for the host to pull anymore; `capture_uri`
-    // stays digest-pinned purely as record-keeping (`spec.image`).
-    let spec = crate::api::sessions::cold_boot_spec(
-        &capture_uri,
-        &config,
-        row.disk_manifest,
-        capture_network,
-    );
+    Ok(None)
+}
 
-    // ADR 0081: the capture VM is a session-sized tenant — reserve its
-    // host through the SAME atomic 2D fit sessions place with, so a
-    // capture can never land RAM it doesn't have (the n05d node-OOM
-    // incident: a 24 GiB capture VM next to a 24 GiB session on a
-    // 64 GiB node). No fit right now is NOT a failure: the waiting job
-    // counts as queued demand (`queued_demand`), the K4 autoscaler
-    // grows the pool toward it, and we re-try the reserve until it
-    // lands or the queue timeout expires — the same posture a queued
-    // session gets. The budgets ride the job row (stamped at creation);
-    // the config fallback covers jobs enqueued before migration 0095,
-    // whose columns default to 0 (which would reserve nothing —
-    // exactly the incident class this exists to close).
-    let mem_budget_mib = if job.mem_budget_mib > 0 {
-        job.mem_budget_mib
-    } else {
-        config.resolved_memory_mib() as i64
-    };
-    let cpu_budget_vcpus = if job.cpu_budget_vcpus > 0 {
-        job.cpu_budget_vcpus as i64
-    } else {
-        config.resolved_vcpus() as i64
-    };
-    const CAPACITY_POLL: std::time::Duration = std::time::Duration::from_secs(5);
-    // ADR 0081 (fix): the wait deadline is anchored to the DB-persisted
-    // `capture_waiting_since` (the first miss), NOT a `tokio::Instant`
-    // computed at call entry. A wall-clock deadline resets on every pod
-    // restart / lease re-claim, so under coordinator churn the 30-min
-    // backstop would never fire and a genuinely-stuck capture would spin
-    // forever. `reserve_capture_host` returns the COALESCE-stamped anchor
-    // in its `Waiting` arm; we compare against it the same way the queue
-    // scanner times out a session (chrono `signed_duration_since` on the
-    // PG timestamp — modest clock skew is acceptable).
-    let capacity_wait_secs = capacity_wait.as_secs() as i64;
-    let host_id = loop {
-        let candidates = crate::placement::capture_candidates(state.services.meta.as_ref())
-            .await
-            .map_err(|e| ApiError::Internal(format!("list capture candidates: {e:?}")))?;
-        let reservation = state
-            .services
-            .meta
-            .reserve_capture_host(
-                job.id,
-                claimant,
-                &candidates,
-                mem_budget_mib,
-                cpu_budget_vcpus,
-            )
-            .await?;
-        match reservation {
-            engram_core::traits::CaptureReservation::Reserved(h) => break h,
-            engram_core::traits::CaptureReservation::Waiting { since } => {
-                let waited_secs = chrono::Utc::now()
-                    .signed_duration_since(since)
-                    .num_seconds()
-                    .max(0);
-                if waited_secs >= capacity_wait_secs {
-                    return Err(ApiError::CaptureFailed {
-                        kind: engram_core::types::CaptureFailureKind::CapacityTimeout,
-                        message: format!(
-                            "no host fit the capture VM for `{}` ({mem_budget_mib} MiB / \
-                             {cpu_budget_vcpus} vCPUs) within {waited_secs}s (limit {}s, \
-                             measured from the first miss) — the fleet is at capacity and \
-                             the autoscaler didn't grow it (maxHosts? cloud quota?). Free \
-                             capacity (or raise the node-pool ceiling) and retry the job.",
-                            row.image_uri, capacity_wait_secs,
-                        ),
-                    });
-                }
-                tracing::info!(
-                    image_uri = %row.image_uri,
-                    mem_budget_mib,
-                    cpu_budget_vcpus,
-                    waited_secs,
-                    "capture waiting for capacity (counted as queued demand; \
-                     the autoscaler scales toward it)",
-                );
-                tokio::time::sleep(CAPACITY_POLL).await;
-            }
+/// ADR 0084 P1b: ensure a `capture_jobs` row exists for this enable job
+/// and return the MOST RECENT one (terminal or not) — the scanner's
+/// entire interaction with capture dispatch. Inserts a WAITING row then
+/// runs the reserving pick (`place_capture_job` over
+/// `capture_candidate_hosts`) only when no
+/// row exists yet for this enable job; an existing row (running,
+/// reassigned, or terminal) is returned as-is — the actual `SandboxSpec`/
+/// env/egress assembly is deferred to the CLAIM endpoint
+/// (`host_http::claim_capture_job`), which resolves secrets fresh at
+/// claim time rather than once at job-creation time (ADR 0084 §A).
+///
+/// ADR 0084 §C: the placement pick uses the honest
+/// [`crate::placement::CaptureFootprint`] inputs for a capture job —
+/// `mem_mib` from the image's declared/default resources,
+/// `image_size_mib` read off the ALREADY-materialized disk
+/// manifest's chunk-store `Manifest::total_bytes` (a metadata-only read,
+/// no chunk bytes fetched). Falls back to [`CaptureFootprint::floor_only`]
+/// (LOUDLY logged) if the manifest can't be read — a capture must never
+/// fail to even GET a placement pick over a sizing-metadata hiccup.
+pub(crate) async fn capture_footprint_for(
+    state: &SharedState,
+    disk_manifest: engram_core::types::manifest::ManifestRef,
+    config: &ImageConfig,
+) -> crate::placement::CaptureFootprint {
+    let mem_mib = config.resolved_memory_mib() as u64;
+    match state.services.chunk_store.get_manifest(disk_manifest).await {
+        Ok(manifest) => {
+            let image_size_mib = (manifest.total_bytes / (1024 * 1024)).max(1);
+            crate::placement::CaptureFootprint::for_capture(image_size_mib, mem_mib)
+        }
+        Err(e) => {
+            tracing::warn!(
+                manifest = %disk_manifest,
+                error = %e,
+                "capture footprint: could not read the disk manifest's total_bytes; \
+                 falling back to FLOOR-ONLY sizing (no footprint headroom veto) for this pick",
+            );
+            crate::placement::CaptureFootprint::floor_only()
+        }
+    }
+}
+
+/// Same as [`capture_footprint_for`] but reads its inputs off an
+/// existing `capture_jobs` row (the deadline-scan reassign pick and the
+/// scanner's retryable-failure reassign pick both already have one) —
+/// parses `row.disk_manifest` and merges `row.image_config` over
+/// `row.oci_defaults` the same way the claim handler does.
+pub(crate) async fn capture_footprint_for_job_row(
+    state: &SharedState,
+    row: &engram_core::types::capture_job::CaptureJobRow,
+) -> crate::placement::CaptureFootprint {
+    let config = row.image_config.merged_with(&row.oci_defaults);
+    match row
+        .disk_manifest
+        .parse::<engram_core::types::manifest::ManifestRef>()
+    {
+        Ok(disk_manifest) => capture_footprint_for(state, disk_manifest, &config).await,
+        Err(e) => {
+            tracing::warn!(
+                capture_job_id = %row.id,
+                disk_manifest = %row.disk_manifest,
+                error = %e,
+                "capture footprint: capture_jobs.disk_manifest failed to parse; \
+                 falling back to FLOOR-ONLY sizing for this reassign pick",
+            );
+            crate::placement::CaptureFootprint::floor_only()
+        }
+    }
+}
+
+/// ADR 0084 §B: the claim handler's cold-base decision for one attempt.
+/// Computed ENTIRELY coordinator-side: the claiming host's own `hosts`
+/// row already carries `capabilities.backend` + `capabilities.
+/// fc_snapshot_version`, and `row`/`config` already carry
+/// `disk_manifest`/`resources` — there is nothing here the executor
+/// could derive independently, which is exactly why [`ColdBasePlan`]
+/// is computed once, here, and only ever echoed back.
+///
+/// Fail-safe: any metadata hiccup (host lookup / `get_cold_base` /
+/// chunk-presence probe) degrades to [`ColdBasePlan::NotApplicable`]
+/// (or the coarsest `Miss` reason) rather than failing the claim — a
+/// missed reuse opportunity costs an extra cold boot, not a broken
+/// capture.
+pub(crate) async fn resolve_cold_base_plan(
+    state: &SharedState,
+    host_id: engram_core::HostId,
+    row: &engram_core::types::capture_job::CaptureJobRow,
+    config: &ImageConfig,
+) -> engram_core::types::capture_job::ColdBasePlan {
+    use engram_core::types::capture_job::{ColdBaseMissReason, ColdBasePlan};
+
+    let hosts = match state.services.meta.list_active_hosts().await {
+        Ok(hosts) => hosts,
+        Err(e) => {
+            tracing::warn!(
+                %host_id, capture_job_id = %row.id, error = %e,
+                "resolve_cold_base_plan: list_active_hosts failed; treating as NotApplicable",
+            );
+            return ColdBasePlan::NotApplicable;
         }
     };
-    let host = state
-        .host_registry
-        .backend_for(host_id)
-        .await
-        .map_err(|e| {
-            ApiError::Unavailable(format!(
-                "reserved capture host {host_id} is unreachable: {e}"
-            ))
-        })?;
+    let Some(host) = hosts.iter().find(|h| h.id == host_id) else {
+        return ColdBasePlan::NotApplicable;
+    };
+    let backend_kind = "firecracker";
+    let Some(fc_version) = (host.capabilities.backend == backend_kind)
+        .then_some(host.capabilities.fc_snapshot_version.as_deref())
+        .flatten()
+    else {
+        // Non-FC host, or an FC host that hasn't reported a
+        // `fc_snapshot_version` yet — no cold-base concept applies.
+        return ColdBasePlan::NotApplicable;
+    };
 
+    let content_key = engram_core::types::capture_job::cold_base_content_key(
+        &row.disk_manifest,
+        &config.resources,
+        Some(fc_version),
+        backend_kind,
+    );
+
+    let candidate = match state.services.meta.get_cold_base(&content_key).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                %host_id, capture_job_id = %row.id, %content_key, error = %e,
+                "resolve_cold_base_plan: get_cold_base failed; treating as a miss",
+            );
+            None
+        }
+    };
+    let Some(candidate) = candidate else {
+        let fc_version_changed = state
+            .services
+            .meta
+            .cold_base_fc_version_changed(&row.disk_manifest, fc_version)
+            .await
+            .unwrap_or(false);
+        let reason = if fc_version_changed {
+            ColdBaseMissReason::FcVersionChanged
+        } else {
+            ColdBaseMissReason::NoCandidate
+        };
+        return ColdBasePlan::Miss {
+            content_key,
+            reason,
+        };
+    };
+
+    // Verify chunk presence before ever handing this candidate to a
+    // host (the same self-heal `try_reuse_base_snapshot` applies to
+    // whole-artifact reuse).
+    let (Ok(disk_ref), mem_ref) = (
+        candidate
+            .disk_manifest
+            .parse::<engram_core::types::manifest::ManifestRef>(),
+        candidate
+            .memory_manifest
+            .parse::<engram_core::types::manifest::ManifestRef>()
+            .ok(),
+    ) else {
+        tracing::warn!(
+            %content_key, disk_manifest = %candidate.disk_manifest,
+            "resolve_cold_base_plan: cold_bases row has an unparseable manifest ref; \
+             treating as a miss",
+        );
+        return ColdBasePlan::Miss {
+            content_key,
+            reason: ColdBaseMissReason::ChunksMissing,
+        };
+    };
+    let present = reuse_candidate_chunks_present(
+        &state.services.chunk_store,
+        state.services.blob.clone(),
+        disk_ref,
+        mem_ref,
+    )
+    .await;
+    if !present {
+        tracing::warn!(
+            %content_key, snapshot_id = %candidate.snapshot_id,
+            "resolve_cold_base_plan: cold-base candidate is missing chunks in BlobStorage; \
+             recapturing instead of reusing (self-heal)",
+        );
+        return ColdBasePlan::Miss {
+            content_key,
+            reason: ColdBaseMissReason::ChunksMissing,
+        };
+    }
+
+    match bincode::deserialize::<engram_core::types::snapshot::SnapshotMetadata>(
+        &candidate.snapshot_bincode,
+    ) {
+        Ok(snapshot) => ColdBasePlan::Hit {
+            content_key,
+            snapshot: Box::new(snapshot),
+        },
+        Err(e) => {
+            tracing::warn!(
+                %content_key, snapshot_id = %candidate.snapshot_id, error = %e,
+                "resolve_cold_base_plan: cold_bases row's snapshot_bincode failed to decode; \
+                 treating as a miss",
+            );
+            ColdBasePlan::Miss {
+                content_key,
+                reason: ColdBaseMissReason::ChunksMissing,
+            }
+        }
+    }
+}
+
+pub(crate) async fn ensure_capture_job(
+    state: &SharedState,
+    row: &EnabledImage,
+    enable_job_id: Uuid,
+) -> Result<engram_core::types::capture_job::CaptureJobRow, ApiError> {
+    if let Some(existing) = state
+        .services
+        .meta
+        .latest_capture_job_for_enable(enable_job_id)
+        .await?
+    {
+        return Ok(existing);
+    }
+    let disk_manifest_ref = row.disk_manifest.ok_or_else(|| {
+        ApiError::Internal(format!(
+            "enable job for `{}` reached the capturing stage without a disk_manifest \
+             (the materializing stage should have stamped one)",
+            row.image_uri
+        ))
+    })?;
+    let disk_manifest = disk_manifest_ref.to_string();
+    let config = row.effective_config();
     tracing::info!(
         image_uri = %row.image_uri,
-        host_id = %host_id,
-        mem_budget_mib,
-        cpu_budget_vcpus,
-        "capturing base snapshot for image enable (host reserved, ADR 0081)",
+        %enable_job_id,
+        "creating capture job for image enable",
     );
-    // Resolve the capture-time env for the `[warm]` hook (`warm.env`, ADR
-    // 0080): literals pass through, secret refs resolve through the same
-    // SecretStore a session uses — FAIL-LOUD: an unresolvable ref aborts
-    // the capture here rather than baking a corrupt "warm" snapshot. The
-    // host receives only resolved values (never the refs). The values
-    // flow coord→host→capture-exec and whatever the warm processes
-    // persist lands in the base snapshot — which we treat as
-    // secret-bearing (see ADR 0007 storage model); the refs themselves
-    // never leave the DB.
-    let warm_env = config
-        .warm
-        .as_ref()
-        .map(|w| w.env.as_slice())
-        .unwrap_or(&[]);
-    let capture_env = resolve_capture_env(state, &row.image_uri, warm_env).await?;
-
-    // ADR 0080 (wire v13): assemble the `[warm]` hook's capture egress
-    // policy HERE (one egress builder for sessions and captures alike)
-    // and ship it ready-to-register; the host stamps the
-    // sandbox-dependent identity (sandbox_id, guest IP) at registration.
-    // `None` ⇒ the capture VM stays egress-less.
-    let capture_egress = config
-        .warm
-        .as_ref()
-        .and_then(|w| w.network.as_ref())
-        .and_then(crate::session_boot::assemble_capture_egress_policy);
-
-    // Thread the image's optional `[warm]` hook into capture: the host
-    // runs it in the live VM before the snapshot freezes, so a warmed
-    // process (e.g. a gradle daemon) is captured into the base snapshot.
-    // A warm failure is fail-loud — it surfaces here as a capture error
-    // and aborts the enable.
-    //
-    // The wire clone is STRIPPED to the fields the host executes
-    // (command/timeout/workdir). `env` and `network` are coordinator
-    // concerns — env is resolved into `capture_env` and network into
-    // `capture_egress` above (the wire-v13 contract: the host never
-    // interprets them) — and `env`'s `CaptureEnvValue` is an
-    // internally-tagged serde enum, which bincode cannot DECODE
-    // (`deserialize_any`): the first image with a non-empty
-    // `[[warm.env]]` failed capture host-side on exactly that (dev-brain,
-    // ADR 0080 rollout). Empty-vec/None round-trip fine.
-    //
-    // Issue #539: `progress` receives live `CaptureProgress` events for
-    // the call's lifetime — the caller (`enable_scanner::advance_one`)
-    // drains it into a fenced `enable_jobs` write per event.
-    let wire_warm = config.warm.clone().map(|mut w| {
-        w.env = Vec::new();
-        w.network = None;
-        w
-    });
-    let meta = host
-        .build_base_snapshot(spec, wire_warm, capture_env, capture_egress, progress)
-        .await
-        .map_err(|e| match e {
-            engram_core::SandboxError::CaptureFailed(failure) => ApiError::CaptureFailed {
-                kind: failure.kind,
-                message: format!(
-                    "base snapshot capture for `{}` failed on host {host_id}: {failure}",
+    // ADR 0084 (c): insert the row WAITING (host_id NULL) with its
+    // placement budgets stamped from the image config — the single source
+    // session placement reserves with, so a capture is exactly as visible
+    // to the fleet as a session of this image.
+    let new_job = engram_core::types::capture_job::NewCaptureJob {
+        enable_job_id,
+        image_uri: row.image_uri.clone(),
+        manifest_digest: row.manifest_digest.clone(),
+        disk_manifest,
+        image_config: row.image_config.clone(),
+        oci_defaults: row.oci_defaults.clone(),
+        mem_budget_mib: config.resolved_memory_mib() as i64,
+        cpu_budget_vcpus: config.resolved_vcpus() as i32,
+    };
+    let inserted = state.services.meta.insert_capture_job(new_job).await?;
+    // Immediately attempt the reserving 2D pick so a fresh job dispatches
+    // THIS tick rather than idling a full scan interval. No fit ⇒ the row
+    // stays WAITING and the capacity scan (`capture_job_capacity_scan`)
+    // re-offers it every tick, failing it with `CapacityTimeout` past the
+    // queue deadline. `fc_snapshot_version` pin: `None` at job-creation
+    // time (the claim handler resolves the cold-base candidate fresh per
+    // attempt — ADR 0084 §B5 "known gap").
+    let footprint = capture_footprint_for(state, disk_manifest_ref, &config).await;
+    let candidates =
+        crate::placement::capture_candidate_hosts(state.services.meta.as_ref(), footprint, None)
+            .await
+            .map_err(|e| {
+                ApiError::Internal(format!(
+                    "capture candidate hosts for `{}`: {e:?}",
                     row.image_uri
-                ),
-            },
-            // ADR 0050 C / issue #229: a connect-time transport death
-            // (host rolled between `pick_capture_host` and this RPC, or a
-            // mixed-version WIRE_VERSION rejection) is the SAME retryable
-            // failure class as a mid-stream `WarmExecTransport` — both
-            // just mean "didn't reach a live, matching-wire host", and
-            // `classify_capture_error` already retries `ApiError::
-            // Unavailable` via the attempts budget. Route both here
-            // instead of falling into the generic `Internal` (bail-fast)
-            // arm, or the enable wedges non-retryable on a transient roll.
-            engram_core::SandboxError::Unavailable(msg) => ApiError::Unavailable(format!(
-                "base snapshot capture for `{}` could not reach host {host_id}: {msg}",
-                row.image_uri
-            )),
-            engram_core::SandboxError::WireSkew {
-                host: host_wire,
-                coord,
-            } => ApiError::Unavailable(format!(
-                "base snapshot capture for `{}` hit a WIRE_VERSION skew against host \
-                     {host_id} (host={host_wire}, coord={coord})",
-                row.image_uri
-            )),
-            other => ApiError::Internal(format!(
-                "base snapshot capture for `{}` failed on host {host_id}: {other}",
-                row.image_uri
-            )),
+                ))
+            })?;
+    let placed = state
+        .services
+        .meta
+        .place_capture_job(inserted.id, &candidates)
+        .await?;
+    Ok(placed.unwrap_or(inserted))
+}
+
+/// ADR 0084 §D: the [`finalize_capture_job`] outcome — its
+/// `reuse_outcome` label (ADR 0084 §D's taxonomy) alongside the
+/// [`ReuseHit`] the caller upserts onto the `enabled_images` row. A
+/// plain string, not an enum: it's a one-way trip straight into
+/// `set_enable_job_reuse_outcome`'s `TEXT` column.
+pub(crate) type FinalizeOutcome = (ReuseHit, &'static str);
+
+/// ADR 0084 P1b/P3: consume a `stage == Done` `capture_jobs` row —
+/// decode its `result_bincode` (the executor's `CaptureJobResult`,
+/// bincode-encoded), verify the chunked manifests are actually durable,
+/// record the `snapshots` row, and (P3) record/skip the `cold_bases` row
+/// per the executor's `cold_base` outcome. Mirrors the tail of the old
+/// `capture_and_record_base_snapshot` exactly, except the FC
+/// snapshot-version comes straight off the job row (the host already
+/// stamped it in its terminal report) instead of a separate
+/// `fc_snapshot_version_for_host` lookup.
+pub(crate) async fn finalize_capture_job(
+    state: &SharedState,
+    capture_row: &engram_core::types::capture_job::CaptureJobRow,
+) -> Result<FinalizeOutcome, ApiError> {
+    let bytes = capture_row.result_bincode.as_deref().ok_or_else(|| {
+        ApiError::Internal(format!(
+            "capture job {} is `done` but carries no result_bincode",
+            capture_row.id
+        ))
+    })?;
+    let result: engram_core::types::capture_job::CaptureJobResult = bincode::deserialize(bytes)
+        .map_err(|e| {
+            ApiError::Internal(format!(
+                "capture job {} result_bincode failed to decode: {e}",
+                capture_row.id
+            ))
         })?;
+    let meta = result.snapshot;
 
     // A base snapshot is only useful if its chunked manifests are
     // durable in BlobStorage — verify before recording, so an
@@ -755,22 +882,81 @@ pub(crate) async fn capture_and_record_base_snapshot(
         return Err(ApiError::Internal(format!(
             "base snapshot for `{}` was captured but its chunked manifests \
              failed HEAD-verify in BlobStorage; not enabling",
-            row.image_uri
+            capture_row.image_uri
         )));
     }
 
+    // ADR 0084 §B6/§D: record (or skip) the cold-base row + derive the
+    // reuse_outcome label. Done BEFORE `record_snapshot` below — an
+    // upsert_cold_base failure should abort the enable the same way a
+    // recoverability failure does, rather than leave the overlay
+    // recorded with an inconsistent cold-base row.
+    use engram_core::types::capture_job::ColdBaseMissReason;
+    let reuse_outcome: &'static str = match &result.cold_base {
+        None => "recaptured:content_changed",
+        Some(cb) if !cb.freshly_captured => "reused_cold_base",
+        Some(cb) => {
+            let label = match cb.miss_reason {
+                Some(ColdBaseMissReason::NoCandidate) => "recaptured:no_cold_base",
+                Some(ColdBaseMissReason::ChunksMissing) => "recaptured:chunks_missing",
+                Some(ColdBaseMissReason::FcVersionChanged) => "recaptured:fc_version_changed",
+                // Shouldn't happen (the executor only sets `freshly_captured`
+                // from a `ColdBasePlan::Miss`, which always carries a
+                // reason) — fall back to the generic label rather than
+                // panicking on a telemetry field.
+                None => "recaptured:content_changed",
+            };
+            let disk_manifest_text = cb
+                .snapshot
+                .disk_manifest
+                .map(|r| r.to_string())
+                .ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "capture job {} produced a cold base with no disk_manifest",
+                        capture_row.id
+                    ))
+                })?;
+            let memory_manifest_text = cb
+                .snapshot
+                .memory_manifest
+                .map(|r| r.to_string())
+                .ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "capture job {} produced a cold base with no memory_manifest \
+                         (a cold base only ever exists on FC, which always chunks memory)",
+                        capture_row.id
+                    ))
+                })?;
+            let fc_snapshot_version = capture_row.fc_snapshot_version.clone().ok_or_else(|| {
+                ApiError::Internal(format!(
+                    "capture job {} produced a cold base but stamped no fc_snapshot_version",
+                    capture_row.id
+                ))
+            })?;
+            let snapshot_bincode = bincode::serialize(&cb.snapshot).map_err(|e| {
+                ApiError::Internal(format!(
+                    "capture job {}: failed to re-encode cold-base snapshot for storage: {e}",
+                    capture_row.id
+                ))
+            })?;
+            state
+                .services
+                .meta
+                .upsert_cold_base(engram_core::types::capture_job::ColdBaseRow {
+                    content_key: cb.content_key.clone(),
+                    snapshot_id: cb.snapshot.id,
+                    disk_manifest: disk_manifest_text,
+                    memory_manifest: memory_manifest_text,
+                    fc_snapshot_version,
+                    captured_at: cb.snapshot.created_at,
+                    snapshot_bincode,
+                })
+                .await?;
+            label
+        }
+    };
+
     let now = Utc::now();
-    // ADR 0068: stamp the capturing host's FC snapshot-version so a
-    // later restore (a fresh `create`, ADR 0020 — there is no warm pool,
-    // every create restores this base row) can eventually be paired
-    // against it at placement. Best-effort: a lookup failure degrades to
-    // NULL (today's unconstrained behavior), never fails the enable.
-    let fc_snapshot_version = state
-        .services
-        .meta
-        .fc_snapshot_version_for_host(host_id)
-        .await
-        .unwrap_or_default();
     // Record the snapshot row (session_id = NULL — a template artifact,
     // not a session capture). The caller stamps the returned id onto the
     // enabled_images row's NOT NULL base_snapshot_id and upserts it only
@@ -781,7 +967,9 @@ pub(crate) async fn capture_and_record_base_snapshot(
         .record_snapshot(SnapshotRecord {
             id: meta.id,
             session_id: None,
-            host_id: Some(host_id),
+            // A `done` capture was necessarily dispatched, so `host_id` is
+            // `Some`; `SnapshotRecord.host_id` is itself `Option`.
+            host_id: capture_row.host_id,
             image_version: meta.image_version.clone(),
             size_bytes: meta.size_bytes,
             created_at: meta.created_at,
@@ -793,12 +981,15 @@ pub(crate) async fn capture_and_record_base_snapshot(
             recoverable,
             // Template artifact — no session, no event log.
             events_cursor: None,
-            fc_snapshot_version,
+            // ADR 0068: stamp the capturing host's FC snapshot-version —
+            // the job row already carries it (stamped by the host in its
+            // terminal report), no separate lookup needed.
+            fc_snapshot_version: capture_row.fc_snapshot_version.clone(),
         })
         .await?;
 
     tracing::info!(
-        image_uri = %row.image_uri,
+        image_uri = %capture_row.image_uri,
         snapshot_id = %meta.id,
         size_bytes = meta.size_bytes,
         "recorded base snapshot for image",
@@ -807,13 +998,16 @@ pub(crate) async fn capture_and_record_base_snapshot(
         ApiError::Internal(format!(
             "base snapshot for `{}` was captured without a chunked disk manifest; \
              residency requires a chunked rootfs — not enabling",
-            row.image_uri
+            capture_row.image_uri
         ))
     })?;
     // Memory manifest is optional (migration 0049): FC produces a chunked
     // memory snapshot, VZ cold-boots and captures disk only. Pass through
     // whatever the backend produced — `None` skips memory residency.
-    Ok((meta.id, disk_manifest, meta.memory_manifest))
+    Ok((
+        (meta.id, disk_manifest, meta.memory_manifest),
+        reuse_outcome,
+    ))
 }
 
 /// Resolve an image's warm env (`config.warm.env`, ADR 0080) into
@@ -824,10 +1018,14 @@ pub(crate) async fn capture_and_record_base_snapshot(
 /// deployment `ref` (backends like GCP SM that honor explicit refs).
 ///
 /// FAIL-LOUD (ADR 0080): an unresolvable or erroring ref fails the
-/// capture with an actionable error. The pre-0080 behavior (warn + skip)
+/// claim with an actionable error. The pre-0080 behavior (warn + skip)
 /// let a missing secret silently bake a corrupt "warm" base snapshot
-/// that every session then inherited.
-async fn resolve_capture_env(
+/// that every session then inherited. ADR 0084 P1b: called from the
+/// coordinator's capture-job CLAIM handler (`host_http::
+/// claim_capture_job`) instead of from the old direct-RPC capture path
+/// — resolution now happens fresh on every claim (including a
+/// reassign), never once at job-creation time.
+pub(crate) async fn resolve_capture_env(
     state: &SharedState,
     image_uri: &str,
     warm_env: &[engram_core::types::CaptureEnvEntry],

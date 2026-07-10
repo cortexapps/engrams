@@ -2,6 +2,7 @@
 //! and backend implementations.
 
 pub mod capability;
+pub mod capture_job;
 pub mod capture_progress;
 pub mod catalog;
 pub mod cow_state;
@@ -28,6 +29,7 @@ pub mod shell;
 pub mod snapshot;
 
 pub use capability::*;
+pub use capture_job::*;
 pub use capture_progress::*;
 pub use catalog::*;
 pub use cow_state::*;

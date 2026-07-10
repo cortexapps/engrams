@@ -1,16 +1,18 @@
-//! ADR 0013 host → coord HTTP endpoints (dark in this commit).
+//! ADR 0013 host → coord HTTP endpoints.
 //!
 //! Replaces the host-initiated bits of the WS protocol with plain
-//! HTTP/JSON POSTs that any coord pod can serve. The host-agent
-//! doesn't call these yet — that wiring lands in the cutover
-//! commit. Routing is live so a `curl` against a coord pod
-//! exercises the endpoint today.
+//! HTTP/JSON POSTs that any coord pod can serve. Wired into the
+//! host-agent's real heartbeat loop / event sink / eviction-pusher
+//! (`engram-host-agent::coord_client`).
 //!
-//! Five endpoints:
+//! Endpoints:
 //!   - `POST /api/hosts/register` — once per host-agent startup
 //!   - `POST /api/hosts/:id/heartbeat` — every 5s
 //!   - `POST /api/hosts/:id/auth/resolve-registry` — host requests
 //!     OCI creds during image pull
+//!   - `POST /api/hosts/:id/capture-jobs/:job_id/claim` (ADR 0084 P1b) —
+//!     host resolves the full dispatch for a `HeartbeatAck.
+//!     capture_assignments` entry it doesn't yet own
 //!   - `POST /api/sessions/:session_id/harness-events` — host
 //!     forwards adapter events one POST at a time
 //!   - `POST /api/hosts/:id/idle-eviction-candidates` — host pushes
@@ -350,6 +352,11 @@ pub struct HeartbeatRequest {
     /// twin). Disagreement-alarm input only.
     #[serde(default)]
     pub harness_attached: Vec<SandboxId>,
+    /// ADR 0084 P1b: un-acked `capture_jobs` progress/terminal reports
+    /// from this host's durable capture-job records — the
+    /// `CheckpointAdvert`/`checkpoints` pattern verbatim, for capture.
+    #[serde(default)]
+    pub capture_job_reports: Vec<engram_core::types::CaptureJobReport>,
 }
 
 #[derive(Serialize)]
@@ -385,6 +392,22 @@ pub struct HeartbeatResponse {
     /// PG. The host deletes the matching durable record files.
     #[serde(default)]
     pub acked_checkpoints: Vec<engram_core::types::SnapshotId>,
+    /// ADR 0084 P1b: `(job_id, epoch)` assignments this host should be
+    /// running (or should claim, if it isn't yet) — read unconditionally
+    /// every tick via `capture_assignments_for_host`. `None` means the
+    /// read FAILED (unknown, do nothing); `Some(vec![])` means the
+    /// authoritative answer is "no assignments" — the host cancels any
+    /// still-running attempt absent from a `Some` list (it was
+    /// reassigned away or terminally superseded). Collapsing an error
+    /// into an empty list would make a PG blip destroy healthy in-flight
+    /// captures fleet-wide.
+    #[serde(default)]
+    pub capture_assignments: Option<Vec<engram_core::types::CaptureJobAssignment>>,
+    /// ADR 0084 P1b: terminal reports from this heartbeat that landed in
+    /// PG (or were already terminal at a matching epoch) — the host
+    /// deletes the matching durable capture-job records.
+    #[serde(default)]
+    pub acked_capture_jobs: Vec<engram_core::types::CaptureJobId>,
 }
 
 pub async fn heartbeat(
@@ -695,6 +718,87 @@ pub async fn heartbeat(
         );
     }
 
+    // ADR 0084 P1b: reconcile this host's un-acked capture-job reports.
+    // Each write is fenced by `(job_id, epoch)` — any coord replica can
+    // perform it, no lease-holder identity involved. A terminal report is
+    // acked when either the fenced write actually landed it, OR the row
+    // is already terminal at a MATCHING epoch (idempotent re-advertise —
+    // e.g. a prior ack this host somehow didn't observe). A terminal
+    // report whose epoch no longer matches (the job was reassigned away)
+    // is silently dropped: the host's own stale-epoch bookkeeping evicts
+    // that attempt, and a fresh report at the new epoch supersedes it.
+    let mut acked_capture_jobs = Vec::new();
+    for report in &hb.capture_job_reports {
+        let applied = match state.services.meta.record_capture_job_report(report).await {
+            Ok(applied) => applied,
+            Err(e) => {
+                tracing::warn!(
+                    host_id = %host_id,
+                    job_id = %report.job_id,
+                    error = %e,
+                    "capture job report reconcile failed; host re-advertises next heartbeat",
+                );
+                false
+            }
+        };
+        // One lookup serves both the ack-idempotency check below and the
+        // dashboard mirror's `enable_job_id`. Keep PG errors distinct
+        // from "row genuinely absent": an error must NEVER ack (the
+        // report may still be landable — losing it would discard a
+        // finished capture), while a genuinely-missing row can never
+        // land and must ack or the host re-advertises forever.
+        let row_lookup = state.services.meta.get_capture_job(report.job_id).await;
+        let row = row_lookup.as_ref().ok().and_then(|r| r.as_ref());
+        if report.terminal.is_some()
+            && should_ack_capture_terminal(applied, &row_lookup, report.epoch)
+        {
+            acked_capture_jobs.push(report.job_id);
+        }
+        // Mirror onto the enable_jobs dashboard columns — best-effort,
+        // cosmetic only (see `mirror_capture_progress_to_enable_job`'s
+        // doc: it does NOT renew any enable-job claim). Gated on
+        // `applied` so a fenced-off stale-epoch report can't overwrite
+        // the live attempt's dashboard columns.
+        if let (true, Some(row)) = (applied, &row) {
+            let capture_phase = capture_job_stage_to_phase(report.stage);
+            let warm_stage = report.progress.as_ref().and_then(|p| p.detail.as_deref());
+            let output_tail = report.progress.as_ref().and_then(|p| p.log_tail.as_deref());
+            if let Err(e) = state
+                .services
+                .meta
+                .mirror_capture_progress_to_enable_job(
+                    row.enable_job_id,
+                    capture_phase.map(|p| p.as_str()),
+                    warm_stage,
+                    output_tail,
+                )
+                .await
+            {
+                tracing::debug!(
+                    host_id = %host_id,
+                    job_id = %report.job_id,
+                    error = %e,
+                    "capture job dashboard mirror failed (non-fatal)",
+                );
+            }
+        }
+    }
+    // This host's current `(job_id, epoch)` assignments — read
+    // unconditionally every tick regardless of whether any capture jobs
+    // exist fleet-wide (mirrors `list_prestaging_refs`'s posture).
+    let capture_assignments = match state
+        .services
+        .meta
+        .capture_assignments_for_host(host_id)
+        .await
+    {
+        Ok(assignments) => Some(assignments),
+        Err(e) => {
+            tracing::debug!(host_id = %host_id, error = %e, "capture_assignments_for_host failed");
+            None
+        }
+    };
+
     Ok(Json(HeartbeatResponse {
         server_time: Utc::now(),
         revoked_sessions: Vec::new(),
@@ -702,7 +806,60 @@ pub async fn heartbeat(
         prestage_images,
         live_bundles,
         acked_checkpoints,
+        capture_assignments,
+        acked_capture_jobs,
     }))
+}
+
+/// ADR 0084 P1b: map a `CaptureJobStage` to the `CapturePhase` the
+/// `enable_jobs.capture_phase` dashboard column has always stored —
+/// `Booting -> Boot`, `Warming -> Warm`, `Freezing -> Snapshot`;
+/// `Assigned`/`Done`/`Failed` have no rendered phase (`None` leaves the
+/// column at its last-known value via `COALESCE`).
+/// ADR 0084 §A: may a host's TERMINAL capture-job report be acked (so the
+/// host deletes its durable record and stops re-advertising)?
+///
+/// The rule: ack iff the report either landed (`applied`) or can NEVER
+/// land —
+///   - the row is genuinely gone, or
+///   - the row's epoch has moved past the report's (reassigned away —
+///     dead history, fenced off forever), or
+///   - the row is already terminal at the same epoch (idempotent
+///     re-advertise of an already-landed terminal).
+///
+/// A LOOKUP ERROR must never ack: the report may still be landable, and
+/// acking it would make the host delete the only durable copy of a
+/// (possibly successful) capture result on a PG blip. Conversely, the
+/// superseded-epoch arm must ack, or a host whose attempt was reassigned
+/// away re-advertises its fenced-off terminal every heartbeat FOREVER
+/// and leaks the record file.
+fn should_ack_capture_terminal(
+    applied: bool,
+    row_lookup: &Result<Option<engram_core::types::CaptureJobRow>, engram_core::error::MetaError>,
+    report_epoch: i64,
+) -> bool {
+    if applied {
+        return true;
+    }
+    match row_lookup {
+        Err(_) => false,
+        Ok(None) => true,
+        Ok(Some(row)) => {
+            row.epoch > report_epoch || (row.epoch == report_epoch && row.stage.is_terminal())
+        }
+    }
+}
+
+fn capture_job_stage_to_phase(
+    stage: engram_core::types::CaptureJobStage,
+) -> Option<engram_core::types::CapturePhase> {
+    use engram_core::types::{CaptureJobStage, CapturePhase};
+    match stage {
+        CaptureJobStage::Booting => Some(CapturePhase::Boot),
+        CaptureJobStage::Warming => Some(CapturePhase::Warm),
+        CaptureJobStage::Freezing => Some(CapturePhase::Snapshot),
+        CaptureJobStage::Assigned | CaptureJobStage::Done | CaptureJobStage::Failed => None,
+    }
 }
 
 /// ADR 0015 M5: project enabled-image rows down to the wire
@@ -798,6 +955,167 @@ pub async fn resolve_registry_auth(
             password: c.password,
         });
     Ok(Json(ResolveRegistryAuthResponse { creds }))
+}
+
+// ---- POST /api/hosts/:id/capture-jobs/:job_id/claim ----
+
+/// ADR 0084 P1b: the epoch a host is claiming — sent so the coordinator
+/// can reject a stale claim (a host that raced a reassignment, or one
+/// replaying an old `HeartbeatAck.capture_assignments` entry) instead of
+/// silently handing out a fresh `CaptureJobSpec` for an epoch it no
+/// longer owns.
+#[derive(Deserialize)]
+pub struct ClaimCaptureJobRequest {
+    pub epoch: i64,
+}
+
+/// ADR 0084 §A: resolve the full dispatch for `(host_id, job_id, epoch)`
+/// — `SandboxSpec` (same construction `capture_and_record_base_snapshot`
+/// used to do directly), the image's optional `[warm]` hook, the
+/// capture-time env resolved FRESH against `SecretStore` (fail-loud), and
+/// the capture egress policy keyed by a synthetic session id derived
+/// deterministically from `job_id` (stable across every claim of the
+/// same job). Secrets ride only this authed response — never PG, never
+/// the heartbeat, never the durable host-side record.
+///
+/// Validates the row is actually assigned to `host_id` at `epoch` and
+/// non-terminal before doing any of that work. A resolve-env failure
+/// (missing/unresolvable secret) is NOT retried by the host — it's a
+/// deterministic misconfiguration, so THIS handler fails the job
+/// directly (non-retryable) via a synthetic terminal report through the
+/// same fenced `record_capture_job_report` path the heartbeat reconcile
+/// uses, then returns the error to the host (which never gets a spec to
+/// run, so it never starts an executor for this job/epoch).
+pub async fn claim_capture_job(
+    State(state): State<SharedState>,
+    Path((host_id, job_id)): Path<(HostId, engram_core::types::CaptureJobId)>,
+    Json(req): Json<ClaimCaptureJobRequest>,
+) -> Result<Json<engram_core::types::capture_job::CaptureJobSpec>, ApiError> {
+    let row = state
+        .services
+        .meta
+        .get_capture_job(job_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("capture job {job_id} not found")))?;
+    // ADR 0084 (c): `host_id` is `None` while WAITING for capacity — a
+    // waiting job is never dispatched to any host, so a claim for one is a
+    // stale/forged request. Only a job bound to exactly this host claims.
+    if row.host_id != Some(host_id) {
+        return Err(ApiError::BadRequest(format!(
+            "capture job {job_id} is assigned to host {:?}, not {host_id}",
+            row.host_id
+        )));
+    }
+    if row.stage.is_terminal() {
+        return Err(ApiError::Conflict(format!(
+            "capture job {job_id} is already terminal ({})",
+            row.stage
+        )));
+    }
+    if row.epoch != req.epoch {
+        return Err(ApiError::Conflict(format!(
+            "capture job {job_id} claim requested epoch {}, current epoch is {}",
+            req.epoch, row.epoch
+        )));
+    }
+
+    let config = row.image_config.merged_with(&row.oci_defaults);
+    let disk_manifest: engram_core::types::manifest::ManifestRef =
+        row.disk_manifest.parse().map_err(|e| {
+            ApiError::Internal(format!(
+                "capture job {job_id}: stored disk_manifest {:?} failed to parse: {e}",
+                row.disk_manifest
+            ))
+        })?;
+
+    // Same construction `capture_and_record_base_snapshot` used to do
+    // directly (issue #192: digest-pin `spec.image` so a moving tag can't
+    // let the host's local OCI cache serve a different bake than the one
+    // materialized; ADR 0057: capture boots with allow-all egress — a
+    // trusted, ephemeral build step).
+    let capture_uri = engram_oci::digest_pinned_uri(
+        &row.image_uri,
+        &engram_oci::Digest256(row.manifest_digest.clone()),
+    );
+    let capture_network = engram_core::types::image::NetworkPolicy {
+        default: engram_core::types::image::NetworkDefault::Allow,
+        allow_hosts: Vec::new(),
+        allow_host_patterns: Vec::new(),
+    };
+    let spec = crate::api::sessions::cold_boot_spec(
+        &capture_uri,
+        &config,
+        Some(disk_manifest),
+        capture_network,
+    );
+
+    let warm_env = config
+        .warm
+        .as_ref()
+        .map(|w| w.env.as_slice())
+        .unwrap_or(&[]);
+    let resolved_env = match crate::api::enabled_images::resolve_capture_env(
+        &state,
+        &row.image_uri,
+        warm_env,
+    )
+    .await
+    {
+        Ok(env) => env,
+        Err(e) => {
+            // Deterministic misconfiguration — fail the job directly
+            // (non-retryable) rather than hand the host a spec it
+            // can't run, and rather than let the host report a
+            // retryable transport-shaped failure for what is really
+            // an operator fix (add the secret / fix the ref).
+            let report = engram_core::types::CaptureJobReport {
+                job_id,
+                epoch: row.epoch,
+                stage: engram_core::types::CaptureJobStage::Failed,
+                progress: None,
+                fc_snapshot_version: None,
+                terminal: Some(engram_core::types::CaptureTerminalReport::Failed {
+                    error: e.to_string(),
+                    error_stage: "assigned".to_string(),
+                    retryable: false,
+                }),
+            };
+            if let Err(write_err) = state.services.meta.record_capture_job_report(&report).await {
+                tracing::warn!(%job_id, error = %write_err, "claim_capture_job: failed to record env-resolve failure");
+            }
+            return Err(e);
+        }
+    };
+
+    let capture_egress = config
+        .warm
+        .as_ref()
+        .and_then(|w| w.network.as_ref())
+        .and_then(|n| {
+            crate::session_boot::assemble_capture_egress_policy(
+                n,
+                crate::session_boot::synthetic_capture_session_id(job_id),
+            )
+        });
+
+    let cold_base_plan =
+        crate::api::enabled_images::resolve_cold_base_plan(&state, host_id, &row, &config).await;
+
+    tracing::info!(
+        host_id = %host_id,
+        %job_id,
+        epoch = req.epoch,
+        image_uri = %row.image_uri,
+        cold_base_plan = ?cold_base_plan,
+        "host claimed capture job",
+    );
+    Ok(Json(engram_core::types::capture_job::CaptureJobSpec {
+        spec,
+        warm: config.warm,
+        resolved_env,
+        capture_egress,
+        cold_base_plan,
+    }))
 }
 
 // ---- POST /api/sessions/:session_id/harness-events ----
@@ -1163,5 +1481,88 @@ mod tests {
             *meta.reconcile_probe_calls.lock() >= 1,
             "reconcile must run once the persist succeeds"
         );
+    }
+
+    /// ADR 0084 §A: the terminal-report ack rule. The two failure modes
+    /// this pins: (a) a superseded-epoch terminal MUST ack, or the old
+    /// host re-advertises its fenced-off record every heartbeat forever;
+    /// (b) a PG lookup error must NEVER ack, or a blip deletes the only
+    /// durable copy of a finished capture before it landed.
+    #[test]
+    fn capture_terminal_ack_rule() {
+        use engram_core::error::MetaError;
+        use engram_core::types::capture_job::{CaptureJobRow, CaptureJobStage};
+
+        fn row(epoch: i64, stage: CaptureJobStage) -> CaptureJobRow {
+            let now = chrono::Utc::now();
+            CaptureJobRow {
+                id: engram_core::types::CaptureJobId::new(),
+                enable_job_id: uuid::Uuid::new_v4(),
+                image_uri: "reg.test/img:tag".into(),
+                manifest_digest: "0".repeat(64),
+                disk_manifest: "manifest".into(),
+                image_config: Default::default(),
+                oci_defaults: Default::default(),
+                host_id: Some(HostId::new()),
+                mem_budget_mib: 2_048,
+                cpu_budget_vcpus: 2,
+                waiting_since: None,
+                epoch,
+                stage,
+                stage_started_at: now,
+                stage_progress: None,
+                last_progress_at: now,
+                attempts: 1,
+                retryable: None,
+                error: None,
+                error_stage: None,
+                fc_snapshot_version: None,
+                result_bincode: None,
+                created_at: now,
+                updated_at: now,
+            }
+        }
+
+        // Applied: always ack, whatever the lookup said.
+        assert!(should_ack_capture_terminal(
+            true,
+            &Err(MetaError::Migration("pg down".into())),
+            1
+        ));
+        // Lookup error, not applied: never ack (retry next heartbeat).
+        assert!(!should_ack_capture_terminal(
+            false,
+            &Err(MetaError::Migration("pg down".into())),
+            1
+        ));
+        // Row gone: the report can never land — ack.
+        assert!(should_ack_capture_terminal(false, &Ok(None), 1));
+        // Superseded epoch (reassigned away): ack, even though the live
+        // row is non-terminal — the immortal-re-advertise regression.
+        assert!(should_ack_capture_terminal(
+            false,
+            &Ok(Some(row(2, CaptureJobStage::Booting))),
+            1
+        ));
+        // Same epoch, already terminal: idempotent re-advertise — ack.
+        assert!(should_ack_capture_terminal(
+            false,
+            &Ok(Some(row(1, CaptureJobStage::Failed))),
+            1
+        ));
+        // Same epoch, NON-terminal, not applied (transient write failure):
+        // don't ack — the report is still landable.
+        assert!(!should_ack_capture_terminal(
+            false,
+            &Ok(Some(row(1, CaptureJobStage::Warming))),
+            1
+        ));
+        // A row somehow BEHIND the report's epoch (shouldn't happen —
+        // epochs only move forward): not ours to discard.
+        assert!(!should_ack_capture_terminal(
+            false,
+            &Ok(Some(row(1, CaptureJobStage::Booting))),
+            2
+        ));
     }
 }

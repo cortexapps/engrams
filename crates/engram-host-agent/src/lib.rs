@@ -25,11 +25,13 @@ pub mod bindings;
 pub mod blob;
 pub mod bundles;
 pub mod capabilities;
+pub mod capture_job;
 pub mod checkpoint;
 pub mod config;
 pub mod coord_client;
 pub mod dirty_map;
 pub mod disk_daemon;
+pub mod durable_record;
 pub mod egress;
 pub mod eviction_finalize;
 pub mod grpc_server;
@@ -311,6 +313,34 @@ impl HostAgent {
                 arc.set_self_ref(&arc);
                 arc
             };
+            // ADR 0084 P1b: the capture-job executor + durable-record
+            // registry. `pooled` (a `SandboxBackend`) is the executor's
+            // engine, unchanged — still `PooledBackend::
+            // build_base_snapshot` under the hood; this layer adds
+            // durable per-job records (surviving a host-agent restart)
+            // and a live-sandbox registry that replaces the retired
+            // `PooledBackend::is_base_capture` reaper exemption.
+            // Unconditional (no chunk-store/diff-checkpoint gate like
+            // checkpointing has): a job record's persistence doesn't
+            // depend on any optional subsystem.
+            // The FC snapshot-format version stamp (probed once — the
+            // binary can't change under a running host-agent; None on
+            // VZ/Process). The coordinator's finalize requires it on any
+            // capture that produced a cold base (ADR 0084 §B content
+            // key), and the host that runs the VMM is its authority.
+            let fc_snapshot_version = capabilities::fc_snapshot_version(
+                self.fc_for_reattach
+                    .as_ref()
+                    .map(|fc| fc.config().firecracker_bin.clone())
+                    .as_deref(),
+            )
+            .await;
+            let capture_jobs = capture_job::CaptureJobExecutor::new(
+                pooled.clone(),
+                self.cfg.work_dir.join("capture-jobs"),
+                fc_snapshot_version,
+            );
+            capture_jobs.rehydrate().await;
             // ADR 0045 C1: the migration export TTL sweep — the
             // dumb-host rule. An export past EXPORT_TTL means the
             // coordinator never sent commit/abort (it died mid-move):
@@ -418,6 +448,7 @@ impl HostAgent {
             // session reliably answers "not owned".
             {
                 let pooled_for_reap = pooled.clone();
+                let capture_jobs_for_reap = capture_jobs.clone();
                 let coord_for_reap = coord_client::CoordClient::new(
                     coord_url.clone(),
                     self.cfg.coordinator_token.clone(),
@@ -451,12 +482,16 @@ impl HostAgent {
                                 strikes.remove(&sandbox_id);
                                 continue;
                             }
-                            // Base-snapshot capture VMs are host-local + transient
-                            // and NEVER session-owned by design; reaping one as an
-                            // "orphan" kills an in-flight capture (a slow `[warm]`
-                            // hook runs past the strike debounce). `build_base_snapshot`
-                            // destroys them itself.
-                            if pooled_for_reap.is_base_capture(sandbox_id) {
+                            // ADR 0084 P1b: base-snapshot capture VMs are host-local
+                            // + transient and NEVER session-owned by design;
+                            // reaping one as an "orphan" kills an in-flight capture
+                            // (a slow `[warm]` hook runs past the strike debounce).
+                            // Exempt while a live (non-terminal) `capture_jobs`
+                            // record says this sandbox belongs to it — the
+                            // executor destroys the VM itself once the job
+                            // finishes, at which point this predicate goes false
+                            // again (never a permanent exemption).
+                            if capture_jobs_for_reap.is_live_sandbox(sandbox_id) {
                                 strikes.remove(&sandbox_id);
                                 continue;
                             }
@@ -1129,6 +1164,7 @@ impl HostAgent {
             let coord_for_heartbeat = coord_client.clone();
             let harness_hub_for_heartbeat = harness_hub.clone();
             let pooled_for_heartbeat = pooled.clone();
+            let capture_jobs_for_heartbeat = capture_jobs.clone();
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
             let util_work_dir = self.cfg.work_dir.clone();
@@ -1274,6 +1310,11 @@ impl HostAgent {
                     // its first call) — this IS the retry for whatever
                     // the old blocking gRPC gate used to loop on.
                     let capabilities = capabilities::probe_all(&probe_inputs_for_heartbeat).await;
+                    // ADR 0084 P1b: re-advertise every un-acked capture-job
+                    // report (running progress + un-acked terminal outcomes)
+                    // until the coord's ack names it — the
+                    // `checkpoints`/`acked_checkpoints` pattern verbatim.
+                    let capture_job_reports = capture_jobs_for_heartbeat.current_reports();
                     let req = coord_client::HeartbeatRequest {
                         capacity: engram_protocol::heartbeat::HostCapacityReport {
                             total_mib: host_total_mib,
@@ -1307,6 +1348,7 @@ impl HostAgent {
                         // only on hosts reporting this.
                         stages_images: stages_images_for_heartbeat,
                         capabilities,
+                        capture_job_reports,
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {
@@ -1359,6 +1401,55 @@ impl HostAgent {
                                     )
                                     .await;
                                 }
+                            }
+                            // ADR 0084 P1b: the coord recorded these
+                            // terminal capture-job reports into PG — drop
+                            // the in-memory report + the durable record
+                            // file (the PG row owns the reference now).
+                            capture_jobs_for_heartbeat
+                                .ack(&resp.acked_capture_jobs)
+                                .await;
+                            // `None` = the coord's assignment read failed
+                            // (unknown) — take no action at all this tick.
+                            // `Some` is authoritative: converge-cancel any
+                            // still-running attempt absent from it (it was
+                            // reassigned away / superseded — fenced-off
+                            // work must not keep burning a VM), then claim
+                            // anything new. For every assignment this host
+                            // doesn't already own at the assigned epoch,
+                            // claim the full dispatch and start the
+                            // executor. Each claim is its own spawned task
+                            // so a slow (or failing) claim round trip for
+                            // one job never delays this tick's ack
+                            // processing or the next heartbeat send.
+                            let Some(assignments) = &resp.capture_assignments else {
+                                continue;
+                            };
+                            capture_jobs_for_heartbeat.cancel_absent(assignments);
+                            for assignment in assignments {
+                                if !capture_jobs_for_heartbeat
+                                    .should_claim(assignment.job_id, assignment.epoch)
+                                {
+                                    continue;
+                                }
+                                let coord = coord_for_heartbeat.clone();
+                                let executor = capture_jobs_for_heartbeat.clone();
+                                let job_id = assignment.job_id;
+                                let epoch = assignment.epoch;
+                                tokio::spawn(async move {
+                                    match coord.claim_capture_job(host_id, job_id, epoch).await {
+                                        Ok(spec) => executor.start(job_id, epoch, spec),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                %job_id,
+                                                epoch,
+                                                error = %e,
+                                                "claim_capture_job failed; will retry on a \
+                                                 later heartbeat tick if the assignment persists",
+                                            );
+                                        }
+                                    }
+                                });
                             }
                         }
                         Err(e) => {

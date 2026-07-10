@@ -163,28 +163,23 @@ async fn progress_state_failure_and_retry_round_trip() {
         .await
         .expect("claim");
 
-    // Issue #539 (migration 0079): stamp a capture-progress event so the
-    // job carries non-NULL `capture_phase`/`warm_stage`/
-    // `warm_stage_started_at`/`warm_stages`/`output_tail` into the
-    // failure below — the retry-reset assertion further down needs a
-    // prior attempt's capture progress actually present to prove it gets
-    // cleared, not just vacuously absent.
-    let stage_started_at = Utc::now();
-    meta.update_enable_job_capture_progress(
+    // ADR 0084 P4: `update_enable_job_capture_progress` (the fenced,
+    // claim-renewing verb `CaptureProgress`-shaped events used to ride)
+    // was deleted as dead code — nothing has called it since the P1b
+    // cutover to heartbeat-dispatched capture jobs. Stamp the same
+    // dashboard columns via its UNFENCED replacement,
+    // `mirror_capture_progress_to_enable_job` (the heartbeat reconcile's
+    // own verb), so the retry-reset assertion further down still has a
+    // prior attempt's progress actually present to prove it gets
+    // cleared, not just vacuously absent. The new verb never populates
+    // `warm_stage_started_at`/`warm_stages` (P1b's lossier
+    // `CaptureJobProgress` wire shape carries no stage HISTORY, only the
+    // current phase/stage/tail), so this test no longer asserts on them.
+    meta.mirror_capture_progress_to_enable_job(
         job.id,
-        "pod-a",
-        &engram_core::types::CaptureProgress {
-            phase: engram_core::types::CapturePhase::Warm,
-            warm_stage: Some("install-deps".to_string()),
-            detail: None,
-            output_tail: "some hook output".to_string(),
-            warm_stages: vec![engram_core::types::WarmStageRecord {
-                name: "install-deps".to_string(),
-                started_at: stage_started_at,
-                ended_at: None,
-                outcome: engram_core::types::WarmStageOutcome::Running,
-            }],
-        },
+        Some(engram_core::types::CapturePhase::Warm.as_str()),
+        Some("install-deps"),
+        Some("some hook output"),
     )
     .await
     .expect("stamp capture progress");
@@ -194,8 +189,6 @@ async fn progress_state_failure_and_retry_round_trip() {
         Some(engram_core::types::CapturePhase::Warm)
     );
     assert_eq!(got.warm_stage.as_deref(), Some("install-deps"));
-    assert!(got.warm_stage_started_at.is_some());
-    assert!(!got.warm_stages.is_empty());
     assert_eq!(got.output_tail.as_deref(), Some("some hook output"));
 
     // Progress: total stamped once, done advances.
@@ -277,8 +270,6 @@ async fn progress_state_failure_and_retry_round_trip() {
     // stage/tail as if it were live.
     assert_eq!(retried.capture_phase, None);
     assert_eq!(retried.warm_stage, None);
-    assert_eq!(retried.warm_stage_started_at, None);
-    assert!(retried.warm_stages.is_empty());
     assert_eq!(retried.output_tail, None);
     // Completeness (review finding): the chunk-progress counters are the same
     // live-progress class — the retry must reset them too. They were 100/625
@@ -505,134 +496,6 @@ async fn stale_claimant_writes_are_fenced_off() {
     meta.set_enable_job_state(job.id, "pod-b", EnableJobState::Failed)
         .await
         .expect("park");
-}
-
-/// Issue #539: `update_enable_job_capture_progress` is claim-fenced
-/// exactly like `update_enable_job_progress` (a peer claimant's write
-/// must `Conflict`, not stomp the row), it renews the lease
-/// (`claimed_at`), and `record_enable_job_failure` — which never
-/// touches `warm_stage`/`output_tail` itself — leaves whatever the last
-/// progress write stamped in place. This is the acceptance-criterion
-/// path: even a `WarmExecTransport` kill (stream dies mid-run, no
-/// further progress write possible) must leave the failing stage + tail
-/// on the row from the last successful write before the kill.
-#[tokio::test]
-#[ignore]
-async fn capture_progress_is_fenced_renews_lease_and_survives_failure() {
-    use engram_core::types::{
-        CaptureFailureKind, CapturePhase, CaptureProgress, WarmStageOutcome, WarmStageRecord,
-    };
-
-    let Some(meta) = connect().await else { return };
-    let uri = unique_uri("capture-progress");
-    let job = meta
-        .create_or_get_enable_job(&uri, None, &test_config())
-        .await
-        .expect("create");
-    meta.claim_enable_jobs("pod-a", 300, 50)
-        .await
-        .expect("claim a");
-
-    let stage_started = Utc::now();
-    let progress = CaptureProgress {
-        phase: CapturePhase::Warm,
-        warm_stage: Some("uiresources-wait".into()),
-        detail: Some("waiting on uiresources/brain-backend".into()),
-        output_tail: "error: timed out waiting for the condition on uiresources/brain-backend"
-            .into(),
-        warm_stages: vec![WarmStageRecord {
-            name: "uiresources-wait".into(),
-            started_at: stage_started,
-            ended_at: None,
-            outcome: WarmStageOutcome::Running,
-        }],
-    };
-    meta.update_enable_job_capture_progress(job.id, "pod-a", &progress)
-        .await
-        .expect("pod-a progress write");
-
-    let after_progress = meta.get_enable_job(job.id).await.unwrap().unwrap();
-    assert_eq!(after_progress.capture_phase, Some(CapturePhase::Warm));
-    assert_eq!(
-        after_progress.warm_stage.as_deref(),
-        Some("uiresources-wait")
-    );
-    assert_eq!(
-        after_progress.warm_stage_started_at.map(|t| t.timestamp()),
-        Some(stage_started.timestamp())
-    );
-    assert_eq!(after_progress.warm_stages.len(), 1);
-    assert!(after_progress
-        .output_tail
-        .as_deref()
-        .unwrap()
-        .contains("uiresources/brain-backend"));
-
-    // The progress write renewed the lease: an immediate re-claim
-    // attempt at lease_secs=300 must NOT hand the job to a peer (it's
-    // not expired).
-    let stolen = meta.claim_enable_jobs("pod-b", 300, 50).await.unwrap();
-    assert!(
-        !stolen.iter().any(|j| j.id == job.id),
-        "a fresh progress write must have renewed the lease — pod-b must not re-claim"
-    );
-
-    // A peer's write against a claim it doesn't hold is fenced off,
-    // exactly like update_enable_job_progress.
-    let peer_progress = CaptureProgress {
-        phase: CapturePhase::Warm,
-        warm_stage: Some("peer-stage".into()),
-        detail: None,
-        output_tail: "peer output".into(),
-        warm_stages: vec![],
-    };
-    match meta
-        .update_enable_job_capture_progress(job.id, "pod-b", &peer_progress)
-        .await
-    {
-        Err(MetaError::Conflict(msg)) => assert!(msg.contains("pod-a"), "{msg}"),
-        other => panic!("stale-claimant capture progress write must Conflict, got {other:?}"),
-    }
-    let unchanged = meta.get_enable_job(job.id).await.unwrap().unwrap();
-    assert_eq!(
-        unchanged.warm_stage.as_deref(),
-        Some("uiresources-wait"),
-        "a fenced-off peer write must not stomp the row"
-    );
-
-    // record_enable_job_failure never touches warm_stage/output_tail —
-    // they must survive the failure exactly as the last progress write
-    // left them (the diagnosis a `status None` / WarmExecTransport kill
-    // used to lose entirely).
-    meta.record_enable_job_failure(
-        job.id,
-        "pod-a",
-        &format!(
-            "base-snapshot capture failed ({}): in-guest wait timed out",
-            CaptureFailureKind::WarmStageDeadline
-        ),
-        5,
-        true,
-    )
-    .await
-    .expect("record failure");
-
-    let failed = meta.get_enable_job(job.id).await.unwrap().unwrap();
-    assert_eq!(failed.state, EnableJobState::Failed);
-    assert!(failed.error.unwrap().contains("in-guest wait timed out"));
-    assert_eq!(
-        failed.warm_stage.as_deref(),
-        Some("uiresources-wait"),
-        "failing stage must survive record_enable_job_failure"
-    );
-    assert!(
-        failed
-            .output_tail
-            .as_deref()
-            .unwrap()
-            .contains("uiresources/brain-backend"),
-        "output tail must survive record_enable_job_failure"
-    );
 }
 
 /// ADR 0036 P4 / ADR 0080: content-keyed base-snapshot reuse lookup.
