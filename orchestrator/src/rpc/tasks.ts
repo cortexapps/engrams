@@ -16,9 +16,11 @@
  *     → keep task's own persisted status ("open" at create, unchanged)
  *
  * List semantics (ADR 0087):
- *   Scope and owner filters run in SQL; live display-state filtering, search,
- *   recent-activity ordering, and pagination run after the control-plane join.
- *   Filters narrow inside the caller's ability; they never widen it.
+ *   Scope, owner, and persisted-task free-text search filters run in SQL; live
+ *   display-state filtering, recent-activity ordering, and pagination run after
+ *   the control-plane join. Synthetic unattributed rows are the sole search
+ *   exception because they have no DB representation. Filters narrow inside
+ *   the caller's ability; they never widen it.
  *
  * Unattributed sessions (anti-attribution / synthetic admin rows):
  *   Control-plane sessions with NO task_session row in the orchestrator DB are
@@ -48,7 +50,7 @@
 import { ConnectError, Code } from "@connectrpc/connect";
 import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
 import { subject } from "@casl/ability";
-import { and, eq, inArray, isNull, or, type SQL } from "drizzle-orm";
+import { and, eq, exists, ilike, inArray, isNull, or, type SQL } from "drizzle-orm";
 
 import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Task, TaskSessionRef } from "../gen/engram/app/v1/task_pb.ts";
@@ -144,6 +146,11 @@ export interface TaskDeps {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Escape a literal substring for use as a PostgreSQL LIKE/ILIKE pattern. */
+export function searchPattern(q: string): string {
+  return `%${q.replace(/[\\%_]/g, "\\$&")}%`;
+}
 
 /** Extract request headers from a HandlerContext as a plain Headers object. */
 function headersOf(ctx: HandlerContext): Headers {
@@ -469,6 +476,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       }
 
       const mineOnly = req.scope === "mine" || (req.scope === "" && !isAdmin);
+      const q = req.search.trim();
       const taskConditions: SQL[] = [];
       if (mineOnly) {
         taskConditions.push(eq(taskTable.createdByUserId, user.id));
@@ -486,6 +494,27 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         const ownerCondition = or(...ownerConds);
         if (ownerCondition) {
           taskConditions.push(ownerCondition);
+        }
+      }
+      if (q !== "") {
+        const pattern = searchPattern(q);
+        const searchCondition = or(
+          ilike(taskTable.title, pattern),
+          ilike(taskTable.id, pattern),
+          exists(
+            db
+              .select({ taskId: taskSessionTable.taskId })
+              .from(taskSessionTable)
+              .where(
+                and(
+                  eq(taskSessionTable.taskId, taskTable.id),
+                  ilike(taskSessionTable.sessionId, pattern),
+                ),
+              ),
+          ),
+        );
+        if (searchCondition) {
+          taskConditions.push(searchCondition);
         }
       }
 
@@ -555,12 +584,18 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       }
 
       // Fleet-wide views surface unattributed sessions unless the owner filter
-      // excludes system-owned rows.
+      // excludes system-owned rows. These synthetic rows have no DB
+      // representation, so they are the sole exception to SQL-backed search.
       if (!mineOnly && (owners.length === 0 || owners.includes("system"))) {
+        const syntheticSearch = q.toLowerCase();
         for (const sess of allSessions) {
-          if (!knownSessionIds.has(sess.id)) {
-            visibleTasks.push(buildUnattributedTask(sess));
-          }
+          if (knownSessionIds.has(sess.id)) continue;
+          if (
+            syntheticSearch !== "" &&
+            !`unattributed-${sess.id}`.toLowerCase().includes(syntheticSearch) &&
+            !sess.id.toLowerCase().includes(syntheticSearch)
+          ) continue;
+          visibleTasks.push(buildUnattributedTask(sess));
         }
       }
 
@@ -572,15 +607,6 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           const displayState = task.sessions[0]?.session?.status ?? "pending";
           return states.has(displayState);
         });
-      }
-
-      const q = req.search.trim().toLowerCase();
-      if (q !== "") {
-        filteredTasks = filteredTasks.filter((task) =>
-          (task.title ?? "").toLowerCase().includes(q) ||
-          task.id.toLowerCase().includes(q) ||
-          task.sessions.some((ref) => ref.sessionId.toLowerCase().includes(q))
-        );
       }
 
       filteredTasks.sort((a, b) => {

@@ -70,10 +70,15 @@ Rather than split one filter pipeline across two engines, each concern runs
 where its data lives:
 
 - **SQL (Drizzle `where`)** — ownership scoping (`eq(createdByUserId, caller)`
-  for mine-scope) and the owner filter (`eq`/`isNull`). These are the
-  security-relevant clauses; rows outside the caller's scope never leave the DB.
-- **In-memory (handler)** — search, state filter, last-active sort, and the
-  page slice, over the already-scoped rows joined with live session state.
+  for mine-scope), the owner filter (`inArray`/`isNull` OR-ed), and (rev 3)
+  the free-text search — `ilike` over title and task id plus an `exists`
+  subquery over `task_session.session_id`, LIKE wildcards escaped. Everything
+  expressible over Postgres data runs in Postgres; rows outside the caller's
+  scope or search never leave the DB.
+- **In-memory (handler)** — the state filter, last-active sort, and the page
+  slice, over the already-scoped rows joined with live session state; plus
+  the search match for synthetic unattributed rows only, which have no DB
+  representation to query.
 
 At the current fleet size (hundreds of tasks) this is strictly cheaper than
 today's load-everything handler. If the table ever outgrows in-memory

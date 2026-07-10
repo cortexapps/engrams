@@ -25,7 +25,7 @@ import { Hono } from "hono";
 import type { AddressInfo } from "node:net";
 
 import { buildServer } from "../server.ts";
-import { registerTasks, buildProfileMap } from "../rpc/tasks.ts";
+import { registerTasks, buildProfileMap, searchPattern } from "../rpc/tasks.ts";
 import type { TaskDeps, SessionsClient, Db, GetSession, ImagesClient } from "../rpc/tasks.ts";
 import type { HarnessCatalogClient } from "../rpc/task-create.ts";
 import type { UserSecretStore } from "../db/user-secrets.ts";
@@ -43,7 +43,7 @@ import {
   taskSession as taskSessionTable,
   profile as profileTable,
 } from "../db/schema.ts";
-import { eq, type SQL } from "drizzle-orm";
+import { eq, sql, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 
 // ---------------------------------------------------------------------------
@@ -346,26 +346,31 @@ function okDb(taskId = "fake-task", listFixture?: ListDbFixture): Db {
     updatedAt: new Date(),
   };
   const dialect = new PgDialect();
-  // First select() (task table) returns [taskRow]; subsequent selects
-  // (task_session) return []. A counter flips after the first resolve.
-  let selectCount = 0;
   const makeSelectChain = () => {
-    const defaultRows = selectCount++ === 0 ? [taskRow] : [];
     let selectedTable: unknown;
     let condition: SQL | undefined;
     const resolveFixtureRows = (): unknown[] => {
-      if (!listFixture) return defaultRows;
+      if (!listFixture) return selectedTable === taskTable ? [taskRow] : [];
 
       if (selectedTable === taskTable) {
         let rows = listFixture.tasks;
         if (!condition) return rows;
         const query = dialect.sqlToQuery(condition);
-        const ownerIds = query.params.filter((param): param is string => typeof param === "string");
+        const stringParams = query.params.filter(
+          (param): param is string => typeof param === "string",
+        );
+        const isLikePattern = (param: string) =>
+          param.startsWith("%") && param.endsWith("%");
+        const ownerIds = stringParams.filter((param) => !isLikePattern(param));
+        const searchNeedles = stringParams
+          .filter(isLikePattern)
+          .map((pattern) =>
+            pattern.slice(1, -1).replace(/\\([\\%_])/g, "$1").toLowerCase()
+          );
         const hasNullOwner = query.sql.includes("created_by_user_id") && query.sql.includes("is null");
-        const hasOwnerOr = query.sql.includes(" or ");
-        const hasOwnerAnd = query.sql.includes(" and ");
+        const hasScopeOwner = /created_by_user_id"\s*=\s*\$\d+/.test(query.sql);
 
-        if (hasOwnerAnd && ownerIds.length > 0) {
+        if (hasScopeOwner && ownerIds.length > 0) {
           const [scopeOwnerId, ...filterOwnerIds] = ownerIds;
           rows = rows.filter((row) => row.createdByUserId === scopeOwnerId);
           if (filterOwnerIds.length > 0 || hasNullOwner) {
@@ -375,16 +380,26 @@ function okDb(taskId = "fake-task", listFixture?: ListDbFixture): Db {
                 (hasNullOwner && row.createdByUserId === null),
             );
           }
-        } else if (hasOwnerOr || ownerIds.length > 1) {
+        } else if (ownerIds.length > 0 || hasNullOwner) {
           rows = rows.filter(
             (row) =>
               (row.createdByUserId != null && ownerIds.includes(row.createdByUserId)) ||
               (hasNullOwner && row.createdByUserId === null),
           );
-        } else if (hasNullOwner) {
-          rows = rows.filter((row) => row.createdByUserId === null);
-        } else if (ownerIds.length === 1) {
-          rows = rows.filter((row) => row.createdByUserId === ownerIds[0]);
+        }
+
+        if (searchNeedles.length > 0) {
+          rows = rows.filter((row) =>
+            searchNeedles.some((needle) =>
+              (row.title ?? "").toLowerCase().includes(needle) ||
+              row.id.toLowerCase().includes(needle) ||
+              listFixture.sessionRefs.some(
+                (ref) =>
+                  ref.taskId === row.id &&
+                  ref.sessionId.toLowerCase().includes(needle),
+              )
+            )
+          );
         }
         return rows;
       }
@@ -409,6 +424,12 @@ function okDb(taskId = "fake-task", listFixture?: ListDbFixture): Db {
       where: (where: SQL | undefined) => {
         condition = where;
         return chain;
+      },
+      getSQL: () => {
+        if (selectedTable !== taskSessionTable) {
+          throw new Error("unexpected fake task DB subquery table");
+        }
+        return sql`select ${taskSessionTable.taskId} from ${taskSessionTable} where ${condition}`;
       },
       limit: () => chain,
       then: (resolve: (v: unknown) => unknown) => resolve(resolveFixtureRows()),
@@ -640,6 +661,10 @@ function makeListClient(
 }
 
 describe("TaskService — ListTasks ADR 0087", () => {
+  test("searchPattern escapes LIKE metacharacters", () => {
+    expect(searchPattern("50%_x\\")).toBe("%50\\%\\_x\\\\%");
+  });
+
   test("member empty scope sees only own tasks", async () => {
     const resp = await makeListClient(MEMBER_A, "user").listTasks({});
     expect(resp.tasks.map((task) => task.id)).toEqual([LIST_MEMBER_TITLE]);
@@ -686,6 +711,17 @@ describe("TaskService — ListTasks ADR 0087", () => {
       expect(resp.tasks.map((task) => task.id)).toEqual([expectedId]);
       expect(resp.totalCount).toBe(1);
     }
+  });
+
+  test("admin all search can match only an unattributed session id", async () => {
+    const resp = await makeListClient(ADMIN_ID, "admin").listTasks({
+      scope: "all",
+      search: "ORPHAN-SESSION",
+    });
+    expect(resp.tasks.map((task) => task.id)).toEqual([
+      `unattributed-${LIST_ORPHAN_SESSION}`,
+    ]);
+    expect(resp.totalCount).toBe(1);
   });
 
   test("states match live primary status and pending fallback", async () => {
