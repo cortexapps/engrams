@@ -1,18 +1,9 @@
-import {
-  useState,
-  type ComponentPropsWithoutRef,
-  type ReactNode,
-  type Ref,
-  type RefObject,
-} from "react";
+import type { ComponentPropsWithoutRef, ReactNode, Ref, RefObject } from "react";
 import { Link } from "@tanstack/react-router";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Pencil } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatusGlyph } from "../../components/Glyph";
-import { TitleEditForm } from "./TitleEditForm";
 import type { SessionListItem } from "../../lib/types";
 import { relativeTime, shortId, statusLabel } from "./session-format";
 import { ProfileChip } from "../../components/profiles/ProfileChip";
@@ -141,17 +132,17 @@ export function SkeletonRows() {
   );
 }
 
-/** Owner column label. Service-account owners (ADR 0086 API keys, email
- *  `apikey+…@service.local`) display their user NAME — which IS the key's
- *  name (e.g. `ci-engineering-blog`) — instead of the synthetic email. */
+/** Owner column label: display name first, email as the fallback. The same
+ *  rule covers service-account owners (ADR 0086 API keys) — their user NAME is
+ *  the key's name (e.g. `ci-engineering-blog`) while the email is the
+ *  synthetic `apikey+…@service.local`. */
 function ownerLabel(s: SessionListItem): string | null {
-  const email = s.owner_email ?? "";
-  if (email.startsWith("apikey+") && email.endsWith("@service.local")) {
-    return s.owner_name || email;
-  }
-  return s.owner_email;
+  return s.owner_name || s.owner_email;
 }
 
+// Rows are read-only: renaming lives on the session detail page, not the list
+// (a hover-revealed control fought the virtualized rows' transforms and full-
+// row Link — retired rather than patched).
 export function SessionRow({
   s,
   showOwner,
@@ -163,45 +154,13 @@ export function SessionRow({
   showOwner: boolean;
   now?: number;
 } & ComponentPropsWithoutRef<"li"> & { ref?: Ref<HTMLLIElement> }) {
-  const [editing, setEditing] = useState(false);
-  // A real task row (not a synthetic unattributed-* admin row) can be renamed.
-  // The server is authoritative (owner or admin); the list only surfaces rows
-  // the caller may see, so showing the control whenever there's a task is safe.
-  const canEdit = s.taskId != null;
-
-  if (editing && s.taskId) {
-    return (
-      // Keep the virtualization contract (ref + absolute positioning + the
-      // virtualizer's transform in rowProps) — dropping it would paint the
-      // edit form at the list's top-left; measureElement absorbs the form's
-      // different height.
-      <li
-        ref={ref}
-        {...rowProps}
-        data-testid="session-row"
-        data-session-id={s.id}
-        className={`absolute left-0 top-0 w-full px-3 py-2 ${rowProps.className ?? ""}`}
-      >
-        <TitleEditForm
-          taskId={s.taskId}
-          initial={s.title ?? ""}
-          isCustom={s.titleIsCustom}
-          onDone={() => setEditing(false)}
-        />
-      </li>
-    );
-  }
-
   return (
-    // `group` reveals the rename affordance on hover; the li is already
-    // absolutely positioned by the virtualizer, which also makes it the
-    // containing block for the Pencil (no `relative` needed).
     <li
       ref={ref}
       {...rowProps}
       data-testid="session-row"
       data-session-id={s.id}
-      className={`group absolute left-0 top-0 w-full ${rowProps.className ?? ""}`}
+      className={`absolute left-0 top-0 w-full ${rowProps.className ?? ""}`}
     >
       <Link
         to="/sessions/$id"
@@ -233,7 +192,9 @@ export function SessionRow({
                     {(s.owner_name || s.owner_email || "?").charAt(0).toUpperCase()}
                   </AvatarFallback>
                 </Avatar>
-                <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
+                {/* Names read as language, not machine data — no mono (the
+                    email fallback inherits the same quiet tone). */}
+                <span className="min-w-0 truncate text-xs text-muted-foreground">
                   {ownerLabel(s)}
                 </span>
               </>
@@ -245,21 +206,6 @@ export function SessionRow({
           {relativeTime(s.last_active_at, now)}
         </span>
       </Link>
-      {/* Rename affordance — a sibling of the Link (never nested in an anchor),
-          revealed on row hover / keyboard focus. */}
-      {canEdit && (
-        <Button
-          type="button"
-          size="icon-xs"
-          variant="ghost"
-          onClick={() => setEditing(true)}
-          aria-label="Rename session"
-          title="Rename"
-          className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
-        >
-          <Pencil />
-        </Button>
-      )}
     </li>
   );
 }
