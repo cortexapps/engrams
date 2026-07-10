@@ -537,6 +537,11 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
                     path.display()
                 )));
             }
+            tracing::info!(
+                drive_id = %drive.drive_id,
+                path = %path.display(),
+                "vz: attaching aux erofs drive"
+            );
             let url = nsurl_for_path(&path);
             let att = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
                 VZDiskImageStorageDeviceAttachment::alloc(),
