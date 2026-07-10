@@ -113,6 +113,13 @@
       "when": 1783648930804,
       "tag": "0015_api_keys",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1783691373160,
+      "tag": "0016_device_code",
+      "breakpoints": true
     }
   ]
 }

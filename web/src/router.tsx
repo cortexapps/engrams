@@ -24,6 +24,7 @@ import {
 import type { AuthState } from "./auth/AuthProvider";
 import { RootLayout } from "./pages/RootLayout";
 import { Login } from "./pages/Login";
+import { DeviceAuth } from "./pages/DeviceAuth";
 import { SessionsLayout } from "./pages/sessions/SessionsLayout";
 import { StartScreen } from "./pages/sessions/StartScreen";
 import { MySessions } from "./pages/sessions/MySessions";
@@ -110,6 +111,22 @@ const indexRoute = createRoute({
     throw redirect({ to: "/sessions" });
   },
 });
+
+// /device — the browser leg of `engrams auth login` (device-flow approval).
+// Child of the app layout so an anonymous visitor logs in first; the CLI
+// opens /device?user_code=XXXX (the code is also typeable by hand).
+const deviceAuthRoute = createRoute({
+  getParentRoute: () => appLayoutRoute,
+  path: "/device",
+  validateSearch: (search: Record<string, unknown>): { user_code?: string } =>
+    typeof search["user_code"] === "string" ? { user_code: search["user_code"] } : {},
+  component: DeviceAuthPage,
+});
+
+function DeviceAuthPage() {
+  const { user_code } = deviceAuthRoute.useSearch();
+  return <DeviceAuth initialCode={user_code} />;
+}
 
 // /sessions layout route (second sidebar) ----------------------------------
 const sessionsLayoutRoute = createRoute({
@@ -263,6 +280,7 @@ export const routeTree = rootRoute.addChildren([
   // Authenticated app shell — all authenticated routes nested here
   appLayoutRoute.addChildren([
     indexRoute,
+    deviceAuthRoute,
     sessionsLayoutRoute.addChildren([
       startScreenRoute,
       mySessionsRoute,

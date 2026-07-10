@@ -32,6 +32,14 @@ export interface Config {
   /** TRUSTED_ORIGINS — comma-separated list; dev default: http://localhost:5173 */
   trustedOrigins: string[];
   /**
+   * ORCHESTRATOR_DEVICE_VERIFICATION_URL — the human-facing page `engrams
+   * auth login` sends the browser to (the SPA's /device route). Default:
+   * `${baseUrl}/device` — ORCHESTRATOR_PUBLIC_URL is the browser-facing
+   * origin in both dev (the Tiltfile sets http://localhost:5173) and prod
+   * (https://engrams.cortex.io), so the default lands on the SPA either way.
+   */
+  deviceVerificationUrl: string;
+  /**
    * BETTER_AUTH_SECRET — signing/encryption key for better-auth cookies and
    * tokens (Task 16). Required: better-auth 1.6.16 has NO silent fallback —
    * it silently uses a publicly known constant with zero warning when the var
@@ -164,6 +172,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+  const deviceVerificationUrl = optional(
+    "ORCHESTRATOR_DEVICE_VERIFICATION_URL",
+    `${baseUrl.replace(/\/$/, "")}/device`,
+  );
 
   // REQUIRED: better-auth 1.6.16 has NO silent dev fallback — it silently
   // uses a publicly known constant when absent, making the secret hole
@@ -259,6 +271,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     controlPlaneHttpUrl,
     controlPlaneBearer,
     trustedOrigins,
+    deviceVerificationUrl,
     betterAuthSecret,
     kekMasterKey,
     iapAudiences,

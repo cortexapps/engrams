@@ -138,6 +138,14 @@ import { extractApiKey } from "./api-key-header.ts";
  *      The strings must stay in lockstep with the routes' `app.post(...)` paths
  *      (orchestrator/src/routes/slack-{events,interactivity}.ts).
  *
+ *   3. The device-authorization CLI endpoints (`engrams auth login`). The CLI
+ *      requests a code and polls for the token from a bare terminal — no IAP
+ *      identity, no cookie, no key yet; that anonymity is the point of the
+ *      flow (RFC 8628). Both endpoints are inert without a human approving
+ *      the code from an IAP'd browser session, and the plugin rate-limits
+ *      them. The browser-side legs (GET /api/auth/device, /approve, /deny)
+ *      are NOT here — they ride the normal IAP + session-cookie path.
+ *
  * Add new probe/observability/webhook paths here rather than scattering inline
  * checks.
  */
@@ -145,6 +153,8 @@ const PUBLIC_PATHS: ReadonlySet<string> = new Set([
   "/healthz",
   "/api/v1/integrations/slack/events",
   "/api/v1/integrations/slack/interactivity",
+  "/api/auth/device/code",
+  "/api/auth/device/token",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -449,17 +459,21 @@ export async function iapBridge(
     return;
   }
 
-  // API-KEY BYPASS (ADR 0086): a programmatic request carrying an API key
-  // (x-api-key or `Authorization: Bearer engk_…`) skips the IAP wall — IAP can
-  // only attest humans, and the fail-closed 401 below would otherwise block
-  // every keyed caller. This is a pure ROUTING bypass: nothing is minted or
-  // granted here. getSession at the auth seams validates the key (the apiKey
-  // plugin's mock-session hook); a junk key sails past the bridge and still
-  // fails closed at every seam with its normal Unauthenticated/401. Checked
-  // BEFORE verifyExistingSession: the mock session it would resolve carries a
-  // @service.local email that can never match an IAP assertion, and the
-  // user-switch logic below would 401 the request.
-  if (extractApiKey(headersOf(req))) {
+  // PROGRAMMATIC BYPASS (ADR 0086): a request carrying an Authorization
+  // header or x-api-key skips the IAP wall — IAP can only attest humans, and
+  // the fail-closed 401 below would otherwise block every programmatic
+  // caller. Two shapes arrive here: API keys (x-api-key / `Bearer engk_…`)
+  // and the CLI login exchange's `Bearer <device session token>` (browsers
+  // never send Authorization, so no human traffic changes lanes). This is a
+  // pure ROUTING bypass: nothing is minted or granted here. getSession at the
+  // auth seams validates the credential (the apiKey plugin's mock-session
+  // hook, or the bearer plugin's HMAC check); junk sails past the bridge and
+  // still fails closed at every seam with its normal Unauthenticated/401.
+  // Checked BEFORE verifyExistingSession: the mock session an API key would
+  // resolve carries a @service.local email that can never match an IAP
+  // assertion, and the user-switch logic below would 401 the request.
+  const hdrs = headersOf(req);
+  if (extractApiKey(hdrs) || hdrs.has("authorization")) {
     next();
     return;
   }
