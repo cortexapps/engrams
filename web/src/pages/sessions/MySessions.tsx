@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { Plus } from "lucide-react";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
@@ -15,6 +15,7 @@ const PAGE_SIZE = 50;
 // start screen's "See all". Starting a task now lives on the composer at
 // /sessions; this page's "New task" is just a link back to it.
 export function MySessions() {
+  const scrollRef = useRef<HTMLDivElement>(null);
   const [search, setSearch] = useState("");
   const [limit, setLimit] = useState(PAGE_SIZE);
   const debouncedSearch = useDebouncedValue(search);
@@ -46,7 +47,7 @@ export function MySessions() {
   );
 
   return (
-    <div className="flex-1 space-y-6 overflow-auto p-4 md:p-6">
+    <div className="flex min-h-0 flex-1 flex-col gap-6 p-4 md:p-6">
       <PageHeading
         title="My tasks"
         description="Bounded units of agent work: launch, watch, resume."
@@ -64,29 +65,32 @@ export function MySessions() {
         className="max-w-xs"
       />
 
-      <SessionsList
-        sessions={sessions ?? []}
-        isPending={isPending}
-        error={error}
-        showOwner={false}
-        emptyText={
-          search
-            ? "No matching tasks."
-            : "No tasks yet. Start one to launch a sandbox and hand an agent a task."
-        }
-        emptyAction={search ? undefined : newTask}
-      />
+      <div ref={scrollRef} className="min-h-0 flex-1 space-y-6 overflow-auto">
+        <SessionsList
+          sessions={sessions ?? []}
+          isPending={isPending}
+          error={error}
+          showOwner={false}
+          emptyText={
+            search
+              ? "No matching tasks."
+              : "No tasks yet. Start one to launch a sandbox and hand an agent a task."
+          }
+          emptyAction={search ? undefined : newTask}
+          scrollRef={scrollRef}
+        />
 
-      {hasMore && (
-        <div ref={loadMoreRef} className="py-2 text-center text-xs text-muted-foreground">
-          Loading more…
-        </div>
-      )}
-      {total > 0 && (
-        <p className="font-mono text-xs tabular-nums text-muted-foreground">
-          {visibleCount} of {total} tasks
-        </p>
-      )}
+        {hasMore && (
+          <div ref={loadMoreRef} className="py-2 text-center text-xs text-muted-foreground">
+            Loading more…
+          </div>
+        )}
+        {total > 0 && (
+          <p className="font-mono text-xs tabular-nums text-muted-foreground">
+            {visibleCount} of {total} tasks
+          </p>
+        )}
+      </div>
     </div>
   );
 }

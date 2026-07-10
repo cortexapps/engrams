@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Activity, UserRound, X } from "lucide-react";
 import { StatusGlyph } from "../../components/Glyph";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
@@ -28,6 +28,7 @@ const SESSION_STATES: SessionState[] = [
 ];
 
 export function AllSessions() {
+  const scrollRef = useRef<HTMLDivElement>(null);
   const [search, setSearch] = useState("");
   const [filters, setFilters] = useState<Record<string, string[]>>({ owner: [], state: [] });
   const [limit, setLimit] = useState(PAGE_SIZE);
@@ -86,7 +87,7 @@ export function AllSessions() {
   };
 
   return (
-    <div className="flex-1 space-y-6 overflow-auto p-4 md:p-6">
+    <div className="flex min-h-0 flex-1 flex-col gap-6 p-4 md:p-6">
       <PageHeading title="All tasks" description="Every task across the fleet, owner-attributed." />
 
       <div className="flex flex-wrap items-center gap-2">
@@ -116,23 +117,26 @@ export function AllSessions() {
         )}
       </div>
 
-      <SessionsList
-        sessions={sessions ?? []}
-        isPending={isPending}
-        error={error}
-        showOwner
-        emptyText={hasFilters ? "No matching tasks." : "No tasks across the fleet yet."}
-      />
-      {hasMore && (
-        <div ref={loadMoreRef} className="py-2 text-center text-xs text-muted-foreground">
-          Loading more…
-        </div>
-      )}
-      {total > 0 && (
-        <p className="font-mono text-xs tabular-nums text-muted-foreground">
-          {visibleCount} of {total} tasks
-        </p>
-      )}
+      <div ref={scrollRef} className="min-h-0 flex-1 space-y-6 overflow-auto">
+        <SessionsList
+          sessions={sessions ?? []}
+          isPending={isPending}
+          error={error}
+          showOwner
+          emptyText={hasFilters ? "No matching tasks." : "No tasks across the fleet yet."}
+          scrollRef={scrollRef}
+        />
+        {hasMore && (
+          <div ref={loadMoreRef} className="py-2 text-center text-xs text-muted-foreground">
+            Loading more…
+          </div>
+        )}
+        {total > 0 && (
+          <p className="font-mono text-xs tabular-nums text-muted-foreground">
+            {visibleCount} of {total} tasks
+          </p>
+        )}
+      </div>
     </div>
   );
 }

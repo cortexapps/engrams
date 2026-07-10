@@ -1,5 +1,6 @@
-import type { ReactNode } from "react";
+import type { ComponentPropsWithoutRef, ReactNode, Ref, RefObject } from "react";
 import { Link } from "@tanstack/react-router";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatusGlyph } from "../../components/Glyph";
@@ -20,6 +21,7 @@ export function SessionsList({
   emptyAction,
   isPending,
   error,
+  scrollRef,
 }: {
   sessions: SessionListItem[];
   showOwner: boolean;
@@ -32,6 +34,8 @@ export function SessionsList({
   /** Fetch error. Only surfaced when there's no data to fall back to; a failed
    * background refetch keeps the last-good list visible (calm under live state). */
   error?: unknown;
+  /** Scroll container shared with the virtualized session rows. */
+  scrollRef: RefObject<HTMLElement | null>;
 }) {
   // The query keeps `placeholderData: prev`, so once we've loaded, `isPending`
   // is false and stale rows stay on screen through refetches. These two guards
@@ -59,21 +63,47 @@ export function SessionsList({
     );
   }
 
-  return <SessionRows sessions={sessions} showOwner={showOwner} />;
+  return <SessionRows sessions={sessions} showOwner={showOwner} scrollRef={scrollRef} />;
 }
 
 export function SessionRows({
   sessions,
   showOwner,
+  scrollRef,
 }: {
   sessions: SessionListItem[];
   showOwner: boolean;
+  scrollRef: RefObject<HTMLElement | null>;
 }) {
+  const virtualizer = useVirtualizer({
+    count: sessions.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => 41,
+    overscan: 12,
+    initialRect: { width: 800, height: 600 },
+  });
+
   return (
-    <ul className="divide-y divide-border overflow-hidden rounded-lg border">
-      {sessions.map((s) => (
-        <SessionRow key={s.id} s={s} showOwner={showOwner} />
-      ))}
+    <ul
+      className="relative overflow-hidden rounded-lg border"
+      style={{ height: virtualizer.getTotalSize() }}
+    >
+      {virtualizer.getVirtualItems().map((virtualRow) => {
+        const s = sessions[virtualRow.index];
+        return (
+          <SessionRow
+            key={s.id}
+            ref={virtualizer.measureElement}
+            data-index={virtualRow.index}
+            className={
+              virtualRow.index === sessions.length - 1 ? undefined : "border-b border-border"
+            }
+            style={{ transform: `translateY(${virtualRow.start}px)` }}
+            s={s}
+            showOwner={showOwner}
+          />
+        );
+      })}
     </ul>
   );
 }
@@ -110,9 +140,23 @@ function ownerLabel(s: SessionListItem): string | null {
   return s.owner_email;
 }
 
-export function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }) {
+export function SessionRow({
+  s,
+  showOwner,
+  ref,
+  ...rowProps
+}: {
+  s: SessionListItem;
+  showOwner: boolean;
+} & ComponentPropsWithoutRef<"li"> & { ref?: Ref<HTMLLIElement> }) {
   return (
-    <li data-testid="session-row" data-session-id={s.id}>
+    <li
+      ref={ref}
+      {...rowProps}
+      data-testid="session-row"
+      data-session-id={s.id}
+      className={`absolute left-0 top-0 w-full ${rowProps.className ?? ""}`}
+    >
       <Link
         to="/sessions/$id"
         params={{ id: s.id }}
