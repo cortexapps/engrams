@@ -24,6 +24,9 @@ plugins:
   - remote: buf.build/bufbuild/es:v2.2.5
     out: orchestrator/src/gen
     opt: target=ts
+  - remote: buf.build/bufbuild/es:v2.2.5
+    out: cli/src/gen
+    opt: target=ts
   - remote: buf.build/connectrpc/query-es:v2.1.0
     out: web/src/gen
     opt: target=ts
