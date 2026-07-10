@@ -76,12 +76,17 @@ export function SessionsRail() {
             </SidebarMenuButton>
           </SidebarMenuItem>
         </SidebarMenu>
+        {/* The rail is a permanently dark surface (`.sidebar-section` re-tones
+            --sidebar in BOTH themes), but stock SidebarInput paints
+            bg-background — near-white in light mode — under the rail's
+            inherited sage text. Key the field to the sidebar palette instead
+            so text/placeholder stay legible in either theme. */}
         <SidebarInput
           value={search}
           onChange={(event) => setSearch(event.target.value)}
           placeholder="Search tasks…"
           aria-label="Search tasks"
-          className="group-data-[collapsible=icon]:hidden"
+          className="border-sidebar-border bg-sidebar-accent/40 text-sidebar-foreground placeholder:text-sidebar-foreground/60 dark:bg-sidebar-accent/40 group-data-[collapsible=icon]:hidden"
         />
       </SidebarHeader>
 
