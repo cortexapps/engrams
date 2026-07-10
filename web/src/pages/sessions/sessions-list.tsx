@@ -1,32 +1,19 @@
-import { useState, type ReactNode } from "react";
+import type { ComponentPropsWithoutRef, ReactNode, Ref, RefObject } from "react";
 import { Link } from "@tanstack/react-router";
-import { Pencil } from "lucide-react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StatusGlyph } from "../../components/Glyph";
-import { TitleEditForm } from "./TitleEditForm";
 import type { SessionListItem } from "../../lib/types";
-import {
-  compareSessions,
-  lifecycleOf,
-  matchesFilter,
-  relativeTime,
-  shortId,
-  statusLabel,
-  type StatusFilter,
-} from "./session-format";
+import { relativeTime, shortId, statusLabel } from "./session-format";
 import { ProfileChip } from "../../components/profiles/ProfileChip";
+import { useNow } from "../../hooks/useNow";
 
 // The sessions list reads as a workspace switcher, not a data grid: a flat list
-// of rich rows ordered most-recently-active first (the same order as the rail),
+// of rich rows in the server's most-recently-active-first order,
 // each row a single focusable link into that workspace. A status telltale (the glyph)
-// leads, the session id carries identity — the slot a human-readable name will
-// take over later — and the image/status/age trail as quiet metadata. Live /
-// Archived / All tabs keep terminal history out of the default working set.
-
-const FILTERS: StatusFilter[] = ["live", "archived", "all"];
+// leads, the title carries identity (short id when unnamed), and the
+// image/status/age trail as quiet metadata.
 
 export function SessionsList({
   sessions,
@@ -35,6 +22,7 @@ export function SessionsList({
   emptyAction,
   isPending,
   error,
+  scrollRef,
 }: {
   sessions: SessionListItem[];
   showOwner: boolean;
@@ -47,9 +35,9 @@ export function SessionsList({
   /** Fetch error. Only surfaced when there's no data to fall back to; a failed
    * background refetch keeps the last-good list visible (calm under live state). */
   error?: unknown;
+  /** Scroll container shared with the virtualized session rows. */
+  scrollRef: RefObject<HTMLElement | null>;
 }) {
-  const [filter, setFilter] = useState<StatusFilter>("live");
-
   // The query keeps `placeholderData: prev`, so once we've loaded, `isPending`
   // is false and stale rows stay on screen through refetches. These two guards
   // therefore only fire on the genuine first load.
@@ -76,66 +64,56 @@ export function SessionsList({
     );
   }
 
-  const live = sessions.filter((s) => lifecycleOf(s.status) !== "ARCHIVED").length;
-
-  return (
-    <Tabs value={filter} onValueChange={(v) => setFilter(v as StatusFilter)}>
-      <TabsList>
-        <TabsTrigger value="live">
-          Live
-          <Count n={live} />
-        </TabsTrigger>
-        <TabsTrigger value="archived">
-          Archived
-          <Count n={sessions.length - live} />
-        </TabsTrigger>
-        <TabsTrigger value="all">
-          All
-          <Count n={sessions.length} />
-        </TabsTrigger>
-      </TabsList>
-      {FILTERS.map((f) => (
-        <TabsContent key={f} value={f}>
-          <SessionRows sessions={sessions} filter={f} showOwner={showOwner} />
-        </TabsContent>
-      ))}
-    </Tabs>
-  );
+  return <SessionRows sessions={sessions} showOwner={showOwner} scrollRef={scrollRef} />;
 }
 
-function SessionRows({
+export function SessionRows({
   sessions,
-  filter,
   showOwner,
+  scrollRef,
 }: {
   sessions: SessionListItem[];
-  filter: StatusFilter;
   showOwner: boolean;
+  scrollRef: RefObject<HTMLElement | null>;
 }) {
-  const rows = sessions.filter((s) => matchesFilter(s.status, filter)).sort(compareSessions);
-  if (rows.length === 0) {
-    return (
-      <p className="py-10 text-center text-sm text-muted-foreground">
-        {filter === "archived" ? "No archived tasks." : "No live tasks."}
-      </p>
-    );
-  }
+  const now = useNow();
+  const virtualizer = useVirtualizer({
+    count: sessions.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => 41,
+    overscan: 12,
+    initialRect: { width: 800, height: 600 },
+  });
+
   return (
-    <ul className="divide-y divide-border overflow-hidden rounded-lg border">
-      {rows.map((s) => (
-        <SessionRow key={s.id} s={s} showOwner={showOwner} />
-      ))}
+    <ul
+      className="relative overflow-hidden rounded-lg border"
+      style={{ height: virtualizer.getTotalSize() }}
+    >
+      {virtualizer.getVirtualItems().map((virtualRow) => {
+        const s = sessions[virtualRow.index];
+        return (
+          <SessionRow
+            key={s.id}
+            ref={virtualizer.measureElement}
+            data-index={virtualRow.index}
+            className={
+              virtualRow.index === sessions.length - 1 ? undefined : "border-b border-border"
+            }
+            style={{ transform: `translateY(${virtualRow.start}px)` }}
+            s={s}
+            showOwner={showOwner}
+            now={now}
+          />
+        );
+      })}
     </ul>
   );
 }
 
-function Count({ n }: { n: number }) {
-  return <span className="ml-1.5 font-mono text-xs tabular-nums opacity-60">{n}</span>;
-}
-
 // First-load placeholder: the row silhouette, not a spinner, so the list keeps
 // its shape while the fetch resolves (mirrors the rail's skeleton behaviour).
-function SkeletonRows() {
+export function SkeletonRows() {
   return (
     <div role="status" aria-label="Loading tasks">
       <ul className="divide-y divide-border overflow-hidden rounded-lg border">
@@ -154,39 +132,36 @@ function SkeletonRows() {
   );
 }
 
-/** Owner column label. Service-account owners (ADR 0086 API keys, email
- *  `apikey+…@service.local`) display their user NAME — which IS the key's
- *  name (e.g. `ci-engineering-blog`) — instead of the synthetic email. */
+/** Owner column label: display name first, email as the fallback. The same
+ *  rule covers service-account owners (ADR 0086 API keys) — their user NAME is
+ *  the key's name (e.g. `ci-engineering-blog`) while the email is the
+ *  synthetic `apikey+…@service.local`. */
 function ownerLabel(s: SessionListItem): string | null {
-  const email = s.owner_email ?? "";
-  if (email.startsWith("apikey+") && email.endsWith("@service.local")) {
-    return s.owner_name || email;
-  }
-  return s.owner_email;
+  return s.owner_name || s.owner_email;
 }
 
-function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }) {
-  const [editing, setEditing] = useState(false);
-  // A real task row (not a synthetic unattributed-* admin row) can be renamed.
-  // The server is authoritative (owner or admin); the list only surfaces rows
-  // the caller may see, so showing the control whenever there's a task is safe.
-  const canEdit = s.taskId != null;
-
-  if (editing && s.taskId) {
-    return (
-      <li data-testid="session-row" data-session-id={s.id} className="px-3 py-2">
-        <TitleEditForm
-          taskId={s.taskId}
-          initial={s.title ?? ""}
-          isCustom={s.titleIsCustom}
-          onDone={() => setEditing(false)}
-        />
-      </li>
-    );
-  }
-
+// Rows are read-only: renaming lives on the session detail page, not the list
+// (a hover-revealed control fought the virtualized rows' transforms and full-
+// row Link — retired rather than patched).
+export function SessionRow({
+  s,
+  showOwner,
+  now,
+  ref,
+  ...rowProps
+}: {
+  s: SessionListItem;
+  showOwner: boolean;
+  now?: number;
+} & ComponentPropsWithoutRef<"li"> & { ref?: Ref<HTMLLIElement> }) {
   return (
-    <li data-testid="session-row" data-session-id={s.id} className="group relative">
+    <li
+      ref={ref}
+      {...rowProps}
+      data-testid="session-row"
+      data-session-id={s.id}
+      className={`absolute left-0 top-0 w-full ${rowProps.className ?? ""}`}
+    >
       <Link
         to="/sessions/$id"
         params={{ id: s.id }}
@@ -217,7 +192,9 @@ function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }
                     {(s.owner_name || s.owner_email || "?").charAt(0).toUpperCase()}
                   </AvatarFallback>
                 </Avatar>
-                <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
+                {/* Names read as language, not machine data — no mono (the
+                    email fallback inherits the same quiet tone). */}
+                <span className="min-w-0 truncate text-xs text-muted-foreground">
                   {ownerLabel(s)}
                 </span>
               </>
@@ -226,24 +203,9 @@ function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }
         )}
         <span className="w-20 shrink-0 text-xs text-muted-foreground">{statusLabel(s.status)}</span>
         <span className="w-9 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground">
-          {relativeTime(s.last_active_at)}
+          {relativeTime(s.last_active_at, now)}
         </span>
       </Link>
-      {/* Rename affordance — a sibling of the Link (never nested in an anchor),
-          revealed on row hover / keyboard focus. */}
-      {canEdit && (
-        <Button
-          type="button"
-          size="icon-xs"
-          variant="ghost"
-          onClick={() => setEditing(true)}
-          aria-label="Rename session"
-          title="Rename"
-          className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
-        >
-          <Pencil />
-        </Button>
-      )}
     </li>
   );
 }

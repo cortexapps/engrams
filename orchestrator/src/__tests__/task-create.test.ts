@@ -27,6 +27,7 @@ import type {
   PortExposureRow,
 } from "../db/port-exposures.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
+import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 
 // The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
 // the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
@@ -335,6 +336,22 @@ function recordingDb(records: Record<string, unknown>[], throwOnTx = false): Db 
   } as unknown as Db;
 }
 
+function fakeUsers(
+  getIdentity: UserIdentityStore["getIdentity"] = async () => null,
+): UserIdentityStore {
+  return {
+    getIdentity,
+    async getIdentities(userIds) {
+      const entries = await Promise.all(
+        userIds.map(async (id) => [id, await getIdentity(id)] as const),
+      );
+      return new Map(
+        entries.filter((entry): entry is readonly [string, UserIdentity] => entry[1] != null),
+      );
+    },
+  };
+}
+
 const createDeps = (
   sessions: TaskSessionsClient,
   db: Db,
@@ -354,7 +371,7 @@ const createDeps = (
   db,
   // Default to "unknown user" so tests exercising other seams don't hit the
   // real Drizzle fallback against the fake Db.
-  users: opts.users ?? { getIdentity: async () => null },
+  users: opts.users ?? fakeUsers(),
   ...(opts.portExposures ? { portExposures: opts.portExposures } : {}),
 });
 
@@ -461,7 +478,9 @@ describe("createTaskWithSession", () => {
     const sessions = fakeSessions();
     await createTaskWithSession(
       createDeps(sessions, recordingDb([]), {
-        users: { getIdentity: async (id) => (id === "user-1" ? { name: "Ada", email: "ada@example.com" } : null) },
+        users: fakeUsers(async (id) =>
+          id === "user-1" ? { name: "Ada", email: "ada@example.com" } : null
+        ),
       }),
       { type: "chat", ownerUserId: "user-1", profileId: "p1" },
     );
@@ -475,9 +494,7 @@ describe("createTaskWithSession", () => {
     const sessions = fakeSessions();
     await createTaskWithSession(
       createDeps(sessions, recordingDb([]), {
-        users: {
-          getIdentity: async () => ({ name: "svc", email: "apikey+abc@service.local" }),
-        },
+        users: fakeUsers(async () => ({ name: "svc", email: "apikey+abc@service.local" })),
       }),
       { type: "chat", ownerUserId: "svc-1", profileId: "p1" },
     );
@@ -490,7 +507,9 @@ describe("createTaskWithSession", () => {
     const sessions = fakeSessions();
     const out = await createTaskWithSession(
       createDeps(sessions, recordingDb([]), {
-        users: { getIdentity: async () => { throw new Error("identity boom"); } },
+        users: fakeUsers(async () => {
+          throw new Error("identity boom");
+        }),
       }),
       { type: "chat", ownerUserId: "user-1", profileId: "p1" },
     );

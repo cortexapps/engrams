@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// App-tier identity snapshot, resolved from the better-auth user table at read
+// time. ORCHESTRATOR-NATIVE: this file is deliberately absent from
+// crates/engram-protocol/build.rs, exactly like task.proto.
+message User {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+}

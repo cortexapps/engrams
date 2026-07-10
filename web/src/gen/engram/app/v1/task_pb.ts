@@ -8,13 +8,15 @@ import type { Session } from "./session_pb";
 import { file_engram_app_v1_session } from "./session_pb";
 import type { ProfileSnapshot } from "./profile_pb";
 import { file_engram_app_v1_profile } from "./profile_pb";
+import type { User } from "./user_pb";
+import { file_engram_app_v1_user } from "./user_pb";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file engram/app/v1/task.proto.
  */
 export const file_engram_app_v1_task: GenFile = /*@__PURE__*/
-  fileDesc("ChhlbmdyYW0vYXBwL3YxL3Rhc2sucHJvdG8SDWVuZ3JhbS5hcHAudjEi5AEKEUNyZWF0ZVRhc2tSZXF1ZXN0EgwKBHR5cGUYASABKAkSEwoGcHJvbXB0GAMgASgJSACIAQESEgoFdGl0bGUYBCABKAlIAYgBARISCgpwcm9maWxlX2lkGAUgASgJEhQKB2hhcm5lc3MYBiABKAlIAogBARISCgVtb2RlbBgHIAEoCUgDiAEBEhMKBmVmZm9ydBgIIAEoCUgEiAEBQgkKB19wcm9tcHRCCAoGX3RpdGxlQgoKCF9oYXJuZXNzQggKBl9tb2RlbEIJCgdfZWZmb3J0SgQIAhADUglpbWFnZV91cmkiNwoSQ3JlYXRlVGFza1Jlc3BvbnNlEiEKBHRhc2sYASABKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2si+QEKBFRhc2sSCgoCaWQYASABKAkSDAoEdHlwZRgCIAEoCRISCgV0aXRsZRgDIAEoCUgAiAEBEg4KBnN0YXR1cxgEIAEoCRIfChJjcmVhdGVkX2J5X3VzZXJfaWQYBSABKAlIAYgBARITCgtzb3VyY2VfanNvbhgGIAEoCRIvCghzZXNzaW9ucxgHIAMoCzIdLmVuZ3JhbS5hcHAudjEuVGFza1Nlc3Npb25SZWYSEgoKY3JlYXRlZF9hdBgIIAEoCRIXCg90aXRsZV9pc19jdXN0b20YCSABKAhCCAoGX3RpdGxlQhUKE19jcmVhdGVkX2J5X3VzZXJfaWQivAEKDlRhc2tTZXNzaW9uUmVmEhIKCnNlc3Npb25faWQYASABKAkSEQoEcm9sZRgCIAEoCUgAiAEBEiwKB3Nlc3Npb24YAyABKAsyFi5lbmdyYW0uYXBwLnYxLlNlc3Npb25IAYgBARI0Cgdwcm9maWxlGAQgASgLMh4uZW5ncmFtLmFwcC52MS5Qcm9maWxlU25hcHNob3RIAogBAUIHCgVfcm9sZUIKCghfc2Vzc2lvbkIKCghfcHJvZmlsZSISChBMaXN0VGFza3NSZXF1ZXN0IjcKEUxpc3RUYXNrc1Jlc3BvbnNlEiIKBXRhc2tzGAEgAygLMhMuZW5ncmFtLmFwcC52MS5UYXNrIiEKDkdldFRhc2tSZXF1ZXN0Eg8KB3Rhc2tfaWQYASABKAkiNAoPR2V0VGFza1Jlc3BvbnNlEiEKBHRhc2sYASABKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2siJAoRRGVsZXRlVGFza1JlcXVlc3QSDwoHdGFza19pZBgBIAEoCSIUChJEZWxldGVUYXNrUmVzcG9uc2UiQgoRVXBkYXRlVGFza1JlcXVlc3QSDwoHdGFza19pZBgBIAEoCRISCgV0aXRsZRgCIAEoCUgAiAEBQggKBl90aXRsZSI3ChJVcGRhdGVUYXNrUmVzcG9uc2USIQoEdGFzaxgBIAEoCzITLmVuZ3JhbS5hcHAudjEuVGFzazKgAwoLVGFza1NlcnZpY2USUQoKQ3JlYXRlVGFzaxIgLmVuZ3JhbS5hcHAudjEuQ3JlYXRlVGFza1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkNyZWF0ZVRhc2tSZXNwb25zZRJOCglMaXN0VGFza3MSHy5lbmdyYW0uYXBwLnYxLkxpc3RUYXNrc1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkxpc3RUYXNrc1Jlc3BvbnNlEkgKB0dldFRhc2sSHS5lbmdyYW0uYXBwLnYxLkdldFRhc2tSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5HZXRUYXNrUmVzcG9uc2USUQoKRGVsZXRlVGFzaxIgLmVuZ3JhbS5hcHAudjEuRGVsZXRlVGFza1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkRlbGV0ZVRhc2tSZXNwb25zZRJRCgpVcGRhdGVUYXNrEiAuZW5ncmFtLmFwcC52MS5VcGRhdGVUYXNrUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuVXBkYXRlVGFza1Jlc3BvbnNlYgZwcm90bzM", [file_engram_app_v1_session, file_engram_app_v1_profile]);
+  fileDesc("ChhlbmdyYW0vYXBwL3YxL3Rhc2sucHJvdG8SDWVuZ3JhbS5hcHAudjEi5AEKEUNyZWF0ZVRhc2tSZXF1ZXN0EgwKBHR5cGUYASABKAkSEwoGcHJvbXB0GAMgASgJSACIAQESEgoFdGl0bGUYBCABKAlIAYgBARISCgpwcm9maWxlX2lkGAUgASgJEhQKB2hhcm5lc3MYBiABKAlIAogBARISCgVtb2RlbBgHIAEoCUgDiAEBEhMKBmVmZm9ydBgIIAEoCUgEiAEBQgkKB19wcm9tcHRCCAoGX3RpdGxlQgoKCF9oYXJuZXNzQggKBl9tb2RlbEIJCgdfZWZmb3J0SgQIAhADUglpbWFnZV91cmkiNwoSQ3JlYXRlVGFza1Jlc3BvbnNlEiEKBHRhc2sYASABKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2sitgIKBFRhc2sSCgoCaWQYASABKAkSDAoEdHlwZRgCIAEoCRISCgV0aXRsZRgDIAEoCUgAiAEBEg4KBnN0YXR1cxgEIAEoCRIfChJjcmVhdGVkX2J5X3VzZXJfaWQYBSABKAlIAYgBARITCgtzb3VyY2VfanNvbhgGIAEoCRIvCghzZXNzaW9ucxgHIAMoCzIdLmVuZ3JhbS5hcHAudjEuVGFza1Nlc3Npb25SZWYSEgoKY3JlYXRlZF9hdBgIIAEoCRIXCg90aXRsZV9pc19jdXN0b20YCSABKAgSLAoKY3JlYXRlZF9ieRgKIAEoCzITLmVuZ3JhbS5hcHAudjEuVXNlckgCiAEBQggKBl90aXRsZUIVChNfY3JlYXRlZF9ieV91c2VyX2lkQg0KC19jcmVhdGVkX2J5IrwBCg5UYXNrU2Vzc2lvblJlZhISCgpzZXNzaW9uX2lkGAEgASgJEhEKBHJvbGUYAiABKAlIAIgBARIsCgdzZXNzaW9uGAMgASgLMhYuZW5ncmFtLmFwcC52MS5TZXNzaW9uSAGIAQESNAoHcHJvZmlsZRgEIAEoCzIeLmVuZ3JhbS5hcHAudjEuUHJvZmlsZVNuYXBzaG90SAKIAQFCBwoFX3JvbGVCCgoIX3Nlc3Npb25CCgoIX3Byb2ZpbGUifwoQTGlzdFRhc2tzUmVxdWVzdBINCgVzY29wZRgBIAEoCRIOCgZzZWFyY2gYAiABKAkSGwoTY3JlYXRlZF9ieV91c2VyX2lkcxgDIAMoCRIOCgZzdGF0ZXMYBCADKAkSDAoEcGFnZRgFIAEoBRIRCglwYWdlX3NpemUYBiABKAUiTAoRTGlzdFRhc2tzUmVzcG9uc2USIgoFdGFza3MYASADKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2sSEwoLdG90YWxfY291bnQYAiABKAUiIQoOR2V0VGFza1JlcXVlc3QSDwoHdGFza19pZBgBIAEoCSI0Cg9HZXRUYXNrUmVzcG9uc2USIQoEdGFzaxgBIAEoCzITLmVuZ3JhbS5hcHAudjEuVGFzayIkChFEZWxldGVUYXNrUmVxdWVzdBIPCgd0YXNrX2lkGAEgASgJIhQKEkRlbGV0ZVRhc2tSZXNwb25zZSJCChFVcGRhdGVUYXNrUmVxdWVzdBIPCgd0YXNrX2lkGAEgASgJEhIKBXRpdGxlGAIgASgJSACIAQFCCAoGX3RpdGxlIjcKElVwZGF0ZVRhc2tSZXNwb25zZRIhCgR0YXNrGAEgASgLMhMuZW5ncmFtLmFwcC52MS5UYXNrMqADCgtUYXNrU2VydmljZRJRCgpDcmVhdGVUYXNrEiAuZW5ncmFtLmFwcC52MS5DcmVhdGVUYXNrUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuQ3JlYXRlVGFza1Jlc3BvbnNlEk4KCUxpc3RUYXNrcxIfLmVuZ3JhbS5hcHAudjEuTGlzdFRhc2tzUmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuTGlzdFRhc2tzUmVzcG9uc2USSAoHR2V0VGFzaxIdLmVuZ3JhbS5hcHAudjEuR2V0VGFza1JlcXVlc3QaHi5lbmdyYW0uYXBwLnYxLkdldFRhc2tSZXNwb25zZRJRCgpEZWxldGVUYXNrEiAuZW5ncmFtLmFwcC52MS5EZWxldGVUYXNrUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuRGVsZXRlVGFza1Jlc3BvbnNlElEKClVwZGF0ZVRhc2sSIC5lbmdyYW0uYXBwLnYxLlVwZGF0ZVRhc2tSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5VcGRhdGVUYXNrUmVzcG9uc2ViBnByb3RvMw", [file_engram_app_v1_session, file_engram_app_v1_profile, file_engram_app_v1_user]);
 
 /**
  * @generated from message engram.app.v1.CreateTaskRequest
@@ -122,8 +124,9 @@ export type Task = Message<"engram.app.v1.Task"> & {
   status: string;
 
   /**
-   * better-auth user id of the creator; unset for system-triggered
-   * tasks. Attribution lives HERE, not on the control-plane Session.
+   * Raw attribution fact matching the task.created_by_user_id DB column;
+   * unset for system-triggered tasks. Attribution lives HERE, not on the
+   * control-plane Session.
    *
    * @generated from field: optional string created_by_user_id = 5;
    */
@@ -156,6 +159,15 @@ export type Task = Message<"engram.app.v1.Task"> & {
    * @generated from field: bool title_is_custom = 9;
    */
   titleIsCustom: boolean;
+
+  /**
+   * Best-effort directory resolution of created_by_user_id, performed
+   * server-side. Unset for unattributed/automation rows (no creator) or when
+   * the corresponding better-auth user row is gone.
+   *
+   * @generated from field: optional engram.app.v1.User created_by = 10;
+   */
+  createdBy?: User;
 };
 
 /**
@@ -209,6 +221,51 @@ export const TaskSessionRefSchema: GenMessage<TaskSessionRef> = /*@__PURE__*/
  * @generated from message engram.app.v1.ListTasksRequest
  */
 export type ListTasksRequest = Message<"engram.app.v1.ListTasksRequest"> & {
+  /**
+   * "" = legacy ability default (member → own, admin → all + unattributed);
+   * "mine" = strictly the caller's own tasks (admins included);
+   * "all"  = fleet-wide + unattributed, admin-only (PermissionDenied otherwise).
+   *
+   * @generated from field: string scope = 1;
+   */
+  scope: string;
+
+  /**
+   * Case-insensitive substring over task title, task id, and session ids.
+   *
+   * @generated from field: string search = 2;
+   */
+  search: string;
+
+  /**
+   * Owner filter: entries are better-auth user ids or the sentinel "system"
+   * for unattributed rows. OR within the field; empty = no owner filter.
+   *
+   * @generated from field: repeated string created_by_user_ids = 3;
+   */
+  createdByUserIds: string[];
+
+  /**
+   * Live session-state filter (e.g. "active", "idle", "dead"). A task matches
+   * when its DISPLAY state — primary session's live status, or "pending" when
+   * no live session is known — is in the set. Empty = no filter.
+   *
+   * @generated from field: repeated string states = 4;
+   */
+  states: string[];
+
+  /**
+   * 1-based page over the filtered, most-recently-active-first ordering.
+   * page_size 0 = unpaginated (legacy callers); clamped to 1000 otherwise.
+   *
+   * @generated from field: int32 page = 5;
+   */
+  page: number;
+
+  /**
+   * @generated from field: int32 page_size = 6;
+   */
+  pageSize: number;
 };
 
 /**
@@ -226,6 +283,13 @@ export type ListTasksResponse = Message<"engram.app.v1.ListTasksResponse"> & {
    * @generated from field: repeated engram.app.v1.Task tasks = 1;
    */
   tasks: Task[];
+
+  /**
+   * matches BEFORE pagination
+   *
+   * @generated from field: int32 total_count = 2;
+   */
+  totalCount: number;
 };
 
 /**
@@ -359,8 +423,8 @@ export const TaskService: GenService<{
     output: typeof CreateTaskResponseSchema;
   },
   /**
-   * No filter fields: the server scopes the list by the CALLER's
-   * ability, never by a client-supplied filter.
+   * Filters narrow inside the caller's ability, never widen it. An empty
+   * request is the legacy ability-scoped, unpaginated behavior.
    *
    * @generated from rpc engram.app.v1.TaskService.ListTasks
    */

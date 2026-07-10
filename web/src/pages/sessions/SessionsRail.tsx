@@ -1,5 +1,5 @@
 import type { CSSProperties } from "react";
-import { Layers, ListChecks, Plus, TriangleAlert } from "lucide-react";
+import { ListChecks, Plus, TriangleAlert } from "lucide-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useIsAdmin } from "../../auth/AuthProvider";
 import { StatusGlyph } from "../../components/Glyph";
@@ -14,8 +14,8 @@ import {
   SidebarGroupContent,
   SidebarGroupLabel,
   SidebarHeader,
+  SidebarInput,
   SidebarMenu,
-  SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSkeleton,
@@ -23,12 +23,14 @@ import {
 import { relativeTime, shortId } from "./session-format";
 import { useRailSessions } from "./useRailSessions";
 import { ProfileChip } from "../../components/profiles/ProfileChip";
+import { useRailStore } from "./rail-store";
+import { useLoadMoreSentinel } from "../../hooks/useLoadMoreSentinel";
+import { useNow } from "../../hooks/useNow";
 
-// The persistent sessions rail: a live switcher between recent sessions that
+// The persistent sessions rail: a live switcher between the caller's tasks that
 // stays mounted across the list views AND the transcript (the rail is the
-// second sidebar of the whole /sessions section). Running sessions sort to the
-// top; the open session is highlighted (the selected-session crumb). "See all"
-// drops to the full table; admins get the fleet-wide list too.
+// second sidebar of the whole /sessions section). The server supplies recency
+// order; the open session is highlighted (the selected-session crumb).
 //
 // The ordering comes from useRailSessions, the same hook the ⌥-jump keymap
 // reads — so the 1–9 numbers this rail reveals while ⌥ is held point at exactly
@@ -39,12 +41,19 @@ export function SessionsRail() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const requestComposerFocus = useKeyboardUi((s) => s.requestComposerFocus);
   const jumpHeld = useKeyboardUi((s) => s.jumpHeld);
+  const search = useRailStore((s) => s.search);
+  const setSearch = useRailStore((s) => s.setSearch);
+  const now = useNow();
 
   const onStart = pathname === "/sessions" || pathname === "/sessions/";
-  const onMyList = pathname.startsWith("/sessions/list");
   const onAllList = pathname.startsWith("/sessions/all");
 
-  const { rows, openId, total, isPending, error } = useRailSessions();
+  const { rows, openId, hasMore, isFetchingMore, fetchMore, isPending, error } = useRailSessions();
+  const loadMoreRef = useLoadMoreSentinel({
+    hasMore,
+    isFetching: isFetchingMore,
+    onLoadMore: fetchMore,
+  });
 
   return (
     <>
@@ -69,15 +78,25 @@ export function SessionsRail() {
             </SidebarMenuButton>
           </SidebarMenuItem>
         </SidebarMenu>
+        {/* The rail is a permanently dark surface (`.sidebar-section` re-tones
+            --sidebar in BOTH themes), but stock SidebarInput paints
+            bg-background — near-white in light mode — under the rail's
+            inherited sage text. Key the field to the sidebar palette instead
+            so text/placeholder stay legible in either theme. */}
+        <SidebarInput
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="Search tasks…"
+          aria-label="Search tasks"
+          className="border-sidebar-border bg-sidebar-accent/40 text-sidebar-foreground placeholder:text-sidebar-foreground/60 dark:bg-sidebar-accent/40 group-data-[collapsible=icon]:hidden"
+        />
       </SidebarHeader>
 
       {/* SidebarContent is the scroll container (min-h-0 flex-1 overflow-auto
           by default), sitting between the pinned header and footer. */}
       <SidebarContent>
         <SidebarGroup className="py-1">
-          {/* "Recent" names what the list IS (my recent sessions, capped) so the
-              footer's "My tasks" can mean the full table without colliding. */}
-          <SidebarGroupLabel>Recent</SidebarGroupLabel>
+          <SidebarGroupLabel>My tasks</SidebarGroupLabel>
           <SidebarGroupContent>
             {/* StatusGlyph reads content-surface vars (--ring, --muted-foreground)
                 which go near-invisible on the dark section rail. Remap them to
@@ -108,91 +127,93 @@ export function SessionsRail() {
                   Couldn’t load tasks.
                 </p>
               ) : rows.length === 0 ? (
-                <p className="px-2 py-2 text-xs text-sidebar-foreground/70">No tasks yet.</p>
+                <p className="px-2 py-2 text-xs text-sidebar-foreground/70">
+                  {search ? "No matching tasks." : "No tasks yet."}
+                </p>
               ) : (
-                rows.map((r, i) => {
-                  const showNum = jumpHeld && i < 9;
-                  return (
-                    <SidebarMenuItem key={r.id}>
-                      <SidebarMenuButton
-                        asChild
-                        isActive={r.id === openId}
-                        className="h-auto items-start gap-2.5 py-1.5 data-[active=true]:font-medium"
-                      >
-                        <Link to="/sessions/$id" params={{ id: r.id }} title={r.id}>
-                          <span className="mt-0.5 shrink-0 text-[0.7rem] leading-none">
-                            <StatusGlyph status={r.status} />
-                          </span>
-                          <span className="flex min-w-0 flex-1 flex-col">
-                            <span
-                              className={cn(
-                                "truncate text-[0.8rem] leading-tight",
-                                r.title ? "font-medium" : "font-mono",
-                              )}
-                            >
-                              {r.title ?? shortId(r.id)}
+                <>
+                  {rows.map((r, i) => {
+                    const showNum = jumpHeld && i < 9;
+                    return (
+                      <SidebarMenuItem key={r.id}>
+                        <SidebarMenuButton
+                          asChild
+                          isActive={r.id === openId}
+                          className="h-auto items-start gap-2.5 py-1.5 data-[active=true]:font-medium"
+                        >
+                          <Link to="/sessions/$id" params={{ id: r.id }} title={r.id}>
+                            <span className="mt-0.5 shrink-0 text-[0.7rem] leading-none">
+                              <StatusGlyph status={r.status} />
                             </span>
-                            <ProfileChip
-                              profile={r.profile}
-                              fallbackImage={r.image}
-                              disclosure="tooltip"
-                              className="text-[0.7rem] leading-tight text-sidebar-foreground/70"
-                            />
-                          </span>
-                          {/* Trailing slot crossfades the relative time with the
-                              ⌥-jump number while the modifier is held. Stretches
-                              the full row height (self-stretch) so the time keeps
-                              the top line while the badge centers vertically; the
-                              fixed footprint stops the row reflowing on reveal. */}
-                          <span className="relative flex min-w-[1.4rem] shrink-0 items-start justify-end self-stretch leading-none">
-                            <span
-                              className={cn(
-                                "mt-0.5 font-mono text-[0.65rem] tabular-nums text-sidebar-foreground/70 transition-opacity duration-150 motion-reduce:transition-none",
-                                showNum && "opacity-0",
-                              )}
-                            >
-                              {relativeTime(r.at)}
-                            </span>
-                            {i < 9 && (
+                            <span className="flex min-w-0 flex-1 flex-col">
                               <span
-                                aria-hidden
                                 className={cn(
-                                  "absolute inset-0 flex items-center justify-end transition-opacity duration-150 motion-reduce:transition-none",
-                                  showNum ? "opacity-100" : "opacity-0",
+                                  "truncate text-[0.8rem] leading-tight",
+                                  r.title ? "font-medium" : "font-mono",
                                 )}
                               >
-                                <Badge className="min-w-5 justify-center rounded-md px-1.5 py-1 font-display font-semibold leading-none tabular-nums bg-sidebar-primary text-sidebar-primary-foreground">
-                                  {i + 1}
-                                </Badge>
+                                {r.title ?? shortId(r.id)}
                               </span>
-                            )}
-                          </span>
-                        </Link>
-                      </SidebarMenuButton>
+                              <ProfileChip
+                                profile={r.profile}
+                                fallbackImage={r.image}
+                                disclosure="tooltip"
+                                className="text-[0.7rem] leading-tight text-sidebar-foreground/70"
+                              />
+                            </span>
+                            {/* Trailing slot crossfades the relative time with the
+                                ⌥-jump number while the modifier is held. Stretches
+                                the full row height (self-stretch) so the time keeps
+                                the top line while the badge centers vertically; the
+                                fixed footprint stops the row reflowing on reveal. */}
+                            <span className="relative flex min-w-[1.4rem] shrink-0 items-start justify-end self-stretch leading-none">
+                              <span
+                                className={cn(
+                                  "mt-0.5 font-mono text-[0.65rem] tabular-nums text-sidebar-foreground/70 transition-opacity duration-150 motion-reduce:transition-none",
+                                  showNum && "opacity-0",
+                                )}
+                              >
+                                {relativeTime(r.at, now)}
+                              </span>
+                              {i < 9 && (
+                                <span
+                                  aria-hidden
+                                  className={cn(
+                                    "absolute inset-0 flex items-center justify-end transition-opacity duration-150 motion-reduce:transition-none",
+                                    showNum ? "opacity-100" : "opacity-0",
+                                  )}
+                                >
+                                  <Badge className="min-w-5 justify-center rounded-md px-1.5 py-1 font-display font-semibold leading-none tabular-nums bg-sidebar-primary text-sidebar-primary-foreground">
+                                    {i + 1}
+                                  </Badge>
+                                </span>
+                              )}
+                            </span>
+                          </Link>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    );
+                  })}
+                  {hasMore && (
+                    <SidebarMenuItem
+                      ref={loadMoreRef}
+                      aria-hidden
+                      className="py-1 text-center text-xs text-sidebar-foreground/70"
+                    >
+                      …
                     </SidebarMenuItem>
-                  );
-                })
+                  )}
+                </>
               )}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>
 
-      {/* Jump to the full tables, in the app's established vocabulary: My tasks
-          (mine, the full table) and All tasks (admin, fleet-wide), each with the
-          icon it carries in the spine + mobile strip. The badge carries the true
-          total, so the rail's 10-item cap stays honest. */}
+      {/* The rail itself is the full my-tasks surface; admins retain the explicit
+          fleet-wide destination. */}
       <SidebarFooter className="gap-1">
         <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton asChild isActive={onMyList}>
-              <Link to="/sessions/list">
-                <Layers />
-                <span>My tasks</span>
-              </Link>
-            </SidebarMenuButton>
-            {total > 0 && <SidebarMenuBadge>{total}</SidebarMenuBadge>}
-          </SidebarMenuItem>
           {isAdmin && (
             <SidebarMenuItem>
               <SidebarMenuButton asChild isActive={onAllList}>

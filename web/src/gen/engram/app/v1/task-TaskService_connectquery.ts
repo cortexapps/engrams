@@ -10,8 +10,8 @@ import { TaskService } from "./task_pb";
 export const createTask = TaskService.method.createTask;
 
 /**
- * No filter fields: the server scopes the list by the CALLER's
- * ability, never by a client-supplied filter.
+ * Filters narrow inside the caller's ability, never widen it. An empty
+ * request is the legacy ability-scoped, unpaginated behavior.
  *
  * @generated from rpc engram.app.v1.TaskService.ListTasks
  */
