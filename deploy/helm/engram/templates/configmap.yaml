@@ -46,6 +46,10 @@ data:
   {{- end }}
   ENGRAM_GITHUB_APP_ID: {{ .Values.forge.github.appId | quote }}
   {{- end }}
+  {{- if .Values.forge.committer.email }}
+  ENGRAM_GIT_COMMITTER_EMAIL: {{ .Values.forge.committer.email | quote }}
+  ENGRAM_GIT_COMMITTER_NAME: {{ .Values.forge.committer.name | quote }}
+  {{- end }}
   ENGRAM_BIND_ADDR: {{ printf "0.0.0.0:%d" (int .Values.service.port) | quote }}
   {{- range $k, $v := .Values.extraConfig }}
   {{ $k }}: {{ $v | quote }}

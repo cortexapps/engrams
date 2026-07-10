@@ -14,10 +14,11 @@
 //! - a skill with `requires_env` (e.g. the ADR 0058 `integrations` discovery
 //!   skill requires `ENGRAM_CLI_INTEGRATIONS`) is wired only when that env key
 //!   is present;
-//! - `/etc/gitconfig` gets a `[user]` block whenever an initiator is known
-//!   (ADR 0031 committer attribution, every session), and the askpass +
-//!   credential blocks only for a forge-bound session whose mounted skills
-//!   shipped an askpass (`provides_askpass`).
+//! - `/etc/gitconfig` gets a `[user]` block whenever an identity is known —
+//!   the human initiator (ADR 0031 §7 attribution) or, failing that, the
+//!   deployment's app committer (the coordinator's `GIT_COMMITTER_*` stamp) —
+//!   and the askpass + credential blocks only for a forge-bound session whose
+//!   mounted skills shipped an askpass (`provides_askpass`).
 //!
 //! **Best-effort.** A missing/garbled bundle (or a failed symlink) is recorded
 //! as a warning and skipped — it must NEVER fail the session.
@@ -126,6 +127,41 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
         }
     }
 
+    // ADR 0031 + 0027: `/etc/gitconfig`. The `[user]` block applies to EVERY
+    // session with a known identity — including a plain image with no skill
+    // bundles, so it's written before the no-bundles early return. The askpass
+    // + credential blocks only apply to a forge-bound session whose mounted
+    // skills shipped an askpass (`provides_askpass`).
+    //
+    // `[user]` is the human initiator when the orchestrator supplied one
+    // (ADR 0031 §7 attribution), else the deployment's app committer identity
+    // (the coordinator stamps git-native `GIT_COMMITTER_*` into session_env) —
+    // so guest commits never degrade to git's guessed `root@<host>`. Taken as
+    // a pair on purpose: never mix one identity's name with the other's email.
+    let committer_email = session_env.get("GIT_COMMITTER_EMAIL").map(String::as_str);
+    let committer_name = session_env.get("GIT_COMMITTER_NAME").map(String::as_str);
+    let (user_email, user_name) = match session_env.get("ENGRAM_USER_EMAIL") {
+        Some(email) => (
+            Some(email.as_str()),
+            session_env.get("ENGRAM_USER_NAME").map(String::as_str),
+        ),
+        None => (committer_email, committer_name),
+    };
+    let askpass = bundles
+        .iter()
+        .find_map(|(slot, m)| m.provides_askpass.as_ref().map(|rel| slot.join(rel)))
+        .filter(|_| session_env.contains_key(FORGE_TOKEN_ENV));
+    if user_email.is_some() || askpass.is_some() {
+        let gitconfig = render_gitconfig(askpass.as_deref(), user_email, user_name);
+        if let Err(e) = write_file(&layout.etc_gitconfig, &gitconfig) {
+            report
+                .warnings
+                .push(format!("write {}: {e}", layout.etc_gitconfig.display()));
+        } else {
+            report.activated.push("gitconfig".into());
+        }
+    }
+
     if bundles.is_empty() {
         // Plain image with no skills selected. Not an error.
         report
@@ -147,13 +183,8 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
             .push(format!("link {}: {e}", layout.claude_skills.display()));
     }
 
-    // Wire each bundle's skills; remember the askpass binary if any bundle
-    // ships one (for the gitconfig credential wiring below).
-    let mut askpass: Option<PathBuf> = None;
+    // Wire each bundle's skills.
     for (slot, manifest) in &bundles {
-        if let Some(rel) = &manifest.provides_askpass {
-            askpass = Some(slot.join(rel));
-        }
         // Bundle-level bins (ADR 0065): launchers a capability bundle puts on
         // PATH without being a user-facing agent skill. Wired independently of
         // the per-skill loop below — no skill dir, no `~/.agents/skills` entry.
@@ -180,24 +211,6 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
                 })
                 .collect();
             wire_skill(&layout, &skill.name, &skill_src, &bins, &mut report);
-        }
-    }
-
-    // ADR 0031 + 0027: `/etc/gitconfig`. The `[user]` block (committer
-    // attribution) applies to EVERY session with a known initiator; the askpass
-    // + credential blocks only to a forge-bound session whose mounted skills
-    // shipped an askpass.
-    let user_email = session_env.get("ENGRAM_USER_EMAIL").map(String::as_str);
-    let user_name = session_env.get("ENGRAM_USER_NAME").map(String::as_str);
-    let askpass = askpass.filter(|_| session_env.contains_key(FORGE_TOKEN_ENV));
-    if user_email.is_some() || askpass.is_some() {
-        let gitconfig = render_gitconfig(askpass.as_deref(), user_email, user_name);
-        if let Err(e) = write_file(&layout.etc_gitconfig, &gitconfig) {
-            report
-                .warnings
-                .push(format!("write {}: {e}", layout.etc_gitconfig.display()));
-        } else {
-            report.activated.push("gitconfig".into());
         }
     }
 
@@ -442,6 +455,82 @@ mod tests {
         // No forge token → no askpass / credential wiring.
         assert!(!gc.contains("askPass"));
         assert!(!gc.contains("x-access-token"));
+    }
+
+    #[test]
+    fn gitconfig_user_block_lands_even_with_no_skill_bundles() {
+        // A plain image (every slot sentinel) still gets the [user] identity —
+        // the gitconfig write must precede the no-bundles early return, or
+        // bundle-less sessions degrade to git's guessed root@<host>.
+        let dir = tempfile::tempdir().unwrap();
+        stage_sentinel_slot(dir.path(), 0);
+        let report = activate(
+            dir.path(),
+            &env(&[
+                ("ENGRAM_USER_EMAIL", "ada@example.com"),
+                ("ENGRAM_USER_NAME", "Ada Lovelace"),
+            ]),
+        );
+        assert!(report.activated.contains(&"gitconfig".to_string()));
+        let l = Layout::under(dir.path());
+        let gc = std::fs::read_to_string(&l.etc_gitconfig).unwrap();
+        assert!(gc.contains("email = ada@example.com"));
+        // No bundles → no askpass wiring, and the skills warning still lands.
+        assert!(!gc.contains("askPass"));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no skill bundles")));
+    }
+
+    #[test]
+    fn committer_stamp_falls_back_into_user_block_when_no_initiator() {
+        // No human initiator (programmatic session): the coordinator's
+        // GIT_COMMITTER_* stamp becomes the [user] block so guest commits
+        // never degrade to git's guessed root@<host>.
+        let dir = tempfile::tempdir().unwrap();
+        stage_skills_slot(dir.path(), 0);
+        let report = activate(
+            dir.path(),
+            &env(&[
+                (
+                    "GIT_COMMITTER_EMAIL",
+                    "1234+engrams[bot]@users.noreply.github.com",
+                ),
+                ("GIT_COMMITTER_NAME", "engrams"),
+            ]),
+        );
+        assert!(report.activated.contains(&"gitconfig".to_string()));
+        let l = Layout::under(dir.path());
+        let gc = std::fs::read_to_string(&l.etc_gitconfig).unwrap();
+        assert!(gc.contains("email = 1234+engrams[bot]@users.noreply.github.com"));
+        assert!(gc.contains("name = engrams"));
+    }
+
+    #[test]
+    fn human_initiator_wins_over_committer_stamp_as_the_author() {
+        // Both present: the human authors the commits ([user] block); the app
+        // identity stays the committer via the env vars git reads natively.
+        // The identities must never mix (human email + bot name or vice versa).
+        let dir = tempfile::tempdir().unwrap();
+        stage_skills_slot(dir.path(), 0);
+        activate(
+            dir.path(),
+            &env(&[
+                ("ENGRAM_USER_EMAIL", "ada@example.com"),
+                ("ENGRAM_USER_NAME", "Ada Lovelace"),
+                (
+                    "GIT_COMMITTER_EMAIL",
+                    "1234+engrams[bot]@users.noreply.github.com",
+                ),
+                ("GIT_COMMITTER_NAME", "engrams"),
+            ]),
+        );
+        let l = Layout::under(dir.path());
+        let gc = std::fs::read_to_string(&l.etc_gitconfig).unwrap();
+        assert!(gc.contains("email = ada@example.com"));
+        assert!(gc.contains("name = Ada Lovelace"));
+        assert!(!gc.contains("users.noreply.github.com"));
     }
 
     #[test]
