@@ -91,6 +91,11 @@ export interface SessionCompileOpts {
    *  0063 B4): human → the harness's `user_env` (per-user token); programmatic →
    *  its `org_env` (org secret, resolved host-side). Default "chat". */
   type?: string;
+  /** The creator is a service-account principal (an ADR 0086 API key — e.g. a
+   *  `ci-<repo>` CI key). Forces the PROGRAMMATIC credential pick regardless
+   *  of task type: a service account has no per-user harness token, so a
+   *  "chat" task it creates must still ride `org_env`. */
+  programmatic?: boolean;
   /** ADR 0063 B2: per-session override of the profile's default harness / model /
    *  effort. Unset = use the profile's default. */
   harness?: string;
@@ -132,8 +137,10 @@ export async function compileSessionCreateInput(
 
   // Strict-by-run-type credentials (ADR 0063 B4): a human (chat) task carries
   // the user's per-user token; a programmatic task carries the org secret. They
-  // are mutually exclusive — never both.
-  const isHuman = (opts.type ?? "chat") === "chat";
+  // are mutually exclusive — never both. Run type is the task type AND the
+  // principal type: a service-account creator (API key) is programmatic even
+  // for a "chat" task — it has no per-user token to inject.
+  const isHuman = (opts.type ?? "chat") === "chat" && !opts.programmatic;
 
   // Harness env, lowest → highest precedence: user token < CLI dummy env <
   // profile env_vars < model env < effort env < trigger extras. NEVER log values.
@@ -242,6 +249,9 @@ export interface CreateTaskParams {
   type: string;
   /** The engrams user who owns the task (createdByUserId → the CASL subject). */
   ownerUserId: string;
+  /** The owner is a service-account principal (API key) — forces the
+   *  programmatic (org-credential) compile path; see SessionCompileOpts. */
+  ownerIsServiceAccount?: boolean;
   /** The profile to start from; must be active (else NotFound). */
   profileId: string;
   title?: string | null;
@@ -291,6 +301,7 @@ export async function createTaskWithSession(
     },
     {
       type: params.type,
+      ...(params.ownerIsServiceAccount ? { programmatic: true } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
       ...(params.harness != null ? { harness: params.harness } : {}),
       ...(params.model != null ? { model: params.model } : {}),
