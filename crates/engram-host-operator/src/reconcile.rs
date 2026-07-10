@@ -3,9 +3,10 @@
 //!
 //! Each reconcile: (1) patch the DaemonSet images toward the CR (so
 //! successors come up on target — `OnDelete` leaves existing pods alone),
-//! (2) list the pods, (3) [`plan_roll`] picks the next action, (4) if it's a
-//! node roll, cordon → delete the pod → wait for the successor Ready on
-//! target → uncordon. The roll **reattaches, it does not evacuate**: ADR 0044
+//! (2) list the pods + release any leaked roll-cordon
+//! ([`converge_roll_cordons`]), (3) [`plan_roll`] picks the next action,
+//! (4) if it's a node roll, cordon → delete the pod → wait for the successor
+//! Ready on target → uncordon. The roll **reattaches, it does not evacuate**: ADR 0044
 //! K2 keeps the node's microVMs alive across the pod swap and the successor's
 //! `reattach_pass` adopts them, so an image roll is lossless (no
 //! snapshot-rehome rewind). Drain/evac is reserved for actual node removal
@@ -30,6 +31,14 @@ use crate::error::OperatorError;
 
 const HOST_AGENT_CONTAINER: &str = "host-agent";
 const STAGE_ASSETS_CONTAINER: &str = "stage-node-assets";
+
+/// Marks a node whose cordon the OPERATOR set for a K3 image roll (stamped in
+/// the same patch as `spec.unschedulable`, so it can't drift from the cordon).
+/// The cordon→uncordon pair in [`roll_node`] lives on one reconcile's stack,
+/// so an operator replacement or a roll timeout between the two leaks the
+/// cordon durably — [`converge_roll_cordons`] releases exactly the cordons
+/// carrying this marker; an admin cordon (no marker) stays sticky.
+pub const ROLL_CORDON_ANNOTATION: &str = "fleet.engram.io/roll-cordon";
 
 /// Context shared across reconciles.
 pub struct Ctx {
@@ -121,6 +130,13 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
 
     // 2. List the DaemonSet's pods.
     let pods = list_ds_pods(client, &spec.daemon_set.namespace, &ds).await?;
+
+    // 2b. Release any roll-cordon whose roll already completed (the operator
+    //     was replaced, or the successor gate timed out, between cordon and
+    //     uncordon). Best-effort — a coord hiccup shouldn't wedge the loop.
+    if let Err(e) = converge_roll_cordons(client, spec, &pods).await {
+        tracing::warn!(error = %e, "roll-cordon convergence failed; continuing");
+    }
 
     // 3. Plan.
     let decision = plan_roll(
@@ -227,8 +243,11 @@ async fn roll_node(
 
     tracing::info!(%node, %host_id, %pod, "rolling node: cordon + reattach (no drain — the node's VMs survive)");
     // The load-bearing cordon is the coordinator's (stops new session
-    // placement); the K8s node cordon stops any stray scheduling.
-    set_node_unschedulable(client, node, true).await?;
+    // placement); the K8s node cordon stops any stray scheduling. The node
+    // patch also stamps the roll marker (same write), and goes FIRST: a crash
+    // between the two leaves a marked node the coordinator still schedules,
+    // which the planner just re-rolls (the cordon is idempotent).
+    set_node_roll_cordon(client, node, true).await?;
     coord.cordon(host_id).await?;
 
     // Delete the pod. With `OnDelete` the DaemonSet recreates it on the target
@@ -249,17 +268,20 @@ async fn roll_node(
     .await?;
 
     // The successor re-registered under the same stable HostId (GAP 1) and is
-    // Ready; resume scheduling.
+    // Ready; resume scheduling. Coordinator first — it's the load-bearing
+    // cordon, and a crash between the two leaves a marked node convergence
+    // re-releases (both calls are idempotent).
     coord.uncordon(host_id).await?;
-    set_node_unschedulable(client, node, false).await?;
+    set_node_roll_cordon(client, node, false).await?;
     tracing::info!(%node, %host_id, "successor Ready + reattached; uncordoned");
     Ok(())
 }
 
 /// Poll the DaemonSet's pods until a Ready pod on `node` carries the target
 /// images (the successor has come up + run its reattach pass), or the budget
-/// elapses (the roll aborts with the host still cordoned; the next reconcile
-/// retries).
+/// elapses (the roll aborts with the host still cordoned; if the successor
+/// is still stale the planner re-rolls it, and if it comes up Ready on target
+/// later, [`converge_roll_cordons`] releases the cordon).
 /// The reattach gate's terminal condition: a Ready pod on `node` carrying
 /// **both** target images (so its host-agent has come up and run its reattach
 /// pass). Pure, so it's unit-tested without a cluster. A roll only uncordons
@@ -405,17 +427,82 @@ fn pod_ready(p: &Pod) -> bool {
         .unwrap_or(false)
 }
 
-/// Patch a Node's `spec.unschedulable`.
-async fn set_node_unschedulable(
-    client: &Client,
-    node: &str,
-    val: bool,
-) -> Result<(), OperatorError> {
+/// Patch a Node's `spec.unschedulable` together with the roll-cordon marker
+/// annotation — one write, so the marker can never drift from the cordon.
+/// `on = false` clears both (a `null` annotation value deletes the key under
+/// a merge patch, same as autoscale's victim marker).
+async fn set_node_roll_cordon(client: &Client, node: &str, on: bool) -> Result<(), OperatorError> {
     let nodes: Api<Node> = Api::all(client.clone());
-    let patch = serde_json::json!({ "spec": { "unschedulable": val } });
+    let marker = if on {
+        serde_json::Value::String("true".into())
+    } else {
+        serde_json::Value::Null
+    };
+    let patch = serde_json::json!({
+        "metadata": { "annotations": { ROLL_CORDON_ANNOTATION: marker } },
+        "spec": { "unschedulable": on },
+    });
     nodes
         .patch(node, &PatchParams::default(), &Patch::Merge(patch))
         .await?;
+    Ok(())
+}
+
+/// The convergence rule (pure, unit-tested): a roll-cordoned node whose pod
+/// is Ready on BOTH target images has a *completed* roll — whoever cordoned
+/// it never uncordoned (the operator was replaced mid-roll, or the successor
+/// gate timed out and the pod came Ready later). Release those. A marked node
+/// whose pod is stale or not Ready is a roll still pending/in-flight — leave
+/// it; the planner (re)rolls it and `roll_node`'s cordon is idempotent.
+fn leaked_roll_cordons<'a>(
+    marked_nodes: &'a [String],
+    pods: &[PodInfo],
+    image: &str,
+    node_assets_image: &str,
+) -> Vec<&'a str> {
+    marked_nodes
+        .iter()
+        .filter(|n| successor_ready(pods, n, image, node_assets_image))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Release roll-cordons that lost their owner. The cordon→uncordon pair in
+/// [`roll_node`] lives on one reconcile's stack, so an operator replacement
+/// between the two leaks the cordon durably — and the operator rolls on any
+/// deploy whose dep closure touches this binary, routinely interleaved with
+/// the fleet roll it is itself driving (2026-07-10: this left half the kvm
+/// pool unschedulable and queued every dev-brain create). Instead of durable
+/// wave state, re-derive the desired state from observation each reconcile:
+/// any node still carrying the roll marker whose successor pod is Ready on
+/// target gets uncordoned. Coordinator first — it's the load-bearing cordon.
+async fn converge_roll_cordons(
+    client: &Client,
+    spec: &HostFleetSpec,
+    pods: &[PodInfo],
+) -> Result<(), OperatorError> {
+    let nodes: Api<Node> = Api::all(client.clone());
+    let marked: Vec<String> = nodes
+        .list(&ListParams::default())
+        .await?
+        .into_iter()
+        .filter(|n| n.annotations().contains_key(ROLL_CORDON_ANNOTATION))
+        .map(|n| n.name_any())
+        .collect();
+    if marked.is_empty() {
+        return Ok(());
+    }
+    let coord = CoordClient::new(spec.coordinator_url.clone(), coord_token());
+    for node in leaked_roll_cordons(&marked, pods, &spec.image, &spec.node_assets_image) {
+        let host_id = HostId::from_node_name(node);
+        tracing::warn!(
+            %node,
+            %host_id,
+            "releasing leaked roll-cordon: roll completed but its owner never uncordoned"
+        );
+        coord.uncordon(host_id).await?;
+        set_node_roll_cordon(client, node, false).await?;
+    }
     Ok(())
 }
 
@@ -506,6 +593,29 @@ mod tests {
             plan_roll(&pods, NEW, NA, 1),
             RollDecision::RollNode { .. }
         ));
+    }
+
+    // The cordon-leak convergence rule: only a marked node whose successor is
+    // Ready ON TARGET is a leak — anything else is a roll still pending or
+    // in flight, and releasing it early would re-open placement onto a host
+    // that's about to lose (or is mid-swapping) its host-agent pod.
+    #[test]
+    fn convergence_releases_only_completed_rolls() {
+        let pods = vec![
+            pod("a", NEW, NA, true),  // roll done, cordon leaked → release
+            pod("b", OLD, NA, true),  // still stale → the planner re-rolls it
+            pod("c", NEW, NA, false), // successor mid-swap → its roll uncordons
+        ];
+        let marked = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(leaked_roll_cordons(&marked, &pods, NEW, NA), vec!["a"]);
+    }
+
+    #[test]
+    fn convergence_never_touches_unmarked_cordons() {
+        // An admin cordon carries no roll marker: even a Ready on-target node
+        // stays cordoned until a human releases it.
+        let pods = vec![pod("a", NEW, NA, true)];
+        assert!(leaked_roll_cordons(&[], &pods, NEW, NA).is_empty());
     }
 
     // ADR 0044 K3 amendment: the reattach roll uncordons only once the
