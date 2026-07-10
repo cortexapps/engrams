@@ -1,8 +1,8 @@
-import { useCallback, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Activity, UserRound, X } from "lucide-react";
 import { StatusGlyph } from "../../components/Glyph";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
-import { useAdminUsersMap, useTasksAsSessionListWithOwners } from "../../hooks/useTasks";
+import { useAdminUsersMap, useTasksInfiniteAsSessionListWithOwners } from "../../hooks/useTasks";
 import type { SessionState } from "../../lib/types";
 import { PageHeading } from "../../components/page-heading";
 import { Button } from "@/components/ui/button";
@@ -31,7 +31,6 @@ export function AllSessions() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [search, setSearch] = useState("");
   const [filters, setFilters] = useState<Record<string, string[]>>({ owner: [], state: [] });
-  const [limit, setLimit] = useState(PAGE_SIZE);
   const debouncedSearch = useDebouncedValue(search);
   const { data: usersMap } = useAdminUsersMap(true);
   const fields: FilterField[] = [
@@ -61,29 +60,32 @@ export function AllSessions() {
   const {
     data: sessions,
     totalCount,
+    hasNextPage,
+    isFetchingNextPage,
+    fetchNextPage,
     isPending,
     error,
-  } = useTasksAsSessionListWithOwners({
-    scope: "all",
-    search: debouncedSearch,
-    createdByUserIds: filters.owner,
-    states: filters.state,
-    page: 1,
-    pageSize: limit,
-  });
+  } = useTasksInfiniteAsSessionListWithOwners(
+    {
+      scope: "all",
+      search: debouncedSearch,
+      createdByUserIds: filters.owner,
+      states: filters.state,
+    },
+    PAGE_SIZE,
+  );
   const total = totalCount ?? 0;
   const visibleCount = sessions?.length ?? 0;
-  const hasMore = visibleCount < total;
   const hasFilters = Boolean(search || filters.owner.length || filters.state.length);
-  // Row count is intentionally a dependency: it re-observes a still-visible
-  // sentinel after the larger response has rendered.
-  const handleLoadMore = useCallback(() => setLimit((value) => value + PAGE_SIZE), [visibleCount]);
-  const loadMoreRef = useLoadMoreSentinel({ hasMore, onLoadMore: handleLoadMore });
+  const loadMoreRef = useLoadMoreSentinel({
+    hasMore: hasNextPage,
+    isFetching: isFetchingNextPage,
+    onLoadMore: fetchNextPage,
+  });
 
   const clearFilters = () => {
     setSearch("");
     setFilters({ owner: [], state: [] });
-    setLimit(PAGE_SIZE);
   };
 
   return (
@@ -93,22 +95,12 @@ export function AllSessions() {
       <div className="flex flex-wrap items-center gap-2">
         <Input
           value={search}
-          onChange={(event) => {
-            setSearch(event.target.value);
-            setLimit(PAGE_SIZE);
-          }}
+          onChange={(event) => setSearch(event.target.value)}
           placeholder="Search tasks…"
           aria-label="Search tasks"
           className="max-w-xs"
         />
-        <FilterBar
-          fields={fields}
-          value={filters}
-          onChange={(next) => {
-            setFilters(next);
-            setLimit(PAGE_SIZE);
-          }}
-        />
+        <FilterBar fields={fields} value={filters} onChange={setFilters} />
         {hasFilters && (
           <Button variant="ghost" onClick={clearFilters}>
             <X />
@@ -126,7 +118,7 @@ export function AllSessions() {
           emptyText={hasFilters ? "No matching tasks." : "No tasks across the fleet yet."}
           scrollRef={scrollRef}
         />
-        {hasMore && (
+        {hasNextPage && (
           <div ref={loadMoreRef} className="py-2 text-center text-xs text-muted-foreground">
             Loading more…
           </div>

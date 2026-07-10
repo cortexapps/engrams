@@ -1,7 +1,7 @@
 import { useRouterState } from "@tanstack/react-router";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
 import { useSession } from "../../hooks/useSessions";
-import { useTasksAsSessionList } from "../../hooks/useTasks";
+import { useTasksInfiniteAsSessionList } from "../../hooks/useTasks";
 import type { Session, SessionListItem, SessionState, ProfileSnapshotView } from "../../lib/types";
 import { useRailStore } from "./rail-store";
 
@@ -51,6 +51,8 @@ export interface RailSessions {
   total: number;
   /** Whether another page-size step is available. */
   hasMore: boolean;
+  isFetchingMore: boolean;
+  fetchMore: ReturnType<typeof useTasksInfiniteAsSessionList>["fetchNextPage"];
   isPending: boolean;
   error: unknown;
 }
@@ -58,7 +60,6 @@ export interface RailSessions {
 export function useRailSessions(): RailSessions {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const search = useRailStore((s) => s.search);
-  const limit = useRailStore((s) => s.limit);
   const debounced = useDebouncedValue(search);
 
   // `/sessions/<id>` → the open session; `/sessions/all` (fleet list) and
@@ -68,20 +69,15 @@ export function useRailSessions(): RailSessions {
   const openId = seg && seg !== "all" && seg !== "list" ? seg : undefined;
 
   // ADR 0051 Task 28: use TaskService-backed list instead of REST /sessions.
-  const { data, totalCount, isPending, error } = useTasksAsSessionList({
-    scope: "mine",
-    search: debounced,
-    page: 1,
-    pageSize: limit,
-  });
+  const { data, totalCount, hasNextPage, isFetchingNextPage, fetchNextPage, isPending, error } =
+    useTasksInfiniteAsSessionList({ scope: "mine", search: debounced }, 25);
   const all = data ?? [];
-  const recent = all.slice(0, limit);
 
   // The open session always needs a row, even if it's older than the recent
   // window or (for an admin) isn't one of mine. Shares the query cache with
   // SessionDetail's own useSession, so it's not an extra fetch.
   const openSession = useSession(openId);
-  const rows: RailRow[] = recent.map(fromListItem);
+  const rows: RailRow[] = all.map(fromListItem);
   if (openId && !rows.some((r) => r.id === openId)) {
     const inAll = all.find((s) => s.id === openId);
     if (inAll) rows.unshift(fromListItem(inAll));
@@ -89,5 +85,14 @@ export function useRailSessions(): RailSessions {
   }
 
   const total = totalCount ?? 0;
-  return { rows, openId, total, hasMore: total > rows.length, isPending, error };
+  return {
+    rows,
+    openId,
+    total,
+    hasMore: hasNextPage,
+    isFetchingMore: isFetchingNextPage,
+    fetchMore: fetchNextPage,
+    isPending,
+    error,
+  };
 }

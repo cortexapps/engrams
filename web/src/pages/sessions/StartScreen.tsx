@@ -36,6 +36,7 @@ import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import { useHarnessEnv } from "../../hooks/useHarnessEnv";
 import { useTasksAsSessionList } from "../../hooks/useTasks";
+import { useNow } from "../../hooks/useNow";
 import {
   SessionHarnessControls,
   EMPTY_OVERRIDE,
@@ -109,7 +110,12 @@ export function StartScreen() {
   const { data: harnesses } = useHarnessCatalog(true);
   const { data: harnessEnvVars } = useHarnessEnv(true);
   const { data: taskList } = useTasksAsSessionList({ scope: "mine", pageSize: 25 });
-  const createTaskMutation = useMutation(createTask);
+  const createTaskMutation = useMutation(createTask, {
+    onSuccess: () =>
+      qc.invalidateQueries({
+        queryKey: createConnectQueryKey({ schema: listTasks, cardinality: undefined }),
+      }),
+  });
 
   const profiles = profilesData?.profiles ?? [];
   const views = useMemo(() => catalogToViews(catalog?.providers ?? []), [catalog]);
@@ -179,9 +185,6 @@ export function StartScreen() {
         ...(harnessOverride.effort ? { effort: harnessOverride.effort } : {}),
       });
       writeLastProfileId(selected.id);
-      qc.invalidateQueries({
-        queryKey: createConnectQueryKey({ schema: listTasks, cardinality: "finite" }),
-      });
       const sessionId = res.task?.sessions[0]?.sessionId;
       if (sessionId) navigate({ to: "/sessions/$id", params: { id: sessionId } });
       else setError("Task created but no session id returned.");
@@ -605,6 +608,7 @@ function PolicyReceipt({
 // the rail (glyph + short id + profile + age), each a link into that session.
 // The full table is one click away.
 function RecentTasks({ rows }: { rows: SessionListItem[] }) {
+  const now = useNow();
   if (rows.length === 0) {
     return (
       <section className="mt-1">
@@ -647,7 +651,7 @@ function RecentTasks({ rows }: { rows: SessionListItem[] }) {
                 className="min-w-0 text-xs"
               />
               <span className="ml-auto shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
-                {relativeTime(s.last_active_at)}
+                {relativeTime(s.last_active_at, now)}
               </span>
             </Link>
           </li>

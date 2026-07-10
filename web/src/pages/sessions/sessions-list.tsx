@@ -7,6 +7,7 @@ import { StatusGlyph } from "../../components/Glyph";
 import type { SessionListItem } from "../../lib/types";
 import { relativeTime, shortId, statusLabel } from "./session-format";
 import { ProfileChip } from "../../components/profiles/ProfileChip";
+import { useNow } from "../../hooks/useNow";
 
 // The sessions list reads as a workspace switcher, not a data grid: a flat list
 // of rich rows in the server's most-recently-active-first order,
@@ -75,6 +76,7 @@ export function SessionRows({
   showOwner: boolean;
   scrollRef: RefObject<HTMLElement | null>;
 }) {
+  const now = useNow();
   const virtualizer = useVirtualizer({
     count: sessions.length,
     getScrollElement: () => scrollRef.current,
@@ -101,6 +103,7 @@ export function SessionRows({
             style={{ transform: `translateY(${virtualRow.start}px)` }}
             s={s}
             showOwner={showOwner}
+            now={now}
           />
         );
       })}
@@ -143,11 +146,13 @@ function ownerLabel(s: SessionListItem): string | null {
 export function SessionRow({
   s,
   showOwner,
+  now,
   ref,
   ...rowProps
 }: {
   s: SessionListItem;
   showOwner: boolean;
+  now?: number;
 } & ComponentPropsWithoutRef<"li"> & { ref?: Ref<HTMLLIElement> }) {
   return (
     <li
@@ -192,7 +197,7 @@ export function SessionRow({
         )}
         <span className="w-20 shrink-0 text-xs text-muted-foreground">{statusLabel(s.status)}</span>
         <span className="w-9 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground">
-          {relativeTime(s.last_active_at)}
+          {relativeTime(s.last_active_at, now)}
         </span>
       </Link>
     </li>

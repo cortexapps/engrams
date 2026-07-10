@@ -10,9 +10,9 @@ export function stripImageHost(uri: string): string {
   const end = colon > start ? colon : uri.length;
   return uri.slice(start, end);
 }
-export function relativeTime(iso: string): string {
+export function relativeTime(iso: string, now = Date.now()): string {
   const t = new Date(iso).getTime();
-  const dt = Math.max(0, (Date.now() - t) / 1000);
+  const dt = Math.max(0, (now - t) / 1000);
   if (dt < 60) return `${Math.floor(dt)}s`;
   if (dt < 3600) return `${Math.floor(dt / 60)}m`;
   if (dt < 86400) return `${Math.floor(dt / 3600)}h`;

@@ -1,4 +1,4 @@
-import { useCallback, type CSSProperties } from "react";
+import type { CSSProperties } from "react";
 import { ListChecks, Plus, TriangleAlert } from "lucide-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useIsAdmin } from "../../auth/AuthProvider";
@@ -25,6 +25,7 @@ import { useRailSessions } from "./useRailSessions";
 import { ProfileChip } from "../../components/profiles/ProfileChip";
 import { useRailStore } from "./rail-store";
 import { useLoadMoreSentinel } from "../../hooks/useLoadMoreSentinel";
+import { useNow } from "../../hooks/useNow";
 
 // The persistent sessions rail: a live switcher between the caller's tasks that
 // stays mounted across the list views AND the transcript (the rail is the
@@ -42,16 +43,17 @@ export function SessionsRail() {
   const jumpHeld = useKeyboardUi((s) => s.jumpHeld);
   const search = useRailStore((s) => s.search);
   const setSearch = useRailStore((s) => s.setSearch);
-  const showMore = useRailStore((s) => s.showMore);
+  const now = useNow();
 
   const onStart = pathname === "/sessions" || pathname === "/sessions/";
   const onAllList = pathname.startsWith("/sessions/all");
 
-  const { rows, openId, hasMore, isPending, error } = useRailSessions();
-  // Row count is intentionally a dependency: it gives the sentinel hook a new
-  // callback to observe after each larger ListTasks response arrives.
-  const handleLoadMore = useCallback(showMore, [showMore, rows.length]);
-  const loadMoreRef = useLoadMoreSentinel({ hasMore, onLoadMore: handleLoadMore });
+  const { rows, openId, hasMore, isFetchingMore, fetchMore, isPending, error } = useRailSessions();
+  const loadMoreRef = useLoadMoreSentinel({
+    hasMore,
+    isFetching: isFetchingMore,
+    onLoadMore: fetchMore,
+  });
 
   return (
     <>
@@ -166,7 +168,7 @@ export function SessionsRail() {
                                   showNum && "opacity-0",
                                 )}
                               >
-                                {relativeTime(r.at)}
+                                {relativeTime(r.at, now)}
                               </span>
                               {i < 9 && (
                                 <span

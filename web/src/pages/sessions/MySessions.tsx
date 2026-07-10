@@ -1,8 +1,8 @@
-import { useCallback, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { Plus } from "lucide-react";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
-import { useTasksAsSessionList } from "../../hooks/useTasks";
+import { useTasksInfiniteAsSessionList } from "../../hooks/useTasks";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageHeading } from "../../components/page-heading";
@@ -17,26 +17,23 @@ const PAGE_SIZE = 50;
 export function MySessions() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [search, setSearch] = useState("");
-  const [limit, setLimit] = useState(PAGE_SIZE);
   const debouncedSearch = useDebouncedValue(search);
   const {
     data: sessions,
     totalCount,
+    hasNextPage,
+    isFetchingNextPage,
+    fetchNextPage,
     isPending,
     error,
-  } = useTasksAsSessionList({
-    scope: "mine",
-    search: debouncedSearch,
-    page: 1,
-    pageSize: limit,
-  });
+  } = useTasksInfiniteAsSessionList({ scope: "mine", search: debouncedSearch }, PAGE_SIZE);
   const total = totalCount ?? 0;
   const visibleCount = sessions?.length ?? 0;
-  const hasMore = visibleCount < total;
-  // Row count is intentionally a dependency: it re-observes a still-visible
-  // sentinel after the larger response has rendered.
-  const handleLoadMore = useCallback(() => setLimit((value) => value + PAGE_SIZE), [visibleCount]);
-  const loadMoreRef = useLoadMoreSentinel({ hasMore, onLoadMore: handleLoadMore });
+  const loadMoreRef = useLoadMoreSentinel({
+    hasMore: hasNextPage,
+    isFetching: isFetchingNextPage,
+    onLoadMore: fetchNextPage,
+  });
   const newTask = (
     <Button asChild>
       <Link to="/sessions">
@@ -56,10 +53,7 @@ export function MySessions() {
 
       <Input
         value={search}
-        onChange={(event) => {
-          setSearch(event.target.value);
-          setLimit(PAGE_SIZE);
-        }}
+        onChange={(event) => setSearch(event.target.value)}
         placeholder="Search tasks…"
         aria-label="Search tasks"
         className="max-w-xs"
@@ -80,7 +74,7 @@ export function MySessions() {
           scrollRef={scrollRef}
         />
 
-        {hasMore && (
+        {hasNextPage && (
           <div ref={loadMoreRef} className="py-2 text-center text-xs text-muted-foreground">
             Loading more…
           </div>

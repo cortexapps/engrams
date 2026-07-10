@@ -14,7 +14,15 @@ filter bar needs no single-select special case (rev 2); every click-to-page
 affordance (rail show-more, Prev/Next pagers) was replaced by sentinel-driven
 infinite scroll over a growing page_size (rev 4); the list pages pin their
 heading/toolbar and virtualize rows (rev 5), which retires the "pager UI"
-described below wherever the two conflict.
+described below wherever the two conflict; rev 6 replaced the flat 1s poll +
+growing-page_size single query with connect-query `useInfiniteQuery`
+(page-appends in the shared cache, dedupe-by-id across page seams) and
+adaptive polling — 2s only while a LIVE session on a visible task is in a
+transitional state (boot/evict bursts; a GC'd-session "pending" fallback does
+not count), 30s ambient, refetch-on-focus, mutation-driven invalidation, and a
+local 30s clock for relative-time labels. Page-appends are safe once the
+constant poll is gone: full-chain refetches are rare and rebuild a consistent
+snapshot.
 
 ## Context
 

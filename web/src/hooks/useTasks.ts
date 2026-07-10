@@ -1,5 +1,5 @@
-import { useQuery } from "@connectrpc/connect-query";
-import { useQuery as useTanstackQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@connectrpc/connect-query";
+import { keepPreviousData, useQuery as useTanstackQuery } from "@tanstack/react-query";
 import { listTasks } from "../gen/engram/app/v1/task-TaskService_connectquery";
 import type { SessionListItem } from "../lib/types";
 import type { Task } from "../gen/engram/app/v1/task_pb";
@@ -12,6 +12,33 @@ export interface TaskListParams {
   createdByUserIds?: string[];
   page?: number;
   pageSize?: number;
+}
+
+const TRANSITIONAL_TASK_STATES = new Set([
+  "pending",
+  "queued",
+  "created",
+  "evacuating",
+  "evicting",
+  "host_lost",
+]);
+
+/** State changes are bursty around task boot and eviction, while ambient task
+ * changes do not need sub-second freshness. Keep transitional work responsive
+ * and let settled lists poll quietly; see ADR 0087.
+ *
+ * A task with NO live session (coordinator GC'd it) DISPLAYS as "pending"
+ * (taskToSessionListItem's fallback) but is not transitional — nothing is
+ * booting, and old datasets are full of such rows. Counting the fallback here
+ * would pin every list at the fast interval forever, so only a status from a
+ * real live session qualifies. */
+export function pollIntervalFor(tasks: readonly Task[] | undefined): number {
+  return tasks?.some((task) => {
+    const status = task.sessions[0]?.session?.status;
+    return status !== undefined && TRANSITIONAL_TASK_STATES.has(status);
+  })
+    ? 2_000
+    : 30_000;
 }
 
 /** ADR 0051 Task 23: map a Task proto to the SessionListItem shape the list
@@ -62,13 +89,13 @@ export function taskToSessionListItem(task: Task): SessionListItem {
  * ListTasks defaults to the legacy CASL-ability scope, while explicit params
  * narrow personal/admin surfaces and enable server-side filtering/pagination.
  *
- * Options are behaviorally equivalent to the former useSessions options
- * (refetchOnWindowFocus and staleTime come from TanStack defaults, not explicit
- * carry-over — 1s live-poll and placeholderData are the meaningful deltas). */
+ * Options are behaviorally equivalent to the former useSessions options while
+ * adapting polling frequency to the freshest task state. */
 export function useTasks(params?: TaskListParams) {
   return useQuery(listTasks, params ?? {}, {
-    refetchInterval: 1_000,
-    placeholderData: (prev) => prev,
+    refetchInterval: (query) => pollIntervalFor(query.state.data?.tasks),
+    refetchOnWindowFocus: true,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -117,6 +144,76 @@ function enrichWithOwners(
     if (!u) return item;
     return { ...item, owner_name: u.name || null, owner_email: u.email };
   });
+}
+
+interface InfiniteSessionListResult {
+  data: SessionListItem[] | undefined;
+  totalCount: number | undefined;
+  hasNextPage: boolean;
+  isFetchingNextPage: boolean;
+  fetchNextPage: ReturnType<typeof useInfiniteQuery>["fetchNextPage"];
+  isPending: boolean;
+  error: unknown;
+}
+
+/** Paginated ListTasks projected into the flat list shape used by session
+ * surfaces. The installed connect-query v2 API derives its initial page param
+ * from the required `page` field and removes that field from the cache key. */
+export function useTasksInfiniteAsSessionList(
+  params: Omit<TaskListParams, "page" | "pageSize">,
+  pageSize: number,
+): InfiniteSessionListResult {
+  const query = useInfiniteQuery(
+    listTasks,
+    { ...params, pageSize, page: 1 },
+    {
+      pageParamKey: "page",
+      getNextPageParam: (lastPage, allPages) => {
+        const rowsSoFar = allPages.reduce((count, page) => count + page.tasks.length, 0);
+        return rowsSoFar < lastPage.totalCount ? allPages.length + 1 : undefined;
+      },
+      refetchInterval: (currentQuery) =>
+        pollIntervalFor(currentQuery.state.data?.pages.flatMap((page) => page.tasks)),
+      refetchOnWindowFocus: true,
+      placeholderData: keepPreviousData,
+    },
+  );
+
+  const seen = new Set<string>();
+  // Live reordering can move the same task across page boundaries between
+  // fetches, so keep the first occurrence to preserve server display order.
+  const data = query.data?.pages
+    .flatMap((page) => page.tasks.map(taskToSessionListItem))
+    .filter((item) => {
+      if (seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    });
+  const lastPage = query.data?.pages[query.data.pages.length - 1];
+
+  return {
+    data,
+    totalCount: lastPage?.totalCount,
+    hasNextPage: query.hasNextPage,
+    isFetchingNextPage: query.isFetchingNextPage,
+    fetchNextPage: query.fetchNextPage,
+    isPending: query.isPending,
+    error: query.error,
+  };
+}
+
+/** Admin variant of the infinite task list with owner labels resolved from the
+ * better-auth admin user map. */
+export function useTasksInfiniteAsSessionListWithOwners(
+  params: Omit<TaskListParams, "page" | "pageSize">,
+  pageSize: number,
+): InfiniteSessionListResult {
+  const result = useTasksInfiniteAsSessionList(params, pageSize);
+  const { data: usersMap } = useAdminUsersMap(true);
+  return {
+    ...result,
+    data: result.data ? enrichWithOwners(result.data, usersMap) : undefined,
+  };
 }
 
 /** Convert the ListTasksResponse tasks array to SessionListItem[]. */
