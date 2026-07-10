@@ -1104,13 +1104,39 @@ fn harness_event_sink(
                 return;
             }
 
-            let payload = match serde_json::to_value(&session_event) {
+            let mut payload = match serde_json::to_value(&session_event) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, "harness event serialize failed");
                     return;
                 }
             };
+            // Postgres `jsonb` cannot represent U+0000 anywhere in a
+            // string (SQLSTATE 22P05), and this payload carries raw guest
+            // tool output — an `xxd` of a binary file puts literal NULs
+            // into `result_summary`, the insert fails, and the event
+            // vanishes from the session log (incident 2026-07-10: exactly
+            // the two hexdumps of the corrupted files were the events
+            // that dropped). Replace NUL with U+FFFD before PG sees it,
+            // and rebuild the in-memory event from the sanitized payload
+            // so the SSE surface serves the same bytes as the durable log.
+            let mut session_event = session_event;
+            if strip_jsonb_nul(&mut payload) {
+                tracing::debug!(
+                    session_id = %session_id,
+                    kind,
+                    "harness event contained U+0000; sanitized for jsonb",
+                );
+                match serde_json::from_value::<SessionEvent>(payload.clone()) {
+                    Ok(ev) => session_event = ev,
+                    // Persisted payload is the authority; a rebuild
+                    // failure only leaves the live SSE copy with the
+                    // original NULs (legal JSON), never drops the event.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sanitized event rebuild failed; SSE keeps original")
+                    }
+                }
+            }
 
             // Phase 1c: token chunks are EPHEMERAL — they are NEVER appended
             // to `session_events`. Fan them out cross-replica on the dedicated
@@ -1243,9 +1269,77 @@ fn harness_event_sink(
     })
 }
 
+/// Replace every U+0000 in the JSON tree's strings (values AND object
+/// keys) with U+FFFD, returning whether anything changed. Postgres
+/// `jsonb` rejects NUL outright (SQLSTATE 22P05) — see the caller in
+/// `harness_event_sink`; guest tool output is the only producer of NULs
+/// in practice, but the sweep is total so no future field regresses.
+fn strip_jsonb_nul(v: &mut serde_json::Value) -> bool {
+    use serde_json::Value;
+    match v {
+        Value::String(s) if s.contains('\0') => {
+            *s = s.replace('\0', "\u{FFFD}");
+            true
+        }
+        Value::String(_) => false,
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= strip_jsonb_nul(item);
+            }
+            changed
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            for (_, val) in map.iter_mut() {
+                changed |= strip_jsonb_nul(val);
+            }
+            if map.keys().any(|k| k.contains('\0')) {
+                let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
+                for (k, val) in entries {
+                    map.insert(k.replace('\0', "\u{FFFD}"), val);
+                }
+                changed = true;
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Incident 2026-07-10: PG jsonb rejects U+0000, so a
+    /// `tool_call_completed` whose `result_summary` carried raw binary
+    /// (an `xxd` of a corrupted file) failed the insert and silently
+    /// vanished from the session log. The sink now sanitizes first.
+    #[test]
+    fn strip_jsonb_nul_replaces_nul_everywhere_and_reports_change() {
+        let mut v = serde_json::json!({
+            "result_summary": "before\u{0000}after",
+            "nested": { "arr": ["ok", "x\u{0000}y"], "clean": "fine" },
+        });
+        assert!(strip_jsonb_nul(&mut v));
+        assert_eq!(v["result_summary"], "before\u{FFFD}after");
+        assert_eq!(v["nested"]["arr"][1], "x\u{FFFD}y");
+        assert_eq!(v["nested"]["clean"], "fine");
+
+        // Untouched payloads report no change (the sink skips the
+        // event rebuild on this path).
+        let mut clean = serde_json::json!({"a": ["b"], "n": 3});
+        assert!(!strip_jsonb_nul(&mut clean));
+
+        // NUL in an object KEY is also scrubbed.
+        let mut keyed = serde_json::Value::Object(
+            [("k\u{0000}ey".to_string(), serde_json::json!("v"))]
+                .into_iter()
+                .collect(),
+        );
+        assert!(strip_jsonb_nul(&mut keyed));
+        assert!(keyed.get("k\u{FFFD}ey").is_some());
+    }
 
     fn evicted() -> SessionEvent {
         SessionEvent::Evicted {
