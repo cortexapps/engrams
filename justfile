@@ -473,6 +473,62 @@ reap-sessions profile='' mac_docker_context='colima':
     fi
     echo "reap-sessions: done. Checkpoints GC in the background once their sessions are gone."
 
+# Clear stale bundle generations / snapshot blobs / chunks from BLOB STORAGE
+# via the coordinator's own GC RPCs (ADR 0035 §5 / ADR 0028 addendum / ADR
+# 0016 Phase C). The pin set is Postgres truth — anything referenced by a
+# live snapshot or the mount/harness catalogs is never touched. Two steps:
+#   1. Deregister DEAD host rows. A dead leftover host-agent (e.g. the
+#      fc-colima VM's after `just dev-fc`, killed or VM stopped) otherwise
+#      keeps feeding the fleet bundle catalog — VZ sessions then resolve the
+#      FC host's SQUASHFS generations, which the VZ guest kernel can't mount
+#      ("cannot find valid erofs superblock" → the agentd-bundle panic) —
+#      and keeps winning session placement. DeleteHost refuses (FAILED_
+#      PRECONDITION) while sessions are still bound, so this can't drop a
+#      row out from under live work; `ready`/`draining` hosts are never
+#      touched (the dead-host detector owns that transition).
+#   2. Run the three sweeps with a zero grace window so unpinned blobs
+#      delete in the same pass — the dev "clear it now" posture (prod
+#      trusts the background loop's 24h grace).
+# Blob generations are pinned by snapshots: run `just reap-sessions` FIRST if
+# old sessions still reference the generations you want gone. Local staged-
+# file pruning (var/shared on the Mac, /opt/engram-dev/shared in the fc VM)
+# also lives in reap-sessions. The stack must be up (coordinator app-gRPC).
+#
+# Deregister dead host rows + GC stale bundle/snapshot/chunk blobs (grace 0).
+reap-bundles:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ENGRAM_APP_GRPC_TOKEN="${ENGRAM_APP_GRPC_TOKEN:-${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}}"
+    cargo build --quiet -p engram-cli
+    cli="$(cargo metadata --format-version=1 --no-deps \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])')/debug/engram-cli"
+    echo "==> deregistering dead host rows"
+    dead="$("$cli" --json host list \
+        | python3 -c 'import sys,json;print("\n".join(h["id"] for h in json.load(sys.stdin)["hosts"] if h["status"]=="dead"))')"
+    if [ -z "$dead" ]; then
+        echo "  (no dead hosts)"
+    else
+        for id in $dead; do
+            printf '  deleting dead host %s ... ' "$id"
+            if "$cli" host delete "$id" >/dev/null 2>&1; then
+                echo deleted
+            else
+                echo "SKIPPED (sessions still bound? reap those first: just reap-sessions)"
+            fi
+        done
+    fi
+    echo "==> GC sweeps (apply, grace 0)"
+    "$cli" admin gc --apply --grace-secs 0
+    echo "reap-bundles: done."
+
+# Params forward to reap-sessions (fc-colima profile + Mac docker context for
+# the VM-side stages): `just reap-all fc-dev`. Order is load-bearing: deleting
+# sessions first drops their snapshots' pins, so the bundle/blob GC pass that
+# follows can actually delete the generations they were holding.
+#
+# Full dev-stack reclaim: reap-sessions, then reap-bundles.
+reap-all profile='' mac_docker_context='colima': (reap-sessions profile mac_docker_context) reap-bundles
+
 # Bake the canonical `demo` image (deploy/demo/) and push it to the local OCI
 # registry as demo:warm-1 (localhost:5001, the registry `just dev` runs). Arch +
 # transport are detected; no per-backend recipe. ADR 0062: the image carries NO

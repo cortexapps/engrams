@@ -112,6 +112,24 @@ enum AdminCmd {
     /// trigger, which has no app-gRPC analog (there is no fleet-wide
     /// "flush every idle session" RPC). This acts on a single session id.
     EvictIdle { id: String },
+    /// Run the three blob-storage GC sweeps (bundle generations,
+    /// snapshot blobs, chunks — ADR 0035 §5 / ADR 0028 addendum /
+    /// ADR 0016 Phase C) and print each report. DRY-RUN by default
+    /// (classify + count, no writes); pass --apply for the live
+    /// pipeline (candidate upserts + promote-pass deletes). Blobs are
+    /// deleted only after their candidate outlives the grace window
+    /// (default 24h) — `--grace-secs 0` promotes immediately, the dev
+    /// "clear stale generations now" posture.
+    Gc {
+        /// Actually mark candidates + delete promoted blobs. Without
+        /// this flag the sweeps only report what WOULD be marked.
+        #[arg(long)]
+        apply: bool,
+        /// Override the candidate grace window (seconds) for these
+        /// sweeps only. 0 = promote (delete) in the same sweep.
+        #[arg(long)]
+        grace_secs: Option<u64>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -192,6 +210,13 @@ enum HostCmd {
     /// Flip a host to `draining`. New sessions won't be assigned to
     /// it; in-flight sessions stay.
     Drain { id: String },
+    /// Deregister a host row (`FleetService.DeleteHost`). Fails with
+    /// FAILED_PRECONDITION while any session is still bound (drain /
+    /// reap sessions first); idempotent-success if already gone. The
+    /// dev use case: a dead leftover host-agent (e.g. an fc-colima VM
+    /// from `just dev-fc`) keeps winning the fleet bundle catalog and
+    /// session placement until its row is removed.
+    Delete { id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -533,6 +558,7 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
             HostCmd::List => host_list(&mut c, cli.json).await,
             HostCmd::Get { id } => host_get(&mut c, id, cli.json).await,
             HostCmd::Drain { id } => host_drain(&mut c, id).await,
+            HostCmd::Delete { id } => host_delete(&mut c, id).await,
         },
         Cmd::Registry { cmd } => match cmd {
             RegistryCmd::Add {
@@ -562,6 +588,9 @@ async fn run(cli: &Cli) -> Result<(), CliError> {
         Cmd::Admin { cmd } => match cmd {
             AdminCmd::Flush { id } => admin_flush(&mut c, id, cli.json).await,
             AdminCmd::EvictIdle { id } => admin_evict_idle(&mut c, id, cli.json).await,
+            AdminCmd::Gc { apply, grace_secs } => {
+                admin_gc(&mut c, *apply, *grace_secs, cli.json).await
+            }
         },
     }
 }
@@ -608,6 +637,135 @@ async fn admin_evict_idle(c: &mut Clients, id: &str, json: bool) -> Result<(), C
         return Ok(());
     }
     println!("{}: {}", resp.session_id, resp.status);
+    Ok(())
+}
+
+async fn admin_gc(
+    c: &mut Clients,
+    apply: bool,
+    grace_secs: Option<u64>,
+    json: bool,
+) -> Result<(), CliError> {
+    // The proto's `dry_run: false` means a LIVE sweep with deletions, so
+    // the CLI inverts the polarity: dry-run unless --apply is explicit.
+    let dry_run = !apply;
+    let mode = if dry_run { "dry-run" } else { "applied" };
+    // The sweeps are independent — run all three and report each result
+    // as it lands (one sweep's failure must not swallow the others'
+    // reports), then fail the command if any errored.
+    let mut failures: Vec<String> = Vec::new();
+    let mut out = serde_json::json!({ "dry_run": dry_run });
+
+    match c
+        .fleet
+        .bundle_gc(app::BundleGcRequest {
+            dry_run,
+            grace_secs,
+        })
+        .await
+    {
+        Ok(resp) => {
+            let bundle = resp.into_inner();
+            if json {
+                out["bundle"] = serde_json::json!({
+                    "listed": bundle.listed,
+                    "pinned": bundle.pin_set_size,
+                    "candidates_marked": bundle.candidates_marked,
+                    "promoted_deletes": bundle.promoted_deletes,
+                    "promote_delete_errors": bundle.promote_delete_errors,
+                });
+            } else {
+                println!(
+                    "bundle-gc ({mode}): listed={} pinned={} candidates={} deleted={} errors={}",
+                    bundle.listed,
+                    bundle.pin_set_size,
+                    bundle.candidates_marked,
+                    bundle.promoted_deletes,
+                    bundle.promote_delete_errors
+                );
+            }
+        }
+        Err(e) => failures.push(format!("bundle-gc: {}", e.message())),
+    }
+
+    match c
+        .fleet
+        .snapshot_blob_gc(app::SnapshotBlobGcRequest {
+            dry_run,
+            grace_secs,
+        })
+        .await
+    {
+        Ok(resp) => {
+            let snap = resp.into_inner();
+            if json {
+                out["snapshot_blob"] = serde_json::json!({
+                    "listed": snap.listed,
+                    "pinned": snap.pin_set_size,
+                    "candidates_marked": snap.candidates_marked,
+                    "promoted_deletes": snap.promoted_deletes,
+                    "promote_repinned_skips": snap.promote_repinned_skips,
+                    "promote_delete_errors": snap.promote_delete_errors,
+                });
+            } else {
+                println!(
+                    "snapshot-blob-gc ({mode}): listed={} pinned={} candidates={} deleted={} repinned_skips={} errors={}",
+                    snap.listed,
+                    snap.pin_set_size,
+                    snap.candidates_marked,
+                    snap.promoted_deletes,
+                    snap.promote_repinned_skips,
+                    snap.promote_delete_errors
+                );
+            }
+        }
+        Err(e) => failures.push(format!("snapshot-blob-gc: {}", e.message())),
+    }
+
+    match c
+        .fleet
+        .chunk_gc(app::ChunkGcRequest {
+            dry_run,
+            grace_secs,
+        })
+        .await
+    {
+        Ok(resp) => {
+            let chunk = resp.into_inner();
+            if json {
+                out["chunk"] = serde_json::json!({
+                    "listed": chunk.listed_chunks,
+                    "pinned": chunk.pin_set_size,
+                    "candidates_marked": chunk.candidates_marked,
+                    "promoted_deletes": chunk.promoted_deletes,
+                    "promote_delete_errors": chunk.promote_delete_errors,
+                    "grace_secs": chunk.grace_secs,
+                });
+            } else {
+                println!(
+                    "chunk-gc ({mode}): listed={} pinned={} candidates={} deleted={} errors={} grace_secs={}",
+                    chunk.listed_chunks,
+                    chunk.pin_set_size,
+                    chunk.candidates_marked,
+                    chunk.promoted_deletes,
+                    chunk.promote_delete_errors,
+                    chunk.grace_secs
+                );
+            }
+        }
+        Err(e) => failures.push(format!("chunk-gc: {}", e.message())),
+    }
+
+    if json {
+        out["failures"] = serde_json::json!(failures);
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    }
+    if let Some(first) = failures.first() {
+        for f in &failures[1..] {
+            eprintln!("engram-cli: {f}");
+        }
+        return Err(CliError::Other(first.clone()));
+    }
     Ok(())
 }
 
@@ -897,6 +1055,16 @@ async fn host_drain(c: &mut Clients, id: &str) -> Result<(), CliError> {
         })
         .await?;
     println!("draining");
+    Ok(())
+}
+
+async fn host_delete(c: &mut Clients, id: &str) -> Result<(), CliError> {
+    c.fleet
+        .delete_host(app::DeleteHostRequest {
+            host_id: id.to_string(),
+        })
+        .await?;
+    println!("deleted");
     Ok(())
 }
 
