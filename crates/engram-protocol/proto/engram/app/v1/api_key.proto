@@ -2,21 +2,39 @@ syntax = "proto3";
 
 package engram.app.v1;
 
-// ADR 0086: admin-managed global API keys. Orchestrator-NATIVE (never proxied
-// to the coordinator). Each key is owned by a dedicated service-account user
-// (apikey+<uuid>@service.local) whose `role` ('admin'|'user') is the key's
-// authorization level; a request bearing the key resolves to that identity at
-// the existing auth seams. ALL RPCs are admin-only. The key material is
-// SHA-256-hashed at rest; the plaintext is returned exactly once, from
-// CreateApiKey, and is never retrievable again.
+// ADR 0086: global API keys. Orchestrator-NATIVE (never proxied to the
+// coordinator). Two key ownership shapes share the table and the auth seams:
+//
+//   - Global (service-account) keys: admin-minted via CreateApiKey; each is
+//     owned by a dedicated service-account user (apikey+<uuid>@service.local)
+//     whose `role` ('admin'|'user') is the key's authorization level.
+//   - CLI (user-owned) keys: self-minted via CreateCliKey during
+//     `engrams auth login`; owned by the CALLING user, so a request bearing
+//     the key resolves to that user with their own role/ownership.
+//
+// The key material is SHA-256-hashed at rest; the plaintext is returned
+// exactly once, from Create*, and is never retrievable again.
 service ApiKeyService {
-  // Mint a key. Returns metadata plus the one-time plaintext key.
+  // Mint a global service-account key. Admin-only. Returns metadata plus the
+  // one-time plaintext key.
   rpc CreateApiKey(CreateApiKeyRequest) returns (CreateApiKeyResponse);
   // List all keys (metadata only — masked preview, never hash or plaintext).
+  // Admin-only.
   rpc ListApiKeys(ListApiKeysRequest) returns (ListApiKeysResponse);
-  // Revoke a key: deletes its service-account user (the key row cascades).
-  // Idempotent (revoking an absent key yields `revoked = false`, not an error).
+  // Revoke any key. For a service-account key this deletes its owning service
+  // user (the key row cascades); for a user-owned CLI key only the key row is
+  // deleted. Admin-only. Idempotent (revoking an absent key yields
+  // `revoked = false`, not an error).
   rpc RevokeApiKey(RevokeApiKeyRequest) returns (RevokeApiKeyResponse);
+  // Mint a CLI key owned by the CALLER (the `engrams auth login` exchange:
+  // the CLI authenticates this call with the short-lived device-flow session
+  // and stores the returned key). Any authenticated HUMAN user; requests
+  // authenticated by a service-account key are rejected (no key laundering).
+  rpc CreateCliKey(CreateCliKeyRequest) returns (CreateCliKeyResponse);
+  // Revoke a key the CALLER owns (the `engrams auth logout` path). A key
+  // owned by someone else reads as absent (`revoked = false`) —
+  // anti-enumeration. Idempotent.
+  rpc RevokeCliKey(RevokeCliKeyRequest) returns (RevokeCliKeyResponse);
 }
 
 // Key metadata — everything EXCEPT the secret material.
@@ -35,6 +53,9 @@ message ApiKeyMeta {
   string expires_at = 6;
   // ISO-8601; empty = never used.
   string last_used_at = 7;
+  // Owner email. A service-account owner (apikey+…@service.local) marks a
+  // global key; a human email marks a user-owned CLI key.
+  string owner_email = 8;
 }
 
 message CreateApiKeyRequest {
@@ -64,5 +85,25 @@ message RevokeApiKeyRequest {
 
 message RevokeApiKeyResponse {
   // Whether a key was revoked (idempotent).
+  bool revoked = 1;
+}
+
+message CreateCliKeyRequest {
+  // Display name, e.g. "cli:nikhils-macbook". Defaults to "cli" when empty.
+  string name = 1;
+}
+
+message CreateCliKeyResponse {
+  ApiKeyMeta meta = 1;
+  // The full plaintext key (engk_…). Shown ONCE; only its hash is stored.
+  string key = 2;
+}
+
+message RevokeCliKeyRequest {
+  string id = 1;
+}
+
+message RevokeCliKeyResponse {
+  // Whether a key was revoked (idempotent; an unowned/unknown id is `false`).
   bool revoked = 1;
 }
