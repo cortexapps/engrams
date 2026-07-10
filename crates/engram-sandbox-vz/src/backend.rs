@@ -1110,6 +1110,76 @@ impl SandboxBackend for VzBackend {
         Ok(())
     }
 
+    /// ADR 0085: ask agentd to ensure the in-guest IDE (code-server) is
+    /// running and answering `/healthz` on its loopback HTTP port. Mirrors
+    /// [`Self::start_browser`]: the coordinator's `ensure_ide` calls this
+    /// just before the orchestrator relays to the guest's port, so the
+    /// dial finds a server.
+    async fn start_ide(&self, id: SandboxId) -> Result<u16, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vsock_uds_path.clone()
+        };
+        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
+        let conn = UnixStream::connect(&agent_uds).await.map_err(|e| {
+            SandboxError::Vm(
+                format!(
+                    "connect agentd UDS for StartIde {}: {e}",
+                    agent_uds.display()
+                )
+                .into(),
+            )
+        })?;
+        let (mut reader, mut writer) = tokio::io::split(conn);
+        // `port: None` → agentd's default (13337). Worst-case serial path
+        // inside agentd's start_ide: up to a 2s /healthz probe timeout
+        // (issue #567's wedge detection) + ~0.3s force-stop grace + up to
+        // 20s (READY_DEADLINE) for the launcher's `--ensure` to bring
+        // code-server up — call it ~23s worst case. 45s here still
+        // comfortably covers it (StartBrowser parity).
+        write_msg(&mut writer, &WireRequest::StartIde { port: None })
+            .await
+            .map_err(|e| SandboxError::Vm(format!("write StartIde: {e}").into()))?;
+        let resp: WireResponse =
+            tokio::time::timeout(Duration::from_secs(45), read_msg(&mut reader))
+                .await
+                .map_err(|_| SandboxError::Vm("StartIde timed out after 45s".into()))?
+                .map_err(|e| SandboxError::Vm(format!("read StartIde response: {e}").into()))?;
+        match resp {
+            WireResponse::IdeReady { port, .. } => Ok(port),
+            WireResponse::Error { kind, message } => Err(SandboxError::Vm(
+                format!("StartIde rejected ({kind}): {message}").into(),
+            )),
+            other => Err(SandboxError::Vm(
+                format!("StartIde: unexpected response: {other:?}").into(),
+            )),
+        }
+    }
+
+    /// ADR 0085: tear down the in-guest IDE. Idempotent — a no-op when the
+    /// sandbox is gone or nothing is running.
+    async fn stop_ide(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let vsock_uds_path = {
+            let Some(live) = self.sandboxes.get(&id) else {
+                return Ok(());
+            };
+            live.vsock_uds_path.clone()
+        };
+        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
+        let conn = UnixStream::connect(&agent_uds)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("connect agentd UDS for StopIde: {e}").into()))?;
+        let (mut reader, mut writer) = tokio::io::split(conn);
+        write_msg(&mut writer, &WireRequest::StopIde)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("write StopIde: {e}").into()))?;
+        let _: WireResponse = tokio::time::timeout(Duration::from_secs(15), read_msg(&mut reader))
+            .await
+            .map_err(|_| SandboxError::Vm("StopIde timed out".into()))?
+            .map_err(|e| SandboxError::Vm(format!("read StopIde response: {e}").into()))?;
+        Ok(())
+    }
+
     /// Discover the guest's network identity by asking agentd over
     /// the vsock-bridge. First successful answer is cached on the
     /// per-sandbox state; subsequent calls are O(1) memory reads.

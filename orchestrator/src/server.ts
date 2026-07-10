@@ -49,10 +49,13 @@ import { iapBridge } from "./auth/iap-bridge.ts";
 
 export type RouteRegistrar = (router: ConnectRouter) => void;
 
-/** ADR 0064 P2b-ws: a preview WS-upgrade hook. Returns `true` if it handled the
- * upgrade (a `<slug>.<previewBaseDomain>` host), `false` to fall through to the
- * normal (shell) upgrade path. */
-export type PreviewUpgrade = (
+/** A raw WS-upgrade hook, tried in order BEFORE the @hono/node-ws (shell/vnc)
+ * dispatch. Returns `true` if it handled the upgrade, `false` to fall through
+ * to the next hook. Handled here (not via the Hono app) because these proxies
+ * need the raw socket, not a parsed request. Today's hooks: the preview proxy
+ * (ADR 0064 P2b-ws, keyed on the `<slug>.<previewBaseDomain>` Host header) and
+ * the IDE proxy (ADR 0085, keyed on the `/api/v1/sessions/:id/ide/*` path). */
+export type UpgradeHook = (
   req: IncomingMessage,
   socket: Socket,
   head: Buffer,
@@ -74,7 +77,7 @@ export function buildServer(
   app: Hono,
   routes: RouteRegistrar = () => {},
   nodeWs?: NodeWebSocket,
-  previewUpgrade?: PreviewUpgrade,
+  upgradeHooks: UpgradeHook[] = [],
 ) {
   // requestPathPrefix must match the "/rpc/" seam — handlers register at
   // prefix+requestPath, so a missing prefix causes every real RPC to 404.
@@ -120,11 +123,11 @@ export function buildServer(
     //       4404 = Not Found, etc.).  Bun socket.end() is not used at all.
     const { wss } = nodeWs;
     server.on("upgrade", async (request: IncomingMessage, socket: Socket, head: Buffer) => {
-      // ADR 0064 P2b-ws: preview hosts (`<slug>.<previewBaseDomain>`) tunnel the
-      // WS to the session's guest port; non-preview hosts fall through to the
-      // shell path below. Handled here (not via the Hono app) because raw WS
-      // passthrough needs the socket, not a parsed request.
-      if (previewUpgrade && (await previewUpgrade(request, socket, head))) return;
+      // Raw-socket proxy hooks (preview by Host, IDE by path — see UpgradeHook)
+      // run in order; unmatched upgrades fall through to the shell/vnc path.
+      for (const hook of upgradeHooks) {
+        if (await hook(request, socket, head)) return;
+      }
       const url = new URL(request.url ?? "/", "http://localhost");
       const headers = new Headers();
       for (const key in request.headers) {

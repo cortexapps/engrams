@@ -1,0 +1,4 @@
+{
+  "kind": "skill",
+  "bins": ["bin/engram-ide"]
+}

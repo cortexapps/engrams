@@ -679,6 +679,10 @@ jobs:
           # + openbox + node + playwright-cli, pointed at that Chrome over CDP),
           # then squashfs. Subsumes the retired headless `playwright` bundle.
           deploy/bundles/browser/build.sh dist/browser.squashfs
+          # ide (ADR 0085): glibc Docker build (the pinned code-server
+          # standalone release, its bundled node patchelf'd self-contained
+          # like browser), then squashfs.
+          deploy/bundles/ide/build.sh dist/ide.squashfs
           # ADR 0062: the built-in claude harness (tree staged above).
           deploy/bundles/harness-claude/build.sh var/harness-claude-stage dist/harness-claude.squashfs
           # ADR 0080: agentd — the guest control surface, exec'd out of this
@@ -707,7 +711,7 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${SHA:0:7}"
-          for name in sentinel skills integrations-cli browser harness-claude agentd guest-tools; do
+          for name in sentinel skills integrations-cli browser ide harness-claude agentd guest-tools; do
             REPO="ghcr.io/${{ github.repository }}/bundle-$name"
             # `oras pull <repo>:<sha>` drops <name>.squashfs into cwd verbatim.
             oras push "$REPO:$SHA" \

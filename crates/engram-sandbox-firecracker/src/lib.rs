@@ -4910,6 +4910,91 @@ impl SandboxBackend for FirecrackerBackend {
             .map_err(|_| SandboxError::Vm("stop_browser: timed out waiting for agentd".into()))?
     }
 
+    /// ADR 0085: ask agentd to ensure the in-guest IDE (code-server) is
+    /// running and answering `/healthz` on its loopback HTTP port. Mirrors
+    /// [`Self::start_browser`] — the coordinator's `ensure_ide` calls this
+    /// just before the orchestrator relays to the guest's port, so the dial
+    /// finds a server.
+    async fn start_ide(&self, id: SandboxId) -> Result<u16, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or_else(|| {
+                SandboxError::Vm(format!("start_ide: no live sandbox {id}").into())
+            })?;
+            live.state.vsock_uds_path.clone()
+        };
+        let fut = async {
+            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("start_ide: vsock connect: {e}").into()))?;
+            engram_agentd::write_msg(&mut conn, &WireRequest::StartIde { port: None })
+                .await
+                .map_err(|e| SandboxError::Vm(format!("start_ide: send: {e}").into()))?;
+            let resp: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(
+                        format!("start_ide: recv: {}", describe_agentd_rpc_recv_failure(&e)).into(),
+                    )
+                })?;
+            match resp {
+                engram_agentd::WireResponse::IdeReady { port, spawned } => {
+                    tracing::info!(
+                        sandbox_id = %id,
+                        port,
+                        spawned,
+                        "agentd reports ide ready",
+                    );
+                    Ok(port)
+                }
+                engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
+                    format!("start_ide: agentd error ({kind}): {message}").into(),
+                )),
+                other => Err(SandboxError::Vm(
+                    format!("start_ide: unexpected response: {other:?}").into(),
+                )),
+            }
+        };
+        // Worst-case serial path inside agentd's start_ide: up to a 2s
+        // /healthz probe timeout (issue #567's wedge detection) + ~0.3s
+        // force-stop grace + up to 20s (READY_DEADLINE) for the launcher's
+        // `--ensure` to bring code-server up — call it ~23s worst case. 30s
+        // of headroom here still comfortably covers it (browser parity).
+        tokio::time::timeout(Duration::from_secs(30), fut)
+            .await
+            .map_err(|_| SandboxError::Vm("start_ide: timed out waiting for agentd".into()))?
+    }
+
+    /// ADR 0085: tear down the in-guest IDE. Idempotent — a no-op when the
+    /// sandbox is gone or nothing is running. Mirrors
+    /// [`Self::stop_browser`]'s connection pattern.
+    async fn stop_ide(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let vsock_uds_path = {
+            let Some(live) = self.sandboxes.get(&id) else {
+                return Ok(());
+            };
+            live.state.vsock_uds_path.clone()
+        };
+        let fut = async {
+            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("stop_ide: vsock connect: {e}").into()))?;
+            engram_agentd::write_msg(&mut conn, &WireRequest::StopIde)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("stop_ide: send: {e}").into()))?;
+            let _: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.map_err(|e| {
+                    SandboxError::Vm(
+                        format!("stop_ide: recv: {}", describe_agentd_rpc_recv_failure(&e)).into(),
+                    )
+                })?;
+            Ok(())
+        };
+        // A wedged guest must never hang teardown — bound the round-trip at
+        // 15s (stop_browser parity; teardown is far cheaper than start).
+        tokio::time::timeout(Duration::from_secs(15), fut)
+            .await
+            .map_err(|_| SandboxError::Vm("stop_ide: timed out waiting for agentd".into()))?
+    }
+
     // ADR 0021 P1.5: `swap_harness_drive` retired with the rest of
     // option-D. The harness lives in the rootfs now, so there's no
     // host file backing a virtio-blk drive to swap.

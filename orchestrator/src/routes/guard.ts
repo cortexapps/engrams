@@ -44,17 +44,88 @@ export interface GuardUser {
   role: string;
 }
 
+/** Outcome of a header-level authorization check (no Hono `Context` involved —
+ * usable from both HTTP handlers and raw `node:http` upgrade handlers). */
+export type GuardResult =
+  | { ok: true; user: GuardUser }
+  | { ok: false; status: 401 | 404 };
+
 // ---------------------------------------------------------------------------
-// Factory
+// Pure authorization check
 // ---------------------------------------------------------------------------
 
 /**
- * Create a guard function with optional injectable deps (for tests).
+ * Resolve + authorize a session-scoped request from raw `Headers` — the
+ * mechanics shared by the Hono-`Context` guard below (`makeGuard`) and the
+ * path-keyed WS upgrade hooks (e.g. `routes/ide.ts`) that run before a Hono
+ * `Context` exists:
+ *   1. Resolve the better-auth session from `headers` → 401 if absent.
+ *   2. Resolve the session owner via DB (`resolveOwner`) → 404 if unknown.
+ *   3. Check `ability.can(action, subject('Session', { createdByUserId: owner }))` → 404 if denied.
  *
- * The guard function:
- *   1. Resolves the better-auth session from `c.req.raw.headers` → 401 if absent.
- *   2. Resolves the session owner via DB (resolveOwner) → 404 if null.
- *   3. Checks `ability.can(action, subject('Session', { createdByUserId: owner }))` → 404 if denied.
+ * Anti-enumeration: unknown and unowned sessions both map to 404.
+ */
+export async function authorizeSessionAccess(
+  headers: Headers,
+  sessionId: string | undefined,
+  action: Actions,
+  resolveSession: GetSession,
+  ownerResolver: ResolveOwner,
+): Promise<GuardResult> {
+  const session = await resolveSession(headers);
+  if (!session) return { ok: false, status: 401 };
+
+  const user: GuardUser = {
+    id: session.user.id,
+    role: session.user.role ?? "user",
+  };
+
+  if (!sessionId) return { ok: false, status: 404 };
+
+  const ability = abilityFor(user);
+  const ownerId = await ownerResolver(sessionId);
+  if (!ability.can(action, subject("Session", { createdByUserId: ownerId }))) {
+    return { ok: false, status: 404 };
+  }
+
+  return { ok: true, user };
+}
+
+// ---------------------------------------------------------------------------
+// Factories
+// ---------------------------------------------------------------------------
+
+/** Resolve the default (real) resolvers, honoring injected overrides. */
+function resolveDefaults(
+  getSession?: GetSession,
+  resolveOwner?: ResolveOwner,
+): { resolveSession: GetSession; ownerResolver: ResolveOwner } {
+  const resolveSession: GetSession =
+    getSession ??
+    ((headers) =>
+      auth.api.getSession({
+        headers,
+      } as Parameters<typeof auth.api.getSession>[0]));
+  const ownerResolver: ResolveOwner = resolveOwner ?? resolveSessionOwner;
+  return { resolveSession, ownerResolver };
+}
+
+/**
+ * Create a header-level guard function with optional injectable deps (for
+ * tests) — same authorization as `makeGuard`, but callable before a Hono
+ * `Context` exists (raw `node:http` upgrade handlers).
+ */
+export function makeHeaderGuard(
+  getSession?: GetSession,
+  resolveOwner?: ResolveOwner,
+) {
+  const { resolveSession, ownerResolver } = resolveDefaults(getSession, resolveOwner);
+  return (headers: Headers, sessionId: string | undefined, action: Actions) =>
+    authorizeSessionAccess(headers, sessionId, action, resolveSession, ownerResolver);
+}
+
+/**
+ * Create a guard function with optional injectable deps (for tests).
  *
  * Returns the resolved user on success; throws HTTPException (401/404) on failure.
  *
@@ -65,51 +136,21 @@ export function makeGuard(
   getSession?: GetSession,
   resolveOwner?: ResolveOwner,
 ) {
-  const resolveSession: GetSession =
-    getSession ??
-    ((headers) =>
-      auth.api.getSession({
-        headers,
-      } as Parameters<typeof auth.api.getSession>[0]));
-
-  const ownerResolver: ResolveOwner = resolveOwner ?? resolveSessionOwner;
+  const headerGuard = makeHeaderGuard(getSession, resolveOwner);
 
   return async function guardSession(
     c: Context,
     action: Actions,
   ): Promise<GuardUser> {
-    // 1. Authenticate — pull headers from the raw fetch Request (Hono wraps it).
-    const session = await resolveSession(c.req.raw.headers);
-    if (!session) {
-      throw new HTTPException(401, { message: "unauthenticated" });
-    }
-
-    const user: GuardUser = {
-      id: session.user.id,
-      role: session.user.role ?? "user",
-    };
-
-    // 2. Resolve session ownership.
     const sessionId = c.req.param("id");
-    if (!sessionId) {
-      throw new HTTPException(404, { message: "not found" });
+    // Pull headers from the raw fetch Request (Hono wraps it).
+    const result = await headerGuard(c.req.raw.headers, sessionId, action);
+    if (!result.ok) {
+      throw new HTTPException(result.status, {
+        message: result.status === 401 ? "unauthenticated" : "not found",
+      });
     }
-
-    const ability = abilityFor(user);
-
-    const ownerId = await ownerResolver(sessionId);
-
-    // Anti-enumeration: unknown OR unowned session → 404.
-    if (
-      !ability.can(
-        action,
-        subject("Session", { createdByUserId: ownerId }),
-      )
-    ) {
-      throw new HTTPException(404, { message: "not found" });
-    }
-
-    return user;
+    return result.user;
   };
 }
 

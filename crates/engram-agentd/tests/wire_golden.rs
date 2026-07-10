@@ -149,6 +149,7 @@ fn wire_request_golden_and_variant_indices() {
     let start_shell = WireRequest::StartShell { port: Some(7681) };
     let spawn = WireRequest::SpawnHarness(spawn_harness());
     let start_browser = WireRequest::StartBrowser { port: Some(5900) };
+    let start_ide = WireRequest::StartIde { port: Some(13337) };
 
     assert_golden("request_exec", &exec);
     assert_golden("request_stat", &stat);
@@ -162,6 +163,8 @@ fn wire_request_golden_and_variant_indices() {
     assert_golden("request_sync", &WireRequest::Sync);
     assert_golden("request_start_browser", &start_browser);
     assert_golden("request_stop_browser", &WireRequest::StopBrowser);
+    assert_golden("request_start_ide", &start_ide);
+    assert_golden("request_stop_ide", &WireRequest::StopIde);
 
     assert_variant_index(&exec, 0, "WireRequest::Exec");
     assert_variant_index(&stat, 1, "WireRequest::Stat");
@@ -178,6 +181,10 @@ fn wire_request_golden_and_variant_indices() {
     assert_variant_index(&WireRequest::Sync, 9, "WireRequest::Sync");
     assert_variant_index(&start_browser, 10, "WireRequest::StartBrowser");
     assert_variant_index(&WireRequest::StopBrowser, 11, "WireRequest::StopBrowser");
+    assert_variant_index(&WireRequest::RefreshAgent, 12, "WireRequest::RefreshAgent");
+    // ADR 0085: appended after RefreshAgent.
+    assert_variant_index(&start_ide, 13, "WireRequest::StartIde");
+    assert_variant_index(&WireRequest::StopIde, 14, "WireRequest::StopIde");
 }
 
 // ---- WireResponse ------------------------------------------------------
@@ -220,6 +227,10 @@ fn wire_response_golden_and_variant_indices() {
         spawned: true,
         cdp_warning: Some("chromium CDP (:9222) not responding".into()),
     };
+    let ide_ready = WireResponse::IdeReady {
+        port: 13337,
+        spawned: true,
+    };
 
     assert_golden("response_stat", &stat);
     assert_golden("response_upload_ok", &WireResponse::UploadOk);
@@ -237,6 +248,8 @@ fn wire_response_golden_and_variant_indices() {
         &browser_ready_with_warning,
     );
     assert_golden("response_browser_stopped", &WireResponse::BrowserStopped);
+    assert_golden("response_ide_ready", &ide_ready);
+    assert_golden("response_ide_stopped", &WireResponse::IdeStopped);
 
     assert_variant_index(&stat, 0, "WireResponse::Stat");
     assert_variant_index(&WireResponse::UploadOk, 1, "WireResponse::UploadOk");
@@ -257,6 +270,17 @@ fn wire_response_golden_and_variant_indices() {
         11,
         "WireResponse::BrowserStopped",
     );
+    assert_variant_index(
+        &WireResponse::AgentRefreshed {
+            restarting: false,
+            sha256: None,
+        },
+        12,
+        "WireResponse::AgentRefreshed",
+    );
+    // ADR 0085: appended after AgentRefreshed.
+    assert_variant_index(&ide_ready, 13, "WireResponse::IdeReady");
+    assert_variant_index(&WireResponse::IdeStopped, 14, "WireResponse::IdeStopped");
 }
 
 // ---- WireExecEvent -----------------------------------------------------
@@ -360,6 +384,11 @@ fn regen_golden() {
         &WireRequest::StartBrowser { port: Some(5900) },
     );
     write("request_stop_browser", &WireRequest::StopBrowser);
+    write(
+        "request_start_ide",
+        &WireRequest::StartIde { port: Some(13337) },
+    );
+    write("request_stop_ide", &WireRequest::StopIde);
 
     write(
         "response_stat",
@@ -422,6 +451,14 @@ fn regen_golden() {
         },
     );
     write("response_browser_stopped", &WireResponse::BrowserStopped);
+    write(
+        "response_ide_ready",
+        &WireResponse::IdeReady {
+            port: 13337,
+            spawned: true,
+        },
+    );
+    write("response_ide_stopped", &WireResponse::IdeStopped);
 
     write(
         "exec_event_stdout",

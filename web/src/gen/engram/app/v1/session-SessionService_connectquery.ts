@@ -89,6 +89,16 @@ export const snapshot = SessionService.method.snapshot;
 export const ensureBrowser = SessionService.method.ensureBrowser;
 
 /**
+ * ADR 0085: bring up the ephemeral in-guest IDE (code-server) for a
+ * session and return its loopback HTTP port. The orchestrator calls this
+ * before proxying the IDE tab's HTTP/WS traffic over a PortRelay tunnel
+ * (ADR 0066), exactly as EnsureBrowser does for VNC.
+ *
+ * @generated from rpc engram.app.v1.SessionService.EnsureIde
+ */
+export const ensureIde = SessionService.method.ensureIde;
+
+/**
  * @generated from rpc engram.app.v1.SessionService.Resume
  */
 export const resume = SessionService.method.resume;

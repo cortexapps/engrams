@@ -516,6 +516,19 @@ impl HostClient for LocalHostClient {
         self.sandbox.stop_browser(sandbox_id).await
     }
 
+    async fn start_ide(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        // ADR 0085: bring up the in-guest IDE (code-server) and return its
+        // loopback HTTP port. The orchestrator reaches it over the ADR-0066
+        // vsock port relay — the guest binds loopback, agentd dials it.
+        self.sandbox.start_ide(sandbox_id).await
+    }
+
+    async fn stop_ide(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        // ADR 0085: forward to the inner backend. Teardown is at the snapshot /
+        // idle-eviction boundary (code-server is ephemeral, never snapshotted).
+        self.sandbox.stop_ide(sandbox_id).await
+    }
+
     fn harness_dial(&self) -> HarnessDial {
         self.sandbox.harness_dial()
     }

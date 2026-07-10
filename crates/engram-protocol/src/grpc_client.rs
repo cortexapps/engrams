@@ -939,6 +939,32 @@ impl GrpcHostClient {
         Ok(())
     }
 
+    pub async fn start_ide(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .start_ide(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        Ok(resp.port as u16)
+    }
+
+    pub async fn stop_ide(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
+        };
+        self.inner
+            .clone()
+            .stop_ide(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
     /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot. Empty
     /// `state_bincode` on the wire encodes `None` (host has no
     /// chunk-tracked view of this sandbox) so coord can distinguish
@@ -1614,6 +1640,14 @@ impl HostClient for GrpcHostClient {
 
     async fn stop_browser(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         Self::stop_browser(self, sandbox_id).await
+    }
+
+    async fn start_ide(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        Self::start_ide(self, sandbox_id).await
+    }
+
+    async fn stop_ide(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Self::stop_ide(self, sandbox_id).await
     }
 
     async fn proxy_shell(

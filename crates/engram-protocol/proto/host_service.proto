@@ -163,6 +163,14 @@ service HostService {
   rpc StartBrowser(SandboxIdMessage) returns (BrowserPortResponse);
   rpc StopBrowser(SandboxIdMessage) returns (Empty);
 
+  // ADR 0085: bring up / tear down the ephemeral in-guest IDE (code-server).
+  // StartIde is idempotent and returns the loopback HTTP port; the
+  // coordinator's EnsureIde calls it, and the snapshot / idle-evict path
+  // calls StopIde alongside StopBrowser so a live code-server is never
+  // snapshotted.
+  rpc StartIde(SandboxIdMessage) returns (IdePortResponse);
+  rpc StopIde(SandboxIdMessage) returns (Empty);
+
   // ---- admin (ADR 0011 follow-up #1: HostAdminHandler folded in) ----
   rpc ReapMaterializeDir(ReapMaterializeDirRequest) returns (ReapMaterializeDirResponse);
 
@@ -261,6 +269,11 @@ message ProbeSandboxResponse {
   // The VMM process for this sandbox_id is alive on this host, checked
   // independently of `known_to_backend`.
   bool process_alive = 2;
+}
+
+message IdePortResponse {
+  // The in-guest HTTP port code-server is serving on (loopback).
+  uint32 port = 1;
 }
 
 message BrowserPortResponse {

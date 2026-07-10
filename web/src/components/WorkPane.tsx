@@ -1,6 +1,7 @@
 import { useEffect, useState, type ComponentType } from "react";
 import {
   Activity,
+  Code2,
   Globe,
   Maximize2,
   Minimize2,
@@ -11,6 +12,7 @@ import {
 
 import { TerminalPane } from "./TerminalPane";
 import { BrowserPane } from "./BrowserPane";
+import { IdePane } from "./IdePane";
 import { DiagnosticsPanel } from "./SessionDiagnostics";
 import { Button } from "@/components/ui/button";
 import { textVariants } from "@/components/ui/text";
@@ -28,7 +30,7 @@ import type { IndexedEvent, Session } from "../lib/types";
 // with expand-to-fill) and the mobile overlay sheet (`variant="overlay"`, where
 // collapse means "close the sheet").
 
-export type PaneTabId = "shell" | "browser" | "diagnostics";
+export type PaneTabId = "shell" | "browser" | "ide" | "diagnostics";
 
 interface PaneTabDef {
   id: PaneTabId;
@@ -38,6 +40,7 @@ interface PaneTabDef {
 
 const SHELL_TAB: PaneTabDef = { id: "shell", label: "Shell", icon: SquareTerminal };
 const BROWSER_TAB: PaneTabDef = { id: "browser", label: "Browser", icon: Globe };
+const IDE_TAB: PaneTabDef = { id: "ide", label: "IDE", icon: Code2 };
 const DIAGNOSTICS_TAB: PaneTabDef = { id: "diagnostics", label: "Diagnostics", icon: Activity };
 
 export interface WorkPaneProps {
@@ -56,6 +59,7 @@ export interface WorkPaneProps {
   tab: PaneTabId;
   onTabChange: (tab: PaneTabId) => void;
   browserEnabled: boolean;
+  ideEnabled: boolean;
   /** Hide the pane (panel: collapse the panel; overlay: close the sheet). */
   onCollapse: () => void;
   variant?: "panel" | "overlay";
@@ -72,14 +76,18 @@ export function WorkPane({
   tab,
   onTabChange,
   browserEnabled,
+  ideEnabled,
   onCollapse,
   variant = "panel",
   expanded = false,
   onToggleExpand,
 }: WorkPaneProps) {
-  const tabs = browserEnabled
-    ? [SHELL_TAB, BROWSER_TAB, DIAGNOSTICS_TAB]
-    : [SHELL_TAB, DIAGNOSTICS_TAB];
+  const tabs = [
+    SHELL_TAB,
+    ...(browserEnabled ? [BROWSER_TAB] : []),
+    ...(ideEnabled ? [IDE_TAB] : []),
+    DIAGNOSTICS_TAB,
+  ];
 
   // Lazy-mount each live pane the first time it's viewed *while the pane is
   // open*, then keep it mounted for the life of the WorkPane (hidden via
@@ -87,10 +95,12 @@ export function WorkPane({
   // `open` is what keeps a collapsed pane from silently opening a shell.
   const [shellEverActive, setShellEverActive] = useState(false);
   const [browserEverActive, setBrowserEverActive] = useState(false);
+  const [ideEverActive, setIdeEverActive] = useState(false);
   useEffect(() => {
     if (!open) return;
     if (tab === "shell") setShellEverActive(true);
     if (tab === "browser") setBrowserEverActive(true);
+    if (tab === "ide") setIdeEverActive(true);
   }, [open, tab]);
 
   return (
@@ -161,6 +171,11 @@ export function WorkPane({
             style={{ display: tab === "browser" ? "block" : "none" }}
           >
             <BrowserPane sessionId={sessionId} />
+          </div>
+        )}
+        {ideEnabled && ideEverActive && (
+          <div className="absolute inset-0" style={{ display: tab === "ide" ? "block" : "none" }}>
+            <IdePane sessionId={sessionId} />
           </div>
         )}
         {/* Diagnostics holds no live socket, so it mounts only while open + on

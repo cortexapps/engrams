@@ -529,6 +529,26 @@ pub trait HostClient: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0085: bring up the ephemeral in-guest IDE (code-server) and
+    /// return its loopback HTTP port. The coordinator calls this before
+    /// opening a relay tunnel to code-server :13337 (ADR 0066); the IDE is
+    /// reached over the vsock port relay, not a direct dial. Default
+    /// `NotFound` — only host-agent impls own an IDE.
+    async fn start_ide(&self, sandbox_id: SandboxId) -> Result<u16, SandboxError> {
+        let _ = sandbox_id;
+        Err(SandboxError::NotFound)
+    }
+
+    /// ADR 0085: tear down the in-guest IDE. Called at the snapshot /
+    /// idle-eviction boundary (code-server is ephemeral and never
+    /// snapshotted — its listeners would resurrect wedged after restore,
+    /// issue #567's lesson), NOT on viewer disconnect. Default no-op; only
+    /// host-agent impls own an IDE.
+    async fn stop_ide(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let _ = sandbox_id;
+        Ok(())
+    }
+
     /// ADR 0064: open a bidi RAW-BYTE tunnel to an arbitrary guest TCP
     /// `port` for `sandbox_id` (a dev server the agent started). The
     /// raw-byte sibling of [`Self::proxy_shell`]: the returned

@@ -71,7 +71,7 @@ fi
 file "$OUT/vmlinux" | grep -q "ELF 64-bit" || { echo "kernel is not an ELF binary:" >&2; file "$OUT/vmlinux" >&2; exit 1; }
 
 # ── RO session bundles (ADR 0027 → 0055 → 0058) ─────────────────────────────
-# The sentinel + skills + integrations-cli + browser + harness-claude +
+# The sentinel + skills + integrations-cli + browser + ide + harness-claude +
 # agentd + guest-tools squashfs bundles + the current.json stamp
 # (logical name -> sha256). The host-agent reads these from
 # /var/lib/engram/shared at startup; the engram-host-fleet init container copies
@@ -111,6 +111,9 @@ integrations_cli_sha="$(stage_bundle integrations-cli)"
 # playwright-cli driving it over CDP), opt-in per session. Subsumes the retired
 # `playwright` bundle.
 browser_sha="$(stage_bundle browser)"
+# ADR 0085: the in-guest IDE (code-server), opt-in per session — agentd spawns
+# it lazily for the dashboard IDE tab.
+ide_sha="$(stage_bundle ide)"
 # ADR 0062: the built-in `claude` harness rides the stamp like a skill — the coord
 # resolves the built-in's squashfs from this stamp (key `harness-claude`) + its
 # embedded descriptor, mounts it on dyn_0, and the session execs it. No registration.
@@ -127,8 +130,8 @@ agentd_sha="$(stage_bundle agentd)"
 # bake ttyd.
 guest_tools_sha="$(stage_bundle guest-tools)"
 # Stamp: logical name -> sha256, matching AuxRoDrive::CURRENT_STAMP / read_stamp().
-printf '{"sentinel":"%s","skills":"%s","integrations-cli":"%s","browser":"%s","harness-claude":"%s","agentd":"%s","guest-tools":"%s"}\n' \
-  "$sentinel_sha" "$skills_sha" "$integrations_cli_sha" "$browser_sha" "$harness_claude_sha" "$agentd_sha" "$guest_tools_sha" \
+printf '{"sentinel":"%s","skills":"%s","integrations-cli":"%s","browser":"%s","ide":"%s","harness-claude":"%s","agentd":"%s","guest-tools":"%s"}\n' \
+  "$sentinel_sha" "$skills_sha" "$integrations_cli_sha" "$browser_sha" "$ide_sha" "$harness_claude_sha" "$agentd_sha" "$guest_tools_sha" \
   > "$BUNDLES_OUT/current.json"
 
 echo "==> staged into ${OUT}:"

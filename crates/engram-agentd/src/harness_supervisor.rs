@@ -78,6 +78,14 @@ pub struct HarnessSupervisor {
     /// back via [`Self::session_env`]. One agentd serves exactly one
     /// session, so this single shared map *is* the session's env.
     session_env: RwLock<HashMap<String, String>>,
+    /// The session working directory, recorded from the reserved
+    /// `HARNESS_CWD_ENV` key on each `SpawnHarness` frame (same lifecycle
+    /// as `session_env`, including the empty-argv readiness probe). The
+    /// IDE (`StartIde`, ADR 0085) reads it back via
+    /// [`Self::session_workdir`] so code-server opens on the workspace,
+    /// not agentd's cwd (`/`). `None` when the frame carried no cwd
+    /// (dev_vm / workdir-less images).
+    session_workdir: RwLock<Option<String>>,
 }
 
 struct Inner {
@@ -94,6 +102,7 @@ impl HarnessSupervisor {
                 current_child: None,
             }),
             session_env: RwLock::new(HashMap::new()),
+            session_workdir: RwLock::new(None),
         })
     }
 
@@ -104,6 +113,16 @@ impl HarnessSupervisor {
         self.session_env
             .read()
             .expect("session_env lock poisoned")
+            .clone()
+    }
+
+    /// The session working directory most recently delivered by the host
+    /// on a `SpawnHarness` frame (the reserved `HARNESS_CWD_ENV` key).
+    /// `None` until the first bind, or when the session has no workdir.
+    pub fn session_workdir(&self) -> Option<String> {
+        self.session_workdir
+            .read()
+            .expect("session_workdir lock poisoned")
             .clone()
     }
 
@@ -123,6 +142,14 @@ impl HarnessSupervisor {
         // dev_vm sessions deliver it on an empty-argv probe and never spawn
         // a harness, but their exec/shell processes still inherit it.
         *self.session_env.write().expect("session_env lock poisoned") = req.session_env.clone();
+        // ADR 0085: record the session workdir alongside — the IDE
+        // (`StartIde`) opens code-server on it, and like the env it must
+        // land even on the readiness probe (dev_vm spawns no harness).
+        *self
+            .session_workdir
+            .write()
+            .expect("session_workdir lock poisoned") =
+            req.env.get(engram_harness_proto::HARNESS_CWD_ENV).cloned();
 
         // ADR 0035 §3: re-mount the bundle mounts BEFORE activation. On a
         // fresh create the host may have patch_drive'd an aux bundle to a

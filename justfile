@@ -514,18 +514,20 @@ bake-demo-enable:
 pull-kernel:
     bash deploy/dev/pull-kernel.sh
 
-# Stage the ADR 0027 RO bundles (skills, integrations-cli, browser) as
+# Stage the ADR 0027 RO bundles (skills, integrations-cli, browser, ide) as
 # UNPACKED trees under var/bundles/ for the dev ProcessBackend, which symlinks
 # them in instead of mounting a squashfs. `skills` is a plain copy;
-# `integrations-cli`/`browser` need Docker (glibc builds) and are best-effort —
-# skip them and only skills get wired (no browser tooling in dev). Re-run after
-# editing a skill.
+# `integrations-cli`/`browser`/`ide` need Docker (glibc builds) and are
+# best-effort — skip them and only skills get wired (no browser/IDE tooling in
+# dev). Re-run after editing a skill.
 bundles:
     deploy/bundles/skills/build.sh --stage var/bundles/skills
     deploy/bundles/integrations-cli/build.sh --stage var/bundles/integrations-cli \
         || echo "integrations-cli bundle skipped (needs Docker) — dev sessions get no integration CLIs"
     deploy/bundles/browser/build.sh --stage var/bundles/browser \
         || echo "browser bundle skipped (needs Docker) — dev sessions get no browser"
+    deploy/bundles/ide/build.sh --stage var/bundles/ide \
+        || echo "ide bundle skipped (needs Docker) — dev sessions get no IDE"
 
 # ADR 0035/0055: build + stage the squashfs bundles CONTENT-ADDRESSED
 # (<sha256>.squashfs + current.json stamp) under var/shared/, the
@@ -544,11 +546,11 @@ bundles-squashfs:
     stamp="{"
     sep=""
     # ADR 0055: `sentinel` rides every reserved dyn-* slot; skills/
-    # integrations-cli/browser are catalog skills swapped in per session;
+    # integrations-cli/browser/ide are catalog skills swapped in per session;
     # guest-tools (ADR 0080 §D) carries the pinned static ttyd for the SHELL
     # tab (reserved slot dyn_2). Files are content-keyed (<sha>.squashfs);
     # the stamp maps logical name -> sha.
-    for name in sentinel skills integrations-cli browser guest-tools; do
+    for name in sentinel skills integrations-cli browser ide guest-tools; do
         tmp="var/shared/.$name.build.squashfs"
         if ! "deploy/bundles/$name/build.sh" "$tmp"; then
             echo "$name bundle build failed; skipping (sessions degrade gracefully)" >&2
@@ -682,16 +684,16 @@ bundles-vz:
     stamp="{"
     sep=""
     # `sentinel` rides every reserved dyn slot at capture; skills/
-    # integrations-cli/browser are catalog skills swapped in per session;
+    # integrations-cli/browser/ide are catalog skills swapped in per session;
     # guest-tools (ADR 0080 §D) carries the pinned static ttyd for the SHELL
     # tab (reserved slot dyn_2 — the coord resolves it per fresh create).
-    # integrations-cli/browser need Docker and are best-effort
+    # integrations-cli/browser/ide need Docker and are best-effort
     # (skipped on failure), exactly as `just bundles` already degrades;
     # guest-tools downloads the pinned ttyd release and degrades the same
     # way offline (SHELL tab then needs an image-baked ttyd).
-    for name in sentinel skills integrations-cli browser guest-tools; do
+    for name in sentinel skills integrations-cli browser ide guest-tools; do
         # Stage under the repo (absolute, $HOME-rooted), NOT `mktemp -d`: the
-        # Docker-built bundles (integrations-cli/browser) bind-mount this dir into the
+        # Docker-built bundles (integrations-cli/browser/ide) bind-mount this dir into the
         # build container, and Docker Desktop on macOS does not share the
         # /var/folders path `mktemp -d` returns — the container's writes never
         # reach the host, silently producing an empty bundle. A path under the

@@ -40,6 +40,11 @@ service SessionService {
   // chromium) for a session and return the VNC port. The orchestrator calls
   // this before opening a PortRelay tunnel to the guest's :5900 (ADR 0066).
   rpc EnsureBrowser(EnsureBrowserRequest) returns (EnsureBrowserResponse);
+  // ADR 0085: bring up the ephemeral in-guest IDE (code-server) for a
+  // session and return its loopback HTTP port. The orchestrator calls this
+  // before proxying the IDE tab's HTTP/WS traffic over a PortRelay tunnel
+  // (ADR 0066), exactly as EnsureBrowser does for VNC.
+  rpc EnsureIde(EnsureIdeRequest) returns (EnsureIdeResponse);
   rpc Resume(ResumeRequest) returns (ResumeResponse);
   rpc EvictLocal(EvictLocalRequest) returns (EvictLocalResponse);
   // ADR 0051: the explicit admin trigger for the idle-eviction primitive
@@ -396,6 +401,15 @@ message EnsureBrowserRequest {
 message EnsureBrowserResponse {
   // The in-guest RFB port x11vnc is serving on (loopback); the orchestrator
   // opens a PortRelay tunnel to it (ADR 0066).
+  uint32 port = 1;
+}
+
+message EnsureIdeRequest {
+  string session_id = 1;
+}
+message EnsureIdeResponse {
+  // The in-guest HTTP port code-server is serving on (loopback); the
+  // orchestrator opens a PortRelay tunnel to it (ADR 0066).
   uint32 port = 1;
 }
 

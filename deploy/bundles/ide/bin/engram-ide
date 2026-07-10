@@ -1,0 +1,174 @@
+#!/bin/sh
+# ADR 0085 ide bundle launcher. Self-contained, glibc-linked; runs on any
+# glibc base — issue #569: NOT via LD_LIBRARY_PATH (the kernel always execs
+# the loader baked into each binary's PT_INTERP, so that only steers a loader
+# that is already running the base image's own), but because build.sh
+# patchelf's the bundled node to carry its own interpreter + rpath. See the
+# BUNDLE_LINK block a few lines down for the run-time half of that fix.
+# ADR 0055: mounts at a dynamic slot (/opt/engram/dyn/<i>) and agentd
+# symlinks this onto PATH, so resolve our real bundle root from $0
+# (readlink -f follows the PATH symlink) — never a fixed mount path.
+#
+# Brings up ONE daemon: code-server (VS Code web) on 127.0.0.1:$ENGRAM_IDE_PORT,
+# opening the session workdir (ENGRAM_IDE_WORKDIR, set by agentd). Loopback
+# ONLY — reachability is the ADR 0066 vsock relay (agentd dials 127.0.0.1
+# in-guest and splices), so the IDE never listens on the guest network; the
+# only route to it is the auth-gated orchestrator proxy (ADR 0085 §4).
+#
+# Unlike the browser (untrusted page rendering -> env allowlist + uid drop,
+# ADR 0065 §7), the IDE is a trusted first-party surface over the user's own
+# workspace, equivalent to the shell: it runs with the FULL session env as
+# whatever user agentd invokes it as, so its integrated terminal behaves
+# identically to the SHELL tab. No setpriv, no scrubbing — deliberately.
+set -eu
+here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
+self="$(readlink -f -- "$0")"
+
+# --- Stable bundle path for the patchelf'd node (issue #569) -----------------
+# build.sh patches the bundled node's PT_INTERP + DT_RPATH to the fixed
+# absolute path /tmp/engram-ide-bundle/lib, baked in at BUILD time — the
+# kernel always execs the interpreter recorded in the ELF, so this can't be
+# steered via LD_LIBRARY_PATH at run time. But bundles mount at a dynamic
+# reserved slot (/opt/engram/dyn/<i>, ADR 0055) that is not known until this
+# script runs, so the baked-in path can't point there directly. Bridge the
+# two here: keep a stable symlink at that fixed path pointing at $here,
+# created/refreshed before ANY bundled binary can run — including the node
+# /healthz probe in ide_up() below, which the --ensure fast path reaches
+# before anything else in the script. No env override is possible (the path
+# is compiled into the ELF, not read from the environment), and /tmp is the
+# right home for the same single-tenant + non-root-dev-ProcessBackend reasons
+# as engram-browser's. If the symlink can't be pointed at $here, fail loudly
+# rather than let the bundled node silently run against a stale bundle's libs.
+BUNDLE_LINK=/tmp/engram-ide-bundle
+if [ "$(readlink -- "$BUNDLE_LINK" 2>/dev/null)" != "$here" ]; then
+    ln -sfn "$here" "$BUNDLE_LINK" 2>/dev/null || {
+        echo "engram-ide: cannot point $BUNDLE_LINK at $here (stale symlink owned by another uid, or /tmp not writable?)" >&2
+        exit 1
+    }
+fi
+
+# --- Lazy, idempotent bring-up + agentd "registration" (ADR 0085) ------------
+# agentd StartIde runs `engram-ide --ensure`. `--ensure` is idempotent —
+# code-server already answering /healthz means it is up — and flock-guarded so
+# concurrent ensures can't double-spawn. The daemon runs DETACHED in its own
+# process group; its pgid is recorded in a pidfile, and agentd reaps THAT at
+# snapshot/idle teardown (StopIde -> killpg — it need not be the spawner). The
+# pidfile IS the registration — no control verb. Guest is single-tenant (the
+# VM is the isolation boundary), so fixed /tmp paths are safe; all overridable.
+IDE_PORT="${ENGRAM_IDE_PORT:-13337}"
+IDE_PIDFILE="${ENGRAM_IDE_PIDFILE:-/tmp/engram-ide.pgid}"
+# Bring-up log (code-server stdout+stderr), truncated per bring-up so it stays
+# small and always holds the latest run — a startup failure must leave a trace
+# (issue #569's lesson: never redirect a detached stack to /dev/null).
+IDE_LOG="${ENGRAM_IDE_LOG:-/tmp/engram-ide.log}"
+NODE="$here/code-server/lib/node"
+
+# Is the IDE up? Probe code-server's /healthz on the loopback port via the
+# BUNDLED node (the guest has no curl-for-sure/python3/nc — same constraint the
+# browser launcher solves with its node probes, and this bundle ships node
+# anyway). Require an HTTP 200 within a bounded deadline so a wedged listener
+# resurrected by snapshot/restore (issue #567: accepts but never answers)
+# fails the probe in bounded time instead of hanging the ensure — a bare
+# TCP connect is NOT enough.
+ide_up() {
+    "$NODE" -e '
+        const http = require("http");
+        setTimeout(() => process.exit(1), 2000);  // one connect+response deadline
+        const req = http.get(
+            { host: "127.0.0.1", port: +process.argv[1], path: "/healthz", timeout: 1500 },
+            (res) => { res.resume(); process.exit(res.statusCode === 200 ? 0 : 1); });
+        req.on("error", () => process.exit(1));
+        req.on("timeout", () => { req.destroy(); process.exit(1); });
+    ' "$IDE_PORT" 2>/dev/null
+}
+
+if [ "${1:-}" = "--ensure" ]; then
+    ide_up && exit 0                        # fast path: already up
+    mkdir -p "$(dirname "$IDE_PIDFILE")" 2>/dev/null || true
+    # Serialize concurrent ensures so exactly one brings the daemon up. flock
+    # ships in the bundle (util-linux); fall back to unlocked if absent.
+    FLOCK=""
+    [ -x "$here/bin/flock" ] && FLOCK="$here/bin/flock"
+    [ -z "$FLOCK" ] && command -v flock >/dev/null 2>&1 && FLOCK="$(command -v flock)"
+    if [ -n "$FLOCK" ]; then
+        exec "$FLOCK" -w 60 "${IDE_PIDFILE}.lock" "$self" --ensure-locked
+    fi
+    exec "$self" --ensure-locked
+fi
+
+if [ "${1:-}" = "--ensure-locked" ]; then
+    ide_up && exit 0                        # re-check under the lock
+    # Bring the daemon up detached in a fresh session/pgid (setsid) and record
+    # the pgid; when this short-lived --ensure process exits, the daemon
+    # reparents to PID 1 (agentd), which reaps it by the pidfile at teardown.
+    # stdout+stderr -> IDE_LOG, truncated here at bring-up.
+    setsid "$self" --run >"$IDE_LOG" 2>&1 &
+    pgid=$!
+    echo "$pgid" > "$IDE_PIDFILE"
+    # Return only once /healthz answers, so callers can connect immediately;
+    # bounded so a launch failure can't hang agentd. 30s (not the browser's
+    # 20s): code-server cold-boots a Node app + extension host on a 2-vCPU
+    # microVM, measurably slower than x11vnc's bind.
+    i=0
+    while [ "$i" -lt 300 ]; do
+        ide_up && exit 0
+        kill -0 "$pgid" 2>/dev/null || { echo "engram-ide: code-server exited during bring-up (see $IDE_LOG)" >&2; exit 1; }
+        i=$((i + 1)); sleep 0.1
+    done
+    echo "engram-ide: code-server /healthz on :$IDE_PORT not ready within 30s" >&2
+    exit 1
+fi
+
+# Default (`--run`, or no arg for dev): the supervised foreground bring-up.
+# Invoked detached by --ensure-locked (or directly on a dev box).
+
+# The folder code-server opens: the session workdir agentd hands us; fall back
+# to $HOME for a bare dev invocation.
+WORKDIR="${ENGRAM_IDE_WORKDIR:-${HOME:-/root}}"
+
+# Seed the bundle's machine-level settings (config/machine-settings.json —
+# e.g. chat.disableAIFeatures, no Copilot in the in-session IDE) into
+# code-server's user-data dir. Machine scope is the admin-managed layer above
+# user settings, and the RO bundle mount can't be its live home, so copy on
+# every bring-up: the bundle stays authoritative for this layer across bundle
+# updates, while User/ settings (the layer the Settings UI edits) are never
+# touched. Path per code-server: <user-data-dir>/Machine/settings.json.
+DATA_DIR="${XDG_DATA_HOME:-${HOME:-/root}/.local/share}/code-server"
+mkdir -p "$DATA_DIR/Machine"
+cp "$here/config/machine-settings.json" "$DATA_DIR/Machine/settings.json"
+
+cleanup() {
+    # Disarm first: `kill 0` signals the WHOLE process group — including this
+    # shell — so without clearing the traps the delivered TERM/INT re-enters
+    # cleanup and recurses. Clear, then kill the group (code-server + its
+    # extension-host/terminal children, all in our setsid group).
+    trap - TERM INT EXIT
+    kill 0 2>/dev/null || true
+}
+trap cleanup TERM INT EXIT
+
+# code-server under a respawn supervisor: if it crashes (or a user kills it
+# from the integrated terminal), relaunch on the same port rather than strand
+# the IDE tab — agentd can't recover it (StartIde re-probes /healthz and would
+# just report not-ready; the next Ensure would race a half-dead pidfile). The
+# 1s pause keeps a hard launch failure from hot-looping. --auth none is safe
+# because the only route here is the better-auth-guarded orchestrator proxy
+# over the vsock relay (ADR 0085); telemetry/update-check/workspace-trust are
+# off — this is a headless, ephemeral, single-user server.
+launch=0
+while :; do
+    launch=$((launch + 1))
+    if "$NODE" "$here/code-server" \
+        --bind-addr "127.0.0.1:$IDE_PORT" \
+        --auth none \
+        --disable-telemetry \
+        --disable-update-check \
+        --disable-workspace-trust \
+        "$WORKDIR"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    echo "engram-ide: code-server exited status=$rc (launch #$launch)"
+    sleep 1
+done
