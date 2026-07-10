@@ -12203,17 +12203,24 @@ mod tests {
         let manifest = cs.get_manifest(memory_ref).await.unwrap();
         assert_eq!(manifest.total_bytes, finalize_payload().len() as u64);
 
+        // The checkpoint record becomes VISIBLE at rename time, but the
+        // job deletes the finalize record only after `persist` returns —
+        // which now includes a parent-dir fsync (an F_FULLFSYNC on macOS)
+        // AFTER the rename. Waiting only for the checkpoint file above
+        // therefore races the deletion/clear steps by that fsync latency;
+        // wait for them like the destroy below, rather than asserting a
+        // point-in-time snapshot of a still-running job.
         let finalize_record_path = ckpt_dir
             .join("finalize")
             .join(format!("{snapshot_id}.json"));
-        assert!(
-            !finalize_record_path.exists(),
-            "the in-flight finalize record must be deleted on completion"
-        );
-        assert!(
-            !pooled.pending_finalizes.contains_key(&sandbox_id),
-            "pending_finalizes must be cleared on completion"
-        );
+        wait_for("in-flight finalize record deleted on completion", || {
+            !finalize_record_path.exists()
+        })
+        .await;
+        wait_for("pending_finalizes cleared on completion", || {
+            !pooled.pending_finalizes.contains_key(&sandbox_id)
+        })
+        .await;
         wait_for("best-effort destroy", || {
             destroy_calls.lock().contains(&sandbox_id)
         })
