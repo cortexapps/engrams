@@ -98,7 +98,7 @@ message ListTasksRequest {
   // no live session is known — is in the set. Empty = no filter.
   repeated string states = 4;
   // 1-based page over the filtered, most-recently-active-first ordering.
-  // page_size 0 = unpaginated (legacy callers); clamped to 200 otherwise.
+  // page_size 0 = unpaginated (legacy callers); clamped to 1000 otherwise.
   int32 page = 5;
   int32 page_size = 6;
 }

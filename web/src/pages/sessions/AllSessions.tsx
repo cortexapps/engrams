@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { Activity, UserRound, X } from "lucide-react";
 import { StatusGlyph } from "../../components/Glyph";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input";
 import { FilterBar, type FilterField } from "./filter-bar";
 import { SessionsList } from "./sessions-list";
 import { statusLabel } from "./session-format";
+import { useLoadMoreSentinel } from "../../hooks/useLoadMoreSentinel";
 
 const PAGE_SIZE = 50;
 const SESSION_STATES: SessionState[] = [
@@ -29,7 +30,7 @@ const SESSION_STATES: SessionState[] = [
 export function AllSessions() {
   const [search, setSearch] = useState("");
   const [filters, setFilters] = useState<Record<string, string[]>>({ owner: [], state: [] });
-  const [page, setPage] = useState(1);
+  const [limit, setLimit] = useState(PAGE_SIZE);
   const debouncedSearch = useDebouncedValue(search);
   const { data: usersMap } = useAdminUsersMap(true);
   const fields: FilterField[] = [
@@ -66,16 +67,22 @@ export function AllSessions() {
     search: debouncedSearch,
     createdByUserIds: filters.owner,
     states: filters.state,
-    page,
-    pageSize: PAGE_SIZE,
+    page: 1,
+    pageSize: limit,
   });
   const total = totalCount ?? 0;
+  const visibleCount = sessions?.length ?? 0;
+  const hasMore = visibleCount < total;
   const hasFilters = Boolean(search || filters.owner.length || filters.state.length);
+  // Row count is intentionally a dependency: it re-observes a still-visible
+  // sentinel after the larger response has rendered.
+  const handleLoadMore = useCallback(() => setLimit((value) => value + PAGE_SIZE), [visibleCount]);
+  const loadMoreRef = useLoadMoreSentinel({ hasMore, onLoadMore: handleLoadMore });
 
   const clearFilters = () => {
     setSearch("");
     setFilters({ owner: [], state: [] });
-    setPage(1);
+    setLimit(PAGE_SIZE);
   };
 
   return (
@@ -87,7 +94,7 @@ export function AllSessions() {
           value={search}
           onChange={(event) => {
             setSearch(event.target.value);
-            setPage(1);
+            setLimit(PAGE_SIZE);
           }}
           placeholder="Search tasks…"
           aria-label="Search tasks"
@@ -98,7 +105,7 @@ export function AllSessions() {
           value={filters}
           onChange={(next) => {
             setFilters(next);
-            setPage(1);
+            setLimit(PAGE_SIZE);
           }}
         />
         {hasFilters && (
@@ -116,30 +123,15 @@ export function AllSessions() {
         showOwner
         emptyText={hasFilters ? "No matching tasks." : "No tasks across the fleet yet."}
       />
-      {/* Also shown past page 1 with a shrunken total (live poll can drop
-          matches out from under us) so Prev is always reachable. */}
-      {(total > PAGE_SIZE || page > 1) && (
-        <div className="flex items-center justify-between gap-4">
-          <p className="font-mono text-xs tabular-nums text-muted-foreground">
-            {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, total)} of {total}
-          </p>
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              onClick={() => setPage((value) => value - 1)}
-              disabled={page === 1}
-            >
-              Prev
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => setPage((value) => value + 1)}
-              disabled={page * PAGE_SIZE >= total}
-            >
-              Next
-            </Button>
-          </div>
+      {hasMore && (
+        <div ref={loadMoreRef} className="py-2 text-center text-xs text-muted-foreground">
+          Loading more…
         </div>
+      )}
+      {total > 0 && (
+        <p className="font-mono text-xs tabular-nums text-muted-foreground">
+          {visibleCount} of {total} tasks
+        </p>
       )}
     </div>
   );

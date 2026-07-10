@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { useCallback, type CSSProperties } from "react";
 import { ListChecks, Plus, TriangleAlert } from "lucide-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useIsAdmin } from "../../auth/AuthProvider";
@@ -24,6 +24,7 @@ import { relativeTime, shortId } from "./session-format";
 import { useRailSessions } from "./useRailSessions";
 import { ProfileChip } from "../../components/profiles/ProfileChip";
 import { useRailStore } from "./rail-store";
+import { useLoadMoreSentinel } from "../../hooks/useLoadMoreSentinel";
 
 // The persistent sessions rail: a live switcher between the caller's tasks that
 // stays mounted across the list views AND the transcript (the rail is the
@@ -46,7 +47,11 @@ export function SessionsRail() {
   const onStart = pathname === "/sessions" || pathname === "/sessions/";
   const onAllList = pathname.startsWith("/sessions/all");
 
-  const { rows, openId, total, hasMore, isPending, error } = useRailSessions();
+  const { rows, openId, hasMore, isPending, error } = useRailSessions();
+  // Row count is intentionally a dependency: it gives the sentinel hook a new
+  // callback to observe after each larger ListTasks response arrives.
+  const handleLoadMore = useCallback(showMore, [showMore, rows.length]);
+  const loadMoreRef = useLoadMoreSentinel({ hasMore, onLoadMore: handleLoadMore });
 
   return (
     <>
@@ -178,13 +183,12 @@ export function SessionsRail() {
                     );
                   })}
                   {hasMore && (
-                    <SidebarMenuItem>
-                      <SidebarMenuButton
-                        onClick={showMore}
-                        className="justify-center text-xs text-sidebar-foreground/70"
-                      >
-                        Show more ({rows.length} of {total})
-                      </SidebarMenuButton>
+                    <SidebarMenuItem
+                      ref={loadMoreRef}
+                      aria-hidden
+                      className="py-1 text-center text-xs text-sidebar-foreground/70"
+                    >
+                      …
                     </SidebarMenuItem>
                   )}
                 </>

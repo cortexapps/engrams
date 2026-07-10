@@ -620,7 +620,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         return { tasks: filteredTasks, totalCount };
       }
 
-      const pageSize = Math.min(req.pageSize, 200);
+      const pageSize = Math.min(req.pageSize, 1000);
       const page = Math.max(1, req.page || 1);
       const offset = (page - 1) * pageSize;
       return {

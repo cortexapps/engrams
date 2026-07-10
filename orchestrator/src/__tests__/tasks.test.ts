@@ -790,10 +790,10 @@ describe("TaskService — ListTasks ADR 0087", () => {
     ]);
   });
 
-  test("paginates after sorting, keeps pre-slice count, clamps to 200, and supports legacy zero", async () => {
-    const tasks = Array.from({ length: 205 }, (_, index) =>
+  test("paginates after sorting, keeps pre-slice count, clamps to 1000, and supports legacy zero", async () => {
+    const tasks = Array.from({ length: 1005 }, (_, index) =>
       listTaskRow(
-        `page-task-${index.toString().padStart(3, "0")}`,
+        `page-task-${index.toString().padStart(4, "0")}`,
         ADMIN_ID,
         new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
       )
@@ -805,20 +805,20 @@ describe("TaskService — ListTasks ADR 0087", () => {
       [],
     );
     const first = await client.listTasks({ scope: "all", page: 1, pageSize: 2 });
-    expect(first.tasks.map((task) => task.id)).toEqual(["page-task-204", "page-task-203"]);
-    expect(first.totalCount).toBe(205);
+    expect(first.tasks.map((task) => task.id)).toEqual(["page-task-1004", "page-task-1003"]);
+    expect(first.totalCount).toBe(1005);
 
     const second = await client.listTasks({ scope: "all", page: 2, pageSize: 2 });
-    expect(second.tasks.map((task) => task.id)).toEqual(["page-task-202", "page-task-201"]);
-    expect(second.totalCount).toBe(205);
+    expect(second.tasks.map((task) => task.id)).toEqual(["page-task-1002", "page-task-1001"]);
+    expect(second.totalCount).toBe(1005);
 
-    const clamped = await client.listTasks({ scope: "all", pageSize: 500 });
-    expect(clamped.tasks).toHaveLength(200);
-    expect(clamped.totalCount).toBe(205);
+    const clamped = await client.listTasks({ scope: "all", pageSize: 1500 });
+    expect(clamped.tasks).toHaveLength(1000);
+    expect(clamped.totalCount).toBe(1005);
 
     const legacy = await client.listTasks({ scope: "all", pageSize: 0 });
-    expect(legacy.tasks).toHaveLength(205);
-    expect(legacy.totalCount).toBe(205);
+    expect(legacy.tasks).toHaveLength(1005);
+    expect(legacy.totalCount).toBe(1005);
   });
 });
 

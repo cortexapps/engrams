@@ -235,7 +235,7 @@ export type ListTasksRequest = Message<"engram.app.v1.ListTasksRequest"> & {
 
   /**
    * 1-based page over the filtered, most-recently-active-first ordering.
-   * page_size 0 = unpaginated (legacy callers); clamped to 200 otherwise.
+   * page_size 0 = unpaginated (legacy callers); clamped to 1000 otherwise.
    *
    * @generated from field: int32 page = 5;
    */

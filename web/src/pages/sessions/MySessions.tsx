@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { Plus } from "lucide-react";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageHeading } from "../../components/page-heading";
 import { SessionsList } from "./sessions-list";
+import { useLoadMoreSentinel } from "../../hooks/useLoadMoreSentinel";
 
 const PAGE_SIZE = 50;
 
@@ -15,7 +16,7 @@ const PAGE_SIZE = 50;
 // /sessions; this page's "New task" is just a link back to it.
 export function MySessions() {
   const [search, setSearch] = useState("");
-  const [page, setPage] = useState(1);
+  const [limit, setLimit] = useState(PAGE_SIZE);
   const debouncedSearch = useDebouncedValue(search);
   const {
     data: sessions,
@@ -25,10 +26,16 @@ export function MySessions() {
   } = useTasksAsSessionList({
     scope: "mine",
     search: debouncedSearch,
-    page,
-    pageSize: PAGE_SIZE,
+    page: 1,
+    pageSize: limit,
   });
   const total = totalCount ?? 0;
+  const visibleCount = sessions?.length ?? 0;
+  const hasMore = visibleCount < total;
+  // Row count is intentionally a dependency: it re-observes a still-visible
+  // sentinel after the larger response has rendered.
+  const handleLoadMore = useCallback(() => setLimit((value) => value + PAGE_SIZE), [visibleCount]);
+  const loadMoreRef = useLoadMoreSentinel({ hasMore, onLoadMore: handleLoadMore });
   const newTask = (
     <Button asChild>
       <Link to="/sessions">
@@ -50,7 +57,7 @@ export function MySessions() {
         value={search}
         onChange={(event) => {
           setSearch(event.target.value);
-          setPage(1);
+          setLimit(PAGE_SIZE);
         }}
         placeholder="Search tasks…"
         aria-label="Search tasks"
@@ -70,30 +77,15 @@ export function MySessions() {
         emptyAction={search ? undefined : newTask}
       />
 
-      {/* Also shown past page 1 with a shrunken total (live poll can drop
-          matches out from under us) so Prev is always reachable. */}
-      {(total > PAGE_SIZE || page > 1) && (
-        <div className="flex items-center justify-between gap-4">
-          <p className="font-mono text-xs tabular-nums text-muted-foreground">
-            {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, total)} of {total}
-          </p>
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              onClick={() => setPage((value) => value - 1)}
-              disabled={page === 1}
-            >
-              Prev
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => setPage((value) => value + 1)}
-              disabled={page * PAGE_SIZE >= total}
-            >
-              Next
-            </Button>
-          </div>
+      {hasMore && (
+        <div ref={loadMoreRef} className="py-2 text-center text-xs text-muted-foreground">
+          Loading more…
         </div>
+      )}
+      {total > 0 && (
+        <p className="font-mono text-xs tabular-nums text-muted-foreground">
+          {visibleCount} of {total} tasks
+        </p>
       )}
     </div>
   );
