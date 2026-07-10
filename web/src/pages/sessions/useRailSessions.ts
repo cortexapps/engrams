@@ -31,6 +31,9 @@ export interface RailRow {
   image: string;
   at: string;
   profile?: ProfileSnapshotView | null;
+  /** Effective display title (custom ?? harness suggestion ?? truncated
+   * prompt), or null → the rail falls back to the short id. */
+  title: string | null;
 }
 const fromListItem = (s: SessionListItem): RailRow => ({
   id: s.id,
@@ -38,6 +41,7 @@ const fromListItem = (s: SessionListItem): RailRow => ({
   image: s.image,
   at: s.last_active_at,
   profile: s.profile,
+  title: s.title,
 });
 const fromSession = (s: Session): RailRow => ({
   id: s.id,
@@ -45,6 +49,7 @@ const fromSession = (s: Session): RailRow => ({
   image: s.image,
   at: s.created_at,
   profile: null,
+  title: null,
 });
 
 // Most-recently-active first (status-agnostic); the stable sort keeps rows that

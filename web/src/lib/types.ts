@@ -110,6 +110,16 @@ export interface SessionListItem extends Session {
   /** ADR 0053: resolved profile snapshot for the row's primary session; null
    * for legacy / profile-less sessions. */
   profile?: ProfileSnapshotView | null;
+  /** The owning task's id — the rename target (UpdateTask). Distinct from `id`
+   * (which is the primary SESSION id used for navigation). `null` for synthetic
+   * `unattributed-*` admin rows, which have no backing task and can't be renamed. */
+  taskId: string | null;
+  /** The effective display title (custom rename ?? harness suggestion ??
+   * truncated prompt), or `null` when none is set → fall back to the short id. */
+  title: string | null;
+  /** True when `title` is the user's sticky custom rename → the UI offers a
+   * "reset to auto" affordance. */
+  titleIsCustom: boolean;
 }
 
 // ---- ADR 0031: identity ------------------------------------------------

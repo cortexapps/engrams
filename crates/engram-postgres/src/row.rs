@@ -64,6 +64,9 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     // to 0 = "not parked".
     let park_rung: i16 = row.try_get("park_rung").unwrap_or(0);
     let parked_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("parked_at").ok().flatten();
+    // Session titles: suggested_title added in migration 0101. Missing-column-
+    // tolerant so a SELECT that doesn't project it still decodes.
+    let suggested_title: Option<String> = row.try_get("suggested_title").ok().flatten();
     Ok(Session {
         id: SessionId(id),
         status: parse_session_state(&status)?,
@@ -76,6 +79,7 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         live_disk_manifest,
         park_rung,
         parked_at,
+        suggested_title,
     })
 }
 

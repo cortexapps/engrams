@@ -341,6 +341,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         let (state, mini, _local) = build_state_for_session(session);
         // No events at all → last_event_at falls back to created_at

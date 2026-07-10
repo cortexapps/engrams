@@ -42,6 +42,7 @@ impl MetadataStore for MiniMeta {
                 live_disk_manifest: None,
                 park_rung: 0,
                 parked_at: None,
+                suggested_title: None,
             },
         );
         Ok(id)

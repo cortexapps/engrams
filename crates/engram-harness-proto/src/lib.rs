@@ -406,6 +406,15 @@ pub enum HarnessEvent {
         path: String,
         change: FileChange,
     },
+    // ── Session titles: LLM-generated title suggestion. APPENDED after
+    //    `FileChanged` so existing bincode variant indices never shift
+    //    (… FileChanged=13, TitleSuggested=14) — see tests/wire_golden.rs.
+    /// The harness proposes a short human-readable title for the session
+    /// (Claude Code emits these as `ai-title` lines). Not tied to a run —
+    /// it can arrive mid- or between-turns. The coordinator records the
+    /// latest one on the session; the orchestrator uses it as a task's
+    /// display title unless the user has set a sticky custom title.
+    TitleSuggested { title: String },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -440,6 +449,7 @@ impl HarnessEvent {
             Self::UserQuestion { .. } => "user_question",
             Self::QuestionAnswered { .. } => "question_answered",
             Self::FileChanged { .. } => "file_changed",
+            Self::TitleSuggested { .. } => "title_suggested",
             Self::Idle => "harness_idle",
         }
     }
@@ -864,6 +874,9 @@ mod tests {
             tool_call_id: "toolu_1".into(),
             answers: sample_answers(),
         }));
+        round_trip(HarnessFrame::Event(HarnessEvent::TitleSuggested {
+            title: "Fix the flaky test".into(),
+        }));
     }
 
     /// Two questions in one call (one multi-select, one single) — the
@@ -1108,6 +1121,10 @@ mod tests {
             }
             .kind(),
             "question_answered"
+        );
+        assert_eq!(
+            HarnessEvent::TitleSuggested { title: "t".into() }.kind(),
+            "title_suggested"
         );
     }
 

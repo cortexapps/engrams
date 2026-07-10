@@ -1,9 +1,12 @@
 import { useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
+import { Pencil } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StatusGlyph } from "../../components/Glyph";
+import { TitleEditForm } from "./TitleEditForm";
 import type { SessionListItem } from "../../lib/types";
 import {
   compareSessions,
@@ -163,8 +166,27 @@ function ownerLabel(s: SessionListItem): string | null {
 }
 
 function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }) {
+  const [editing, setEditing] = useState(false);
+  // A real task row (not a synthetic unattributed-* admin row) can be renamed.
+  // The server is authoritative (owner or admin); the list only surfaces rows
+  // the caller may see, so showing the control whenever there's a task is safe.
+  const canEdit = s.taskId != null;
+
+  if (editing && s.taskId) {
+    return (
+      <li data-testid="session-row" data-session-id={s.id} className="px-3 py-2">
+        <TitleEditForm
+          taskId={s.taskId}
+          initial={s.title ?? ""}
+          isCustom={s.titleIsCustom}
+          onDone={() => setEditing(false)}
+        />
+      </li>
+    );
+  }
+
   return (
-    <li data-testid="session-row" data-session-id={s.id}>
+    <li data-testid="session-row" data-session-id={s.id} className="group relative">
       <Link
         to="/sessions/$id"
         params={{ id: s.id }}
@@ -174,10 +196,14 @@ function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }
         <span className="inline-flex w-3 shrink-0 justify-center text-[0.7rem] leading-none">
           <StatusGlyph status={s.status} />
         </span>
-        {/* Identity: the id carries the row (a human-readable name lands here
-            later); the image trails as the recessive "what kind" descriptor. */}
+        {/* Identity: the title carries the row (falling back to the short id
+            when unnamed); the image trails as the recessive "what kind" descriptor. */}
         <span className="flex min-w-0 flex-1 items-baseline gap-2.5">
-          <span className="shrink-0 font-mono text-sm font-medium">{shortId(s.id)}</span>
+          {s.title ? (
+            <span className="min-w-0 truncate text-sm font-medium">{s.title}</span>
+          ) : (
+            <span className="shrink-0 font-mono text-sm font-medium">{shortId(s.id)}</span>
+          )}
           <ProfileChip profile={s.profile} fallbackImage={s.image} className="text-xs" />
         </span>
         {showOwner && (
@@ -203,6 +229,21 @@ function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }
           {relativeTime(s.last_active_at)}
         </span>
       </Link>
+      {/* Rename affordance — a sibling of the Link (never nested in an anchor),
+          revealed on row hover / keyboard focus. */}
+      {canEdit && (
+        <Button
+          type="button"
+          size="icon-xs"
+          variant="ghost"
+          onClick={() => setEditing(true)}
+          aria-label="Rename session"
+          title="Rename"
+          className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
+        >
+          <Pencil />
+        </Button>
+      )}
     </li>
   );
 }

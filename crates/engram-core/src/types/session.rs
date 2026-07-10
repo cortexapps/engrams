@@ -503,6 +503,13 @@ pub struct Session {
     /// accounting. `None` when `park_rung == 0`.
     #[serde(default)]
     pub parked_at: Option<DateTime<Utc>>,
+    /// Session titles: the latest harness-suggested (LLM-generated) title for
+    /// this session, or `None` until the harness emits one. Written in real
+    /// time by the coordinator's harness event sink; the orchestrator reads it
+    /// (via the Session proto) as a task's display title. A self-descriptive
+    /// operational fact, never user attribution.
+    #[serde(default)]
+    pub suggested_title: Option<String>,
 }
 
 #[cfg(test)]
@@ -763,6 +770,7 @@ mod tests {
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
+            suggested_title: None,
         };
         let blob = serde_json::to_string(&original).unwrap();
         let back: Session = serde_json::from_str(&blob).unwrap();

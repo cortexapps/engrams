@@ -14,7 +14,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/task.proto.
  */
 export const file_engram_app_v1_task: GenFile = /*@__PURE__*/
-  fileDesc("ChhlbmdyYW0vYXBwL3YxL3Rhc2sucHJvdG8SDWVuZ3JhbS5hcHAudjEi5AEKEUNyZWF0ZVRhc2tSZXF1ZXN0EgwKBHR5cGUYASABKAkSEwoGcHJvbXB0GAMgASgJSACIAQESEgoFdGl0bGUYBCABKAlIAYgBARISCgpwcm9maWxlX2lkGAUgASgJEhQKB2hhcm5lc3MYBiABKAlIAogBARISCgVtb2RlbBgHIAEoCUgDiAEBEhMKBmVmZm9ydBgIIAEoCUgEiAEBQgkKB19wcm9tcHRCCAoGX3RpdGxlQgoKCF9oYXJuZXNzQggKBl9tb2RlbEIJCgdfZWZmb3J0SgQIAhADUglpbWFnZV91cmkiNwoSQ3JlYXRlVGFza1Jlc3BvbnNlEiEKBHRhc2sYASABKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2si4AEKBFRhc2sSCgoCaWQYASABKAkSDAoEdHlwZRgCIAEoCRISCgV0aXRsZRgDIAEoCUgAiAEBEg4KBnN0YXR1cxgEIAEoCRIfChJjcmVhdGVkX2J5X3VzZXJfaWQYBSABKAlIAYgBARITCgtzb3VyY2VfanNvbhgGIAEoCRIvCghzZXNzaW9ucxgHIAMoCzIdLmVuZ3JhbS5hcHAudjEuVGFza1Nlc3Npb25SZWYSEgoKY3JlYXRlZF9hdBgIIAEoCUIICgZfdGl0bGVCFQoTX2NyZWF0ZWRfYnlfdXNlcl9pZCK8AQoOVGFza1Nlc3Npb25SZWYSEgoKc2Vzc2lvbl9pZBgBIAEoCRIRCgRyb2xlGAIgASgJSACIAQESLAoHc2Vzc2lvbhgDIAEoCzIWLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbkgBiAEBEjQKB3Byb2ZpbGUYBCABKAsyHi5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTbmFwc2hvdEgCiAEBQgcKBV9yb2xlQgoKCF9zZXNzaW9uQgoKCF9wcm9maWxlIhIKEExpc3RUYXNrc1JlcXVlc3QiNwoRTGlzdFRhc2tzUmVzcG9uc2USIgoFdGFza3MYASADKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2siIQoOR2V0VGFza1JlcXVlc3QSDwoHdGFza19pZBgBIAEoCSI0Cg9HZXRUYXNrUmVzcG9uc2USIQoEdGFzaxgBIAEoCzITLmVuZ3JhbS5hcHAudjEuVGFzayIkChFEZWxldGVUYXNrUmVxdWVzdBIPCgd0YXNrX2lkGAEgASgJIhQKEkRlbGV0ZVRhc2tSZXNwb25zZTLNAgoLVGFza1NlcnZpY2USUQoKQ3JlYXRlVGFzaxIgLmVuZ3JhbS5hcHAudjEuQ3JlYXRlVGFza1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkNyZWF0ZVRhc2tSZXNwb25zZRJOCglMaXN0VGFza3MSHy5lbmdyYW0uYXBwLnYxLkxpc3RUYXNrc1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkxpc3RUYXNrc1Jlc3BvbnNlEkgKB0dldFRhc2sSHS5lbmdyYW0uYXBwLnYxLkdldFRhc2tSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5HZXRUYXNrUmVzcG9uc2USUQoKRGVsZXRlVGFzaxIgLmVuZ3JhbS5hcHAudjEuRGVsZXRlVGFza1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkRlbGV0ZVRhc2tSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session, file_engram_app_v1_profile]);
+  fileDesc("ChhlbmdyYW0vYXBwL3YxL3Rhc2sucHJvdG8SDWVuZ3JhbS5hcHAudjEi5AEKEUNyZWF0ZVRhc2tSZXF1ZXN0EgwKBHR5cGUYASABKAkSEwoGcHJvbXB0GAMgASgJSACIAQESEgoFdGl0bGUYBCABKAlIAYgBARISCgpwcm9maWxlX2lkGAUgASgJEhQKB2hhcm5lc3MYBiABKAlIAogBARISCgVtb2RlbBgHIAEoCUgDiAEBEhMKBmVmZm9ydBgIIAEoCUgEiAEBQgkKB19wcm9tcHRCCAoGX3RpdGxlQgoKCF9oYXJuZXNzQggKBl9tb2RlbEIJCgdfZWZmb3J0SgQIAhADUglpbWFnZV91cmkiNwoSQ3JlYXRlVGFza1Jlc3BvbnNlEiEKBHRhc2sYASABKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2si+QEKBFRhc2sSCgoCaWQYASABKAkSDAoEdHlwZRgCIAEoCRISCgV0aXRsZRgDIAEoCUgAiAEBEg4KBnN0YXR1cxgEIAEoCRIfChJjcmVhdGVkX2J5X3VzZXJfaWQYBSABKAlIAYgBARITCgtzb3VyY2VfanNvbhgGIAEoCRIvCghzZXNzaW9ucxgHIAMoCzIdLmVuZ3JhbS5hcHAudjEuVGFza1Nlc3Npb25SZWYSEgoKY3JlYXRlZF9hdBgIIAEoCRIXCg90aXRsZV9pc19jdXN0b20YCSABKAhCCAoGX3RpdGxlQhUKE19jcmVhdGVkX2J5X3VzZXJfaWQivAEKDlRhc2tTZXNzaW9uUmVmEhIKCnNlc3Npb25faWQYASABKAkSEQoEcm9sZRgCIAEoCUgAiAEBEiwKB3Nlc3Npb24YAyABKAsyFi5lbmdyYW0uYXBwLnYxLlNlc3Npb25IAYgBARI0Cgdwcm9maWxlGAQgASgLMh4uZW5ncmFtLmFwcC52MS5Qcm9maWxlU25hcHNob3RIAogBAUIHCgVfcm9sZUIKCghfc2Vzc2lvbkIKCghfcHJvZmlsZSISChBMaXN0VGFza3NSZXF1ZXN0IjcKEUxpc3RUYXNrc1Jlc3BvbnNlEiIKBXRhc2tzGAEgAygLMhMuZW5ncmFtLmFwcC52MS5UYXNrIiEKDkdldFRhc2tSZXF1ZXN0Eg8KB3Rhc2tfaWQYASABKAkiNAoPR2V0VGFza1Jlc3BvbnNlEiEKBHRhc2sYASABKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2siJAoRRGVsZXRlVGFza1JlcXVlc3QSDwoHdGFza19pZBgBIAEoCSIUChJEZWxldGVUYXNrUmVzcG9uc2UiQgoRVXBkYXRlVGFza1JlcXVlc3QSDwoHdGFza19pZBgBIAEoCRISCgV0aXRsZRgCIAEoCUgAiAEBQggKBl90aXRsZSI3ChJVcGRhdGVUYXNrUmVzcG9uc2USIQoEdGFzaxgBIAEoCzITLmVuZ3JhbS5hcHAudjEuVGFzazKgAwoLVGFza1NlcnZpY2USUQoKQ3JlYXRlVGFzaxIgLmVuZ3JhbS5hcHAudjEuQ3JlYXRlVGFza1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkNyZWF0ZVRhc2tSZXNwb25zZRJOCglMaXN0VGFza3MSHy5lbmdyYW0uYXBwLnYxLkxpc3RUYXNrc1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkxpc3RUYXNrc1Jlc3BvbnNlEkgKB0dldFRhc2sSHS5lbmdyYW0uYXBwLnYxLkdldFRhc2tSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5HZXRUYXNrUmVzcG9uc2USUQoKRGVsZXRlVGFzaxIgLmVuZ3JhbS5hcHAudjEuRGVsZXRlVGFza1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkRlbGV0ZVRhc2tSZXNwb25zZRJRCgpVcGRhdGVUYXNrEiAuZW5ncmFtLmFwcC52MS5VcGRhdGVUYXNrUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuVXBkYXRlVGFza1Jlc3BvbnNlYgZwcm90bzM", [file_engram_app_v1_session, file_engram_app_v1_profile]);
 
 /**
  * @generated from message engram.app.v1.CreateTaskRequest
@@ -147,6 +147,15 @@ export type Task = Message<"engram.app.v1.Task"> & {
    * @generated from field: string created_at = 8;
    */
   createdAt: string;
+
+  /**
+   * True when `title` is the user's sticky custom title (they renamed it);
+   * false when it is auto (harness suggestion or truncated prompt). Lets the
+   * UI offer a "reset to auto" affordance. Derived: custom_title != null.
+   *
+   * @generated from field: bool title_is_custom = 9;
+   */
+  titleIsCustom: boolean;
 };
 
 /**
@@ -291,6 +300,47 @@ export const DeleteTaskResponseSchema: GenMessage<DeleteTaskResponse> = /*@__PUR
   messageDesc(file_engram_app_v1_task, 9);
 
 /**
+ * @generated from message engram.app.v1.UpdateTaskRequest
+ */
+export type UpdateTaskRequest = Message<"engram.app.v1.UpdateTaskRequest"> & {
+  /**
+   * @generated from field: string task_id = 1;
+   */
+  taskId: string;
+
+  /**
+   * Present ⇒ set the sticky custom title. Absent ⇒ clear it (reset to auto).
+   *
+   * @generated from field: optional string title = 2;
+   */
+  title?: string;
+};
+
+/**
+ * Describes the message engram.app.v1.UpdateTaskRequest.
+ * Use `create(UpdateTaskRequestSchema)` to create a new message.
+ */
+export const UpdateTaskRequestSchema: GenMessage<UpdateTaskRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_task, 10);
+
+/**
+ * @generated from message engram.app.v1.UpdateTaskResponse
+ */
+export type UpdateTaskResponse = Message<"engram.app.v1.UpdateTaskResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.Task task = 1;
+   */
+  task?: Task;
+};
+
+/**
+ * Describes the message engram.app.v1.UpdateTaskResponse.
+ * Use `create(UpdateTaskResponseSchema)` to create a new message.
+ */
+export const UpdateTaskResponseSchema: GenMessage<UpdateTaskResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_task, 11);
+
+/**
  * The application aggregate root (ADR 0051 §3, rev 2026-06-10).
  * ORCHESTRATOR-NATIVE: the
  * control plane neither implements nor knows about tasks — this file
@@ -342,6 +392,21 @@ export const TaskService: GenService<{
     methodKind: "unary";
     input: typeof DeleteTaskRequestSchema;
     output: typeof DeleteTaskResponseSchema;
+  },
+  /**
+   * Rename (or reset) a task's title. Requires ability "update" on the
+   * task — the owner or an admin. A present `title` sets the user's
+   * STICKY custom title (harness suggestions no longer override it); an
+   * absent `title` clears it (reset), so the effective title falls back
+   * to the most-recent harness suggestion, then the truncated-prompt
+   * default.
+   *
+   * @generated from rpc engram.app.v1.TaskService.UpdateTask
+   */
+  updateTask: {
+    methodKind: "unary";
+    input: typeof UpdateTaskRequestSchema;
+    output: typeof UpdateTaskResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_task, 0);
