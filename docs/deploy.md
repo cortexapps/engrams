@@ -69,7 +69,8 @@ production the cache lives on each host-agent.
 | `ENGRAM_GCS_BUCKET`            | Same bucket as the coord; host materialises chunks on demand         |
 | `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` | NVMe-backed LRU chunk cache budget (default 200 GiB)              |
 | `ENGRAM_NBD_DEVICES`           | `/dev/nbd0,/dev/nbd1,…` for the chunked-disk NBD daemon. Empty / unset falls back to materialize-to-file (correct, slower cold start). |
-| `ENGRAM_EGRESS_PROXY_PORT`     | TCP listener for the host-side TLS-MITM proxy (e.g. `9443`). `0` disables egress filtering entirely (legacy `ACCEPT VM→1.1.1.1:53` rules stay; guests get unfiltered network). When set, iptables REDIRECTs guest tcp/443 here and runs the filtering DNS proxy on the DNS port (default 5353) — see [ADR 0010](./adr/0010-dns-filtering.md). |
+| `ENGRAM_EGRESS_PROXY_PORT`     | Mandatory TCP listener for the host-side TLS-MITM proxy (default `8443`). Must be non-zero; iptables REDIRECTs guest tcp/443 here. |
+| `ENGRAM_EGRESS_DNS_PORT`       | Mandatory UDP+TCP listener for filtering DNS (default `5353`). Must be non-zero and match the guest DNS REDIRECT target. |
 | `ENGRAM_EGRESS_CA_SOURCE`      | `local-disk` (default) \| `env` \| `gcp-secret-manager`. See the Egress proxy section below for the per-source vars. |
 | `ENGRAM_LOG_FORMAT=json`       | Same as coordinator                                                  |
 
@@ -146,7 +147,8 @@ impls ship today, with one more impl per cloud later:
 
 | Variable                              | Purpose                                                              |
 |---------------------------------------|----------------------------------------------------------------------|
-| `ENGRAM_EGRESS_PROXY_PORT`            | Local listener port (`0` disables the proxy)                         |
+| `ENGRAM_EGRESS_PROXY_PORT`            | Mandatory TCP listener port (default `8443`; must be non-zero)       |
+| `ENGRAM_EGRESS_DNS_PORT`              | Mandatory filtering DNS port (default `5353`; must be non-zero)      |
 | `ENGRAM_EGRESS_CA_SOURCE`             | `env` \| `local-disk` \| `gcp-secret-manager`                        |
 | `ENGRAM_EGRESS_CA_CERT_VAR`           | Env var name holding the cert PEM (`--ca-source=env`)                |
 | `ENGRAM_EGRESS_CA_KEY_VAR`            | Env var name holding the key PEM (`--ca-source=env`)                 |
@@ -179,11 +181,13 @@ the policy lands before the subsequent `start_agent` request, so
 the harness can't make egress calls before the proxy knows the
 policy. Cold resume re-issues the policy when a session moves hosts.
 
-`ENGRAM_EGRESS_PROXY_PORT=0` on a host-agent disables egress
-filtering for that host — guests get unfiltered network access
-and the iptables ruleset reverts to "ACCEPT VM→1.1.1.1:53" for
-DNS so resolution still works. Mix-and-match is fine: some hosts
-can run with the proxy off during bring-up while others have it on.
+Egress filtering cannot be disabled per host. Both listener ports must be
+non-zero because Firecracker iptables rules redirect guest `:443` and `:53`
+to those literal ports. The host-agent rejects `0` and fails startup if either
+listener cannot bind, keeping an unusable host out of the schedulable fleet.
+Tilt uses `18443`/`15353` for local VZ so it does not collide with retained
+Colima SSH forwards or macOS mDNS; Firecracker and production retain the binary
+defaults above.
 
 ### DNS filtering
 
