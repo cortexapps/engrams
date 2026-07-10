@@ -601,6 +601,16 @@ impl SandboxBackend for VzBackend {
         // slots (which VZ deliberately skips) this one must attach.
         let mut aux_ro_drives = spec.aux_ro_drives.clone();
         self.resolve_agentd_slot(&mut aux_ro_drives)?;
+        tracing::info!(
+            sandbox_id = %id,
+            bundle_dir = %self.cfg.bundle_dir.display(),
+            resolved = ?aux_ro_drives
+                .iter()
+                .filter(|d| d.sha256.is_some())
+                .map(|d| format!("{}={}", d.drive_id, d.sha256.as_deref().unwrap_or("")))
+                .collect::<Vec<_>>(),
+            "vz: aux drives after agentd-slot resolution"
+        );
 
         let vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),

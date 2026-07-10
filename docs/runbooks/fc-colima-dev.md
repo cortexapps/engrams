@@ -104,9 +104,8 @@ sets `ENGRAM_MKE2FS=/opt/engram-dev/bin/mke2fs`; rerun
   table vs the session's `mem_budget_mib`.
 - **Claude sessions need egress + a per-session policy.** The egress proxy is
   mandatory (issue #240) — it's the only path a guest reaches the network — and
-  `dev-fc` runs it on `8443` (the `ENGRAM_EGRESS_PROXY_PORT=0` default is a
-  footgun: a dead `:443→0` redirect while the proxy binds a random port, so the
-  claude CLI's `api.anthropic.com` call hangs and the session sits "working").
+  `dev-fc` runs it on `8443`. Port `0` is rejected because it would create a
+  dead `:443→0` redirect while the proxy binds a random ephemeral port.
   For a claude session to actually reach the API you also set, per session in
   the UI: (1) `api.anthropic.com` (and `statsig.anthropic.com`) in the policy's
   `network.allow_hosts` — ADR 0057, it comes from the session policy, NOT the

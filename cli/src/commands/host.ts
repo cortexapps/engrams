@@ -68,6 +68,17 @@ export async function drain(c: Clients, id: string): Promise<void> {
   console.log("draining");
 }
 
+/** FleetService.DeleteHost — deregister a host row. FAILED_PRECONDITION while
+ *  any session is still bound (drain / reap sessions first); idempotent-success
+ *  if already gone. The dev case: a dead leftover host-agent (e.g. an fc-colima
+ *  VM's after `just dev-fc`) otherwise keeps feeding the fleet bundle catalog
+ *  and winning placement — the dead-host probe dials its host_addr, reaches
+ *  whatever now answers on that port, and "rescues" the row forever. */
+export async function remove(c: Clients, id: string): Promise<void> {
+  await c.fleet.deleteHost({ hostId: id }).catch(failWith);
+  console.log("deleted");
+}
+
 export async function uncordon(c: Clients, id: string, json: boolean): Promise<void> {
   const resp = await c.fleet.uncordonHost({ hostId: id }).catch(failWith);
   if (json) printJson({ host_id: resp.hostId, status: resp.status });

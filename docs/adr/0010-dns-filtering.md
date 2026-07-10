@@ -73,8 +73,8 @@ client sees what looks like a normal DNS exchange.
 
 ### iptables (`engram-sandbox-firecracker::net::host_startup_lines`)
 
-When `--egress-proxy-port` is set (production), the two
-unconditional `ACCEPT VM→1.1.1.1:53` rules are dropped. Instead:
+The mandatory egress configuration drops the two unconditional
+`ACCEPT VM→1.1.1.1:53` rules. Instead:
 
 ```
 -t nat -A PREROUTING -i tap-engr-+ -p udp --dport 53 \
@@ -88,10 +88,9 @@ unconditional `ACCEPT VM→1.1.1.1:53` rules are dropped. Instead:
 The `INPUT` accepts come *before* the blanket `engram-host-input`
 DROP so REDIRECTed packets reach the proxy's listening sockets.
 
-When `--egress-proxy-port=0` (operator opted out of filtering
-entirely), the legacy ACCEPT rules stay — DNS still has to work
-for anything in the VM to function, and the operator has
-explicitly accepted the unfiltered-egress posture.
+ADR 0083 and issue #240 removed the bring-up-only unfiltered mode. Port `0` is
+rejected at host-agent startup because an ephemeral listener cannot match a
+literal iptables REDIRECT target.
 
 ### Policy source
 
