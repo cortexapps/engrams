@@ -369,6 +369,21 @@ impl EnableJobState {
     }
 }
 
+/// ADR 0088: one host's in-flight enable work — the operator roll/drain
+/// gates' input, surfaced per host on the fleet view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveEnableWork {
+    /// `enable_jobs` rows live-materializing on this host: state =
+    /// `materializing`, `materialize_host_id` = host, and a fresh claim
+    /// (the host's ≤30 s keepalive frames renew `claimed_at`, so a dead
+    /// stream ages out within the lease window — never gate on a ghost).
+    pub materializes: u32,
+    /// `capture_jobs` rows in a non-terminal stage bound to this host.
+    /// No freshness filter: the enable scanner's stage deadlines already
+    /// redrive-or-fail a stuck capture row.
+    pub captures: u32,
+}
+
 /// One row in `enable_jobs` (ADR 0036): an asynchronous image-enable
 /// in flight (or terminal, kept for audit). The wire shape of
 /// `GET /api/enable-jobs/:id` — `chunks_done/chunks_total` is the

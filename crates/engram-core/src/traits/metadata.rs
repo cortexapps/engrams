@@ -1887,6 +1887,43 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// ADR 0088: durable materialize placement — stamp the host this
+    /// claimed job's materialize is about to run on, BEFORE the streaming
+    /// RPC starts (no window where work runs unattributed). Liveness is
+    /// derived, never stored: the binding counts as live only while
+    /// `state = 'materializing'` and the claim is fresh (the keepalive
+    /// frames renew it via
+    /// [`Self::update_enable_job_materialize_progress`]). Never cleared —
+    /// inert outside `materializing`, and a useful "where did the last
+    /// materialize run" breadcrumb.
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    async fn set_enable_job_materialize_host(
+        &self,
+        id: uuid::Uuid,
+        claimant: &str,
+        host: HostId,
+    ) -> Result<(), MetaError> {
+        let _ = (id, claimant, host);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// ADR 0088: per-host in-flight enable work — the operator roll/drain
+    /// gates' input, surfaced on the fleet view. `materialize_lease` is
+    /// the claim-freshness window (the enable scanner's `lease_secs`): a
+    /// materialize whose stream died stops renewing its claim and ages
+    /// out of this map within the window. Hosts with no live work are
+    /// absent. Default impl (mocks): empty map.
+    async fn live_enable_work_by_host(
+        &self,
+        materialize_lease: std::time::Duration,
+    ) -> Result<std::collections::HashMap<HostId, crate::types::LiveEnableWork>, MetaError> {
+        let _ = materialize_lease;
+        Ok(std::collections::HashMap::new())
+    }
+
     /// Move the job's state forward (also renews the claim, clears
     /// `error` on non-failed targets, and releases the claim on
     /// terminal states).

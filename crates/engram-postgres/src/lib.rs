@@ -4502,6 +4502,81 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn set_enable_job_materialize_host(
+        &self,
+        id: Uuid,
+        claimant: &str,
+        host: HostId,
+    ) -> Result<(), MetaError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET materialize_host_id = $3,
+                   updated_at = NOW()
+             WHERE id = $1 AND claimed_by = $2
+            "#,
+        )
+        .bind(id)
+        .bind(claimant)
+        .bind(host.as_uuid())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(self.enable_job_fence_miss(id, claimant).await);
+        }
+        Ok(())
+    }
+
+    async fn live_enable_work_by_host(
+        &self,
+        materialize_lease: std::time::Duration,
+    ) -> Result<std::collections::HashMap<HostId, engram_core::types::LiveEnableWork>, MetaError>
+    {
+        let mut out: std::collections::HashMap<HostId, engram_core::types::LiveEnableWork> =
+            std::collections::HashMap::new();
+        // Live materializes: fresh-claimed `materializing` rows bound to a
+        // host. The keepalive frames renew `claimed_at` (~every <=30 s), so a
+        // dead stream ages out of this set within the lease window.
+        let mat_rows: Vec<(Uuid, i64)> = sqlx::query_as(
+            r#"
+            SELECT materialize_host_id, COUNT(*)
+              FROM enable_jobs
+             WHERE state = 'materializing'
+               AND materialize_host_id IS NOT NULL
+               AND claimed_at IS NOT NULL
+               AND claimed_at > NOW() - make_interval(secs => $1)
+             GROUP BY materialize_host_id
+            "#,
+        )
+        .bind(materialize_lease.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        for (host, n) in mat_rows {
+            out.entry(HostId::from(host)).or_default().materializes = n.max(0) as u32;
+        }
+        // Live captures: non-terminal stages bound to a host (WAITING rows
+        // carry NULL host_id). No freshness filter — the enable scanner's
+        // stage deadlines redrive-or-fail a stuck row.
+        let cap_rows: Vec<(Uuid, i64)> = sqlx::query_as(
+            r#"
+            SELECT host_id, COUNT(*)
+              FROM capture_jobs
+             WHERE stage NOT IN ('done','failed')
+               AND host_id IS NOT NULL
+             GROUP BY host_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        for (host, n) in cap_rows {
+            out.entry(HostId::from(host)).or_default().captures = n.max(0) as u32;
+        }
+        Ok(out)
+    }
+
     async fn set_enable_job_state(
         &self,
         id: Uuid,

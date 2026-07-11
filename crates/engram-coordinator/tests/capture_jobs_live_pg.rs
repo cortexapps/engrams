@@ -902,3 +902,51 @@ async fn cold_base_fc_version_changed_detects_a_version_drift_on_the_same_disk_m
         .await
         .expect("unrelated disk manifest, no drift"));
 }
+
+/// ADR 0088: a host-bound, non-terminal capture job counts in the
+/// per-host live-work aggregate the operator's roll/drain gates read —
+/// and drops out the moment the job reaches a terminal stage. (WAITING
+/// rows bind no host and are covered by the placement tests above.)
+#[tokio::test]
+#[ignore]
+async fn placed_capture_job_counts_as_live_enable_work() {
+    let Some(meta) = connect().await else { return };
+    let enable_job_id = seed_enable_job(&meta, "live-work").await;
+    let host = seed_host(&meta, 16_384, 8).await;
+    let placed = insert_placed(&meta, enable_job_id, host).await;
+
+    let work = meta
+        .live_enable_work_by_host(std::time::Duration::from_secs(300))
+        .await
+        .expect("live work");
+    assert_eq!(
+        work.get(&host).map(|w| w.captures),
+        Some(1),
+        "a placed non-terminal capture counts: {work:?}"
+    );
+
+    let done = CaptureJobReport {
+        job_id: placed.id,
+        epoch: placed.epoch,
+        stage: CaptureJobStage::Done,
+        progress: None,
+        fc_snapshot_version: Some("v6".into()),
+        terminal: Some(CaptureTerminalReport::Done {
+            result_bincode: vec![1],
+        }),
+    };
+    assert!(meta
+        .record_capture_job_report(&done)
+        .await
+        .expect("terminal report"));
+
+    let work = meta
+        .live_enable_work_by_host(std::time::Duration::from_secs(300))
+        .await
+        .expect("live work");
+    assert_eq!(
+        work.get(&host).map(|w| w.captures).unwrap_or(0),
+        0,
+        "a terminal capture releases the host: {work:?}"
+    );
+}

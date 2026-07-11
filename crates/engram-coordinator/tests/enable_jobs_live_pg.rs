@@ -1046,3 +1046,88 @@ async fn prestage_flip_and_straggler_reach_ready_via_live_host_rows() {
         "the never-staged host must be recorded timed_out"
     );
 }
+
+/// ADR 0088: the durable materialize placement + the per-host live-work
+/// aggregate the operator's roll/drain gates read. Covers: the fenced
+/// host stamp, liveness = state × claim freshness (a stale claim ages
+/// out; a state move off `materializing` releases immediately), and the
+/// wrong-claimant fence.
+#[tokio::test]
+#[ignore]
+async fn materialize_host_binding_feeds_live_enable_work() {
+    let Some(meta) = connect().await else { return };
+    let uri = unique_uri("mat-host");
+    let host = HostId::new();
+
+    let job = meta
+        .create_or_get_enable_job(&uri, None, &test_config())
+        .await
+        .expect("create");
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim");
+
+    // Wrong claimant is fenced before any binding exists.
+    let fenced = meta
+        .set_enable_job_materialize_host(job.id, "pod-b", host)
+        .await;
+    assert!(fenced.is_err(), "a non-claimant must not stamp placement");
+
+    meta.set_enable_job_materialize_host(job.id, "pod-a", host)
+        .await
+        .expect("stamp placement");
+
+    // Not yet live: the job is still `pending` (placement is stamped
+    // just before the state flip in the real pipeline; order here is
+    // reversed deliberately to pin the state predicate).
+    let work = meta
+        .live_enable_work_by_host(Duration::from_secs(300))
+        .await
+        .expect("live work");
+    assert!(
+        !work.contains_key(&host),
+        "a non-materializing job must not count: {work:?}"
+    );
+
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Materializing)
+        .await
+        .expect("materializing");
+    let work = meta
+        .live_enable_work_by_host(Duration::from_secs(300))
+        .await
+        .expect("live work");
+    assert_eq!(
+        work.get(&host).map(|w| w.materializes),
+        Some(1),
+        "fresh-claimed materializing job counts: {work:?}"
+    );
+    assert_eq!(
+        work.get(&host).map(|w| w.captures),
+        Some(0),
+        "no capture rows were seeded"
+    );
+
+    // A zero freshness window ages the claim out — the gate never waits
+    // on a dead stream longer than the lease.
+    let work = meta
+        .live_enable_work_by_host(Duration::ZERO)
+        .await
+        .expect("live work");
+    assert!(
+        !work.contains_key(&host),
+        "stale claim must age out: {work:?}"
+    );
+
+    // Moving off `materializing` releases the host immediately.
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Capturing)
+        .await
+        .expect("capturing");
+    let work = meta
+        .live_enable_work_by_host(Duration::from_secs(300))
+        .await
+        .expect("live work");
+    assert!(
+        !work.contains_key(&host),
+        "a capturing job holds no materialize placement: {work:?}"
+    );
+}
