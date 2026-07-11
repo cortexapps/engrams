@@ -189,10 +189,13 @@ impl Materializer {
     /// returned [`Materialized`].
     ///
     /// `progress` (phase 3b): best-effort stage frames (`try_send`),
-    /// one per pipeline stage transition — the `MaterializeImage` RPC
-    /// forwards them coord-ward; the keepalive cadence (≤30 s) is the
-    /// CALLER's job (it re-sends the last frame), this crate only
-    /// signals honest transitions. `None` = silent (tests, the bake).
+    /// one per pipeline stage transition PLUS intra-stage chunk-window
+    /// progress frames (stage `Chunk` with `chunks_done/chunks_total`
+    /// set, one per flushed upload window — the enable UI's progress
+    /// bar). The `MaterializeImage` RPC forwards them coord-ward; the
+    /// keepalive cadence (≤30 s) is the CALLER's job (it re-sends the
+    /// last frame). Consumers must tolerate repeated frames for the
+    /// same stage. `None` = silent (tests, the bake).
     pub async fn materialize(
         &self,
         image_uri: &str,

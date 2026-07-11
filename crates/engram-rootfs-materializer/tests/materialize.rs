@@ -403,15 +403,33 @@ async fn materialize_is_deterministic_and_scrubs_scratch() {
         )
         .await
         .expect("first materialize");
-    let mut stages = Vec::new();
+    let mut frames = Vec::new();
     while let Ok(p) = prx.try_recv() {
-        stages.push(p.stage);
+        frames.push(p);
     }
     use engram_core::types::MaterializeStage as S;
+    // One frame per stage TRANSITION in pipeline order, plus intra-stage
+    // chunk-window progress frames (repeated stage Chunk carrying
+    // chunks_done/chunks_total — the enable UI's progress bar), so
+    // dedup consecutive stages before asserting the order.
+    let mut stages: Vec<S> = frames.iter().map(|p| p.stage).collect();
+    stages.dedup();
     assert_eq!(
         stages,
         vec![S::Pull, S::Flatten, S::Pack, S::Chunk],
-        "one frame per stage transition, in pipeline order"
+        "stage transitions in pipeline order (intra-stage progress deduped)"
+    );
+    let last_chunk = frames
+        .iter()
+        .rfind(|p| p.stage == S::Chunk)
+        .expect("at least one chunk frame");
+    assert_eq!(
+        last_chunk.chunks_done, last_chunk.chunks_total,
+        "the final chunk-window frame reports completion"
+    );
+    assert!(
+        last_chunk.chunks_total.is_some_and(|t| t > 0),
+        "chunk-window counts ride the final chunk frame: {last_chunk:?}"
     );
     assert!(
         std::fs::read_dir(scratch.path()).unwrap().next().is_none(),
