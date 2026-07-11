@@ -129,7 +129,7 @@ impl Default for EnableScannerConfig {
             // Capture on a nested-KVM dev-vm has been observed at
             // ~150 s; 300 s keeps a healthy margin before a peer
             // declares the claim stale.
-            lease_secs: 300,
+            lease_secs: DEFAULT_ENABLE_JOB_LEASE_SECS,
             claim_limit: 2,
             max_attempts: 5,
             progress_interval: Duration::from_secs(2),
@@ -141,6 +141,11 @@ impl Default for EnableScannerConfig {
 
 const DEFAULT_PRESTAGE_TIMEOUT: Duration = Duration::from_secs(1200);
 const DEFAULT_CAPTURE_CAPACITY_WAIT: Duration = Duration::from_secs(1800);
+/// ADR 0088: the claim lease default, shared with the fleet view's
+/// live-materialize freshness window (`live_enable_work_by_host`) so
+/// "the gate stops counting a dead stream" and "a peer may re-claim"
+/// happen on the same clock.
+pub(crate) const DEFAULT_ENABLE_JOB_LEASE_SECS: u32 = 300;
 
 impl EnableScannerConfig {
     /// Resolves `ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS` on top of the pure
@@ -496,7 +501,8 @@ async fn advance_one(
                 }
             })
         };
-        let materialize_result = materialize_image_on_host(state, &image_uri, progress_tx).await;
+        let materialize_result =
+            materialize_image_on_host(state, job_id, claimant, &image_uri, progress_tx).await;
         // `materialize_image_on_host` returning means every `Sender` clone
         // is dropped — awaiting the consumer guarantees the final frame is
         // persisted before we act on the result (same ordering property as

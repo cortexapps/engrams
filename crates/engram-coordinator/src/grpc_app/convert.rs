@@ -342,6 +342,9 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         util_base_shm_mib,
         util_parked_pss_mib,
         util_running_pss_mib,
+        // ADR 0088: in-flight enable work (the operator's roll/drain gates).
+        live_materializes,
+        live_capture_jobs,
     } = v;
     app::HostView {
         id: id.to_string(),
@@ -372,6 +375,8 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         util_base_shm_mib: *util_base_shm_mib,
         util_parked_pss_mib: *util_parked_pss_mib,
         util_running_pss_mib: *util_running_pss_mib,
+        live_materializes: *live_materializes,
+        live_capture_jobs: *live_capture_jobs,
     }
 }
 

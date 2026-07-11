@@ -209,6 +209,8 @@ pub(crate) async fn resolve_static_registry_auth(
 /// (`ApiError::MaterializeFailed`) for the scanner's classifier.
 pub(crate) async fn materialize_image_on_host(
     state: &SharedState,
+    job_id: uuid::Uuid,
+    claimant: &str,
     image_uri: &str,
     progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
 ) -> Result<engram_core::types::MaterializedImage, ApiError> {
@@ -226,6 +228,22 @@ pub(crate) async fn materialize_image_on_host(
                      Register a disk-healthy host and retry the enable."
                 ))
             })?;
+    // ADR 0088: stamp the durable materialize placement BEFORE the
+    // streaming RPC starts, so the host-operator's roll gate can never
+    // observe work running on a host it thinks is idle. Fenced by the
+    // claim: a Conflict means the lease moved to a peer — abort rather
+    // than materialize unattributed (retryable, same as any lease loss).
+    state
+        .services
+        .meta
+        .set_enable_job_materialize_host(job_id, claimant, host_id)
+        .await
+        .map_err(|e| {
+            ApiError::Unavailable(format!(
+                "materialize `{image_uri}`: recording placement on host {host_id} failed \
+                 (lease moved or store error): {e}"
+            ))
+        })?;
     let registry_auth = resolve_static_registry_auth(state, image_uri).await?;
     let arch = coord_platform_arch();
     tracing::info!(
