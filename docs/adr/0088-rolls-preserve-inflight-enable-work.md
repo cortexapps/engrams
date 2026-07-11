@@ -157,6 +157,19 @@ release-the-victim-on-timeout semantics.)
   field absent from the schema is silently dropped, which would have made
   the helm knob a no-op.
 
+## UI follow-up (same PR)
+
+The same investigation surfaced that the enable pipeline was nearly
+unwatchable ("materializing chunks" for an hour). Riding this ADR's new
+surfaces: `enable_jobs.materialize_stages` (migration 0103 — the
+materialize twin of `warm_stages`, coordinator-stamped from the progress
+frames), chunk-window counts on chunk-stage frames (optional host-proto
+fields → the long-dead `chunks_done/chunks_total` columns), the full
+stage histories + `materialize_host_id` on the app-proto `EnableJob`,
+and a dashboard rework (stage timelines with previous-run ETAs, live
+output tail, attempt/host badges, fleet enable-work badges that make the
+roll gate observable).
+
 ## Commits
 
 - ADR (Proposed)
