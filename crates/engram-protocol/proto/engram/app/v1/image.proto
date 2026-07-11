@@ -207,6 +207,21 @@ message EnableJob {
   // "staged"|"timed_out"|"unschedulable", "waited_ms": <u64>}}`). `"{}"`
   // until the prestage stage runs.
   string prestage_hosts = 15;
+  // ADR 0088 UI follow-up: the [warm]-hook stage history, JSON-encoded
+  // array of {name, started_at, ended_at, outcome} records (the
+  // `enable_jobs.warm_stages` JSONB verbatim; `"[]"` before a capture
+  // runs). Issue #539 scoped the proto to the CURRENT stage only; the
+  // UI's stage timeline needs the full history.
+  string warm_stages = 16;
+  // ADR 0088 UI follow-up: the materialize-side twin — pull/flatten/
+  // pack/chunk records in the same shape (`enable_jobs.materialize_stages`,
+  // migration 0103). `"[]"` before the first materialize frame. An open
+  // record (ended_at null) on a non-materializing job marks where a
+  // failed attempt died; a retry's fresh pull resets the array.
+  string materialize_stages = 17;
+  // ADR 0088: host UUID the (last) materialize ran on. Unset before the
+  // first placement.
+  optional string materialize_host_id = 18;
 }
 
 message DisableImageRequest {

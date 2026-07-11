@@ -67,6 +67,16 @@ pub struct MaterializeProgress {
     pub stage: MaterializeStage,
     /// Free-form human detail ("layer 3/7", byte counts, …).
     pub detail: Option<String>,
+    /// Chunk-stage progress: 16 MiB windows scanned / total windows of
+    /// the ext4 (the denominator counts zero-elided windows too — they
+    /// complete instantly, which just makes the bar honest about sparse
+    /// regions). `None` outside the chunk stage. Rides the wire as
+    /// OPTIONAL proto fields, so a version-skewed peer simply sees
+    /// `None` — never a decode error.
+    #[serde(default)]
+    pub chunks_done: Option<u64>,
+    #[serde(default)]
+    pub chunks_total: Option<u64>,
 }
 
 /// Terminal success of one materialize: everything the enable

@@ -1875,13 +1875,20 @@ pub trait MetadataStore: Send + Sync {
     /// the lease exactly like capture frames do.
     ///
     /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    ///
+    /// `stages` is the scanner-maintained materialize stage timeline
+    /// (ADR 0088 UI follow-up — the caller advances it per frame via
+    /// pure logic and passes the whole array; this write replaces the
+    /// column). Chunk-stage frames also carry window counts, persisted
+    /// into `chunks_done`/`chunks_total` for the operator progress bar.
     async fn update_enable_job_materialize_progress(
         &self,
         id: uuid::Uuid,
         claimant: &str,
         progress: &crate::types::MaterializeProgress,
+        stages: &[crate::types::WarmStageRecord],
     ) -> Result<(), MetaError> {
-        let _ = (id, claimant, progress);
+        let _ = (id, claimant, progress, stages);
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))

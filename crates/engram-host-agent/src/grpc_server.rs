@@ -678,6 +678,8 @@ impl HostService for HostServiceImpl {
                                 MaterializeProgress {
                                     stage: p.stage.as_str().to_string(),
                                     detail: p.detail,
+                                    chunks_done: p.chunks_done,
+                                    chunks_total: p.chunks_total,
                                 },
                             ),
                         ),

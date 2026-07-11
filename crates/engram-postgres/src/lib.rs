@@ -4296,7 +4296,7 @@ impl MetadataStore for PostgresStore {
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
             DO NOTHING
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, materialize_stages, materialize_host_id, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(Uuid::new_v4())
@@ -4316,7 +4316,7 @@ impl MetadataStore for PostgresStore {
         }
         let existing = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, materialize_stages, materialize_host_id, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              WHERE image_uri = $1 AND state NOT IN ('ready', 'failed')
             "#,
@@ -4337,7 +4337,7 @@ impl MetadataStore for PostgresStore {
                     VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
                     DO NOTHING
-                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, materialize_stages, materialize_host_id, output_tail, prestage_hosts, created_at, updated_at
                     "#,
                 )
                 .bind(Uuid::new_v4())
@@ -4360,7 +4360,7 @@ impl MetadataStore for PostgresStore {
 
     async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
         let row = sqlx::query(
-            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
+            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, materialize_stages, materialize_host_id, output_tail, prestage_hosts, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -4372,7 +4372,7 @@ impl MetadataStore for PostgresStore {
     async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, materialize_stages, materialize_host_id, output_tail, prestage_hosts, created_at, updated_at
               FROM enable_jobs
              ORDER BY created_at DESC
              LIMIT $1
@@ -4412,7 +4412,7 @@ impl MetadataStore for PostgresStore {
                     LIMIT $3
                       FOR UPDATE SKIP LOCKED
              )
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, materialize_stages, materialize_host_id, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(claimant)
@@ -4476,15 +4476,26 @@ impl MetadataStore for PostgresStore {
         id: Uuid,
         claimant: &str,
         progress: &engram_core::types::MaterializeProgress,
+        stages: &[engram_core::types::WarmStageRecord],
     ) -> Result<(), MetaError> {
         let line = match &progress.detail {
             Some(detail) => format!("materialize[{}] {detail}", progress.stage),
             None => format!("materialize[{}]", progress.stage),
         };
+        let stages_json =
+            serde_json::to_value(stages).map_err(|e| MetaError::Serialization(e.to_string()))?;
+        // Chunk-stage frames carry window counts (i32 columns; a count
+        // past i32::MAX would need a >32 PiB ext4 — clamp, don't wrap).
+        let chunks_done: Option<i32> = progress.chunks_done.map(|v| v.min(i32::MAX as u64) as i32);
+        let chunks_total: Option<i32> =
+            progress.chunks_total.map(|v| v.min(i32::MAX as u64) as i32);
         let res = sqlx::query(
             r#"
             UPDATE enable_jobs
                SET output_tail = $3,
+                   materialize_stages = $4,
+                   chunks_done = COALESCE($5, chunks_done),
+                   chunks_total = COALESCE($6, chunks_total),
                    claimed_at = NOW(),
                    updated_at = NOW()
              WHERE id = $1 AND claimed_by = $2
@@ -4493,6 +4504,9 @@ impl MetadataStore for PostgresStore {
         .bind(id)
         .bind(claimant)
         .bind(&line)
+        .bind(stages_json)
+        .bind(chunks_done)
+        .bind(chunks_total)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4695,7 +4709,7 @@ impl MetadataStore for PostgresStore {
                    -- read as live until the retry's first chunk event.
                    chunks_done = 0, chunks_total = NULL
              WHERE id = $1 AND state = 'failed'
-            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, output_tail, prestage_hosts, created_at, updated_at
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, materialize_stages, materialize_host_id, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
         .bind(id)

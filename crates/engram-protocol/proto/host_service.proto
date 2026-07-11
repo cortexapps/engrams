@@ -511,6 +511,11 @@ message MaterializeImageRequest {
 message MaterializeProgress {
   string stage = 1;
   optional string detail = 2;
+  // Chunk-stage progress: 16 MiB windows scanned / total windows of the
+  // ext4. Unset outside the chunk stage. OPTIONAL so a version-skewed
+  // peer sees absence, never a decode error.
+  optional uint64 chunks_done = 3;
+  optional uint64 chunks_total = 4;
 }
 
 // Terminal success frame.

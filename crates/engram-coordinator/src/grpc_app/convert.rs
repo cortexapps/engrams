@@ -725,13 +725,9 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         capture_phase,
         warm_stage,
         warm_stage_started_at,
-        // The full stage history is an internal/debugging shape (also
-        // rides the `enable_jobs.warm_stages` JSONB column); the app
-        // surface exposes only the CURRENT stage + tail, not the whole
-        // history — issue #539's plan scopes the proto to fields 11-14
-        // (prestage_hosts is field 15 — renumbered post-merge, ADR 0036
-        // amendment landed after issue #539's 11-14 allocation).
-        warm_stages: _,
+        warm_stages,
+        materialize_stages,
+        materialize_host_id,
         output_tail,
         // ADR 0084 (c): the capture placement reservation moved onto
         // `capture_jobs` (no longer bookkept on this enable-job row).
@@ -757,6 +753,14 @@ pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::Ena
         // outcome map. `prestage_hosts` is NOT NULL DEFAULT '{}'::jsonb
         // (migration 0081), so `to_string()` always yields valid JSON.
         prestage_hosts: prestage_hosts.to_string(),
+        // ADR 0088 UI follow-up: both stage timelines, JSON-encoded (the
+        // Vec<WarmStageRecord> serde shape — same as the JSONB columns).
+        // Vec-of-Serialize can't fail to encode; fall back to "[]" rather
+        // than poisoning the whole list response.
+        warm_stages: serde_json::to_string(warm_stages).unwrap_or_else(|_| "[]".to_string()),
+        materialize_stages: serde_json::to_string(materialize_stages)
+            .unwrap_or_else(|_| "[]".to_string()),
+        materialize_host_id: materialize_host_id.map(|h| h.to_string()),
     }
 }
 

@@ -55,7 +55,8 @@ impl ChunkStore {
         kind: ManifestKind,
         chunk_size: Option<u64>,
     ) -> Result<Manifest> {
-        self.chunk_file_into(path, kind, chunk_size, None).await
+        self.chunk_file_into(path, kind, chunk_size, None, None)
+            .await
     }
 
     /// Like [`Self::chunk_file`], but also write-throughs each produced
@@ -71,11 +72,17 @@ impl ChunkStore {
         kind: ManifestKind,
         chunk_size: Option<u64>,
         cache: Option<&ChunkCache>,
+        // Called after each window flush (and once at the end) with
+        // (windows_scanned, windows_total) — windows_total counts
+        // zero-elided windows too, so callers get a monotone fraction
+        // with a known denominator (the enable UI's progress bar).
+        progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
     ) -> Result<Manifest> {
         let chunk_size = chunk_size.unwrap_or_else(|| kind.default_chunk_size());
         let mut file = fs::File::open(path).await?;
         let meta = file.metadata().await?;
         let total_bytes = meta.len();
+        let windows_total = total_bytes.div_ceil(chunk_size);
 
         let mut manifest = Manifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -114,11 +121,17 @@ impl ChunkStore {
             if window.len() == SPARSE_RECHUNK_CONCURRENCY {
                 self.flush_chunk_window(std::mem::take(&mut window), &mut manifest, cache)
                     .await?;
+                if let Some(report) = progress {
+                    report(offset.div_ceil(chunk_size), windows_total);
+                }
             }
         }
         if !window.is_empty() {
             self.flush_chunk_window(window, &mut manifest, cache)
                 .await?;
+        }
+        if let Some(report) = progress {
+            report(windows_total, windows_total);
         }
         // Windows are read + appended in offset order and each window is
         // internally re-sorted, so `manifest.chunks` stays offset-sorted.
