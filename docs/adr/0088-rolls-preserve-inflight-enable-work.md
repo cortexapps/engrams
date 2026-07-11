@@ -1,6 +1,6 @@
 # ADR 0088: Fleet rolls must not kill in-flight enable work
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 
@@ -140,6 +140,32 @@ release-the-victim-on-timeout semantics.)
   `enableWorkTimeoutSeconds` (0 disables the gate entirely = today's
   behavior).
 
+## Implementation notes / divergences
+
+- Liveness came out even simpler than proposed: `claimed_at` freshness
+  needed **zero** new renewal machinery — the materialize keepalive frames
+  were already renewing the claim (`update_enable_job_materialize_progress`).
+  The fleet view shares the scanner's default lease window
+  (`DEFAULT_ENABLE_JOB_LEASE_SECS`) so gate-release and peer-reclaim happen
+  on the same clock.
+- `GetHost` deliberately does NOT best-effort the live-work read (unlike
+  `reserved`): a failed read rendering zeros would tell the gate "no work"
+  and let a roll kill a live materialize. `ListHosts` (view-only) stays
+  best-effort.
+- The CRD yaml is generated with structural pruning, so
+  `enableWorkTimeoutSeconds` had to ride the checked-in CRD too — a CR
+  field absent from the schema is silently dropped, which would have made
+  the helm knob a no-op.
+
 ## Commits
 
-- (this ADR)
+- ADR (Proposed)
+- `store: durable materialize placement + per-host live enable work` —
+  migration 0102, `set_enable_job_materialize_host`,
+  `live_enable_work_by_host`, live-PG tests
+- `coordinator: stamp materialize placement; expose live enable work on
+  HostView` — the fenced stamp in `materialize_image_on_host`, HostView +
+  app.v1 proto fields 30/31
+- `operator: gate rolls and drains on in-flight enable work` —
+  `gate_enable_work` in `roll_node`, the `gate_drain` enable-work leg,
+  `enableWorkTimeoutSeconds` (CRD + helm)
