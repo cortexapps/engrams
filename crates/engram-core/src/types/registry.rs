@@ -28,6 +28,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::types::ids::HostId;
+
 /// One row in `registry_credentials`. The `auth` field carries the
 /// variant-specific payload; identity / decryption / token-fetch
 /// happens at the resolver layer (`engram-oci-auth`), not here.
@@ -369,6 +371,21 @@ impl EnableJobState {
     }
 }
 
+/// ADR 0088: one host's in-flight enable work — the operator roll/drain
+/// gates' input, surfaced per host on the fleet view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveEnableWork {
+    /// `enable_jobs` rows live-materializing on this host: state =
+    /// `materializing`, `materialize_host_id` = host, and a fresh claim
+    /// (the host's ≤30 s keepalive frames renew `claimed_at`, so a dead
+    /// stream ages out within the lease window — never gate on a ghost).
+    pub materializes: u32,
+    /// `capture_jobs` rows in a non-terminal stage bound to this host.
+    /// No freshness filter: the enable scanner's stage deadlines already
+    /// redrive-or-fail a stuck capture row.
+    pub captures: u32,
+}
+
 /// One row in `enable_jobs` (ADR 0036): an asynchronous image-enable
 /// in flight (or terminal, kept for audit). The wire shape of
 /// `GET /api/enable-jobs/:id` — `chunks_done/chunks_total` is the
@@ -426,6 +443,19 @@ pub struct EnableJob {
     pub warm_stage_started_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub warm_stages: Vec<crate::types::WarmStageRecord>,
+    /// ADR 0088 UI follow-up: the materialize-side twin of `warm_stages` —
+    /// pull/flatten/pack/chunk stage records (same [`WarmStageRecord`]
+    /// shape, so the UI renders one timeline component for both),
+    /// maintained by the enable scanner from the host's streamed stage
+    /// frames. A stage left open on a killed materialize stays open;
+    /// a retry's fresh `pull` frame resets the list.
+    #[serde(default)]
+    pub materialize_stages: Vec<crate::types::WarmStageRecord>,
+    /// ADR 0088: the host the (last) materialize ran on — stamped before
+    /// the streaming RPC starts, never cleared (inert outside
+    /// `materializing`; see `live_enable_work_by_host` for liveness).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialize_host_id: Option<HostId>,
     /// Rolling last 16 KiB of the `[warm]` hook's combined stdout+stderr —
     /// the diagnostic that used to require host-log access.
     #[serde(default, skip_serializing_if = "Option::is_none")]

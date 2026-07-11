@@ -188,6 +188,13 @@ export interface HostView {
    *  (pre-0068 row, or mid-roll) — the soft-pass posture. `>= 1` once
    *  it has reported a real vector. */
   capabilities_schema: number;
+  /** ADR 0088: in-flight enable work bound to this host — live
+   *  materializes (fresh-claimed materializing enable_jobs) and
+   *  non-terminal capture_jobs. The operator's roll/drain gates wait on
+   *  both reaching zero; nonzero here explains "why is the roll
+   *  waiting on this host". */
+  live_materializes: number;
+  live_capture_jobs: number;
 }
 
 export interface ListHostsResponse {
@@ -466,6 +473,26 @@ export interface EnableJob {
    * "staged"|"timed_out"|"unschedulable", "waited_ms": <u64>}}`). `"{}"`
    * until the prestage stage runs. */
   prestage_hosts: string;
+  /** ADR 0088 UI follow-up: the [warm]-hook stage history — JSON-encoded
+   * array of {name, started_at, ended_at, outcome} records ("[]" before
+   * a capture runs). */
+  warm_stages: string;
+  /** ADR 0088 UI follow-up: the materialize-side twin (pull/flatten/
+   * pack/chunk records, same shape). An open record (ended_at null) on
+   * a non-materializing job marks where a failed attempt died. */
+  materialize_stages: string;
+  /** ADR 0088: host UUID the (last) materialize ran on. */
+  materialize_host_id: string | null;
+}
+
+/** One stage record of either enable timeline (`warm_stages` /
+ * `materialize_stages`), as persisted server-side. */
+export interface StageRecord {
+  name: string;
+  started_at: string;
+  /** null while the stage is open (running, or abandoned by a failure). */
+  ended_at: string | null;
+  outcome: "running" | "done" | "failed";
 }
 
 export interface ListEnableJobsResponse {

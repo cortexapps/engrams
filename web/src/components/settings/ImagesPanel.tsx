@@ -15,7 +15,7 @@ import {
 } from "../../hooks/useEnabledImages";
 import { isJobActive, useEnableJobs, useRetryEnableJob } from "../../hooks/useEnableJobs";
 import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
-import type { EnableJob, EnabledImageSummary } from "../../lib/types";
+import type { EnableJob, EnabledImageSummary, StageRecord } from "../../lib/types";
 import {
   CaptureEnvEntrySchema,
   ImageConfigSchema,
@@ -106,7 +106,15 @@ export function ImagesPanel() {
       {visibleJobs.length > 0 && (
         <ul className="space-y-2 mb-6">
           {visibleJobs.map((job) => (
-            <EnableJobRow key={job.id} job={job} />
+            <EnableJobRow
+              key={job.id}
+              job={job}
+              // ETA reference: the most recent READY job for the same URI —
+              // its stage durations are the "typically ~Xm" denominators.
+              reference={(jobs ?? []).find(
+                (j) => j.state === "ready" && j.image_uri === job.image_uri,
+              )}
+            />
           ))}
         </ul>
       )}
@@ -758,9 +766,9 @@ function EnableImageDialog({
                 </Button>
               </div>
               <FieldDescription>
-                Non-secret env applied to every sandbox of this image — merged over the
-                Dockerfile's <code className="font-mono">ENV</code>, under session env (ADR 0080).
-                Applies immediately on save, no recapture.
+                Non-secret env applied to every sandbox of this image — merged over the Dockerfile's{" "}
+                <code className="font-mono">ENV</code>, under session env (ADR 0080). Applies
+                immediately on save, no recapture.
               </FieldDescription>
               {envArray.fields.length === 0 ? (
                 <p className="text-xs text-muted-foreground">No image env vars.</p>
@@ -868,8 +876,8 @@ function EnableImageDialog({
               <div>
                 <FieldLabel>Warm capture hook</FieldLabel>
                 <FieldDescription>
-                  Runs inside the capture VM at base-snapshot capture. Everything in this section
-                  is capture-affecting — editing it recaptures the base snapshot (minutes; sessions
+                  Runs inside the capture VM at base-snapshot capture. Everything in this section is
+                  capture-affecting — editing it recaptures the base snapshot (minutes; sessions
                   keep working against the old snapshot until the new one is ready).
                 </FieldDescription>
               </div>
@@ -1000,9 +1008,9 @@ function EnableImageDialog({
                     )}
                   />
                   <FieldDescription>
-                    Egress policy for the capture VM while the warm hook runs (ADR 0080; same
-                    shape as a profile's allow-list). No network — or deny with an empty
-                    allow-list — is an egress-less capture.
+                    Egress policy for the capture VM while the warm hook runs (ADR 0080; same shape
+                    as a profile's allow-list). No network — or deny with an empty allow-list — is
+                    an egress-less capture.
                   </FieldDescription>
                   {netDefaultLive === "deny" && (
                     <div className="grid gap-3 sm:grid-cols-2">
@@ -1057,9 +1065,9 @@ function EnableImageDialog({
               </p>
               <p className="font-mono text-xs text-muted-foreground">{pendingRecapture.reason}</p>
               <p className="text-xs text-muted-foreground">
-                Applying it will recapture the base snapshot — that takes minutes, and sessions
-                keep working against the old snapshot until the new one is ready. Progress shows
-                in the jobs list above.
+                Applying it will recapture the base snapshot — that takes minutes, and sessions keep
+                working against the old snapshot until the new one is ready. Progress shows in the
+                jobs list above.
               </p>
               <div className="flex justify-end gap-2">
                 <Button
@@ -1161,26 +1169,117 @@ function summarizePrestageHosts(raw: string): string | null {
   return `${staged}/${eligible} hosts staged${suffix}`;
 }
 
-function EnableJobRow({ job }: { job: EnableJob }) {
+/// Parse a JSON-encoded stage-record array (`materialize_stages` /
+/// `warm_stages`). Malformed/absent JSON renders nothing rather than
+/// throwing — best-effort operator surface.
+function parseStages(raw: string): StageRecord[] {
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as StageRecord[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function fmtDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${s % 60 ? ` ${s % 60}s` : ""}`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+function stageDurationMs(s: StageRecord): number | null {
+  const start = new Date(s.started_at).getTime();
+  if (Number.isNaN(start)) return null;
+  const end = s.ended_at ? new Date(s.ended_at).getTime() : Date.now();
+  return Math.max(0, end - start);
+}
+
+/// One enable timeline (materialize or warm) as inline stage chips:
+/// `pull 2m46s ✓ → flatten 12m ⏱ (typically ~48m)`. The open stage
+/// ticks on every poll re-render (the jobs query polls at 2 s while any
+/// job is active). `reference` supplies the previous successful run's
+/// per-stage durations — the "typically ~X" ETA denominators.
+function StageTimeline({
+  label,
+  stages,
+  reference,
+  jobFailed,
+}: {
+  label: string;
+  stages: StageRecord[];
+  reference: StageRecord[];
+  jobFailed: boolean;
+}) {
+  if (stages.length === 0) return null;
+  const typicalMs = new Map<string, number>();
+  for (const r of reference) {
+    const d = r.ended_at ? stageDurationMs(r) : null;
+    if (d !== null) typicalMs.set(r.name, d);
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
+      <span className="uppercase tracking-wide text-[10px]">{label}</span>
+      {stages.map((s, i) => {
+        const open = s.ended_at === null;
+        const d = stageDurationMs(s);
+        const typical = open ? typicalMs.get(s.name) : undefined;
+        return (
+          <span key={`${s.name}-${i}`} className="flex items-center gap-1">
+            {i > 0 && <span className="text-muted-foreground/50">→</span>}
+            <span className={open && !jobFailed ? "font-medium text-foreground" : undefined}>
+              {s.name}
+            </span>
+            {d !== null && <span className="font-mono">{fmtDuration(d)}</span>}
+            {open ? (
+              jobFailed ? (
+                <span className="text-destructive" title="the attempt died in this stage">
+                  ✗
+                </span>
+              ) : (
+                <span className="animate-pulse">⏱</span>
+              )
+            ) : (
+              <span className="text-muted-foreground/70">✓</span>
+            )}
+            {typical !== undefined && !jobFailed && (
+              <span className="text-muted-foreground/60">(typically ~{fmtDuration(typical)})</span>
+            )}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+function EnableJobRow({ job, reference }: { job: EnableJob; reference?: EnableJob }) {
   const retry = useRetryEnableJob();
   const failed = job.state === "failed";
+  const active = isJobActive(job);
   const capturing = job.state === "capturing";
+  const materializing = job.state === "materializing";
   const pct =
     job.chunks_total && job.chunks_total > 0
       ? Math.min(100, Math.round((job.chunks_done / job.chunks_total) * 100))
       : null;
   const prestageSummary = summarizePrestageHosts(job.prestage_hosts);
 
-  // Issue #539: while capturing, show the live capture_phase/warm_stage
-  // instead of a frozen progress bar — the operator-facing fix for a
-  // dev-brain enable that used to look identically "capturing" for the
-  // full 10-33 min [warm] hook with zero visibility into what it was
-  // doing. On a failed job, `output_tail` is the [warm] hook's last
-  // 16 KiB of stdout+stderr — no host-log access required to diagnose.
+  const materializeStages = parseStages(job.materialize_stages);
+  const warmStages = parseStages(job.warm_stages);
+  const refMaterialize = reference ? parseStages(reference.materialize_stages) : [];
+  const refWarm = reference ? parseStages(reference.warm_stages) : [];
+
+  // The live substage, most-specific first: an open materialize stage
+  // while materializing, else issue #539's capture_phase/warm_stage.
+  const openMaterialize = materializing ? materializeStages.find((s) => s.ended_at === null) : null;
   const captureDetail =
     capturing && (job.capture_phase || job.warm_stage)
       ? [job.capture_phase, job.warm_stage].filter(Boolean).join(" · ")
       : null;
+
+  // Wall-clock context: total job age, ticked by the 2 s active poll.
+  const totalMs = Date.now() - new Date(job.created_at).getTime();
 
   return (
     <li>
@@ -1190,7 +1289,8 @@ function EnableJobRow({ job }: { job: EnableJob }) {
             <span className="font-mono text-sm whitespace-nowrap">{job.image_uri}</span>
             <Badge variant={failed ? "destructive" : "secondary"} className="font-normal">
               {JOB_STATE_LABEL[job.state]}
-              {job.state === "materializing" && job.chunks_total
+              {openMaterialize ? ` · ${openMaterialize.name}` : ""}
+              {materializing && job.chunks_total
                 ? ` · ${job.chunks_done}/${job.chunks_total} chunks`
                 : ""}
             </Badge>
@@ -1203,6 +1303,25 @@ function EnableJobRow({ job }: { job: EnableJob }) {
               <Badge variant="outline" className="font-normal">
                 {prestageSummary}
               </Badge>
+            )}
+            {job.attempts > 1 && (
+              <Badge variant="outline" className="font-normal" title="pipeline attempts so far">
+                attempt {job.attempts}
+              </Badge>
+            )}
+            {job.materialize_host_id && (
+              <Badge
+                variant="outline"
+                className="font-mono font-normal"
+                title={`materialize host ${job.materialize_host_id}`}
+              >
+                host {job.materialize_host_id.slice(0, 8)}
+              </Badge>
+            )}
+            {active && !Number.isNaN(totalMs) && (
+              <span className="text-xs text-muted-foreground font-mono">
+                {fmtDuration(totalMs)}
+              </span>
             )}
             {!failed && (
               <span className="text-xs text-muted-foreground italic animate-pulse">working…</span>
@@ -1219,12 +1338,35 @@ function EnableJobRow({ job }: { job: EnableJob }) {
               </Button>
             )}
           </div>
+          <StageTimeline
+            label="materialize"
+            stages={materializeStages}
+            reference={refMaterialize}
+            jobFailed={failed}
+          />
+          <StageTimeline label="warm" stages={warmStages} reference={refWarm} jobFailed={failed} />
           {pct !== null && !failed && <Progress value={pct} className="h-1 max-w-md" />}
           {failed && job.error && <p className="text-xs text-destructive">{job.error}</p>}
           {failed && job.warm_stage && (
             <p className="text-xs text-muted-foreground">
               failed at [warm] stage <span className="font-mono">{job.warm_stage}</span>
             </p>
+          )}
+          {/* The live tail is the "something is happening" signal a
+              45-minute flatten or 10-minute JVM boot needs: during
+              materialize it's the current stage frame; during capture,
+              the [warm] hook's rolling last 16 KiB (the per-service
+              "brain-backend ready in 527s" lines). Collapsed by default
+              while running; the failure rendering keeps it expanded. */}
+          {!failed && job.output_tail && (
+            <details className="text-xs">
+              <summary className="cursor-pointer text-muted-foreground select-none">
+                live output
+              </summary>
+              <pre className="mt-1 max-h-40 overflow-y-auto rounded bg-muted p-2 whitespace-pre-wrap">
+                {job.output_tail}
+              </pre>
+            </details>
           )}
           {failed && job.output_tail && (
             <pre className="max-h-40 overflow-y-auto rounded bg-muted p-2 text-xs whitespace-pre-wrap">

@@ -129,7 +129,7 @@ impl Default for EnableScannerConfig {
             // Capture on a nested-KVM dev-vm has been observed at
             // ~150 s; 300 s keeps a healthy margin before a peer
             // declares the claim stale.
-            lease_secs: 300,
+            lease_secs: DEFAULT_ENABLE_JOB_LEASE_SECS,
             claim_limit: 2,
             max_attempts: 5,
             progress_interval: Duration::from_secs(2),
@@ -141,6 +141,11 @@ impl Default for EnableScannerConfig {
 
 const DEFAULT_PRESTAGE_TIMEOUT: Duration = Duration::from_secs(1200);
 const DEFAULT_CAPTURE_CAPACITY_WAIT: Duration = Duration::from_secs(1800);
+/// ADR 0088: the claim lease default, shared with the fleet view's
+/// live-materialize freshness window (`live_enable_work_by_host`) so
+/// "the gate stops counting a dead stream" and "a peer may re-claim"
+/// happen on the same clock.
+pub(crate) const DEFAULT_ENABLE_JOB_LEASE_SECS: u32 = 300;
 
 impl EnableScannerConfig {
     /// Resolves `ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS` on top of the pure
@@ -479,9 +484,16 @@ async fn advance_one(
             let meta = state.services.meta.clone();
             let claimant = claimant.to_string();
             tokio::spawn(async move {
+                // ADR 0088 UI follow-up: the materialize stage timeline
+                // (pull → flatten → pack → chunk with wall-clock bounds),
+                // advanced per frame by pure logic and persisted whole on
+                // each write. Returned to the scanner so a successful
+                // materialize can close the open stage.
+                let mut stages: Vec<engram_core::types::WarmStageRecord> = Vec::new();
                 while let Some(frame) = progress_rx.recv().await {
+                    advance_materialize_stages(&mut stages, frame.stage, Utc::now());
                     match meta
-                        .update_enable_job_materialize_progress(job_id, &claimant, &frame)
+                        .update_enable_job_materialize_progress(job_id, &claimant, &frame, &stages)
                         .await
                     {
                         Ok(()) => {}
@@ -494,15 +506,41 @@ async fn advance_one(
                         }
                     }
                 }
+                stages
             })
         };
-        let materialize_result = materialize_image_on_host(state, &image_uri, progress_tx).await;
+        let materialize_result =
+            materialize_image_on_host(state, job_id, claimant, &image_uri, progress_tx).await;
         // `materialize_image_on_host` returning means every `Sender` clone
         // is dropped — awaiting the consumer guarantees the final frame is
         // persisted before we act on the result (same ordering property as
         // the capture consumer below).
-        let _ = progress_consumer.await;
+        let mut stages = progress_consumer.await.unwrap_or_default();
         let materialized = materialize_result.map_err(classify_materialize_error)?;
+        // Success: close the open (chunk) stage so the timeline's durations
+        // are complete — the ETA denominators for the NEXT enable of this
+        // image. A failed materialize deliberately leaves its stage open
+        // (same abandoned-stage semantics as `warm_stages`: the open stage
+        // marks where it died). Best-effort: a lost lease here surfaces on
+        // the very next fenced state write.
+        if let Some(open) = stages.last_mut().filter(|s| s.ended_at.is_none()) {
+            open.ended_at = Some(Utc::now());
+            open.outcome = engram_core::types::WarmStageOutcome::Done;
+            let done_frame = engram_core::types::MaterializeProgress {
+                stage: engram_core::types::MaterializeStage::Chunk,
+                detail: Some("complete".to_string()),
+                chunks_done: None,
+                chunks_total: None,
+            };
+            if let Err(e) = state
+                .services
+                .meta
+                .update_enable_job_materialize_progress(job_id, claimant, &done_frame, &stages)
+                .await
+            {
+                tracing::debug!(%job_id, error = %e, "closing materialize stage timeline failed");
+            }
+        }
         tracing::info!(
             %job_id,
             %image_uri,
@@ -1231,6 +1269,42 @@ fn prestage_host_outcomes(
         .collect()
 }
 
+/// ADR 0088 UI follow-up: advance the materialize stage timeline for one
+/// progress frame. Pure, so it's unit-tested without a store:
+///
+/// - a keepalive re-send of the currently-open stage is a no-op;
+/// - a NEW stage closes the open one and appends its record;
+/// - a `pull` frame arriving when the list already has entries is a fresh
+///   attempt (a retried materialize restarts from pull) — reset the list
+///   so the timeline never interleaves two attempts.
+pub(crate) fn advance_materialize_stages(
+    stages: &mut Vec<engram_core::types::WarmStageRecord>,
+    stage: engram_core::types::MaterializeStage,
+    now: DateTime<Utc>,
+) {
+    let name = stage.as_str();
+    if let Some(open) = stages.last() {
+        if open.ended_at.is_none() && open.name == name {
+            return; // keepalive of the open stage
+        }
+    }
+    if stage == engram_core::types::MaterializeStage::Pull && !stages.is_empty() {
+        stages.clear();
+    }
+    if let Some(open) = stages.last_mut() {
+        if open.ended_at.is_none() {
+            open.ended_at = Some(now);
+            open.outcome = engram_core::types::WarmStageOutcome::Done;
+        }
+    }
+    stages.push(engram_core::types::WarmStageRecord {
+        name: name.to_string(),
+        started_at: now,
+        ended_at: None,
+        outcome: engram_core::types::WarmStageOutcome::Running,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1252,6 +1326,42 @@ mod tests {
     // claimant's lease + burn its attempts budget). Every other
     // `MetaError`, and every pipeline error, must stay a `Pipeline`
     // error so the budget path still runs.
+    // ADR 0088 UI follow-up: the materialize stage-timeline advance is
+    // pure — pin the keepalive no-op, the close-on-transition, and the
+    // fresh-attempt reset.
+    #[test]
+    fn materialize_stage_timeline_advances_and_resets() {
+        use engram_core::types::{MaterializeStage, WarmStageOutcome};
+        let t = |s: i64| chrono::DateTime::from_timestamp(s, 0).unwrap();
+        let mut stages = Vec::new();
+
+        advance_materialize_stages(&mut stages, MaterializeStage::Pull, t(0));
+        assert_eq!(stages.len(), 1);
+        // Keepalive re-send of the open stage: no-op.
+        advance_materialize_stages(&mut stages, MaterializeStage::Pull, t(10));
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].ended_at, None);
+
+        // Transition closes the open stage and opens the next.
+        advance_materialize_stages(&mut stages, MaterializeStage::Flatten, t(20));
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].ended_at, Some(t(20)));
+        assert_eq!(stages[0].outcome, WarmStageOutcome::Done);
+        assert_eq!(stages[1].name, "flatten");
+        assert_eq!(stages[1].outcome, WarmStageOutcome::Running);
+
+        advance_materialize_stages(&mut stages, MaterializeStage::Pack, t(30));
+        advance_materialize_stages(&mut stages, MaterializeStage::Chunk, t(40));
+        assert_eq!(stages.len(), 4);
+
+        // A fresh `pull` (retry after a killed attempt) resets the list —
+        // the timeline never interleaves two attempts.
+        advance_materialize_stages(&mut stages, MaterializeStage::Pull, t(100));
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].name, "pull");
+        assert_eq!(stages[0].started_at, t(100));
+    }
+
     #[test]
     fn lease_conflict_maps_to_lease_lost_not_pipeline() {
         match AdvanceError::from(MetaError::Conflict("lease lost: held by pod-b".into())) {

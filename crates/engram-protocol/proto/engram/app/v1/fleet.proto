@@ -128,6 +128,14 @@ message HostView {
   // (pre-0068 row, or mid-roll) — the soft-pass posture. `>= 1` once
   // it has.
   uint32 capabilities_schema = 29;
+  // ADR 0088: in-flight enable work bound to this host — live
+  // materializes (fresh-claimed `materializing` enable_jobs) and
+  // non-terminal capture_jobs. The host-operator's roll/drain gates
+  // wait on both reaching zero before killing the host-agent pod.
+  // RUST-WIRE-ONLY: absent from the TS mirror, same note as
+  // ready_images.
+  uint32 live_materializes = 30;
+  uint32 live_capture_jobs = 31;
 }
 
 message GetHostRequest {

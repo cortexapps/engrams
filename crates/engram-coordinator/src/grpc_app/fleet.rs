@@ -43,11 +43,25 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .per_host_reserved()
             .await
             .unwrap_or_default();
+        // ADR 0088: in-flight enable work per host — the operator's
+        // roll/drain gates read these counts off this view. Best-effort
+        // like `reserved`: a read failure renders zeros, never fails the
+        // fleet view.
+        let enable_work = self
+            .state
+            .services
+            .meta
+            .live_enable_work_by_host(std::time::Duration::from_secs(
+                crate::enable_scanner::DEFAULT_ENABLE_JOB_LEASE_SECS.into(),
+            ))
+            .await
+            .unwrap_or_default();
         let hosts = rows
             .into_iter()
             .map(|row| {
                 let r = reserved.get(&row.id).copied().unwrap_or_default();
-                let view = crate::api::hosts::HostView::from_row(row, r);
+                let w = enable_work.get(&row.id).copied().unwrap_or_default();
+                let view = crate::api::hosts::HostView::from_row(row, r, w);
                 convert::host_view_to_proto(&view)
             })
             .collect();
@@ -82,7 +96,22 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .await
             .unwrap_or_default();
         let r = reserved.get(&host_id).copied().unwrap_or_default();
-        let view = crate::api::hosts::HostView::from_row(row, r);
+        // ADR 0088: the operator's roll/drain gates poll THIS RPC for the
+        // host's in-flight enable work. NOT best-effort here: a failed read
+        // rendering zeros would tell the gate "no work" and let a roll kill
+        // a live materialize — propagate, and let the operator's bounded
+        // error budget handle a flaky coordinator.
+        let enable_work = self
+            .state
+            .services
+            .meta
+            .live_enable_work_by_host(std::time::Duration::from_secs(
+                crate::enable_scanner::DEFAULT_ENABLE_JOB_LEASE_SECS.into(),
+            ))
+            .await
+            .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
+        let w = enable_work.get(&host_id).copied().unwrap_or_default();
+        let view = crate::api::hosts::HostView::from_row(row, r, w);
         Ok(Response::new(app::GetHostResponse {
             host: Some(convert::host_view_to_proto(&view)),
         }))

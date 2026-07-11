@@ -113,12 +113,19 @@ pub struct HostView {
     /// vector (pre-0068 row, or mid-roll) — the soft-pass posture.
     /// `>= 1` once it has.
     pub capabilities_schema: u32,
+    /// ADR 0088: in-flight enable work bound to this host — live
+    /// materializes (fresh-claimed `materializing` enable_jobs) and
+    /// non-terminal capture_jobs. The host-operator's roll/drain gates
+    /// wait on both reaching zero before killing the host-agent pod.
+    pub live_materializes: u32,
+    pub live_capture_jobs: u32,
 }
 
 impl HostView {
     pub(crate) fn from_row(
         row: engram_core::types::HostRecord,
         reserved: engram_core::types::host::ReservedBudget,
+        enable_work: engram_core::types::LiveEnableWork,
     ) -> Self {
         let mut ready_image_digests = row.ready_images.clone();
         ready_image_digests.sort();
@@ -163,6 +170,8 @@ impl HostView {
             failing_capabilities,
             fc_snapshot_version,
             capabilities_schema,
+            live_materializes: enable_work.materializes,
+            live_capture_jobs: enable_work.captures,
         }
     }
 }

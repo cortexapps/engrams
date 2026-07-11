@@ -250,6 +250,21 @@ async fn roll_node(
     set_node_roll_cordon(client, node, true).await?;
     coord.cordon(host_id).await?;
 
+    // ADR 0088: the reattach roll is lossless for session VMs but NOT for
+    // the host-agent's own enable work — an in-flight materialize stream or
+    // a capture VM dies with the pod, restarting a 40-90 min attempt from
+    // scratch (and burning the enable job's attempts budget against
+    // deploys). The cordon above stops NEW enable work being picked here,
+    // so this waits out at most the tail of what is already running.
+    // Bounded + proceed-on-timeout: a roll must never wedge on enable work.
+    gate_enable_work(
+        &coord,
+        host_id,
+        node,
+        Duration::from_secs(spec.enable_work_timeout_seconds),
+    )
+    .await;
+
     // Delete the pod. With `OnDelete` the DaemonSet recreates it on the target
     // image; the successor's `reattach_pass` adopts the still-running microVMs.
     let pods: Api<Pod> = Api::namespaced(client.clone(), &spec.daemon_set.namespace);
@@ -275,6 +290,83 @@ async fn roll_node(
     set_node_roll_cordon(client, node, false).await?;
     tracing::info!(%node, %host_id, "successor Ready + reattached; uncordoned");
     Ok(())
+}
+
+/// ADR 0088: wait (bounded) for the host's in-flight enable work — live
+/// materializes + non-terminal capture jobs — to reach zero before the pod
+/// delete. Never fails the roll:
+///
+/// - budget `0` disables the gate (pre-0088 behavior);
+/// - budget exhausted → WARN and proceed (the enable's durable-job retry
+///   is the backstop, demoted from primary mechanism to rare fallback);
+/// - RPC errors are tolerated up to a small consecutive budget, then WARN
+///   and proceed — a down coordinator must not block a fleet roll (rolls
+///   are often part of the fix), and host-gone (`None`) passes trivially.
+///
+/// The freshness of the counts is the coordinator's problem (a dead
+/// materialize stream ages out of `live_materializes` within the enable-job
+/// lease window), so this gate can never wait on a ghost longer than that
+/// window.
+async fn gate_enable_work(
+    coord: &dyn crate::autoscale::CoordApi,
+    host: engram_core::HostId,
+    node: &str,
+    budget: Duration,
+) {
+    if budget.is_zero() {
+        return;
+    }
+    const MAX_CONSECUTIVE_ERRORS: u32 = 6;
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut consecutive_errors = 0u32;
+    let mut waiting_logged = false;
+    loop {
+        match coord.host_status(host).await {
+            Ok(None) => return, // host no longer registered — nothing to protect
+            Ok(Some(st)) if !st.has_enable_work() => {
+                if waiting_logged {
+                    tracing::info!(%node, %host, "enable work finished; proceeding with the roll");
+                }
+                return;
+            }
+            Ok(Some(st)) => {
+                consecutive_errors = 0;
+                if !waiting_logged {
+                    tracing::info!(
+                        %node, %host,
+                        live_materializes = st.live_materializes,
+                        live_capture_jobs = st.live_capture_jobs,
+                        budget_secs = budget.as_secs(),
+                        "roll gated on in-flight enable work (cordoned — no new work can arrive)"
+                    );
+                    waiting_logged = true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        %node, %host,
+                        live_materializes = st.live_materializes,
+                        live_capture_jobs = st.live_capture_jobs,
+                        budget_secs = budget.as_secs(),
+                        "enable-work gate timed out; rolling anyway (the enable job will retry)"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS
+                    || tokio::time::Instant::now() >= deadline
+                {
+                    tracing::warn!(
+                        %node, %host, error = %e,
+                        "enable-work gate can't reach the coordinator; rolling anyway"
+                    );
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 /// Poll the DaemonSet's pods until a Ready pod on `node` carries the target
@@ -515,6 +607,152 @@ pub(crate) fn coord_token() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal CoordApi mock for [`gate_enable_work`]: scripted
+    /// `host_status` responses, popped per call (empty → idle host).
+    #[derive(Default)]
+    struct GateMock {
+        responses: std::sync::Mutex<
+            std::collections::VecDeque<Result<Option<crate::coord::HostStatus>, ()>>,
+        >,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl GateMock {
+        fn status(mats: u32, caps: u32) -> Result<Option<crate::coord::HostStatus>, ()> {
+            Ok(Some(crate::coord::HostStatus {
+                status: "ready".into(),
+                running_sandboxes: 0,
+                live_materializes: mats,
+                live_capture_jobs: caps,
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::autoscale::CoordApi for GateMock {
+        async fn fleet_demand(&self) -> Result<crate::scaler::FleetDemand, OperatorError> {
+            unreachable!("gate_enable_work never calls fleet_demand")
+        }
+        async fn list_hosts(&self) -> Result<Vec<crate::coord::HostLoad>, OperatorError> {
+            unreachable!("gate_enable_work never calls list_hosts")
+        }
+        async fn host_status(
+            &self,
+            _host: HostId,
+        ) -> Result<Option<crate::coord::HostStatus>, OperatorError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.responses.lock().unwrap().pop_front() {
+                Some(Ok(v)) => Ok(v),
+                Some(Err(())) => Err(OperatorError::Invalid("scripted error".into())),
+                None => Ok(Some(crate::coord::HostStatus {
+                    status: "ready".into(),
+                    running_sandboxes: 0,
+                    live_materializes: 0,
+                    live_capture_jobs: 0,
+                })),
+            }
+        }
+        async fn cordon(&self, _host: HostId) -> Result<(), OperatorError> {
+            unreachable!("gate_enable_work never cordons")
+        }
+        async fn uncordon(&self, _host: HostId) -> Result<(), OperatorError> {
+            unreachable!("gate_enable_work never uncordons")
+        }
+        async fn drain(&self, _host: HostId) -> Result<(), OperatorError> {
+            unreachable!("gate_enable_work never drains")
+        }
+        async fn delete_host(&self, _host: HostId) -> Result<(), OperatorError> {
+            unreachable!("gate_enable_work never deletes hosts")
+        }
+    }
+
+    fn gate_host() -> HostId {
+        HostId::from_node_name("gate-node")
+    }
+
+    #[tokio::test]
+    async fn gate_passes_immediately_on_idle_host() {
+        let mock = GateMock::default();
+        gate_enable_work(&mock, gate_host(), "gate-node", Duration::from_secs(60)).await;
+        assert_eq!(mock.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gate_zero_budget_is_disabled() {
+        let mock = GateMock::default();
+        mock.responses
+            .lock()
+            .unwrap()
+            .push_back(GateMock::status(1, 0));
+        gate_enable_work(&mock, gate_host(), "gate-node", Duration::ZERO).await;
+        assert_eq!(
+            mock.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "budget 0 must not even poll"
+        );
+    }
+
+    /// The core property: a live materialize holds the roll until it
+    /// finishes, then the gate releases. Paused time auto-advances the
+    /// inter-poll sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn gate_waits_for_live_work_then_releases() {
+        let mock = GateMock::default();
+        {
+            let mut q = mock.responses.lock().unwrap();
+            q.push_back(GateMock::status(1, 0));
+            q.push_back(GateMock::status(1, 1));
+            q.push_back(GateMock::status(0, 0));
+        }
+        gate_enable_work(&mock, gate_host(), "gate-node", Duration::from_secs(3600)).await;
+        assert_eq!(mock.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// Budget exhaustion proceeds (never wedges a roll).
+    #[tokio::test(start_paused = true)]
+    async fn gate_times_out_and_proceeds() {
+        let mock = GateMock::default();
+        {
+            let mut q = mock.responses.lock().unwrap();
+            for _ in 0..100 {
+                q.push_back(GateMock::status(0, 1));
+            }
+        }
+        gate_enable_work(&mock, gate_host(), "gate-node", Duration::from_secs(12)).await;
+        // 12 s budget / 5 s poll → ~3-4 polls, then the deadline fires. The
+        // exact count is timing-shaped; the property is termination well
+        // before the 100 scripted busy responses drain.
+        assert!(mock.calls.load(std::sync::atomic::Ordering::SeqCst) < 10);
+    }
+
+    /// A coordinator that keeps erroring stops blocking the roll after the
+    /// consecutive-error budget.
+    #[tokio::test(start_paused = true)]
+    async fn gate_proceeds_after_consecutive_errors() {
+        let mock = GateMock::default();
+        {
+            let mut q = mock.responses.lock().unwrap();
+            for _ in 0..100 {
+                q.push_back(Err(()));
+            }
+        }
+        gate_enable_work(&mock, gate_host(), "gate-node", Duration::from_secs(3600)).await;
+        assert_eq!(
+            mock.calls.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "gives up after MAX_CONSECUTIVE_ERRORS"
+        );
+    }
+
+    /// A deregistered host (None) has nothing to protect.
+    #[tokio::test]
+    async fn gate_passes_on_missing_host() {
+        let mock = GateMock::default();
+        mock.responses.lock().unwrap().push_back(Ok(None));
+        gate_enable_work(&mock, gate_host(), "gate-node", Duration::from_secs(60)).await;
+        assert_eq!(mock.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     fn pod(node: &str, host_image: &str, init_image: &str, ready: bool) -> PodInfo {
         PodInfo {

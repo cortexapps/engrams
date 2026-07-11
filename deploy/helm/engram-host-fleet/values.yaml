@@ -296,6 +296,10 @@ operator:
   capacityFloor: 1
   # Abort a roll if a drained host still has running sandboxes after this long.
   drainTimeoutSeconds: 600
+  # ADR 0088: wait this long (post-cordon, pre-pod-delete) for a host's
+  # in-flight enable work (materialize / base-snapshot capture) before an
+  # image roll kills the host-agent pod anyway. 0 disables the gate.
+  enableWorkTimeoutSeconds: 5400
   resources:
     requests: {cpu: "10m", memory: 64Mi}
     limits: {cpu: "250m", memory: 128Mi}

@@ -23,6 +23,8 @@ function protoHostToLegacy(h: ProtoHostView): HostView {
     failing_capabilities: h.failingCapabilities,
     fc_snapshot_version: h.fcSnapshotVersion,
     capabilities_schema: h.capabilitiesSchema,
+    live_materializes: h.liveMaterializes,
+    live_capture_jobs: h.liveCaptureJobs,
   };
 }
 

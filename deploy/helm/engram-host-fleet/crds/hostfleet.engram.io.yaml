@@ -136,6 +136,20 @@ spec:
                 format: uint64
                 minimum: 0.0
                 type: integer
+              enableWorkTimeoutSeconds:
+                default: 5400
+                description: "ADR 0088: seconds the image roll waits (post-cordon,\
+                  \ pre-pod-delete) for the host's in-flight enable work — a\
+                  \ live materialize or a base-snapshot capture — to finish before\
+                  \ killing the host-agent pod. The cordon stops NEW work arriving,\
+                  \ so this waits out at most the tail of what is already running\
+                  \ (a dev-brain materialize ~55-90 min; a capture = its warm timeout\
+                  \ + freeze). On timeout the roll proceeds LOUDLY (the enable's durable-job\
+                  \ retry remains the backstop — the pre-0088 behavior, demoted\
+                  \ to rare fallback). `0` disables the gate."
+                format: uint64
+                minimum: 0.0
+                type: integer
               image:
                 description: "Target host-agent container image (digest-pinned in\
                   \ prod). A change here is what the operator rolls \u2014 never a\

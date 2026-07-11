@@ -648,6 +648,8 @@ impl GrpcHostClient {
                         let _ = progress.try_send(MaterializeProgress {
                             stage,
                             detail: p.detail,
+                            chunks_done: p.chunks_done,
+                            chunks_total: p.chunks_total,
                         });
                     }
                 }

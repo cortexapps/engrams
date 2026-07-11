@@ -56,6 +56,17 @@ pub struct HostFleetSpec {
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_seconds: u64,
 
+    /// ADR 0088: seconds the image roll waits (post-cordon, pre-pod-delete)
+    /// for the host's in-flight enable work — a live materialize or a
+    /// base-snapshot capture — to finish before killing the host-agent pod.
+    /// The cordon stops NEW work arriving, so this waits out at most the
+    /// tail of what is already running (a dev-brain materialize ~55-90 min;
+    /// a capture = its warm timeout + freeze). On timeout the roll proceeds
+    /// LOUDLY (the enable's durable-job retry remains the backstop — the
+    /// pre-0088 behavior, demoted to rare fallback). `0` disables the gate.
+    #[serde(default = "default_enable_work_timeout")]
+    pub enable_work_timeout_seconds: u64,
+
     /// ADR 0044 K4: optional node-pool autoscaling. When set, the operator
     /// polls the coordinator's fleet demand and resizes the host node pool to
     /// hold `targetFreeMib` of headroom (scale-up only in v1; drain-gated
@@ -67,6 +78,10 @@ pub struct HostFleetSpec {
 
 fn default_drain_timeout() -> u64 {
     600
+}
+
+fn default_enable_work_timeout() -> u64 {
+    5400
 }
 
 /// Reference to the host-agent DaemonSet the operator patches + rolls.

@@ -189,10 +189,13 @@ impl Materializer {
     /// returned [`Materialized`].
     ///
     /// `progress` (phase 3b): best-effort stage frames (`try_send`),
-    /// one per pipeline stage transition — the `MaterializeImage` RPC
-    /// forwards them coord-ward; the keepalive cadence (≤30 s) is the
-    /// CALLER's job (it re-sends the last frame), this crate only
-    /// signals honest transitions. `None` = silent (tests, the bake).
+    /// one per pipeline stage transition PLUS intra-stage chunk-window
+    /// progress frames (stage `Chunk` with `chunks_done/chunks_total`
+    /// set, one per flushed upload window — the enable UI's progress
+    /// bar). The `MaterializeImage` RPC forwards them coord-ward; the
+    /// keepalive cadence (≤30 s) is the CALLER's job (it re-sends the
+    /// last frame). Consumers must tolerate repeated frames for the
+    /// same stage. `None` = silent (tests, the bake).
     pub async fn materialize(
         &self,
         image_uri: &str,
@@ -204,7 +207,12 @@ impl Materializer {
         use engram_core::types::{MaterializeProgress, MaterializeStage};
         let report = |stage: MaterializeStage, detail: Option<String>| {
             if let Some(tx) = &progress {
-                let _ = tx.try_send(MaterializeProgress { stage, detail });
+                let _ = tx.try_send(MaterializeProgress {
+                    stage,
+                    detail,
+                    chunks_done: None,
+                    chunks_total: None,
+                });
             }
         };
 
@@ -372,8 +380,27 @@ impl Materializer {
         // recognize "already captured this exact rootfs" and reuse the
         // base snapshot. An already-present manifest is success.
         let chunk_started = std::time::Instant::now();
+        // Window-count frames feed the enable UI's chunk progress bar —
+        // one per flushed upload window (~every 512 MiB), so a dev-brain
+        // ext4 emits ~dozens, not thousands.
+        let chunk_progress = |done: u64, total: u64| {
+            if let Some(tx) = &progress {
+                let _ = tx.try_send(MaterializeProgress {
+                    stage: MaterializeStage::Chunk,
+                    detail: Some(format!("{ext4_size_bytes} ext4 bytes")),
+                    chunks_done: Some(done),
+                    chunks_total: Some(total),
+                });
+            }
+        };
         let manifest = chunk_store
-            .chunk_file(&ext4_path, ManifestKind::Disk, None)
+            .chunk_file_into(
+                &ext4_path,
+                ManifestKind::Disk,
+                None,
+                None,
+                Some(&chunk_progress),
+            )
             .await?;
         let chunk_ms = chunk_started.elapsed().as_millis() as u64;
         let disk_manifest = manifest.content_ref();

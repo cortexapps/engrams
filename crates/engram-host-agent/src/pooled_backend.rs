@@ -4973,6 +4973,7 @@ pub(crate) async fn chunk_memory_to_store(
             engram_chunk_store::ManifestKind::Memory,
             None,
             cache,
+            None,
         )
         .await
         .map_err(|e| {
