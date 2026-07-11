@@ -215,7 +215,9 @@ impl Materializer {
         // 1. Pull.
         report(MaterializeStage::Pull, Some(format!("{platform}")));
         let layers_dir = work.join("layers");
+        let pull_started = std::time::Instant::now();
         let pulled = pull::pull_image(&self.oci, image_uri, platform, &layers_dir).await?;
+        let pull_ms = pull_started.elapsed().as_millis() as u64;
 
         // 2. Flatten (sync tar/decompress IO — off the async runtime).
         // Each layer file is deleted as soon as it's applied, so the
@@ -230,12 +232,21 @@ impl Materializer {
         );
         let rootfs = work.join("rootfs");
         tokio::fs::create_dir_all(&rootfs).await?;
+        let flatten_started = std::time::Instant::now();
         let tree_meta = {
             let rootfs = rootfs.clone();
             let layers = pulled.layers.clone();
             tokio::task::spawn_blocking(move || -> Result<TreeMetadata, MaterializeError> {
                 let mut meta = TreeMetadata::default();
                 for layer in &layers {
+                    // Per-layer timing + entry delta: the flatten is the
+                    // dominant materialize leg for warm dev images
+                    // (prod-measured 48 min for a 16 GiB tree), and these
+                    // fields attribute it — a slow layer with a huge entry
+                    // delta is syscall-bound tiny-file creation; slow with a
+                    // small delta is decompression.
+                    let layer_started = std::time::Instant::now();
+                    let entries_before = meta.len();
                     let file = std::fs::File::open(&layer.path)?;
                     let reader = std::io::BufReader::new(file);
                     match layer.compression {
@@ -252,6 +263,13 @@ impl Materializer {
                         )?,
                         LayerCompression::None => flatten::apply_layer(&rootfs, &mut meta, reader)?,
                     }
+                    tracing::debug!(
+                        digest = %layer.digest,
+                        compression = ?layer.compression,
+                        entries = meta.len() - entries_before,
+                        elapsed_ms = layer_started.elapsed().as_millis() as u64,
+                        "layer applied to tree"
+                    );
                     let _ = std::fs::remove_file(&layer.path);
                 }
                 Ok(meta)
@@ -261,6 +279,14 @@ impl Materializer {
                 MaterializeError::Io(std::io::Error::other(format!("flatten task: {e}")))
             })??
         };
+        let flatten_ms = flatten_started.elapsed().as_millis() as u64;
+        tracing::info!(
+            image = %image_uri,
+            layers = pulled.layers.len(),
+            entries = tree_meta.len(),
+            elapsed_ms = flatten_ms,
+            "flattened layers into tree"
+        );
         if !tree_meta.skipped_xattrs.is_empty() {
             tracing::warn!(
                 count = tree_meta.skipped_xattrs.len(),
@@ -285,6 +311,7 @@ impl Materializer {
         // (tests, dev) gets PermissionDenied on the first foreign
         // chown and degrades to recorded-only — the same limitation
         // the retiring docker-export bake had.
+        let ownership_started = std::time::Instant::now();
         {
             let rootfs_c = rootfs.clone();
             let result = tokio::task::spawn_blocking(move || tree_meta.apply_ownership(&rootfs_c))
@@ -304,9 +331,11 @@ impl Materializer {
                 Err(e) => return Err(e.into()),
             }
         }
+        let ownership_ms = ownership_started.elapsed().as_millis() as u64;
 
         // 4. Deterministic pack: clamp mtimes, then mke2fs.
         report(MaterializeStage::Pack, None);
+        let clamp_started = std::time::Instant::now();
         {
             let rootfs_c = rootfs.clone();
             tokio::task::spawn_blocking(move || ext4::clamp_mtimes(&rootfs_c))
@@ -315,6 +344,7 @@ impl Materializer {
                     MaterializeError::Io(std::io::Error::other(format!("clamp task: {e}")))
                 })??;
         }
+        let clamp_ms = clamp_started.elapsed().as_millis() as u64;
         let dir_size = ext4::recursive_size(&rootfs).await?;
         let ext4_path = work.join("rootfs.ext4");
         let fs_size = ext4::recommended_size(dir_size);
@@ -324,7 +354,9 @@ impl Materializer {
             ext4_size_bytes = fs_size,
             "packing flattened tree to ext4"
         );
+        let pack_started = std::time::Instant::now();
         self.packer.pack(&rootfs, &ext4_path, fs_size).await?;
+        let pack_ms = pack_started.elapsed().as_millis() as u64;
         // The tree served its purpose — free it before chunking so the
         // scratch peak drops to just the ext4.
         let _ = tokio::fs::remove_dir_all(&rootfs).await;
@@ -339,9 +371,11 @@ impl Materializer {
         // reproduces the SAME ManifestRef, so the enable pipeline can
         // recognize "already captured this exact rootfs" and reuse the
         // base snapshot. An already-present manifest is success.
+        let chunk_started = std::time::Instant::now();
         let manifest = chunk_store
             .chunk_file(&ext4_path, ManifestKind::Disk, None)
             .await?;
+        let chunk_ms = chunk_started.elapsed().as_millis() as u64;
         let disk_manifest = manifest.content_ref();
         match chunk_store.get_manifest(disk_manifest).await {
             Ok(_) => {
@@ -353,12 +387,21 @@ impl Materializer {
             Err(_) => chunk_store.put_manifest(disk_manifest, &manifest).await?,
         }
 
+        // One-line stage attribution for the whole materialize — the
+        // "where did the hours go" answer for a big-image enable, readable
+        // straight off the host log without correlating stage frames.
         tracing::info!(
             image = %image_uri,
             platform = %platform,
             manifest = %disk_manifest,
             chunks = manifest.chunks.len(),
             ext4_size_bytes,
+            pull_ms,
+            flatten_ms,
+            ownership_ms,
+            clamp_ms,
+            pack_ms,
+            chunk_ms,
             "materialized image into chunk store"
         );
 
