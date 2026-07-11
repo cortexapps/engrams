@@ -40,6 +40,9 @@ function protoEnableJobToLegacy(j: ProtoEnableJob): EnableJob {
     warm_stage_started_at: j.warmStageStartedAt ?? null,
     output_tail: j.outputTail ?? null,
     prestage_hosts: j.prestageHosts,
+    warm_stages: j.warmStages,
+    materialize_stages: j.materializeStages,
+    materialize_host_id: j.materializeHostId ?? null,
   };
 }
 

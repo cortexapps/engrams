@@ -164,6 +164,22 @@ function HostCard({
               caps unreported
             </Badge>
           )}
+          {/* ADR 0088: in-flight enable work — the roll/drain gates wait
+              on these reaching zero, so a nonzero badge is the visual
+              answer to "why is the roll waiting on this host". */}
+          {(host.live_materializes > 0 || host.live_capture_jobs > 0) && (
+            <Badge
+              variant="secondary"
+              title="In-flight image-enable work bound to this host (live materialize / base-snapshot capture). Fleet rolls and drains wait for it (ADR 0088)."
+            >
+              {[
+                host.live_materializes > 0 ? `${host.live_materializes} materializing` : null,
+                host.live_capture_jobs > 0 ? `${host.live_capture_jobs} capturing` : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </Badge>
+          )}
           {host.status === "ready" && (
             <AlertDialog>
               <AlertDialogTrigger asChild>

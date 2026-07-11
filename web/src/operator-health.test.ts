@@ -26,6 +26,8 @@ const host = (
   failing_capabilities: failingCapabilities,
   fc_snapshot_version: "",
   capabilities_schema: 0,
+  live_materializes: 0,
+  live_capture_jobs: 0,
 });
 const row = (last_flush_at: string | null): DurabilityRow => ({
   sandbox_id: "s",

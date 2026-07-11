@@ -86,6 +86,10 @@ function makeProtoJob(
     updatedAt: new Date().toISOString(),
     // ADR 0036 amendment (issue #538): "{}" until the prestage stage runs.
     prestageHosts,
+    // ADR 0088 UI follow-up: "[]" before any stage frame arrives.
+    warmStages: "[]",
+    materializeStages: "[]",
+    materializeHostId: undefined,
   };
 }
 
@@ -463,6 +467,42 @@ describe("ImagesPanel RPC contract", () => {
 
     await waitFor(() => {
       expect(screen.getByText(/1\/2 hosts staged \(1 unschedulable\)/i)).toBeTruthy();
+    });
+  });
+
+  test("materialize stage timeline + live output render on an active job", async () => {
+    // ADR 0088 UI follow-up: the enable row must show the per-stage
+    // timeline (with the open stage marked live), the substage in the
+    // state badge, and the collapsible live output tail — the fix for
+    // "materializing chunks" being the only thing to watch for an hour.
+    const job = makeProtoJob("ghcr.io/cortex/api:warm-1", "materializing");
+    job.materializeStages = JSON.stringify([
+      {
+        name: "pull",
+        started_at: "2026-07-11T10:00:00Z",
+        ended_at: "2026-07-11T10:02:46Z",
+        outcome: "done",
+      },
+      { name: "flatten", started_at: "2026-07-11T10:02:46Z", ended_at: null, outcome: "running" },
+    ]);
+    job.outputTail = "materialize[flatten] 36 layers, 5706951764 compressed bytes";
+    job.materializeHostId = "5b819b12-988c-b030-ecd2-45deb5bbd8ea";
+    const { transport } = installCapturingTransport(
+      [makeProtoImage("ghcr.io/cortex/api:warm-1")],
+      [job],
+    );
+    renderWithProviders(<ImagesPanel />, { transport });
+
+    await waitFor(() => {
+      // Substage in the state badge + the timeline chips.
+      expect(screen.getByText(/materializing chunks · flatten/i)).toBeTruthy();
+      expect(screen.getByText("pull")).toBeTruthy();
+      expect(screen.getByText("2m 46s")).toBeTruthy();
+      // Materialize host attribution (short uuid).
+      expect(screen.getByText(/host 5b819b12/i)).toBeTruthy();
+      // The live tail rides a collapsed <details>.
+      expect(screen.getByText(/live output/i)).toBeTruthy();
+      expect(screen.getByText(/materialize\[flatten\] 36 layers/i)).toBeTruthy();
     });
   });
 
