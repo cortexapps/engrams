@@ -50,12 +50,13 @@ use engram_core::traits::sandbox::{BuildBaseSnapshotRequest, SandboxBackend};
 use engram_core::traits::{BlobStorage, ByteStream};
 use engram_core::types::capture_job::ColdBasePlan;
 use engram_core::types::image::WarmConfig;
-use engram_core::types::sandbox::{CpuLimit, DiskLimit, SandboxSpec};
+use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
+use futures::StreamExt;
 
 /// Wraps a real `BlobStorage` and counts `put_streaming` calls — the
 /// chunk store's write path calls this once per chunk it decides is
@@ -340,6 +341,33 @@ impl TestEnv {
         )
     }
 
+    /// Like [`Self::pooled`] but restoring in the PRODUCTION memory mode:
+    /// UFFD over a chunked memory manifest, served by the locally-built
+    /// `engram-uffd-handler`. No upload counting — the fidelity test
+    /// asserts bytes, not costs.
+    fn pooled_uffd(&self, handler: &Path) -> Arc<PooledBackend> {
+        let mut cfg = FirecrackerConfig::with_kernel(self.kernel.clone());
+        cfg.bundle_dir = self.staged.bundle_dir.clone();
+        cfg.net_pool = None;
+        cfg.restore_mode = RestoreMode::Uffd;
+        cfg.uffd_handler_bin = handler.to_path_buf();
+        cfg.track_dirty_pages = true;
+        cfg.default_boot_args =
+            "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
+        let inner = Arc::new(FirecrackerBackend::new(self.work.path(), cfg));
+        let store = ChunkStore::new(self.blob.clone());
+        let mut cache_cfg = engram_chunk_store::cache::ChunkCacheConfig::new(
+            self.work.path().join("chunk-cache-uffd"),
+        );
+        cache_cfg.budget_bytes = 1024 * 1024 * 1024;
+        Arc::new(
+            PooledBackend::new(inner)
+                .with_chunk_store(store, self.work.path().join("materialize-uffd"))
+                .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
+                .with_checkpoint_dir(self.work.path().join("checkpoints-uffd")),
+        )
+    }
+
     async fn bake(&self, name: &str) -> std::path::PathBuf {
         let outcome = common::bake_fixture_ext4(
             &self.images.path().join(format!("{name}.ext4")),
@@ -376,4 +404,173 @@ impl TestEnv {
             aux_ro_drives: vec![self.staged.agentd_slot()],
         }
     }
+}
+
+/// Incident 2026-07-10 regression gate: guest state that exists ONLY in
+/// RAM at capture time — dirty page cache the guest has not yet written
+/// back — must survive the warm capture pipeline in its production
+/// shape (pre-hook Full SEED → warm-hook writes → final DIFF → sparse
+/// re-chunk → chunked memory manifest) and a UFFD restore, and still
+/// read back intact after the restored guest syncs and drops its page
+/// cache.
+///
+/// In production, docker-overlay directories, Postgres index pages, and
+/// git metadata written mid-warm-hook came back as zeros / stale bytes
+/// in every session restored from the dev-brain base: the restored page
+/// cache masked the loss until memory pressure evicted it, then ext4
+/// dirblock checksums failed (`__ext4_find_entry: checksumming
+/// directory block 0`), PG reported `invalid page in block 0`, and
+/// `.git/HEAD` read back as foreign machine code.
+///
+/// Two-step verification splits the failure domain on a regression:
+///   1. read BEFORE sync+drop — served from restored RAM. Garbage here
+///      = the memory leg (FC diff fidelity / sparse re-chunk / UFFD
+///      serving) lost the pages.
+///   2. read AFTER `sync; echo 3 > drop_caches` — served from the disk
+///      backend after the restored guest wrote the pages back. Garbage
+///      only here = the write-back/disk leg.
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
+async fn unsynced_warm_writes_survive_uffd_restore_and_cache_drop() {
+    let Some(env) = TestEnv::gate() else { return };
+    // The production restore path is UFFD (chunked memory manifest); the
+    // shared TestEnv uses File mode for its dedup-cost assertions, so
+    // build a dedicated backend here.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let handler = Path::new(&manifest_dir).join("../../target/debug/engram-uffd-handler");
+    if !handler.exists() {
+        eprintln!(
+            "SKIP: engram-uffd-handler not built at {} — cargo build -p engram-uffd-handler",
+            handler.display(),
+        );
+        return;
+    }
+    let pooled = env.pooled_uffd(&handler);
+    let rootfs = env.bake("engram-unsynced-capture-test").await;
+
+    // The warm hook writes a deterministic 4 MiB sentinel to the ext4
+    // ROOT (not tmpfs!) and deliberately does NOT sync: at the final
+    // capture instant, seconds later, the sentinel exists only as dirty
+    // page cache in guest RAM (default writeback expiry is 30 s) — the
+    // exact state the incident lost. 4 MiB spans 8 memory-manifest
+    // chunks (512 KiB), so partial loss shows too. The sha of the
+    // regenerated stream is compared in-guest, so no digest needs to
+    // ride out of the hook.
+    let warm = WarmConfig {
+        command: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "yes engram-sentinel | head -c 4194304 > /engram-sentinel.bin".into(),
+        ],
+        timeout_secs: Some(60),
+        workdir: None,
+        env: Vec::new(),
+        network: None,
+    };
+
+    // Miss + warm ⇒ the SEED Full snapshot is taken BEFORE the hook and
+    // the final capture is a DIFF against it — the sentinel rides
+    // exclusively in the diff, mirroring the incident capture (seed
+    // 06:07 → docker/PG/git writes 06:10+ → final diff 06:24).
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let result = pooled
+        .build_base_snapshot(
+            BuildBaseSnapshotRequest {
+                spec: env.spec(&rootfs),
+                warm: Some(warm),
+                capture_env: Default::default(),
+                capture_egress: None,
+                cold_base_plan: ColdBasePlan::Miss {
+                    content_key: "fc-test-unsynced-sentinel-key".to_string(),
+                    reason: engram_core::types::capture_job::ColdBaseMissReason::NoCandidate,
+                },
+            },
+            tx,
+        )
+        .await
+        .expect("warm capture must succeed");
+    assert!(
+        result.cold_base.is_some_and(|cb| cb.freshly_captured),
+        "Miss + warm must have minted the pre-hook seed (the diff-shape precondition)",
+    );
+
+    let restored = pooled
+        .restore_fresh(result.snapshot, Vec::new())
+        .await
+        .expect("UFFD restore from the warm base snapshot");
+
+    let expected = exec_out(
+        &pooled,
+        restored,
+        "yes engram-sentinel | head -c 4194304 | sha256sum | cut -d' ' -f1",
+    )
+    .await;
+    assert_eq!(expected.trim().len(), 64, "sha helper sanity: {expected}");
+
+    // Step 1: restored-RAM view (page cache as captured).
+    let from_ram = exec_out(
+        &pooled,
+        restored,
+        "sha256sum /engram-sentinel.bin | cut -d' ' -f1",
+    )
+    .await;
+    assert_eq!(
+        from_ram.trim(),
+        expected.trim(),
+        "sentinel corrupted in RESTORED RAM — the memory leg (FC diff \
+         fidelity / sparse re-chunk / UFFD serving) lost or mangled \
+         pages the capture guest held as dirty page cache",
+    );
+
+    // Step 2: durability view — write back, drop every clean page,
+    // re-read through the disk backend.
+    let from_disk = exec_out(
+        &pooled,
+        restored,
+        "sync && echo 3 > /proc/sys/vm/drop_caches && sha256sum /engram-sentinel.bin | cut -d' ' -f1",
+    )
+    .await;
+    assert_eq!(
+        from_disk.trim(),
+        expected.trim(),
+        "sentinel corrupted after sync + drop_caches — restored RAM was \
+         intact but the write-back/disk leg lost it",
+    );
+
+    pooled.destroy(restored).await.expect("destroy restored");
+}
+
+/// Run a shell command in the guest via agentd exec and return stdout.
+/// Retries the dial until agentd answers (a freshly-restored guest's
+/// vsock comes up within a few hundred ms).
+async fn exec_out(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &str) -> String {
+    let req = ExecRequest {
+        command: vec!["/bin/sh".into(), "-c".into(), cmd.into()],
+        stdin: None,
+        env: HashMap::new(),
+        workdir: None,
+        timeout: Some(std::time::Duration::from_secs(30)),
+    };
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    let stream = loop {
+        match backend.exec_stream(id, req.clone()).await {
+            Ok(s) => break s,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("agent never came up: {e:?}"),
+        }
+    };
+    let mut events = stream.events;
+    let mut stdout = Vec::new();
+    while let Some(ev) = events.next().await {
+        use engram_core::types::sandbox::ExecEvent;
+        match ev {
+            ExecEvent::Stdout(b) => stdout.extend_from_slice(&b),
+            ExecEvent::Stderr(_) => {}
+            ExecEvent::Exit(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&stdout).into_owned()
 }

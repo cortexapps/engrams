@@ -1516,11 +1516,59 @@ impl ChunkedDiskBackend {
         let _flush_guard = pending.flush_guard;
         let new_chunks = pending.new_chunks;
         if new_chunks.is_empty() {
+            // Incident 2026-07-10 follow-up: an ARMED fork (ADR 0077 —
+            // fresh restore off a SHARED base manifest) must still
+            // materialize on an empty flush. The eviction capture records
+            // this outcome's ref as the session's disk lineage; returning
+            // the shared base ref for a session that never dirtied a
+            // chunk would resume it UNFORKED, and its post-resume flushes
+            // would tick the shared chain again. Publish the private id
+            // at v1 with the base's exact chunk list — one manifest PUT,
+            // no chunk uploads. (Residual gap, deliberate: a pod roll
+            // before ANY flush loses the in-memory `fork_identity`; the
+            // rehydrated backend can't distinguish shared-vs-private refs
+            // and re-attaches unforked. The window is one flush interval.)
+            let mut state = self.state.lock().await;
+            if let Some(fork_id) = state.fork_identity {
+                let forked_ref = ManifestRef {
+                    manifest_id: fork_id,
+                    version: 1,
+                };
+                let manifest = Manifest {
+                    schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+                    kind: ManifestKind::Disk,
+                    chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(chunk_size),
+                    total_bytes: self.total_bytes,
+                    chunks: state
+                        .base
+                        .chunks
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, h)| {
+                            h.map(|hash| ChunkRef {
+                                offset: (i as u64) * chunk_size,
+                                hash,
+                            })
+                        })
+                        .collect(),
+                    parent: Some(state.manifest_ref),
+                    working_set_trace: None,
+                    annotations: serde_json::Value::Null,
+                };
+                self.store.put_manifest(forked_ref, &manifest).await?;
+                state.manifest_ref = forked_ref;
+                state.fork_identity = None;
+                tracing::info!(
+                    manifest = %forked_ref,
+                    "empty flush materialized the armed manifest fork (no dirty chunks)",
+                );
+            }
             let out = DiskFlushOutcome {
-                manifest_ref: self.state.lock().await.manifest_ref,
+                manifest_ref: state.manifest_ref,
                 chunks_flushed: 0,
                 bytes_uploaded: 0,
             };
+            drop(state);
             self.stamp_flush_completion();
             return Ok(out);
         }
@@ -2261,6 +2309,56 @@ mod tests {
         assert_eq!(oa2.manifest_ref.version, 2);
     }
 
+    /// Incident 2026-07-10 follow-up: an ARMED fork materializes even on
+    /// an EMPTY flush. A base-restored session that never dirtied a chunk
+    /// gets evicted → the capture's flush records the outcome ref as its
+    /// disk lineage — that ref must be the PRIVATE id (published, v1),
+    /// never the shared base ref, or the resume re-attaches unforked and
+    /// post-resume flushes tick the shared chain again.
+    #[tokio::test]
+    async fn armed_fork_materializes_on_empty_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![(0, h0)]);
+        let base_ref = ManifestRef::new();
+        store.put_manifest(base_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache-empty-fork"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let backend = ChunkedDiskBackend::new(
+            base_ref,
+            &manifest,
+            ChunkCache::new(cfg),
+            store.clone(),
+            u64::MAX,
+        )
+        .unwrap();
+        backend.fork_manifest_identity().await;
+
+        // NO writes. The flush is empty — but the fork must still mint.
+        let out = backend.flush().await.unwrap();
+        assert_eq!(out.chunks_flushed, 0);
+        assert_ne!(
+            out.manifest_ref.manifest_id, base_ref.manifest_id,
+            "empty flush must materialize the armed fork, not return the shared base ref",
+        );
+        assert_eq!(out.manifest_ref.version, 1);
+        // The private manifest is PUBLISHED (resolvable) and carries the
+        // base's exact chunk list.
+        let forked = store.get_manifest(out.manifest_ref).await.unwrap();
+        assert_eq!(forked.chunks.len(), 1);
+        assert_eq!(forked.chunks[0].hash, h0);
+        // The shared base chain was never ticked.
+        assert!(store.get_manifest(base_ref.next_version()).await.is_err());
+        // A later real write ticks the private id (no re-fork).
+        backend.write(0, &[0x44u8; 8]).await.unwrap();
+        let out2 = backend.flush().await.unwrap();
+        assert_eq!(out2.manifest_ref.manifest_id, out.manifest_ref.manifest_id);
+        assert_eq!(out2.manifest_ref.version, 2);
+    }
+
     /// #584 review regression: `manifest_ref()` must stay STORE-RESOLVABLE
     /// between the fresh-create fork and the first publish. The eviction
     /// capture, finalize, and cow-state paths all `get_manifest` whatever
@@ -2298,30 +2396,34 @@ mod tests {
             .await
             .expect("pre-publish manifest_ref must resolve in the store");
 
-        // Zero-dirty flush (the evict-with-no-writes shape): still the
-        // resolvable base, no phantom publish.
+        // Zero-dirty flush (the evict-with-no-writes shape): the armed
+        // fork MATERIALIZES (incident 2026-07-10 — returning the shared
+        // base ref here resumed the session unforked), and the property
+        // this test exists for still holds: the outcome ref is PUBLISHED,
+        // never a dangling placeholder.
         let out = backend.flush().await.unwrap();
         assert_eq!(out.chunks_flushed, 0);
-        assert_eq!(
-            out.manifest_ref, base_ref,
-            "zero-dirty flush must not mint a ref"
+        assert_ne!(
+            out.manifest_ref.manifest_id, base_ref.manifest_id,
+            "zero-dirty flush must materialize the armed fork, not echo the shared base",
         );
+        assert_eq!(out.manifest_ref.version, 1);
         store
             .get_manifest(out.manifest_ref)
             .await
             .expect("zero-dirty flush outcome must resolve in the store");
 
-        // First real write adopts the private identity at v1 — and THAT
-        // resolves too.
+        // The first real write TICKS the (already-materialized) private
+        // identity — and that resolves too.
         backend.write(0, &[0x55u8; 4096]).await.unwrap();
-        let out = backend.flush().await.unwrap();
-        assert_ne!(out.manifest_ref.manifest_id, base_ref.manifest_id);
-        assert_eq!(out.manifest_ref.version, 1);
+        let out2 = backend.flush().await.unwrap();
+        assert_eq!(out2.manifest_ref.manifest_id, out.manifest_ref.manifest_id);
+        assert_eq!(out2.manifest_ref.version, 2);
         store
-            .get_manifest(out.manifest_ref)
+            .get_manifest(out2.manifest_ref)
             .await
-            .expect("first publish must resolve in the store");
-        assert_eq!(backend.manifest_ref().await, out.manifest_ref);
+            .expect("first real publish must resolve in the store");
+        assert_eq!(backend.manifest_ref().await, out2.manifest_ref);
     }
 
     /// The resume/recovery path (fork NOT armed) keeps ticking the id it

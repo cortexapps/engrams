@@ -188,6 +188,15 @@ pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lo
 /// after deploy would mean the skip path isn't exercised.
 pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";
 
+/// Incident 2026-07-10: a Diff capture failed AFTER Firecracker consumed
+/// (and reset) the KVM dirty-page bitmap, so its dirty set is
+/// unrecoverable and the sandbox's checkpoint chain was dropped — the
+/// next capture takes a FULL snapshot instead of a silently-incomplete
+/// Diff. Each increment is a corruption event AVOIDED; sustained
+/// increments mean the re-chunk/persist leg is unhealthy (find out why —
+/// Fulls are expensive) but never mean data loss.
+pub const CHECKPOINT_CHAIN_POISONED_TOTAL: &str = "engram_checkpoint_chain_poisoned_total";
+
 /// Issue #529: an `EvictionFinalizeRecord` (+ its `disk-pending/` chunk
 /// files, when the capture had a dirty disk tier) was durably persisted
 /// before `snapshot_begin` returned — the durability boundary moved
