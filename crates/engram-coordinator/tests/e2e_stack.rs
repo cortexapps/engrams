@@ -434,17 +434,26 @@ impl Driver {
     /// the load-bearing end-state assertion for Phase B e2e tests: a flush
     /// of dirty bytes — by either the FlushScheduler tick OR the admin
     /// flush trigger — advances `disk_manifest_version`.
+    /// Wait until the session's disk lineage advances past the given
+    /// baseline. Advancement is either a version tick WITHIN the same
+    /// manifest id, or the id CHANGING entirely: the first flush of a
+    /// session restored from a shared base FORKS to a private manifest
+    /// id whose version restarts at 1 (ADR 0077 phase 2), so version
+    /// numbers are only comparable within one id — a bare
+    /// `version > prior` predicate deadlocks on the fork.
     async fn wait_for_disk_manifest_advance(
         &mut self,
         sid: SessionId,
+        prior_id: &str,
         prior_version: u64,
         deadline: Duration,
-    ) -> Option<u64> {
+    ) -> Option<(String, u64)> {
         let started = std::time::Instant::now();
         while started.elapsed() < deadline {
             if let Some(state) = self.cow_state(sid).await {
-                if state.disk_manifest_version > prior_version {
-                    return Some(state.disk_manifest_version);
+                if state.disk_manifest_id != prior_id || state.disk_manifest_version > prior_version
+                {
+                    return Some((state.disk_manifest_id, state.disk_manifest_version));
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -984,10 +993,15 @@ async fn e2e_flush_now_applies_then_short_circuits_on_no_dirty() {
         return;
     }
 
-    // Step 4: capture the baseline disk_manifest_version BEFORE dd. The
-    // FlushScheduler may already have ticked between create-session and
-    // now; whatever version it left behind is what we measure forward from.
-    let baseline_version = cow.as_ref().map(|s| s.disk_manifest_version).unwrap_or(0);
+    // Step 4: capture the baseline disk lineage (id + version) BEFORE dd.
+    // The FlushScheduler may already have ticked — or FORKED the shared
+    // base id to the session's private one — between create-session and
+    // now; whatever (id, version) it left behind is what we measure
+    // forward from.
+    let (baseline_id, baseline_version) = cow
+        .as_ref()
+        .map(|s| (s.disk_manifest_id.clone(), s.disk_manifest_version))
+        .unwrap_or_default();
 
     // Step 5: write enough dirty bytes to materialise at least one full
     // 16 MiB chunk in the chunked-disk dirty buffer. `/var` is writable +
@@ -1018,21 +1032,28 @@ async fn e2e_flush_now_applies_then_short_circuits_on_no_dirty() {
     // disk lineage advances on writes, regardless of who drained the buffer.
     let _ = driver.flush_now(sid).await;
 
-    // Step 7: end-state assertion. Poll cow-state until the disk manifest
-    // version advances past `baseline_version`. The 90-second deadline
-    // covers one full scheduler tick (30s) + generous CI slack.
+    // Step 7: end-state assertion. Poll cow-state until the disk lineage
+    // advances past the baseline (a version tick, or the ADR 0077 fork to
+    // the session's private id). The 90-second deadline covers one full
+    // scheduler tick (30s) + generous CI slack.
     let advanced = driver
-        .wait_for_disk_manifest_advance(sid, baseline_version, Duration::from_secs(90))
+        .wait_for_disk_manifest_advance(
+            sid,
+            &baseline_id,
+            baseline_version,
+            Duration::from_secs(90),
+        )
         .await;
     assert!(
         advanced.is_some(),
-        "disk_manifest_version never advanced past baseline {baseline_version} in 90s — \
+        "disk lineage never advanced past baseline {baseline_id}@v{baseline_version} in 90s — \
          chunked-disk publish pipeline regressed",
     );
-    let v_after = advanced.unwrap();
+    let (id_after, v_after) = advanced.unwrap();
     assert!(
-        v_after > baseline_version,
-        "post-write manifest_version {v_after} must exceed baseline {baseline_version}",
+        id_after != baseline_id || v_after > baseline_version,
+        "post-write lineage {id_after}@v{v_after} must exceed baseline \
+         {baseline_id}@v{baseline_version}",
     );
 
     driver.delete(sid).await;
@@ -1128,10 +1149,10 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
     // non-trivial flush on the resumed sandbox. Capture the post-resume
     // baseline and write a NEW file so the assertion can't be satisfied by
     // stale state.
-    let post_resume_baseline = post_cow
+    let (post_resume_baseline_id, post_resume_baseline) = post_cow
         .as_ref()
-        .map(|s| s.disk_manifest_version)
-        .unwrap_or(0);
+        .map(|s| (s.disk_manifest_id.clone(), s.disk_manifest_version))
+        .unwrap_or_default();
 
     let post_dd = driver
         .exec(
@@ -1159,11 +1180,17 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
     // advance past the post-resume baseline. Pre-commit-5 this would hang
     // forever (resumed sandbox isn't in nbd_sandboxes).
     let post_advanced = driver
-        .wait_for_disk_manifest_advance(sid, post_resume_baseline, Duration::from_secs(90))
+        .wait_for_disk_manifest_advance(
+            sid,
+            &post_resume_baseline_id,
+            post_resume_baseline,
+            Duration::from_secs(90),
+        )
         .await;
     assert!(
         post_advanced.is_some(),
-        "post-resume disk_manifest_version never advanced past baseline {post_resume_baseline} in 90s — \
+        "post-resume disk lineage never advanced past baseline \
+         {post_resume_baseline_id}@v{post_resume_baseline} in 90s — \
          the resumed sandbox isn't rejoined to chunked-disk tracking",
     );
 
