@@ -376,7 +376,15 @@ async fn drive_one(act: &WaveActuator<'_>, node: &str, host: HostId) -> DriveOut
 }
 
 /// Poll the coordinator's drain gate until the host reports
-/// `running_sandboxes == 0` (or it's deregistered), or the budget elapses.
+/// `running_sandboxes == 0` AND no in-flight enable work (or it's
+/// deregistered), or the budget elapses.
+///
+/// ADR 0088: the sandbox count *incidentally* covers a capture VM (it is
+/// registered in the backend and counted) but a materialize boots no VM —
+/// without the `has_enable_work` leg, a scale-down could remove the node
+/// under a live materialize. Node removal genuinely destroys the work, so
+/// unlike the image roll's proceed-on-timeout gate, this stays inside the
+/// wave's existing release-the-victim-on-timeout semantics.
 async fn gate_drain(
     coord: &dyn CoordApi,
     host: HostId,
@@ -386,7 +394,7 @@ async fn gate_drain(
     loop {
         match coord.host_status(host).await? {
             None => return Ok(()), // already deregistered
-            Some(st) if st.running_sandboxes == 0 => return Ok(()),
+            Some(st) if st.running_sandboxes == 0 && !st.has_enable_work() => return Ok(()),
             Some(st) => {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(OperatorError::DrainTimeout {
@@ -619,6 +627,9 @@ mod tests {
         /// host_id → running_sandboxes returned by host_status (one entry per
         /// call, popped front; empty → 0).
         drain_progress: Mutex<HashMap<HostId, std::collections::VecDeque<u32>>>,
+        /// ADR 0088: host_id → (live_materializes, live_capture_jobs) per
+        /// host_status call (popped front; empty → (0, 0)).
+        enable_work: Mutex<HashMap<HostId, std::collections::VecDeque<(u32, u32)>>>,
         annotated: Mutex<Vec<String>>,
     }
     impl Rec {
@@ -646,9 +657,18 @@ mod tests {
                 .get_mut(&host)
                 .and_then(|q| q.pop_front())
                 .unwrap_or(0);
+            let (mats, caps) = self
+                .enable_work
+                .lock()
+                .unwrap()
+                .get_mut(&host)
+                .and_then(|q| q.pop_front())
+                .unwrap_or((0, 0));
             Ok(Some(HostStatus {
                 status: "draining".into(),
                 running_sandboxes: running,
+                live_materializes: mats,
+                live_capture_jobs: caps,
             }))
         }
         async fn cordon(&self, host: HostId) -> Result<(), OperatorError> {
@@ -772,6 +792,34 @@ mod tests {
         assert!(
             !log.iter().any(|l| l.starts_with("remove_node ")),
             "a timed-out victim is NEVER removed: {log:?}"
+        );
+    }
+
+    /// ADR 0088: zero sandboxes is no longer sufficient — in-flight enable
+    /// work (here a live capture job) holds the drain gate, and the wave
+    /// releases the victim on timeout instead of removing the node under it.
+    #[tokio::test(start_paused = true)]
+    async fn drive_one_blocks_on_live_enable_work() {
+        let rec = Arc::new(Rec::default());
+        let scaler = RecScaler { rec: rec.clone() };
+        let host = HostId::from_node_name("node-c");
+        // 0 running sandboxes throughout (materialize boots no VM), but a
+        // capture job stays live past the drain budget.
+        rec.enable_work
+            .lock()
+            .unwrap()
+            .insert(host, std::iter::repeat_n((0u32, 1u32), 100).collect());
+        let act = actuator(&rec, &scaler, 1);
+        let out = drive_victims(&act, &["node-c".to_string()]).await;
+        assert_eq!(out, 0, "released → not counted as in flight");
+        let log = rec.log();
+        assert!(
+            !log.iter().any(|l| l.starts_with("remove_node ")),
+            "a node with live enable work is NEVER removed: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.starts_with("uncordon ")),
+            "the enable-work timeout releases the victim: {log:?}"
         );
     }
 

@@ -18,6 +18,7 @@ spec:
   coordinatorUrl: {{ required "operator.coordinatorUrl is required when the operator is enabled" .Values.operator.coordinatorUrl | quote }}
   capacityFloor: {{ .Values.operator.capacityFloor }}
   drainTimeoutSeconds: {{ .Values.operator.drainTimeoutSeconds }}
+  enableWorkTimeoutSeconds: {{ .Values.operator.enableWorkTimeoutSeconds }}
   {{- if .Values.operator.autoscaling.enabled }}
   # ADR 0044 K4 + ADR 0048: node-pool autoscaling. Scale-up sizes the pool to
   # hold targetFreeMib of headroom (2D + queue-aware, one-shot); scale-down

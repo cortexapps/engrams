@@ -22,15 +22,30 @@ use tonic::transport::Channel;
 use crate::error::OperatorError;
 use crate::scaler::FleetDemand;
 
-/// The `HostView` fields the drain gate needs (from `FleetService.GetHost`).
+/// The `HostView` fields the drain/roll gates need (from
+/// `FleetService.GetHost`).
 #[derive(Debug)]
 pub struct HostStatus {
     /// `"ready"` | `"draining"` | `"dead"` — the coordinator's view.
     #[allow(dead_code)]
     pub status: String,
-    /// Live sandbox count from the host's latest heartbeat. The gate waits
-    /// for this to reach 0.
+    /// Live sandbox count from the host's latest heartbeat. The drain gate
+    /// waits for this to reach 0.
     pub running_sandboxes: u32,
+    /// ADR 0088: in-flight enable work bound to this host — enable_jobs
+    /// live-materializing here, and non-terminal capture_jobs. Both roll
+    /// paths wait on these reaching 0 before killing the host-agent pod
+    /// (a materialize/capture is the host-agent process's OWN work; unlike
+    /// session VMs it does not survive the pod swap).
+    pub live_materializes: u32,
+    pub live_capture_jobs: u32,
+}
+
+impl HostStatus {
+    /// Any in-flight enable work a pod kill would destroy.
+    pub fn has_enable_work(&self) -> bool {
+        self.live_materializes > 0 || self.live_capture_jobs > 0
+    }
 }
 
 /// One host's load + budget (from `FleetService.ListHosts`) — the fields the
@@ -200,6 +215,8 @@ impl CoordClient {
             Ok(resp) => Ok(resp.into_inner().host.map(|v| HostStatus {
                 status: v.status,
                 running_sandboxes: v.running_sandboxes,
+                live_materializes: v.live_materializes,
+                live_capture_jobs: v.live_capture_jobs,
             })),
             Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
             Err(status) => Err(OperatorError::Rpc {
