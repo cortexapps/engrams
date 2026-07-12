@@ -74,7 +74,8 @@ CONTAINER_BINS = {
 # dev_image lane (whose `just dev` stages the harness from source). It is in
 # NEITHER the container nor the host closure, so without this lane a
 # harness-only change shipped nothing (the bug this gate fixes).
-SESSION_HARNESS_BINS = {"engram-harness-claude"}
+SESSION_HARNESS_BINS = {"engram-harness-claude", "engram-harness-codex"}
+HARNESS_PATHS = ["deploy/harness-claude/", "deploy/harness-codex/"]
 # The product CLI (`engrams`, cli/ — Bun/TS, orchestrator-native; the Rust
 # engram-cli crate is retired). No cargo closure: its inputs are its own
 # sources + the generated proto bindings. OSS publishes it once as the
@@ -99,6 +100,7 @@ E2E_BINS = {
     "engram-host-agent",
     "engram-agentd",
     "engram-harness-claude",
+    "engram-harness-codex",
 }
 
 # Non-crate path prefixes per lane. `Cargo.lock`/root `Cargo.toml`/this
@@ -301,7 +303,7 @@ def main():
     # change (in neither container nor host closure) must rebake it too —
     # without this term, a harness change shipped nothing. NOT tripped by
     # doc/TF/helm-only pushes.
-    harness_changed = bool(cc & harness)
+    harness_changed = bool(cc & harness) or any_path(changed, HARNESS_PATHS)
     # A harness-source change must ALSO republish the `bundle-harness-claude`
     # artifact: publish-bundles builds it from the engram-harness-claude tree
     # (ADR 0062), and node-assets stages it onto the fleet. Without this term a
@@ -326,7 +328,11 @@ def main():
     # moved or any of its non-crate inputs changed. Skipping it on
     # doc/TF/web-only PRs is the win; a false positive just runs it
     # needlessly (safe), so this errs toward running.
-    e2e = bool(cc & e2e_closure) or any_path(changed, E2E_PATHS)
+    e2e = (
+        bool(cc & e2e_closure)
+        or any_path(changed, E2E_PATHS)
+        or any_path(changed, HARNESS_PATHS)
+    )
 
     # ── PR test-lane gating ────────────────────────────────────────────
     ci_self = any_path(changed, CI_SELF_PATHS)
@@ -334,7 +340,12 @@ def main():
     # lint + tests(linux) + the two macOS lanes build/test the whole workspace:
     # any workspace crate (cc — protos included via engram-protocol), a
     # lockfile/toolchain bump, or a CI-definition change.
-    test_rust = ci_self or bool(cc) or any_path(changed, RUST_COMMON)
+    test_rust = (
+        ci_self
+        or bool(cc)
+        or any_path(changed, RUST_COMMON)
+        or any_path(changed, HARNESS_PATHS)
+    )
     # musl cross-compile of the FC host binaries — same closure as host_binaries.
     test_cross = ci_self or host_binaries
     # Firecracker integration lane. Gated on the e2e binary CLOSURE (the FC

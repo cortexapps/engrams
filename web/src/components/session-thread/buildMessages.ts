@@ -661,6 +661,10 @@ export function buildMessages(
         heldUserText.delete(ev.prompt_id);
         break;
       }
+      case "prompt_steered":
+        // The durable user echo is already present; this is only the
+        // confirmation that the active agent turn consumed it.
+        break;
 
       default:
         // status_changed, evicted, checkpoint_* — not surfaced; the RAW

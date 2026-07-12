@@ -15,6 +15,7 @@ use engram_core::types::harness::HarnessDescriptor;
 /// built-in without a catalog row or an OCI pull. Single source of truth with the
 /// `harness.toml` shipped inside the harness-claude squashfs.
 const CLAUDE_HARNESS_TOML: &str = include_str!("../../../deploy/harness-claude/harness.toml");
+const CODEX_HARNESS_TOML: &str = include_str!("../../../deploy/harness-codex/harness.toml");
 
 /// A harness the platform ships built-in.
 pub struct BuiltinHarness {
@@ -34,11 +35,18 @@ impl BuiltinHarness {
     }
 }
 
-static BUILTINS: &[BuiltinHarness] = &[BuiltinHarness {
-    name: "claude",
-    descriptor_toml: CLAUDE_HARNESS_TOML,
-    stamp_key: "harness-claude",
-}];
+static BUILTINS: &[BuiltinHarness] = &[
+    BuiltinHarness {
+        name: "claude",
+        descriptor_toml: CLAUDE_HARNESS_TOML,
+        stamp_key: "harness-claude",
+    },
+    BuiltinHarness {
+        name: "codex",
+        descriptor_toml: CODEX_HARNESS_TOML,
+        stamp_key: "harness-codex",
+    },
+];
 
 /// Every built-in harness, in listing order.
 pub fn builtin_harnesses() -> &'static [BuiltinHarness] {
@@ -63,5 +71,15 @@ mod tests {
         assert_eq!(b.stamp_key, "harness-claude");
         // A built-in is never in the catalog: the name is resolved from here.
         assert!(builtin("definitely-not-a-builtin").is_none());
+    }
+
+    #[test]
+    fn embedded_codex_descriptor_is_valid() {
+        let b = builtin("codex").expect("codex is built-in");
+        let d = b.descriptor().expect("embedded codex harness.toml parses");
+        assert_eq!(d.name, "codex");
+        assert_eq!(d.auth.user_env.as_deref(), Some("CODEX_ACCESS_TOKEN"));
+        assert_eq!(d.auth.org_env.as_deref(), Some("CODEX_API_KEY"));
+        assert_eq!(b.stamp_key, "harness-codex");
     }
 }

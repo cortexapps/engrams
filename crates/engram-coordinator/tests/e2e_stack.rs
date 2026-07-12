@@ -275,6 +275,27 @@ impl Driver {
         self.create_session_retrying(req, "claude").await
     }
 
+    /// Select the built-in Codex bundle without making an external model call.
+    /// This proves the host stamp, built-in descriptor, and dyn_0 mount agree.
+    async fn create_session_codex(&mut self, image: &str) -> SessionId {
+        let req = app::CreateSessionRequest {
+            capabilities: Vec::new(),
+            integration_policy_json: E2E_ALLOW_ALL_POLICY.to_string(),
+            selected_skills: Vec::new(),
+            image_uri: image.to_string(),
+            mode: "agent".to_string(),
+            prompt: None,
+            secrets: HashMap::new(),
+            harness_env: HashMap::from([(
+                "CODEX_ACCESS_TOKEN".to_string(),
+                "bogus-e2e-token".to_string(),
+            )]),
+            prompt_id: None,
+            harness: Some("codex".to_string()),
+        };
+        self.create_session_retrying(req, "codex").await
+    }
+
     /// `SessionService.Exec` — server-streaming `ExecOutput`. Drains the
     /// stream to a collected stdout/stderr + exit status, mirroring the
     /// old unary `/exec` response shape the assertions expect.
@@ -853,6 +874,27 @@ async fn e2e_cold_session_claude_harness_can_exec_ls() {
     // ADR 0080 §D: ttyd is bundle-delivered, not baked — the no-harness
     // sibling test asserts the guest-tools mount; here plain exec working
     // with the harness bound is the property.
+    driver.delete(sid).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + the harness-codex bundle in the host stamp"]
+async fn e2e_cold_session_codex_harness_is_selectable() {
+    let mut driver = Driver::from_env().await;
+    let sid = driver.create_session_codex(&Driver::image_uri()).await;
+    let resp = driver
+        .exec(
+            sid,
+            "test -x /opt/engram/dyn/0/harness && test -x /opt/engram/dyn/0/codex",
+        )
+        .await;
+    assert_eq!(
+        resp.exit_status,
+        Some(0),
+        "Codex harness mount or CLI sidecar is not executable; stdout=<{}> stderr=<{}>",
+        resp.stdout,
+        resp.stderr,
+    );
     driver.delete(sid).await;
 }
 

@@ -42,19 +42,24 @@ mod adapter {
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::{ExitCode, ExitStatus, Stdio};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    #[cfg(test)]
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use clap::Parser;
     use engram_core::SessionId;
+    #[cfg(test)]
+    use engram_harness_proto::{read_msg, write_msg, HarnessFrame};
     use engram_harness_proto::{
-        read_msg, write_msg, AgentRole, EditHunk, FileChange, HarnessAttach, HarnessAttachAck,
-        HarnessCommand, HarnessEvent, HarnessFrame, MAX_FILE_CHANGE_BYTES,
+        AgentRole, EditHunk, FileChange, HarnessCommand, HarnessEvent, MAX_FILE_CHANGE_BYTES,
     };
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     use serde_json::Value;
-    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+    #[cfg(test)]
+    use tokio::io::AsyncWrite;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
     use tokio::sync::{mpsc, Notify};
     use tokio::time::{timeout, Instant};
@@ -249,182 +254,39 @@ mod adapter {
         //       engine re-announces `Idle` iff it's idle (so the host's
         //       soft idle-TTL stays armed for a genuinely-idle session),
         //       but a mid-run reconnect emits NO `Idle`.
-        let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(16);
-        let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(1024);
-        let reattach = Arc::new(Notify::new());
-        let held: HeldEvent = Arc::new(Mutex::new(None));
+        let engram_harness_sdk::Channels {
+            command_tx,
+            command_rx,
+            event_tx,
+            event_rx,
+            reattach,
+        } = engram_harness_sdk::Channels::new();
         // Issue #535 (d): no more env-seeded initial prompt — every prompt,
         // first or follow-up, arrives as a `HarnessCommand::Prompt` frame
         // over the same connection this loop dials. The engine starts with
         // an empty pending queue and waits.
 
-        let engine = tokio::spawn(run_engine(cli.clone(), cmd_rx, reattach.clone(), evt_tx));
-
-        // Connection loop: dial → handshake → splice (forward host
-        // commands / pump engine events) until the link drops, then
-        // re-dial. The engine drives termination.
-        //
-        // ADR 0045 C1: SIGUSR1 = "drop the connection and re-dial NOW",
-        // sent by agentd's SpawnHarness-reattach arm right after a live
-        // move / snapshot restore. The restore rebuilds the vsock
-        // device, but this side's established connection never EOFs —
-        // the splice would block forever on a read the peer can no
-        // longer answer, and the new host would never see an attach.
-        let mut reconnect_nudge =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
-                .expect("install SIGUSR1 handler");
-        let mut consecutive_failures: u32 = 0;
-        const MAX_BACKOFF_SECS: u64 = 10;
-        // The loop ends ONLY when the engine finishes on its own; every
-        // failure to reach or attach the host is retried forever (the
-        // harness is the session's sole event channel — giving up strands
-        // it). The engine's exit code is reaped after the loop.
-        loop {
-            // The engine owns shutdown: once it returns (Shutdown / all
-            // command senders gone) stop reconnecting and reap its code.
-            if engine.is_finished() {
-                break;
-            }
-            let stream = match dial(&cli).await {
-                Some(s) => s,
-                None => {
-                    // Couldn't reach the host at all — distinct from a
-                    // mid-session drop. Back off and KEEP TRYING,
-                    // forever. The harness is the session's only event
-                    // channel: a live move / snapshot restore rebuilds
-                    // the vsock device while the guest is CPU-starved
-                    // for tens of seconds, and the old give-up budget
-                    // (10 failures) expired exactly then — the harness
-                    // exited silently, the host kept a binding to a
-                    // corpse, and every later prompt 500'd ("sandbox
-                    // not found", prod canary 1f64052e). Dying never
-                    // helps: a genuinely-orphaned harness is reaped by
-                    // agentd's next SpawnHarness, and an idle retry at
-                    // the backoff cap costs nothing.
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    let backoff =
-                        std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(4));
-                    if consecutive_failures.is_power_of_two() {
-                        tracing::warn!(
-                            consecutive_failures,
-                            backoff_secs = backoff,
-                            "host unreachable; retrying indefinitely"
-                        );
-                    }
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
-                    continue;
-                }
-            };
-            let outcome = tokio::select! {
-                outcome = run_one_connection(stream, &cli, &cmd_tx, &mut evt_rx, &held, &reattach) => outcome,
-                _ = reconnect_nudge.recv() => {
-                    tracing::info!(
-                        "SIGUSR1 reconnect nudge (live move / restore); \
-                         dropping the connection and re-dialing"
-                    );
-                    ConnOutcome::Dropped { reason: "SIGUSR1 reconnect nudge" }
-                }
-            };
-            match outcome.reconnect() {
-                // Engine finished on its own — reap its code below.
-                Reconnect::Stop => break,
-                // Couldn't reach/attach the host: transport flake, handshake
-                // race, OR an attach REJECTION. The last one matters — during
-                // a host-agent roll the incoming host answers "no sandbox
-                // bound to this session_id" until its reattach pass repopulates
-                // the session→sandbox map. That window is transient; the old
-                // `Rejected => exit` arm turned it terminal and orphaned the
-                // agent across a deploy roll (session b9b28452). Back off and
-                // retry forever, exactly like the dial arm — a truly-misrouted
-                // harness is harmless to retry and gets reaped by agentd's next
-                // SpawnHarness.
-                Reconnect::Backoff => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    let backoff =
-                        std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(4));
-                    tracing::warn!(
-                        reason = outcome.reason(),
-                        consecutive_failures,
-                        backoff_secs = backoff,
-                        "harness could not attach to host; reconnecting"
-                    );
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
-                }
-                // The connection was established and later dropped —
-                // progress, not a failure to reach the host. Reset the
-                // give-up counter so a long-lived session that reconnects
-                // many times (across checkpoints) never exhausts it; settle
-                // briefly so a flapping link doesn't hot-loop.
-                Reconnect::Settle => {
-                    consecutive_failures = 0;
-                    tracing::warn!(
-                        reason = outcome.reason(),
-                        "harness connection dropped; reconnecting"
-                    );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
-
-        // The loop exits on EngineDone (engine already finished) or on a
-        // Superseded rejection (engine still RUNNING). Drop our command
-        // sender either way: the engine terminates when all senders are
-        // gone, and holding this one across the await turned the
-        // Superseded "exiting cleanly" into a LIE — the process lingered
-        // alive with its connection loop (and SIGUSR1 handler) dead, so
-        // agentd's SpawnHarness reattach arm saw a live pid, nudged a
-        // corpse-in-spirit forever, and never respawned a fresh harness:
-        // every resume from a live-harness checkpoint (evict_local, the
-        // ADR 0028 host-loss recovery) wedged prompt delivery permanently
-        // (prod session 7ed23d9f, 2026-07-06).
-        drop(cmd_tx);
-
-        // Engine finished — reap its exit code.
-        engine.await.unwrap_or_else(|e| {
-            tracing::error!(error = %e, "engine task panicked");
-            ExitCode::from(1)
-        })
-    }
-
-    /// Boxed stream half-pair so the outer reconnect loop can hold the
-    /// halves regardless of whether the transport was TCP or vsock.
-    type BoxedReader = Box<dyn AsyncRead + Unpin + Send>;
-    type BoxedWriter = Box<dyn AsyncWrite + Unpin + Send>;
-
-    /// Dial the harness hub. Returns `None` on transport failure
-    /// (logged at error). The outer loop turns that into a backoff
-    /// retry.
-    async fn dial(cli: &Cli) -> Option<(BoxedReader, BoxedWriter)> {
-        match (cli.connect.as_deref(), cli.vsock_host) {
-            (Some(addr), None) => match tokio::net::TcpStream::connect(addr).await {
-                Ok(s) => {
-                    let _ = s.set_nodelay(true);
-                    let (r, w) = tokio::io::split(s);
-                    Some((Box::new(r), Box::new(w)))
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, addr, "TCP dial failed");
-                    None
-                }
+        let engine = tokio::spawn(run_engine(
+            cli.clone(),
+            command_rx,
+            reattach.clone(),
+            event_tx,
+        ));
+        engram_harness_sdk::serve(
+            engram_harness_sdk::ConnectionConfig {
+                connect: cli.connect,
+                port: cli.vsock_host,
+                session_id: cli.session_id,
+                sandbox_id: cli.sandbox_id,
+                binding_epoch: cli.binding_epoch,
+                harness_version: format!("engram-harness-claude/{}", env!("CARGO_PKG_VERSION")),
             },
-            (None, Some(port)) => match engram_transport::from_env() {
-                Ok(transport) => match transport.dial(port).await {
-                    Ok(stream) => {
-                        let (r, w) = tokio::io::split(stream);
-                        Some((Box::new(r), Box::new(w)))
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, port, "transport dial failed");
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::error!(error = %e, "build transport from ENGRAM_TRANSPORT failed");
-                    None
-                }
-            },
-            _ => unreachable!("validated in entry()"),
-        }
+            engine,
+            command_tx,
+            event_rx,
+            reattach,
+        )
+        .await
     }
 
     /// The single event a connection pulled from the engine but hadn't
@@ -432,9 +294,11 @@ mod adapter {
     /// connection so a transient drop never loses an event. Only ever
     /// touched by `pump_events` (one connection at a time), under a sync
     /// lock so there's no await between pulling an event and parking it.
+    #[cfg(test)]
     type HeldEvent = Arc<Mutex<Option<HarnessEvent>>>;
 
     /// Outcome of one host connection's life.
+    #[cfg(test)]
     enum ConnOutcome {
         /// The engine finished (Shutdown / all command senders gone).
         /// Stop reconnecting and reap the engine's exit code.
@@ -461,6 +325,7 @@ mod adapter {
     /// What the reconnect loop does after one connection's outcome.
     /// Extracted so the retry policy is unit-testable in isolation.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg(test)]
     enum Reconnect {
         /// Engine finished — end the loop and reap its exit code.
         Stop,
@@ -471,6 +336,7 @@ mod adapter {
         Backoff,
     }
 
+    #[cfg(test)]
     impl ConnOutcome {
         /// The reconnect decision for this outcome. The load-bearing
         /// invariant: ONLY `EngineDone` stops the loop. An attach `Rejected`
@@ -1124,112 +990,12 @@ mod adapter {
         }
     }
 
-    /// Drive one host connection: handshake, then splice the transport
-    /// to the long-lived engine until the link drops. The two halves
-    /// run concurrently and either ending ends the connection. Both are
-    /// cancellation-safe: `forward_commands` only loses an in-flight
-    /// command on a dying link (the host retries), and `pump_events`
-    /// parks its un-acked event in `held` *before* awaiting the write.
-    async fn run_one_connection(
-        stream: (BoxedReader, BoxedWriter),
-        cli: &Cli,
-        cmd_tx: &mpsc::Sender<HarnessCommand>,
-        evt_rx: &mut mpsc::Receiver<HarnessEvent>,
-        held: &HeldEvent,
-        reattach: &Arc<Notify>,
-    ) -> ConnOutcome {
-        let (mut reader, mut writer) = stream;
-
-        // Handshake: announce who we are, await the host's ack.
-        if let Err(e) = write_msg(
-            &mut writer,
-            &HarnessAttach {
-                session_id: cli.session_id,
-                sandbox_id: cli.sandbox_id,
-                binding_epoch: cli.binding_epoch,
-                harness_version: format!("engram-harness-claude/{}", env!("CARGO_PKG_VERSION")),
-            },
-        )
-        .await
-        {
-            tracing::error!(error = %e, "attach write failed");
-            return ConnOutcome::HandshakeFailed {
-                reason: "attach_write",
-            };
-        }
-        match read_msg::<_, HarnessAttachAck>(&mut reader).await {
-            Ok(ack) if ack.ok => {}
-            Ok(ack) => {
-                // ADR 0073: typed rejection. `Superseded` is FATAL — a
-                // newer generation owns the session; retrying can never
-                // succeed, and exiting promptly is what makes the
-                // competing-bind loop (fbd3794c) unrepresentable.
-                // Everything else is transient (create/restore bind
-                // still in flight): the outer loop retries with backoff.
-                if ack.reject == Some(engram_harness_proto::AttachReject::Superseded) {
-                    tracing::warn!(
-                        "attach superseded: a newer binding generation owns this                          session; exiting cleanly",
-                    );
-                    return ConnOutcome::Superseded;
-                }
-                return ConnOutcome::Rejected {
-                    reason: ack.message.unwrap_or_else(|| "host rejected attach".into()),
-                };
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "attach ack read failed");
-                return ConnOutcome::HandshakeFailed { reason: "ack_read" };
-            }
-        }
-
-        // Live. Tell the engine a connection attached so it re-announces
-        // `Idle` if (and only if) it's currently idle.
-        reattach.notify_one();
-
-        // Splice: forward host→guest commands and pump guest→host
-        // events concurrently. Whichever side dies first ends the
-        // connection; the engine keeps running regardless.
-        tokio::select! {
-            reason = forward_commands(&mut reader, cmd_tx) => ConnOutcome::Dropped { reason },
-            outcome = pump_events(&mut writer, evt_rx, held) => outcome,
-        }
-    }
-
-    /// Read host→guest frames and shovel commands onto the engine's
-    /// long-lived command channel. Returns the drop reason when the
-    /// read side dies. A `send` failure means the engine is gone, which
-    /// the pump reports as `EngineDone`; here we just stop reading.
-    async fn forward_commands<R>(
-        reader: &mut R,
-        cmd_tx: &mpsc::Sender<HarnessCommand>,
-    ) -> &'static str
-    where
-        R: AsyncRead + Unpin,
-    {
-        loop {
-            match read_msg::<_, HarnessFrame>(reader).await {
-                // Track A: a re-handshake is handled entirely at the
-                // connection layer — drop the link so the outer loop
-                // re-dials and the re-attach re-emits `Idle`. It is never
-                // forwarded to the engine (the running agent is untouched).
-                // This is the in-band twin of the SIGUSR1 reconnect nudge.
-                Ok(HarnessFrame::Command(c)) => {
-                    if cmd_tx.send(c).await.is_err() {
-                        return "engine_gone";
-                    }
-                }
-                Ok(HarnessFrame::Event(_)) => {} // hosts don't send events
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return "eof",
-                Err(_) => return "read_error",
-            }
-        }
-    }
-
     /// Drain engine events to the current connection's writer. The
     /// event being written is parked in `held` *before* the await, so
     /// if this future is cancelled (the read half died) or the write
     /// fails, the event survives and is re-sent on the next connection
     /// — at-least-once delivery across a reconnect, no loss.
+    #[cfg(test)]
     async fn pump_events<W>(
         writer: &mut W,
         evt_rx: &mut mpsc::Receiver<HarnessEvent>,
@@ -1489,18 +1255,8 @@ mod adapter {
         // spawn comment). On an abnormal exit we attach this tail to a
         // System message so the failure cause survives VM teardown.
         let stderr = child.stderr.take().expect("piped stderr");
-        let stderr_task: tokio::task::JoinHandle<Vec<String>> = tokio::spawn(async move {
-            let mut tail: VecDeque<String> = VecDeque::with_capacity(MAX_STDERR_TAIL_LINES + 1);
-            let mut elines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = elines.next_line().await {
-                eprintln!("{line}");
-                if tail.len() >= MAX_STDERR_TAIL_LINES {
-                    tail.pop_front();
-                }
-                tail.push_back(line);
-            }
-            tail.into_iter().collect()
-        });
+        let stderr_task =
+            engram_harness_sdk::spawn_stderr_tail(stderr, MAX_STDERR_TAIL_LINES, true);
 
         let mut turn: Option<TurnState> = None;
         let mut shutting_down = false;
@@ -2864,16 +2620,7 @@ mod adapter {
     }
 
     pub fn truncate_str(s: &str, max_bytes: usize) -> String {
-        if s.len() <= max_bytes {
-            return s.to_string();
-        }
-        let mut end = max_bytes;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        let mut truncated = s[..end].to_string();
-        truncated.push_str("…[truncated]");
-        truncated
+        engram_harness_sdk::truncate_utf8(s, max_bytes)
     }
 
     #[cfg(test)]
@@ -2979,6 +2726,7 @@ mod adapter {
                 Reconnect::Settle,
             );
             assert_eq!(ConnOutcome::EngineDone.reconnect(), Reconnect::Stop);
+            assert_eq!(ConnOutcome::Superseded.reconnect(), Reconnect::Stop);
         }
 
         // ADR 0054 Part C: the scrub removes exactly the suppressed

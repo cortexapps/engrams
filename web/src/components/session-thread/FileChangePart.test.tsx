@@ -5,7 +5,7 @@
 
 import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import { FileChangePart } from "./FileChangePart";
+import { beforeAfter, FileChangePart } from "./FileChangePart";
 import type { FileChangeArgs } from "./buildMessages";
 
 afterEach(cleanup);
@@ -35,5 +35,16 @@ describe("FileChangePart", () => {
     expect(screen.getByText(/^\+\d+$/)).toBeTruthy();
     // Deletions use the U+2212 minus sign, matching the component.
     expect(screen.getByText(/^−\d+$/)).toBeTruthy();
+  });
+});
+
+describe("Codex unified patches", () => {
+  test("reconstructs before and after content for the Pierre renderer", () => {
+    const result = beforeAfter({
+      patch: {
+        unified_diff: "--- a/demo.txt\n+++ b/demo.txt\n@@ -1,2 +1,2 @@\n keep\n-old\n+new\n",
+      },
+    });
+    expect(result).toEqual({ before: "keep\nold", after: "keep\nnew" });
   });
 });

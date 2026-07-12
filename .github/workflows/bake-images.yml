@@ -642,7 +642,8 @@ jobs:
           CLAUDE_VERSION=2.1.185
           # ADR 0080: agentd ships as bundle-agentd off this same musl build
           # (no image bake carries it anymore).
-          cargo build --release --target x86_64-unknown-linux-musl -p engram-harness-claude -p engram-agentd
+          cargo build --release --target x86_64-unknown-linux-musl \
+            -p engram-harness-claude -p engram-harness-codex -p engram-agentd
           curl -fsSL --retry 3 \
             "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
             -o /tmp/claude
@@ -652,6 +653,14 @@ jobs:
           cp -p target/x86_64-unknown-linux-musl/release/engram-harness-claude "$STAGE/harness"
           cp -p /tmp/claude "$STAGE/claude"
           cp -p deploy/harness-claude/harness.toml "$STAGE/harness.toml"
+
+      - name: Stage harness-codex tree
+        run: |
+          set -euo pipefail
+          STAGE="$PWD/var/harness-codex-stage"
+          deploy/harness-codex/stage.sh x86_64 \
+            target/x86_64-unknown-linux-musl/release/engram-harness-codex \
+            "$STAGE"
 
       - name: Build bundles
         run: |
@@ -677,6 +686,7 @@ jobs:
           deploy/bundles/ide/build.sh dist/ide.squashfs
           # ADR 0062: the built-in claude harness (tree staged above).
           deploy/bundles/harness-claude/build.sh var/harness-claude-stage dist/harness-claude.squashfs
+          deploy/bundles/harness-codex/build.sh var/harness-codex-stage dist/harness-codex.squashfs
           # ADR 0080: agentd — the guest control surface, exec'd out of this
           # bundle by the stage-1 init; an agentd change ships fleet-wide by
           # republishing this (zero image re-bakes / recaptures).
@@ -703,7 +713,7 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${SHA:0:7}"
-          for name in sentinel skills integrations-cli browser ide harness-claude agentd guest-tools; do
+          for name in sentinel skills integrations-cli browser ide harness-claude harness-codex agentd guest-tools; do
             REPO="ghcr.io/${{ github.repository }}/bundle-$name"
             # `oras pull <repo>:<sha>` drops <name>.squashfs into cwd verbatim.
             oras push "$REPO:$SHA" \
