@@ -883,12 +883,17 @@ async fn e2e_cold_session_codex_harness_is_selectable() {
     let mut driver = Driver::from_env().await;
     let sid = driver.create_session_codex(&Driver::image_uri()).await;
     let resp = driver
-        .exec(sid, "test -x /opt/engram/harness/harness")
+        .exec(
+            sid,
+            "test -x /opt/engram/dyn/0/harness && test -x /opt/engram/dyn/0/codex",
+        )
         .await;
     assert_eq!(
         resp.exit_status,
         Some(0),
-        "Codex harness mount is not executable"
+        "Codex harness mount or CLI sidecar is not executable; stdout=<{}> stderr=<{}>",
+        resp.stdout,
+        resp.stderr,
     );
     driver.delete(sid).await;
 }
