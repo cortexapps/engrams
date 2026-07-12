@@ -37,7 +37,7 @@ jobs:
       LINUX_VERSION: ${{ github.event.inputs.linux_version || '6.1.102' }}
       KERNEL_REV: ${{ github.event.inputs.kernel_rev || '1' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install kernel build deps
         run: |

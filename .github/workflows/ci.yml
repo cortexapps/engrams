@@ -140,7 +140,7 @@ jobs:
       test_cli: ${{ steps.lanes.outputs.test_cli }}
       test_buf: ${{ steps.lanes.outputs.test_buf }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Full history so the PR base SHA is present for the diff.
           fetch-depth: 0
@@ -163,7 +163,7 @@ jobs:
     if: needs.detect.outputs.test_rust == 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -266,7 +266,7 @@ jobs:
       STORAGE_EMULATOR_HOST: http://localhost:4443
       ENGRAM_TEST_GCS_BUCKET: engram-snapshots-test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # Install protoc via apt: arduino/setup-protoc@v3 with a pinned
       # version *still* called the GH releases API to validate and
@@ -393,7 +393,7 @@ jobs:
       CFLAGS_x86_64_unknown_linux_musl: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
       BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -469,7 +469,7 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
         with:
           version: 9
@@ -534,7 +534,7 @@ jobs:
       # schema before the suite; DBOS creates its own `dbos` schema on launch.
       ORCHESTRATOR_DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_orchestrator_test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -559,7 +559,7 @@ jobs:
       run:
         working-directory: cli
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -596,7 +596,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Lint (fatal). Split from breaking because a single buf-action run
       # can't make one check fatal and another advisory.
       - name: buf lint (fatal)
@@ -677,7 +677,7 @@ jobs:
     # tests enough headroom to run microVMs without queuing.
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -740,7 +740,7 @@ jobs:
           sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" /usr/local/bin/firecracker
           firecracker --version
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       # ADR 0045 Phase B: stage both binaries for the stock<->fork
       # snapshot-compat test (`stock_fork_snapshot_compat`). Stock = the
@@ -775,14 +775,14 @@ jobs:
       # total). Without the cache, every CI run pays a ~19 min
       # download from `spec.ccfc.min` (Firecracker's S3 bucket).
       #
-      # On Blacksmith runners, actions/cache@v4 transparently uses
+      # On Blacksmith runners, actions/cache@v6 transparently uses
       # Blacksmith's colocated cache — see
       # https://docs.blacksmith.sh/github-actions-runners/blacksmith-cache.
       # No useblacksmith/* fork needed (those are archived). The
       # cache key hashes the fetch script content, so bumping
       # either URL (kernel or rootfs version) invalidates cleanly.
       - name: Cache FC kernel + rootfs artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/engram-fc-test
           key: fc-test-artifacts-${{ hashFiles('crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh') }}
@@ -838,7 +838,7 @@ jobs:
       # tolerates whatever version is in the cache and only
       # re-downloads when the cache misses.
       - name: Cache Claude Code CLI
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/engram-e2e-harness
           # Refresh every ~week — gives some staleness so we
@@ -1142,7 +1142,7 @@ jobs:
       # uploads as a workflow artifact and never touches GHCR.
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -1220,7 +1220,7 @@ jobs:
       # Always runs so the artifact exists regardless of whether the
       # GHCR push below ran.
       - name: Upload staged harness as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: harness-claude-artifact
           path: ${{ steps.stage.outputs.dir }}
@@ -1243,7 +1243,7 @@ jobs:
           echo "dir=$STAGE" >> "$GITHUB_OUTPUT"
 
       - name: Upload staged Codex harness as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: harness-codex-artifact
           path: ${{ steps.stage_codex.outputs.dir }}
@@ -1255,7 +1255,7 @@ jobs:
       # stamp) and future consumers see the same artifact.
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1334,7 +1334,7 @@ jobs:
       matrix:
         variant: [demo]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # ADR 0080: a session image is a plain `docker build && docker push`
       # of a standard OCI image — no engram-cli bake, no agentd/ttyd
@@ -1342,7 +1342,7 @@ jobs:
       # host-side (MaterializeImage) at enable time. So this job is now a
       # straight buildx build+push, same shape as bake-images.yml.
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1367,10 +1367,10 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build + push ${{ matrix.variant }} image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/${{ matrix.variant }}/Dockerfile
@@ -1407,7 +1407,7 @@ jobs:
       || github.event_name == 'merge_group'
       || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -1456,7 +1456,7 @@ jobs:
               -p engram-agentd
 
       - name: Upload e2e binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-binaries
           path: |
@@ -1585,7 +1585,7 @@ jobs:
       contents: read
       packages: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -1647,7 +1647,7 @@ jobs:
           firecracker --version
 
       - name: Cache FC kernel + rootfs artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/engram-fc-test
           key: fc-test-artifacts-${{ hashFiles('crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh') }}
@@ -1675,14 +1675,14 @@ jobs:
       # makes the order unambiguous: nothing can prune what hasn't
       # been written yet.
       #
-      # actions/upload-artifact@v4 strips the longest common path
+      # actions/upload-artifact@v7 strips the longest common path
       # prefix shared by all `path:` entries when packing — for the
       # artifacts-e2e-stack upload that's `target/`, so the artifact
       # contents are flattened to `release/...` +
       # `x86_64-unknown-linux-musl/release/...`. Downloading directly
       # into `./target/` reconstructs the expected layout in place.
       - name: Download e2e binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: e2e-binaries
           path: ./target/
@@ -1733,13 +1733,13 @@ jobs:
       # resolves the built-in from the host's current_bundles + its embedded
       # descriptor.
       - name: Download harness-claude artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: harness-claude-artifact
           path: var/harness-claude-stage
 
       - name: Download harness-codex artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: harness-codex-artifact
           path: var/harness-codex-stage
@@ -1888,7 +1888,7 @@ jobs:
     if: needs.detect.outputs.test_rust == 'true'
     runs-on: blacksmith-6vcpu-macos-15  # arm64, has Xcode CLT pre-installed
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -1942,7 +1942,7 @@ jobs:
     if: needs.detect.outputs.test_rust == 'true'
     runs-on: blacksmith-6vcpu-macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
         with:
