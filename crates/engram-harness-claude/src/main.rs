@@ -42,19 +42,24 @@ mod adapter {
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::{ExitCode, ExitStatus, Stdio};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    #[cfg(test)]
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use clap::Parser;
     use engram_core::SessionId;
+    #[cfg(test)]
+    use engram_harness_proto::{read_msg, write_msg, HarnessFrame};
     use engram_harness_proto::{
-        read_msg, write_msg, AgentRole, EditHunk, FileChange, HarnessAttach, HarnessAttachAck,
-        HarnessCommand, HarnessEvent, HarnessFrame, MAX_FILE_CHANGE_BYTES,
+        AgentRole, EditHunk, FileChange, HarnessCommand, HarnessEvent, MAX_FILE_CHANGE_BYTES,
     };
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     use serde_json::Value;
-    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+    #[cfg(test)]
+    use tokio::io::AsyncWrite;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
     use tokio::sync::{mpsc, Notify};
     use tokio::time::{timeout, Instant};
@@ -282,50 +287,6 @@ mod adapter {
             reattach,
         )
         .await
-    }
-
-    /// Boxed stream half-pair so the outer reconnect loop can hold the
-    /// halves regardless of whether the transport was TCP or vsock.
-    #[cfg(test)]
-    type BoxedReader = Box<dyn AsyncRead + Unpin + Send>;
-    #[cfg(test)]
-    type BoxedWriter = Box<dyn AsyncWrite + Unpin + Send>;
-
-    /// Dial the harness hub. Returns `None` on transport failure
-    /// (logged at error). The outer loop turns that into a backoff
-    /// retry.
-    #[cfg(test)]
-    async fn dial(cli: &Cli) -> Option<(BoxedReader, BoxedWriter)> {
-        match (cli.connect.as_deref(), cli.vsock_host) {
-            (Some(addr), None) => match tokio::net::TcpStream::connect(addr).await {
-                Ok(s) => {
-                    let _ = s.set_nodelay(true);
-                    let (r, w) = tokio::io::split(s);
-                    Some((Box::new(r), Box::new(w)))
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, addr, "TCP dial failed");
-                    None
-                }
-            },
-            (None, Some(port)) => match engram_transport::from_env() {
-                Ok(transport) => match transport.dial(port).await {
-                    Ok(stream) => {
-                        let (r, w) = tokio::io::split(stream);
-                        Some((Box::new(r), Box::new(w)))
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, port, "transport dial failed");
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::error!(error = %e, "build transport from ENGRAM_TRANSPORT failed");
-                    None
-                }
-            },
-            _ => unreachable!("validated in entry()"),
-        }
     }
 
     /// The single event a connection pulled from the engine but hadn't
@@ -1025,109 +986,6 @@ mod adapter {
                     }
                     // loop → respawn with --resume
                 }
-            }
-        }
-    }
-
-    /// Drive one host connection: handshake, then splice the transport
-    /// to the long-lived engine until the link drops. The two halves
-    /// run concurrently and either ending ends the connection. Both are
-    /// cancellation-safe: `forward_commands` only loses an in-flight
-    /// command on a dying link (the host retries), and `pump_events`
-    /// parks its un-acked event in `held` *before* awaiting the write.
-    #[cfg(test)]
-    async fn run_one_connection(
-        stream: (BoxedReader, BoxedWriter),
-        cli: &Cli,
-        cmd_tx: &mpsc::Sender<HarnessCommand>,
-        evt_rx: &mut mpsc::Receiver<HarnessEvent>,
-        held: &HeldEvent,
-        reattach: &Arc<Notify>,
-    ) -> ConnOutcome {
-        let (mut reader, mut writer) = stream;
-
-        // Handshake: announce who we are, await the host's ack.
-        if let Err(e) = write_msg(
-            &mut writer,
-            &HarnessAttach {
-                session_id: cli.session_id,
-                sandbox_id: cli.sandbox_id,
-                binding_epoch: cli.binding_epoch,
-                harness_version: format!("engram-harness-claude/{}", env!("CARGO_PKG_VERSION")),
-            },
-        )
-        .await
-        {
-            tracing::error!(error = %e, "attach write failed");
-            return ConnOutcome::HandshakeFailed {
-                reason: "attach_write",
-            };
-        }
-        match read_msg::<_, HarnessAttachAck>(&mut reader).await {
-            Ok(ack) if ack.ok => {}
-            Ok(ack) => {
-                // ADR 0073: typed rejection. `Superseded` is FATAL — a
-                // newer generation owns the session; retrying can never
-                // succeed, and exiting promptly is what makes the
-                // competing-bind loop (fbd3794c) unrepresentable.
-                // Everything else is transient (create/restore bind
-                // still in flight): the outer loop retries with backoff.
-                if ack.reject == Some(engram_harness_proto::AttachReject::Superseded) {
-                    tracing::warn!(
-                        "attach superseded: a newer binding generation owns this                          session; exiting cleanly",
-                    );
-                    return ConnOutcome::Superseded;
-                }
-                return ConnOutcome::Rejected {
-                    reason: ack.message.unwrap_or_else(|| "host rejected attach".into()),
-                };
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "attach ack read failed");
-                return ConnOutcome::HandshakeFailed { reason: "ack_read" };
-            }
-        }
-
-        // Live. Tell the engine a connection attached so it re-announces
-        // `Idle` if (and only if) it's currently idle.
-        reattach.notify_one();
-
-        // Splice: forward host→guest commands and pump guest→host
-        // events concurrently. Whichever side dies first ends the
-        // connection; the engine keeps running regardless.
-        tokio::select! {
-            reason = forward_commands(&mut reader, cmd_tx) => ConnOutcome::Dropped { reason },
-            outcome = pump_events(&mut writer, evt_rx, held) => outcome,
-        }
-    }
-
-    /// Read host→guest frames and shovel commands onto the engine's
-    /// long-lived command channel. Returns the drop reason when the
-    /// read side dies. A `send` failure means the engine is gone, which
-    /// the pump reports as `EngineDone`; here we just stop reading.
-    #[cfg(test)]
-    async fn forward_commands<R>(
-        reader: &mut R,
-        cmd_tx: &mpsc::Sender<HarnessCommand>,
-    ) -> &'static str
-    where
-        R: AsyncRead + Unpin,
-    {
-        loop {
-            match read_msg::<_, HarnessFrame>(reader).await {
-                // Track A: a re-handshake is handled entirely at the
-                // connection layer — drop the link so the outer loop
-                // re-dials and the re-attach re-emits `Idle`. It is never
-                // forwarded to the engine (the running agent is untouched).
-                // This is the in-band twin of the SIGUSR1 reconnect nudge.
-                Ok(HarnessFrame::Command(c)) => {
-                    if cmd_tx.send(c).await.is_err() {
-                        return "engine_gone";
-                    }
-                }
-                Ok(HarnessFrame::Event(_)) => {} // hosts don't send events
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return "eof",
-                Err(_) => return "read_error",
             }
         }
     }
@@ -2868,6 +2726,7 @@ mod adapter {
                 Reconnect::Settle,
             );
             assert_eq!(ConnOutcome::EngineDone.reconnect(), Reconnect::Stop);
+            assert_eq!(ConnOutcome::Superseded.reconnect(), Reconnect::Stop);
         }
 
         // ADR 0054 Part C: the scrub removes exactly the suppressed
