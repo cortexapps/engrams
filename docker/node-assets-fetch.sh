@@ -118,6 +118,8 @@ ide_sha="$(stage_bundle ide)"
 # resolves the built-in's squashfs from this stamp (key `harness-claude`) + its
 # embedded descriptor, mounts it on dyn_0, and the session execs it. No registration.
 harness_claude_sha="$(stage_bundle harness-claude)"
+# Built-in Codex harness (adapter + pinned Codex CLI).
+harness_codex_sha="$(stage_bundle harness-codex)"
 # ADR 0080: agentd is MANDATORY like the sentinel — every guest boots by the
 # stage-1 init copying agentd out of this bundle (reserved slot dyn_1), and a
 # fresh-create restore re-execs onto whatever generation this stamp carries.
@@ -130,8 +132,8 @@ agentd_sha="$(stage_bundle agentd)"
 # bake ttyd.
 guest_tools_sha="$(stage_bundle guest-tools)"
 # Stamp: logical name -> sha256, matching AuxRoDrive::CURRENT_STAMP / read_stamp().
-printf '{"sentinel":"%s","skills":"%s","integrations-cli":"%s","browser":"%s","ide":"%s","harness-claude":"%s","agentd":"%s","guest-tools":"%s"}\n' \
-  "$sentinel_sha" "$skills_sha" "$integrations_cli_sha" "$browser_sha" "$ide_sha" "$harness_claude_sha" "$agentd_sha" "$guest_tools_sha" \
+printf '{"sentinel":"%s","skills":"%s","integrations-cli":"%s","browser":"%s","ide":"%s","harness-claude":"%s","harness-codex":"%s","agentd":"%s","guest-tools":"%s"}\n' \
+  "$sentinel_sha" "$skills_sha" "$integrations_cli_sha" "$browser_sha" "$ide_sha" "$harness_claude_sha" "$harness_codex_sha" "$agentd_sha" "$guest_tools_sha" \
   > "$BUNDLES_OUT/current.json"
 
 echo "==> staged into ${OUT}:"

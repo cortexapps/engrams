@@ -1,0 +1,45 @@
+name = "codex"
+label = "Codex"
+description = "OpenAI Codex coding agent. Human runs use a ChatGPT-backed access token; programmatic runs use an organization API key."
+exec = "harness"
+
+[auth]
+org_env = "CODEX_API_KEY"
+user_env = "CODEX_ACCESS_TOKEN"
+
+[[models]]
+id = "gpt-5.6"
+label = "GPT-5.6"
+default = true
+env = { ENGRAM_CODEX_MODEL = "gpt-5.6" }
+
+[[models]]
+id = "gpt-5.6-terra"
+label = "GPT-5.6 Terra"
+env = { ENGRAM_CODEX_MODEL = "gpt-5.6-terra" }
+
+[[models]]
+id = "gpt-5.6-luna"
+label = "GPT-5.6 Luna"
+env = { ENGRAM_CODEX_MODEL = "gpt-5.6-luna" }
+
+[[effort]]
+id = "medium"
+label = "Medium"
+default = true
+env = { ENGRAM_CODEX_EFFORT = "medium" }
+
+[[effort]]
+id = "low"
+label = "Low"
+env = { ENGRAM_CODEX_EFFORT = "low" }
+
+[[effort]]
+id = "high"
+label = "High"
+env = { ENGRAM_CODEX_EFFORT = "high" }
+
+[[effort]]
+id = "xhigh"
+label = "Extra High"
+env = { ENGRAM_CODEX_EFFORT = "xhigh" }

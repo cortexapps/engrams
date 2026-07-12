@@ -689,6 +689,40 @@ bundles-squashfs:
         # externally-provided ENGRAM_HARNESS_CLAUDE_TREE is left untouched.
         [ "$harness_tree" = "$PWD/var/shared/.harness-claude.stage" ] && rm -rf "$harness_tree"
     fi
+    # Built-in Codex tree. CI supplies the already-staged tree; local dev
+    # cross-builds the wrapper and downloads the checksum-verified official
+    # Linux package for the guest architecture.
+    codex_tree="${ENGRAM_HARNESS_CODEX_TREE:-}"
+    if [ -z "$codex_tree" ]; then
+        case "$(uname -m)" in
+            arm64 | aarch64) codex_arch=aarch64; codex_target=aarch64-unknown-linux-musl ;;
+            x86_64 | amd64) codex_arch=x86_64; codex_target=x86_64-unknown-linux-musl ;;
+            *) codex_arch="" ;;
+        esac
+        if [ -n "$codex_arch" ]; then
+            tree="$PWD/var/shared/.harness-codex.stage"
+            if cargo build --release --target "$codex_target" -p engram-harness-codex \
+                && deploy/harness-codex/stage.sh "$codex_arch" \
+                    "target/$codex_target/release/engram-harness-codex" "$tree"; then
+                codex_tree="$tree"
+            else
+                echo "harness-codex local build failed; skipping" >&2
+            fi
+        fi
+    fi
+    if [ -n "$codex_tree" ]; then
+        [ -x "$codex_tree/harness" ] && [ -x "$codex_tree/codex" ] || {
+            echo "Codex harness tree must contain executable harness + codex" >&2
+            exit 1
+        }
+        tmp="var/shared/.harness-codex.build.squashfs"
+        deploy/bundles/harness-codex/build.sh "$codex_tree" "$tmp"
+        sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
+        mv "$tmp" "var/shared/$sha.squashfs"
+        stamp="$stamp$sep\"harness-codex\": \"$sha\""
+        sep=", "
+        [ "$codex_tree" = "$PWD/var/shared/.harness-codex.stage" ] && rm -rf "$codex_tree"
+    fi
     # ADR 0080: the agentd bundle (reserved slot dyn_1) — MANDATORY, not
     # best-effort: without it no guest can boot (the stage-1 init execs
     # agentd out of this mount) and no capture can run. CI/e2e hands the
@@ -848,6 +882,31 @@ bundles-vz:
         # Drop the locally-built stage tree (keep the download cache); CI's
         # externally-provided ENGRAM_HARNESS_CLAUDE_TREE is left untouched.
         [ "$harness_tree" = "$PWD/var/shared/.harness-claude.stage" ] && rm -rf "$harness_tree"
+    fi
+    codex_tree="${ENGRAM_HARNESS_CODEX_TREE:-}"
+    if [ -z "$codex_tree" ]; then
+        tree="$PWD/var/shared/.harness-codex.stage"
+        if cargo build --release --target aarch64-unknown-linux-musl -p engram-harness-codex \
+            && deploy/harness-codex/stage.sh aarch64 \
+                target/aarch64-unknown-linux-musl/release/engram-harness-codex "$tree"; then
+            codex_tree="$tree"
+        else
+            echo "harness-codex local VZ build failed; skipping" >&2
+        fi
+    fi
+    if [ -n "$codex_tree" ]; then
+        [ -x "$codex_tree/harness" ] && [ -x "$codex_tree/codex" ] || {
+            echo "Codex harness tree must contain executable harness + codex" >&2
+            exit 1
+        }
+        out="var/shared/.harness-codex.build.erofs"
+        rm -f "$out"
+        pack_erofs "$out" "$codex_tree"
+        sha="$(sha256_of "$out")"
+        mv "$out" "var/shared/$sha.erofs"
+        stamp="$stamp$sep\"harness-codex\": \"$sha\""
+        sep=", "
+        [ "$codex_tree" = "$PWD/var/shared/.harness-codex.stage" ] && rm -rf "$codex_tree"
     fi
     # ADR 0080: the agentd bundle (reserved slot dyn_1) — MANDATORY: the
     # stage-1 init execs agentd out of this mount, so a stamp without it

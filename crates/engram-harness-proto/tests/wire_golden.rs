@@ -135,6 +135,11 @@ fn ev_prompt_dequeued() -> HarnessEvent {
         prompt_id: "p1".into(),
     }
 }
+fn ev_prompt_steered() -> HarnessEvent {
+    HarnessEvent::PromptSteered {
+        prompt_id: "p1".into(),
+    }
+}
 fn ev_agent_message() -> HarnessEvent {
     HarnessEvent::AgentMessage {
         run_id: "r1".into(),
@@ -274,6 +279,16 @@ fn ev_file_changed_write() -> HarnessEvent {
         },
     }
 }
+fn ev_file_changed_patch() -> HarnessEvent {
+    HarnessEvent::FileChanged {
+        run_id: "r1".into(),
+        tool_call_id: "tool-3".into(),
+        path: "src/main.rs".into(),
+        change: FileChange::Patch {
+            unified_diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+        },
+    }
+}
 
 /// A harness-suggested title — pins `TitleSuggested` (index 14).
 fn ev_title_suggested() -> HarnessEvent {
@@ -338,7 +353,9 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_question_answered", &ev_question_answered());
     assert_golden("event_file_changed_edit", &ev_file_changed_edit());
     assert_golden("event_file_changed_write", &ev_file_changed_write());
+    assert_golden("event_file_changed_patch", &ev_file_changed_patch());
     assert_golden("event_title_suggested", &ev_title_suggested());
+    assert_golden("event_prompt_steered", &ev_prompt_steered());
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -371,8 +388,10 @@ fn harness_event_golden_and_variant_indices() {
     // Both `op` arms are the same enum variant, so both pin index 13.
     assert_variant_index(&ev_file_changed_edit(), 13, "HarnessEvent::FileChanged");
     assert_variant_index(&ev_file_changed_write(), 13, "HarnessEvent::FileChanged");
+    assert_variant_index(&ev_file_changed_patch(), 13, "HarnessEvent::FileChanged");
     // Session titles — APPENDED after FileChanged (14).
     assert_variant_index(&ev_title_suggested(), 14, "HarnessEvent::TitleSuggested");
+    assert_variant_index(&ev_prompt_steered(), 15, "HarnessEvent::PromptSteered");
 }
 
 #[test]
@@ -562,7 +581,9 @@ fn regen_golden() {
     write("event_question_answered", &ev_question_answered());
     write("event_file_changed_edit", &ev_file_changed_edit());
     write("event_file_changed_write", &ev_file_changed_write());
+    write("event_file_changed_patch", &ev_file_changed_patch());
     write("event_title_suggested", &ev_title_suggested());
+    write("event_prompt_steered", &ev_prompt_steered());
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);

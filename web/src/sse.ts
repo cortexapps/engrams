@@ -74,6 +74,7 @@ export function subscribeSession(sessionId: string, handlers: SseHandlers, since
     "prompt_queued",
     "prompt_edited",
     "prompt_dequeued",
+    "prompt_steered",
     "integration_asset",
     "file_shared",
     "recovered_from_checkpoint",

@@ -174,6 +174,11 @@ pub enum SessionEvent {
         prompt_id: String,
         at: DateTime<Utc>,
     },
+    /// The harness injected this prompt into the currently-running turn.
+    HarnessPromptSteered {
+        prompt_id: String,
+        at: DateTime<Utc>,
+    },
     /// Phase 1c (ADR 0052): one live token delta of the in-flight
     /// assistant message. EPHEMERAL — fanned out to live SSE subscribers
     /// only (never appended to `session_events`); the terminal
@@ -377,6 +382,7 @@ impl SessionEvent {
             Self::HarnessPromptQueued { .. } => "prompt_queued",
             Self::HarnessPromptEdited { .. } => "prompt_edited",
             Self::HarnessPromptDequeued { .. } => "prompt_dequeued",
+            Self::HarnessPromptSteered { .. } => "prompt_steered",
             Self::HarnessAgentMessageChunk { .. } => "agent_message_chunk",
             Self::HarnessUserQuestion { .. } => "user_question",
             Self::HarnessQuestionAnswered { .. } => "question_answered",
@@ -463,6 +469,9 @@ impl SessionEvent {
             },
             HarnessEvent::PromptDequeued { prompt_id } => {
                 Self::HarnessPromptDequeued { prompt_id, at }
+            }
+            HarnessEvent::PromptSteered { prompt_id } => {
+                Self::HarnessPromptSteered { prompt_id, at }
             }
             HarnessEvent::AgentMessageChunk {
                 run_id,
@@ -984,6 +993,7 @@ fn outbox_ack_id(event: &SessionEvent) -> Option<String> {
             ..
         } => Some(pid.clone()),
         SessionEvent::HarnessPromptQueued { prompt_id, .. } => Some(prompt_id.clone()),
+        SessionEvent::HarnessPromptSteered { prompt_id, .. } => Some(prompt_id.clone()),
         SessionEvent::HarnessQuestionAnswered { tool_call_id, .. } => {
             Some(format!("answer:{tool_call_id}"))
         }
@@ -1393,6 +1403,18 @@ pub(crate) mod tests {
             other => panic!("expected HarnessRunInterrupted, got {other:?}"),
         }
         assert_eq!(ev.kind(), "run_interrupted");
+    }
+
+    #[test]
+    fn prompt_steered_maps_and_acks_by_prompt_id() {
+        let ev = SessionEvent::from_harness(
+            HarnessEvent::PromptSteered {
+                prompt_id: "p-steer".into(),
+            },
+            chrono::Utc::now(),
+        );
+        assert_eq!(ev.kind(), "prompt_steered");
+        assert_eq!(outbox_ack_id(&ev).as_deref(), Some("p-steer"));
     }
 
     #[test]
@@ -2875,6 +2897,20 @@ pub(crate) mod tests {
             mini.acked_outbox.lock().len(),
             1,
             "a run_started with no prompt_id must ack nothing",
+        );
+
+        sink(
+            sid,
+            sandbox_id,
+            HarnessEvent::PromptSteered {
+                prompt_id: "prompt-steered".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            mini.acked_outbox.lock().as_slice(),
+            ["prompt-abc".to_string(), "prompt-steered".to_string()],
+            "prompt_steered must ack without opening a second run",
         );
     }
 

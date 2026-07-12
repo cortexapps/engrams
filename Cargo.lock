@@ -1253,9 +1253,26 @@ dependencies = [
  "clap",
  "engram-core",
  "engram-harness-proto",
+ "engram-harness-sdk",
  "engram-transport",
  "nix 0.31.2",
  "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-harness-codex"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "engram-core",
+ "engram-harness-proto",
+ "engram-harness-sdk",
  "serde_json",
  "tokio",
  "tracing",
@@ -1291,6 +1308,18 @@ dependencies = [
  "serde",
  "tokio",
  "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-harness-sdk"
+version = "0.1.0"
+dependencies = [
+ "engram-core",
+ "engram-harness-proto",
+ "engram-transport",
+ "tokio",
+ "tracing",
  "workspace-hack",
 ]
 

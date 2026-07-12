@@ -210,6 +210,11 @@ pub enum FileChange {
     /// One or more search/replace edits (Claude's `Edit` = one hunk;
     /// `MultiEdit` = many). The UI renders red/green hunks.
     Edit { hunks: Vec<EditHunk> },
+    /// A complete unified diff, as emitted by agents whose native file-change
+    /// protocol is patch-oriented (Codex app-server). Keeping the patch intact
+    /// preserves line numbers, context, renames, and multi-hunk edits that
+    /// cannot be represented truthfully as search/replace pairs.
+    Patch { unified_diff: String },
 }
 
 /// One search/replace edit. Maps from Claude's `{ old_string, new_string }`.
@@ -415,6 +420,11 @@ pub enum HarnessEvent {
     /// latest one on the session; the orchestrator uses it as a task's
     /// display title unless the user has set a sticky custom title.
     TitleSuggested { title: String },
+    /// A prompt was accepted into the agent's currently-running turn rather
+    /// than queued for a later turn. `prompt_id` is the delivery confirmation
+    /// used to retire the coordinator outbox row and un-grey the optimistic
+    /// user message without synthesizing another `RunStarted`.
+    PromptSteered { prompt_id: String },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -450,6 +460,7 @@ impl HarnessEvent {
             Self::QuestionAnswered { .. } => "question_answered",
             Self::FileChanged { .. } => "file_changed",
             Self::TitleSuggested { .. } => "title_suggested",
+            Self::PromptSteered { .. } => "prompt_steered",
             Self::Idle => "harness_idle",
         }
     }

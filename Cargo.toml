@@ -21,6 +21,8 @@ members = [
     "crates/engram-cloud-static",
     "crates/engram-cloud-mock",
     "crates/engram-harness-claude",
+    "crates/engram-harness-codex",
+    "crates/engram-harness-sdk",
     "crates/engram-harness-noop",
     "crates/engram-harness-proto",
     "crates/engram-migrate-proto",
@@ -77,6 +79,7 @@ engram-cloud-static = { path = "crates/engram-cloud-static" }
 engram-cloud-mock = { path = "crates/engram-cloud-mock" }
 engram-harness-noop = { path = "crates/engram-harness-noop" }
 engram-harness-proto = { path = "crates/engram-harness-proto" }
+engram-harness-sdk = { path = "crates/engram-harness-sdk" }
 engram-migrate-proto = { path = "crates/engram-migrate-proto" }
 engram-substrate-proto = { path = "crates/engram-substrate-proto" }
 engram-transport = { path = "crates/engram-transport" }

@@ -53,7 +53,8 @@ export interface EditHunk {
 }
 export type FileChange =
   | { write: { content: string }; edit?: undefined }
-  | { edit: { hunks: EditHunk[] }; write?: undefined };
+  | { edit: { hunks: EditHunk[] }; write?: undefined }
+  | { patch: { unified_diff: string }; write?: undefined; edit?: undefined };
 
 // `serde(tag = "type", rename_all = "snake_case")` produces a discriminated
 // union with `type` as the discriminant.
@@ -187,6 +188,7 @@ export type SessionEvent =
   | { type: "prompt_queued"; prompt_id: string; summary: string | null; at: string }
   | { type: "prompt_edited"; prompt_id: string; summary: string | null; at: string }
   | { type: "prompt_dequeued"; prompt_id: string; at: string }
+  | { type: "prompt_steered"; prompt_id: string; at: string }
   // ADR 0056: a third-party integration surfaced a typed asset/action.
   // Subsumes the old `pull_request_opened` (a PR is provider:"forge",
   // asset_kind:"pull_request"). The wire is semantic-only — the web keys its

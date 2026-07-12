@@ -106,13 +106,15 @@ export function SessionThread({
   // ~1 KB). Bounded — one short entry per prompt sent.
   const sentTextRef = useRef(new Map<string, string>());
 
-  // prompt_ids the server has CONSUMED (`run_started{prompt_id}` — the bubble is
-  // now in the durable transcript) or DEQUEUED (recalled / cancelled). Either
+  // prompt_ids the server has CONSUMED (`run_started{prompt_id}` or
+  // `prompt_steered{prompt_id}` — the bubble is now in the durable transcript)
+  // or DEQUEUED (recalled / cancelled). Either
   // ends an optimistic entry's life.
   const consumedPromptIds = useMemo(() => {
     const s = new Set<string>();
     for (const { event } of events) {
       if (event.type === "run_started" && event.prompt_id) s.add(event.prompt_id);
+      if (event.type === "prompt_steered") s.add(event.prompt_id);
     }
     return s;
   }, [events]);

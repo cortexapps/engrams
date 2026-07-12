@@ -814,7 +814,7 @@ jobs:
       # path it shares with harness_loopback. (ADR 0015 M1 collapsed
       # engram-bootstrap into engram-agentd; the standalone crate is
       # gone.)
-      - name: Build static musl binaries (agentd / noop / harness-claude)
+      - name: Build static musl binaries (agentd / noop / built-in harnesses)
         # engram-harness-claude is the real wrapper that the
         # e2e_harness tests load into the harness substrate at
         # `/claude/harness`. Building it here lets the same `target/`
@@ -825,6 +825,7 @@ jobs:
             -p engram-agentd \
             -p engram-harness-noop \
             -p engram-harness-claude \
+            -p engram-harness-codex \
             --target x86_64-unknown-linux-musl \
             --release
 
@@ -1164,10 +1165,10 @@ jobs:
           # first's deps.
           shared-key: release-musl-bake
 
-      - name: Build engram-harness-claude (musl) + engram-publish-builtin-harness (host)
+      - name: Build built-in harnesses (musl) + publisher (host)
         run: |
           cargo build --release --target x86_64-unknown-linux-musl \
-            -p engram-harness-claude
+            -p engram-harness-claude -p engram-harness-codex
           cargo build --release -p engram-publish-builtin-harness
 
       - name: Download Claude Code CLI (Linux x64)
@@ -1231,6 +1232,24 @@ jobs:
           # Three files (binary + binary + 200-byte toml); leave
           # compression default.
 
+      - name: Download and stage Codex CLI 0.144.1
+        id: stage_codex
+        run: |
+          set -euo pipefail
+          STAGE="$PWD/var/harness-codex-stage"
+          deploy/harness-codex/stage.sh x86_64 \
+            target/x86_64-unknown-linux-musl/release/engram-harness-codex \
+            "$STAGE"
+          echo "dir=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload staged Codex harness as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-codex-artifact
+          path: ${{ steps.stage_codex.outputs.dir }}
+          if-no-files-found: error
+          retention-days: 7
+
       # Push-to-main only: also publish to the production GHCR tag
       # so production hosts (node-assets stages it into the bundle
       # stamp) and future consumers see the same artifact.
@@ -1260,6 +1279,14 @@ jobs:
             --from "$STAGE" \
             --to "$TAG"
           echo "Published $TAG"
+
+      - name: Push harness-codex artifact to GHCR (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          STAGE: ${{ steps.stage_codex.outputs.dir }}
+          TAG: ghcr.io/${{ github.repository }}/harness-codex:${{ env.HARNESS_VERSION }}-${{ env.HARNESS_PLATFORM }}
+        run: |
+          ./target/release/engram-publish-builtin-harness --from "$STAGE" --to "$TAG"
 
       - name: Summarize
         if: always()
@@ -1711,15 +1738,23 @@ jobs:
           name: harness-claude-artifact
           path: var/harness-claude-stage
 
+      - name: Download harness-codex artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: harness-codex-artifact
+          path: var/harness-codex-stage
+
       - name: Restore +x on the harness binaries + hand the tree to tilt
         run: |
           # upload/download-artifact's ZIP drops Unix mode bits; the guest execs
           # /opt/engram/dyn/0/harness, so it must stay executable in the squashfs.
           chmod +x var/harness-claude-stage/harness var/harness-claude-stage/claude
+          chmod +x var/harness-codex-stage/harness var/harness-codex-stage/codex
           ls -la var/harness-claude-stage/
           # Point `just bundles-squashfs` (tilt runs it next) at this downloaded
           # tree so it packs `harness-claude` into var/shared's stamp.
           echo "ENGRAM_HARNESS_CLAUDE_TREE=$PWD/var/harness-claude-stage" >> "$GITHUB_ENV"
+          echo "ENGRAM_HARNESS_CODEX_TREE=$PWD/var/harness-codex-stage" >> "$GITHUB_ENV"
           # ADR 0080: likewise hand it the pre-built musl agentd (downloaded
           # with the e2e binaries above) so packing `bundle-agentd` doesn't
           # recompile anything in this no-cargo lane.

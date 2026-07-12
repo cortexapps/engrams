@@ -1,4 +1,4 @@
-import { diffLines } from "diff";
+import { diffLines, parsePatch } from "diff";
 import { ChevronDownIcon, FileDiffIcon } from "lucide-react";
 import { lazy, Suspense, useMemo } from "react";
 import type { ToolCallMessagePartProps } from "@assistant-ui/react";
@@ -18,7 +18,7 @@ const PierreDiff = lazy(() => import("./PierreDiff"));
 
 /** Reconstruct before/after contents from a FileChange for diffing. A write
  *  is empty → content (all additions); an edit is the joined hunks. */
-function beforeAfter(change: FileChangeArgs["change"]): { before: string; after: string } {
+export function beforeAfter(change: FileChangeArgs["change"]): { before: string; after: string } {
   if (change.write) return { before: "", after: change.write.content };
   if (change.edit) {
     const hunks = change.edit.hunks;
@@ -26,6 +26,22 @@ function beforeAfter(change: FileChangeArgs["change"]): { before: string; after:
       before: hunks.map((h) => h.old).join("\n"),
       after: hunks.map((h) => h.new).join("\n"),
     };
+  }
+  if (change.patch) {
+    const parsed = parsePatch(change.patch.unified_diff)[0];
+    if (!parsed) return { before: "", after: "" };
+    const before: string[] = [];
+    const after: string[] = [];
+    for (const hunk of parsed.hunks) {
+      for (const line of hunk.lines) {
+        if (line.startsWith("\\ No newline")) continue;
+        const marker = line[0];
+        const text = line.slice(1);
+        if (marker !== "+") before.push(text);
+        if (marker !== "-") after.push(text);
+      }
+    }
+    return { before: before.join("\n"), after: after.join("\n") };
   }
   return { before: "", after: "" };
 }
