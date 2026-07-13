@@ -495,20 +495,27 @@ mod adapter {
         /// answer right now." Set true when the hook cards the first AUQ;
         /// cleared when that answer is delivered. While true, EVERY further AUQ
         /// — same run or a later one (the #64389 double-fire fires both ways) —
-        /// is a duplicate: no card, recorded in `DuplicateAuqIds` for the scrub.
+        /// is a duplicate: no card, recorded in `DuplicateDeferredIds` for the scrub.
         /// Session-scoped (not per-run) so a cross-run sibling is still caught.
         pub type QuestionOutstanding = Arc<Mutex<bool>>;
-        /// ADR 0054: `tool_use_id`s of duplicate AUQs the hook suppressed.
+        /// ADR 0054 / 0089: `tool_use_id`s of duplicate deferred calls the hook
+        /// suppressed (AUQ or manifest tool).
         /// Drained at the answer-resume and handed to `scrub_transcript`, which
         /// deletes each duplicate's `tool_use` from claude's transcript so the
-        /// resume re-fires exactly one question. Owned by `run_engine` so the
-        /// hook (which populates it) and the scrub (which drains it) share it.
-        pub type DuplicateAuqIds = Arc<Mutex<HashSet<String>>>;
+        /// resume re-fires exactly one logical call. Owned by `run_engine` so
+        /// the hook (which populates it) and the scrub (which drains it) share it.
+        pub type DuplicateDeferredIds = Arc<Mutex<HashSet<String>>>;
         /// Deferred generic calls awaiting a host result, tagged with the
-        /// claude process generation whose hook parked them. The generation
-        /// lets delivery distinguish a still-alive original process from a
-        /// later respawn (ADR 0089 scenario C).
-        pub type DeferredCalls = Arc<Mutex<HashMap<String, u64>>>;
+        /// turn, tool name, and claude process generation whose hook parked
+        /// them. Turn + name identify #64389 double-fires; the generation lets
+        /// delivery distinguish a still-alive original process from a later
+        /// respawn (ADR 0089 scenario C).
+        pub type DeferredCalls = Arc<Mutex<HashMap<String, DeferredCall>>>;
+        pub struct DeferredCall {
+            pub run_id: String,
+            pub tool_name: String,
+            pub process_generation: u64,
+        }
         pub type ProcessGeneration = Arc<AtomicU64>;
 
         /// Session-scoped state shared by every transient hook connection.
@@ -521,7 +528,7 @@ mod adapter {
             pub current_run_id: CurrentRunId,
             pub evt_tx: mpsc::Sender<HarnessEvent>,
             pub question_outstanding: QuestionOutstanding,
-            pub duplicate_auq_ids: DuplicateAuqIds,
+            pub duplicate_deferred_ids: DuplicateDeferredIds,
             pub manifest: Arc<ToolManifest>,
             pub results_in_hand: mcp_server::ResultsInHand,
             pub deferred_calls: DeferredCalls,
@@ -573,7 +580,7 @@ mod adapter {
                 current_run_id,
                 evt_tx,
                 question_outstanding,
-                duplicate_auq_ids,
+                duplicate_deferred_ids,
                 manifest,
                 results_in_hand,
                 deferred_calls,
@@ -615,14 +622,48 @@ mod adapter {
                             HookVerdict::Allow
                         }
                         Some(_) => {
-                            let first_request = deferred_calls
-                                .lock()
-                                .await
-                                .insert(
-                                    req.tool_use_id.clone(),
-                                    process_generation.load(Ordering::SeqCst),
-                                )
-                                .is_none();
+                            // Claude #64389 can issue the same logical deferred
+                            // call twice with distinct ids in one turn. Decide
+                            // and insert under one lock so concurrent hook
+                            // connections cannot both become host-visible.
+                            // An exact-id re-fire remains ordinary idempotency:
+                            // never scrub the original id.
+                            let (first_request, duplicate) = {
+                                let mut calls = deferred_calls.lock().await;
+                                if calls.contains_key(&req.tool_use_id) {
+                                    (false, false)
+                                } else if calls
+                                    .values()
+                                    .any(|call| call.run_id == run_id && call.tool_name == name)
+                                {
+                                    (false, true)
+                                } else {
+                                    calls.insert(
+                                        req.tool_use_id.clone(),
+                                        DeferredCall {
+                                            run_id: run_id.clone(),
+                                            tool_name: name.to_string(),
+                                            process_generation: process_generation
+                                                .load(Ordering::SeqCst),
+                                        },
+                                    );
+                                    (true, false)
+                                }
+                            };
+                            if duplicate {
+                                duplicate_deferred_ids
+                                    .lock()
+                                    .await
+                                    .insert(req.tool_use_id.clone());
+                                tracing::warn!(
+                                    %run_id,
+                                    tool_use_id = %req.tool_use_id,
+                                    tool_name = %name,
+                                    "ADR 0089: duplicate deferred manifest tool in one turn \
+                                     (#64389 double-fire); deferring with no request \
+                                     (scrubbed before resume)"
+                                );
+                            }
                             if first_request {
                                 event = Some(HarnessEvent::ToolCallRequested {
                                     run_id,
@@ -659,7 +700,7 @@ mod adapter {
             //     rather than deny: a deny leaves a "stop and wait" tool_result
             //     in claude's transcript that the model retries after the real
             //     answer lands (re-ask + a second card). The duplicate stays a
-            //     parked tool; its id goes to `duplicate_auq_ids` so the
+            //     parked tool; its id goes to `duplicate_deferred_ids` so the
             //     answer-resume scrub drops it, leaving exactly one question.
             // The answers-map lock is a temporary (dropped before the
             // outstanding lock — no lock-order coupling), and the event is
@@ -692,7 +733,7 @@ mod adapter {
                             was_set
                         };
                         if duplicate {
-                            duplicate_auq_ids
+                            duplicate_deferred_ids
                                 .lock()
                                 .await
                                 .insert(req.tool_use_id.clone());
@@ -1388,12 +1429,14 @@ mod adapter {
         // ADR 0054: session-level AskUserQuestion dedup of the #64389 double-fire
         // (within- OR cross-run). `question_outstanding` is set when the hook
         // cards a question and cleared when its answer is delivered; while set,
-        // every further AUQ is a duplicate with no card. `duplicate_auq_ids`
-        // collects those duplicates' tool_use ids so the answer-resume scrub
-        // deletes them from the transcript. Owned here so both span respawns.
+        // every further AUQ is a duplicate with no card. Manifest deferred
+        // tools use the same set for same-name double-fires within one turn.
+        // `duplicate_deferred_ids` collects every suppressed duplicate's
+        // tool_use id so the deferred-delivery scrub deletes it from the
+        // transcript. Owned here so all deferred paths span respawns.
         let question_outstanding: hook_server::QuestionOutstanding =
             Arc::new(tokio::sync::Mutex::new(false));
-        let duplicate_auq_ids: hook_server::DuplicateAuqIds =
+        let duplicate_deferred_ids: hook_server::DuplicateDeferredIds =
             Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         write_hook_settings().await;
         let self_exe =
@@ -1427,7 +1470,7 @@ mod adapter {
                         current_run_id: current_run_id.clone(),
                         evt_tx: evt_tx.clone(),
                         question_outstanding: question_outstanding.clone(),
-                        duplicate_auq_ids: duplicate_auq_ids.clone(),
+                        duplicate_deferred_ids: duplicate_deferred_ids.clone(),
                         manifest: tool_manifest.clone(),
                         results_in_hand: results_in_hand.clone(),
                         deferred_calls: deferred_calls.clone(),
@@ -1514,17 +1557,18 @@ mod adapter {
                     // to edit. Remove both poisons so the resumed model sees a
                     // clean defer (one `tool_use`, nothing after) and delivers
                     // the real answer instead of re-asking: (a) narrate-past
-                    // assistant text (`scrub_msg_ids`), and (b) duplicate AUQ
-                    // tool_uses the hook suppressed (`duplicate_auq_ids`, the
-                    // #64389 double-fire — within- or cross-run). Fail-safe: on
-                    // any miss/error we skip — the Part B fallback still
-                    // delivers the answer as a user message.
+                    // assistant text (`scrub_msg_ids`), and (b) duplicate
+                    // deferred tool_uses the hook suppressed
+                    // (`duplicate_deferred_ids`: AUQ within/cross-run or
+                    // manifest tool within-turn #64389 double-fire). Fail-safe:
+                    // on any miss/error we skip — the Part B fallback still
+                    // delivers the result as a user message.
                     let ids: HashSet<String> = {
                         let mut g = scrub_msg_ids.lock().await;
                         std::mem::take(&mut *g)
                     };
                     let dup_ids: HashSet<String> = {
-                        let mut g = duplicate_auq_ids.lock().await;
+                        let mut g = duplicate_deferred_ids.lock().await;
                         std::mem::take(&mut *g)
                     };
                     if !ids.is_empty() || !dup_ids.is_empty() {
@@ -1539,7 +1583,7 @@ mod adapter {
                                         Ok(Ok(n)) => tracing::info!(
                                             removed = n,
                                             %sid,
-                                            "ADR 0054 Part C: scrubbed narrate-past + duplicate AUQs from transcript before resume"
+                                            "ADR 0054 / 0089: scrubbed narrate-past + duplicate deferred calls from transcript before resume"
                                         ),
                                         Ok(Err(e)) => tracing::warn!(
                                             error = %e,
@@ -2258,8 +2302,11 @@ mod adapter {
                             break;
                         }
                         Some(HarnessCommand::ToolResult { call_id, result_json }) => {
-                            let deferred_generation =
-                                deferred_calls.lock().await.get(&call_id).copied();
+                            let deferred_generation = deferred_calls
+                                .lock()
+                                .await
+                                .get(&call_id)
+                                .map(|call| call.process_generation);
                             if let Some(origin_generation) = deferred_generation {
                                 // Stash first: if live stdin delivery races a
                                 // process death, the next id-stable re-fire can
@@ -2854,12 +2901,13 @@ mod adapter {
     /// stale text and re-asks regardless of the real answer we deliver. We
     /// remove exactly the assistant messages whose ids Part A suppressed
     /// (matched by `message.id`, never a content heuristic), AND any assistant
-    /// message carrying a `tool_use` whose id is a suppressed DUPLICATE AUQ
-    /// (`dup_tool_ids` — the #64389 double-fire, within- or cross-run; matched
-    /// by the tool_use id the hook recorded, not a heuristic). Re-link the
+    /// message carrying a `tool_use` whose id is a suppressed duplicate
+    /// deferred call (`dup_tool_ids` — AUQ within/cross-run or manifest tool
+    /// within-turn #64389 double-fire; matched by the tool_use id the hook
+    /// recorded, not a heuristic). Re-link the
     /// `parentUuid` of any survivor that pointed at a removed line, and write
-    /// atomically. The result is byte-equivalent to a clean single-question
-    /// defer, which resumes correctly. Returns messages removed.
+    /// atomically. The result is byte-equivalent to a clean single-call defer,
+    /// which resumes correctly. Returns messages removed.
     fn scrub_transcript(
         path: &Path,
         suppressed_ids: &HashSet<String>,
@@ -2885,8 +2933,8 @@ mod adapter {
                 .get("message")
                 .and_then(|m| m.get("id"))
                 .and_then(|s| s.as_str());
-            // A duplicate-AUQ message: an assistant line whose content holds a
-            // `tool_use` block with an id the hook flagged as a duplicate.
+            // A duplicate-deferred-call message: an assistant line whose
+            // content holds a `tool_use` block with an id the hook flagged.
             let carries_dup_tool = is_assistant
                 && !dup_tool_ids.is_empty()
                 && v.get("message")
@@ -2912,7 +2960,7 @@ mod adapter {
                         .map(str::to_string);
                     removed_parent.insert(uuid.to_string(), parent);
                 }
-                continue; // drop the narrate-past / duplicate-AUQ message
+                continue; // drop the narrate-past / duplicate-call message
             }
             kept.push(line.to_string());
         }
@@ -3967,6 +4015,48 @@ mod adapter {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        #[test]
+        fn scrub_removes_duplicate_manifest_tool_use() {
+            let dir = std::env::temp_dir().join(format!(
+                "engram-scrub-manifest-dup-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("sess.jsonl");
+            let lines = [
+                r#"{"type":"user","uuid":"u-prompt","parentUuid":null,"message":{"role":"user","content":[{"type":"text","text":"remember this"}]}}"#,
+                r#"{"type":"assistant","uuid":"u-A","parentUuid":"u-prompt","message":{"id":"msg_AAA","role":"assistant","content":[{"type":"tool_use","id":"toolu_FIRST","name":"mcp__engrams__save_memory","input":{"text":"remember"}}]}}"#,
+                r#"{"type":"assistant","uuid":"u-B","parentUuid":"u-A","message":{"id":"msg_BBB","role":"assistant","content":[{"type":"tool_use","id":"toolu_DUP","name":"mcp__engrams__save_memory","input":{"text":"remember"}}]}}"#,
+                r#"{"type":"assistant","uuid":"u-C","parentUuid":"u-B","message":{"id":"msg_CCC","role":"assistant","content":[{"type":"text","text":"trailing"}]}}"#,
+            ];
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+            let duplicates = HashSet::from(["toolu_DUP".to_string()]);
+            let removed = scrub_transcript(&path, &HashSet::new(), &duplicates).unwrap();
+            assert_eq!(
+                removed, 1,
+                "exactly the duplicate manifest tool message is removed"
+            );
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(!after.contains("toolu_DUP"), "duplicate tool_use gone");
+            assert!(
+                after.contains("toolu_FIRST"),
+                "the original deferred manifest tool_use is preserved"
+            );
+            let trailing = after
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|value| value["uuid"] == "u-C")
+                .unwrap();
+            assert_eq!(
+                trailing["parentUuid"], "u-A",
+                "survivor re-linked past the removed duplicate"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         // The next connection re-sends the parked event first (at-least-once).
         #[tokio::test]
         async fn pump_resends_parked_event() {
@@ -4667,7 +4757,7 @@ mod adapter {
             hook_server::AnswersInHand,
             hook_server::CurrentRunId,
             mpsc::Receiver<HarnessEvent>,
-            hook_server::DuplicateAuqIds,
+            hook_server::DuplicateDeferredIds,
         ) {
             let sock = std::env::temp_dir()
                 .join(format!("engram-hooktest-{}.sock", uuid::Uuid::new_v4()))
@@ -4679,7 +4769,7 @@ mod adapter {
                 Arc::new(tokio::sync::Mutex::new(Some("run-x".into())));
             let outstanding: hook_server::QuestionOutstanding =
                 Arc::new(tokio::sync::Mutex::new(false));
-            let dup_ids: hook_server::DuplicateAuqIds =
+            let dup_ids: hook_server::DuplicateDeferredIds =
                 Arc::new(tokio::sync::Mutex::new(HashSet::new()));
             let results: mcp_server::ResultsInHand =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -4696,7 +4786,7 @@ mod adapter {
                     current_run_id: run_id.clone(),
                     evt_tx,
                     question_outstanding: outstanding,
-                    duplicate_auq_ids: dup_ids.clone(),
+                    duplicate_deferred_ids: dup_ids.clone(),
                     manifest: Arc::new(Vec::new()),
                     results_in_hand: results,
                     deferred_calls: deferred,
@@ -4713,6 +4803,7 @@ mod adapter {
             mcp_server::ResultsInHand,
             hook_server::DeferredCalls,
             mpsc::Receiver<HarnessEvent>,
+            hook_server::DuplicateDeferredIds,
         ) {
             let sock = std::env::temp_dir()
                 .join(format!(
@@ -4731,7 +4822,7 @@ mod adapter {
                 Arc::new(tokio::sync::Mutex::new(Some("run-x".into())));
             let outstanding: hook_server::QuestionOutstanding =
                 Arc::new(tokio::sync::Mutex::new(false));
-            let duplicates: hook_server::DuplicateAuqIds =
+            let duplicates: hook_server::DuplicateDeferredIds =
                 Arc::new(tokio::sync::Mutex::new(HashSet::new()));
             let generation: hook_server::ProcessGeneration =
                 Arc::new(std::sync::atomic::AtomicU64::new(7));
@@ -4744,14 +4835,14 @@ mod adapter {
                     current_run_id: run_id,
                     evt_tx,
                     question_outstanding: outstanding,
-                    duplicate_auq_ids: duplicates,
+                    duplicate_deferred_ids: duplicates.clone(),
                     manifest: Arc::new(manifest),
                     results_in_hand: results.clone(),
                     deferred_calls: pending.clone(),
                     process_generation: generation,
                 },
             ));
-            (sock, results, pending, evt_rx)
+            (sock, results, pending, evt_rx, duplicates)
         }
 
         /// A fake `PreToolUse` hook client: one request line, one verdict.
@@ -4812,7 +4903,8 @@ mod adapter {
         #[tokio::test]
         async fn hook_defers_manifest_deferred_tool_and_emits_request() {
             let manifest = vec![generic_tool("save_memory", ToolExecution::Deferred)];
-            let (sock, results, pending, mut evt_rx) = spawn_manifest_hook_server(manifest).await;
+            let (sock, results, pending, mut evt_rx, _duplicates) =
+                spawn_manifest_hook_server(manifest).await;
             assert!(matches!(
                 hook_fire_named(
                     &sock,
@@ -4846,9 +4938,59 @@ mod adapter {
         }
 
         #[tokio::test]
+        async fn hook_dedups_duplicate_manifest_deferred_tool_in_same_turn() {
+            let manifest = vec![generic_tool("save_memory", ToolExecution::Deferred)];
+            let (sock, _results, pending, mut evt_rx, duplicates) =
+                spawn_manifest_hook_server(manifest).await;
+
+            assert!(matches!(
+                hook_fire_named(
+                    &sock,
+                    "toolu_first",
+                    "mcp__engrams__save_memory",
+                    serde_json::json!({"text":"remember"}),
+                )
+                .await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::ToolCallRequested { call_id, .. })
+                    if call_id == "toolu_first"
+            ));
+
+            assert!(matches!(
+                hook_fire_named(
+                    &sock,
+                    "toolu_duplicate",
+                    "mcp__engrams__save_memory",
+                    serde_json::json!({"text":"remember"}),
+                )
+                .await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(
+                evt_rx.try_recv().is_err(),
+                "the duplicate must not emit another ToolCallRequested"
+            );
+            assert_eq!(
+                *duplicates.lock().await,
+                HashSet::from(["toolu_duplicate".to_string()]),
+                "the duplicate id is recorded for transcript scrubbing"
+            );
+            assert_eq!(
+                pending.lock().await.keys().cloned().collect::<HashSet<_>>(),
+                HashSet::from(["toolu_first".to_string()]),
+                "only the original host-visible call remains outstanding"
+            );
+            let _ = tokio::fs::remove_file(sock).await;
+        }
+
+        #[tokio::test]
         async fn hook_allows_manifest_sync_tool_without_emitting() {
             let manifest = vec![generic_tool("save_memory", ToolExecution::Sync)];
-            let (sock, _results, pending, mut evt_rx) = spawn_manifest_hook_server(manifest).await;
+            let (sock, _results, pending, mut evt_rx, _duplicates) =
+                spawn_manifest_hook_server(manifest).await;
             assert!(matches!(
                 hook_fire_named(
                     &sock,
@@ -4867,7 +5009,8 @@ mod adapter {
         #[tokio::test]
         async fn hook_never_defers_tool_search() {
             let manifest = vec![generic_tool("save_memory", ToolExecution::Deferred)];
-            let (sock, _results, pending, mut evt_rx) = spawn_manifest_hook_server(manifest).await;
+            let (sock, _results, pending, mut evt_rx, _duplicates) =
+                spawn_manifest_hook_server(manifest).await;
             assert!(matches!(
                 hook_fire_named(
                     &sock,
@@ -4886,7 +5029,8 @@ mod adapter {
         #[tokio::test]
         async fn hook_allows_deferred_refire_with_result_in_hand() {
             let manifest = vec![generic_tool("save_memory", ToolExecution::Deferred)];
-            let (sock, results, pending, mut evt_rx) = spawn_manifest_hook_server(manifest).await;
+            let (sock, results, pending, mut evt_rx, _duplicates) =
+                spawn_manifest_hook_server(manifest).await;
             results
                 .lock()
                 .await
