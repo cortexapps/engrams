@@ -473,6 +473,24 @@ interaction (P4).
   `OutboxKind::ToolResult`; orchestrator registry (zod), manifest compilation
   into `harness_env`, handled-tool dispatch, `CompleteToolCall` RPC, the
   presenter-coverage test; latency measurement.
+
+  *As built (2026-07-13):* landed test-first, red→green. Divergences and
+  notes: (1) applied migration 0084's `CHECK (kind IN ('prompt','answer'))`
+  required the new migration `0105_outbox_tool_result_kind.sql`; (2)
+  `tool_call_completed` joined the curated ingest set too, so the
+  orchestrator's `pending_tool_calls` ledger (new drizzle table — powers the
+  §8 session-handled-only external gate and the §1 watchdog) can stamp
+  consumption; (3) the ToolResult outbox row is retired by the existing
+  `ToolCallCompleted` harness event (`tool_result:<call_id>` ack id); (4)
+  handled-tool failures complete with the protocol error envelope
+  `{"error":"<message>"}` — the one exception to a tool's output schema; (5)
+  unknown tool names in the ledger default to `handling:"handled"` (fail
+  closed for external completion), which also means a call naming a tool
+  since deleted from the registry is never completed — acceptable while
+  manifest and registry ship together, revisit if registry becomes dynamic;
+  (6) both harnesses carry a loud-warn placeholder arm for
+  `HarnessCommand::ToolResult` until their P2/P3 frontends land; (7) sync
+  latency measurement deferred to the P2 live smoke (needs a real session).
 - **P2 — claude frontend.** `mcp-bridge` subcommand + config generation +
   `--strict-mcp-config`; hook manifest matching (prefix filter, ToolSearch
   exemption); deferred delivery via the AUQ machinery; scrub broadening.

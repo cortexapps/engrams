@@ -77,6 +77,11 @@ export const POLICY: Record<string, PolicyEntry> = {
     subject: "Session",
     sessionIdField: "sessionId",
   },
+  "SessionService.CompleteToolCall": {
+    action: "prompt",
+    subject: "Session",
+    sessionIdField: "sessionId",
+  },
   "SessionService.Interrupt": {
     action: "prompt",
     subject: "Session",

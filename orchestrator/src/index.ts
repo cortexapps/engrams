@@ -26,6 +26,7 @@ import { makePreviewProxyMiddleware } from "./routes/preview-proxy.ts";
 import { makePreviewUpgradeHandler } from "./routes/preview-ws.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
+import { makeExternalToolCompletionGuard } from "./rpc/tool-completion-guard.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
@@ -158,6 +159,7 @@ const server = buildServer(
     // any active profile still references (the coordinator only knows sessions).
     registerPassthrough(router, SURFACE, controlPlaneTransport, undefined, undefined, {
       "ImageService.DisableImage": makeDisableImageGuard(),
+      "SessionService.CompleteToolCall": makeExternalToolCompletionGuard(),
     });
   },
   // Pass the full NodeWebSocket handle so buildServer can install the

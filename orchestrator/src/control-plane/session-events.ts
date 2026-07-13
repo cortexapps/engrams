@@ -25,6 +25,9 @@ export const CURATED_KINDS: ReadonlySet<string> = new Set([
   "run_completed",
   "user_question",
   "question_answered",
+  "tool_call_requested",
+  "tool_result_submitted",
+  "tool_call_completed",
   "integration_asset",
   "file_shared",
 ]);

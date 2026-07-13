@@ -36,6 +36,8 @@ import {
   loadRegistry,
   type CustomConnectorSource,
 } from "../connectors/registry.ts";
+import { compileToolManifest } from "../tools/manifest.ts";
+import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -101,6 +103,9 @@ export interface SessionCompileDeps {
   images: ImagesClient;
   connectors: CustomConnectorSource;
   harnessCatalog: HarnessCatalogClient;
+  /** Tool registry to compile into the harness manifest. Production uses the
+   *  process-wide registry; tests may inject a focused registry. */
+  toolRegistry?: ToolRegistry;
   /** Resolve the owner's harness token for `envVar` (e.g. CLAUDE_CODE_OAUTH_TOKEN),
    *  or null. Only called when the profile sets includeUserTokens. */
   resolveUserToken: (envVar: string) => Promise<string | null>;
@@ -189,6 +194,8 @@ export async function compileSessionCreateInput(
   const cliPlan = compileCliIntegrations(profile.capabilities, registry);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
   if (cliPlan.enabled.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(cliPlan.enabled);
+  const toolManifest = compileToolManifest(deps.toolRegistry ?? productionTools, profile.capabilities);
+  if (toolManifest.length > 0) harness.ENGRAM_TOOLS = JSON.stringify(toolManifest);
   for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
   // ADR 0063: the selected model/effort map to env vars via the harness
   // descriptor (an explicit picker wins over a stale ANTHROPIC_MODEL in env_vars).

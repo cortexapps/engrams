@@ -81,6 +81,30 @@ export const taskSession = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Generic tool protocol pending-call ledger (ADR 0089 P1)
+// ---------------------------------------------------------------------------
+
+/** Durable lifecycle bookkeeping for generic tool calls. The coordinator event
+ *  log remains the wire source of truth; this orchestrator-owned projection
+ *  supports external-completion policy and stale session-call watchdogs. */
+export const pendingToolCall = pgTable(
+  "pending_tool_calls",
+  {
+    sessionId: text("session_id").notNull(),
+    toolCallId: text("tool_call_id").notNull(),
+    toolName: text("tool_name").notNull(),
+    handling: text("handling").notNull(),
+    requestedAt: timestamp("requested_at", { withTimezone: true }).notNull(),
+    submittedAt: timestamp("submitted_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex("pending_tool_calls_tool_call_id_unique").on(t.toolCallId),
+    index("pending_tool_calls_session_idx").on(t.sessionId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // Session profiles (ADR 0053)
 //
 // Admin-curated session starting points. Orchestrator-only data — the control

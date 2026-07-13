@@ -10,6 +10,7 @@
  */
 
 import { expect, test, describe } from "bun:test";
+import { z } from "zod";
 import {
   compileSessionCreateInput,
   createTaskWithSession,
@@ -28,6 +29,7 @@ import type {
 } from "../db/port-exposures.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
+import { createToolRegistry } from "../tools/registry.ts";
 
 // The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
 // the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
@@ -262,6 +264,63 @@ describe("compileSessionCreateInput", () => {
     const inp = await compileSessionCreateInput(profile(), deps());
     expect(inp.harnessEnv?.ENGRAM_USER_EMAIL).toBeUndefined();
     expect(inp.harnessEnv?.ENGRAM_USER_NAME).toBeUndefined();
+  });
+
+  test("injects ENGRAM_TOOLS with capability-gated and ungated manifest tools", async () => {
+    const toolRegistry = createToolRegistry();
+    toolRegistry.register({
+      name: "always_available",
+      description: "Available to every profile.",
+      input: z.object({ value: z.string() }),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      handler: async () => ({ ok: true }),
+    });
+    toolRegistry.register({
+      name: "save_memory",
+      description: "Save a note.",
+      input: z.object({ text: z.string() }),
+      output: z.object({ saved: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: "memory:write",
+      handler: async () => ({ saved: true }),
+    });
+    toolRegistry.register({
+      name: "admin_only",
+      description: "Requires another capability.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: "admin:tools",
+      handler: async () => ({ ok: true }),
+    });
+
+    const inp = await compileSessionCreateInput(
+      profile({ capabilities: ["memory:write"] }),
+      { ...deps(), toolRegistry },
+    );
+    const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
+    expect(manifest.map((tool) => tool.name)).toEqual(["always_available", "save_memory"]);
+  });
+
+  test("omits ENGRAM_TOOLS when no registered tool matches the profile", async () => {
+    const toolRegistry = createToolRegistry();
+    toolRegistry.register({
+      name: "save_memory",
+      description: "Save a note.",
+      input: z.object({ text: z.string() }),
+      output: z.object({ saved: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: "memory:write",
+      handler: async () => ({ saved: true }),
+    });
+
+    const inp = await compileSessionCreateInput(profile(), { ...deps(), toolRegistry });
+    expect(inp.harnessEnv?.ENGRAM_TOOLS).toBeUndefined();
   });
 });
 
