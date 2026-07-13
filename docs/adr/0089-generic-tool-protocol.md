@@ -495,11 +495,43 @@ interaction (P4).
   `--strict-mcp-config`; hook manifest matching (prefix filter, ToolSearch
   exemption); deferred delivery via the AUQ machinery; scrub broadening.
   Rebundle-only. Exit gate: scenario A + C live on a VZ session.
+
+  *As built (2026-07-13):* landed as designed (ToolSearch/built-ins
+  short-circuit in the hook client — only AUQ + `mcp__engrams__` names
+  round-trip the socket), plus three live-smoke-driven fixes: (1) the
+  narrate-past double-fire (#64389) reproduced for manifest deferred tools —
+  `duplicate_auq_ids` generalized to `duplicate_deferred_ids` so a same-turn
+  duplicate defers without a second `ToolCallRequested` and is scrubbed;
+  (2) **idle eviction drains the harness before the snapshot** ("claude-free"
+  snapshots), so resume always presents a *fresh* harness — the
+  "CLI survived in the snapshot" fast path never occurs post-eviction, and an
+  unknown `ToolResult` now mirrors AnswerQuestion (stash → SIGINT →
+  `ResumeForDeferred` → id-stable re-fire served from stash); (3) dispatch
+  had been wired into the Slack-only ingest pump — web tasks had no pump at
+  all — so bookkeeping/dispatch moved to a per-session
+  `toolDispatchWorkflow` started from `createTaskWithSession`, the funnel all
+  creation surfaces share. Scenario A measured sub-4s submit→reply through
+  the 1s ingest poll — the §3 latency escalation (live `StreamEvents`) is
+  not needed.
 - **P3 — codex frontend.** `experimentalApi: true`; `dynamicTools`
   declaration on start/resume; parked-call table in `engram-harness-sdk`
   (fixes the answer-drop gap); sync + deferred + crash degrade; schema-check
   additions. Exit gate: scenario A analog live, **and the snapshot-park
   spike** (park → evict → restore → respond, same callId).
+
+  *As built (2026-07-13):* implemented against a fake-codex stdio seam
+  (shell script speaking the app-server newline-JSON protocol, mirroring the
+  claude crate's fake-CLI pattern) — 22 red→green tests including the
+  answer-drop regression (post-respawn answer delivered as a follow-up user
+  message, unknown ids logged loudly) and the crash degrade.
+  `check-app-server-schema.sh` pins `DynamicToolCallParams`/`Response` + the
+  `experimentalApi` capability against the pinned 0.144.1 binary. NOTE: the
+  P2 finding that idle eviction produces harness-free snapshots applies here
+  too — the §5 "whole-VM snapshot captures the parked await" assumption does
+  not hold for *idle-evicted* sessions; the durable parked-call table +
+  crash-degrade path (already built) are the actual delivery mechanism after
+  eviction. Exit gates (scenario A analog + snapshot-park) still open: the
+  dev stack has no codex profile yet.
 - **P4 — parked eviction.** The parked signal (`Parked` event vs `Idle`
   reuse), ADR 0034 state-machine integration, wake-on-result.
 - **P5 — AUQ convergence.** Native bindings both harnesses; policy/web/Slack
