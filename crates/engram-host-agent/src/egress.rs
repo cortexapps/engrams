@@ -16,7 +16,50 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engram_egress_proxy::{CaSource, CertMint, Listeners, Proxy, ProxyConfig, Registry};
+use async_trait::async_trait;
+use engram_core::{HostId, SessionId};
+use engram_egress_proxy::{
+    CaSource, CertMint, InjectRefresher, Listeners, Proxy, ProxyConfig, RefreshedInject, Registry,
+};
+
+use crate::coord_client::CoordClient;
+
+/// WS4: the host-agent's [`InjectRefresher`] — bridges the egress proxy's
+/// near-expiry re-mint request to the coordinator's inject-refresh route (which
+/// holds the mint authority). The proxy AWAITS this before injecting a stale
+/// minted credential, closing the campaign's reads-401/writes-succeed asymmetry.
+pub struct CoordInjectRefresher {
+    coord: CoordClient,
+    host_id: HostId,
+}
+
+impl CoordInjectRefresher {
+    pub fn new(coord: CoordClient, host_id: HostId) -> Self {
+        Self { coord, host_id }
+    }
+}
+
+#[async_trait]
+impl InjectRefresher for CoordInjectRefresher {
+    async fn refresh(&self, session_id: SessionId, mint_provider: &str) -> Option<RefreshedInject> {
+        match self
+            .coord
+            .refresh_inject(self.host_id, session_id, mint_provider)
+            .await
+        {
+            Ok(resp) => Some(RefreshedInject {
+                secret: resp.secret,
+                expires_at: resp.expires_at,
+            }),
+            Err(e) => {
+                // The proxy keeps the stale secret on `None` — a stale token 401s
+                // (recoverable), and a coord blip must not drop the guest's request.
+                tracing::warn!(%session_id, provider = %mint_provider, error = %e, "egress inject re-mint via coord failed");
+                None
+            }
+        }
+    }
+}
 
 /// Per-host egress-proxy handle. Holds the registry (mutated as
 /// sessions come and go on this host), the CA cert PEM (handed to
@@ -82,6 +125,7 @@ impl HostEgress {
         bind_addr: SocketAddr,
         dns_bind_addr: Option<SocketAddr>,
         observe_sink: Option<engram_egress_proxy::ObserveSink>,
+        inject_refresher: Option<Arc<dyn InjectRefresher>>,
     ) -> Result<Self, EgressError> {
         let ca = ca_source.load().await.map_err(EgressError::Ca)?;
         let ca_cert_pem = ca.cert_pem.clone();
@@ -99,6 +143,7 @@ impl HostEgress {
         let mut proxy_cfg = ProxyConfig::new(bind_addr, registry.clone(), mint);
         proxy_cfg.dns_bind_addr = dns_bind_addr;
         proxy_cfg.observe_sink = observe_sink;
+        proxy_cfg.inject_refresher = inject_refresher;
         let proxy = Proxy::new(proxy_cfg);
 
         let listeners = bind_with_retry(&proxy).await.map_err(EgressError::Bind)?;
@@ -218,7 +263,6 @@ pub fn register_policy(
             }
         };
         injects.push(engram_egress_proxy::InjectEntry {
-            secret: i.secret,
             header_name: i.header_name,
             header_template: i.header_template,
             allow,
@@ -227,6 +271,10 @@ pub fn register_policy(
                 path_globs: i.path_globs,
                 graphql,
             },
+            // WS4: a minted entry (non-empty provider) carries a TTL the proxy
+            // re-mints against near expiry; a static secret has neither.
+            mint_provider: i.mint_provider,
+            cred: engram_egress_proxy::RefreshableCred::new(i.secret, i.expires_at),
         });
     }
     // ADR 0056 Phase 4: translate the policy's observe specs (no secret to
@@ -319,8 +367,11 @@ mod tests {
                         path_globs: vec!["/api/v2/logs*".into()],
                         graphql_operation: String::new(),
                         graphql_field: String::new(),
+                        mint_provider: String::new(),
+                        expires_at: None,
                     },
                     // ADR 0059: a GraphQL inject (gated by operation+field).
+                    // WS4: a minted (refreshable) github entry with a TTL.
                     EgressInjectEntry {
                         secret: "gh-token".into(),
                         header_name: "Authorization".into(),
@@ -331,6 +382,8 @@ mod tests {
                         path_globs: vec!["/graphql".into()],
                         graphql_operation: "mutation".into(),
                         graphql_field: "mergePullRequest".into(),
+                        mint_provider: "github".into(),
+                        expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
                     },
                 ],
                 observes: vec![
@@ -374,7 +427,8 @@ mod tests {
         let state = registry.lookup(guest_ip).expect("session registered");
         assert_eq!(state.injects.len(), 2);
         let inj = &state.injects[0];
-        assert_eq!(inj.secret, "dd-secret");
+        assert_eq!(inj.secret(), "dd-secret");
+        assert_eq!(inj.mint_provider, ""); // static: never refreshed
         assert_eq!(inj.header_name, "DD-API-KEY");
         assert!(inj.allow.matches("api.datadoghq.com"));
         assert!(inj.policy.allows("GET", "/api/v2/logs/events"));
@@ -386,7 +440,8 @@ mod tests {
 
         // ADR 0059: the GraphQL inject translates into a RequestPolicy.graphql.
         let gql_inj = &state.injects[1];
-        assert_eq!(gql_inj.secret, "gh-token");
+        assert_eq!(gql_inj.secret(), "gh-token");
+        assert_eq!(gql_inj.mint_provider, "github"); // WS4: refreshable
         let g = gql_inj
             .policy
             .graphql

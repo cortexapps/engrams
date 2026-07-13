@@ -86,6 +86,11 @@ pub fn router(state: SharedState) -> Router {
             "/hosts/:id/live-manifest",
             post(host_http::live_manifest_publish),
         )
+        // WS4: the egress proxy re-mints a near-expiry inject credential.
+        .route(
+            "/hosts/:id/sessions/:session_id/inject/refresh",
+            post(host_http::refresh_inject),
+        )
         .route(
             "/sessions/:id/harness-events",
             post(host_http::harness_event_ingest),

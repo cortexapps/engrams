@@ -11,6 +11,7 @@
 
 use std::net::Ipv4Addr;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::image::SecretMode;
@@ -97,6 +98,22 @@ pub struct EgressInjectEntry {
     /// ADR 0059: the GraphQL top-level field this inject authorizes; empty = REST.
     #[serde(default)]
     pub graphql_field: String,
+    /// WS4 (ADR 0056 amendment): the mint provider whose credential this entry
+    /// injects (e.g. `"github"`), or empty for a static/non-refreshable secret.
+    /// Non-empty entries carry a short-lived minted credential — the egress
+    /// proxy re-mints it via its `InjectRefresher` seam near `expires_at` so a
+    /// long-lived session doesn't keep injecting an installation token that
+    /// expired ~1h after boot (the campaign's reads-401/writes-succeed
+    /// asymmetry). `#[serde(default)]` so policies persisted before this field
+    /// (re-read on resume) decode as static.
+    #[serde(default)]
+    pub mint_provider: String,
+    /// WS4: when the minted `secret` expires. `None` for a static secret (never
+    /// refreshed). The proxy refreshes within 5 min of this instant — the same
+    /// freshness rule the coordinator's own token cache uses (`mint_basic`).
+    /// `#[serde(default)]` for resume-safety.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// ADR 0056 Phase 4: one resolved response-observation spec the host proxy

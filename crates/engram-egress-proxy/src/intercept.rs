@@ -37,7 +37,7 @@ use crate::cert_mint::CertMint;
 use crate::graphql::{self, ParsedGraphql};
 use crate::inject;
 use crate::observe::{self, ObserveSink};
-use crate::registry::{InjectEntry, ObserveEntry, SecretEntry};
+use crate::registry::{InjectEntry, InjectRefresher, ObserveEntry, SecretEntry};
 use crate::replayed::Replayed;
 use crate::resolver::{ResolveError, UpstreamResolver};
 use crate::substitute::{scan_for_violation, substitute};
@@ -261,6 +261,7 @@ pub async fn run<C>(
     observes: &[&ObserveEntry],
     session_id: SessionId,
     sink: Option<&ObserveSink>,
+    refresher: Option<&dyn InjectRefresher>,
     server_cfg: Arc<ServerConfig>,
     client_cfg: Arc<ClientConfig>,
 ) -> Result<(), InterceptError>
@@ -384,6 +385,16 @@ where
             }
             m
         };
+        // WS4: re-mint any near-expiry minted credential BEFORE injecting it, so a
+        // long-lived session never sends a stale (expired ~1h post-boot)
+        // installation token — the campaign's reads-401/writes-succeed asymmetry.
+        // Single-flighted per entry; on refresh failure the stale secret is kept
+        // (see `InjectEntry::refresh_if_stale`). Static entries are a no-op.
+        if let Some(refresher) = refresher {
+            for e in &matched {
+                e.refresh_if_stale(session_id, refresher).await;
+            }
+        }
         prefix = inject::inject_headers(prefix, &matched);
     }
 

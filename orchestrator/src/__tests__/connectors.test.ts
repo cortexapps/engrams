@@ -870,7 +870,10 @@ describe("cli facet (ADR 0058)", () => {
   test("the on-disk github + datadog connectors expose their cli facet", () => {
     const plan = compileCliIntegrations(["github:pulls:write", "datadog:metrics:read"], connectorRegistry());
     expect(plan.enabled.map((e) => e.provider).sort()).toEqual(["datadog", "github"]);
-    expect(plan.dummyEnv.GH_TOKEN).toBe("x-engrams-managed");
+    // WS4: the github connector's dummy token is GITHUB_TOKEN (not GH_TOKEN) so it
+    // stays outside bufgen's `GH_TOKEN:-GITHUB_PASSWORD` password chain.
+    expect(plan.dummyEnv.GITHUB_TOKEN).toBe("x-engrams-managed");
+    expect(plan.dummyEnv.GH_TOKEN).toBeUndefined();
     expect(plan.dummyEnv.DD_API_KEY).toBe("x-engrams-managed");
     expect(plan.dummyEnv.DD_APP_KEY).toBe("x-engrams-managed");
     expect(plan.enabled.find((e) => e.provider === "datadog")?.bins).toEqual(["pup"]);

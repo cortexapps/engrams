@@ -43,8 +43,9 @@ pub use graphql::{parse_request_body as parse_graphql_request, ParsedGraphql};
 pub use observe::{ObserveSink, ObservedAsset};
 pub use policy::{HostList, HostSpec, ParseError as PolicyParseError};
 pub use registry::{
-    Decision, GraphqlMatch, GraphqlOperation, InjectEntry, ObserveEntry, Registry, RequestPolicy,
-    SecretEntry, SessionState, SuccessRule,
+    Decision, GraphqlMatch, GraphqlOperation, InjectEntry, InjectRefresher, ObserveEntry,
+    RefreshableCred, RefreshedInject, Registry, RequestPolicy, SecretEntry, SessionState,
+    SuccessRule,
 };
 pub use sni::{peek_sni, PeekError as SniPeekError};
 pub use substitute::{scan_for_violation, substitute};

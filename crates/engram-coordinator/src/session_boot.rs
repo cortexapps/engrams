@@ -636,7 +636,7 @@ pub(crate) async fn resolve_inject_entries(
             // auth scheme is the provider's, not hardcoded by the policy compiler.
             // The scoped credential never enters the guest.
             match mint_inject_header(state, &inj.mint_provider, &caps).await {
-                Some(h) => engram_core::types::egress::EgressInjectEntry {
+                Some((h, expires_at)) => engram_core::types::egress::EgressInjectEntry {
                     secret: h.value,
                     header_name: h.name,
                     header_template: "{}".to_string(),
@@ -648,6 +648,11 @@ pub(crate) async fn resolve_inject_entries(
                     // the provider's host; the GraphQL matcher rides through.
                     graphql_operation: inj.graphql_operation.clone(),
                     graphql_field: inj.graphql_field.clone(),
+                    // WS4: a minted entry is refreshable — the proxy re-mints via
+                    // its InjectRefresher near `expires_at` (this provider is the
+                    // one the refresh route re-runs the mint for).
+                    mint_provider: inj.mint_provider.clone(),
+                    expires_at: Some(expires_at),
                 },
                 None => continue, // mint_inject_header logged the reason
             }
@@ -686,6 +691,9 @@ pub(crate) async fn resolve_inject_entries(
                 // ADR 0059: a static-token connector can also gate GraphQL ops.
                 graphql_operation: inj.graphql_operation.clone(),
                 graphql_field: inj.graphql_field.clone(),
+                // WS4: a static secret is not refreshable (empty provider, no TTL).
+                mint_provider: String::new(),
+                expires_at: None,
             }
         };
         out.push(entry);
@@ -696,14 +704,19 @@ pub(crate) async fn resolve_inject_entries(
 /// ADR 0056 amendment: resolve a *mint* provider's egress inject header — mint a
 /// credential scoped to the session's caps, then let the integration render it
 /// into a header (`Integration::inject_header`, e.g. github → `Bearer`). The
-/// scoped credential never enters the guest. `None` (logged) when the provider
-/// isn't resolvable, minting fails, or the credential isn't header-injectable
-/// (e.g. AWS SigV4).
+/// scoped credential never enters the guest. Returns the rendered header AND the
+/// credential's `expires_at` (WS4: the egress proxy threads the TTL so it can
+/// re-mint before the token goes stale). `None` (logged) when the provider isn't
+/// resolvable, minting fails, or the credential isn't header-injectable (e.g. AWS
+/// SigV4).
 async fn mint_inject_header(
     state: &SharedState,
     provider: &str,
     caps: &[engram_core::types::Capability],
-) -> Option<engram_core::traits::InjectHeader> {
+) -> Option<(
+    engram_core::traits::InjectHeader,
+    chrono::DateTime<chrono::Utc>,
+)> {
     let engine = state
         .integrations
         .resolve(provider, &state.services.secrets)
@@ -731,8 +744,9 @@ async fn mint_inject_header(
             return None;
         }
     };
+    let expires_at = cred.expires_at();
     match engine.inject_header(&cred) {
-        Some(h) => Some(h),
+        Some(h) => Some((h, expires_at)),
         None => {
             tracing::warn!(
                 provider,
@@ -741,6 +755,30 @@ async fn mint_inject_header(
             None
         }
     }
+}
+
+/// WS4: re-mint the egress inject header for a single provider on demand — the
+/// reusable core the proxy-refresh route (`POST /hosts/:id/sessions/:sid/
+/// inject/refresh`) runs when the proxy's minted credential nears expiry. Fetches
+/// the session's bound capabilities (the same scope `resolve_inject_entries` uses
+/// at boot) and re-runs the mint. Returns the freshly rendered header + its new
+/// `expires_at`, or `None` (logged in `mint_inject_header`) on any failure — the
+/// proxy then keeps the stale secret rather than failing the request.
+pub(crate) async fn refresh_inject_header(
+    state: &SharedState,
+    session_id: SessionId,
+    provider: &str,
+) -> Option<(
+    engram_core::traits::InjectHeader,
+    chrono::DateTime<chrono::Utc>,
+)> {
+    let caps = state
+        .services
+        .meta
+        .get_session_capabilities(session_id)
+        .await
+        .unwrap_or_default();
+    mint_inject_header(state, provider, &caps).await
 }
 
 // Issue #535 (b): `persist_integration_policy` (ADR 0056 B′) retired — the

@@ -239,6 +239,36 @@ impl CoordClient {
         Ok(())
     }
 
+    /// POST /api/v1/hosts/:id/sessions/:session_id/inject/refresh
+    ///
+    /// WS4: the egress proxy's minted inject credential (a GitHub App
+    /// installation token, ~1h TTL) is nearing expiry. Ask the coord to re-mint
+    /// it against the session's bound capabilities and return the fresh header +
+    /// TTL. Unlike the fire-and-forget observe/harness sinks this is a
+    /// request/response the proxy awaits (it substitutes the returned secret on
+    /// the outbound request). A transport/HTTP failure is an `Err` — the proxy
+    /// then keeps the stale secret rather than failing the guest's request.
+    pub async fn refresh_inject(
+        &self,
+        host_id: HostId,
+        session_id: SessionId,
+        mint_provider: &str,
+    ) -> Result<RefreshInjectResponse, CoordClientError> {
+        let url = self.endpoint(&format!(
+            "/hosts/{host_id}/sessions/{session_id}/inject/refresh"
+        ));
+        let builder = self.http.post(&url);
+        let req = RefreshInjectRequest {
+            mint_provider: mint_provider.to_string(),
+        };
+        let resp = self
+            .auth(builder, &req)
+            .send()
+            .await
+            .map_err(CoordClientError::Transport)?;
+        decode_json(resp, "refresh_inject").await
+    }
+
     /// POST /api/v1/hosts/forge
     ///
     /// ADR 0023 split-mode forge forwarding. The host-agent reads the
@@ -680,6 +710,22 @@ pub struct IntegrationAssetReport {
 pub struct IdleEvictionCandidatesResponse {
     pub accepted: usize,
     pub failed: usize,
+}
+
+/// WS4: request body for the inject-refresh route — the mint provider whose
+/// credential the proxy needs re-minted.
+#[derive(Serialize)]
+pub struct RefreshInjectRequest {
+    pub mint_provider: String,
+}
+
+/// WS4: the coord's re-minted inject credential — the fresh rendered header
+/// value the proxy substitutes, plus its new expiry (drives the next refresh).
+#[derive(Deserialize)]
+pub struct RefreshInjectResponse {
+    pub header_name: String,
+    pub secret: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 // ---- ADR 0016 Phase B: live disk manifest publish ----
