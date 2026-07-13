@@ -69,6 +69,24 @@ pub struct SessionCreateWriteSet {
     pub runtime_spec: crate::types::runtime_spec::RuntimeSpec,
 }
 
+/// One candidate host's fit verdict from
+/// [`MetadataStore::placement_no_fit_details`]. `reason` is a bounded
+/// vocabulary (metric-label safe): `ram_full` / `cpu_full` /
+/// `unmeasured` (no allocatable measurement yet) / `not_lockable`
+/// (status/cordon changed between ranking and the pick) / `fits_now`
+/// (freed up since the failed pick — indicates a race, not a bug).
+#[derive(Clone, Debug)]
+pub struct PlacementNoFit {
+    pub host_id: HostId,
+    pub reason: &'static str,
+    /// `allocatable − reserved` at read time (MiB; meaningless when
+    /// `reason == "unmeasured"`).
+    pub free_mib: i64,
+    /// `cpu_budget − reserved_vcpus` at read time (0-gated hosts report
+    /// `i64::MAX` — CPU is ungated there).
+    pub free_vcpus: i64,
+}
+
 /// Outcome of [`MetadataStore::reserve_and_persist_create`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateDisposition {
@@ -169,15 +187,22 @@ pub trait MetadataStore: Send + Sync {
     /// session with an unroutable sandbox.
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError>;
 
-    /// ADR 0046: the fleet's schedulable free memory (MiB) — `Σ over ready /
-    /// draining hosts of max(0, allocatable_mib − Σ reserved session budgets)`.
-    /// This is the REAL demand-pressure signal the K4 autoscaler scales on
-    /// (`/admin/fleet/demand` + the `engram_fleet_free_mib` gauge), replacing the
-    /// phantom in-memory `total − used(=0)` that always read "fleet empty" (why
-    /// it never scaled during the OOM incident). Default impl (mock stores)
-    /// returns 0.
-    async fn fleet_free_mib(&self) -> Result<i64, MetaError> {
-        Ok(0)
+    /// Diagnostic twin of the `reserve_and_persist_create` /
+    /// `place_queued_session` 2D pick: for each candidate host, why the
+    /// session's `(mem_budget_mib, cpu_budget_vcpus)` does not fit right
+    /// now. Read OUTSIDE the placement transaction (no `FOR UPDATE`) —
+    /// a snapshot for observability, so a host that frees up between the
+    /// failed pick and this read can honestly report `fits_now`. Called
+    /// only on the no-capacity path (2026-07-11 campaign: every host was
+    /// rejected with zero per-host visibility — the "no capacity with
+    /// free hosts" mystery). Default impl (mock stores): empty.
+    async fn placement_no_fit_details(
+        &self,
+        _candidates: &[HostId],
+        _mem_budget_mib: i64,
+        _cpu_budget_vcpus: i32,
+    ) -> Result<Vec<PlacementNoFit>, MetaError> {
+        Ok(Vec::new())
     }
 
     /// Issue #535 (b): the ENTIRE session write-set — one logical fact

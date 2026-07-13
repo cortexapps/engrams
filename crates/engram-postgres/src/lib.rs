@@ -393,6 +393,55 @@ fn choose_placement_host(
         })
 }
 
+/// Per-candidate no-fit classification — the diagnostic twin of
+/// [`choose_placement_host`], sharing its exact fit arithmetic so the
+/// reported reason can never disagree with the pick. Bounded reason
+/// vocabulary per [`engram_core::traits::PlacementNoFit`]. Pure so it's
+/// unit-tested without a database.
+fn classify_no_fit(
+    candidates: &[uuid::Uuid],
+    fit: &std::collections::HashMap<uuid::Uuid, HostFit>,
+    budget_mib: i64,
+    budget_vcpus: i64,
+) -> Vec<engram_core::traits::PlacementNoFit> {
+    candidates
+        .iter()
+        .map(|h| {
+            let Some(f) = fit.get(h) else {
+                return engram_core::traits::PlacementNoFit {
+                    host_id: HostId(*h),
+                    reason: "not_lockable",
+                    free_mib: 0,
+                    free_vcpus: 0,
+                };
+            };
+            let free_vcpus = if f.cpu_budget > 0 {
+                f.cpu_budget - f.reserved_vcpus
+            } else {
+                i64::MAX
+            };
+            let free_mib = f.alloc_mib - f.reserved_mib;
+            let reason = if f.alloc_mib <= 0 {
+                "unmeasured"
+            } else if free_mib < budget_mib {
+                "ram_full"
+            } else if free_vcpus < budget_vcpus {
+                "cpu_full"
+            } else {
+                // Fits at read time — the pick ran earlier under FOR
+                // UPDATE and lost a race; honest label beats a lie.
+                "fits_now"
+            };
+            engram_core::traits::PlacementNoFit {
+                host_id: HostId(*h),
+                reason,
+                free_mib,
+                free_vcpus,
+            }
+        })
+        .collect()
+}
+
 /// Best-fit (smallest free RAM that fits both dims) among MEASURED hosts.
 fn best_fit_measured(
     candidates: &[uuid::Uuid],
@@ -588,6 +637,53 @@ mod placement_tests {
         let h = ids(2);
         let fit = ram_fit(&[(h[0], 32768, 28000), (h[1], 32768, 0)]);
         assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 0), Some(h[0]));
+    }
+
+    /// The diagnostic classifier must agree with the pick: whenever
+    /// `choose_placement_host` returns `None`, every candidate needs a
+    /// non-`fits_now` reason, and the reason must name the binding
+    /// dimension.
+    #[test]
+    fn classify_no_fit_names_the_binding_dimension() {
+        let h = ids(4);
+        let mut fit = ram_fit(&[
+            (h[0], 8192, 6000), // free 2192 < 4096 → ram_full
+            (h[1], 0, 0),       // unmeasured
+        ]);
+        fit.insert(
+            h[2],
+            HostFit {
+                alloc_mib: 32768,
+                reserved_mib: 0,
+                cpu_budget: 8,
+                reserved_vcpus: 8, // free 0 < 2 → cpu_full
+            },
+        );
+        // h[3] deliberately absent from the map → not_lockable.
+        let details = super::classify_no_fit(&h, &fit, 4096, 2);
+        let by_id: HashMap<Uuid, &str> = details
+            .iter()
+            .map(|d| (d.host_id.as_uuid(), d.reason))
+            .collect();
+        assert_eq!(by_id[&h[0]], "ram_full");
+        assert_eq!(by_id[&h[1]], "unmeasured");
+        assert_eq!(by_id[&h[2]], "cpu_full");
+        assert_eq!(by_id[&h[3]], "not_lockable");
+        let ram = details
+            .iter()
+            .find(|d| d.host_id.as_uuid() == h[0])
+            .unwrap();
+        assert_eq!(ram.free_mib, 2192);
+    }
+
+    /// A host that fits at diagnostic-read time reports the honest
+    /// `fits_now` (the pick lost a race) rather than inventing a reason.
+    #[test]
+    fn classify_no_fit_reports_fits_now_on_race() {
+        let h = ids(1);
+        let fit = ram_fit(&[(h[0], 8192, 0)]);
+        let details = super::classify_no_fit(&h, &fit, 4096, 0);
+        assert_eq!(details[0].reason, "fits_now");
     }
 
     #[test]
@@ -1613,45 +1709,89 @@ impl MetadataStore for PostgresStore {
         row::session_from_row(&row)
     }
 
-    /// ADR 0046: Σ over schedulable hosts of `max(0, allocatable − reserved)` —
-    /// the real fleet free-memory signal (replaces the phantom `total − used`).
-    /// `pending` reservations older than 10 min are excluded as crash-orphaned
-    /// (a boot never takes that long), matching `reserve_placement`.
-    async fn fleet_free_mib(&self) -> Result<i64, MetaError> {
-        let free: i64 = sqlx::query_scalar(
+    /// Diagnostic twin of `pick_host_2d`, without the `FOR UPDATE`: same
+    /// fit-map construction (same status/cordon predicate, same reserved
+    /// SUM incl. capture jobs and the 10-min crash-orphan gate), then the
+    /// pure [`classify_no_fit`]. Runs only on the no-capacity path.
+    async fn placement_no_fit_details(
+        &self,
+        candidates: &[HostId],
+        mem_budget_mib: i64,
+        cpu_budget_vcpus: i32,
+    ) -> Result<Vec<engram_core::traits::PlacementNoFit>, MetaError> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
+        let host_rows = sqlx::query(
             r#"
-            SELECT COALESCE(SUM(GREATEST(0, h.allocatable_mib - COALESCE(r.reserved, 0))), 0)::BIGINT
-            FROM hosts h
-            LEFT JOIN (
-                SELECT host_id, SUM(mem) AS reserved
-                FROM (
-                    SELECT host_id, mem_budget_mib AS mem
-                    FROM sessions
-                    WHERE host_id IS NOT NULL
-                      AND status IN ('pending','created','active',
-                                     'evacuating','evicting')
-                      -- ADR 0048: gate on last_active_at, not created_at — a session
-                      -- can sit `queued` for many minutes before `place_queued_session`
-                      -- flips it to `pending` (bumping last_active_at), and an old
-                      -- created_at would make that fresh reservation look crash-orphaned
-                      -- and leak (overcommit). reserve_and_persist_create sets both to NOW().
-                      AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
-                    UNION ALL
-                    -- ADR 0084 (c): a capturing VM reserves like a session.
-                    SELECT host_id, mem_budget_mib
-                    FROM capture_jobs
-                    WHERE host_id IS NOT NULL
-                      AND stage NOT IN ('done','failed')
-                ) reserved
-                GROUP BY host_id
-            ) r ON r.host_id = h.id
-            WHERE h.status IN ('ready','draining') AND NOT h.cordoned
+            SELECT id, allocatable_mib, total_vcpus
+            FROM hosts
+            WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
             "#,
         )
-        .fetch_one(&self.pool)
+        .bind(&cand)
+        .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(free)
+        let mut fit: std::collections::HashMap<uuid::Uuid, HostFit> =
+            std::collections::HashMap::with_capacity(host_rows.len());
+        for r in &host_rows {
+            let hid: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
+            let alloc_mib: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
+            let total_vcpus: i32 = sqlx::Row::try_get(r, "total_vcpus").map_err(db_err)?;
+            fit.insert(
+                hid,
+                HostFit {
+                    alloc_mib,
+                    reserved_mib: 0,
+                    cpu_budget: engram_core::types::host::host_cpu_budget(
+                        total_vcpus.max(0) as u32
+                    ),
+                    reserved_vcpus: 0,
+                },
+            );
+        }
+        let res_rows = sqlx::query(
+            r#"
+            SELECT host_id,
+                   COALESCE(SUM(mem), 0)::BIGINT AS reserved_mib,
+                   COALESCE(SUM(cpu), 0)::BIGINT AS reserved_vcpus
+            FROM (
+                SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
+                FROM sessions
+                WHERE host_id = ANY($1)
+                  AND status IN ('pending','created','active',
+                                 'evacuating','evicting')
+                  AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
+                UNION ALL
+                SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+                FROM capture_jobs
+                WHERE host_id = ANY($1)
+                  AND stage NOT IN ('done','failed')
+            ) reserved
+            GROUP BY host_id
+            "#,
+        )
+        .bind(&cand)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        for r in &res_rows {
+            let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
+            let mem: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
+            let cpu: i64 = sqlx::Row::try_get(r, "reserved_vcpus").map_err(db_err)?;
+            if let Some(f) = fit.get_mut(&h) {
+                f.reserved_mib = mem;
+                f.reserved_vcpus = cpu;
+            }
+        }
+        Ok(classify_no_fit(
+            &cand,
+            &fit,
+            mem_budget_mib,
+            cpu_budget_vcpus as i64,
+        ))
     }
 
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {

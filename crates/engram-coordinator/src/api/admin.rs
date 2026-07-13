@@ -942,13 +942,11 @@ pub(crate) async fn fleet_demand_core(state: &SharedState) -> FleetDemandRespons
     let m = crate::placement::fleet_snapshot(state.services.meta.as_ref())
         .await
         .unwrap_or_default();
-    let free_mib = state
-        .services
-        .meta
-        .fleet_free_mib()
-        .await
-        .map(|f| f.max(0) as u64)
-        .unwrap_or(m.total_mib);
+    // free_mib rides the snapshot now: same capability/TTL-gated host set
+    // as schedulable_hosts, so the autoscaler can't see capacity placement
+    // won't use (the retired SQL `fleet_free_mib` did — the 2026-07-11
+    // under-scaling mechanism).
+    let free_mib = m.free_mib;
     let queued = state
         .services
         .meta

@@ -515,7 +515,26 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
         .await
     {
         Ok(Some(host_id)) => PlaceOutcome::Placed(host_id),
-        Ok(None) => PlaceOutcome::NoCapacity,
+        Ok(None) => {
+            // Candidates ranked but the 2D pick fit none — the reserve-
+            // side twin of the empty-candidates logging above (2026-07-11
+            // campaign: this arm was silent, so a fleet that queued every
+            // create looked identical to a full one). One WARN per class
+            // head per sweep, same cadence the empty-set branch already
+            // accepted.
+            if !candidates.hosts.is_empty() {
+                crate::placement::log_reserve_no_fit(
+                    state.services.meta.as_ref(),
+                    &ctx,
+                    "queue_create",
+                    &candidates.hosts,
+                    q.mem_budget_mib,
+                    q.cpu_budget_vcpus,
+                )
+                .await;
+            }
+            PlaceOutcome::NoCapacity
+        }
         Err(e) => {
             tracing::warn!(session_id = %q.session.id, error = %e,
                 "queue-scanner: place_queued_session failed");
@@ -685,33 +704,74 @@ async fn time_out_session(state: &SharedState, q: &QueuedSession) {
         .max(0);
     match q.origin {
         QueueOrigin::Create => {
-            // User-visible reason BEFORE the terminal flip so subscribers
-            // see why it failed.
-            if let Err(e) = state
-                .services
-                .meta
-                .append_session_event(
-                    session_id,
-                    "queue_timeout",
-                    serde_json::json!({
-                        "waited_secs": waited,
-                        "reason": "no host capacity became available in time",
-                    }),
-                )
-                .await
-            {
-                tracing::warn!(%session_id, error = %e, "queue-scanner: queue_timeout event failed");
-            }
-            match state
+            // Terminal flip FIRST: `transition_session` is the legality-
+            // checked claim on this timeout. Appending the event before it
+            // (the old order) double-emitted `queue_timeout` when the flip
+            // lost a race (a sibling's place_create won the queued→pending
+            // CAS): the event landed unconditionally, the transition
+            // no-op'd, and the NEXT sweep appended it again (2026-07-11
+            // campaign, session B6). Losing the race now means no event at
+            // all — correct, since the session is actually proceeding.
+            let prev = match state
                 .services
                 .meta
                 .transition_session(session_id, SessionState::Failed)
                 .await
             {
-                Ok(prev) => emit_from(state, session_id, prev, SessionState::Failed).await,
-                Err(e) => tracing::warn!(%session_id, error = %e,
-                    "queue-scanner: timeout Queued→Failed failed"),
+                Ok(prev) => prev,
+                Err(e) => {
+                    tracing::warn!(%session_id, error = %e,
+                        "queue-scanner: timeout Queued→Failed failed (likely raced a placement); \
+                         no queue_timeout event emitted");
+                    return;
+                }
+            };
+            // The user-visible reason, with enough fleet diagnostics that
+            // the failure explains itself (per-host fit reasons — the same
+            // vocabulary as PLACEMENT_EXCLUDED_TOTAL). Appended before the
+            // status event below so stream subscribers read reason-then-flip.
+            let mut payload = serde_json::json!({
+                "waited_secs": waited,
+                "reason": "no host capacity became available in time",
+            });
+            if let Ok(m) = crate::placement::fleet_snapshot(state.services.meta.as_ref()).await {
+                payload["fleet"] = serde_json::json!({
+                    "schedulable_hosts": m.schedulable_hosts,
+                    "free_mib": m.free_mib,
+                    "free_vcpus": m.free_vcpus,
+                    "cordoned_hosts": m.cordoned_hosts,
+                });
             }
+            if let Ok(hosts) = state.services.meta.list_active_hosts().await {
+                let ids: Vec<_> = hosts.iter().map(|h| h.id).collect();
+                if let Ok(details) = state
+                    .services
+                    .meta
+                    .placement_no_fit_details(&ids, q.mem_budget_mib, q.cpu_budget_vcpus)
+                    .await
+                {
+                    payload["hosts"] = details
+                        .iter()
+                        .take(16)
+                        .map(|d| {
+                            serde_json::json!({
+                                "id": d.host_id.to_string(),
+                                "reason": d.reason,
+                                "free_mib": d.free_mib,
+                            })
+                        })
+                        .collect();
+                }
+            }
+            if let Err(e) = state
+                .services
+                .meta
+                .append_session_event(session_id, "queue_timeout", payload)
+                .await
+            {
+                tracing::warn!(%session_id, error = %e, "queue-scanner: queue_timeout event failed");
+            }
+            emit_from(state, session_id, prev, SessionState::Failed).await;
         }
         QueueOrigin::Resume => match state
             .services

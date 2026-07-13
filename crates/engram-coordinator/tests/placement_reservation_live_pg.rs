@@ -210,24 +210,35 @@ async fn burst_packs_one_host_then_overflows_then_rejects() {
     );
 }
 
+/// The reserve path's diagnostic twin (2026-07-11 campaign): after a
+/// no-fit pick, `placement_no_fit_details` must classify each candidate
+/// with the same arithmetic the pick used. Also asserts the SQL (the
+/// no-FOR-UPDATE fit read + the reserved UNION incl. capture_jobs)
+/// parses and runs against real Postgres.
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn fleet_free_mib_sql_runs_against_real_pg() {
+async fn placement_no_fit_details_classifies_against_real_pg() {
     let Some(meta) = connect().await else {
         return;
     };
-    // The exact value is global (all ready hosts) and unit-tested via the pure
-    // decision fn; here we only assert the SQL — the LEFT JOIN over the
-    // reserved aggregate, GREATEST(0, …), the pending age-guard, the ::BIGINT
-    // cast — parses and runs against real Postgres and yields a sane figure.
-    let free = meta
-        .fleet_free_mib()
+    // One 16 GiB host, fully reserved by one 16 GiB session → a further
+    // 4 GiB ask must classify as ram_full with free_mib == 0.
+    let host = seed_host(&meta, "no-fit-details-host", 16384).await;
+    let sid = SessionId::new();
+    let placed = reserve(&meta, sid, 16384, 2, &[host], 0).await;
+    assert_eq!(placed, Some(host), "the 16 GiB session reserves the host");
+    let details = meta
+        .placement_no_fit_details(&[host], 4096, 2)
         .await
-        .expect("fleet_free_mib SQL runs");
-    assert!(
-        free >= 0,
-        "free_mib is a non-negative MiB count; got {free}"
+        .expect("placement_no_fit_details SQL runs");
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0].host_id, host);
+    assert_eq!(
+        details[0].reason, "ram_full",
+        "fully-reserved host must classify ram_full; got {:?}",
+        details[0]
     );
+    assert_eq!(details[0].free_mib, 0, "16384 alloc − 16384 reserved");
 }
 
 /// Issue #535 (b) acceptance criterion: the session write-set ({row,

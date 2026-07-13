@@ -385,20 +385,24 @@ pub const ENABLE_PRESTAGE_SECONDS: &str = "engram_enable_prestage_seconds";
 pub const ENABLE_PRESTAGE_HOST_OUTCOMES_TOTAL: &str = "engram_enable_prestage_host_outcomes_total";
 
 /// Counter (ADR 0068; `origin` label added in the core-ops-batch
-/// correction pass). Per-host exclusion reasons whenever a placement
-/// attempt turns up an empty candidate set — kills the "no capacity
-/// with free hosts" mystery mode (a wire-skewed or capability-failing
-/// host used to vanish from the candidate set with the caller seeing
-/// only a bare `NoCapacity`/empty-`RankedCandidates`). Emitted from
-/// `placement::log_empty_candidates`, the one call site every
-/// empty-candidates path shares. Labels:
+/// correction pass; reserve-path reasons added after the 2026-07-11
+/// campaign). Per-host exclusion reasons whenever a placement attempt
+/// rejects hosts — kills the "no capacity with free hosts" mystery mode.
+/// Two emitters:
+/// - `placement::log_empty_candidates` — every empty-candidate-set path.
+/// - `placement::log_reserve_no_fit` — candidates existed but the
+///   FOR-UPDATE 2D pick fit none (previously the LAST silent branch).
+///
+/// Labels:
 /// - `reason` = the bounded `placement::exclusion_summary` vocabulary
 ///   (`excluded` / `not_ready` / `cordoned` / `wire_skew` / `stale` /
 ///   `cap:<name>` — one of the ~6 named capabilities, so still bounded
-///   / `digest_not_ready` / `no_fit`).
-/// - `origin` = which call site hit the empty set: `create` (fresh
-///   session, `api/sessions.rs::boot_prepared`) / `queue_create`
-///   (queue-scanner re-placing a create-origin queued session) /
+///   / `digest_not_ready` / `no_fit`) PLUS the reserve-path fit
+///   vocabulary from `PlacementNoFit` (`ram_full` / `cpu_full` /
+///   `unmeasured` / `not_lockable` / `fits_now`).
+/// - `origin` = which call site: `create` (fresh session,
+///   `api/sessions.rs::boot_prepared`) / `queue_create` (queue-scanner
+///   re-placing a create-origin queued session) /
 ///   `queue_resume_precheck` (queue-scanner's resume dequeue capacity
 ///   check) / `resume` (the resume/evac path, `pick_for_session`).
 ///   Bounded to these 4 values — do not add a 5th without updating this
