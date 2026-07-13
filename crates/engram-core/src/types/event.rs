@@ -53,6 +53,15 @@ pub struct RewindSummary {
     /// rewind (`git push` / opened PR / shared file). The platform
     /// can't undo them — it surfaces them. One line each.
     pub surviving_side_effects: Vec<String>,
+    /// Workspace paths whose `file_changed` events fell in the
+    /// rolled-back span (2026-07-13 dfa0face incident): those edits are
+    /// GONE from the restored guest — the agent won't remember them and
+    /// the disk doesn't have them — but the exact hunks remain in the
+    /// tombstoned (greyed) transcript. Naming the files on the recovery
+    /// boundary is what lets a user tell "cosmetic rollback" from "my
+    /// change needs re-applying" without archaeology.
+    #[serde(default)]
+    pub rolled_back_files: Vec<String>,
 }
 
 /// ADR 0026: one row from the `artifacts` table — a file shared into a

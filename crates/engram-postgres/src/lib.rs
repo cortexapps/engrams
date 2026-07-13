@@ -3876,6 +3876,29 @@ impl MetadataStore for PostgresStore {
             })
             .collect();
 
+        // Files whose edits fall in the rolled-back span (2026-07-13
+        // incident): the restored guest has neither the agent's memory of
+        // these edits NOR the bytes on disk — only the tombstoned
+        // transcript keeps the hunks. Surface the paths on the boundary
+        // so a user can see at a glance that real code changes were lost
+        // and need re-applying.
+        let rolled_back_files: Vec<String> = sqlx::query(
+            r#"
+            SELECT DISTINCT payload->>'path' AS path FROM session_events
+             WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
+               AND kind = 'file_changed' AND payload->>'path' IS NOT NULL
+             ORDER BY path
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(events_cursor)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .iter()
+        .filter_map(|r| sqlx::Row::try_get(r, "path").ok())
+        .collect();
+
         // Tombstone the rolled-back span (audit-preserving) and count it.
         // Issue #529: exclude coordinator-fact kinds — `status_changed`,
         // `snapshot_taken`, `evicted`, `resumed`, `recovered_from_checkpoint`.
@@ -3960,6 +3983,7 @@ impl MetadataStore for PostgresStore {
             recovery_epoch: recovery_epoch as i64,
             through_idx: events_cursor,
             surviving_side_effects,
+            rolled_back_files,
         })
     }
 

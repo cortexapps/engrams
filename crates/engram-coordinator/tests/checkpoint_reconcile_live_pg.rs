@@ -443,14 +443,30 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
     )
     .await
     .expect("append PR");
+    // Post-checkpoint edits (2026-07-13 incident): the rolled-back files
+    // must be NAMED on the summary — they're gone from the restored guest
+    // (memory and disk) and only the tombstoned hunks record them. Two
+    // events on one path prove the DISTINCT.
+    for _ in 0..2 {
+        meta.append_session_event(
+            session_id,
+            "file_changed",
+            serde_json::json!({
+                "path": "/workspace/app/src/Cleaner.kt",
+                "change": {"edit": {"hunks": []}},
+            }),
+        )
+        .await
+        .expect("append file_changed");
+    }
 
     let summary = meta
         .rewind_session_to_cursor(session_id, cursor)
         .await
         .expect("rewind");
     assert_eq!(
-        summary.rolled_back, 2,
-        "the two post-cursor events tombstoned"
+        summary.rolled_back, 4,
+        "the four post-cursor events tombstoned"
     );
     assert_eq!(summary.recovery_epoch, 1, "epoch bumped 0 → 1");
     assert_eq!(summary.through_idx, cursor);
@@ -460,6 +476,11 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
         "the opened PR is a surviving side-effect",
     );
     assert!(summary.surviving_side_effects[0].contains("pull/7"));
+    assert_eq!(
+        summary.rolled_back_files,
+        vec!["/workspace/app/src/Cleaner.kt".to_string()],
+        "rolled-back edit paths surface once (DISTINCT) on the summary",
+    );
 
     // Replay carries the rewind flags, all rows retained (audit).
     let events = meta
@@ -473,8 +494,8 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
         .filter(|e| e.idx > cursor && e.rewound_at.is_some())
         .count();
     assert_eq!(
-        rolled, 2,
-        "both post-cursor events are tombstoned but retained"
+        rolled, 4,
+        "all post-cursor events are tombstoned but retained"
     );
 
     // A new event after the rewind carries the bumped epoch.

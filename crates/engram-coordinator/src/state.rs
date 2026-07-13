@@ -292,6 +292,15 @@ pub enum SessionEvent {
         /// Outside-world side-effects in the rolled-back span that
         /// survive (one human-readable line each).
         surviving_side_effects: Vec<String>,
+        /// Workspace paths whose edits fell in the rolled-back span —
+        /// gone from the restored guest (memory AND disk), preserved as
+        /// hunks in the tombstoned transcript. `#[serde(default)]` for
+        /// events persisted before the field. (2026-07-13 incident:
+        /// without this the card says "80 events rolled back" and the
+        /// user has to diff-hunt the greyed span to learn a real code
+        /// change needs re-applying.)
+        #[serde(default)]
+        rolled_back_files: Vec<String>,
         /// ADR 0045 F1: why the rewind happened, so the web doesn't
         /// label a planned operator move as a host failure. `#[serde(default)]`
         /// → events persisted before this field default to the historical
@@ -1573,6 +1582,7 @@ pub(crate) mod tests {
             through_idx: 7,
             rolled_back: 4,
             surviving_side_effects: vec![],
+            rolled_back_files: vec![],
             cause: RecoveryCause::PlannedRelocation,
             at: chrono::Utc::now(),
         };
