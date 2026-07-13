@@ -118,6 +118,15 @@ mount -t devtmpfs dev /dev 2>/dev/null || true
 # nodes to materialise here. Standard Linux init does this.
 mkdir -p /dev/pts 2>/dev/null || true
 mount -t devpts devpts /dev/pts 2>/dev/null || true
+# /dev/fd + stdio symlinks — standard Linux init creates these; devtmpfs
+# does not. Without /dev/fd, bash process substitution (`<(...)`) fails
+# guest-wide with `cat: /dev/fd/63: No such file or directory`, which
+# broke real repo tooling in sessions (helm-chart's validate-snapshots
+# uses `cat <(git diff) <(git status)`).
+ln -sf /proc/self/fd   /dev/fd     2>/dev/null || true
+ln -sf /proc/self/fd/0 /dev/stdin  2>/dev/null || true
+ln -sf /proc/self/fd/1 /dev/stdout 2>/dev/null || true
+ln -sf /proc/self/fd/2 /dev/stderr 2>/dev/null || true
 # /dev/shm is POSIX shared memory (tmpfs). Standard Linux init mounts it;
 # our minimal devtmpfs /dev doesn't carry it. Chromium (the ADR 0027
 # playwright bundle) allocates its renderer's shared memory here and the
