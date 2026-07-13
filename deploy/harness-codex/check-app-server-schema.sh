@@ -16,7 +16,10 @@ for schema in \
   v2/AgentMessageDeltaNotification.json \
   v2/FileChangePatchUpdatedNotification.json \
   v2/ThreadNameUpdatedNotification.json \
-  ToolRequestUserInputParams.json; do
+  ToolRequestUserInputParams.json \
+  v1/InitializeParams.json \
+  DynamicToolCallParams.json \
+  DynamicToolCallResponse.json; do
   test -s "$out/$schema" || { echo "Codex stable app-server schema missing $schema" >&2; exit 1; }
 done
 
@@ -26,3 +29,27 @@ jq -e '.properties.delta and .properties.itemId' "$out/v2/AgentMessageDeltaNotif
 jq -e '.properties.threadId and .properties.threadName' "$out/v2/ThreadNameUpdatedNotification.json" >/dev/null
 jq -e '.definitions.TurnStatus.enum | contains(["completed", "failed", "interrupted", "inProgress"])' \
   "$out/ServerNotification.json" >/dev/null
+
+# ADR 0089 P3, pinned from live codex 0.144.1 generated schemas.
+jq -e '.definitions.InitializeCapabilities.properties.experimentalApi.type == "boolean"' \
+  "$out/v1/InitializeParams.json" >/dev/null
+jq -e '
+  (.required | contains(["arguments", "callId", "threadId", "tool", "turnId"])) and
+  (.properties.arguments == true) and
+  (.properties.callId.type == "string") and
+  (.properties.threadId.type == "string") and
+  (.properties.tool.type == "string") and
+  (.properties.turnId.type == "string")
+' "$out/DynamicToolCallParams.json" >/dev/null
+jq -e '
+  (.required | contains(["contentItems", "success"])) and
+  (.properties.success.type == "boolean") and
+  (.properties.contentItems.type == "array") and
+  (.properties.contentItems.items["$ref"] == "#/definitions/DynamicToolCallOutputContentItem") and
+  any(
+    .definitions.DynamicToolCallOutputContentItem.oneOf[];
+    (.required | contains(["text", "type"])) and
+    (.properties.text.type == "string") and
+    (.properties.type.enum | contains(["inputText"]))
+  )
+' "$out/DynamicToolCallResponse.json" >/dev/null

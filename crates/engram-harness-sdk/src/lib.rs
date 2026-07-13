@@ -4,6 +4,8 @@
 //! owns the failure-prone Engram-facing half: dial/attach, reconnect across
 //! snapshot restores and host rolls, and at-least-once event delivery.
 
+pub mod parked;
+
 use std::collections::{HashSet, VecDeque};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
