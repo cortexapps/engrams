@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 Guidance for working in this repo (Claude Code agents and humans alike). Keep it
 accurate — if something here drifts from reality, fix it in the same change.
@@ -15,46 +15,6 @@ against the same code paths.
 The deep architecture lives in `README.md` and `DESIGN.md`; design decisions live in
 `docs/adr/` (the source of truth — see [ADRs](#adrs)). This file is the operational
 layer: how to build, test, and the conventions we hold.
-
-## The tiers (request → execution)
-
-1. **web/** — React/Vite dashboard. Talks Connect/gRPC + SSE to the orchestrator.
-2. **orchestrator/** — Bun + Hono TypeScript app tier (ADR 0051): human auth
-   (better-auth), the task model, and authorization. The **only** web backend; it
-   fronts the coordinator over app-gRPC. (Drizzle ORM, its own Postgres DB.)
-3. **engram-coordinator** (Rust, axum + gRPC) — the control plane: session lifecycle,
-   scheduling, idle eviction, the append-only **session event log**, GC. Stateless;
-   **Postgres is the authority**; replicas coordinate via `LISTEN/NOTIFY`. Hosts
-   **dial in** over WebSocket (NAT-friendly, ADR 0013).
-4. **engram-host-agent** (Rust, per-host daemon) — wraps a `SandboxBackend` + the
-   harness hub + chunked-OCI cache + NBD/UFFD (FC) + the egress proxy. Boots the VM.
-5. **In-guest** — `engram-agentd` (PID 1 control surface over vsock/virtio-console)
-   supervises a **harness** (`engram-harness-claude`) that drives the agent CLI and
-   reports events back up.
-
-## Repo map
-
-**Rust workspace** (`crates/`, ~35 members). Key binaries:
-`engram-coordinator`, `engram-host-agent`, `engram-host-operator` (K8s rollout, ADR
-0044), `engram-uffd-handler` (FC snapshot page-faulting, Linux-only), `engram-agentd`,
-`engram-harness-claude`. (The product CLI is `cli/` — Bun/TS `engrams`,
-orchestrator-native; the Rust `engram-cli` crate is retired.)
-(ADR 0080 retired `engram-image-builder`: a session image is a plain `docker build
-&& docker push`, materialized host-side at enable time.) Notable libraries:
-`engram-core` (shared traits:
-`SandboxBackend`, `HarnessHub`, `BlobStorage`, `MetadataStore`, `GitForge`, …),
-`engram-protocol` (control-plane wire types), `engram-sandbox-{firecracker,vz,process}`,
-`engram-chunk-store` (content-addressed storage, ADR 0007), `engram-rootfs-materializer`
-(standard OCI image → flattened ext4 rootfs + chunks, ADR 0080), `engram-postgres`,
-`engram-crypto`, `engram-egress-proxy`, `engram-transport`, `engram-telemetry`.
-
-**Other top-level:** `orchestrator/` (Bun), `web/` (pnpm), `cli/` (Bun — the
-`engrams` product CLI; talks to the orchestrator, never the coordinator;
-`engrams auth login` or ENGRAMS_API_KEY, dev scripts read var/dev-api-key),
-`deploy/` (helm,
-migrations, packer, dev/, otel, bundles, kernel), `docker/` (per-image Dockerfiles),
-`docs/` (`adr/`, `runbooks/`, `history.md`, `known-issues.md`), `third_party/firecracker`
-(vendored fork), `.github/workflows/`.
 
 ## Daily commands (justfile)
 
