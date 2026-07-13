@@ -1135,6 +1135,16 @@ mod tests {
         ManifestRef,
         Vec<u8>,
     ) {
+        // Hermetic against the HOST machine's disk fullness: the cache's
+        // dynamic free-space floor (default: keep the backing fs ≤ ~80%
+        // full) is probed via statvfs on every sweep, and these tests run
+        // with sweep_debounce_ms=0 — on a dev machine whose disk is past
+        // the floor, every sweep evicted every not-yet-pinned chunk and
+        // the readiness recheck flipped images unready (found 2026-07-13:
+        // deterministic failure on an 81%-full laptop, green on CI).
+        // Floor 0 = never floor-evict; the byte budget still governs.
+        // Safe under nextest (one process per test).
+        std::env::set_var(engram_chunk_store::cache::FREE_FLOOR_PCT_ENV_VAR, "0");
         let dir = tempfile::tempdir().unwrap();
         let blob: StdArc<dyn BlobStorage> =
             StdArc::new(LocalBlobStorage::new(dir.path().join("blob")));
