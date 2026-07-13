@@ -21,6 +21,7 @@ use super::ids::SessionId;
 pub enum OutboxKind {
     Prompt,
     Answer,
+    ToolResult,
 }
 
 impl OutboxKind {
@@ -28,6 +29,7 @@ impl OutboxKind {
         match self {
             OutboxKind::Prompt => "prompt",
             OutboxKind::Answer => "answer",
+            OutboxKind::ToolResult => "tool_result",
         }
     }
 
@@ -35,6 +37,7 @@ impl OutboxKind {
         match s {
             "prompt" => Some(OutboxKind::Prompt),
             "answer" => Some(OutboxKind::Answer),
+            "tool_result" => Some(OutboxKind::ToolResult),
             _ => None,
         }
     }
@@ -46,10 +49,12 @@ impl OutboxKind {
 /// into the typed shape at the host-RPC boundary:
 /// - kind=prompt: `{"text": String}`
 /// - kind=answer: `{"tool_call_id": String, "answers": Answers}`
+/// - kind=tool_result: `{"tool_call_id": String, "result_json": String}`
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutboxRow {
     /// Client-minted for prompts (ADR 0052); `answer:<tool_call_id>`
-    /// for answers. PRIMARY KEY — a retried enqueue is a no-op.
+    /// for answers; `tool_result:<tool_call_id>` for generic tool results.
+    /// PRIMARY KEY — a retried enqueue is a no-op.
     pub prompt_id: String,
     pub session_id: SessionId,
     pub kind: OutboxKind,
@@ -65,4 +70,22 @@ pub struct OutboxRow {
     pub delivered_at: Option<DateTime<Utc>>,
     /// Confirming harness event ingested. Terminal.
     pub acked_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutboxKind;
+
+    #[test]
+    fn outbox_kind_strings_round_trip() {
+        for (kind, encoded) in [
+            (OutboxKind::Prompt, "prompt"),
+            (OutboxKind::Answer, "answer"),
+            (OutboxKind::ToolResult, "tool_result"),
+        ] {
+            assert_eq!(kind.as_str(), encoded);
+            assert_eq!(OutboxKind::parse(encoded), Some(kind));
+        }
+        assert_eq!(OutboxKind::parse("unknown"), None);
+    }
 }

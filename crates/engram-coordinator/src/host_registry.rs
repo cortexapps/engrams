@@ -804,6 +804,18 @@ impl HostClient for HostRegistry {
             .await
     }
 
+    async fn tool_result(
+        &self,
+        sandbox_id: SandboxId,
+        tool_call_id: String,
+        result_json: String,
+    ) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend
+            .tool_result(sandbox_id, tool_call_id, result_json)
+            .await
+    }
+
     async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.interrupt(sandbox_id).await

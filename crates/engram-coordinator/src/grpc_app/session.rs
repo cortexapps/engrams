@@ -169,6 +169,27 @@ impl app::session_service_server::SessionService for AppSessionService {
         }))
     }
 
+    async fn complete_tool_call(
+        &self,
+        req: Request<app::CompleteToolCallRequest>,
+    ) -> Result<Response<app::CompleteToolCallResponse>, Status> {
+        self.auth.check(&req)?;
+        let r = req.into_inner();
+        let id = parse_session_id(&r.session_id)?;
+        let note = crate::api::prompt::complete_tool_call_core(
+            &self.state,
+            id,
+            r.tool_call_id,
+            r.result_json,
+        )
+        .await
+        .map_err(into_status)?;
+        Ok(Response::new(app::CompleteToolCallResponse {
+            session_id: id.to_string(),
+            note: note.to_string(),
+        }))
+    }
+
     async fn interrupt(
         &self,
         req: Request<app::InterruptRequest>,

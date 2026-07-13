@@ -209,6 +209,63 @@ pub(crate) async fn answer_question_core(
     Ok("answer queued")
 }
 
+/// ADR 0089: accept an opaque result for an orchestrator-registered tool.
+/// The submitted event is persisted before the durable outbox row so
+/// surfaces can resolve the pending call immediately, even when delivery
+/// must wait for an idle session to resume.
+pub(crate) async fn complete_tool_call_core(
+    state: &SharedState,
+    id: SessionId,
+    tool_call_id: String,
+    result_json: String,
+) -> Result<&'static str, ApiError> {
+    if tool_call_id.is_empty() {
+        return Err(ApiError::BadRequest("`tool_call_id` is required".into()));
+    }
+    let session = state.services.meta.get_session(id).await?;
+    if session.status.is_terminal() {
+        return Err(ApiError::Gone(format!(
+            "session is {} — fork it to continue from its last snapshot",
+            session.status.as_str()
+        )));
+    }
+
+    state
+        .emit(
+            id,
+            SessionEvent::ToolResultSubmitted {
+                tool_call_id: tool_call_id.clone(),
+                result_json: result_json.clone(),
+                at: chrono::Utc::now(),
+            },
+        )
+        .await?;
+
+    let row = engram_core::types::outbox::OutboxRow {
+        prompt_id: format!("tool_result:{tool_call_id}"),
+        session_id: id,
+        kind: engram_core::types::outbox::OutboxKind::ToolResult,
+        payload: serde_json::json!({
+            "tool_call_id": tool_call_id,
+            "result_json": result_json,
+        }),
+        created_at: chrono::Utc::now(),
+        attempts: 0,
+        not_before: chrono::Utc::now(),
+        delivered_at: None,
+        acked_at: None,
+    };
+    state
+        .services
+        .meta
+        .outbox_enqueue(&row)
+        .await
+        .map_err(|e| ApiError::Internal(format!("enqueue tool result: {e}")))?;
+    crate::outbox_delivery::enqueue_deliver_op(state, id).await;
+    state.outbox_wake.notify_one();
+    Ok("tool result queued")
+}
+
 /// Phase 1b: edit a still-queued type-ahead prompt by its `prompt_id`,
 /// before the harness consumes it. The hold/auto-resume logic of
 /// `send_prompt_core` is unnecessary here — the prompt was only queued

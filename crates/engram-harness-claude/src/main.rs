@@ -1624,6 +1624,15 @@ mod adapter {
                             // `ResumeForAnswer`.
                             break;
                         }
+                        Some(HarnessCommand::ToolResult { call_id, .. }) => {
+                            // ADR 0089 P1: the wire exists but this harness
+                            // serves no MCP tools yet (P2). Surface loudly,
+                            // never drop.
+                            tracing::warn!(
+                                %call_id,
+                                "ToolResult before ADR 0089 P2: claude harness has no generic tools yet"
+                            );
+                        }
                         Some(HarnessCommand::EditQueued { prompt_id, text }) => {
                             // Single-writer: mutate only while still queued
                             // (not yet consumed). A consumed prompt already

@@ -470,6 +470,11 @@ async fn drive(
                         }
                     }
                 }
+                Some(HarnessCommand::ToolResult { call_id, .. }) => {
+                    // ADR 0089 P1: the wire exists but this harness declares
+                    // no dynamic tools yet (P3). Surface loudly, never drop.
+                    tracing::warn!(%call_id, "ToolResult before ADR 0089 P3: codex harness has no generic tools yet");
+                }
                 Some(HarnessCommand::Shutdown { .. }) => return DriveOutcome::Shutdown,
                 Some(HarnessCommand::Checkpoint { .. }) => {}
                 None => return DriveOutcome::ChannelClosed,

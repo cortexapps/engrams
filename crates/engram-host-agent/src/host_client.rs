@@ -394,6 +394,18 @@ impl HostClient for LocalHostClient {
             .map_err(harness_err_to_sandbox)
     }
 
+    async fn tool_result(
+        &self,
+        sandbox_id: SandboxId,
+        tool_call_id: String,
+        result_json: String,
+    ) -> Result<(), SandboxError> {
+        self.harness_hub
+            .tool_result(sandbox_id, tool_call_id, result_json)
+            .await
+            .map_err(harness_err_to_sandbox)
+    }
+
     async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.harness_hub
             .interrupt(sandbox_id)

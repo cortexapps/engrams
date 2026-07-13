@@ -425,6 +425,16 @@ pub enum HarnessEvent {
     /// used to retire the coordinator outbox row and un-grey the optimistic
     /// user message without synthesizing another `RunStarted`.
     PromptSteered { prompt_id: String },
+    // ── ADR 0089: generic tool protocol. APPENDED after PromptSteered so
+    //    existing bincode variant indices never shift (ToolCallRequested=16).
+    /// A model-facing tool registered by the orchestrator was invoked. The
+    /// JSON arguments remain opaque across the harness wire and coordinator.
+    ToolCallRequested {
+        run_id: String,
+        call_id: String,
+        name: String,
+        args_json: String,
+    },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -461,6 +471,7 @@ impl HarnessEvent {
             Self::FileChanged { .. } => "file_changed",
             Self::TitleSuggested { .. } => "title_suggested",
             Self::PromptSteered { .. } => "prompt_steered",
+            Self::ToolCallRequested { .. } => "tool_call_requested",
             Self::Idle => "harness_idle",
         }
     }
@@ -475,6 +486,7 @@ impl HarnessEvent {
             | Self::UserQuestion { tool_call_id, .. }
             | Self::QuestionAnswered { tool_call_id, .. }
             | Self::FileChanged { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            Self::ToolCallRequested { call_id, .. } => Some(call_id.as_str()),
             _ => None,
         }
     }
@@ -531,7 +543,7 @@ pub enum HarnessCommand {
     DequeueQueued { prompt_id: String },
     // ── ADR 0054 Flavor B: answer an interactive question. APPENDED after
     //    `DequeueQueued` so existing variant indices (Checkpoint=0 …
-    //    DequeueQueued=6, AnswerQuestion=7) never shift — see wire_golden.rs.
+    //    DequeueQueued=5, AnswerQuestion=6) never shift — see wire_golden.rs.
     /// The user's answer to a deferred [`HarnessEvent::UserQuestion`],
     /// keyed by its `tool_call_id`. Delivered by the **same path as a
     /// `Prompt`** (coordinator `ensure_active` resumes an idle/evicted
@@ -546,6 +558,13 @@ pub enum HarnessCommand {
     AnswerQuestion {
         tool_call_id: String,
         answers: Answers,
+    },
+    // ── ADR 0089: generic tool result. APPENDED after AnswerQuestion so
+    //    existing bincode variant indices never shift (ToolResult=7).
+    /// The opaque JSON result for an orchestrator-registered tool call.
+    ToolResult {
+        call_id: String,
+        result_json: String,
     },
 }
 
@@ -888,6 +907,12 @@ mod tests {
         round_trip(HarnessFrame::Event(HarnessEvent::TitleSuggested {
             title: "Fix the flaky test".into(),
         }));
+        round_trip(HarnessFrame::Event(HarnessEvent::ToolCallRequested {
+            run_id: "r1".into(),
+            call_id: "call_1".into(),
+            name: "save_memory".into(),
+            args_json: r#"{"text":"remember this"}"#.into(),
+        }));
     }
 
     /// Two questions in one call (one multi-select, one single) — the
@@ -960,6 +985,10 @@ mod tests {
         round_trip(HarnessFrame::Command(HarnessCommand::AnswerQuestion {
             tool_call_id: "toolu_1".into(),
             answers: sample_answers(),
+        }));
+        round_trip(HarnessFrame::Command(HarnessCommand::ToolResult {
+            call_id: "call_1".into(),
+            result_json: r#"{"saved":true}"#.into(),
         }));
     }
 
@@ -1137,6 +1166,16 @@ mod tests {
             HarnessEvent::TitleSuggested { title: "t".into() }.kind(),
             "title_suggested"
         );
+        assert_eq!(
+            HarnessEvent::ToolCallRequested {
+                run_id: "x".into(),
+                call_id: "call_1".into(),
+                name: "save_memory".into(),
+                args_json: r#"{"text":"remember this"}"#.into(),
+            }
+            .kind(),
+            "tool_call_requested"
+        );
     }
 
     #[test]
@@ -1176,6 +1215,16 @@ mod tests {
                 run_id: "x".into(),
                 tool_call_id: id.into(),
                 answers: Answers::new(),
+            }
+            .tool_call_id(),
+            Some(id)
+        );
+        assert_eq!(
+            HarnessEvent::ToolCallRequested {
+                run_id: "x".into(),
+                call_id: id.into(),
+                name: "save_memory".into(),
+                args_json: "{}".into(),
             }
             .tool_call_id(),
             Some(id)

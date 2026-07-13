@@ -439,6 +439,25 @@ impl HarnessHub {
         Ok(())
     }
 
+    /// ADR 0089: deliver an opaque result for an orchestrator-registered
+    /// tool. The coordinator outbox owns retry and confirmation semantics.
+    pub async fn tool_result(
+        &self,
+        sandbox_id: SandboxId,
+        tool_call_id: String,
+        result_json: String,
+    ) -> Result<(), HarnessError> {
+        let cmd_tx = self.acquire_cmd_tx(sandbox_id)?;
+        cmd_tx
+            .send(HarnessFrame::Command(HarnessCommand::ToolResult {
+                call_id: tool_call_id,
+                result_json,
+            }))
+            .await
+            .map_err(|_| HarnessError::WriterClosed)?;
+        Ok(())
+    }
+
     /// ADR 0073 phase 4: sandboxes with a live harness connection —
     /// the heartbeat's `harness_attached` liveness set (the coordinator
     /// compares it against its own view as a disagreement alarm).
@@ -1301,6 +1320,70 @@ mod tests {
         // ADR 0073: no host-side replay buffer to assert on — the
         // QuestionAnswered event flows to the coordinator, whose emit
         // path acks the `answer:<tool_call_id>` outbox row instead.
+    }
+
+    #[tokio::test]
+    async fn tool_result_reaches_harness_and_retires_on_confirmation() {
+        let (sink, _) = collecting_sink();
+        let hub = test_hub(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        let harness_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(harness_side);
+            write_msg(
+                &mut hw,
+                &HarnessAttach {
+                    session_id,
+                    sandbox_id,
+                    binding_epoch: 1,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
+            let frame: HarnessFrame = read_msg(&mut hr).await.unwrap();
+            let ok = matches!(
+                &frame,
+                HarnessFrame::Command(HarnessCommand::ToolResult {
+                    call_id,
+                    result_json,
+                }) if call_id == "call_1" && result_json == r#"{"saved":true}"#
+            );
+            write_msg(
+                &mut hw,
+                &HarnessFrame::Event(HarnessEvent::ToolCallCompleted {
+                    run_id: "run-1".into(),
+                    tool_call_id: "call_1".into(),
+                    tool_name: "save_memory".into(),
+                    ok: true,
+                    duration_ms: 1,
+                    result_summary: None,
+                }),
+            )
+            .await
+            .unwrap();
+            ok
+        });
+
+        assert!(
+            wait_until(|| hub.attached_count() == 1).await,
+            "harness should attach within the 1s deadline"
+        );
+
+        hub.tool_result(sandbox_id, "call_1".into(), r#"{"saved":true}"#.into())
+            .await
+            .expect("tool_result");
+
+        assert!(
+            harness_task.await.unwrap(),
+            "harness should receive a ToolResult frame and confirm the same call id"
+        );
     }
 
     #[tokio::test]

@@ -35,8 +35,8 @@ use engram_protocol::grpc::{
     ProbeSandboxResponse, ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose,
     ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
     ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    SendHarnessPromptRequest, SendHarnessToolResultRequest, SnapshotBeginResponse,
+    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -859,6 +859,19 @@ impl HostService for HostServiceImpl {
             .collect();
         self.inner
             .answer_question(sandbox_id, r.tool_call_id, answers)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn send_harness_tool_result(
+        &self,
+        req: Request<SendHarnessToolResultRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let r = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+        self.inner
+            .tool_result(sandbox_id, r.tool_call_id, r.result_json)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))

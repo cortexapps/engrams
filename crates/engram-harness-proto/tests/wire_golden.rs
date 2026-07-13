@@ -140,6 +140,14 @@ fn ev_prompt_steered() -> HarnessEvent {
         prompt_id: "p1".into(),
     }
 }
+fn ev_tool_call_requested() -> HarnessEvent {
+    HarnessEvent::ToolCallRequested {
+        run_id: "r1".into(),
+        call_id: "call_1".into(),
+        name: "save_memory".into(),
+        args_json: r#"{"text":"remember this"}"#.into(),
+    }
+}
 fn ev_agent_message() -> HarnessEvent {
     HarnessEvent::AgentMessage {
         run_id: "r1".into(),
@@ -322,6 +330,12 @@ fn cmd_dequeue_queued() -> HarnessCommand {
         prompt_id: "p1".into(),
     }
 }
+fn cmd_tool_result() -> HarnessCommand {
+    HarnessCommand::ToolResult {
+        call_id: "call_1".into(),
+        result_json: r#"{"saved":true}"#.into(),
+    }
+}
 
 // ---- tests -------------------------------------------------------------
 
@@ -356,6 +370,7 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_file_changed_patch", &ev_file_changed_patch());
     assert_golden("event_title_suggested", &ev_title_suggested());
     assert_golden("event_prompt_steered", &ev_prompt_steered());
+    assert_golden("event_tool_call_requested", &ev_tool_call_requested());
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -392,6 +407,11 @@ fn harness_event_golden_and_variant_indices() {
     // Session titles — APPENDED after FileChanged (14).
     assert_variant_index(&ev_title_suggested(), 14, "HarnessEvent::TitleSuggested");
     assert_variant_index(&ev_prompt_steered(), 15, "HarnessEvent::PromptSteered");
+    assert_variant_index(
+        &ev_tool_call_requested(),
+        16,
+        "HarnessEvent::ToolCallRequested",
+    );
 }
 
 #[test]
@@ -413,6 +433,7 @@ fn harness_command_golden_and_variant_indices() {
     assert_golden("command_edit_queued", &cmd_edit_queued());
     assert_golden("command_dequeue_queued", &cmd_dequeue_queued());
     assert_golden("command_answer_question", &cmd_answer_question());
+    assert_golden("command_tool_result", &cmd_tool_result());
 
     assert_variant_index(&cmd_checkpoint(), 0, "HarnessCommand::Checkpoint");
     assert_variant_index(&cmd_shutdown(), 1, "HarnessCommand::Shutdown");
@@ -426,6 +447,7 @@ fn harness_command_golden_and_variant_indices() {
     assert_variant_index(&cmd_edit_queued(), 4, "HarnessCommand::EditQueued");
     assert_variant_index(&cmd_dequeue_queued(), 5, "HarnessCommand::DequeueQueued");
     assert_variant_index(&cmd_answer_question(), 6, "HarnessCommand::AnswerQuestion");
+    assert_variant_index(&cmd_tool_result(), 7, "HarnessCommand::ToolResult");
 }
 
 #[test]
@@ -584,6 +606,7 @@ fn regen_golden() {
     write("event_file_changed_patch", &ev_file_changed_patch());
     write("event_title_suggested", &ev_title_suggested());
     write("event_prompt_steered", &ev_prompt_steered());
+    write("event_tool_call_requested", &ev_tool_call_requested());
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);
@@ -596,6 +619,7 @@ fn regen_golden() {
     write("command_edit_queued", &cmd_edit_queued());
     write("command_dequeue_queued", &cmd_dequeue_queued());
     write("command_answer_question", &cmd_answer_question());
+    write("command_tool_result", &cmd_tool_result());
 
     write("checkpoint_reason_idle", &CheckpointReason::Idle);
     write("checkpoint_reason_preempt", &CheckpointReason::Preempt);

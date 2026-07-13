@@ -135,6 +135,8 @@ service HostService {
   // attached harness (which stashes it and re-fires the deferred tool via
   // `--resume`).
   rpc AnswerHarnessQuestion(AnswerHarnessQuestionRequest) returns (Empty);
+  // ADR 0089: deliver an opaque result for an orchestrator-registered tool.
+  rpc SendHarnessToolResult(SendHarnessToolResultRequest) returns (Empty);
   // ADR 0030: operator interrupt. Stop the in-flight run on the
   // attached harness (it SIGINTs its current `claude` child and
   // returns to Idle); the session stays alive and resumable.
@@ -624,6 +626,12 @@ message AnswerHarnessQuestionRequest {
   map<string, StringList> answers = 3;
 }
 
+message SendHarnessToolResultRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+  string tool_call_id = 2;
+  string result_json = 3;
+}
+
 // A list of strings, for use as a proto3 map value.
 message StringList {
   repeated string values = 1;
@@ -829,4 +837,3 @@ message FlushSandboxResponse {
   // non-empty encodes `Some(ManifestRef { manifest_id, version })`.
   bytes manifest_ref_bincode = 1;
 }
-

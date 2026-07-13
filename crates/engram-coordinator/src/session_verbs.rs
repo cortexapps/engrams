@@ -697,6 +697,25 @@ async fn forward_outbox_row(
                     .answer_question(sandbox_id, tool_call_id, answers)
                     .await
             }
+            OutboxKind::ToolResult => {
+                let tool_call_id = row
+                    .payload
+                    .get("tool_call_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let result_json = row
+                    .payload
+                    .get("result_json")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                state
+                    .services
+                    .host
+                    .tool_result(sandbox_id, tool_call_id, result_json)
+                    .await
+            }
         }
     };
 
@@ -1077,6 +1096,26 @@ mod tests {
         }
     }
 
+    fn outbox_tool_result(
+        id: SessionId,
+        tool_call_id: &str,
+    ) -> engram_core::types::outbox::OutboxRow {
+        engram_core::types::outbox::OutboxRow {
+            prompt_id: format!("tool_result:{tool_call_id}"),
+            session_id: id,
+            kind: engram_core::types::outbox::OutboxKind::ToolResult,
+            payload: serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "result_json": r#"{"saved":true}"#,
+            }),
+            created_at: chrono::Utc::now(),
+            attempts: 0,
+            not_before: chrono::Utc::now(),
+            delivered_at: None,
+            acked_at: None,
+        }
+    }
+
     /// ADR 0079 pass 2, the headline ordering property: a Deliver op on
     /// a non-Active (Idle) session enqueues a RESUME op and requeues
     /// itself with backoff — the resume (higher id, due) becomes the
@@ -1162,6 +1201,54 @@ mod tests {
         assert!(
             mini.acked_outbox.lock().contains(&"p-1".to_string()),
             "the terminal session's row is acked (dropped), not redelivered forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_delivery_on_idle_enqueues_resume_before_completion() {
+        let id = SessionId::new();
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(idle_session(id));
+        state
+            .services
+            .meta
+            .outbox_enqueue(&outbox_tool_result(id, "call_1"))
+            .await
+            .unwrap();
+
+        let deliver = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Deliver, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue deliver")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        let deliver_id = deliver.id;
+        crate::session_ops::drive_claimed(&state, deliver).await;
+
+        let ops = mini.ops.all();
+        let resume = ops
+            .iter()
+            .find(|op| op.kind == OpKind::Resume)
+            .expect("ToolResult delivery on Idle must enqueue Resume");
+        assert!(resume.id > deliver_id, "Resume is queued behind Deliver");
+        assert_eq!(
+            resume.state,
+            OpState::Failed,
+            "the resume runs before the delivery retry"
+        );
+        assert_eq!(
+            mini.ops.get(deliver_id).expect("deliver row").state,
+            OpState::Done,
+            "delivery completes after the session settles terminal"
+        );
+        assert!(
+            mini.acked_outbox
+                .lock()
+                .contains(&"tool_result:call_1".to_string()),
+            "the completed delivery lane retires the ToolResult row"
         );
     }
 

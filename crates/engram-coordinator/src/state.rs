@@ -51,6 +51,14 @@ pub enum SessionEvent {
         prompt_id: String,
         at: DateTime<Utc>,
     },
+    /// ADR 0089: the coordinator accepted a tool result for durable
+    /// delivery. This is intentionally visible before the harness consumes
+    /// it so surfaces can resolve pending UI immediately.
+    ToolResultSubmitted {
+        tool_call_id: String,
+        result_json: String,
+        at: DateTime<Utc>,
+    },
     /// `POST /sessions/:id/exec*` started a new command. `exec_id` is
     /// the sandbox-side identifier; downstream Stdout/Stderr/Exit
     /// events for this run carry the same value so multiplexed clients
@@ -135,6 +143,16 @@ pub enum SessionEvent {
         ok: bool,
         duration_ms: u64,
         result_summary: Option<String>,
+        at: DateTime<Utc>,
+    },
+    /// ADR 0089: an orchestrator-registered tool was invoked. The
+    /// coordinator preserves the JSON arguments verbatim and never parses
+    /// their tool-specific shape.
+    HarnessToolCallRequested {
+        run_id: String,
+        tool_call_id: String,
+        name: String,
+        args_json: String,
         at: DateTime<Utc>,
     },
     HarnessRunCompleted {
@@ -373,6 +391,7 @@ impl SessionEvent {
         match self {
             Self::StatusChanged { .. } => "status_changed",
             Self::PromptReceived { .. } => "prompt_received",
+            Self::ToolResultSubmitted { .. } => "tool_result_submitted",
             Self::ExecStarted { .. } => "exec_started",
             Self::ExecCompleted { .. } => "exec_completed",
             Self::Stdout { .. } => "stdout",
@@ -384,6 +403,7 @@ impl SessionEvent {
             Self::HarnessAgentMessage { .. } => "agent_message",
             Self::HarnessToolCallStarted { .. } => "tool_call_started",
             Self::HarnessToolCallCompleted { .. } => "tool_call_completed",
+            Self::HarnessToolCallRequested { .. } => "tool_call_requested",
             Self::HarnessRunCompleted { .. } => "run_completed",
             Self::HarnessRunInterrupted { .. } => "run_interrupted",
             Self::HarnessIdle { .. } => "harness_idle",
@@ -458,6 +478,18 @@ impl SessionEvent {
                 ok,
                 duration_ms,
                 result_summary,
+                at,
+            },
+            HarnessEvent::ToolCallRequested {
+                run_id,
+                call_id,
+                name,
+                args_json,
+            } => Self::HarnessToolCallRequested {
+                run_id,
+                tool_call_id: call_id,
+                name,
+                args_json,
                 at,
             },
             HarnessEvent::RunCompleted { run_id, ok } => {
@@ -994,6 +1026,7 @@ impl AppState {
 ///   harness itself does, and an edit/dequeue of a queued prompt keeps
 ///   its own confirmations).
 /// - `question_answered{tool_call_id}` — the answer landed.
+/// - `tool_call_completed{tool_call_id}` — a generic tool result landed.
 fn outbox_ack_id(event: &SessionEvent) -> Option<String> {
     match event {
         SessionEvent::HarnessRunStarted {
@@ -1004,6 +1037,9 @@ fn outbox_ack_id(event: &SessionEvent) -> Option<String> {
         SessionEvent::HarnessPromptSteered { prompt_id, .. } => Some(prompt_id.clone()),
         SessionEvent::HarnessQuestionAnswered { tool_call_id, .. } => {
             Some(format!("answer:{tool_call_id}"))
+        }
+        SessionEvent::HarnessToolCallCompleted { tool_call_id, .. } => {
+            Some(format!("tool_result:{tool_call_id}"))
         }
         _ => None,
     }
@@ -1519,6 +1555,64 @@ pub(crate) mod tests {
             other => panic!("expected HarnessQuestionAnswered, got {other:?}"),
         }
         assert_eq!(a.kind(), "question_answered");
+    }
+
+    #[test]
+    fn generic_tool_events_have_stable_kinds_and_opaque_payloads() {
+        let args_json = r#" { "text": [1, true, null] } "#;
+        let requested = SessionEvent::from_harness(
+            HarnessEvent::ToolCallRequested {
+                run_id: "r1".into(),
+                call_id: "call_1".into(),
+                name: "save_memory".into(),
+                args_json: args_json.into(),
+            },
+            chrono::Utc::now(),
+        );
+        match &requested {
+            SessionEvent::HarnessToolCallRequested {
+                run_id,
+                tool_call_id,
+                name,
+                args_json: mapped_args,
+                ..
+            } => {
+                assert_eq!(run_id, "r1");
+                assert_eq!(tool_call_id, "call_1");
+                assert_eq!(name, "save_memory");
+                assert_eq!(mapped_args, args_json);
+            }
+            other => panic!("expected HarnessToolCallRequested, got {other:?}"),
+        }
+        assert_eq!(requested.kind(), "tool_call_requested");
+
+        let result_json = r#" { "saved": true } "#;
+        let submitted = SessionEvent::ToolResultSubmitted {
+            tool_call_id: "call_1".into(),
+            result_json: result_json.into(),
+            at: chrono::Utc::now(),
+        };
+        assert_eq!(submitted.kind(), "tool_result_submitted");
+        let json = serde_json::to_value(&submitted).expect("serialize submitted event");
+        assert_eq!(json["type"], "tool_result_submitted");
+        assert_eq!(json["tool_call_id"], "call_1");
+        assert_eq!(json["result_json"], result_json);
+    }
+
+    #[test]
+    fn tool_call_completed_acks_tool_result_outbox_row() {
+        let ev = SessionEvent::from_harness(
+            HarnessEvent::ToolCallCompleted {
+                run_id: "r1".into(),
+                tool_call_id: "call_1".into(),
+                tool_name: "save_memory".into(),
+                ok: true,
+                duration_ms: 1,
+                result_summary: None,
+            },
+            chrono::Utc::now(),
+        );
+        assert_eq!(outbox_ack_id(&ev).as_deref(), Some("tool_result:call_1"));
     }
 
     #[test]

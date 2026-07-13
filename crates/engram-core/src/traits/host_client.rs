@@ -445,6 +445,18 @@ pub trait HostClient: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0089: deliver an opaque result for an orchestrator-registered
+    /// tool call to the attached harness. Default no-op for harness-less
+    /// fakes; real local and gRPC clients override it.
+    async fn tool_result(
+        &self,
+        _sandbox_id: SandboxId,
+        _tool_call_id: String,
+        _result_json: String,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// ADR 0030: operator interrupt — stop the in-flight run on the
     /// attached harness for `sandbox_id` while keeping the session
     /// alive. The harness SIGINTs its current child and returns to Idle;

@@ -41,7 +41,8 @@ use crate::grpc::{
     ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
     ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
     ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, StartAgentRequest, StringList, UnbindHarnessSessionRequest,
+    SendHarnessPromptRequest, SendHarnessToolResultRequest, StartAgentRequest, StringList,
+    UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -820,6 +821,25 @@ impl GrpcHostClient {
         self.inner
             .clone()
             .answer_harness_question(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
+    pub async fn send_harness_tool_result(
+        &self,
+        sandbox_id: SandboxId,
+        tool_call_id: String,
+        result_json: String,
+    ) -> Result<(), SandboxError> {
+        let req = SendHarnessToolResultRequest {
+            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+            tool_call_id,
+            result_json,
+        };
+        self.inner
+            .clone()
+            .send_harness_tool_result(req)
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -1619,6 +1639,16 @@ impl HostClient for GrpcHostClient {
         answers: std::collections::BTreeMap<String, Vec<String>>,
     ) -> Result<(), SandboxError> {
         self.answer_harness_question(sandbox_id, tool_call_id, answers)
+            .await
+    }
+
+    async fn tool_result(
+        &self,
+        sandbox_id: SandboxId,
+        tool_call_id: String,
+        result_json: String,
+    ) -> Result<(), SandboxError> {
+        self.send_harness_tool_result(sandbox_id, tool_call_id, result_json)
             .await
     }
 

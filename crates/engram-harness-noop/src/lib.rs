@@ -167,6 +167,10 @@ where
                     // ADR 0054: noop never calls AskUserQuestion, so it never
                     // receives an answer to feed back. Nothing to do.
                 }
+                Ok(HarnessFrame::Command(HarnessCommand::ToolResult { .. })) => {
+                    // ADR 0089: noop never requests a registered tool, so it
+                    // has no pending call that could consume this result.
+                }
                 Ok(HarnessFrame::Event(_)) => {
                     // Host shouldn't send Events; ignore.
                 }
