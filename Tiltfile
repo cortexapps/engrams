@@ -931,6 +931,9 @@ orchestrator_env = {
     # to .env at parse time (above). Required — the orchestrator refuses to
     # boot without it, which is correct: a missing .env KEK is a real misconfig.
     'ENGRAM_KEK_MASTER_KEY': env_or('ENGRAM_KEK_MASTER_KEY', ''),
+    # ADR 0089: register the dev-only smoke tools (dev_echo / dev_echo_deferred)
+    # so live scenario A/C verification works against the local stack.
+    'ENGRAM_DEV_TOOLS': '1',
 }
 
 skip_web = env_or('ENGRAM_SKIP_WEB', '') in ('1', 'true', 'yes')
