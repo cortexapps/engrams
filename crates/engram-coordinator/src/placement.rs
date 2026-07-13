@@ -281,6 +281,16 @@ pub struct FleetSnapshot {
     /// ADR 0048: Σ max(0, cpu_budget − reserved_vcpus) over schedulable
     /// hosts — the spare vCPU the autoscaler scales the CPU dimension on.
     pub free_vcpus: u64,
+    /// Σ max(0, allocatable_mib − reserved_mib) over schedulable hosts —
+    /// the RAM demand-pressure signal (`/admin/fleet/demand` + the
+    /// `engram_fleet_free_mib` gauge). Subsumes the retired
+    /// `MetadataStore::fleet_free_mib`, whose SQL counted every
+    /// ready/uncordoned host: a capability-failed or heartbeat-stale
+    /// host that placement excludes was still counted as free capacity,
+    /// so the autoscaler under-scaled while placement starved
+    /// (2026-07-11 campaign: 3 "ready" hosts took zero sessions while
+    /// creates queue-timed out).
+    pub free_mib: u64,
     /// ADR 0047/0048: hosts cordoned off for scale-down — operator
     /// visibility into how much of the fleet is mid-drain.
     pub cordoned_hosts: u32,
@@ -747,6 +757,91 @@ pub async fn log_empty_candidates(
     );
 }
 
+/// The sibling of [`log_empty_candidates`] for the OTHER silent-queue
+/// branch: candidates existed (they passed schedulability/capability/
+/// digest gates) but the FOR-UPDATE 2D pick fit none of them. Pre-fix,
+/// this branch logged only a generic "no capacity — session queued"
+/// with zero per-host figures (2026-07-11 campaign, ADR 0068's gap).
+/// Emits one bounded reason per host — fit reasons (`ram_full` /
+/// `cpu_full` / `unmeasured` / `not_lockable` / `fits_now`) for ranked
+/// candidates via `MetadataStore::placement_no_fit_details`, and
+/// `exclusion_summary` reasons for every active host that never made
+/// the candidate set — as `PLACEMENT_EXCLUDED_TOTAL{origin,reason}`
+/// plus one WARN line. Returns the combined per-host summary so the
+/// caller can attach it to a durable event (`queue_timeout` payload).
+pub async fn log_reserve_no_fit(
+    meta: &dyn MetadataStore,
+    ctx: &ScheduleContext<'_>,
+    origin: &'static str,
+    candidates: &[HostId],
+    mem_budget_mib: i64,
+    cpu_budget_vcpus: i32,
+) -> Vec<(HostId, String)> {
+    let mut summary: Vec<(HostId, String)> = Vec::new();
+    match meta
+        .placement_no_fit_details(candidates, mem_budget_mib, cpu_budget_vcpus)
+        .await
+    {
+        Ok(details) => {
+            for d in details {
+                summary.push((
+                    d.host_id,
+                    format!(
+                        "{} free_mib={} free_vcpus={}",
+                        d.reason,
+                        d.free_mib,
+                        // i64::MAX = CPU-ungated host; render compactly.
+                        if d.free_vcpus == i64::MAX {
+                            -1
+                        } else {
+                            d.free_vcpus
+                        }
+                    ),
+                ));
+                ::metrics::counter!(
+                    crate::metrics::PLACEMENT_EXCLUDED_TOTAL,
+                    "origin" => origin,
+                    "reason" => d.reason,
+                )
+                .increment(1);
+            }
+        }
+        Err(e) => {
+            tracing::debug!(origin, error = %e,
+                "log_reserve_no_fit: placement_no_fit_details failed; fit reasons unavailable");
+        }
+    }
+    // Hosts that never made the candidate set — the rank_hosts-side
+    // exclusions, previously logged only when the whole set was empty.
+    if let Ok(hosts) = meta.list_active_hosts().await {
+        let non_candidates: Vec<_> = hosts
+            .into_iter()
+            .filter(|h| !candidates.contains(&h.id))
+            .collect();
+        for (host_id, reason) in
+            exclusion_summary(&non_candidates, ctx, Utc::now(), placement_ttl())
+        {
+            ::metrics::counter!(
+                crate::metrics::PLACEMENT_EXCLUDED_TOTAL,
+                "origin" => origin,
+                "reason" => reason.clone(),
+            )
+            .increment(1);
+            summary.push((host_id, reason));
+        }
+    }
+    tracing::warn!(
+        repo = ctx.repo,
+        image_version = ctx.image_version,
+        origin,
+        mem_budget_mib,
+        cpu_budget_vcpus,
+        exclusions = ?summary,
+        "placement: candidates present but none fit — per-host reasons",
+    );
+    summary
+}
+
 /// Session scheduler for the resume/evac path: pick from the hosts rows
 /// and resolve the backend (dialing through the PG `host_addr` when this
 /// replica hasn't seen the host yet). Emits the ADR 0044 K4
@@ -1022,8 +1117,33 @@ pub async fn restore_for_session(
     Ok((host_id, sandbox_id))
 }
 
+/// The capability posture the AUTOSCALER's counts assume: every prod
+/// image is an FC memory-manifest placement, so a host whose UFFD
+/// substrate probes fail can't take any of the demand the autoscaler is
+/// sizing for. Counting such a host as capacity makes the scaler
+/// complacent while placement starves (the 2026-07-11 "3 cold hosts"
+/// mechanism). `NotApplicable` still passes (File-backend hosts,
+/// ADR 0022); `fc_snapshot_version` imposes nothing here.
+fn fleet_capability_req() -> CapabilityRequirements {
+    CapabilityRequirements {
+        needs_uffd_substrate: true,
+        fc_snapshot_version: None,
+    }
+}
+
+/// The autoscaler's per-host capacity predicate: a host counts only if
+/// PLACEMENT would rank it — `host_is_schedulable` AND
+/// `host_meets_capabilities` under the fleet posture. Pure so the
+/// gate is unit-testable without a store.
+pub fn host_counts_as_capacity(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> bool {
+    host_is_schedulable(h, now, ttl) && host_meets_capabilities(h, &fleet_capability_req()).is_ok()
+}
+
 /// Fleet-wide autoscaling counts (ADR 0044 K4 + ADR 0048 CPU dims),
-/// from the hosts rows + the per-host reserved aggregate.
+/// from the hosts rows + the per-host reserved aggregate. A host counts
+/// as schedulable capacity only per [`host_counts_as_capacity`] — so
+/// the demand signal can never read healthier than the candidate set
+/// placement actually ranks.
 pub async fn fleet_snapshot(meta: &dyn MetadataStore) -> Result<FleetSnapshot, PickError> {
     let hosts = meta
         .list_active_hosts()
@@ -1048,13 +1168,14 @@ pub async fn fleet_snapshot(meta: &dyn MetadataStore) -> Result<FleetSnapshot, P
         if h.cordoned {
             m.cordoned_hosts += 1;
         }
-        if host_is_schedulable(h, now, ttl) {
+        if host_counts_as_capacity(h, now, ttl) {
             m.schedulable_hosts += 1;
             m.total_mib += h.utilization.allocatable_mib;
             let cpu_budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
             m.total_vcpus += cpu_budget as u64;
-            let reserved_vcpus = reserved.get(&h.id).map(|r| r.vcpus).unwrap_or(0);
-            m.free_vcpus += (cpu_budget - reserved_vcpus).max(0) as u64;
+            let r = reserved.get(&h.id).copied().unwrap_or_default();
+            m.free_vcpus += (cpu_budget - r.vcpus).max(0) as u64;
+            m.free_mib += (h.utilization.allocatable_mib as i64 - r.mem_mib).max(0) as u64;
         }
     }
     Ok(m)
@@ -1786,6 +1907,28 @@ mod tests {
         cordoned.cordoned = true;
         assert!(!host_is_schedulable(&cordoned, Utc::now(), TTL));
         assert!(host_is_schedulable(&host(2), Utc::now(), TTL));
+    }
+
+    /// 2026-07-11 campaign: a "ready" host whose substrate capability
+    /// probe fails must NOT count as autoscaler capacity — counting it
+    /// made the scaler complacent while placement excluded the host and
+    /// creates queue-timed out. (`schema == 0` = pre-capability row still
+    /// passes: soft posture during a mixed-version roll.)
+    #[test]
+    fn fleet_counts_exclude_capability_failed_hosts() {
+        let now = Utc::now();
+        let healthy = host(1);
+        assert!(host_counts_as_capacity(&healthy, now, TTL));
+
+        let mut cap_failed = host(2);
+        cap_failed.capabilities.schema = 1;
+        cap_failed.capabilities.grpc_self_connect =
+            engram_core::types::host::CapStatus::Failed("refused".into());
+        assert!(
+            host_is_schedulable(&cap_failed, now, TTL),
+            "precondition: the host looks schedulable to the pre-fix filter"
+        );
+        assert!(!host_counts_as_capacity(&cap_failed, now, TTL));
     }
 
     mod capture_placement {

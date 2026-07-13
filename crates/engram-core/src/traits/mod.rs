@@ -29,7 +29,7 @@ pub use integration::{
     MintFieldSchema, MintKindDescriptor, ResolvedFields, ScopedCredential,
 };
 pub use metadata::{
-    CreateDisposition, DisableEnabledImageOutcome, GcCandidateRow, MetadataStore,
+    CreateDisposition, DisableEnabledImageOutcome, GcCandidateRow, MetadataStore, PlacementNoFit,
     SessionCreateWriteSet, SnapshotTotals, UpdateOutcome,
 };
 pub use sandbox::{

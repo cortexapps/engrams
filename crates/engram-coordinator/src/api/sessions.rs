@@ -819,6 +819,19 @@ async fn boot_prepared(
                 tracing::warn!(%session_id, error = %e, "emit pending→queued failed; continuing");
             }
             tracing::info!(%session_id, "no capacity — session queued for placement (ADR 0048)");
+            // ADR 0068 gap closed (2026-07-11 campaign): this branch —
+            // candidates ranked but none fit the 2D budget — used to be
+            // the LAST silent placement rejection. Per-host reasons, or
+            // this is the "no capacity with free hosts" mystery again.
+            crate::placement::log_reserve_no_fit(
+                state.services.meta.as_ref(),
+                &ctx,
+                "create",
+                &candidates.hosts,
+                memory_mib as i64,
+                cpu_budget_vcpus as i32,
+            )
+            .await;
             return Ok(CreateSessionResponse {
                 session_id,
                 status: SessionState::Queued.as_str(),

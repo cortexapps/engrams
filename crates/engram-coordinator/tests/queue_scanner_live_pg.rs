@@ -789,6 +789,24 @@ async fn create_origin_timeout_fails_session_and_records_wait() {
         .as_i64()
         .expect("waited_secs is a number");
     assert!(waited >= 0, "recorded wait must be non-negative");
+
+    // 2026-07-11 campaign (session B6): the event used to be appended
+    // BEFORE the guarded Failed transition, so a second sweep — or a
+    // sweep racing a placement — appended it twice. The event now rides
+    // the successful transition claim: a second sweep over the same
+    // (now-Failed) session must be a strict no-op.
+    queue_scanner::run_once(&cfg, &state)
+        .await
+        .expect("second run_once");
+    let events = meta
+        .list_session_events_since(sid, -1, 100)
+        .await
+        .expect("events after second sweep");
+    assert_eq!(
+        events.iter().filter(|e| e.kind == "queue_timeout").count(),
+        1,
+        "exactly one queue_timeout event, ever — the terminal flip is the claim"
+    );
 }
 
 #[tokio::test]

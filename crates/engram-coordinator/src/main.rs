@@ -438,11 +438,12 @@ async fn main() -> Result<(), CoordinatorError> {
                         .set(m.ready_hosts as f64);
                     ::metrics::gauge!(engram_coordinator::metrics::FLEET_SCHEDULABLE_HOSTS)
                         .set(m.schedulable_hosts as f64);
-                }
-                // ADR 0046: real free_mib = Σ(allocatable − reserved) from PG.
-                if let Ok(free) = meta.fleet_free_mib().await {
+                    // ADR 0046, corrected 2026-07: free_mib now comes from the
+                    // SAME capability/TTL-gated host set as schedulable_hosts
+                    // (the retired SQL `fleet_free_mib` counted capability-
+                    // failed "ready" hosts as free capacity).
                     ::metrics::gauge!(engram_coordinator::metrics::FLEET_FREE_MIB)
-                        .set(free.max(0) as f64);
+                        .set(m.free_mib as f64);
                 }
             }
         });

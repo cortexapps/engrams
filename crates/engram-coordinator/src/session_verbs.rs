@@ -731,12 +731,16 @@ async fn create_boot_retry_or_fail(ctx: &OpCtx<'_>, reason: String) -> OpOutcome
     }
     let state = ctx.state;
     let id = ctx.op.session_id;
+    // Own event kind, NOT `queue_timeout`: this session was PLACED and its
+    // boot kept failing — a different failure class from "waited out the
+    // capacity queue". Sharing the kind made consumers conflate the two
+    // (2026-07-11 campaign confusion while triaging queue deaths).
     if let Err(e) = state
         .services
         .meta
         .append_session_event(
             id,
-            "queue_timeout",
+            "boot_retry_exhausted",
             serde_json::json!({
                 "reason": "placed but the boot kept failing; retry budget exhausted",
                 "detail": reason,
@@ -744,7 +748,7 @@ async fn create_boot_retry_or_fail(ctx: &OpCtx<'_>, reason: String) -> OpOutcome
         )
         .await
     {
-        tracing::warn!(session_id = %id, error = %e, "create_boot: queue_timeout event failed");
+        tracing::warn!(session_id = %id, error = %e, "create_boot: boot_retry_exhausted event failed");
     }
     match crate::session_ops::transition_with_fence(state, id, ctx.fence(), SessionState::Failed)
         .await

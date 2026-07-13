@@ -170,7 +170,7 @@ pub struct CaptureJobRow {
     /// Placement reservation (ADR 0081 → ADR 0084 (c)): the capture VM's
     /// RAM/CPU budgets, stamped at insert from `ImageConfig::
     /// resolved_memory_mib` / `resolved_vcpus`. Every reserved-SUM reader
-    /// (session placement, per_host_reserved, fleet_free_mib) sums a
+    /// (session placement, per_host_reserved, placement_no_fit_details) sums a
     /// non-terminal `capture_jobs` row with a bound `host_id` by these;
     /// release is IMPLICIT — a terminal `stage` drops the row out of the
     /// SUM (no explicit clear).
