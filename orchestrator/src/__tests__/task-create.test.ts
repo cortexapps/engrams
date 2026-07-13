@@ -419,6 +419,7 @@ const createDeps = (
     profileOver?: Partial<ProfileRow>;
     portExposures?: PortExposureStore;
     users?: CreateTaskDeps["users"];
+    startToolDispatch?: CreateTaskDeps["startToolDispatch"];
   } = {},
 ): CreateTaskDeps => ({
   profiles: fakeProfiles(opts.active ?? true, opts.profileOver ?? {}),
@@ -431,10 +432,26 @@ const createDeps = (
   // Default to "unknown user" so tests exercising other seams don't hit the
   // real Drizzle fallback against the fake Db.
   users: opts.users ?? fakeUsers(),
+  startToolDispatch: opts.startToolDispatch ?? (async () => {}),
   ...(opts.portExposures ? { portExposures: opts.portExposures } : {}),
 });
 
 describe("createTaskWithSession", () => {
+  test("starts the per-session tool dispatch workflow after creating the task", async () => {
+    const started: string[] = [];
+
+    await createTaskWithSession(
+      createDeps(fakeSessions(), recordingDb([]), {
+        startToolDispatch: async (sessionId) => {
+          started.push(sessionId);
+        },
+      }),
+      { type: "chat", ownerUserId: "user-1", profileId: "p1" },
+    );
+
+    expect(started).toEqual(["sess-1"]);
+  });
+
   test("persists task + primary task_session and folds extraHarnessEnv into the session", async () => {
     const records: Record<string, unknown>[] = [];
     const sessions = fakeSessions();

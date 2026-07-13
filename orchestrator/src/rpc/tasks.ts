@@ -83,8 +83,10 @@ import {
   createTaskWithSession,
   type Db,
   type HarnessCatalogClient,
+  type StartToolDispatch,
 } from "./task-create.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
+import { startToolDispatchWorkflow } from "../workflows/tool-dispatch.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
@@ -150,6 +152,8 @@ export interface TaskDeps {
   portExposures?: PortExposureStore;
   /** Owner identity lookup for git attribution and task read enrichment. */
   users?: UserIdentityStore;
+  /** Durable per-session generic-tool pump starter (ADR 0089). */
+  startToolDispatch?: StartToolDispatch;
   db?: Db;
 }
 
@@ -547,6 +551,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           connectors,
           harnessCatalog: harnessCatalogClient,
           sessions: sessionsClient,
+          startToolDispatch: deps?.startToolDispatch ?? startToolDispatchWorkflow,
           secrets: resolveSecrets(),
           portExposures: resolvePortExposures(),
           users: resolveUsers(),

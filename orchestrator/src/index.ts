@@ -40,8 +40,9 @@ import { controlPlaneTransport } from "./control-plane/transport.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
 // ADR 0060: embedded DBOS engine. Workflow modules (P1+) must be imported
 // ABOVE the initDbos() call below so their workflows/steps are registered
-// before DBOS.launch(). Importing slack-thread.ts registers both the thread
-// workflow and (transitively) the per-session ingest pump.
+// before DBOS.launch(). Importing slack-thread.ts registers the thread and
+// Slack ingest workflows; importing tasks.ts transitively registers the
+// per-session generic-tool dispatch workflow.
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
 import { makeSlackPolicy } from "./integrations/slack-policy.ts";

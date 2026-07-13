@@ -29,12 +29,14 @@ import {
   type Db,
   type TaskSessionsClient,
   type HarnessCatalogClient,
+  type StartToolDispatch,
 } from "../rpc/task-create.ts";
 import { resolveEngramsUser } from "../integrations/slack-identity.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 import { config } from "../config.ts";
 import type { ThreadControlPlane } from "./slack-thread.ts";
+import { startToolDispatchWorkflow } from "./tool-dispatch.ts";
 
 /** A StringList map value (proto3 maps can't hold `repeated` directly). */
 interface StringList {
@@ -61,6 +63,7 @@ export interface ThreadControlPlaneDeps {
   secrets?: { get(userId: string, envVar: string): Promise<string | null> };
   sessions?: ThreadSessionsClient;
   resolveUser?: (provider: string, externalUserId: string) => Promise<string | null>;
+  startToolDispatch?: StartToolDispatch;
   /** The Drizzle DB the task-persist transaction runs on. Default = the pool. */
   db?: Db;
 }
@@ -75,6 +78,7 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
   const secrets = deps.secrets ?? makeUserSecretStore(getDb());
   const sessions = deps.sessions ?? (defaultSessions as unknown as ThreadSessionsClient);
   const resolveUser = deps.resolveUser ?? resolveEngramsUser;
+  const startToolDispatch = deps.startToolDispatch ?? startToolDispatchWorkflow;
   const db = deps.db ?? getDb();
 
   return {
@@ -83,7 +87,16 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
 
     async createTask(input) {
       const { sessionId } = await createTaskWithSession(
-        { profiles, images, connectors, harnessCatalog, sessions, secrets, db },
+        {
+          profiles,
+          images,
+          connectors,
+          harnessCatalog,
+          sessions,
+          startToolDispatch,
+          secrets,
+          db,
+        },
         {
           type: "slack_thread",
           ownerUserId: input.ownerUserId,

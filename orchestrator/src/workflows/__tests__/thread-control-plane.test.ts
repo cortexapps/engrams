@@ -84,6 +84,7 @@ describe("makeThreadControlPlane", () => {
       harnessCatalog: fakeHarnessCatalog(),
       secrets: { get: async () => null },
       resolveUser: async () => "user-1",
+      startToolDispatch: async () => {},
       db: recordingDb(records),
       sessions: {
         createSession: async (req) => {

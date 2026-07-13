@@ -1,5 +1,5 @@
 /**
- * ADR 0089 handled-tool dispatch. The production ingest workflow supplies a
+ * ADR 0089 handled-tool dispatch. The production dispatch workflow supplies a
  * DBOS StepRunner; these tests run steps inline and inject recording seams, so
  * no DBOS engine, coordinator, or database is started.
  */
@@ -7,6 +7,10 @@
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 
+import {
+  readSessionEventsBounded,
+  type ListEventsFn,
+} from "../../control-plane/session-events.ts";
 import {
   createToolRegistry,
   type SessionToolContext,
@@ -23,7 +27,8 @@ import {
   type ToolCallCompleter,
   type ToolDispatchDeps,
   type ToolStepRunner,
-} from "../session-ingest.ts";
+  toolDispatchWorkflowImpl,
+} from "../tool-dispatch.ts";
 
 const STEP: ToolStepRunner = (fn) => fn();
 
@@ -37,6 +42,64 @@ const EVENT = {
     args_json: JSON.stringify({ text: "remember this" }),
   }),
 };
+
+describe("toolDispatchWorkflowImpl", () => {
+  test("processes tool effects before advancing the cursor and exits on terminal", async () => {
+    const reads: bigint[] = [];
+    const effects: Array<{ kind: "bookkeep" | "dispatch"; idx: bigint }> = [];
+    const sleeps: number[] = [];
+    const restarts: string[] = [];
+    const listEvents: ListEventsFn = async (_sessionId, after) => {
+      reads.push(after);
+      if (reads.length === 1) {
+        return { events: [EVENT], nextAfterIdx: EVENT.idx };
+      }
+      if (reads.length === 2) {
+        return {
+          events: [
+            {
+              idx: 10n,
+              kind: "status_changed",
+              payloadJson: JSON.stringify({ to: "completed" }),
+            },
+          ],
+          nextAfterIdx: 10n,
+        };
+      }
+      throw new Error("dispatch pump read past terminal");
+    };
+
+    await toolDispatchWorkflowImpl(
+      { sessionId: "session-1" },
+      {
+        step: STEP,
+        readPage: (sessionId, after) =>
+          readSessionEventsBounded(sessionId, after, listEvents),
+        bookkeep: async (_step, _sessionId, event) => {
+          effects.push({ kind: "bookkeep", idx: event.idx });
+        },
+        dispatch: async (_step, _sessionId, event) => {
+          effects.push({ kind: "dispatch", idx: event.idx });
+          return true;
+        },
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+        restart: async (_input, workflowId) => {
+          restarts.push(workflowId);
+        },
+      },
+    );
+
+    expect(effects).toEqual([
+      { kind: "bookkeep", idx: 9n },
+      { kind: "dispatch", idx: 9n },
+    ]);
+    expect(reads).toEqual([-1n, 9n]);
+    expect(sleeps).toEqual([]);
+    expect(restarts).toEqual([]);
+  });
+});
 
 function recordingCompleter() {
   const calls: Array<{ sessionId: string; toolCallId: string; resultJson: string }> = [];
@@ -171,7 +234,7 @@ describe("dispatchHandledToolCall", () => {
     });
   });
 
-  test("session-handled tools are not dispatched or completed by ingest", async () => {
+  test("session-handled tools are not dispatched or completed by the tool pump", async () => {
     const registry = createToolRegistry();
     registry.register({
       name: "ask_user_question",

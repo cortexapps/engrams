@@ -171,7 +171,8 @@ async function slackThreadWorkflowImpl(): Promise<void> {
 
   await step(() => pol.onStarted(m, session), "onStarted");
 
-  // 2) Start the per-session pump; it sends curated events back to us.
+  // 2) Start the Slack surface pump; generic tool dispatch was already started
+  // by the shared task-creation path.
   await DBOS.startWorkflow(sessionIngestWorkflow, {
     workflowID: `ingest:${session.id}`,
   })({ sessionId: session.id, threadWfId: DBOS.workflowID! });
