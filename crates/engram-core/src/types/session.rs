@@ -42,6 +42,16 @@ pub enum SessionState {
     /// only state in which `/exec`, `/shell`, `/prompt` proceed
     /// without a state-mismatch error.
     Active,
+    /// ADR 0091: the coordinator believes a sandbox exists on a live,
+    /// heartbeating host, but the GUEST is not responding on the
+    /// control plane (the host's periodic-checkpoint driver hit N
+    /// consecutive socket-level failures against the FC API socket).
+    /// Distinct from `HostLost` (the whole host vanished): the host is
+    /// fine, the VM is dead/wedged. Non-terminal — a prompt/exec
+    /// auto-drives the existing checkpoint recovery (relocating if
+    /// needed), and a healed probe flips back to `Active`. Pre-ADR, a
+    /// dead guest read `active` indefinitely with every exec bouncing.
+    Unreachable,
     /// Sandbox has been evicted to a snapshot in BlobStorage. Resumes
     /// via `Idle → Created → Active` (the resume path re-runs the
     /// create-shape transitions on the new sandbox).
@@ -113,7 +123,12 @@ impl SessionState {
     pub fn reserves_host_memory(&self) -> bool {
         matches!(
             self,
-            Self::Pending | Self::Created | Self::Active | Self::Evacuating | Self::Evicting
+            Self::Pending
+                | Self::Created
+                | Self::Active
+                | Self::Unreachable
+                | Self::Evacuating
+                | Self::Evicting
         )
     }
 
@@ -121,7 +136,14 @@ impl SessionState {
     /// `status IN (…)` reservation aggregate. Kept in lockstep with the matcher
     /// by `reserving_states_match` (test).
     pub const fn host_memory_reserving_states() -> &'static [&'static str] {
-        &["pending", "created", "active", "evacuating", "evicting"]
+        &[
+            "pending",
+            "created",
+            "active",
+            "unreachable",
+            "evacuating",
+            "evicting",
+        ]
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -130,6 +152,7 @@ impl SessionState {
             Self::Queued => "queued",
             Self::Created => "created",
             Self::Active => "active",
+            Self::Unreachable => "unreachable",
             Self::Idle => "idle",
             Self::HostLost => "host_lost",
             Self::Evacuating => "evacuating",
@@ -212,7 +235,14 @@ impl SessionState {
             Created => matches!(target, Active | Failed | HostLost),
             Active => matches!(
                 target,
-                Idle | HostLost | Evacuating | Evicting | Failed | Completed | Dead
+                Idle | HostLost | Evacuating | Evicting | Failed | Completed | Dead | Unreachable
+            ),
+            // ADR 0091: Unreachable reaches everything Active can (the
+            // recovery machinery is unchanged) plus back to Active when
+            // the guest heals / recovery lands.
+            Unreachable => matches!(
+                target,
+                Active | Idle | HostLost | Evicting | Failed | Completed | Dead
             ),
             // ADR 0077 phase 4 (Revive): Idle -> Active directly — a
             // successful resume binds the sandbox and reattaches the
@@ -243,7 +273,7 @@ impl SessionState {
     pub fn terminal_target(&self) -> Option<Self> {
         use SessionState::*;
         let target = match self {
-            Active | Idle | HostLost | Evacuating | Evicting => Completed,
+            Active | Unreachable | Idle | HostLost | Evacuating | Evicting => Completed,
             // Queued never ran → Failed, alongside the other never-usable
             // early states.
             Pending | Queued | Created => Failed,

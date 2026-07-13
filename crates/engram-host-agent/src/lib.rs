@@ -1402,6 +1402,9 @@ impl HostAgent {
                         // destroyed; the coord enqueues evict_local (the op
                         // layer dedups repeats).
                         quarantined_survivors: pooled_for_heartbeat.quarantined_survivors(),
+                        // ADR 0091: control-plane-dead guests; the coord
+                        // flips their sessions Active → Unreachable.
+                        unreachable_guests: pooled_for_heartbeat.unreachable_guests(),
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {

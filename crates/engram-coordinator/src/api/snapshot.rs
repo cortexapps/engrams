@@ -631,6 +631,15 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
             enqueue_and_observe_resume(state, id).await?;
             Ok(())
         }
+        // ADR 0091: the guest stopped answering on the control plane
+        // (host alive, VM dead/wedged). Forwarding work into it would
+        // hang; the honest dispatch is the same checkpoint recovery a
+        // dead host gets — the resume verb's Unreachable arm destroys
+        // the dead sandbox and re-enters the Idle resume path.
+        SessionState::Unreachable => {
+            enqueue_and_observe_resume(state, id).await?;
+            Ok(())
+        }
         // ADR 0018: operator drain / live teleport. Unlike Idle, an
         // Evacuating session is NOT inline-resumable here: `resume_session`
         // has no Evacuating arm (it would 409), and `resume_from_idle`'s
@@ -1759,13 +1768,19 @@ async fn resume_from_fc_snapshot(
     // before the harness comes back, so the resumed agent's first
     // events append after an honest recovery boundary, not after
     // messages it never made. No-op for a checkpoint that was the head.
-    // ADR 0045 F1: the manual `/resume` path only rewinds when the
-    // checkpoint lags the lost live head — an unplanned host-death case.
+    // ADR 0091: a clean idle resume tombstones NOTHING (harness_idle +
+    // coordinator facts are rewind-excluded) and thus emits no recovery
+    // event; when rows genuinely roll back here the honest cause is
+    // CheckpointLag — the session idled normally but its latest usable
+    // checkpoint predates real guest activity. This path serves resumes
+    // from `Idle`; no host death is implied (the old hardcoded
+    // HostFailureRecovery made every campaign resume read as a
+    // disaster).
     apply_rung1_rewind(
         state,
         id,
         record.events_cursor,
-        RecoveryCause::HostFailureRecovery,
+        RecoveryCause::CheckpointLag,
     )
     .await;
     if !op_ctx.step("finish").await {

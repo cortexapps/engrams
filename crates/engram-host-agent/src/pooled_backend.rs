@@ -447,6 +447,11 @@ pub struct PooledBackend {
     /// until the sandbox is destroyed; the coordinator drives
     /// `evict_local → resume` off it.
     quarantined_survivors: Arc<DashMap<SandboxId, SessionId>>,
+    /// ADR 0091: guests whose control plane stopped answering (3/3
+    /// socket probes refused after a checkpoint failure). Advertised in
+    /// every heartbeat until cleared by a successful capture or destroy;
+    /// the coordinator flips the session Active → Unreachable off it.
+    unreachable_guests: Arc<DashMap<SandboxId, SessionId>>,
     /// ADR 0007: chunk-store-backed materialization. When set, the
     /// `bundle.json` on a cached image is the source of truth for
     /// the disk — chunks are fetched from `BlobStorage`, written to
@@ -1635,6 +1640,7 @@ impl PooledBackend {
             egress: None,
             session_bindings: Arc::new(DashMap::new()),
             quarantined_survivors: Arc::new(DashMap::new()),
+            unreachable_guests: Arc::new(DashMap::new()),
             chunk_store: None,
             materialize_dir: None,
             bundle_dir,
@@ -3017,6 +3023,25 @@ impl PooledBackend {
                 sandbox_id: *e.key(),
                 session_id: *e.value(),
             })
+            .collect()
+    }
+
+    /// ADR 0091: record a control-plane-dead guest (checkpoint driver's
+    /// 3/3-probe verdict). Re-advertised every heartbeat until cleared.
+    pub fn mark_guest_unreachable(&self, sandbox_id: SandboxId, session_id: SessionId) {
+        self.unreachable_guests.insert(sandbox_id, session_id);
+    }
+
+    /// ADR 0091: a successful capture (or destroy) clears the suspicion.
+    pub fn clear_guest_unreachable(&self, sandbox_id: SandboxId) {
+        self.unreachable_guests.remove(&sandbox_id);
+    }
+
+    /// ADR 0091: the heartbeat's unreachable-guest advert.
+    pub fn unreachable_guests(&self) -> Vec<(SandboxId, SessionId)> {
+        self.unreachable_guests
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
             .collect()
     }
 
@@ -6825,11 +6850,43 @@ impl SandboxBackend for PooledBackend {
 
     /// ADR 0018 commit 12m: forward pause to the wrapped backend.
     /// PooledBackend doesn't have its own pause concept — it just
-    /// delegates to whatever VMM is underneath. Used by our own
-    /// `snapshot` above (pre-flush quiesce) and exposed on the
-    /// trait so external orchestration can call it directly.
+    /// delegates to whatever VMM is underneath. This is the EXTERNAL
+    /// orchestration surface (the coordinator's rung-2 park rides it);
+    /// every internal capture path quiesces via `self.inner.pause`
+    /// directly, under its own capture lock.
+    ///
+    /// ADR 0091: refuse (typed, retryable) while a capture holds this
+    /// sandbox's capture lock instead of racing it on FC's single-
+    /// threaded API socket. This race — park pause vs the periodic
+    /// checkpoint's own pause/flush/resume — made rung-2 parking fail
+    /// on EVERY observed idle eviction (2026-07-11 campaign: 4/4 fell
+    /// through to a 15-19 min full checkpoint). The caller (idle
+    /// evictor) treats it like the checkpoint driver's own skip: retry
+    /// next nomination.
     async fn pause(&self, id: SandboxId) -> Result<(), SandboxError> {
-        self.inner.pause(id).await
+        if self.capture_in_flight(id) {
+            ::metrics::counter!(
+                crate::metrics::RUNG2_PARK_FAILED_TOTAL,
+                "reason" => "capture_in_flight",
+            )
+            .increment(1);
+            // `Unavailable` round-trips the gRPC boundary as the typed
+            // RETRYABLE variant (ADR 0050 C), which is exactly the
+            // caller contract: try the park again next nomination.
+            return Err(SandboxError::Unavailable(format!(
+                "pause {id}: a capture is in flight; retry after it completes"
+            )));
+        }
+        let res = self.inner.pause(id).await;
+        if let Err(e) = &res {
+            ::metrics::counter!(
+                crate::metrics::RUNG2_PARK_FAILED_TOTAL,
+                "reason" => "vmm_pause",
+            )
+            .increment(1);
+            tracing::warn!(%id, error = %e, "external pause failed at the VMM");
+        }
+        res
     }
 
     /// ADR 0018 commit 12m: forward resume. Symmetric with pause.
@@ -7006,6 +7063,7 @@ impl SandboxBackend for PooledBackend {
         // ADR 0090: a destroyed survivor stops advertising quarantine —
         // the evict_local remediation (or any destroy) closes the loop.
         self.quarantined_survivors.remove(&id);
+        self.unreachable_guests.remove(&id);
         if let Some(egress) = self.egress.as_ref() {
             if let Some(session_id) = removed_session {
                 egress.registry.unregister(session_id);

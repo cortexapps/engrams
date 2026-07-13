@@ -235,7 +235,7 @@ export type SessionEvent =
       // `host_failure_recovery`. Optional: events persisted before this
       // field omit it, and the renderer treats a missing value as a
       // host failure (the card's historical meaning).
-      cause?: "planned_relocation" | "host_failure_recovery";
+      cause?: "planned_relocation" | "host_failure_recovery" | "checkpoint_lag";
       at: string;
     }
   // Session titles: the harness proposed an LLM-generated title. Not rendered

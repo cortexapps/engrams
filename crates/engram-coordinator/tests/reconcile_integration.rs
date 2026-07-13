@@ -785,6 +785,7 @@ impl engram_core::traits::HostClient for ProbeBackend {
         Ok(engram_core::types::sandbox::SandboxProbe {
             known_to_backend: false,
             process_alive: *self.process_alive.lock(),
+            control_alive: None,
         })
     }
     async fn exec_stream(

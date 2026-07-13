@@ -321,6 +321,14 @@ pub enum RecoveryCause {
     /// meaning of the recovery boundary.
     #[default]
     HostFailureRecovery,
+    /// ADR 0091: a routine resume from `Idle` whose latest checkpoint
+    /// nevertheless lags real guest activity (e.g. the eviction's
+    /// terminal capture failed and recovery fell back to a prior
+    /// periodic checkpoint). Nothing "failed" at resume time and no host
+    /// died — the copy must say "resumed from an earlier checkpoint",
+    /// not cry host-failure. Clean cycles emit NO recovery event at all
+    /// (zero rolled-back rows short-circuit before the cause is used).
+    CheckpointLag,
 }
 
 /// ADR 0056: an [`SessionEvent::IntegrationAsset`] is either a durable noun

@@ -29,6 +29,13 @@ pub struct SandboxProbe {
     /// The VMM process for this sandbox is alive on this host, checked
     /// independently of `known_to_backend`.
     pub process_alive: bool,
+    /// ADR 0091: is the guest's CONTROL PLANE answering — for FC, a
+    /// connect() against the VMM API socket. `None` = not probed /
+    /// backend has no such concept. A process can be alive with a dead
+    /// control socket (the zombie-session class): `process_alive` says
+    /// "don't reap me", `control_alive == Some(false)` says "don't
+    /// route work into me".
+    pub control_alive: Option<bool>,
 }
 
 /// Spec for creating a sandbox via `SandboxBackend::create`.

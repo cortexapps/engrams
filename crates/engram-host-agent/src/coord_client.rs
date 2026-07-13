@@ -579,6 +579,13 @@ pub struct HeartbeatRequest {
     /// re-advertised until destroyed; the coord drives evict_local.
     #[serde(default)]
     pub quarantined_survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor>,
+    /// ADR 0091: guests whose control plane stopped answering (the
+    /// checkpoint driver's 3/3-probe verdict) — `(sandbox_id,
+    /// session_id)` pairs, re-advertised until a successful capture or
+    /// destroy clears them. The coordinator flips the owning session
+    /// Active → Unreachable.
+    #[serde(default)]
+    pub unreachable_guests: Vec<(SandboxId, SessionId)>,
 }
 
 #[derive(Deserialize)]
@@ -788,6 +795,7 @@ mod tests {
             harness_attached: Vec::new(),
             capture_job_reports: Vec::new(),
             quarantined_survivors: Vec::new(),
+            unreachable_guests: Vec::new(),
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");
