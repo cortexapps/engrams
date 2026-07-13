@@ -1082,6 +1082,12 @@ mod adapter {
         /// SUCCESSFUL result (never a phantom diff for a failed edit). Value
         /// is `(path, change)`.
         pending_file_changes: HashMap<String, (String, FileChange)>,
+        /// `(tool_name, started_at)` per in-flight tool_use_id, recorded at
+        /// `ToolCallStarted` and consumed at the matching `tool_result` so
+        /// `ToolCallCompleted` carries a real `duration_ms` + `tool_name`
+        /// (both shipped hardcoded-empty/zero before — 2026-07-11 campaign
+        /// papercut: every timing consumer read 0).
+        tool_call_starts: HashMap<String, (String, std::time::Instant)>,
         /// ADR 0054: `AskUserQuestion` tool_use_ids seen this turn that have
         /// NOT yet received a `tool_result` — i.e. questions the hook deferred
         /// and that are still pending. While this is non-empty, any assistant
@@ -1487,6 +1493,7 @@ mod adapter {
                                     cli.max_tool_calls,
                                     &mut t.current_message_id,
                                     &mut t.pending_file_changes,
+                                    &mut t.tool_call_starts,
                                     &mut t.auq_pending,
                                     &mut t.suppressed_msg_ids,
                                 ) {
@@ -1529,6 +1536,7 @@ mod adapter {
                                     &mut sink,
                                     cli.max_tool_calls,
                                     &mut None,
+                                    &mut HashMap::new(),
                                     &mut HashMap::new(),
                                     &mut HashSet::new(),
                                     &mut Vec::new(),
@@ -1898,6 +1906,7 @@ mod adapter {
             deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
             current_message_id: None,
             pending_file_changes: HashMap::new(),
+            tool_call_starts: HashMap::new(),
             auq_pending: HashSet::new(),
             is_answer_resume: false,
             suppressed_msg_ids: Vec::new(),
@@ -1936,6 +1945,7 @@ mod adapter {
             deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
             current_message_id: None,
             pending_file_changes: HashMap::new(),
+            tool_call_starts: HashMap::new(),
             auq_pending: HashSet::new(),
             is_answer_resume: true,
             suppressed_msg_ids: Vec::new(),
@@ -2323,6 +2333,11 @@ mod adapter {
         // tool_use_id and held until the matching tool_result (so we emit a
         // `FileChanged` only on success). Tracked across lines within a turn.
         pending_file_changes: &mut HashMap<String, (String, FileChange)>,
+        // Papercut fix (2026-07-11 campaign): (tool_name, started_at) per
+        // in-flight tool_use_id — recorded at tool_use, consumed at the
+        // matching tool_result so ToolCallCompleted carries a real
+        // duration_ms + tool_name. Tracked across lines within a turn.
+        tool_call_starts: &mut HashMap<String, (String, std::time::Instant)>,
         // ADR 0054: pending (no-result) `AskUserQuestion` tool_use_ids for this
         // turn. We add an id on a deferred AUQ tool_use and remove it on the
         // matching tool_result; while the set is non-empty, assistant
@@ -2462,6 +2477,10 @@ mod adapter {
                                 if name == "AskUserQuestion" {
                                     auq_pending.insert(tcid.clone());
                                 }
+                                tool_call_starts.insert(
+                                    tcid.clone(),
+                                    (name.clone(), std::time::Instant::now()),
+                                );
                                 out.push(HarnessEvent::ToolCallStarted {
                                     run_id: rid.clone(),
                                     tool_call_id: tcid,
@@ -2523,12 +2542,20 @@ mod adapter {
                                     .join("\n"),
                                 _ => String::new(),
                             };
+                            let (tool_name, duration_ms) = match tool_call_starts.remove(&tcid) {
+                                Some((name, started)) => {
+                                    (name, started.elapsed().as_millis() as u64)
+                                }
+                                // Result for a tool_use this process never saw
+                                // start (e.g. a --resume replay) — honest zeros.
+                                None => (String::new(), 0),
+                            };
                             out.push(HarnessEvent::ToolCallCompleted {
                                 run_id: rid.clone(),
                                 tool_call_id: tcid.clone(),
-                                tool_name: String::new(),
+                                tool_name,
                                 ok: !is_error,
-                                duration_ms: 0,
+                                duration_ms,
                                 result_summary: Some(truncate_str(
                                     &result_text,
                                     MAX_RESULT_SUMMARY_BYTES,
@@ -4051,6 +4078,7 @@ mod tests {
             50,
             &mut None,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new(),
         )
@@ -4064,6 +4092,7 @@ mod tests {
             50,
             &mut None,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new(),
         )
@@ -4093,6 +4122,7 @@ mod tests {
             50,
             &mut None,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new(),
         )
@@ -4112,6 +4142,7 @@ mod tests {
             50,
             &mut None,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new(),
         )
@@ -4144,6 +4175,7 @@ mod tests {
             50,
             &mut mid,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new()
         )
@@ -4159,6 +4191,7 @@ mod tests {
             50,
             &mut mid,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new()
         )
@@ -4173,6 +4206,7 @@ mod tests {
                 50,
                 &mut mid,
                 &mut fc,
+                &mut HashMap::new(),
                 &mut std::collections::HashSet::new(),
                 &mut Vec::new(),
             )
@@ -4201,6 +4235,7 @@ mod tests {
             50,
             &mut mid,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new(),
         )
@@ -4230,6 +4265,7 @@ mod tests {
             50,
             &mut None,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new(),
         )
@@ -4245,6 +4281,7 @@ mod tests {
             50,
             &mut None,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new(),
         )
@@ -4284,6 +4321,7 @@ mod tests {
             50,
             &mut None,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new(),
         )
@@ -4303,6 +4341,7 @@ mod tests {
             50,
             &mut None,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new(),
         )
@@ -4348,6 +4387,7 @@ mod tests {
             50,
             &mut None,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new(),
         )
@@ -4361,6 +4401,7 @@ mod tests {
             50,
             &mut None,
             &mut fc,
+            &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut Vec::new(),
         )
@@ -4443,6 +4484,7 @@ mod tests {
             50,
             &mut None,
             &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
             &mut auq,
             &mut Vec::new(),
         )
@@ -4462,6 +4504,7 @@ mod tests {
             50,
             &mut None,
             &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
             &mut auq,
             &mut Vec::new(),
         )
@@ -4490,6 +4533,7 @@ mod tests {
             50,
             &mut None,
             &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
             &mut auq,
             &mut suppressed,
         )
@@ -4507,6 +4551,7 @@ mod tests {
             50,
             &mut None,
             &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
             &mut auq,
             &mut suppressed,
         )
@@ -4535,6 +4580,7 @@ mod tests {
             50,
             &mut mid,
             &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
             &mut auq,
             &mut Vec::new(),
         )
@@ -4548,6 +4594,7 @@ mod tests {
             50,
             &mut mid,
             &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
             &mut auq,
             &mut Vec::new(),
         )
@@ -4575,6 +4622,7 @@ mod tests {
             50,
             &mut None,
             &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
             &mut auq,
             &mut Vec::new(),
         )
@@ -4587,6 +4635,7 @@ mod tests {
             50,
             &mut None,
             &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
             &mut auq,
             &mut Vec::new(),
         )
@@ -4600,6 +4649,7 @@ mod tests {
             50,
             &mut None,
             &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
             &mut auq,
             &mut Vec::new(),
         )
@@ -4626,6 +4676,7 @@ mod tests {
             50,
             &mut None,
             &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
             &mut auq,
             &mut Vec::new(),
         )

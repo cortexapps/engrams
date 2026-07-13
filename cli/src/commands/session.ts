@@ -203,12 +203,14 @@ export async function log(
   c: Clients,
   id: string,
   limit: number | undefined,
+  tail: boolean,
   json: boolean,
 ): Promise<void> {
   const resp = await c.session
     .getLog({
       sessionId: id,
       kind: "conversation",
+      tail,
       ...(limit !== undefined ? { limit: BigInt(limit) } : {}),
     })
     .catch(failWith);

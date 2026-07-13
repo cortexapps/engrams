@@ -357,9 +357,15 @@ impl app::session_service_server::SessionService for AppSessionService {
         self.auth.check(&req)?;
         let r = req.into_inner();
         let id = parse_session_id(&r.session_id)?;
-        let entries = crate::api::sessions_inspect::get_log_core(&self.state, id, r.kind, r.limit)
-            .await
-            .map_err(into_status)?;
+        let entries = crate::api::sessions_inspect::get_log_core(
+            &self.state,
+            id,
+            r.kind,
+            r.limit,
+            r.tail.unwrap_or(false),
+        )
+        .await
+        .map_err(into_status)?;
         let proto_entries = entries
             .into_iter()
             .map(super::convert::conversation_entry_to_proto)

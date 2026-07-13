@@ -372,6 +372,11 @@ message GetLogRequest {
   // Cap on number of rows returned. Server defaults to 200, hard-capped
   // at 1000 to keep responses bounded.
   optional int64 limit = 3;
+  // Return the NEWEST `limit` rows (still in ascending idx order) instead
+  // of the oldest. What every interactive consumer wants — the CLI's
+  // `session log` defaults to it. (2026-07-11 campaign: oldest-N default
+  // cost multiple agents stalled polls against long sessions.)
+  optional bool tail = 4;
 }
 
 message GetLogResponse {
