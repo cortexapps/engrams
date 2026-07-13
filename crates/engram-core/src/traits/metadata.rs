@@ -1558,6 +1558,21 @@ pub trait MetadataStore: Send + Sync {
         limit: i64,
     ) -> Result<Vec<PersistedEvent>, MetaError>;
 
+    /// The NEWEST `limit` events, returned in ASCENDING idx order (the
+    /// same shape `list_session_events_since` yields, just anchored at
+    /// the tail). What every interactive consumer wants; the forward
+    /// cursor has no way to express it (2026-07-11 campaign: agents
+    /// polling long sessions with oldest-N reads stalled repeatedly).
+    /// Default impl (mocks): delegate to the forward read — correct for
+    /// stores whose event count fits the caller's limit anyway.
+    async fn list_session_events_tail(
+        &self,
+        session_id: SessionId,
+        limit: i64,
+    ) -> Result<Vec<PersistedEvent>, MetaError> {
+        self.list_session_events_since(session_id, -1, limit).await
+    }
+
     /// ADR 0028 A.log: rung-1 recovery rewind. Tombstone every live
     /// event with `idx > events_cursor` (set `rewound_at = now()`),
     /// bump the session's `recovery_epoch`, and return a

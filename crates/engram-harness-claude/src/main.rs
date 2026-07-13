@@ -1316,6 +1316,12 @@ mod adapter {
         /// SUCCESSFUL result (never a phantom diff for a failed edit). Value
         /// is `(path, change)`.
         pending_file_changes: HashMap<String, (String, FileChange)>,
+        /// `(tool_name, started_at)` per in-flight tool_use_id, recorded at
+        /// `ToolCallStarted` and consumed at the matching `tool_result` so
+        /// `ToolCallCompleted` carries a real `duration_ms` + `tool_name`
+        /// (both shipped hardcoded-empty/zero before — 2026-07-11 campaign
+        /// papercut: every timing consumer read 0).
+        tool_call_starts: HashMap<String, (String, std::time::Instant)>,
         /// ADR 0054: `AskUserQuestion` tool_use_ids seen this turn that have
         /// NOT yet received a `tool_result` — i.e. questions the hook deferred
         /// and that are still pending. While this is non-empty, any assistant
@@ -2142,6 +2148,7 @@ mod adapter {
             deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
             current_message_id: None,
             pending_file_changes: HashMap::new(),
+            tool_call_starts: HashMap::new(),
             auq_pending: HashSet::new(),
             is_answer_resume: false,
             suppressed_msg_ids: Vec::new(),
@@ -2180,6 +2187,7 @@ mod adapter {
             deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
             current_message_id: None,
             pending_file_changes: HashMap::new(),
+            tool_call_starts: HashMap::new(),
             auq_pending: HashSet::new(),
             is_answer_resume: true,
             suppressed_msg_ids: Vec::new(),
@@ -2706,6 +2714,10 @@ mod adapter {
                                 if name == "AskUserQuestion" {
                                     auq_pending.insert(tcid.clone());
                                 }
+                                tool_call_starts.insert(
+                                    tcid.clone(),
+                                    (name.clone(), std::time::Instant::now()),
+                                );
                                 out.push(HarnessEvent::ToolCallStarted {
                                     run_id: rid.clone(),
                                     tool_call_id: tcid,
@@ -2767,12 +2779,20 @@ mod adapter {
                                     .join("\n"),
                                 _ => String::new(),
                             };
+                            let (tool_name, duration_ms) = match tool_call_starts.remove(&tcid) {
+                                Some((name, started)) => {
+                                    (name, started.elapsed().as_millis() as u64)
+                                }
+                                // Result for a tool_use this process never saw
+                                // start (e.g. a --resume replay) — honest zeros.
+                                None => (String::new(), 0),
+                            };
                             out.push(HarnessEvent::ToolCallCompleted {
                                 run_id: rid.clone(),
                                 tool_call_id: tcid.clone(),
-                                tool_name: String::new(),
+                                tool_name,
                                 ok: !is_error,
-                                duration_ms: 0,
+                                duration_ms,
                                 result_summary: Some(truncate_str(
                                     &result_text,
                                     MAX_RESULT_SUMMARY_BYTES,

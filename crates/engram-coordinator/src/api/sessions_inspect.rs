@@ -43,16 +43,25 @@ pub(crate) async fn get_log_core(
     id: SessionId,
     kind: Option<String>,
     limit: Option<i64>,
+    tail: bool,
 ) -> Result<Vec<ConversationEntry>, ApiError> {
     let _session = state.services.meta.get_session(id).await?;
     let limit = limit.unwrap_or(200).clamp(1, 1000);
     match kind.as_deref().unwrap_or("conversation") {
         "conversation" => {
-            let rows = state
-                .services
-                .meta
-                .list_session_events_since(id, -1, limit)
-                .await?;
+            let rows = if tail {
+                state
+                    .services
+                    .meta
+                    .list_session_events_tail(id, limit)
+                    .await?
+            } else {
+                state
+                    .services
+                    .meta
+                    .list_session_events_since(id, -1, limit)
+                    .await?
+            };
             Ok(rows
                 .into_iter()
                 .map(|e| ConversationEntry {
@@ -252,8 +261,9 @@ mod tests {
             .unwrap();
 
         let events = get_log_core(
-            &state, session_id, None, // kind defaults to conversation
-            None, // limit defaults to 200
+            &state, session_id, None,  // kind defaults to conversation
+            None,  // limit defaults to 200
+            false, // forward read
         )
         .await
         .expect("log conversation");
@@ -268,7 +278,7 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let (state, _local) = build_state_for_session(ephemeral_session(session_id));
 
-        let err = get_log_core(&state, session_id, Some("workspace".into()), None)
+        let err = get_log_core(&state, session_id, Some("workspace".into()), None, false)
             .await
             .expect_err("workspace kind retired in ADR 0005");
         assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);

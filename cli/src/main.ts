@@ -148,11 +148,12 @@ sessionCmd
   });
 sessionCmd
   .command("log <id>")
-  .description("show the conversation timeline")
+  .description("show the conversation timeline (newest rows by default)")
   .option("--limit <n>", "cap on rows returned", (v: string) => parseInt(v, 10))
-  .action((id: string, o: { limit?: number }) => {
+  .option("--from-start", "oldest rows instead of the tail")
+  .action((id: string, o: { limit?: number; fromStart?: boolean }) => {
     const { clients, json } = ctx();
-    return session.log(clients(), id, o.limit, json);
+    return session.log(clients(), id, o.limit, !o.fromStart, json);
   });
 sessionCmd
   .command("resume <id>")

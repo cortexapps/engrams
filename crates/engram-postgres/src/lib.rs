@@ -3569,6 +3569,35 @@ impl MetadataStore for PostgresStore {
         rows.iter().map(row::persisted_event_from_row).collect()
     }
 
+    async fn list_session_events_tail(
+        &self,
+        session_id: SessionId,
+        limit: i64,
+    ) -> Result<Vec<PersistedEvent>, MetaError> {
+        // Newest `limit` by idx, re-ascended so the caller sees the same
+        // shape as the forward read (a plain ORDER BY idx DESC would
+        // render the transcript backwards).
+        let rows = sqlx::query(
+            r#"
+            SELECT idx, kind, payload, created_at, recovery_epoch, rewound_at
+              FROM (
+                SELECT idx, kind, payload, created_at, recovery_epoch, rewound_at
+                  FROM session_events
+                 WHERE session_id = $1
+                 ORDER BY idx DESC
+                 LIMIT $2
+              ) newest
+             ORDER BY idx
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::persisted_event_from_row).collect()
+    }
+
     async fn prompt_received_seconds_ago(
         &self,
         session_id: SessionId,

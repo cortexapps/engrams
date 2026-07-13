@@ -548,6 +548,7 @@ async fn snapshot_evict_resume_smoke() {
         session_id: session_id.clone(),
         kind: None,
         limit: Some(10),
+        tail: None,
     });
     log_req.set_timeout(rpc_timeout);
     let log_resp = client
