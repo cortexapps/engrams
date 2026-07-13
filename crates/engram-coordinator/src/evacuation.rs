@@ -326,6 +326,14 @@ pub async fn evacuate_dead_source(
                 .as_ref()
                 .and_then(|s| s.fc_snapshot_version.clone()),
         },
+        // ADR 0090: steer the relocation toward hosts whose bundle stamp
+        // already covers the snapshot's pinned generations (campaign B1:
+        // a recovery landed on a mid-staging fresh node and the harness
+        // spawn had nothing to exec). Soft — see rank_hosts.
+        prefer_bundles: snapshot
+            .as_ref()
+            .map(|s| s.aux_bundles.as_slice())
+            .unwrap_or(&[]),
     };
 
     // Split pick + restore so picker errors and backend errors keep

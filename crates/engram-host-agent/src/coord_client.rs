@@ -378,6 +378,30 @@ impl CoordClient {
         let body: Resp = resp.json().await.map_err(CoordClientError::Transport)?;
         Ok(body.owned)
     }
+
+    /// ADR 0090: the unknown-binding ownership form — "does ANY session
+    /// own this sandbox on me?" Used by the teardown reconciler when the
+    /// local binding table has no entry (fresh generation after a roll
+    /// whose NBD rehydrate failed). Returns the owning session id so the
+    /// caller can repopulate its binding table.
+    pub async fn sandbox_owner(
+        &self,
+        host_id: HostId,
+        sandbox_id: engram_core::SandboxId,
+    ) -> Result<Option<engram_core::SessionId>, CoordClientError> {
+        let url = self.endpoint(&format!("/hosts/{host_id}/sandboxes/{sandbox_id}/owner"));
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            session_id: Option<engram_core::SessionId>,
+        }
+        let mut builder = self.http.get(&url);
+        if !self.auth_token.is_empty() {
+            builder = builder.bearer_auth(&self.auth_token);
+        }
+        let resp = builder.send().await.map_err(CoordClientError::Transport)?;
+        let body: Resp = decode_json(resp, "sandbox_owner").await?;
+        Ok(body.session_id)
+    }
 }
 
 async fn decode_json<T: serde::de::DeserializeOwned>(
@@ -551,6 +575,10 @@ pub struct HeartbeatRequest {
     /// heartbeat until `HeartbeatResponse.acked_capture_jobs` names them.
     #[serde(default)]
     pub capture_job_reports: Vec<engram_core::types::CaptureJobReport>,
+    /// ADR 0090: survivors whose NBD slot this generation quarantined —
+    /// re-advertised until destroyed; the coord drives evict_local.
+    #[serde(default)]
+    pub quarantined_survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor>,
 }
 
 #[derive(Deserialize)]
@@ -759,6 +787,7 @@ mod tests {
             capabilities: Default::default(),
             harness_attached: Vec::new(),
             capture_job_reports: Vec::new(),
+            quarantined_survivors: Vec::new(),
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");

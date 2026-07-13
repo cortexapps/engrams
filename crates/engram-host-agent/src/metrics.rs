@@ -267,6 +267,14 @@ pub const WARM_HOOK_STAGE_SECONDS: &str = "engram_warm_hook_stage_seconds";
 /// `warm-brain-stack.sh` fix (engrams-internal) lands.
 pub const WARM_HOOK_FAILURES_TOTAL: &str = "engram_warm_hook_failures_total";
 
+/// Counter (ADR 0090). One increment per failed heartbeat POST. The
+/// fleet alert rule watches the RATE of this per host: sustained
+/// nonzero means the host is invisible to the coordinator (node
+/// egress/network wedge class — 2026-07-12 incident: 1.5h of lost
+/// capacity with only DEBUG traces). Escalating ERROR logs pair with
+/// it after ~30s of consecutive failures.
+pub const HEARTBEAT_DELIVERY_FAILURES_TOTAL: &str = "engram_host_heartbeat_delivery_failures_total";
+
 /// Issue #540 (host RAM ledger): gauge of host RAM (MiB) attributed to
 /// one named bucket, sampled once per heartbeat tick from
 /// `ram_ledger::RamLedgerSnapshot`. Label `category`:

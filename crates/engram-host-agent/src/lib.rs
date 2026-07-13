@@ -522,11 +522,31 @@ impl HostAgent {
                                     // reap on a transient control-plane blip.
                                     Err(_) => false,
                                 },
-                                // No session binding. Past the debounce this is an
-                                // unreclaimable orphan; a fresh create publishes its
-                                // binding within a tick, so the strike count protects
-                                // it.
-                                None => true,
+                                // ADR 0090: a missing LOCAL binding is not ownership
+                                // truth — a fresh generation whose NBD rehydrate
+                                // failed has no entry for a legitimately-owned,
+                                // pidfd-reattached survivor, and this arm's old
+                                // unconditional `true` SIGKILLed exactly such a VM
+                                // mid-build (2026-07-11 campaign). Ask the
+                                // coordinator; an owned answer also repairs the
+                                // local table. Only a coordinator-confirmed
+                                // "no session owns this" counts as an orphan.
+                                None => match coord_for_reap
+                                    .sandbox_owner(host_id_for_reap, sandbox_id)
+                                    .await
+                                {
+                                    Ok(Some(sid)) => {
+                                        tracing::info!(%sandbox_id, session_id = %sid,
+                                            "teardown reconcile: coordinator owns this \
+                                             sandbox; repopulating the local binding");
+                                        pooled_for_reap.record_session_binding(sandbox_id, sid);
+                                        false
+                                    }
+                                    Ok(None) => true,
+                                    // Coord unreachable → assume owned (same
+                                    // posture as the Some arm).
+                                    Err(_) => false,
+                                },
                             };
                             if orphan_strike(&mut strikes, sandbox_id, orphan, ORPHAN_STRIKES) {
                                 tracing::warn!(%sandbox_id, ?session,
@@ -1193,6 +1213,18 @@ impl HostAgent {
             // once outside the loop (same pattern `base_memfile_dir`
             // above uses).
             let base_shm_dir_for_heartbeat = engram_sandbox_firecracker::uffd_base_dir_from_env();
+            // ADR 0090: consecutive heartbeat delivery failures. The
+            // 2026-07-12 outbound-network wedge kept a healthy host out of
+            // the registry for 1.5h with only DEBUG traces — the dead-host
+            // detector fired (correctly), but nothing on THIS side ever
+            // escalated, so no alert could exist. Past the threshold every
+            // further failure logs ERROR and bumps the counter metric the
+            // fleet alert rule watches. (No self-heal attempt here: the
+            // wedge class is node-network-down — a re-register would fail
+            // identically, and a returning network heals via the normal
+            // heartbeat/registration path anyway.)
+            const HEARTBEAT_FAILURES_BEFORE_ESCALATION: u32 = 6; // ~30s at 5s cadence
+            let mut consecutive_heartbeat_failures: u32 = 0;
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(heartbeat_interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1366,9 +1398,23 @@ impl HostAgent {
                         stages_images: stages_images_for_heartbeat,
                         capabilities,
                         capture_job_reports,
+                        // ADR 0090: re-advertised until the sandbox is
+                        // destroyed; the coord enqueues evict_local (the op
+                        // layer dedups repeats).
+                        quarantined_survivors: pooled_for_heartbeat.quarantined_survivors(),
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {
+                            if consecutive_heartbeat_failures
+                                >= HEARTBEAT_FAILURES_BEFORE_ESCALATION
+                            {
+                                tracing::info!(
+                                    host_id = %host_id,
+                                    after_failures = consecutive_heartbeat_failures,
+                                    "heartbeat delivery recovered",
+                                );
+                            }
+                            consecutive_heartbeat_failures = 0;
                             if let Some(tx) = enabled_images_tx.as_ref() {
                                 // ADR 0036 amendment (issue #538): the
                                 // supervisor watches the UNION of
@@ -1470,11 +1516,29 @@ impl HostAgent {
                             }
                         }
                         Err(e) => {
-                            tracing::debug!(
-                                host_id = %host_id,
-                                error = %e,
-                                "heartbeat POST failed; retrying next tick",
-                            );
+                            consecutive_heartbeat_failures =
+                                consecutive_heartbeat_failures.saturating_add(1);
+                            ::metrics::counter!(crate::metrics::HEARTBEAT_DELIVERY_FAILURES_TOTAL)
+                                .increment(1);
+                            if consecutive_heartbeat_failures
+                                >= HEARTBEAT_FAILURES_BEFORE_ESCALATION
+                            {
+                                tracing::error!(
+                                    host_id = %host_id,
+                                    error = %e,
+                                    consecutive = consecutive_heartbeat_failures,
+                                    "heartbeat delivery failing repeatedly — this host is \
+                                     (or will shortly be) invisible to the coordinator; \
+                                     check node egress/network (ADR 0090)",
+                                );
+                            } else {
+                                tracing::debug!(
+                                    host_id = %host_id,
+                                    error = %e,
+                                    consecutive = consecutive_heartbeat_failures,
+                                    "heartbeat POST failed; retrying next tick",
+                                );
+                            }
                         }
                     }
                 }

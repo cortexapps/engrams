@@ -357,6 +357,11 @@ pub struct HeartbeatRequest {
     /// `CheckpointAdvert`/`checkpoints` pattern verbatim, for capture.
     #[serde(default)]
     pub capture_job_reports: Vec<engram_core::types::CaptureJobReport>,
+    /// ADR 0090: survivors whose NBD slot the host quarantined after a
+    /// failed rehydrate — the coordinator enqueues `evict_local` for
+    /// each still-owned one (the op layer dedups re-adverts).
+    #[serde(default)]
+    pub quarantined_survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor>,
 }
 
 #[derive(Serialize)]
@@ -716,6 +721,56 @@ pub async fn heartbeat(
             count = acked_checkpoints.len(),
             "reconciled host-advertised checkpoints into PG",
         );
+    }
+
+    // ADR 0090: drive the documented remediation for quarantined
+    // survivors (NBD rehydrate failed after a roll — VM possibly live,
+    // disk unserved). Enqueue `evict_local` (full capture, no park) for
+    // each survivor the session still owns; `session_ops::enqueue`
+    // returns `Duplicate` for the re-adverts every 5s heartbeat carries,
+    // so this is idempotent. Pre-fix, nothing consumed the host's WARN
+    // and the teardown reconciler's orphan path SIGKILLed the VM.
+    for q in &hb.quarantined_survivors {
+        match state.services.meta.get_session(q.session_id).await {
+            Ok(s) if s.sandbox_id == Some(q.sandbox_id) => {
+                match crate::session_ops::enqueue(
+                    &state,
+                    q.session_id,
+                    engram_core::types::session_op::OpKind::Evict,
+                    serde_json::json!({
+                        "target": "idle",
+                        "allow_park": false,
+                        "nominated": false,
+                    }),
+                    None,
+                )
+                .await
+                {
+                    Ok(engram_core::types::session_op::EnqueueOutcome::Duplicate) => {}
+                    Ok(_) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            session_id = %q.session_id,
+                            sandbox_id = %q.sandbox_id,
+                            "quarantined survivor advertised — enqueued evict_local \
+                             (capture + relocate; ADR 0090)",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            session_id = %q.session_id,
+                            error = %e,
+                            "quarantined-survivor evict enqueue failed; retried next heartbeat",
+                        );
+                    }
+                }
+            }
+            // Session moved on (relocated / terminal) or unknown — the
+            // host's quarantine entry clears when the sandbox is
+            // destroyed; nothing to drive here.
+            _ => {}
+        }
     }
 
     // ADR 0084 P1b: reconcile this host's un-acked capture-job reports.
@@ -1304,6 +1359,30 @@ pub async fn sandbox_ownership(
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SandboxOwnershipResponse {
     pub owned: bool,
+}
+
+/// ADR 0090: the teardown reconciler's unknown-binding form — "does ANY
+/// session own sandbox Y on this host?" A fresh host-agent generation
+/// whose NBD rehydrate failed has no local binding for a pidfd-reattached
+/// survivor; before the reconciler may count an orphan strike it must ask
+/// here. Returns the owning session id (non-terminal states only, incl.
+/// `host_lost`) so the host can also repopulate its binding table.
+pub async fn sandbox_owner(
+    State(state): State<SharedState>,
+    Path((host_id, sandbox_id)): Path<(HostId, SandboxId)>,
+) -> Result<Json<SandboxOwnerResponse>, ApiError> {
+    let session_id = state
+        .services
+        .meta
+        .session_owning_sandbox(host_id, sandbox_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("session_owning_sandbox: {e}")))?;
+    Ok(Json(SandboxOwnerResponse { session_id }))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SandboxOwnerResponse {
+    pub session_id: Option<SessionId>,
 }
 
 #[cfg(test)]

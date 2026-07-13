@@ -802,6 +802,7 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
         exclude_host: None,
         prefer_host: None,
         caps: Default::default(),
+        prefer_bundles: &[],
     };
     let (first_pick, _) = placement::pick_for_session(meta.as_ref(), &registry, &ctx)
         .await
@@ -1149,6 +1150,7 @@ async fn drain_dont_strand_guard_blocks_when_no_survivor_fits() {
         exclude_host: Some(victim),
         prefer_host: None,
         caps: Default::default(),
+        prefer_bundles: &[],
     };
 
     // 8 GiB session, survivor has 4 GiB free → no fit → would strand.

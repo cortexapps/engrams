@@ -485,6 +485,9 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
             needs_uffd_substrate,
             fc_snapshot_version: None,
         },
+        // Fresh create: the harness resolves against the target's own
+        // current stamp, so there is no pinned generation to prefer.
+        prefer_bundles: &[],
     };
     let candidates =
         match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
@@ -586,6 +589,9 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<b
             needs_uffd_substrate: latest.as_ref().is_some_and(|s| s.memory_manifest.is_some()),
             fc_snapshot_version: latest.and_then(|s| s.fc_snapshot_version),
         },
+        // Capacity PRE-check only (the resume's own pick carries the
+        // real pins); ordering is irrelevant to an emptiness test.
+        prefer_bundles: &[],
     };
     match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
         Ok(c) => {

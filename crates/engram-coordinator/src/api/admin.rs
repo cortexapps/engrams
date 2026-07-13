@@ -592,6 +592,7 @@ pub(crate) async fn admin_drain_host_core(
                     exclude_host: Some(host_id),
                     prefer_host: None,
                     caps: crate::placement::CapabilityRequirements::default(),
+                    prefer_bundles: &[],
                 };
                 match crate::placement::placement_preview(
                     st.services.meta.as_ref(),
@@ -627,6 +628,7 @@ pub(crate) async fn admin_drain_host_core(
                         // `migrate_session_live`'s own capture path is the
                         // authoritative gate for the live-teleport target.
                         caps: crate::placement::CapabilityRequirements::default(),
+                        prefer_bundles: &[],
                     };
                     let target = crate::placement::pick_for_session(
                         st.services.meta.as_ref(),
