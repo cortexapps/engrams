@@ -161,6 +161,15 @@ function stubRoutes(router: ConnectRouter): void {
           status: "ready",
           capacityTotalMib: 16384n,
           capacityUsedMib: 512n,
+          // ADR 0046 figures — what host list actually renders post-#650.
+          allocatableMib: 16384n,
+          reservedMib: 512n,
+          freeMib: 15872n,
+          utilBaseShmMib: 1024n,
+          cpuBudgetVcpus: 64n,
+          freeVcpus: 56n,
+          cordoned: false,
+          failingCapabilities: [],
           runningSandboxes: 2,
           lastHeartbeatAt: "2026-07-10T00:00:00Z",
         },
@@ -318,11 +327,13 @@ describe("engrams (binary vs stub orchestrator)", () => {
 
   test("hosts list serializes bigint capacities in BOTH output modes", async () => {
     // Regression: HostView's uint64 fields arrive as bigint; --json must not
-    // crash on JSON.stringify and the table must render them.
+    // crash on JSON.stringify and the table must render them. Post-#650 the
+    // surfaced figures are the ADR 0046 allocatable/free set (the legacy
+    // capacity_used_mib was a dead always-0 field).
     const j = await runCli(["--json", "hosts", "list"]);
     expect(j.code).toBe(0);
     const body = JSON.parse(j.stdout) as { hosts: Array<Record<string, unknown>> };
-    expect(body.hosts[0]!["capacity_total_mib"]).toBe(16384);
+    expect(body.hosts[0]!["allocatable_mib"]).toBe(16384);
     expect(body.hosts[0]!["hostname"]).toBe("stub-host");
     const t = await runCli(["hosts", "list"]);
     expect(t.code).toBe(0);
