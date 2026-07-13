@@ -1104,17 +1104,26 @@ async fn scanner_advance_one(
     Ok(())
 }
 
-/// ADR 0074 rung reaper: dwell cap (seconds) after which a parked VM is
-/// descended to a full eviction even without memory pressure — its RAM
-/// isn't worth holding if the user hasn't returned in this long, and a
-/// paused guest's TCP connections go stale past this window anyway.
-/// Env-tunable; default 15 minutes (ADR 0074 rung-2 dwell).
-fn park_dwell_cap() -> chrono::Duration {
+/// ADR 0074 addendum (2026-07-13): the dwell cap is RETIRED as a reclaim
+/// trigger. `None` (the default) = descent is pressure-driven only, which
+/// is what this ADR's own Decision always said ("Pressure-driven descent
+/// becomes the ONLY mode; the clock TTL survives as candidacy, never as a
+/// reclaim trigger"). The shipped 900s clock violated that: it descended
+/// parked VMs on hosts with abundant free RAM, and a descent costs the
+/// full guest rebuild on return — measured 26.9s of `wait_agent_ready` +
+/// `SpawnHarness` against 562ms of actual byte movement (prod trace
+/// 2026-07-13). Its stated rationale ("stale guest TCP") doesn't
+/// distinguish the paths: a rung-4 restore resumes the guest from a
+/// memory snapshot whose TCP state is equally stale.
+///
+/// `ENGRAM_PARK_DWELL_SECS` survives as an operator escape hatch: set it
+/// to re-arm a clock-based descent. The absolute ceiling remains the idle
+/// detector's hard TTL, which evicts parked sessions regardless.
+fn park_dwell_cap() -> Option<chrono::Duration> {
     let secs = std::env::var("ENGRAM_PARK_DWELL_SECS")
         .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(900);
-    chrono::Duration::seconds(secs.max(1))
+        .and_then(|s| s.parse::<i64>().ok())?;
+    (secs > 0).then(|| chrono::Duration::seconds(secs))
 }
 
 /// ADR 0074 rungs 2-3: advance one PARKED session (park_rung >= 2). The
@@ -1160,17 +1169,34 @@ async fn park_reaper_advance_one(
         return Ok(());
     }
 
-    let dwell_exceeded = session
-        .parked_at
-        .map(|at| Utc::now().signed_duration_since(at) >= park_dwell_cap())
-        .unwrap_or(true); // no stamp → treat as long-parked (descend)
+    // ADR 0074 addendum: pressure is the primary (normally the only)
+    // trigger. A parked VM on a host with headroom KEEPS ITS RAM — the
+    // user's return is then an un-pause (ms) instead of a ~27s rebuild.
     let has_headroom = host_has_memory_headroom(state, session_id).await;
+    // The absolute ceiling. The idle DETECTOR's hard TTL can't reach a
+    // parked session (it scans `Active` rows; a parked one is `Evicting`),
+    // so with the dwell clock retired the reaper owns the ceiling: an
+    // abandoned park descends after the same hard TTL, measured from the
+    // park instant (which trails the session's last event by the soft
+    // window — an intentional, bounded overshoot, not a second clock).
+    let hard_cap = crate::idle_detector::IdleDetectorConfig::from_env().hard_ttl;
+    let parked_for = session
+        .parked_at
+        .map(|at| Utc::now().signed_duration_since(at))
+        .unwrap_or_else(chrono::Duration::zero);
+    let hard_exceeded = parked_for.to_std().is_ok_and(|elapsed| elapsed >= hard_cap);
+    // Operator escape hatch (off by default) — see `park_dwell_cap`.
+    let dwell_exceeded = park_dwell_cap().is_some_and(|cap| parked_for >= cap);
     let reason = if !has_headroom {
         "pressure"
+    } else if hard_exceeded {
+        "hard_ttl"
     } else if dwell_exceeded {
         "dwell"
     } else {
-        // Still within dwell and the host has room — keep the VM parked.
+        // Host has room and the ceiling is far off — HOLD THE PARK. This
+        // is the ladder's whole point: idle sessions keep their VM (and
+        // therefore their ms-fast ascent) until the RAM is actually needed.
         return Ok(());
     };
 
@@ -3074,12 +3100,13 @@ mod tests {
         );
     }
 
-    /// ADR 0074 rung 2 reaper: a parked-paused VM whose dwell cap has
-    /// elapsed is DESCENDED to a full eviction (un-pause → capture →
-    /// destroy → Idle), reclaiming its RAM. The parking left no trace in
-    /// the terminal state.
+    /// ADR 0074 addendum (2026-07-13): a long-parked VM on a host with
+    /// HEADROOM keeps its RAM — no clock reclaims it. This is the
+    /// behavior the shipped 900s dwell cap violated (it descended parked
+    /// VMs on empty hosts, costing a ~27s guest rebuild on return for
+    /// RAM nobody wanted).
     #[tokio::test]
-    async fn parked_paused_descends_to_full_eviction_on_dwell() {
+    async fn long_parked_vm_with_headroom_is_not_descended_by_a_clock() {
         let session_id = engram_core::SessionId::new();
         let sandbox_root = TempDir::new().unwrap();
         let session = evicting_session(session_id);
@@ -3095,15 +3122,15 @@ mod tests {
             .host_registry
             .host_of(sandbox_id)
             .expect("sandbox routed");
-        meta.session.lock().host_id = Some(host_id); // headroom resolves via PG now
-        seed_host_with_free_ram(&meta, host_id, 60_000);
+        meta.session.lock().host_id = Some(host_id);
+        seed_host_with_free_ram(&meta, host_id, 60_000); // abundant headroom
 
-        // Park first.
         let op = drive_evict(&state, session_id, true, false).await;
         assert_eq!(op.state, OpState::Done);
         assert_eq!(meta.session.lock().park_rung, 2, "parked-paused");
 
-        // Backdate the park entry beyond the dwell cap (default 600s).
+        // An hour parked — past the RETIRED 900s dwell, far short of the
+        // 8h hard ceiling.
         let stale = chrono::Utc::now() - chrono::Duration::seconds(3600);
         state
             .services
@@ -3112,9 +3139,123 @@ mod tests {
             .await
             .unwrap();
 
-        // A scanner tick routes the parked row to the reaper, which
-        // ENQUEUES the descent op (host still has headroom, so the
-        // trigger is dwell); the claimed op drives on a detached task.
+        wait_for_op_lane_free(&meta, session_id).await;
+        scanner_run_once(&state).await.expect("tick");
+        // Give any (incorrectly) enqueued descent a chance to run.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let s = meta.session.lock().clone();
+        assert_eq!(
+            s.park_rung, 2,
+            "still parked — pressure, not a clock, reclaims a parked VM"
+        );
+        assert_eq!(s.status, SessionState::Evicting, "still at rung 2");
+        assert!(
+            state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "the VM (and its ms-fast un-pause ascent) survives"
+        );
+    }
+
+    /// The absolute ceiling (ADR 0074: "hard TTL remains the absolute
+    /// ceiling"). With the dwell clock retired, the reaper owns it — the
+    /// idle DETECTOR can't reach a parked session (it scans `Active`; a
+    /// parked one is `Evicting`), so without this an abandoned park would
+    /// hold RAM until pressure arrived.
+    #[tokio::test]
+    async fn abandoned_park_descends_at_the_hard_ceiling() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let session = evicting_session(session_id);
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+        let host_id = state
+            .host_registry
+            .host_of(sandbox_id)
+            .expect("sandbox routed");
+        meta.session.lock().host_id = Some(host_id);
+        seed_host_with_free_ram(&meta, host_id, 60_000); // headroom the whole time
+
+        let op = drive_evict(&state, session_id, true, false).await;
+        assert_eq!(op.state, OpState::Done);
+        assert_eq!(meta.session.lock().park_rung, 2, "parked-paused");
+
+        // Parked past the 8h hard ceiling with nobody returning.
+        let ancient = chrono::Utc::now()
+            - chrono::Duration::seconds(crate::idle_detector::DEFAULT_HARD_TTL_SECS as i64 + 60);
+        state
+            .services
+            .meta
+            .set_session_park_rung(session_id, 2, Some(ancient))
+            .await
+            .unwrap();
+
+        wait_for_op_lane_free(&meta, session_id).await;
+        scanner_run_once(&state).await.expect("tick");
+
+        {
+            let m = meta.clone();
+            wait_for("descended to Idle", move || {
+                m.session.lock().status == SessionState::Idle
+            })
+            .await;
+        }
+        assert_eq!(
+            meta.session.lock().park_rung,
+            0,
+            "the hard ceiling reclaims an abandoned park even with headroom"
+        );
+    }
+
+    /// ADR 0074's primary trigger: the host loses headroom → the parked
+    /// VM yields its RAM via a full eviction (un-pause → capture →
+    /// destroy → Idle), leaving no trace of the parking.
+    #[tokio::test]
+    async fn parked_paused_descends_to_full_eviction_under_pressure() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let session = evicting_session(session_id);
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+        let host_id = state
+            .host_registry
+            .host_of(sandbox_id)
+            .expect("sandbox routed");
+        meta.session.lock().host_id = Some(host_id);
+        seed_host_with_free_ram(&meta, host_id, 60_000);
+
+        // Park first (needs headroom).
+        let op = drive_evict(&state, session_id, true, false).await;
+        assert_eq!(op.state, OpState::Done);
+        assert_eq!(meta.session.lock().park_rung, 2, "parked-paused");
+
+        // The host now has none — the RAM the park was borrowing is needed.
+        // (Mutate the seeded row in place; `seed_host_with_free_ram` PUSHES,
+        // so re-seeding would leave the roomy record ahead of it.)
+        // MEASURED-but-tiny, not 0: `host_has_memory_headroom` treats a 0
+        // allocatable as "pre-ledger host" and falls back to raw physical
+        // free, which the fixture reports as plentiful.
+        for h in meta.hosts.lock().iter_mut().filter(|h| h.id == host_id) {
+            h.utilization.allocatable_mib = 1;
+        }
+
         wait_for_op_lane_free(&meta, session_id).await;
         scanner_run_once(&state).await.expect("tick");
 
@@ -3129,7 +3270,7 @@ mod tests {
         assert_eq!(
             s.status,
             SessionState::Idle,
-            "dwell-expired park descends to a full eviction"
+            "memory pressure descends the park to a full eviction"
         );
         assert_eq!(s.park_rung, 0, "rung cleared after descent");
         assert!(

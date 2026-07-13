@@ -1,6 +1,14 @@
 # 0074 — The parking ladder: cancellable, pressure-driven eviction
 
-Status: Proposed (2026-07-06)
+Status: Accepted (2026-07-13)
+
+Commit chain: rung 1 + the `Evicting → Active` edge and `park_rung`
+schema in #581; rung 2 (parked-paused) in the same Tier-2 stack, made
+to actually engage by ADR 0091 / #655 (its host-side `pause` raced the
+periodic checkpoint on FC's API socket and failed every time); the
+2026-07-13 addendum below — pressure-driven descent, the retired dwell
+clock, the 8h ceiling, and rung 3's measured deprioritization — in #659.
+Rung 4 is the pre-existing full eviction, unchanged.
 
 Issue: #545 (2026-07 core-ops overhaul, Tier 2). Depends on: #540 (RAM
 ledger — hard for rungs 2–4), #543 (op log — soft; cancel becomes an
@@ -188,3 +196,118 @@ resolves the host via PG `sessions.host_id` (the in-memory registry made
 parking a per-replica coin flip), and `ensure_active` maps terminal
 sessions to Gone so the outbox driver drops their rows instead of
 deferring forever. Follow-up: file the plain-resume gate bug upstream.
+
+## Addendum (2026-07-13): the ladder, measured — pressure-only descent, and rung 3's real ascent cost
+
+The 2026-07-11 reliability campaign and the post-deploy verification that
+followed put numbers on the rungs. Two of this ADR's premises need
+correcting, and the correction makes the ADR *more* right, not less.
+
+### 1. Rung 3's ascent is ~27s, not 0.5-2s — it is deprioritized
+
+Rung 3 ("parked-local") was specified above as a ~0.5-2s ascent: destroy
+the VM, keep the snapshot staging + NBD backing on NVMe, resume pinned to
+the parking host from local artifacts. That estimate priced only the
+**byte movement**. It missed that rung 3, like rung 4, **destroys the VM**
+— so its ascent must still re-run the whole guest bring-up:
+`wait_agent_ready` (the restored guest boots agentd) then `SpawnHarness`
+(the harness process comes up).
+
+Measured on a real prod resume (2026-07-13, session `b87d75cf`, same host,
+warm caches, Cloud Trace):
+
+| leg | duration |
+|---|---|
+| `coord.restore_for_session` (all byte movement: state.bin, memory, NBD rebind) | **562 ms** |
+| `coord.finish_resume_to_active` (`wait_agent_ready` + `SpawnHarness`) | **26,941 ms** |
+
+The byte leg — the *only* leg rung 3 optimizes — is already 2% of the
+resume, because a same-host restore already short-circuits:
+`materialize_state_if_missing` and `materialize_memory_if_missing` are
+`fs::metadata` no-ops when the artifacts are still local, and a UFFD
+memory restore reads chunks from the local cache rather than
+materializing `memory.bin` at all. Rung 3 would therefore turn a ~27.5s
+ascent into a ~27s ascent on the common path.
+
+**Decision: rung 3 is not built.** Its residual value is narrow — the
+cold/cross-host case, where the chunk cache has since evicted the
+snapshot's chunks and rung 4 must refetch from GCS. That is real but rare,
+and it is better addressed by chunk-cache retention policy (ADR 0070) than
+by a second retention plane with its own GC, disk budget, and re-index
+path. `park_rung=3` stays reserved; if the cold case is ever measured to
+matter, this is where it lands. The 26.9s guest-bring-up floor is the
+honest target for any future resume-latency work — it gates rung 4, every
+cold create, and every relocation, and no retention tier touches it.
+
+### 2. The 900s dwell cap violates this ADR's own invariant — descent is pressure-only
+
+This ADR's Decision says: *"Pressure-driven descent becomes the ONLY mode;
+the clock TTL survives as candidacy, never as a reclaim trigger."* But
+rung 2 shipped with `park_dwell_cap` (default 900s), and the park reaper
+descends a parked VM to a full eviction when that clock expires **even on
+a host with abundant free RAM** — a clock reclaiming resources, which is
+exactly what the invariant forbids. Verification caught it doing so on
+every parked session on the fleet (2026-07-13: 901s dwell → descent, twice
+on the same session, concurrently on three others).
+
+The stated rationale — "stale guest TCP" — does not distinguish the two
+paths: a rung-4 restore resumes the guest from a *memory snapshot* whose
+TCP state is equally stale. Descending to protect against staleness buys
+nothing and costs the 26.9s rebuild above.
+
+**Decision: the dwell cap is retired as a reclaim trigger.** Descent from
+rung 2 fires on:
+- **memory pressure** — the host loses headroom (already implemented in
+  the reaper; this becomes the primary trigger), or
+- **the hard cap** — the absolute ceiling this ADR always reserved
+  ("hard TTL remains the absolute ceiling"), raised from 1800s to 28800s
+  (8h). The idle DETECTOR cannot reach a parked session (it scans
+  `Active` rows; a parked one is `Evicting`), so with the clock gone the
+  REAPER owns the ceiling — otherwise an abandoned park would hold RAM
+  until pressure happened to arrive.
+
+`ENGRAM_PARK_DWELL_SECS` survives as an operator escape hatch (default:
+disabled). With this change a returning user meets a *paused VM* — ascent
+is an un-pause, milliseconds — instead of a 27s rebuild, which is the
+entire point of the ladder.
+
+### 3. Presence-aware nomination: considered, NOT built
+
+The flat 300s soft TTL treats "the harness finished its turn 300s ago" as
+"nobody is here", and the campaign measured the consequence: a developer
+reading an answer for six minutes returned to an evicting session. The
+obvious fix was to make nomination presence-aware — suppress it while an
+SSE subscriber is live on the session's event stream (web UI open, or a
+`session logs` tail), or while the guest's preview proxy sees the user
+clicking around the running app.
+
+**That design is deliberately not implemented, because §2 removed the
+pain it was built for.** With descent now pressure-driven, nomination is
+cheap and fully reversible: a nominated/parked session keeps its VM, and
+the returning user's prompt un-pauses it in milliseconds. Being nominated
+while you read an answer no longer costs anything. The residual value —
+avoiding the ~40ms pause for a session whose preview app someone is
+actively using, and preferring least-recently-present sessions when
+pressure *does* force a descent — does not justify its cost: a new PG
+table, an SSE-subscriber tracking plane across replicas, and a heartbeat
+field.
+
+If pressure-driven descent later proves to evict the wrong sessions
+first, presence is the right input to rank them by, and this is the
+design to build.
+
+The vestigial host-side idle-TTL code
+(`engram-host-agent/src/idle_evictor.rs` env helpers, no call sites since
+ADR 0073 phase 4 retired the host detection plane) is deleted — it
+misled readers into thinking the host still owned an idle policy.
+
+### Resulting ladder
+
+| rung | trigger to descend | ascent |
+|---|---|---|
+| 1 — nominated | immediate (nomination itself) | PG CAS, ms |
+| 2 — parked-paused | **memory pressure** or the 8h hard cap | **un-pause, ms** |
+| 3 — parked-local | *not built* (see §1) | — |
+| 4 — evicted-remote | terminal rung | full rebuild, ~27s warm / minutes cold |
+
+Idle sessions now sit at rung 2 until the host actually needs their RAM.

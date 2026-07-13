@@ -239,7 +239,17 @@ pub const EVICTION_UNPARKED_PAUSED_TOTAL: &str = "engram_eviction_unparked_pause
 /// Counter (ADR 0074 rung reaper). Parked sessions DESCENDED to a full
 /// eviction — the user never returned within the dwell cap, or the host
 /// came under memory pressure and the parked VM's RAM had to be
-/// reclaimed. Labelled by `reason` (`dwell` | `pressure`).
+/// reclaimed. Labelled by `reason`:
+/// - `pressure` — the host lost memory headroom (ADR 0074's intended
+///   primary, now normally the ONLY, descent trigger).
+/// - `hard_ttl` — the absolute ceiling: parked past the idle hard TTL
+///   (8h default) with nobody returning.
+/// - `dwell` — the retired clock-based descent, re-armed by an operator
+///   via `ENGRAM_PARK_DWELL_SECS` (off by default; see the ADR 0074
+///   addendum for why a clock must not reclaim RAM).
+///
+/// A sustained `dwell`/`hard_ttl` rate with zero `pressure` means the
+/// fleet is rebuilding guests (~27s each) that it had the RAM to keep.
 pub const EVICTION_PARK_DESCEND_TOTAL: &str = "engram_eviction_park_descend_total";
 /// Counter (ADR 0073 phase 4). Heartbeats reporting a RUNNING sandbox
 /// for an Active session with NO attached harness — the demoted

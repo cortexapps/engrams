@@ -1,68 +1,18 @@
-//! Host-side idle-eviction detection driver (ADR 0011 follow-up #2,
-//! landed via ADR 0013).
+//! Host-side disk-pressure utilities.
 //!
-//! The host's local `HarnessHub` is the authoritative source of
-//! "this sandbox's adapter has been quiet for N seconds" — only the
-//! host sees every harness event in real-time. In the pre-0013
-//! single-replica coord world, the coord polled the hub directly
-//! because the hub was in-proc. With a stateless coord, no single
-//! pod's local hub is authoritative anymore (events fan in via
-//! HTTP POSTs from multiple hosts to multiple coord pods).
+//! HISTORICAL NOTE: this module was the host-side idle-eviction
+//! *detection driver* (ADR 0011 follow-up #2 / ADR 0013) — it scanned
+//! the local `HarnessHub` for over-TTL sandboxes and POSTed candidates
+//! to the coordinator. ADR 0073 phase 4 retired that plane entirely:
+//! the coordinator's PG-derived `idle_detector` is now the ONLY
+//! detection plane (same semantics, sourced from the durable event log
+//! instead of hub memory, which went amnesiac on every detach/restart).
 //!
-//! Resolution: the host runs the *driver* (this module), the coord
-//! runs the *pipeline* (`engram_coordinator::idle_evictor::
-//! run_evict_pipeline`, the evict verb). The driver scans the local hub on a tick,
-//! finds candidates past TTL, POSTs them to
-//! `/api/hosts/:id/idle-eviction-candidates`. The receiving coord
-//! pod (any pod) runs the pipeline; the pipeline is idempotent so
-//! multiple pods receiving the same batch (or the same candidate
-//! batched across two ticks) doesn't cause double-eviction.
-
-use std::time::Duration;
-
-/// Soft idle TTL — a session whose adapter emitted `Idle` and stayed
-/// quiet for this long is hot-suspended.
-///
-/// ADR 0039 follow-up #20: bumped 30s → 300s (5 min). The 30s default
-/// was too aggressive for an interactive agent session: the harness
-/// emits `HarnessEvent::Idle` the moment it finishes a turn and has no
-/// queued prompt, so an ordinary think-pause while the user reads the
-/// output and composes the next message crosses 30s routinely (prod
-/// observed a just-resumed session re-nominated 32s later). Each such
-/// eviction pays a full snapshot+destroy and the next message a cold
-/// resume — churn with no density benefit on a session a human is
-/// actively driving. 5 min keeps the warm sandbox alive across normal
-/// conversational gaps while still reclaiming genuinely-abandoned
-/// sessions; the hard TTL ([`DEFAULT_IDLE_HARD_TTL_SECS`], 30 min)
-/// still backstops adapters that never emit `Idle`. Operators tune via
-/// `ENGRAM_IDLE_TTL_SECS` for denser-but-colder fleets.
-pub const DEFAULT_IDLE_TTL_SECS: u64 = 300;
-
-/// Hard idle TTL — backstop for adapters that go silent without ever
-/// emitting `Idle` (stuck in a tool call, infinite loop). Matches
-/// the coord-side constant.
-pub const DEFAULT_IDLE_HARD_TTL_SECS: u64 = 1800;
-
-/// How often the host scans for over-TTL sandboxes.
-pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Read `ENGRAM_IDLE_TTL_SECS` (soft TTL) — falls through to default.
-pub fn idle_ttl_from_env() -> Duration {
-    std::env::var("ENGRAM_IDLE_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_IDLE_TTL_SECS))
-}
-
-/// Read `ENGRAM_IDLE_HARD_TTL_SECS` (hard TTL) — falls through to default.
-pub fn idle_hard_ttl_from_env() -> Duration {
-    std::env::var("ENGRAM_IDLE_HARD_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_IDLE_HARD_TTL_SECS))
-}
+//! The ADR 0074 addendum (2026-07-13) removed the last vestige — the
+//! module's TTL/pressure env helpers, which had no call sites and
+//! misled readers into thinking the host still owned an idle policy.
+//! What remains is the disk-pressure surface `materialize.rs` uses:
+//! the free-space probe and its floor.
 
 /// ADR 0014 issue #4 default disk-pressure floor. 20 GiB worst-case
 /// is N=5 concurrent in-flight idle-evicts × ~4 GiB per FC memory
@@ -71,15 +21,6 @@ pub fn idle_hard_ttl_from_env() -> Duration {
 /// × 4 GiB; 20 GiB free is the safety margin under which idle-evict
 /// stops pushing new candidates.
 pub const DEFAULT_DISK_FLOOR_BYTES: u64 = engram_core::types::host::HOST_DISK_CACHE_FLOOR_BYTES;
-
-/// Read `ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES` — falls through to
-/// [`DEFAULT_DISK_FLOOR_BYTES`].
-pub fn disk_floor_bytes_from_env() -> u64 {
-    std::env::var("ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_DISK_FLOOR_BYTES)
-}
 
 /// ADR 0014 issue #4: query the host's free disk via `statvfs(3)`.
 /// Returns `Some(bytes)` on success, `None` if the FS lookup fails
@@ -116,74 +57,9 @@ pub fn disk_pressure_check(work_dir: &std::path::Path, floor_bytes: u64) -> (boo
     (allow, free)
 }
 
-/// Tier 1 (pressure-aware idle eviction): master switch, read from
-/// `ENGRAM_IDLE_EVICT_PRESSURE_AWARE`. **Default OFF** — when unset (or
-/// not `1`/`true`) the host nominates every soft-idle candidate exactly
-/// as it always has (TTL-only), so this ships dark and flips per-host via
-/// env with an instant rollback.
-///
-/// When ON, a *soft*-idle sandbox is only nominated for eviction while the
-/// host is under real memory pressure (free RAM under the floor); *hard*-
-/// idle sandboxes and the coord's own hard-TTL backstop are unaffected.
-/// The rationale: eviction snapshots + destroys a warm VM to reclaim
-/// **RAM**, and on a host with abundant free memory that just trades an
-/// instant warm resume for a slow cold one with no density benefit — the
-/// exact churn ADR 0039 follow-up #20 already softened via the 5-min TTL.
-/// This makes the reclaim demand-driven instead of purely time-driven.
-pub fn pressure_aware_from_env() -> bool {
-    std::env::var("ENGRAM_IDLE_EVICT_PRESSURE_AWARE")
-        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-/// Default free-RAM floor (percent of `MemTotal`) below which soft-idle
-/// sandboxes become eligible for reclamation under pressure-aware mode.
-/// 15 % leaves generous headroom above OOM while still reclaiming before
-/// the host genuinely runs out — the 10 s evict tick then has room to
-/// shed the least-recently-active sessions.
-pub const DEFAULT_MEM_FLOOR_PCT: u8 = 15;
-
-/// Read `ENGRAM_IDLE_EVICT_MEM_FLOOR_PCT` — falls through to
-/// [`DEFAULT_MEM_FLOOR_PCT`]. Only consulted when
-/// [`pressure_aware_from_env`] is on.
-pub fn mem_floor_pct_from_env() -> u8 {
-    std::env::var("ENGRAM_IDLE_EVICT_MEM_FLOOR_PCT")
-        .ok()
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(DEFAULT_MEM_FLOOR_PCT)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// ADR 0039 follow-up #20: the soft idle TTL default is no longer
-    /// the aggressive 30s that evicted interactive sessions during
-    /// normal think-pauses. Guards against an accidental revert at
-    /// compile time. The floor of "at least a couple of minutes" is
-    /// what matters, not the exact value — and it must stay strictly
-    /// below the hard TTL (the never-emits-Idle backstop) so the soft
-    /// path still fires first for a genuinely abandoned session.
-    const _SOFT_TTL_NOT_AGGRESSIVE: () = {
-        assert!(DEFAULT_IDLE_TTL_SECS >= 120);
-        assert!(DEFAULT_IDLE_TTL_SECS < DEFAULT_IDLE_HARD_TTL_SECS);
-    };
-
-    /// With no env override, `idle_ttl_from_env` returns the (bumped)
-    /// default. Asserting the no-override branch keeps the test
-    /// race-free — it never mutates the process-global env.
-    #[test]
-    fn idle_ttl_from_env_falls_through_to_default_without_override() {
-        // The CI/dev environment does not set ENGRAM_IDLE_TTL_SECS; if a
-        // local shell does, skip rather than assert a wrong value.
-        if std::env::var("ENGRAM_IDLE_TTL_SECS").is_ok() {
-            return;
-        }
-        assert_eq!(
-            idle_ttl_from_env(),
-            Duration::from_secs(DEFAULT_IDLE_TTL_SECS),
-        );
-    }
 
     /// `free_disk_bytes` should return Some for any existing path
     /// on every supported host (Linux + macOS). The exact value is
@@ -236,18 +112,4 @@ mod tests {
     }
 
     // ── Tier 1: pressure-aware idle eviction ────────────────────────────
-
-    /// Without an env override, the master switch defaults OFF (historical
-    /// TTL-only behavior) and the floor defaults to
-    /// [`DEFAULT_MEM_FLOOR_PCT`]. Skips if the shell sets the vars, keeping
-    /// the test race-free (never mutates process-global env).
-    #[test]
-    fn pressure_env_defaults_off_and_floor_default() {
-        if std::env::var("ENGRAM_IDLE_EVICT_PRESSURE_AWARE").is_err() {
-            assert!(!pressure_aware_from_env(), "must default OFF");
-        }
-        if std::env::var("ENGRAM_IDLE_EVICT_MEM_FLOOR_PCT").is_err() {
-            assert_eq!(mem_floor_pct_from_env(), DEFAULT_MEM_FLOOR_PCT);
-        }
-    }
 }
