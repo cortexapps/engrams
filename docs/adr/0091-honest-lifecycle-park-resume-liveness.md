@@ -1,7 +1,13 @@
 # ADR 0091: Honest lifecycle — parking that parks, resumes that aren't recoveries, and a state for dead guests
 
-- Status: Proposed
+- Status: Accepted (2026-07-13)
 - Date: 2026-07-13
+- Commit chain: PR #655 (`5eb7af64`) — the rung-2 capture-lock guard +
+  `rung2_park_failed_total`, the `harness_idle` rewind exclusion and the
+  derived `CheckpointLag` cause, and `SessionState::Unreachable`
+  end-to-end (migration 0104, `SandboxProbe::control_alive`, the
+  checkpoint-driver producer, the heartbeat advert, the coordinator flip,
+  and the resume verb's recovery arm).
 - Issues: 2026-07-11 reliability campaign (`scratch/devbrain-campaign-2026-07-11/REPORT.md` §3, §6, §7); ADR 0074 (parking ladder); ADR 0028 (A.log rewind); ADR 0034 (state-machine discipline)
 
 ## Context
@@ -81,3 +87,35 @@ Three lifecycle dishonesties, each measured in production:
   value (high-water: this ADR ships migration 0104).
 - A busy-but-alive guest is protected from misclassification by requiring
   socket-level connection errors (not timeouts) and N consecutive ticks.
+
+## Outcome (2026-07-13)
+
+Deployed and verified against prod the same day.
+
+**Decision 1 (park) — confirmed.** The capture-lock race is dead: coord
+logs show `rung-2 park: VM paused in place` on every idle nomination
+(pre-fix: 4/4 fell through to a full eviction). But verification also
+found the park being *undone* 15 minutes later by ADR 0074's dwell
+reaper, which descends a parked VM on a clock regardless of memory
+pressure — so the latency win did not reach users. That is an ADR 0074
+policy bug, not a defect here; see its 2026-07-13 addendum (PR #659),
+which retires the dwell clock and makes descent pressure-driven, as ADR
+0074's own Decision always specified.
+
+**Decision 2 (honest resumes) — confirmed, with one correction.** The
+campaign's claim that resume "takes a fresh ~25.8 GB snapshot before
+going active" was a misread: that `snapshot_taken` is the *eviction's*
+own host-owned finalize landing asynchronously via heartbeat reconcile,
+not a resume-time capture. No snapshot is taken on the resume path. The
+mislabeled `host_failure_recovery` cause and the `rolled_back: 1` on
+clean cycles were real and are fixed.
+
+**Decision 3 (`Unreachable`) — shipped, not yet exercised.** No zombie
+guest has occurred since deploy. The state machine, migration, probe, and
+recovery arm are in place; its acceptance test is the next dead FC
+process.
+
+**Follow-up found during verification:** on a genuine checkpoint-recovery
+resume, the rewind tombstones the *resume prompt's own user-echo* (the
+prompt is appended before `apply_rung1_rewind` runs). Cosmetic, predates
+this ADR; filed rather than fixed here.

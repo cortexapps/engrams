@@ -1,6 +1,14 @@
 # ADR 0092: Sparse base-shm — keep only the hot working set resident, fault the cold tail from the NVMe chunk cache
 
-- Status: **Proposed**
+- Status: **Proposed** — awaiting a go/no-go. Nothing has been
+  implemented: this is the WS0 spike's deliverable, and the rollout gate
+  it proposes (`ENGRAM_FC_BASE_SHM_MODE=sparse` + a dev-brain prod
+  canary) is the decision that would move it to Accepted. It stays open
+  deliberately: the capacity problem it addresses (21.6 GiB/host of
+  resident base-shm → one dev-brain session per node) is still live, and
+  is unaffected by the 2026-07-13 resume-latency findings in ADR 0074's
+  addendum (that work concerns guest rebuild time; this concerns host
+  RAM).
 - Date: 2026-07-13
 - Workstream: WS0 of the dev-brain campaign-remediation plan (design gate)
 - Spike branch (if productionized): `ws0-sparse-spike`
