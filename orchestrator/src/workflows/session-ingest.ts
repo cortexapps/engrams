@@ -36,6 +36,7 @@ import { getDb } from "../db/client.ts";
 import { profile, task, taskSession } from "../db/schema.ts";
 import {
   tools as productionTools,
+  type SessionToolContext,
   type ToolContext,
   type ToolRegistry,
 } from "../tools/registry.ts";
@@ -74,7 +75,7 @@ export type { ToolCallCompleter } from "../tools/complete.ts";
 
 export interface ToolDispatchDeps {
   registry: ToolRegistry;
-  resolveContext(sessionId: string): Promise<ToolContext>;
+  resolveContext(sessionId: string): Promise<SessionToolContext>;
   pendingCalls: PendingToolCallStore;
   completer: ToolCallCompleter;
 }
@@ -218,7 +219,10 @@ export async function dispatchHandledToolCall(
 
   let context: ToolContext;
   try {
-    context = await step(() => deps.resolveContext(sessionId), "resolve-tool-context");
+    const session = await step(() => deps.resolveContext(sessionId), "resolve-tool-context");
+    // Call identity rides the context so a deferred handler can later call
+    // tools.complete(ctx.sessionId, ctx.toolCallId, result).
+    context = { ...session, toolCallId: requested.toolCallId, toolName: tool.name };
   } catch {
     await submitToolResult(
       step,
@@ -290,7 +294,7 @@ export async function dispatchHandledToolCall(
 }
 
 /** Load the task/profile context that authorizes a handled tool invocation. */
-async function resolveToolContext(sessionId: string): Promise<ToolContext> {
+async function resolveToolContext(sessionId: string): Promise<SessionToolContext> {
   const rows = await getDb()
     .select({
       taskId: task.id,

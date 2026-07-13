@@ -14,13 +14,22 @@ export interface NativeBindings {
   codex?: string;
 }
 
-/** Context supplied to an orchestrator-handled tool invocation. */
-export interface ToolContext {
+/** The session-scoped half of a tool invocation's context, resolvable
+ *  before any specific call exists. */
+export interface SessionToolContext {
   sessionId: string;
   capabilities: readonly string[];
   taskId?: string;
   profileId?: string;
   userId?: string;
+}
+
+/** Context supplied to an orchestrator-handled tool invocation. Carries the
+ *  call identity so a deferred handler can later call
+ *  `tools.complete(ctx.sessionId, ctx.toolCallId, result)`. */
+export interface ToolContext extends SessionToolContext {
+  toolCallId: string;
+  toolName: string;
 }
 
 export type ToolHandler<

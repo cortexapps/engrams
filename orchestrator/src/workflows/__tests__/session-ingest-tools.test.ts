@@ -7,7 +7,11 @@
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 
-import { createToolRegistry, type ToolContext } from "../../tools/registry.ts";
+import {
+  createToolRegistry,
+  type SessionToolContext,
+  type ToolContext,
+} from "../../tools/registry.ts";
 import type {
   PendingToolCallInput,
   PendingToolCallRow,
@@ -81,7 +85,7 @@ function handledDeps(options: {
     },
   });
   const completion = recordingCompleter();
-  const context: ToolContext = {
+  const context: SessionToolContext = {
     sessionId: "session-1",
     taskId: "task-1",
     profileId: "profile-1",
@@ -140,7 +144,14 @@ describe("dispatchHandledToolCall", () => {
     const dispatched = await dispatchHandledToolCall(STEP, "session-1", EVENT, deps);
 
     expect(dispatched).toBe(true);
-    expect(handlerCalls).toEqual([{ ctx: context, args: { text: "remember this" } }]);
+    // The context carries the call identity so a deferred handler can later
+    // call tools.complete(ctx.sessionId, ctx.toolCallId, result).
+    const expectedCtx: ToolContext = {
+      ...context,
+      toolCallId: "call-1",
+      toolName: "save_memory",
+    };
+    expect(handlerCalls).toEqual([{ ctx: expectedCtx, args: { text: "remember this" } }]);
     expect(completionCalls).toEqual([
       {
         sessionId: "session-1",
