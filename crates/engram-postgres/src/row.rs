@@ -518,6 +518,7 @@ fn parse_session_state(s: &str) -> Result<SessionState, MetaError> {
         "queued" => SessionState::Queued,
         "created" => SessionState::Created,
         "active" => SessionState::Active,
+        "unreachable" => SessionState::Unreachable,
         "idle" => SessionState::Idle,
         "host_lost" => SessionState::HostLost,
         "evacuating" => SessionState::Evacuating,

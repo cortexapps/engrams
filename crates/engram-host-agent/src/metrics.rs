@@ -274,6 +274,12 @@ pub const WARM_HOOK_FAILURES_TOTAL: &str = "engram_warm_hook_failures_total";
 /// capacity with only DEBUG traces). Escalating ERROR logs pair with
 /// it after ~30s of consecutive failures.
 pub const HEARTBEAT_DELIVERY_FAILURES_TOTAL: &str = "engram_host_heartbeat_delivery_failures_total";
+/// Counter (ADR 0091). External pause (the rung-2 park's host leg)
+/// refused or failed, labeled by bounded `reason`:
+/// `capture_in_flight` (typed retryable refusal — the park retries next
+/// nomination) / `vmm_pause` (the VMM itself failed the PATCH). Sustained
+/// `vmm_pause` means parking is genuinely broken, not merely contended.
+pub const RUNG2_PARK_FAILED_TOTAL: &str = "engram_rung2_park_failed_total";
 
 /// Issue #540 (host RAM ledger): gauge of host RAM (MiB) attributed to
 /// one named bucket, sampled once per heartbeat tick from

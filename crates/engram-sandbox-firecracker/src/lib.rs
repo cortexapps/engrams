@@ -4534,9 +4534,24 @@ impl SandboxBackend for FirecrackerBackend {
             // verify against; fall back to the in-memory signal.
             Err(_) => known_to_backend,
         };
+        // ADR 0091: the control-plane leg — a connect() against the VMM
+        // API socket. Refused/missing with the process alive is the
+        // zombie-guest class (2026-07-11 campaign C1: a dead FC read
+        // `active` for 16+ min). Only probed when we know the socket
+        // path (in-memory entry); a reattach-window miss reads `None`,
+        // never `Some(false)`.
+        let control_alive = match self.sandboxes.get(&id) {
+            Some(entry) => {
+                let sock = entry.state.firecracker_socket.clone();
+                drop(entry);
+                Some(tokio::net::UnixStream::connect(&sock).await.is_ok())
+            }
+            None => None,
+        };
         Ok(SandboxProbe {
             known_to_backend,
             process_alive,
+            control_alive,
         })
     }
 

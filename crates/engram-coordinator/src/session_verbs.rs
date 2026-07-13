@@ -224,6 +224,58 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
         // ordering: a resume op queued behind an in-flight rung-2 ascent
         // (or another resume) must complete idempotently, not spin.
         SessionState::Active => OpOutcome::Done,
+        // ADR 0091: the guest is dead/wedged on a live host. Recovery =
+        // destroy the dead sandbox (best-effort — it may already be
+        // gone), release the binding, flip to Idle, and Retry: the next
+        // attempt re-dispatches into the normal Idle resume below, which
+        // restores from the latest checkpoint (and arbitrates
+        // recoverability, demoting to Dead when nothing usable exists).
+        SessionState::Unreachable => {
+            if let Some(sandbox_id) = session.sandbox_id {
+                if let Err(e) = state.services.host.destroy(sandbox_id, ctx.fence()).await {
+                    tracing::warn!(session_id = %id, %sandbox_id, error = %e,
+                        "unreachable recovery: destroy of the dead sandbox failed \
+                         (continuing — orphan_reap owns stragglers)");
+                }
+            }
+            match state
+                .services
+                .meta
+                .fenced_assign_sandbox(id, ctx.epoch, None, session.host_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    // A successor re-claimed; stop silently.
+                    return OpOutcome::Done;
+                }
+                Err(e) => return OpOutcome::Retry(format!("unreachable recovery: unbind: {e}")),
+            }
+            match crate::session_ops::transition_with_fence(
+                state,
+                id,
+                ctx.fence(),
+                SessionState::Idle,
+            )
+            .await
+            {
+                Ok(prev) => {
+                    let _ = state
+                        .emit_fenced(
+                            id,
+                            ctx.fence(),
+                            SessionEvent::StatusChanged {
+                                from: prev,
+                                to: SessionState::Idle,
+                                at: chrono::Utc::now(),
+                            },
+                        )
+                        .await;
+                    OpOutcome::Retry("unreachable guest cleared; resuming from checkpoint".into())
+                }
+                Err(e) => OpOutcome::Retry(format!("unreachable recovery: idle flip: {e}")),
+            }
+        }
         SessionState::Idle => match crate::api::snapshot::resume_from_idle(ctx, session).await {
             Ok(_) => OpOutcome::Done,
             Err(e) => outcome_from_api_error(e),

@@ -875,6 +875,7 @@ pub trait SandboxBackend: Send + Sync {
         Ok(SandboxProbe {
             known_to_backend,
             process_alive: known_to_backend,
+            control_alive: None,
         })
     }
 

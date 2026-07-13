@@ -362,6 +362,10 @@ pub struct HeartbeatRequest {
     /// each still-owned one (the op layer dedups re-adverts).
     #[serde(default)]
     pub quarantined_survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor>,
+    /// ADR 0091: control-plane-dead guests (host's 3/3-probe verdict) —
+    /// the handler flips each owning session Active → Unreachable.
+    #[serde(default)]
+    pub unreachable_guests: Vec<(SandboxId, SessionId)>,
 }
 
 #[derive(Serialize)]
@@ -769,6 +773,54 @@ pub async fn heartbeat(
             // Session moved on (relocated / terminal) or unknown — the
             // host's quarantine entry clears when the sandbox is
             // destroyed; nothing to drive here.
+            _ => {}
+        }
+    }
+
+    // ADR 0091: flip sessions whose guest control plane is dead. The
+    // host re-advertises until a successful capture or destroy clears
+    // the entry, so this is idempotent (already-Unreachable sessions
+    // skip). Pre-fix a dead guest read `active` indefinitely with every
+    // exec bouncing (2026-07-11 campaign C1: a 16+ minute zombie only
+    // in-guest execs could unmask).
+    for (sandbox_id, session_id) in &hb.unreachable_guests {
+        match state.services.meta.get_session(*session_id).await {
+            Ok(s)
+                if s.status == engram_core::types::SessionState::Active
+                    && s.sandbox_id == Some(*sandbox_id) =>
+            {
+                match state
+                    .services
+                    .meta
+                    .transition_session(*session_id, engram_core::types::SessionState::Unreachable)
+                    .await
+                {
+                    Ok(prev) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            session_id = %session_id,
+                            %sandbox_id,
+                            "guest control plane dead — session flipped Unreachable (ADR 0091)",
+                        );
+                        let _ = state
+                            .emit(
+                                *session_id,
+                                crate::state::SessionEvent::StatusChanged {
+                                    from: prev,
+                                    to: engram_core::types::SessionState::Unreachable,
+                                    at: chrono::Utc::now(),
+                                },
+                            )
+                            .await;
+                    }
+                    Err(e) => tracing::warn!(
+                        session_id = %session_id, error = %e,
+                        "unreachable flip failed (state raced?); host re-advertises next tick",
+                    ),
+                }
+            }
+            // Not Active / rebound elsewhere / unknown — nothing to flip;
+            // the host clears its entry on destroy.
             _ => {}
         }
     }

@@ -24,6 +24,7 @@
 //! O(dirty set); manifests stay full-image chunk lists, so every
 //! checkpoint restores with no chain replay.
 
+use engram_core::traits::SandboxBackend as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -218,6 +219,9 @@ pub fn spawn_checkpoint_driver(
                 }
                 match backend.checkpoint_sandbox(sandbox_id).await {
                     Ok(metadata) => {
+                        // A successful capture proves the control plane
+                        // answers — clear any unreachable suspicion.
+                        backend.clear_guest_unreachable(sandbox_id);
                         tracing::info!(
                             %sandbox_id,
                             %session_id,
@@ -233,6 +237,31 @@ pub fn spawn_checkpoint_driver(
                             error = %e,
                             "periodic checkpoint failed; retrying next tick",
                         );
+                        // ADR 0091: a checkpoint failure was the ONLY signal a
+                        // dead guest emitted, and it died here as a WARN while
+                        // the session read `active` (campaign C1: 16+ min
+                        // zombie). Confirm with the cheap control-socket probe
+                        // — 3 tries, 2s apart, so a mid-restart FC can't be
+                        // misclassified — and advertise via the heartbeat.
+                        // Only socket-level probe results count: a BUSY guest
+                        // fails a capture but still accept()s its API socket.
+                        let mut dead_probes = 0u32;
+                        for _ in 0..3 {
+                            match backend.probe_sandbox(sandbox_id).await {
+                                Ok(p) if p.control_alive == Some(false) => dead_probes += 1,
+                                _ => break,
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                        if dead_probes == 3 {
+                            tracing::error!(
+                                %sandbox_id,
+                                %session_id,
+                                "guest control plane is dead (3/3 socket probes refused); \
+                                 advertising unreachable (ADR 0091)",
+                            );
+                            backend.mark_guest_unreachable(sandbox_id, session_id);
+                        }
                     }
                 }
             }

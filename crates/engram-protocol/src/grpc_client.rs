@@ -226,6 +226,7 @@ impl GrpcHostClient {
         Ok(SandboxProbe {
             known_to_backend: resp.known_to_backend,
             process_alive: resp.process_alive,
+            control_alive: None,
         })
     }
 

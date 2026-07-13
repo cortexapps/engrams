@@ -551,7 +551,7 @@ async fn pick_host_2d(
             SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
             FROM sessions
             WHERE host_id = ANY($1)
-              AND status IN ('pending','created','active',
+              AND status IN ('pending','created','active','unreachable',
                              'evacuating','evicting')
               -- A `pending` row older than 10 min is a crash-orphaned
               -- reservation (a boot never takes that long); don't let it
@@ -1641,7 +1641,7 @@ impl MetadataStore for PostgresStore {
                 SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
                 FROM sessions
                 WHERE host_id IS NOT NULL
-                  AND status IN ('pending','created','active',
+                  AND status IN ('pending','created','active','unreachable',
                                  'evacuating','evicting')
                   -- ADR 0048: gate on last_active_at, not created_at — a session
                   -- can sit `queued` for many minutes before `place_queued_session`
@@ -1723,6 +1723,7 @@ impl MetadataStore for PostgresStore {
             WHERE sandbox_id = $1 AND host_id = $2
               AND status NOT IN ('failed','completed','dead')
             LIMIT 1
+                      AND status IN ('pending','created','active','unreachable',
             "#,
         )
         .bind(sandbox_id.as_uuid())
@@ -1785,7 +1786,7 @@ impl MetadataStore for PostgresStore {
                 SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
                 FROM sessions
                 WHERE host_id = ANY($1)
-                  AND status IN ('pending','created','active',
+                  AND status IN ('pending','created','active','unreachable',
                                  'evacuating','evicting')
                   AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
                 UNION ALL
@@ -1838,7 +1839,7 @@ impl MetadataStore for PostgresStore {
                    live_disk_manifest_id, live_disk_manifest_version,
                    suggested_title
             FROM sessions
-            WHERE status IN ('pending','created','active',
+            WHERE status IN ('pending','created','active','unreachable',
                              'idle','evacuating','evicting')
             "#,
         )
@@ -2037,7 +2038,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT (SELECT COUNT(*) FROM sessions
                      WHERE host_id = $1
-                       AND status IN ('pending','created','active',
+                       AND status IN ('pending','created','active','unreachable',
                                       'evacuating','evicting'))::BIGINT
                  + (SELECT COUNT(*) FROM capture_jobs
                      WHERE host_id = $1
@@ -3884,8 +3885,21 @@ impl MetadataStore for PostgresStore {
         // what made every clean evict→resume "roll back" (median 4
         // events) even with nothing lost. Everything guest-derived
         // (run_*, agent_message*, tool_call_*, exec_*, stdout/stderr,
-        // prompt_*, harness_idle, user_question, question_answered,
-        // file_changed, file_shared, integration_asset, …) still rewinds.
+        // user_question, question_answered, file_changed, file_shared,
+        // integration_asset, …) still rewinds.
+        //
+        // ADR 0091: `harness_idle` joins the exclusion list. It is the
+        // idle detector's nomination input — "the harness finished its
+        // turn and is waiting" — a fact that stays true across a clean
+        // evict/resume (the resumed harness IS idle until the next
+        // prompt), and it lands after the eviction checkpoint's cursor
+        // by construction (idle → 5 min TTL → capture cut at pause
+        // time). Rewinding it made EVERY clean cycle report
+        // `rolled_back: 1` under a `host_failure_recovery` banner
+        // (2026-07-11 campaign, every observed resume). With it
+        // excluded, a clean resume tombstones nothing and
+        // `apply_rung1_rewind`'s zero-rows early-return emits no
+        // recovery event at all — the honest outcome.
         //
         // Issue #527 Phase 1: `prompt_received` is ALSO excluded here — it
         // is a coordinator-authoritative fact ("the user asked at time T")
@@ -3905,7 +3919,8 @@ impl MetadataStore for PostgresStore {
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
                AND kind NOT IN (
                    'status_changed', 'snapshot_taken', 'evicted',
-                   'resumed', 'recovered_from_checkpoint', 'prompt_received'
+                   'resumed', 'recovered_from_checkpoint', 'prompt_received',
+                   'harness_idle'
                )
             "#,
         )

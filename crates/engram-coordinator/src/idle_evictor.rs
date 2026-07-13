@@ -412,8 +412,24 @@ pub(crate) async fn run_evict_pipeline(
                     // Backend can't pause (VZ/Process) — fall through to
                     // the full eviction below.
                 }
+                // ADR 0091: TRANSIENT refusal — the host declined the park
+                // because a capture (usually the periodic checkpoint, 600s
+                // cadence) holds the sandbox's capture lock. Pre-fix this
+                // fell through to a full 15-19 min eviction on EVERY
+                // overlap (4/4 observed in the 2026-07-11 campaign, since
+                // any session >10 min old overlaps a checkpoint window).
+                // Skip like the checkpoint driver's own skip posture: the
+                // detector re-nominates next tick and the park succeeds
+                // once the capture drains.
+                Err(engram_core::SandboxError::Unavailable(msg)) => {
+                    tracing::info!(session_id = %session_id, %sandbox_id, %msg,
+                        "rung-2 park: host busy (capture in flight); retrying next nomination");
+                    return Ok(EvictOutcome::Skipped {
+                        reason: "park deferred: capture in flight on the host",
+                    });
+                }
                 Err(e) => {
-                    tracing::warn!(session_id = %session_id, error = %e,
+                    tracing::warn!(session_id = %session_id, error = %e, error_kind = ?e,
                         "rung-2 park: pause failed; falling through to full eviction");
                 }
             }
