@@ -77,6 +77,11 @@ pub fn router(state: SharedState) -> Router {
             "/hosts/:id/sessions/:session_id/sandboxes/:sandbox_id/ownership",
             get(host_http::sandbox_ownership),
         )
+        // ADR 0090: the unknown-binding form (teardown reconciler).
+        .route(
+            "/hosts/:id/sandboxes/:sandbox_id/owner",
+            get(host_http::sandbox_owner),
+        )
         .route(
             "/hosts/:id/live-manifest",
             post(host_http::live_manifest_publish),

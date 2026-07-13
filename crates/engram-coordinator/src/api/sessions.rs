@@ -713,6 +713,9 @@ async fn boot_prepared(
             needs_uffd_substrate,
             fc_snapshot_version: None,
         },
+        // Fresh create: the harness resolves against the target's own
+        // current stamp — nothing pinned yet to prefer.
+        prefer_bundles: &[],
     };
     let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
         .await

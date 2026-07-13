@@ -69,6 +69,17 @@ pub struct ScheduleContext<'a> {
     /// gets (`grpc_self_connect` + `bundle_stamp` — see
     /// `host_meets_capabilities`).
     pub caps: CapabilityRequirements,
+    /// ADR 0090: SOFT ordering preference — the session's pinned aux
+    /// bundle generations (harness/skills squashfs). `rank_hosts` puts
+    /// hosts whose heartbeat-reported `current_bundles` stamp covers
+    /// every sha here FIRST, steering resume/recovery placements away
+    /// from freshly-provisioned nodes whose bundle staging hasn't
+    /// finished (campaign B1: a relocation landed on a 25-min-old node
+    /// and the harness spawn found no `/opt/engram/dyn/0/harness`).
+    /// Soft — an uncovered host still places (the restore-side
+    /// `materialize_if_missing` + the start_agent retry budget own
+    /// correctness); empty imposes no ordering.
+    pub prefer_bundles: &'a [engram_core::types::sandbox::AuxBundleRef],
 }
 
 /// ADR 0068: what a specific placement needs from a host's capability
@@ -428,15 +439,38 @@ pub fn rank_hosts(
     // candidate set in row order; there is no longer a capacity-blind
     // affinity prefix baked in here (the dead `local_snapshots` tier).
     let mut ranked: Vec<HostId> = Vec::new();
+    // ADR 0090: bundle-covered hosts first (soft, stable — row order
+    // preserved within each tier). Uncovered hosts still rank; they just
+    // lose ties, so a recovery avoids a mid-staging node when any
+    // alternative exists but is never stranded when none does.
+    let mut uncovered: Vec<HostId> = Vec::new();
     for h in hosts {
         if host_passes_filters(h, ctx, now, ttl) {
-            ranked.push(h.id);
+            if host_covers_bundles(h, ctx.prefer_bundles) {
+                ranked.push(h.id);
+            } else {
+                uncovered.push(h.id);
+            }
         }
     }
+    ranked.extend(uncovered);
     RankedCandidates {
         hosts: ranked,
         affinity_len: 0,
     }
+}
+
+/// Does `h`'s heartbeat-reported bundle stamp cover every preferred sha?
+/// Sha-only containment — the stamp and the snapshot pin reference the
+/// same content-addressed generations, but drive-id spelling is a
+/// slot-assignment detail. Empty prefer set ⇒ trivially covered.
+pub fn host_covers_bundles(
+    h: &HostRecord,
+    prefer: &[engram_core::types::sandbox::AuxBundleRef],
+) -> bool {
+    prefer
+        .iter()
+        .all(|p| h.current_bundles.iter().any(|b| b.sha256 == p.sha256))
 }
 
 /// Pure pick for the resume/evac path. Ranking tiers:
@@ -1545,6 +1579,7 @@ mod tests {
             exclude_host: None,
             prefer_host: None,
             caps: CapabilityRequirements::default(),
+            prefer_bundles: &[],
         }
     }
 
@@ -1898,6 +1933,37 @@ mod tests {
         // drains them), not a placement onto a host that would 400.
         let err = pick_from(&[skewed], &HashMap::new(), &ctx(), Utc::now(), TTL).unwrap_err();
         assert!(matches!(err, PickError::NoCapacity));
+    }
+
+    /// ADR 0090: bundle-covered hosts outrank uncovered ones (soft —
+    /// uncovered hosts still rank, last), steering recoveries away from
+    /// mid-staging fresh nodes without ever stranding a resume.
+    #[test]
+    fn rank_hosts_prefers_bundle_covered_hosts_without_excluding() {
+        use engram_core::types::sandbox::AuxBundleRef;
+        let pin = [AuxBundleRef {
+            drive_id: "dyn_0".into(),
+            sha256: "abc123".into(),
+        }];
+        let mut fresh = host(1); // row-order first, but NO stamp coverage
+        fresh.current_bundles = vec![];
+        let mut staged = host(2);
+        staged.current_bundles = vec![AuxBundleRef {
+            // different drive-id spelling on purpose: coverage is sha-only
+            drive_id: "slot0".into(),
+            sha256: "abc123".into(),
+        }];
+        let mut c = ctx();
+        c.prefer_bundles = &pin;
+        let ranked = rank_hosts(&[fresh.clone(), staged.clone()], &c, Utc::now(), TTL);
+        assert_eq!(
+            ranked.hosts,
+            vec![staged.id, fresh.id],
+            "covered host first, uncovered still present (soft ordering)"
+        );
+        // Empty prefer set imposes no reordering (row order preserved).
+        let ranked = rank_hosts(&[fresh.clone(), staged.clone()], &ctx(), Utc::now(), TTL);
+        assert_eq!(ranked.hosts, vec![fresh.id, staged.id]);
     }
 
     #[test]

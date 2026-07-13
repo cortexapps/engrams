@@ -442,6 +442,11 @@ pub struct PooledBackend {
     /// is no longer an egress-only concern. `Arc` wrapping lets the
     /// publisher drain task and the destroy path share ownership.
     session_bindings: Arc<DashMap<SandboxId, SessionId>>,
+    /// ADR 0090: survivors whose NBD slot this generation quarantined
+    /// (rehydrate `RECONFIGURE` failed). Advertised in every heartbeat
+    /// until the sandbox is destroyed; the coordinator drives
+    /// `evict_local → resume` off it.
+    quarantined_survivors: Arc<DashMap<SandboxId, SessionId>>,
     /// ADR 0007: chunk-store-backed materialization. When set, the
     /// `bundle.json` on a cached image is the source of truth for
     /// the disk — chunks are fetched from `BlobStorage`, written to
@@ -1629,6 +1634,7 @@ impl PooledBackend {
             image_cache: None,
             egress: None,
             session_bindings: Arc::new(DashMap::new()),
+            quarantined_survivors: Arc::new(DashMap::new()),
             chunk_store: None,
             materialize_dir: None,
             bundle_dir,
@@ -2989,6 +2995,29 @@ impl PooledBackend {
     /// `notify_session_policy` / registration rehydration).
     pub fn session_for_sandbox(&self, id: SandboxId) -> Option<SessionId> {
         self.session_bindings.get(&id).map(|e| *e)
+    }
+
+    /// ADR 0090: repopulate a binding the local table missed (e.g. a
+    /// pidfd-reattached survivor whose NBD rehydrate bailed before the
+    /// insert). Source of truth is the coordinator's `sandbox_owner`
+    /// answer; recording it locally restores the fast path for the
+    /// publisher/reconciler without another RPC.
+    pub fn record_session_binding(&self, sandbox_id: SandboxId, session_id: SessionId) {
+        self.session_bindings.insert(sandbox_id, session_id);
+    }
+
+    /// ADR 0090: the survivors whose NBD slots this generation
+    /// quarantined (rehydrate `RECONFIGURE` failed) — re-advertised in
+    /// every heartbeat until the sandbox is destroyed, so the
+    /// coordinator drives the `evict_local → resume` remediation.
+    pub fn quarantined_survivors(&self) -> Vec<engram_protocol::heartbeat::QuarantinedSurvivor> {
+        self.quarantined_survivors
+            .iter()
+            .map(|e| engram_protocol::heartbeat::QuarantinedSurvivor {
+                sandbox_id: *e.key(),
+                session_id: *e.value(),
+            })
+            .collect()
     }
 
     pub fn checkpoint_records_dir(&self) -> Option<PathBuf> {
@@ -6974,6 +7003,9 @@ impl SandboxBackend for PooledBackend {
         // population AND cleanup must be unconditional now that the
         // map is shared with the publisher.
         let removed_session = self.session_bindings.remove(&id).map(|(_, sid)| sid);
+        // ADR 0090: a destroyed survivor stops advertising quarantine —
+        // the evict_local remediation (or any destroy) closes the loop.
+        self.quarantined_survivors.remove(&id);
         if let Some(egress) = self.egress.as_ref() {
             if let Some(session_id) = removed_session {
                 egress.registry.unregister(session_id);
@@ -7876,6 +7908,12 @@ impl PooledBackend {
                      device; recover via evict_local → resume",
                 );
                 slot.quarantine();
+                // ADR 0090: don't just log the remediation — advertise the
+                // survivor in every heartbeat so the coordinator actually
+                // DRIVES evict_local → resume (pre-fix, nothing consumed
+                // this WARN and the teardown reconciler's orphan path
+                // SIGKILLed the healthy VM ~60s later).
+                self.quarantined_survivors.insert(sandbox_id, session_id);
                 return Err(SandboxError::Vm(
                     format!(
                         "rehydrate nbd reconfigure at {}: {e} \

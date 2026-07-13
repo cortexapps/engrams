@@ -9,6 +9,7 @@ use engram_core::types::SessionState;
 
 use crate::error::ApiError;
 use crate::session_ops::{OpCtx, OpOutcome};
+use crate::state::SessionEvent;
 
 pub async fn dispatch(ctx: &OpCtx<'_>) -> OpOutcome {
     match ctx.op.kind {
@@ -84,12 +85,68 @@ async fn resume(ctx: &OpCtx<'_>) -> OpOutcome {
                 error = %e,
                 "resume op retry budget exhausted; failing terminally (gone)",
             );
+            // ADR 0090: a session still parked at `Created` when the budget
+            // exhausts is the harness-start wedge class — failing only the
+            // OP row left the SESSION at Created forever with nothing but a
+            // 409 for the user (campaign B1: 16+ min of "agentd is not yet
+            // ready" and no terminal state). Flip it Failed with a
+            // user-visible event. An `Idle` session is left alone: its
+            // durable state is intact and a later resume can succeed.
+            fail_wedged_created_session(ctx, &e).await;
             OpOutcome::Failed(format!(
                 "gone: resume did not complete after {} attempts: {e}",
                 ctx.op.attempts
             ))
         }
         other => other,
+    }
+}
+
+/// Budget-exhaustion terminal flip for a resume that left the session at
+/// `Created` (the ADR 0090 harness-start wedge). Best-effort: a fenced
+/// transition failure (successor claimed / state moved on) logs and leaves
+/// the op's terminal `Failed` as the only record.
+async fn fail_wedged_created_session(ctx: &OpCtx<'_>, reason: &str) {
+    let state = ctx.state;
+    let id = ctx.op.session_id;
+    match state.services.meta.get_session(id).await {
+        Ok(s) if s.status == SessionState::Created => {}
+        _ => return,
+    }
+    if let Err(e) = state
+        .services
+        .meta
+        .append_session_event(
+            id,
+            "harness_start_failed",
+            serde_json::json!({
+                "reason": "resume retry budget exhausted; the harness never started",
+                "detail": reason,
+                "attempts": ctx.op.attempts,
+            }),
+        )
+        .await
+    {
+        tracing::warn!(session_id = %id, error = %e, "harness_start_failed event failed");
+    }
+    match crate::session_ops::transition_with_fence(state, id, ctx.fence(), SessionState::Failed)
+        .await
+    {
+        Ok(prev) => {
+            let _ = state
+                .emit_fenced(
+                    id,
+                    ctx.fence(),
+                    SessionEvent::StatusChanged {
+                        from: prev,
+                        to: SessionState::Failed,
+                        at: chrono::Utc::now(),
+                    },
+                )
+                .await;
+        }
+        Err(e) => tracing::warn!(session_id = %id, error = %e,
+            "resume budget exhausted but Created→Failed flip failed (state moved on?)"),
     }
 }
 

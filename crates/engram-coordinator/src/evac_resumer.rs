@@ -518,11 +518,13 @@ async fn run_resume_pipeline(
                 "evac-resumer: session reached Active on peer host",
             );
         }
-        Ok(FinishResumeOutcome::CreatedHarnessFailed) => {
+        Ok(FinishResumeOutcome::CreatedHarnessFailed(e)) => {
             tracing::warn!(
                 %session_id,
+                error = %e,
                 "evac-resumer: harness rebuild failed on peer; session left at Created — \
-                 user /resume retries from there. Scanner won't re-pick (status != Evacuating).",
+                 user /resume retries from there (ADR 0090: the resume op now owns \
+                 backoff + budget). Scanner won't re-pick (status != Evacuating).",
             );
         }
         Err(e) => {

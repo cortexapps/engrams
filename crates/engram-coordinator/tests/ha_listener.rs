@@ -351,6 +351,7 @@ async fn cross_replica_scheduling_pins_and_tokens() {
         exclude_host: None,
         prefer_host: None,
         caps: Default::default(),
+        prefer_bundles: &[],
     };
     let (picked, _) = placement::pick_for_session(meta_b.as_ref(), &registry_b, &ctx)
         .await

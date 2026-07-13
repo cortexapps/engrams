@@ -177,6 +177,24 @@ pub trait MetadataStore: Send + Sync {
 
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
 
+    /// ADR 0090: reverse ownership lookup — which session (if any)
+    /// currently binds `sandbox_id` on `host_id`? Answers the teardown
+    /// reconciler's unknown-binding arm: a host-agent generation whose
+    /// in-memory binding table missed a sandbox (NBD rehydrate failed
+    /// mid-roll) must ask the coordinator before counting an orphan
+    /// strike — local absence-of-binding is NOT ownership truth
+    /// (2026-07-11 campaign: a healthy pidfd-reattached VM was SIGKILLed
+    /// mid-build on exactly this). Non-terminal sessions only (`failed`/
+    /// `completed`/`dead` don't own anything; `host_lost` DOES — its
+    /// surviving VM is what recovery is for). Default impl (mocks): none.
+    async fn session_owning_sandbox(
+        &self,
+        _host_id: HostId,
+        _sandbox_id: crate::SandboxId,
+    ) -> Result<Option<SessionId>, MetaError> {
+        Ok(None)
+    }
+
     /// Every live (non-terminal, non-`host_lost`) session: `pending`,
     /// `created`, `active`, `idle`, `evacuating`, `evicting`. This is
     /// the rehydration source for the coord's in-memory routing maps

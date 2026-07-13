@@ -891,8 +891,12 @@ pub(crate) async fn resume_from_created(
     let outcome = finish_resume_to_active(state, &session, sandbox_id, true, ctx.fence()).await?;
     let note = match outcome {
         FinishResumeOutcome::Active => "resumed from Created (auto-evac completion)",
-        FinishResumeOutcome::CreatedHarnessFailed => {
-            "resume attempted from Created; harness reattach failed — session still Created"
+        // ADR 0090: retryable, not a 200 — the resume op's backoff +
+        // budget own the retry; Done here re-enqueued fresh ops forever.
+        FinishResumeOutcome::CreatedHarnessFailed(e) => {
+            return Err(ApiError::Unavailable(format!(
+                "harness start failed after resume from Created (will retry): {e}"
+            )));
         }
     };
     // No SnapshotResponse.snapshot_id — the session might've been
@@ -1076,8 +1080,13 @@ async fn resume_disk_only_cold_boot(
         FinishResumeOutcome::Active => {
             "resumed via disk-only cold boot (fresh kernel on latest disk; in-RAM context lost)"
         }
-        FinishResumeOutcome::CreatedHarnessFailed => {
-            "disk-only cold boot relocated the session; harness spawn failed — still Created"
+        // ADR 0090: retryable — see FinishResumeOutcome. This is the exact
+        // arm behind campaign B1's wedge (relocated onto a fresh node whose
+        // bundle staging lacked the harness; the loop never surfaced).
+        FinishResumeOutcome::CreatedHarnessFailed(e) => {
+            return Err(ApiError::Unavailable(format!(
+                "harness spawn failed after disk-only relocation (will retry): {e}"
+            )));
         }
     };
     Ok(SnapshotResponse {
@@ -1202,13 +1211,17 @@ fn resume_placement_label(
 
 /// Outcome of [`finish_resume_to_active`]. The session is either
 /// fully back at `Active` (`Active`) or the rebuilt VM is bound at
-/// `Created` because the harness rebuild failed (`CreatedHarnessFailed`).
-/// Callers map both to a 200 — `/exec` against `CreatedHarnessFailed`
-/// returns 409 with the honest state, the user can retry resume.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// `Created` because the harness rebuild failed (`CreatedHarnessFailed`,
+/// carrying the start_agent error). ADR 0090: callers must surface the
+/// failed case as a RETRYABLE error (`ApiError::Unavailable`) so the
+/// resume op's backoff + `RESUME_MAX_ATTEMPTS` budget engage — mapping
+/// it to a 200/`Done` made the Deliver verb enqueue a fresh Resume op
+/// each round: an unbounded, backoff-free spawn loop (5/sec measured,
+/// 2026-07-11 campaign B1) that never surfaced to the user.
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum FinishResumeOutcome {
     Active,
-    CreatedHarnessFailed,
+    CreatedHarnessFailed(String),
 }
 
 /// ADR 0028 A.log: rung-1 recovery rewind. Called after a coherent
@@ -1348,7 +1361,7 @@ pub async fn finish_resume_to_active(
     // (shared with the ADR 0034 Track A in-place reattach) returns `None`
     // when the manifest bundle can't load (dev-VM / process backend) — we
     // skip the agent re-attach then, same as before.
-    let mut start_agent_failed = false;
+    let mut start_agent_failed: Option<String> = None;
     if let Some((agent, policy)) =
         resolve_resume_agent_and_policy(state, session, new_sandbox_id).await
     {
@@ -1364,10 +1377,10 @@ pub async fn finish_resume_to_active(
                 error = %e,
                 "post-resume start_agent failed; leaving session at Created so /exec returns 409",
             );
-            start_agent_failed = true;
+            start_agent_failed = Some(e.to_string());
         }
     }
-    if start_agent_failed {
+    if let Some(err) = start_agent_failed {
         // ADR 0077 phase 4: with the Created limbo removed from the
         // happy path, the direct-resume caller arrives here at Idle, so
         // a start_agent failure must PARK the session at Created
@@ -1398,7 +1411,7 @@ pub async fn finish_resume_to_active(
                 )
                 .await;
         }
-        return Ok(FinishResumeOutcome::CreatedHarnessFailed);
+        return Ok(FinishResumeOutcome::CreatedHarnessFailed(err));
     }
     let prev_for_active =
         crate::session_ops::transition_with_fence(state, id, fence, SessionState::Active).await?;
@@ -1534,6 +1547,9 @@ async fn resume_from_fc_snapshot(
             needs_uffd_substrate: record.memory_manifest.is_some(),
             fc_snapshot_version: record.fc_snapshot_version.clone(),
         },
+        // ADR 0090: prefer hosts already staging the snapshot's pinned
+        // aux generations (soft — see rank_hosts).
+        prefer_bundles: record.aux_bundles.as_slice(),
     };
 
     // ADR 0048 C7: if NO host can take this resume (the fleet is fully
@@ -1768,12 +1784,10 @@ async fn resume_from_fc_snapshot(
     )
     .await?;
     match outcome {
-        FinishResumeOutcome::CreatedHarnessFailed => Ok(SnapshotResponse {
-            session_id: id,
-            snapshot_id: Some(record.id.to_string()),
-            size_bytes: Some(record.size_bytes),
-            note: "resumed; harness reattach failed — session left in Created",
-        }),
+        // ADR 0090: retryable — see FinishResumeOutcome.
+        FinishResumeOutcome::CreatedHarnessFailed(e) => Err(ApiError::Unavailable(format!(
+            "harness reattach failed after snapshot resume (will retry): {e}"
+        ))),
         FinishResumeOutcome::Active => {
             state
                 .emit(

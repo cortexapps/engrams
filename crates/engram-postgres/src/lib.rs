@@ -1709,6 +1709,30 @@ impl MetadataStore for PostgresStore {
         row::session_from_row(&row)
     }
 
+    /// ADR 0090: reverse ownership — non-terminal states only. `host_lost`
+    /// is deliberately INCLUDED (its surviving VM is what recovery is for);
+    /// a terminal row owns nothing.
+    async fn session_owning_sandbox(
+        &self,
+        host_id: HostId,
+        sandbox_id: engram_core::SandboxId,
+    ) -> Result<Option<SessionId>, MetaError> {
+        let row: Option<uuid::Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM sessions
+            WHERE sandbox_id = $1 AND host_id = $2
+              AND status NOT IN ('failed','completed','dead')
+            LIMIT 1
+            "#,
+        )
+        .bind(sandbox_id.as_uuid())
+        .bind(host_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(SessionId))
+    }
+
     /// Diagnostic twin of `pick_host_2d`, without the `FOR UPDATE`: same
     /// fit-map construction (same status/cordon predicate, same reserved
     /// SUM incl. capture jobs and the 10-min crash-orphan gate), then the
