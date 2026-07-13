@@ -317,3 +317,168 @@ async fn survivor_reconfigure_resumes_parked_io() {
     drop(state2);
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+/// Shared mini-fixture for the identifier tests below: a 4 MiB tagged
+/// image chunked into a fresh store. Small on purpose — the property
+/// under test is the CONNECT/RECONFIGURE identifier contract, not
+/// throughput.
+async fn identifier_fixture(
+    work: &std::path::Path,
+) -> (
+    Vec<u8>,
+    engram_chunk_store::Manifest,
+    ManifestRef,
+    ChunkCache,
+    Arc<ChunkStore>,
+) {
+    let image = work.join("disk.img");
+    let mut bytes = vec![0u8; 4 * 1024 * 1024];
+    for (i, block) in bytes.chunks_mut(4096).enumerate() {
+        let tag = (i as u64).to_le_bytes();
+        block[..8].copy_from_slice(&tag);
+    }
+    std::fs::write(&image, &bytes).expect("write image");
+    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.join("blob")));
+    let store = Arc::new(ChunkStore::new(blob));
+    let mut cache_cfg = ChunkCacheConfig::new(work.join("chunk-cache"));
+    cache_cfg.budget_bytes = 64 * 1024 * 1024;
+    let cache = ChunkCache::new(cache_cfg);
+    let manifest = store
+        .chunk_file(&image, ManifestKind::Disk, None)
+        .await
+        .expect("chunk image");
+    let manifest_ref = ManifestRef::new();
+    store
+        .put_manifest(manifest_ref, &manifest)
+        .await
+        .expect("put manifest");
+    (bytes, manifest, manifest_ref, cache, store)
+}
+
+/// 2026-07-13 dfa0face regression: the fresh-create path forks the
+/// manifest identity AT ATTACH (ADR 0077), and every durable ref a
+/// survivor rehydrate is later handed carries the POST-fork id — so the
+/// kernel identifier recorded at CONNECT must be the post-fork id too.
+/// Pre-fix, CONNECT recorded the pre-fork (shared base) id and every
+/// forked-chain survivor's RECONFIGURE died with EINVAL (identifier
+/// strcmp), quarantining the slot and killing the guest's disk.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Linux + modprobe nbd + writable /dev/nbd0 (root)"]
+async fn forked_chain_survivor_reconfigures_under_post_fork_id() {
+    let nbd_path = match preflight() {
+        Some(p) => p,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("tempdir");
+    let (bytes, manifest, base_ref, cache, store) = identifier_fixture(work.path()).await;
+
+    // Generation one: the FRESH-CREATE shape — fork at attach.
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
+    let state = attach_manifest(
+        base_ref,
+        cache.clone(),
+        store.clone(),
+        &pool,
+        u64::MAX,
+        /*fork=*/ true,
+    )
+    .await
+    .expect("netlink CONNECT attach (forked)");
+    let device = state.device_path().to_path_buf();
+    let forked_ref = state.backend.manifest_ref().await;
+    assert_ne!(
+        forked_ref.manifest_id, base_ref.manifest_id,
+        "fork_at_attach must mint a private manifest id",
+    );
+    let read1 = pread_direct(&device, 0, 4096).expect("gen-1 read");
+    assert_eq!(&read1[..16], &bytes[..16], "gen-1 content mismatch");
+
+    // The rehydrate source is durable state keyed by the FORKED id (live
+    // flushes / snapshot rows) — persist the manifest there like the
+    // flush scheduler would have.
+    store
+        .put_manifest(forked_ref, &manifest)
+        .await
+        .expect("put forked manifest");
+
+    // Pod roll, then generation two rehydrates from the forked ref.
+    let engram_host_agent::disk_daemon::NbdSandboxState {
+        scheduler: _,
+        backend: _gen1_backend,
+        handle,
+        slot,
+    } = state;
+    handle.abandon();
+    drop(slot);
+
+    let pool2 = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool2");
+    let slot2 = pool2.claim(&device).await.expect("claim survivor device");
+    let state2 = reattach_manifest(forked_ref, cache, store, slot2, u64::MAX)
+        .await
+        .expect("RECONFIGURE under the post-fork id must be accepted (pre-fix: EINVAL)");
+
+    let read2 = pread_direct(&device, 1024 * 1024, 4096).expect("gen-2 read");
+    assert_eq!(
+        &read2[..16],
+        &bytes[1024 * 1024..1024 * 1024 + 16],
+        "gen-2 content mismatch",
+    );
+    drop(state2);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Transition fallback: a device CONNECTed by a PRE-fix host-agent
+/// generation carries an identifier the rehydrate ref no longer matches.
+/// `reattach_manifest` must read the kernel's recorded identifier from
+/// `/sys/block/nbdN/backend` and retry with it instead of quarantining
+/// the survivor. (Remove alongside the fallback after a full fleet roll.)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Linux + modprobe nbd + writable /dev/nbd0 (root)"]
+async fn mismatched_identifier_falls_back_to_kernel_recorded_id() {
+    let nbd_path = match preflight() {
+        Some(p) => p,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("tempdir");
+    let (bytes, manifest, ref_a, cache, store) = identifier_fixture(work.path()).await;
+
+    // Generation one connects under ref A's id (no fork — the pre-fix
+    // shape where the connect-time id and the rehydrate id diverge).
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
+    let state = attach_manifest(ref_a, cache.clone(), store.clone(), &pool, u64::MAX, false)
+        .await
+        .expect("netlink CONNECT attach");
+    let device = state.device_path().to_path_buf();
+
+    // The rehydrate arrives under a DIFFERENT manifest id (ref B) — same
+    // content, mismatched identifier.
+    let ref_b = ManifestRef::new();
+    store
+        .put_manifest(ref_b, &manifest)
+        .await
+        .expect("put ref-b manifest");
+
+    let engram_host_agent::disk_daemon::NbdSandboxState {
+        scheduler: _,
+        backend: _gen1_backend,
+        handle,
+        slot,
+    } = state;
+    handle.abandon();
+    drop(slot);
+
+    let pool2 = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool2");
+    let slot2 = pool2.claim(&device).await.expect("claim survivor device");
+    let state2 = reattach_manifest(ref_b, cache, store, slot2, u64::MAX)
+        .await
+        .expect("mismatched identifier must fall back to the kernel-recorded id");
+
+    let read2 = pread_direct(&device, 2 * 1024 * 1024, 4096).expect("fallback read");
+    assert_eq!(
+        &read2[..16],
+        &bytes[2 * 1024 * 1024..2 * 1024 * 1024 + 16],
+        "fallback content mismatch",
+    );
+    drop(state2);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}

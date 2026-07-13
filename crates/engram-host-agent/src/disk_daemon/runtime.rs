@@ -572,12 +572,18 @@ pub async fn attach_manifest(
     // resume / recovery, which attach the session's own forked id.
     fork_at_attach: bool,
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
-    let backend_id = disk_manifest_ref.manifest_id.to_string();
     let backend =
         ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await?;
     if fork_at_attach {
         backend.fork_manifest_identity().await;
     }
+    // The kernel records this as `/sys/block/nbdN/backend` and a survivor
+    // rehydrate's RECONFIGURE must strcmp-match it. Every durable ref the
+    // rehydrate can be handed (live flushes, snapshot rows) carries the
+    // POST-fork id, so derive the identifier after the fork — deriving it
+    // from the pre-fork base id made every forked-chain survivor's
+    // rehydrate fail with EINVAL (2026-07-13 dfa0face incident).
+    let backend_id = backend.manifest_ref().await.manifest_id.to_string();
     attach_backend(backend, slot_pool, &backend_id).await
 }
 
@@ -637,6 +643,48 @@ pub async fn reattach_manifest(
         };
     let handle = match reattach(backend.clone(), slot.path(), &backend_id).await {
         Ok(h) => h,
+        // Transition fallback: a device CONNECTed by a pre-fix host-agent
+        // generation carries the PRE-fork (base) manifest id, so the
+        // kernel's identifier strcmp fails with EINVAL. The device↔sandbox
+        // mapping is already pinned by the caller (`rootfs_device(sandbox_id)`
+        // → `pool.claim` on that exact device), so retrying with the
+        // kernel's own recorded identifier is safe — the strcmp is a
+        // belt-and-suspenders check we've re-verified by other means.
+        // Remove after a full fleet roll past the post-fork-id generation.
+        Err(NbdRuntimeError::Io(ref ioe)) if ioe.raw_os_error() == Some(libc::EINVAL) => {
+            match kernel_backend_identifier(slot.path()) {
+                Some(kernel_id) if kernel_id != backend_id => {
+                    tracing::warn!(
+                        device = %slot.path().display(),
+                        expected = %backend_id,
+                        kernel = %kernel_id,
+                        "NBD RECONFIGURE identifier mismatch (pre-fix generation \
+                         device); retrying with the kernel-recorded identifier",
+                    );
+                    match reattach(backend.clone(), slot.path(), &kernel_id).await {
+                        Ok(h) => h,
+                        Err(e) => return Err((slot, e)),
+                    }
+                }
+                kernel_id => {
+                    tracing::warn!(
+                        device = %slot.path().display(),
+                        expected = %backend_id,
+                        kernel = ?kernel_id,
+                        "NBD RECONFIGURE EINVAL with no usable kernel identifier",
+                    );
+                    return Err((
+                        slot,
+                        NbdRuntimeError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "reconfigure EINVAL: identifier {backend_id} vs kernel {kernel_id:?}"
+                            ),
+                        )),
+                    ));
+                }
+            }
+        }
         Err(e) => return Err((slot, e)),
     };
     Ok(NbdSandboxState {
@@ -645,6 +693,16 @@ pub async fn reattach_manifest(
         handle,
         slot,
     })
+}
+
+/// The identifier the kernel recorded at CONNECT time —
+/// `/sys/block/nbdN/backend`. `None` when the attr is missing/unreadable
+/// (device never netlink-configured, or pre-identifier kernel).
+fn kernel_backend_identifier(nbd_device: &Path) -> Option<String> {
+    let name = nbd_device.file_name()?.to_str()?;
+    let raw = std::fs::read_to_string(format!("/sys/block/{name}/backend")).ok()?;
+    let id = raw.trim();
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 async fn attach_backend(
