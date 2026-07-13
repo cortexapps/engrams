@@ -177,6 +177,13 @@ fn park_headroom_floor_pct() -> u8 {
 }
 
 /// ADR 0079: the evict VERB's pipeline — the same pause → flush →
+/// Wall-clock bound on ONE composed-capture attempt of a quarantined
+/// survivor (ADR 0090 — `payload.quarantine`). Generous next to a healthy
+/// capture (upload legs run seconds-to-a-couple-minutes) but a hard stop
+/// for the pathological crawl class; see the timeout site in
+/// [`run_evict_pipeline`].
+const QUARANTINE_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// memory-snapshot → destroy sequence the legacy `evict_session_to_state`
 /// ran, now driven under an op claim (the mutual exclusion; the
 /// `session_ops_one_running` index replaces the session lease) with
@@ -463,12 +470,37 @@ pub(crate) async fn run_evict_pipeline(
         }
     }
 
-    let metadata = state
-        .services
-        .host
-        .snapshot(sandbox_id, ctx.fence())
-        .await
-        .map_err(EvictError::Sandbox)?;
+    // Quarantine flavor (ADR 0090): bound the composed capture. A
+    // quarantined survivor's capture can legitimately succeed (its memory
+    // and dirty-chunk upload don't need the dead guest-visible NBD
+    // device), but it can also crawl for hours (2026-07-13 incident: a
+    // chain-poisoned re-chunk at ~0.5 MB/s held the session lane ~50 min
+    // with the user's resume queued behind it — and the within-step
+    // heartbeat keeps an in-flight attempt unreclaimable by design). The
+    // timeout turns a crawl into a failed attempt; the verb's small
+    // quarantine budget then converges to destroy + rewind.
+    let quarantine = ctx
+        .op
+        .payload
+        .get("quarantine")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let snapshot_fut = state.services.host.snapshot(sandbox_id, ctx.fence());
+    let metadata = if quarantine {
+        match tokio::time::timeout(QUARANTINE_CAPTURE_TIMEOUT, snapshot_fut).await {
+            Ok(res) => res.map_err(EvictError::Sandbox)?,
+            Err(_elapsed) => {
+                abort_inflight_snapshot(ctx, session_id, sandbox_id, "quarantine capture timeout")
+                    .await;
+                return Err(EvictError::Meta(format!(
+                    "quarantined-survivor capture timed out after {}s",
+                    QUARANTINE_CAPTURE_TIMEOUT.as_secs()
+                )));
+            }
+        }
+    } else {
+        snapshot_fut.await.map_err(EvictError::Sandbox)?
+    };
 
     let host_id = state.host_registry.host_of(sandbox_id);
     let now = Utc::now();

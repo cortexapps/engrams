@@ -246,6 +246,76 @@ pub async fn register(
         }
     };
 
+    // Survivor egress re-registration (2026-07-13 dfa0face incident): the
+    // egress proxy's guest registry died with the old pod (it holds
+    // resolved secrets — in-memory by design), so a pidfd-reattached
+    // survivor keeps its VM but loses ALL egress: every guest packet is
+    // rejected (`UnknownGuest` NXDOMAIN / "no session for source IP")
+    // until something re-registers it. The host can't rebuild the policy
+    // alone; re-derive it from durable state exactly like resume does
+    // (`build_resume_egress_policy`) and push it over the gRPC channel
+    // registered above. Detached: inject resolution can round-trip a mint
+    // provider, and the register response must not wait on it.
+    // Best-effort per survivor — a miss logs loudly and degrades to the
+    // pre-fix posture (egress dead until evict_local → resume recovers
+    // the session).
+    {
+        let state = state.clone();
+        let survivors = rehydrate_sandboxes.clone();
+        let host_id = req.host_id;
+        tokio::spawn(async move {
+            for s in survivors {
+                let session = match state.services.meta.get_session(s.session_id).await {
+                    Ok(sess) => sess,
+                    Err(e) => {
+                        tracing::warn!(
+                            %host_id,
+                            session_id = %s.session_id,
+                            error = %e,
+                            "survivor egress re-push: session lookup failed",
+                        );
+                        continue;
+                    }
+                };
+                if session.sandbox_id != Some(s.sandbox_id) {
+                    continue; // moved on since the register snapshot
+                }
+                let Some(policy) = crate::api::sessions::build_resume_egress_policy(
+                    &state,
+                    s.session_id,
+                    s.sandbox_id,
+                    &session.image,
+                )
+                .await
+                else {
+                    tracing::warn!(
+                        %host_id,
+                        session_id = %s.session_id,
+                        sandbox_id = %s.sandbox_id,
+                        "survivor egress re-push: no guest IP / policy — survivor stays egress-less",
+                    );
+                    continue;
+                };
+                match state.services.host.apply_egress_policy(policy).await {
+                    Ok(()) => tracing::info!(
+                        %host_id,
+                        session_id = %s.session_id,
+                        sandbox_id = %s.sandbox_id,
+                        "survivor egress re-registered after host restart",
+                    ),
+                    Err(e) => tracing::warn!(
+                        %host_id,
+                        session_id = %s.session_id,
+                        sandbox_id = %s.sandbox_id,
+                        error = %e,
+                        "survivor egress re-push failed; survivor stays egress-less \
+                         (recover via evict_local → resume)",
+                    ),
+                }
+            }
+        });
+    }
+
     tracing::info!(
         host_id = %req.host_id,
         host_addr = %req.host_addr,
@@ -730,10 +800,13 @@ pub async fn heartbeat(
     // ADR 0090: drive the documented remediation for quarantined
     // survivors (NBD rehydrate failed after a roll — VM possibly live,
     // disk unserved). Enqueue `evict_local` (full capture, no park) for
-    // each survivor the session still owns; `session_ops::enqueue`
-    // returns `Duplicate` for the re-adverts every 5s heartbeat carries,
-    // so this is idempotent. Pre-fix, nothing consumed the host's WARN
-    // and the teardown reconciler's orphan path SIGKILLed the VM.
+    // each survivor the session still owns. Dedup keys ONLY on the
+    // idempotency key (ADR 0079 finding #4 — active-state-scoped), so the
+    // re-adverts every 5s heartbeat carries MUST pass one; a key-less
+    // enqueue inserts a fresh queued row per heartbeat (ADR 0093: 423
+    // rows piled up behind one wedged evict in the 2026-07-13 incident).
+    // Pre-ADR-0090, nothing consumed the host's WARN and the teardown
+    // reconciler's orphan path SIGKILLed the VM.
     for q in &hb.quarantined_survivors {
         match state.services.meta.get_session(q.session_id).await {
             Ok(s) if s.sandbox_id == Some(q.sandbox_id) => {
@@ -745,8 +818,15 @@ pub async fn heartbeat(
                         "target": "idle",
                         "allow_park": false,
                         "nominated": false,
+                        // Quarantine flavor: the survivor's disk is unserved, so
+                        // the evict verb bounds each capture attempt and, on
+                        // budget exhaustion, destroys the crippled VM + falls
+                        // back to HostLost (rewind-to-checkpoint is the designed
+                        // blast radius; an unbounded retry loop locking the
+                        // user out is not).
+                        "quarantine": true,
                     }),
-                    None,
+                    Some(&format!("adr0090-quarantine:{}", q.sandbox_id)),
                 )
                 .await
                 {
@@ -1675,6 +1755,55 @@ mod tests {
         assert!(
             *meta.reconcile_probe_calls.lock() >= 1,
             "reconcile must run once the persist succeeds"
+        );
+    }
+
+    /// 2026-07-13 incident regression: the ADR 0090 quarantined-survivor
+    /// arm fires on EVERY 5s heartbeat, and `session_ops` dedup keys
+    /// ONLY on the idempotency key — a key-less enqueue inserts a fresh
+    /// queued row per heartbeat (423 piled up behind one wedged evict in
+    /// prod). Pin that re-adverts collapse to ONE keyed row. The seeded
+    /// running evict keeps the lane busy so the first advert's row stays
+    /// `queued` (never claimed/driven) and the second advert must dedup
+    /// against it.
+    #[tokio::test]
+    async fn quarantined_survivor_readverts_dedup_to_one_op() {
+        let host_id = HostId::new();
+        let sandbox_id = SandboxId::new();
+        let session_id = engram_core::SessionId::new();
+        let mut session = session_with_status(session_id, sandbox_id, SessionState::Active);
+        session.host_id = Some(host_id);
+        let (state, meta, _local) = build_state_for_session(session);
+        meta.ops
+            .seed_running(session_id, engram_core::types::session_op::OpKind::Evict);
+
+        let hb_json = serde_json::json!({
+            "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 1 },
+            "running_sandboxes": [sandbox_id],
+            "quarantined_survivors": [
+                { "sandbox_id": sandbox_id, "session_id": session_id },
+            ],
+        });
+        for tick in 0..2 {
+            let hb: HeartbeatRequest =
+                serde_json::from_value(hb_json.clone()).expect("deserialize heartbeat");
+            let result = heartbeat(State(state.clone()), Path(host_id), Json(hb)).await;
+            assert!(result.is_ok(), "heartbeat tick {tick}: {:?}", result.err());
+        }
+
+        let keyed: Vec<_> = meta
+            .ops
+            .all()
+            .into_iter()
+            .filter(|o| {
+                o.idempotency_key.as_deref()
+                    == Some(format!("adr0090-quarantine:{sandbox_id}").as_str())
+            })
+            .collect();
+        assert_eq!(
+            keyed.len(),
+            1,
+            "re-advertised quarantined survivor must dedup to one keyed evict op, got {keyed:#?}",
         );
     }
 

@@ -343,6 +343,15 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
 /// loop by construction.
 const EVICT_MAX_ATTEMPTS: i32 = 20;
 
+/// Retry budget for the ADR 0090 quarantined-survivor flavor
+/// (`payload.quarantine`). The survivor's disk is unserved and its user
+/// already degraded — a capture that keeps failing (or timing out; the
+/// pipeline bounds each quarantine capture attempt) must converge to the
+/// rewind ladder in minutes, not spin the 20-attempt budget while the
+/// session lane stays locked (2026-07-13 incident: one wedged evict held
+/// the lane for ~50 minutes with the user's resume queued behind it).
+const QUARANTINE_EVICT_MAX_ATTEMPTS: i32 = 3;
+
 /// The evict verb: the idle-eviction / drain pipeline
 /// (`idle_evictor::run_evict_pipeline` — park or capture + destroy +
 /// mark-idle). Payload: `{"target": "idle"|"evacuating", "allow_park":
@@ -362,6 +371,10 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
         .unwrap_or(false);
     let nominated = payload
         .get("nominated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let quarantine = payload
+        .get("quarantine")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
@@ -400,8 +413,60 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
             // forever), NOT Idle (lies: no durable snapshot), NOT Dead
             // (destroys a healthy runtime over a coord-side failure) —
             // exactly the retired scanner's classification (ADR 0034).
-            if ctx.op.attempts >= EVICT_MAX_ATTEMPTS {
+            //
+            // Quarantine flavor (ADR 0090, 2026-07-13 incident): a smaller
+            // budget, and the fallback DESTROYS the sandbox first. The VM
+            // is structurally crippled (disk unserved, often egress-dead);
+            // "healthy runtime" doesn't apply, and only its death lets the
+            // ownership reconcile drive HostLost → Idle (recoverable) so
+            // the user's next prompt resumes from the last checkpoint.
+            // Without the destroy, the session stays Active-and-crippled,
+            // the host re-advertises the quarantine every 5s, and the
+            // whole loop restarts (the key isn't burned by a terminal op).
+            let budget = if quarantine {
+                QUARANTINE_EVICT_MAX_ATTEMPTS
+            } else {
+                EVICT_MAX_ATTEMPTS
+            };
+            if ctx.op.attempts >= budget {
                 ::metrics::counter!(crate::metrics::EVICTION_BUDGET_EXHAUSTED_TOTAL).increment(1);
+                if quarantine {
+                    match ctx.state.services.meta.get_session(ctx.op.session_id).await {
+                        Ok(s) => {
+                            if let Some(sandbox_id) = s.sandbox_id {
+                                match ctx
+                                    .state
+                                    .services
+                                    .host
+                                    .destroy(sandbox_id, ctx.fence())
+                                    .await
+                                {
+                                    Ok(()) => tracing::warn!(
+                                        session_id = %ctx.op.session_id,
+                                        %sandbox_id,
+                                        attempts = ctx.op.attempts,
+                                        error = %e,
+                                        "quarantined-survivor evict budget exhausted; destroyed \
+                                         the crippled VM (reconcile drives HostLost → Idle, \
+                                         resume rewinds to the last checkpoint)",
+                                    ),
+                                    Err(de) => tracing::warn!(
+                                        session_id = %ctx.op.session_id,
+                                        %sandbox_id,
+                                        error = %de,
+                                        "quarantined-survivor destroy failed; the ownership \
+                                         reconcile / next advert re-drives recovery",
+                                    ),
+                                }
+                            }
+                        }
+                        Err(le) => tracing::warn!(
+                            session_id = %ctx.op.session_id,
+                            error = %le,
+                            "quarantined-survivor exhaustion: session lookup failed",
+                        ),
+                    }
+                }
                 if nominated {
                     match crate::session_ops::transition_with_fence(
                         ctx.state,
