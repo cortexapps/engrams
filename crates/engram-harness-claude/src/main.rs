@@ -1941,18 +1941,17 @@ mod adapter {
         // the abort's `result` lands.
         let mut interrupt_deadline: Option<Instant> = None;
 
-        // ADR 0054: if an answer is stashed, claude WILL re-fire the
-        // deferred AUQ on this `--resume` startup (id-stable, no stdin —
-        // findings #9/#12). Establish a CONTINUATION turn (fresh run_id,
-        // `RunStarted` with no `prompt_id`, no user-echo, no
-        // `write_user_message`) so the re-fired `tool_result` and the
-        // model's continuation are captured by the in-flight-turn branch
-        // instead of dropped by the "line outside any turn" / "result with
-        // no in-flight turn" branches. This takes precedence over the
-        // pending queue — an outstanding answer must be delivered first.
-        // (Edge: a stale answer with no matching pending tool — e.g. a
-        // duplicate after full consumption — leaves a continuation turn with
-        // no output until `max_run_secs` or the next command; rare, and the
+        // ADR 0054 / 0089: if an answer or deferred result is stashed, claude
+        // WILL re-fire the tool on this `--resume` startup (id-stable, no
+        // stdin — findings #9/#12). Establish a CONTINUATION turn (fresh
+        // run_id, `RunStarted` with no `prompt_id`, no user-echo, no
+        // `write_user_message`) so the re-fired `tool_result` and the model's
+        // continuation are captured by the in-flight-turn branch instead of
+        // dropped by the "line outside any turn" / "result with no in-flight
+        // turn" branches. This takes precedence over the pending queue — an
+        // outstanding delivery must be consumed first. (Edge: a stale result
+        // with no matching pending tool leaves a continuation turn with no
+        // output until `max_run_secs` or the next command; rare, and the
         // session stays command-responsive.)
         if !answers_in_hand.lock().await.is_empty() || !results_in_hand.lock().await.is_empty() {
             turn = Some(start_continuation_turn(evt_tx, cli, current_run_id).await);
@@ -2376,6 +2375,22 @@ mod adapter {
                                 )
                                 .await;
                                 tracing::debug!(%call_id, delivered, "routed sync or early generic tool result");
+                                if !delivered {
+                                    // A fresh harness after idle eviction has
+                                    // no in-memory DeferredCall even though
+                                    // claude's durable transcript still owns
+                                    // this pending tool_use. route_tool_result
+                                    // stashed the result; respawn so --resume
+                                    // re-fires the id-stable call and consumes
+                                    // it through hook allow + MCP.
+                                    tracing::info!(
+                                        %call_id,
+                                        "generic tool result has no live owner; resuming with result in hand"
+                                    );
+                                    resuming_for_deferred = true;
+                                    sigint_child(&child);
+                                    break;
+                                }
                             }
                         }
                         Some(HarnessCommand::EditQueued { prompt_id, text }) => {
@@ -5283,6 +5298,43 @@ mod adapter {
             path.to_string_lossy().into_owned()
         }
 
+        async fn write_fresh_restore_refire_fake_claude(
+            counter: &Path,
+            invocations: &Path,
+            completion_gate: &Path,
+            session_id: &str,
+        ) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path =
+                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            let body = format!(
+                "#!/bin/sh\n\
+                 trap 'exit 0' INT TERM\n\
+                 n=0\n\
+                 if [ -f '{counter}' ]; then n=$(sed -n '1p' '{counter}'); fi\n\
+                 n=$((n + 1))\n\
+                 printf '%s\\n' \"$n\" > '{counter}'\n\
+                 printf '%s\\n' \"$*\" >> '{invocations}'\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{session_id}\"}}'\n\
+                 if [ \"$n\" -ge 2 ]; then\n\
+                   printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-restored-refire\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_restored\",\"name\":\"mcp__engrams__save_memory\",\"input\":{{\"text\":\"remember\"}}}}]}}}}'\n\
+                   while [ ! -f '{completion_gate}' ]; do sleep 0.05; done\n\
+                   printf '%s\\n' '{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_restored\",\"content\":\"{{\\\"saved\\\":true}}\"}}]}}}}'\n\
+                   printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-restored-done\",\"content\":[{{\"type\":\"text\",\"text\":\"continued after restore\"}}]}}}}'\n\
+                   printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"completed\"}}'\n\
+                 fi\n\
+                 while IFS= read -r _line; do :; done\n",
+                counter = counter.display(),
+                invocations = invocations.display(),
+                completion_gate = completion_gate.display(),
+            );
+            tokio::fs::write(&path, body).await.unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
         async fn write_deferred_alive_fake_claude(captured: &Path) -> String {
             use std::os::unix::fs::PermissionsExt;
             let path =
@@ -5427,6 +5479,131 @@ mod adapter {
                 .expect("engine task does not panic");
             let _ = tokio::fs::remove_file(script).await;
             let _ = tokio::fs::remove_file(counter).await;
+        }
+
+        #[tokio::test]
+        async fn deferred_result_after_fresh_restore_resumes_and_serves_refire() {
+            let nonce = uuid::Uuid::new_v4();
+            let counter = std::env::temp_dir().join(format!("fake-claude-count-{nonce}"));
+            let invocations = std::env::temp_dir().join(format!("fake-claude-invocations-{nonce}"));
+            let completion_gate =
+                std::env::temp_dir().join(format!("fake-claude-complete-{nonce}"));
+            let session_id = format!("fresh-restore-{nonce}");
+            let script = write_fresh_restore_refire_fake_claude(
+                &counter,
+                &invocations,
+                &completion_gate,
+                &session_id,
+            )
+            .await;
+            let (cli, hook, mcp) = deferred_engine_cli(script.clone(), "fresh-restore").await;
+            let (cmd_tx, cmd_rx) = mpsc::channel(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel(64);
+            let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if tokio::fs::read_to_string(CLAUDE_SESSION_ID_FILE)
+                        .await
+                        .is_ok_and(|contents| contents.trim() == session_id)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the fresh process should persist its resumable session id");
+
+            // This is the post-restore boundary: the durable transcript knows
+            // about toolu_restored, but this fresh harness has never seen its
+            // hook, so deferred_calls is empty when the result arrives.
+            cmd_tx
+                .send(HarnessCommand::ToolResult {
+                    call_id: "toolu_restored".into(),
+                    result_json: r#"{"saved":true}"#.into(),
+                })
+                .await
+                .unwrap();
+
+            let (_run, prompt_id) =
+                tokio::time::timeout(Duration::from_secs(5), expect_run_started_id(&mut evt_rx))
+                    .await
+                    .expect("result for a fresh engine should trigger a continuation resume");
+            assert_eq!(prompt_id, None);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if tokio::fs::read_to_string(&invocations)
+                        .await
+                        .is_ok_and(|contents| contents.lines().count() >= 2)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the resumed claude invocation should be recorded");
+            let argv = tokio::fs::read_to_string(&invocations).await.unwrap();
+            let resumed_argv = argv.lines().last().unwrap();
+            assert!(
+                resumed_argv.contains(&format!("--resume {session_id}")),
+                "second claude invocation must resume the durable transcript: {resumed_argv}"
+            );
+
+            assert!(matches!(
+                hook_fire_named(
+                    &hook,
+                    "toolu_restored",
+                    "mcp__engrams__save_memory",
+                    serde_json::json!({"text":"remember"}),
+                )
+                .await,
+                hook_server::HookVerdict::Allow
+            ));
+            assert_eq!(
+                fire_main_mcp_call(&mcp, "toolu_restored").await["result_json"],
+                r#"{"saved":true}"#
+            );
+            tokio::fs::write(&completion_gate, b"served").await.unwrap();
+
+            let mut continued = false;
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), evt_rx.recv())
+                    .await
+                    .expect("the resumed deferred turn should complete")
+                {
+                    Some(HarnessEvent::AgentMessage { text, .. })
+                        if text == "continued after restore" =>
+                    {
+                        continued = true;
+                    }
+                    Some(HarnessEvent::RunCompleted { ok, .. }) => {
+                        assert!(ok, "the resumed deferred turn should complete normally");
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("engine event channel closed before turn completion"),
+                }
+            }
+            assert!(
+                continued,
+                "claude continued after consuming the stashed result"
+            );
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+            let _ = tokio::fs::remove_file(script).await;
+            let _ = tokio::fs::remove_file(counter).await;
+            let _ = tokio::fs::remove_file(invocations).await;
+            let _ = tokio::fs::remove_file(completion_gate).await;
         }
 
         #[tokio::test]
