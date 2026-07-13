@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
 use engram_core::SessionId;
 use parking_lot::RwLock;
 
@@ -69,17 +71,130 @@ pub struct SecretEntry {
 /// (SNI) AND `policy` (method + path), the proxy adds
 /// `header_name: <header_template with "{}" → secret>`. The secret lives
 /// only in this struct, on the host.
+///
+/// WS4: the credential is *refreshable*. A minted entry (`mint_provider`
+/// non-empty) carries a short-lived credential (a GitHub App installation
+/// token, ~1h TTL) that the proxy re-mints via its [`InjectRefresher`] seam
+/// near expiry — closing the campaign's reads-401/writes-succeed asymmetry
+/// where the boot-time inject token was minted ONCE and went stale ~1h later.
 #[derive(Clone, Debug)]
 pub struct InjectEntry {
-    /// The real credential — host-side only.
-    pub secret: String,
     pub header_name: String,
-    /// `{}` is replaced by `secret` (e.g. `"Bearer {}"`, or `"{}"`).
+    /// `{}` is replaced by the current secret (e.g. `"Bearer {}"`, or `"{}"`).
     pub header_template: String,
     /// Hosts (SNI) this injection applies to.
     pub allow: HostList,
     /// Request shapes this injection gates + applies to.
     pub policy: RequestPolicy,
+    /// WS4: the mint provider whose credential this injects (e.g. `"github"`),
+    /// or empty for a static/non-refreshable secret. Non-empty ⇒ the proxy
+    /// re-mints `cred` via the [`InjectRefresher`] near expiry.
+    pub mint_provider: String,
+    /// WS4: the refreshable credential cell. [`Self::secret`] reads the current
+    /// value; [`Self::refresh_if_stale`] re-mints it (single-flighted) when a
+    /// near-expiry request arrives. The secret lives only here, on the host.
+    pub cred: Arc<RefreshableCred>,
+}
+
+impl InjectEntry {
+    /// The current secret to inject (host-side only).
+    pub fn secret(&self) -> String {
+        self.cred.secret()
+    }
+
+    /// WS4: if this is a refreshable (minted) entry within 5 min of expiry,
+    /// re-mint it via `refresher`, single-flighted so concurrent connections
+    /// re-mint at most once. On refresh failure the STALE secret is kept — a
+    /// request under a stale token 401s (recoverable), whereas dropping the
+    /// request is not. A no-op for a static entry (empty `mint_provider`) or one
+    /// still comfortably inside its validity window.
+    pub async fn refresh_if_stale(&self, session_id: SessionId, refresher: &dyn InjectRefresher) {
+        if self.mint_provider.is_empty() || self.cred.fresh_enough() {
+            return;
+        }
+        // Single-flight: hold the async guard across the re-mint. Late arrivals
+        // block here, then re-check and observe the freshly-minted value.
+        let _guard = self.cred.refreshing.lock().await;
+        if self.cred.fresh_enough() {
+            return; // another connection refreshed while we waited
+        }
+        match refresher.refresh(session_id, &self.mint_provider).await {
+            Some(fresh) => {
+                *self.cred.current.write() = CredState {
+                    secret: fresh.secret,
+                    expires_at: Some(fresh.expires_at),
+                };
+            }
+            None => tracing::warn!(
+                provider = %self.mint_provider,
+                %session_id,
+                "egress inject refresh failed; keeping the stale credential \
+                 (a 401 is recoverable; a dropped request is not)",
+            ),
+        }
+    }
+}
+
+/// WS4: the mutable, single-flighted credential behind an [`InjectEntry`]. Reads
+/// (`secret`) take a short `parking_lot` read lock; a refresh holds the async
+/// `refreshing` mutex so a burst of concurrent connections re-mints at most once.
+#[derive(Debug)]
+pub struct RefreshableCred {
+    current: RwLock<CredState>,
+    refreshing: tokio::sync::Mutex<()>,
+}
+
+#[derive(Clone, Debug)]
+struct CredState {
+    secret: String,
+    /// `None` for a static secret (never refreshed).
+    expires_at: Option<DateTime<Utc>>,
+}
+
+impl RefreshableCred {
+    /// Build a cell. `expires_at = None` marks a static secret (never refreshed).
+    pub fn new(secret: String, expires_at: Option<DateTime<Utc>>) -> Arc<Self> {
+        Arc::new(Self {
+            current: RwLock::new(CredState { secret, expires_at }),
+            refreshing: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    fn secret(&self) -> String {
+        self.current.read().secret.clone()
+    }
+
+    /// Is the credential comfortably inside its validity window? A static secret
+    /// (no TTL) is always fresh; a minted one is fresh until 5 min before expiry —
+    /// the same window the coordinator's own token cache re-mints on
+    /// (`GitHubApp::mint_basic`), so the proxy asks for a re-mint exactly when a
+    /// fresh token is actually available.
+    fn fresh_enough(&self) -> bool {
+        match self.current.read().expires_at {
+            None => true,
+            Some(exp) => exp > Utc::now() + Duration::minutes(5),
+        }
+    }
+}
+
+/// WS4: the seam the host-agent injects so the proxy can re-mint a near-expiry
+/// inject credential via the coordinator (which holds the mint authority). An
+/// async trait object — unlike the fire-and-forget [`crate::observe::ObserveSink`]
+/// the proxy AWAITS the fresh secret before injecting it.
+#[async_trait]
+pub trait InjectRefresher: Send + Sync {
+    /// Re-mint the credential for `mint_provider` on `session_id`. `None` ⇒ the
+    /// refresh failed (the caller keeps the stale secret).
+    async fn refresh(&self, session_id: SessionId, mint_provider: &str) -> Option<RefreshedInject>;
+}
+
+/// WS4: the result of an [`InjectRefresher::refresh`] — the fresh rendered header
+/// value + its new expiry. `header_name` is unchanged across a refresh (same
+/// scheme), so it isn't carried here.
+#[derive(Clone, Debug)]
+pub struct RefreshedInject {
+    pub secret: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 /// ADR 0059: a GraphQL operation type. The body-parsed operation must equal this
@@ -384,7 +499,6 @@ mod tests {
                 allow: HostList::from_manifest(&["api.openai.com".into()], &[]).unwrap(),
             }],
             injects: vec![InjectEntry {
-                secret: "dd-secret".into(),
                 header_name: "DD-API-KEY".into(),
                 header_template: "{}".into(),
                 allow: HostList::from_manifest(&["api.datadoghq.com".into()], &[]).unwrap(),
@@ -393,6 +507,8 @@ mod tests {
                     path_globs: vec!["/api/v2/logs*".into()],
                     graphql: None,
                 },
+                mint_provider: String::new(),
+                cred: RefreshableCred::new("dd-secret".into(), None),
             }],
             observes: vec![ObserveEntry {
                 allow: HostList::from_manifest(&["api.github.com".into()], &[]).unwrap(),
@@ -505,6 +621,95 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert!(p.contains(&"engram_ph_xxx_yyy"));
         assert!(p.contains(&"engram_ph_aaa_bbb"));
+    }
+
+    struct StubRefresher {
+        calls: std::sync::atomic::AtomicUsize,
+        result: Option<RefreshedInject>,
+    }
+
+    #[async_trait]
+    impl InjectRefresher for StubRefresher {
+        async fn refresh(&self, _s: SessionId, _p: &str) -> Option<RefreshedInject> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.result.clone()
+        }
+    }
+
+    fn mint_entry(secret: &str, expires_at: Option<DateTime<Utc>>) -> InjectEntry {
+        InjectEntry {
+            header_name: "Authorization".into(),
+            header_template: "Bearer {}".into(),
+            allow: HostList::from_manifest(&["api.github.com".into()], &[]).unwrap(),
+            policy: RequestPolicy::default(),
+            mint_provider: "github".into(),
+            cred: RefreshableCred::new(secret.into(), expires_at),
+        }
+    }
+
+    #[tokio::test]
+    async fn static_entry_never_refreshes() {
+        // Empty mint_provider (a static secret) is a no-op even with a refresher.
+        let e = InjectEntry {
+            mint_provider: String::new(),
+            ..mint_entry("static", None)
+        };
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: Some(RefreshedInject {
+                secret: "fresh".into(),
+                expires_at: Utc::now() + Duration::hours(1),
+            }),
+        };
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(e.secret(), "static");
+    }
+
+    #[tokio::test]
+    async fn fresh_minted_entry_is_not_refreshed() {
+        // Expiry comfortably beyond the 5-min window → no re-mint.
+        let e = mint_entry("current", Some(Utc::now() + Duration::hours(1)));
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: None,
+        };
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(e.secret(), "current");
+    }
+
+    #[tokio::test]
+    async fn near_expiry_minted_entry_refreshes() {
+        // Inside the 5-min window → re-mint and adopt the fresh secret.
+        let e = mint_entry("stale", Some(Utc::now() + Duration::minutes(2)));
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: Some(RefreshedInject {
+                secret: "fresh".into(),
+                expires_at: Utc::now() + Duration::hours(1),
+            }),
+        };
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(e.secret(), "fresh");
+        // Now fresh — a second call is a no-op.
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_keeps_stale_secret() {
+        // A failed re-mint must NOT drop the credential — a stale token 401s
+        // (recoverable) but the request still goes out.
+        let e = mint_entry("stale", Some(Utc::now() + Duration::minutes(1)));
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: None,
+        };
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(e.secret(), "stale");
     }
 
     #[test]

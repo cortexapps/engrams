@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::cert_mint::CertMint;
-use crate::registry::{Decision, Registry};
+use crate::registry::{Decision, InjectRefresher, Registry};
 use crate::resolver::{default_resolver, UpstreamResolver};
 use crate::{bypass, dns, intercept, sni};
 
@@ -63,6 +63,11 @@ pub struct ProxyConfig {
     /// The host-agent wires this to its coordinator bridge; tests pass a
     /// collecting closure.
     pub observe_sink: Option<crate::observe::ObserveSink>,
+    /// WS4: seam to re-mint a near-expiry inject credential via the coordinator.
+    /// `None` disables refresh (a minted inject then rides its boot token until
+    /// expiry — the pre-WS4 behaviour). The host-agent wires this to its coord
+    /// client; tests pass a stub.
+    pub inject_refresher: Option<Arc<dyn InjectRefresher>>,
 }
 
 impl ProxyConfig {
@@ -85,6 +90,7 @@ impl ProxyConfig {
                 .parse()
                 .expect("dns upstream default parses"),
             observe_sink: None,
+            inject_refresher: None,
         }
     }
 }
@@ -173,6 +179,7 @@ impl Proxy {
             let server_cfg = self.server_cfg.clone();
             let client_cfg = self.client_cfg.clone();
             let observe_sink = self.cfg.observe_sink.clone();
+            let inject_refresher = self.cfg.inject_refresher.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle(
                     stream,
@@ -182,6 +189,7 @@ impl Proxy {
                     server_cfg,
                     client_cfg,
                     observe_sink,
+                    inject_refresher,
                 )
                 .await
                 {
@@ -217,6 +225,7 @@ async fn handle(
     server_cfg: Arc<rustls::ServerConfig>,
     client_cfg: Arc<rustls::ClientConfig>,
     observe_sink: Option<crate::observe::ObserveSink>,
+    inject_refresher: Option<Arc<dyn InjectRefresher>>,
 ) -> Result<(), HandleError> {
     let guest_ip = match peer.ip() {
         IpAddr::V4(v4) => v4,
@@ -237,6 +246,23 @@ async fn handle(
     // tcp/443). The port the upstream listens on is the same.
     let port = original_dst.map(|(_, p)| p).unwrap_or(443);
 
+    // WS4 (campaign C2 audit — empty-body-looks-like-204 hazard): every reject
+    // path below closes the connection WITHOUT writing any HTTP bytes to the
+    // guest — `Reject` before any TLS at all, `RequestRejected`/`GraphqlRejected`
+    // after the guest-side TLS handshake but before a single response byte. The
+    // guest's HTTP client sees an unambiguous connection close (curl: "empty
+    // reply from server"; gh: transport error), NEVER a synthesized 2xx/204. And
+    // the intercept path streams the upstream response VERBATIM
+    // (`copy_bidirectional` / `pump_and_observe` — no status/body synthesis), so a
+    // real upstream 401 reaches the guest AS a 401. Therefore the campaign's
+    // "branch DELETE returned an empty body indistinguishable from 204 while the
+    // branch survived" was NOT produced here: the DELETE matched its inject policy
+    // (a permitted write), so it was forwarded with the boot-time injected token
+    // that had gone stale ~1h in — GitHub 401'd it, and `gh`'s own handling
+    // rendered that 401 as an empty body. The root cause is the stale token, fixed
+    // by the TTL-aware re-mint above (`InjectEntry::refresh_if_stale`), not a
+    // proxy-synthesized success. No proxy-side fix is warranted; do NOT add a path
+    // here that forwards or synthesizes an empty success-shaped reply.
     match session.decide(&sni) {
         Decision::Reject => {
             tracing::info!(
@@ -276,6 +302,7 @@ async fn handle(
                 &observes,
                 session.session_id,
                 observe_sink.as_ref(),
+                inject_refresher.as_deref(),
                 server_cfg,
                 client_cfg,
             )

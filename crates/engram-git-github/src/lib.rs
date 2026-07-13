@@ -366,6 +366,36 @@ impl GitHubApp {
         let id = self.installation_id(owner).await?;
         let jwt = self.app_jwt()?;
         let url = format!("{}/app/installations/{}/access_tokens", self.base_url, id);
+        // WS4 (422 clamp alignment): request the clamped set UP FRONT so the
+        // steady state doesn't pay a 422 + retry on every mint/resume (a WARN was
+        // observed on every campaign resume). The installation's actual grant is
+        // cached per owner — populated here, or by the 422 fallback below on a
+        // cold miss — so only the FIRST mint per owner pays the extra installation
+        // GET; subsequent mints clamp from cache and never 422. Best-effort: an
+        // unknown grant (lookup failed) or an all-or-nothing clamp (empty / no
+        // change) leaves the request as-is and the 422 fallback still covers it —
+        // preserving the historical "surface the original 422" behaviour when the
+        // App grants nothing requested.
+        let permissions = if permissions.is_empty() {
+            permissions
+        } else {
+            match self.installation_permissions(owner, id).await {
+                Ok(granted) if !granted.is_empty() => {
+                    let (clamped, dropped) = clamp_permissions(&permissions, &granted);
+                    if clamped.is_empty() || clamped == permissions {
+                        permissions // nothing safely clampable — let the request/422 fallback decide
+                    } else {
+                        tracing::debug!(
+                            owner = owner.unwrap_or("<default>"),
+                            dropped = ?dropped,
+                            "github mint: clamped requested permissions to the App's grant up front",
+                        );
+                        clamped
+                    }
+                }
+                _ => permissions, // unknown grant — request as-is; 422 fallback covers it
+            }
+        };
         // Permissions are computed from the bound caps; an empty set (a
         // capability-less profile) falls back to the historical default scopes
         // so existing forge-bound sessions are unaffected. `repositories` is

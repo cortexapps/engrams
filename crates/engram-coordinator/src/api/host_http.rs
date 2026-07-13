@@ -1245,6 +1245,69 @@ pub async fn integration_asset_ingest(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ---- POST /api/hosts/:id/sessions/:session_id/inject/refresh (WS4) ----
+
+#[derive(Deserialize)]
+pub struct RefreshInjectRequest {
+    /// The mint provider whose credential to re-mint (e.g. `"github"`) — the
+    /// value the egress proxy stored on the inject entry at boot.
+    pub mint_provider: String,
+}
+
+#[derive(Serialize)]
+pub struct RefreshInjectResponse {
+    /// The header the credential renders into (unchanged across a refresh, but
+    /// returned so the proxy needn't assume the scheme).
+    pub header_name: String,
+    /// The freshly rendered header value (e.g. `Bearer ghs_…`) — the proxy
+    /// substitutes it verbatim. Host-side only; never reaches the guest.
+    pub secret: String,
+    /// When the new credential expires (drives the proxy's next refresh).
+    pub expires_at: DateTime<Utc>,
+}
+
+/// WS4: the egress proxy's minted inject credential (a GitHub App installation
+/// token, ~1h TTL) is nearing expiry on a long-lived session. Re-mint it against
+/// the session's bound capabilities — the same scope `resolve_inject_entries`
+/// used at boot — and hand back the fresh header + TTL. This closes the
+/// campaign's reads-401/writes-succeed asymmetry: the boot-time inject token was
+/// minted ONCE and went stale ~1h later while the askpass write path re-minted
+/// per call. Fail-loud (4xx/5xx) so the proxy keeps the stale secret rather than
+/// injecting an empty header; the mint itself is cached + single-flighted
+/// server-side (`GitHubApp::mint_basic`), so a refresh burst re-mints once.
+pub async fn refresh_inject(
+    State(state): State<SharedState>,
+    Path((host_id, session_id)): Path<(HostId, SessionId)>,
+    Json(req): Json<RefreshInjectRequest>,
+) -> Result<Json<RefreshInjectResponse>, ApiError> {
+    if req.mint_provider.is_empty() {
+        return Err(ApiError::BadRequest(
+            "mint_provider is required for an inject refresh".into(),
+        ));
+    }
+    let (header, expires_at) =
+        crate::session_boot::refresh_inject_header(&state, session_id, &req.mint_provider)
+            .await
+            .ok_or_else(|| {
+                ApiError::Internal(format!(
+                    "inject refresh for provider {} on session {session_id} could not be minted",
+                    req.mint_provider
+                ))
+            })?;
+    tracing::debug!(
+        %host_id,
+        %session_id,
+        provider = %req.mint_provider,
+        %expires_at,
+        "re-minted egress inject credential for the proxy",
+    );
+    Ok(Json(RefreshInjectResponse {
+        header_name: header.name,
+        secret: header.value,
+        expires_at,
+    }))
+}
+
 // ---- POST /api/hosts/:id/live-manifest (ADR 0016 Phase B) ----
 
 #[derive(Deserialize)]

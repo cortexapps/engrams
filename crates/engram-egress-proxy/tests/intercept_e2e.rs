@@ -22,8 +22,8 @@ use engram_egress_proxy::intercept::{
 use engram_egress_proxy::observe::{ObserveSink, ObservedAsset};
 use engram_egress_proxy::policy::HostList;
 use engram_egress_proxy::registry::{
-    GraphqlMatch, GraphqlOperation, InjectEntry, ObserveEntry, RequestPolicy, SecretEntry,
-    SuccessRule,
+    GraphqlMatch, GraphqlOperation, InjectEntry, InjectRefresher, ObserveEntry, RefreshableCred,
+    RefreshedInject, RequestPolicy, SecretEntry, SuccessRule,
 };
 use engram_egress_proxy::resolver::StaticResolver;
 use parking_lot::Mutex;
@@ -81,7 +81,6 @@ async fn tls_client_to(
 // fake-upstream, adding `DD-API-KEY: <secret>`.
 fn inject_entry(secret: &str, methods: &[&str], paths: &[&str]) -> InjectEntry {
     InjectEntry {
-        secret: secret.into(),
         header_name: "DD-API-KEY".into(),
         header_template: "{}".into(),
         allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
@@ -90,6 +89,8 @@ fn inject_entry(secret: &str, methods: &[&str], paths: &[&str]) -> InjectEntry {
             path_globs: paths.iter().map(|s| s.to_string()).collect(),
             graphql: None,
         },
+        mint_provider: String::new(),
+        cred: engram_egress_proxy::RefreshableCred::new(secret.into(), None),
     }
 }
 
@@ -187,6 +188,7 @@ async fn substitutes_placeholder_in_intercept_path() {
             &[],
             SessionId::new(),
             None,
+            None, // WS4: no inject refresher in this test
             server_cfg_for_task,
             client_cfg_for_task,
         )
@@ -282,6 +284,7 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
             &[],
             SessionId::new(),
             None,
+            None, // WS4: no inject refresher in this test
             server_cfg,
             client_cfg,
         )
@@ -358,6 +361,7 @@ async fn injects_header_on_allowed_request() {
             &[],
             SessionId::new(),
             None,
+            None, // WS4: no inject refresher in this test
             server_cfg,
             client_cfg,
         )
@@ -426,6 +430,7 @@ async fn rejects_request_shape_outside_policy() {
             &[],
             SessionId::new(),
             None,
+            None, // WS4: no inject refresher in this test
             server_cfg,
             client_cfg,
         )
@@ -454,6 +459,170 @@ async fn rejects_request_shape_outside_policy() {
     assert!(
         captured.lock().is_empty(),
         "upstream must see nothing when the request shape is rejected",
+    );
+}
+
+// WS4 (campaign C2 regression): a rejected request must NEVER surface to the
+// guest as an empty success-shaped response. The reject path closes the
+// connection, so the guest reads ZERO bytes (an unambiguous transport failure)
+// — not a synthesized `HTTP/1.1 204`/`200` with an empty body that a stale-token
+// branch DELETE could be mistaken for succeeding. (The stale-token root cause is
+// fixed by the TTL-aware re-mint; this pins the shape invariant regardless.)
+#[tokio::test]
+async fn reject_writes_no_response_to_the_guest() {
+    let ca = ca();
+    let mint = Arc::new(CertMint::new(ca.clone()));
+    let server_cfg = build_server_config(mint);
+    let client_cfg = build_client_config();
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
+
+    // Only GET /api/v2/logs* is allowed; the guest attempts a DELETE (the
+    // campaign's stale-token branch-delete shape) — matches no policy → rejected.
+    let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs*"]);
+    let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
+    let proxy_task = tokio::spawn(async move {
+        let injects: Vec<&InjectEntry> = vec![&inj];
+        intercept::run(
+            proxy_from_client,
+            Vec::new(),
+            "fake-upstream",
+            upstream_addr.port(),
+            resolver,
+            &[],
+            &injects,
+            &[],
+            SessionId::new(),
+            None,
+            None,
+            server_cfg,
+            client_cfg,
+        )
+        .await
+    });
+
+    let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
+    tls_client
+        .write_all(
+            b"DELETE /repos/o/r/git/refs/heads/x HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    tls_client.flush().await.unwrap();
+
+    // Read whatever the guest gets before the connection closes.
+    let mut resp = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tls_client.read_to_end(&mut resp),
+    )
+    .await;
+
+    let outcome = proxy_task.await.unwrap();
+    assert!(
+        matches!(outcome, Err(InterceptError::RequestRejected { .. })),
+        "expected RequestRejected, got: {outcome:?}",
+    );
+    assert!(
+        resp.is_empty(),
+        "reject must write NO response to the guest (no synthesized 2xx/204); got: {:?}",
+        String::from_utf8_lossy(&resp),
+    );
+    assert!(
+        captured.lock().is_empty(),
+        "upstream must see nothing on reject"
+    );
+}
+
+// WS4: a minted inject entry within 5 min of expiry is re-minted via the
+// refresher BEFORE injection, so the upstream sees the FRESH token — not the
+// stale boot-time one. This is the end-to-end proof of the reads-401 fix.
+struct FreshRefresher;
+
+#[async_trait::async_trait]
+impl InjectRefresher for FreshRefresher {
+    async fn refresh(&self, _s: SessionId, _p: &str) -> Option<RefreshedInject> {
+        Some(RefreshedInject {
+            secret: "fresh-token".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        })
+    }
+}
+
+#[tokio::test]
+async fn near_expiry_inject_is_reminted_before_forwarding() {
+    let ca = ca();
+    let mint = Arc::new(CertMint::new(ca.clone()));
+    let server_cfg = build_server_config(mint);
+    let client_cfg = build_client_config();
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
+
+    // A minted github inject whose token expires in 2 min — inside the 5-min
+    // refresh window, so `intercept::run` re-mints it via the refresher first.
+    let inj = InjectEntry {
+        header_name: "Authorization".into(),
+        header_template: "Bearer {}".into(),
+        allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
+        policy: RequestPolicy {
+            methods: vec!["GET".into()],
+            path_globs: vec!["/user".into()],
+            graphql: None,
+        },
+        mint_provider: "github".into(),
+        cred: RefreshableCred::new(
+            "stale-token".into(),
+            Some(chrono::Utc::now() + chrono::Duration::minutes(2)),
+        ),
+    };
+    let refresher: Arc<dyn InjectRefresher> = Arc::new(FreshRefresher);
+    let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
+    let proxy_task = tokio::spawn(async move {
+        let injects: Vec<&InjectEntry> = vec![&inj];
+        intercept::run(
+            proxy_from_client,
+            Vec::new(),
+            "fake-upstream",
+            upstream_addr.port(),
+            resolver,
+            &[],
+            &injects,
+            &[],
+            SessionId::new(),
+            None,
+            Some(refresher.as_ref()),
+            server_cfg,
+            client_cfg,
+        )
+        .await
+    });
+
+    let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
+    tls_client
+        .write_all(b"GET /user HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 0\r\n\r\n")
+        .await
+        .unwrap();
+    tls_client.flush().await.unwrap();
+    let mut buf = [0u8; 1024];
+    let _ = tls_client.read(&mut buf).await;
+    // Close the client half so the proxy's `copy_bidirectional` sees EOF and the
+    // task completes (same choreography the substitution test uses).
+    let _ = tls_client.shutdown().await;
+    drop(tls_client);
+
+    let _ = proxy_task.await.unwrap();
+    let seen = String::from_utf8_lossy(&captured.lock()).to_string();
+    assert!(
+        seen.contains("Authorization: Bearer fresh-token"),
+        "upstream must see the RE-MINTED token, got head: {seen:?}",
+    );
+    assert!(
+        !seen.contains("stale-token"),
+        "the stale boot-time token must never reach upstream",
     );
 }
 
@@ -563,6 +732,7 @@ async fn observes_response_and_emits_asset() {
             &observes,
             session_id,
             Some(&sink),
+            None, // WS4: no inject refresher in this test
             server_cfg,
             client_cfg,
         )
@@ -663,6 +833,7 @@ async fn failed_status_emits_no_asset() {
             &observes,
             SessionId::new(),
             Some(&sink),
+            None, // WS4: no inject refresher in this test
             server_cfg,
             client_cfg,
         )
@@ -697,7 +868,6 @@ async fn failed_status_emits_no_asset() {
 /// injecting `Authorization: Bearer <secret>` (mirrors GitHub's mint plane).
 fn graphql_inject_entry(secret: &str, op: GraphqlOperation, field: &str) -> InjectEntry {
     InjectEntry {
-        secret: secret.into(),
         header_name: "Authorization".into(),
         header_template: "Bearer {}".into(),
         allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
@@ -709,6 +879,8 @@ fn graphql_inject_entry(secret: &str, op: GraphqlOperation, field: &str) -> Inje
                 field: field.into(),
             }),
         },
+        mint_provider: String::new(),
+        cred: engram_egress_proxy::RefreshableCred::new(secret.into(), None),
     }
 }
 
@@ -777,6 +949,7 @@ async fn run_graphql_inject(
             &[],
             SessionId::new(),
             None,
+            None, // WS4: no inject refresher in this test
             server_cfg,
             client_cfg,
         )
@@ -976,6 +1149,7 @@ async fn run_graphql_observe(
             &observes,
             SessionId::new(),
             Some(&sink),
+            None, // WS4: no inject refresher in this test
             server_cfg,
             client_cfg,
         )

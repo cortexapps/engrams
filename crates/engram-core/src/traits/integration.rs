@@ -57,6 +57,19 @@ pub enum ScopedCredential {
     },
 }
 
+impl ScopedCredential {
+    /// When this credential expires — the field every variant carries. WS4: the
+    /// egress inject plane threads this through so the proxy can re-mint a minted
+    /// credential (e.g. a GitHub App installation token) before it goes stale.
+    pub fn expires_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Basic { expires_at, .. }
+            | Self::Bearer { expires_at, .. }
+            | Self::AwsSts { expires_at, .. } => *expires_at,
+        }
+    }
+}
+
 /// What a credential is being minted for.
 ///
 /// `served_host` is the provider's OWN host identity (e.g. `github.com` — the

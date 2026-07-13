@@ -53,7 +53,9 @@ pub fn inject_headers(prefix: Vec<u8>, entries: &[&InjectEntry]) -> Vec<u8> {
     for e in entries {
         out.extend_from_slice(e.header_name.as_bytes());
         out.extend_from_slice(b": ");
-        out.extend_from_slice(e.header_template.replace("{}", &e.secret).as_bytes());
+        // WS4: read the CURRENT secret (the caller re-mints a near-expiry minted
+        // credential before this via `InjectEntry::refresh_if_stale`).
+        out.extend_from_slice(e.header_template.replace("{}", &e.secret()).as_bytes());
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(&prefix[insert_at..]);
@@ -103,11 +105,12 @@ mod tests {
 
     fn entry(header: &str, template: &str, secret: &str) -> InjectEntry {
         InjectEntry {
-            secret: secret.into(),
             header_name: header.into(),
             header_template: template.into(),
             allow: HostList::from_manifest(&["api.datadoghq.com".into()], &[]).unwrap(),
             policy: RequestPolicy::default(),
+            mint_provider: String::new(),
+            cred: crate::registry::RefreshableCred::new(secret.into(), None),
         }
     }
 

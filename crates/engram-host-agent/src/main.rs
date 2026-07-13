@@ -564,6 +564,10 @@ async fn main() -> Result<(), HostAgentError> {
         .clone()
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
     let observe_token = cfg.coordinator_token.clone();
+    // WS4: the egress proxy's inject refresher needs the same coord endpoint +
+    // token; capture them here too (before `cfg` moves into `HostAgent`).
+    let refresh_coord_url = observe_coord_url.clone();
+    let refresh_token = cfg.coordinator_token.clone();
 
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
         .with_chunk_store(chunk_store, materialize_dir)
@@ -617,7 +621,15 @@ async fn main() -> Result<(), HostAgentError> {
             }
         });
     });
-    match build_host_egress(&cli, Some(observe_sink)).await {
+    // WS4: the inject refresher — re-mints a near-expiry minted inject
+    // credential via the coord's inject-refresh route (mirrors the observe
+    // sink's coord bridge, but request/response since the proxy awaits it).
+    let inject_refresher: Arc<dyn engram_egress_proxy::InjectRefresher> =
+        Arc::new(engram_host_agent::egress::CoordInjectRefresher::new(
+            engram_host_agent::coord_client::CoordClient::new(refresh_coord_url, refresh_token),
+            host_id,
+        ));
+    match build_host_egress(&cli, Some(observe_sink), Some(inject_refresher)).await {
         Ok(egress) => agent = agent.with_egress(Arc::new(egress)),
         Err(e) => {
             tracing::error!(error = %e, "egress proxy spawn failed; aborting (egress filtering is mandatory)");
@@ -639,6 +651,7 @@ async fn main() -> Result<(), HostAgentError> {
 async fn build_host_egress(
     cli: &Cli,
     observe_sink: Option<engram_egress_proxy::ObserveSink>,
+    inject_refresher: Option<Arc<dyn engram_egress_proxy::InjectRefresher>>,
 ) -> Result<engram_host_agent::egress::HostEgress, String> {
     use std::sync::Arc;
     // Port 0 would bind an ephemeral port while the iptables REDIRECT
@@ -689,9 +702,15 @@ async fn build_host_egress(
     let dns_bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_dns_port)
         .parse()
         .map_err(|e| format!("parse dns bind addr: {e}"))?;
-    engram_host_agent::egress::HostEgress::spawn(source, bind, Some(dns_bind), observe_sink)
-        .await
-        .map_err(|e| e.to_string())
+    engram_host_agent::egress::HostEgress::spawn(
+        source,
+        bind,
+        Some(dns_bind),
+        observe_sink,
+        inject_refresher,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Parse the gRPC listen address from `ENGRAM_GRPC_LISTEN_ADDR`.
