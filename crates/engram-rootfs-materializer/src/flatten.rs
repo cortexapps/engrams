@@ -104,10 +104,28 @@ impl TreeMetadata {
     }
 
     /// Drop the record for `rel` and everything under it.
+    ///
+    /// O(log N + K) via a range walk — NOT `retain`. This runs before
+    /// EVERY regular-file/symlink/hardlink entry (`remove_entry`), so a
+    /// full-map `retain` here was O(N) per entry ⇒ O(N²) per flatten:
+    /// the ACTUAL dominant cost of a dev-brain-class flatten (millions
+    /// of entries ⇒ ~10^12 key comparisons ⇒ tens of minutes pinning
+    /// one core), misattributed to syscalls for two ADRs running.
+    /// `BTreeMap` keys are lexicographically ordered, so the subtree
+    /// `{rel}/…` is exactly the contiguous range starting at the
+    /// prefix.
     fn remove_subtree(&mut self, rel: &str) {
+        self.entries.remove(rel);
         let prefix = format!("{rel}/");
-        self.entries
-            .retain(|k, _| k != rel && !k.starts_with(&prefix));
+        let doomed: Vec<String> = self
+            .entries
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(prefix.as_str()))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &doomed {
+            self.entries.remove(k);
+        }
     }
 
     /// Apply the recorded uid/gid (and re-assert the mode — `chown`
@@ -211,8 +229,34 @@ pub struct Flattener {
     /// the scoped ancestor resolution — amortizes the per-entry
     /// ancestor lstat walk to ~zero. Invalidated (prefix-wide) by
     /// `remove_entry`, which every type-replacing write funnels
-    /// through.
-    resolve_cache: HashSet<String>,
+    /// through. A `BTreeSet` so invalidation is an O(log N + K) range
+    /// walk — a per-entry `retain` here would be the same O(N²)
+    /// pattern `TreeMetadata::remove_subtree` had.
+    resolve_cache: std::collections::BTreeSet<String>,
+    /// Every directory in the tree (tar-declared AND implied by
+    /// `ensure_parent`), tracked so `finish()` can stamp dir
+    /// mtimes/ownership in ONE in-memory-driven pass — folding the old
+    /// full-tree `clamp_mtimes` walk (44s of a dev-brain profile) into
+    /// bookkeeping we already do. Also feeds the entry-count hint.
+    dirs: std::collections::BTreeSet<String>,
+    /// Rounded byte accumulator for the packed-size hint — folds the
+    /// old `recursive_size` walk (~27s) into the write path. Coarse by
+    /// design: `recommended_size`'s 2× + 256 MiB banding absorbs the
+    /// block-size approximation.
+    tree_bytes_hint: u64,
+}
+
+/// What the flatten already knows at `finish()` that the pack stage
+/// used to re-derive with full-tree walks (count_entries,
+/// recursive_size) — ADR 0088 addendum round 2.
+#[derive(Clone, Copy, Debug)]
+pub struct FlattenStats {
+    /// Filesystem entries in the tree (files + dirs + symlinks;
+    /// hardlink names counted per-name) — the `-N` inode-count input.
+    pub entry_count_hint: u64,
+    /// Approximate on-disk bytes (lengths rounded to 4 KiB) — the
+    /// `recommended_size` input.
+    pub tree_bytes_hint: u64,
 }
 
 impl Flattener {
@@ -220,8 +264,24 @@ impl Flattener {
         Ok(Self {
             root: root.to_path_buf(),
             pool: WritePool::new(write_concurrency)?,
-            resolve_cache: HashSet::new(),
+            resolve_cache: std::collections::BTreeSet::new(),
+            dirs: std::collections::BTreeSet::new(),
+            tree_bytes_hint: 0,
         })
+    }
+
+    /// Register `rel`'s ancestor directories (and optionally `rel`
+    /// itself) in the dirs set — pure string work, no syscalls.
+    fn note_dirs(&mut self, rel: &str, include_self: bool) {
+        let mut end = 0usize;
+        while let Some(i) = rel[end..].find('/') {
+            end += i;
+            self.dirs.insert(rel[..end].to_string());
+            end += 1;
+        }
+        if include_self {
+            self.dirs.insert(rel.to_string());
+        }
     }
 
     /// Apply one layer tar onto the tree, updating `meta`. Layers must
@@ -314,12 +374,19 @@ impl Flattener {
                     std::fs::create_dir_all(&dst)?;
                     set_mode(&dst, mode)?;
                     apply_xattrs(&mut entry, &dst, &rel, meta)?;
+                    self.note_dirs(&rel, true);
                     meta.insert(rel.clone(), entry_meta);
                     created_this_layer.insert(rel);
                 }
                 EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
                     self.remove_entry(meta, &rel)?;
                     ensure_parent(&dst)?;
+                    self.note_dirs(&rel, false);
+                    self.tree_bytes_hint =
+                        self.tree_bytes_hint.saturating_add((size + 4095) & !4095);
+                    // Fold the old clamp_mtimes walk into the write: the
+                    // stamped time IS the clamped time (min(tar, epoch)).
+                    let mtime = mtime.min(crate::ext4::DETERMINISTIC_EPOCH_SECS);
                     // PAX xattrs are parsed reader-side (they borrow the
                     // entry); application is fd-scoped in the worker.
                     let xattrs = collect_xattrs(&mut entry)?;
@@ -331,11 +398,15 @@ impl Flattener {
                             let mut w = &f;
                             std::io::copy(&mut entry, &mut w)?;
                         }
-                        for skipped in parallel::finish_file_fd(&f, &rel, mode, mtime, &xattrs)
-                            .map_err(FlattenError::Io)?
-                        {
-                            meta.skipped_xattrs.push(skipped);
+                        let ownership =
+                            (!self.pool.ownership_denied()).then_some((uid as u32, gid as u32));
+                        let (skipped, denied) =
+                            parallel::finish_file_fd(&f, &rel, mode, mtime, ownership, &xattrs)
+                                .map_err(FlattenError::Io)?;
+                        if denied {
+                            self.pool.mark_ownership_denied();
                         }
+                        meta.skipped_xattrs.extend(skipped);
                     } else {
                         let mut bytes = Vec::with_capacity(size as usize);
                         entry.read_to_end(&mut bytes)?;
@@ -346,6 +417,8 @@ impl Flattener {
                             bytes,
                             mode,
                             mtime,
+                            uid: uid as u32,
+                            gid: gid as u32,
                             xattrs,
                         })?;
                     }
@@ -367,6 +440,25 @@ impl Flattener {
                     // resolve in the GUEST's namespace, e.g. /bin -> /usr/bin)
                     // and never dereferenced on the host by this crate.
                     std::os::unix::fs::symlink(&target, &dst)?;
+                    self.note_dirs(&rel, false);
+                    if !self.pool.ownership_denied() {
+                        match std::os::unix::fs::lchown(&dst, Some(uid as u32), Some(gid as u32)) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                                self.pool.mark_ownership_denied()
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    // Parity with the retired clamp walk: a symlink's
+                    // lmtime was its (wall-clock) creation time, always
+                    // newer than the epoch, so the clamp always landed
+                    // it AT the epoch.
+                    let epoch = filetime::FileTime::from_unix_time(
+                        crate::ext4::DETERMINISTIC_EPOCH_SECS as i64,
+                        0,
+                    );
+                    filetime::set_symlink_file_times(&dst, epoch, epoch)?;
                     meta.insert(rel.clone(), entry_meta);
                     created_this_layer.insert(rel);
                 }
@@ -397,6 +489,8 @@ impl Flattener {
                     }
                     self.remove_entry(meta, &rel)?;
                     ensure_parent(&dst)?;
+                    self.note_dirs(&rel, false);
+                    self.tree_bytes_hint = self.tree_bytes_hint.saturating_add(4096);
                     std::fs::hard_link(&target_abs, &dst)?;
                     // A hardlink shares the target's inode — record the
                     // target's identity so the sidecar stays consistent.
@@ -420,19 +514,73 @@ impl Flattener {
     }
 
     /// Join every worker; surface the first worker failure; fold the
-    /// fd-applied xattr refusals into `meta`. MUST complete (Ok) before
-    /// the ownership pass / mtime clamp / pack consume the tree.
-    pub fn finish(self, meta: &mut TreeMetadata) -> Result<(), FlattenError> {
-        match self.pool.finish() {
-            Ok(mut skipped) => {
+    /// fd-applied xattr refusals into `meta`; stamp every directory's
+    /// ownership + mtime from the in-memory dirs set (children are all
+    /// on disk once the pool is joined, so nothing bumps a dir after
+    /// its stamp) — the fold that retired the full-tree `clamp_mtimes`
+    /// and `apply_ownership` walks. MUST complete (Ok) before the pack
+    /// consumes the tree.
+    ///
+    /// Dir mtimes land AT the deterministic epoch — bit-parity with
+    /// the retired clamp (a dir's wall-clock mtime was always newer
+    /// than the epoch, so the clamp always landed it there).
+    pub fn finish(self, meta: &mut TreeMetadata) -> Result<FlattenStats, FlattenError> {
+        let denied = match self.pool.finish() {
+            Ok((mut skipped, denied)) => {
                 meta.skipped_xattrs.append(&mut skipped);
-                Ok(())
+                denied
             }
-            Err((rel, e)) => Err(FlattenError::Io(std::io::Error::new(
-                e.kind(),
-                format!("{rel}: {e}"),
-            ))),
+            Err((rel, e)) => {
+                return Err(FlattenError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("{rel}: {e}"),
+                )))
+            }
+        };
+        let epoch =
+            filetime::FileTime::from_unix_time(crate::ext4::DETERMINISTIC_EPOCH_SECS as i64, 0);
+        let mut ownership_denied = denied;
+        let mut implied_dirs = 0u64;
+        for dir in &self.dirs {
+            if meta.get(dir).is_none() {
+                implied_dirs += 1;
+            }
+            let p = self.root.join(dir);
+            if !ownership_denied {
+                if let Some(m) = meta.get(dir) {
+                    match std::os::unix::fs::lchown(&p, Some(m.uid as u32), Some(m.gid as u32)) {
+                        Ok(()) => {
+                            // lchown clears setuid/setgid — re-assert.
+                            set_mode(&p, m.mode)?;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            ownership_denied = true;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            match filetime::set_symlink_file_times(&p, epoch, epoch) {
+                Ok(()) => {}
+                // Replaced/removed by a later layer (dir → file/symlink).
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
+        // The tree root itself (the retired clamp stamped it too).
+        filetime::set_symlink_file_times(&self.root, epoch, epoch)?;
+        if ownership_denied {
+            tracing::warn!(
+                "unprivileged flatten: tree ownership recorded in the sidecar but not applied                  (uid/gid in the packed image will be the caller's); the host RPC runs as root                  and applies it for real"
+            );
+        }
+        Ok(FlattenStats {
+            entry_count_hint: meta.len() as u64 + implied_dirs,
+            tree_bytes_hint: self
+                .tree_bytes_hint
+                .saturating_add(4096 * (self.dirs.len() as u64 + 1)),
+        })
     }
 
     /// `remove_entry` + resolve-cache invalidation. EVERY namespace
@@ -440,9 +588,17 @@ impl Flattener {
     /// keeps the memoized not-a-symlink facts sound (a dir replaced by
     /// a symlink invalidates itself and everything beneath it).
     fn remove_entry(&mut self, meta: &mut TreeMetadata, rel: &str) -> std::io::Result<()> {
+        self.resolve_cache.remove(rel);
         let prefix = format!("{rel}/");
-        self.resolve_cache
-            .retain(|k| k != rel && !k.starts_with(&prefix));
+        let doomed: Vec<String> = self
+            .resolve_cache
+            .range(prefix.clone()..)
+            .take_while(|k| k.starts_with(prefix.as_str()))
+            .cloned()
+            .collect();
+        for k in &doomed {
+            self.resolve_cache.remove(k);
+        }
         remove_entry(&self.root, meta, rel)
     }
 
@@ -565,8 +721,8 @@ pub fn apply_layer<R: Read>(
     match (applied, finished) {
         // finish() holds the root cause when a worker failed mid-apply.
         (_, Err(e)) => Err(e),
-        (Err(e), Ok(())) => Err(e),
-        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(_)) => Err(e),
+        (Ok(()), Ok(_)) => Ok(()),
     }
 }
 
@@ -1302,6 +1458,8 @@ mod tests {
             bytes: b"data".to_vec(),
             mode: 0o644,
             mtime: 0,
+            uid: 0,
+            gid: 0,
             xattrs: Vec::new(),
         })
         .unwrap();
@@ -1353,6 +1511,64 @@ mod tests {
         std::fs::metadata("/proc/self")
             .map(|m| m.uid() == 0)
             .unwrap_or(false)
+    }
+
+    /// ADR 0088 addendum round 2: the clamp fold. Files land at
+    /// min(tar mtime, deterministic epoch) AT WRITE TIME; dirs
+    /// (tar-declared AND implied) and symlinks land AT the epoch at
+    /// finish() — the exact end state the retired full-tree
+    /// `clamp_mtimes` walk produced.
+    #[test]
+    fn mtimes_are_clamped_at_write_time_and_dirs_stamped_at_finish() {
+        use crate::ext4::DETERMINISTIC_EPOCH_SECS;
+        let old = 946_684_800u64; // 2000-01-01, older than the epoch
+        let new = DETERMINISTIC_EPOCH_SECS + 86_400; // newer than the epoch
+
+        let mut b = tar::Builder::new(Vec::new());
+        {
+            let mut add = |path: &str, mtime: u64, kind: tar::EntryType, body: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_mode(if matches!(kind, tar::EntryType::Directory) {
+                    0o755
+                } else {
+                    0o644
+                });
+                h.set_uid(0);
+                h.set_gid(0);
+                h.set_size(body.len() as u64);
+                h.set_mtime(mtime);
+                h.set_entry_type(kind);
+                b.append_data(&mut h, path, body).unwrap();
+            };
+            add("decl-dir/", old, tar::EntryType::Directory, b"");
+            add("decl-dir/old-file", old, tar::EntryType::Regular, b"a");
+            add("implied/dir/new-file", new, tar::EntryType::Regular, b"b");
+        }
+        let mut lb = LayerBuilder::new();
+        lb.tar = b;
+        let layer = lb.build();
+
+        let (root, _meta) = flatten_parallel(&[layer], 4);
+        let mt = |rel: &str| {
+            filetime::FileTime::from_last_modification_time(
+                &std::fs::symlink_metadata(root.path().join(rel)).unwrap(),
+            )
+            .unix_seconds() as u64
+        };
+        assert_eq!(mt("decl-dir/old-file"), old, "old file mtimes survive");
+        assert_eq!(
+            mt("implied/dir/new-file"),
+            DETERMINISTIC_EPOCH_SECS,
+            "newer-than-epoch file mtimes clamp at write time"
+        );
+        for d in ["decl-dir", "implied", "implied/dir"] {
+            assert_eq!(
+                mt(d),
+                DETERMINISTIC_EPOCH_SECS,
+                "dir {d} stamped at the epoch"
+            );
+        }
+        assert_eq!(mt(""), DETERMINISTIC_EPOCH_SECS, "tree root stamped");
     }
 
     /// The resolve memo must not serve a stale "not a symlink" fact

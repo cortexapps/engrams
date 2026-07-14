@@ -303,6 +303,55 @@ dev-brain class; small images (~1.5 min end-to-end) must not regress.
   capture block (a deflate failure destroys the restored VM instead of
   leaking it to the reconcile).
 
+### Rollout correction (2026-07-14): the flatten was never syscall-bound
+
+The first post-#663 dev-brain enable still spent 55+ min in flatten,
+one core busy, workers idle. Root cause — measured live, and present
+since ADR 0080: `TreeMetadata::remove_subtree` did a full-map `retain`
+on EVERY regular-file/symlink/hardlink entry (O(N) per entry ⇒ O(N²)
+per flatten; millions of entries ⇒ ~10^12 key comparisons on the
+reader thread). The "syscall-bound tiny-file creation" attribution the
+parallel-flatten work was built on was a misdiagnosis; the fd-worker
+pool is still correct (it removes real work from the reader) but the
+quadratic bookkeeping dominated everything. Fixed with an
+O(log N + K) BTreeMap range walk (and the same fix applied to #663's
+own `resolve_cache` invalidation, which had copied the retain
+pattern). Secondary finding from the same investigation: dev-brain's
+layers are ZSTD, so the zlib-rs inflate never fires — the C-backed
+`zstd` crate replaces `ruzstd` (measured 2.9x on synthetic decode,
+more on match-heavy real layers), unblocked by scoping the musl
+lane's UAPI-header injection to `-idirafter /opt/uapi` instead of
+glibc's entire `/usr/include`.
+
+### Rollout round 2 (2026-07-14): profile-driven — the walks, not the writes
+
+A samply CPU profile of the full dev-brain materialize on this branch
+(local run, 551,774 entries, 27.9 GiB ext4) showed the remaining cost
+was not where the logs implied:
+
+- C-zstd made layer decode ~2s of CPU for the whole image.
+- The write pool burned 37.9s of CPU in `Mutex::lock` — the shared
+  `Mutex<mpsc::Receiver>` dequeue, not file writes. → crossbeam's
+  lock-free Clone receiver.
+- The tree was re-walked FOUR times after being built — `clamp_mtimes`
+  (44s), `recursive_size` (~27s), `apply_ownership` (per-entry lchown
+  when root), `count_entries` (inside pack) — then walked a fifth time
+  to DELETE it (~40s), all on the critical path. → mtime clamp,
+  ownership, and byte/entry accounting now happen AT WRITE TIME
+  (workers fchown→fchmod→fsetxattr→futimens with the pre-clamped
+  mtime; dirs and symlinks stamped at the epoch from the in-memory
+  dirs set at `finish()`; `inject_init` stamps its own file); the
+  rootfs tree is renamed aside after pack and reaped in the
+  background, joined after the chunk stage. `count_entries` stays (a
+  cheap readdir-only walk inside the packer).
+
+Measured A/B on the identical image, same machine (post-pull
+pipeline): 373s → 214s. Sizing note: the write-time byte accounting
+rounds lengths to 4 KiB rather than measuring `st_blocks`, so the
+size hint runs a few percent high — absorbed by `recommended_size`'s
+2× + 256 MiB banding except for a ONE-TIME band step on this change
+(zero-filled, manifest-elided; no upload or storage cost).
+
 ### Future direction: a streaming packer
 
 The remaining materialize cost after this overhaul is structural: the

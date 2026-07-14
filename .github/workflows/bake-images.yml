@@ -214,7 +214,18 @@ jobs:
         # linux-libc-dev provides /usr/include/linux/*.h needed by
         # uffd-handler's transitive userfaultfd-sys build script; the musl
         # cross-gcc sysroot has no kernel uapi headers.
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools linux-libc-dev
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools linux-libc-dev
+          # Adversarial finding from the #663 rollout: injecting ALL of
+          # /usr/include poisons any real vendored-C build (zstd-sys) with
+          # glibc headers under a musl target. The shim only needs the
+          # KERNEL UAPI headers, which are libc-agnostic — stage exactly
+          # those in a scoped dir and reference it with -idirafter, so the
+          # musl sysroot's own headers always win and only genuinely
+          # missing ones (linux/*, asm*/*) fall through.
+          sudo mkdir -p /opt/uapi
+          sudo cp -r /usr/include/linux /usr/include/asm-generic /opt/uapi/
+          sudo cp -r /usr/include/x86_64-linux-gnu/asm /opt/uapi/asm
 
       - name: Build engram-host-agent + engram-uffd-handler (musl-static)
         env:
@@ -222,8 +233,8 @@ jobs:
           # kernel uapi headers so userfaultfd-sys finds <linux/types.h>.
           # uapi headers are libc-agnostic, so mixing them with the musl
           # sysroot is safe.
-          CFLAGS_x86_64_unknown_linux_musl: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
-          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+          CFLAGS_x86_64_unknown_linux_musl: "-idirafter /opt/uapi"
+          BINDGEN_EXTRA_CLANG_ARGS: "-idirafter /opt/uapi"
         run: |
           cargo build \
             --target x86_64-unknown-linux-musl \

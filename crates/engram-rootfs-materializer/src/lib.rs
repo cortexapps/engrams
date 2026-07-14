@@ -42,8 +42,8 @@ pub use ext4::{
     clamp_mtimes, recommended_size, recursive_size, Ext4Error, Ext4Packer, Mke2fsPacker,
 };
 pub use flatten::{
-    apply_layer, default_write_concurrency, ChannelReader, EntryMeta, FlattenError, Flattener,
-    SkippedXattr, TreeMetadata,
+    apply_layer, default_write_concurrency, ChannelReader, EntryMeta, FlattenError, FlattenStats,
+    Flattener, SkippedXattr, TreeMetadata,
 };
 pub use inject::{inject_init, InitInjection, Transport, DEFAULT_INIT_SHIM};
 pub use pull::{
@@ -291,91 +291,101 @@ impl Materializer {
         let flatten_consumer = {
             let rootfs = rootfs.clone();
             let progress = progress.clone();
-            tokio::task::spawn_blocking(move || -> Result<(TreeMetadata, u64), MaterializeError> {
-                let mut meta = TreeMetadata::default();
-                // One engine across all layers: the fd-scoped write pool
-                // and the memoized resolve cache are reused layer to layer.
-                let mut flattener =
-                    flatten::Flattener::new(&rootfs, flatten::default_write_concurrency())?;
-                let mut layer_result: Result<(), MaterializeError> = Ok(());
-                let mut applied = 0usize;
-                let mut flatten_busy_ms = 0u64;
-                while let Some(layer) = layer_rx.blocking_recv() {
-                    applied += 1;
-                    // Frame per layer (keepalive-coalesced coord-side;
-                    // never re-emits Pull after the first Flatten).
-                    if let Some(tx) = &progress {
-                        let _ = tx.try_send(engram_core::types::MaterializeProgress {
-                            stage: MaterializeStage::Flatten,
-                            detail: Some(format!(
+            tokio::task::spawn_blocking(
+                move || -> Result<(TreeMetadata, FlattenStats, u64), MaterializeError> {
+                    let mut meta = TreeMetadata::default();
+                    // One engine across all layers: the fd-scoped write pool
+                    // and the memoized resolve cache are reused layer to layer.
+                    let mut flattener =
+                        flatten::Flattener::new(&rootfs, flatten::default_write_concurrency())?;
+                    let mut layer_result: Result<(), MaterializeError> = Ok(());
+                    let mut applied = 0usize;
+                    let mut flatten_busy_ms = 0u64;
+                    while let Some(layer) = layer_rx.blocking_recv() {
+                        applied += 1;
+                        // Frame per layer (keepalive-coalesced coord-side;
+                        // never re-emits Pull after the first Flatten).
+                        if let Some(tx) = &progress {
+                            let _ = tx.try_send(engram_core::types::MaterializeProgress {
+                                stage: MaterializeStage::Flatten,
+                                detail: Some(format!(
                                 "layer {applied}/{layer_count}, {compressed_bytes} compressed bytes"
                             )),
-                            chunks_done: None,
-                            chunks_total: None,
-                        });
-                    }
-                    // Per-layer timing + entry delta: a slow layer with a
-                    // huge entry delta is syscall-bound tiny-file creation;
-                    // slow with a small delta is decompression.
-                    let layer_started = std::time::Instant::now();
-                    let entries_before = meta.len();
-                    let file = match std::fs::File::open(&layer.path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            layer_result = Err(e.into());
-                            break;
+                                chunks_done: None,
+                                chunks_total: None,
+                            });
                         }
-                    };
-                    let reader = std::io::BufReader::new(file);
-                    // Decompression runs on its own thread (ChannelReader)
-                    // so inflate overlaps the reader's syscall work.
-                    let decode = || -> Result<flatten::ChannelReader, std::io::Error> {
-                        let decoder: Box<dyn std::io::Read + Send> = match layer.compression {
-                            LayerCompression::Gzip => {
-                                Box::new(flate2::read::GzDecoder::new(reader))
+                        // Per-layer timing + entry delta: a slow layer with a
+                        // huge entry delta is syscall-bound tiny-file creation;
+                        // slow with a small delta is decompression.
+                        let layer_started = std::time::Instant::now();
+                        let entries_before = meta.len();
+                        let file = match std::fs::File::open(&layer.path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                layer_result = Err(e.into());
+                                break;
                             }
-                            LayerCompression::Zstd => Box::new(
-                                ruzstd::decoding::StreamingDecoder::new(reader)
-                                    .map_err(|e| std::io::Error::other(e.to_string()))?,
-                            ),
-                            LayerCompression::None => Box::new(reader),
                         };
-                        flatten::ChannelReader::spawn(decoder)
-                    };
-                    let piped = match decode() {
-                        Ok(p) => p,
-                        Err(e) => {
+                        let reader = std::io::BufReader::new(file);
+                        // Decompression runs on its own thread (ChannelReader)
+                        // so inflate overlaps the reader's syscall work.
+                        let decode = || -> Result<flatten::ChannelReader, std::io::Error> {
+                            let decoder: Box<dyn std::io::Read + Send> = match layer.compression {
+                                LayerCompression::Gzip => {
+                                    Box::new(flate2::read::GzDecoder::new(reader))
+                                }
+                                // C-backed zstd (ADR 0088 addendum rollout
+                                // fix): ruzstd's single-threaded pure-Rust
+                                // decode WAS the flatten bottleneck for
+                                // zstd-layered images — dev-brain's 3.5 GB
+                                // compressed layer held the fd-worker pool
+                                // idle behind it for tens of minutes.
+                                LayerCompression::Zstd => Box::new(
+                                    zstd::stream::read::Decoder::with_buffer(reader)
+                                        .map_err(std::io::Error::other)?,
+                                ),
+                                LayerCompression::None => Box::new(reader),
+                            };
+                            flatten::ChannelReader::spawn(decoder)
+                        };
+                        let piped = match decode() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                layer_result = Err(e.into());
+                                break;
+                            }
+                        };
+                        if let Err(e) = flattener.apply_layer(&mut meta, piped) {
                             layer_result = Err(e.into());
                             break;
                         }
-                    };
-                    if let Err(e) = flattener.apply_layer(&mut meta, piped) {
-                        layer_result = Err(e.into());
-                        break;
+                        tracing::debug!(
+                            digest = %layer.digest,
+                            compression = ?layer.compression,
+                            entries = meta.len() - entries_before,
+                            elapsed_ms = layer_started.elapsed().as_millis() as u64,
+                            "layer applied to tree"
+                        );
+                        flatten_busy_ms += layer_started.elapsed().as_millis() as u64;
+                        let _ = std::fs::remove_file(&layer.path);
                     }
-                    tracing::debug!(
-                        digest = %layer.digest,
-                        compression = ?layer.compression,
-                        entries = meta.len() - entries_before,
-                        elapsed_ms = layer_started.elapsed().as_millis() as u64,
-                        "layer applied to tree"
-                    );
-                    flatten_busy_ms += layer_started.elapsed().as_millis() as u64;
-                    let _ = std::fs::remove_file(&layer.path);
-                }
-                // Drain-close so a mid-flatten abort unblocks the driver's
-                // bounded send promptly.
-                layer_rx.close();
-                // Join the write pool BEFORE anything consumes the tree
-                // (ownership pass, clamp, pack). On a mid-layer abort,
-                // finish()'s error is the root cause (a worker failure
-                // echoes into the reader as a generic abort).
-                match (layer_result, flattener.finish(&mut meta)) {
-                    (_, Err(e)) => Err(e.into()),
-                    (Err(e), Ok(())) => Err(e),
-                    (Ok(()), Ok(())) => Ok((meta, flatten_busy_ms)),
-                }
-            })
+                    // Drain-close so a mid-flatten abort unblocks the driver's
+                    // bounded send promptly.
+                    layer_rx.close();
+                    // Join the write pool BEFORE anything consumes the tree.
+                    // finish() also stamps dir mtimes/ownership and returns
+                    // the entry/byte hints that retired the pack stage's
+                    // full-tree walks. On a mid-layer abort, finish()'s
+                    // error is the root cause (a worker failure echoes into
+                    // the reader as a generic abort).
+                    match (layer_result, flattener.finish(&mut meta)) {
+                        (_, Err(e)) => Err(e.into()),
+                        (Err(e), Ok(_)) => Err(e),
+                        (Ok(()), Ok(stats)) => Ok((meta, stats, flatten_busy_ms)),
+                    }
+                },
+            )
         };
 
         let (pull_join, flatten_join) = tokio::join!(pull_driver, flatten_consumer);
@@ -388,7 +398,7 @@ impl Materializer {
         let pull_ms = pull_join.map_err(|e| {
             MaterializeError::Io(std::io::Error::other(format!("pull task: {e}")))
         })??;
-        let (tree_meta, flatten_busy_ms) = flatten_result?;
+        let (tree_meta, flatten_stats, flatten_busy_ms) = flatten_result?;
         let pipeline_ms = pipeline_started.elapsed().as_millis() as u64;
         let (pulled, flatten_ms) = (resolved, flatten_busy_ms);
         tracing::info!(
@@ -398,6 +408,8 @@ impl Materializer {
             pipeline_ms,
             pull_ms,
             flatten_busy_ms,
+            entry_count_hint = flatten_stats.entry_count_hint,
+            tree_bytes_hint = flatten_stats.tree_bytes_hint,
             "flattened layers into tree (pipelined with pull)"
         );
         if !tree_meta.skipped_xattrs.is_empty() {
@@ -415,64 +427,50 @@ impl Materializer {
             );
         }
 
-        // 3. Inject the stage-1 init shim.
+        // 3. Inject the stage-1 init shim. Ownership + mtime clamping
+        // happened AT WRITE TIME inside the flatten (ADR 0088 addendum
+        // round 2: the old apply_ownership/clamp_mtimes full-tree walks
+        // — 44s + a per-entry lchown pass on a dev-brain profile — are
+        // folded into the write path; inject stamps its own file).
         inject::inject_init(&rootfs, &self.init).await?;
 
-        // 3b. Ownership: apply the tar-recorded uid/gid to the real
-        // tree (mke2fs -d copies ownership as-is). Root (the phase-3b
-        // host RPC) applies it for real; an unprivileged caller
-        // (tests, dev) gets PermissionDenied on the first foreign
-        // chown and degrades to recorded-only — the same limitation
-        // the retiring docker-export bake had.
-        let ownership_started = std::time::Instant::now();
-        {
-            let rootfs_c = rootfs.clone();
-            let result = tokio::task::spawn_blocking(move || tree_meta.apply_ownership(&rootfs_c))
-                .await
-                .map_err(|e| {
-                    MaterializeError::Io(std::io::Error::other(format!("chown task: {e}")))
-                })?;
-            match result {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    tracing::warn!(
-                        "unprivileged materialize: tree ownership recorded in the sidecar but \
-                         not applied (uid/gid in the packed image will be the caller's); the \
-                         host RPC runs as root and applies it for real"
-                    );
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        let ownership_ms = ownership_started.elapsed().as_millis() as u64;
-
-        // 4. Deterministic pack: clamp mtimes, then mke2fs.
+        // 4. Deterministic pack. The size input comes from the
+        // flatten's byte accounting (the old `recursive_size` walk —
+        // ~27s of readdir+lstat on a dev-brain tree — retired);
+        // `recommended_size`'s 2x + 256 MiB banding absorbs the
+        // rounded-length approximation.
         report(MaterializeStage::Pack, None);
-        let clamp_started = std::time::Instant::now();
-        {
-            let rootfs_c = rootfs.clone();
-            tokio::task::spawn_blocking(move || ext4::clamp_mtimes(&rootfs_c))
-                .await
-                .map_err(|e| {
-                    MaterializeError::Io(std::io::Error::other(format!("clamp task: {e}")))
-                })??;
-        }
-        let clamp_ms = clamp_started.elapsed().as_millis() as u64;
-        let dir_size = ext4::recursive_size(&rootfs).await?;
+        let dir_size = flatten_stats.tree_bytes_hint;
         let ext4_path = work.join("rootfs.ext4");
         let fs_size = ext4::recommended_size(dir_size);
         tracing::info!(
             image = %image_uri,
             dir_size_bytes = dir_size,
+            entry_count_hint = flatten_stats.entry_count_hint,
             ext4_size_bytes = fs_size,
             "packing flattened tree to ext4"
         );
         let pack_started = std::time::Instant::now();
         self.packer.pack(&rootfs, &ext4_path, fs_size).await?;
         let pack_ms = pack_started.elapsed().as_millis() as u64;
-        // The tree served its purpose — free it before chunking so the
-        // scratch peak drops to just the ext4.
-        let _ = tokio::fs::remove_dir_all(&rootfs).await;
+        // The tree served its purpose. Deleting 500k+ files cost ~40s
+        // ON the critical path — rename it aside (instant) and reap it
+        // in the background, joined after the chunk stage so scratch
+        // hygiene stays deterministic before return.
+        let doomed = work.join(format!("rootfs.doomed-{}", uuid::Uuid::new_v4().simple()));
+        let tree_reaper = match tokio::fs::rename(&rootfs, &doomed).await {
+            Ok(()) => {
+                let doomed = doomed.clone();
+                Some(tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(&doomed);
+                }))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "rootfs rename-aside failed; deleting inline");
+                let _ = tokio::fs::remove_dir_all(&rootfs).await;
+                None
+            }
+        };
         let ext4_size_bytes = tokio::fs::metadata(&ext4_path).await?.len();
         report(
             MaterializeStage::Chunk,
@@ -508,6 +506,11 @@ impl Materializer {
             )
             .await?;
         let chunk_ms = chunk_started.elapsed().as_millis() as u64;
+        // Background tree deletion overlapped the chunk stage; join it
+        // so the scratch guard's final scrub never races a live reaper.
+        if let Some(reaper) = tree_reaper {
+            let _ = reaper.await;
+        }
         let disk_manifest = manifest.content_ref();
         match chunk_store.get_manifest(disk_manifest).await {
             Ok(_) => {
@@ -530,8 +533,6 @@ impl Materializer {
             ext4_size_bytes,
             pull_ms,
             flatten_ms,
-            ownership_ms,
-            clamp_ms,
             pack_ms,
             chunk_ms,
             chunk_scan_ms = (chunk_stats.scan_seconds * 1000.0) as u64,

@@ -385,6 +385,29 @@ pub async fn inject_init(
         }
     }
 
+    // ADR 0088 addendum round 2: the post-flatten `clamp_mtimes` walk
+    // that used to normalize this write is retired — the shim (and the
+    // dirs its creation touched) must land at the deterministic epoch
+    // itself, or the packed ext4 bytes vary run to run.
+    let epoch = filetime::FileTime::from_unix_time(crate::ext4::DETERMINISTIC_EPOCH_SECS as i64, 0);
+    let stamp = |p: std::path::PathBuf| async move {
+        tokio::task::spawn_blocking(move || filetime::set_symlink_file_times(&p, epoch, epoch))
+            .await
+            .map_err(std::io::Error::other)?
+    };
+    stamp(init_dst.clone()).await?;
+    let mut dir = init_dst.parent();
+    while let Some(d) = dir {
+        if !d.starts_with(rootfs_dir) || d == rootfs_dir.parent().unwrap_or(rootfs_dir) {
+            break;
+        }
+        stamp(d.to_path_buf()).await?;
+        if d == rootfs_dir {
+            break;
+        }
+        dir = d.parent();
+    }
+
     Ok(())
 }
 
