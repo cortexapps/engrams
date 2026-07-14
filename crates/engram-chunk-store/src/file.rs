@@ -145,7 +145,9 @@ impl ChunkStore {
             SPARSE_RECHUNK_CONCURRENCY * 2,
         );
         let std_file = file.into_std().await;
-        tokio::task::spawn_blocking(move || read_nonzero_chunks(std_file, total_bytes, chunk_size, &tx));
+        tokio::task::spawn_blocking(move || {
+            read_nonzero_chunks(std_file, total_bytes, chunk_size, &tx)
+        });
 
         let mut window: Vec<(u64, Bytes)> = Vec::with_capacity(SPARSE_RECHUNK_CONCURRENCY);
         loop {

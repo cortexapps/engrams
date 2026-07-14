@@ -323,11 +323,7 @@ async fn survivor_chain_rehydrates_across_a_roll_and_torn_captures_fall_back_to_
     pooled_c.destroy(restored).await.expect("destroy restored");
 }
 
-async fn plant_marker(
-    backend: &Arc<PooledBackend>,
-    id: engram_core::SandboxId,
-    n: u32,
-) -> String {
+async fn plant_marker(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, n: u32) -> String {
     let out = exec(
         backend,
         id,

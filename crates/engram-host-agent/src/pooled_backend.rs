@@ -5247,7 +5247,10 @@ pub(crate) async fn chunk_memory_to_store(
         .await;
     let outcome = if res.is_ok() { "success" } else { "error" };
     if let Ok((_, stats)) = &res {
-        for (phase, seconds) in [("scan", stats.scan_seconds), ("upload", stats.flush_seconds)] {
+        for (phase, seconds) in [
+            ("scan", stats.scan_seconds),
+            ("upload", stats.flush_seconds),
+        ] {
             metrics::histogram!(
                 crate::metrics::RECHUNK_SECONDS,
                 "phase" => phase,
