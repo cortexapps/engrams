@@ -472,7 +472,6 @@ mod adapter {
         };
         use engram_harness_proto::{Answers, Question};
         use std::collections::{HashMap, HashSet};
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         use tokio::net::{UnixListener, UnixStream};
@@ -505,18 +504,15 @@ mod adapter {
         /// resume re-fires exactly one logical call. Owned by `run_engine` so
         /// the hook (which populates it) and the scrub (which drains it) share it.
         pub type DuplicateDeferredIds = Arc<Mutex<HashSet<String>>>;
-        /// Deferred generic calls awaiting a host result, tagged with the
-        /// turn, tool name, and claude process generation whose hook parked
-        /// them. Turn + name identify #64389 double-fires; the generation lets
-        /// delivery distinguish a still-alive original process from a later
-        /// respawn (ADR 0089 scenario C).
+        /// Deferred generic calls awaiting a host result, tagged with the turn
+        /// and tool name. Turn + name identify #64389 double-fires; every
+        /// result delivery resumes through the durable transcript regardless
+        /// of whether the process that parked the call is still alive.
         pub type DeferredCalls = Arc<Mutex<HashMap<String, DeferredCall>>>;
         pub struct DeferredCall {
             pub run_id: String,
             pub tool_name: String,
-            pub process_generation: u64,
         }
-        pub type ProcessGeneration = Arc<AtomicU64>;
 
         /// Session-scoped state shared by every transient hook connection.
         /// Bundling it makes the ownership boundary explicit and avoids a
@@ -532,7 +528,6 @@ mod adapter {
             pub manifest: Arc<ToolManifest>,
             pub results_in_hand: mcp_server::ResultsInHand,
             pub deferred_calls: DeferredCalls,
-            pub process_generation: ProcessGeneration,
         }
 
         /// hook → harness (request). One line.
@@ -584,7 +579,6 @@ mod adapter {
                 manifest,
                 results_in_hand,
                 deferred_calls,
-                process_generation,
             } = state;
             let (r, mut w) = stream.into_split();
             let mut lines = BufReader::new(r).lines();
@@ -643,8 +637,6 @@ mod adapter {
                                         DeferredCall {
                                             run_id: run_id.clone(),
                                             tool_name: name.to_string(),
-                                            process_generation: process_generation
-                                                .load(Ordering::SeqCst),
                                         },
                                     );
                                     (true, false)
@@ -1416,8 +1408,6 @@ mod adapter {
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let deferred_calls: hook_server::DeferredCalls =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let process_generation: hook_server::ProcessGeneration =
-            Arc::new(std::sync::atomic::AtomicU64::new(0));
         let tool_manifest = Arc::new(cli.tool_manifest.clone());
         let current_run_id: hook_server::CurrentRunId = Arc::new(tokio::sync::Mutex::new(None));
         // ADR 0054 Part C: narrate-past message-ids to scrub from claude's
@@ -1474,7 +1464,6 @@ mod adapter {
                         manifest: tool_manifest.clone(),
                         results_in_hand: results_in_hand.clone(),
                         deferred_calls: deferred_calls.clone(),
-                        process_generation: process_generation.clone(),
                     },
                 ));
                 Some(SockGuard {
@@ -1519,8 +1508,6 @@ mod adapter {
 
         loop {
             let spawned_at = Instant::now();
-            let generation =
-                process_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             match run_claude_session(
                 &cli,
                 &mut cmd_rx,
@@ -1532,7 +1519,6 @@ mod adapter {
                 &results_in_hand,
                 &parked_mcp_calls,
                 &deferred_calls,
-                generation,
                 &current_run_id,
                 &scrub_msg_ids,
                 &question_outstanding,
@@ -1698,10 +1684,10 @@ mod adapter {
         Respawn,
         /// claude could not be spawned at all. Back off and retry.
         SpawnFailed,
-        /// An AUQ answer, or a generic deferred result whose original claude
-        /// process is gone, is stashed before SIGINT so the deferred tool
-        /// re-fires id-stably on `--resume`. A sibling of `Respawn` that is
-        /// INTENTIONAL: no fast-crash backoff, no abnormal-exit System message.
+        /// An AUQ answer or generic deferred result is stashed before SIGINT so
+        /// the deferred tool re-fires id-stably on `--resume`. A sibling of
+        /// `Respawn` that is INTENTIONAL: no fast-crash backoff, no
+        /// abnormal-exit System message.
         ResumeForDeferred,
     }
 
@@ -1816,7 +1802,6 @@ mod adapter {
         results_in_hand: &mcp_server::ResultsInHand,
         parked_mcp_calls: &mcp_server::ParkedCalls,
         deferred_calls: &hook_server::DeferredCalls,
-        process_generation: u64,
         current_run_id: &hook_server::CurrentRunId,
         // ADR 0054 Part C: session-level set of narrate-past message-ids to
         // scrub from the transcript before the next answer-resume. Owned by
@@ -2090,6 +2075,22 @@ mod adapter {
                                         } else {
                                             Vec::new()
                                         };
+                                    let stale_result_names: HashMap<String, String> =
+                                        if stale_results.is_empty() {
+                                            HashMap::new()
+                                        } else {
+                                            let mut deferred = deferred_calls.lock().await;
+                                            stale_results
+                                                .iter()
+                                                .map(|(call_id, _)| {
+                                                    let tool_name = deferred
+                                                        .remove(call_id)
+                                                        .map(|call| call.tool_name)
+                                                        .unwrap_or_default();
+                                                    (call_id.clone(), tool_name)
+                                                })
+                                                .collect()
+                                        };
                                     if !stale.is_empty() || !stale_results.is_empty() {
                                         // ADR 0054: this is an answer-delivery
                                         // path the hook never reaches (claude
@@ -2109,12 +2110,6 @@ mod adapter {
                                         if !stale.is_empty() {
                                             *question_outstanding.lock().await = false;
                                         }
-                                        if !stale_results.is_empty() {
-                                            let mut deferred = deferred_calls.lock().await;
-                                            for (call_id, _) in &stale_results {
-                                                deferred.remove(call_id);
-                                            }
-                                        }
                                         if let Some(s) = stdin.as_mut() {
                                             let text = fallback_delivery_message(
                                                 &stale,
@@ -2131,6 +2126,31 @@ mod adapter {
                                                         run_id: ft.run_id.clone(),
                                                         tool_call_id,
                                                         answers,
+                                                    },
+                                                )
+                                                .await;
+                                            }
+                                            // The normal id-stable re-fire
+                                            // produces ToolCallCompleted when
+                                            // Claude streams its tool_result.
+                                            // This abandoned-re-fire fallback
+                                            // has no such stream event, so ack
+                                            // each drained result explicitly or
+                                            // its coordinator outbox row will
+                                            // redeliver forever.
+                                            for (tool_call_id, _) in stale_results {
+                                                emit(
+                                                    evt_tx,
+                                                    HarnessEvent::ToolCallCompleted {
+                                                        run_id: ft.run_id.clone(),
+                                                        tool_name: stale_result_names
+                                                            .get(&tool_call_id)
+                                                            .cloned()
+                                                            .unwrap_or_default(),
+                                                        tool_call_id,
+                                                        ok: true,
+                                                        duration_ms: 0,
+                                                        result_summary: None,
                                                     },
                                                 )
                                                 .await;
@@ -2301,96 +2321,31 @@ mod adapter {
                             break;
                         }
                         Some(HarnessCommand::ToolResult { call_id, result_json }) => {
-                            let deferred_generation = deferred_calls
-                                .lock()
-                                .await
-                                .get(&call_id)
-                                .map(|call| call.process_generation);
-                            if let Some(origin_generation) = deferred_generation {
-                                // Stash first: if live stdin delivery races a
-                                // process death, the next id-stable re-fire can
-                                // still consume the result through MCP.
-                                results_in_hand
-                                    .lock()
-                                    .await
-                                    .insert(call_id.clone(), result_json.clone());
-                                if origin_generation == process_generation {
-                                    // Scenario C, process-alive half. The exact
-                                    // deferred tool_use still exists in this
-                                    // claude process, so a stream-json
-                                    // tool_result resumes it without inference
-                                    // or a new tool_use_id.
-                                    if turn.is_none() {
-                                        turn = Some(
-                                            start_continuation_turn(
-                                                evt_tx,
-                                                cli,
-                                                current_run_id,
-                                            )
-                                            .await,
-                                        );
-                                    }
-                                    let delivered = match stdin.as_mut() {
-                                        Some(stdin) => write_tool_result(
-                                            stdin,
-                                            &call_id,
-                                            &result_json,
-                                        )
-                                        .await
-                                        .is_ok(),
-                                        None => false,
-                                    };
-                                    if delivered {
-                                        results_in_hand.lock().await.remove(&call_id);
-                                        deferred_calls.lock().await.remove(&call_id);
-                                        tracing::info!(%call_id, "delivered deferred tool result to live claude stdin");
-                                    } else {
-                                        tracing::warn!(%call_id, "live deferred delivery failed; resuming for id-stable re-fire");
-                                        resuming_for_deferred = true;
-                                        sigint_child(&child);
-                                        break;
-                                    }
-                                } else {
-                                    // The process that parked this call died.
-                                    // Kill the later no-result respawn and start
-                                    // one more `--resume` with the stash already
-                                    // present, so hook allow + MCP consumption
-                                    // cannot race result arrival.
-                                    tracing::info!(
-                                        %call_id,
-                                        origin_generation,
-                                        process_generation,
-                                        "deferred result arrived after claude respawn; resuming with result in hand"
-                                    );
-                                    resuming_for_deferred = true;
-                                    sigint_child(&child);
-                                    break;
-                                }
+                            let known_deferred =
+                                deferred_calls.lock().await.contains_key(&call_id);
+                            // A live parked MCP bridge is a synchronous call:
+                            // serve it in place. Deferred hooks never open the
+                            // bridge until their id-stable resume re-fire, so
+                            // every other result is stashed before SIGINT and
+                            // consumed only after transcript scrub + --resume.
+                            let delivered = mcp_server::route_tool_result(
+                                &call_id,
+                                result_json,
+                                parked_mcp_calls,
+                                results_in_hand,
+                            )
+                            .await;
+                            if delivered {
+                                tracing::debug!(%call_id, "served result to parked live MCP call");
                             } else {
-                                let delivered = mcp_server::route_tool_result(
-                                    &call_id,
-                                    result_json,
-                                    parked_mcp_calls,
-                                    results_in_hand,
-                                )
-                                .await;
-                                tracing::debug!(%call_id, delivered, "routed sync or early generic tool result");
-                                if !delivered {
-                                    // A fresh harness after idle eviction has
-                                    // no in-memory DeferredCall even though
-                                    // claude's durable transcript still owns
-                                    // this pending tool_use. route_tool_result
-                                    // stashed the result; respawn so --resume
-                                    // re-fires the id-stable call and consumes
-                                    // it through hook allow + MCP.
-                                    tracing::info!(
-                                        %call_id,
-                                        "generic tool result has no live owner; resuming with result in hand"
-                                    );
-                                    resuming_for_deferred = true;
-                                    sigint_child(&child);
-                                    break;
-                                }
+                                tracing::info!(
+                                    %call_id,
+                                    known_deferred,
+                                    "deferred or unowned tool result stashed; resuming for id-stable re-fire"
+                                );
+                                resuming_for_deferred = true;
+                                sigint_child(&child);
+                                break;
                             }
                         }
                         Some(HarnessCommand::EditQueued { prompt_id, text }) => {
@@ -2763,36 +2718,6 @@ mod adapter {
         let mut line = serde_json::to_string(&msg).expect("serialize user message");
         line.push('\n');
         stdin.write_all(line.as_bytes()).await?;
-        stdin.flush().await
-    }
-
-    /// Claude stream-json frame that resolves an already-proposed tool_use in
-    /// a still-alive process. The opaque protocol result remains a string in
-    /// Claude's content block; parsing it here would silently change scalar vs
-    /// object representation at the model boundary.
-    fn tool_result_message(call_id: &str, result_json: &str) -> Value {
-        serde_json::json!({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": call_id,
-                    "content": result_json,
-                }]
-            }
-        })
-    }
-
-    async fn write_tool_result(
-        stdin: &mut tokio::process::ChildStdin,
-        call_id: &str,
-        result_json: &str,
-    ) -> std::io::Result<()> {
-        let mut line = serde_json::to_vec(&tool_result_message(call_id, result_json))
-            .expect("tool result stream message contains only serializable values");
-        line.push(b'\n');
-        stdin.write_all(&line).await?;
         stdin.flush().await
     }
 
@@ -4790,8 +4715,6 @@ mod adapter {
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let deferred: hook_server::DeferredCalls =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            let generation: hook_server::ProcessGeneration =
-                Arc::new(std::sync::atomic::AtomicU64::new(1));
             let (evt_tx, evt_rx) = mpsc::channel::<HarnessEvent>(16);
             let listener = tokio::net::UnixListener::bind(&sock).unwrap();
             tokio::spawn(hook_server::serve(
@@ -4805,7 +4728,6 @@ mod adapter {
                     manifest: Arc::new(Vec::new()),
                     results_in_hand: results,
                     deferred_calls: deferred,
-                    process_generation: generation,
                 },
             ));
             (sock, answers, run_id, evt_rx, dup_ids)
@@ -4839,8 +4761,6 @@ mod adapter {
                 Arc::new(tokio::sync::Mutex::new(false));
             let duplicates: hook_server::DuplicateDeferredIds =
                 Arc::new(tokio::sync::Mutex::new(HashSet::new()));
-            let generation: hook_server::ProcessGeneration =
-                Arc::new(std::sync::atomic::AtomicU64::new(7));
             let (evt_tx, evt_rx) = mpsc::channel(16);
             let listener = tokio::net::UnixListener::bind(&sock).unwrap();
             tokio::spawn(hook_server::serve(
@@ -4854,7 +4774,6 @@ mod adapter {
                     manifest: Arc::new(manifest),
                     results_in_hand: results.clone(),
                     deferred_calls: pending.clone(),
-                    process_generation: generation,
                 },
             ));
             (sock, results, pending, evt_rx, duplicates)
@@ -5335,23 +5254,72 @@ mod adapter {
             path.to_string_lossy().into_owned()
         }
 
-        async fn write_deferred_alive_fake_claude(captured: &Path) -> String {
+        async fn write_deferred_alive_refire_fake_claude(counter: &Path) -> String {
             use std::os::unix::fs::PermissionsExt;
             let path =
                 std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
             let body = format!(
                 "#!/bin/sh\n\
+                 trap 'exit 0' INT TERM\n\
+                 n=0\n\
+                 if [ -f '{counter}' ]; then n=$(sed -n '1p' '{counter}'); fi\n\
+                 n=$((n + 1))\n\
+                 printf '%s\\n' \"$n\" > '{counter}'\n\
                  printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\n\
-                 IFS= read -r _prompt\n\
-                 sleep 0.3\n\
-                 printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-defer\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_alive\",\"name\":\"mcp__engrams__save_memory\",\"input\":{{\"text\":\"remember\"}}}}]}}}}'\n\
-                 printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"tool_deferred\"}}'\n\
-                 IFS= read -r delivered\n\
-                 printf '%s\\n' \"$delivered\" > '{captured}'\n\
-                 printf '%s\\n' '{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_alive\",\"content\":\"{{\\\"saved\\\":true}}\"}}]}}}}'\n\
-                 printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-after\",\"content\":[{{\"type\":\"text\",\"text\":\"continued alive\"}}]}}}}'\n\
-                 printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"completed\"}}'\n\
+                 if [ \"$n\" -eq 1 ]; then\n\
+                   IFS= read -r _prompt\n\
+                   sleep 0.3\n\
+                   printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-defer\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_alive\",\"name\":\"mcp__engrams__save_memory\",\"input\":{{\"text\":\"remember\"}}}}]}}}}'\n\
+                   printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"tool_deferred\"}}'\n\
+                 fi\n\
                  while IFS= read -r _line; do :; done\n",
+                counter = counter.display(),
+            );
+            tokio::fs::write(&path, body).await.unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        async fn write_deferred_fallback_fake_claude(counter: &Path, captured: &Path) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path =
+                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            // Branch on --resume in argv, NOT on a spawn counter: the engine
+            // SIGINTs the idle generation, which can die before a counter
+            // increment lands (observed flake). The init line carries a
+            // session_id so the engine can build the --resume respawn at all.
+            let body = format!(
+                "#!/bin/sh\n\
+                 trap 'exit 0' INT TERM\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-fallback\"}}'\n\
+                 case \"$*\" in\n\
+                 *--resume*)\n\
+                   printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-resumed\",\"content\":[{{\"type\":\"text\",\"text\":\"resumed without refire\"}}]}}}}'\n\
+                   printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"completed\"}}'\n\
+                   IFS= read -r delivered\n\
+                   printf '%s\\n' \"$delivered\" > '{captured}'\n\
+                   printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-fallback\",\"content\":[{{\"type\":\"text\",\"text\":\"got deferred result\"}}]}}}}'\n\
+                   printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"completed\"}}'\n\
+                   while IFS= read -r _l; do :; done\n\
+                   ;;\n\
+                 *)\n\
+                   n=0\n\
+                   if [ -f '{counter}' ]; then n=$(sed -n '1p' '{counter}'); fi\n\
+                   n=$((n + 1))\n\
+                   printf '%s\\n' \"$n\" > '{counter}'\n\
+                   if [ \"$n\" -eq 1 ]; then\n\
+                     IFS= read -r _prompt\n\
+                     sleep 0.3\n\
+                     printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-defer\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_fallback\",\"name\":\"mcp__engrams__save_memory\",\"input\":{{\"text\":\"remember\"}}}}]}}}}'\n\
+                     printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"tool_deferred\"}}'\n\
+                     exit 0\n\
+                   fi\n\
+                   while :; do sleep 0.2; done\n\
+                   ;;\n\
+                 esac\n",
+                counter = counter.display(),
                 captured = captured.display(),
             );
             tokio::fs::write(&path, body).await.unwrap();
@@ -5374,24 +5342,6 @@ mod adapter {
             cli.mcp_sock_path = Some(mcp.clone());
             cli.tool_manifest = vec![generic_tool("save_memory", ToolExecution::Deferred)];
             (cli, hook, mcp)
-        }
-
-        #[test]
-        fn deferred_tool_result_message_is_stream_json_user_content() {
-            assert_eq!(
-                tool_result_message("toolu_1", r#"{"saved":true}"#),
-                serde_json::json!({
-                    "type": "user",
-                    "message": {
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_1",
-                            "content": "{\"saved\":true}"
-                        }]
-                    }
-                })
-            );
         }
 
         #[tokio::test]
@@ -5607,11 +5557,11 @@ mod adapter {
         }
 
         #[tokio::test]
-        async fn deferred_result_with_live_process_injects_tool_result_on_stdin() {
-            let captured =
-                std::env::temp_dir().join(format!("fake-claude-stdin-{}", uuid::Uuid::new_v4()));
-            let script = write_deferred_alive_fake_claude(&captured).await;
-            let (cli, hook, _mcp) = deferred_engine_cli(script.clone(), "alive").await;
+        async fn deferred_result_with_live_process_resumes_and_serves_refire() {
+            let counter =
+                std::env::temp_dir().join(format!("fake-claude-count-{}", uuid::Uuid::new_v4()));
+            let script = write_deferred_alive_refire_fake_claude(&counter).await;
+            let (cli, hook, mcp) = deferred_engine_cli(script.clone(), "alive").await;
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (evt_tx, mut evt_rx) = mpsc::channel(64);
             let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
@@ -5648,33 +5598,37 @@ mod adapter {
                 })
                 .await
                 .unwrap();
-            let (_run, prompt_id) = expect_run_started_id(&mut evt_rx).await;
+            let (_run, prompt_id) =
+                tokio::time::timeout(Duration::from_secs(5), expect_run_started_id(&mut evt_rx))
+                    .await
+                    .expect("result for a live generation should trigger a continuation resume");
             assert_eq!(prompt_id, None, "delivery is a continuation, not a prompt");
-            // The fake echoes the injected result as normal Claude output.
-            loop {
-                match evt_rx.recv().await {
-                    Some(HarnessEvent::AgentMessage { text, .. }) if text == "continued alive" => {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if tokio::fs::read_to_string(&counter)
+                        .await
+                        .is_ok_and(|contents| contents.trim() == "2")
+                    {
                         break;
                     }
-                    Some(_) => {}
-                    None => panic!("engine event channel closed"),
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-            }
-            let delivered: Value = serde_json::from_slice(
-                &tokio::time::timeout(Duration::from_secs(2), tokio::fs::read(&captured))
-                    .await
-                    .expect("fake captures injected stdin")
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(delivered["type"], "user");
+            })
+            .await
+            .expect("the live process should be replaced for an id-stable refire");
+            assert!(matches!(
+                hook_fire_named(
+                    &hook,
+                    "toolu_alive",
+                    "mcp__engrams__save_memory",
+                    serde_json::json!({"text":"remember"}),
+                )
+                .await,
+                hook_server::HookVerdict::Allow
+            ));
             assert_eq!(
-                delivered["message"]["content"][0],
-                serde_json::json!({
-                    "type":"tool_result",
-                    "tool_use_id":"toolu_alive",
-                    "content":"{\"saved\":true}"
-                })
+                fire_main_mcp_call(&mcp, "toolu_alive").await["result_json"],
+                r#"{"saved":true}"#
             );
 
             cmd_tx
@@ -5686,6 +5640,122 @@ mod adapter {
                 .expect("engine exits")
                 .expect("engine task does not panic");
             let _ = tokio::fs::remove_file(script).await;
+            let _ = tokio::fs::remove_file(counter).await;
+        }
+
+        #[tokio::test]
+        async fn deferred_result_abandoned_refire_fallback_emits_completion() {
+            let nonce = uuid::Uuid::new_v4();
+            let counter = std::env::temp_dir().join(format!("fake-claude-count-{nonce}"));
+            let captured = std::env::temp_dir().join(format!("fake-claude-fallback-{nonce}"));
+            let script = write_deferred_fallback_fake_claude(&counter, &captured).await;
+            let (cli, hook, _mcp) = deferred_engine_cli(script.clone(), "fallback").await;
+            let (cmd_tx, cmd_rx) = mpsc::channel(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel(64);
+            let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p-fallback".into(),
+                    text: "remember this".into(),
+                })
+                .await
+                .unwrap();
+            let _ = expect_run_started(&mut evt_rx).await;
+            assert!(matches!(
+                hook_fire_named(
+                    &hook,
+                    "toolu_fallback",
+                    "mcp__engrams__save_memory",
+                    serde_json::json!({"text":"remember"}),
+                )
+                .await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::ToolCallRequested { call_id, .. })
+                    if call_id == "toolu_fallback"
+            ));
+
+            let mut idle_count = 0;
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while idle_count < 2 {
+                    if matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)) {
+                        idle_count += 1;
+                    }
+                }
+            })
+            .await
+            .expect("the dead deferred process should respawn before result delivery");
+
+            cmd_tx
+                .send(HarnessCommand::ToolResult {
+                    call_id: "toolu_fallback".into(),
+                    result_json: r#"{"saved":true}"#.into(),
+                })
+                .await
+                .unwrap();
+
+            let (_resume_run_id, prompt_id) =
+                tokio::time::timeout(Duration::from_secs(10), expect_run_started_id(&mut evt_rx))
+                    .await
+                    .expect("resume run for the delivered result never started");
+            assert_eq!(prompt_id, None, "delivery resume carries no prompt_id");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                expect_agent_message(&mut evt_rx, "resumed without refire"),
+            )
+            .await
+            .expect("resumed-without-refire message never arrived");
+            let _ =
+                tokio::time::timeout(Duration::from_secs(10), expect_run_completed(&mut evt_rx))
+                    .await
+                    .expect("abandoned resume run never completed");
+
+            let (fallback_run_id, prompt_id) =
+                tokio::time::timeout(Duration::from_secs(10), expect_run_started_id(&mut evt_rx))
+                    .await
+                    .expect("fallback delivery run never started");
+            assert_eq!(prompt_id, None, "fallback delivery is not a user prompt");
+            match evt_rx.recv().await {
+                Some(HarnessEvent::ToolCallCompleted {
+                    run_id,
+                    tool_call_id,
+                    tool_name,
+                    ok,
+                    duration_ms,
+                    result_summary,
+                }) => {
+                    assert_eq!(run_id, fallback_run_id);
+                    assert_eq!(tool_call_id, "toolu_fallback");
+                    assert_eq!(tool_name, "save_memory");
+                    assert!(ok);
+                    assert_eq!(duration_ms, 0);
+                    assert_eq!(result_summary, None);
+                }
+                other => panic!("expected fallback ToolCallCompleted ack, got {other:?}"),
+            }
+            expect_agent_message(&mut evt_rx, "got deferred result").await;
+            let delivered: Value =
+                serde_json::from_slice(&tokio::fs::read(&captured).await.unwrap()).unwrap();
+            assert!(delivered["message"]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("toolu_fallback") && text.contains("saved")));
+            let _ = expect_run_completed(&mut evt_rx).await;
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+            let _ = tokio::fs::remove_file(script).await;
+            let _ = tokio::fs::remove_file(counter).await;
             let _ = tokio::fs::remove_file(captured).await;
         }
 
