@@ -202,12 +202,13 @@ if kernel_key:
 # `just dev` normally brings up its own fake-gcs-server (compose,
 # profile `local-gcs`). But if another environment already has a
 # fake-gcs-server bound at STORAGE_EMULATOR_HOST, starting a second one
-# just collides on :4443 and the whole stack cascades to failure —
-# seed-buckets and the coordinator both resource_dep on it. So probe
-# the endpoint at parse time: if something answers, treat it as
-# external — skip our own container and point everything at the
-# existing one. Set ENGRAM_USE_EXTERNAL_GCS=1 to force this without the
-# probe (e.g. if the probe gives a false negative).
+# just collides on :4443 and the cold-tier setup cascades to failure.
+# seed-buckets resource_deps on it; the coordinator merely points its
+# GCS client at the endpoint and is deliberately not readiness-gated on
+# either resource. So probe the endpoint at parse time: if something
+# answers, treat it as external — skip our own container and point
+# everything at the existing one. Set ENGRAM_USE_EXTERNAL_GCS=1 to
+# force this without the probe (e.g. if the probe gives a false negative).
 # ----------------------------------------------------------------
 storage_emulator_host = env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443')
 gcs_external = env_or('ENGRAM_USE_EXTERNAL_GCS', '') in ('1', 'true', 'yes')
@@ -278,6 +279,12 @@ dc_resource('jaeger',
 # the bucket already exists, and ensures it does if it doesn't. When the
 # emulator is external it has no Tilt resource to gate on, so the dep is
 # dropped; otherwise it waits on our own container.
+#
+# Nothing in the control plane resource_deps on this one-shot. GCS client
+# construction is local and does not contact the emulator or inspect the
+# bucket, so a broken cold-tier setup must not block the coordinator,
+# orchestrator, or web development loops. Operations that actually need
+# blob storage still fail at their point of use until seeding succeeds.
 local_resource('seed-buckets',
     cmd=(
         'STORAGE_EMULATOR_HOST=' + storage_emulator_host + ' ' +
@@ -396,10 +403,11 @@ else:
 local_resource('coordinator',
     serve_cmd=coord_serve_cmd,
     serve_env=coord_env,
-    # fake-gcs-server is only a Tilt resource when we run our own; when
-    # it's external, seed-buckets (also gated below) carries the GCS dep.
-    resource_deps=(['postgres', 'registry', 'jaeger', 'seed-buckets'] +
-        ([] if gcs_external else ['fake-gcs-server'])),
+    # Blob setup is intentionally absent: GCS client construction does not
+    # contact the emulator or bucket. Keep the control plane available when
+    # fake-gcs-server/seed-buckets is unhealthy; only blob-using operations
+    # need those resources. Bundles independently gate the host-agent below.
+    resource_deps=['postgres', 'registry', 'jaeger'],
     # Tilt's HTTP probe opens a fresh loopback TCP connection per
     # tick AND issues an HTTP request that makes the server log it.
     # On macOS the closed sockets sit in TIME_WAIT for 2*MSL=30s
