@@ -256,61 +256,93 @@ pub async fn register(
     // (`build_resume_egress_policy`) and push it over the gRPC channel
     // registered above. Detached: inject resolution can round-trip a mint
     // provider, and the register response must not wait on it.
-    // Best-effort per survivor — a miss logs loudly and degrades to the
-    // pre-fix posture (egress dead until evict_local → resume recovers
-    // the session).
+    // Bounded-retry per survivor: registration races the host's own
+    // startup (the reattach pass populates guest endpoints; a mint
+    // provider can blip), so one fire-and-forget attempt could strand a
+    // survivor egress-less on a transient. Exhaustion logs loudly and
+    // degrades to the pre-fix posture (egress dead until evict_local →
+    // resume recovers the session).
     {
         let state = state.clone();
         let survivors = rehydrate_sandboxes.clone();
         let host_id = req.host_id;
         tokio::spawn(async move {
+            const ATTEMPTS: u32 = 5;
+            const RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(10);
             for s in survivors {
-                let session = match state.services.meta.get_session(s.session_id).await {
-                    Ok(sess) => sess,
-                    Err(e) => {
-                        tracing::warn!(
+                let mut done = false;
+                for attempt in 1..=ATTEMPTS {
+                    if attempt > 1 {
+                        tokio::time::sleep(RETRY_GAP).await;
+                    }
+                    let session = match state.services.meta.get_session(s.session_id).await {
+                        Ok(sess) => sess,
+                        Err(e) => {
+                            tracing::debug!(
+                                %host_id,
+                                session_id = %s.session_id,
+                                attempt,
+                                error = %e,
+                                "survivor egress re-push: session lookup failed",
+                            );
+                            continue;
+                        }
+                    };
+                    if session.sandbox_id != Some(s.sandbox_id) {
+                        done = true; // moved on since the register snapshot
+                        break;
+                    }
+                    let Some(policy) = crate::api::sessions::build_resume_egress_policy(
+                        &state,
+                        s.session_id,
+                        s.sandbox_id,
+                        &session.image,
+                    )
+                    .await
+                    else {
+                        // No guest IP yet (reattach still settling) or a
+                        // genuinely IP-less backend — retry either way;
+                        // the exhaustion log below is the verdict.
+                        tracing::debug!(
                             %host_id,
                             session_id = %s.session_id,
-                            error = %e,
-                            "survivor egress re-push: session lookup failed",
+                            sandbox_id = %s.sandbox_id,
+                            attempt,
+                            "survivor egress re-push: no guest IP / policy yet",
                         );
                         continue;
+                    };
+                    match state.services.host.apply_egress_policy(policy).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                %host_id,
+                                session_id = %s.session_id,
+                                sandbox_id = %s.sandbox_id,
+                                attempt,
+                                "survivor egress re-registered after host restart",
+                            );
+                            done = true;
+                            break;
+                        }
+                        Err(e) => tracing::debug!(
+                            %host_id,
+                            session_id = %s.session_id,
+                            sandbox_id = %s.sandbox_id,
+                            attempt,
+                            error = %e,
+                            "survivor egress re-push attempt failed",
+                        ),
                     }
-                };
-                if session.sandbox_id != Some(s.sandbox_id) {
-                    continue; // moved on since the register snapshot
                 }
-                let Some(policy) = crate::api::sessions::build_resume_egress_policy(
-                    &state,
-                    s.session_id,
-                    s.sandbox_id,
-                    &session.image,
-                )
-                .await
-                else {
+                if !done {
                     tracing::warn!(
                         %host_id,
                         session_id = %s.session_id,
                         sandbox_id = %s.sandbox_id,
-                        "survivor egress re-push: no guest IP / policy — survivor stays egress-less",
+                        attempts = ATTEMPTS,
+                        "survivor egress re-push exhausted its retries; survivor stays \
+                         egress-less (recover via evict_local → resume)",
                     );
-                    continue;
-                };
-                match state.services.host.apply_egress_policy(policy).await {
-                    Ok(()) => tracing::info!(
-                        %host_id,
-                        session_id = %s.session_id,
-                        sandbox_id = %s.sandbox_id,
-                        "survivor egress re-registered after host restart",
-                    ),
-                    Err(e) => tracing::warn!(
-                        %host_id,
-                        session_id = %s.session_id,
-                        sandbox_id = %s.sandbox_id,
-                        error = %e,
-                        "survivor egress re-push failed; survivor stays egress-less \
-                         (recover via evict_local → resume)",
-                    ),
                 }
             }
         });
