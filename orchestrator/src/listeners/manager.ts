@@ -158,6 +158,10 @@ export function makeProductionListenerManager(): ListenerManager {
           makeProductionSlackConsumer(),
         ],
         readPage: readSessionEventsBounded,
+        fetchStatus: async (id) => {
+          const response = await sessions.getSession({ sessionId: id });
+          return response.session?.status ?? "";
+        },
         openStream: async (id, since) => {
           const abort = new AbortController();
           const events = sessions.streamEvents(

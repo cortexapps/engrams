@@ -301,6 +301,41 @@ describe("SessionListener", () => {
     expect(await base.tryAcquire("session-1", "owner-2", 30_000)).toBe(false);
   });
 
+  test("a session already in a terminal status finishes with the mapped outcome without reading the log", async () => {
+    const rec = recordingConsumer();
+    const base = await acquiredLease();
+    let reads = 0;
+    const subject = await listener({
+      leaseStore: base,
+      fetchStatus: async () => "failed",
+      readPage: async () => {
+        reads++;
+        return page([], -1n);
+      },
+    }, [rec.consumer]);
+
+    await subject.run();
+
+    expect(reads).toBe(0);
+    expect(rec.terminals).toEqual(["failed"]);
+    expect(await base.listDesired()).toEqual([]);
+  });
+
+  test("a live status probe proceeds to normal delivery", async () => {
+    const rec = recordingConsumer();
+    const cursors = makeInMemoryCursorStore();
+    const subject = await listener({
+      fetchStatus: async () => "active",
+      readPage: async (_sessionId, after) =>
+        after < 1n ? page([event(0n), event(1n)], 1n, "completed") : page([], after),
+    }, [rec.consumer], cursors);
+
+    await subject.run();
+
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n]);
+    expect(rec.terminals).toEqual(["completed"]);
+  });
+
   test("a session unknown to the coordinator marks terminal and exits instead of retrying", async () => {
     const rec = recordingConsumer();
     const base = await acquiredLease();

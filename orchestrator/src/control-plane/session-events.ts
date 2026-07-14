@@ -176,6 +176,12 @@ function parseAssistantText(payloadJson: string): string | undefined {
   }
 }
 
+/** Map a session's CURRENT status (GetSession) to its terminal outcome, or
+ *  undefined while non-terminal. Same vocabulary as the event-log transition. */
+export function terminalOutcomeForStatus(status: string): TerminalOutcome | undefined {
+  return TERMINAL_OUTCOME[status];
+}
+
 /** Map a `status_changed` payload's `to` state to its terminal outcome, or
  *  undefined if `to` is not a terminal state. */
 export function parseTerminalOutcome(payloadJson: string): TerminalOutcome | undefined {

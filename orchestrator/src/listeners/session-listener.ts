@@ -3,6 +3,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import {
   curateWireEvent,
   parseTerminalOutcome,
+  terminalOutcomeForStatus,
   type BoundedRead,
   type CuratedEvent,
   type TerminalOutcome,
@@ -33,6 +34,10 @@ export interface SessionListenerDeps {
   consumers: SessionConsumer[];
   readPage(sessionId: string, after: bigint): Promise<BoundedRead>;
   openStream(sessionId: string, since: bigint): Promise<OpenedSessionStream>;
+  /** Current session status (GetSession), probed once at start: a session
+   * already in a terminal status finishes immediately — its event log may
+   * predate terminal status_changed events. */
+  fetchStatus?(sessionId: string): Promise<string>;
   sleep(ms: number): Promise<void>;
   queueCapacity?: number;
 }
@@ -154,8 +159,22 @@ export class SessionListener {
   async #listen(): Promise<void> {
     let lastSeen = this.#minimumCursor();
     let reconnectAttempt = 0;
+    let statusProbed = false;
     while (!this.#stopRequested) {
       try {
+        if (!statusProbed && this.#deps.fetchStatus) {
+          const status = await this.#deps.fetchStatus(this.#deps.sessionId);
+          statusProbed = true;
+          const outcome = terminalOutcomeForStatus(status);
+          if (outcome) {
+            log.info(
+              { sessionId: this.#deps.sessionId, status },
+              "session status is already terminal",
+            );
+            await this.#finishTerminal(outcome);
+            return;
+          }
+        }
         const caughtUp = await this.#catchUp();
         if (caughtUp.lastSeen > lastSeen) lastSeen = caughtUp.lastSeen;
         log.info(
