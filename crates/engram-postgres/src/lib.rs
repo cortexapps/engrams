@@ -1723,7 +1723,6 @@ impl MetadataStore for PostgresStore {
             WHERE sandbox_id = $1 AND host_id = $2
               AND status NOT IN ('failed','completed','dead')
             LIMIT 1
-                      AND status IN ('pending','created','active','unreachable',
             "#,
         )
         .bind(sandbox_id.as_uuid())

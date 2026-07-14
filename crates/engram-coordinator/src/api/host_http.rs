@@ -1612,8 +1612,15 @@ pub async fn sandbox_ownership(
     State(state): State<SharedState>,
     Path((_host_id, session_id, sandbox_id)): Path<(HostId, SessionId, SandboxId)>,
 ) -> Result<Json<SandboxOwnershipResponse>, ApiError> {
+    // ADR 0092 hardening: a terminal row owns nothing, even if its
+    // `sandbox_id` column still carries the binding — a create that
+    // failed AFTER the VM spawned flips the session Failed and leans on
+    // the teardown reconciler to reap the live VM; answering
+    // `owned=true` here kept those orphans alive (and their guest
+    // memory pinned) indefinitely. Mirrors `session_owning_sandbox`'s
+    // non-terminal predicate.
     let owned = match state.services.meta.get_session(session_id).await {
-        Ok(s) => s.sandbox_id == Some(sandbox_id),
+        Ok(s) => s.sandbox_id == Some(sandbox_id) && !s.status.is_terminal(),
         Err(engram_core::MetaError::NotFound) => false,
         Err(e) => return Err(ApiError::Internal(format!("get_session: {e}"))),
     };
@@ -1728,6 +1735,35 @@ mod tests {
             park_rung: 0,
             parked_at: None,
             suggested_title: None,
+        }
+    }
+
+    /// ADR 0092 hardening: a terminal session whose `sandbox_id` column
+    /// still carries the binding must answer `owned=false`. Before this,
+    /// a create that failed after the VM spawned (session flipped Failed,
+    /// binding never cleared) kept its orphan alive forever: the host's
+    /// teardown reconciler asked here, got `owned=true`, and never
+    /// counted an orphan strike.
+    #[tokio::test]
+    async fn sandbox_ownership_denies_terminal_sessions() {
+        let sid = engram_core::SessionId::new();
+        let sandbox = SandboxId::new();
+        for (status, want) in [
+            (SessionState::Active, true),
+            (SessionState::Idle, true),
+            (SessionState::Failed, false),
+            (SessionState::Completed, false),
+            (SessionState::Dead, false),
+        ] {
+            let (state, _meta, _tmp) =
+                build_state_for_session(session_with_status(sid, sandbox, status));
+            let Json(resp) = sandbox_ownership(
+                State(state),
+                Path((engram_core::HostId::new(), sid, sandbox)),
+            )
+            .await
+            .expect("handler");
+            assert_eq!(resp.owned, want, "status {status:?}: expected owned={want}");
         }
     }
 
