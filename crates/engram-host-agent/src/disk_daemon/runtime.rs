@@ -572,18 +572,20 @@ pub async fn attach_manifest(
     // resume / recovery, which attach the session's own forked id.
     fork_at_attach: bool,
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
+    // The attach-time manifest id becomes the kernel's recorded
+    // `/sys/block/nbdN/backend` — INFORMATIONAL ONLY. It must never be
+    // treated as the device's identity: the manifest identity legitimately
+    // changes over the device's life (the ADR 0077 fork publishes flushes
+    // under a private id this connect-time value never sees), which is why
+    // [`reattach_manifest`] echoes the kernel's own recorded value instead
+    // of re-deriving one (2026-07-13 dfa0face incident: re-deriving from
+    // the live ref EINVAL'd every forked-chain survivor's rehydrate).
+    let backend_id = disk_manifest_ref.manifest_id.to_string();
     let backend =
         ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await?;
     if fork_at_attach {
         backend.fork_manifest_identity().await;
     }
-    // The kernel records this as `/sys/block/nbdN/backend` and a survivor
-    // rehydrate's RECONFIGURE must strcmp-match it. Every durable ref the
-    // rehydrate can be handed (live flushes, snapshot rows) carries the
-    // POST-fork id, so derive the identifier after the fork — deriving it
-    // from the pre-fork base id made every forked-chain survivor's
-    // rehydrate fail with EINVAL (2026-07-13 dfa0face incident).
-    let backend_id = backend.manifest_ref().await.manifest_id.to_string();
     attach_backend(backend, slot_pool, &backend_id).await
 }
 
@@ -634,7 +636,33 @@ pub async fn reattach_manifest(
     slot: NbdSlot,
     threshold_bytes: u64,
 ) -> Result<NbdSandboxState, (NbdSlot, NbdRuntimeError)> {
-    let backend_id = disk_manifest_ref.manifest_id.to_string();
+    // The kernel strcmp-verifies `NBD_ATTR_BACKEND_IDENTIFIER` against the
+    // CONNECT-time value at RECONFIGURE (and REQUIRES one when the device
+    // has it recorded) — but the connect-time value is a manifest id and
+    // manifest identity legitimately changes over the device's life (the
+    // ADR 0077 fork publishes flushes under a private id, so the rehydrate
+    // ref's id and the connect-time id diverge for every fresh-created
+    // session; 2026-07-13 dfa0face: every such rehydrate died EINVAL and
+    // the survivor's disk stayed dead). Echo the kernel's own durable
+    // record of the connect-time value (`/sys/block/nbdN/backend`) instead
+    // of re-deriving one — deterministic for every host-agent generation.
+    // The device↔sandbox pinning that actually protects against serving
+    // the wrong disk is the caller's (`rootfs_device(sandbox_id)` →
+    // `pool.claim` on that exact device); the kernel identifier is
+    // informational. Fall back to the ref's manifest id only when sysfs
+    // has no record (never netlink-configured — the RECONFIGURE will fail
+    // regardless, with the right error).
+    let backend_id = match kernel_backend_identifier(slot.path()) {
+        Some(kernel_id) => kernel_id,
+        None => {
+            tracing::warn!(
+                device = %slot.path().display(),
+                "no kernel-recorded NBD backend identifier; falling back to the \
+                 rehydrate ref's manifest id",
+            );
+            disk_manifest_ref.manifest_id.to_string()
+        }
+    };
     let backend =
         match ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await
         {
@@ -643,48 +671,6 @@ pub async fn reattach_manifest(
         };
     let handle = match reattach(backend.clone(), slot.path(), &backend_id).await {
         Ok(h) => h,
-        // Transition fallback: a device CONNECTed by a pre-fix host-agent
-        // generation carries the PRE-fork (base) manifest id, so the
-        // kernel's identifier strcmp fails with EINVAL. The device↔sandbox
-        // mapping is already pinned by the caller (`rootfs_device(sandbox_id)`
-        // → `pool.claim` on that exact device), so retrying with the
-        // kernel's own recorded identifier is safe — the strcmp is a
-        // belt-and-suspenders check we've re-verified by other means.
-        // Remove after a full fleet roll past the post-fork-id generation.
-        Err(NbdRuntimeError::Io(ref ioe)) if ioe.raw_os_error() == Some(libc::EINVAL) => {
-            match kernel_backend_identifier(slot.path()) {
-                Some(kernel_id) if kernel_id != backend_id => {
-                    tracing::warn!(
-                        device = %slot.path().display(),
-                        expected = %backend_id,
-                        kernel = %kernel_id,
-                        "NBD RECONFIGURE identifier mismatch (pre-fix generation \
-                         device); retrying with the kernel-recorded identifier",
-                    );
-                    match reattach(backend.clone(), slot.path(), &kernel_id).await {
-                        Ok(h) => h,
-                        Err(e) => return Err((slot, e)),
-                    }
-                }
-                kernel_id => {
-                    tracing::warn!(
-                        device = %slot.path().display(),
-                        expected = %backend_id,
-                        kernel = ?kernel_id,
-                        "NBD RECONFIGURE EINVAL with no usable kernel identifier",
-                    );
-                    return Err((
-                        slot,
-                        NbdRuntimeError::Io(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "reconfigure EINVAL: identifier {backend_id} vs kernel {kernel_id:?}"
-                            ),
-                        )),
-                    ));
-                }
-            }
-        }
         Err(e) => return Err((slot, e)),
     };
     Ok(NbdSandboxState {
