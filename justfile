@@ -74,8 +74,10 @@ test-pkg pkg *ARGS:
 # mounted so crates aren't re-downloaded, and a container-local
 # CARGO_TARGET_DIR keeps the macOS `target/` (a different target triple)
 # untouched. Uses `cargo test` (not nextest) so the container needs no extra
-# tooling. `rust:bookworm` tracks the latest stable, matching our pinned
-# `channel = "stable"`. Example: `just test-linux engram-harness-claude`.
+# cargo tooling; `jq` is installed on demand — the fake-codex test scripts
+# shell out to it, and `rust:bookworm` doesn't ship it. `rust:bookworm`
+# tracks the latest stable, matching our pinned `channel = "stable"`.
+# Example: `just test-linux engram-harness-claude`.
 test-linux pkg='engram-harness-claude' *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -99,7 +101,7 @@ test-linux pkg='engram-harness-claude' *ARGS:
                 -w /work \
                 -e CARGO_TARGET_DIR=/lxtarget \
                 rust:bookworm \
-                bash -c "cargo test -p {{pkg}} {{ARGS}}" ;;
+                bash -c "command -v jq >/dev/null || (apt-get update -qq && apt-get install -y -qq jq); cargo test -p {{pkg}} {{ARGS}}" ;;
         *)
             echo "unsupported host: $(uname -s)" >&2; exit 1 ;;
     esac
