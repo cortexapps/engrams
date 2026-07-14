@@ -182,3 +182,86 @@ roll gate observable).
 - `operator: gate rolls and drains on in-flight enable work` —
   `gate_enable_work` in `roll_node`, the `gate_drain` enable-work leg,
   `enableWorkTimeoutSeconds` (CRD + helm)
+
+## Addendum (2026-07-13): enable-leg latency overhaul
+
+This ADR made enable jobs *survive* infrastructure churn; the follow-up
+question was why a single healthy attempt still costs ~2 h for a
+dev-brain-class image. Prod benchmark (2026-07-13, cold recapture,
+28 GiB rootfs / 24 GiB VM):
+
+| leg | measured | mechanism |
+|---|---|---|
+| pull | 2m25–2m56 | strictly sequential per-layer downloads |
+| flatten | 51m39–**74m24** | single-threaded tar→tree; syscall-bound tiny-file creation; pure-Rust decoders |
+| pack | 2m03–4m17 | deterministic `mke2fs -d` (fine) |
+| chunk+upload | 3m46–7m31 | stop-and-wait 32-chunk windows; ~60–80 MiB/s effective to GCS |
+| capture: memory seed | 40s–**11m29** | pre-hook full 24 GiB dump; dedup-miss uploads ~all of it, contending with the still-running rootfs upload (independent 32-wide pools, no shared budget) |
+| capture: NBD page-in | 1–2m | capture host ≠ materialize host ⇒ re-fetch from GCS instead of local NVMe |
+| warm hook | 10m44–20m53 | real work (dev-brain's own stack; out of scope here) |
+
+One PR (commit chain below) attacks every engrams-side leg:
+
+- **Parallel fd-scoped flatten.** The reader thread keeps *all* namespace
+  operations (whiteouts, opaque dirs, dir/symlink/hardlink creation,
+  unlink-before-create) in exact tar order; a bounded worker pool receives
+  already-open file descriptors and does only fd-scoped work (write,
+  fchmod, fsetxattr, futimens). Workers never touch paths, so overwrite /
+  whiteout / readdir races are impossible by construction and the final
+  tree is bit-identical to sequential apply — mke2fs determinism and
+  rebake chunk-dedup are preserved. Ancestor-symlink resolution is
+  memoized (invalidated at `remove_entry`); decompression moves to its
+  own pipelined thread.
+- **Pull/flatten pipeline.** Layer downloads run 3-wide with in-order
+  readiness, feeding the flattener as each layer lands — pull wall-time
+  hides under flatten.
+- **flate2 `zlib-rs` backend.** zlib-ng-class inflate, pure Rust (the
+  C-backed decoders stay banned: zstd-sys breaks the musl cross lane).
+- **Streaming chunk upload.** The read-32-then-drain-32 window becomes a
+  continuous reader → 64-wide `buffer_unordered` pipeline. The per-chunk
+  HEAD dedup stays — a host-local "known present" cache is unsafe against
+  chunk-GC's grace/generation windows.
+- **Host-global upload budget.** One FIFO semaphore (default 96 permits,
+  `ENGRAM_UPLOAD_BUDGET_PERMITS`) gates every ChunkStore PUT on the host,
+  so concurrent workloads (materialize + memory seed + disk flush) share
+  the NIC instead of stacking on it. Solo workloads never queue.
+- **Capture co-location.** Capture placement prefers
+  `materialize_host_id` (two-call placement: singleton candidate first,
+  full candidate set on miss) so the capture VM pages the fresh rootfs in
+  from local NVMe write-through cache, not GCS. Not applied to
+  reassign/redrive — a failed attempt shouldn't prefer its way back.
+- **Deferred seed finish.** The pre-hook cold-base seed still dumps
+  synchronously (the dirty-bitmap boundary must precede the hook), but
+  its `finish()` (disk flush + memory chunk upload + artifacts + chain
+  seed) runs on a spawned task joined *after* the warm hook — the
+  40s–11.5m upload leg leaves the critical path entirely. Join-before-
+  final-snapshot keeps the final capture a Diff and keeps the durability
+  barrier ahead of `finalize_capture_job`, exactly as today.
+- **Balloon-shrunk seed.** A virtio-balloon device (guest kernel already
+  has `CONFIG_VIRTIO_BALLOON=y`) inflates before the seed dump —
+  ballooned pages are host-`MADV_DONTNEED`ed, the dense dump reads zeros,
+  and the existing all-zero 512 KiB elision drops them from the manifest
+  (~24 GiB → ~1–2 GiB). Fail-open on inflate (dense seed is merely slow),
+  fail-loud on deflate (a hook in a starved guest is a guaranteed slow
+  failure). Kill switch `ENGRAM_FC_BALLOON=0`. No `fc_snapshot_version`
+  bump: device topology rides inside `state.bin`, and legacy balloon-less
+  cold bases stay valid Hits (deflate tolerates their absence).
+
+Explicit non-goals, considered and rejected:
+
+- **New materialize wire stages** (e.g. a separate `upload` leg): the
+  coordinator drops unknown stage strings and the host keepalive re-sends
+  the last frame, so a mid-roll skew window would starve claim renewal.
+  The four-stage vocabulary stays; upload visibility comes from the new
+  per-stage histogram + `chunks_done` frames.
+- **HEAD-skip presence cache**: widens the HEAD→manifest-commit window
+  that chunk-GC's generation barrier covers; a cache hit on a
+  GC-reclaimed chunk yields an unbootable image.
+- **Capture before materialize completes**: needs a new job-creation path
+  and a not-yet-durable claim mode; co-location + the upload budget
+  remove most of the win.
+
+Targets: materialize ≤15 min, capture wall ≈ warm hook + ~5 min for the
+dev-brain class; small images (~1.5 min end-to-end) must not regress.
+
+Commit chain: recorded at close (see PR).
