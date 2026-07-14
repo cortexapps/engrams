@@ -230,10 +230,6 @@ export type SessionEvent =
       through_idx: number;
       rolled_back: number;
       surviving_side_effects: string[];
-      // Workspace paths whose edits were rolled back with the checkpoint —
-      // gone from the restored guest, preserved as hunks in the greyed
-      // span. Optional: events persisted before the field omit it.
-      rolled_back_files?: string[];
       // ADR 0045 F1: why the rewind happened — `planned_relocation`
       // (operator drain / teleport, no host failed) vs the original
       // `host_failure_recovery`. Optional: events persisted before this

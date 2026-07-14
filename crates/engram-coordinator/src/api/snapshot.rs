@@ -1303,7 +1303,6 @@ pub async fn apply_rung1_rewind(
                 through_idx: summary.through_idx,
                 rolled_back: summary.rolled_back,
                 surviving_side_effects: summary.surviving_side_effects,
-                rolled_back_files: summary.rolled_back_files,
                 cause,
                 at: Utc::now(),
             },

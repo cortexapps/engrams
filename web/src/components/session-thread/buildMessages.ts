@@ -116,9 +116,6 @@ export type SystemMarker =
       kind: "recovery";
       rolledBack: number;
       survivingSideEffects: string[];
-      // Paths whose edits were rolled back with the checkpoint (the exact
-      // hunks stay recoverable in the greyed span above the boundary).
-      rolledBackFiles: string[];
       // ADR 0045 F1: planned operator relocation vs unplanned host failure.
       cause: "planned_relocation" | "host_failure_recovery" | "checkpoint_lag";
       at: string;
@@ -608,7 +605,6 @@ export function buildMessages(
           kind: "recovery",
           rolledBack: ev.rolled_back,
           survivingSideEffects: ev.surviving_side_effects,
-          rolledBackFiles: ev.rolled_back_files ?? [],
           // ADR 0045 F1: a missing cause (events predating the field)
           // reads as a host failure — the card's historical meaning.
           cause: ev.cause ?? "host_failure_recovery",

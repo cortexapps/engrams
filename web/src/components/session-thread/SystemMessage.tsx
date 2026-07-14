@@ -86,20 +86,6 @@ function Recovery({ marker }: { marker: Extract<SystemMarker, { kind: "recovery"
             ))}
           </ul>
         )}
-        {marker.rolledBackFiles.length > 0 && (
-          <div className="text-sm text-muted-foreground">
-            <p>
-              Edits to {marker.rolledBackFiles.length === 1 ? "this file were" : "these files were"}{" "}
-              rolled back — the agent no longer remembers them, but the exact changes remain in the
-              greyed messages above:
-            </p>
-            <ul className="list-disc pl-5 font-mono text-xs">
-              {marker.rolledBackFiles.map((p, i) => (
-                <li key={i}>{p}</li>
-              ))}
-            </ul>
-          </div>
-        )}
       </CardContent>
     </Card>
   );
