@@ -6732,11 +6732,45 @@ impl SandboxBackend for PooledBackend {
         // success — re-pause immediately (the guest is mid-move; its
         // post-capture execution would be discarded anyway, exactly
         // the D5 argument).
-        let metadata = self
-            .inner
-            .snapshot_diff(id)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("migration diff capture: {e}")))?;
+        let create_res = self.inner.snapshot_diff(id).await;
+        // The diff just consumed+reset the KVM dirty bitmap, but its
+        // resulting manifest only becomes durable on the DESTINATION
+        // (the re-chunk below sinks to the local cache; the dest's
+        // catch-up publishes). If this export is later ABORTED (explicit
+        // abort or the TTL sweep's AbortInPlace) the guest resumes here
+        // with a bitmap baseline the local chain head does not describe
+        // — a subsequent diff against it would silently omit every page
+        // dirtied before this capture, the same corruption class the
+        // failed-diff poison exists for. Retire the chain (and its
+        // durable record, already write-ahead-removed above) NOW, on
+        // success and failure alike: commit destroys the sandbox anyway,
+        // and an abort costs one recovery Full instead of a
+        // silently-incomplete diff. (Advancing the chain to the new ref
+        // instead would be unsound: its chunks are cache-only until the
+        // dest publishes.)
+        let metadata = match create_res {
+            Ok(m) => {
+                if self.checkpoint_chains.remove(&id).is_some() {
+                    tracing::info!(
+                        sandbox_id = %id,
+                        "C1 capture consumed the dirty bitmap; chain retired — an aborted \
+                         move's next capture will be a FULL snapshot",
+                    );
+                }
+                m
+            }
+            Err(e) => {
+                poison_checkpoint_chain_after_failed_diff(
+                    &self.checkpoint_chains,
+                    self.chain_heads_dir().as_deref(),
+                    id,
+                    "migration diff capture",
+                );
+                return Err(SandboxError::Snapshot(format!(
+                    "migration diff capture: {e}"
+                )));
+            }
+        };
         if let Err(e) = self.inner.pause(id).await {
             tracing::debug!(sandbox_id = %id, error = %e, "post-capture re-pause failed (benign)");
         }
