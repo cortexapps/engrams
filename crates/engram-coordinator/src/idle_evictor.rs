@@ -177,12 +177,27 @@ fn park_headroom_floor_pct() -> u8 {
 }
 
 /// ADR 0079: the evict VERB's pipeline — the same pause → flush →
-/// Wall-clock bound on ONE composed-capture attempt of a quarantined
-/// survivor (ADR 0090 — `payload.quarantine`). Generous next to a healthy
-/// capture (upload legs run seconds-to-a-couple-minutes) but a hard stop
-/// for the pathological crawl class; see the timeout site in
-/// [`run_evict_pipeline`].
-const QUARANTINE_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Wall-clock bound on ONE capture attempt of a quarantined survivor
+/// (ADR 0090 — `payload.quarantine`), covering BOTH capture flavors —
+/// the D5 `snapshot_begin` split (the normal prod-FC path) and the
+/// composed `snapshot()` fallback. Generous next to a healthy capture
+/// (upload legs run seconds-to-a-couple-minutes) but a hard stop for the
+/// pathological crawl class; see the timeout sites in
+/// [`run_evict_pipeline`]. Env-tunable for tests.
+fn quarantine_capture_timeout() -> std::time::Duration {
+    let secs = std::env::var("ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(300);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Bound on the best-effort pre-capture guest RPCs (`stop_browser` /
+/// `stop_ide`) for a quarantined survivor: they route into a guest whose
+/// rootfs is unserved and can hang in-guest indefinitely; their results
+/// are discarded anyway.
+const QUARANTINE_GUEST_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// memory-snapshot → destroy sequence the legacy `evict_session_to_state`
 /// ran, now driven under an op claim (the mutual exclusion; the
@@ -372,6 +387,25 @@ pub(crate) async fn run_evict_pipeline(
     // the evac scanner resumes from the row, so it must be durable first.
     // Hosts that don't support the split (pre-D5, non-FC) surface
     // InvalidSpec and fall through to the composed path too.
+    //
+    // Quarantine flavor (ADR 0090): bound EVERY leg that talks to the
+    // crippled sandbox. A quarantined survivor's capture can legitimately
+    // succeed (its memory + dirty-chunk upload don't need the dead
+    // guest-visible NBD device), but it can also crawl for hours
+    // (2026-07-13 incident: a chain-poisoned re-chunk at ~0.5 MB/s held
+    // the session lane ~50 min with the user's resume queued behind it —
+    // and the within-step heartbeat keeps an in-flight attempt
+    // unreclaimable by design). The timeouts turn a hang or crawl into a
+    // failed attempt; the verb's small quarantine budget then converges
+    // to destroy + rewind. Covers BOTH capture flavors — `snapshot_begin`
+    // (the normal prod-FC D5 path; adversarial-review finding: the first
+    // cut bounded only the composed fallback) and composed `snapshot()`.
+    let quarantine = ctx
+        .op
+        .payload
+        .get("quarantine")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if target_state == SessionState::Idle {
         // ADR 0074 rung 2 (parked-paused): if the host has memory
         // headroom, PAUSE the VM in place instead of snapshot+destroy.
@@ -443,18 +477,51 @@ pub(crate) async fn run_evict_pipeline(
         }
         // ADR 0065: reap the ephemeral in-guest browser stack before the eviction
         // snapshot so a live Chrome is never frozen into it (re-lazy-started on
-        // the next EnsureBrowser after resume). Best-effort; never blocks eviction.
-        let _ = state.services.host.stop_browser(sandbox_id).await;
+        // the next EnsureBrowser after resume). Best-effort; never blocks eviction
+        // (a quarantined guest can hang these — bounded above discard).
+        if quarantine {
+            let _ = tokio::time::timeout(
+                QUARANTINE_GUEST_RPC_TIMEOUT,
+                state.services.host.stop_browser(sandbox_id),
+            )
+            .await;
+        } else {
+            let _ = state.services.host.stop_browser(sandbox_id).await;
+        }
         // ADR 0085: same for the IDE — a live code-server's listeners would
         // resurrect wedged after restore (issue #567's lesson); the next
         // EnsureIde re-lazy-starts it. Best-effort; never blocks eviction.
-        let _ = state.services.host.stop_ide(sandbox_id).await;
-        match state
-            .services
-            .host
-            .snapshot_begin(sandbox_id, ctx.fence())
-            .await
-        {
+        if quarantine {
+            let _ = tokio::time::timeout(
+                QUARANTINE_GUEST_RPC_TIMEOUT,
+                state.services.host.stop_ide(sandbox_id),
+            )
+            .await;
+        } else {
+            let _ = state.services.host.stop_ide(sandbox_id).await;
+        }
+        let begin_fut = state.services.host.snapshot_begin(sandbox_id, ctx.fence());
+        let begin_res = if quarantine {
+            match tokio::time::timeout(quarantine_capture_timeout(), begin_fut).await {
+                Ok(res) => res,
+                Err(_elapsed) => {
+                    abort_inflight_snapshot(
+                        ctx,
+                        session_id,
+                        sandbox_id,
+                        "quarantine snapshot_begin timeout",
+                    )
+                    .await;
+                    return Err(EvictError::Meta(format!(
+                        "quarantined-survivor capture (snapshot_begin) timed out after {}s",
+                        quarantine_capture_timeout().as_secs()
+                    )));
+                }
+            }
+        } else {
+            begin_fut.await
+        };
+        match begin_res {
             Ok(snapshot_id) => {
                 return finish_eviction_d5(ctx, session_id, sandbox_id, snapshot_id, &session)
                     .await;
@@ -470,31 +537,16 @@ pub(crate) async fn run_evict_pipeline(
         }
     }
 
-    // Quarantine flavor (ADR 0090): bound the composed capture. A
-    // quarantined survivor's capture can legitimately succeed (its memory
-    // and dirty-chunk upload don't need the dead guest-visible NBD
-    // device), but it can also crawl for hours (2026-07-13 incident: a
-    // chain-poisoned re-chunk at ~0.5 MB/s held the session lane ~50 min
-    // with the user's resume queued behind it — and the within-step
-    // heartbeat keeps an in-flight attempt unreclaimable by design). The
-    // timeout turns a crawl into a failed attempt; the verb's small
-    // quarantine budget then converges to destroy + rewind.
-    let quarantine = ctx
-        .op
-        .payload
-        .get("quarantine")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     let snapshot_fut = state.services.host.snapshot(sandbox_id, ctx.fence());
     let metadata = if quarantine {
-        match tokio::time::timeout(QUARANTINE_CAPTURE_TIMEOUT, snapshot_fut).await {
+        match tokio::time::timeout(quarantine_capture_timeout(), snapshot_fut).await {
             Ok(res) => res.map_err(EvictError::Sandbox)?,
             Err(_elapsed) => {
                 abort_inflight_snapshot(ctx, session_id, sandbox_id, "quarantine capture timeout")
                     .await;
                 return Err(EvictError::Meta(format!(
                     "quarantined-survivor capture timed out after {}s",
-                    QUARANTINE_CAPTURE_TIMEOUT.as_secs()
+                    quarantine_capture_timeout().as_secs()
                 )));
             }
         }
@@ -3368,6 +3420,268 @@ mod tests {
                 .unwrap()
                 .contains(&sandbox_id),
             "parked VM untouched by the scanner"
+        );
+    }
+
+    /// Adversarial-review regression (2026-07-13 incident fix): the
+    /// quarantine capture deadline must cover `snapshot_begin` — the
+    /// NORMAL prod-FC capture path — not only the composed fallback the
+    /// first cut bounded. A wedged `snapshot_begin` (FC blocked on a dead
+    /// NBD, or the crawling re-chunk) must become a FAILED attempt
+    /// (retryable, counting against the small quarantine budget) with the
+    /// in-flight host capture aborted — not an immortal running op whose
+    /// heartbeat shields it from reclaim while the user's resume queues
+    /// behind it.
+    #[tokio::test]
+    async fn quarantine_evict_times_out_a_hanging_snapshot_begin() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc as StdArc;
+        // Nextest runs each test in its own process, so the override
+        // cannot leak into sibling tests.
+        std::env::set_var("ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS", "1");
+
+        struct HangingBegin {
+            inner: StdArc<dyn engram_core::traits::HostClient>,
+            aborts: StdArc<AtomicU32>,
+        }
+
+        #[async_trait::async_trait]
+        impl engram_core::traits::HostClient for HangingBegin {
+            async fn snapshot_begin(
+                &self,
+                _id: engram_core::SandboxId,
+                _fence: SessionFence,
+            ) -> Result<engram_core::types::SnapshotId, engram_core::SandboxError> {
+                // The prod-FC D5 path, wedged: never returns.
+                std::future::pending().await
+            }
+            async fn abort_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.aborts.fetch_add(1, Ordering::SeqCst);
+                self.inner.abort_snapshot(id, fence).await
+            }
+            async fn create(
+                &self,
+                spec: SandboxSpec,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.create(spec).await
+            }
+            async fn destroy(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.destroy(id, fence).await
+            }
+            async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
+                self.inner.list().await
+            }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
+            async fn exec_stream(
+                &self,
+                id: engram_core::SandboxId,
+                cmd: engram_core::types::sandbox::ExecRequest,
+            ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError>
+            {
+                self.inner.exec_stream(id, cmd).await
+            }
+            async fn snapshot(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError>
+            {
+                self.inner.snapshot(id, fence).await
+            }
+            async fn commit_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.commit_snapshot(id, fence).await
+            }
+            async fn restore(
+                &self,
+                metadata: engram_core::types::snapshot::SnapshotMetadata,
+                fence: SessionFence,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.restore(metadata, fence).await
+            }
+            async fn start_agent(
+                &self,
+                id: engram_core::SandboxId,
+                agent: engram_core::types::sandbox::AgentSpec,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.start_agent(id, agent, policy, fence).await
+            }
+            async fn apply_egress_policy(
+                &self,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.apply_egress_policy(policy).await
+            }
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
+                self.inner.guest_ip(id).await
+            }
+            async fn bind_session(
+                &self,
+                session_id: engram_core::SessionId,
+                sandbox_id: engram_core::SandboxId,
+                binding_epoch: u64,
+            ) {
+                self.inner
+                    .bind_session(session_id, sandbox_id, binding_epoch)
+                    .await
+            }
+            async fn unbind_session(&self, session_id: engram_core::SessionId) {
+                self.inner.unbind_session(session_id).await
+            }
+            async fn send_prompt(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+                prompt_id: String,
+                text: String,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+            }
+        }
+
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:quarantine-timeout".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+            park_rung: 0,
+            parked_at: None,
+            suggested_title: None,
+        };
+        let sandbox_root = TempDir::new().unwrap();
+        let local_path = sandbox_root.path().join("local");
+        std::fs::create_dir_all(&local_path).unwrap();
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes")));
+        let meta = Arc::new(MiniMeta::new(session));
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
+        host_registry.register(
+            engram_core::HostId::new(),
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(
+                backend.clone(),
+            )),
+        );
+        let aborts = StdArc::new(AtomicU32::new(0));
+        let hanging: Arc<dyn engram_core::traits::HostClient> = Arc::new(HangingBegin {
+            inner: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            aborts: aborts.clone(),
+        });
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: hanging,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-quarantine-timeout-test"),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-quarantine-timeout-test"),
+                ),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = crate::config::CoordinatorConfig {
+            local_path,
+            ..crate::config::CoordinatorConfig::default()
+        };
+        let state = Arc::new(crate::state::AppState::new_with_registry(
+            cfg,
+            services,
+            host_registry,
+        ));
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        // The ADR 0090 quarantine flavor, exactly as the heartbeat arm
+        // enqueues it.
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({
+                    "target": "idle",
+                    "allow_park": false,
+                    "nominated": false,
+                    "quarantine": true,
+                }),
+                Some(&format!("adr0090-quarantine:{sandbox_id}")),
+                "test-pod",
+            )
+            .await
+            .expect("enqueue+claim")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy at claim: {other:?}"),
+        };
+        let op_id = op.id;
+        crate::session_ops::drive_claimed(&state, op).await;
+        let row = state
+            .services
+            .meta
+            .op_get(op_id)
+            .await
+            .expect("op_get")
+            .expect("op row exists");
+
+        assert_eq!(
+            row.state,
+            OpState::Queued,
+            "a timed-out quarantine capture attempt requeues (counts against the budget): {row:?}",
+        );
+        assert!(
+            row.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("snapshot_begin) timed out"),
+            "the snapshot_begin deadline is what fired: {:?}",
+            row.error,
+        );
+        assert_eq!(
+            aborts.load(Ordering::SeqCst),
+            1,
+            "the in-flight host-side capture must be aborted on timeout",
         );
     }
 }

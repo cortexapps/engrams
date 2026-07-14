@@ -257,7 +257,10 @@ pub(crate) async fn boot_on_reserved_host(
         if let Some(a) = agent.as_mut() {
             crate::api::sessions::inject_harness_env(state, session_id, &mut a.env).await;
         }
-        resolve_inject_entries(state, session_id, integration_policy.as_ref(), &image_ref).await
+        let (injects, _failures) =
+            resolve_inject_entries(state, session_id, integration_policy.as_ref(), &image_ref)
+                .await;
+        injects
     };
     // Issue #535 correction: neither `coord_prepare` nor `coord_finalize`
     // covers this join itself — `coord_finalize` only starts once it
@@ -598,14 +601,21 @@ pub(crate) fn build_observe_entries(
 /// or guest. A ref that doesn't resolve is skipped + logged (the connector
 /// gates the request regardless, but without a credential it would fail
 /// upstream — so we drop it rather than inject an empty header).
+/// The second tuple element counts resolution FAILURES (secret-store
+/// errors, failed mints, a capabilities lookup error under a mint entry —
+/// not `Ok(None)` unresolvable refs, which are persistent config state).
+/// Boot/resume callers deliberately ignore it (lossy-by-design); the
+/// survivor egress re-push retries on any failure rather than applying an
+/// incomplete policy (adversarial-review finding, 2026-07-13 incident fix).
 pub(crate) async fn resolve_inject_entries(
     state: &SharedState,
     session_id: SessionId,
     integration_policy: Option<&engram_core::types::IntegrationPolicy>,
     image: &str,
-) -> Vec<engram_core::types::egress::EgressInjectEntry> {
+) -> (Vec<engram_core::types::egress::EgressInjectEntry>, usize) {
+    let mut failures = 0usize;
     let Some(policy) = integration_policy else {
-        return Vec::new();
+        return (Vec::new(), failures);
     };
     let (repo, image_tag) = {
         let (r, t) = engram_core::types::session::split_image_ref(image);
@@ -619,12 +629,22 @@ pub(crate) async fn resolve_inject_entries(
     // ADR 0056 amendment: mint entries scope their token to the session's bound
     // capabilities. Fetch them once, only when a mint entry is actually present.
     let caps = if policy.injects.iter().any(|i| !i.mint_provider.is_empty()) {
-        state
+        match state
             .services
             .meta
             .get_session_capabilities(session_id)
             .await
-            .unwrap_or_default()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // A mint under empty caps mints a wrongly-scoped token —
+                // count the lookup failure so a strict caller retries.
+                tracing::warn!(%session_id, error = %e,
+                    "capabilities lookup failed under a mint inject; minting unscoped");
+                failures += 1;
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
@@ -654,7 +674,12 @@ pub(crate) async fn resolve_inject_entries(
                     mint_provider: inj.mint_provider.clone(),
                     expires_at: Some(expires_at),
                 },
-                None => continue, // mint_inject_header logged the reason
+                None => {
+                    // Logged inside; could be a transient mint-provider
+                    // failure — count for strict callers.
+                    failures += 1;
+                    continue;
+                }
             }
         } else {
             // Static secret: value from the SecretStore, header from the config.
@@ -677,6 +702,7 @@ pub(crate) async fn resolve_inject_entries(
                         secret_ref = %inj.secret_ref, error = %e,
                         "integration inject secret_ref resolution failed; skipping injection",
                     );
+                    failures += 1;
                     continue;
                 }
             };
@@ -698,7 +724,7 @@ pub(crate) async fn resolve_inject_entries(
         };
         out.push(entry);
     }
-    out
+    (out, failures)
 }
 
 /// ADR 0056 amendment: resolve a *mint* provider's egress inject header — mint a

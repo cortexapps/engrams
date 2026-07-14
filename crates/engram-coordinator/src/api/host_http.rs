@@ -292,25 +292,44 @@ pub async fn register(
                         done = true; // moved on since the register snapshot
                         break;
                     }
-                    let Some(policy) = crate::api::sessions::build_resume_egress_policy(
+                    // STRICT build (adversarial-review finding): a lossy
+                    // build turns transient PG/secret/mint failures into a
+                    // REDUCED policy whose apply "succeeds" and suppresses
+                    // every remaining retry — permanently downgrading a
+                    // healthy running session. Err = retry.
+                    let policy = match crate::api::sessions::build_survivor_egress_policy(
                         &state,
                         s.session_id,
                         s.sandbox_id,
                         &session.image,
                     )
                     .await
-                    else {
-                        // No guest IP yet (reattach still settling) or a
-                        // genuinely IP-less backend — retry either way;
-                        // the exhaustion log below is the verdict.
-                        tracing::debug!(
-                            %host_id,
-                            session_id = %s.session_id,
-                            sandbox_id = %s.sandbox_id,
-                            attempt,
-                            "survivor egress re-push: no guest IP / policy yet",
-                        );
-                        continue;
+                    {
+                        Ok(Some(policy)) => policy,
+                        Ok(None) => {
+                            // No guest IP yet (reattach still settling) or a
+                            // genuinely IP-less backend — retry either way;
+                            // the exhaustion log below is the verdict.
+                            tracing::debug!(
+                                %host_id,
+                                session_id = %s.session_id,
+                                sandbox_id = %s.sandbox_id,
+                                attempt,
+                                "survivor egress re-push: no guest IP / policy yet",
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                %host_id,
+                                session_id = %s.session_id,
+                                sandbox_id = %s.sandbox_id,
+                                attempt,
+                                error = %e,
+                                "survivor egress re-push: strict policy rebuild failed",
+                            );
+                            continue;
+                        }
                     };
                     match state.services.host.apply_egress_policy(policy).await {
                         Ok(()) => {
