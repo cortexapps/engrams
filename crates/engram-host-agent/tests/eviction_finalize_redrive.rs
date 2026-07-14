@@ -389,7 +389,12 @@ async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &st
 }
 
 async fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
-    for _ in 0..400 {
+    // 60 s ceiling: a redrive finalize on a loaded 2-vcpu CI runner has
+    // been observed to need >20 s (the 2026-07-14 flake on PR #669's run
+    // — "timed out waiting for eviction-final checkpoint record after
+    // re-drive" at the old 400×50 ms cap). Passes exit early, so a
+    // roomier bound costs nothing on green runs.
+    for _ in 0..1200 {
         if f() {
             return;
         }
