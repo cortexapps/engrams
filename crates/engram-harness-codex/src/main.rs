@@ -226,7 +226,16 @@ enum Pending {
     Interrupt,
     FollowUp {
         call_id: String,
-        question_answers: Option<engram_harness_proto::Answers>,
+        completion: FollowUpCompletion,
+    },
+}
+
+#[derive(Debug)]
+enum FollowUpCompletion {
+    LegacyQuestion(engram_harness_proto::Answers),
+    Tool {
+        name: String,
+        result_summary: String,
     },
 }
 
@@ -613,10 +622,23 @@ async fn drive(
                     }
                 },
                 Some(HarnessCommand::AnswerQuestion { tool_call_id, answers }) => {
+                    tracing::warn!(
+                        %tool_call_id,
+                        "received legacy AnswerQuestion command; use ToolResult for native ask_user_question"
+                    );
                     route_question_answer(server, parked, &mut pending, &active, events, &tool_call_id, answers).await;
                 }
                 Some(HarnessCommand::ToolResult { call_id, result_json }) => {
-                    route_tool_result(server, parked, &mut pending, &active, &call_id, result_json).await;
+                    route_tool_result(
+                        server,
+                        parked,
+                        &mut pending,
+                        &active,
+                        events,
+                        &call_id,
+                        result_json,
+                    )
+                    .await;
                 }
                 Some(HarnessCommand::Shutdown { .. }) => return DriveOutcome::Shutdown,
                 Some(HarnessCommand::Checkpoint { .. }) => {}
@@ -788,6 +810,7 @@ async fn route_tool_result(
     parked: &mut ParkedCallStore,
     pending: &mut HashMap<i64, Pending>,
     active: &Option<String>,
+    events: &mpsc::Sender<HarnessEvent>,
     call_id: &str,
     result_json: String,
 ) {
@@ -799,17 +822,51 @@ async fn route_tool_result(
         tracing::error!(%call_id, kind = ?call.kind, "ToolResult does not match a dynamic tool call");
         return;
     }
+    let native_question =
+        call.context.get("nativeBinding").and_then(Value::as_str) == Some("requestUserInput");
+    let answers = if native_question {
+        match serde_json::from_str::<engram_harness_proto::Answers>(&result_json) {
+            Ok(answers) => Some(answers),
+            Err(error) => {
+                tracing::error!(%error, %call_id, "ToolResult for ask_user_question is not a canonical answer map");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     if call.request_generation != server.generation || call.request_id.is_null() {
-        let message = format!(
-            "The earlier `{}` tool call ({call_id}) completed after Codex restarted. Result: {result_json}",
-            call.tool_name
-        );
-        if let Err(error) = send_follow_up(server, active, pending, call_id, message, None).await {
+        let message = if native_question {
+            format!(
+                "Answer to the earlier question ({call_id}) after Codex restarted: {result_json}"
+            )
+        } else {
+            format!(
+                "The earlier `{}` tool call ({call_id}) completed after Codex restarted. Result: {result_json}",
+                call.tool_name
+            )
+        };
+        let completion = FollowUpCompletion::Tool {
+            name: call.tool_name.clone(),
+            result_summary: result_json,
+        };
+        if let Err(error) =
+            send_follow_up(server, active, pending, call_id, message, completion).await
+        {
             tracing::error!(%error, %call_id, "could not deliver late ToolResult as user message");
         }
         return;
     }
-    if let Err(error) = server
+    if native_question {
+        let codex_answers = codex_answers(&call, answers.as_ref().expect("parsed above"));
+        if let Err(error) = server
+            .respond(call.request_id, json!({"answers":codex_answers}))
+            .await
+        {
+            tracing::error!(%error, %call_id, "could not answer Codex requestUserInput");
+            return;
+        }
+    } else if let Err(error) = server
         .respond(
             call.request_id,
             json!({
@@ -825,6 +882,38 @@ async fn route_tool_result(
     if let Err(error) = parked.take(call_id) {
         tracing::error!(%error, %call_id, "could not retire answered Codex dynamic tool call");
     }
+    if native_question {
+        emit(
+            events,
+            HarnessEvent::ToolCallCompleted {
+                run_id: active.clone().unwrap_or_default(),
+                tool_call_id: call_id.to_owned(),
+                tool_name: call.tool_name,
+                ok: true,
+                duration_ms: 0,
+                result_summary: Some(engram_harness_sdk::truncate_utf8(&result_json, MAX_SUMMARY)),
+            },
+        )
+        .await;
+    }
+}
+
+fn codex_answers(
+    call: &ParkedCall,
+    answers: &engram_harness_proto::Answers,
+) -> serde_json::Map<String, Value> {
+    let ids_by_text = call.context.get("idsByText").and_then(Value::as_object);
+    answers
+        .iter()
+        .map(|(text, selections)| {
+            let id = ids_by_text
+                .and_then(|ids| ids.get(text))
+                .and_then(Value::as_str)
+                .unwrap_or(text)
+                .to_owned();
+            (id, json!({"answers":selections}))
+        })
+        .collect()
 }
 
 async fn route_question_answer(
@@ -845,18 +934,7 @@ async fn route_question_answer(
         return;
     }
     if call.request_generation == server.generation && !call.request_id.is_null() {
-        let ids_by_text = call.context.get("idsByText").and_then(Value::as_object);
-        let codex_answers: serde_json::Map<String, Value> = answers
-            .iter()
-            .map(|(text, selections)| {
-                let id = ids_by_text
-                    .and_then(|ids| ids.get(text))
-                    .and_then(Value::as_str)
-                    .unwrap_or(text)
-                    .to_owned();
-                (id, json!({"answers":selections}))
-            })
-            .collect();
+        let codex_answers = codex_answers(&call, &answers);
         if let Err(error) = server
             .respond(call.request_id, json!({"answers":codex_answers}))
             .await
@@ -878,7 +956,7 @@ async fn route_question_answer(
             pending,
             tool_call_id,
             message,
-            Some(answers),
+            FollowUpCompletion::LegacyQuestion(answers),
         )
         .await
         {
@@ -903,7 +981,7 @@ async fn send_follow_up(
     pending: &mut HashMap<i64, Pending>,
     call_id: &str,
     text: String,
-    question_answers: Option<engram_harness_proto::Answers>,
+    completion: FollowUpCompletion,
 ) -> Result<(), String> {
     let client_id = format!("codex-follow-up-{}", uuid::Uuid::new_v4());
     let request_id = if let Some(turn_id) = active.as_deref() {
@@ -932,7 +1010,7 @@ async fn send_follow_up(
         request_id,
         Pending::FollowUp {
             call_id: call_id.to_owned(),
-            question_answers,
+            completion,
         },
     );
     Ok(())
@@ -981,27 +1059,60 @@ async fn handle_message(
             tracing::error!(%item_id, "requestUserInput missing JSON-RPC id");
             return;
         };
+        let native_tool = tools
+            .manifest
+            .iter()
+            .find(|tool| tool.codex_native_binding.as_deref() == Some("requestUserInput"))
+            .map(|tool| tool.name.clone());
+        let (kind, tool_name, context) = match native_tool.as_deref() {
+            Some(name) => (
+                ParkedCallKind::DynamicTool,
+                name,
+                json!({
+                    "nativeBinding":"requestUserInput",
+                    "idsByText":ids_by_text
+                }),
+            ),
+            None => (
+                ParkedCallKind::UserQuestion,
+                "requestUserInput",
+                json!({"idsByText":ids_by_text}),
+            ),
+        };
         let call = ParkedCall::new(
             &item_id,
-            ParkedCallKind::UserQuestion,
+            kind,
             request_id,
-            "requestUserInput",
+            tool_name,
             server.generation,
-            json!({"idsByText":ids_by_text}),
+            context,
         );
         if let Err(error) = tools.parked.record(call) {
             tracing::error!(%error, %item_id, "could not durably park Codex requestUserInput");
             return;
         }
-        emit(
-            events,
-            HarnessEvent::UserQuestion {
-                run_id,
-                tool_call_id: item_id,
-                questions: qs,
-            },
-        )
-        .await;
+        if let Some(name) = native_tool {
+            emit(
+                events,
+                HarnessEvent::ToolCallRequested {
+                    run_id,
+                    call_id: item_id,
+                    name,
+                    args_json: json!({"questions":qs}).to_string(),
+                },
+            )
+            .await;
+        } else {
+            emit(
+                events,
+                HarnessEvent::UserQuestion {
+                    run_id,
+                    tool_call_id: item_id,
+                    questions: qs,
+                },
+            )
+            .await;
+        }
         emit(events, HarnessEvent::Parked).await;
         return;
     }
@@ -1046,7 +1157,7 @@ async fn handle_message(
                 Pending::Interrupt => {}
                 Pending::FollowUp {
                     call_id,
-                    question_answers,
+                    completion,
                 } if value.get("error").is_none() => {
                     if let Some(turn_id) = value.pointer("/result/turn/id").and_then(Value::as_str)
                     {
@@ -1064,16 +1175,38 @@ async fn handle_message(
                     if let Err(error) = tools.parked.take(&call_id) {
                         tracing::error!(%error, %call_id, "could not retire crash-degraded Codex call");
                     }
-                    if let Some(answers) = question_answers {
-                        emit(
-                            events,
-                            HarnessEvent::QuestionAnswered {
-                                run_id: active.clone().unwrap_or_default(),
-                                tool_call_id: call_id,
-                                answers,
-                            },
-                        )
-                        .await;
+                    match completion {
+                        FollowUpCompletion::LegacyQuestion(answers) => {
+                            emit(
+                                events,
+                                HarnessEvent::QuestionAnswered {
+                                    run_id: active.clone().unwrap_or_default(),
+                                    tool_call_id: call_id,
+                                    answers,
+                                },
+                            )
+                            .await;
+                        }
+                        FollowUpCompletion::Tool {
+                            name,
+                            result_summary,
+                        } => {
+                            emit(
+                                events,
+                                HarnessEvent::ToolCallCompleted {
+                                    run_id: active.clone().unwrap_or_default(),
+                                    tool_call_id: call_id,
+                                    tool_name: name,
+                                    ok: true,
+                                    duration_ms: 0,
+                                    result_summary: Some(engram_harness_sdk::truncate_utf8(
+                                        &result_summary,
+                                        MAX_SUMMARY,
+                                    )),
+                                },
+                            )
+                            .await;
+                        }
                     }
                 }
                 Pending::FollowUp { call_id, .. } => {
@@ -1624,6 +1757,13 @@ done
         }
     }
 
+    fn native_question_manifest() -> ToolManifest {
+        parse_tool_manifest(
+            r#"[{"name":"ask_user_question","description":"Ask the user one or more structured questions.","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{"codex":"requestUserInput"}}]"#,
+        )
+        .unwrap()
+    }
+
     async fn recorded_requests(path: &Path) -> Vec<Value> {
         tokio::fs::read_to_string(path)
             .await
@@ -1913,12 +2053,13 @@ done
     }
 
     #[tokio::test]
-    async fn request_user_input_event_is_unchanged_and_parked_durably() {
+    async fn native_request_user_input_uses_generic_frames_and_is_parked_durably() {
         let question = r#"{"id":88,"method":"item/tool/requestUserInput","params":{"itemId":"question-1","threadId":"t1","turnId":"turn-1","questions":[{"id":"q1","question":"Deploy now?","header":"Deploy","multiSelect":false,"options":[{"label":"Yes","description":"Deploy it"}]}]}}"#;
-        let (script, _) = write_fake_codex(&[question]).await;
+        let (script, record) = write_fake_codex(&[question]).await;
         let base = script.parent().unwrap().to_path_buf();
         let mut cli = test_cli(script, base.join("home"));
         cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = native_question_manifest();
         let parked_path = cli.parked_calls_file().to_path_buf();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -1938,13 +2079,14 @@ done
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
-                if let Some(HarnessEvent::UserQuestion {
+                if let Some(HarnessEvent::ToolCallRequested {
                     run_id,
-                    tool_call_id,
-                    questions,
+                    call_id,
+                    name,
+                    args_json,
                 }) = event_rx.recv().await
                 {
-                    break (run_id, tool_call_id, questions);
+                    break (run_id, call_id, name, args_json);
                 }
             }
         })
@@ -1952,17 +2094,15 @@ done
         .expect("requestUserInput event timed out");
         assert_eq!(event.0, "turn-1");
         assert_eq!(event.1, "question-1");
+        assert_eq!(event.2, "ask_user_question");
         assert_eq!(
-            event.2,
-            vec![Question {
-                question: "Deploy now?".into(),
-                header: "Deploy".into(),
-                multi_select: false,
-                options: vec![QuestionOption {
-                    label: "Yes".into(),
-                    description: "Deploy it".into(),
-                }],
-            }]
+            serde_json::from_str::<Value>(&event.3).unwrap(),
+            json!({"questions":[{
+                "question":"Deploy now?",
+                "header":"Deploy",
+                "multiSelect":false,
+                "options":[{"label":"Yes","description":"Deploy it"}]
+            }]})
         );
         assert!(matches!(
             tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
@@ -1973,8 +2113,135 @@ done
         let parked = ParkedCallStore::open(parked_path).unwrap().all();
         assert_eq!(parked.len(), 1);
         assert_eq!(parked[0].tool_call_id, "question-1");
-        assert_eq!(parked[0].kind, ParkedCallKind::UserQuestion);
+        assert_eq!(parked[0].kind, ParkedCallKind::DynamicTool);
+        assert_eq!(parked[0].tool_name, "ask_user_question");
         assert_eq!(parked[0].request_id, json!(88));
+
+        command_tx
+            .send(HarnessCommand::ToolResult {
+                call_id: "question-1".into(),
+                result_json: json!({"Deploy now?":["Yes"]}).to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if recorded_requests(&record).await.iter().any(|request| {
+                    request
+                        == &json!({
+                            "id":88,
+                            "result":{"answers":{"q1":{"answers":["Yes"]}}}
+                        })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("native question result response timed out");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(HarnessEvent::ToolCallCompleted {
+                        tool_call_id,
+                        tool_name,
+                        ok,
+                        ..
+                    }) = event_rx.recv().await
+                    {
+                        break (tool_call_id, tool_name, ok);
+                    }
+                }
+            })
+            .await,
+            Ok((call_id, name, true))
+                if call_id == "question-1" && name == "ask_user_question"
+        ));
+        engine.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_answer_question_still_completes_unbound_request_user_input() {
+        let question = r#"{"id":88,"method":"item/tool/requestUserInput","params":{"itemId":"legacy-question","threadId":"t1","turnId":"turn-1","questions":[{"id":"q1","question":"Deploy now?","header":"Deploy","multiSelect":false,"options":[{"label":"Yes","description":"Deploy it"}]}]}}"#;
+        let (script, record) = write_fake_codex(&[question]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = Vec::new();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-legacy".into(),
+                text: "deploy".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    event_rx.recv().await,
+                    Some(HarnessEvent::UserQuestion { ref tool_call_id, .. })
+                        if tool_call_id == "legacy-question"
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("legacy requestUserInput event timed out");
+
+        let answers = [("Deploy now?".into(), vec!["Yes".into()])]
+            .into_iter()
+            .collect();
+        command_tx
+            .send(HarnessCommand::AnswerQuestion {
+                tool_call_id: "legacy-question".into(),
+                answers,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if recorded_requests(&record).await.iter().any(|request| {
+                    request
+                        == &json!({
+                            "id":88,
+                            "result":{"answers":{"q1":{"answers":["Yes"]}}}
+                        })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("legacy AnswerQuestion response timed out");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(HarnessEvent::QuestionAnswered {
+                        tool_call_id,
+                        answers,
+                        ..
+                    }) = event_rx.recv().await
+                    {
+                        break (tool_call_id, answers);
+                    }
+                }
+            })
+            .await,
+            Ok((call_id, answers))
+                if call_id == "legacy-question"
+                    && answers.get("Deploy now?") == Some(&vec!["Yes".into()])
+        ));
         engine.abort();
     }
 
@@ -2026,11 +2293,12 @@ done
     }
 
     #[tokio::test]
-    async fn answer_after_app_server_crash_becomes_follow_up_user_message() {
+    async fn native_question_result_after_app_server_crash_becomes_follow_up_user_message() {
         let (script, record) = write_crashing_question_fake().await;
         let base = script.parent().unwrap().to_path_buf();
         let mut cli = test_cli(script, base.join("home"));
         cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = native_question_manifest();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(32);
         let engine = tokio::spawn(run_engine(
@@ -2050,8 +2318,8 @@ done
             loop {
                 if matches!(
                     event_rx.recv().await,
-                    Some(HarnessEvent::UserQuestion { ref tool_call_id, .. })
-                        if tool_call_id == "question-1"
+                    Some(HarnessEvent::ToolCallRequested { ref call_id, ref name, .. })
+                        if call_id == "question-1" && name == "ask_user_question"
                 ) {
                     break;
                 }
@@ -2075,11 +2343,9 @@ done
         .expect("fake app-server did not respawn");
 
         command_tx
-            .send(HarnessCommand::AnswerQuestion {
-                tool_call_id: "question-1".into(),
-                answers: [("Deploy now?".into(), vec!["Yes".into()])]
-                    .into_iter()
-                    .collect(),
+            .send(HarnessCommand::ToolResult {
+                call_id: "question-1".into(),
+                result_json: json!({"Deploy now?":["Yes"]}).to_string(),
             })
             .await
             .unwrap();
@@ -2104,16 +2370,19 @@ done
             loop {
                 if matches!(
                     event_rx.recv().await,
-                    Some(HarnessEvent::QuestionAnswered { ref tool_call_id, ref answers, .. })
-                        if tool_call_id == "question-1"
-                            && answers.get("Deploy now?") == Some(&vec!["Yes".into()])
+                    Some(HarnessEvent::ToolCallCompleted {
+                        ref tool_call_id,
+                        ref tool_name,
+                        ok: true,
+                        ..
+                    }) if tool_call_id == "question-1" && tool_name == "ask_user_question"
                 ) {
                     break;
                 }
             }
         })
         .await
-        .expect("late answer was not confirmed after the follow-up was accepted");
+        .expect("late result was not confirmed after the follow-up was accepted");
         engine.abort();
     }
 

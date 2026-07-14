@@ -137,6 +137,21 @@ mod adapter {
             .collect()
     }
 
+    fn normalize_native_tool_event(event: &mut HarnessEvent, manifest: &[ManifestTool]) {
+        let observed = match event {
+            HarnessEvent::ToolCallStarted { tool_name, .. }
+            | HarnessEvent::ToolCallCompleted { tool_name, .. } => tool_name,
+            _ => return,
+        };
+        let Some(canonical) = manifest.iter().find_map(|tool| {
+            (tool.native_bindings.claude.as_deref() == Some(observed.as_str()))
+                .then(|| tool.name.clone())
+        }) else {
+            return;
+        };
+        *observed = canonical;
+    }
+
     /// Truncation budgets used when building summary fields. Adapter-
     /// local enforcement of the wire docs.
     pub const MAX_ARGS_SUMMARY_BYTES: usize = 1024;
@@ -247,6 +262,15 @@ mod adapter {
         /// `MCP_SOCK_FILE`; fake-engine tests bind an isolated temp path.
         #[arg(skip)]
         pub mcp_sock_path: Option<String>,
+
+        /// Test seam for the resumable-session-id stash. Production always
+        /// uses the fixed in-VM path (`CLAUDE_SESSION_ID_FILE`); parallel
+        /// engine tests each get an isolated temp path — a shared stash
+        /// leaks one test's resumable id into another's FIRST spawn, which
+        /// then boots `--resume` and derails the fake's choreography
+        /// (observed as a schedule-dependent suite-only failure).
+        #[arg(skip)]
+        pub session_id_file: Option<String>,
 
         /// Parsed once from `ENGRAM_TOOLS` by the main harness process. Not a
         /// clap argument; tests inject a fixture directly.
@@ -595,8 +619,99 @@ mod adapter {
             };
             let run_id = current_run_id.lock().await.clone().unwrap_or_default();
 
+            // A native binding adapts a Claude built-in onto the same generic
+            // deferred-call ledger used by injected MCP tools. Its result is
+            // consumed here (rather than by the MCP bridge) because Claude's
+            // own AskUserQuestion implementation produces the tool_result once
+            // the hook allows it with updatedInput.answers.
+            if let Some(tool) = manifest
+                .iter()
+                .find(|tool| tool.native_bindings.claude.as_deref() == Some(req.tool_name.as_str()))
+            {
+                let mut event = None;
+                let verdict = if tool.execution == ToolExecution::Sync {
+                    tracing::warn!(
+                        tool_name = %tool.name,
+                        native_binding = %req.tool_name,
+                        "sync native binding is unsupported; allowing the built-in"
+                    );
+                    HookVerdict::Allow
+                } else if let Some(result_json) =
+                    results_in_hand.lock().await.remove(&req.tool_use_id)
+                {
+                    match serde_json::from_str::<Answers>(&result_json) {
+                        Ok(answers) => {
+                            deferred_calls.lock().await.remove(&req.tool_use_id);
+                            HookVerdict::Answer { answers }
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                tool_use_id = %req.tool_use_id,
+                                tool_name = %tool.name,
+                                "native tool result is not a canonical answer map"
+                            );
+                            results_in_hand
+                                .lock()
+                                .await
+                                .insert(req.tool_use_id.clone(), result_json);
+                            HookVerdict::Defer
+                        }
+                    }
+                } else {
+                    // Questions are session-scoped: while one native AUQ is
+                    // outstanding, a second same-name call in any run is the
+                    // #64389 double-fire. Exact-id re-fires remain ordinary
+                    // idempotency and are never scrubbed.
+                    let (first_request, duplicate) = {
+                        let mut calls = deferred_calls.lock().await;
+                        if calls.contains_key(&req.tool_use_id) {
+                            (false, false)
+                        } else if calls.values().any(|call| call.tool_name == tool.name) {
+                            (false, true)
+                        } else {
+                            calls.insert(
+                                req.tool_use_id.clone(),
+                                DeferredCall {
+                                    run_id: run_id.clone(),
+                                    tool_name: tool.name.clone(),
+                                },
+                            );
+                            (true, false)
+                        }
+                    };
+                    if duplicate {
+                        duplicate_deferred_ids
+                            .lock()
+                            .await
+                            .insert(req.tool_use_id.clone());
+                        tracing::warn!(
+                            %run_id,
+                            tool_use_id = %req.tool_use_id,
+                            tool_name = %tool.name,
+                            "ADR 0089: duplicate deferred native tool (#64389 double-fire); \
+                             deferring with no request (scrubbed before resume)"
+                        );
+                    }
+                    if first_request {
+                        event = Some(HarnessEvent::ToolCallRequested {
+                            run_id,
+                            call_id: req.tool_use_id.clone(),
+                            name: tool.name.clone(),
+                            args_json: serde_json::json!({"questions": req.questions}).to_string(),
+                        });
+                    }
+                    HookVerdict::Defer
+                };
+                if let Some(event) = event {
+                    emit(&evt_tx, event).await;
+                }
+                write_verdict(&mut w, &verdict).await;
+                return;
+            }
+
             // Before ADR 0089 only AUQ reached this socket, so old requests
-            // omitted `tool_name`. Treat an empty name as AUQ to keep that
+            // omitted `tool_name`. Treat an empty name as legacy AUQ to keep that
             // one-line protocol byte-compatible while new prefixed MCP tools
             // carry their full hook payload.
             let is_auq = req.tool_name.is_empty() || req.tool_name == "AskUserQuestion";
@@ -1558,7 +1673,7 @@ mod adapter {
                         std::mem::take(&mut *g)
                     };
                     if !ids.is_empty() || !dup_ids.is_empty() {
-                        if let Some(sid) = read_claude_session_id().await {
+                        if let Some(sid) = read_claude_session_id(session_id_stash(&cli)).await {
                             match find_claude_transcript(&sid) {
                                 Some(tr) => {
                                     let res = tokio::task::spawn_blocking(move || {
@@ -1817,7 +1932,7 @@ mod adapter {
         // A socket call outside a turn must carry the wire-mandated empty
         // run_id, never the previous turn's id.
         *current_run_id.lock().await = None;
-        let resume_id = read_claude_session_id().await;
+        let resume_id = read_claude_session_id(session_id_stash(cli)).await;
         // ADR 0060: ENGRAM_APPEND_SYSTEM_PROMPT (carried via harness_env) flavors
         // the agent's system prompt. Read per spawn — it is constant for the
         // process, and a respawn must re-apply it.
@@ -1994,6 +2109,7 @@ mod adapter {
                 line = lines.next_line() => {
                     match line {
                         Ok(Some(line)) => {
+                            maybe_stash_session_id(&line, cli).await;
                             if let Some(marker) = detect_result_marker(&line) {
                                 // Explicit turn-end. Close the in-flight
                                 // run, then run the next queued prompt
@@ -2218,7 +2334,7 @@ mod adapter {
                                     &mut t.deferred_pending,
                                     &mut t.suppressed_msg_ids,
                                 ) {
-                                    for ev in translated {
+                                    for mut ev in translated {
                                         // ADR 0054: drop a duplicate AUQ's
                                         // tool-log entry (the #64389 double-fire,
                                         // within- or cross-run). A question is
@@ -2238,15 +2354,16 @@ mod adapter {
                                                 continue;
                                             }
                                         }
+                                        normalize_native_tool_event(&mut ev, &cli.tool_manifest);
                                         emit(evt_tx, ev).await;
                                     }
                                 }
                             } else {
                                 // A line outside any turn (e.g. claude's
-                                // init banner before the first prompt):
-                                // parse mainly for the session-id capture
-                                // side effect. No turn ⇒ no chunks to stream,
-                                // so the message-id sink is a throwaway. A
+                                // init banner before the first prompt; the
+                                // session-id capture already happened above).
+                                // No turn ⇒ no chunks to stream, so the
+                                // message-id sink is a throwaway. A
                                 // `TitleSuggested` can legitimately arrive
                                 // between turns, though — forward those (they
                                 // carry no run_id) rather than drop them.
@@ -2322,6 +2439,10 @@ mod adapter {
                             }
                         }
                         Some(HarnessCommand::AnswerQuestion { tool_call_id, answers }) => {
+                            tracing::warn!(
+                                %tool_call_id,
+                                "received legacy AnswerQuestion command; use ToolResult for native ask_user_question"
+                            );
                             // ADR 0054: stash the answer for the hook of the
                             // NEXT (resumed) process — it can ONLY land on the
                             // resumed re-fire, never on this live process
@@ -2824,8 +2945,14 @@ mod adapter {
         argv
     }
 
-    async fn read_claude_session_id() -> Option<String> {
-        match tokio::fs::read_to_string(CLAUDE_SESSION_ID_FILE).await {
+    fn session_id_stash(cli: &Cli) -> &str {
+        cli.session_id_file
+            .as_deref()
+            .unwrap_or(CLAUDE_SESSION_ID_FILE)
+    }
+
+    async fn read_claude_session_id(path: &str) -> Option<String> {
+        match tokio::fs::read_to_string(path).await {
             Ok(s) => {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
@@ -2838,10 +2965,32 @@ mod adapter {
         }
     }
 
-    async fn write_claude_session_id(id: &str) {
-        let _ = tokio::fs::create_dir_all("/workspace/.engram").await;
-        if let Err(e) = tokio::fs::write(CLAUDE_SESSION_ID_FILE, id).await {
+    async fn write_claude_session_id(path: &str, id: &str) {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Err(e) = tokio::fs::write(path, id).await {
             tracing::warn!(error = %e, "couldn't persist claude session id");
+        }
+    }
+
+    /// Capture + persist claude's session id from a `system/init` line so a
+    /// respawn can `--resume` the same conversation. Lives in the engine (not
+    /// the pure translator) because the stash path is per-session state.
+    async fn maybe_stash_session_id(line: &str, cli: &Cli) {
+        if !line.contains("init") {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("system")
+            || v.get("subtype").and_then(|s| s.as_str()) != Some("init")
+        {
+            return;
+        }
+        if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+            write_claude_session_id(session_id_stash(cli), sid).await;
         }
     }
 
@@ -3199,24 +3348,10 @@ mod adapter {
                     _ => {}
                 }
             }
-            "system" => {
-                let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
-                if subtype == "init" {
-                    // Capture + persist claude's session id so a respawn
-                    // can `--resume` the same conversation. Fire-and-forget
-                    // the disk write only when a tokio runtime is present
-                    // (sync unit tests call this outside one).
-                    if let Some(sid) = v
-                        .get("session_id")
-                        .and_then(|s| s.as_str())
-                        .map(str::to_string)
-                    {
-                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                            handle.spawn(async move { write_claude_session_id(&sid).await });
-                        }
-                    }
-                }
-            }
+            // The session-id capture from `system/init` lives in the engine
+            // (`maybe_stash_session_id`) — the stash path is per-session
+            // state, and this translator stays pure.
+            "system" => {}
             "assistant" => {
                 let rid = run_id.to_string();
                 // ADR 0054 / 0089: snapshot BEFORE the block loop. If an EARLIER
@@ -4151,6 +4286,14 @@ mod adapter {
                 claude_bin: Some(claude_bin),
                 hook_sock_path: None,
                 mcp_sock_path: None,
+                // Isolated per test: a shared stash leaks one test's
+                // resumable id into another's first spawn (--resume).
+                session_id_file: Some(
+                    std::env::temp_dir()
+                        .join(format!("claude-session-id-{}", uuid::Uuid::new_v4()))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 tool_manifest: Vec::new(),
             }
         }
@@ -4870,11 +5013,15 @@ mod adapter {
         ) -> hook_server::HookVerdict {
             let stream = tokio::net::UnixStream::connect(sock).await.unwrap();
             let (r, mut w) = stream.into_split();
+            let questions = tool_input
+                .get("questions")
+                .and_then(|value| serde_json::from_value::<Vec<Question>>(value.clone()).ok())
+                .unwrap_or_default();
             let request = serde_json::json!({
                 "tool_use_id": tool_use_id,
                 "tool_name": tool_name,
                 "tool_input": tool_input,
-                "questions": []
+                "questions": questions
             });
             let mut line = serde_json::to_vec(&request).unwrap();
             line.push(b'\n');
@@ -4897,6 +5044,118 @@ mod adapter {
                 execution,
                 native_bindings: NativeBindings::default(),
             }
+        }
+
+        fn native_question_tool() -> ManifestTool {
+            ManifestTool {
+                name: "ask_user_question".into(),
+                description: "Ask the user one or more structured questions.".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                execution: ToolExecution::Deferred,
+                native_bindings: NativeBindings {
+                    claude: Some("AskUserQuestion".into()),
+                },
+            }
+        }
+
+        #[test]
+        fn native_question_completion_uses_canonical_tool_name() {
+            let mut event = HarnessEvent::ToolCallCompleted {
+                run_id: "run-1".into(),
+                tool_call_id: "toolu_question".into(),
+                tool_name: "AskUserQuestion".into(),
+                ok: true,
+                duration_ms: 12,
+                result_summary: Some("answered".into()),
+            };
+            normalize_native_tool_event(&mut event, &[native_question_tool()]);
+            assert!(matches!(
+                event,
+                HarnessEvent::ToolCallCompleted { tool_name, .. }
+                    if tool_name == "ask_user_question"
+            ));
+        }
+
+        #[tokio::test]
+        async fn native_ask_user_question_uses_generic_request_and_result_frames() {
+            let (sock, results, pending, mut evt_rx, _duplicates) =
+                spawn_manifest_hook_server(vec![native_question_tool()]).await;
+            let input = serde_json::json!({
+                "questions": [{
+                    "question": "Deploy now?",
+                    "header": "Deploy",
+                    "multiSelect": false,
+                    "options": [{"label": "Yes", "description": "Deploy it"}]
+                }]
+            });
+
+            assert!(matches!(
+                hook_fire_named(&sock, "toolu_question", "AskUserQuestion", input.clone()).await,
+                hook_server::HookVerdict::Defer
+            ));
+            match evt_rx.recv().await {
+                Some(HarnessEvent::ToolCallRequested {
+                    run_id,
+                    call_id,
+                    name,
+                    args_json,
+                }) => {
+                    assert_eq!(run_id, "run-x");
+                    assert_eq!(call_id, "toolu_question");
+                    assert_eq!(name, "ask_user_question");
+                    assert_eq!(serde_json::from_str::<Value>(&args_json).unwrap(), input);
+                }
+                other => panic!("expected ToolCallRequested, got {other:?}"),
+            }
+            assert!(pending.lock().await.contains_key("toolu_question"));
+
+            results.lock().await.insert(
+                "toolu_question".into(),
+                serde_json::json!({"Deploy now?": ["Yes"]}).to_string(),
+            );
+            match hook_fire_named(&sock, "toolu_question", "AskUserQuestion", input).await {
+                hook_server::HookVerdict::Answer { answers } => {
+                    assert_eq!(answers.get("Deploy now?"), Some(&vec!["Yes".into()]));
+                }
+                _ => panic!("expected native answer verdict"),
+            }
+            assert!(results.lock().await.is_empty());
+            assert!(pending.lock().await.is_empty());
+            assert!(
+                evt_rx.try_recv().is_err(),
+                "native delivery must not emit QuestionAnswered"
+            );
+            let _ = tokio::fs::remove_file(sock).await;
+        }
+
+        #[tokio::test]
+        async fn native_ask_user_question_dedups_double_fire_via_generic_ledger() {
+            let (sock, _results, pending, mut evt_rx, duplicates) =
+                spawn_manifest_hook_server(vec![native_question_tool()]).await;
+            let input = serde_json::json!({"questions": []});
+
+            assert!(matches!(
+                hook_fire_named(&sock, "toolu_first", "AskUserQuestion", input.clone()).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::ToolCallRequested { call_id, .. }) if call_id == "toolu_first"
+            ));
+            assert!(matches!(
+                hook_fire_named(&sock, "toolu_duplicate", "AskUserQuestion", input).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(evt_rx.try_recv().is_err());
+            assert_eq!(
+                *duplicates.lock().await,
+                HashSet::from(["toolu_duplicate".to_string()])
+            );
+            assert_eq!(
+                pending.lock().await.keys().cloned().collect::<HashSet<_>>(),
+                HashSet::from(["toolu_first".to_string()])
+            );
+            let _ = tokio::fs::remove_file(sock).await;
         }
 
         #[tokio::test]
@@ -5347,7 +5606,10 @@ mod adapter {
             path.to_string_lossy().into_owned()
         }
 
-        async fn write_deferred_fallback_fake_claude(counter: &Path, captured: &Path) -> String {
+        async fn write_native_question_fallback_fake_claude(
+            counter: &Path,
+            captured: &Path,
+        ) -> String {
             use std::os::unix::fs::PermissionsExt;
             let path =
                 std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
@@ -5516,6 +5778,7 @@ mod adapter {
             )
             .await;
             let (cli, hook, mcp) = deferred_engine_cli(script.clone(), "fresh-restore").await;
+            let stash = cli.session_id_file.clone().expect("test_cli sets a stash");
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (evt_tx, mut evt_rx) = mpsc::channel(64);
             let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
@@ -5523,7 +5786,7 @@ mod adapter {
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    if tokio::fs::read_to_string(CLAUDE_SESSION_ID_FILE)
+                    if tokio::fs::read_to_string(&stash)
                         .await
                         .is_ok_and(|contents| contents.trim() == session_id)
                     {
@@ -5721,12 +5984,13 @@ mod adapter {
         }
 
         #[tokio::test]
-        async fn deferred_result_abandoned_refire_fallback_emits_completion() {
+        async fn native_question_abandoned_refire_fallback_emits_completion() {
             let nonce = uuid::Uuid::new_v4();
             let counter = std::env::temp_dir().join(format!("fake-claude-count-{nonce}"));
             let captured = std::env::temp_dir().join(format!("fake-claude-fallback-{nonce}"));
-            let script = write_deferred_fallback_fake_claude(&counter, &captured).await;
-            let (cli, hook, _mcp) = deferred_engine_cli(script.clone(), "fallback").await;
+            let script = write_native_question_fallback_fake_claude(&counter, &captured).await;
+            let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone(), "fallback").await;
+            cli.tool_manifest = vec![native_question_tool()];
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (evt_tx, mut evt_rx) = mpsc::channel(64);
             let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
@@ -5744,16 +6008,23 @@ mod adapter {
                 hook_fire_named(
                     &hook,
                     "toolu_fallback",
-                    "mcp__engrams__save_memory",
-                    serde_json::json!({"text":"remember"}),
+                    "AskUserQuestion",
+                    serde_json::json!({
+                        "questions": [{
+                            "question": "Deploy now?",
+                            "header": "Deploy",
+                            "multiSelect": false,
+                            "options": [{"label": "Yes", "description": "Deploy it"}]
+                        }]
+                    }),
                 )
                 .await,
                 hook_server::HookVerdict::Defer
             ));
             assert!(matches!(
                 evt_rx.recv().await,
-                Some(HarnessEvent::ToolCallRequested { call_id, .. })
-                    if call_id == "toolu_fallback"
+                Some(HarnessEvent::ToolCallRequested { call_id, name, .. })
+                    if call_id == "toolu_fallback" && name == "ask_user_question"
             ));
 
             let mut waiting = Vec::new();
@@ -5774,7 +6045,7 @@ mod adapter {
             cmd_tx
                 .send(HarnessCommand::ToolResult {
                     call_id: "toolu_fallback".into(),
-                    result_json: r#"{"saved":true}"#.into(),
+                    result_json: r#"{"Deploy now?":["Yes"]}"#.into(),
                 })
                 .await
                 .unwrap();
@@ -5811,7 +6082,7 @@ mod adapter {
                 }) => {
                     assert_eq!(run_id, fallback_run_id);
                     assert_eq!(tool_call_id, "toolu_fallback");
-                    assert_eq!(tool_name, "save_memory");
+                    assert_eq!(tool_name, "ask_user_question");
                     assert!(ok);
                     assert_eq!(duration_ms, 0);
                     assert_eq!(result_summary, None);
@@ -5823,7 +6094,7 @@ mod adapter {
                 serde_json::from_slice(&tokio::fs::read(&captured).await.unwrap()).unwrap();
             assert!(delivered["message"]["content"]
                 .as_str()
-                .is_some_and(|text| text.contains("toolu_fallback") && text.contains("saved")));
+                .is_some_and(|text| text.contains("toolu_fallback") && text.contains("Yes")));
             let _ = expect_run_completed(&mut evt_rx).await;
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
 
