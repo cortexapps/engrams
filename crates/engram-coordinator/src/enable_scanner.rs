@@ -1156,11 +1156,13 @@ async fn capture_job_capacity_scan(cfg: &EnableScannerConfig, state: &SharedStat
                 continue;
             }
         };
-        match state
-            .services
-            .meta
-            .place_capture_job(row.id, &candidates)
-            .await
+        match crate::api::enabled_images::place_capture_job_preferring_materialize_host(
+            state.services.meta.as_ref(),
+            row.id,
+            row.enable_job_id,
+            &candidates,
+        )
+        .await
         {
             Ok(Some(placed)) if placed.host_id.is_some() => {
                 tracing::info!(capture_job_id = %row.id, host = ?placed.host_id, "capture-job capacity scan: placed a waiting capture (capacity freed)");

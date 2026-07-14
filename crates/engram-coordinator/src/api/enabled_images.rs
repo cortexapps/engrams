@@ -894,12 +894,70 @@ pub(crate) async fn ensure_capture_job(
                     row.image_uri
                 ))
             })?;
-    let placed = state
-        .services
-        .meta
-        .place_capture_job(inserted.id, &candidates)
-        .await?;
+    let placed = place_capture_job_preferring_materialize_host(
+        state.services.meta.as_ref(),
+        inserted.id,
+        enable_job_id,
+        &candidates,
+    )
+    .await?;
     Ok(placed.unwrap_or(inserted))
+}
+
+/// ADR 0088 addendum: place a capture job, PREFERRING the host that
+/// materialized this enable's rootfs. The materializer write-throughs
+/// every chunk into that host's local NVMe cache, so a co-located
+/// capture VM pages its ~GiBs of rootfs in locally instead of
+/// re-fetching from GCS — and the seed-upload-vs-rootfs-upload GCS
+/// contention window disappears by construction.
+///
+/// Two-call shape (not candidate reordering): `pick_host_2d` is a
+/// best-fit over RAM, so candidate order only breaks ties — a
+/// singleton first call is the only way to express preference, and
+/// the second call preserves today's placement exactly. Membership in
+/// `candidates` inherits every existing gate for free (schedulability,
+/// capabilities, disk floor, one-capture-per-host anti-affinity).
+/// A first-call miss stamps `waiting_since` (COALESCE); the second
+/// call's fit clears it — cosmetic, self-healing.
+///
+/// Deliberately NOT used by reassign/redrive: a failed attempt
+/// (possibly on the materialize host) must not prefer its way back.
+pub(crate) async fn place_capture_job_preferring_materialize_host(
+    meta: &dyn engram_core::traits::MetadataStore,
+    job_id: engram_core::types::ids::CaptureJobId,
+    enable_job_id: Uuid,
+    candidates: &[engram_core::HostId],
+) -> Result<Option<engram_core::types::capture_job::CaptureJobRow>, engram_core::MetaError> {
+    let preferred = match meta.get_enable_job(enable_job_id).await {
+        Ok(job) => job.and_then(|j| j.materialize_host_id),
+        Err(e) => {
+            // Preference is an optimization, never a gate.
+            tracing::debug!(%enable_job_id, error = %e, "materialize-host lookup failed; placing without preference");
+            None
+        }
+    };
+    if let Some(host) = preferred {
+        if candidates.contains(&host) {
+            match meta.place_capture_job(job_id, &[host]).await? {
+                // Job gone/terminal: the full-set call would say the same.
+                None => return Ok(None),
+                Some(placed) if placed.host_id.is_some() => {
+                    if placed.host_id == Some(host) {
+                        tracing::info!(
+                            capture_job_id = %job_id,
+                            %enable_job_id,
+                            host = %host,
+                            "capture co-located with its materialize host (warm local chunk cache)",
+                        );
+                    }
+                    return Ok(Some(placed));
+                }
+                // Singleton no-fit (2D-full on that host): fall through.
+                Some(_) => {}
+            }
+        }
+    }
+    meta.place_capture_job(job_id, candidates).await
 }
 
 /// ADR 0084 §D: the [`finalize_capture_job`] outcome — its
@@ -1156,6 +1214,431 @@ mod tests {
     use engram_core::traits::BlobStorage;
     use engram_storage_local::LocalBlobStorage;
     use std::sync::Arc;
+
+    // ---- capture co-location (ADR 0088 addendum) ----
+
+    mod colocation {
+        use super::super::place_capture_job_preferring_materialize_host;
+        use async_trait::async_trait;
+        use chrono::Utc;
+        use engram_core::traits::MetadataStore;
+        use engram_core::types::capture_job::{CaptureJobRow, CaptureJobStage};
+        use engram_core::types::ids::CaptureJobId;
+        use engram_core::types::registry::{EnableJob, EnableJobState};
+        use engram_core::{HostId, MetaError};
+        use uuid::Uuid;
+
+        /// Minimal fake: `get_enable_job` serves one row;
+        /// `place_capture_job` records each candidate list and binds the
+        /// first candidate with capacity (`fits`), else leaves WAITING —
+        /// the same fit-or-wait contract as the PG impl (best-fit vs
+        /// first-fit is irrelevant to the two-call preference shape).
+        struct PlacementFake {
+            job: EnableJob,
+            fits: Vec<HostId>,
+            calls: parking_lot::Mutex<Vec<Vec<HostId>>>,
+        }
+
+        fn enable_job(materialize_host_id: Option<HostId>) -> EnableJob {
+            let image_config: engram_core::types::image::ImageConfig =
+                toml::from_str("name = \"colo\"\n[resources]\nsuggested_vcpus = 2\n").unwrap();
+            EnableJob {
+                id: Uuid::new_v4(),
+                image_uri: "ghcr.io/x/colo:latest".into(),
+                manifest_digest: None,
+                state: EnableJobState::Capturing,
+                chunks_total: None,
+                chunks_done: 0,
+                attempts: 0,
+                error: None,
+                image_config,
+                force_recapture: false,
+                prestage_hosts: serde_json::Value::Null,
+                capture_phase: None,
+                warm_stage: None,
+                warm_stage_started_at: None,
+                warm_stages: Vec::new(),
+                materialize_stages: Vec::new(),
+                materialize_host_id,
+                output_tail: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }
+        }
+
+        fn row(job: &EnableJob, host: Option<HostId>) -> CaptureJobRow {
+            CaptureJobRow {
+                id: CaptureJobId::new(),
+                enable_job_id: job.id,
+                image_uri: job.image_uri.clone(),
+                manifest_digest: "sha256:0".into(),
+                disk_manifest: "m@v1".into(),
+                image_config: job.image_config.clone(),
+                oci_defaults: Default::default(),
+                host_id: host,
+                mem_budget_mib: 1024,
+                cpu_budget_vcpus: 2,
+                waiting_since: host.is_none().then(Utc::now),
+                epoch: 1,
+                stage: CaptureJobStage::Assigned,
+                stage_started_at: Utc::now(),
+                stage_progress: None,
+                last_progress_at: Utc::now(),
+                attempts: 0,
+                retryable: None,
+                error: None,
+                error_stage: None,
+                fc_snapshot_version: None,
+                result_bincode: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }
+        }
+
+        #[async_trait]
+        impl MetadataStore for PlacementFake {
+            async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
+                Ok((id == self.job.id).then(|| self.job.clone()))
+            }
+            async fn place_capture_job(
+                &self,
+                _id: CaptureJobId,
+                candidates: &[HostId],
+            ) -> Result<Option<CaptureJobRow>, MetaError> {
+                self.calls.lock().push(candidates.to_vec());
+                let bound = candidates.iter().find(|h| self.fits.contains(h)).copied();
+                Ok(Some(row(&self.job, bound)))
+            }
+
+            // ---- unused required surface ----
+            async fn create_session(
+                &self,
+                _: engram_core::types::session::SessionSpec,
+            ) -> Result<engram_core::SessionId, MetaError> {
+                unreachable!()
+            }
+            async fn transition_session_created(
+                &self,
+                _: engram_core::SessionId,
+                _: engram_core::SandboxId,
+            ) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn get_session(
+                &self,
+                _: engram_core::SessionId,
+            ) -> Result<engram_core::types::session::Session, MetaError> {
+                unreachable!()
+            }
+            async fn list_active_sessions(
+                &self,
+            ) -> Result<Vec<engram_core::types::session::Session>, MetaError> {
+                unreachable!()
+            }
+            async fn reserve_and_persist_create(
+                &self,
+                _: engram_core::traits::SessionCreateWriteSet,
+                _: &[HostId],
+                _: usize,
+            ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
+                unreachable!()
+            }
+            async fn transition_session(
+                &self,
+                _: engram_core::SessionId,
+                _: engram_core::types::session::SessionState,
+            ) -> Result<engram_core::types::session::SessionState, MetaError> {
+                unreachable!()
+            }
+            async fn assign_session_host(
+                &self,
+                _: engram_core::SessionId,
+                _: Option<HostId>,
+            ) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn assign_session_sandbox(
+                &self,
+                _: engram_core::SessionId,
+                _: Option<engram_core::SandboxId>,
+            ) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn upsert_host(
+                &self,
+                _: engram_core::types::host::HostRecord,
+            ) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn list_active_hosts(
+                &self,
+            ) -> Result<Vec<engram_core::types::host::HostRecord>, MetaError> {
+                unreachable!()
+            }
+            async fn set_host_status(
+                &self,
+                _: HostId,
+                _: engram_core::types::host::HostStatus,
+            ) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn touch_host_heartbeat(
+                &self,
+                _: HostId,
+                _: engram_core::types::host::HostHeartbeat,
+            ) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn list_stale_hosts(
+                &self,
+                _: u64,
+            ) -> Result<Vec<engram_core::types::host::HostRecord>, MetaError> {
+                unreachable!()
+            }
+            async fn mark_host_dead_and_orphan_sessions(
+                &self,
+                _: HostId,
+            ) -> Result<
+                Vec<(
+                    engram_core::SessionId,
+                    engram_core::types::session::SessionState,
+                )>,
+                MetaError,
+            > {
+                unreachable!()
+            }
+            async fn record_snapshot(
+                &self,
+                _: engram_core::types::snapshot::SnapshotRecord,
+            ) -> Result<bool, MetaError> {
+                unreachable!()
+            }
+            async fn list_snapshots_for_session(
+                &self,
+                _: engram_core::SessionId,
+            ) -> Result<Vec<engram_core::types::snapshot::SnapshotRecord>, MetaError> {
+                unreachable!()
+            }
+            async fn latest_snapshot_for_session(
+                &self,
+                _: engram_core::SessionId,
+            ) -> Result<Option<engram_core::types::snapshot::SnapshotRecord>, MetaError>
+            {
+                unreachable!()
+            }
+            async fn append_session_event(
+                &self,
+                _: engram_core::SessionId,
+                _: &str,
+                _: serde_json::Value,
+            ) -> Result<i64, MetaError> {
+                unreachable!()
+            }
+            async fn list_session_events_since(
+                &self,
+                _: engram_core::SessionId,
+                _: i64,
+                _: i64,
+            ) -> Result<Vec<engram_core::types::event::PersistedEvent>, MetaError> {
+                unreachable!()
+            }
+            async fn insert_artifact(
+                &self,
+                _: Uuid,
+                _: engram_core::SessionId,
+                _: &str,
+                _: &str,
+                _: i64,
+                _: Option<&str>,
+            ) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn get_artifact(
+                &self,
+                _: engram_core::SessionId,
+                _: Uuid,
+            ) -> Result<Option<engram_core::types::event::ArtifactRow>, MetaError> {
+                unreachable!()
+            }
+            async fn artifact_usage(
+                &self,
+                _: engram_core::SessionId,
+            ) -> Result<(i64, i64), MetaError> {
+                unreachable!()
+            }
+            async fn upsert_registry_credential(
+                &self,
+                _: engram_core::types::registry::RegistryCredential,
+            ) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn list_registry_credentials(
+                &self,
+            ) -> Result<Vec<engram_core::types::registry::RegistryCredential>, MetaError>
+            {
+                unreachable!()
+            }
+            async fn registry_credential_for_host(
+                &self,
+                _: &str,
+            ) -> Result<Option<engram_core::types::registry::RegistryCredential>, MetaError>
+            {
+                unreachable!()
+            }
+            async fn delete_registry_credential(&self, _: &str) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn upsert_enabled_image(
+                &self,
+                _: engram_core::types::registry::EnabledImage,
+            ) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn list_enabled_images(
+                &self,
+            ) -> Result<Vec<engram_core::types::registry::EnabledImage>, MetaError> {
+                unreachable!()
+            }
+            async fn get_enabled_image(
+                &self,
+                _: &str,
+            ) -> Result<Option<engram_core::types::registry::EnabledImage>, MetaError> {
+                unreachable!()
+            }
+            async fn get_enabled_image_any(
+                &self,
+                _: &str,
+            ) -> Result<Option<engram_core::types::registry::EnabledImage>, MetaError> {
+                unreachable!()
+            }
+            async fn soft_delete_enabled_image(
+                &self,
+                _: &str,
+            ) -> Result<engram_core::traits::metadata::DisableEnabledImageOutcome, MetaError>
+            {
+                unreachable!()
+            }
+            async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
+                unreachable!()
+            }
+            async fn get_session_secrets(
+                &self,
+                _: engram_core::SessionId,
+            ) -> Result<Option<engram_core::types::registry::SessionSecrets>, MetaError>
+            {
+                unreachable!()
+            }
+            async fn delete_session_secrets(
+                &self,
+                _: engram_core::SessionId,
+            ) -> Result<(), MetaError> {
+                unreachable!()
+            }
+        }
+
+        /// The materialize host wins even when the 2D pick would have
+        /// chosen another candidate (singleton-first expresses the
+        /// preference best-fit ordering can't).
+        #[tokio::test]
+        async fn preferred_materialize_host_wins() {
+            let (h1, h2) = (HostId::new(), HostId::new());
+            let fake = PlacementFake {
+                job: enable_job(Some(h1)),
+                fits: vec![h2, h1],
+                calls: parking_lot::Mutex::new(Vec::new()),
+            };
+            let placed = place_capture_job_preferring_materialize_host(
+                &fake,
+                CaptureJobId::new(),
+                fake.job.id,
+                &[h2, h1], // h2 first: a plain call would bind h2
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                placed.host_id,
+                Some(h1),
+                "must land on the materialize host"
+            );
+            assert_eq!(*fake.calls.lock(), vec![vec![h1]], "one singleton call");
+        }
+
+        /// A materialize host that fails any placement gate (not in the
+        /// candidate set) falls straight through to today's placement.
+        #[tokio::test]
+        async fn preferred_host_outside_candidates_falls_back() {
+            let (h1, h2, h3) = (HostId::new(), HostId::new(), HostId::new());
+            let fake = PlacementFake {
+                job: enable_job(Some(h3)), // cordoned/rolled/ineligible
+                fits: vec![h1, h2],
+                calls: parking_lot::Mutex::new(Vec::new()),
+            };
+            let placed = place_capture_job_preferring_materialize_host(
+                &fake,
+                CaptureJobId::new(),
+                fake.job.id,
+                &[h1, h2],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(placed.host_id, Some(h1));
+            assert_eq!(
+                *fake.calls.lock(),
+                vec![vec![h1, h2]],
+                "exactly one full-set call — no singleton probe for an ineligible host"
+            );
+        }
+
+        /// A 2D-no-fit on the materialize host (capacity) falls back to
+        /// the full candidate set.
+        #[tokio::test]
+        async fn preferred_host_no_fit_falls_back_to_full_set() {
+            let (h1, h2) = (HostId::new(), HostId::new());
+            let fake = PlacementFake {
+                job: enable_job(Some(h1)),
+                fits: vec![h2], // h1 is 2D-full
+                calls: parking_lot::Mutex::new(Vec::new()),
+            };
+            let placed = place_capture_job_preferring_materialize_host(
+                &fake,
+                CaptureJobId::new(),
+                fake.job.id,
+                &[h1, h2],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(placed.host_id, Some(h2), "fallback must place normally");
+            assert_eq!(*fake.calls.lock(), vec![vec![h1], vec![h1, h2]]);
+        }
+
+        /// No recorded materialize host (legacy rows) ⇒ single full call.
+        #[tokio::test]
+        async fn no_materialize_host_is_a_plain_placement() {
+            let (h1, h2) = (HostId::new(), HostId::new());
+            let fake = PlacementFake {
+                job: enable_job(None),
+                fits: vec![h1, h2],
+                calls: parking_lot::Mutex::new(Vec::new()),
+            };
+            let placed = place_capture_job_preferring_materialize_host(
+                &fake,
+                CaptureJobId::new(),
+                fake.job.id,
+                &[h1, h2],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(placed.host_id, Some(h1));
+            assert_eq!(*fake.calls.lock(), vec![vec![h1, h2]]);
+        }
+    }
 
     #[test]
     fn force_recapture_disables_base_snapshot_reuse() {
