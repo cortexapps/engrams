@@ -104,10 +104,28 @@ impl TreeMetadata {
     }
 
     /// Drop the record for `rel` and everything under it.
+    ///
+    /// O(log N + K) via a range walk — NOT `retain`. This runs before
+    /// EVERY regular-file/symlink/hardlink entry (`remove_entry`), so a
+    /// full-map `retain` here was O(N) per entry ⇒ O(N²) per flatten:
+    /// the ACTUAL dominant cost of a dev-brain-class flatten (millions
+    /// of entries ⇒ ~10^12 key comparisons ⇒ tens of minutes pinning
+    /// one core), misattributed to syscalls for two ADRs running.
+    /// `BTreeMap` keys are lexicographically ordered, so the subtree
+    /// `{rel}/…` is exactly the contiguous range starting at the
+    /// prefix.
     fn remove_subtree(&mut self, rel: &str) {
+        self.entries.remove(rel);
         let prefix = format!("{rel}/");
-        self.entries
-            .retain(|k, _| k != rel && !k.starts_with(&prefix));
+        let doomed: Vec<String> = self
+            .entries
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(prefix.as_str()))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &doomed {
+            self.entries.remove(k);
+        }
     }
 
     /// Apply the recorded uid/gid (and re-assert the mode — `chown`
@@ -211,8 +229,10 @@ pub struct Flattener {
     /// the scoped ancestor resolution — amortizes the per-entry
     /// ancestor lstat walk to ~zero. Invalidated (prefix-wide) by
     /// `remove_entry`, which every type-replacing write funnels
-    /// through.
-    resolve_cache: HashSet<String>,
+    /// through. A `BTreeSet` so invalidation is an O(log N + K) range
+    /// walk — a per-entry `retain` here would be the same O(N²)
+    /// pattern `TreeMetadata::remove_subtree` had.
+    resolve_cache: std::collections::BTreeSet<String>,
 }
 
 impl Flattener {
@@ -220,7 +240,7 @@ impl Flattener {
         Ok(Self {
             root: root.to_path_buf(),
             pool: WritePool::new(write_concurrency)?,
-            resolve_cache: HashSet::new(),
+            resolve_cache: std::collections::BTreeSet::new(),
         })
     }
 
@@ -440,9 +460,17 @@ impl Flattener {
     /// keeps the memoized not-a-symlink facts sound (a dir replaced by
     /// a symlink invalidates itself and everything beneath it).
     fn remove_entry(&mut self, meta: &mut TreeMetadata, rel: &str) -> std::io::Result<()> {
+        self.resolve_cache.remove(rel);
         let prefix = format!("{rel}/");
-        self.resolve_cache
-            .retain(|k| k != rel && !k.starts_with(&prefix));
+        let doomed: Vec<String> = self
+            .resolve_cache
+            .range(prefix.clone()..)
+            .take_while(|k| k.starts_with(prefix.as_str()))
+            .cloned()
+            .collect();
+        for k in &doomed {
+            self.resolve_cache.remove(k);
+        }
         remove_entry(&self.root, meta, rel)
     }
 

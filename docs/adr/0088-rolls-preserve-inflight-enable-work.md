@@ -303,6 +303,26 @@ dev-brain class; small images (~1.5 min end-to-end) must not regress.
   capture block (a deflate failure destroys the restored VM instead of
   leaking it to the reconcile).
 
+### Rollout correction (2026-07-14): the flatten was never syscall-bound
+
+The first post-#663 dev-brain enable still spent 55+ min in flatten,
+one core busy, workers idle. Root cause — measured live, and present
+since ADR 0080: `TreeMetadata::remove_subtree` did a full-map `retain`
+on EVERY regular-file/symlink/hardlink entry (O(N) per entry ⇒ O(N²)
+per flatten; millions of entries ⇒ ~10^12 key comparisons on the
+reader thread). The "syscall-bound tiny-file creation" attribution the
+parallel-flatten work was built on was a misdiagnosis; the fd-worker
+pool is still correct (it removes real work from the reader) but the
+quadratic bookkeeping dominated everything. Fixed with an
+O(log N + K) BTreeMap range walk (and the same fix applied to #663's
+own `resolve_cache` invalidation, which had copied the retain
+pattern). Secondary finding from the same investigation: dev-brain's
+layers are ZSTD, so the zlib-rs inflate never fires — the C-backed
+`zstd` crate replaces `ruzstd` (measured 2.9x on synthetic decode,
+more on match-heavy real layers), unblocked by scoping the musl
+lane's UAPI-header injection to `-idirafter /opt/uapi` instead of
+glibc's entire `/usr/include`.
+
 ### Future direction: a streaming packer
 
 The remaining materialize cost after this overhaul is structural: the
