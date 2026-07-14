@@ -77,9 +77,16 @@ report as `pack` then `chunk` by fill progress.
 - **Fidelity improvement**: device nodes / FIFOs, which the tree-based
   flatten had to skip (`mknod` needs root), are now declared into the
   image. `skipped_specials` reporting retires.
-- **Kill switch**: `ENGRAM_STREAMING_PACKER=0` reverts to the legacy
-  flatten+mke2fs path, which stays in-tree until this ADR flips to
-  Accepted on prod evidence; its removal is the closing commit.
+- **Clean break — e2fsprogs retires everywhere** (owner directive at
+  phase 2): no kill switch, no legacy path. `Mke2fsPacker`,
+  `resolve_mke2fs`/`ENGRAM_MKE2FS`, the pinned static mke2fs shipped in
+  the cli-tools artifact, `ensure-reproducible-mke2fs.sh`, and the
+  nix/CI e2fsprogs installs are all deleted in this PR. The tree-based
+  flatten engine (`flatten.rs`/`flatten/parallel.rs`) and
+  `inject_init`'s tree write retire with them. Rollback is `git
+  revert`, not an env var — the determinism cutover already forces
+  re-capture either way, so a runtime toggle would buy nothing and
+  cost a second maintained path.
 - **mkext4 0.0.2 caveat**: declaration is O(N²) in single-directory
   entry count (linear duplicate scan). Nested trees (node_modules
   shape) are unaffected; a pathological flat directory would regress
@@ -89,9 +96,15 @@ report as `pack` then `chunk` by fill progress.
 
 ## Gates
 
-- Differential: same fixture layers through legacy and streaming
-  paths → namespace/content equality via the mkext4 verification
-  reader over both images (runs on macOS, no mounts).
+- Semantic: fixture layers (whiteouts, opaque, overwrite, hardlinks,
+  hostile symlinks, zip-slip) → build → namespace/content assertions
+  via the mkext4 verification reader (runs on macOS, no mounts). The
+  legacy flatten's semantic test matrix ports over entry-for-entry.
+- One-time legacy A/B (local, recorded at close): the same fixture
+  layers through the pre-deletion flatten+mke2fs path and the
+  streaming path → tree-content equality. Not a CI gate — mke2fs no
+  longer exists in CI; the FC boot test is the standing kernel
+  oracle.
 - Determinism: streaming path double-run → identical `ManifestRef`.
 - FC lane: boot a streaming-packed image in a real guest (wired into
   ci.yml's `--test` list).
