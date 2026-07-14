@@ -108,6 +108,113 @@ impl CheckpointRecord {
     }
 }
 
+/// Durable mirror of a sandbox's in-RAM [`CheckpointChain`] head, at
+/// `<checkpoint_dir>/chains/<sandbox_id>.json` — the hostPath survives
+/// a pod roll, the DashMap does not. Incident 2026-07-13: every VM that
+/// survives a host-agent roll (pidfd reattach, ADR 0044 K2 / ADR 0090)
+/// lost its chain and paid a FULL multi-GiB memory re-chunk on its next
+/// capture; the incident's evict ran 40+ minutes and was killed.
+///
+/// ## The protocol (why this is NOT just a cache of the chain head)
+///
+/// FC's `PUT /snapshot/create` — Full and Diff alike — consumes and
+/// RESETS the KVM dirty bitmap. A capture that fails after that instant
+/// leaves a bitmap baseline nothing durable describes: a diff seeded
+/// from any earlier manifest would silently omit the consumed pages
+/// (memory corruption on restore — the in-RAM analogue is
+/// `poison_checkpoint_chain_after_failed_diff`). So the record is
+/// maintained write-ahead:
+///
+/// 1. **Invalidate** (delete) BEFORE any FC snapshot create;
+/// 2. **Persist** only after the chain durably advanced (manifest in
+///    the store + in-RAM head updated).
+///
+/// A crash/SIGKILL anywhere between the two leaves no record, and the
+/// rehydrate seeds nothing → the survivor's next capture is a safe
+/// Full. Invariant: **record present ⟹ its `manifest_ref` is the
+/// durably-published chain head AND no FC snapshot create has run
+/// since.** This is also why the coordinator's `snapshots` rows must
+/// never be the rehydrate seed source: torn-capture knowledge is
+/// host-local (the 2026-07-13 roll tore a diff at 22:23:46, 28 s before
+/// the successor pod registered — the latest recoverable row no longer
+/// matched the surviving VM's bitmap baseline).
+///
+/// The unlink needs no dir fsync: losing a completed unlink takes a
+/// kernel crash, which also kills the FC VM — and rehydrate only seeds
+/// sandboxes that actually reattached, so a resurrected stale record is
+/// unreachable and swept by the startup GC.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChainHeadRecord {
+    pub sandbox_id: SandboxId,
+    /// The durably-published chain head at persist time.
+    pub manifest_ref: ManifestRef,
+    /// Bound session, when known — diagnostic only.
+    pub session_id: Option<SessionId>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ChainHeadRecord {
+    /// The records' directory under the checkpoint root (a sibling of
+    /// `records/`).
+    pub fn subdir(checkpoint_dir: &Path) -> PathBuf {
+        checkpoint_dir.join("chains")
+    }
+
+    /// Durably persist (tmp + fsync + rename) — call ONLY after the
+    /// in-RAM chain advanced to `manifest_ref` and that manifest is in
+    /// the chunk store.
+    pub async fn persist(&self, dir: &Path) -> std::io::Result<()> {
+        crate::durable_record::persist(dir, self.sandbox_id, self, "chain-head record").await
+    }
+
+    /// The record for one sandbox; `None` if absent or torn (a torn
+    /// record is treated exactly like a missing one — no seed, next
+    /// capture Full).
+    pub async fn load(dir: &Path, id: SandboxId) -> Option<ChainHeadRecord> {
+        let path = crate::durable_record::record_path(dir, id);
+        let bytes = tokio::fs::read(&path).await.ok()?;
+        match serde_json::from_slice(&bytes) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e,
+                    "unparseable chain-head record; treating as absent");
+                None
+            }
+        }
+    }
+
+    /// Every record in `dir` (the startup rehydrate/GC sweep).
+    pub async fn load_all(dir: &Path) -> Vec<ChainHeadRecord> {
+        crate::durable_record::load_all(dir, "chain-head record").await
+    }
+
+    /// Write-ahead invalidate: MUST complete before the FC snapshot
+    /// create is issued (see the type doc). Absent is fine; any other
+    /// failure must abort the capture — proceeding would leave a record
+    /// whose baseline the create is about to consume.
+    pub async fn invalidate(dir: &Path, id: SandboxId) -> std::io::Result<()> {
+        match tokio::fs::remove_file(crate::durable_record::record_path(dir, id)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Best-effort removal for teardown/poison paths (the write-ahead
+    /// invalidate already guarantees absence on every capture path; this
+    /// is the defensive double-unlink). Sync — a local unlink is
+    /// cheaper than the DashMap ops around these call sites.
+    pub fn remove_best_effort(dir: &Path, id: SandboxId) {
+        let path = crate::durable_record::record_path(dir, id);
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), error = %e,
+                    "chain-head record removal failed");
+            }
+        }
+    }
+}
+
 /// Walk `diff`'s data extents (`SEEK_DATA`/`SEEK_HOLE`) and return
 /// them as `(offset, len)` ranges. FC's Diff snapshot writes dirty
 /// pages at their guest-physical offsets into an otherwise-sparse

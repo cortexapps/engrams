@@ -1968,6 +1968,30 @@ impl PooledBackend {
             .get(&id)
             .map(|c| (c.manifest_ref, c.manifest.clone()));
 
+        // Write-ahead invalidate of the durable chain-head record: BOTH
+        // snapshot flavors below consume+reset the KVM dirty bitmap the
+        // moment FC runs `PUT /snapshot/create`, and from that instant
+        // the on-disk record — the seed source for survivor rehydrate
+        // after a pod roll — would describe a baseline the bitmap no
+        // longer has. Remove it BEFORE the create (under the capture
+        // lock, before the pause); it is re-written only after the chain
+        // durably advances (`advance_checkpoint_state`). A crash
+        // anywhere between leaves no record → the survivor's next
+        // capture is a safe Full. The 2026-07-13 roll tore a capture in
+        // exactly this window (post-processing died at 22:23:46 with the
+        // bitmap consumed), which is why the coordinator's snapshots
+        // rows can never be the rehydrate seed source. A failed unlink
+        // (non-NotFound) aborts the capture: nothing is paused or
+        // consumed yet, and proceeding would leave a stale record the
+        // create is about to falsify.
+        if let Some(dir) = self.chain_heads_dir() {
+            crate::checkpoint::ChainHeadRecord::invalidate(&dir, id)
+                .await
+                .map_err(|e| {
+                    SandboxError::Snapshot(format!("chain-head write-ahead invalidate: {e}"))
+                })?;
+        }
+
         // ADR 0014 issue #1/#2: if a prior snapshot for this sandbox
         // was produced but never committed (caller's downstream
         // pipeline failed or the coord pod crashed between snapshot
@@ -2165,6 +2189,7 @@ impl PooledBackend {
                 if chain_prev.is_some() {
                     poison_checkpoint_chain_after_failed_diff(
                         &self.checkpoint_chains,
+                        self.chain_heads_dir().as_deref(),
                         id,
                         "fc snapshot_diff create",
                     );
@@ -2873,6 +2898,13 @@ impl PooledBackend {
         #[cfg(target_os = "linux")]
         let nbd = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone());
         let inline_disks = self.inline_disk_manifests.clone();
+        // For the deferred chain-head commit below: the in-RAM seed
+        // above precedes chunk durability, so the durable record must
+        // wait for the catch-up's put_manifest — a pod roll mid-catch-up
+        // then rehydrates nothing (Full, safe) instead of a head whose
+        // chunks never reached GCS.
+        let chain_heads_dir = self.chain_heads_dir();
+        let chain_session = self.session_bindings.get(&id).map(|s| *s);
         let handle = tokio::spawn(async move {
             let _capture_guard = capture_guard;
             // 1. Upload every pulled chunk (content-addressed,
@@ -2924,6 +2956,22 @@ impl PooledBackend {
                 .put_manifest(mig.memory_manifest_ref, &mem_manifest)
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("publish mem manifest: {e}")))?;
+            // The chain head is durable now — commit its record (the
+            // capture_guard is still held, so no capture can have
+            // invalidated in between). Best-effort like every other
+            // chain-head write.
+            if let Some(dir) = &chain_heads_dir {
+                let record = crate::checkpoint::ChainHeadRecord {
+                    sandbox_id: id,
+                    manifest_ref: mig.memory_manifest_ref,
+                    session_id: chain_session,
+                    updated_at: chrono::Utc::now(),
+                };
+                if let Err(e) = record.persist(dir).await {
+                    tracing::warn!(sandbox_id = %id, error = %e,
+                        "migration catch-up: chain-head record write failed");
+                }
+            }
             // 3. Publish the disk manifest with the shared-lineage
             //    conflict-retry (mirror flush_upload's rule).
             let mut disk_ref_final = None;
@@ -3047,6 +3095,108 @@ impl PooledBackend {
 
     pub fn checkpoint_records_dir(&self) -> Option<PathBuf> {
         self.checkpoint_dir.as_ref().map(|d| d.join("records"))
+    }
+
+    /// Test-only view of a sandbox's in-RAM chain head.
+    #[cfg(test)]
+    pub(crate) fn chain_head_for_test(
+        &self,
+        id: SandboxId,
+    ) -> Option<engram_core::types::manifest::ManifestRef> {
+        self.checkpoint_chains.get(&id).map(|c| c.manifest_ref)
+    }
+
+    /// Where the durable chain-head records live (see
+    /// [`crate::checkpoint::ChainHeadRecord`]). `None` ⟺ checkpointing
+    /// disabled, same gate as the chains themselves.
+    fn chain_heads_dir(&self) -> Option<PathBuf> {
+        self.checkpoint_dir
+            .as_ref()
+            .map(|d| crate::checkpoint::ChainHeadRecord::subdir(d))
+    }
+
+    /// Re-seed checkpoint chains for VMs that survived a host-agent
+    /// restart (pidfd reattach, ADR 0044 K2 / ADR 0090), from the
+    /// durable [`crate::checkpoint::ChainHeadRecord`]s — and GC records
+    /// whose sandbox did NOT survive. Called once at startup, after the
+    /// reattach pass and `set_self_ref`, BEFORE anything that can start
+    /// a capture (checkpoint driver, eviction redrive, coordinator
+    /// registration): a survivor's first post-roll capture then rides
+    /// the O(dirty-set) diff path instead of a FULL multi-GiB re-chunk
+    /// (the 2026-07-13 incident's 40-minute evict).
+    ///
+    /// Torn-capture safety is inherited from the record's write-ahead
+    /// protocol (see the record's type doc): a record only exists if no
+    /// FC snapshot create ran since the chain durably advanced, so
+    /// seeding from it is exactly as sound as never having lost the
+    /// DashMap. NBD-quarantined survivors seed too — the disk plane's
+    /// health is orthogonal to the KVM dirty bitmap, and their
+    /// evict_local capture is precisely the one that must not be a
+    /// Full.
+    pub async fn rehydrate_chain_heads(&self) {
+        let Some(dir) = self.chain_heads_dir() else {
+            return;
+        };
+        let Some(chunk_store) = self.chunk_store.clone() else {
+            return;
+        };
+        let live: std::collections::HashSet<SandboxId> = match self.inner.list().await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "chain-head rehydrate: backend list failed; skipping");
+                return;
+            }
+        };
+        for record in crate::checkpoint::ChainHeadRecord::load_all(&dir).await {
+            let id = record.sandbox_id;
+            if !live.contains(&id) {
+                // The sandbox didn't survive (node reboot, destroyed
+                // while the record write raced teardown) — the record
+                // is unreachable; sweep it.
+                crate::checkpoint::ChainHeadRecord::remove_best_effort(&dir, id);
+                continue;
+            }
+            // Serialize against any capture already running for this
+            // sandbox: a capture that won the lock first has already
+            // write-ahead-removed the record, so the re-read below
+            // no-ops — without the lock, "read record → capture
+            // invalidates + creates (bitmap reset) → seed stale head"
+            // would rebuild exactly the corrupt diff this protocol
+            // exists to prevent.
+            let lock = self.capture_lock(id);
+            let _guard = lock.lock_owned().await;
+            if self.checkpoint_chains.contains_key(&id) {
+                continue;
+            }
+            let Some(record) = crate::checkpoint::ChainHeadRecord::load(&dir, id).await else {
+                continue;
+            };
+            match chunk_store.get_manifest(record.manifest_ref).await {
+                Ok(manifest) => {
+                    self.checkpoint_chains.insert(
+                        id,
+                        crate::checkpoint::CheckpointChain {
+                            manifest_ref: record.manifest_ref,
+                            manifest,
+                        },
+                    );
+                    tracing::info!(
+                        sandbox_id = %id,
+                        session_id = ?record.session_id,
+                        manifest = %record.manifest_ref,
+                        "chain head rehydrated from durable record; survivor's next capture will diff",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        manifest = %record.manifest_ref,
+                        error = %e,
+                        "chain-head rehydrate: manifest fetch failed; next capture falls back to Full",
+                    );
+                }
+            }
+        }
     }
 
     /// ADR 0028 Fix A: post-capture chain bookkeeping + the durable
@@ -4488,9 +4638,17 @@ pub(crate) struct SnapshotCapture {
 /// sites.)
 fn poison_checkpoint_chain_after_failed_diff(
     chains: &DashMap<SandboxId, crate::checkpoint::CheckpointChain>,
+    chain_heads_dir: Option<&std::path::Path>,
     id: SandboxId,
     failed_step: &str,
 ) {
+    // The durable chain-head record was already write-ahead-removed
+    // before the FC create (capture_phase / migration_capture), so this
+    // is the defensive double-unlink — the poison must never leave a
+    // record a post-roll rehydrate could seed from.
+    if let Some(dir) = chain_heads_dir {
+        crate::checkpoint::ChainHeadRecord::remove_best_effort(dir, id);
+    }
     if chains.remove(&id).is_some() {
         metrics::counter!(crate::metrics::CHECKPOINT_CHAIN_POISONED_TOTAL).increment(1);
         tracing::warn!(
@@ -4793,6 +4951,7 @@ impl SnapshotFinisher {
                 if chain_prev.is_some() {
                     poison_checkpoint_chain_after_failed_diff(
                         &self.checkpoint_chains,
+                        self.chain_heads_dir().as_deref(),
                         id,
                         "snapshot post-processing",
                     );
@@ -4831,6 +4990,43 @@ impl SnapshotFinisher {
         self.checkpoint_dir.as_ref().map(|d| d.join("records"))
     }
 
+    fn chain_heads_dir(&self) -> Option<PathBuf> {
+        self.checkpoint_dir
+            .as_ref()
+            .map(|d| crate::checkpoint::ChainHeadRecord::subdir(d))
+    }
+
+    /// Durably mirror the in-RAM chain head at `manifest_ref` (which
+    /// MUST already be published in the chunk store — every caller sits
+    /// after a successful `put_manifest` or a fetch of an existing
+    /// manifest). Best-effort: a failed write just means a post-roll
+    /// rehydrate finds no record and the survivor's next capture is a
+    /// Full — safe, slower, and self-healing at the next checkpoint.
+    async fn persist_chain_head(
+        &self,
+        id: SandboxId,
+        manifest_ref: engram_core::types::manifest::ManifestRef,
+    ) {
+        let Some(dir) = self.chain_heads_dir() else {
+            return;
+        };
+        let record = crate::checkpoint::ChainHeadRecord {
+            sandbox_id: id,
+            manifest_ref,
+            session_id: self.session_bindings.get(&id).map(|s| *s),
+            updated_at: chrono::Utc::now(),
+        };
+        if let Err(e) = record.persist(&dir).await {
+            tracing::warn!(
+                sandbox_id = %id,
+                manifest = %manifest_ref,
+                error = %e,
+                "durable chain-head write failed; a pod roll before the next \
+                 checkpoint costs this sandbox one Full capture",
+            );
+        }
+    }
+
     async fn advance_checkpoint_state(
         &self,
         id: SandboxId,
@@ -4850,17 +5046,21 @@ impl SnapshotFinisher {
 
         match next_manifest {
             // Diff capture: the sparse re-chunk already ran in the post
-            // block; just advance the chain's manifest pointer.
+            // block; just advance the chain's manifest pointer, then
+            // re-commit the durable chain-head record the capture's
+            // write-ahead invalidate removed.
             Some(next) => {
                 if let Some(mut chain) = self.checkpoint_chains.get_mut(&id) {
                     chain.manifest_ref = memory_ref;
                     chain.manifest = next;
                 }
+                self.persist_chain_head(id, memory_ref).await;
             }
             // Full capture: seed the chain manifest-only from the manifest
             // we just published (ADR 0039 — no local rolling image; the
             // memory.bin was chunked + removed in the post block).
-            // Subsequent captures ride the sparse diff path.
+            // Subsequent captures ride the sparse diff path. (The seed
+            // persists the chain-head record itself.)
             None => {
                 self.seed_checkpoint_chain_sparse(id, memory_ref).await;
             }
@@ -4955,6 +5155,9 @@ impl SnapshotFinisher {
                 manifest,
             },
         );
+        // The fork manifest is durable (put_manifest above succeeded) —
+        // commit the chain-head record so the chain survives a pod roll.
+        self.persist_chain_head(id, fork_ref).await;
         tracing::info!(
             sandbox_id = %id,
             src = %src_ref,
@@ -4999,6 +5202,10 @@ impl SnapshotFinisher {
                         manifest,
                     },
                 );
+                // The seed source is a published manifest (we just
+                // fetched it) — commit the chain-head record so the
+                // chain survives a pod roll.
+                self.persist_chain_head(id, memory_ref).await;
                 tracing::info!(
                     sandbox_id = %id,
                     manifest = %memory_ref,
@@ -5687,6 +5894,7 @@ impl SandboxBackend for PooledBackend {
                     if chain_prev.is_some() {
                         poison_checkpoint_chain_after_failed_diff(
                             &self.checkpoint_chains,
+                            self.chain_heads_dir().as_deref(),
                             id,
                             "eviction disk-pending persist",
                         );
@@ -5745,6 +5953,7 @@ impl SandboxBackend for PooledBackend {
             if record.chain_prev_ref.is_some() {
                 poison_checkpoint_chain_after_failed_diff(
                     &self.checkpoint_chains,
+                    self.chain_heads_dir().as_deref(),
                     id,
                     "eviction finalizer unavailable",
                 );
@@ -5766,6 +5975,7 @@ impl SandboxBackend for PooledBackend {
             if record.chain_prev_ref.is_some() {
                 poison_checkpoint_chain_after_failed_diff(
                     &self.checkpoint_chains,
+                    self.chain_heads_dir().as_deref(),
                     id,
                     "eviction finalize-record persist",
                 );
@@ -6400,6 +6610,23 @@ impl SandboxBackend for PooledBackend {
 
         // Checkpoint fence: held for the export's lifetime.
         let capture_guard = self.capture_lock(id).lock_owned().await;
+
+        // Write-ahead invalidate of the durable chain-head record — the
+        // C1 diff create below consumes the KVM dirty bitmap exactly
+        // like capture_phase's (see the comment there). Note the C2
+        // post-copy capture (`migration_capture_postcopy`) deliberately
+        // does NOT invalidate: its fork-v3 vmstate-only snapshot never
+        // touches the bitmap (persist.rs gates the memory dump on
+        // `!vmstate_only`), and an aborted C2 resumes with bitmap AND
+        // chain intact — removing the record there would needlessly
+        // cost the survivor a Full after a later roll.
+        if let Some(dir) = self.chain_heads_dir() {
+            crate::checkpoint::ChainHeadRecord::invalidate(&dir, id)
+                .await
+                .map_err(|e| {
+                    SandboxError::Snapshot(format!("chain-head write-ahead invalidate: {e}"))
+                })?;
+        }
 
         match self.inner.wait_agent_ready(id).await {
             Ok(()) => {}
@@ -7140,6 +7367,9 @@ impl SandboxBackend for PooledBackend {
         // running unaffected: it is a pure function of `dest` + the chunk
         // store, never the live sandbox, and this method deletes neither.
         let _ = self.checkpoint_chains.remove(&id);
+        if let Some(dir) = self.chain_heads_dir() {
+            crate::checkpoint::ChainHeadRecord::remove_best_effort(&dir, id);
+        }
         let _ = self.capture_locks.remove(&id);
         // Issue #221: reclaim any unconsumed `snapshot_wait` slot. The
         // entry is now kept-until-consumed (so a cancelled coordinator
@@ -12868,6 +13098,189 @@ mod tests {
         assert!(
             matches!(err, SandboxError::InvalidSpec(_)),
             "expected InvalidSpec (the idle_evictor's composed-path fallback signal), got {err:?}"
+        );
+    }
+
+    // ─── durable chain-head record (survivor rehydrate after a pod roll) ───
+
+    fn chain_head_file(checkpoint_dir: &Path, id: SandboxId) -> PathBuf {
+        crate::checkpoint::ChainHeadRecord::subdir(checkpoint_dir).join(format!("{id}.json"))
+    }
+
+    /// The write-ahead protocol end to end on the composed snapshot
+    /// path: (1) a successful Full capture commits a chain-head record
+    /// matching the published memory manifest; (2) the next capture
+    /// takes the diff path (chain seeded) and — because the write-ahead
+    /// invalidate runs BEFORE the FC create — a failed diff create
+    /// leaves NO record (the torn-capture property from the 2026-07-13
+    /// incident) and drops the chain; (3) the capture after that is a
+    /// Full again and re-commits the record.
+    #[tokio::test]
+    async fn chain_head_record_follows_the_write_ahead_protocol() {
+        let (pooled, _cs, ckpt_dir, _destroy) = finalize_test_backend(None).await;
+        let id = SandboxId::new();
+
+        // (1) Full capture → chain seeded → record committed.
+        let meta = pooled.snapshot(id).await.expect("full capture");
+        let mem_ref = meta.memory_manifest.expect("memory manifest chunked");
+        let record = crate::checkpoint::ChainHeadRecord::load(
+            &crate::checkpoint::ChainHeadRecord::subdir(&ckpt_dir),
+            id,
+        )
+        .await
+        .expect("chain-head record committed after the Full");
+        assert_eq!(record.manifest_ref, mem_ref);
+        assert_eq!(pooled.chain_head_for_test(id), Some(mem_ref));
+
+        // (2) The chain routes the next capture to snapshot_diff, which
+        // the fake backend doesn't support — a create failure AFTER the
+        // write-ahead invalidate. The record must be gone and the chain
+        // poisoned; nothing may have resurrected the record.
+        pooled
+            .snapshot(id)
+            .await
+            .expect_err("diff create must fail on the fake backend");
+        assert!(
+            !chain_head_file(&ckpt_dir, id).exists(),
+            "failed diff must leave no chain-head record (write-ahead invalidate)"
+        );
+        assert_eq!(
+            pooled.chain_head_for_test(id),
+            None,
+            "failed diff create must poison the in-RAM chain"
+        );
+
+        // (3) Chain-less again → Full succeeds → record re-committed.
+        let meta = pooled.snapshot(id).await.expect("post-poison full capture");
+        let mem_ref = meta.memory_manifest.expect("memory manifest chunked");
+        let record = crate::checkpoint::ChainHeadRecord::load(
+            &crate::checkpoint::ChainHeadRecord::subdir(&ckpt_dir),
+            id,
+        )
+        .await
+        .expect("record re-committed by the recovery Full");
+        assert_eq!(record.manifest_ref, mem_ref);
+
+        // destroy removes the record with the chain.
+        use engram_core::traits::SandboxBackend as _;
+        pooled.destroy(id).await.expect("destroy");
+        assert!(!chain_head_file(&ckpt_dir, id).exists());
+    }
+
+    /// `FakeCaptureBackend` with a configurable `list()` — the survivor
+    /// set `rehydrate_chain_heads` seeds from.
+    #[derive(Clone)]
+    struct SurvivorListBackend {
+        inner: FakeCaptureBackend,
+        survivors: Vec<SandboxId>,
+    }
+    #[async_trait]
+    impl SandboxBackend for SurvivorListBackend {
+        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn exec_stream(
+            &self,
+            _: SandboxId,
+            _: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        fn supports_diff_checkpoints(&self) -> bool {
+            true
+        }
+        async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+            self.inner.snapshot(id).await
+        }
+        fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+            self.inner.snapshot_path_for(id)
+        }
+        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.inner.destroy(id).await
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            Ok(self.survivors.clone())
+        }
+        async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+            Ok(())
+        }
+    }
+
+    /// The pod-roll simulation at the unit level: generation A captures
+    /// (committing the chain-head record) and dies; generation B — a
+    /// fresh `PooledBackend` on the same checkpoint_dir + chunk store,
+    /// whose backend reattached the survivor — rehydrates the chain from
+    /// the record. Records for sandboxes that did NOT survive are GC'd,
+    /// and a torn record seeds nothing.
+    #[tokio::test]
+    async fn rehydrate_chain_heads_seeds_survivors_and_gcs_strays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = ChunkStore::new(blob);
+        let checkpoint_dir = tmp.path().join("checkpoints");
+        let fake = FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: tmp.path().join("fc-snaps"),
+            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+        };
+
+        let survivor = SandboxId::new();
+        let dead = SandboxId::new();
+        let torn = SandboxId::new();
+
+        // Generation A: capture the survivor AND the dead sandbox —
+        // both get chain-head records.
+        let gen_a = {
+            let p = PooledBackend::new(Arc::new(fake.clone()) as Arc<dyn SandboxBackend>)
+                .with_chunk_store(cs.clone(), tmp.path().join("materialize-a"))
+                .with_checkpoint_dir(checkpoint_dir.clone());
+            let arc = Arc::new(p);
+            arc.set_self_ref(&arc);
+            arc
+        };
+        let survivor_meta = gen_a.snapshot(survivor).await.expect("survivor capture");
+        let survivor_ref = survivor_meta.memory_manifest.expect("chunked");
+        gen_a.snapshot(dead).await.expect("dead-sandbox capture");
+        // A torn (unparseable) record for a third "survivor".
+        let chains_dir = crate::checkpoint::ChainHeadRecord::subdir(&checkpoint_dir);
+        tokio::fs::write(chains_dir.join(format!("{torn}.json")), b"not json")
+            .await
+            .unwrap();
+        drop(gen_a); // the roll
+
+        // Generation B: only `survivor` (and the torn id) reattached.
+        let gen_b = {
+            let p = PooledBackend::new(Arc::new(SurvivorListBackend {
+                inner: fake,
+                survivors: vec![survivor, torn],
+            }) as Arc<dyn SandboxBackend>)
+            .with_chunk_store(cs, tmp.path().join("materialize-b"))
+            .with_checkpoint_dir(checkpoint_dir.clone());
+            let arc = Arc::new(p);
+            arc.set_self_ref(&arc);
+            arc
+        };
+        assert_eq!(gen_b.chain_head_for_test(survivor), None, "fresh map");
+        gen_b.rehydrate_chain_heads().await;
+
+        assert_eq!(
+            gen_b.chain_head_for_test(survivor),
+            Some(survivor_ref),
+            "survivor's chain must be re-seeded from the durable record"
+        );
+        assert!(
+            !chain_head_file(&checkpoint_dir, dead).exists(),
+            "record for a non-surviving sandbox must be GC'd"
+        );
+        assert_eq!(
+            gen_b.chain_head_for_test(torn),
+            None,
+            "a torn record must seed nothing (treated as absent)"
         );
     }
 }
