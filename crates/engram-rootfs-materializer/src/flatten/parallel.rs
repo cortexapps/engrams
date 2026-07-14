@@ -14,7 +14,7 @@
 //!   reader's syscall work instead of serializing with it.
 
 use std::io::Read;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 
 use super::SkippedXattr;
@@ -59,7 +59,16 @@ pub(super) struct WriteJob {
     pub rel: String,
     pub bytes: Vec<u8>,
     pub mode: u32,
+    /// Already CLAMPED by the reader (min(tar mtime, the deterministic
+    /// epoch)) — folding the old post-flatten `clamp_mtimes` tree walk
+    /// into the write itself (ADR 0088 addendum round 2).
     pub mtime: u64,
+    /// Tar-carried ownership, applied via fchown (before fchmod — chown
+    /// clears setuid). Folds the old `apply_ownership` tree walk into
+    /// the write. Skipped entirely once `ownership_denied` flips (the
+    /// documented unprivileged dev/test degradation).
+    pub uid: u32,
+    pub gid: u32,
     pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
@@ -71,6 +80,10 @@ struct PoolShared {
     /// `finish()` (same "collected, never silently lost" contract as
     /// the sequential path).
     skipped_xattrs: Mutex<Vec<SkippedXattr>>,
+    /// Flipped on the first EPERM fchown/lchown: unprivileged run —
+    /// ownership stays recorded-in-sidecar only (the exact degradation
+    /// `apply_ownership` documented), and further attempts stop.
+    ownership_denied: std::sync::atomic::AtomicBool,
     inflight: Mutex<Inflight>,
     freed: Condvar,
 }
@@ -85,7 +98,7 @@ struct Inflight {
 /// argument; the short version is that a worker cannot observe or
 /// perturb the namespace, only the inode it was handed.
 pub(super) struct WritePool {
-    tx: Option<SyncSender<WriteJob>>,
+    tx: Option<crossbeam_channel::Sender<WriteJob>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     shared: Arc<PoolShared>,
 }
@@ -95,17 +108,21 @@ impl WritePool {
         let concurrency = concurrency.max(1);
         // The channel bound is a handoff buffer, not the real gate —
         // the byte/job gate in `submit` is what bounds memory.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<WriteJob>(concurrency * 2);
-        let rx = Arc::new(Mutex::new(rx));
+        // crossbeam (lock-free MPMC, Clone receiver) replaces the old
+        // `Mutex<mpsc::Receiver>`: a dev-brain profile showed 16
+        // workers burning 38s of CPU contending on that one mutex —
+        // most of the pool's CPU was lock spin, not file writes.
+        let (tx, rx) = crossbeam_channel::bounded::<WriteJob>(concurrency * 2);
         let shared = Arc::new(PoolShared {
             failure: Mutex::new(None),
             skipped_xattrs: Mutex::new(Vec::new()),
+            ownership_denied: std::sync::atomic::AtomicBool::new(false),
             inflight: Mutex::new(Inflight::default()),
             freed: Condvar::new(),
         });
         let mut workers = Vec::with_capacity(concurrency);
         for i in 0..concurrency {
-            let rx = Arc::clone(&rx);
+            let rx = rx.clone();
             let shared = Arc::clone(&shared);
             workers.push(
                 std::thread::Builder::new()
@@ -124,6 +141,20 @@ impl WritePool {
     /// entries to abort early instead of queueing more work.
     pub fn failed(&self) -> bool {
         self.shared.failure.lock().unwrap().is_some()
+    }
+
+    /// Ownership application state — shared between the workers (fchown)
+    /// and the reader (lchown for symlinks, dir stamping at finish).
+    pub fn ownership_denied(&self) -> bool {
+        self.shared
+            .ownership_denied
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn mark_ownership_denied(&self) {
+        self.shared
+            .ownership_denied
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Hand a job to the pool, blocking on the byte/job gate.
@@ -160,7 +191,7 @@ impl WritePool {
     /// Join every worker and surface the first failure. MUST run (and
     /// return `Ok`) before anything consumes the tree — ownership pass,
     /// mtime clamp, pack.
-    pub fn finish(mut self) -> Result<Vec<SkippedXattr>, (String, std::io::Error)> {
+    pub fn finish(mut self) -> Result<(Vec<SkippedXattr>, bool), (String, std::io::Error)> {
         drop(self.tx.take()); // close the channel: workers drain + exit
         for w in self.workers.drain(..) {
             let _ = w.join();
@@ -168,8 +199,13 @@ impl WritePool {
         if let Some(fail) = self.shared.failure.lock().unwrap().take() {
             return Err(fail);
         }
-        Ok(std::mem::take(
-            &mut self.shared.skipped_xattrs.lock().unwrap(),
+        let denied = self
+            .shared
+            .ownership_denied
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Ok((
+            std::mem::take(&mut self.shared.skipped_xattrs.lock().unwrap()),
+            denied,
         ))
     }
 }
@@ -180,19 +216,16 @@ fn gate_cost(len: u64) -> u64 {
     len.max(1)
 }
 
-fn worker_loop(rx: &Mutex<Receiver<WriteJob>>, shared: &PoolShared) {
+fn worker_loop(rx: &crossbeam_channel::Receiver<WriteJob>, shared: &PoolShared) {
     loop {
-        let job = {
-            let rx = rx.lock().unwrap();
-            match rx.recv() {
-                Ok(j) => j,
-                Err(_) => return, // channel closed: finish() is joining
-            }
+        let job = match rx.recv() {
+            Ok(j) => j,
+            Err(_) => return, // channel closed: finish() is joining
         };
         let cost = gate_cost(job.bytes.len() as u64);
         let already_failed = shared.failure.lock().unwrap().is_some();
         if !already_failed {
-            match run_job(&job) {
+            match run_job(&job, shared) {
                 Ok(mut skipped) => {
                     if !skipped.is_empty() {
                         shared.skipped_xattrs.lock().unwrap().append(&mut skipped);
@@ -218,27 +251,58 @@ fn worker_loop(rx: &Mutex<Receiver<WriteJob>>, shared: &PoolShared) {
 }
 
 /// The fd-scoped half of a regular-file extraction. Order matters:
-/// content first, then mode (fchmod — may drop our own write
+/// content first, then ownership (fchown — chown clears setuid, so it
+/// must precede fchmod), then mode (fchmod — may drop our own write
 /// permission, e.g. mode 0444), then xattrs, then futimens LAST so
 /// the writes don't bump the deterministic mtime.
-fn run_job(job: &WriteJob) -> std::io::Result<Vec<SkippedXattr>> {
+fn run_job(job: &WriteJob, shared: &PoolShared) -> std::io::Result<Vec<SkippedXattr>> {
     use std::io::Write;
     let mut f = &job.file;
     f.write_all(&job.bytes)?;
-    finish_file_fd(&job.file, &job.rel, job.mode, job.mtime, &job.xattrs)
+    let denied = shared
+        .ownership_denied
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let ownership = (!denied).then_some((job.uid, job.gid));
+    let (skipped, denied_now) = finish_file_fd(
+        &job.file,
+        &job.rel,
+        job.mode,
+        job.mtime,
+        ownership,
+        &job.xattrs,
+    )?;
+    if denied_now {
+        shared
+            .ownership_denied
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(skipped)
 }
 
 /// fd-scoped attribute application shared by workers and the reader's
-/// inline large-entry path: fchmod → fsetxattr (refusals collected,
-/// never fatal) → futimens last.
+/// inline large-entry path: fchown (optional; the returned bool
+/// reports an EPERM — the unprivileged degradation, never fatal) →
+/// fchmod → fsetxattr (refusals collected, never fatal) → futimens
+/// last.
 pub(super) fn finish_file_fd(
     file: &std::fs::File,
     rel: &str,
     mode: u32,
     mtime: u64,
+    ownership: Option<(u32, u32)>,
     xattrs: &[(String, Vec<u8>)],
-) -> std::io::Result<Vec<SkippedXattr>> {
+) -> std::io::Result<(Vec<SkippedXattr>, bool)> {
     use std::os::unix::fs::PermissionsExt;
+    let mut ownership_denied = false;
+    if let Some((uid, gid)) = ownership {
+        match std::os::unix::fs::fchown(file, Some(uid), Some(gid)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                ownership_denied = true;
+            }
+            Err(e) => return Err(e),
+        }
+    }
     file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     let mut skipped = Vec::new();
     for (name, value) in xattrs {
@@ -252,7 +316,7 @@ pub(super) fn finish_file_fd(
     }
     let ft = filetime::FileTime::from_unix_time(mtime as i64, 0);
     filetime::set_file_handle_times(file, Some(ft), Some(ft))?;
-    Ok(skipped)
+    Ok((skipped, ownership_denied))
 }
 
 /// Runs a `Read` (in practice: a decompressor) on its own thread and

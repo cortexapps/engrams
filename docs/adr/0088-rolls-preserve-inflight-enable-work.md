@@ -323,6 +323,35 @@ more on match-heavy real layers), unblocked by scoping the musl
 lane's UAPI-header injection to `-idirafter /opt/uapi` instead of
 glibc's entire `/usr/include`.
 
+### Rollout round 2 (2026-07-14): profile-driven — the walks, not the writes
+
+A samply CPU profile of the full dev-brain materialize on this branch
+(local run, 551,774 entries, 27.9 GiB ext4) showed the remaining cost
+was not where the logs implied:
+
+- C-zstd made layer decode ~2s of CPU for the whole image.
+- The write pool burned 37.9s of CPU in `Mutex::lock` — the shared
+  `Mutex<mpsc::Receiver>` dequeue, not file writes. → crossbeam's
+  lock-free Clone receiver.
+- The tree was re-walked FOUR times after being built — `clamp_mtimes`
+  (44s), `recursive_size` (~27s), `apply_ownership` (per-entry lchown
+  when root), `count_entries` (inside pack) — then walked a fifth time
+  to DELETE it (~40s), all on the critical path. → mtime clamp,
+  ownership, and byte/entry accounting now happen AT WRITE TIME
+  (workers fchown→fchmod→fsetxattr→futimens with the pre-clamped
+  mtime; dirs and symlinks stamped at the epoch from the in-memory
+  dirs set at `finish()`; `inject_init` stamps its own file); the
+  rootfs tree is renamed aside after pack and reaped in the
+  background, joined after the chunk stage. `count_entries` stays (a
+  cheap readdir-only walk inside the packer).
+
+Measured A/B on the identical image, same machine (post-pull
+pipeline): 373s → 214s. Sizing note: the write-time byte accounting
+rounds lengths to 4 KiB rather than measuring `st_blocks`, so the
+size hint runs a few percent high — absorbed by `recommended_size`'s
+2× + 256 MiB banding except for a ONE-TIME band step on this change
+(zero-filled, manifest-elided; no upload or storage cost).
+
 ### Future direction: a streaming packer
 
 The remaining materialize cost after this overhaul is structural: the
