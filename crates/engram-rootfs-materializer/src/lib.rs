@@ -41,7 +41,10 @@ use engram_core::types::image::OciRuntimeDefaults;
 pub use ext4::{
     clamp_mtimes, recommended_size, recursive_size, Ext4Error, Ext4Packer, Mke2fsPacker,
 };
-pub use flatten::{apply_layer, EntryMeta, FlattenError, SkippedXattr, TreeMetadata};
+pub use flatten::{
+    apply_layer, default_write_concurrency, ChannelReader, EntryMeta, FlattenError, Flattener,
+    SkippedXattr, TreeMetadata,
+};
 pub use inject::{inject_init, InitInjection, Transport, DEFAULT_INIT_SHIM};
 pub use pull::{
     layer_compression, pull_image, LayerCompression, Platform, PullError, PulledImage, PulledLayer,
@@ -246,30 +249,39 @@ impl Materializer {
             let layers = pulled.layers.clone();
             tokio::task::spawn_blocking(move || -> Result<TreeMetadata, MaterializeError> {
                 let mut meta = TreeMetadata::default();
+                // One engine across all layers: the fd-scoped write pool
+                // and the memoized resolve cache are reused layer to
+                // layer (ADR 0088 addendum — the parallel flatten).
+                let mut flattener =
+                    flatten::Flattener::new(&rootfs, flatten::default_write_concurrency())?;
+                let mut layer_result: Result<(), MaterializeError> = Ok(());
                 for layer in &layers {
                     // Per-layer timing + entry delta: the flatten is the
                     // dominant materialize leg for warm dev images
-                    // (prod-measured 48 min for a 16 GiB tree), and these
-                    // fields attribute it — a slow layer with a huge entry
-                    // delta is syscall-bound tiny-file creation; slow with a
-                    // small delta is decompression.
+                    // (prod-measured 48 min for a 16 GiB tree pre-overhaul),
+                    // and these fields attribute it — a slow layer with a
+                    // huge entry delta is syscall-bound tiny-file creation;
+                    // slow with a small delta is decompression.
                     let layer_started = std::time::Instant::now();
                     let entries_before = meta.len();
                     let file = std::fs::File::open(&layer.path)?;
                     let reader = std::io::BufReader::new(file);
-                    match layer.compression {
-                        LayerCompression::Gzip => flatten::apply_layer(
-                            &rootfs,
-                            &mut meta,
-                            flate2::read::GzDecoder::new(reader),
-                        )?,
-                        LayerCompression::Zstd => flatten::apply_layer(
-                            &rootfs,
-                            &mut meta,
+                    // Decompression runs on its own thread (ChannelReader)
+                    // so inflate overlaps the reader's syscall work.
+                    let decoder: Box<dyn std::io::Read + Send> = match layer.compression {
+                        LayerCompression::Gzip => {
+                            Box::new(flate2::read::GzDecoder::new(reader))
+                        }
+                        LayerCompression::Zstd => Box::new(
                             ruzstd::decoding::StreamingDecoder::new(reader)
                                 .map_err(|e| std::io::Error::other(e.to_string()))?,
-                        )?,
-                        LayerCompression::None => flatten::apply_layer(&rootfs, &mut meta, reader)?,
+                        ),
+                        LayerCompression::None => Box::new(reader),
+                    };
+                    let piped = flatten::ChannelReader::spawn(decoder)?;
+                    if let Err(e) = flattener.apply_layer(&mut meta, piped) {
+                        layer_result = Err(e.into());
+                        break;
                     }
                     tracing::debug!(
                         digest = %layer.digest,
@@ -280,7 +292,15 @@ impl Materializer {
                     );
                     let _ = std::fs::remove_file(&layer.path);
                 }
-                Ok(meta)
+                // Join the write pool BEFORE anything consumes the tree
+                // (ownership pass, clamp, pack). On a mid-layer abort,
+                // finish()'s error is the root cause (a worker failure
+                // echoes into the reader as a generic abort).
+                match (layer_result, flattener.finish(&mut meta)) {
+                    (_, Err(e)) => Err(e.into()),
+                    (Err(e), Ok(())) => Err(e),
+                    (Ok(()), Ok(())) => Ok(meta),
+                }
             })
             .await
             .map_err(|e| {

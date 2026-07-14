@@ -44,9 +44,14 @@
 //! case), while a hostile `evil -> /host` re-anchors at the tree
 //! root — nothing is ever written through a symlink to the host fs.
 
+mod parallel;
+
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
+
+pub use parallel::{default_write_concurrency, ChannelReader};
+use parallel::{WriteJob, WritePool, INLINE_WRITE_THRESHOLD};
 
 /// Tar-carried identity of one flattened entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,222 +186,388 @@ const OPAQUE_MARKER: &str = ".wh..wh..opq";
 /// File whiteout prefix (`.wh.<name>`).
 const WHITEOUT_PREFIX: &str = ".wh.";
 
-/// Apply one layer tar onto the tree at `root`, updating `meta`.
-/// Layers must be applied in manifest order (base first). Takes any
-/// `Read` so tests feed in-memory tars and the pipeline feeds
-/// decompressors — no registry required. Blocking (std IO); call from
-/// `spawn_blocking` in async contexts.
+/// The parallel flatten engine (ADR 0088 addendum). Owns a persistent
+/// [`WritePool`] (reused across layers) plus the memoized
+/// ancestor-symlink facts; one instance per materialize.
+///
+/// Concurrency contract, load-bearing for correctness:
+///
+/// - The CALLER's thread (the "reader") performs every namespace
+///   operation in exact tar order: sanitize, scoped resolution,
+///   whiteouts/opaque, dir/symlink/hardlink creation, and the
+///   unlink+create for every regular file.
+/// - Workers receive an already-open fd and do only fd-scoped work
+///   (write, fchmod, fsetxattr, futimens). They never touch paths, so
+///   a later namespace op can at worst orphan an in-flight inode —
+///   exactly the state sequential apply would leave. The final tree is
+///   bit-identical to sequential apply (mke2fs determinism + rebake
+///   chunk-dedup preserved).
+/// - [`Flattener::finish`] joins the pool and MUST complete before
+///   anything consumes the tree (ownership pass, mtime clamp, pack).
+pub struct Flattener {
+    root: PathBuf,
+    pool: WritePool,
+    /// Memoized "this tree-relative path is NOT a symlink" facts for
+    /// the scoped ancestor resolution — amortizes the per-entry
+    /// ancestor lstat walk to ~zero. Invalidated (prefix-wide) by
+    /// `remove_entry`, which every type-replacing write funnels
+    /// through.
+    resolve_cache: HashSet<String>,
+}
+
+impl Flattener {
+    pub fn new(root: &Path, write_concurrency: usize) -> Result<Self, FlattenError> {
+        Ok(Self {
+            root: root.to_path_buf(),
+            pool: WritePool::new(write_concurrency)?,
+            resolve_cache: HashSet::new(),
+        })
+    }
+
+    /// Apply one layer tar onto the tree, updating `meta`. Layers must
+    /// be applied in manifest order (base first). Takes any `Read` so
+    /// tests feed in-memory tars and the pipeline feeds decompressors.
+    /// Blocking (std IO); call from `spawn_blocking` in async contexts.
+    ///
+    /// On `Err`, call [`Flattener::finish`] and prefer ITS error — a
+    /// mid-layer abort is usually the echo of a worker failure whose
+    /// root cause the pool holds.
+    pub fn apply_layer<R: Read>(
+        &mut self,
+        meta: &mut TreeMetadata,
+        layer: R,
+    ) -> Result<(), FlattenError> {
+        let mut archive = tar::Archive::new(layer);
+        // Whiteouts (incl. opaque) apply to LOWER layers only: entries this
+        // layer created are immune, whatever order the archive lists them in.
+        let mut created_this_layer: HashSet<String> = HashSet::new();
+
+        for entry in archive.entries()? {
+            if self.pool.failed() {
+                // A worker already failed; stop queueing work. finish()
+                // carries the root cause.
+                return Err(FlattenError::Io(std::io::Error::other(
+                    "flatten write pool failed (see finish)",
+                )));
+            }
+            let mut entry = entry?;
+            let raw_path = entry
+                .path()
+                .map_err(|e| FlattenError::Malformed(format!("entry path: {e}")))?
+                .into_owned();
+            let Some(rel) = sanitize(&raw_path)? else {
+                continue; // the root dir itself ("./")
+            };
+            // Ancestor symlinks resolve the way the GUEST kernel would,
+            // scoped to the tree (the usrmerge case: base layer has
+            // `bin -> usr/bin`, upper writes `bin/ls` → usr/bin/ls). This
+            // is also the symlink-traversal half of zip-slip: without it,
+            // a layer symlink pointing at an absolute host path would have
+            // later entries written THROUGH it, outside the tree.
+            let rel = self.resolve_scoped(&rel)?;
+            if rel.is_empty() {
+                continue;
+            }
+            let (parent, name) = split_parent(&rel);
+
+            // --- whiteouts ---
+            if name == OPAQUE_MARKER {
+                let parent = parent.to_string();
+                self.opaque_dir(meta, &parent, &created_this_layer)?;
+                continue;
+            }
+            if let Some(hidden) = name.strip_prefix(WHITEOUT_PREFIX) {
+                let target = join_rel(parent, hidden);
+                if !created_this_layer.contains(&target) {
+                    self.remove_entry(meta, &target)?;
+                }
+                continue;
+            }
+
+            // --- real entries ---
+            let header = entry.header();
+            let mode = header
+                .mode()
+                .map_err(|e| FlattenError::Malformed(format!("{rel}: mode: {e}")))?
+                & 0o7777;
+            let uid = header
+                .uid()
+                .map_err(|e| FlattenError::Malformed(format!("{rel}: uid: {e}")))?;
+            let gid = header
+                .gid()
+                .map_err(|e| FlattenError::Malformed(format!("{rel}: gid: {e}")))?;
+            let mtime = header.mtime().unwrap_or(0);
+            let size = header.size().unwrap_or(0);
+            let entry_meta = EntryMeta { uid, gid, mode };
+            let dst = self.root.join(&rel);
+
+            use tar::EntryType;
+            match header.entry_type() {
+                EntryType::Directory => {
+                    // Replacing a non-dir with a dir drops the old entry;
+                    // an existing dir is merged (metadata refreshed).
+                    if let Ok(m) = std::fs::symlink_metadata(&dst) {
+                        if !m.is_dir() {
+                            self.remove_entry(meta, &rel)?;
+                        }
+                    }
+                    std::fs::create_dir_all(&dst)?;
+                    set_mode(&dst, mode)?;
+                    apply_xattrs(&mut entry, &dst, &rel, meta)?;
+                    meta.insert(rel.clone(), entry_meta);
+                    created_this_layer.insert(rel);
+                }
+                EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
+                    self.remove_entry(meta, &rel)?;
+                    ensure_parent(&dst)?;
+                    // PAX xattrs are parsed reader-side (they borrow the
+                    // entry); application is fd-scoped in the worker.
+                    let xattrs = collect_xattrs(&mut entry)?;
+                    if size > INLINE_WRITE_THRESHOLD {
+                        // Large entry: stream inline on the reader —
+                        // constant memory, bandwidth-bound anyway.
+                        let f = std::fs::File::create(&dst)?;
+                        {
+                            let mut w = &f;
+                            std::io::copy(&mut entry, &mut w)?;
+                        }
+                        for skipped in parallel::finish_file_fd(&f, &rel, mode, mtime, &xattrs)
+                            .map_err(FlattenError::Io)?
+                        {
+                            meta.skipped_xattrs.push(skipped);
+                        }
+                    } else {
+                        let mut bytes = Vec::with_capacity(size as usize);
+                        entry.read_to_end(&mut bytes)?;
+                        let file = std::fs::File::create(&dst)?;
+                        self.pool.submit(WriteJob {
+                            file,
+                            rel: rel.clone(),
+                            bytes,
+                            mode,
+                            mtime,
+                            xattrs,
+                        })?;
+                    }
+                    meta.insert(rel.clone(), entry_meta);
+                    created_this_layer.insert(rel);
+                }
+                EntryType::Symlink => {
+                    let target = entry
+                        .link_name()
+                        .map_err(|e| FlattenError::Malformed(format!("{rel}: link name: {e}")))?
+                        .ok_or_else(|| {
+                            FlattenError::Malformed(format!("{rel}: symlink without target"))
+                        })?
+                        .into_owned();
+                    self.remove_entry(meta, &rel)?;
+                    ensure_parent(&dst)?;
+                    // Symlink TARGETS are stored verbatim — absolute or
+                    // `..`-relative targets are legal inside the image (they
+                    // resolve in the GUEST's namespace, e.g. /bin -> /usr/bin)
+                    // and never dereferenced on the host by this crate.
+                    std::os::unix::fs::symlink(&target, &dst)?;
+                    meta.insert(rel.clone(), entry_meta);
+                    created_this_layer.insert(rel);
+                }
+                EntryType::Link => {
+                    let raw_target = entry
+                        .link_name()
+                        .map_err(|e| FlattenError::Malformed(format!("{rel}: link name: {e}")))?
+                        .ok_or_else(|| {
+                            FlattenError::Malformed(format!("{rel}: hardlink without target"))
+                        })?
+                        .into_owned();
+                    // Hardlink targets are tree-relative paths and ARE
+                    // resolved on the host — path-safety + scoped
+                    // ancestor-symlink resolution apply. The target inode
+                    // exists the moment the reader File::create'd it, even
+                    // if a worker is still writing its content — both
+                    // names share the inode either way.
+                    let target_rel = sanitize(&raw_target)?.ok_or_else(|| {
+                        FlattenError::PathEscape(raw_target.display().to_string())
+                    })?;
+                    let target_rel = self.resolve_scoped(&target_rel)?;
+                    let target_abs = self.root.join(&target_rel);
+                    if !target_abs.exists() {
+                        return Err(FlattenError::HardlinkTarget {
+                            path: rel,
+                            target: target_rel,
+                        });
+                    }
+                    self.remove_entry(meta, &rel)?;
+                    ensure_parent(&dst)?;
+                    std::fs::hard_link(&target_abs, &dst)?;
+                    // A hardlink shares the target's inode — record the
+                    // target's identity so the sidecar stays consistent.
+                    let linked_meta = meta.get(&target_rel).copied().unwrap_or(entry_meta);
+                    meta.insert(rel.clone(), linked_meta);
+                    created_this_layer.insert(rel);
+                }
+                EntryType::Fifo | EntryType::Char | EntryType::Block => {
+                    // mknod is root-only; record and continue (module docs).
+                    tracing::warn!(path = %rel, kind = ?header.entry_type(), "skipping special file (mknod requires root)");
+                    meta.skipped_specials.push(rel.clone());
+                    meta.insert(rel, entry_meta);
+                }
+                // PAX/GNU metadata records are consumed by the tar crate
+                // itself (surfaced via pax_extensions on the entry that
+                // follows); anything else is noise, not rootfs content.
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Join every worker; surface the first worker failure; fold the
+    /// fd-applied xattr refusals into `meta`. MUST complete (Ok) before
+    /// the ownership pass / mtime clamp / pack consume the tree.
+    pub fn finish(self, meta: &mut TreeMetadata) -> Result<(), FlattenError> {
+        match self.pool.finish() {
+            Ok(mut skipped) => {
+                meta.skipped_xattrs.append(&mut skipped);
+                Ok(())
+            }
+            Err((rel, e)) => Err(FlattenError::Io(std::io::Error::new(
+                e.kind(),
+                format!("{rel}: {e}"),
+            ))),
+        }
+    }
+
+    /// `remove_entry` + resolve-cache invalidation. EVERY namespace
+    /// removal funnels through here — that single choke point is what
+    /// keeps the memoized not-a-symlink facts sound (a dir replaced by
+    /// a symlink invalidates itself and everything beneath it).
+    fn remove_entry(&mut self, meta: &mut TreeMetadata, rel: &str) -> std::io::Result<()> {
+        let prefix = format!("{rel}/");
+        self.resolve_cache
+            .retain(|k| k != rel && !k.starts_with(&prefix));
+        remove_entry(&self.root, meta, rel)
+    }
+
+    /// `.wh..wh..opq`: drop every child of `dir_rel` that this layer
+    /// didn't itself create. `read_dir` sees exactly the names the
+    /// reader created — workers add none.
+    fn opaque_dir(
+        &mut self,
+        meta: &mut TreeMetadata,
+        dir_rel: &str,
+        created_this_layer: &HashSet<String>,
+    ) -> Result<(), FlattenError> {
+        let dir = if dir_rel.is_empty() {
+            self.root.clone()
+        } else {
+            self.root.join(dir_rel)
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let child_rel = join_rel(dir_rel, &entry.file_name().to_string_lossy());
+            if !created_this_layer.contains(&child_rel) {
+                self.remove_entry(meta, &child_rel)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve `rel`'s ANCESTOR symlinks the way the guest kernel would,
+    /// scoped to the tree — docker's `FollowSymlinkInScope` semantics:
+    /// an absolute symlink target re-anchors at the tree root (never the
+    /// host's `/`), `..` clamps at the root, and the FINAL component is
+    /// never followed (an entry replaces the node itself — lstat
+    /// semantics; `remove_entry` runs before every write). Bounded hops
+    /// so a symlink loop fails loud instead of spinning.
+    ///
+    /// Not-a-symlink facts (including "nothing there yet" — also not a
+    /// symlink) are memoized in `resolve_cache`; only symlink CREATION
+    /// can flip a fact, and every creation path unlinks first via
+    /// [`Flattener::remove_entry`], which invalidates.
+    fn resolve_scoped(&mut self, rel: &str) -> Result<String, FlattenError> {
+        use std::collections::VecDeque;
+        let mut queue: VecDeque<String> = rel.split('/').map(str::to_string).collect();
+        let mut resolved: Vec<String> = Vec::new();
+        let mut hops = 0u32;
+        while let Some(comp) = queue.pop_front() {
+            if comp.is_empty() || comp == "." {
+                continue;
+            }
+            if comp == ".." {
+                // Only symlink targets can inject `..` (sanitize rejected
+                // it in entry paths); clamp at the tree root.
+                resolved.pop();
+                continue;
+            }
+            if queue.is_empty() {
+                // Final component: never followed.
+                resolved.push(comp);
+                break;
+            }
+            let candidate_rel = if resolved.is_empty() {
+                comp.clone()
+            } else {
+                format!("{}/{comp}", resolved.join("/"))
+            };
+            let is_symlink = if self.resolve_cache.contains(&candidate_rel) {
+                false
+            } else {
+                let is = std::fs::symlink_metadata(self.root.join(&candidate_rel))
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                if !is {
+                    self.resolve_cache.insert(candidate_rel);
+                }
+                is
+            };
+            if is_symlink {
+                hops += 1;
+                if hops > 40 {
+                    return Err(FlattenError::Malformed(format!(
+                        "symlink loop while resolving {rel}"
+                    )));
+                }
+                let target = std::fs::read_link(self.root.join(if resolved.is_empty() {
+                    comp.clone()
+                } else {
+                    format!("{}/{comp}", resolved.join("/"))
+                }))?;
+                if target.is_absolute() {
+                    resolved.clear();
+                }
+                let target = target.to_string_lossy().into_owned();
+                for c in target.split('/').rev() {
+                    queue.push_front(c.to_string());
+                }
+            } else {
+                resolved.push(comp);
+            }
+        }
+        Ok(resolved.join("/"))
+    }
+}
+
+/// Apply one layer tar onto the tree at `root`, updating `meta` —
+/// the single-layer convenience over [`Flattener`] (tests, the bake).
+/// The materializer's hot path constructs one `Flattener` and reuses
+/// its pool across all layers.
 pub fn apply_layer<R: Read>(
     root: &Path,
     meta: &mut TreeMetadata,
     layer: R,
 ) -> Result<(), FlattenError> {
-    let mut archive = tar::Archive::new(layer);
-    // Whiteouts (incl. opaque) apply to LOWER layers only: entries this
-    // layer created are immune, whatever order the archive lists them in.
-    let mut created_this_layer: HashSet<String> = HashSet::new();
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let raw_path = entry
-            .path()
-            .map_err(|e| FlattenError::Malformed(format!("entry path: {e}")))?
-            .into_owned();
-        let Some(rel) = sanitize(&raw_path)? else {
-            continue; // the root dir itself ("./")
-        };
-        // Ancestor symlinks resolve the way the GUEST kernel would,
-        // scoped to the tree (the usrmerge case: base layer has
-        // `bin -> usr/bin`, upper writes `bin/ls` → usr/bin/ls). This
-        // is also the symlink-traversal half of zip-slip: without it,
-        // a layer symlink pointing at an absolute host path would have
-        // later entries written THROUGH it, outside the tree.
-        let rel = resolve_scoped(root, &rel)?;
-        if rel.is_empty() {
-            continue;
-        }
-        let (parent, name) = split_parent(&rel);
-
-        // --- whiteouts ---
-        if name == OPAQUE_MARKER {
-            opaque_dir(root, meta, parent, &created_this_layer)?;
-            continue;
-        }
-        if let Some(hidden) = name.strip_prefix(WHITEOUT_PREFIX) {
-            let target = join_rel(parent, hidden);
-            if !created_this_layer.contains(&target) {
-                remove_entry(root, meta, &target)?;
-            }
-            continue;
-        }
-
-        // --- real entries ---
-        let header = entry.header();
-        let mode = header
-            .mode()
-            .map_err(|e| FlattenError::Malformed(format!("{rel}: mode: {e}")))?
-            & 0o7777;
-        let uid = header
-            .uid()
-            .map_err(|e| FlattenError::Malformed(format!("{rel}: uid: {e}")))?;
-        let gid = header
-            .gid()
-            .map_err(|e| FlattenError::Malformed(format!("{rel}: gid: {e}")))?;
-        let mtime = header.mtime().unwrap_or(0);
-        let entry_meta = EntryMeta { uid, gid, mode };
-        let dst = root.join(&rel);
-
-        use tar::EntryType;
-        match header.entry_type() {
-            EntryType::Directory => {
-                // Replacing a non-dir with a dir drops the old entry;
-                // an existing dir is merged (metadata refreshed).
-                if let Ok(m) = std::fs::symlink_metadata(&dst) {
-                    if !m.is_dir() {
-                        remove_entry(root, meta, &rel)?;
-                    }
-                }
-                std::fs::create_dir_all(&dst)?;
-                set_mode(&dst, mode)?;
-                apply_xattrs(&mut entry, &dst, &rel, meta)?;
-                meta.insert(rel.clone(), entry_meta);
-                created_this_layer.insert(rel);
-            }
-            EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
-                remove_entry(root, meta, &rel)?;
-                ensure_parent(&dst)?;
-                {
-                    let mut f = std::fs::File::create(&dst)?;
-                    std::io::copy(&mut entry, &mut f)?;
-                }
-                set_mode(&dst, mode)?;
-                // Deterministic tree: stamp the tar's own mtime (stable
-                // across pulls); the pack's clamp handles anything newer
-                // than the epoch.
-                let ft = filetime::FileTime::from_unix_time(mtime as i64, 0);
-                filetime::set_file_times(&dst, ft, ft)?;
-                apply_xattrs(&mut entry, &dst, &rel, meta)?;
-                meta.insert(rel.clone(), entry_meta);
-                created_this_layer.insert(rel);
-            }
-            EntryType::Symlink => {
-                let target = entry
-                    .link_name()
-                    .map_err(|e| FlattenError::Malformed(format!("{rel}: link name: {e}")))?
-                    .ok_or_else(|| {
-                        FlattenError::Malformed(format!("{rel}: symlink without target"))
-                    })?
-                    .into_owned();
-                remove_entry(root, meta, &rel)?;
-                ensure_parent(&dst)?;
-                // Symlink TARGETS are stored verbatim — absolute or
-                // `..`-relative targets are legal inside the image (they
-                // resolve in the GUEST's namespace, e.g. /bin -> /usr/bin)
-                // and never dereferenced on the host by this crate.
-                std::os::unix::fs::symlink(&target, &dst)?;
-                meta.insert(rel.clone(), entry_meta);
-                created_this_layer.insert(rel);
-            }
-            EntryType::Link => {
-                let raw_target = entry
-                    .link_name()
-                    .map_err(|e| FlattenError::Malformed(format!("{rel}: link name: {e}")))?
-                    .ok_or_else(|| {
-                        FlattenError::Malformed(format!("{rel}: hardlink without target"))
-                    })?
-                    .into_owned();
-                // Hardlink targets are tree-relative paths and ARE
-                // resolved on the host — path-safety + scoped
-                // ancestor-symlink resolution apply.
-                let target_rel = sanitize(&raw_target)?
-                    .ok_or_else(|| FlattenError::PathEscape(raw_target.display().to_string()))?;
-                let target_rel = resolve_scoped(root, &target_rel)?;
-                let target_abs = root.join(&target_rel);
-                if !target_abs.exists() {
-                    return Err(FlattenError::HardlinkTarget {
-                        path: rel,
-                        target: target_rel,
-                    });
-                }
-                remove_entry(root, meta, &rel)?;
-                ensure_parent(&dst)?;
-                std::fs::hard_link(&target_abs, &dst)?;
-                // A hardlink shares the target's inode — record the
-                // target's identity so the sidecar stays consistent.
-                let linked_meta = meta.get(&target_rel).copied().unwrap_or(entry_meta);
-                meta.insert(rel.clone(), linked_meta);
-                created_this_layer.insert(rel);
-            }
-            EntryType::Fifo | EntryType::Char | EntryType::Block => {
-                // mknod is root-only; record and continue (module docs).
-                tracing::warn!(path = %rel, kind = ?header.entry_type(), "skipping special file (mknod requires root)");
-                meta.skipped_specials.push(rel.clone());
-                meta.insert(rel, entry_meta);
-            }
-            // PAX/GNU metadata records are consumed by the tar crate
-            // itself (surfaced via pax_extensions on the entry that
-            // follows); anything else is noise, not rootfs content.
-            _ => {}
-        }
+    let mut flattener = Flattener::new(root, default_write_concurrency())?;
+    let applied = flattener.apply_layer(meta, layer);
+    let finished = flattener.finish(meta);
+    match (applied, finished) {
+        // finish() holds the root cause when a worker failed mid-apply.
+        (_, Err(e)) => Err(e),
+        (Err(e), Ok(())) => Err(e),
+        (Ok(()), Ok(())) => Ok(()),
     }
-    Ok(())
-}
-
-/// Resolve `rel`'s ANCESTOR symlinks the way the guest kernel would,
-/// scoped to the tree — docker's `FollowSymlinkInScope` semantics:
-/// an absolute symlink target re-anchors at the tree root (never the
-/// host's `/`), `..` clamps at the root, and the FINAL component is
-/// never followed (an entry replaces the node itself — lstat
-/// semantics; `remove_entry` runs before every write). Bounded hops
-/// so a symlink loop fails loud instead of spinning.
-fn resolve_scoped(root: &Path, rel: &str) -> Result<String, FlattenError> {
-    use std::collections::VecDeque;
-    let mut queue: VecDeque<String> = rel.split('/').map(str::to_string).collect();
-    let mut resolved: Vec<String> = Vec::new();
-    let mut hops = 0u32;
-    while let Some(comp) = queue.pop_front() {
-        if comp.is_empty() || comp == "." {
-            continue;
-        }
-        if comp == ".." {
-            // Only symlink targets can inject `..` (sanitize rejected
-            // it in entry paths); clamp at the tree root.
-            resolved.pop();
-            continue;
-        }
-        if queue.is_empty() {
-            // Final component: never followed.
-            resolved.push(comp);
-            break;
-        }
-        let candidate = if resolved.is_empty() {
-            root.join(&comp)
-        } else {
-            root.join(resolved.join("/")).join(&comp)
-        };
-        let is_symlink = std::fs::symlink_metadata(&candidate)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false);
-        if is_symlink {
-            hops += 1;
-            if hops > 40 {
-                return Err(FlattenError::Malformed(format!(
-                    "symlink loop while resolving {rel}"
-                )));
-            }
-            let target = std::fs::read_link(&candidate)?;
-            if target.is_absolute() {
-                resolved.clear();
-            }
-            let target = target.to_string_lossy().into_owned();
-            for c in target.split('/').rev() {
-                queue.push_front(c.to_string());
-            }
-        } else {
-            resolved.push(comp);
-        }
-    }
-    Ok(resolved.join("/"))
 }
 
 /// Normalize a tar path to a tree-relative `a/b/c` string.
@@ -463,32 +634,24 @@ fn remove_entry(root: &Path, meta: &mut TreeMetadata, rel: &str) -> std::io::Res
     Ok(())
 }
 
-/// `.wh..wh..opq`: drop every child of `dir_rel` that this layer
-/// didn't itself create.
-fn opaque_dir(
-    root: &Path,
-    meta: &mut TreeMetadata,
-    dir_rel: &str,
-    created_this_layer: &HashSet<String>,
-) -> Result<(), FlattenError> {
-    let dir = if dir_rel.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(dir_rel)
+/// Parse the entry's PAX-carried xattrs (`SCHILY.xattr.*`) without
+/// applying them — the reader parses (the extensions borrow the
+/// entry), the worker applies fd-scoped.
+fn collect_xattrs<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+) -> Result<Vec<(String, Vec<u8>)>, FlattenError> {
+    let Some(exts) = entry.pax_extensions()? else {
+        return Ok(Vec::new());
     };
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let child_rel = join_rel(dir_rel, &entry.file_name().to_string_lossy());
-        if !created_this_layer.contains(&child_rel) {
-            remove_entry(root, meta, &child_rel)?;
+    let mut xattrs: Vec<(String, Vec<u8>)> = Vec::new();
+    for ext in exts {
+        let ext = ext?;
+        let Ok(key) = ext.key() else { continue };
+        if let Some(name) = key.strip_prefix("SCHILY.xattr.") {
+            xattrs.push((name.to_string(), ext.value_bytes().to_vec()));
         }
     }
-    Ok(())
+    Ok(xattrs)
 }
 
 /// Apply the entry's PAX-carried xattrs (`SCHILY.xattr.*`) to the
@@ -941,6 +1104,281 @@ mod tests {
         let (root, meta) = flatten(&[layer]);
         assert!(!root.path().join("run/queue.pipe").exists());
         assert_eq!(meta.skipped_specials, vec!["run/queue.pipe".to_string()]);
+    }
+
+    // ---- parallel-engine tests (ADR 0088 addendum) ----
+
+    /// Flatten with an explicit Flattener at fixed concurrency —
+    /// the parallel-path twin of the `flatten()` helper.
+    fn flatten_parallel(
+        layers: &[Vec<u8>],
+        concurrency: usize,
+    ) -> (tempfile::TempDir, TreeMetadata) {
+        let root = tempfile::tempdir().unwrap();
+        let mut meta = TreeMetadata::default();
+        let mut f = Flattener::new(root.path(), concurrency).unwrap();
+        for layer in layers {
+            f.apply_layer(&mut meta, layer.as_slice()).unwrap();
+        }
+        f.finish(&mut meta).unwrap();
+        (root, meta)
+    }
+
+    /// Recursive tree fingerprint: (rel, type, mode, mtime, content or
+    /// link target, inode group). Inode numbers differ across runs, so
+    /// hardlink structure is captured as "which paths share an inode".
+    fn tree_fingerprint(root: &Path) -> Vec<String> {
+        use std::collections::HashMap;
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64, String)>) {
+            let mut names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            names.sort();
+            for p in names {
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                let m = std::fs::symlink_metadata(&p).unwrap();
+                let (kind, body) = if m.file_type().is_symlink() {
+                    (
+                        "symlink",
+                        std::fs::read_link(&p).unwrap().display().to_string(),
+                    )
+                } else if m.is_dir() {
+                    ("dir", String::new())
+                } else {
+                    ("file", format!("{:x}", md5ish(&std::fs::read(&p).unwrap())))
+                };
+                let mode = m.permissions().mode() & 0o7777;
+                // Dir mtimes are wall-clock at flatten time (child
+                // creation bumps them; the pack-stage clamp normalizes
+                // later) — only FILE mtimes are flatten's contract.
+                let mtime = if m.is_dir() {
+                    0
+                } else {
+                    filetime::FileTime::from_last_modification_time(&m).unix_seconds()
+                };
+                out.push((
+                    format!("{rel}|{kind}|{mode:o}|{mtime}|{body}"),
+                    m.ino(),
+                    rel,
+                ));
+                if m.is_dir() {
+                    walk(root, &p, out);
+                }
+            }
+        }
+        // Cheap stable content hash (no external dep): FNV-1a.
+        fn md5ish(bytes: &[u8]) -> u64 {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        }
+        let mut raw = Vec::new();
+        walk(root, root, &mut raw);
+        // Map inodes to first-seen path so hardlink groups are stable.
+        let mut groups: HashMap<u64, String> = HashMap::new();
+        raw.iter().for_each(|(_, ino, rel)| {
+            groups.entry(*ino).or_insert_with(|| rel.clone());
+        });
+        raw.into_iter()
+            .map(|(line, ino, _)| format!("{line}|group={}", groups[&ino]))
+            .collect()
+    }
+
+    /// Two entries for the SAME path in one layer: last wins (the
+    /// first write lands on an orphaned inode — harmless).
+    #[test]
+    fn duplicate_path_in_same_layer_last_wins() {
+        let layer = LayerBuilder::new()
+            .file("app/cfg", 0o600, b"first")
+            .file("app/cfg", 0o644, b"second")
+            .build();
+        let (root, meta) = flatten_parallel(&[layer], 8);
+        assert_eq!(
+            std::fs::read(root.path().join("app/cfg")).unwrap(),
+            b"second"
+        );
+        assert_eq!(
+            std::fs::metadata(root.path().join("app/cfg"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644
+        );
+        assert_eq!(meta.get("app/cfg").unwrap().mode, 0o644);
+    }
+
+    /// The parallelism determinism gate: many small files + symlinks +
+    /// hardlinks + a whiteout + an overwrite, applied twice at
+    /// concurrency 8 — identical tree fingerprints (type, mode, mtime,
+    /// content, link targets, hardlink grouping).
+    #[test]
+    fn parallel_apply_tree_is_deterministic() {
+        let mut lower = LayerBuilder::new().dir("d", 0o755);
+        for i in 0..300 {
+            lower = lower.file(&format!("d/f{i:03}"), 0o640, format!("body-{i}").as_bytes());
+        }
+        let lower = lower
+            .file("shared", 0o755, b"tool")
+            .hardlink("shared-link", "shared")
+            .symlink("alias", "d")
+            .build();
+        let upper = LayerBuilder::new()
+            .whiteout("d", "f000")
+            .file("d/f001", 0o600, b"replaced")
+            .file("alias/via-link", 0o644, b"through-symlink")
+            .build();
+
+        let (root_a, _) = flatten_parallel(&[lower.clone(), upper.clone()], 8);
+        let (root_b, _) = flatten_parallel(&[lower, upper], 8);
+        let (fa, fb) = (
+            tree_fingerprint(root_a.path()),
+            tree_fingerprint(root_b.path()),
+        );
+        assert_eq!(fa, fb, "parallel flatten must be run-to-run identical");
+        assert!(
+            fa.iter().any(|l| l.starts_with("d/via-link|file")),
+            "symlink-dir write must land through the link: {fa:?}"
+        );
+        assert!(!root_a.path().join("d/f000").exists(), "whiteout applied");
+    }
+
+    /// A hardlink created immediately after its target is queued for a
+    /// pool write: both names share the inode and show the final bytes.
+    #[test]
+    fn hardlink_to_in_flight_write_shares_content() {
+        let body = vec![0xabu8; 1 << 20]; // 1 MiB: guaranteed pool path
+        let layer = LayerBuilder::new()
+            .file("blob", 0o644, &body)
+            .hardlink("blob-link", "blob")
+            .build();
+        let (root, _) = flatten_parallel(&[layer], 8);
+        let a = std::fs::metadata(root.path().join("blob")).unwrap();
+        let b = std::fs::metadata(root.path().join("blob-link")).unwrap();
+        assert_eq!(a.ino(), b.ino());
+        assert_eq!(std::fs::read(root.path().join("blob-link")).unwrap(), body);
+    }
+
+    /// finish() must join the pool: immediately after it returns,
+    /// every queued write is on disk with its attrs.
+    #[test]
+    fn finish_joins_workers_before_return() {
+        let mut b = LayerBuilder::new();
+        for i in 0..1000 {
+            b = b.file(&format!("many/f{i:04}"), 0o600, format!("{i}").as_bytes());
+        }
+        let (root, _) = flatten_parallel(&[b.build()], 16);
+        for i in 0..1000 {
+            let p = root.path().join(format!("many/f{i:04}"));
+            assert_eq!(std::fs::read(&p).unwrap(), format!("{i}").as_bytes());
+            let m = std::fs::metadata(&p).unwrap();
+            assert_eq!(m.permissions().mode() & 0o7777, 0o600);
+            assert_eq!(
+                filetime::FileTime::from_last_modification_time(&m).unix_seconds(),
+                946_684_800,
+                "futimens must have landed before finish() returned"
+            );
+        }
+    }
+
+    /// A worker failure fails the flatten loudly at finish() with the
+    /// failing path in the error.
+    #[test]
+    fn worker_error_fails_the_flatten() {
+        use super::parallel::{WriteJob, WritePool};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("victim");
+        std::fs::write(&path, b"x").unwrap();
+        // A read-only handle: write_all fails with EBADF-class error.
+        let ro = std::fs::File::open(&path).unwrap();
+        let pool = WritePool::new(2).unwrap();
+        pool.submit(WriteJob {
+            file: ro,
+            rel: "victim".into(),
+            bytes: b"data".to_vec(),
+            mode: 0o644,
+            mtime: 0,
+            xattrs: Vec::new(),
+        })
+        .unwrap();
+        let err = pool.finish().expect_err("read-only fd must fail the pool");
+        assert_eq!(err.0, "victim", "failure carries the entry path");
+    }
+
+    /// user.* xattrs land via the worker's fd path; refused names are
+    /// collected on the sidecar, never fatal (linux-only refusal leg:
+    /// `trusted.*` needs CAP_SYS_ADMIN there, while macOS accepts
+    /// arbitrary names).
+    #[test]
+    fn xattrs_apply_via_fd_and_refusals_collected() {
+        let mut b = tar::Builder::new(Vec::new());
+        b.append_pax_extensions([("SCHILY.xattr.user.engram.test", &b"hello"[..])])
+            .unwrap();
+        let mut h = LayerBuilder::header(0o644, 0, 0, 4, tar::EntryType::Regular);
+        b.append_data(&mut h, "xf", &b"data"[..]).unwrap();
+        b.finish().unwrap();
+        let layer = b.into_inner().unwrap();
+
+        let (root, meta) = flatten_parallel(&[layer], 4);
+        let got = xattr::get(root.path().join("xf"), "user.engram.test").unwrap();
+        assert_eq!(got.as_deref(), Some(&b"hello"[..]), "fd xattr must land");
+        assert!(
+            meta.skipped_xattrs.is_empty(),
+            "user.* must not be refused: {:?}",
+            meta.skipped_xattrs
+        );
+
+        // Refusal leg (linux: trusted.* needs CAP_SYS_ADMIN; macOS
+        // accepts arbitrary names, so only assert there's no crash).
+        #[cfg(target_os = "linux")]
+        if !nix_is_root() {
+            let mut b = tar::Builder::new(Vec::new());
+            b.append_pax_extensions([("SCHILY.xattr.trusted.engram", &b"x"[..])])
+                .unwrap();
+            let mut h = LayerBuilder::header(0o644, 0, 0, 1, tar::EntryType::Regular);
+            b.append_data(&mut h, "tf", &b"y"[..]).unwrap();
+            b.finish().unwrap();
+            let (_root, meta) = flatten_parallel(&[b.into_inner().unwrap()], 4);
+            assert_eq!(meta.skipped_xattrs.len(), 1, "trusted.* refusal collected");
+            assert_eq!(meta.skipped_xattrs[0].name, "trusted.engram");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn nix_is_root() -> bool {
+        std::fs::metadata("/proc/self")
+            .map(|m| m.uid() == 0)
+            .unwrap_or(false)
+    }
+
+    /// The resolve memo must not serve a stale "not a symlink" fact
+    /// after a dir is replaced by a symlink: `a/f` written after the
+    /// replacement lands under the link target.
+    #[test]
+    fn resolve_cache_invalidated_by_symlink_replace() {
+        let lower = LayerBuilder::new()
+            .dir("a", 0o755)
+            .file("a/seed", 0o644, b"warm the cache")
+            .dir("b", 0o755)
+            .build();
+        let upper = LayerBuilder::new()
+            .whiteout("", "a")
+            .symlink("a", "b")
+            .file("a/f", 0o644, b"through")
+            .build();
+        let (root, _) = flatten_parallel(&[lower, upper], 4);
+        assert!(
+            root.path().join("b/f").is_file(),
+            "write after symlink-replace must follow the fresh link"
+        );
+        assert!(std::fs::symlink_metadata(root.path().join("a"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     /// apply_ownership under an unprivileged caller: refused chowns
