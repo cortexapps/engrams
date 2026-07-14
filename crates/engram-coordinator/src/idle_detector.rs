@@ -231,7 +231,11 @@ fn classify(
     if age >= cfg.hard_ttl {
         return Some(IdleKind::Hard);
     }
-    if c.last_event_kind.as_deref() == Some("harness_idle") && age >= cfg.soft_ttl {
+    if matches!(
+        c.last_event_kind.as_deref(),
+        Some("harness_idle" | "harness_parked")
+    ) && age >= cfg.soft_ttl
+    {
         return Some(IdleKind::Soft);
     }
     None
@@ -390,6 +394,18 @@ mod tests {
         // A non-idle newest event = the hub's clear-on-any-event rule.
         assert_eq!(
             classify(&cfg(), &cand(301, Some("agent_message"), None)),
+            None
+        );
+    }
+
+    #[test]
+    fn parked_soft_fires_only_past_soft_ttl() {
+        assert_eq!(
+            classify(&cfg(), &cand(301, Some("harness_parked"), None)),
+            Some(IdleKind::Soft)
+        );
+        assert_eq!(
+            classify(&cfg(), &cand(299, Some("harness_parked"), None)),
             None
         );
     }

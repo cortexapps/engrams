@@ -534,6 +534,14 @@ interaction (P4).
   dev stack has no codex profile yet.
 - **P4 — parked eviction.** The parked signal (`Parked` event vs `Idle`
   reuse), ADR 0034 state-machine integration, wake-on-result.
+
+  *As built (2026-07-14):* added the trailing `Parked` wire variant (kind
+  `harness_parked`). Codex emits it for deferred dynamic tools and
+  `requestUserInput`; claude emits it when a turn ends `tool_deferred`. The
+  coordinator classifies it like `harness_idle` for the soft TTL, and the ADR
+  0091 resume-rewind excludes it for the same reason. Wake-on-result is
+  unchanged (`ToolResult` outbox → `Resume`); after idle eviction, codex uses
+  the existing crash-degrade delivery path because snapshots are harness-free.
 - **P5 — AUQ convergence.** Native bindings both harnesses; policy/web/Slack
   switch to generic kinds (legacy kinds still render for old sessions);
   delete the bespoke question wire types, RPC, and outbox kind.

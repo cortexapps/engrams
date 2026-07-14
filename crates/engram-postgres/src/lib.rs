@@ -3888,15 +3888,17 @@ impl MetadataStore for PostgresStore {
         // user_question, question_answered, file_changed, file_shared,
         // integration_asset, …) still rewinds.
         //
-        // ADR 0091: `harness_idle` joins the exclusion list. It is the
-        // idle detector's nomination input — "the harness finished its
-        // turn and is waiting" — a fact that stays true across a clean
-        // evict/resume (the resumed harness IS idle until the next
-        // prompt), and it lands after the eviction checkpoint's cursor
-        // by construction (idle → 5 min TTL → capture cut at pause
-        // time). Rewinding it made EVERY clean cycle report
+        // ADR 0091: `harness_idle` and ADR 0089's `harness_parked` join
+        // the exclusion list. They are the idle detector's nomination
+        // inputs — either "the harness finished its turn and is waiting"
+        // or "the open turn is waiting only on deferred external work" —
+        // facts that stay true across a clean evict/resume (the resumed
+        // session remains idle or parked until the next prompt/result),
+        // and they land after the eviction checkpoint's cursor by
+        // construction (waiting marker → 5 min TTL → capture cut at pause
+        // time). Rewinding them made EVERY clean cycle report
         // `rolled_back: 1` under a `host_failure_recovery` banner
-        // (2026-07-11 campaign, every observed resume). With it
+        // (2026-07-11 campaign, every observed resume). With them
         // excluded, a clean resume tombstones nothing and
         // `apply_rung1_rewind`'s zero-rows early-return emits no
         // recovery event at all — the honest outcome.
@@ -3920,7 +3922,7 @@ impl MetadataStore for PostgresStore {
                AND kind NOT IN (
                    'status_changed', 'snapshot_taken', 'evicted',
                    'resumed', 'recovered_from_checkpoint', 'prompt_received',
-                   'harness_idle'
+                   'harness_idle', 'harness_parked'
                )
             "#,
         )

@@ -171,6 +171,12 @@ pub enum SessionEvent {
     HarnessIdle {
         at: DateTime<Utc>,
     },
+    /// The harness has an open agent turn whose only outstanding work is
+    /// deferred external calls. Eviction-eligible like `HarnessIdle`, but the
+    /// turn remains open until a result arrives.
+    HarnessParked {
+        at: DateTime<Utc>,
+    },
     /// Phase 1b: a prompt arrived while a run was in flight and was
     /// queued (type-ahead / steering). The harness owns the queue; the
     /// web renders this as a greyed, editable composer item keyed on
@@ -407,6 +413,7 @@ impl SessionEvent {
             Self::HarnessRunCompleted { .. } => "run_completed",
             Self::HarnessRunInterrupted { .. } => "run_interrupted",
             Self::HarnessIdle { .. } => "harness_idle",
+            Self::HarnessParked { .. } => "harness_parked",
             Self::HarnessPromptQueued { .. } => "prompt_queued",
             Self::HarnessPromptEdited { .. } => "prompt_edited",
             Self::HarnessPromptDequeued { .. } => "prompt_dequeued",
@@ -497,6 +504,7 @@ impl SessionEvent {
             }
             HarnessEvent::RunInterrupted { run_id } => Self::HarnessRunInterrupted { run_id, at },
             HarnessEvent::Idle => Self::HarnessIdle { at },
+            HarnessEvent::Parked => Self::HarnessParked { at },
             HarnessEvent::PromptQueued { prompt_id, summary } => Self::HarnessPromptQueued {
                 prompt_id,
                 summary,
@@ -1083,11 +1091,10 @@ fn harness_event_sink(
     meta: Arc<dyn engram_core::traits::MetadataStore>,
 ) -> EventSink {
     // Per-session cache of the most-recent forwarded event kind. Used
-    // to drop a `harness_idle` that would land back-to-back with
-    // another `harness_idle`: the claude harness re-announces Idle on
-    // every reconnect (a protocol "ready for prompts" signal), so an
-    // evict/resume cycle on an already-idle session would otherwise
-    // append a redundant idle to the log on every cycle.
+    // to drop a `harness_idle` or `harness_parked` that would land
+    // back-to-back with the same kind: harnesses re-announce their
+    // waiting state on reconnect, so an evict/resume cycle would
+    // otherwise append a redundant marker to the log on every cycle.
     let last_kind: Arc<DashMap<SessionId, &'static str>> = Arc::new(DashMap::new());
     Arc::new(move |session_id, _sandbox_id, ev| {
         let events = events.clone();
@@ -1145,14 +1152,14 @@ fn harness_event_sink(
                     None
                 };
 
-            // Drop a back-to-back duplicate `harness_idle`. The
+            // Drop a back-to-back duplicate waiting-state marker. The
             // upstream TTL bookkeeping in HarnessHub::reader_loop
             // already saw the event, so suppressing it here only
             // affects the persisted log + SSE bus.
-            if kind == "harness_idle"
+            if matches!(kind, "harness_idle" | "harness_parked")
                 && last_kind
                     .get(&session_id)
-                    .map(|v| *v == "harness_idle")
+                    .map(|v| *v == kind)
                     .unwrap_or(false)
             {
                 return;
@@ -1447,6 +1454,13 @@ pub(crate) mod tests {
             other => panic!("expected HarnessRunInterrupted, got {other:?}"),
         }
         assert_eq!(ev.kind(), "run_interrupted");
+    }
+
+    #[test]
+    fn parked_maps_from_harness_with_stable_kind() {
+        let ev = SessionEvent::from_harness(HarnessEvent::Parked, chrono::Utc::now());
+        assert!(matches!(ev, SessionEvent::HarnessParked { .. }));
+        assert_eq!(ev.kind(), "harness_parked");
     }
 
     #[test]
@@ -2796,7 +2810,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn harness_event_sink_dedupes_back_to_back_idles() {
+    async fn harness_event_sink_dedupes_back_to_back_idles_and_parked() {
         // The claude harness re-emits Idle on every reconnect (e.g.
         // after an evict/resume cycle on an already-idle session).
         // Persisting each one would litter the timeline with redundant
@@ -2856,6 +2870,38 @@ pub(crate) mod tests {
                 "harness_idle".to_string(),
                 "run_started".to_string(),
                 "harness_idle".to_string(),
+            ],
+        );
+
+        // Parked is also re-announced after reconnect while the agent's
+        // turn remains open. Consecutive markers collapse independently
+        // from Idle, while an intervening event permits the next marker.
+        for _ in 0..3 {
+            sink(session_id, sandbox_id, HarnessEvent::Parked).await;
+        }
+        sink(
+            session_id,
+            sandbox_id,
+            HarnessEvent::RunStarted {
+                run_id: "run-2".into(),
+                prompt_summary: None,
+                prompt_id: None,
+            },
+        )
+        .await;
+        sink(session_id, sandbox_id, HarnessEvent::Parked).await;
+        sink(session_id, sandbox_id, HarnessEvent::Parked).await;
+
+        let kinds: Vec<String> = mini.events.lock().iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "harness_idle",
+                "run_started",
+                "harness_idle",
+                "harness_parked",
+                "run_started",
+                "harness_parked",
             ],
         );
     }

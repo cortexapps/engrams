@@ -277,13 +277,20 @@ async fn run_engine(
                     outcome,
                     DriveOutcome::Shutdown | DriveOutcome::ChannelClosed
                 ) {
-                    let _ = server.stdin.shutdown().await;
-                    if tokio::time::timeout(std::time::Duration::from_secs(5), server.child.wait())
+                    // ChildStdin::shutdown() only flushes — dropping the
+                    // handle is what closes the pipe and delivers the EOF
+                    // the app-server exits on. Without it every drain ate
+                    // the full 5s timeout and ended in SIGKILL.
+                    let AppServer {
+                        mut child, stdin, ..
+                    } = server;
+                    drop(stdin);
+                    if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
                         .await
                         .is_err()
                     {
-                        let _ = server.child.start_kill();
-                        let _ = server.child.wait().await;
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
                     }
                     return ExitCode::SUCCESS;
                 }
@@ -772,8 +779,7 @@ async fn handle_dynamic_tool_call(
     )
     .await;
     if tool.execution == ToolExecution::Deferred {
-        // ADR 0089 P4: emit the parked/idle-eviction signal here once its
-        // wire representation and coordinator state transition land.
+        emit(events, HarnessEvent::Parked).await;
     }
 }
 
@@ -996,6 +1002,7 @@ async fn handle_message(
             },
         )
         .await;
+        emit(events, HarnessEvent::Parked).await;
         return;
     }
     if let Some(id) = value.get("id").and_then(Value::as_i64) {
@@ -1754,6 +1761,64 @@ done
     }
 
     #[tokio::test]
+    async fn deferred_dynamic_tool_call_emits_requested_then_parked_without_idle() {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-1","tool":"save_memory","arguments":{"text":"remember this"},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, _) = write_fake_codex(&[tool_call]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = parse_tool_manifest(
+            r#"[{"name":"save_memory","description":"Save a memory","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
+        )
+        .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "remember".into(),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    event_rx.recv().await,
+                    Some(HarnessEvent::ToolCallRequested { ref call_id, .. })
+                        if call_id == "call-1"
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("deferred dynamic tool request timed out");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("deferred call did not emit a parked marker"),
+            Some(HarnessEvent::Parked)
+        ));
+        let idle = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if matches!(event_rx.recv().await, Some(HarnessEvent::Idle)) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(idle.is_err(), "a parked open turn must not emit Idle");
+        engine.abort();
+    }
+
+    #[tokio::test]
     async fn sync_dynamic_tool_call_emits_request_and_routes_result() {
         let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-1","tool":"save_memory","arguments":{"text":"remember this"},"threadId":"t1","turnId":"turn-1"}}"#;
         let (script, record) = write_fake_codex(&[tool_call]).await;
@@ -1804,6 +1869,15 @@ done
                 r#"{"text":"remember this"}"#.into(),
             )
         );
+        let parked = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if matches!(event_rx.recv().await, Some(HarnessEvent::Parked)) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(parked.is_err(), "sync dynamic tools must not emit Parked");
 
         command_tx
             .send(HarnessCommand::ToolResult {
@@ -1890,12 +1964,65 @@ done
                 }],
             }]
         );
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("requestUserInput did not emit a parked marker"),
+            Some(HarnessEvent::Parked)
+        ));
         let parked = ParkedCallStore::open(parked_path).unwrap().all();
         assert_eq!(parked.len(), 1);
         assert_eq!(parked[0].tool_call_id, "question-1");
         assert_eq!(parked[0].kind, ParkedCallKind::UserQuestion);
         assert_eq!(parked[0].request_id, json!(88));
         engine.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_promptly_while_dynamic_tool_call_is_parked() {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-1","tool":"save_memory","arguments":{"text":"remember this"},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, _) = write_fake_codex(&[tool_call]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = parse_tool_manifest(
+            r#"[{"name":"save_memory","description":"Save a memory","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
+        )
+        .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "remember".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(event_rx.recv().await, Some(HarnessEvent::Parked)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("deferred call did not park");
+
+        command_tx
+            .send(HarnessCommand::Shutdown { grace_secs: 1 })
+            .await
+            .unwrap();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), engine)
+            .await
+            .expect("shutdown waited on the open JSON-RPC tool call")
+            .expect("engine task panicked");
+        assert_eq!(exit, ExitCode::SUCCESS);
     }
 
     #[tokio::test]

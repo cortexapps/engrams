@@ -371,6 +371,7 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_title_suggested", &ev_title_suggested());
     assert_golden("event_prompt_steered", &ev_prompt_steered());
     assert_golden("event_tool_call_requested", &ev_tool_call_requested());
+    assert_golden("event_parked", &HarnessEvent::Parked);
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -412,6 +413,7 @@ fn harness_event_golden_and_variant_indices() {
         16,
         "HarnessEvent::ToolCallRequested",
     );
+    assert_variant_index(&HarnessEvent::Parked, 17, "HarnessEvent::Parked");
 }
 
 #[test]
@@ -607,6 +609,7 @@ fn regen_golden() {
     write("event_title_suggested", &ev_title_suggested());
     write("event_prompt_steered", &ev_prompt_steered());
     write("event_tool_call_requested", &ev_tool_call_requested());
+    write("event_parked", &HarnessEvent::Parked);
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);

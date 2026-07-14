@@ -435,6 +435,13 @@ pub enum HarnessEvent {
         name: String,
         args_json: String,
     },
+    // ── ADR 0089 P4: parked eviction. APPENDED after ToolCallRequested so
+    //    existing bincode variant indices never shift (Parked=17).
+    /// The harness's only outstanding work is deferred tool calls or a
+    /// pending user question held open by the agent. The session is eligible
+    /// for eviction (the coordinator's soft TTL treats this like `Idle`), but
+    /// unlike `Idle` the agent's turn remains open awaiting an external result.
+    Parked,
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -473,6 +480,7 @@ impl HarnessEvent {
             Self::PromptSteered { .. } => "prompt_steered",
             Self::ToolCallRequested { .. } => "tool_call_requested",
             Self::Idle => "harness_idle",
+            Self::Parked => "harness_parked",
         }
     }
 
@@ -913,6 +921,7 @@ mod tests {
             name: "save_memory".into(),
             args_json: r#"{"text":"remember this"}"#.into(),
         }));
+        round_trip(HarnessFrame::Event(HarnessEvent::Parked));
     }
 
     /// Two questions in one call (one multi-select, one single) — the
@@ -1144,6 +1153,7 @@ mod tests {
             "prompt_dequeued"
         );
         assert_eq!(HarnessEvent::Idle.kind(), "harness_idle");
+        assert_eq!(HarnessEvent::Parked.kind(), "harness_parked");
         assert_eq!(
             HarnessEvent::UserQuestion {
                 run_id: "x".into(),

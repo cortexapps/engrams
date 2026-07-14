@@ -1942,8 +1942,9 @@ mod adapter {
             turn = Some(start_continuation_turn(evt_tx, cli, current_run_id).await);
         } else {
             // Kick off the first queued prompt (an initial prompt, or a
-            // queue that survived a respawn) with no leading Idle; otherwise
-            // announce Idle so the host's soft TTL arms.
+            // queue that survived a respawn) with no leading waiting marker;
+            // otherwise announce whether this process is truly idle or still
+            // parked on deferred work retained by the session-level tables.
             match pending.pop_front() {
                 Some(qp) => {
                     if let Some(s) = stdin.as_mut() {
@@ -1953,7 +1954,19 @@ mod adapter {
                         );
                     }
                 }
-                None => emit(evt_tx, HarnessEvent::Idle).await,
+                None => {
+                    let parked = *question_outstanding.lock().await
+                        || !deferred_calls.lock().await.is_empty();
+                    emit(
+                        evt_tx,
+                        if parked {
+                            HarnessEvent::Parked
+                        } else {
+                            HarnessEvent::Idle
+                        },
+                    )
+                    .await;
+                }
             }
         }
 
@@ -2012,6 +2025,8 @@ mod adapter {
                                         && !t.deferred_pending.is_empty();
                                     let pending_tools = t.deferred_pending.len();
                                     let is_delivery_resume = t.is_delivery_resume;
+                                    let tool_deferred = marker.terminal_reason.as_deref()
+                                        == Some("tool_deferred");
                                     let run_id = t.run_id;
                                     tracing::info!(
                                         %run_id,
@@ -2174,7 +2189,17 @@ mod adapter {
                                                     );
                                                 }
                                             }
-                                            None => emit(evt_tx, HarnessEvent::Idle).await,
+                                            None => {
+                                                emit(
+                                                    evt_tx,
+                                                    if tool_deferred {
+                                                        HarnessEvent::Parked
+                                                    } else {
+                                                        HarnessEvent::Idle
+                                                    },
+                                                )
+                                                .await
+                                            }
                                         }
                                     }
                                 } else {
@@ -4072,6 +4097,46 @@ mod adapter {
             }
         }
 
+        #[tokio::test]
+        async fn normal_turn_ends_with_idle_not_parked() {
+            let script = write_persistent_fake_claude(&[
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"done"}]}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}"#,
+            ])
+            .await;
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(16);
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                Arc::new(Notify::new()),
+                evt_tx,
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p-normal".into(),
+                    text: "finish normally".into(),
+                })
+                .await
+                .unwrap();
+            let run_id = expect_run_started(&mut evt_rx).await;
+            expect_agent_message(&mut evt_rx, "done").await;
+            assert_eq!(expect_run_completed(&mut evt_rx).await, run_id);
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+            let _ = tokio::fs::remove_file(script).await;
+        }
+
         fn test_cli(claude_bin: String) -> Cli {
             Cli {
                 connect: None,
@@ -5379,18 +5444,22 @@ mod adapter {
                     if call_id == "toolu_deferred"
             ));
 
-            // Drain the deferred turn's tool log/completion and both Idle
+            // Drain the deferred turn's tool log/completion and both Parked
             // announcements: one at turn-end, one from the respawned process.
-            let mut idle_count = 0;
+            let mut waiting = Vec::new();
             tokio::time::timeout(Duration::from_secs(8), async {
-                while idle_count < 2 {
-                    if matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)) {
-                        idle_count += 1;
+                while waiting.len() < 2 {
+                    match evt_rx.recv().await {
+                        Some(HarnessEvent::Parked) => waiting.push("parked"),
+                        Some(HarnessEvent::Idle) => waiting.push("idle"),
+                        Some(_) => {}
+                        None => panic!("engine event channel closed before parked re-announce"),
                     }
                 }
             })
             .await
             .expect("the dead first process should respawn");
+            assert_eq!(waiting, ["parked", "parked"]);
 
             cmd_tx
                 .send(HarnessCommand::ToolResult {
@@ -5589,7 +5658,15 @@ mod adapter {
                 evt_rx.recv().await,
                 Some(HarnessEvent::ToolCallRequested { call_id, .. }) if call_id == "toolu_alive"
             ));
-            while !matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)) {}
+            let waiting = loop {
+                match evt_rx.recv().await {
+                    Some(HarnessEvent::Parked) => break "parked",
+                    Some(HarnessEvent::Idle) => break "idle",
+                    Some(_) => {}
+                    None => panic!("engine event channel closed before waiting marker"),
+                }
+            };
+            assert_eq!(waiting, "parked");
 
             cmd_tx
                 .send(HarnessCommand::ToolResult {
@@ -5679,16 +5756,20 @@ mod adapter {
                     if call_id == "toolu_fallback"
             ));
 
-            let mut idle_count = 0;
+            let mut waiting = Vec::new();
             tokio::time::timeout(Duration::from_secs(8), async {
-                while idle_count < 2 {
-                    if matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)) {
-                        idle_count += 1;
+                while waiting.len() < 2 {
+                    match evt_rx.recv().await {
+                        Some(HarnessEvent::Parked) => waiting.push("parked"),
+                        Some(HarnessEvent::Idle) => waiting.push("idle"),
+                        Some(_) => {}
+                        None => panic!("engine event channel closed before parked re-announce"),
                     }
                 }
             })
             .await
             .expect("the dead deferred process should respawn before result delivery");
+            assert_eq!(waiting, ["parked", "parked"]);
 
             cmd_tx
                 .send(HarnessCommand::ToolResult {
