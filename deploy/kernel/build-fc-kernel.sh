@@ -116,11 +116,15 @@ require() {
 # NAMESPACES/USER_NS/PID_NS/NET_NS/SECCOMP*: required for chromium's
 # unprivileged namespace (zygote) sandbox (ADR 0065 §7, issue #569) — a future
 # base-config re-sync must not silently drop them.
+# VIRTIO_BALLOON: the ADR 0088 addendum's capture-time seed shrink inflates a
+# balloon before the cold-base dump; a guest without the driver silently
+# degrades every warm enable back to a dense multi-GiB seed upload.
 for c in \
   CONFIG_NF_TABLES CONFIG_NFT_COMPAT CONFIG_NFT_NAT \
   CONFIG_IP_NF_RAW CONFIG_IP6_NF_NAT CONFIG_IP6_NF_RAW \
   CONFIG_BRIDGE_NETFILTER CONFIG_VXLAN CONFIG_OVERLAY_FS CONFIG_BRIDGE CONFIG_VETH \
   CONFIG_VIRTIO_MMIO CONFIG_VIRTIO_BLK CONFIG_VIRTIO_NET CONFIG_VIRTIO_VSOCKETS \
+  CONFIG_VIRTIO_BALLOON \
   CONFIG_IP_PNP CONFIG_EXT4_FS \
   CONFIG_FUSE_FS \
   CONFIG_NAMESPACES CONFIG_USER_NS CONFIG_PID_NS CONFIG_NET_NS \

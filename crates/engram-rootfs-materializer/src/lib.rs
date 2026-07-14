@@ -41,11 +41,21 @@ use engram_core::types::image::OciRuntimeDefaults;
 pub use ext4::{
     clamp_mtimes, recommended_size, recursive_size, Ext4Error, Ext4Packer, Mke2fsPacker,
 };
-pub use flatten::{apply_layer, EntryMeta, FlattenError, SkippedXattr, TreeMetadata};
+pub use flatten::{
+    apply_layer, default_write_concurrency, ChannelReader, EntryMeta, FlattenError, Flattener,
+    SkippedXattr, TreeMetadata,
+};
 pub use inject::{inject_init, InitInjection, Transport, DEFAULT_INIT_SHIM};
 pub use pull::{
-    layer_compression, pull_image, LayerCompression, Platform, PullError, PulledImage, PulledLayer,
+    download_layer, layer_compression, pull_image, resolve_image, LayerCompression, LayerPlan,
+    Platform, PullError, PulledImage, PulledLayer, ResolvedImage,
 };
+
+/// Download look-ahead for the pull/flatten pipeline: up to this many
+/// layer downloads in flight, delivered to the flattener in manifest
+/// order (`buffered`, not `buffer_unordered` — layers MUST apply in
+/// order). Scratch holds at most this + the layer being flattened.
+const PULL_LOOKAHEAD: usize = 3;
 
 /// Scratch headroom to budget for one materialize, as a multiple of
 /// the image's compressed size: compressed layers (~1×) + the
@@ -220,56 +230,128 @@ impl Materializer {
         let work = scratch_dir.join(format!("materialize-{}", uuid::Uuid::new_v4().simple()));
         let _guard = ScratchGuard { dir: work.clone() };
 
-        // 1. Pull.
+        // 1+2. Pull/flatten PIPELINE (ADR 0088 addendum): downloads run
+        // up to PULL_LOOKAHEAD-wide with in-order readiness (`buffered`)
+        // and feed the flatten consumer as each layer lands — pull
+        // wall-time hides under the flatten. Each layer file is deleted
+        // as soon as it's applied, so scratch holds ≤ lookahead + one
+        // layer at the peak (LESS than the old all-layers-then-flatten).
         report(MaterializeStage::Pull, Some(format!("{platform}")));
+        let pipeline_started = std::time::Instant::now();
+        let resolved = pull::resolve_image(&self.oci, image_uri, platform).await?;
+        let layer_count = resolved.layers.len();
+        let compressed_bytes = resolved.compressed_bytes;
         let layers_dir = work.join("layers");
-        let pull_started = std::time::Instant::now();
-        let pulled = pull::pull_image(&self.oci, image_uri, platform, &layers_dir).await?;
-        let pull_ms = pull_started.elapsed().as_millis() as u64;
-
-        // 2. Flatten (sync tar/decompress IO — off the async runtime).
-        // Each layer file is deleted as soon as it's applied, so the
-        // scratch peak during the flatten is tree + ONE layer.
-        report(
-            MaterializeStage::Flatten,
-            Some(format!(
-                "{} layers, {} compressed bytes",
-                pulled.layers.len(),
-                pulled.compressed_bytes
-            )),
-        );
+        tokio::fs::create_dir_all(&layers_dir).await?;
         let rootfs = work.join("rootfs");
         tokio::fs::create_dir_all(&rootfs).await?;
-        let flatten_started = std::time::Instant::now();
-        let tree_meta = {
+
+        // Bounded handoff: the driver blocks once the flattener is
+        // 2 layers behind (plus lookahead in flight).
+        let (layer_tx, mut layer_rx) = tokio::sync::mpsc::channel::<PulledLayer>(2);
+
+        // The driver is spawned with owned captures (OciClient is
+        // Clone): a reference-capturing async block joined under the
+        // caller's #[instrument] span trips rustc's
+        // Send-not-general-enough inference.
+        let pull_driver =
+            {
+                let oci = self.oci.clone();
+                let image_uri = image_uri.to_string();
+                let layers_dir = layers_dir.clone();
+                let plans = resolved.layers.clone();
+                tokio::spawn(async move {
+                    use futures::StreamExt as _;
+                    let started = std::time::Instant::now();
+                    let mut stream =
+                        futures::stream::iter(plans.into_iter().map(|plan| {
+                            // Fully owned per-download captures: reference-holding
+                            // closures under buffered() trip rustc's
+                            // FnOnce-not-general-enough inference.
+                            let oci = oci.clone();
+                            let image_uri = image_uri.clone();
+                            let layers_dir = layers_dir.clone();
+                            async move {
+                                pull::download_layer(&oci, &image_uri, &plan, &layers_dir).await
+                            }
+                        }))
+                        .buffered(PULL_LOOKAHEAD);
+                    while let Some(pulled) = stream.next().await {
+                        let pulled = pulled?;
+                        if layer_tx.send(pulled).await.is_err() {
+                            // Consumer died (flatten error) — its error wins;
+                            // just stop downloading.
+                            break;
+                        }
+                    }
+                    Ok::<u64, PullError>(started.elapsed().as_millis() as u64)
+                })
+            };
+
+        let flatten_consumer = {
             let rootfs = rootfs.clone();
-            let layers = pulled.layers.clone();
-            tokio::task::spawn_blocking(move || -> Result<TreeMetadata, MaterializeError> {
+            let progress = progress.clone();
+            tokio::task::spawn_blocking(move || -> Result<(TreeMetadata, u64), MaterializeError> {
                 let mut meta = TreeMetadata::default();
-                for layer in &layers {
-                    // Per-layer timing + entry delta: the flatten is the
-                    // dominant materialize leg for warm dev images
-                    // (prod-measured 48 min for a 16 GiB tree), and these
-                    // fields attribute it — a slow layer with a huge entry
-                    // delta is syscall-bound tiny-file creation; slow with a
-                    // small delta is decompression.
+                // One engine across all layers: the fd-scoped write pool
+                // and the memoized resolve cache are reused layer to layer.
+                let mut flattener =
+                    flatten::Flattener::new(&rootfs, flatten::default_write_concurrency())?;
+                let mut layer_result: Result<(), MaterializeError> = Ok(());
+                let mut applied = 0usize;
+                let mut flatten_busy_ms = 0u64;
+                while let Some(layer) = layer_rx.blocking_recv() {
+                    applied += 1;
+                    // Frame per layer (keepalive-coalesced coord-side;
+                    // never re-emits Pull after the first Flatten).
+                    if let Some(tx) = &progress {
+                        let _ = tx.try_send(engram_core::types::MaterializeProgress {
+                            stage: MaterializeStage::Flatten,
+                            detail: Some(format!(
+                                "layer {applied}/{layer_count}, {compressed_bytes} compressed bytes"
+                            )),
+                            chunks_done: None,
+                            chunks_total: None,
+                        });
+                    }
+                    // Per-layer timing + entry delta: a slow layer with a
+                    // huge entry delta is syscall-bound tiny-file creation;
+                    // slow with a small delta is decompression.
                     let layer_started = std::time::Instant::now();
                     let entries_before = meta.len();
-                    let file = std::fs::File::open(&layer.path)?;
+                    let file = match std::fs::File::open(&layer.path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            layer_result = Err(e.into());
+                            break;
+                        }
+                    };
                     let reader = std::io::BufReader::new(file);
-                    match layer.compression {
-                        LayerCompression::Gzip => flatten::apply_layer(
-                            &rootfs,
-                            &mut meta,
-                            flate2::read::GzDecoder::new(reader),
-                        )?,
-                        LayerCompression::Zstd => flatten::apply_layer(
-                            &rootfs,
-                            &mut meta,
-                            ruzstd::decoding::StreamingDecoder::new(reader)
-                                .map_err(|e| std::io::Error::other(e.to_string()))?,
-                        )?,
-                        LayerCompression::None => flatten::apply_layer(&rootfs, &mut meta, reader)?,
+                    // Decompression runs on its own thread (ChannelReader)
+                    // so inflate overlaps the reader's syscall work.
+                    let decode = || -> Result<flatten::ChannelReader, std::io::Error> {
+                        let decoder: Box<dyn std::io::Read + Send> = match layer.compression {
+                            LayerCompression::Gzip => {
+                                Box::new(flate2::read::GzDecoder::new(reader))
+                            }
+                            LayerCompression::Zstd => Box::new(
+                                ruzstd::decoding::StreamingDecoder::new(reader)
+                                    .map_err(|e| std::io::Error::other(e.to_string()))?,
+                            ),
+                            LayerCompression::None => Box::new(reader),
+                        };
+                        flatten::ChannelReader::spawn(decoder)
+                    };
+                    let piped = match decode() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            layer_result = Err(e.into());
+                            break;
+                        }
+                    };
+                    if let Err(e) = flattener.apply_layer(&mut meta, piped) {
+                        layer_result = Err(e.into());
+                        break;
                     }
                     tracing::debug!(
                         digest = %layer.digest,
@@ -278,22 +360,45 @@ impl Materializer {
                         elapsed_ms = layer_started.elapsed().as_millis() as u64,
                         "layer applied to tree"
                     );
+                    flatten_busy_ms += layer_started.elapsed().as_millis() as u64;
                     let _ = std::fs::remove_file(&layer.path);
                 }
-                Ok(meta)
+                // Drain-close so a mid-flatten abort unblocks the driver's
+                // bounded send promptly.
+                layer_rx.close();
+                // Join the write pool BEFORE anything consumes the tree
+                // (ownership pass, clamp, pack). On a mid-layer abort,
+                // finish()'s error is the root cause (a worker failure
+                // echoes into the reader as a generic abort).
+                match (layer_result, flattener.finish(&mut meta)) {
+                    (_, Err(e)) => Err(e.into()),
+                    (Err(e), Ok(())) => Err(e),
+                    (Ok(()), Ok(())) => Ok((meta, flatten_busy_ms)),
+                }
             })
-            .await
-            .map_err(|e| {
-                MaterializeError::Io(std::io::Error::other(format!("flatten task: {e}")))
-            })??
         };
-        let flatten_ms = flatten_started.elapsed().as_millis() as u64;
+
+        let (pull_join, flatten_join) = tokio::join!(pull_driver, flatten_consumer);
+        let flatten_result = flatten_join.map_err(|e| {
+            MaterializeError::Io(std::io::Error::other(format!("flatten task: {e}")))
+        })?;
+        // Error precedence: a pull failure truncates the layer stream,
+        // which the flattener sees as a short (but well-formed) apply —
+        // the pull error is the root cause and wins.
+        let pull_ms = pull_join.map_err(|e| {
+            MaterializeError::Io(std::io::Error::other(format!("pull task: {e}")))
+        })??;
+        let (tree_meta, flatten_busy_ms) = flatten_result?;
+        let pipeline_ms = pipeline_started.elapsed().as_millis() as u64;
+        let (pulled, flatten_ms) = (resolved, flatten_busy_ms);
         tracing::info!(
             image = %image_uri,
-            layers = pulled.layers.len(),
+            layers = layer_count,
             entries = tree_meta.len(),
-            elapsed_ms = flatten_ms,
-            "flattened layers into tree"
+            pipeline_ms,
+            pull_ms,
+            flatten_busy_ms,
+            "flattened layers into tree (pipelined with pull)"
         );
         if !tree_meta.skipped_xattrs.is_empty() {
             tracing::warn!(

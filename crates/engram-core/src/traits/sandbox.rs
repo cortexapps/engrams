@@ -521,6 +521,46 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
+    /// ADR 0088 addendum: inflate the sandbox's virtio-balloon toward
+    /// `target_mib`, polling until the guest's actual is within
+    /// tolerance or `deadline` elapses. Returns the MiB actually
+    /// reclaimed (may be < target — the guest gives what it can).
+    /// Used by the capture-time cold-base seed shrink: ballooned pages
+    /// are host-`MADV_DONTNEED`ed, so the dense memory dump reads
+    /// zeros there and the all-zero chunk elision drops them.
+    ///
+    /// Error contract (adversarial-review fix): `InvalidSpec` is the
+    /// TYPED "no balloon device / unsupported backend" outcome — the
+    /// inflate never landed and there is nothing to release. Any OTHER
+    /// error means the balloon state is UNKNOWN (the inflate target
+    /// may have landed before the failure): callers must normalize via
+    /// [`Self::balloon_release`] before running guest workloads, and
+    /// must fail rather than proceed if that release cannot confirm.
+    async fn balloon_reclaim(
+        &self,
+        _id: SandboxId,
+        _target_mib: u64,
+        _deadline: std::time::Duration,
+    ) -> Result<u64, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `balloon_reclaim` (FC-only)".into(),
+        ))
+    }
+
+    /// Deflate the balloon fully AND CONFIRM the guest took its pages
+    /// back (`actual == 0`) before returning — the target PATCH alone
+    /// is asynchronous and MUST NOT be reported as a completed release
+    /// (adversarial-review fix). `InvalidSpec` is the one benign
+    /// outcome: this VM carries no balloon device (legacy cold base
+    /// restored under a balloon-aware host, non-FC backend) — callers
+    /// on the restore path treat exactly that as a no-op and every
+    /// other error as fatal to the capture.
+    async fn balloon_release(&self, _id: SandboxId) -> Result<(), SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `balloon_release` (FC-only)".into(),
+        ))
+    }
+
     /// ADR 0035/0062: the directory this backend reads its RO bundle stamp
     /// (`current.json`) and staged `<sha>.squashfs` generations from — i.e.
     /// where `restore_fresh` resolves a selected skill/harness sha to a file

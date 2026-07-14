@@ -147,3 +147,99 @@ async fn snapshot_then_restore_round_trips_microvm() {
         .await
         .expect("destroy restored");
 }
+
+/// ADR 0088 addendum: inflating the virtio-balloon before a Full dump
+/// must strictly grow the dump's zero fraction (ballooned pages are
+/// host-`MADV_DONTNEED`ed and read back as zeros — the mechanism the
+/// capture-time seed shrink rides), and the VM must survive a deflate.
+/// Sized to the property: one 128 MiB VM, two Full dumps, byte-count
+/// comparison — no throughput measurement.
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker; run with --ignored on the dev VM"]
+async fn balloon_inflate_shrinks_full_memory_dump() {
+    let env = match common::fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("tempdir");
+    let local_rootfs = work.path().join("rootfs.ext4");
+    tokio::fs::copy(&env.rootfs, &local_rootfs)
+        .await
+        .expect("clone rootfs into tempdir");
+
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    cfg.net_pool = None;
+    cfg.balloon = true; // explicit — independent of ENGRAM_FC_BALLOON in the env
+    cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    let backend = FirecrackerBackend::new(work.path(), cfg);
+
+    let spec = SandboxSpec {
+        image: "fc-balloon-test".into(),
+        rootfs_source: Some(local_rootfs.clone()),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 128 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+    let id = backend.create(spec).await.expect("create");
+    let _ = common::wait_for_log_contains(
+        &work.path().join(id.to_string()).join("firecracker.log"),
+        &["Linux version"],
+        Duration::from_secs(15),
+    )
+    .await;
+    // Give the guest a moment past the banner so the balloon driver has
+    // negotiated (built-in; probes early in boot).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    async fn zero_fraction(path: &std::path::Path) -> f64 {
+        use tokio::io::AsyncReadExt;
+        let mut f = tokio::fs::File::open(path).await.expect("open memory.bin");
+        let mut buf = vec![0u8; 1024 * 1024];
+        let (mut zeros, mut total) = (0u64, 0u64);
+        loop {
+            let n = f.read(&mut buf).await.expect("read memory.bin");
+            if n == 0 {
+                break;
+            }
+            zeros += buf[..n].iter().filter(|&&b| b == 0).count() as u64;
+            total += n as u64;
+        }
+        zeros as f64 / total as f64
+    }
+
+    // Control dump: no inflation.
+    let control = backend.snapshot(id).await.expect("control snapshot");
+    let control_zeros =
+        zero_fraction(&backend.snapshot_path_for(control.id).join("memory.bin")).await;
+
+    // Inflate toward all-but-48 MiB; accept whatever the guest grants.
+    let reclaimed = backend
+        .balloon_reclaim(id, 128 - 48, Duration::from_secs(20))
+        .await
+        .expect("balloon_reclaim (device is attached)");
+    assert!(
+        reclaimed > 0,
+        "the guest must grant SOME balloon pages (got 0 MiB)"
+    );
+
+    let inflated = backend.snapshot(id).await.expect("inflated snapshot");
+    let inflated_zeros =
+        zero_fraction(&backend.snapshot_path_for(inflated.id).join("memory.bin")).await;
+    assert!(
+        inflated_zeros > control_zeros,
+        "inflating the balloon must strictly grow the dump's zero fraction \
+         (control {control_zeros:.3} vs inflated {inflated_zeros:.3}, reclaimed {reclaimed} MiB)",
+    );
+
+    // Deflate: the guest gets its RAM back and the VM stays live.
+    backend.balloon_release(id).await.expect("balloon_release");
+    assert_eq!(backend.list().await.expect("list"), vec![id]);
+    backend.destroy(id).await.expect("destroy");
+}

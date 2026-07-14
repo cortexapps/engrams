@@ -61,6 +61,12 @@ pub struct ChunkStore {
     /// re-fetching from `inner`. `None` on the coordinator (no local
     /// resume-serving cache) — there `put_chunk` is blob-only, unchanged.
     cache: Option<crate::cache::ChunkCache>,
+    /// Optional host-global upload budget (ADR 0088 addendum): every
+    /// chunk PUT body acquires one permit, so concurrent bulk-upload
+    /// workloads (materialize / memory seed / disk flush) share the
+    /// NIC instead of stacking on it. `None` (coordinator, tests) =
+    /// unbudgeted, unchanged.
+    upload_budget: Option<crate::budget::UploadBudget>,
 }
 
 impl ChunkStore {
@@ -77,7 +83,18 @@ impl ChunkStore {
             inner: blob,
             resolver,
             cache: None,
+            upload_budget: None,
         }
+    }
+
+    /// Wire the host-global [`UploadBudget`](crate::budget::UploadBudget):
+    /// every chunk PUT body (checked and unchecked) acquires one permit
+    /// after the dedup HEAD short-circuit — deduped puts, HEADs, and
+    /// manifest/trace PUTs consume nothing. Pass the SAME budget clone
+    /// to every store on the host.
+    pub fn with_upload_budget(mut self, budget: crate::budget::UploadBudget) -> Self {
+        self.upload_budget = Some(budget);
+        self
     }
 
     /// Wire a local [`ChunkCache`](crate::cache::ChunkCache) as a
@@ -144,7 +161,15 @@ impl ChunkStore {
             return Ok(hash);
         }
         let bytes = Bytes::copy_from_slice(body);
-        let _ = self.inner.put(&key, bytes).await?;
+        {
+            // Budget the PUT body only — the HEAD above and the local
+            // warm below stay unbudgeted.
+            let _permit = match &self.upload_budget {
+                Some(b) => Some(b.acquire().await),
+                None => None,
+            };
+            let _ = self.inner.put(&key, bytes).await?;
+        }
         self.warm_local(hash, body).await;
         metrics::counter!("engram_chunk_put_total", "mode" => "checked", "outcome" => "uploaded")
             .increment(1);
@@ -168,7 +193,13 @@ impl ChunkStore {
         let hash = ChunkHash::of(body);
         let key = hash.storage_key();
         let bytes = Bytes::copy_from_slice(body);
-        let _ = self.inner.put(&key, bytes).await?;
+        {
+            let _permit = match &self.upload_budget {
+                Some(b) => Some(b.acquire().await),
+                None => None,
+            };
+            let _ = self.inner.put(&key, bytes).await?;
+        }
         self.warm_local(hash, body).await;
         metrics::counter!("engram_chunk_put_total", "mode" => "unchecked", "outcome" => "uploaded")
             .increment(1);
@@ -366,6 +397,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         (ChunkStore::new(blob), dir)
+    }
+
+    /// ADR 0088 addendum: the dedup short-circuit must not consume an
+    /// upload-budget permit — a fully-deduped re-bake (the 40s prod
+    /// case) must never queue behind other workloads' PUT traffic.
+    #[tokio::test]
+    async fn deduped_put_consumes_no_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let budget = crate::budget::UploadBudget::new(1);
+        let s = ChunkStore::new(blob).with_upload_budget(budget.clone());
+
+        // First put uploads (consumes + releases the only permit).
+        let body = b"budgeted-chunk";
+        s.put_chunk(body).await.unwrap();
+
+        // Hold the only permit hostage; the deduped re-put must still
+        // return promptly via the exists() short-circuit.
+        let _hostage = budget.acquire().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), s.put_chunk(body))
+            .await
+            .expect("deduped put must not wait on the budget")
+            .unwrap();
     }
 
     /// A store with a wired local write-through cache (the host-agent shape),

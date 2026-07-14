@@ -40,6 +40,7 @@
 //! - `engram-rootfs-materializer` — chunks bake/materialize outputs
 
 pub mod bootstrap;
+pub mod budget;
 pub mod cache;
 pub mod error;
 pub mod file;
@@ -52,6 +53,7 @@ pub mod store;
 pub mod working_set;
 
 pub use bootstrap::{Bootstrap, BootstrapEntry, BOOTSTRAP_SCHEMA_VERSION};
+pub use budget::UploadBudget;
 pub use cache::{ChunkCache, ChunkCacheConfig};
 pub use error::{ChunkStoreError, Result};
 pub use file::ChunkFileStats;

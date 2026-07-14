@@ -491,7 +491,11 @@ async fn advance_one(
                 // materialize can close the open stage.
                 let mut stages: Vec<engram_core::types::WarmStageRecord> = Vec::new();
                 while let Some(frame) = progress_rx.recv().await {
-                    advance_materialize_stages(&mut stages, frame.stage, Utc::now());
+                    if let Some(closed) =
+                        advance_materialize_stages(&mut stages, frame.stage, Utc::now())
+                    {
+                        record_materialize_stage(closed);
+                    }
                     match meta
                         .update_enable_job_materialize_progress(job_id, &claimant, &frame, &stages)
                         .await
@@ -524,8 +528,13 @@ async fn advance_one(
         // marks where it died). Best-effort: a lost lease here surfaces on
         // the very next fenced state write.
         if let Some(open) = stages.last_mut().filter(|s| s.ended_at.is_none()) {
-            open.ended_at = Some(Utc::now());
+            let ended = Utc::now();
+            open.ended_at = Some(ended);
             open.outcome = engram_core::types::WarmStageOutcome::Done;
+            record_materialize_stage(ClosedMaterializeStage {
+                name: open.name.clone(),
+                secs: (ended - open.started_at).as_seconds_f64().max(0.0),
+            });
             let done_frame = engram_core::types::MaterializeProgress {
                 stage: engram_core::types::MaterializeStage::Chunk,
                 detail: Some("complete".to_string()),
@@ -1147,11 +1156,13 @@ async fn capture_job_capacity_scan(cfg: &EnableScannerConfig, state: &SharedStat
                 continue;
             }
         };
-        match state
-            .services
-            .meta
-            .place_capture_job(row.id, &candidates)
-            .await
+        match crate::api::enabled_images::place_capture_job_preferring_materialize_host(
+            state.services.meta.as_ref(),
+            row.id,
+            row.enable_job_id,
+            &candidates,
+        )
+        .await
         {
             Ok(Some(placed)) if placed.host_id.is_some() => {
                 tracing::info!(capture_job_id = %row.id, host = ?placed.host_id, "capture-job capacity scan: placed a waiting capture (capacity freed)");
@@ -1281,20 +1292,28 @@ pub(crate) fn advance_materialize_stages(
     stages: &mut Vec<engram_core::types::WarmStageRecord>,
     stage: engram_core::types::MaterializeStage,
     now: DateTime<Utc>,
-) {
+) -> Option<ClosedMaterializeStage> {
     let name = stage.as_str();
     if let Some(open) = stages.last() {
         if open.ended_at.is_none() && open.name == name {
-            return; // keepalive of the open stage
+            return None; // keepalive of the open stage
         }
     }
     if stage == engram_core::types::MaterializeStage::Pull && !stages.is_empty() {
+        // Fresh attempt: the dropped open stage gets no histogram sample —
+        // a killed attempt's partial duration would poison the per-stage
+        // distribution the overhaul is benchmarked against.
         stages.clear();
     }
+    let mut closed = None;
     if let Some(open) = stages.last_mut() {
         if open.ended_at.is_none() {
             open.ended_at = Some(now);
             open.outcome = engram_core::types::WarmStageOutcome::Done;
+            closed = Some(ClosedMaterializeStage {
+                name: open.name.clone(),
+                secs: (now - open.started_at).as_seconds_f64().max(0.0),
+            });
         }
     }
     stages.push(engram_core::types::WarmStageRecord {
@@ -1303,6 +1322,22 @@ pub(crate) fn advance_materialize_stages(
         ended_at: None,
         outcome: engram_core::types::WarmStageOutcome::Running,
     });
+    closed
+}
+
+/// A materialize stage the timeline just closed — the scanner records one
+/// `ENABLE_MATERIALIZE_STAGE_SECONDS` sample per value returned.
+pub(crate) struct ClosedMaterializeStage {
+    pub(crate) name: String,
+    pub(crate) secs: f64,
+}
+
+fn record_materialize_stage(closed: ClosedMaterializeStage) {
+    ::metrics::histogram!(
+        crate::metrics::ENABLE_MATERIALIZE_STAGE_SECONDS,
+        "stage" => closed.name,
+    )
+    .record(closed.secs);
 }
 
 #[cfg(test)]
@@ -1335,15 +1370,21 @@ mod tests {
         let t = |s: i64| chrono::DateTime::from_timestamp(s, 0).unwrap();
         let mut stages = Vec::new();
 
-        advance_materialize_stages(&mut stages, MaterializeStage::Pull, t(0));
+        let opened = advance_materialize_stages(&mut stages, MaterializeStage::Pull, t(0));
         assert_eq!(stages.len(), 1);
-        // Keepalive re-send of the open stage: no-op.
-        advance_materialize_stages(&mut stages, MaterializeStage::Pull, t(10));
+        assert!(opened.is_none(), "first frame closes nothing");
+        // Keepalive re-send of the open stage: no-op, no histogram sample.
+        let kept = advance_materialize_stages(&mut stages, MaterializeStage::Pull, t(10));
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].ended_at, None);
+        assert!(kept.is_none(), "keepalive closes nothing");
 
-        // Transition closes the open stage and opens the next.
-        advance_materialize_stages(&mut stages, MaterializeStage::Flatten, t(20));
+        // Transition closes the open stage (returning it for the histogram)
+        // and opens the next.
+        let closed = advance_materialize_stages(&mut stages, MaterializeStage::Flatten, t(20))
+            .expect("transition closes the open stage");
+        assert_eq!(closed.name, "pull");
+        assert_eq!(closed.secs, 20.0);
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].ended_at, Some(t(20)));
         assert_eq!(stages[0].outcome, WarmStageOutcome::Done);
@@ -1355,8 +1396,11 @@ mod tests {
         assert_eq!(stages.len(), 4);
 
         // A fresh `pull` (retry after a killed attempt) resets the list —
-        // the timeline never interleaves two attempts.
-        advance_materialize_stages(&mut stages, MaterializeStage::Pull, t(100));
+        // the timeline never interleaves two attempts, and the dropped
+        // open stage records NO duration (a killed attempt's partial time
+        // would poison the per-stage distribution).
+        let reset = advance_materialize_stages(&mut stages, MaterializeStage::Pull, t(100));
+        assert!(reset.is_none(), "reset-on-pull must not emit a sample");
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].name, "pull");
         assert_eq!(stages[0].started_at, t(100));

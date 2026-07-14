@@ -214,6 +214,17 @@ pub const RECHUNK_SECONDS: &str = "engram_rechunk_seconds";
 pub const RECHUNK_BYTES_SCANNED_TOTAL: &str = "engram_rechunk_bytes_scanned_total";
 pub const RECHUNK_BYTES_UPLOADED_TOTAL: &str = "engram_rechunk_bytes_uploaded_total";
 
+/// ADR 0088 addendum: histogram of each closed capture-timeline leg's
+/// wall-clock, recorded by the capture-job executor as its synthetic
+/// `[capture]` legs close. Labels: `leg` = `boot` |
+/// `cold_base_memory_dump` | `warm_hook` | `cold_base_upload` |
+/// `final_snapshot` (slug of the leg name). The capture pipeline in
+/// one query — `SNAPSHOT_CREATE/FINISH_SECONDS` remain the per-
+/// snapshot-call views; this is the per-enable-leg view the overhaul
+/// is benchmarked against. Warm-hook SUB-stages ride the existing
+/// `engram_warm_stage_seconds` (see `record_warm_stage_metrics`).
+pub const CAPTURE_LEG_SECONDS: &str = "engram_capture_leg_seconds";
+
 /// ADR 0038 B0: histogram of how long a capture waited to acquire the
 /// per-sandbox capture lock. The gridlock signal — the 5fadd364
 /// incident showed 52–151 s waits as captures queued behind a hung
