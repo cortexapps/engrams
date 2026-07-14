@@ -292,6 +292,40 @@ dev-brain class; small images (~1.5 min end-to-end) must not regress.
 - Everything landed with **zero migrations and zero wire-stage
   changes**, as planned.
 
+### Future direction: a streaming packer
+
+The remaining materialize cost after this overhaul is structural: the
+tree is written TWICE (flatten extracts tar entries into a directory
+tree; `mke2fs -d` then re-reads the whole tree and copies it into the
+ext4 image). A streaming packer — our own deterministic tar→ext4
+writer that builds the filesystem incrementally as layers apply —
+would eliminate the intermediate tree, the second full I/O pass, and
+most of the pack leg in one move.
+
+Two constraints make this ADR-sized, not a quick win:
+
+- **Determinism must be preserved by construction.** Chunk-level
+  rebake dedup, cold-base reuse keys, and roll-kill retry cheapness
+  all hang off byte-identical output for identical input (see the
+  1%-dedup incident in `ext4.rs::recommended_size`'s comment). Being
+  our own writer, a streaming packer CAN be deterministic — fixed
+  geometry, fixed allocation order — but that property has to be
+  designed in, not recovered later. The `golden_diff` / double-run
+  manifest-equality tests are the gate.
+- **OCI layer semantics fight streaming.** Whiteouts, opaque dirs, and
+  later-layer overwrites mutate earlier-layer state, so blocks can't
+  be finalized until the last layer lands (or the writer needs an
+  ext4-aware delete/rewrite path). A candidate shape: flatten into an
+  in-memory/indexed staging form (inode table + extent plan), then a
+  single sequential materialization pass — one write of the image
+  instead of tree-write + tree-read + image-write.
+
+Explicitly NOT the path: dropping determinism to "simplify" a
+streaming writer — that trades a 2-4 min pack leg for tens of GiB of
+re-upload per rebake, fleet-wide cache invalidation, and the loss of
+every content-keyed reuse path (evaluated at close; see the
+determinism consumers above).
+
 Commit chain: `ADR 0088 addendum (open)` → `coordinator: per-stage
 materialize histogram` → `materializer: parallel fd-scoped flatten
 engine` → `materializer: pipeline layer downloads with the flatten` →
