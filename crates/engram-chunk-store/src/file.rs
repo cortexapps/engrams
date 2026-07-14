@@ -136,13 +136,15 @@ impl ChunkStore {
         // channel while the consumer fans puts out with
         // `buffer_unordered` — scan and upload overlap, so wall-clock is
         // ~max(scan, upload) instead of their sum. Resident RAM stays
-        // bounded: channel depth × chunk_size + one read block.
+        // bounded BY BYTES, not items (see `rechunk_channel_capacity`):
+        // queued chunks ≤ the byte budget, plus the in-flight flush
+        // window (pre-existing, ADR 0039) and one read block.
         let mut stats = ChunkFileStats {
             bytes_scanned: total_bytes,
             ..Default::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<(u64, Bytes)>>(
-            SPARSE_RECHUNK_CONCURRENCY * 2,
+            rechunk_channel_capacity(chunk_size),
         );
         let std_file = file.into_std().await;
         tokio::task::spawn_blocking(move || {
@@ -592,6 +594,26 @@ fn is_all_zero(buf: &[u8]) -> bool {
 /// block plus the channel backlog stays tens-of-MiB resident.
 const RECHUNK_READ_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Byte budget for chunks queued between the reader and the consumer —
+/// the pipeline's read-ahead, ON TOP of the in-flight flush window
+/// (`SPARSE_RECHUNK_CONCURRENCY` chunks, pre-existing ADR 0039
+/// behavior) and one read block. An item-count bound alone would let
+/// 16 MiB DISK chunks (rootfs materialization) queue ~1 GiB per
+/// operation and OOM the host-agent under concurrent materializes;
+/// deriving the capacity from bytes keeps the added buffering flat
+/// across chunk sizes (64 MiB), while 512 KiB memory chunks still get
+/// deep-enough read-ahead to hide PD latency.
+const RECHUNK_CHANNEL_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// Channel capacity (in chunks) for [`ChunkStore::chunk_file_into`]'s
+/// reader→consumer queue: the byte budget divided by the chunk size,
+/// clamped to [1, 2 × SPARSE_RECHUNK_CONCURRENCY].
+fn rechunk_channel_capacity(chunk_size: u64) -> usize {
+    usize::try_from(RECHUNK_CHANNEL_BYTE_BUDGET / chunk_size.max(1))
+        .unwrap_or(1)
+        .clamp(1, SPARSE_RECHUNK_CONCURRENCY * 2)
+}
+
 /// Blocking-side reader for [`ChunkStore::chunk_file_into`]: stream the
 /// first `total_bytes` of `file` in large sequential reads (a multiple
 /// of `chunk_size`), split each block into `chunk_size` pieces,
@@ -725,6 +747,23 @@ mod tests {
         .await
         .expect("chunk_file must not hang after an upload error");
         assert!(res.is_err(), "upload failure must propagate");
+    }
+
+    /// The reader→consumer queue is bounded by BYTES, not items — a
+    /// flat item count let production 16 MiB disk chunks (rootfs
+    /// materialization) queue ~1 GiB per operation.
+    #[test]
+    fn rechunk_channel_capacity_is_byte_bounded() {
+        // 512 KiB memory chunks: budget allows 128, clamped to 64 —
+        // deep read-ahead, ≤ 32 MiB queued.
+        assert_eq!(
+            super::rechunk_channel_capacity(512 * 1024),
+            SPARSE_RECHUNK_CONCURRENCY * 2
+        );
+        // 16 MiB disk chunks: 4 × 16 MiB = the 64 MiB budget.
+        assert_eq!(super::rechunk_channel_capacity(16 * 1024 * 1024), 4);
+        // A chunk bigger than the whole budget still gets a slot.
+        assert_eq!(super::rechunk_channel_capacity(256 * 1024 * 1024), 1);
     }
 
     /// `ChunkFileStats` accounting matches the manifest the same call
