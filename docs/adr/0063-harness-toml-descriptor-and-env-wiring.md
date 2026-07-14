@@ -130,7 +130,7 @@ run type** (mutually exclusive, no cross-fallback):
   `principal.has_claude_token` keeps working until the web migrates. The injection path resolves
   the name from `descriptor.auth.user_env` instead of the deleted `CLAUDE_OAUTH_ENV_VAR` constant.
 
-- **Programmatic** (Slack trigger, cron, API — `task.type !== "chat"`): inject the **org**
+- **Programmatic** (service-account principals — cron, CI/API keys): inject the **org**
   credential under `org_env`. **Critically, org-secret *values* never leave the coordinator (ADR
   0057)** — so the orchestrator cannot read `org_env` and place it in `harness_env`. Instead it
   appends an `IntegrationSecretJson { secret_ref: org_env, env_var: org_env, mode: "literal" }` to
@@ -139,7 +139,15 @@ run type** (mutually exclusive, no cross-fallback):
   org secret is named after the env var (an admin creates an org secret `ANTHROPIC_API_KEY` via the
   existing org-secret UI); an unresolvable ref is skipped + warn-logged and the session still boots.
 
-The single `task.type` discriminator guarantees a session never gets both credentials.
+The single programmatic discriminator guarantees a session never gets both credentials.
+
+*Amended 2026-07-14*: the discriminator is the **principal**, not `task.type`. The original
+`type === "chat"` gate booted Slack sessions credential-less ("Not logged in", session
+`e721311e`) even though the Slack mention was email-matched to a real engrams user whose token
+was on file and whose profile set `include_user_tokens`. A human owner now rides their own token
+on every surface (chat UI, Slack thread, …); only service-account creators
+(`ownerIsServiceAccount` → `programmatic`) take the `org_env` path. Cron remains programmatic by
+construction (service-account principal), so the original cron/CI behavior is unchanged.
 
 ### 5. Model + effort → env mapping
 

@@ -161,11 +161,13 @@ describe("compileSessionCreateInput", () => {
     expect(inp.harnessEnv?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
   });
 
-  // ADR 0063 B4: strict-by-run-type credentials.
-  test("human (chat) task injects user_env and no org_env secret", async () => {
-    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
-      type: "chat",
-    });
+  // ADR 0063 B4 (amended): strict-by-principal credentials.
+  test("a human-owned task injects user_env and no org_env secret", async () => {
+    // The PRINCIPAL decides the credential, never the task type/surface: a
+    // Slack mention email-matched to a real engrams user rides that user's
+    // token exactly like the chat UI. (Under the old `type === "chat"` gate,
+    // Slack session e721311e booted credential-less — "Not logged in".)
+    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {});
     expect(inp.harnessEnv?.[USER_ENV]).toBe("tok");
     const policy = inp.integrationPolicyJson
       ? (JSON.parse(inp.integrationPolicyJson) as { secrets?: Array<{ env_var: string }> })
@@ -173,30 +175,11 @@ describe("compileSessionCreateInput", () => {
     expect((policy.secrets ?? []).some((s) => s.env_var === ORG_ENV)).toBe(false);
   });
 
-  test("programmatic task injects org_env into the policy, not the user token", async () => {
+  test("a task from a SERVICE-ACCOUNT principal rides org_env (the CI smoke regression)", async () => {
+    // A `ci-<repo>` API key has no per-user harness token — the programmatic
+    // flag must pick the org-credential path or the harness boots
+    // credential-less ("not logged in", session 47723225).
     const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
-      type: "slack_thread",
-    });
-    // No per-user token for a programmatic task — strict by run type.
-    expect(inp.harnessEnv?.[USER_ENV]).toBeUndefined();
-    // The org secret rides the policy as a literal secret-inject (resolved host-side).
-    const policy = JSON.parse(inp.integrationPolicyJson!) as {
-      secrets?: Array<{ secret_ref: string; env_var: string; mode: string }>;
-    };
-    expect((policy.secrets ?? []).find((s) => s.env_var === ORG_ENV)).toMatchObject({
-      secret_ref: ORG_ENV,
-      env_var: ORG_ENV,
-      mode: "literal",
-    });
-  });
-
-  test("a chat task from a SERVICE-ACCOUNT principal rides org_env (the CI smoke regression)", async () => {
-    // A `ci-<repo>` API key creates type:"chat" tasks (the only accepted
-    // type), but the service account has no per-user harness token — the
-    // programmatic flag must force the org-credential path or the harness
-    // boots credential-less ("not logged in", session 47723225).
-    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
-      type: "chat",
       programmatic: true,
     });
     expect(inp.harnessEnv?.[USER_ENV]).toBeUndefined();

@@ -117,11 +117,10 @@ export interface SessionCompileOpts {
    *  e.g. "slack_thread"). Drives the strict-by-run-type credential pick (ADR
    *  0063 B4): human → the harness's `user_env` (per-user token); programmatic →
    *  its `org_env` (org secret, resolved host-side). Default "chat". */
-  type?: string;
   /** The creator is a service-account principal (an ADR 0086 API key — e.g. a
-   *  `ci-<repo>` CI key). Forces the PROGRAMMATIC credential pick regardless
-   *  of task type: a service account has no per-user harness token, so a
-   *  "chat" task it creates must still ride `org_env`. */
+   *  `ci-<repo>` CI key). Picks the PROGRAMMATIC credential (`org_env`): a
+   *  service account has no per-user harness token. Human-owned tasks get the
+   *  owner's token regardless of surface (chat UI, Slack, …). */
   programmatic?: boolean;
   /** ADR 0063 B2: per-session override of the profile's default harness / model /
    *  effort. Unset = use the profile's default. */
@@ -167,12 +166,14 @@ export async function compileSessionCreateInput(
   const { harnesses } = await deps.harnessCatalog.listHarnesses({});
   const descriptor = harnesses.find((h) => h.name === selectedHarness)?.descriptor;
 
-  // Strict-by-run-type credentials (ADR 0063 B4): a human (chat) task carries
-  // the user's per-user token; a programmatic task carries the org secret. They
-  // are mutually exclusive — never both. Run type is the task type AND the
-  // principal type: a service-account creator (API key) is programmatic even
-  // for a "chat" task — it has no per-user token to inject.
-  const isHuman = (opts.type ?? "chat") === "chat" && !opts.programmatic;
+  // Strict-by-principal credentials (ADR 0063 B4, amended): a human-owned task
+  // carries the owner's per-user token; a service-account-created task carries
+  // the org secret. They are mutually exclusive — never both. The PRINCIPAL
+  // decides, never the task type/surface: a Slack mention email-matched to a
+  // real user is that user (the old `type === "chat"` gate booted Slack
+  // sessions credential-less — "Not logged in", session e721311e), while an
+  // API-key creator is programmatic even for a "chat" task.
+  const isHuman = !opts.programmatic;
 
   // Harness env, lowest → highest precedence: user token < CLI dummy env <
   // profile env_vars < model env < effort env < git attribution < trigger
@@ -367,7 +368,6 @@ export async function createTaskWithSession(
       resolveUserToken: (envVar) => deps.secrets.get(params.ownerUserId, envVar),
     },
     {
-      type: params.type,
       ...(params.ownerIsServiceAccount ? { programmatic: true } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
       ...(params.harness != null ? { harness: params.harness } : {}),
