@@ -1000,7 +1000,16 @@ pub async fn heartbeat(
         if let (true, Some(row)) = (applied, &row) {
             let capture_phase = capture_job_stage_to_phase(report.stage);
             let warm_stage = report.progress.as_ref().and_then(|p| p.detail.as_deref());
-            let output_tail = report.progress.as_ref().and_then(|p| p.log_tail.as_deref());
+            // Empty-string tails must NOT reach the COALESCE mirror: the
+            // seed's dump/upload leg frames carry no hook output, and
+            // `COALESCE('', old)` takes '' — the 2026-07-14 dev-brain
+            // failure wiped the very hook tail the column exists to
+            // preserve (the diagnosis survived only in host logs).
+            let output_tail = report
+                .progress
+                .as_ref()
+                .and_then(|p| p.log_tail.as_deref())
+                .filter(|t| !t.is_empty());
             // ADR 0088 addendum: the capture timeline → the (previously
             // orphaned) `enable_jobs.warm_stages` column. Empty ⇒ None
             // ⇒ COALESCE keeps the last-known timeline.
