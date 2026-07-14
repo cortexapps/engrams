@@ -308,6 +308,7 @@ mod tests {
             uffd_base_dir: None,
             uffd_substrate_sock: None,
             restore_mode: engram_sandbox_firecracker::RestoreMode::File,
+            fresh_restore_override: None,
             track_dirty_pages: false,
             balloon: false,
             net_pool: None,

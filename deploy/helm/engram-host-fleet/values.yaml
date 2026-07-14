@@ -69,6 +69,11 @@ firecracker:
   # the v2 forked firecracker (engrams#164+). Under workDirHostPath so it
   # survives pod restarts (K2 reattach).
   uffdBaseDir: ""     # e.g. /var/lib/engram/shm
+  # ADR 0092: the density knobs (canary config = file + "0" + lazy; every
+  # default is today's behavior).
+  freshRestoreMode: ""  # "" (derived) | file | uffd — fresh creates only
+  baseMemfilePin: ""    # "" / "1" (mlock, default) | "0" (reclaimable cache)
+  baseShmMode: ""       # "" / full (eager pre-warm, default) | lazy
   # tmpfs size cap for uffdBaseDir (one base per enabled template; each
   # file is guest-RAM-sized but populated lazily + hole-punchable).
   uffdBaseTmpfsSize: 32g

@@ -384,6 +384,10 @@ async fn main() -> Result<(), HostAgentError> {
             // to the chunk-native UFFD handler (lazy memory, no memory.bin
             // materialize). Defaults to File.
             fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
+            // ADR 0092: fresh-create backend override (File-unpinned
+            // density path on substrate hosts). Read once at startup.
+            fc_cfg.fresh_restore_override =
+                engram_sandbox_firecracker::fresh_restore_mode_from_env();
             // Point the UFFD handler's READ-ONLY view at the SAME
             // chunk cache the PooledBackend's restore-prefetch warms
             // (`chunk-cache`, see below). ADR 0075: the handler never
