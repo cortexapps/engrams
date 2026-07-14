@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 
+import { registerBuiltinTools } from "../../tools/builtin.ts";
 import { createToolRegistry } from "../../tools/registry.ts";
 import type {
   PendingToolCallInput,
@@ -49,14 +50,7 @@ function registryFixture() {
     execution: "sync",
     handler: async () => ({ saved: true }),
   });
-  registry.register({
-    name: "ask_user_question",
-    description: "Ask",
-    input: z.object({ question: z.string() }),
-    output: z.object({ answer: z.string() }),
-    handling: "session",
-    presenters: { web: "QuestionCard" },
-  });
+  registerBuiltinTools(registry);
   return registry;
 }
 
@@ -81,7 +75,7 @@ describe("tool consumer", () => {
     expect(workflowIds).toEqual(["toolexec:call-1", "toolexec:call-1"]);
   });
 
-  test("session-handled and unknown tools only run bookkeeping", async () => {
+  test("ask_user_question is bookkept as session-handled and never dispatched", async () => {
     const pending = pendingRecorder();
     const workflowIds: string[] = [];
     const consumer = makeToolConsumer({
@@ -94,13 +88,28 @@ describe("tool consumer", () => {
     await consumer.handle(requested("ask_user_question", "call-session"), {
       sessionId: "session-1",
     });
+    expect(workflowIds).toEqual([]);
+    expect(pending.requested.map((row) => [row.toolCallId, row.handling])).toEqual([
+      ["call-session", "session"],
+    ]);
+  });
+
+  test("unknown tools run bookkeeping without dispatch", async () => {
+    const pending = pendingRecorder();
+    const workflowIds: string[] = [];
+    const consumer = makeToolConsumer({
+      registry: registryFixture(),
+      pendingCalls: pending.store,
+      startWorkflow: async (_input, workflowId) => void workflowIds.push(workflowId),
+      now: () => new Date(0),
+    });
+
     await consumer.handle(requested("stale_manifest_tool", "call-stale"), {
       sessionId: "session-1",
     });
 
     expect(workflowIds).toEqual([]);
     expect(pending.requested.map((row) => [row.toolCallId, row.handling])).toEqual([
-      ["call-session", "session"],
       ["call-stale", "handled"],
     ]);
   });

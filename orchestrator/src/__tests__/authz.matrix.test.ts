@@ -19,7 +19,6 @@
  */
 
 import { expect, test, describe, afterEach } from "bun:test";
-import { z } from "zod";
 
 import {
   createClient,
@@ -54,6 +53,7 @@ import type {
   PendingToolCallStore,
 } from "../tools/pending-tool-calls.ts";
 import { createToolRegistry } from "../tools/registry.ts";
+import { registerBuiltinTools } from "../tools/builtin.ts";
 import {
   ListHostsResponseSchema,
 } from "../gen/engram/app/v1/fleet_pb.ts";
@@ -202,14 +202,7 @@ function completeToolCallTransport(
 ): { transport: Transport; upstreamCallCount: { value: number } } {
   const upstreamCallCount = { value: 0 };
   const registry = createToolRegistry();
-  registry.register({
-    name: "ask_user_question",
-    description: "Ask a question.",
-    input: z.object({ question: z.string() }),
-    output: z.object({ answer: z.string() }),
-    handling: "session",
-    presenters: { web: "QuestionCard" },
-  });
+  registerBuiltinTools(registry);
   const upstream = createRouterTransport((router: ConnectRouter) => {
     router.service(SessionService, {
       completeToolCall: (req: { sessionId: string }) => {
@@ -318,7 +311,7 @@ describe("authz.matrix — member accessing own session", () => {
     const result = await client.completeToolCall({
       sessionId: SESSION_OF_A,
       toolCallId: "session-call",
-      resultJson: JSON.stringify({ answer: "yes" }),
+      resultJson: JSON.stringify({ "Deploy now?": ["Yes"] }),
     });
     expect(result.sessionId).toBe(SESSION_OF_A);
     expect(orch.upstreamCallCount.value).toBe(1);
@@ -353,7 +346,7 @@ describe("authz.matrix — member cross-session access (anti-enumeration)", () =
       () => client.completeToolCall({
         sessionId: SESSION_OF_A,
         toolCallId: "session-call",
-        resultJson: JSON.stringify({ answer: "yes" }),
+        resultJson: JSON.stringify({ "Deploy now?": ["Yes"] }),
       }),
       Code.NotFound,
     );
@@ -422,7 +415,7 @@ describe("CompleteToolCall external handling guard", () => {
       () => client.completeToolCall({
         sessionId: SESSION_OF_A,
         toolCallId: "session-call",
-        resultJson: JSON.stringify({ answer: 42 }),
+        resultJson: JSON.stringify({ "Deploy now?": 42 }),
       }),
       Code.InvalidArgument,
     );

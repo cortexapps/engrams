@@ -27,6 +27,7 @@ import { makePreviewUpgradeHandler } from "./routes/preview-ws.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
 import { makeExternalToolCompletionGuard } from "./rpc/tool-completion-guard.ts";
+import { registerBuiltinTools } from "./tools/builtin.ts";
 import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
@@ -182,8 +183,9 @@ const server = buildServer(
 // bind can start a workflow.
 setThreadPolicy(makeSlackPolicy());
 setThreadControlPlane(makeThreadControlPlane());
-// ADR 0089: dev-only smoke tools (dev_echo / dev_echo_deferred). Registered
-// before DBOS launches so tool execution sees them.
+// ADR 0089: production built-ins and optional dev smoke tools are registered
+// before DBOS launches so manifest compilation and tool execution see them.
+registerBuiltinTools();
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
 const listenerManager = makeProductionListenerManager();
