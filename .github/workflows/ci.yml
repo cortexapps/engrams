@@ -369,6 +369,7 @@ jobs:
             --test host_status_transition_live_pg \
             --test queue_scanner_live_pg \
             --test binding_cas_live_pg \
+            --test sandbox_owner_live_pg \
             --test outbox_live_pg \
             --test session_ops_live_pg \
             --test mount_catalog_live_pg \
