@@ -264,4 +264,40 @@ Explicit non-goals, considered and rejected:
 Targets: materialize ≤15 min, capture wall ≈ warm hook + ~5 min for the
 dev-brain class; small images (~1.5 min end-to-end) must not regress.
 
-Commit chain: recorded at close (see PR).
+### Implementation notes / divergences (at close)
+
+- **Upload budget landed inside `ChunkStore`, not as a `BlobStorage`
+  decorator**: a permit wraps only the chunk PUT body (checked and
+  unchecked flavors), acquired after the dedup-HEAD short-circuit —
+  which makes "deduped puts consume nothing" and "manifest PUTs are
+  never queued" true by construction instead of needing a small-body
+  bypass heuristic.
+- **The capture timeline is synthesized executor-side** (`capture_job::
+  advance_capture_legs`) from the progress frames `build_base_snapshot`
+  already emits, rather than a new `CaptureTimeline` type inside the
+  backend — the frame transitions (boot / cold-base memory dump / warm
+  hook / cold-base upload / final snapshot) were already the leg
+  boundaries. `CaptureJobProgress` gained a `serde(default)`
+  `warm_stages` field (JSON-only wire), and the heartbeat mirror now
+  COALESCEs it into the previously-orphaned `enable_jobs.warm_stages`.
+- **Balloon needed no FC-fork or kernel work**: the vendored guest
+  configs already carry `CONFIG_VIRTIO_BALLOON=y`; the change adds the
+  symbol to `build-fc-kernel.sh`'s required-config gate so a base-config
+  re-sync can't silently drop it. A balloon deflate failure after the
+  seed dump settles the deferred seed BEFORE aborting (the
+  await-never-abort contract holds on every path).
+- **Flatten parallelism shipped as fd-scoped workers exactly as
+  designed**; the pull/flatten pipeline additionally REDUCED peak
+  scratch (lookahead + 1 layer vs the old all-layers-then-flatten).
+- Everything landed with **zero migrations and zero wire-stage
+  changes**, as planned.
+
+Commit chain: `ADR 0088 addendum (open)` → `coordinator: per-stage
+materialize histogram` → `materializer: parallel fd-scoped flatten
+engine` → `materializer: pipeline layer downloads with the flatten` →
+`deps: flate2 zlib-rs backend` → `chunk-store: streaming read->upload
+pipeline` → `chunk-store: host-global UploadBudget` → `coordinator:
+prefer the materialize host for capture placement` → `host-agent:
+defer the cold-base seed finish behind the warm hook` → `firecracker:
+virtio-balloon device + capture-time seed shrink` → `capture-leg
+telemetry + warm_stages re-wire (this commit, addendum closed)`.

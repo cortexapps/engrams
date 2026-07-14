@@ -1001,6 +1001,14 @@ pub async fn heartbeat(
             let capture_phase = capture_job_stage_to_phase(report.stage);
             let warm_stage = report.progress.as_ref().and_then(|p| p.detail.as_deref());
             let output_tail = report.progress.as_ref().and_then(|p| p.log_tail.as_deref());
+            // ADR 0088 addendum: the capture timeline → the (previously
+            // orphaned) `enable_jobs.warm_stages` column. Empty ⇒ None
+            // ⇒ COALESCE keeps the last-known timeline.
+            let warm_stages = report
+                .progress
+                .as_ref()
+                .filter(|p| !p.warm_stages.is_empty())
+                .and_then(|p| serde_json::to_value(&p.warm_stages).ok());
             if let Err(e) = state
                 .services
                 .meta
@@ -1009,6 +1017,7 @@ pub async fn heartbeat(
                     capture_phase.map(|p| p.as_str()),
                     warm_stage,
                     output_tail,
+                    warm_stages.as_ref(),
                 )
                 .await
             {

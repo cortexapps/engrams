@@ -87,6 +87,17 @@ pub struct CaptureJobProgress {
     /// stream-based protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_tail: Option<String>,
+    /// ADR 0088 addendum: the capture timeline — the executor's
+    /// synthetic `[capture] …` leg records (boot / cold-base memory
+    /// dump / cold-base upload / final snapshot) followed by the warm
+    /// hook's own stage history. Mirrored into `enable_jobs.warm_stages`
+    /// (the column ADR 0084 P1b's RPC deletion had orphaned). Trailing
+    /// field + `serde(default)`: this type rides JSON only (heartbeat
+    /// report + durable record), so old payloads without the field
+    /// decode cleanly. Deliberately NO `skip_serializing_if` — see
+    /// `WarmStageRecord`'s bincode-positional caution.
+    #[serde(default)]
+    pub warm_stages: Vec<crate::types::WarmStageRecord>,
 }
 
 /// A capture job's terminal outcome, carried on the last

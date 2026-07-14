@@ -237,6 +237,7 @@ async fn record_capture_job_report_is_fenced_by_epoch() {
         progress: Some(CaptureJobProgress {
             detail: Some("should never land".into()),
             log_tail: None,
+            warm_stages: Vec::new(),
         }),
         fc_snapshot_version: None,
         terminal: None,
@@ -263,6 +264,7 @@ async fn record_capture_job_report_is_fenced_by_epoch() {
         progress: Some(CaptureJobProgress {
             detail: Some("cold boot".into()),
             log_tail: None,
+            warm_stages: Vec::new(),
         }),
         fc_snapshot_version: None,
         terminal: None,
@@ -374,6 +376,7 @@ async fn reassign_bumps_epoch_and_attempts_and_resets_stage() {
         progress: Some(CaptureJobProgress {
             detail: Some("booting".into()),
             log_tail: None,
+            warm_stages: Vec::new(),
         }),
         fc_snapshot_version: None,
         terminal: None,
