@@ -317,3 +317,135 @@ async fn survivor_reconfigure_resumes_parked_io() {
     drop(state2);
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
+
+/// Shared mini-fixture for the identifier tests below: a 4 MiB tagged
+/// image chunked into a fresh store. Small on purpose — the property
+/// under test is the CONNECT/RECONFIGURE identifier contract, not
+/// throughput.
+async fn identifier_fixture(
+    work: &std::path::Path,
+) -> (
+    Vec<u8>,
+    engram_chunk_store::Manifest,
+    ManifestRef,
+    ChunkCache,
+    Arc<ChunkStore>,
+) {
+    let image = work.join("disk.img");
+    let mut bytes = vec![0u8; 4 * 1024 * 1024];
+    for (i, block) in bytes.chunks_mut(4096).enumerate() {
+        let tag = (i as u64).to_le_bytes();
+        block[..8].copy_from_slice(&tag);
+    }
+    std::fs::write(&image, &bytes).expect("write image");
+    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.join("blob")));
+    let store = Arc::new(ChunkStore::new(blob));
+    let mut cache_cfg = ChunkCacheConfig::new(work.join("chunk-cache"));
+    cache_cfg.budget_bytes = 64 * 1024 * 1024;
+    let cache = ChunkCache::new(cache_cfg);
+    let manifest = store
+        .chunk_file(&image, ManifestKind::Disk, None)
+        .await
+        .expect("chunk image");
+    let manifest_ref = ManifestRef::new();
+    store
+        .put_manifest(manifest_ref, &manifest)
+        .await
+        .expect("put manifest");
+    (bytes, manifest, manifest_ref, cache, store)
+}
+
+/// 2026-07-13 dfa0face regression — the incident shape: a device is
+/// CONNECTed under the attach-time manifest id, the session's disk
+/// lineage forks (ADR 0077 — flushes publish under a private id), the
+/// pod rolls, and the rehydrate arrives holding a ref whose manifest id
+/// no longer matches the kernel's recorded identifier. Pre-fix,
+/// `reattach_manifest` re-derived the identifier from the rehydrate ref
+/// and the kernel's strcmp died with EINVAL — every forked-chain
+/// survivor's disk stayed dead across every roll. The contract now:
+/// RECONFIGURE echoes the kernel's own recorded connect-time identifier
+/// (`/sys/block/nbdN/backend`), so the manifest id on the ref is
+/// irrelevant to adoption.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Linux + modprobe nbd + writable /dev/nbd0 (root)"]
+async fn reattach_echoes_kernel_identifier_across_manifest_fork() {
+    let nbd_path = match preflight() {
+        Some(p) => p,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("tempdir");
+    let (bytes, manifest, base_ref, cache, store) = identifier_fixture(work.path()).await;
+
+    // Generation one: the FRESH-CREATE shape — connect under the base
+    // ref, fork the manifest identity at attach.
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
+    let state = attach_manifest(
+        base_ref,
+        cache.clone(),
+        store.clone(),
+        &pool,
+        u64::MAX,
+        /*fork=*/ true,
+    )
+    .await
+    .expect("netlink CONNECT attach (forked)");
+    let device = state.device_path().to_path_buf();
+    let read1 = pread_direct(&device, 0, 4096).expect("gen-1 read");
+    assert_eq!(&read1[..16], &bytes[..16], "gen-1 content mismatch");
+
+    // The kernel durably recorded the connect-time identifier.
+    let dev_name = device.file_name().unwrap().to_str().unwrap().to_string();
+    let kernel_id = std::fs::read_to_string(format!("/sys/block/{dev_name}/backend"))
+        .expect("kernel backend attr readable")
+        .trim()
+        .to_string();
+    assert_eq!(
+        kernel_id,
+        base_ref.manifest_id.to_string(),
+        "CONNECT must record the attach-time manifest id",
+    );
+
+    // The rehydrate ref carries a DIFFERENT manifest id (the forked live
+    // chain in prod). Persist the content there like the flush scheduler
+    // would have.
+    let live_ref = ManifestRef::new();
+    store
+        .put_manifest(live_ref, &manifest)
+        .await
+        .expect("put live manifest");
+
+    // Pod roll, then generation two rehydrates from the diverged ref.
+    let engram_host_agent::disk_daemon::NbdSandboxState {
+        scheduler: _,
+        backend: _gen1_backend,
+        handle,
+        slot,
+    } = state;
+    handle.abandon();
+    drop(slot);
+
+    let pool2 = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool2");
+    let slot2 = pool2.claim(&device).await.expect("claim survivor device");
+    let state2 = reattach_manifest(live_ref, cache, store, slot2, u64::MAX)
+        .await
+        .expect("RECONFIGURE must adopt regardless of the ref's manifest id (pre-fix: EINVAL)");
+
+    // Adoption serves the right bytes, and the kernel identifier is
+    // unchanged (RECONFIGURE never rewrites it).
+    let read2 = pread_direct(&device, 2 * 1024 * 1024, 4096).expect("gen-2 read");
+    assert_eq!(
+        &read2[..16],
+        &bytes[2 * 1024 * 1024..2 * 1024 * 1024 + 16],
+        "gen-2 content mismatch",
+    );
+    let kernel_id_after = std::fs::read_to_string(format!("/sys/block/{dev_name}/backend"))
+        .expect("kernel backend attr readable post-reattach")
+        .trim()
+        .to_string();
+    assert_eq!(
+        kernel_id_after, kernel_id,
+        "RECONFIGURE must not rewrite the identifier"
+    );
+    drop(state2);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
