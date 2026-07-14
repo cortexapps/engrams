@@ -76,6 +76,7 @@ describe("makeThreadControlPlane", () => {
   test("createTask injects ENGRAM_APPEND_SYSTEM_PROMPT + persists a slack_thread task", async () => {
     let createdReq: { harnessEnv?: Record<string, string> } | undefined;
     const records: Record<string, unknown>[] = [];
+    const ensured: string[] = [];
 
     const cp = makeThreadControlPlane({
       profiles: fakeProfiles(),
@@ -84,7 +85,7 @@ describe("makeThreadControlPlane", () => {
       harnessCatalog: fakeHarnessCatalog(),
       secrets: { get: async () => null },
       resolveUser: async () => "user-1",
-      startToolDispatch: async () => {},
+      ensureListenerRow: async (sessionId) => void ensured.push(sessionId),
       db: recordingDb(records),
       sessions: {
         createSession: async (req) => {
@@ -113,6 +114,7 @@ describe("makeThreadControlPlane", () => {
       source: { provider: "slack", team: "T1", channel: "C1", threadRoot: "100.0" },
     });
     expect(records[1]).toMatchObject({ sessionId: "sess-1", role: "primary", profileId: "default-profile" });
+    expect(ensured).toEqual(["sess-1"]);
     expect(started.id).toBe("sess-1");
     expect(started.webUrl).toContain("/sessions/sess-1");
   });

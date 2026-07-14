@@ -15,7 +15,13 @@
  */
 
 import { expect, test, describe } from "bun:test";
-import { handleInbound, type StepRunner, type ThreadControlPlane } from "../slack-thread.ts";
+import {
+  bindThreadSession,
+  closingSummary,
+  handleInbound,
+  type StepRunner,
+  type ThreadControlPlane,
+} from "../slack-thread.ts";
 import type { CommunicationPolicy, StartedSession } from "../communication-policy.ts";
 import type { SourceMention, ThreadInbox } from "../thread-inbox.ts";
 import type { CuratedEvent } from "../../control-plane/session-events.ts";
@@ -113,6 +119,7 @@ const freshState = (m: SourceMention) => ({
   questionTs: new Map<string, string>(),
   assets: [],
   bubble: null,
+  lastAssistantText: null,
   currentMention: m,
 });
 
@@ -243,5 +250,52 @@ describe("handleInbound() — session event", () => {
 
     expect(next).toBe("180.0");
     expect(calls.onDeliveryError).toHaveLength(0); // render drops are silent (logged only)
+  });
+});
+
+describe("Slack thread ingest-v2 state", () => {
+  test("closing summary comes from ThreadRender.lastAssistantText", async () => {
+    const { pol } = recordingPolicy();
+    const { cp } = recordingControlPlane();
+    const st = freshState(mention("100.0", "Ev0"));
+
+    await handleInbound(STEP, pol, cp, SESSION, st, "100.0", {
+      kind: "session_event",
+      event: {
+        idx: 1n,
+        kind: "agent_message",
+        payloadJson: JSON.stringify({ role: "assistant", text: "first" }),
+      },
+    });
+    await handleInbound(STEP, pol, cp, SESSION, st, "100.0", {
+      kind: "session_event",
+      event: {
+        idx: 2n,
+        kind: "agent_message",
+        payloadJson: JSON.stringify({ role: "assistant", text: "final answer" }),
+      },
+    });
+
+    expect(closingSummary(st)).toEqual({
+      lastMessage: "final answer",
+      assets: [],
+    });
+  });
+
+  test("session startup writes the Slack binding row", async () => {
+    const bindings: Array<{ sessionId: string; threadWfId: string }> = [];
+
+    await bindThreadSession(
+      STEP,
+      "session-1",
+      "thread-wf-1",
+      async (sessionId, threadWfId) => {
+        bindings.push({ sessionId, threadWfId });
+      },
+    );
+
+    expect(bindings).toEqual([
+      { sessionId: "session-1", threadWfId: "thread-wf-1" },
+    ]);
   });
 });

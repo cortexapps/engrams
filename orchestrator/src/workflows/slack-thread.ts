@@ -11,7 +11,7 @@
  * Shape: the first `recv` is the initial @mention; ack pickup, resolve the
  * engrams user (unlinked → fail), pick the org default profile, gather the
  * thread into a prompt, create the task (carrying the policy's constant system
- * prompt), ack started, start the per-session pump, then a single recv
+ * prompt), ack started, bind the session listener, then a single recv
  * loop multiplexes session events ∪ trigger events off `THREAD_TOPIC`:
  *   - session_event   → route to the policy (question/answer-update/asset)
  *   - session_terminal → closing summary (ok) or failure, then exit
@@ -29,11 +29,12 @@ import {
   routeSessionEvent,
   summarizeAsset,
   type AssetSummary,
+  type ClosingSummary,
   type CommunicationPolicy,
   type StartedSession,
 } from "./communication-policy.ts";
 import { THREAD_TOPIC, type ThreadInbox, type SourceMention } from "./thread-inbox.ts";
-import { sessionIngestWorkflow } from "./session-ingest.ts";
+import { bindSlackSession } from "../listeners/slack-session-store.ts";
 
 const log = rootLog.child({ component: "slack" });
 
@@ -87,7 +88,7 @@ function requireControlPlane(): ThreadControlPlane {
 }
 
 /** Recv timeout (seconds). A timeout just re-loops — the session may be idle
- *  for a long time between events; the pump always sends the terminal. */
+ *  for a long time between events; the listener sends the terminal. */
 const RECV_TIMEOUT_S = 3_600;
 
 const NO_USER_MSG =
@@ -113,6 +114,21 @@ const ANSWER_FAIL_MSG = "I couldn't record that answer — the session may have 
  *  test passes a plain runner so the drain-loop control flow is unit-testable
  *  without a live DBOS engine (the engine integration is deferred — ADR 0060). */
 export type StepRunner = <T>(fn: () => Promise<T>, name: string) => Promise<T>;
+
+export type SlackSessionBinder = (
+  sessionId: string,
+  threadWfId: string,
+) => Promise<void>;
+
+/** Checkpoint the idempotent session→thread binding write at workflow start. */
+export async function bindThreadSession(
+  step: StepRunner,
+  sessionId: string,
+  threadWfId: string,
+  bind: SlackSessionBinder = bindSlackSession,
+): Promise<void> {
+  await step(() => bind(sessionId, threadWfId), "bindSlackSession");
+}
 
 async function slackThreadWorkflowImpl(): Promise<void> {
   const pol = requirePolicy();
@@ -171,11 +187,12 @@ async function slackThreadWorkflowImpl(): Promise<void> {
 
   await step(() => pol.onStarted(m, session), "onStarted");
 
-  // 2) Start the Slack surface pump; generic tool dispatch was already started
-  // by the shared task-creation path.
-  await DBOS.startWorkflow(sessionIngestWorkflow, {
-    workflowID: `ingest:${session.id}`,
-  })({ sessionId: session.id, threadWfId: DBOS.workflowID! });
+  // 2) Bind the session to this thread mailbox. The process listener discovers
+  // the session through session_listeners and applies the Slack consumer once
+  // this row exists.
+  const threadWfId = DBOS.workflowID;
+  if (!threadWfId) throw new Error("Slack thread workflow ID is unavailable");
+  await bindThreadSession(step, session.id, threadWfId);
 
   // 3) Drain loop — one recv multiplexes session events ∪ trigger events.
   // `st` is plain workflow-local render state, rebuilt deterministically on
@@ -187,6 +204,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
     questionTs: new Map<string, string>(),
     assets: [],
     bubble: null,
+    lastAssistantText: null,
     currentMention: m,
   };
   let lastTs = ctx0.maxTs;
@@ -198,7 +216,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
     if (msg.kind === "session_terminal") {
       switch (msg.outcome) {
         case "completed": {
-          const summary = { lastMessage: msg.lastMessage ?? null, assets: st.assets };
+          const summary = closingSummary(st);
           await step(() => pol.onComplete(m, session, summary), "onComplete");
           break;
         }
@@ -299,7 +317,7 @@ export async function handleInbound(
 
 /** Per-thread render state the drain loop threads through `dispatchSessionEvent`.
  *  All fields are workflow-local and replay-deterministic. */
-interface ThreadRender {
+export interface ThreadRender {
   /** tool_call_id → posted question `ts`, so an answer updates that message. */
   questionTs: Map<string, string>;
   /** Durable assets, accumulated for the closing recap. */
@@ -307,8 +325,16 @@ interface ThreadRender {
   /** The active assistant message consecutive responses coalesce into, or null
    *  when the next response should open a fresh message. */
   bubble: { ts: string; text: string } | null;
+  /** Most recent individual assistant message, retained for closing summary. */
+  lastAssistantText: string | null;
   /** The mention driving the live turn — the run lifecycle reacts on it. */
   currentMention: SourceMention;
+}
+
+export function closingSummary(
+  st: Pick<ThreadRender, "lastAssistantText" | "assets">,
+): ClosingSummary {
+  return { lastMessage: st.lastAssistantText, assets: st.assets };
 }
 
 /** Cap an assistant bubble's accumulated text; past this a new response opens a
@@ -338,6 +364,7 @@ async function dispatchSessionEvent(
       const ref = append ? st.bubble!.ts : undefined;
       const ts = await step(() => pol.onAssistantMessage(m, text, ref), "onAssistantMessage");
       st.bubble = { ts, text };
+      st.lastAssistantText = effect.text;
       break;
     }
     case "working": {

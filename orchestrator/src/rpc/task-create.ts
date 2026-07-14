@@ -272,8 +272,8 @@ export interface TaskSessionsClient {
   deleteSession(req: { sessionId: string }): Promise<unknown>;
 }
 
-/** Start the durable generic-tool pump for a newly persisted session. */
-export type StartToolDispatch = (sessionId: string) => Promise<void>;
+/** Register a newly persisted session for listener scanner discovery. */
+export type EnsureListenerRow = (sessionId: string) => Promise<void>;
 
 export interface CreateTaskDeps {
   profiles: ProfileStore;
@@ -281,7 +281,7 @@ export interface CreateTaskDeps {
   connectors: CustomConnectorSource;
   harnessCatalog: HarnessCatalogClient;
   sessions: TaskSessionsClient;
-  startToolDispatch: StartToolDispatch;
+  ensureListenerRow: EnsureListenerRow;
   /** Resolve `envVar` for the OWNER (e.g. the Claude OAuth token), or null. */
   secrets: { get(userId: string, envVar: string): Promise<string | null> };
   db: Db;
@@ -416,9 +416,9 @@ export async function createTaskWithSession(
     throw err;
   }
 
-  // The task/profile rows must be visible before dispatch can resolve a tool's
-  // session context. Every creation surface funnels through this point.
-  await deps.startToolDispatch(created.sessionId);
+  // The task/profile rows must be visible before a listener can resolve tool
+  // context. Every creation surface registers the session through this point.
+  await deps.ensureListenerRow(created.sessionId);
 
   // ADR 0064: auto-mint one private port-exposure per port the profile declares.
   // Best-effort — an exposure failure must NOT fail the task (the session is

@@ -419,7 +419,7 @@ const createDeps = (
     profileOver?: Partial<ProfileRow>;
     portExposures?: PortExposureStore;
     users?: CreateTaskDeps["users"];
-    startToolDispatch?: CreateTaskDeps["startToolDispatch"];
+    ensureListenerRow?: CreateTaskDeps["ensureListenerRow"];
   } = {},
 ): CreateTaskDeps => ({
   profiles: fakeProfiles(opts.active ?? true, opts.profileOver ?? {}),
@@ -432,24 +432,24 @@ const createDeps = (
   // Default to "unknown user" so tests exercising other seams don't hit the
   // real Drizzle fallback against the fake Db.
   users: opts.users ?? fakeUsers(),
-  startToolDispatch: opts.startToolDispatch ?? (async () => {}),
+  ensureListenerRow: opts.ensureListenerRow ?? (async () => {}),
   ...(opts.portExposures ? { portExposures: opts.portExposures } : {}),
 });
 
 describe("createTaskWithSession", () => {
-  test("starts the per-session tool dispatch workflow after creating the task", async () => {
-    const started: string[] = [];
+  test("writes the per-session listener row after creating the task", async () => {
+    const ensured: string[] = [];
 
     await createTaskWithSession(
       createDeps(fakeSessions(), recordingDb([]), {
-        startToolDispatch: async (sessionId) => {
-          started.push(sessionId);
+        ensureListenerRow: async (sessionId) => {
+          ensured.push(sessionId);
         },
       }),
       { type: "chat", ownerUserId: "user-1", profileId: "p1" },
     );
 
-    expect(started).toEqual(["sess-1"]);
+    expect(ensured).toEqual(["sess-1"]);
   });
 
   test("persists task + primary task_session and folds extraHarnessEnv into the session", async () => {

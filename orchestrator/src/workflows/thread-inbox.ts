@@ -3,10 +3,9 @@
  *
  * `DBOS.recv` is single-topic, so the ADR's "one recv multiplexes
  * { session events ∪ trigger events }" is realized by funnelling BOTH sources
- * onto ONE topic with a tagged message: the per-session pump
- * (`SessionIngestWorkflow`) sends the `session_*` variants, and the trigger
- * HTTP handlers (P2) send the `trigger_*` variants — all to the thread
- * workflow's id on `THREAD_TOPIC`. The thread workflow switches on `kind`.
+ * onto ONE topic with a tagged message: the per-session Slack consumer sends
+ * the `session_*` variants, and trigger HTTP handlers send the `trigger_*`
+ * variants — all to the thread workflow's id on `THREAD_TOPIC`.
  */
 
 import type { CuratedEvent, TerminalOutcome } from "../control-plane/session-events.ts";
@@ -38,12 +37,10 @@ export interface SourceAnswer {
   answers: Record<string, string[]>;
 }
 
-/** Everything the thread workflow can receive, tagged by origin. `lastMessage`
- *  on the terminal is the session's final assistant message (if any), which the
- *  pump captured while walking the log — it enriches the closing summary.
- *  `outcome` classifies the terminal state (success / failure / neutral). */
+/** Everything the thread workflow can receive, tagged by origin. `outcome`
+ * classifies the terminal state (success / failure / neutral). */
 export type ThreadInbox =
   | { kind: "session_event"; event: CuratedEvent }
-  | { kind: "session_terminal"; outcome: TerminalOutcome; lastMessage?: string }
+  | { kind: "session_terminal"; outcome: TerminalOutcome }
   | { kind: "trigger_mention"; mention: SourceMention }
   | { kind: "trigger_answer"; answer: SourceAnswer };
