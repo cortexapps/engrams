@@ -1815,6 +1815,41 @@ impl PooledBackend {
         }
     }
 
+    /// ADR 0088 addendum: the deferred-finish flavor of `snapshot()`,
+    /// used by the cold-base seed so its multi-GiB upload runs
+    /// CONCURRENTLY with the warm hook instead of blocking it. The
+    /// capture_phase (pause → dump to local NVMe → resume) stays
+    /// synchronous — the FC dirty bitmap is consumed inside it, which
+    /// is exactly what makes hook-dirtied pages the final Diff's dirty
+    /// set — then `finish()` (disk flush upload, memory chunk upload,
+    /// portable blobs, chain seed) runs on a spawned task holding the
+    /// capture-lock guard, so the final snapshot's own `capture_phase`
+    /// naturally serializes behind it even if the hook is instant.
+    ///
+    /// Callers MUST `join()` (never drop/abort) before taking another
+    /// snapshot of `id` and before reporting the capture durable:
+    /// - join-before-final-snapshot ⇒ the chain is seeded
+    ///   (`advance_checkpoint_state` is finish()'s last step) so the
+    ///   final capture stays a Diff;
+    /// - aborting mid-finish could leak a snapshot dir the
+    ///   `inflight_snapshots` bookkeeping no longer tracks;
+    /// - a joined `Ok` is the SAME durability barrier `snapshot()`
+    ///   provides, moved in wall-clock only.
+    pub(crate) async fn snapshot_deferred(
+        &self,
+        id: SandboxId,
+    ) -> Result<DeferredSnapshot, SandboxError> {
+        let (capture_guard, cap) = self.capture_phase(id).await?;
+        self.spawn_trace_publish(id);
+        let finisher = self.finisher();
+        Ok(DeferredSnapshot {
+            handle: tokio::spawn(async move {
+                let _guard = capture_guard;
+                finisher.finish(id, cap).await
+            }),
+        })
+    }
+
     /// Issue #529: install the weak self-reference `snapshot_begin`'s
     /// spawned finalize job upgrades to reach the full `destroy()` at its
     /// terminal stage. MUST be called exactly once, immediately after
@@ -4657,6 +4692,25 @@ fn poison_checkpoint_chain_after_failed_diff(
             "diff capture failed after FC consumed the dirty bitmap; \
              checkpoint chain dropped — next capture will be a FULL snapshot",
         );
+    }
+}
+
+/// ADR 0088 addendum: a snapshot whose `capture_phase` completed
+/// synchronously but whose `finish()` runs on a spawned task — see
+/// [`PooledBackend::snapshot_deferred`] for the contract (always
+/// `join()`, never drop).
+pub(crate) struct DeferredSnapshot {
+    handle: tokio::task::JoinHandle<Result<SnapshotMetadata, SandboxError>>,
+}
+
+impl DeferredSnapshot {
+    pub(crate) async fn join(self) -> Result<SnapshotMetadata, SandboxError> {
+        match self.handle.await {
+            Ok(result) => result,
+            Err(e) => Err(SandboxError::Snapshot(format!(
+                "deferred snapshot finish task died: {e}"
+            ))),
+        }
     }
 }
 
@@ -7628,7 +7682,16 @@ impl SandboxBackend for PooledBackend {
             // cold-base concept), `Hit` (already have one — the restore
             // above seeded the chain sparse off IT), and warm-less
             // (its single final snapshot below IS the cold base).
-            let minted_cold_base = if is_warm && matches!(cold_base_plan, ColdBasePlan::Miss { .. })
+            // ADR 0088 addendum: only the DUMP blocks the hook now. The
+            // seed's finish() (the 40s–11.5min chunk+upload leg measured
+            // in prod) runs on a spawned task concurrent with the warm
+            // hook and is joined — success AND failure paths — before
+            // the final snapshot below (join-before-final keeps the
+            // final capture a Diff and keeps the durability barrier
+            // ahead of the CaptureJobResult, exactly as the inline
+            // shape did).
+            let deferred_cold_base = if is_warm
+                && matches!(cold_base_plan, ColdBasePlan::Miss { .. })
             {
                 #[cfg(target_os = "linux")]
                 if let Some(state) = self.nbd_sandboxes.get(&id) {
@@ -7638,13 +7701,13 @@ impl SandboxBackend for PooledBackend {
                     phase: engram_core::types::CapturePhase::Snapshot,
                     sandbox_id: Some(id),
                     warm_stage: None,
-                    detail: Some("cold-base capture".to_string()),
+                    detail: Some("cold-base memory dump".to_string()),
                     output_tail: String::new(),
                     warm_stages: Vec::new(),
                 };
                 let _ = progress.try_send(cold_base_event.clone());
                 let cold_base_keepalive = spawn_leg_keepalive(progress.clone(), cold_base_event);
-                let meta = self.snapshot(id).await.map_err(|e| {
+                let deferred = self.snapshot_deferred(id).await.map_err(|e| {
                     SandboxError::CaptureFailed(engram_core::types::CaptureFailure {
                         kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
                         stage: Some("booting".to_string()),
@@ -7653,7 +7716,7 @@ impl SandboxBackend for PooledBackend {
                     })
                 });
                 drop(cold_base_keepalive);
-                Some(meta?)
+                Some(deferred?)
             } else {
                 None
             };
@@ -7681,10 +7744,76 @@ impl SandboxBackend for PooledBackend {
             // output — the diagnosis a `status None` / vsock-lost failure
             // used to lose entirely.
             let mut warm_tail = crate::warm_progress::OutputTail::default();
-            if let Some(warm) = &warm {
-                warm_tail = self
+            // The hook result is NOT `?`-returned before the seed join
+            // below — the deferred finish must always be awaited (never
+            // dropped/aborted; see `snapshot_deferred`'s contract).
+            let hook_result = match &warm {
+                Some(warm) => self
                     .run_warm_hook(id, warm, &session_env, &progress)
-                    .await?;
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            };
+
+            // ---- JOIN BARRIER (ADR 0088 addendum) ----
+            // Settle the deferred cold-base seed on success AND failure
+            // paths. Under its own keepalive: the upload may still have
+            // minutes left when a short hook finishes, and the claim
+            // lease must not expire while we wait it out.
+            let seed_result: Option<Result<SnapshotMetadata, SandboxError>> =
+                match deferred_cold_base {
+                    Some(deferred) => {
+                        let upload_event = engram_core::types::CaptureProgress {
+                            phase: engram_core::types::CapturePhase::Snapshot,
+                            sandbox_id: Some(id),
+                            warm_stage: None,
+                            detail: Some("cold-base upload".to_string()),
+                            output_tail: String::new(),
+                            warm_stages: Vec::new(),
+                        };
+                        let _ = progress.try_send(upload_event.clone());
+                        let upload_keepalive =
+                            spawn_leg_keepalive(progress.clone(), upload_event);
+                        let joined = deferred.join().await;
+                        drop(upload_keepalive);
+                        Some(joined)
+                    }
+                    None => None,
+                };
+
+            // Error priority: the hook's failure is the actionable one
+            // (it aborts today too); a concurrent seed failure is logged
+            // alongside rather than masking it.
+            match hook_result {
+                Ok(Some(tail)) => warm_tail = tail,
+                Ok(None) => {}
+                Err(e) => {
+                    if let Some(Err(seed_err)) = &seed_result {
+                        tracing::warn!(
+                            sandbox_id = %id,
+                            error = %seed_err,
+                            "cold-base seed upload also failed while the warm hook was failing",
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+            let minted_cold_base = match seed_result {
+                None => None,
+                Some(Ok(meta)) => Some(meta),
+                Some(Err(e)) => {
+                    return Err(SandboxError::CaptureFailed(
+                        engram_core::types::CaptureFailure {
+                            kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
+                            stage: Some("booting".to_string()),
+                            tail: warm_tail.render(),
+                            message: format!("cold-base capture failed: {e}"),
+                        },
+                    ))
+                }
+            };
+
+            if warm.is_some() {
                 // Incident 2026-07-10 mitigation: flush the guest's dirty
                 // page cache to the (durably captured) disk BEFORE the
                 // final snapshot. The memory image is REQUIRED to carry
