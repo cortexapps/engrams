@@ -216,22 +216,33 @@ host-agent startup, rolled out together in the ADR 0022 canary shape
 
 ### Goal 2 (TTFM): fix it where it lives — the guest
 
-Base-shm policy moves this number by ±2 s. The levers that matter, as
-follow-up work items in priority order:
+Base-shm policy moves this number by ±2 s. Lever ordering CORRECTED
+after implementation-time validation (2026-07-14, PR #669):
 
-1. **Harness spawn priority** (agentd): spawn the harness with elevated
-   CPU weight (nice/cgroup) so a ~1 s-CPU cold start cuts through the
-   resume stampede instead of queueing behind it. Small agentd change;
-   measured headroom says storm-time first prompts drop from ~40 s to
-   single digits.
-2. **Verify warm-harness reattach actually fires in prod** (ADR
-   0037/0062): a stamp-matched create should reattach the captured warm
-   harness and skip the cold spawn; any stamp churn between capture and
-   create silently forces the slow path fleet-wide.
-3. **Capture-time quiesce guidance** for warm images: settle GC/timers
-   before the `[warm]` capture so resume doesn't start with a
-   thundering herd (image-config documentation; dev-brain first).
-4. Minor: the prompt-dispatch outbox tick contributes ~2.3 s median;
+1. ~~Harness spawn priority~~ — **implemented and measured
+   insufficient**: with the harness verified running at nice -10
+   mid-storm, first replies stayed 38.9–39.5 s. The starvation is not
+   CPU-scheduler contention: the cold start is **fault/IO-bound** — its
+   first-touch page faults and cold disk reads queue behind the JVM
+   stampede in the single handler fault loop (33% futex serialization
+   in the profile) and the NBD daemon, which priority cannot jump. The
+   change ships anyway as cheap, correct insurance for CPU-shaped
+   contention, but is not the 40 s fix.
+2. **Warm reattach does not exist for fresh creates today**: dev-brain's
+   base capture carries the *sentinel* at dyn_0 — no captured harness —
+   so every fresh create cold-spawns by construction (reattach only
+   serves resumes of a session's own snapshot). The real fresh-create
+   levers are therefore:
+   - **a warm harness in the base capture** (ADR 0037's persistent-
+     harness design, revived for base captures): the harness's pages
+     become canonical base pages (shared, pre-faultable) and the cold
+     start disappears entirely; or
+   - **capture-time quiesce** for warm images (settle GC/timers before
+     the `[warm]` capture) so the resume stampede the cold start queues
+     behind is smaller.
+   Both need their own design pass — follow-up ADR material, not this
+   one.
+3. Minor: the prompt-dispatch outbox tick contributes ~2.3 s median;
    event-driven dispatch would shave it.
 
 Debuggability rider: the ADR 0025 guest kernel compiles out PSI
