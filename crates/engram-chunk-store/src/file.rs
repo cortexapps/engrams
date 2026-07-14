@@ -37,6 +37,32 @@ use crate::store::ChunkStore;
 /// below GCS per-object rate limits (mirrors the prefetch bound).
 const SPARSE_RECHUNK_CONCURRENCY: usize = 32;
 
+/// Where the wall-clock of a [`ChunkStore::chunk_file_into`] run went.
+/// The 2026-07-13 incident's full memory re-chunk was invisible in
+/// metrics (the enclosing `snapshot_finish_seconds` wraps it whole):
+/// per-phase timings let callers export a scan-vs-upload breakdown so
+/// a slow capture is diagnosable from the metrics endpoint instead of
+/// log archaeology.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChunkFileStats {
+    /// Cumulative wall-time spent producing chunks from the source
+    /// file (reads + zero-checks; after the pipelined reader, time the
+    /// consumer spent waiting on the reader). When this dominates, the
+    /// re-chunk is scan-bound (storage tier / read path).
+    pub scan_seconds: f64,
+    /// Cumulative wall-time spent flushing chunk windows to the store
+    /// (hash + dedup HEAD + PUT). When this dominates, the re-chunk is
+    /// upload-bound (network / GCS).
+    pub flush_seconds: f64,
+    /// Total bytes read from the source file (the file length).
+    pub bytes_scanned: u64,
+    /// Non-zero chunks uploaded (zero-elided chunks never leave the
+    /// scan).
+    pub chunks_uploaded: u64,
+    /// Bytes across the uploaded chunks.
+    pub bytes_uploaded: u64,
+}
+
 impl ChunkStore {
     /// Walk a file in `chunk_size` blocks, PUT each non-zero block
     /// into the store, return a `Manifest` describing the result.
@@ -57,6 +83,7 @@ impl ChunkStore {
     ) -> Result<Manifest> {
         self.chunk_file_into(path, kind, chunk_size, None, None)
             .await
+            .map(|(manifest, _)| manifest)
     }
 
     /// Like [`Self::chunk_file`], but also write-throughs each produced
@@ -77,7 +104,7 @@ impl ChunkStore {
         // zero-elided windows too, so callers get a monotone fraction
         // with a known denominator (the enable UI's progress bar).
         progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
-    ) -> Result<Manifest> {
+    ) -> Result<(Manifest, ChunkFileStats)> {
         let chunk_size = chunk_size.unwrap_or_else(|| kind.default_chunk_size());
         let mut file = fs::File::open(path).await?;
         let meta = file.metadata().await?;
@@ -105,30 +132,41 @@ impl ChunkStore {
         // `buffer_unordered`, then drain the window before reading the
         // next one. This bounds resident RAM at concurrency × chunk_size
         // (no whole-image buffering) while still overlapping the network.
+        let mut stats = ChunkFileStats {
+            bytes_scanned: total_bytes,
+            ..Default::default()
+        };
         let mut buf = vec![0u8; chunk_size as usize];
         let mut offset: u64 = 0;
         let mut window: Vec<(u64, Bytes)> = Vec::with_capacity(SPARSE_RECHUNK_CONCURRENCY);
         while offset < total_bytes {
             let want = chunk_size.min(total_bytes - offset) as usize;
             let slice = &mut buf[..want];
+            let scan_start = std::time::Instant::now();
             file.read_exact(slice).await?;
 
-            if !is_all_zero(slice) {
+            let nonzero = !is_all_zero(slice);
+            stats.scan_seconds += scan_start.elapsed().as_secs_f64();
+            if nonzero {
                 window.push((offset, Bytes::copy_from_slice(slice)));
             }
             offset += want as u64;
 
             if window.len() == SPARSE_RECHUNK_CONCURRENCY {
-                self.flush_chunk_window(std::mem::take(&mut window), &mut manifest, cache)
+                let flush_start = std::time::Instant::now();
+                self.flush_chunk_window(std::mem::take(&mut window), &mut manifest, cache, &mut stats)
                     .await?;
+                stats.flush_seconds += flush_start.elapsed().as_secs_f64();
                 if let Some(report) = progress {
                     report(offset.div_ceil(chunk_size), windows_total);
                 }
             }
         }
         if !window.is_empty() {
-            self.flush_chunk_window(window, &mut manifest, cache)
+            let flush_start = std::time::Instant::now();
+            self.flush_chunk_window(window, &mut manifest, cache, &mut stats)
                 .await?;
+            stats.flush_seconds += flush_start.elapsed().as_secs_f64();
         }
         if let Some(report) = progress {
             report(windows_total, windows_total);
@@ -136,7 +174,7 @@ impl ChunkStore {
         // Windows are read + appended in offset order and each window is
         // internally re-sorted, so `manifest.chunks` stays offset-sorted.
 
-        Ok(manifest)
+        Ok((manifest, stats))
     }
 
     /// Put a window of non-zero `(offset, bytes)` chunks concurrently
@@ -148,8 +186,11 @@ impl ChunkStore {
         window: Vec<(u64, Bytes)>,
         manifest: &mut Manifest,
         cache: Option<&ChunkCache>,
+        stats: &mut ChunkFileStats,
     ) -> Result<()> {
         use futures::stream::{self, StreamExt, TryStreamExt};
+        stats.chunks_uploaded += window.len() as u64;
+        stats.bytes_uploaded += window.iter().map(|(_, b)| b.len() as u64).sum::<u64>();
         let mut refs: Vec<ChunkRef> = stream::iter(window)
             .map(|(offset, bytes)| {
                 let store = self.clone();

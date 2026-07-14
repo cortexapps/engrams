@@ -4660,8 +4660,13 @@ impl SnapshotFinisher {
                 if fs::metadata(&mem_path).await.is_err() {
                     return Ok(metadata);
                 }
-                let mref = chunk_memory_to_store(chunk_store, &mem_path, self.chunk_cache.as_ref())
-                    .await?;
+                let mref = chunk_memory_to_store(
+                    chunk_store,
+                    &mem_path,
+                    self.chunk_cache.as_ref(),
+                    "snapshot_finish",
+                )
+                .await?;
                 // ADR 0039: the dump is now durable in the chunk store and
                 // the chain seeds from the manifest (not this file) — drop
                 // the GiB-scale memory.bin so committed snapshot dirs stay
@@ -5017,11 +5022,14 @@ pub(crate) async fn chunk_memory_to_store(
     chunk_store: &ChunkStore,
     memory_bin: &std::path::Path,
     cache: Option<&ChunkCache>,
+    // `source` label for the re-chunk histogram: which capture flavor
+    // paid for this full-image scan (`snapshot_finish` | `evict_finalize`).
+    source: &'static str,
 ) -> Result<engram_core::types::manifest::ManifestRef, SandboxError> {
     // ADR 0039 (sticky-everywhere): write-through the base memory chunks
     // into the host's local cache as they're uploaded, so the capturing
     // host keeps them local instead of re-fetching its own writes.
-    let manifest = chunk_store
+    let res = chunk_store
         .chunk_file_into(
             memory_bin,
             engram_chunk_store::ManifestKind::Memory,
@@ -5029,10 +5037,36 @@ pub(crate) async fn chunk_memory_to_store(
             cache,
             None,
         )
-        .await
-        .map_err(|e| {
-            SandboxError::Snapshot(format!("chunk memory.bin {}: {e}", memory_bin.display(),))
-        })?;
+        .await;
+    let outcome = if res.is_ok() { "success" } else { "error" };
+    if let Ok((_, stats)) = &res {
+        for (phase, seconds) in [("scan", stats.scan_seconds), ("upload", stats.flush_seconds)] {
+            metrics::histogram!(
+                crate::metrics::RECHUNK_SECONDS,
+                "phase" => phase,
+                "source" => source,
+                "outcome" => outcome,
+            )
+            .record(seconds);
+        }
+        metrics::counter!(crate::metrics::RECHUNK_BYTES_SCANNED_TOTAL, "source" => source)
+            .increment(stats.bytes_scanned);
+        metrics::counter!(crate::metrics::RECHUNK_BYTES_UPLOADED_TOTAL, "source" => source)
+            .increment(stats.bytes_uploaded);
+        tracing::info!(
+            memory_bin = %memory_bin.display(),
+            source,
+            scan_ms = (stats.scan_seconds * 1000.0) as u64,
+            upload_ms = (stats.flush_seconds * 1000.0) as u64,
+            bytes_scanned = stats.bytes_scanned,
+            chunks_uploaded = stats.chunks_uploaded,
+            bytes_uploaded = stats.bytes_uploaded,
+            "full memory re-chunk phase breakdown",
+        );
+    }
+    let (manifest, _) = res.map_err(|e| {
+        SandboxError::Snapshot(format!("chunk memory.bin {}: {e}", memory_bin.display(),))
+    })?;
     let manifest_ref = engram_core::types::manifest::ManifestRef::new();
     chunk_store
         .put_manifest(manifest_ref, &manifest)
