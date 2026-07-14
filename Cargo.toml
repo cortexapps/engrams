@@ -180,7 +180,11 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # misc
 tar = "0.4"
-flate2 = "1"
+# ADR 0088 addendum: the zlib-rs backend is pure Rust with zlib-ng-class
+# inflate throughput (~2x miniz_oxide) — the OCI layer gzip decode is on
+# the enable critical path. Pure Rust keeps the musl cross-compile lane
+# safe (same reason ruzstd stays below: no C toolchain in the closure).
+flate2 = { version = "1.1", features = ["zlib-rs"] }
 # ADR 0080: engram-rootfs-materializer's deterministic-pack mtime clamp
 # (regular files, dirs, AND symlinks — std can't lutimes) and its OCI
 # layer xattr application. Both are already transitive deps of `tar`.
