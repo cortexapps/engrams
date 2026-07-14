@@ -334,9 +334,15 @@ impl Materializer {
                             LayerCompression::Gzip => {
                                 Box::new(flate2::read::GzDecoder::new(reader))
                             }
+                            // C-backed zstd (ADR 0088 addendum rollout
+                            // fix): ruzstd's single-threaded pure-Rust
+                            // decode WAS the flatten bottleneck for
+                            // zstd-layered images — dev-brain's 3.5 GB
+                            // compressed layer held the fd-worker pool
+                            // idle behind it for tens of minutes.
                             LayerCompression::Zstd => Box::new(
-                                ruzstd::decoding::StreamingDecoder::new(reader)
-                                    .map_err(|e| std::io::Error::other(e.to_string()))?,
+                                zstd::stream::read::Decoder::with_buffer(reader)
+                                    .map_err(std::io::Error::other)?,
                             ),
                             LayerCompression::None => Box::new(reader),
                         };

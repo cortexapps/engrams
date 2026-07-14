@@ -24,15 +24,10 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 xattr.workspace = true
-ruzstd.workspace = true
+zstd.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
-# Encoder for the zstd-layer round-trip fixture ONLY (ruzstd is decode-only).
-# A dev-dependency deliberately: the C-backed zstd-sys must stay out of the
-# shipped binary closure (it breaks the musl cross-compile lane's CFLAGS).
-zstd = "0.13"
-
 axum.workspace = true
 bytes.workspace = true
 engram-storage-local.workspace = true

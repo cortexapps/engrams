@@ -1535,7 +1535,6 @@ dependencies = [
  "futures",
  "http",
  "parking_lot",
- "ruzstd",
  "serde",
  "serde_json",
  "sha2",
@@ -4506,15 +4505,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
-name = "ruzstd"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6610,7 +6600,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-core",
- "twox-hash",
  "uuid",
  "winnow",
  "zeroize",

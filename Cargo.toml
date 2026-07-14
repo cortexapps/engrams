@@ -182,8 +182,7 @@ clap = { version = "4", features = ["derive", "env"] }
 tar = "0.4"
 # ADR 0088 addendum: the zlib-rs backend is pure Rust with zlib-ng-class
 # inflate throughput (~2x miniz_oxide) — the OCI layer gzip decode is on
-# the enable critical path. Pure Rust keeps the musl cross-compile lane
-# safe (same reason ruzstd stays below: no C toolchain in the closure).
+# the enable critical path.
 flate2 = { version = "1.1", features = ["zlib-rs"] }
 # ADR 0080: engram-rootfs-materializer's deterministic-pack mtime clamp
 # (regular files, dirs, AND symlinks — std can't lutimes) and its OCI
@@ -193,10 +192,17 @@ xattr = "1"
 # ADR 0055 P2: read user-uploaded .zip skill archives. Lean: deflate + store
 # only (no bzip2/zstd/aes), and extraction is budgeted against zip bombs.
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# Pure-Rust zstd DECODER (layer decompression only). Deliberately not the
-# C-backed `zstd` crate: zstd-sys breaks the musl cross-compile lane, whose
-# CFLAGS inject glibc host headers for kernel-UAPI bindgen (ci.yml ~:390).
-ruzstd = "0.8"
+# ADR 0088 addendum rollout fix: the C-backed zstd. The prior pure-Rust
+# `ruzstd` was the enable pipeline's REAL flatten bottleneck for
+# zstd-layered images (dev-brain's 3.5 GB compressed layer decoded
+# single-threaded at ruzstd speed ⇒ tens of minutes; zstd-c decodes the
+# same layer ~10x faster). The old blocker — "zstd-sys breaks the musl
+# cross lane" — was the lane's own fault: it injected ALL of glibc's
+# /usr/include for userfaultfd-sys's kernel-UAPI shim, poisoning any
+# vendored-C build under a musl target. The lane now stages a scoped
+# UAPI-only dir referenced via `-idirafter` (ci.yml / bake-images.yml),
+# so the musl sysroot's headers always win and zstd-sys compiles clean.
+zstd = { version = "0.13", default-features = false }
 once_cell = "1"
 parking_lot = "0.12"
 dashmap = "6"
