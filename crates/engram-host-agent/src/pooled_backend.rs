@@ -7575,6 +7575,9 @@ impl SandboxBackend for PooledBackend {
         let mut session_env = spec.env.clone();
         session_env.extend(capture_env);
         let is_warm = warm.is_some();
+        // Captured before `spec` moves into `create` — the balloon
+        // reclaim target below derives from guest RAM size.
+        let guest_mem_mib = u64::from(spec.memory.max_mib);
 
         // ---- stage 1: a LIVE VM at (or converging toward) agentd-ready
         // — restore the cold base on a Hit (no cold boot at all), else
@@ -7618,6 +7621,17 @@ impl SandboxBackend for PooledBackend {
                     .await?;
                 if let Some(memory_ref) = memory_ref {
                     self.seed_checkpoint_chain_forked(id, memory_ref).await;
+                }
+                // ADR 0088 addendum: a balloon-era cold base was dumped
+                // with the balloon INFLATED — deflate so the warm hook
+                // gets its RAM back. Tolerant: a legacy balloon-less
+                // base (or a non-FC backend) has nothing to deflate.
+                if let Err(e) = self.inner.balloon_release(id).await {
+                    tracing::debug!(
+                        sandbox_id = %id,
+                        error = %e,
+                        "cold-base restore: balloon deflate skipped (legacy balloon-less base?)",
+                    );
                 }
                 self.spawn_prefault_stats_probe(id);
                 id
@@ -7707,6 +7721,39 @@ impl SandboxBackend for PooledBackend {
                 };
                 let _ = progress.try_send(cold_base_event.clone());
                 let cold_base_keepalive = spawn_leg_keepalive(progress.clone(), cold_base_event);
+
+                // ADR 0088 addendum: shrink the seed. Inflating the
+                // balloon hands the guest's free pages back to the host
+                // (`MADV_DONTNEED`), so the dense dump reads zeros there
+                // and the all-zero 512 KiB elision drops them from the
+                // memory manifest (~guest-RAM → ~touched-pages). FAIL-
+                // OPEN: a guest that can't balloon (kill switch, legacy
+                // kernel, VZ) just pays the dense seed, which the
+                // deferred finish hides behind the hook anyway. The
+                // reserve keeps the paused-adjacent guest comfortably
+                // functional while inflated.
+                const BALLOON_RESERVE_MIB: u64 = 1536;
+                let balloon_target = guest_mem_mib.saturating_sub(BALLOON_RESERVE_MIB);
+                let ballooned_mib = if balloon_target > 0 {
+                    match self
+                        .inner
+                        .balloon_reclaim(id, balloon_target, std::time::Duration::from_secs(30))
+                        .await
+                    {
+                        Ok(mib) => mib,
+                        Err(e) => {
+                            tracing::info!(
+                                sandbox_id = %id,
+                                error = %e,
+                                "balloon reclaim unavailable; taking a dense cold-base seed",
+                            );
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
+
                 let deferred = self.snapshot_deferred(id).await.map_err(|e| {
                     SandboxError::CaptureFailed(engram_core::types::CaptureFailure {
                         kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
@@ -7716,7 +7763,32 @@ impl SandboxBackend for PooledBackend {
                     })
                 });
                 drop(cold_base_keepalive);
-                Some(deferred?)
+                let deferred = deferred?;
+
+                // FAIL-LOUD deflate: a warm hook in a balloon-starved
+                // guest (~1.5 GiB effective) is a guaranteed slow OOM-
+                // flavored failure 20 minutes later — better to fail in
+                // seconds here. Only reached when the inflate succeeded.
+                if ballooned_mib > 0 {
+                    if let Err(e) = self.inner.balloon_release(id).await {
+                        // The deferred finish must still be settled
+                        // (await-never-abort) before surfacing.
+                        let seed = deferred.join().await;
+                        tracing::warn!(sandbox_id = %id, seed_ok = seed.is_ok(), "balloon deflate failed; seed settled before aborting");
+                        return Err(SandboxError::CaptureFailed(
+                            engram_core::types::CaptureFailure {
+                                kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
+                                stage: Some("booting".to_string()),
+                                tail: String::new(),
+                                message: format!(
+                                    "balloon deflate after the cold-base dump failed: {e} — \
+                                     refusing to run the warm hook in a memory-starved guest"
+                                ),
+                            },
+                        ));
+                    }
+                }
+                Some(deferred)
             } else {
                 None
             };

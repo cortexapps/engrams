@@ -309,6 +309,7 @@ mod tests {
             uffd_substrate_sock: None,
             restore_mode: engram_sandbox_firecracker::RestoreMode::File,
             track_dirty_pages: false,
+            balloon: false,
             net_pool: None,
             egress_proxy_port: None,
             egress_dns_port: None,

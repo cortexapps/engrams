@@ -319,6 +319,14 @@ pub struct FirecrackerConfig {
     /// write-protect cost that's only worth paying when diffs are
     /// actually taken.
     pub track_dirty_pages: bool,
+    /// ADR 0088 addendum: attach a (deflated, `deflate_on_oom`)
+    /// virtio-balloon device to every fresh-created VM, pre-boot. The
+    /// capture-time seed shrink inflates it before the cold-base dump
+    /// so untouched pages elide from the memory manifest; restored VMs
+    /// inherit whatever device set rides their snapshot's `state.bin`
+    /// (this flag only affects `create`). Kill switch:
+    /// `ENGRAM_FC_BALLOON=0`.
+    pub balloon: bool,
     /// Engram CIDR pool — every sandbox gets a unique /30 carved out
     /// of this. `Some(10.200.0.0)` (the default) provisions per-VM
     /// TAPs + iptables rules; production deployments always want
@@ -583,6 +591,7 @@ impl FirecrackerConfig {
             uffd_base_dir: None,
             restore_mode: RestoreMode::File,
             track_dirty_pages: false,
+            balloon: std::env::var("ENGRAM_FC_BALLOON").map_or(true, |v| v != "0"),
             host_id: None,
             uffd_cache_root: None,
             uffd_substrate_sock: None,
@@ -2119,6 +2128,17 @@ impl FirecrackerBackend {
             cpu_template: self.config.cpu_template.clone(),
         })
         .await?;
+        // ADR 0088 addendum: the balloon must be attached BEFORE
+        // InstanceStart (FC rejects post-boot device adds). Attached
+        // deflated; only the capture-time seed shrink ever inflates it.
+        if self.config.balloon {
+            api.put_balloon(&client::BalloonConfig {
+                amount_mib: 0,
+                deflate_on_oom: true,
+                stats_polling_interval_s: 1,
+            })
+            .await?;
+        }
         // Append the per-sandbox `ip=...` to the kernel cmdline so
         // CONFIG_IP_PNP brings up eth0 with the guest's static
         // address before init runs. Skipped when networking is
@@ -4406,6 +4426,74 @@ impl SandboxBackend for FirecrackerBackend {
         FirecrackerClient::new(&socket).pause().await
     }
 
+    /// ADR 0088 addendum: inflate toward `target_mib`, polling
+    /// `GET /balloon/statistics` until the guest's `actual_mib`
+    /// stabilizes (two identical consecutive reads at/after a partial
+    /// grant) or `deadline` elapses. Whatever the guest granted by
+    /// then is accepted — partial inflation still elides partially. A
+    /// VM without the device surfaces FC's 400 as `InvalidSpec` via
+    /// `patch_balloon`, which callers treat as fail-open.
+    async fn balloon_reclaim(
+        &self,
+        id: SandboxId,
+        target_mib: u64,
+        deadline: std::time::Duration,
+    ) -> Result<u64, SandboxError> {
+        let socket = self
+            .sandboxes
+            .get(&id)
+            .ok_or(SandboxError::NotFound)?
+            .state
+            .firecracker_socket
+            .clone();
+        let api = FirecrackerClient::new(&socket);
+        api.patch_balloon(target_mib).await?;
+        let started = std::time::Instant::now();
+        let mut last_actual = 0u64;
+        let mut stable_reads = 0u32;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let stats = api.get_balloon_statistics().await?;
+            if stats.actual_mib >= target_mib {
+                last_actual = stats.actual_mib;
+                break;
+            }
+            if stats.actual_mib == last_actual && stats.actual_mib > 0 {
+                stable_reads += 1;
+                // Two identical sub-target reads = the guest has given
+                // what it can; more waiting won't reclaim more.
+                if stable_reads >= 2 {
+                    break;
+                }
+            } else {
+                stable_reads = 0;
+                last_actual = stats.actual_mib;
+            }
+            if started.elapsed() >= deadline {
+                break;
+            }
+        }
+        tracing::info!(
+            sandbox_id = %id,
+            target_mib,
+            actual_mib = last_actual,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "balloon reclaim settled",
+        );
+        Ok(last_actual)
+    }
+
+    async fn balloon_release(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let socket = self
+            .sandboxes
+            .get(&id)
+            .ok_or(SandboxError::NotFound)?
+            .state
+            .firecracker_socket
+            .clone();
+        FirecrackerClient::new(&socket).patch_balloon(0).await
+    }
+
     /// ADR 0018 commit 12m: symmetric companion to `pause`. Resume
     /// the VM via PATCH /vm {state: Resumed}. Idempotent on FC's
     /// side. Not currently invoked by PooledBackend (the
@@ -6009,6 +6097,7 @@ mod tests {
             uffd_base_dir: None,
             restore_mode: RestoreMode::File,
             track_dirty_pages: false,
+            balloon: false,
             net_pool: None,
             egress_proxy_port: None,
             egress_dns_port: None,

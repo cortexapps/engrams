@@ -95,6 +95,38 @@ impl FirecrackerClient {
         self.put("/boot-source", src).await
     }
 
+    /// `PUT /balloon` — attach the virtio-balloon device. PRE-BOOT
+    /// ONLY (Firecracker rejects device adds after `InstanceStart`).
+    /// ADR 0088 addendum: the capture-time seed shrink inflates this
+    /// before the cold-base dump so untouched guest pages read back
+    /// as zeros (host-side `madvise(MADV_DONTNEED)`) and the all-zero
+    /// chunk elision drops them from the memory manifest.
+    pub async fn put_balloon(&self, cfg: &BalloonConfig) -> Result<(), SandboxError> {
+        self.put("/balloon", cfg).await
+    }
+
+    /// `PATCH /balloon` — retarget the balloon at runtime (inflate
+    /// toward `amount_mib`; `0` deflates fully).
+    pub async fn patch_balloon(&self, amount_mib: u64) -> Result<(), SandboxError> {
+        #[derive(Serialize)]
+        struct Patch {
+            amount_mib: u64,
+        }
+        self.request_with_body("PATCH", "/balloon", Some(&Patch { amount_mib }))
+            .await?;
+        Ok(())
+    }
+
+    /// `GET /balloon/statistics` — requires the device to have been
+    /// configured with `stats_polling_interval_s > 0`.
+    pub async fn get_balloon_statistics(&self) -> Result<BalloonStats, SandboxError> {
+        let raw = self
+            .request_with_body::<()>("GET", "/balloon/statistics", None)
+            .await?;
+        serde_json::from_slice(&raw)
+            .map_err(|e| vm_err(format!("parse GET /balloon/statistics: {e}")))
+    }
+
     /// `PUT /drives/{drive_id}` — attach a block device. Set
     /// `is_root_device=true` for the rootfs.
     pub async fn put_drive(&self, drive: &DriveConfig) -> Result<(), SandboxError> {
@@ -635,6 +667,28 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
 //
 // Field names match the Firecracker swagger schema; serde_json picks
 // snake_case automatically so we don't need rename_all.
+
+/// `PUT /balloon` payload (pre-boot device attach).
+#[derive(Debug, Clone, Serialize)]
+pub struct BalloonConfig {
+    /// Initial target in MiB — `0` = attached but deflated.
+    pub amount_mib: u64,
+    /// Guest driver returns pages under guest OOM pressure instead of
+    /// OOM-killing — the safety valve for an inflated balloon.
+    pub deflate_on_oom: bool,
+    /// `> 0` enables `GET /balloon/statistics` at this cadence.
+    pub stats_polling_interval_s: u64,
+}
+
+/// `GET /balloon/statistics` response (the fields the reclaim loop
+/// polls; Firecracker sends more — unknown fields are ignored).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BalloonStats {
+    /// MiB the guest driver has actually handed to the device.
+    pub actual_mib: u64,
+    /// Current target.
+    pub target_mib: u64,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MachineConfig {
