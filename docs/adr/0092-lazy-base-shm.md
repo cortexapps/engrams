@@ -257,7 +257,11 @@ gates look good: demo TTFM 6.2–7.4 s sequential and 6.7 s under two
 concurrent boots (pre-flip p50 7.6 / p95 9.3, 7-day mined baseline);
 dev-brain 45.4 s (n=1) inside its pre-flip band (p50 36.9 / p95 86);
 fresh creates confirmed restoring `mode=File` with no uffd-handler.
-Three findings, first one gate-blocking:
+On the strength of that, the reclaimable-residency config is now the
+**helm-chart default** (`freshRestoreMode: "file"`, `baseMemfilePin:
+"0"`, `baseShmMode: "lazy"`); set `""` in values to fall back to the
+binary defaults. The binary's own defaults stay conservative — a
+non-chart deploy is unchanged. Three findings, first one gate-blocking:
 
 1. **Disk headroom is not a "confirm sizing" checkbox — it needed a
    mechanism.** `/var/lib/engram` is the 300 GB boot disk (no dedicated
