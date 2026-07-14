@@ -157,16 +157,37 @@ struct ImageConfigSection {
     working_dir: Option<String>,
 }
 
-/// Run the pull stage: resolve the platform manifest, validate every
-/// layer's mediaType (before downloading any bytes), fetch the config
-/// blob → [`OciRuntimeDefaults`], and stream each layer to
-/// `layers_dir/<index>.layer`.
-pub async fn pull_image(
+/// A platform-resolved image: everything known BEFORE any layer bytes
+/// move. mediaTypes are validated here (fail loud), so a download plan
+/// can never contain an unflattenable layer.
+#[derive(Debug)]
+pub struct ResolvedImage {
+    pub manifest_digest: String,
+    pub oci_defaults: OciRuntimeDefaults,
+    /// Layers in application order (base first).
+    pub layers: Vec<LayerPlan>,
+    /// Sum of the layers' compressed sizes (the scratch-budget input).
+    pub compressed_bytes: u64,
+}
+
+/// One planned (not yet downloaded) layer.
+#[derive(Clone, Debug)]
+pub struct LayerPlan {
+    pub blob: engram_oci::DockerBlobRef,
+    pub compression: LayerCompression,
+    /// Manifest position — application order AND the scratch filename.
+    pub index: usize,
+}
+
+/// Resolve the platform manifest, validate every layer's mediaType
+/// (before downloading any bytes), and fetch the config blob →
+/// [`OciRuntimeDefaults`]. The download side is [`download_layer`];
+/// the materializer pipelines the two (ADR 0088 addendum).
+pub async fn resolve_image(
     oci: &OciClient,
     image_uri: &str,
     platform: Platform,
-    layers_dir: &Path,
-) -> Result<PulledImage, PullError> {
+) -> Result<ResolvedImage, PullError> {
     let manifest = oci
         .pull_docker_manifest(image_uri, platform.os(), platform.architecture())
         .await?;
@@ -188,41 +209,86 @@ pub async fn pull_image(
     let oci_defaults =
         OciRuntimeDefaults::from_docker_config(&section.env, section.working_dir.as_deref());
 
-    tokio::fs::create_dir_all(layers_dir).await?;
-    let mut layers = Vec::with_capacity(manifest.layers.len());
     let mut compressed_bytes = 0u64;
-    for (i, (blob, compression)) in manifest.layers.iter().zip(compressions).enumerate() {
-        let path = layers_dir.join(format!("{i:04}.layer"));
-        oci.pull_docker_blob_to_file(image_uri, blob, &path).await?;
-        compressed_bytes = compressed_bytes.saturating_add(blob.size);
-        tracing::debug!(
-            layer = i,
-            digest = %blob.digest,
-            bytes = blob.size,
-            ?compression,
-            "layer pulled to scratch"
-        );
-        layers.push(PulledLayer {
-            path,
-            compression,
-            digest: blob.digest.clone(),
-        });
+    let layers = manifest
+        .layers
+        .iter()
+        .zip(compressions)
+        .enumerate()
+        .map(|(index, (blob, compression))| {
+            compressed_bytes = compressed_bytes.saturating_add(blob.size);
+            LayerPlan {
+                blob: blob.clone(),
+                compression,
+                index,
+            }
+        })
+        .collect();
+
+    Ok(ResolvedImage {
+        manifest_digest: manifest.manifest_digest.as_str().to_string(),
+        oci_defaults,
+        layers,
+        compressed_bytes,
+    })
+}
+
+/// Stream one planned layer to `layers_dir/<index>.layer`. Digest
+/// verification + range-resume retry live in `engram-oci`.
+pub async fn download_layer(
+    oci: &OciClient,
+    image_uri: &str,
+    plan: &LayerPlan,
+    layers_dir: &Path,
+) -> Result<PulledLayer, PullError> {
+    let path = layers_dir.join(format!("{:04}.layer", plan.index));
+    oci.pull_docker_blob_to_file(image_uri, &plan.blob, &path)
+        .await?;
+    tracing::debug!(
+        layer = plan.index,
+        digest = %plan.blob.digest,
+        bytes = plan.blob.size,
+        compression = ?plan.compression,
+        "layer pulled to scratch"
+    );
+    Ok(PulledLayer {
+        path,
+        compression: plan.compression,
+        digest: plan.blob.digest.clone(),
+    })
+}
+
+/// Run the whole pull stage sequentially: [`resolve_image`] + one
+/// [`download_layer`] per layer. The single-caller convenience (tests,
+/// the bake); the materializer's hot path pipelines downloads with the
+/// flatten instead.
+pub async fn pull_image(
+    oci: &OciClient,
+    image_uri: &str,
+    platform: Platform,
+    layers_dir: &Path,
+) -> Result<PulledImage, PullError> {
+    let resolved = resolve_image(oci, image_uri, platform).await?;
+    tokio::fs::create_dir_all(layers_dir).await?;
+    let mut layers = Vec::with_capacity(resolved.layers.len());
+    for plan in &resolved.layers {
+        layers.push(download_layer(oci, image_uri, plan, layers_dir).await?);
     }
 
     tracing::info!(
         image = %image_uri,
         platform = %platform,
         layers = layers.len(),
-        compressed_bytes,
-        manifest = %manifest.manifest_digest.as_str(),
+        compressed_bytes = resolved.compressed_bytes,
+        manifest = %resolved.manifest_digest,
         "image pulled"
     );
 
     Ok(PulledImage {
         layers,
-        oci_defaults,
-        compressed_bytes,
-        manifest_digest: manifest.manifest_digest.as_str().to_string(),
+        oci_defaults: resolved.oci_defaults,
+        compressed_bytes: resolved.compressed_bytes,
+        manifest_digest: resolved.manifest_digest,
     })
 }
 

@@ -1532,6 +1532,7 @@ dependencies = [
  "engram-storage-local",
  "filetime",
  "flate2",
+ "futures",
  "http",
  "parking_lot",
  "ruzstd",
