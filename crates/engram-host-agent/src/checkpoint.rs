@@ -143,6 +143,9 @@ impl CheckpointRecord {
 /// kernel crash, which also kills the FC VM — and rehydrate only seeds
 /// sandboxes that actually reattached, so a resurrected stale record is
 /// unreachable and swept by the startup GC.
+///
+/// All mutation goes through [`ChainHeadStore`] (never bare file ops) —
+/// see its doc for the cancellation-ordering guarantee.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainHeadRecord {
     pub sandbox_id: SandboxId,
@@ -158,13 +161,6 @@ impl ChainHeadRecord {
     /// `records/`).
     pub fn subdir(checkpoint_dir: &Path) -> PathBuf {
         checkpoint_dir.join("chains")
-    }
-
-    /// Durably persist (tmp + fsync + rename) — call ONLY after the
-    /// in-RAM chain advanced to `manifest_ref` and that manifest is in
-    /// the chunk store.
-    pub async fn persist(&self, dir: &Path) -> std::io::Result<()> {
-        crate::durable_record::persist(dir, self.sandbox_id, self, "chain-head record").await
     }
 
     /// The record for one sandbox; `None` if absent or torn (a torn
@@ -187,31 +183,157 @@ impl ChainHeadRecord {
     pub async fn load_all(dir: &Path) -> Vec<ChainHeadRecord> {
         crate::durable_record::load_all(dir, "chain-head record").await
     }
+}
+
+/// Owner of every [`ChainHeadRecord`] MUTATION, closing the detached-
+/// tail cancellation race: `tokio::fs`/`spawn_blocking` operations keep
+/// running after their awaiting future is cancelled, and cancellation
+/// also releases the capture lock — so a cancelled `persist`'s rename
+/// could land AFTER a later capture's write-ahead invalidate,
+/// resurrecting a record whose baseline that capture's FC create just
+/// consumed (the corruption the write-ahead protocol exists to
+/// prevent).
+///
+/// The guard: a per-sandbox **epoch** bumped by every invalidate,
+/// atomically with the unlink, under a per-sandbox mutex. A persist
+/// captures the epoch when it is INITIATED (under the capture lock,
+/// after its own capture's invalidate) and re-checks it under the same
+/// mutex immediately before the rename — a detached tail that lost the
+/// race to a newer invalidate refuses to publish, in either interleaving:
+///
+/// - tail publishes first → the newer invalidate's unlink removes it;
+/// - the newer invalidate runs first → the tail's epoch check fails.
+///
+/// Epochs are in-process state, which is sufficient: a dead process's
+/// detached tails die with it, and cross-process ordering is what the
+/// on-disk write-ahead protocol itself provides. Per-sandbox states are
+/// kept for the process lifetime (bytes each; a removed entry could
+/// let a detached tail race a fresh one).
+pub struct ChainHeadStore {
+    dir: PathBuf,
+    states: dashmap::DashMap<SandboxId, Arc<RecState>>,
+}
+
+#[derive(Default)]
+struct RecState {
+    /// Bumped (under `io`) by every invalidate; a persist initiated
+    /// before the bump refuses to publish.
+    epoch: std::sync::atomic::AtomicU64,
+    /// Serializes the epoch-check+rename / bump+unlink transactions.
+    io: std::sync::Mutex<()>,
+}
+
+/// Collision-free temp names across a live persist and a detached tail
+/// for the same sandbox (a shared temp path would let the tail's
+/// cleanup delete the live persist's staged bytes).
+static PERSIST_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl ChainHeadStore {
+    pub fn new(checkpoint_dir: &Path) -> Self {
+        Self {
+            dir: ChainHeadRecord::subdir(checkpoint_dir),
+            states: dashmap::DashMap::new(),
+        }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn state(&self, id: SandboxId) -> Arc<RecState> {
+        self.states.entry(id).or_default().clone()
+    }
 
     /// Write-ahead invalidate: MUST complete before the FC snapshot
-    /// create is issued (see the type doc). Absent is fine; any other
-    /// failure must abort the capture — proceeding would leave a record
-    /// whose baseline the create is about to consume.
-    pub async fn invalidate(dir: &Path, id: SandboxId) -> std::io::Result<()> {
-        match tokio::fs::remove_file(crate::durable_record::record_path(dir, id)).await {
+    /// create is issued (see [`ChainHeadRecord`]'s doc). Sync and
+    /// inline — one unlink, no await point a cancellation could split.
+    /// Absent is fine; any other failure must abort the capture —
+    /// proceeding would leave a record whose baseline the create is
+    /// about to consume.
+    pub fn invalidate(&self, id: SandboxId) -> std::io::Result<()> {
+        let st = self.state(id);
+        let _g = st.io.lock().expect("chain-head io lock poisoned");
+        st.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match std::fs::remove_file(crate::durable_record::record_path(&self.dir, id)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
     }
 
-    /// Best-effort removal for teardown/poison paths (the write-ahead
-    /// invalidate already guarantees absence on every capture path; this
-    /// is the defensive double-unlink). Sync — a local unlink is
-    /// cheaper than the DashMap ops around these call sites.
-    pub fn remove_best_effort(dir: &Path, id: SandboxId) {
-        let path = crate::durable_record::record_path(dir, id);
-        if let Err(e) = std::fs::remove_file(&path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %path.display(), error = %e,
-                    "chain-head record removal failed");
-            }
+    /// Best-effort invalidate for teardown/poison paths (the capture
+    /// paths' write-ahead invalidate already guarantees absence; this
+    /// is the defensive double-unlink — it still bumps the epoch, so it
+    /// also fences any straggling persist).
+    pub fn remove_best_effort(&self, id: SandboxId) {
+        if let Err(e) = self.invalidate(id) {
+            tracing::warn!(sandbox_id = %id, error = %e,
+                "chain-head record removal failed");
         }
+    }
+
+    /// Durably persist (tmp + fsync + epoch-checked rename + dir fsync)
+    /// — call ONLY after the in-RAM chain advanced to the record's
+    /// `manifest_ref` and that manifest is in the chunk store. The whole
+    /// transaction runs in one `spawn_blocking`; if the awaiting future
+    /// is cancelled the detached transaction still either publishes
+    /// atomically (and a subsequent invalidate removes it) or refuses
+    /// because the epoch moved. `Ok` includes the superseded no-op.
+    pub async fn persist(&self, record: ChainHeadRecord) -> std::io::Result<()> {
+        let st = self.state(record.sandbox_id);
+        let epoch0 = st.epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || Self::persist_at_epoch(&dir, &st, record, epoch0))
+            .await
+            .map_err(|e| std::io::Error::other(format!("chain-head persist join: {e}")))?
+    }
+
+    /// The blocking transaction body; `epoch0` is the epoch observed
+    /// when the persist was initiated. Split out (and epoch-explicit)
+    /// so the detached-tail interleaving is deterministically testable.
+    fn persist_at_epoch(
+        dir: &Path,
+        st: &RecState,
+        record: ChainHeadRecord,
+        epoch0: u64,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let dest = crate::durable_record::record_path(dir, record.sandbox_id);
+        let nonce = PERSIST_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dest.with_extension(format!("json.partial.{nonce}"));
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|e| std::io::Error::other(format!("serialize chain-head record: {e}")))?;
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        {
+            let _g = st.io.lock().expect("chain-head io lock poisoned");
+            if st.epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch0 {
+                // A newer invalidate fenced this persist off — its
+                // record describes a baseline an FC create has since
+                // consumed. Publishing it would be the resurrection
+                // this store exists to prevent.
+                let _ = std::fs::remove_file(&tmp);
+                tracing::debug!(
+                    sandbox_id = %record.sandbox_id,
+                    "chain-head persist superseded by a newer invalidate; not published",
+                );
+                return Ok(());
+            }
+            std::fs::rename(&tmp, &dest)?;
+        }
+        // Dir fsync so the rename itself is crash-durable (matches
+        // durable_record::persist).
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Test-only view of a sandbox's current epoch (to simulate a
+    /// detached persist tail deterministically).
+    #[cfg(test)]
+    fn epoch_for_test(&self, id: SandboxId) -> u64 {
+        self.state(id)
+            .epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -374,4 +496,77 @@ pub fn spawn_checkpoint_driver(
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(id: SandboxId) -> ChainHeadRecord {
+        ChainHeadRecord {
+            sandbox_id: id,
+            manifest_ref: ManifestRef::new(),
+            session_id: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// The detached-tail interleaving from the adversarial review: a
+    /// persist whose awaiting future was cancelled keeps running on the
+    /// blocking pool while the capture lock is released; a NEWER
+    /// capture's write-ahead invalidate then runs, and the tail's
+    /// rename must NOT resurrect the old head afterwards. Simulated
+    /// deterministically by capturing the epoch (what a persist does at
+    /// initiation) and running the blocking transaction only AFTER the
+    /// invalidate.
+    #[tokio::test]
+    async fn stale_persist_tail_cannot_resurrect_an_invalidated_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ChainHeadStore::new(tmp.path());
+        let id = SandboxId::new();
+
+        // Baseline: a current-epoch persist publishes.
+        let first = record(id);
+        store.persist(first.clone()).await.unwrap();
+        assert_eq!(
+            ChainHeadRecord::load(store.dir(), id)
+                .await
+                .unwrap()
+                .manifest_ref,
+            first.manifest_ref,
+        );
+
+        // The tail: initiated (epoch captured) before the next
+        // capture's invalidate...
+        let stale_epoch = store.epoch_for_test(id);
+        let stale = record(id);
+        // ...the next capture invalidates (bump + unlink)...
+        store.invalidate(id).unwrap();
+        assert!(ChainHeadRecord::load(store.dir(), id).await.is_none());
+        // ...and the detached transaction finally runs: it must refuse.
+        let st = store.state(id);
+        ChainHeadStore::persist_at_epoch(store.dir(), &st, stale, stale_epoch).unwrap();
+        assert!(
+            ChainHeadRecord::load(store.dir(), id).await.is_none(),
+            "a persist initiated before an invalidate must never publish after it",
+        );
+        // No stray temp files left behind either.
+        let leftovers = std::fs::read_dir(store.dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .count();
+        assert_eq!(leftovers, 0, "superseded persist must clean its temp file");
+
+        // The ratchet resumes: a persist initiated AFTER the invalidate
+        // publishes normally.
+        let next = record(id);
+        store.persist(next.clone()).await.unwrap();
+        assert_eq!(
+            ChainHeadRecord::load(store.dir(), id)
+                .await
+                .unwrap()
+                .manifest_ref,
+            next.manifest_ref,
+        );
+    }
 }

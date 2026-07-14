@@ -580,6 +580,12 @@ pub struct PooledBackend {
     /// stays pure-Full and the periodic driver no-ops — the rollout
     /// gate, and the natural state for non-FC backends.
     checkpoint_dir: Option<PathBuf>,
+    /// Durable mirror of the chain heads (survivor rehydrate after a
+    /// pod roll) — every record mutation routes through this store so
+    /// a cancelled persist's detached tail can never resurrect a record
+    /// a later capture invalidated (see [`crate::checkpoint::ChainHeadStore`]).
+    /// `Some` ⟺ `checkpoint_dir` is `Some`.
+    chain_heads: Option<Arc<crate::checkpoint::ChainHeadStore>>,
     /// ADR 0028 Fix A: per-sandbox rolling chain state. Present once
     /// the first (Full, seeding) checkpoint completed; every
     /// subsequent `snapshot()` on that sandbox — periodic checkpoint
@@ -1661,6 +1667,7 @@ impl PooledBackend {
             live_manifest_publisher: Arc::new(crate::disk_daemon::NoOpLiveManifestPublisher),
             live_manifest_publisher_handle: None,
             checkpoint_dir: None,
+            chain_heads: None,
             checkpoint_chains: Arc::new(DashMap::new()),
             capture_locks: Arc::new(DashMap::new()),
             snapshot_waits: Arc::new(DashMap::new()),
@@ -1744,6 +1751,7 @@ impl PooledBackend {
     /// this, `snapshot()` stays pure-Full and the periodic driver
     /// no-ops.
     pub fn with_checkpoint_dir(mut self, dir: PathBuf) -> Self {
+        self.chain_heads = Some(Arc::new(crate::checkpoint::ChainHeadStore::new(&dir)));
         self.checkpoint_dir = Some(dir);
         self
     }
@@ -1802,6 +1810,7 @@ impl PooledBackend {
             last_snapshot_unix_ms: self.last_snapshot_unix_ms.clone(),
             checkpoint_chains: self.checkpoint_chains.clone(),
             checkpoint_dir: self.checkpoint_dir.clone(),
+            chain_heads: self.chain_heads.clone(),
             session_bindings: self.session_bindings.clone(),
         }
     }
@@ -1984,12 +1993,10 @@ impl PooledBackend {
         // (non-NotFound) aborts the capture: nothing is paused or
         // consumed yet, and proceeding would leave a stale record the
         // create is about to falsify.
-        if let Some(dir) = self.chain_heads_dir() {
-            crate::checkpoint::ChainHeadRecord::invalidate(&dir, id)
-                .await
-                .map_err(|e| {
-                    SandboxError::Snapshot(format!("chain-head write-ahead invalidate: {e}"))
-                })?;
+        if let Some(store) = &self.chain_heads {
+            store.invalidate(id).map_err(|e| {
+                SandboxError::Snapshot(format!("chain-head write-ahead invalidate: {e}"))
+            })?;
         }
 
         // ADR 0014 issue #1/#2: if a prior snapshot for this sandbox
@@ -2189,7 +2196,7 @@ impl PooledBackend {
                 if chain_prev.is_some() {
                     poison_checkpoint_chain_after_failed_diff(
                         &self.checkpoint_chains,
-                        self.chain_heads_dir().as_deref(),
+                        self.chain_heads.as_deref(),
                         id,
                         "fc snapshot_diff create",
                     );
@@ -2903,7 +2910,7 @@ impl PooledBackend {
         // wait for the catch-up's put_manifest — a pod roll mid-catch-up
         // then rehydrates nothing (Full, safe) instead of a head whose
         // chunks never reached GCS.
-        let chain_heads_dir = self.chain_heads_dir();
+        let chain_heads = self.chain_heads.clone();
         let chain_session = self.session_bindings.get(&id).map(|s| *s);
         let handle = tokio::spawn(async move {
             let _capture_guard = capture_guard;
@@ -2960,14 +2967,14 @@ impl PooledBackend {
             // capture_guard is still held, so no capture can have
             // invalidated in between). Best-effort like every other
             // chain-head write.
-            if let Some(dir) = &chain_heads_dir {
+            if let Some(store) = &chain_heads {
                 let record = crate::checkpoint::ChainHeadRecord {
                     sandbox_id: id,
                     manifest_ref: mig.memory_manifest_ref,
                     session_id: chain_session,
                     updated_at: chrono::Utc::now(),
                 };
-                if let Err(e) = record.persist(dir).await {
+                if let Err(e) = store.persist(record).await {
                     tracing::warn!(sandbox_id = %id, error = %e,
                         "migration catch-up: chain-head record write failed");
                 }
@@ -3106,15 +3113,6 @@ impl PooledBackend {
         self.checkpoint_chains.get(&id).map(|c| c.manifest_ref)
     }
 
-    /// Where the durable chain-head records live (see
-    /// [`crate::checkpoint::ChainHeadRecord`]). `None` ⟺ checkpointing
-    /// disabled, same gate as the chains themselves.
-    fn chain_heads_dir(&self) -> Option<PathBuf> {
-        self.checkpoint_dir
-            .as_ref()
-            .map(|d| crate::checkpoint::ChainHeadRecord::subdir(d))
-    }
-
     /// Re-seed checkpoint chains for VMs that survived a host-agent
     /// restart (pidfd reattach, ADR 0044 K2 / ADR 0090), from the
     /// durable [`crate::checkpoint::ChainHeadRecord`]s — and GC records
@@ -3134,7 +3132,7 @@ impl PooledBackend {
     /// evict_local capture is precisely the one that must not be a
     /// Full.
     pub async fn rehydrate_chain_heads(&self) {
-        let Some(dir) = self.chain_heads_dir() else {
+        let Some(store) = self.chain_heads.clone() else {
             return;
         };
         let Some(chunk_store) = self.chunk_store.clone() else {
@@ -3147,13 +3145,14 @@ impl PooledBackend {
                 return;
             }
         };
+        let dir = store.dir().to_path_buf();
         for record in crate::checkpoint::ChainHeadRecord::load_all(&dir).await {
             let id = record.sandbox_id;
             if !live.contains(&id) {
                 // The sandbox didn't survive (node reboot, destroyed
                 // while the record write raced teardown) — the record
                 // is unreachable; sweep it.
-                crate::checkpoint::ChainHeadRecord::remove_best_effort(&dir, id);
+                store.remove_best_effort(id);
                 continue;
             }
             // Serialize against any capture already running for this
@@ -4638,16 +4637,17 @@ pub(crate) struct SnapshotCapture {
 /// sites.)
 fn poison_checkpoint_chain_after_failed_diff(
     chains: &DashMap<SandboxId, crate::checkpoint::CheckpointChain>,
-    chain_heads_dir: Option<&std::path::Path>,
+    chain_heads: Option<&crate::checkpoint::ChainHeadStore>,
     id: SandboxId,
     failed_step: &str,
 ) {
     // The durable chain-head record was already write-ahead-removed
     // before the FC create (capture_phase / migration_capture), so this
     // is the defensive double-unlink — the poison must never leave a
-    // record a post-roll rehydrate could seed from.
-    if let Some(dir) = chain_heads_dir {
-        crate::checkpoint::ChainHeadRecord::remove_best_effort(dir, id);
+    // record a post-roll rehydrate could seed from. (It also bumps the
+    // store epoch, fencing any straggling persist.)
+    if let Some(store) = chain_heads {
+        store.remove_best_effort(id);
     }
     if chains.remove(&id).is_some() {
         metrics::counter!(crate::metrics::CHECKPOINT_CHAIN_POISONED_TOTAL).increment(1);
@@ -4678,6 +4678,7 @@ pub(crate) struct SnapshotFinisher {
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
     checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
     checkpoint_dir: Option<PathBuf>,
+    chain_heads: Option<Arc<crate::checkpoint::ChainHeadStore>>,
     session_bindings: Arc<DashMap<SandboxId, SessionId>>,
 }
 
@@ -4951,7 +4952,7 @@ impl SnapshotFinisher {
                 if chain_prev.is_some() {
                     poison_checkpoint_chain_after_failed_diff(
                         &self.checkpoint_chains,
-                        self.chain_heads_dir().as_deref(),
+                        self.chain_heads.as_deref(),
                         id,
                         "snapshot post-processing",
                     );
@@ -4990,24 +4991,21 @@ impl SnapshotFinisher {
         self.checkpoint_dir.as_ref().map(|d| d.join("records"))
     }
 
-    fn chain_heads_dir(&self) -> Option<PathBuf> {
-        self.checkpoint_dir
-            .as_ref()
-            .map(|d| crate::checkpoint::ChainHeadRecord::subdir(d))
-    }
-
     /// Durably mirror the in-RAM chain head at `manifest_ref` (which
     /// MUST already be published in the chunk store — every caller sits
     /// after a successful `put_manifest` or a fetch of an existing
     /// manifest). Best-effort: a failed write just means a post-roll
     /// rehydrate finds no record and the survivor's next capture is a
     /// Full — safe, slower, and self-healing at the next checkpoint.
+    /// Routed through the [`crate::checkpoint::ChainHeadStore`] so a
+    /// cancelled write's detached tail can never outlive a later
+    /// invalidate.
     async fn persist_chain_head(
         &self,
         id: SandboxId,
         manifest_ref: engram_core::types::manifest::ManifestRef,
     ) {
-        let Some(dir) = self.chain_heads_dir() else {
+        let Some(store) = &self.chain_heads else {
             return;
         };
         let record = crate::checkpoint::ChainHeadRecord {
@@ -5016,7 +5014,7 @@ impl SnapshotFinisher {
             session_id: self.session_bindings.get(&id).map(|s| *s),
             updated_at: chrono::Utc::now(),
         };
-        if let Err(e) = record.persist(&dir).await {
+        if let Err(e) = store.persist(record).await {
             tracing::warn!(
                 sandbox_id = %id,
                 manifest = %manifest_ref,
@@ -5897,7 +5895,7 @@ impl SandboxBackend for PooledBackend {
                     if chain_prev.is_some() {
                         poison_checkpoint_chain_after_failed_diff(
                             &self.checkpoint_chains,
-                            self.chain_heads_dir().as_deref(),
+                            self.chain_heads.as_deref(),
                             id,
                             "eviction disk-pending persist",
                         );
@@ -5956,7 +5954,7 @@ impl SandboxBackend for PooledBackend {
             if record.chain_prev_ref.is_some() {
                 poison_checkpoint_chain_after_failed_diff(
                     &self.checkpoint_chains,
-                    self.chain_heads_dir().as_deref(),
+                    self.chain_heads.as_deref(),
                     id,
                     "eviction finalizer unavailable",
                 );
@@ -5978,7 +5976,7 @@ impl SandboxBackend for PooledBackend {
             if record.chain_prev_ref.is_some() {
                 poison_checkpoint_chain_after_failed_diff(
                     &self.checkpoint_chains,
-                    self.chain_heads_dir().as_deref(),
+                    self.chain_heads.as_deref(),
                     id,
                     "eviction finalize-record persist",
                 );
@@ -6623,12 +6621,10 @@ impl SandboxBackend for PooledBackend {
         // `!vmstate_only`), and an aborted C2 resumes with bitmap AND
         // chain intact — removing the record there would needlessly
         // cost the survivor a Full after a later roll.
-        if let Some(dir) = self.chain_heads_dir() {
-            crate::checkpoint::ChainHeadRecord::invalidate(&dir, id)
-                .await
-                .map_err(|e| {
-                    SandboxError::Snapshot(format!("chain-head write-ahead invalidate: {e}"))
-                })?;
+        if let Some(store) = &self.chain_heads {
+            store.invalidate(id).map_err(|e| {
+                SandboxError::Snapshot(format!("chain-head write-ahead invalidate: {e}"))
+            })?;
         }
 
         match self.inner.wait_agent_ready(id).await {
@@ -6765,7 +6761,7 @@ impl SandboxBackend for PooledBackend {
             Err(e) => {
                 poison_checkpoint_chain_after_failed_diff(
                     &self.checkpoint_chains,
-                    self.chain_heads_dir().as_deref(),
+                    self.chain_heads.as_deref(),
                     id,
                     "migration diff capture",
                 );
@@ -7404,8 +7400,8 @@ impl SandboxBackend for PooledBackend {
         // running unaffected: it is a pure function of `dest` + the chunk
         // store, never the live sandbox, and this method deletes neither.
         let _ = self.checkpoint_chains.remove(&id);
-        if let Some(dir) = self.chain_heads_dir() {
-            crate::checkpoint::ChainHeadRecord::remove_best_effort(&dir, id);
+        if let Some(store) = &self.chain_heads {
+            store.remove_best_effort(id);
         }
         let _ = self.capture_locks.remove(&id);
         // Issue #221: reclaim any unconsumed `snapshot_wait` slot. The
