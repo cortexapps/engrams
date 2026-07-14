@@ -527,9 +527,15 @@ pub trait SandboxBackend: Send + Sync {
     /// reclaimed (may be < target — the guest gives what it can).
     /// Used by the capture-time cold-base seed shrink: ballooned pages
     /// are host-`MADV_DONTNEED`ed, so the dense memory dump reads
-    /// zeros there and the all-zero chunk elision drops them. Default
-    /// errors `InvalidSpec` — only FC wires a balloon; callers treat
-    /// that as "no balloon, dense seed" (fail-open).
+    /// zeros there and the all-zero chunk elision drops them.
+    ///
+    /// Error contract (adversarial-review fix): `InvalidSpec` is the
+    /// TYPED "no balloon device / unsupported backend" outcome — the
+    /// inflate never landed and there is nothing to release. Any OTHER
+    /// error means the balloon state is UNKNOWN (the inflate target
+    /// may have landed before the failure): callers must normalize via
+    /// [`Self::balloon_release`] before running guest workloads, and
+    /// must fail rather than proceed if that release cannot confirm.
     async fn balloon_reclaim(
         &self,
         _id: SandboxId,
@@ -541,10 +547,14 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
-    /// Deflate the balloon fully (`amount_mib = 0`). `InvalidSpec` also
-    /// covers "this VM carries no balloon device" (e.g. a legacy cold
-    /// base restored under a balloon-aware host) — callers on the
-    /// restore path treat that as a no-op.
+    /// Deflate the balloon fully AND CONFIRM the guest took its pages
+    /// back (`actual == 0`) before returning — the target PATCH alone
+    /// is asynchronous and MUST NOT be reported as a completed release
+    /// (adversarial-review fix). `InvalidSpec` is the one benign
+    /// outcome: this VM carries no balloon device (legacy cold base
+    /// restored under a balloon-aware host, non-FC backend) — callers
+    /// on the restore path treat exactly that as a no-op and every
+    /// other error as fatal to the capture.
     async fn balloon_release(&self, _id: SandboxId) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `balloon_release` (FC-only)".into(),

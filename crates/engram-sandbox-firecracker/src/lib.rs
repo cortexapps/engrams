@@ -4447,13 +4447,41 @@ impl SandboxBackend for FirecrackerBackend {
             .firecracker_socket
             .clone();
         let api = FirecrackerClient::new(&socket);
-        api.patch_balloon(target_mib).await?;
+        // Adversarial-review fix: the initial PATCH is the one place
+        // "400 ⇒ no balloon device" is a sound, TYPED inference (the
+        // request is fixed-shape) — surface it as InvalidSpec so
+        // callers can distinguish "nothing to release" from "balloon
+        // state unknown".
+        api.patch_balloon(target_mib).await.map_err(|e| {
+            if client::is_balloon_device_missing(&e) {
+                SandboxError::InvalidSpec(format!("no balloon device in this VM: {e}"))
+            } else {
+                e
+            }
+        })?;
         let started = std::time::Instant::now();
         let mut last_actual = 0u64;
         let mut stable_reads = 0u32;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let stats = api.get_balloon_statistics().await?;
+            // Adversarial-review fix: from here the inflate PATCH has
+            // LANDED — any polling error must not strand the balloon at
+            // the high target. Best-effort rollback before propagating;
+            // the caller still owes a release-and-confirm on this path.
+            let stats = match api.get_balloon_statistics().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        error = %e,
+                        "balloon statistics poll failed after inflate PATCH; rolling target back to 0",
+                    );
+                    if let Err(rollback) = api.patch_balloon(0).await {
+                        tracing::warn!(sandbox_id = %id, error = %rollback, "balloon rollback PATCH failed too");
+                    }
+                    return Err(e);
+                }
+            };
             if stats.actual_mib >= target_mib {
                 last_actual = stats.actual_mib;
                 break;
@@ -4483,6 +4511,13 @@ impl SandboxBackend for FirecrackerBackend {
         Ok(last_actual)
     }
 
+    /// Adversarial-review fix: a release is only a release once the
+    /// GUEST has taken its pages back — the target PATCH is
+    /// asynchronous (the reclaim loop above exists precisely because
+    /// target ≠ actual). Deflate is fast (the driver just reclaims the
+    /// ballooned pages), so the confirm loop is normally one or two
+    /// polls; a guest that cannot deflate within the deadline is a
+    /// guest we must not run a warm hook in, surfaced as an error.
     async fn balloon_release(&self, id: SandboxId) -> Result<(), SandboxError> {
         let socket = self
             .sandboxes
@@ -4491,7 +4526,35 @@ impl SandboxBackend for FirecrackerBackend {
             .state
             .firecracker_socket
             .clone();
-        FirecrackerClient::new(&socket).patch_balloon(0).await
+        let api = FirecrackerClient::new(&socket);
+        api.patch_balloon(0).await.map_err(|e| {
+            if client::is_balloon_device_missing(&e) {
+                SandboxError::InvalidSpec(format!("no balloon device in this VM: {e}"))
+            } else {
+                e
+            }
+        })?;
+        const DEFLATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        loop {
+            let stats = api.get_balloon_statistics().await?;
+            if stats.actual_mib == 0 {
+                tracing::debug!(
+                    sandbox_id = %id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "balloon deflate confirmed (actual_mib=0)",
+                );
+                return Ok(());
+            }
+            if started.elapsed() >= DEFLATE_DEADLINE {
+                return Err(SandboxError::Snapshot(format!(
+                    "balloon deflate did not complete within {DEFLATE_DEADLINE:?} \
+                     (actual_mib={} still ballooned)",
+                    stats.actual_mib,
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
     }
 
     /// ADR 0018 commit 12m: symmetric companion to `pause`. Resume

@@ -291,6 +291,17 @@ dev-brain class; small images (~1.5 min end-to-end) must not regress.
   scratch (lookahead + 1 layer vs the old all-layers-then-flatten).
 - Everything landed with **zero migrations and zero wire-stage
   changes**, as planned.
+- **Balloon lifecycle hardened after adversarial review** (post-open):
+  `balloon_release` now polls until `actual == 0` (a target PATCH alone
+  is asynchronous and was being reported as a completed release);
+  "no balloon device" became a TYPED outcome (fixed-shape requests ⇒ a
+  400 from `/balloon` can only mean device-absent), and it is the ONLY
+  fail-open path. Any other reclaim failure is treated as "the inflate
+  may have landed" and normalized via release-and-confirm — or fails
+  the capture — so no path runs a warm hook with the balloon state
+  unknown. The Hit-path deflate moved inside the teardown-covered
+  capture block (a deflate failure destroys the restored VM instead of
+  leaking it to the reconcile).
 
 ### Future direction: a streaming packer
 

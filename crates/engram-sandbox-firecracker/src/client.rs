@@ -668,6 +668,29 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
 // Field names match the Firecracker swagger schema; serde_json picks
 // snake_case automatically so we don't need rename_all.
 
+/// Adversarial-review fix (ADR 0088 addendum): is this error
+/// Firecracker telling us the VM simply has NO balloon device?
+///
+/// Our balloon requests are FIXED-SHAPE (static JSON, no user input),
+/// so a 400 from a `/balloon` endpoint cannot mean "malformed request"
+/// — it can only mean the device isn't configured in this VM (legacy
+/// snapshot, `ENGRAM_FC_BALLOON=0` create, stats not enabled). That is
+/// the one benign outcome callers are allowed to tolerate; transport
+/// errors and 5xx stay opaque (real failures that must not be
+/// swallowed). Matched on `parse_response`'s stable rendering
+/// (`"Firecracker <METHOD> /balloon… -> 400: …"`) because FC's control
+/// plane exposes no machine-readable fault code beyond the HTTP
+/// status.
+pub fn is_balloon_device_missing(e: &SandboxError) -> bool {
+    match e {
+        SandboxError::Vm(inner) => {
+            let msg = inner.to_string();
+            msg.contains("/balloon") && msg.contains("-> 400:")
+        }
+        _ => false,
+    }
+}
+
 /// `PUT /balloon` payload (pre-boot device attach).
 #[derive(Debug, Clone, Serialize)]
 pub struct BalloonConfig {
@@ -1198,6 +1221,42 @@ mod tests {
             serde_json::to_string(&VmState::Resumed).unwrap(),
             "\"Resumed\""
         );
+    }
+
+    /// Adversarial-review fix: the "no balloon device" classifier keys
+    /// off exactly a 400 from a `/balloon` endpoint (fixed-shape
+    /// requests ⇒ 400 ≡ device absent) — 5xx and non-balloon 400s must
+    /// stay opaque so real failures are never swallowed as benign.
+    #[test]
+    fn balloon_device_missing_classifies_only_balloon_400s() {
+        let err_for = |method: &str, path: &str, code: u16| {
+            let raw = format!(
+                "HTTP/1.1 {code} X\r\nContent-Length: 26\r\n\r\n{{\"fault_message\":\"nope\"}}  "
+            );
+            parse_response(method, path, raw.as_bytes()).unwrap_err()
+        };
+        assert!(is_balloon_device_missing(&err_for(
+            "PATCH", "/balloon", 400
+        )));
+        assert!(is_balloon_device_missing(&err_for(
+            "GET",
+            "/balloon/statistics",
+            400
+        )));
+        // 5xx from a balloon endpoint: a real failure, not "no device".
+        assert!(!is_balloon_device_missing(&err_for(
+            "PATCH", "/balloon", 500
+        )));
+        // 400 from a non-balloon endpoint: unrelated.
+        assert!(!is_balloon_device_missing(&err_for(
+            "PUT",
+            "/machine-config",
+            400
+        )));
+        // Non-Vm errors: unrelated.
+        assert!(!is_balloon_device_missing(&SandboxError::InvalidSpec(
+            "x".into()
+        )));
     }
 
     #[test]

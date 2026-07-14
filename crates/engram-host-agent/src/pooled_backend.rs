@@ -717,6 +717,63 @@ fn progress_line_detail(line: &crate::warm_progress::WarmProgressLine) -> Option
 /// Record `engram_warm_hook_stage_seconds` for every CLOSED stage in a
 /// `[warm]`-hook stage history (the still-open stage, if any — `outcome:
 /// Running` — has no duration to record).
+/// ADR 0088 addendum (adversarial-review fix): the pre-seed balloon
+/// inflate with rollback-safe cleanup. Returns:
+///
+/// - `Ok(true)` — the inflate PATCH landed (whatever the guest granted,
+///   including 0 MiB): the caller OWES a confirmed `balloon_release`
+///   before any guest workload runs.
+/// - `Ok(false)` — no balloon in play (target 0, the TYPED no-device
+///   `InvalidSpec`, or a failed reclaim that was successfully
+///   normalized back to deflated): dense seed, nothing to release.
+/// - `Err` — the reclaim failed AND the balloon could not be confirmed
+///   deflated: the capture must fail rather than run a warm hook in a
+///   possibly-starved guest.
+///
+/// The reclaim's `InvalidSpec` is the only fail-open path; every other
+/// reclaim error is treated as "the inflate target may have landed"
+/// (it is PATCHed before the first statistics poll) and normalized via
+/// release-and-confirm.
+async fn balloon_inflate_for_seed(
+    inner: &dyn SandboxBackend,
+    id: SandboxId,
+    target_mib: u64,
+    deadline: std::time::Duration,
+) -> Result<bool, SandboxError> {
+    if target_mib == 0 {
+        return Ok(false);
+    }
+    match inner.balloon_reclaim(id, target_mib, deadline).await {
+        // Even a 0-MiB grant means the target PATCH landed — release.
+        Ok(_granted_mib) => Ok(true),
+        Err(SandboxError::InvalidSpec(msg)) => {
+            tracing::info!(
+                sandbox_id = %id,
+                detail = %msg,
+                "no balloon available; taking a dense cold-base seed",
+            );
+            Ok(false)
+        }
+        Err(reclaim_err) => {
+            tracing::warn!(
+                sandbox_id = %id,
+                error = %reclaim_err,
+                "balloon reclaim failed after the inflate may have landed; normalizing via release",
+            );
+            match inner.balloon_release(id).await {
+                // Confirmed deflated: safe to proceed with a dense seed.
+                Ok(()) => Ok(false),
+                // No device ⇒ the inflate PATCH never landed either.
+                Err(SandboxError::InvalidSpec(_)) => Ok(false),
+                Err(release_err) => Err(SandboxError::Snapshot(format!(
+                    "balloon reclaim failed ({reclaim_err}) and the normalizing release also \
+                     failed ({release_err}); balloon state unknown"
+                ))),
+            }
+        }
+    }
+}
+
 fn record_warm_stage_metrics(stages: &[engram_core::types::WarmStageRecord]) {
     use engram_core::types::WarmStageOutcome;
     for stage in stages {
@@ -7623,16 +7680,10 @@ impl SandboxBackend for PooledBackend {
                     self.seed_checkpoint_chain_forked(id, memory_ref).await;
                 }
                 // ADR 0088 addendum: a balloon-era cold base was dumped
-                // with the balloon INFLATED — deflate so the warm hook
-                // gets its RAM back. Tolerant: a legacy balloon-less
-                // base (or a non-FC backend) has nothing to deflate.
-                if let Err(e) = self.inner.balloon_release(id).await {
-                    tracing::debug!(
-                        sandbox_id = %id,
-                        error = %e,
-                        "cold-base restore: balloon deflate skipped (legacy balloon-less base?)",
-                    );
-                }
+                // with the balloon INFLATED — the deflate happens inside
+                // the teardown-covered capture block below (so a deflate
+                // failure destroys the restored VM instead of leaking it
+                // to the reconcile).
                 self.spawn_prefault_stats_probe(id);
                 id
             }
@@ -7681,6 +7732,40 @@ impl SandboxBackend for PooledBackend {
             }
             drop(boot_keepalive);
 
+            // ADR 0088 addendum (adversarial-review fix): a balloon-era
+            // cold base was dumped with the balloon INFLATED, so a Hit
+            // restore comes up ballooned — deflate AND CONFIRM
+            // (`balloon_release`'s contract) before anything runs in the
+            // guest. Only the TYPED no-device outcome (`InvalidSpec` — a
+            // legacy balloon-less base, or a non-FC backend) is a no-op;
+            // any other failure fails the capture (inside this block, so
+            // the teardown below destroys the VM rather than leaking it).
+            if matches!(cold_base_plan, ColdBasePlan::Hit { .. }) {
+                match self.inner.balloon_release(id).await {
+                    Ok(()) => {}
+                    Err(SandboxError::InvalidSpec(msg)) => {
+                        tracing::debug!(
+                            sandbox_id = %id,
+                            detail = %msg,
+                            "cold-base restore: no balloon device to deflate (legacy base)",
+                        );
+                    }
+                    Err(e) => {
+                        return Err(SandboxError::CaptureFailed(
+                            engram_core::types::CaptureFailure {
+                                kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
+                                stage: Some("booting".to_string()),
+                                tail: String::new(),
+                                message: format!(
+                                    "balloon deflate after cold-base restore failed: {e} — \
+                                     refusing to run the warm hook in a possibly-starved guest"
+                                ),
+                            },
+                        ));
+                    }
+                }
+            }
+
             // ADR 0084 §B3: a WARM image on a MISS needs its OWN cold
             // base minted before the hook runs (the hook must land on
             // top of an established base, not fold into the artifact's
@@ -7726,33 +7811,36 @@ impl SandboxBackend for PooledBackend {
                 // balloon hands the guest's free pages back to the host
                 // (`MADV_DONTNEED`), so the dense dump reads zeros there
                 // and the all-zero 512 KiB elision drops them from the
-                // memory manifest (~guest-RAM → ~touched-pages). FAIL-
-                // OPEN: a guest that can't balloon (kill switch, legacy
-                // kernel, VZ) just pays the dense seed, which the
-                // deferred finish hides behind the hook anyway. The
-                // reserve keeps the paused-adjacent guest comfortably
-                // functional while inflated.
+                // memory manifest (~guest-RAM → ~touched-pages).
+                // Fail-open is limited to the TYPED no-balloon outcome
+                // (kill switch, legacy kernel, VZ) — any other reclaim
+                // failure means the inflate target may have landed, and
+                // `balloon_inflate_for_seed` normalizes (release-and-
+                // confirm) or fails the capture rather than ever running
+                // the warm hook in a possibly-starved guest
+                // (adversarial-review fix). The reserve keeps the
+                // paused-adjacent guest comfortably functional while
+                // inflated.
                 const BALLOON_RESERVE_MIB: u64 = 1536;
                 let balloon_target = guest_mem_mib.saturating_sub(BALLOON_RESERVE_MIB);
-                let ballooned_mib = if balloon_target > 0 {
-                    match self
-                        .inner
-                        .balloon_reclaim(id, balloon_target, std::time::Duration::from_secs(30))
-                        .await
-                    {
-                        Ok(mib) => mib,
-                        Err(e) => {
-                            tracing::info!(
-                                sandbox_id = %id,
-                                error = %e,
-                                "balloon reclaim unavailable; taking a dense cold-base seed",
-                            );
-                            0
-                        }
-                    }
-                } else {
-                    0
-                };
+                let inflated = balloon_inflate_for_seed(
+                    self.inner.as_ref(),
+                    id,
+                    balloon_target,
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .map_err(|e| {
+                    SandboxError::CaptureFailed(engram_core::types::CaptureFailure {
+                        kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
+                        stage: Some("booting".to_string()),
+                        tail: String::new(),
+                        message: format!(
+                            "balloon state could not be normalized before the cold-base dump: \
+                             {e} — refusing to run the warm hook in a possibly-starved guest"
+                        ),
+                    })
+                })?;
 
                 let deferred = self.snapshot_deferred(id).await.map_err(|e| {
                     SandboxError::CaptureFailed(engram_core::types::CaptureFailure {
@@ -7768,8 +7856,11 @@ impl SandboxBackend for PooledBackend {
                 // FAIL-LOUD deflate: a warm hook in a balloon-starved
                 // guest (~1.5 GiB effective) is a guaranteed slow OOM-
                 // flavored failure 20 minutes later — better to fail in
-                // seconds here. Only reached when the inflate succeeded.
-                if ballooned_mib > 0 {
+                // seconds here. `balloon_release` CONFIRMS actual==0
+                // before returning; `InvalidSpec` here is ALSO fatal
+                // (the device demonstrably existed at inflate time).
+                // Only reached when the inflate landed.
+                if inflated {
                     if let Err(e) = self.inner.balloon_release(id).await {
                         // The deferred finish must still be settled
                         // (await-never-abort) before surfacing.
@@ -13519,5 +13610,188 @@ mod tests {
             None,
             "a torn record must seed nothing (treated as absent)"
         );
+    }
+
+    // ---- balloon_inflate_for_seed matrix (adversarial-review fix) ----
+    //
+    // The invariant under test: after ANY outcome, either the balloon is
+    // provably deflated / absent (Ok(false)), or the caller has been told
+    // it owes a confirmed release (Ok(true)), or the capture fails (Err).
+    // There is no path that proceeds with the balloon state unknown.
+
+    mod balloon_matrix {
+        use super::super::balloon_inflate_for_seed;
+        use async_trait::async_trait;
+        use engram_core::traits::sandbox::SandboxBackend;
+        use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
+        use engram_core::types::snapshot::SnapshotMetadata;
+        use engram_core::{SandboxError, SandboxId};
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        struct BalloonMock {
+            reclaim_result: Mutex<Option<Result<u64, SandboxError>>>,
+            release_result: Mutex<Option<Result<(), SandboxError>>>,
+            release_calls: AtomicUsize,
+        }
+
+        impl BalloonMock {
+            fn new(reclaim: Result<u64, SandboxError>, release: Result<(), SandboxError>) -> Self {
+                Self {
+                    reclaim_result: Mutex::new(Some(reclaim)),
+                    release_result: Mutex::new(Some(release)),
+                    release_calls: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl SandboxBackend for BalloonMock {
+            async fn balloon_reclaim(
+                &self,
+                _: SandboxId,
+                _: u64,
+                _: std::time::Duration,
+            ) -> Result<u64, SandboxError> {
+                self.reclaim_result
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("reclaim called once")
+            }
+            async fn balloon_release(&self, _: SandboxId) -> Result<(), SandboxError> {
+                self.release_calls.fetch_add(1, Ordering::SeqCst);
+                self.release_result
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("release called at most once")
+            }
+
+            // ---- unused required surface ----
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                unreachable!()
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                unreachable!()
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                unreachable!()
+            }
+            fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+                unreachable!()
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                unreachable!()
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                unreachable!()
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                unreachable!()
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                unreachable!()
+            }
+        }
+
+        fn vm_err(msg: &str) -> SandboxError {
+            SandboxError::Vm(msg.to_string().into())
+        }
+
+        const DL: std::time::Duration = std::time::Duration::from_secs(1);
+
+        /// A landed inflate — even a 0-MiB grant — obligates a release.
+        #[tokio::test]
+        async fn landed_inflate_owes_a_release() {
+            for granted in [0u64, 512] {
+                let mock = BalloonMock::new(Ok(granted), Ok(()));
+                let inflated = balloon_inflate_for_seed(&mock, SandboxId::new(), 1024, DL)
+                    .await
+                    .unwrap();
+                assert!(
+                    inflated,
+                    "granted={granted}: caller must be told to release"
+                );
+                assert_eq!(
+                    mock.release_calls.load(Ordering::SeqCst),
+                    0,
+                    "the helper itself must not release on the happy path \
+                     (the caller releases after the dump)"
+                );
+            }
+        }
+
+        /// The TYPED no-device outcome is the only fail-open: dense
+        /// seed, no release owed, no release attempted.
+        #[tokio::test]
+        async fn typed_no_device_is_fail_open() {
+            let mock = BalloonMock::new(
+                Err(SandboxError::InvalidSpec("no balloon device".into())),
+                Ok(()),
+            );
+            let inflated = balloon_inflate_for_seed(&mock, SandboxId::new(), 1024, DL)
+                .await
+                .unwrap();
+            assert!(!inflated);
+            assert_eq!(mock.release_calls.load(Ordering::SeqCst), 0);
+        }
+
+        /// An untyped reclaim failure (the inflate PATCH may have
+        /// landed) is normalized via release-and-confirm; a confirmed
+        /// release means a safe dense seed.
+        #[tokio::test]
+        async fn untyped_reclaim_failure_normalizes_via_release() {
+            let mock = BalloonMock::new(Err(vm_err("stats poll: connection reset")), Ok(()));
+            let inflated = balloon_inflate_for_seed(&mock, SandboxId::new(), 1024, DL)
+                .await
+                .unwrap();
+            assert!(!inflated, "normalized ⇒ dense seed, nothing owed");
+            assert_eq!(
+                mock.release_calls.load(Ordering::SeqCst),
+                1,
+                "the normalizing release MUST run on an untyped reclaim failure"
+            );
+        }
+
+        /// Reclaim failed AND the normalizing release failed: the
+        /// balloon state is unknown — the capture must fail, never
+        /// proceed to a warm hook.
+        #[tokio::test]
+        async fn unnormalizable_balloon_state_fails_the_capture() {
+            let mock = BalloonMock::new(
+                Err(vm_err("stats poll: connection reset")),
+                Err(SandboxError::Snapshot("deflate did not complete".into())),
+            );
+            let err = balloon_inflate_for_seed(&mock, SandboxId::new(), 1024, DL)
+                .await
+                .expect_err("unknown balloon state must fail the capture");
+            assert!(
+                err.to_string().contains("balloon state unknown"),
+                "error must say why: {err}"
+            );
+            assert_eq!(mock.release_calls.load(Ordering::SeqCst), 1);
+        }
+
+        /// Target 0 (tiny guest ≤ the reserve): no balloon interaction
+        /// at all.
+        #[tokio::test]
+        async fn zero_target_never_touches_the_balloon() {
+            let mock = BalloonMock::new(Ok(0), Ok(()));
+            let inflated = balloon_inflate_for_seed(&mock, SandboxId::new(), 0, DL)
+                .await
+                .unwrap();
+            assert!(!inflated);
+            assert_eq!(mock.release_calls.load(Ordering::SeqCst), 0);
+            assert!(
+                mock.reclaim_result.lock().unwrap().is_some(),
+                "reclaim must not have been called"
+            );
+        }
     }
 }
