@@ -249,6 +249,48 @@ Debuggability rider: the ADR 0025 guest kernel compiles out PSI
 (`/proc/pressure`); enable it in the next kernel rev — this
 investigation had to infer guest starvation from the host side.
 
+## Canary findings (2026-07-14, prod fleet, engrams-internal#72)
+
+The three knobs went live fleet-wide (2 kvm hosts; the chart has no
+per-node override, so control = recorded pre-flip baselines). Latency
+gates look good: demo TTFM 6.2–7.4 s sequential and 6.7 s under two
+concurrent boots (pre-flip p50 7.6 / p95 9.3, 7-day mined baseline);
+dev-brain 45.4 s (n=1) inside its pre-flip band (p50 36.9 / p95 86);
+fresh creates confirmed restoring `mode=File` with no uffd-handler.
+Three findings, first one gate-blocking:
+
+1. **Disk headroom is not a "confirm sizing" checkbox — it needed a
+   mechanism.** `/var/lib/engram` is the 300 GB boot disk (no dedicated
+   device), watched by kubelet's nodefs eviction. The ADR 0070 chunk
+   cache ceiling (~175 GB default) was derived assuming the cache owns
+   its disk fraction; the flip added ~40 GB/host of memfiles the
+   sweeper can't evict. On a warm at-budget host the sum crossed the
+   kubelet line mid-benchmark: node w8wq went NotReady with
+   DiskPressure and GKE auto-repair recreated it. Fix (this ADR's
+   follow-up commit): the prefetch supervisor publishes the memfiles'
+   allocated bytes as a **co-tenant reserve** the cache subtracts from
+   its ceiling every sweep, so memfile growth converts into cache
+   eviction instead of disk overshoot (`engram_chunk_cache_co_tenant_
+   reserved_bytes`; the pins-over-budget alarm now fires against the
+   effective ceiling).
+2. **Lazy mode does not reclaim pre-existing prewarmed tmpfs files.**
+   The tmpfs is a node mount; base files written by the pre-flip Full
+   mode survive pod rolls and stay pinned (~21.7 GiB Shmem) until image
+   disable or node recreation. Follow-up: hole-punch untracked-but-
+   present base files at lazy-mode startup (keeps the inode — the
+   measured punched-base config).
+3. **Env-only values changes don't roll the fleet.** The K3 operator's
+   `plan_roll` compares images only; a ConfigMap-only change (exactly
+   how these knobs deploy) rolls nothing. The canary was applied by
+   operator-equivalent manual pod deletes. Follow-up: hash the rendered
+   ConfigMap into the pod template and teach `on_target` to compare it.
+
+(An unrelated lifecycle bug also surfaced while clearing a host for the
+roll: an operator `evacuate` racing the idle detector's soft-evict
+nomination wedges `evicting → evacuating` and strands the session in
+`host_lost` — durable state intact, cold recovery works. Tracked
+separately.)
+
 ## Consequences
 
 **Positive**
