@@ -28,6 +28,7 @@ pub mod refresh;
 pub mod remount;
 pub mod share;
 pub mod shell;
+pub mod storm_shield;
 
 pub use cacerts::{CaCertInstaller, CaCertPaths};
 pub use handler::serve_connection;

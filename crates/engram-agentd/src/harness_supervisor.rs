@@ -190,6 +190,19 @@ impl HarnessSupervisor {
         // correct clock right after a resume. The periodic tick keeps a
         // long-running harness corrected across later resumes.
         crate::clock::sync_now();
+        // ADR 0093: a cold spawn right after a resume races the guest's
+        // wake-up stampede (measured 40 s to first reply vs 2.7 s quiet;
+        // nice and the memory substrate both measured ineffective). Freeze
+        // the resumed workload for the cold-start window — a detached
+        // timer thaws it; the guard thaws early if the spawn fails. The
+        // reattach arm above never reaches this (a warm harness has no
+        // cold start to protect), and without a fresh resume marker
+        // (VZ/dev, live re-issues, plain restarts) this is a no-op.
+        let storm_shield = if crate::storm_shield::resumed_recently() {
+            crate::storm_shield::engage()
+        } else {
+            None
+        };
         let argv0 = req.argv[0].clone();
 
         // ADR 0021 P1.4: the harness binary is baked into the rootfs
@@ -343,6 +356,9 @@ impl HarnessSupervisor {
             .map_err(|e| std::io::Error::new(e.kind(), format!("spawn {:?}: {e}", argv0)))?;
         let pid = child.id();
         boost_harness_priority(pid);
+        if let Some(shield) = storm_shield {
+            shield.release(); // spawn succeeded — the grace timer thaws
+        }
         tracing::info!(pid = ?pid, argv0 = %argv0, argc = req.argv.len(), "harness child running");
         guard.current_child = Some(child);
         Ok(pid)
