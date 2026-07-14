@@ -310,6 +310,11 @@ pub struct FirecrackerConfig {
     /// spawns engram-uffd-handler and serves pages on demand (fast,
     /// requires Linux + the handler binary on the host).
     pub restore_mode: RestoreMode,
+    /// ADR 0092: fresh-create memory backend override. `None` = derived
+    /// (`uffd_base_dir` set ⇒ Uffd, else File). `Some(File)` restores
+    /// fresh creates from the per-image memfile even on a substrate host
+    /// (reclaimable page-cache residency); resumes are unaffected.
+    pub fresh_restore_override: Option<RestoreMode>,
     /// ADR 0028: arm KVM dirty-page tracking on every VM — cold
     /// creates via `MachineConfig.track_dirty_pages`, restores via
     /// `enable_diff_snapshots` at `snapshot/load` — so periodic
@@ -459,6 +464,29 @@ pub fn restore_mode_from_env() -> RestoreMode {
     }
 }
 
+/// ADR 0092: override the *fresh-create* memory backend independently of
+/// the substrate. Unset/empty ⇒ `None` (the derived default:
+/// `effective_restore_mode` picks Uffd when `uffd_base_dir` is set, File
+/// otherwise). `file` lets a substrate host — which still needs
+/// UFFD+base-shm for resumes — restore fresh creates from the per-image
+/// memfile instead, whose residency is reclaimable page cache (the
+/// density win; pair with `ENGRAM_FC_BASE_MEMFILE_PIN=0`). `uffd` pins
+/// the derived substrate behavior explicitly.
+pub fn fresh_restore_mode_from_env() -> Option<RestoreMode> {
+    match std::env::var("ENGRAM_FC_FRESH_RESTORE_MODE") {
+        Ok(s) if s.eq_ignore_ascii_case("file") => Some(RestoreMode::File),
+        Ok(s) if s.eq_ignore_ascii_case("uffd") => Some(RestoreMode::Uffd),
+        Ok(s) if !s.trim().is_empty() => {
+            tracing::warn!(
+                value = %s,
+                "unrecognised ENGRAM_FC_FRESH_RESTORE_MODE; using the derived default",
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
 /// ADR 0045 substrate (v2b): per-template base-shm directory for
 /// Uffd-mode restores from `ENGRAM_FC_UFFD_BASE_DIR`. Unset/empty ⇒
 /// `None` (stock anonymous Uffd restore — the D2 rollout gate; the
@@ -590,6 +618,7 @@ impl FirecrackerConfig {
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             uffd_base_dir: None,
             restore_mode: RestoreMode::File,
+            fresh_restore_override: None,
             track_dirty_pages: false,
             balloon: std::env::var("ENGRAM_FC_BALLOON").map_or(true, |v| v != "0"),
             host_id: None,
@@ -1101,6 +1130,12 @@ impl FirecrackerBackend {
     /// job is now derived, not configured).
     fn effective_restore_mode(&self, fresh: bool) -> RestoreMode {
         if fresh {
+            // ADR 0092: explicit override first — `file` on a substrate
+            // host restores fresh creates from the per-image memfile
+            // (reclaimable page-cache residency) while resumes keep Uffd.
+            if let Some(m) = self.config.fresh_restore_override {
+                return m;
+            }
             if self.config.uffd_base_dir.is_some() {
                 RestoreMode::Uffd
             } else {
@@ -6159,6 +6194,7 @@ mod tests {
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             uffd_base_dir: None,
             restore_mode: RestoreMode::File,
+            fresh_restore_override: None,
             track_dirty_pages: false,
             balloon: false,
             net_pool: None,
@@ -6824,6 +6860,29 @@ mod tests {
         be.config.uffd_base_dir = Some(std::path::PathBuf::from("/dev/shm/engram"));
         assert_eq!(be.effective_restore_mode(true), RestoreMode::Uffd);
         assert_eq!(be.effective_restore_mode(false), RestoreMode::Uffd);
+
+        // ADR 0092: the fresh-create override beats the derivation — a
+        // substrate host restores fresh creates from the per-image
+        // memfile (reclaimable page-cache residency) while resumes keep
+        // the substrate.
+        be.config.fresh_restore_override = Some(RestoreMode::File);
+        assert_eq!(
+            be.effective_restore_mode(true),
+            RestoreMode::File,
+            "explicit file override wins for fresh creates on a substrate host",
+        );
+        assert_eq!(
+            be.effective_restore_mode(false),
+            RestoreMode::Uffd,
+            "the override never touches resumes",
+        );
+        be.config.fresh_restore_override = Some(RestoreMode::Uffd);
+        be.config.uffd_base_dir = None;
+        assert_eq!(
+            be.effective_restore_mode(true),
+            RestoreMode::Uffd,
+            "explicit uffd override wins over the substrate-off derivation",
+        );
     }
 
     #[test]

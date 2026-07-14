@@ -41,6 +41,22 @@ data:
   # the host-agent derives everything else from this one switch.
   ENGRAM_FC_UFFD_BASE_DIR: {{ . | quote }}
   {{- end }}
+  {{- with .Values.firecracker.freshRestoreMode }}
+  # ADR 0092: fresh-create memory backend override. "file" restores fresh
+  # creates from the per-image memfile even on a substrate host
+  # (reclaimable page-cache residency); resumes keep the substrate.
+  ENGRAM_FC_FRESH_RESTORE_MODE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.firecracker.baseMemfilePin }}
+  # ADR 0092: "0" skips the memfile mlock — the kernel reclaims cold base
+  # pages under pressure instead of the host OOMing.
+  ENGRAM_FC_BASE_MEMFILE_PIN: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.firecracker.baseShmMode }}
+  # ADR 0092: "lazy" skips the eager base-shm pre-warm — the handler
+  # populates the tmpfs base on fault (resume working set only).
+  ENGRAM_FC_BASE_SHM_MODE: {{ . | quote }}
+  {{- end }}
   {{- with .Values.firecracker.vmCgroupParent }}
   # ADR 0044 K2: node-level cgroup-v2 dir the host-agent moves each VM's
   # FC + uffd-handler into, so they survive this pod's cgroup teardown on
