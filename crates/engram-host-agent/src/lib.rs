@@ -327,6 +327,16 @@ impl HostAgent {
                 // incoming snapshot_begin, or resume_pending_finalizes
                 // below all rely on it for the terminal destroy call).
                 arc.set_self_ref(&arc);
+                // Re-seed checkpoint chains for pidfd-reattached
+                // survivors from their durable chain-head records (and
+                // GC records for sandboxes that didn't survive). Must
+                // run before the checkpoint driver, the eviction
+                // redrive, and coordinator registration — the first
+                // post-roll capture of every survivor rides the diff
+                // path instead of a FULL multi-GiB memory re-chunk
+                // (2026-07-13 incident: a survivor's evict capture ran
+                // 40+ minutes).
+                arc.rehydrate_chain_heads().await;
                 arc
             };
             // ADR 0084 P1b: the capture-job executor + durable-record

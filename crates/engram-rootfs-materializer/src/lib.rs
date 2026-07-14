@@ -393,7 +393,7 @@ impl Materializer {
                 });
             }
         };
-        let manifest = chunk_store
+        let (manifest, chunk_stats) = chunk_store
             .chunk_file_into(
                 &ext4_path,
                 ManifestKind::Disk,
@@ -429,6 +429,9 @@ impl Materializer {
             clamp_ms,
             pack_ms,
             chunk_ms,
+            chunk_scan_ms = (chunk_stats.scan_seconds * 1000.0) as u64,
+            chunk_flush_ms = (chunk_stats.flush_seconds * 1000.0) as u64,
+            chunk_bytes_uploaded = chunk_stats.bytes_uploaded,
             "materialized image into chunk store"
         );
 
