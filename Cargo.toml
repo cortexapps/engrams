@@ -203,6 +203,11 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # UAPI-only dir referenced via `-idirafter` (ci.yml / bake-images.yml),
 # so the musl sysroot's headers always win and zstd-sys compiles clean.
 zstd = { version = "0.13", default-features = false }
+# ADR 0093: the streaming packer. Pinned EXACT: mkext4's byte layout is
+# stable per crate version only, and our chunk dedup + cold-base reuse
+# keys hang off byte-identical images — a version bump is a deliberate
+# fleet-wide chunk-cache invalidation event, never a float.
+mkext4 = "=0.0.2"
 once_cell = "1"
 # ADR 0088 addendum round 2: the flatten write pool's job dequeue. A
 # `Mutex<mpsc::Receiver>` shared by 16 workers burned 38s of CPU in
