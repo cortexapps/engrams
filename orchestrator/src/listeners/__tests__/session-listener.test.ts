@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Code, ConnectError } from "@connectrpc/connect";
 
 import type {
   BoundedRead,
@@ -298,6 +299,40 @@ describe("SessionListener", () => {
     expect(rec.terminals).toEqual(["failed"]);
     expect(actions).toEqual(["terminal:session-1", "release:session-1:owner-1"]);
     expect(await base.tryAcquire("session-1", "owner-2", 30_000)).toBe(false);
+  });
+
+  test("a session unknown to the coordinator marks terminal and exits instead of retrying", async () => {
+    const rec = recordingConsumer();
+    const base = await acquiredLease();
+    const actions: string[] = [];
+    const leases: LeaseStore = {
+      ...base,
+      markTerminal: async (sessionId) => {
+        actions.push(`terminal:${sessionId}`);
+        await base.markTerminal(sessionId);
+      },
+      release: async (sessionId, owner) => {
+        actions.push(`release:${sessionId}:${owner}`);
+        await base.release(sessionId, owner);
+      },
+    };
+    let reads = 0;
+    const subject = await listener({
+      leaseStore: leases,
+      sleep: async () => {},
+      readPage: async () => {
+        reads++;
+        throw new ConnectError("metadata row not found", Code.NotFound);
+      },
+    }, [rec.consumer]);
+
+    await subject.run();
+
+    expect(reads).toBe(1);
+    expect(actions).toEqual(["terminal:session-1", "release:session-1:owner-1"]);
+    // The outcome is unknown — no fabricated terminal reaches consumers.
+    expect(rec.terminals).toEqual([]);
+    expect(await base.listDesired()).toEqual([]);
   });
 
   test("a failed lease renewal stops before delivering further events", async () => {

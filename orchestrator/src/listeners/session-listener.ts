@@ -1,3 +1,5 @@
+import { Code, ConnectError } from "@connectrpc/connect";
+
 import {
   curateWireEvent,
   parseTerminalOutcome,
@@ -211,6 +213,20 @@ export class SessionListener {
         throw new Error("coordinator event stream closed");
       } catch (err) {
         if (this.#stopRequested) return;
+        if (err instanceof ConnectError && err.code === Code.NotFound) {
+          // The coordinator no longer knows this session (GC'd / reaped): it
+          // can never produce events again, so conclude instead of retrying.
+          // The real outcome is unknown — consumers get no fabricated
+          // onTerminal.
+          log.warn(
+            { sessionId: this.#deps.sessionId, err },
+            "session unknown to coordinator; marking listener terminal",
+          );
+          await this.#deps.leaseStore.markTerminal(this.#deps.sessionId);
+          await this.#release();
+          this.#requestStop();
+          return;
+        }
         reconnectAttempt++;
         const delayMs = Math.min(
           RETRY_MAX_MS,
