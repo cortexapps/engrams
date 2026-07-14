@@ -173,8 +173,8 @@ impl Ext4Packer for Mke2fsPacker {
 /// guests mount the rootfs by virtio device path, never by UUID, and
 /// the images are block devices inside dedicated microVMs (no host
 /// blkid involvement).
-const DETERMINISTIC_FS_UUID: &str = "00000000-e9a4-4a11-8036-000000000036";
-const DETERMINISTIC_HASH_SEED: &str = "00000000-5eed-4a11-8036-000000000036";
+pub(crate) const DETERMINISTIC_FS_UUID: &str = "00000000-e9a4-4a11-8036-000000000036";
+pub(crate) const DETERMINISTIC_HASH_SEED: &str = "00000000-5eed-4a11-8036-000000000036";
 /// 2024-01-01T00:00:00Z. e2fsprogs (≥1.45) reads `SOURCE_DATE_EPOCH`
 /// and (a) stamps superblock mkfs/write times from it instead of the
 /// wall clock, and (b) clamps inode timestamps newer than it — which

@@ -31,6 +31,7 @@ pub mod ext4;
 pub mod flatten;
 pub mod inject;
 pub mod pull;
+pub mod stream_pack;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
