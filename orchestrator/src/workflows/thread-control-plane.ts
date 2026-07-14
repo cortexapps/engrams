@@ -36,6 +36,7 @@ import type { CustomConnectorSource } from "../connectors/registry.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 import { config } from "../config.ts";
 import type { ThreadControlPlane } from "./slack-thread.ts";
+import { tools as defaultToolRegistry, type ToolRegistry } from "../tools/registry.ts";
 import { ensureListenerRow as ensureProductionListenerRow } from "../listeners/lease-store.ts";
 
 /** A StringList map value (proto3 maps can't hold `repeated` directly). */
@@ -62,6 +63,7 @@ export interface ThreadControlPlaneDeps {
   harnessCatalog?: HarnessCatalogClient;
   secrets?: { get(userId: string, envVar: string): Promise<string | null> };
   sessions?: ThreadSessionsClient;
+  toolRegistry?: Pick<ToolRegistry, "complete">;
   resolveUser?: (provider: string, externalUserId: string) => Promise<string | null>;
   ensureListenerRow?: EnsureListenerRow;
   /** The Drizzle DB the task-persist transaction runs on. Default = the pool. */
@@ -77,6 +79,7 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
     deps.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
   const secrets = deps.secrets ?? makeUserSecretStore(getDb());
   const sessions = deps.sessions ?? (defaultSessions as unknown as ThreadSessionsClient);
+  const toolRegistry = deps.toolRegistry ?? defaultToolRegistry;
   const resolveUser = deps.resolveUser ?? resolveEngramsUser;
   const ensureListenerRow =
     deps.ensureListenerRow ?? ensureProductionListenerRow;
@@ -121,5 +124,8 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
       for (const [k, v] of Object.entries(answers)) wire[k] = { values: v };
       await sessions.answerQuestion({ sessionId, toolCallId, answers: wire });
     },
+
+    completeToolCall: (sessionId, toolCallId, result) =>
+      toolRegistry.complete(sessionId, toolCallId, result),
   };
 }

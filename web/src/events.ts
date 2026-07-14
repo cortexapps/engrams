@@ -141,6 +141,24 @@ export type SessionEvent =
       result_summary: string | null;
       at: string;
     }
+  // ADR 0089: an orchestrator-registered tool was invoked. `args_json` is
+  // deliberately opaque JSON text; tool-specific presenters parse it.
+  | {
+      type: "tool_call_requested";
+      run_id: string;
+      tool_call_id: string;
+      name: string;
+      args_json: string;
+      at: string;
+    }
+  // ADR 0089: the coordinator synchronously accepted a result for delivery.
+  // Surfaces resolve pending UI from this event without waiting for the harness.
+  | {
+      type: "tool_result_submitted";
+      tool_call_id: string;
+      result_json: string;
+      at: string;
+    }
   | { type: "run_completed"; run_id: string; ok: boolean; at: string }
   // ADR 0030: the in-flight run was stopped by an operator interrupt
   // (`POST /sessions/:id/interrupt`). The session stays alive; the
@@ -150,7 +168,7 @@ export type SessionEvent =
   // ADR 0054: the agent called `AskUserQuestion`; the harness deferred it
   // (the turn ends so the VM can idle-evict) and emitted this durable
   // "awaiting input" card. The web renders an interactive question form and
-  // POSTs the answer back via `SessionService.AnswerQuestion`, keyed on
+  // POSTs historical answers via `SessionService.AnswerQuestion`, keyed on
   // `tool_call_id` (Claude's tool_use_id). Survives eviction — it's in the log.
   | {
       type: "user_question";

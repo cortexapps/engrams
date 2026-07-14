@@ -93,9 +93,10 @@ function recordingPolicy() {
 
 /** A control plane whose delivery methods are scriptable per test. */
 function recordingControlPlane() {
-  const calls: { sendPrompt: unknown[][]; answerQuestion: unknown[][] } = {
+  const calls: { sendPrompt: unknown[][]; answerQuestion: unknown[][]; completeToolCall: unknown[][] } = {
     sendPrompt: [],
     answerQuestion: [],
+    completeToolCall: [],
   };
   const cp: ThreadControlPlane & { sendPromptImpl: () => Promise<void>; answerImpl: () => Promise<void> } = {
     resolveUser: async () => "u1",
@@ -109,6 +110,10 @@ function recordingControlPlane() {
       calls.answerQuestion.push([sessionId, toolCallId, answers]);
       await cp.answerImpl();
     },
+    completeToolCall: async (sessionId, toolCallId, answers) => {
+      calls.completeToolCall.push([sessionId, toolCallId, answers]);
+      await cp.answerImpl();
+    },
     sendPromptImpl: async () => {},
     answerImpl: async () => {},
   };
@@ -117,6 +122,7 @@ function recordingControlPlane() {
 
 const freshState = (m: SourceMention) => ({
   questionTs: new Map<string, string>(),
+  questionProtocols: new Map<string, "generic" | "legacy">(),
   assets: [],
   bubble: null,
   lastAssistantText: null,
@@ -194,8 +200,42 @@ describe("handleInbound() — answer", () => {
     const next = await handleInbound(STEP, pol, cp, SESSION, st, "180.0", answerMsg);
 
     expect(cpCalls.answerQuestion).toEqual([["s1", "tc", { "Ship?": ["Yes"] }]]);
+    expect(cpCalls.completeToolCall).toHaveLength(0);
     expect(calls.onDeliveryError).toHaveLength(0);
     expect(next).toBe("180.0");
+  });
+
+  test("a generic question answer uses CompleteToolCall and never AnswerQuestion", async () => {
+    const { pol } = recordingPolicy();
+    const { cp, calls: cpCalls } = recordingControlPlane();
+    const st = freshState(mention("100.0", "Ev0"));
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", {
+      kind: "session_event",
+      event: {
+        idx: 1n,
+        kind: "tool_call_requested",
+        payloadJson: JSON.stringify({
+          run_id: "r1",
+          tool_call_id: "tc",
+          name: "ask_user_question",
+          args_json: JSON.stringify({
+            questions: [
+              {
+                question: "Ship?",
+                header: "Ship",
+                multiSelect: false,
+                options: [{ label: "Yes", description: "Deploy" }],
+              },
+            ],
+          }),
+        }),
+      },
+    });
+
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", answerMsg);
+
+    expect(cpCalls.completeToolCall).toEqual([["s1", "tc", { "Ship?": ["Yes"] }]]);
+    expect(cpCalls.answerQuestion).toHaveLength(0);
   });
 
   test("answerQuestion failure is NON-FATAL: ⚠️ onDeliveryError, no throw", async () => {
@@ -250,6 +290,75 @@ describe("handleInbound() — session event", () => {
 
     expect(next).toBe("180.0");
     expect(calls.onDeliveryError).toHaveLength(0); // render drops are silent (logged only)
+  });
+
+  test("generic request posts a card and its submitted result locks that same card", async () => {
+    const { pol, calls } = recordingPolicy();
+    const { cp } = recordingControlPlane();
+    const st = freshState(mention("100.0", "Ev0"));
+    const request = ev(
+      "tool_call_requested",
+      JSON.stringify({
+        run_id: "r1",
+        tool_call_id: "tc-generic",
+        name: "ask_user_question",
+        args_json: JSON.stringify({
+          questions: [
+            {
+              question: "Ship?",
+              header: "Ship",
+              multiSelect: false,
+              options: [{ label: "Yes", description: "Deploy" }],
+            },
+          ],
+        }),
+      }),
+    );
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", {
+      kind: "session_event",
+      event: request,
+    });
+    const submitted = ev(
+      "tool_result_submitted",
+      JSON.stringify({
+        tool_call_id: "tc-generic",
+        result_json: JSON.stringify({ "Ship?": ["Yes"] }),
+      }),
+    );
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", {
+      kind: "session_event",
+      event: submitted,
+    });
+
+    expect(calls.onUserQuestion).toEqual([[st.currentMention, request]]);
+    expect(calls.onAnswered).toEqual([[st.currentMention, submitted, "q-ts"]]);
+    expect(st.questionProtocols.get("tc-generic")).toBe("generic");
+  });
+
+  test("legacy user_question and question_answered still post and lock a card", async () => {
+    const { pol, calls } = recordingPolicy();
+    const { cp } = recordingControlPlane();
+    const st = freshState(mention("100.0", "Ev0"));
+    const question = ev(
+      "user_question",
+      JSON.stringify({ tool_call_id: "tc-legacy", questions: [] }),
+    );
+    const answered = ev(
+      "question_answered",
+      JSON.stringify({ tool_call_id: "tc-legacy", answers: { "Ship?": ["Yes"] } }),
+    );
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", {
+      kind: "session_event",
+      event: question,
+    });
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", {
+      kind: "session_event",
+      event: answered,
+    });
+
+    expect(calls.onUserQuestion).toEqual([[st.currentMention, question]]);
+    expect(calls.onAnswered).toEqual([[st.currentMention, answered, "q-ts"]]);
+    expect(st.questionProtocols.get("tc-legacy")).toBe("legacy");
   });
 });
 

@@ -16,7 +16,7 @@
  *   - session_event   → route to the policy (question/answer-update/asset)
  *   - session_terminal → closing summary (ok) or failure, then exit
  *   - trigger_mention  → gather NEW context, SendPrompt (idempotent prompt_id)
- *   - trigger_answer   → AnswerQuestion
+ *   - trigger_answer   → CompleteToolCall (generic) or AnswerQuestion (legacy)
  *
  * `questionTs` (tool_call_id → posted-question ref) is plain workflow-local
  * state: it is rebuilt deterministically on replay from the checkpointed
@@ -31,6 +31,7 @@ import {
   type AssetSummary,
   type ClosingSummary,
   type CommunicationPolicy,
+  type QuestionProtocol,
   type StartedSession,
 } from "./communication-policy.ts";
 import { THREAD_TOPIC, type ThreadInbox, type SourceMention } from "./thread-inbox.ts";
@@ -64,6 +65,12 @@ export interface ThreadControlPlane {
     sessionId: string,
     toolCallId: string,
     answers: Record<string, string[]>,
+  ): Promise<void>;
+  /** Complete an ADR 0089 session-handled tool through its registered schema. */
+  completeToolCall(
+    sessionId: string,
+    toolCallId: string,
+    result: Record<string, string[]>,
   ): Promise<void>;
 }
 
@@ -102,9 +109,9 @@ const SESSION_FAILED_MSG = "The session ended in failure.";
 // continue. See `TerminalOutcome` in session-events.ts.
 const SESSION_CLOSED_MSG = "This session is complete. Start a new session if you'd like to continue.";
 // Non-fatal: the thread stays alive after these so the user can retry.
-// ADR 0067: SendPrompt/AnswerQuestion now durably ENQUEUE on the
-// coordinator (202) — a resuming/idle session is no longer a delivery
-// failure, so there is no "mention me again" apology arm. These fire
+// ADR 0067: SendPrompt, AnswerQuestion, and CompleteToolCall now durably
+// ENQUEUE on the coordinator (202) — a resuming/idle session is no longer a
+// delivery failure, so there is no "mention me again" apology arm. These fire
 // only for hard enqueue failures (session gone / coord unreachable).
 const DELIVER_FAIL_MSG =
   "I couldn't queue that for your session (it may have ended). Start a new session to continue.";
@@ -202,6 +209,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
   // driving the live turn, so the run lifecycle reacts on the right message.
   const st: ThreadRender = {
     questionTs: new Map<string, string>(),
+    questionProtocols: new Map<string, QuestionProtocol>(),
     assets: [],
     bubble: null,
     lastAssistantText: null,
@@ -302,10 +310,18 @@ export async function handleInbound(
     }
     case "trigger_answer": {
       try {
-        await step(
-          () => cp.answerQuestion(session.id, msg.answer.toolCallId, msg.answer.answers),
-          "answerQuestion",
-        );
+        const via = st.questionProtocols.get(msg.answer.toolCallId) ?? "legacy";
+        if (via === "generic") {
+          await step(
+            () => cp.completeToolCall(session.id, msg.answer.toolCallId, msg.answer.answers),
+            "completeToolCall",
+          );
+        } else {
+          await step(
+            () => cp.answerQuestion(session.id, msg.answer.toolCallId, msg.answer.answers),
+            "answerQuestion",
+          );
+        }
       } catch (err) {
         log.error({ sessionId: session.id, err }, "slack: failed to enqueue answer — keeping the thread alive");
         await step(() => pol.onDeliveryError(st.currentMention, ANSWER_FAIL_MSG), "onDeliveryError").catch(() => {});
@@ -320,6 +336,8 @@ export async function handleInbound(
 export interface ThreadRender {
   /** tool_call_id → posted question `ts`, so an answer updates that message. */
   questionTs: Map<string, string>;
+  /** tool_call_id → originating protocol, which selects the completion RPC. */
+  questionProtocols: Map<string, QuestionProtocol>;
   /** Durable assets, accumulated for the closing recap. */
   assets: AssetSummary[];
   /** The active assistant message consecutive responses coalesce into, or null
@@ -352,7 +370,7 @@ async function dispatchSessionEvent(
   st: ThreadRender,
   session: StartedSession,
 ): Promise<void> {
-  const effect = routeSessionEvent(msg.event);
+  const effect = routeSessionEvent(msg.event, st.questionProtocols);
   switch (effect.kind) {
     case "message": {
       if (!effect.text) break;
@@ -380,7 +398,10 @@ async function dispatchSessionEvent(
     case "question": {
       st.bubble = null; // the question is its own message
       const ref = await step(() => pol.onUserQuestion(m, msg.event), "onUserQuestion");
-      if (effect.toolCallId) st.questionTs.set(effect.toolCallId, ref);
+      if (effect.toolCallId) {
+        st.questionTs.set(effect.toolCallId, ref);
+        st.questionProtocols.set(effect.toolCallId, effect.via);
+      }
       break;
     }
     case "answered": {

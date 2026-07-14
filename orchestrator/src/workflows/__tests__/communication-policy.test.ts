@@ -18,6 +18,7 @@ describe("routeSessionEvent()", () => {
     expect(routeSessionEvent(ev("user_question", '{"tool_call_id":"t1"}'))).toEqual({
       kind: "question",
       toolCallId: "t1",
+      via: "legacy",
     });
   });
 
@@ -25,7 +26,85 @@ describe("routeSessionEvent()", () => {
     expect(routeSessionEvent(ev("question_answered", '{"tool_call_id":"t1"}'))).toEqual({
       kind: "answered",
       toolCallId: "t1",
+      via: "legacy",
     });
+  });
+
+  test("ask_user_question tool_call_requested → generic question from canonical args_json", () => {
+    const payload = JSON.stringify({
+      run_id: "r1",
+      tool_call_id: "t-generic",
+      name: "ask_user_question",
+      args_json: JSON.stringify({
+        questions: [
+          {
+            question: "Ship it?",
+            header: "Ship",
+            multiSelect: false,
+            options: [{ label: "Yes", description: "Deploy now" }],
+          },
+        ],
+      }),
+    });
+
+    expect(routeSessionEvent(ev("tool_call_requested", payload))).toEqual({
+      kind: "question",
+      toolCallId: "t-generic",
+      via: "generic",
+    });
+  });
+
+  test("other or malformed generic requests are ignored", () => {
+    expect(
+      routeSessionEvent(
+        ev(
+          "tool_call_requested",
+          JSON.stringify({
+            tool_call_id: "t1",
+            name: "save_memory",
+            args_json: JSON.stringify({ text: "remember" }),
+          }),
+        ),
+      ),
+    ).toEqual({ kind: "ignore" });
+    expect(
+      routeSessionEvent(
+        ev(
+          "tool_call_requested",
+          JSON.stringify({
+            tool_call_id: "t2",
+            name: "ask_user_question",
+            args_json: JSON.stringify({ questions: [{ question: "missing canonical fields" }] }),
+          }),
+        ),
+      ),
+    ).toEqual({ kind: "ignore" });
+  });
+
+  test("tool_result_submitted answers only a call previously routed as a generic question", () => {
+    const payload = JSON.stringify({
+      tool_call_id: "t-generic",
+      result_json: JSON.stringify({ "Ship it?": ["Yes"] }),
+    });
+    const protocols = new Map<string, "generic" | "legacy">([
+      ["t-generic", "generic"],
+      ["t-legacy", "legacy"],
+    ]);
+
+    expect(routeSessionEvent(ev("tool_result_submitted", payload), protocols)).toEqual({
+      kind: "answered",
+      toolCallId: "t-generic",
+      via: "generic",
+    });
+    expect(
+      routeSessionEvent(
+        ev(
+          "tool_result_submitted",
+          JSON.stringify({ tool_call_id: "unknown", result_json: JSON.stringify({}) }),
+        ),
+        protocols,
+      ),
+    ).toEqual({ kind: "ignore" });
   });
 
   test("integration_asset and file_shared → asset", () => {
@@ -55,6 +134,7 @@ describe("routeSessionEvent()", () => {
     expect(routeSessionEvent(ev("user_question", "not json"))).toEqual({
       kind: "question",
       toolCallId: undefined,
+      via: "legacy",
     });
   });
 });

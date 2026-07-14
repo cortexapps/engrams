@@ -10,9 +10,10 @@ import { useQuestionActions } from "./question-actions";
 
 // ADR 0054: the interactive AskUserQuestion card. While unanswered it's a form
 // — one block per question, options as selectable rows (single-select behaves
-// like radios, multi-select toggles). On submit it POSTs via `answerQuestion`
-// (resuming the session) and locks into a read-only receipt; the authoritative
-// `question_answered` event arriving over SSE shows the same thing.
+// like radios, multi-select toggles). On submit it uses the protocol recorded
+// on the marker (CompleteToolCall for generic, AnswerQuestion for historical)
+// and locks into a read-only receipt; the authoritative resolving SSE event
+// shows the same thing.
 
 type QuestionMarker = Extract<SystemMarker, { kind: "user_question" }>;
 
@@ -23,7 +24,7 @@ export function UserQuestionCard({ marker }: { marker: QuestionMarker }) {
   const { submitAnswer, answeredToolCallIds, sendBlocked } = useQuestionActions();
   const [selections, setSelections] = useState<Selections>({});
 
-  // `confirmed` = the authoritative `question_answered` event has landed.
+  // `confirmed` = the authoritative result/answered event has landed.
   // `pending` = we optimistically submitted but it hasn't round-tripped yet
   // (the VM may take seconds to resume and re-fire). Both show the receipt;
   // pending shows it greyed with a spinner, mirroring the optimistic
@@ -56,7 +57,7 @@ export function UserQuestionCard({ marker }: { marker: QuestionMarker }) {
 
   const onSubmit = () => {
     if (!complete || answered || sendBlocked) return;
-    submitAnswer(marker.toolCallId, selections);
+    submitAnswer(marker.via, marker.toolCallId, selections);
   };
 
   return (

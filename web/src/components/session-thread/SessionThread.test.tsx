@@ -271,6 +271,89 @@ describe("SessionThread", () => {
     await waitFor(() => expect(screen.getByText("saving…")).toBeTruthy());
   });
 
+  test("a generic question submits canonical answers through CompleteToolCall only", async () => {
+    let completed: { sessionId: string; toolCallId: string; resultJson: string } | null = null;
+    let legacyCalls = 0;
+    const transport = createRouterTransport((router) => {
+      router.service(SessionService, {
+        answerQuestion: (req) => {
+          legacyCalls += 1;
+          return { sessionId: req.sessionId, note: "unexpected" };
+        },
+        completeToolCall: (req) => {
+          completed = {
+            sessionId: req.sessionId,
+            toolCallId: req.toolCallId,
+            resultJson: req.resultJson,
+          };
+          return { sessionId: req.sessionId, note: "ok" };
+        },
+      });
+    });
+    const user = userEvent.setup();
+    renderWithProviders(
+      <SessionThread
+        sessionId="s1"
+        status="idle"
+        events={indexed([
+          {
+            type: "tool_call_requested",
+            run_id: "r1",
+            tool_call_id: "t-generic",
+            name: "ask_user_question",
+            args_json: JSON.stringify({
+              questions: [
+                {
+                  question: "Which database?",
+                  header: "Database",
+                  multiSelect: false,
+                  options: [{ label: "Postgres", description: "Relational, default" }],
+                },
+              ],
+            }),
+            at: AT,
+          },
+        ])}
+      />,
+      { transport },
+    );
+
+    await user.click(await screen.findByText("Postgres"));
+    await user.click(screen.getByRole("button", { name: "Submit answer" }));
+
+    await waitFor(() => expect(completed).not.toBeNull());
+    expect(completed).toEqual({
+      sessionId: "s1",
+      toolCallId: "t-generic",
+      resultJson: JSON.stringify({ "Which database?": ["Postgres"] }),
+    });
+    expect(legacyCalls).toBe(0);
+    expect(await screen.findByText("saving…")).toBeTruthy();
+  });
+
+  test("an unanswered non-question generic call shows a waiting tool affordance", async () => {
+    renderWithProviders(
+      <SessionThread
+        sessionId="s1"
+        status="idle"
+        events={indexed([
+          {
+            type: "tool_call_requested",
+            run_id: "r1",
+            tool_call_id: "approval-1",
+            name: "approve_deploy",
+            args_json: JSON.stringify({ environment: "production" }),
+            at: AT,
+          },
+        ])}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Waiting for tool: approve_deploy" })).toBeTruthy(),
+    );
+  });
+
   // Regression: an idle send to session A must not bleed its optimistic bubble
   // into session B when the same (un-remounted) SessionThread navigates there,
   // and the bubble must reappear on returning to A (it survives navigation; it's

@@ -120,6 +120,7 @@ describe("makeThreadControlPlane", () => {
   });
 
   test("getDefaultProfile + resolveUser delegate to their seams", async () => {
+    const completed: unknown[][] = [];
     const cp = makeThreadControlPlane({
       profiles: fakeProfiles(),
       images: fakeImages(),
@@ -127,6 +128,9 @@ describe("makeThreadControlPlane", () => {
       harnessCatalog: fakeHarnessCatalog(),
       secrets: { get: async () => null },
       resolveUser: async (provider, ext) => (provider === "slack" && ext === "U1" ? "user-7" : null),
+      toolRegistry: {
+        complete: async (...args) => void completed.push(args),
+      },
       db: recordingDb([]),
       sessions: {
         createSession: async () => ({ sessionId: "s" }),
@@ -138,5 +142,7 @@ describe("makeThreadControlPlane", () => {
 
     expect((await cp.getDefaultProfile())?.id).toBe("default-profile");
     expect(await cp.resolveUser("slack", "U1")).toBe("user-7");
+    await cp.completeToolCall("s", "tc", { "Ship?": ["Yes"] });
+    expect(completed).toEqual([["s", "tc", { "Ship?": ["Yes"] }]]);
   });
 });
