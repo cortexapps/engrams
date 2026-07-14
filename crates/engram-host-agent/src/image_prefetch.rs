@@ -714,14 +714,17 @@ async fn reconcile(
     }
 
     // ADR 0070: gauge summed on-disk bytes of every currently-tracked
-    // base memfile — unevictable disk (mlock'd, reclaimed only on
-    // image-disable), part of the same "floor the budget can't touch"
-    // accounting as pinned chunk bytes (see engram-chunk-store's
-    // engram_chunk_cache_pinned_bytes). Runs every tick, including the
-    // LRU-recheck; reads 0 when density is off (`memfiles` stays empty).
-    // A metadata() failure (not yet materialized, or racing the disable
-    // reclaim above) just skips that entry — best-effort, same tolerance
-    // as the pin loop above.
+    // base memfile — disk the chunk sweeper can't evict (reclaimed only
+    // on image-disable; mlock'd too when the pin is on), part of the
+    // same "floor the budget can't touch" accounting as pinned chunk
+    // bytes (see engram-chunk-store's engram_chunk_cache_pinned_bytes).
+    // Allocated bytes (st_blocks), not apparent length: the memfiles are
+    // sparse (dev-brain: 24 GiB apparent, ~21 GiB non-hole) and both the
+    // gauge and the reserve below account real disk consumption. Runs
+    // every tick, including the LRU-recheck; reads 0 when density is off
+    // (`memfiles` stays empty). A metadata() failure (not yet
+    // materialized, or racing the disable reclaim above) just skips that
+    // entry — best-effort, same tolerance as the pin loop above.
     //
     // Collect owned paths FIRST, then await: `MemfileState::pin` holds a
     // raw `*mut libc::c_void` (only `unsafe impl Send`, never `Sync`), so
@@ -734,10 +737,32 @@ async fn reconcile(
     let mut memfile_bytes: u64 = 0;
     for path in memfile_paths {
         if let Ok(meta) = tokio::fs::metadata(&path).await {
-            memfile_bytes += meta.len();
+            memfile_bytes += allocated_bytes(&meta);
         }
     }
     ::metrics::gauge!(crate::metrics::HOST_BASE_MEMFILE_BYTES).set(memfile_bytes as f64);
+    // ADR 0092: the memfiles live on the same filesystem as the chunk
+    // cache (both under the work dir) and its sweeper can't evict them —
+    // reserve their allocated bytes out of the cache's ceiling so the
+    // cache yields the space instead of racing the memfiles to the
+    // kubelet eviction line (the 2026-07-14 w8wq DiskPressure incident:
+    // a warm at-budget cache + 40 GB of unbudgeted memfiles).
+    chunk_cache.set_co_tenant_reserved(memfile_bytes);
+}
+
+/// Allocated (on-disk) bytes of a file: `st_blocks × 512` on unix, so a
+/// sparse memfile reserves what it actually consumes; apparent length
+/// elsewhere (VZ/macOS dev, where the memfile path is never taken).
+fn allocated_bytes(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
 }
 
 /// The outcome of [`prefetch_one`]: the total chunk count warmed (for
@@ -1972,6 +1997,109 @@ mod tests {
         assert!(
             !memfiles.contains_key(&img.manifest_digest),
             "the stale memfiles entry must be dropped so re-prefetch re-materializes",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_publishes_memfile_bytes_as_the_cache_co_tenant_reserve() {
+        // ADR 0092: the memfiles share the chunk cache's filesystem and
+        // its sweeper can't evict them — every reconcile tick publishes
+        // their allocated bytes as the cache's co-tenant reserve so the
+        // cache stops aiming for disk the memfiles occupy (the 2026-07-14
+        // w8wq DiskPressure incident: at-budget warm cache + 40 GB of
+        // unbudgeted memfiles).
+        let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
+        let readiness = ImageReadiness::new();
+        let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
+        let tracked: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
+        let skipped: HeadroomSkipped = Arc::new(Mutex::new(HashSet::new()));
+        let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
+        let img = image_ref(SnapshotId::new(), disk_ref, Some(mem_ref));
+
+        // Make the image ready first — the disable-reclaim arm below keys
+        // on readiness (same order as the vanish test above).
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        for _ in 0..200 {
+            if readiness.contains(&img.manifest_digest) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(readiness.contains(&img.manifest_digest), "ready");
+
+        let memfile = dir.path().join("memory.bin");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&memfile).unwrap();
+            f.write_all(&[0xAB; 8192]).unwrap();
+            // Force block allocation: APFS/ext4 delayed allocation can
+            // report st_blocks=0 until the write is flushed, making the
+            // expected value racy against reconcile's later read.
+            f.sync_all().unwrap();
+        }
+        let expected = allocated_bytes(&std::fs::metadata(&memfile).unwrap());
+        assert!(expected > 0, "allocated bytes must be visible after sync");
+        memfiles.insert(
+            img.manifest_digest.clone(),
+            MemfileState {
+                path: memfile.clone(),
+                pin: None,
+            },
+        );
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        assert_eq!(
+            cache.co_tenant_reserved(),
+            expected,
+            "the tick must reserve the memfile's allocated bytes out of the cache ceiling",
+        );
+
+        // Image disabled → memfile reclaimed → the reserve returns to 0.
+        reconcile(
+            &[],
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        assert_eq!(
+            cache.co_tenant_reserved(),
+            0,
+            "disabling the image must release its reserve",
         );
     }
 
