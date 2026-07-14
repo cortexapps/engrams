@@ -13049,10 +13049,13 @@ mod tests {
         let in_flight_path = checkpoint_dir
             .join("finalize")
             .join(format!("{snapshot_id}.json"));
-        assert!(
-            !in_flight_path.exists(),
-            "the in-flight record must be gone once quarantined"
-        );
+        // `quarantine()` persists the failed/ copy FIRST, then deletes
+        // the in-flight record — observing the former does not imply
+        // the latter yet (flaked under full-suite load).
+        wait_for("in-flight record cleared after quarantine", || {
+            !in_flight_path.exists()
+        })
+        .await;
         assert!(
             !pooled.pending_finalizes.contains_key(&sandbox_id),
             "pending_finalizes must be cleared on quarantine"
