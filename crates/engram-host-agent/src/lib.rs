@@ -830,9 +830,10 @@ impl HostAgent {
             // §3). On `list()` error, ship an empty list — the
             // 3-strike grace window (15s) absorbs transient errors
             // without flipping live sessions.
-            // Seed capacity once at startup from /proc/meminfo. Used
-            // by the scheduler's fit check — without this the coord
-            // sees `total_mib=0` and rejects every session.
+            // Seed capacity once at startup (/proc/meminfo on Linux,
+            // hw.memsize on macOS). Used by the scheduler's fit check —
+            // without this the coord sees `total_mib=0` and rejects
+            // every session, and rung-2 park never fires (ADR 0096).
             // TODO: `used_mib` accounting. Plumbing record_start /
             // record_stop hooks into the SandboxBackend is a follow-up;
             // until then the host always looks "fully available",
