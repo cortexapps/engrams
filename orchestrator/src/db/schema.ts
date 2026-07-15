@@ -109,6 +109,34 @@ export const pendingToolCall = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Papercuts
+// ---------------------------------------------------------------------------
+
+/** Small, concrete sources of friction reported by agents while they work. */
+export const papercut = pgTable(
+  "papercuts",
+  {
+    id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+    summary: text("summary").notNull(),
+    description: text("description").notNull(),
+    category: text("category").notNull(),
+    severity: text("severity"),
+    tags: jsonb("tags").$type<string[]>().default([]),
+    sessionId: text("session_id").notNull(),
+    taskId: text("task_id"),
+    profileId: text("profile_id"),
+    userId: text("user_id"),
+    fixTaskId: text("fix_task_id"),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("papercuts_created_at_idx").on(t.createdAt),
+    index("papercuts_archived_at_idx").on(t.archivedAt),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // Stream-fed session listeners (ingest v2)
 // ---------------------------------------------------------------------------
 
